@@ -29,9 +29,18 @@ mod tests {
             assert!(ids.insert(r.id()), "duplicate active rule id {}", r.id());
             assert!(!r.alerts().is_empty(), "rule {} lists no alerts", r.id());
             for a in r.alerts() {
-                assert!(!a.description.is_empty() && !a.solution.is_empty(), "alert {} lacks texts", a.alert_ref);
+                assert!(!a.description.is_empty(), "alert {} lacks a description", a.alert_ref);
+                // ZAP leaves the solution empty only for informational alerts (e.g. 10104).
+                assert!(
+                    !a.solution.is_empty() || a.risk == crate::scan::Risk::Info,
+                    "alert {} lacks a solution",
+                    a.alert_ref
+                );
                 for t in a.tags {
-                    assert!(!["PENTEST", "QA_STD", "QA_FULL", "DEV_STD", "DEV_FULL", "SEQUENCE"].contains(t), "policy tag {t}");
+                    assert!(
+                        !["PENTEST", "QA_STD", "QA_FULL", "DEV_STD", "DEV_FULL", "SEQUENCE"].contains(t),
+                        "policy tag {t}"
+                    );
                 }
             }
         }

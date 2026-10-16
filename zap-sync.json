@@ -3,10 +3,22 @@
   "branch": "main",
   "commit": "21f3c6c759756c65ec71016933d0ee72566e58f4",
   "data_files": [
-    {"upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml", "ours": "crates/core/src/scan/passive/data/application_errors.xml"},
-    {"upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/debug-error-messages.txt", "ours": "crates/core/src/scan/passive/data/debug-error-messages.txt"},
-    {"upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/URL-information-disclosure-messages.txt", "ours": "crates/core/src/scan/passive/data/URL-information-disclosure-messages.txt"},
-    {"upstream": "addOns/ascanrules/src/main/zapHomeFiles/json/hidden_files.json", "ours": "crates/core/src/scan/active/rules/probes/data/hidden_files.json"}
+    {
+      "upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml",
+      "ours": "crates/core/src/scan/passive/data/application_errors.xml"
+    },
+    {
+      "upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/debug-error-messages.txt",
+      "ours": "crates/core/src/scan/passive/data/debug-error-messages.txt"
+    },
+    {
+      "upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/URL-information-disclosure-messages.txt",
+      "ours": "crates/core/src/scan/passive/data/URL-information-disclosure-messages.txt"
+    },
+    {
+      "upstream": "addOns/ascanrules/src/main/zapHomeFiles/json/hidden_files.json",
+      "ours": "crates/core/src/scan/active/rules/probes/data/hidden_files.json"
+    }
   ],
   "skipped": {
     "ZapVersionScanRule": "ZAP-specific",
@@ -18,6 +30,7 @@
     "Log4ShellScanRule": "needs an out-of-band callback server; planned",
     "PersistentXssScanRule": "needs cross-request state; planned",
     "PersistentXssPrimeScanRule": "needs cross-request state; planned",
-    "PersistentXssSpiderScanRule": "needs cross-request state; planned"
+    "PersistentXssSpiderScanRule": "needs cross-request state; planned",
+    "XsltInjectionScanRule": "not ported yet"
   }
 }

@@ -9,3 +9,7 @@ Copyright the ZAP development team, licensed under the Apache License, Version 2
 - crates/core/src/scan/passive/rules/: passive scan rules ported from the pscanrules
   add-on, including their alert texts. Each file names the ZAP class it was ported from.
 - crates/core/src/scan/passive/data/: data files copied from the pscanrules add-on.
+- crates/core/src/scan/active/rules/: active scan rules ported from the ascanrules add-on
+  and helpers from the commonlib add-on (AbstractAppFilePlugin, ComparableResponse,
+  TimingUtils), including their alert texts and payload lists.
+- crates/core/src/scan/active/rules/probes/data/hidden_files.json: copied from ascanrules.

@@ -120,7 +120,7 @@ mod e2e {
             .map(|p| {
                 let (request, response) = fetch(port, p);
                 let target = Target::from_url(&format!("http://127.0.0.1:{port}{p}")).unwrap();
-                ScanTarget { history_id: None, target, request, response }
+                ScanTarget { history_id: None, target, request, response, duration_ms: None }
             })
             .collect();
         let guard =

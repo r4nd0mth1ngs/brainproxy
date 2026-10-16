@@ -110,6 +110,14 @@ brainproxy findings mark 7 --state false-positive --note "test cookie"
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off
 brainproxy scan passive --rescan                  # rescan all history
 
+# Crawl, then actively scan (42 rules ported from ZAP); everything stays inside the engagement scope
+brainproxy crawl https://app.example.com/ --background         # job id; brainproxy job wait ID
+brainproxy scan active                                         # all crawled/proxied/sent endpoints
+brainproxy scan active https://app.example.com/item?id=1 --strength high
+brainproxy scan active --where "path LIKE '/api/%'" --rules 40018,40012 --background
+brainproxy scan rules --active
+brainproxy findings list --source active
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -148,7 +156,12 @@ brainproxy decode jwt eyJhbGciOi...
   race-condition sending (last-byte sync); diff.
 - **Phase 3 (done):** passive scanner with 49 rules ported from ZAP (see
   [docs/PASSIVE_RULES.md](docs/PASSIVE_RULES.md)), de-duplicated findings, triage.
-- **Next:** Phase 4, crawling and the active scanner.
+- **Phase 4 (done):** crawler, background jobs, immutable engagement scope enforced on
+  every connection, active scanner with 42 rules ported from ZAP (see
+  [docs/ACTIVE_RULES.md](docs/ACTIVE_RULES.md)), ZAP drift detection
+  ([docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
+- **Next:** Phase 5: reports (HTML/JSON/SARIF), authenticated scanning (login flows and
+  session handling), API import (OpenAPI/GraphQL), and automation plans.
 
 ## License
 

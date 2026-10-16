@@ -79,8 +79,13 @@ fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> Act
         exclude_rules: vec![],
         max_duration: None,
     };
-    let targets =
-        vec![ScanTarget { history_id: None, target, request: request.into_bytes(), response: response.into_bytes() }];
+    let targets = vec![ScanTarget {
+        history_id: None,
+        target,
+        request: request.into_bytes(),
+        response: response.into_bytes(),
+        duration_ms: None,
+    }];
     let project = project();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     rt.block_on(active::run(&project, targets, cfg, JobControl::default())).unwrap()
