@@ -177,6 +177,7 @@ dependencies = [
  "brainproxy-core",
  "clap",
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

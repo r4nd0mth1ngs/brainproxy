@@ -2,7 +2,9 @@
 //! `brainproxy capabilities` for the machine-readable command list.
 
 mod capabilities;
+mod crawl_cmd;
 mod fuzz_cmd;
+mod jobs_cmd;
 mod output;
 mod proxy_cmd;
 mod request_args;
@@ -93,6 +95,13 @@ enum Cmd {
     /// Intruder-style fuzzing: payload positions, four attack modes, grep/extract, outlier summary.
     #[command(subcommand)]
     Fuzz(fuzz_cmd::FuzzCmd),
+
+    /// Spider a site: links, forms, redirects, robots.txt, sitemap.xml. Results go to history.
+    Crawl(crawl_cmd::CrawlArgs),
+
+    /// Background jobs (crawl/scan --background): list, status, wait, stop.
+    #[command(subcommand)]
+    Job(jobs_cmd::JobCmd),
 
     /// Passive scanner: run it, list rules, enable/disable them.
     #[command(subcommand)]
@@ -296,6 +305,8 @@ fn command_name(cmd: &Cmd) -> String {
         },
         Cmd::Diff(_) => "diff",
         Cmd::Scan(_) => "scan",
+        Cmd::Crawl(_) => "crawl",
+        Cmd::Job(_) => "job",
         Cmd::Findings(_) => "findings",
         Cmd::Scope(_) => "scope",
         Cmd::Rules(_) => "rules",
@@ -341,6 +352,8 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
         Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, cmd, out)?,
+        Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
+        Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
@@ -500,12 +513,13 @@ fn schema_json() -> Value {
     };
     json!({
         "tables": [
-            {"name": "history", "description": "One row per request: source is send, race, proxy, or fuzz.", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "history", "description": "One row per request: source is send, race, proxy, fuzz, crawl, or scan.", "columns": cols(store::HISTORY_COLUMNS)},
             {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
             {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
             {"name": "findings", "description": "Scanner findings, de-duplicated (hits counts repeats). Join finding_types ON alert_ref for description/solution.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_COLUMNS)},
             {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
+            {"name": "jobs", "description": "Background jobs (crawl, active scan).", "columns": cols(brainproxy_core::jobs::JOB_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),

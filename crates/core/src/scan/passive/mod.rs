@@ -3,7 +3,7 @@
 //! (proxy, send, findings queries) can cheaply "catch up" at any time.
 
 pub mod rules;
-mod util;
+pub mod util;
 
 use std::sync::OnceLock;
 
