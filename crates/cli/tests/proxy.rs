@@ -405,3 +405,78 @@ fn passive_scan_and_findings() {
     let (code, v) = env.run(&["scan", "disable", "99999999"]);
     assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
 }
+
+/// A small app with known issues: /go reflects the decoded `next` parameter into a
+/// Location header unsanitised, and /.env is readable. /safe has a parameter but
+/// no issue.
+fn spawn_vulnerable_app() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let target = req.split(' ').nth(1).unwrap_or("/").to_string();
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                let param = |name: &str| -> String {
+                    query
+                        .split('&')
+                        .find_map(|p| p.strip_prefix(&format!("{name}=")))
+                        .map(brainproxy_core::scan::message::url_decode)
+                        .unwrap_or_default()
+                };
+                let resp = match path {
+                    "/go" => format!("HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", param("next")),
+                    "/.env" => "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nConnection: close\r\n\r\nDB_PASSWORD=hunter2\nDEBUG=true".to_string(),
+                    "/safe" => {
+                        let body = format!("<html>hello {}</html>", param("name").len());
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn active_scan_finds_known_issues() {
+    let env = Env::new("active");
+    let port = spawn_vulnerable_app();
+    let base = format!("http://127.0.0.1:{port}");
+    let rules = env.ok(&["scan", "rules", "--active"]);
+    assert!(rules["count"].as_u64().unwrap() >= 2);
+
+    let s = env.ok(&["scan", "active", &format!("{base}/go?next=home"), &format!("{base}/safe?name=x")]);
+    assert_eq!(s["targets"], 2, "{s}");
+    let raised = &s["raised"];
+    assert_eq!(raised["40003"], 1, "CRLF should be found once, on /go: {s}");
+    assert_eq!(raised["40034-1"], 1, ".env should be found once for the shared directory: {s}");
+
+    let all = env.ok(&["findings", "list", "--all", "--source", "active"]);
+    let crlf = all["items"].as_array().unwrap().iter().find(|f| f["alert_ref"] == "40003").unwrap();
+    assert_eq!(crlf["param"], "next");
+    assert!(crlf["url"].as_str().unwrap().contains("/go?"));
+    let shown = env.ok(&["findings", "show", &crlf["id"].to_string()]);
+    assert!(shown["attack"].as_str().unwrap().contains("Set-cookie: Tamper="), "{shown}");
+    // The proving exchange is in history as source=scan.
+    let hid = shown["history_id"].as_i64().unwrap();
+    assert_eq!(env.count(&format!("SELECT count(*) FROM history WHERE id = {hid} AND source = 'scan'")), 1);
+
+    // Rule selection, history targets, and background mode.
+    let s = env.ok(&["scan", "active", "--rules", "40003", "--where", "path = '/safe'"]);
+    assert_eq!(s["rules"], 1);
+    assert!(s["raised"].as_object().unwrap().is_empty(), "{s}");
+    let (code, v) = env.run(&["scan", "active", "--rules", "999999", &format!("{base}/safe")]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
+    let job = env.ok(&["scan", "active", "--background", "--rules", "40003", &format!("{base}/go?next=a")]);
+    let done = env.ok(&["job", "wait", &job["job"].to_string(), "--timeout", "60"]);
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["result"]["raised"]["40003"], 1);
+}

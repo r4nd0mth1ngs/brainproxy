@@ -1,6 +1,7 @@
 //! brainproxy CLI. Every feature is reachable non-interactively; see
 //! `brainproxy capabilities` for the machine-readable command list.
 
+mod active_cmd;
 mod capabilities;
 mod crawl_cmd;
 mod engagement_cmd;
@@ -108,7 +109,7 @@ enum Cmd {
     #[command(subcommand)]
     Job(jobs_cmd::JobCmd),
 
-    /// Passive scanner: run it, list rules, enable/disable them.
+    /// Scanners: active scan, passive scan, rules, enable/disable.
     #[command(subcommand)]
     Scan(scan_cmd::ScanCmd),
 
@@ -357,7 +358,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Ca(cmd) => proxy_cmd::ca(&proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
-        Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, cmd, out)?,
+        Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,

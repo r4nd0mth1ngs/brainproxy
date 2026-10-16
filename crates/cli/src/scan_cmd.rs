@@ -14,6 +14,8 @@ use crate::output::Out;
 
 #[derive(Subcommand)]
 pub enum ScanCmd {
+    /// Active scan: attack targets with the active rules (all requests stay inside the engagement scope).
+    Active(Box<crate::active_cmd::ActiveArgs>),
     /// Run the passive rules over captures not scanned yet (this also happens
     /// automatically after send, proxy traffic, and before `findings`).
     Passive {
@@ -21,11 +23,14 @@ pub enum ScanCmd {
         #[arg(long)]
         rescan: bool,
     },
-    /// List passive rules and whether they're enabled.
+    /// List passive rules (or active rules with --active) and whether they're enabled.
     Rules {
         /// Only rules whose name or id contains this text.
         #[arg(long)]
         filter: Option<String>,
+        /// List the active rules instead.
+        #[arg(long)]
+        active: bool,
     },
     /// Enable passive rules by id.
     Enable { ids: Vec<u32> },
@@ -53,6 +58,9 @@ pub enum FindingsCmd {
         /// open, confirmed, false_positive, or all (default hides false positives).
         #[arg(long)]
         state: Option<String>,
+        /// Only findings from this scanner.
+        #[arg(long, value_parser = ["passive", "active"])]
+        source: Option<String>,
         /// One row per instance instead of grouping.
         #[arg(long)]
         all: bool,
@@ -89,14 +97,48 @@ pub enum StateArg {
     FalsePositive,
 }
 
-pub fn scan(project: &Path, cmd: ScanCmd, out: &Out) -> Result<(), Error> {
+pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), Error> {
+    if let ScanCmd::Active(args) = cmd {
+        return crate::active_cmd::active(project, home, *args, out);
+    }
     let mut store = Store::open(project)?;
     match cmd {
+        ScanCmd::Active(_) => unreachable!(),
         ScanCmd::Passive { rescan } => {
             let stats = if rescan { passive::rescan(&mut store)? } else { passive::scan_pending(&mut store)? };
             out.ok(json!(stats), || format!("scanned {} captures, {} new findings", stats.scanned, stats.new_findings));
         }
-        ScanCmd::Rules { filter } => {
+        ScanCmd::Rules { filter, active: true } => {
+            let rules: Vec<_> = brainproxy_core::scan::active::all_rules()
+                .iter()
+                .filter(|r| {
+                    filter.as_deref().is_none_or(|f| {
+                        r.name().to_ascii_lowercase().contains(&f.to_ascii_lowercase()) || r.id().to_string().contains(f)
+                    })
+                })
+                .map(|r| {
+                    let max_risk = r.alerts().iter().map(|a| a.risk).max().map(|r| r.as_str());
+                    json!({"id": r.id(), "name": r.name(), "scope": r.scope(), "max_risk": max_risk,
+                        "alerts": r.alerts().iter().map(|a| json!({"alert_ref": a.alert_ref, "name": a.name, "risk": a.risk.as_str()})).collect::<Vec<_>>()})
+                })
+                .collect();
+            out.ok(json!({"count": rules.len(), "rules": rules}), || {
+                rules
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{:>6}  {:<6} {:<7} {}",
+                            r["id"],
+                            r["scope"].as_str().unwrap_or(""),
+                            r["max_risk"].as_str().unwrap_or(""),
+                            r["name"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        ScanCmd::Rules { filter, .. } => {
             let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
             let rules: Vec<_> = passive::all_rules()
                 .iter()
@@ -168,7 +210,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     // Findings always reflect everything captured so far.
     passive::scan_pending(&mut store)?;
     match cmd {
-        FindingsCmd::List { risk, host, alert, state, all, examples, limit } => {
+        FindingsCmd::List { risk, host, alert, state, source, all, examples, limit } => {
             let filter = FindingFilter {
                 min_risk: risk.map(|r| match r {
                     RiskArg::Info => Risk::Info,
@@ -179,7 +221,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 host,
                 alert_ref: alert,
                 state,
-                source: None,
+                source,
                 examples,
             };
             if all {

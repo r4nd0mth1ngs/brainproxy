@@ -57,6 +57,29 @@ impl Message {
         }
     }
 
+    /// Parses a raw exchange (as sent/received) into a message.
+    pub fn from_exchange(history_id: i64, target: &crate::http::Target, request: &[u8], response: &[u8]) -> Self {
+        let c = crate::capture::Capture::new("", target, request, Some(response), None, None);
+        let headers = |s: Option<&str>| -> Vec<(String, String)> {
+            s.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
+        };
+        Self::new(
+            history_id,
+            c.method.clone(),
+            c.url.clone(),
+            c.scheme.clone(),
+            c.host.clone(),
+            c.port,
+            c.path.clone(),
+            c.query.clone(),
+            headers(Some(&c.req_headers)),
+            c.req_body.clone(),
+            c.status.unwrap_or(0),
+            headers(c.resp_headers.as_deref()),
+            c.resp_body.clone().unwrap_or_default(),
+        )
+    }
+
     /// Response body as text (lossy UTF-8).
     pub fn body(&self) -> &str {
         self.text.get_or_init(|| String::from_utf8_lossy(&self.resp_body).into_owned())

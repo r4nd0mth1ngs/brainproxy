@@ -4,6 +4,7 @@
 //! (https://github.com/zaproxy/zap-extensions, Apache License 2.0). Each rule file
 //! names the ZAP class it was ported from; alert texts are ZAP's.
 
+pub mod active;
 pub mod findings_db;
 pub mod message;
 pub mod passive;
@@ -88,6 +89,7 @@ impl AlertDef {
             param: param.into(),
             evidence: evidence.into(),
             other_info: String::new(),
+            attack: String::new(),
         }
     }
 }
@@ -102,9 +104,16 @@ pub struct Finding {
     pub param: String,
     pub evidence: String,
     pub other_info: String,
+    /// The payload that triggered an active finding.
+    pub attack: String,
 }
 
 impl Finding {
+    pub fn attack(mut self, s: impl Into<String>) -> Self {
+        self.attack = s.into();
+        self
+    }
+
     pub fn other_info(mut self, s: impl Into<String>) -> Self {
         self.other_info = s.into();
         self

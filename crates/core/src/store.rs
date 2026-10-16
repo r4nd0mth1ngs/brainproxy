@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -342,6 +342,9 @@ impl Store {
         }
         if version < 5 {
             self.conn.execute_batch(crate::jobs::SCHEMA)?;
+        }
+        if version < 6 {
+            self.conn.execute_batch("ALTER TABLE findings ADD COLUMN attack TEXT NOT NULL DEFAULT '';")?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

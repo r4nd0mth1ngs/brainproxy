@@ -66,6 +66,7 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("param", "TEXT", "Affected parameter, header, or cookie"),
     ("evidence", "TEXT", "Matched evidence"),
     ("other_info", "TEXT", "Extra detail"),
+    ("attack", "TEXT", "Payload that triggered an active finding"),
     ("history_id", "INTEGER", "history.id where first seen"),
     ("last_history_id", "INTEGER", "history.id where last seen"),
     ("hits", "INTEGER", "Times seen (same alert, host, method, path, param, evidence)"),
@@ -128,8 +129,8 @@ impl Store {
             )?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, wasc, host,
-                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17)
+                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id
                  RETURNING hits",
             )?;
@@ -166,6 +167,7 @@ impl Store {
                         truncate(&f.other_info, 4000),
                         msg.history_id,
                         dedupe,
+                        truncate(&f.attack, 2000),
                     ],
                     |r| r.get(0),
                 )?;

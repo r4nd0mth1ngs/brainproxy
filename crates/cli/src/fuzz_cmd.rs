@@ -373,7 +373,7 @@ fn spawn_background(project: &Path, home: &Path, run_id: i64, store: &Store, out
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("fuzz-{run_id}.log"));
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-    let argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "--background").collect();
+    let argv = crate::jobs_cmd::child_args();
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
     cmd.arg("--attach-run").arg(run_id.to_string());

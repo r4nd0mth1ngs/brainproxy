@@ -112,7 +112,7 @@ fn reap(store: &Store, id: i64) -> Result<(), Error> {
 /// and returns once the child has picked the job up.
 pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
-    let argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "--background").collect();
+    let argv = child_args();
     let id = store.job_create(kind, "queued", &argv)?;
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("job-{id}.log"));
@@ -145,6 +145,27 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     });
     out.ok(data, || format!("{kind} running in the background as job {id}"));
     Ok(())
+}
+
+/// This process's arguments minus `--background` and the global options the
+/// child gets explicitly (`--project`, `--home`, `--format`).
+pub fn child_args() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--background" {
+            continue;
+        }
+        if ["--project", "--home", "--format"].contains(&a.as_str()) {
+            args.next();
+            continue;
+        }
+        if ["--project=", "--home=", "--format="].iter().any(|p| a.starts_with(p)) {
+            continue;
+        }
+        out.push(a);
+    }
+    out
 }
 
 /// Runs a job body in this process: marks the job running, watches for stop
