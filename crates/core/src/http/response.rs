@@ -1,12 +1,11 @@
 //! Reading and parsing raw HTTP/1.x responses.
 
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 
 use crate::error::{Error, Result};
 use crate::http::request::{find, split_head_body};
-
-const MAX_HEAD: usize = 256 * 1024;
+use crate::http::wire::WireReader;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ResponseHead {
@@ -47,114 +46,7 @@ pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead> {
 /// received (chunked framing included). Interim 1xx responses are kept in the
 /// output and skipped over.
 pub async fn read_response<S: AsyncRead + Unpin>(stream: &mut S, request_method: &str) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(16 * 1024);
-    let mut start = 0;
-    loop {
-        let head_end = read_until_head_end(stream, &mut buf, start).await?;
-        let head = parse_response_head(&buf[start..head_end])?;
-        if (100..200).contains(&head.status) && head.status != 101 {
-            start = head_end;
-            continue;
-        }
-        let no_body = request_method.eq_ignore_ascii_case("HEAD")
-            || head.status == 204
-            || head.status == 304
-            || head.status == 101
-            || (request_method.eq_ignore_ascii_case("CONNECT") && (200..300).contains(&head.status));
-        if no_body {
-            buf.truncate(head_end);
-            return Ok(buf);
-        }
-        let chunked =
-            head.header("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
-        if chunked {
-            read_chunked(stream, &mut buf, head_end).await?;
-        } else if let Some(len) = head.header("content-length").and_then(|v| v.trim().parse::<usize>().ok()) {
-            let want = head_end + len;
-            while buf.len() < want {
-                if read_more(stream, &mut buf).await? == 0 {
-                    break; // Truncated; return what we have.
-                }
-            }
-            buf.truncate(want.min(buf.len()));
-        } else {
-            while read_more(stream, &mut buf).await? > 0 {}
-        }
-        return Ok(buf);
-    }
-}
-
-async fn read_more<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>) -> Result<usize> {
-    let mut chunk = [0u8; 16 * 1024];
-    let n = match stream.read(&mut chunk).await {
-        Ok(n) => n,
-        // Many servers close TLS without close_notify; treat it as EOF.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-        Err(e) => return Err(e.into()),
-    };
-    buf.extend_from_slice(&chunk[..n]);
-    Ok(n)
-}
-
-async fn read_until_head_end<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>, start: usize) -> Result<usize> {
-    loop {
-        if let Some(i) = find(&buf[start..], b"\r\n\r\n") {
-            return Ok(start + i + 4);
-        }
-        if buf.len() - start > MAX_HEAD {
-            return Err(Error::Protocol("response head too large".into()));
-        }
-        if read_more(stream, buf).await? == 0 {
-            return Err(if buf.len() == start {
-                Error::Protocol("connection closed before any response".into())
-            } else {
-                Error::Protocol("connection closed inside response head".into())
-            });
-        }
-    }
-}
-
-async fn read_chunked<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>, body_start: usize) -> Result<()> {
-    let mut pos = body_start;
-    loop {
-        // Chunk size line.
-        let line_end = loop {
-            if let Some(i) = find(&buf[pos..], b"\r\n") {
-                break pos + i;
-            }
-            if read_more(stream, buf).await? == 0 {
-                return Ok(());
-            }
-        };
-        let size_str = String::from_utf8_lossy(&buf[pos..line_end]);
-        let size_hex = size_str.split(';').next().unwrap_or("").trim();
-        let size =
-            usize::from_str_radix(size_hex, 16).map_err(|_| Error::Protocol(format!("bad chunk size {size_hex:?}")))?;
-        pos = line_end + 2;
-        if size == 0 {
-            // Trailers end with an empty line.
-            loop {
-                if buf[pos..].starts_with(b"\r\n") {
-                    buf.truncate(pos + 2);
-                    return Ok(());
-                }
-                if let Some(i) = find(&buf[pos..], b"\r\n\r\n") {
-                    buf.truncate(pos + i + 4);
-                    return Ok(());
-                }
-                if read_more(stream, buf).await? == 0 {
-                    return Ok(());
-                }
-            }
-        }
-        let want = pos + size + 2;
-        while buf.len() < want {
-            if read_more(stream, buf).await? == 0 {
-                return Ok(());
-            }
-        }
-        pos = want;
-    }
+    WireReader::new().read_response(stream, request_method).await
 }
 
 /// Removes chunked framing from a body. Returns the input unchanged if it

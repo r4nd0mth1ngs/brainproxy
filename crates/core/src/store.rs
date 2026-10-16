@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -68,6 +68,36 @@ END;
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
+
+const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS intercepts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    direction TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    status INTEGER,
+    original BLOB NOT NULL,
+    edited BLOB,
+    resolved_time TEXT
+);
+CREATE INDEX IF NOT EXISTS intercepts_state ON intercepts(state);
+";
+
+/// Column documentation for the intercept queue.
+pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Intercept id"),
+    ("time", "TEXT", "UTC time the message was held"),
+    ("direction", "TEXT", "request or response"),
+    ("state", "TEXT", "pending, forwarded, dropped, or expired (timed out)"),
+    ("method", "TEXT", "Request method"),
+    ("url", "TEXT", "Request URL"),
+    ("status", "INTEGER", "Response status (response direction only)"),
+    ("original", "BLOB", "The message as held"),
+    ("edited", "BLOB", "Replacement message, if one was forwarded"),
+    ("resolved_time", "TEXT", "When it was forwarded, dropped, or expired"),
+];
 
 /// Column documentation, served by `brainproxy schema` so an agent can write SQL
 /// without guessing.
@@ -165,6 +195,19 @@ pub struct HistoryFilter {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct InterceptEntry {
+    pub id: i64,
+    pub time: String,
+    pub direction: String,
+    pub state: String,
+    pub method: String,
+    pub url: String,
+    pub status: Option<u16>,
+    pub length: i64,
+    pub resolved_time: Option<String>,
+}
+
 /// Result of a read-only SQL query, in a compact column/row shape.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
@@ -218,9 +261,146 @@ impl Store {
         }
         if version < 1 {
             self.conn.execute_batch(SCHEMA)?;
-            self.conn.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            self.conn.execute_batch(SCHEMA_V2)?;
+        }
+        if version < SCHEMA_VERSION {
+            self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(())
+    }
+
+    /// Records many captures in one transaction.
+    pub fn record_batch(&mut self, captures: &[Capture]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for c in captures {
+            insert_capture(&tx, c)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    pub fn meta_set(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(v) => self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, v],
+            )?,
+            None => self.conn.execute("DELETE FROM meta WHERE key = ?1", [key])?,
+        };
+        Ok(())
+    }
+
+    /// Reads a JSON setting, or its default when unset.
+    pub fn setting<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
+        match self.meta_get(&format!("setting.{key}"))? {
+            Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("setting {key}: {e}"))),
+            None => Ok(T::default()),
+        }
+    }
+
+    /// Writes a JSON setting and bumps the settings version so running proxies reload.
+    pub fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        self.meta_set(&format!("setting.{key}"), Some(&json))?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('settings_version', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn settings_version(&self) -> Result<i64> {
+        Ok(self.meta_get("settings_version")?.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    pub fn intercept_create(
+        &self,
+        direction: &str,
+        method: &str,
+        url: &str,
+        status: Option<u16>,
+        original: &[u8],
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO intercepts (direction, method, url, status, original) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![direction, method, url, status, original],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Current state and edited message (if any) of an intercept.
+    pub fn intercept_state(&self, id: i64) -> Result<(String, Option<Vec<u8>>)> {
+        self.conn
+            .query_row("SELECT state, edited FROM intercepts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("intercept {id}")))
+    }
+
+    /// Moves a pending intercept to `state`. Fails if it isn't pending any more.
+    pub fn intercept_resolve(&self, id: i64, state: &str, edited: Option<&[u8]>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE intercepts SET state = ?1, edited = ?2, resolved_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?3 AND state = 'pending'",
+            params![state, edited, id],
+        )?;
+        if n == 0 {
+            let (current, _) = self.intercept_state(id)?;
+            return Err(Error::Conflict(format!("intercept {id} is {current}, not pending")));
+        }
+        Ok(())
+    }
+
+    pub fn intercept_list(&self, state: Option<&str>, limit: u32) -> Result<Vec<InterceptEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, time, direction, state, method, url, status, length(original), resolved_time
+             FROM intercepts WHERE (?1 IS NULL OR state = ?1) ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![state, limit], |r| {
+            Ok(InterceptEntry {
+                id: r.get(0)?,
+                time: r.get(1)?,
+                direction: r.get(2)?,
+                state: r.get(3)?,
+                method: r.get(4)?,
+                url: r.get(5)?,
+                status: r.get(6)?,
+                length: r.get(7)?,
+                resolved_time: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn intercept_get(&self, id: i64) -> Result<(InterceptEntry, Vec<u8>, Option<Vec<u8>>)> {
+        self.conn
+            .query_row(
+                "SELECT id, time, direction, state, method, url, status, length(original), resolved_time, original, edited
+                 FROM intercepts WHERE id = ?1",
+                [id],
+                |r| {
+                    let entry = InterceptEntry {
+                        id: r.get(0)?,
+                        time: r.get(1)?,
+                        direction: r.get(2)?,
+                        state: r.get(3)?,
+                        method: r.get(4)?,
+                        url: r.get(5)?,
+                        status: r.get(6)?,
+                        length: r.get(7)?,
+                        resolved_time: r.get(8)?,
+                    };
+                    Ok((entry, r.get(9)?, r.get(10)?))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("intercept {id}")))
     }
 
     pub fn record_exchange(&self, source: &str, ex: &Exchange) -> Result<i64> {
@@ -239,41 +419,7 @@ impl Store {
     }
 
     pub fn record(&self, c: &Capture) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO history (source, scheme, host, port, method, url, path, query,
-                req_headers, req_content_type, req_body, req_body_text,
-                status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
-                title, duration_ms, error, request, response)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                ?20, ?21, ?22, ?23, ?24)",
-            params![
-                c.source,
-                c.scheme,
-                c.host,
-                c.port,
-                c.method,
-                c.url,
-                c.path,
-                c.query,
-                c.req_headers,
-                c.req_content_type,
-                c.req_body,
-                c.req_body_text,
-                c.status,
-                c.reason,
-                c.resp_headers,
-                c.resp_content_type,
-                c.resp_body,
-                c.resp_body_text,
-                c.resp_body.as_ref().map(|b| b.len() as i64),
-                c.title,
-                c.duration_ms,
-                c.error,
-                c.request,
-                c.response,
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        insert_capture(&self.conn, c)
     }
 
     pub fn list(&self, f: &HistoryFilter) -> Result<Vec<HistoryEntry>> {
@@ -391,6 +537,44 @@ impl Store {
         }
         Ok(QueryResult { row_count: rows.len(), columns, rows, truncated })
     }
+}
+
+fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO history (source, scheme, host, port, method, url, path, query,
+            req_headers, req_content_type, req_body, req_body_text,
+            status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
+            title, duration_ms, error, request, response)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+            ?20, ?21, ?22, ?23, ?24)",
+        params![
+            c.source,
+            c.scheme,
+            c.host,
+            c.port,
+            c.method,
+            c.url,
+            c.path,
+            c.query,
+            c.req_headers,
+            c.req_content_type,
+            c.req_body,
+            c.req_body_text,
+            c.status,
+            c.reason,
+            c.resp_headers,
+            c.resp_content_type,
+            c.resp_body,
+            c.resp_body_text,
+            c.resp_body.as_ref().map(|b| b.len() as i64),
+            c.title,
+            c.duration_ms,
+            c.error,
+            c.request,
+            c.response,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 fn cell(v: ValueRef, max: usize) -> Value {

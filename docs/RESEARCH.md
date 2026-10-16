@@ -245,9 +245,11 @@ brainproxy history show <id> [--part request|response|response-body --raw]   ✔
 brainproxy history note <id> [TEXT]                       ✔
 brainproxy history tag <id> [--add t] [--remove t]        ✔
 brainproxy encode|decode|hash <chain> [INPUT|-]           ✔ Decoder (base64, url, hex, html, jwt, md5/sha*)
-brainproxy ca init|export                                 Phase 1
-brainproxy proxy start|stop|status [--listen] [--scope] [--rules]   Phase 1
-brainproxy intercept list|show|edit|forward|drop          Phase 1
+brainproxy ca init|export|install-system                  ✔
+brainproxy proxy start|run|stop|status [--listen]         ✔ background proxy, captures to the DB
+brainproxy scope show|set|add|clear|check                 ✔ host regexes
+brainproxy rules list|add|remove|enable|disable|clear     ✔ match-and-replace
+brainproxy intercept enable|disable|status|list|show|forward|drop   ✔ agent-driven queue
 brainproxy send --parallel N | --single-packet             Phase 2 (race conditions)
 brainproxy fuzz <file> --mode sniper|ram|pitchfork|cluster -p 1=list ... [--grep] [--rate]   Phase 2
 brainproxy diff <id1> <id2> [--words|--bytes]             Phase 2
@@ -268,7 +270,7 @@ brainproxy mcp                                            Phase 6
 | Phase | Deliverable | Burp/ZAP parity reached |
 |---|---|---|
 | **0: Skeleton (done)** | Rust workspace, `brainproxy` CLI, JSON envelope and exit codes, `capabilities`, SQLite capture DB with `query`/`schema`, FTS, and SQL helpers, raw HTTP/1.x client (HTTP and HTTPS), `send`, `history`, codecs, static Linux build | Repeater (single request), Decoder, Logger |
-| **1: Proxy and history** | MITM proxy (HTTP/1.1, then HTTP/2), CA generation and export, scope, match-and-replace, history and show commands, HAR import/export | Burp Proxy, ZAP proxy |
+| **1: Proxy (done)** | MITM proxy (HTTP/1.x, CONNECT, TLS interception, WebSocket pass-through), CA generation/export/system install, scope, match-and-replace, intercept queue in the project DB, background lifecycle. Still to do: HTTP/2 to clients, upstream connection pooling, upstream proxy chaining, HAR import/export | Burp Proxy, ZAP proxy |
 | **2: Manual tools** | `repeat` (with race and single-packet modes), `fuzz` (all 4 Intruder modes, payload processors, grep), `decode`, `diff` | Repeater, Intruder, Decoder, Comparer |
 | **3: Passive scanner** | Port the ZAP passive rules. Run them inline in the proxy and over history. | ZAP passive scan |
 | **4: Crawl and active scan** | HTTP spider, insertion-point engine, scan policies, port of the ZAP release active rules, YAML checks, reports (HTML/JSON/SARIF) | Burp Scanner (core), ZAP active scan |

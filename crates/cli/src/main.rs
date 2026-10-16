@@ -3,6 +3,7 @@
 
 mod capabilities;
 mod output;
+mod proxy_cmd;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,10 @@ struct Cli {
     /// Output format.
     #[arg(long, global = true, env = "BRAINPROXY_FORMAT", value_enum, default_value = "auto")]
     format: Format,
+
+    /// Directory for per-user data such as the CA (default: ~/.local/share/brainproxy).
+    #[arg(long, global = true, env = "BRAINPROXY_HOME")]
+    home: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -58,6 +63,30 @@ enum Cmd {
     #[command(after_help = "Request sources, in order: --url (build a request like curl), FILE, or stdin. \
         Raw requests are sent byte-for-byte after optional line-ending normalization and Content-Length update.")]
     Send(SendArgs),
+
+    /// Run the intercepting proxy (background by default) and see its status.
+    #[command(subcommand)]
+    Proxy(proxy_cmd::ProxyCmd),
+
+    /// Manage the interception CA that clients must trust.
+    #[command(subcommand)]
+    Ca(proxy_cmd::CaCmd),
+
+    /// Which hosts the proxy intercepts, modifies, and records.
+    #[command(subcommand)]
+    Scope(proxy_cmd::ScopeCmd),
+
+    /// Match-and-replace rules applied to in-scope proxy traffic.
+    #[command(subcommand)]
+    Rules(proxy_cmd::RulesCmd),
+
+    /// Hold proxied requests/responses in a queue to inspect, edit, forward, or drop.
+    #[command(
+        subcommand,
+        after_help = "Typical loop: `intercept enable`, then `intercept list --wait 30`, \
+        `intercept show ID --raw > msg.http`, edit, `intercept forward ID --file msg.http` (or `drop ID`)."
+    )]
+    Intercept(proxy_cmd::InterceptCmd),
 
     /// Browse recorded requests and responses.
     #[command(subcommand)]
@@ -265,6 +294,16 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
         Cmd::History(HistoryCmd::Note { .. }) => "history note",
         Cmd::History(HistoryCmd::Tag { .. }) => "history tag",
+        Cmd::Proxy(c) => match c {
+            proxy_cmd::ProxyCmd::Start(_) => "proxy start",
+            proxy_cmd::ProxyCmd::Run(_) => "proxy run",
+            proxy_cmd::ProxyCmd::Stop => "proxy stop",
+            proxy_cmd::ProxyCmd::Status => "proxy status",
+        },
+        Cmd::Ca(_) => "ca",
+        Cmd::Scope(_) => "scope",
+        Cmd::Rules(_) => "rules",
+        Cmd::Intercept(_) => "intercept",
         Cmd::Encode(_) => "encode",
         Cmd::Decode(_) => "decode",
         Cmd::Hash(_) => "hash",
@@ -301,6 +340,11 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         }
         Cmd::Send(args) => send(&cli.project, args, out)?,
         Cmd::History(cmd) => history(&cli.project, cmd, out)?,
+        Cmd::Proxy(cmd) => proxy_cmd::proxy(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
+        Cmd::Ca(cmd) => proxy_cmd::ca(&proxy_cmd::resolve_home(cli.home), cmd, out)?,
+        Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
+        Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
+        Cmd::Intercept(cmd) => proxy_cmd::intercept(&cli.project, cmd, out)?,
         Cmd::Encode(a) => codec_cmd(a, out, codec::encode)?,
         Cmd::Decode(a) => codec_cmd(a, out, codec::decode)?,
         Cmd::Hash(a) => codec_cmd(a, out, |k, b| codec::hash(k, b).map(String::into_bytes))?,
@@ -439,7 +483,8 @@ fn schema_json() -> Value {
     };
     json!({
         "tables": [
-            {"name": "history", "description": "One row per request sent or proxied.", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "history", "description": "One row per request sent (source=send) or proxied (source=proxy).", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),

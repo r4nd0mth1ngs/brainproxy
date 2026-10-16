@@ -5,6 +5,7 @@ pub mod capture;
 pub mod codec;
 pub mod error;
 pub mod http;
+pub mod proxy;
 pub mod store;
 
 pub use error::{Error, Result};

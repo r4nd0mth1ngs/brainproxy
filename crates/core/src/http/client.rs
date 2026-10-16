@@ -13,8 +13,8 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::{Error, Result};
 use crate::http::request::RawRequest;
-use crate::http::response::read_response;
 use crate::http::target::Target;
+use crate::http::wire::WireReader;
 
 #[derive(Debug, Clone)]
 pub struct SendOptions {
@@ -80,27 +80,33 @@ impl Client {
     }
 
     async fn round_trip(&self, bytes: &[u8], target: &Target, method: &str) -> Result<Vec<u8>> {
+        let mut stream = self.connect(target).await?;
+        stream.write_all(bytes).await?;
+        stream.flush().await?;
+        WireReader::new().read_response(&mut stream, method).await
+    }
+
+    /// Opens a connection to the target, wrapped in TLS for https.
+    pub async fn connect(&self, target: &Target) -> Result<Stream> {
         let tcp = TcpStream::connect((target.host.as_str(), target.port))
             .await
             .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?;
         tcp.set_nodelay(true).ok();
-        if target.is_tls() {
-            let name = self.opts.sni.as_deref().unwrap_or(&target.host);
-            let server_name = ServerName::try_from(name.to_string())
-                .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
-            let tls = self.tls.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))?;
-            exchange(tls, bytes, method).await
-        } else {
-            exchange(tcp, bytes, method).await
+        if !target.is_tls() {
+            return Ok(Box::new(tcp));
         }
+        let name = self.opts.sni.as_deref().unwrap_or(&target.host);
+        let server_name = ServerName::try_from(name.to_string())
+            .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
+        let tls = self.tls.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))?;
+        Ok(Box::new(tls))
     }
 }
 
-async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, bytes: &[u8], method: &str) -> Result<Vec<u8>> {
-    stream.write_all(bytes).await?;
-    stream.flush().await?;
-    read_response(&mut stream, method).await
-}
+/// Any bidirectional byte stream (plain TCP or TLS).
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub type Stream = Box<dyn AsyncStream>;
 
 #[derive(Debug)]
 struct NoVerify;

@@ -8,6 +8,9 @@ pub enum Error {
     InvalidInput(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The request conflicts with current state (e.g. already running, not pending).
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("connection failed: {0}")]
     Connect(String),
     #[error("TLS error: {0}")]
@@ -27,6 +30,7 @@ impl Error {
         match self {
             Error::InvalidInput(_) => "invalid_input",
             Error::NotFound(_) => "not_found",
+            Error::Conflict(_) => "conflict",
             Error::Connect(_) => "connect",
             Error::Tls(_) => "tls",
             Error::Timeout(_) => "timeout",
@@ -39,7 +43,7 @@ impl Error {
     /// Process exit code. 2 is reserved for usage errors from argument parsing.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Error::InvalidInput(_) => 2,
+            Error::InvalidInput(_) | Error::Conflict(_) => 2,
             Error::NotFound(_) => 4,
             Error::Connect(_) | Error::Tls(_) | Error::Timeout(_) | Error::Protocol(_) => 3,
             Error::Io(_) | Error::Store(_) => 1,

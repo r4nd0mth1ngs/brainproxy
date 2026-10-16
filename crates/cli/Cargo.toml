@@ -16,3 +16,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 clap.workspace = true
+libc = "0.2.190"
+
+[dev-dependencies]
+brainproxy-core = { path = "../core" }
+tokio.workspace = true
+tokio-rustls.workspace = true
