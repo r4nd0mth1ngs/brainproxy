@@ -6,6 +6,7 @@ mod fuzz_cmd;
 mod output;
 mod proxy_cmd;
 mod request_args;
+mod scan_cmd;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -92,6 +93,14 @@ enum Cmd {
     /// Intruder-style fuzzing: payload positions, four attack modes, grep/extract, outlier summary.
     #[command(subcommand)]
     Fuzz(fuzz_cmd::FuzzCmd),
+
+    /// Passive scanner: run it, list rules, enable/disable them.
+    #[command(subcommand)]
+    Scan(scan_cmd::ScanCmd),
+
+    /// Scanner findings: grouped by alert type, per instance, details, triage.
+    #[command(subcommand)]
+    Findings(scan_cmd::FindingsCmd),
 
     /// Compare two history entries (Comparer): line, word, or byte diff.
     Diff(fuzz_cmd::DiffArgs),
@@ -286,6 +295,8 @@ fn command_name(cmd: &Cmd) -> String {
             fuzz_cmd::FuzzCmd::Stop { .. } => "fuzz stop",
         },
         Cmd::Diff(_) => "diff",
+        Cmd::Scan(_) => "scan",
+        Cmd::Findings(_) => "findings",
         Cmd::Scope(_) => "scope",
         Cmd::Rules(_) => "rules",
         Cmd::Intercept(_) => "intercept",
@@ -329,6 +340,8 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Ca(cmd) => proxy_cmd::ca(&proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
+        Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, cmd, out)?,
+        Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
         Cmd::Intercept(cmd) => proxy_cmd::intercept(&cli.project, cmd, out)?,
@@ -373,6 +386,10 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         Some(s) => Some(s.record_exchange("send", &ex)?),
         None => None,
     };
+    let new_findings = match store {
+        Some(mut s) => brainproxy_core::scan::passive::scan_pending(&mut s)?.new_findings,
+        None => 0,
+    };
 
     if args.raw {
         out.raw(&ex.response);
@@ -381,6 +398,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let mut data = exchange_json(id, &target, &ex.request, &ex.response, Some(ex.duration_ms), args.max_body);
     if args.show_request {
         data["request"] = body_value(&ex.request, args.max_body);
+    }
+    if new_findings > 0 {
+        data["new_findings"] = json!(new_findings);
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
@@ -484,6 +504,8 @@ fn schema_json() -> Value {
             {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
             {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
+            {"name": "findings", "description": "Scanner findings, de-duplicated (hits counts repeats). Join finding_types ON alert_ref for description/solution.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_COLUMNS)},
+            {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),

@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -221,7 +221,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 ];
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// One history row without bodies.
@@ -336,6 +336,9 @@ impl Store {
         }
         if version < 3 {
             self.conn.execute_batch(SCHEMA_V3)?;
+        }
+        if version < 4 {
+            self.conn.execute_batch(crate::scan::findings_db::SCHEMA)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -793,7 +796,7 @@ impl Store {
     }
 }
 
-fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
+pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
     conn.execute(
         "INSERT INTO history (source, scheme, host, port, method, url, path, query,
             req_headers, req_content_type, req_body, req_body_text,

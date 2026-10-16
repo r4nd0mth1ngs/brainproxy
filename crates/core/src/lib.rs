@@ -9,6 +9,7 @@ pub mod fuzz;
 pub mod http;
 pub mod proxy;
 pub mod race;
+pub mod scan;
 pub mod store;
 
 pub use error::{Error, Result};

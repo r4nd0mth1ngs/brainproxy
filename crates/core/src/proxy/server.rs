@@ -79,6 +79,9 @@ pub async fn run(
             if let Err(e) = writer_store.record_batch(&batch) {
                 eprintln!("brainproxy: failed to record {} captures: {e}", batch.len());
             }
+            if let Err(e) = crate::scan::passive::scan_pending(&mut writer_store) {
+                eprintln!("brainproxy: passive scan failed: {e}");
+            }
         }
     });
 
