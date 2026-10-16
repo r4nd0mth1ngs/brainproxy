@@ -381,6 +381,8 @@ pub struct ScanTarget {
     pub target: Target,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
+    /// Round-trip time of the baseline exchange, if known.
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -450,7 +452,8 @@ pub async fn run(
     let mut hosts_seen = HashSet::new();
     let mut point_count = 0;
     for t in &targets {
-        let Ok(response) = Response::parse(t.request.clone(), t.response.clone(), Duration::ZERO) else { continue };
+        let duration = Duration::from_millis(t.duration_ms.unwrap_or(0));
+        let Ok(response) = Response::parse(t.request.clone(), t.response.clone(), duration) else { continue };
         let msg = Message::from_exchange(t.history_id.unwrap_or(0), &t.target, &t.request, &t.response);
         let base = Arc::new(Base {
             history_id: t.history_id,

@@ -187,7 +187,13 @@ fn select_targets(
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
             let ex = rt.block_on(client.send(&req, &target))?;
             let id = store.record_exchange("scan", &ex)?;
-            targets.push(ScanTarget { history_id: Some(id), target, request: ex.request, response: ex.response });
+            targets.push(ScanTarget {
+                history_id: Some(id),
+                target,
+                request: ex.request,
+                response: ex.response,
+                duration_ms: Some(ex.duration_ms),
+            });
         }
     }
     if args.urls.is_empty() && ids.is_empty() && args.where_sql.is_none() {
@@ -216,6 +222,7 @@ fn select_targets(
             target: item.target,
             request: item.request,
             response: item.response,
+            duration_ms: item.entry.duration_ms.map(|d| d.max(0) as u64),
         });
     }
     // One target per method + origin + path + parameter names.

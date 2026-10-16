@@ -121,6 +121,7 @@ fn target(port: u16, path_and_query: &str) -> ScanTarget {
         target: Target::from_url(&format!("http://127.0.0.1:{port}")).unwrap(),
         request: req,
         response,
+        duration_ms: None,
     }
 }
 
