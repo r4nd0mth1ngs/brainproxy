@@ -1,0 +1,54 @@
+name: ZAP rule drift
+
+# Weekly check for upstream changes to the ZAP rules brainproxy has ported.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare with upstream
+        id: drift
+        run: |
+          set +e
+          python3 scripts/zap_drift.py > drift.md
+          code=$?
+          set -e
+          cat drift.md
+          if [ "$code" = "10" ]; then echo "found=true" >> "$GITHUB_OUTPUT"; elif [ "$code" = "0" ]; then echo "found=false" >> "$GITHUB_OUTPUT"; else exit "$code"; fi
+      - name: Open or update the drift issue
+        if: steps.drift.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create zap-drift --color FBCA04 --description "Upstream ZAP rule changes to port" --force
+          {
+            echo "Upstream ZAP rules changed since the pinned commit in \`zap-sync.json\`."
+            echo "Port the changes (each rule file names its ZAP class), then bump \`commit\` in \`zap-sync.json\`."
+            echo
+            echo '```'
+            cat drift.md
+            echo '```'
+          } > body.md
+          existing=$(gh issue list --label zap-drift --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file body.md
+          else
+            gh issue create --title "ZAP rule drift" --label zap-drift --body-file body.md
+          fi
+      - name: Close the drift issue when in sync
+        if: steps.drift.outputs.found == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label zap-drift --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "No drift against upstream ZAP any more."
+          done
