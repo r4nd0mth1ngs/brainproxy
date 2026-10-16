@@ -1,0 +1,8 @@
+brainproxy
+Copyright 2026 the brainproxy authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Parts of this product will be derived from OWASP ZAP and its add-ons
+(https://github.com/zaproxy), Copyright the ZAP development team,
+licensed under the Apache License, Version 2.0. Each ported file credits its origin.

@@ -1,0 +1,32 @@
+[package]
+name = "brainproxy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "brainproxy engine: HTTP model, raw client, capture store, codecs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+httparse.workspace = true
+rusqlite.workspace = true
+regex.workspace = true
+flate2.workspace = true
+brotli-decompressor.workspace = true
+base64.workspace = true
+hex.workspace = true
+percent-encoding.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+url.workspace = true
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
+libc = "0.2.190"
+time = "0.3.55"
+pem = "4.0.0"

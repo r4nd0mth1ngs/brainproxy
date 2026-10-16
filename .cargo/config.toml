@@ -1,0 +1,3 @@
+# Static Linux builds (Kali and other distros): needs `apt install musl-tools`.
+[env]
+CC_x86_64_unknown_linux_musl = "musl-gcc"
