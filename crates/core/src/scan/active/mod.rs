@@ -246,6 +246,13 @@ impl Cx {
 
     /// Sends a raw request to the base target.
     pub async fn send(&self, request: Vec<u8>) -> Result<Response> {
+        let target = self.base.target.clone();
+        self.send_to(&target, request).await
+    }
+
+    /// Sends a raw request to another target (e.g. the same host over http).
+    /// Still subject to the engagement scope.
+    pub async fn send_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
         if self.stopped() {
             return Err(Error::Protocol("scan stopped".into()));
         }
@@ -254,8 +261,38 @@ impl Cx {
         }
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         let req = RawRequest::from_bytes(request);
-        let ex = self.shared.client.send(&req, &self.base.target).await?;
+        let ex = self.shared.client.send(&req, target).await?;
         Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))
+    }
+
+    /// Sends a request and follows up to 5 redirects with GETs (ZAP's default
+    /// `sendAndReceive(msg)`); returns the final response. Redirects outside the
+    /// engagement scope end with an out-of-scope error.
+    pub async fn send_following(&self, request: Vec<u8>) -> Result<Response> {
+        let mut target = self.base.target.clone();
+        let mut resp = self.send_to(&target, request).await?;
+        for _ in 0..5 {
+            if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = resp.header("location").map(str::to_string) else { break };
+            let current = url::Url::parse(&format!("{}{}", target.origin(), self.path_of(&resp.request)))
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            let next = current.join(&loc).map_err(|e| Error::Protocol(format!("bad redirect {loc:?}: {e}")))?;
+            target = Target::from_url(next.as_str())?;
+            let mut pq = next.path().to_string();
+            if let Some(q) = next.query() {
+                pq.push('?');
+                pq.push_str(q);
+            }
+            let req = RawRequest::from_bytes(self.request_for("GET", &pq)).set_header("Host", &target.host_header());
+            resp = self.send_to(&target, req.into_bytes()).await?;
+        }
+        Ok(resp)
+    }
+
+    fn path_of(&self, request: &[u8]) -> String {
+        RawRequest::from_bytes(request.to_vec()).head().map(|h| h.target).unwrap_or_else(|_| "/".into())
     }
 
     /// Whether a response is a "not found" page: a 404, or a page that looks like
