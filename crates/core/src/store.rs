@@ -1,44 +1,155 @@
-//! Project store: a single SQLite file holding history (and later findings,
-//! notes, and config). Opening a missing project creates it.
+//! Capture store: one SQLite file per project. Every request brainproxy sends or
+//! proxies is stored raw and pre-parsed into plain columns, so it can be searched
+//! with ordinary SQL (`brainproxy query`). Opening a missing project creates it.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use regex::Regex;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
+use serde_json::{json, Value};
 
+use crate::capture::Capture;
 use crate::error::{Error, Result};
-use crate::http::{parse_response_head, Exchange, RawRequest, Target};
+use crate::http::{Exchange, Target};
 
 const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    source TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    path TEXT NOT NULL,
+    query TEXT,
+    req_headers TEXT NOT NULL,
+    req_content_type TEXT,
+    req_body BLOB NOT NULL,
+    req_body_text TEXT,
+    status INTEGER,
+    reason TEXT,
+    resp_headers TEXT,
+    resp_content_type TEXT,
+    resp_body BLOB,
+    resp_body_text TEXT,
+    resp_body_length INTEGER,
+    title TEXT,
+    duration_ms INTEGER,
+    error TEXT,
+    note TEXT,
+    tags TEXT NOT NULL DEFAULT '[]',
+    request BLOB NOT NULL,
+    response BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS history_host ON history(host);
+CREATE INDEX IF NOT EXISTS history_status ON history(status);
+CREATE INDEX IF NOT EXISTS history_path ON history(path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+    url, req_headers, req_body_text, resp_headers, resp_body_text,
+    content='history', content_rowid='id', tokenize=\"unicode61 tokenchars '_'\"
+);
+CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
+    INSERT INTO history_fts(rowid, url, req_headers, req_body_text, resp_headers, resp_body_text)
+    VALUES (new.id, new.url, new.req_headers, new.req_body_text, new.resp_headers, new.resp_body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, url, req_headers, req_body_text, resp_headers, resp_body_text)
+    VALUES ('delete', old.id, old.url, old.req_headers, old.req_body_text, old.resp_headers, old.resp_body_text);
+END;
+
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
+
+/// Column documentation, served by `brainproxy schema` so an agent can write SQL
+/// without guessing.
+pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Capture id, increasing"),
+    ("time", "TEXT", "UTC ISO-8601 time the capture was recorded"),
+    ("source", "TEXT", "Tool that produced it: send, proxy, fuzz, scan, crawl"),
+    ("scheme", "TEXT", "http or https"),
+    ("host", "TEXT", "Target host name or IP"),
+    ("port", "INTEGER", "Target port"),
+    ("method", "TEXT", "HTTP method"),
+    ("url", "TEXT", "Full URL including query string"),
+    ("path", "TEXT", "URL path without query string"),
+    ("query", "TEXT", "Raw query string without '?', or NULL"),
+    ("req_headers", "TEXT", "Request headers as JSON [[name, value], ...]; use header(req_headers, 'name')"),
+    ("req_content_type", "TEXT", "Request Content-Type, or NULL"),
+    ("req_body", "BLOB", "Request body (chunking and compression removed)"),
+    ("req_body_text", "TEXT", "Request body as text if valid UTF-8, else NULL"),
+    ("status", "INTEGER", "Response status code; NULL if the request failed"),
+    ("reason", "TEXT", "Response reason phrase"),
+    ("resp_headers", "TEXT", "Response headers as JSON [[name, value], ...]; use header(resp_headers, 'name')"),
+    ("resp_content_type", "TEXT", "Response Content-Type, or NULL"),
+    ("resp_body", "BLOB", "Response body (chunking and gzip/deflate/br removed)"),
+    ("resp_body_text", "TEXT", "Response body as text if valid UTF-8, else NULL"),
+    ("resp_body_length", "INTEGER", "Length of the decoded response body"),
+    ("title", "TEXT", "HTML <title>, if any"),
+    ("duration_ms", "INTEGER", "Round-trip time"),
+    ("error", "TEXT", "Error message when no response was received"),
+    ("note", "TEXT", "Free-text note (set with `history note`)"),
+    ("tags", "TEXT", "JSON array of tags (set with `history tag`)"),
+    ("request", "BLOB", "Raw request bytes exactly as sent"),
+    ("response", "BLOB", "Raw response bytes exactly as received"),
+];
+
+pub const FUNCTIONS: &[(&str, &str)] = &[
+    ("header(headers_json, name)", "First value of a header, case-insensitive. NULL if absent."),
+    ("regexp(pattern, text) / text REGEXP pattern", "Rust regex match. Prefix pattern with (?i) for case-insensitive."),
+    ("regexp_extract(text, pattern[, group])", "First match (or capture group) of a regex, else NULL."),
+    ("json_extract / json_each", "SQLite JSON functions; work on *_headers and JSON bodies."),
+];
+
+pub const EXAMPLES: &[(&str, &str)] = &[
+    ("Server errors", "SELECT id, method, url, status FROM history WHERE status >= 500"),
+    ("Endpoints seen", "SELECT DISTINCT method, host, path FROM history ORDER BY host, path"),
+    ("Full-text search", "SELECT id, url FROM history WHERE id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH 'password OR secret')"),
+    ("Regex over bodies", "SELECT id, url FROM history WHERE resp_body_text REGEXP '(?i)sql syntax|ORA-[0-9]{5}'"),
+    ("Header lookup", "SELECT id, url, header(resp_headers, 'server') AS server FROM history WHERE server IS NOT NULL"),
+    ("Missing security header", "SELECT id, url FROM history WHERE resp_content_type LIKE 'text/html%' AND header(resp_headers, 'content-security-policy') IS NULL"),
+    ("JSON body field", "SELECT id, json_extract(resp_body_text, '$.token') FROM history WHERE resp_content_type LIKE '%json%'"),
+    ("Extract values", "SELECT id, regexp_extract(resp_body_text, 'csrf[^\"]*\"([^\"]+)', 1) AS csrf FROM history WHERE csrf IS NOT NULL"),
+    ("Parameters seen", "SELECT DISTINCT path, query FROM history WHERE query IS NOT NULL"),
+];
 
 pub struct Store {
     conn: Connection,
 }
 
-/// One history row without the raw bodies.
+/// One history row without bodies.
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntry {
     pub id: i64,
     pub time: String,
     pub source: String,
-    pub scheme: String,
-    pub host: String,
-    pub port: u16,
     pub method: String,
-    pub path: String,
+    pub url: String,
     pub status: Option<u16>,
-    pub request_length: i64,
-    pub response_length: i64,
+    pub resp_content_type: Option<String>,
+    pub resp_body_length: Option<i64>,
+    pub title: Option<String>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
     pub note: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HistoryItem {
     pub entry: HistoryEntry,
+    pub target: Target,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
+    pub resp_body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -47,10 +158,21 @@ pub struct HistoryFilter {
     pub method: Option<String>,
     pub status: Option<u16>,
     pub source: Option<String>,
-    /// Substring searched in raw request and response.
+    pub tag: Option<String>,
+    /// Substring searched in the raw request and response.
     pub contains: Option<String>,
     pub after_id: Option<i64>,
     pub limit: Option<u32>,
+}
+
+/// Result of a read-only SQL query, in a compact column/row shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    pub row_count: usize,
+    /// More rows existed than `limit` allowed.
+    pub truncated: bool,
 }
 
 impl Store {
@@ -58,16 +180,33 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let store = Self { conn };
+        let store = Self::init(conn)?;
         store.migrate()?;
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let store = Self { conn: Connection::open_in_memory()? };
+        let store = Self::init(Connection::open_in_memory()?)?;
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Opens an existing project read-only, for `query`. Writes are impossible on
+    /// this connection, so arbitrary SQL from an agent is safe to run.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(Error::NotFound(format!("project {}", path.display())));
+        }
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.pragma_update(None, "query_only", true)?;
+        Self::init(conn)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        register_functions(&conn)?;
+        Ok(Self { conn })
     }
 
     fn migrate(&self) -> Result<()> {
@@ -78,68 +217,60 @@ impl Store {
             )));
         }
         if version < 1 {
-            self.conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                    source TEXT NOT NULL,
-                    scheme TEXT NOT NULL,
-                    host TEXT NOT NULL,
-                    port INTEGER NOT NULL,
-                    method TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    status INTEGER,
-                    request BLOB NOT NULL,
-                    response BLOB NOT NULL,
-                    duration_ms INTEGER,
-                    error TEXT,
-                    note TEXT
-                );
-                CREATE INDEX IF NOT EXISTS history_host ON history(host);
-                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                PRAGMA user_version = 1;",
-            )?;
+            self.conn.execute_batch(SCHEMA)?;
+            self.conn.pragma_update(None, "user_version", 1)?;
         }
         Ok(())
     }
 
     pub fn record_exchange(&self, source: &str, ex: &Exchange) -> Result<i64> {
-        let status = parse_response_head(&ex.response).ok().map(|h| h.status);
-        self.insert(source, &ex.target, &ex.request, &ex.response, status, Some(ex.duration_ms as i64), None)
+        self.record(&Capture::new(
+            source,
+            &ex.target,
+            &ex.request,
+            Some(&ex.response),
+            Some(ex.duration_ms as i64),
+            None,
+        ))
     }
 
     pub fn record_failure(&self, source: &str, target: &Target, request: &[u8], error: &str) -> Result<i64> {
-        self.insert(source, target, request, &[], None, None, Some(error))
+        self.record(&Capture::new(source, target, request, None, None, Some(error)))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn insert(
-        &self,
-        source: &str,
-        target: &Target,
-        request: &[u8],
-        response: &[u8],
-        status: Option<u16>,
-        duration_ms: Option<i64>,
-        error: Option<&str>,
-    ) -> Result<i64> {
-        let head = RawRequest::from_bytes(request.to_vec()).head().ok();
-        let (method, path) = head.map(|h| (h.method, h.target)).unwrap_or_default();
+    pub fn record(&self, c: &Capture) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO history (source, scheme, host, port, method, path, status, request, response, duration_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO history (source, scheme, host, port, method, url, path, query,
+                req_headers, req_content_type, req_body, req_body_text,
+                status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
+                title, duration_ms, error, request, response)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                ?20, ?21, ?22, ?23, ?24)",
             params![
-                source,
-                target.scheme,
-                target.host,
-                target.port,
-                method,
-                path,
-                status,
-                request,
-                response,
-                duration_ms,
-                error
+                c.source,
+                c.scheme,
+                c.host,
+                c.port,
+                c.method,
+                c.url,
+                c.path,
+                c.query,
+                c.req_headers,
+                c.req_content_type,
+                c.req_body,
+                c.req_body_text,
+                c.status,
+                c.reason,
+                c.resp_headers,
+                c.resp_content_type,
+                c.resp_body,
+                c.resp_body_text,
+                c.resp_body.as_ref().map(|b| b.len() as i64),
+                c.title,
+                c.duration_ms,
+                c.error,
+                c.request,
+                c.response,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -150,22 +281,25 @@ impl Store {
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut push = |clause: &str, v: Box<dyn rusqlite::ToSql>| {
             args.push(v);
-            sql.push_str(&format!(" AND {clause} ?{}", args.len()));
+            sql.push_str(&format!(" AND {}", clause.replace('?', &format!("?{}", args.len()))));
         };
         if let Some(h) = &f.host {
-            push("host =", Box::new(h.clone()));
+            push("host = ?", Box::new(h.clone()));
         }
         if let Some(m) = &f.method {
-            push("method =", Box::new(m.to_ascii_uppercase()));
+            push("method = ?", Box::new(m.to_ascii_uppercase()));
         }
         if let Some(s) = f.status {
-            push("status =", Box::new(s));
+            push("status = ?", Box::new(s));
         }
         if let Some(s) = &f.source {
-            push("source =", Box::new(s.clone()));
+            push("source = ?", Box::new(s.clone()));
+        }
+        if let Some(t) = &f.tag {
+            push("EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)", Box::new(t.clone()));
         }
         if let Some(id) = f.after_id {
-            push("id >", Box::new(id));
+            push("id > ?", Box::new(id));
         }
         if let Some(c) = &f.contains {
             args.push(Box::new(c.clone().into_bytes()));
@@ -183,9 +317,21 @@ impl Store {
 
     pub fn get(&self, id: i64) -> Result<HistoryItem> {
         self.conn
-            .query_row(&format!("SELECT {ENTRY_COLS}, request, response FROM history WHERE id = ?1"), [id], |r| {
-                Ok(HistoryItem { entry: row_to_entry(r)?, request: r.get(14)?, response: r.get(15)? })
-            })
+            .query_row(
+                &format!(
+                    "SELECT {ENTRY_COLS}, scheme, host, port, request, response, resp_body FROM history WHERE id = ?1"
+                ),
+                [id],
+                |r| {
+                    Ok(HistoryItem {
+                        entry: row_to_entry(r)?,
+                        target: Target { scheme: r.get(13)?, host: r.get(14)?, port: r.get(15)? },
+                        request: r.get(16)?,
+                        response: r.get(17)?,
+                        resp_body: r.get(18)?,
+                    })
+                },
+            )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("history item {id}")))
     }
@@ -198,30 +344,145 @@ impl Store {
         Ok(())
     }
 
+    /// Adds and removes tags; returns the resulting tag list.
+    pub fn update_tags(&self, id: i64, add: &[String], remove: &[String]) -> Result<Vec<String>> {
+        let current: String = self
+            .conn
+            .query_row("SELECT tags FROM history WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("history item {id}")))?;
+        let mut tags: Vec<String> = serde_json::from_str(&current).unwrap_or_default();
+        tags.retain(|t| !remove.contains(t));
+        for t in add {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        let json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
+        self.conn.execute("UPDATE history SET tags = ?1 WHERE id = ?2", params![json, id])?;
+        Ok(tags)
+    }
+
     pub fn count(&self) -> Result<i64> {
         Ok(self.conn.query_row("SELECT count(*) FROM history", [], |r| r.get(0))?)
     }
+
+    /// Runs one SQL statement and returns up to `limit` rows. Text and blob cells
+    /// longer than `max_cell` bytes are cut and marked. Blobs that aren't UTF-8
+    /// come back as `{"base64": ...}`.
+    pub fn query(&self, sql: &str, params: &[String], limit: usize, max_cell: usize) -> Result<QueryResult> {
+        let mut stmt = self.conn.prepare(sql).map_err(|e| Error::InvalidInput(format!("SQL: {e}")))?;
+        let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let mut rows_iter = stmt
+            .query(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| Error::InvalidInput(format!("SQL: {e}")))?;
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        while let Some(row) = rows_iter.next().map_err(|e| Error::InvalidInput(format!("SQL: {e}")))? {
+            if rows.len() == limit {
+                truncated = true;
+                break;
+            }
+            let mut out = Vec::with_capacity(columns.len());
+            for i in 0..columns.len() {
+                out.push(cell(row.get_ref(i)?, max_cell));
+            }
+            rows.push(out);
+        }
+        Ok(QueryResult { row_count: rows.len(), columns, rows, truncated })
+    }
 }
 
-const ENTRY_COLS: &str = "id, time, source, scheme, host, port, method, path, status, \
-    length(request), length(response), duration_ms, error, note";
+fn cell(v: ValueRef, max: usize) -> Value {
+    match v {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => json!(i),
+        ValueRef::Real(f) => json!(f),
+        ValueRef::Text(t) => json!(clip_text(&String::from_utf8_lossy(t), max)),
+        ValueRef::Blob(b) => match std::str::from_utf8(b) {
+            Ok(s) => json!(clip_text(s, max)),
+            Err(_) => {
+                use base64::Engine;
+                let n = b.len().min(max);
+                let mut v = json!({"base64": base64::engine::general_purpose::STANDARD.encode(&b[..n])});
+                if n < b.len() {
+                    v["truncated_from"] = json!(b.len());
+                }
+                v
+            }
+        },
+    }
+}
+
+fn clip_text(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
+}
+
+fn register_functions(conn: &Connection) -> Result<()> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("header", 2, flags, |ctx| {
+        let Some(json) = ctx.get::<Option<String>>(0)? else { return Ok(None) };
+        let name: String = ctx.get(1)?;
+        let pairs: Vec<(String, String)> = serde_json::from_str(&json).unwrap_or_default();
+        Ok(pairs.into_iter().find(|(k, _)| k.eq_ignore_ascii_case(&name)).map(|(_, v)| v))
+    })?;
+    conn.create_scalar_function("regexp", 2, flags, |ctx| {
+        let re = cached_regex(ctx, 0)?;
+        Ok(text_arg(ctx, 1)?.map(|t| re.is_match(&t)).unwrap_or(false))
+    })?;
+    for n_args in [2, 3] {
+        conn.create_scalar_function("regexp_extract", n_args, flags, move |ctx| {
+            let re = cached_regex(ctx, 1)?;
+            let group: usize = if n_args == 3 { ctx.get::<i64>(2)? as usize } else { 0 };
+            Ok(text_arg(ctx, 0)?
+                .and_then(|t| re.captures(&t).and_then(|c| c.get(group)).map(|m| m.as_str().to_string())))
+        })?;
+    }
+    Ok(())
+}
+
+fn cached_regex(ctx: &rusqlite::functions::Context, idx: i32) -> rusqlite::Result<Arc<Regex>> {
+    ctx.get_or_create_aux(idx, |v| -> std::result::Result<Regex, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Regex::new(v.as_str()?)?)
+    })
+}
+
+/// Text or UTF-8 blob argument as a string; NULL and non-UTF-8 blobs are None.
+fn text_arg(ctx: &rusqlite::functions::Context, idx: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match ctx.get_raw(idx) {
+        ValueRef::Text(t) | ValueRef::Blob(t) => std::str::from_utf8(t).ok().map(str::to_string),
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Null => None,
+    })
+}
+
+const ENTRY_COLS: &str = "id, time, source, method, url, status, resp_content_type, resp_body_length, \
+    title, duration_ms, error, note, tags";
 
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<HistoryEntry> {
+    let tags: String = r.get(12)?;
     Ok(HistoryEntry {
         id: r.get(0)?,
         time: r.get(1)?,
         source: r.get(2)?,
-        scheme: r.get(3)?,
-        host: r.get(4)?,
-        port: r.get(5)?,
-        method: r.get(6)?,
-        path: r.get(7)?,
-        status: r.get(8)?,
-        request_length: r.get(9)?,
-        response_length: r.get(10)?,
-        duration_ms: r.get(11)?,
-        error: r.get(12)?,
-        note: r.get(13)?,
+        method: r.get(3)?,
+        url: r.get(4)?,
+        status: r.get(5)?,
+        resp_content_type: r.get(6)?,
+        resp_body_length: r.get(7)?,
+        title: r.get(8)?,
+        duration_ms: r.get(9)?,
+        error: r.get(10)?,
+        note: r.get(11)?,
+        tags: serde_json::from_str(&tags).unwrap_or_default(),
     })
 }
 
@@ -229,31 +490,77 @@ fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<HistoryEntry> {
 mod tests {
     use super::*;
 
+    fn sample(store: &Store) -> i64 {
+        let ex = Exchange {
+            target: Target::from_url("http://a.test").unwrap(),
+            request: b"GET /x?id=1 HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(),
+            response: b"HTTP/1.1 500 Oops\r\nServer: nginx\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"token\":\"abc\",\"msg\":\"You have SQL syntax\"}".to_vec(),
+            duration_ms: 7,
+        };
+        store.record_exchange("send", &ex).unwrap()
+    }
+
     #[test]
     fn records_and_filters() {
         let s = Store::open_in_memory().unwrap();
-        let target = Target::from_url("http://a.test").unwrap();
-        let ex = Exchange {
-            target: target.clone(),
-            request: b"GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(),
-            response: b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nnah".to_vec(),
-            duration_ms: 7,
-        };
-        let id = s.record_exchange("send", &ex).unwrap();
-        s.record_failure("send", &target, b"POST /y HTTP/1.1\r\n\r\n", "boom").unwrap();
+        let id = sample(&s);
+        s.record_failure("send", &Target::from_url("http://a.test").unwrap(), b"POST /y HTTP/1.1\r\n\r\n", "boom")
+            .unwrap();
 
         let all = s.list(&HistoryFilter::default()).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].status, Some(404));
-        assert_eq!(all[0].path, "/x");
+        assert_eq!(all[0].status, Some(500));
+        assert_eq!(all[0].url, "http://a.test/x?id=1");
 
-        let hits = s.list(&HistoryFilter { contains: Some("nah".into()), ..Default::default() }).unwrap();
+        let hits = s.list(&HistoryFilter { contains: Some("token".into()), ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         let hits = s.list(&HistoryFilter { method: Some("post".into()), ..Default::default() }).unwrap();
         assert_eq!(hits[0].error.as_deref(), Some("boom"));
 
         s.set_note(id, Some("interesting")).unwrap();
         assert_eq!(s.get(id).unwrap().entry.note.as_deref(), Some("interesting"));
+        assert_eq!(s.update_tags(id, &["sqli".into(), "todo".into()], &[]).unwrap(), ["sqli", "todo"]);
+        assert_eq!(s.update_tags(id, &[], &["todo".into()]).unwrap(), ["sqli"]);
+        let hits = s.list(&HistoryFilter { tag: Some("sqli".into()), ..Default::default() }).unwrap();
+        assert_eq!(hits.len(), 1);
         assert!(matches!(s.get(99), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn sql_functions_and_fts() {
+        let s = Store::open_in_memory().unwrap();
+        sample(&s);
+        let q = |sql: &str| s.query(sql, &[], 100, 1000).unwrap().rows;
+        assert_eq!(q("SELECT header(resp_headers, 'SERVER') FROM history")[0][0], "nginx");
+        assert_eq!(q("SELECT count(*) FROM history WHERE resp_body_text REGEXP '(?i)sql syntax'")[0][0], 1);
+        assert_eq!(q("SELECT regexp_extract(resp_body_text, '\"token\":\"(\\w+)\"', 1) FROM history")[0][0], "abc");
+        assert_eq!(q("SELECT json_extract(resp_body_text, '$.token') FROM history")[0][0], "abc");
+        assert_eq!(q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'syntax'").len(), 1);
+    }
+
+    #[test]
+    fn query_limits_and_clips() {
+        let s = Store::open_in_memory().unwrap();
+        sample(&s);
+        sample(&s);
+        let r = s.query("SELECT resp_body_text FROM history", &[], 1, 5).unwrap();
+        assert!(r.truncated);
+        assert_eq!(r.rows.len(), 1);
+        assert!(r.rows[0][0].as_str().unwrap().starts_with("{\"tok…[truncated"));
+        let r = s.query("SELECT id FROM history WHERE id = ?1", &["2".into()], 10, 100).unwrap();
+        assert_eq!(r.rows, vec![vec![json!(2)]]);
+        assert!(s.query("SELEC nope", &[], 1, 1).is_err());
+    }
+
+    #[test]
+    fn read_only_connection_rejects_writes() {
+        let dir = std::env::temp_dir().join(format!("bp-store-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        sample(&Store::open(&path).unwrap());
+        let ro = Store::open_read_only(&path).unwrap();
+        assert!(ro.query("DELETE FROM history", &[], 10, 10).is_err());
+        assert_eq!(ro.count().unwrap(), 1);
     }
 }

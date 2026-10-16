@@ -1,9 +1,9 @@
 [package]
-name = "braintruder-core"
+name = "brainproxy-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Engine for Braintruder: HTTP model, raw client, project store, codecs"
+description = "brainproxy engine: HTTP model, raw client, capture store, codecs"
 
 [dependencies]
 anyhow.workspace = true
@@ -16,6 +16,9 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 httparse.workspace = true
 rusqlite.workspace = true
+regex.workspace = true
+flate2.workspace = true
+brotli-decompressor.workspace = true
 base64.workspace = true
 hex.workspace = true
 percent-encoding.workspace = true

@@ -1,11 +1,12 @@
-# Braintruder: research on Burp Suite and OWASP ZAP, and a CLI design
+# brainproxy: research on Burp Suite and OWASP ZAP, and a CLI design
 
 Status: design, updated 2026-10-16. Phase 0 is implemented (see the README).
 
 Goal: a fast, lightweight, **AI-first** web security testing tool. It covers the core
 workflow of Burp Suite and OWASP ZAP (intercept, replay, fuzz, crawl, scan, report).
-Every feature is a non-interactive CLI command, so an AI agent can drive all of it. A GUI
-comes later on the same engine.
+**Braintruder** runs it through a Kali runner (CLI-only Kali first, other platforms later),
+so its main operator is an LLM. Every feature is a non-interactive CLI command. A GUI comes
+later on the same engine.
 
 ---
 
@@ -111,14 +112,14 @@ fuzzing, small static binaries, and low memory when a proxy holds thousands of c
 | TLS client and MITM | `rustls` (ring backend, no C toolchain), `rcgen` for the CA and per-host leaf certificates |
 | Raw, malformed requests (smuggling, CRLF) | Our own raw HTTP/1.x writer and reader (done in Phase 0), with `httparse` |
 | HTTP/2, single-packet race attacks | `h2` for normal traffic, plus a small hand-written frame writer for single-packet attacks |
-| Storage | SQLite via `rusqlite` (bundled), one `.btdb` file per project |
+| Storage | SQLite via `rusqlite` (bundled), one `.bpdb` file per project |
 | CLI | `clap` (derive). Its command tree also generates the `capabilities` JSON. |
 | Headless crawling | `chromiumoxide` (Chrome DevTools Protocol) |
 | Custom checks / filters | YAML via `serde`, filter expressions via an embedded expression engine (e.g. `cel-interpreter` or `evalexpr`) |
 | Plugins (later) | WASM via `wasmtime`, so plugins are sandboxed and language-agnostic |
 | GUI (later) | Tauri, on the same engine crate |
 
-Workspace layout: `crates/core` (engine library) and `crates/cli` (the `braintruder`
+Workspace layout: `crates/core` (engine library) and `crates/cli` (the `brainproxy`
 binary). Later: `crates/mcp` (MCP server) and `crates/gui`.
 
 ## 4. Architecture
@@ -178,64 +179,100 @@ These rules apply to every command, current and future:
    `{"ok":false,"command":"send","error":{"kind":"connect","message":"..."}}`.
 3. **Stable exit codes:** 0 success, 1 internal/storage error, 2 invalid input or usage,
    3 network error, 4 not found. Later: 5 findings at or above a `--fail-on` severity.
-4. **Self-description.** `braintruder capabilities` returns every command, flag, default,
+4. **Self-description.** `brainproxy capabilities` returns every command, flag, default,
    allowed value, env var, exit code, and codec as JSON. An agent learns the whole tool in
    one call.
 5. **Bounded output.** Bodies are capped (`--max-body`) and marked `truncated`. Binary data
    comes back as base64 with `"encoding":"base64"`. Lists take `--limit` and `--after <id>`
    for incremental polling.
 6. **Pipes everywhere.** Inputs accept `-`/stdin. `--raw` prints bare bytes, so
-   `history show 7 --part request --raw | braintruder send --target ...` works.
+   `history show 7 --part request --raw | brainproxy send --target ...` works.
 7. **Long-running work becomes jobs.** Proxy, crawl, scan, and fuzz will run as background
    jobs with IDs (`job start|status|stop|results`) that stream NDJSON. An agent never has
    to hold a terminal open.
 8. **Intercept without a human.** Instead of a modal "forward/drop" prompt, interception
    is either rules (match-and-replace, auto-drop) or a queue an agent polls and resolves:
    `intercept list`, `intercept edit <id> --file`, `intercept forward|drop <id>`.
-9. **MCP server.** `braintruder mcp` will expose the same commands as MCP tools, generated
+9. **MCP server.** `brainproxy mcp` will expose the same commands as MCP tools, generated
    from the same command tree, so CLI and MCP never drift.
+10. **Captures are a SQL database.** Every request any tool sends or proxies goes into one
+    SQLite table, stored raw *and* pre-parsed (see below). `brainproxy query` runs
+    read-only SQL against it.
+
+### Designing for an LLM operator
+
+Choices made from the point of view of the model that will run brainproxy:
+
+- **SQL rather than a custom filter language.** LLMs already write SQL well. Learning a new
+  filter DSL costs tokens and causes mistakes; SQL needs no learning. The database is opened
+  read-only for `query`, so there is no risk in letting the model write any SQL.
+- **Pre-parsed columns.** `url`, `path`, `query`, `status`, `*_content_type`, `title`, and
+  headers as JSON are filled in when a capture is recorded. Bodies are stored decoded
+  (chunking, gzip, deflate, and br removed) in `*_body`, plus a `*_body_text` copy when
+  they're UTF-8. The model filters with plain `WHERE` clauses instead of parsing raw HTTP.
+- **Helper SQL functions** for the things models otherwise get wrong:
+  `header(resp_headers, 'set-cookie')` (case-insensitive), `REGEXP` and
+  `regexp_extract(text, pattern, group)` (Rust regex syntax), plus SQLite's built-in
+  `json_extract`/`json_each` for JSON bodies.
+- **Full-text search** (`history_fts`, FTS5) for "find anything mentioning X" across URLs,
+  headers, and bodies of large captures.
+- **`schema` is self-documenting.** It returns every column with a description, the helper
+  functions, and worked example queries, so the model writes correct SQL first time.
+- **Token-frugal output.** Query results default to `{columns, rows:[[...]]}`. Column
+  names aren't repeated per row. Cells are capped (`--max-cell`), rows are capped
+  (`--limit`) with a `truncated` flag, and `--format text` gives TSV. `send` omits the
+  echoed request unless `--show-request`, and prints headers as `"Name: value"` strings.
+- **Parameter binding** (`-p value` maps to `?1`) so payloads with quotes never break the SQL.
+- **Tags and notes** (`history tag`, `history note`) give the model a place to record its
+  working state ("idor-candidate", "tested") and query it later
+  (`EXISTS (SELECT 1 FROM json_each(tags) WHERE value='idor-candidate')`).
+- **Targeted help.** `capabilities send` describes just one command, so the model doesn't
+  reload the whole CLI description each time.
 
 ### Command map
 
 Implemented commands are marked with a check.
 
 ```
-braintruder capabilities                                   ✔ machine-readable command list
-braintruder project init|info                              ✔
-braintruder send [FILE|-] [--url U -X M -H h -d body]      ✔ Repeater
+brainproxy capabilities [COMMAND...]                      ✔ machine-readable command list
+brainproxy schema                                         ✔ capture DB columns, functions, examples
+brainproxy query <SQL|-> [-p v]... [--limit --max-cell --shape rows|objects]   ✔ read-only SQL
+brainproxy project init|info                              ✔
+brainproxy send [FILE|-] [--url U -X M -H h -d body]      ✔ Repeater
                  [--target T] [--verbatim] [--raw]
-braintruder history list [--host --status --contains --after --limit]   ✔
-braintruder history show <id> [--part request|response|response-body --raw]   ✔
-braintruder history note <id> [TEXT]                       ✔
-braintruder encode|decode|hash <chain> [INPUT|-]           ✔ Decoder (base64, url, hex, html, jwt, md5/sha*)
-braintruder ca init|export                                 Phase 1
-braintruder proxy start|stop|status [--listen] [--scope] [--rules]   Phase 1
-braintruder intercept list|show|edit|forward|drop          Phase 1
-braintruder send --parallel N | --single-packet             Phase 2 (race conditions)
-braintruder fuzz <file> --mode sniper|ram|pitchfork|cluster -p 1=list ... [--grep] [--rate]   Phase 2
-braintruder diff <id1> <id2> [--words|--bytes]             Phase 2
-braintruder crawl <url> [--browser] [--auth auth.yaml]     Phase 4
-braintruder scan <url|--history> [--policy] [--checks dir] Phase 3-4
-braintruder findings list|show                             Phase 3
-braintruder report --format html|json|md|sarif             Phase 4
-braintruder import openapi|graphql|har|postman             Phase 5
-braintruder run plan.yaml                                  Phase 5 (ZAP-style automation)
-braintruder sequencer <id> --token ...                     Phase 6
-braintruder oast serve|poll                                Phase 6
-braintruder job list|status|stop|results                   Phase 1+
-braintruder mcp                                            Phase 6
+brainproxy history list [--host --status --tag --contains --after --limit]   ✔
+brainproxy history show <id> [--part request|response|response-body --raw]   ✔
+brainproxy history note <id> [TEXT]                       ✔
+brainproxy history tag <id> [--add t] [--remove t]        ✔
+brainproxy encode|decode|hash <chain> [INPUT|-]           ✔ Decoder (base64, url, hex, html, jwt, md5/sha*)
+brainproxy ca init|export                                 Phase 1
+brainproxy proxy start|stop|status [--listen] [--scope] [--rules]   Phase 1
+brainproxy intercept list|show|edit|forward|drop          Phase 1
+brainproxy send --parallel N | --single-packet             Phase 2 (race conditions)
+brainproxy fuzz <file> --mode sniper|ram|pitchfork|cluster -p 1=list ... [--grep] [--rate]   Phase 2
+brainproxy diff <id1> <id2> [--words|--bytes]             Phase 2
+brainproxy crawl <url> [--browser] [--auth auth.yaml]     Phase 4
+brainproxy scan <url|--history> [--policy] [--checks dir] Phase 3-4
+brainproxy findings list|show                             Phase 3
+brainproxy report --format html|json|md|sarif             Phase 4
+brainproxy import openapi|graphql|har|postman             Phase 5
+brainproxy run plan.yaml                                  Phase 5 (ZAP-style automation)
+brainproxy sequencer <id> --token ...                     Phase 6
+brainproxy oast serve|poll                                Phase 6
+brainproxy job list|status|stop|results                   Phase 1+
+brainproxy mcp                                            Phase 6
 ```
 
 ## 6. Phased roadmap
 
 | Phase | Deliverable | Burp/ZAP parity reached |
 |---|---|---|
-| **0: Skeleton (done)** | Rust workspace, `braintruder` CLI, JSON envelope and exit codes, `capabilities`, SQLite store, raw HTTP/1.x client (HTTP and HTTPS), `send`, `history`, codecs | Repeater (single request), Decoder |
+| **0: Skeleton (done)** | Rust workspace, `brainproxy` CLI, JSON envelope and exit codes, `capabilities`, SQLite capture DB with `query`/`schema`, FTS, and SQL helpers, raw HTTP/1.x client (HTTP and HTTPS), `send`, `history`, codecs, static Linux build | Repeater (single request), Decoder, Logger |
 | **1: Proxy and history** | MITM proxy (HTTP/1.1, then HTTP/2), CA generation and export, scope, match-and-replace, history and show commands, HAR import/export | Burp Proxy, ZAP proxy |
 | **2: Manual tools** | `repeat` (with race and single-packet modes), `fuzz` (all 4 Intruder modes, payload processors, grep), `decode`, `diff` | Repeater, Intruder, Decoder, Comparer |
 | **3: Passive scanner** | Port the ZAP passive rules. Run them inline in the proxy and over history. | ZAP passive scan |
 | **4: Crawl and active scan** | HTTP spider, insertion-point engine, scan policies, port of the ZAP release active rules, YAML checks, reports (HTML/JSON/SARIF) | Burp Scanner (core), ZAP active scan |
-| **5: Auth and automation** | Contexts, login flows, session macros, `braintruder run plan.yaml`, OpenAPI/GraphQL import | ZAP Automation Framework, Burp session rules |
+| **5: Auth and automation** | Contexts, login flows, session macros, `brainproxy run plan.yaml`, OpenAPI/GraphQL import | ZAP Automation Framework, Burp session rules |
 | **6: Advanced** | OAST server/client, headless browser crawler, Sequencer, WebSocket fuzzing, ZAP beta rules, MCP server for AI agents, plugins | Collaborator, Sequencer, Burp AT/ZAP MCP |
 | **7: GUI** | Tauri on the same engine | Burp/ZAP desktop |
 
@@ -243,8 +280,8 @@ braintruder mcp                                            Phase 6
 
 ## 7. Legal and ethical guardrails
 
-- Keep `LICENSE` (our choice; Apache 2.0 is the simplest fit with ZAP) and a `NOTICE`
-  file that credits ZAP and the payload sources.
+- Keep `LICENSE` (Apache 2.0 for now) and a `NOTICE` file that credits ZAP and the
+  payload sources. These obligations stay even if brainproxy later goes closed source.
 - Burp: clean-room only. Never use decompiled code, text copied from PortSwigger docs, or
   their trademarks.
 - The tool should require an explicit scope for active scanning and fuzzing, warn when the
@@ -258,8 +295,10 @@ braintruder mcp                                            Phase 6
 |---|---|
 | Language | Rust |
 | Interface | AI-first, non-interactive CLI. GUI later. |
-| Binary name | `braintruder` |
-| Project license | Apache 2.0, proposed for easy ZAP reuse. Not yet confirmed. |
+| Binary name | `brainproxy` (driven by Braintruder through a Kali runner) |
+| First platform | CLI-only Kali Linux, as a fully static x86_64 binary (musl). arm64 is next. |
+| Capture storage | SQLite, one `.bpdb` file per project, queried with read-only SQL |
+| Project license | Apache 2.0 for now. Closed source may come later. Apache 2.0 allows ZAP-derived code in a closed product, as long as the NOTICE and license text for that code are kept. |
 
 ## Sources
 

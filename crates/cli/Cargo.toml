@@ -1,16 +1,16 @@
 [package]
-name = "braintruder"
+name = "brainproxy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "AI-first, non-interactive web security testing CLI"
 
 [[bin]]
-name = "braintruder"
+name = "brainproxy"
 path = "src/main.rs"
 
 [dependencies]
-braintruder-core = { path = "../core" }
+brainproxy-core = { path = "../core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

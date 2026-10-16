@@ -51,7 +51,7 @@ impl RawRequest {
             out.push_str(&format!("{k}: {v}\r\n"));
         }
         if !has("user-agent") {
-            out.push_str(concat!("User-Agent: braintruder/", env!("CARGO_PKG_VERSION"), "\r\n"));
+            out.push_str(concat!("User-Agent: brainproxy/", env!("CARGO_PKG_VERSION"), "\r\n"));
         }
         if !has("accept") {
             out.push_str("Accept: */*\r\n");

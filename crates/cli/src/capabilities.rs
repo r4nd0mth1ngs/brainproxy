@@ -1,19 +1,19 @@
 //! Machine-readable description of every command, so an agent can discover the
 //! whole CLI in one call instead of scraping `--help`.
 
-use braintruder_core::codec;
+use brainproxy_core::codec;
 use clap::{ArgAction, Command};
 use serde_json::{json, Value};
 
 pub fn describe(cmd: &Command) -> Value {
     json!({
-        "name": "braintruder",
+        "name": "brainproxy",
         "version": env!("CARGO_PKG_VERSION"),
         "conventions": {
             "interactive_prompts": false,
             "output": "With --format json (the default when stdout is not a terminal) every command prints one JSON envelope: {ok, command, data} or {ok:false, command, error:{kind, message}}.",
             "stdin": "Commands that take a FILE or INPUT read stdin when it is '-' or omitted.",
-            "project": "History is stored in the SQLite project file from --project or BRAINTRUDER_PROJECT, created on first use.",
+            "project": "History is stored in the SQLite project file from --project or BRAINPROXY_PROJECT, created on first use.",
         },
         "exit_codes": {
             "0": "success",
@@ -23,8 +23,8 @@ pub fn describe(cmd: &Command) -> Value {
             "4": "not found",
         },
         "env": {
-            "BRAINTRUDER_PROJECT": "project file path",
-            "BRAINTRUDER_FORMAT": "auto | json | text",
+            "BRAINPROXY_PROJECT": "project file path",
+            "BRAINPROXY_FORMAT": "auto | json | text",
         },
         "codecs": {
             "encode": codec::ENCODINGS,
@@ -56,7 +56,7 @@ fn command(cmd: &Command, prefix: &str) -> Value {
 fn args(cmd: &Command) -> Vec<Value> {
     cmd.get_arguments()
         .filter(|a| !a.is_hide_set() && !matches!(a.get_id().as_str(), "help" | "version"))
-        .filter(|a| !a.is_global_set() || cmd.get_name() == "braintruder")
+        .filter(|a| !a.is_global_set() || cmd.get_name() == "brainproxy")
         .map(|a| {
             let takes_value = !matches!(
                 a.get_action(),
@@ -91,4 +91,19 @@ fn args(cmd: &Command) -> Vec<Value> {
             v
         })
         .collect()
+}
+
+/// Describes a single command by its space-separated path, e.g. "history list".
+pub fn describe_one(root: &Command, path: &str) -> Option<Value> {
+    let mut cmd = root;
+    let mut walked = Vec::new();
+    for part in path.split_whitespace() {
+        cmd = cmd.get_subcommands().find(|c| c.get_name() == part)?;
+        walked.push(part);
+    }
+    if walked.is_empty() {
+        return None;
+    }
+    let prefix = walked[..walked.len() - 1].join(" ");
+    Some(command(cmd, &prefix))
 }

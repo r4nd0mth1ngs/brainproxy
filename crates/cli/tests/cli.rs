@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_braintruder"))
+    Command::new(env!("CARGO_BIN_EXE_brainproxy"))
 }
 
 /// Serves `n` connections, echoing back the request line and body in a fixed response.
@@ -73,9 +73,9 @@ fn run(args: &[&str], project: &std::path::Path, stdin: Option<&[u8]>) -> (i32, 
 }
 
 fn tmp_project(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("bt-test-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bp-test-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("p.btdb");
+    let p = dir.join("p.bpdb");
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -97,7 +97,7 @@ fn send_raw_from_stdin_then_history() {
     let (code, v) = run(&["history", "list", "--status", "201"], &project, None);
     assert_eq!(code, 0);
     assert_eq!(v["data"]["count"], 1);
-    assert_eq!(v["data"]["items"][0]["path"], "/echo?a=1");
+    assert_eq!(v["data"]["items"][0]["url"], format!("http://127.0.0.1:{port}/echo?a=1"));
 
     let (code, v) = run(&["history", "show", &id.to_string()], &project, None);
     assert_eq!(code, 0);
@@ -157,8 +157,67 @@ fn capabilities_lists_all_commands() {
     assert_eq!(code, 0);
     let names: Vec<&str> =
         v["data"]["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-    for want in ["send", "history", "encode", "decode", "hash", "project"] {
+    for want in ["send", "history", "query", "schema", "encode", "decode", "hash", "project"] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
     assert_eq!(v["data"]["conventions"]["interactive_prompts"], false);
+}
+
+#[test]
+fn query_schema_and_tags() {
+    let port = serve(2);
+    let project = tmp_project("query");
+    for path in ["/a?x=1", "/b"] {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        assert_eq!(run(&["send", "--url", &url], &project, None).0, 0);
+    }
+
+    let (code, v) = run(
+        &["query", "SELECT id, path, header(resp_headers, 'x-test') AS h FROM history WHERE query = ?1", "-p", "x=1"],
+        &project,
+        None,
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["columns"], serde_json::json!(["id", "path", "h"]));
+    assert_eq!(v["data"]["rows"], serde_json::json!([[1, "/a", "yes"]]));
+
+    // FTS over the decoded (dechunked) body, objects shape, row limit.
+    let (_, v) = run(
+        &[
+            "query",
+            "--shape",
+            "objects",
+            "--limit",
+            "1",
+            "SELECT rowid AS id FROM history_fts WHERE history_fts MATCH 'GET'",
+        ],
+        &project,
+        None,
+    );
+    assert_eq!(v["data"]["truncated"], true);
+    assert_eq!(v["data"]["rows"][0]["id"], 1);
+
+    // Read-only: writes are rejected as invalid input.
+    let (code, v) = run(&["query", "DELETE FROM history"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")));
+
+    let (_, v) = run(&["history", "tag", "2", "--add", "idor", "--add", "todo"], &project, None);
+    assert_eq!(v["data"]["tags"], serde_json::json!(["idor", "todo"]));
+    let (_, v) = run(&["history", "list", "--tag", "idor"], &project, None);
+    assert_eq!(v["data"]["count"], 1);
+
+    let (_, v) = run(&["schema"], &project, None);
+    let cols = v["data"]["tables"][0]["columns"].as_array().unwrap();
+    assert!(cols.iter().any(|c| c["name"] == "resp_body_text"));
+    assert!(!v["data"]["examples"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn capabilities_for_one_command() {
+    let project = tmp_project("caps-one");
+    let (code, v) = run(&["capabilities", "history", "list"], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!(v["data"]["command"], "history list");
+    let (code, _) = run(&["capabilities", "nope"], &project, None);
+    assert_eq!(code, 4);
 }

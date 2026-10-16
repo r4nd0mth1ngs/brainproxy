@@ -35,7 +35,7 @@ impl Format {
                 _ => {}
             }
         }
-        match std::env::var("BRAINTRUDER_FORMAT").as_deref() {
+        match std::env::var("BRAINPROXY_FORMAT").as_deref() {
             Ok("json") => Format::Json,
             Ok("text") => Format::Text,
             _ => Format::Auto.resolve(),
@@ -93,7 +93,7 @@ pub fn body_value(bytes: &[u8], max: usize) -> Value {
             ("utf8", String::from_utf8_lossy(&slice[..e.valid_up_to()]).into_owned())
         }
         Err(_) => {
-            use braintruder_core::codec;
+            use brainproxy_core::codec;
             ("base64", String::from_utf8(codec::encode("base64", slice).unwrap_or_default()).unwrap_or_default())
         }
     };

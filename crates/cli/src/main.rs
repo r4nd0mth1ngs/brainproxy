@@ -1,5 +1,5 @@
-//! Braintruder CLI. Every feature is reachable non-interactively; see
-//! `braintruder capabilities` for the machine-readable command list.
+//! brainproxy CLI. Every feature is reachable non-interactively; see
+//! `brainproxy capabilities` for the machine-readable command list.
 
 mod capabilities;
 mod output;
@@ -8,24 +8,26 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use braintruder_core::codec;
-use braintruder_core::http::{dechunk, parse_response_head, Client, RawRequest, SendOptions, Target};
-use braintruder_core::store::{HistoryFilter, Store};
-use braintruder_core::Error;
+use brainproxy_core::capture::decode_body;
+use brainproxy_core::codec;
+use brainproxy_core::http::request::split_head_body;
+use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use brainproxy_core::store::{self, HistoryFilter, Store};
+use brainproxy_core::Error;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use output::{body_value, Format, Out};
 
 #[derive(Parser)]
-#[command(name = "braintruder", version, about = "AI-first, non-interactive web security testing toolkit")]
+#[command(name = "brainproxy", version, about = "AI-first, non-interactive web security testing toolkit")]
 struct Cli {
     /// Project file (SQLite). Created on first use.
-    #[arg(long, global = true, env = "BRAINTRUDER_PROJECT", default_value = "braintruder.btdb")]
+    #[arg(long, global = true, env = "BRAINPROXY_PROJECT", default_value = "brainproxy.bpdb")]
     project: PathBuf,
 
     /// Output format.
-    #[arg(long, global = true, env = "BRAINTRUDER_FORMAT", value_enum, default_value = "auto")]
+    #[arg(long, global = true, env = "BRAINPROXY_FORMAT", value_enum, default_value = "auto")]
     format: Format,
 
     #[command(subcommand)]
@@ -35,7 +37,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Describe every command, flag, exit code, and convention as JSON.
-    Capabilities,
+    Capabilities {
+        /// Only describe this command, e.g. "send" or "history list".
+        command: Vec<String>,
+    },
+
+    /// Describe the capture database: tables, columns, SQL functions, and example queries.
+    Schema,
+
+    /// Run one read-only SQL statement against the capture database.
+    #[command(after_help = "The database is opened read-only, so any SQL is safe. Run `schema` for the \
+        tables, columns, helper functions (header, regexp, regexp_extract), and example queries.")]
+    Query(QueryArgs),
 
     /// Manage the project file.
     #[command(subcommand)]
@@ -114,9 +127,36 @@ struct SendArgs {
     /// Maximum response body bytes to include in output.
     #[arg(long, default_value_t = 65536)]
     max_body: usize,
+    /// Include the request as sent in the output.
+    #[arg(long)]
+    show_request: bool,
     /// Print the raw response bytes instead of structured output.
     #[arg(long)]
     raw: bool,
+}
+
+#[derive(clap::Args)]
+struct QueryArgs {
+    /// SQL statement; '-' or omitted reads stdin.
+    sql: Option<String>,
+    /// Bind a value to ?1, ?2, ... in order. Repeatable. Avoids quoting problems.
+    #[arg(short = 'p', long = "param")]
+    params: Vec<String>,
+    /// Maximum rows to return; `truncated` is true when more exist.
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
+    /// Maximum bytes per cell before it is cut off.
+    #[arg(long, default_value_t = 2000)]
+    max_cell: usize,
+    /// rows: {columns, rows:[[...]]} (compact). objects: rows as [{column: value}].
+    #[arg(long, value_enum, default_value = "rows")]
+    shape: Shape,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Shape {
+    Rows,
+    Objects,
 }
 
 #[derive(Subcommand)]
@@ -132,6 +172,8 @@ enum HistoryCmd {
         /// Tool that produced the entry (e.g. send, proxy).
         #[arg(long)]
         source: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
         /// Substring to search for in raw requests and responses.
         #[arg(long)]
         contains: Option<String>,
@@ -144,7 +186,7 @@ enum HistoryCmd {
     /// Show one entry with its request and response.
     Show {
         id: i64,
-        /// Which part to print with --raw.
+        /// Which part to print with --raw. response-body is decoded (no chunking or compression).
         #[arg(long, value_enum, default_value = "response")]
         part: Part,
         /// Print the selected part as raw bytes (pipe a request back into `send`).
@@ -156,6 +198,16 @@ enum HistoryCmd {
     },
     /// Attach a note to an entry; omit TEXT to clear it.
     Note { id: i64, text: Option<String> },
+    /// Add or remove tags on an entry.
+    Tag {
+        id: i64,
+        /// Tag to add. Repeatable.
+        #[arg(long)]
+        add: Vec<String>,
+        /// Tag to remove. Repeatable.
+        #[arg(long)]
+        remove: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -203,13 +255,16 @@ fn main() {
 
 fn command_name(cmd: &Cmd) -> String {
     match cmd {
-        Cmd::Capabilities => "capabilities",
+        Cmd::Capabilities { .. } => "capabilities",
+        Cmd::Schema => "schema",
+        Cmd::Query(_) => "query",
         Cmd::Project(ProjectCmd::Init) => "project init",
         Cmd::Project(ProjectCmd::Info) => "project info",
         Cmd::Send(_) => "send",
         Cmd::History(HistoryCmd::List { .. }) => "history list",
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
         Cmd::History(HistoryCmd::Note { .. }) => "history note",
+        Cmd::History(HistoryCmd::Tag { .. }) => "history tag",
         Cmd::Encode(_) => "encode",
         Cmd::Decode(_) => "decode",
         Cmd::Hash(_) => "hash",
@@ -219,10 +274,21 @@ fn command_name(cmd: &Cmd) -> String {
 
 fn run(cli: Cli, out: &Out) -> Result<(), Error> {
     match cli.command {
-        Cmd::Capabilities => {
-            let v = capabilities::describe(&Cli::command());
+        Cmd::Capabilities { command } => {
+            let v = if command.is_empty() {
+                capabilities::describe(&Cli::command())
+            } else {
+                let path = command.join(" ");
+                capabilities::describe_one(&Cli::command(), &path)
+                    .ok_or_else(|| Error::NotFound(format!("command {path:?}")))?
+            };
             out.ok(v.clone(), || serde_json::to_string_pretty(&v).unwrap_or_default());
         }
+        Cmd::Schema => {
+            let v = schema_json();
+            out.ok(v.clone(), || serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        Cmd::Query(args) => query(&cli.project, args, out)?,
         Cmd::Project(cmd) => {
             let store = Store::open(&cli.project)?;
             let path = std::fs::canonicalize(&cli.project).unwrap_or(cli.project.clone());
@@ -325,25 +391,78 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         out.raw(&ex.response);
         return Ok(());
     }
-    let data = exchange_json(id, &target, &ex.request, &ex.response, Some(ex.duration_ms), args.max_body);
+    let mut data = exchange_json(id, &target, &ex.request, &ex.response, Some(ex.duration_ms), args.max_body);
+    if args.show_request {
+        data["request"] = body_value(&ex.request, args.max_body);
+    }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
+}
+
+fn query(project: &Path, args: QueryArgs, out: &Out) -> Result<(), Error> {
+    let sql = String::from_utf8(read_input(args.sql.as_deref())?)
+        .map_err(|_| Error::InvalidInput("SQL must be UTF-8".into()))?;
+    // Make sure the project exists and is migrated before opening it read-only.
+    drop(Store::open(project)?);
+    let store = Store::open_read_only(project)?;
+    let r = store.query(sql.trim(), &args.params, args.limit, args.max_cell)?;
+    let data = match args.shape {
+        Shape::Rows => json!(r),
+        Shape::Objects => {
+            let rows: Vec<Value> = r
+                .rows
+                .iter()
+                .map(|row| Value::Object(r.columns.iter().cloned().zip(row.iter().cloned()).collect()))
+                .collect();
+            json!({"rows": rows, "row_count": r.row_count, "truncated": r.truncated})
+        }
+    };
+    out.ok(data, || {
+        let cell = |v: &Value| match v {
+            Value::String(s) => s.replace(['\t', '\n', '\r'], " "),
+            Value::Null => "NULL".into(),
+            other => other.to_string(),
+        };
+        let mut lines = vec![r.columns.join("\t")];
+        lines.extend(r.rows.iter().map(|row| row.iter().map(cell).collect::<Vec<_>>().join("\t")));
+        if r.truncated {
+            lines.push(format!("... more rows; raise --limit (showing {})", r.row_count));
+        }
+        lines.join("\n")
+    });
+    Ok(())
+}
+
+fn schema_json() -> Value {
+    let cols = |list: &[(&str, &str, &str)]| -> Vec<Value> {
+        list.iter().map(|(n, t, d)| json!({"name": n, "type": t, "description": d})).collect()
+    };
+    json!({
+        "tables": [
+            {"name": "history", "description": "One row per request sent or proxied.", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
+        ],
+        "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),
+        "examples": store::EXAMPLES.iter().map(|(t, q)| json!({"title": t, "sql": q})).collect::<Vec<_>>(),
+        "notes": [
+            "query opens the database read-only; writes fail.",
+            "Prefer *_text columns for searching; they are NULL for binary bodies.",
+            "Bind values with -p/--param and ?1, ?2 instead of quoting them into SQL.",
+        ],
+    })
 }
 
 fn response_json(response: &[u8], max_body: usize) -> Value {
     let Ok(head) = parse_response_head(response) else {
         return json!({"parse_error": true, "raw": body_value(response, max_body)});
     };
-    let (_, body) = braintruder_core::http::request::split_head_body(response);
-    let chunked = head.header("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
-    let body = if chunked { dechunk(body) } else { body.to_vec() };
+    let body = decode_body(&head.headers, split_head_body(response).1);
     json!({
         "status": head.status,
         "reason": head.reason,
-        "version": head.version,
-        "headers": head.headers.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
+        "headers": head.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>(),
         "body": body_value(&body, max_body),
-        "length": response.len(),
+        "raw_length": response.len(),
     })
 }
 
@@ -355,11 +474,14 @@ fn exchange_json(
     duration_ms: Option<u64>,
     max_body: usize,
 ) -> Value {
+    let url = RawRequest::from_bytes(request.to_vec())
+        .head()
+        .map(|h| if h.target.contains("://") { h.target } else { format!("{}{}", target.origin(), h.target) })
+        .unwrap_or_else(|_| target.origin());
     json!({
         "id": id,
-        "target": target.origin(),
+        "url": url,
         "duration_ms": duration_ms,
-        "request": body_value(request, max_body),
         "response": response_json(response, max_body),
     })
 }
@@ -374,12 +496,13 @@ fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
 fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        HistoryCmd::List { host, method, status, source, contains, after, limit } => {
+        HistoryCmd::List { host, method, status, source, tag, contains, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,
                 method,
                 status,
                 source,
+                tag,
                 contains,
                 after_id: after,
                 limit: Some(limit),
@@ -390,10 +513,8 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                     .iter()
                     .map(|e| {
                         let status = e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
-                        format!(
-                            "{:>6}  {:<4} {:<7} {}://{}:{}{}  {}B",
-                            e.id, status, e.method, e.scheme, e.host, e.port, e.path, e.response_length
-                        )
+                        let len = e.resp_body_length.unwrap_or(0);
+                        format!("{:>6}  {:<4} {:<7} {}  {len}B", e.id, status, e.method, e.url)
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -405,34 +526,20 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                 let bytes = match part {
                     Part::Request => item.request,
                     Part::Response => item.response,
-                    Part::ResponseBody => {
-                        let (_, body) = braintruder_core::http::request::split_head_body(&item.response);
-                        let chunked = parse_response_head(&item.response)
-                            .ok()
-                            .and_then(|h| {
-                                h.header("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked"))
-                            })
-                            .unwrap_or(false);
-                        if chunked {
-                            dechunk(body)
-                        } else {
-                            body.to_vec()
-                        }
-                    }
+                    Part::ResponseBody => item.resp_body.unwrap_or_default(),
                 };
                 out.raw(&bytes);
                 return Ok(());
             }
-            let target =
-                Target { scheme: item.entry.scheme.clone(), host: item.entry.host.clone(), port: item.entry.port };
             let mut data = exchange_json(
                 Some(id),
-                &target,
+                &item.target,
                 &item.request,
                 &item.response,
                 item.entry.duration_ms.map(|d| d as u64),
                 max_body,
             );
+            data["request"] = body_value(&item.request, max_body);
             data["entry"] = json!(item.entry);
             out.ok(data, || {
                 format!("{}\n\n{}", String::from_utf8_lossy(&item.request), String::from_utf8_lossy(&item.response))
@@ -441,6 +548,10 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
         HistoryCmd::Note { id, text } => {
             store.set_note(id, text.as_deref())?;
             out.ok(json!({"id": id, "note": text}), || format!("note updated on #{id}"));
+        }
+        HistoryCmd::Tag { id, add, remove } => {
+            let tags = store.update_tags(id, &add, &remove)?;
+            out.ok(json!({"id": id, "tags": tags}), || format!("#{id} tags: {}", tags.join(", ")));
         }
     }
     Ok(())
