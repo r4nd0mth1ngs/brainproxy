@@ -1,6 +1,3 @@
-// Helpers are adopted rule by rule as the ZAP ports land.
-#![allow(dead_code)]
-
 //! Lenient HTML helpers for passive rules: start tags with attributes, comments,
 //! and script contents. Good enough for scanning arbitrary (often broken) pages
 //! without a full DOM.
@@ -141,16 +138,6 @@ pub fn comments(html: &str) -> Vec<&str> {
     out
 }
 
-/// Contents of every inline `<script>` element.
-pub fn scripts(html: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    for t in tags(html).iter().filter(|t| t.name == "script") {
-        let end = find_ci(html, "</script", t.end).unwrap_or(html.len());
-        out.push(&html[t.end..end]);
-    }
-    out
-}
-
 pub fn find_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
     let h = hay.as_bytes();
     let n = needle.as_bytes();
@@ -208,7 +195,6 @@ mod tests {
         assert_eq!(t[1].attr("target"), Some("_blank"));
         assert!(t[4].has("alt"));
         assert_eq!(comments(html), [" secret: todo "]);
-        assert_eq!(scripts(html), ["", "var a = \"<b>\";"]);
         assert_eq!(url_host("https://user@CDN.test:8443/x"), Some("cdn.test".into()));
         assert_eq!(url_host("//other.test/x"), Some("other.test".into()));
         assert_eq!(url_host("/relative"), None);
