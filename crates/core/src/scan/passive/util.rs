@@ -1,3 +1,6 @@
+// Helpers are adopted rule by rule as the ZAP ports land.
+#![allow(dead_code)]
+
 //! Lenient HTML helpers for passive rules: start tags with attributes, comments,
 //! and script contents. Good enough for scanning arbitrary (often broken) pages
 //! without a full DOM.
@@ -209,5 +212,162 @@ mod tests {
         assert_eq!(url_host("https://user@CDN.test:8443/x"), Some("cdn.test".into()));
         assert_eq!(url_host("//other.test/x"), Some("other.test".into()));
         assert_eq!(url_host("/relative"), None);
+    }
+}
+
+/// Parses an HTTP date (RFC 1123 `Thu, 01 Jan 1970 00:00:00 GMT`, the Netscape
+/// cookie form `Thu, 01-Jan-1970 00:00:00 GMT`, or RFC 850) to Unix seconds.
+pub fn parse_http_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let rest = s.split_once(',').map(|(_, r)| r).unwrap_or(s).trim();
+    let rest = rest.replace('-', " ");
+    let mut it = rest.split_whitespace();
+    let day: i64 = it.next()?.parse().ok()?;
+    let month = match it.next()?.to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let mut year: i64 = it.next()?.parse().ok()?;
+    if year < 100 {
+        year += if year < 70 { 2000 } else { 1900 };
+    }
+    let mut hms = it.next()?.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, m, sec) = (hms.next()??, hms.next()??, hms.next()??);
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + m * 60 + sec)
+}
+
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// ZAP CookieUtils.isExpired: the Expires attribute parses to a time in the past.
+pub fn cookie_expired(c: &crate::scan::message::SetCookie) -> bool {
+    c.attr("expires").and_then(parse_http_date).is_some_and(|t| t < now_unix())
+}
+
+/// ZAP CookieUtils.getSetCookiePlusName: "<header name as sent>: <cookie name>".
+pub fn set_cookie_evidence(msg: &crate::scan::Message, raw_value: &str, name: &str) -> String {
+    let header = msg
+        .resp_headers
+        .iter()
+        .find(|(k, v)| {
+            v == raw_value && (k.eq_ignore_ascii_case("set-cookie") || k.eq_ignore_ascii_case("set-cookie2"))
+        })
+        .map(|(k, _)| k.as_str())
+        .unwrap_or("Set-Cookie");
+    format!("{header}: {name}")
+}
+
+/// All Set-Cookie then Set-Cookie2 values, in order (ZAP order).
+pub fn set_cookie_values(msg: &crate::scan::Message) -> Vec<&str> {
+    msg.resp_headers_named("set-cookie").chain(msg.resp_headers_named("set-cookie2")).collect()
+}
+
+#[cfg(test)]
+pub mod testing {
+    //! Builders for rule unit tests.
+    use crate::scan::{Finding, Message, PassiveRule};
+
+    pub struct M {
+        pub url: String,
+        pub method: String,
+        pub req_headers: Vec<(String, String)>,
+        pub req_body: Vec<u8>,
+        pub status: u16,
+        pub resp_headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+
+    /// A GET for `url` answered 200 with no headers and an empty body.
+    pub fn msg(url: &str) -> M {
+        M {
+            url: url.into(),
+            method: "GET".into(),
+            req_headers: vec![],
+            req_body: vec![],
+            status: 200,
+            resp_headers: vec![],
+            body: vec![],
+        }
+    }
+
+    impl M {
+        pub fn method(mut self, m: &str) -> Self {
+            self.method = m.into();
+            self
+        }
+        pub fn req_header(mut self, k: &str, v: &str) -> Self {
+            self.req_headers.push((k.into(), v.into()));
+            self
+        }
+        pub fn req_body(mut self, b: &str) -> Self {
+            self.req_body = b.as_bytes().to_vec();
+            self
+        }
+        pub fn status(mut self, s: u16) -> Self {
+            self.status = s;
+            self
+        }
+        pub fn header(mut self, k: &str, v: &str) -> Self {
+            self.resp_headers.push((k.into(), v.into()));
+            self
+        }
+        pub fn html(self, body: &str) -> Self {
+            self.header("Content-Type", "text/html; charset=utf-8").body(body)
+        }
+        pub fn body(mut self, b: &str) -> Self {
+            self.body = b.as_bytes().to_vec();
+            self
+        }
+        pub fn build(self) -> Message {
+            let target = crate::http::Target::from_url(&self.url).unwrap();
+            let after = &self.url[self.url.find("://").map(|i| i + 3).unwrap_or(0)..];
+            let pq = after.find('/').map(|i| &after[i..]).unwrap_or("/");
+            let (path, query) = match pq.split_once('?') {
+                Some((p, q)) => (p.to_string(), Some(q.to_string())),
+                None => (pq.to_string(), None),
+            };
+            Message::new(
+                1,
+                self.method,
+                self.url.clone(),
+                target.scheme.clone(),
+                target.host.clone(),
+                target.port,
+                path,
+                query,
+                self.req_headers,
+                self.req_body,
+                self.status,
+                self.resp_headers,
+                self.body,
+            )
+        }
+        /// Runs `rule` on the message.
+        pub fn scan(self, rule: &dyn PassiveRule) -> Vec<Finding> {
+            let m = self.build();
+            let mut out = Vec::new();
+            rule.scan(&m, &mut out);
+            out
+        }
     }
 }

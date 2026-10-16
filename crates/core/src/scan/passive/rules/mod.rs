@@ -1,7 +1,9 @@
 //! Passive rules, ported from ZAP's pscanrules add-on (Apache License 2.0).
 
+mod cookie_http_only;
+
 use crate::scan::PassiveRule;
 
 pub fn all() -> Vec<Box<dyn PassiveRule>> {
-    vec![]
+    vec![Box::new(cookie_http_only::CookieHttpOnly)]
 }
