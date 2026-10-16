@@ -282,7 +282,7 @@ async fn fetch(client: &Client, req: &Req, headers: &[(String, String)]) -> Fetc
 fn endpoint(req: &Req, page: &Url) -> Endpoint {
     let mut params: Vec<String> = page.query_pairs().map(|(k, _)| k.into_owned()).collect();
     if let Some(b) = &req.body {
-        params.extend(b.split('&').filter_map(|p| p.split('=').next()).map(|k| crate::scan::message::url_decode(k)));
+        params.extend(b.split('&').filter_map(|p| p.split('=').next()).map(crate::scan::message::url_decode));
     }
     params.sort();
     params.dedup();
