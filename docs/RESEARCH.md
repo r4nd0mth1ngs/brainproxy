@@ -226,6 +226,10 @@ Choices made from the point of view of the model that will run brainproxy:
 - **Tags and notes** (`history tag`, `history note`) give the model a place to record its
   working state ("idor-candidate", "tested") and query it later
   (`EXISTS (SELECT 1 FROM json_each(tags) WHERE value='idor-candidate')`).
+- **Fuzz results are pre-triaged.** A fuzz run ends with a summary instead of thousands
+  of rows: the baseline response shape (status + word count), outliers whose shape is rare,
+  grep matches with extracted values, the slowest responses, and grouped errors. Everything
+  is still in `fuzz_results` for SQL.
 - **Targeted help.** `capabilities send` describes just one command, so the model doesn't
   reload the whole CLI description each time.
 
@@ -250,9 +254,9 @@ brainproxy proxy start|run|stop|status [--listen]         ✔ background proxy, 
 brainproxy scope show|set|add|clear|check                 ✔ host regexes
 brainproxy rules list|add|remove|enable|disable|clear     ✔ match-and-replace
 brainproxy intercept enable|disable|status|list|show|forward|drop   ✔ agent-driven queue
-brainproxy send --parallel N | --single-packet             Phase 2 (race conditions)
-brainproxy fuzz <file> --mode sniper|ram|pitchfork|cluster -p 1=list ... [--grep] [--rate]   Phase 2
-brainproxy diff <id1> <id2> [--words|--bytes]             Phase 2
+brainproxy send --race N                                  ✔ last-byte sync (HTTP/2 single-packet: later)
+brainproxy fuzz run|status|results|list|stop              ✔ 4 modes, -p list:|file:|range:, --process, --grep, --extract
+brainproxy diff <id1> <id2> [--part] [--mode lines|words|bytes]   ✔
 brainproxy crawl <url> [--browser] [--auth auth.yaml]     Phase 4
 brainproxy scan <url|--history> [--policy] [--checks dir] Phase 3-4
 brainproxy findings list|show                             Phase 3
@@ -271,7 +275,7 @@ brainproxy mcp                                            Phase 6
 |---|---|---|
 | **0: Skeleton (done)** | Rust workspace, `brainproxy` CLI, JSON envelope and exit codes, `capabilities`, SQLite capture DB with `query`/`schema`, FTS, and SQL helpers, raw HTTP/1.x client (HTTP and HTTPS), `send`, `history`, codecs, static Linux build | Repeater (single request), Decoder, Logger |
 | **1: Proxy (done)** | MITM proxy (HTTP/1.x, CONNECT, TLS interception, WebSocket pass-through), CA generation/export/system install, scope, match-and-replace, intercept queue in the project DB, background lifecycle. Still to do: HTTP/2 to clients, upstream connection pooling, upstream proxy chaining, HAR import/export | Burp Proxy, ZAP proxy |
-| **2: Manual tools** | `repeat` (with race and single-packet modes), `fuzz` (all 4 Intruder modes, payload processors, grep), `decode`, `diff` | Repeater, Intruder, Decoder, Comparer |
+| **2: Manual tools (done)** | `send --race` (last-byte sync), `fuzz` (4 Intruder modes, payload sources and processors, grep/extract, match-status, stop-on-match, rate limit, keep-alive workers, background runs, outlier summary), `diff`. Still to do: HTTP/2 single-packet attack, streaming very large wordlists | Repeater, Intruder, Comparer |
 | **3: Passive scanner** | Port the ZAP passive rules. Run them inline in the proxy and over history. | ZAP passive scan |
 | **4: Crawl and active scan** | HTTP spider, insertion-point engine, scan policies, port of the ZAP release active rules, YAML checks, reports (HTML/JSON/SARIF) | Burp Scanner (core), ZAP active scan |
 | **5: Auth and automation** | Contexts, login flows, session macros, `brainproxy run plan.yaml`, OpenAPI/GraphQL import | ZAP Automation Framework, Burp session rules |

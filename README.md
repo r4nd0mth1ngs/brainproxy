@@ -58,6 +58,21 @@ brainproxy intercept show 4 --raw > msg.http      # edit it...
 brainproxy intercept forward 4 --file msg.http    # ...and release it (or: intercept drop 4)
 brainproxy intercept disable
 
+# Fuzzing (Intruder): mark positions with §value§
+brainproxy fuzz run --url 'https://target.test/api/user?id=§1§' -p range:1-500 --grep 'api_key'
+brainproxy fuzz run req.http --mode cluster-bomb -p file:users.txt -p file:pass.txt \
+    --grep '"ok": ?true' --extract '"token": "([^"]+)"' --stop-on-match --store matches
+brainproxy fuzz run req.http -p file:big.txt --rate 50 --background    # returns a run id
+brainproxy fuzz status 3          # baseline, outliers, matches, errors
+brainproxy fuzz results 3 --matched
+brainproxy fuzz stop 3
+
+# Race conditions: N requests, last byte released together
+brainproxy send req.http --race 20
+
+# Compare two captures
+brainproxy diff 12 15 --part response-body --mode words
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -91,7 +106,10 @@ brainproxy decode jwt eyJhbGciOi...
 - **Phase 1 (done):** intercepting proxy (HTTP/1.x, CONNECT, TLS interception with a
   per-install CA, WebSocket pass-through), scope, match-and-replace rules, and an
   agent-driven intercept queue.
-- **Next:** Phase 2 manual tools: race-condition sending, the fuzzer (Intruder modes), and diff.
+- **Phase 2 (done):** fuzzer with sniper, battering-ram, pitchfork, and cluster-bomb modes,
+  payload sources and processing, grep/extract, outlier summary, background runs;
+  race-condition sending (last-byte sync); diff.
+- **Next:** Phase 3, the passive scanner (port of ZAP's passive rules).
 
 ## License
 

@@ -43,6 +43,7 @@ pub struct Exchange {
     pub duration_ms: u64,
 }
 
+#[derive(Clone)]
 pub struct Client {
     tls: TlsConnector,
     opts: SendOptions,

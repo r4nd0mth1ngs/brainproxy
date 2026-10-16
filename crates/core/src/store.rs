@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -84,6 +84,75 @@ CREATE TABLE IF NOT EXISTS intercepts (
 );
 CREATE INDEX IF NOT EXISTS intercepts_state ON intercepts(state);
 ";
+
+const SCHEMA_V3: &str = "
+CREATE TABLE IF NOT EXISTS fuzz_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    state TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    target TEXT NOT NULL,
+    positions INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    matched INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    config TEXT NOT NULL,
+    template BLOB NOT NULL,
+    pid INTEGER,
+    finished_time TEXT,
+    error TEXT
+);
+CREATE TABLE IF NOT EXISTS fuzz_results (
+    run_id INTEGER NOT NULL,
+    idx INTEGER NOT NULL,
+    position INTEGER,
+    payloads TEXT NOT NULL,
+    history_id INTEGER,
+    status INTEGER,
+    length INTEGER,
+    words INTEGER,
+    lines INTEGER,
+    duration_ms INTEGER,
+    matched INTEGER NOT NULL DEFAULT 0,
+    grep TEXT,
+    extract TEXT,
+    error TEXT,
+    PRIMARY KEY (run_id, idx)
+) WITHOUT ROWID;
+";
+
+pub const FUZZ_RUN_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Run id"),
+    ("time", "TEXT", "UTC start time"),
+    ("state", "TEXT", "queued, running, stopping, completed, stopped, failed"),
+    ("mode", "TEXT", "sniper, battering-ram, pitchfork, cluster-bomb"),
+    ("target", "TEXT", "Origin requests were sent to"),
+    ("positions", "INTEGER", "Number of payload positions in the template"),
+    ("total", "INTEGER", "Requests planned"),
+    ("done", "INTEGER", "Requests finished so far"),
+    ("matched", "INTEGER", "Results that matched --grep or --match-status"),
+    ("errors", "INTEGER", "Requests that got no response"),
+    ("config", "TEXT", "Run settings as JSON"),
+    ("template", "BLOB", "Request template with payload markers"),
+];
+
+pub const FUZZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
+    ("run_id", "INTEGER", "fuzz_runs.id"),
+    ("idx", "INTEGER", "Request number within the run, from 0"),
+    ("position", "INTEGER", "Attacked position (sniper only), from 0"),
+    ("payloads", "TEXT", "JSON array of the payloads used; json_extract(payloads, '$[0]')"),
+    ("history_id", "INTEGER", "history.id of the stored exchange (NULL if not stored)"),
+    ("status", "INTEGER", "Response status"),
+    ("length", "INTEGER", "Decoded response body length"),
+    ("words", "INTEGER", "Words in the response body"),
+    ("lines", "INTEGER", "Lines in the response body"),
+    ("duration_ms", "INTEGER", "Response time"),
+    ("matched", "INTEGER", "1 if a --grep pattern or --match-status matched"),
+    ("grep", "TEXT", "JSON array of grep patterns that matched"),
+    ("extract", "TEXT", "Value captured by --extract"),
+    ("error", "TEXT", "Error if no response was received"),
+];
 
 /// Column documentation for the intercept queue.
 pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -265,6 +334,9 @@ impl Store {
         if version < 2 {
             self.conn.execute_batch(SCHEMA_V2)?;
         }
+        if version < 3 {
+            self.conn.execute_batch(SCHEMA_V3)?;
+        }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -279,6 +351,188 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fuzz_create(
+        &self,
+        state: &str,
+        mode: &str,
+        target: &str,
+        positions: usize,
+        total: u64,
+        config: &Value,
+        template: &[u8],
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO fuzz_runs (state, mode, target, positions, total, config, template)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![state, mode, target, positions as i64, total as i64, config.to_string(), template],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Sets a run's state; `finished` also stamps the finish time.
+    pub fn fuzz_set_state(
+        &self,
+        id: i64,
+        state: &str,
+        pid: Option<u32>,
+        error: Option<&str>,
+        finished: bool,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE fuzz_runs SET state = ?1, pid = COALESCE(?2, pid), error = COALESCE(?3, error),
+                finished_time = CASE WHEN ?4 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE finished_time END
+             WHERE id = ?5",
+            params![state, pid, error, finished, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("fuzz run {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn fuzz_state(&self, id: i64) -> Result<String> {
+        self.conn
+            .query_row("SELECT state FROM fuzz_runs WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("fuzz run {id}")))
+    }
+
+    /// Records a batch of results (and their exchanges) in one transaction.
+    pub fn fuzz_record(&mut self, run_id: i64, rows: &[crate::fuzz::engine::Row]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let (mut matched, mut errors) = (0i64, 0i64);
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO fuzz_results (run_id, idx, position, payloads, history_id, status, length,
+                    words, lines, duration_ms, matched, grep, extract, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
+            for (capture, r) in rows {
+                let history_id = capture.as_ref().map(|c| insert_capture(&tx, c)).transpose()?;
+                matched += r.matched as i64;
+                errors += r.error.is_some() as i64;
+                stmt.execute(params![
+                    run_id,
+                    r.idx as i64,
+                    r.position.map(|p| p as i64),
+                    serde_json::to_string(&r.payloads).unwrap_or_default(),
+                    history_id,
+                    r.status,
+                    r.length,
+                    r.words,
+                    r.lines,
+                    r.duration_ms,
+                    r.matched,
+                    (!r.grep.is_empty()).then(|| serde_json::to_string(&r.grep).unwrap_or_default()),
+                    r.extract,
+                    r.error,
+                ])?;
+            }
+        }
+        tx.execute(
+            "UPDATE fuzz_runs SET done = done + ?1, matched = matched + ?2, errors = errors + ?3 WHERE id = ?4",
+            params![rows.len() as i64, matched, errors, run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One run's metadata (without the template).
+    pub fn fuzz_run(&self, id: i64) -> Result<Value> {
+        let r = self.query(
+            "SELECT id, time, state, mode, target, positions, total, done, matched, errors, pid, finished_time, error,
+                json(config) AS config
+             FROM fuzz_runs WHERE id = ?1",
+            &[id.to_string()],
+            1,
+            100_000,
+        )?;
+        let row = r.rows.into_iter().next().ok_or_else(|| Error::NotFound(format!("fuzz run {id}")))?;
+        let mut obj: serde_json::Map<String, Value> = r.columns.into_iter().zip(row).collect();
+        if let Some(Value::String(c)) = obj.get("config") {
+            obj.insert("config".into(), serde_json::from_str(c).unwrap_or(Value::Null));
+        }
+        Ok(Value::Object(obj))
+    }
+
+    /// What an agent needs to triage a run without reading every row: status
+    /// counts, the most common (baseline) response shape, outliers whose
+    /// (status, words) shape is rare, matches, and errors.
+    pub fn fuzz_summary(&self, id: i64, top: usize) -> Result<Value> {
+        let run = self.fuzz_run(id)?;
+        let done = run["done"].as_i64().unwrap_or(0);
+        let p = [id.to_string()];
+        let rows = |sql: &str, params: &[String]| -> Result<Vec<Value>> {
+            let r = self.query(sql, params, top, 500)?;
+            Ok(r.rows
+                .into_iter()
+                .map(|row| {
+                    let mut obj: serde_json::Map<String, Value> = r.columns.iter().cloned().zip(row).collect();
+                    for key in ["payloads", "grep"] {
+                        if let Some(Value::String(s)) = obj.get(key) {
+                            let parsed = serde_json::from_str(s).unwrap_or(Value::Null);
+                            obj.insert(key.into(), parsed);
+                        }
+                    }
+                    Value::Object(obj)
+                })
+                .collect())
+        };
+        let by_status = rows(
+            "SELECT status, count(*) AS count FROM fuzz_results WHERE run_id = ?1 GROUP BY status ORDER BY count DESC",
+            &p,
+        )?;
+        let baseline = rows(
+            "SELECT status, words, count(*) AS count, min(length) AS min_length, max(length) AS max_length
+             FROM fuzz_results WHERE run_id = ?1 AND error IS NULL GROUP BY status, words ORDER BY count DESC LIMIT 1",
+            &p,
+        )?;
+        let threshold = (done / 100).max(1);
+        let outliers = rows(
+            "WITH g AS (SELECT status, words, count(*) AS c FROM fuzz_results
+                        WHERE run_id = ?1 AND error IS NULL GROUP BY status, words)
+             SELECT r.idx, r.payloads, r.status, r.length, r.words, r.duration_ms, r.history_id, g.c AS shape_count
+             FROM fuzz_results r JOIN g ON g.status IS r.status AND g.words IS r.words
+             WHERE r.run_id = ?1 AND g.c <= CAST(?2 AS INTEGER) ORDER BY g.c, r.idx",
+            &[id.to_string(), threshold.to_string()],
+        )?;
+        let shapes: i64 = self.conn.query_row(
+            "SELECT count(*) FROM (SELECT 1 FROM fuzz_results WHERE run_id = ?1 AND error IS NULL GROUP BY status, words)",
+            [id],
+            |r| r.get(0),
+        )?;
+        let matches = rows(
+            "SELECT idx, payloads, status, length, words, grep, extract, history_id
+             FROM fuzz_results WHERE run_id = ?1 AND matched = 1 ORDER BY idx",
+            &p,
+        )?;
+        let slowest = rows(
+            "SELECT idx, payloads, status, duration_ms, history_id FROM fuzz_results
+             WHERE run_id = ?1 AND error IS NULL ORDER BY duration_ms DESC LIMIT 3",
+            &p,
+        )?;
+        let errors = rows(
+            "SELECT error, count(*) AS count, min(idx) AS first_idx FROM fuzz_results
+             WHERE run_id = ?1 AND error IS NOT NULL GROUP BY error ORDER BY count DESC",
+            &p,
+        )?;
+        Ok(serde_json::json!({
+            "run": run,
+            "by_status": by_status,
+            "baseline": baseline.into_iter().next(),
+            "distinct_shapes": shapes,
+            "outliers": {
+                "rule": format!("(status, words) shape seen <= {threshold} time(s)"),
+                "items": outliers,
+            },
+            "matches": matches,
+            "slowest": slowest,
+            "errors": errors,
+            "hint": "More: brainproxy query \"SELECT * FROM fuzz_results WHERE run_id = N ...\"; join history ON history.id = history_id for bodies.",
+        }))
     }
 
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
@@ -520,7 +774,7 @@ impl Store {
         let mut stmt = self.conn.prepare(sql).map_err(|e| Error::InvalidInput(format!("SQL: {e}")))?;
         let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let mut rows_iter = stmt
-            .query(rusqlite::params_from_iter(params.iter()))
+            .query(rusqlite::params_from_iter(params.iter().map(|p| bind_value(p))))
             .map_err(|e| Error::InvalidInput(format!("SQL: {e}")))?;
         let mut rows = Vec::new();
         let mut truncated = false;
@@ -575,6 +829,17 @@ fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Binds parameters that are canonical integers ("42", "-7"; not "007" or "+5")
+/// as integers, everything else as text. Comparisons against columns work
+/// either way thanks to column affinity; this also makes expressions like
+/// `?1 = 0` or `idx > ?1` behave as expected.
+fn bind_value(p: &str) -> rusqlite::types::Value {
+    match p.parse::<i64>() {
+        Ok(i) if i.to_string() == p => rusqlite::types::Value::Integer(i),
+        _ => rusqlite::types::Value::Text(p.to_string()),
+    }
 }
 
 fn cell(v: ValueRef, max: usize) -> Value {
@@ -733,6 +998,8 @@ mod tests {
         assert!(r.rows[0][0].as_str().unwrap().starts_with("{\"tok…[truncated"));
         let r = s.query("SELECT id FROM history WHERE id = ?1", &["2".into()], 10, 100).unwrap();
         assert_eq!(r.rows, vec![vec![json!(2)]]);
+        let r = s.query("SELECT ?1 = 0, ?2 > 1, typeof(?3)", &["0".into(), "5".into(), "007".into()], 1, 100).unwrap();
+        assert_eq!(r.rows, vec![vec![json!(1), json!(1), json!("text")]]);
         assert!(s.query("SELEC nope", &[], 1, 1).is_err());
     }
 

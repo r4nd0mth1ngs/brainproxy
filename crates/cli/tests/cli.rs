@@ -157,7 +157,21 @@ fn capabilities_lists_all_commands() {
     assert_eq!(code, 0);
     let names: Vec<&str> =
         v["data"]["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-    for want in ["send", "history", "query", "schema", "proxy", "ca", "scope", "rules", "intercept", "encode", "decode", "hash", "project"] {
+    for want in [
+        "send",
+        "history",
+        "query",
+        "schema",
+        "proxy",
+        "ca",
+        "scope",
+        "rules",
+        "intercept",
+        "encode",
+        "decode",
+        "hash",
+        "project",
+    ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
     assert_eq!(v["data"]["conventions"]["interactive_prompts"], false);

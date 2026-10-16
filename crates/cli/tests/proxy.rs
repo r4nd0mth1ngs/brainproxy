@@ -253,3 +253,87 @@ fn proxy_websocket_upgrade_and_intercept_timeout() {
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(env.ok(&["intercept", "list", "--state", "expired"])["count"], 1);
 }
+
+#[test]
+fn fuzz_race_and_diff() {
+    let env = Env::new("fuzz");
+    let port = spawn_echo(false, &env.dir);
+    let base = format!("http://127.0.0.1:{port}");
+
+    // Sniper over two positions; the echo body reflects the request line.
+    let s = env.ok(&[
+        "fuzz",
+        "run",
+        "--url",
+        &format!("{base}/item?a=§1§&b=§2§"),
+        "-p",
+        "list:x,y,z",
+        "--grep",
+        "a=y",
+        "--extract",
+        "b=(\\w+)",
+    ]);
+    assert_eq!(s["run"]["total"], 6);
+    assert_eq!(s["run"]["done"], 6);
+    assert_eq!(s["run"]["state"], "completed");
+    assert_eq!(s["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(s["matches"][0]["payloads"], serde_json::json!(["y"]));
+    assert_eq!(s["matches"][0]["extract"], "2");
+    let run = s["run"]["id"].as_i64().unwrap().to_string();
+    let r = env.ok(&["fuzz", "results", &run, "--matched"]);
+    assert_eq!(r["row_count"], 1);
+    let r = env.ok(&["fuzz", "results", &run, "--after", "3"]);
+    assert_eq!(r["row_count"], 2);
+
+    // Cluster bomb with processing and stop-on-match.
+    let s = env.ok(&[
+        "fuzz",
+        "run",
+        "--url",
+        &format!("{base}/login"),
+        "-X",
+        "POST",
+        "-d",
+        "u=§u§&p=§p§",
+        "--mode",
+        "cluster-bomb",
+        "-p",
+        "list:a,b",
+        "-p",
+        "range:1-3",
+        "--process",
+        "2=prefix:pw",
+        "-c",
+        "1",
+        "--grep",
+        "u=b&p=pw2",
+        "--stop-on-match",
+        "--store",
+        "matches",
+    ]);
+    assert_eq!(s["outcome"], "stopped-on-match");
+    assert_eq!(s["matches"][0]["payloads"], serde_json::json!(["b", "pw2"]));
+    // Content-Length was fixed after substitution: the echo shows the full body.
+    let hid = s["matches"][0]["history_id"].as_i64().unwrap();
+    assert_eq!(env.count(&format!("SELECT count(*) FROM history WHERE id = {hid} AND req_body_text = 'u=b&p=pw2'")), 1);
+
+    // Pitchfork needs one set per position.
+    let (code, v) =
+        env.run(&["fuzz", "run", "--url", &format!("{base}/?a=§1§&b=§2§"), "--mode", "pitchfork", "-p", "list:1"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")));
+
+    // Race: N identical requests, all recorded.
+    let r = env.ok(&["send", "--url", &format!("{base}/race"), "-X", "POST", "-d", "x=1", "--race", "5"]);
+    assert_eq!(r["results"].as_array().unwrap().len(), 5);
+    assert!(r["results"].as_array().unwrap().iter().all(|i| i["status"] == 200));
+    assert_eq!(env.count("SELECT count(*) FROM history WHERE source = 'race'"), 5);
+
+    // Diff two different fuzz responses.
+    let ids = env.ok(&["query", "SELECT min(id), max(id) FROM history WHERE source = 'fuzz'"]);
+    let (a, b) = (ids["rows"][0][0].to_string(), ids["rows"][0][1].to_string());
+    let d = env.ok(&["diff", &a, &b, "--part", "response-body"]);
+    assert_eq!(d["identical"], false);
+    assert!(d["unified"].as_str().unwrap().contains("@@"));
+    let d = env.ok(&["diff", &a, &a]);
+    assert_eq!(d["identical"], true);
+}

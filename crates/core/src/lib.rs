@@ -3,9 +3,12 @@
 
 pub mod capture;
 pub mod codec;
+pub mod diff;
 pub mod error;
+pub mod fuzz;
 pub mod http;
 pub mod proxy;
+pub mod race;
 pub mod store;
 
 pub use error::{Error, Result};

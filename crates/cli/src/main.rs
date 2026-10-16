@@ -2,17 +2,18 @@
 //! `brainproxy capabilities` for the machine-readable command list.
 
 mod capabilities;
+mod fuzz_cmd;
 mod output;
 mod proxy_cmd;
+mod request_args;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use brainproxy_core::capture::decode_body;
 use brainproxy_core::codec;
 use brainproxy_core::http::request::split_head_body;
-use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use brainproxy_core::http::{parse_response_head, Client, RawRequest, Target};
 use brainproxy_core::store::{self, HistoryFilter, Store};
 use brainproxy_core::Error;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -88,6 +89,13 @@ enum Cmd {
     )]
     Intercept(proxy_cmd::InterceptCmd),
 
+    /// Intruder-style fuzzing: payload positions, four attack modes, grep/extract, outlier summary.
+    #[command(subcommand)]
+    Fuzz(fuzz_cmd::FuzzCmd),
+
+    /// Compare two history entries (Comparer): line, word, or byte diff.
+    Diff(fuzz_cmd::DiffArgs),
+
     /// Browse recorded requests and responses.
     #[command(subcommand)]
     History(HistoryCmd),
@@ -112,44 +120,13 @@ enum ProjectCmd {
 
 #[derive(clap::Args)]
 struct SendArgs {
-    /// Raw HTTP request file; '-' or omitted reads stdin (unless --url is given).
-    file: Option<String>,
+    #[command(flatten)]
+    req: request_args::RequestArgs,
 
-    /// Build the request from a URL instead of a raw file.
-    #[arg(long)]
-    url: Option<String>,
-    /// Method for --url.
-    #[arg(short = 'X', long, default_value = "GET")]
-    method: String,
-    /// Header for --url requests, or set on a raw request ("Name: value"). Repeatable.
-    #[arg(short = 'H', long = "header")]
-    headers: Vec<String>,
-    /// Body for --url requests.
-    #[arg(short = 'd', long)]
-    data: Option<String>,
-
-    /// Where to send a raw request (scheme://host[:port]). Defaults to the Host header.
-    #[arg(long)]
-    target: Option<String>,
-    /// Scheme used with the Host header when --target is not given.
-    #[arg(long, default_value = "https", value_parser = ["http", "https"])]
-    scheme: String,
-    /// Remove a header from the request. Repeatable.
-    #[arg(long)]
-    remove_header: Vec<String>,
-    /// Send bytes exactly as given: no line-ending normalization, no Content-Length update.
-    #[arg(long)]
-    verbatim: bool,
-
-    /// Timeout in seconds.
-    #[arg(long, default_value_t = 30.0)]
-    timeout: f64,
-    /// Verify the server certificate (off by default, as with most intercepting tools).
-    #[arg(long)]
-    verify_tls: bool,
-    /// Override the TLS SNI host name.
-    #[arg(long)]
-    sni: Option<String>,
+    /// Race mode: send the request N times at once over N connections, releasing the
+    /// last byte of every request together (last-byte sync) to hit race windows.
+    #[arg(long, value_name = "N")]
+    race: Option<usize>,
     /// Don't record the exchange in history.
     #[arg(long)]
     no_store: bool,
@@ -301,6 +278,14 @@ fn command_name(cmd: &Cmd) -> String {
             proxy_cmd::ProxyCmd::Status => "proxy status",
         },
         Cmd::Ca(_) => "ca",
+        Cmd::Fuzz(c) => match c {
+            fuzz_cmd::FuzzCmd::Run(_) => "fuzz run",
+            fuzz_cmd::FuzzCmd::Status { .. } => "fuzz status",
+            fuzz_cmd::FuzzCmd::Results { .. } => "fuzz results",
+            fuzz_cmd::FuzzCmd::List { .. } => "fuzz list",
+            fuzz_cmd::FuzzCmd::Stop { .. } => "fuzz stop",
+        },
+        Cmd::Diff(_) => "diff",
         Cmd::Scope(_) => "scope",
         Cmd::Rules(_) => "rules",
         Cmd::Intercept(_) => "intercept",
@@ -342,6 +327,8 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::History(cmd) => history(&cli.project, cmd, out)?,
         Cmd::Proxy(cmd) => proxy_cmd::proxy(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Ca(cmd) => proxy_cmd::ca(&proxy_cmd::resolve_home(cli.home), cmd, out)?,
+        Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
+        Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
         Cmd::Intercept(cmd) => proxy_cmd::intercept(&cli.project, cmd, out)?,
@@ -363,56 +350,12 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
     }
 }
 
-fn parse_header(h: &str) -> Result<(String, String), Error> {
-    h.split_once(':')
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .filter(|(k, _)| !k.is_empty())
-        .ok_or_else(|| Error::InvalidInput(format!("header {h:?} must look like 'Name: value'")))
-}
-
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
-    let headers = args.headers.iter().map(|h| parse_header(h)).collect::<Result<Vec<_>, _>>()?;
-
-    let (mut req, inferred) = if let Some(url) = &args.url {
-        let (req, target) =
-            RawRequest::build(&args.method, url, &headers, args.data.as_deref().unwrap_or("").as_bytes())?;
-        (req, Some(target))
-    } else {
-        let bytes = match args.file.as_deref() {
-            Some(path) if path != "-" => std::fs::read(path)
-                .map_err(|e| Error::InvalidInput(format!("cannot read request file {path:?}: {e}")))?,
-            _ => read_input(None)?,
-        };
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Err(Error::InvalidInput("empty request; pass a FILE, stdin, or --url".into()));
-        }
-        let mut req = RawRequest::from_bytes(bytes);
-        if !args.verbatim {
-            req = req.normalize_line_endings();
-        }
-        for (k, v) in &headers {
-            req = req.set_header(k, v);
-        }
-        (req, None)
-    };
-    for name in &args.remove_header {
-        req = req.remove_header(name);
+    let (req, target) = args.req.prepare(None)?;
+    let client = Client::new(args.req.send_options());
+    if let Some(n) = args.race {
+        return race(project, &args, req, target, client, n, out);
     }
-    if !args.verbatim {
-        req = req.update_content_length();
-    }
-
-    let target = match (&args.target, inferred) {
-        (Some(t), _) => Target::from_url(t)?,
-        (None, Some(t)) => t,
-        (None, None) => req.infer_target(&args.scheme)?,
-    };
-
-    let client = Client::new(SendOptions {
-        timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
-        verify_tls: args.verify_tls,
-        sni: args.sni.clone(),
-    });
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     let result = rt.block_on(client.send(&req, &target));
 
@@ -440,6 +383,60 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         data["request"] = body_value(&ex.request, args.max_body);
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
+    Ok(())
+}
+
+fn race(
+    project: &Path,
+    args: &SendArgs,
+    req: RawRequest,
+    target: Target,
+    client: Client,
+    n: usize,
+    out: &Out,
+) -> Result<(), Error> {
+    if !(1..=1000).contains(&n) {
+        return Err(Error::InvalidInput("--race must be between 1 and 1000".into()));
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
+    let results =
+        rt.block_on(brainproxy_core::race::last_byte_sync(&client, &target, vec![req.as_bytes().to_vec(); n]));
+    let store = if args.no_store { None } else { Some(Store::open(project)?) };
+    let mut items = Vec::new();
+    let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in &results {
+        match r {
+            Ok(ex) => {
+                let id = store.as_ref().map(|s| s.record_exchange("race", ex)).transpose()?;
+                let head = parse_response_head(&ex.response).ok();
+                let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(&ex.response).1));
+                let status = head.as_ref().map(|h| h.status);
+                let length = body.as_ref().map(|b| b.len());
+                *shapes.entry(format!("{} {}B", status.unwrap_or(0), length.unwrap_or(0))).or_default() += 1;
+                items.push(json!({"id": id, "status": status, "length": length, "duration_ms": ex.duration_ms}));
+            }
+            Err(e) => {
+                if let Some(s) = &store {
+                    s.record_failure("race", &target, req.as_bytes(), &e.to_string())?;
+                }
+                *shapes.entry(format!("error: {}", e.kind())).or_default() += 1;
+                items.push(json!({"error": e.to_string(), "kind": e.kind()}));
+            }
+        }
+    }
+    let data = json!({
+        "race": n,
+        "sync": "last-byte",
+        "target": target.origin(),
+        "distinct_responses": shapes,
+        "results": items,
+        "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2.",
+    });
+    out.ok(data.clone(), || {
+        let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
+        lines.insert(0, format!("race x{n} -> {}", target.origin()));
+        lines.join("\n")
+    });
     Ok(())
 }
 
@@ -483,8 +480,10 @@ fn schema_json() -> Value {
     };
     json!({
         "tables": [
-            {"name": "history", "description": "One row per request sent (source=send) or proxied (source=proxy).", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "history", "description": "One row per request: source is send, race, proxy, or fuzz.", "columns": cols(store::HISTORY_COLUMNS)},
             {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
+            {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
+            {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),
@@ -492,7 +491,7 @@ fn schema_json() -> Value {
         "notes": [
             "query opens the database read-only; writes fail.",
             "Prefer *_text columns for searching; they are NULL for binary bodies.",
-            "Bind values with -p/--param and ?1, ?2 instead of quoting them into SQL.",
+            "Bind values with -p/--param and ?1, ?2 instead of quoting them into SQL. Values that are plain integers (42, -7) bind as integers; anything else (including 007) binds as text.",
         ],
     })
 }
