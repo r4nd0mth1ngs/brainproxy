@@ -1,0 +1,18 @@
+[package]
+name = "braintruder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI-first, non-interactive web security testing CLI"
+
+[[bin]]
+name = "braintruder"
+path = "src/main.rs"
+
+[dependencies]
+braintruder-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true

@@ -1,9 +1,11 @@
-# BrainProxy: research on Burp Suite and OWASP ZAP, and a CLI design
+# Braintruder: research on Burp Suite and OWASP ZAP, and a CLI design
 
-Status: research and design draft, written 2026-10-16. No code yet.
+Status: design, updated 2026-10-16. Phase 0 is implemented (see the README).
 
-Goal: a lightweight, CLI-first web security testing tool (a GUI comes later) that covers
-the core workflow of Burp Suite and OWASP ZAP: intercept, replay, fuzz, crawl, scan, report.
+Goal: a fast, lightweight, **AI-first** web security testing tool. It covers the core
+workflow of Burp Suite and OWASP ZAP (intercept, replay, fuzz, crawl, scan, report).
+Every feature is a non-interactive CLI command, so an AI agent can drive all of it. A GUI
+comes later on the same engine.
 
 ---
 
@@ -47,7 +49,7 @@ Other permissively licensed sources worth taking from:
 | **Organizer** | Saves and annotates interesting requests. Newer versions can share collections. | P2 |
 | **Logger** | Shows all traffic from every tool, not only the proxy. | Free if our store records every source |
 | **Session handling rules / macros** | Re-login, refresh CSRF tokens, update cookies before each request. | P1 (needed to scan authenticated apps) |
-| **Turbo Intruder** (BApp) | Very fast scripted sending, race conditions, HTTP pipelining. | P1 (Go makes this cheap) |
+| **Turbo Intruder** (BApp) | Very fast scripted sending, race conditions, HTTP pipelining. | P1 (cheap with tokio) |
 | **Extensions (Montoya API)** | A plugin API. | P2. Plugins as external processes or WASM. |
 | **Burp AI / Burp AT** (2026.7) | An agentic AI that drives Burp's deterministic tools toward a testing goal. | P2. Expose our engine over MCP so any LLM agent can drive it. |
 
@@ -98,34 +100,35 @@ ViewState, SRI, the polyfill.io CDN check, and modern-app detection.
 
 ---
 
-## 3. Recommended stack: Go
+## 3. Stack: Rust
 
-| Need | Why Go fits |
+Chosen for speed and efficiency: no garbage collector, predictable latency under heavy
+fuzzing, small static binaries, and low memory when a proxy holds thousands of connections.
+
+| Need | Rust choice |
 |---|---|
-| Lightweight distribution | One static binary, cross-compiled for Linux, macOS, and Windows with no JVM. |
-| MITM proxy | `net/http`, `crypto/tls`, `crypto/x509` for on-the-fly leaf certificates, `golang.org/x/net/http2`. |
-| Raw, malformed requests (smuggling, CRLF) | We need our own raw HTTP/1.x writer next to `net/http`. That's straightforward in Go. |
-| Intruder, Turbo Intruder, race conditions | Goroutines with rate limiting. Single-packet attack via HTTP/2 frame batching. |
-| Headless browser crawling | `chromedp` (MIT) or `go-rod` (MIT). |
-| Future GUI | Wails (Go + web UI) or a web UI served by the same binary. The CLI engine becomes the backend. |
-| Ecosystem precedent | Nuclei, httpx, katana, ffuf, and interactsh are all Go, so tooling and libraries are mature. |
+| Async networking | `tokio` |
+| TLS client and MITM | `rustls` (ring backend, no C toolchain), `rcgen` for the CA and per-host leaf certificates |
+| Raw, malformed requests (smuggling, CRLF) | Our own raw HTTP/1.x writer and reader (done in Phase 0), with `httparse` |
+| HTTP/2, single-packet race attacks | `h2` for normal traffic, plus a small hand-written frame writer for single-packet attacks |
+| Storage | SQLite via `rusqlite` (bundled), one `.btdb` file per project |
+| CLI | `clap` (derive). Its command tree also generates the `capabilities` JSON. |
+| Headless crawling | `chromiumoxide` (Chrome DevTools Protocol) |
+| Custom checks / filters | YAML via `serde`, filter expressions via an embedded expression engine (e.g. `cel-interpreter` or `evalexpr`) |
+| Plugins (later) | WASM via `wasmtime`, so plugins are sandboxed and language-agnostic |
+| GUI (later) | Tauri, on the same engine crate |
 
-Rust would be the alternative: faster and smaller, but slower to build in, especially for
-the TLS-interception and browser-automation parts. Go is the pragmatic choice.
-
-Storage: **SQLite** (`modernc.org/sqlite`, pure Go, no cgo). One `.bpdb` project file holds
-history, findings, and config. This mirrors Burp's project file and makes the later GUI simple.
-
----
+Workspace layout: `crates/core` (engine library) and `crates/cli` (the `braintruder`
+binary). Later: `crates/mcp` (MCP server) and `crates/gui`.
 
 ## 4. Architecture
 
 ```
                  +----------------------------------------------+
-  CLI / TUI  --> |            core engine (Go library)          | <-- later: GUI, MCP server, REST API
+  CLI        --> |           core engine (Rust crate)           | <-- later: GUI, MCP server, REST API
                  +----------------------------------------------+
                  | proxy (MITM, CA, HTTP/1/2, WS, intercept)    |
-                 | sender (net/http + raw socket client)        |
+                 | sender (raw HTTP/1.x client, h2 later)       |
                  | store (SQLite: history, findings, notes)     |
                  | scope + contexts + auth/session handling     |
                  | crawler (HTTP spider + headless browser)     |
@@ -141,7 +144,7 @@ The engine is a library. The CLI is a thin layer over it. That keeps "GUI later"
 
 ### Custom check format (our BCheck equivalent)
 
-Our own YAML, not a copy of BCheck syntax:
+Our own YAML, not a copy of BCheck syntax. Agents can write new checks as plain files:
 
 ```yaml
 id: bp-ssti-basic
@@ -158,52 +161,83 @@ match:
 oast: false
 ```
 
-Ported ZAP rules live in Go (`checks/zap/...`) with a header that credits the original file.
+Ported ZAP rules live in Rust (`crates/core/src/checks/zap/...`) with a header that credits the original file.
 Simple ones can be written as YAML checks.
 
 ---
 
-## 5. CLI design (draft)
+## 5. AI-first CLI contract
+
+These rules apply to every command, current and future:
+
+1. **No interactive prompts, ever.** Every choice is a flag, an env var, or a file. Missing
+   state, like the project file, is created automatically. Dangerous actions are gated by
+   explicit flags (for example `--scope`), not by confirmations.
+2. **One JSON envelope per command.** `--format json` is the default when stdout isn't a
+   terminal: `{"ok":true,"command":"send","data":{...}}` or
+   `{"ok":false,"command":"send","error":{"kind":"connect","message":"..."}}`.
+3. **Stable exit codes:** 0 success, 1 internal/storage error, 2 invalid input or usage,
+   3 network error, 4 not found. Later: 5 findings at or above a `--fail-on` severity.
+4. **Self-description.** `braintruder capabilities` returns every command, flag, default,
+   allowed value, env var, exit code, and codec as JSON. An agent learns the whole tool in
+   one call.
+5. **Bounded output.** Bodies are capped (`--max-body`) and marked `truncated`. Binary data
+   comes back as base64 with `"encoding":"base64"`. Lists take `--limit` and `--after <id>`
+   for incremental polling.
+6. **Pipes everywhere.** Inputs accept `-`/stdin. `--raw` prints bare bytes, so
+   `history show 7 --part request --raw | braintruder send --target ...` works.
+7. **Long-running work becomes jobs.** Proxy, crawl, scan, and fuzz will run as background
+   jobs with IDs (`job start|status|stop|results`) that stream NDJSON. An agent never has
+   to hold a terminal open.
+8. **Intercept without a human.** Instead of a modal "forward/drop" prompt, interception
+   is either rules (match-and-replace, auto-drop) or a queue an agent polls and resolves:
+   `intercept list`, `intercept edit <id> --file`, `intercept forward|drop <id>`.
+9. **MCP server.** `braintruder mcp` will expose the same commands as MCP tools, generated
+   from the same command tree, so CLI and MCP never drift.
+
+### Command map
+
+Implemented commands are marked with a check.
 
 ```
-bp init <project.bpdb>                       create a project and generate a CA
-bp ca export --format pem|der                export the CA for browser or OS install
-bp proxy  [-l 127.0.0.1:8080] [--intercept] [--scope scope.yaml]
-          [--match-replace rules.yaml]       run the MITM proxy and log to the project
-bp history [--filter 'status==500 && host~"api"'] [--json]
-bp show <id> [--raw|--req|--resp]
-bp repeat <id|file.http> [--set-header k:v] [--parallel N] [--single-packet]
-bp fuzz  <file.http> --mode sniper|ram|pitchfork|cluster
-         -p 1=wordlist.txt -p 2=ids.txt [--proc urlencode,b64] [--grep 'error'] [--rate 50]
-bp crawl <url> [--depth 5] [--browser] [--auth auth.yaml]
-bp scan  <url|--from-history> [--policy default|quick|full|tags:owasp-a03] [--checks dir/]
-bp import openapi|graphql|har|postman <file|url>
-bp findings [--severity high] [--json]
-bp report --format html|json|md|sarif -o out.html
-bp decode|encode <b64|url|html|hex|jwt> [input]
-bp diff <id1> <id2> [--words|--bytes]
-bp sequencer <id> --token 'cookie:session' [--samples 10000]
-bp oast serve | poll                         Collaborator-like server or client
-bp run plan.yaml                             ZAP-style automation plan for CI, exits non-zero on findings
+braintruder capabilities                                   ✔ machine-readable command list
+braintruder project init|info                              ✔
+braintruder send [FILE|-] [--url U -X M -H h -d body]      ✔ Repeater
+                 [--target T] [--verbatim] [--raw]
+braintruder history list [--host --status --contains --after --limit]   ✔
+braintruder history show <id> [--part request|response|response-body --raw]   ✔
+braintruder history note <id> [TEXT]                       ✔
+braintruder encode|decode|hash <chain> [INPUT|-]           ✔ Decoder (base64, url, hex, html, jwt, md5/sha*)
+braintruder ca init|export                                 Phase 1
+braintruder proxy start|stop|status [--listen] [--scope] [--rules]   Phase 1
+braintruder intercept list|show|edit|forward|drop          Phase 1
+braintruder send --parallel N | --single-packet             Phase 2 (race conditions)
+braintruder fuzz <file> --mode sniper|ram|pitchfork|cluster -p 1=list ... [--grep] [--rate]   Phase 2
+braintruder diff <id1> <id2> [--words|--bytes]             Phase 2
+braintruder crawl <url> [--browser] [--auth auth.yaml]     Phase 4
+braintruder scan <url|--history> [--policy] [--checks dir] Phase 3-4
+braintruder findings list|show                             Phase 3
+braintruder report --format html|json|md|sarif             Phase 4
+braintruder import openapi|graphql|har|postman             Phase 5
+braintruder run plan.yaml                                  Phase 5 (ZAP-style automation)
+braintruder sequencer <id> --token ...                     Phase 6
+braintruder oast serve|poll                                Phase 6
+braintruder job list|status|stop|results                   Phase 1+
+braintruder mcp                                            Phase 6
 ```
-
-Request files (`.http`) use the raw HTTP format, with optional `§…§` markers for fuzzing,
-so you can copy one from the history and edit it in `$EDITOR`.
-
----
 
 ## 6. Phased roadmap
 
 | Phase | Deliverable | Burp/ZAP parity reached |
 |---|---|---|
-| **0: Skeleton** | Go module, `bp` CLI (cobra), SQLite store, request/response model, `.http` parser, CI | none |
+| **0: Skeleton (done)** | Rust workspace, `braintruder` CLI, JSON envelope and exit codes, `capabilities`, SQLite store, raw HTTP/1.x client (HTTP and HTTPS), `send`, `history`, codecs | Repeater (single request), Decoder |
 | **1: Proxy and history** | MITM proxy (HTTP/1.1, then HTTP/2), CA generation and export, scope, match-and-replace, history and show commands, HAR import/export | Burp Proxy, ZAP proxy |
 | **2: Manual tools** | `repeat` (with race and single-packet modes), `fuzz` (all 4 Intruder modes, payload processors, grep), `decode`, `diff` | Repeater, Intruder, Decoder, Comparer |
 | **3: Passive scanner** | Port the ZAP passive rules. Run them inline in the proxy and over history. | ZAP passive scan |
 | **4: Crawl and active scan** | HTTP spider, insertion-point engine, scan policies, port of the ZAP release active rules, YAML checks, reports (HTML/JSON/SARIF) | Burp Scanner (core), ZAP active scan |
-| **5: Auth and automation** | Contexts, login flows, session macros, `bp run plan.yaml`, OpenAPI/GraphQL import | ZAP Automation Framework, Burp session rules |
+| **5: Auth and automation** | Contexts, login flows, session macros, `braintruder run plan.yaml`, OpenAPI/GraphQL import | ZAP Automation Framework, Burp session rules |
 | **6: Advanced** | OAST server/client, headless browser crawler, Sequencer, WebSocket fuzzing, ZAP beta rules, MCP server for AI agents, plugins | Collaborator, Sequencer, Burp AT/ZAP MCP |
-| **7: GUI** | Wails or embedded web UI on the same engine | Burp/ZAP desktop |
+| **7: GUI** | Tauri on the same engine | Burp/ZAP desktop |
 
 ---
 
@@ -218,14 +252,14 @@ so you can copy one from the history and edit it in `$EDITOR`.
 
 ---
 
-## 8. Open decisions
+## 8. Decisions
 
-1. Language: Go (recommended) or Rust?
-2. Project license: Apache 2.0 (recommended for easy ZAP reuse), MIT, or GPL?
-3. Binary name: `bp`, `brainproxy`, or `braintruder`?
-4. Interactive intercept in the CLI: a TUI (bubbletea) or an `$EDITOR` round-trip?
-
----
+| Decision | Choice |
+|---|---|
+| Language | Rust |
+| Interface | AI-first, non-interactive CLI. GUI later. |
+| Binary name | `braintruder` |
+| Project license | Apache 2.0, proposed for easy ZAP reuse. Not yet confirmed. |
 
 ## Sources
 
