@@ -337,3 +337,69 @@ fn fuzz_race_and_diff() {
     let d = env.ok(&["diff", &a, &a]);
     assert_eq!(d["identical"], true);
 }
+
+/// Serves the same raw response to every request.
+fn spawn_fixed(response: &'static str) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let mut seen = Vec::new();
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s.write_all(response.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn passive_scan_and_findings() {
+    let env = Env::new("passive");
+    let port = spawn_fixed(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: session=abc; Path=/\r\n\
+         Content-Length: 13\r\nConnection: close\r\n\r\n<html></html>",
+    );
+    for path in ["/a", "/b", "/a"] {
+        env.ok(&["send", "--url", &format!("http://127.0.0.1:{port}{path}")]);
+    }
+
+    // Grouped view: one alert type; /a twice counts as one instance with 2 hits.
+    let list = env.ok(&["findings", "list", "--alert", "10010"]);
+    assert_eq!(list["alert_types"], 1, "{list}");
+    let group = &list["groups"][0];
+    assert_eq!(group["name"], "Cookie No HttpOnly Flag");
+    assert_eq!(group["instances"], 2);
+    assert_eq!(group["hits"], 3);
+
+    let all = env.ok(&["findings", "list", "--all", "--alert", "10010"]);
+    let id = all["items"][0]["id"].as_i64().unwrap().to_string();
+    let shown = env.ok(&["findings", "show", &id]);
+    assert_eq!(shown["param"], "session");
+    assert!(shown["solution"].as_str().unwrap().contains("HttpOnly"));
+    assert_eq!(shown["cwe"], 1004);
+
+    // Triage: false positives drop out of the default view.
+    env.ok(&["findings", "mark", &id, "--state", "false-positive", "--note", "test cookie"]);
+    let list = env.ok(&["findings", "list", "--alert", "10010"]);
+    assert_eq!(list["groups"][0]["instances"], 1);
+
+    // Disabling a rule and rescanning removes its findings.
+    env.ok(&["scan", "disable", "10010"]);
+    let stats = env.ok(&["scan", "passive", "--rescan"]);
+    assert_eq!(stats["scanned"], 3);
+    assert_eq!(env.ok(&["findings", "list", "--alert", "10010"])["alert_types"], 0);
+    let rules = env.ok(&["scan", "rules", "--filter", "10010"]);
+    assert_eq!(rules["rules"][0]["enabled"], false);
+    let (code, v) = env.run(&["scan", "disable", "99999999"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
+}
