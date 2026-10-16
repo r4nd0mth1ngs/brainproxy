@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::error::{Error, Result};
+use crate::guard::Guard;
 use crate::http::request::RawRequest;
 use crate::http::target::Target;
 use crate::http::wire::WireReader;
@@ -24,11 +25,13 @@ pub struct SendOptions {
     pub verify_tls: bool,
     /// Override the TLS SNI name (defaults to the target host).
     pub sni: Option<String>,
+    /// Scope every connection must pass. Without one, nothing is sent.
+    pub guard: Option<Arc<Guard>>,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(30), verify_tls: false, sni: None }
+        Self { timeout: Duration::from_secs(30), verify_tls: false, sni: None, guard: None }
     }
 }
 
@@ -87,9 +90,15 @@ impl Client {
         WireReader::new().read_response(&mut stream, method).await
     }
 
-    /// Opens a connection to the target, wrapped in TLS for https.
+    /// Opens a connection to the target, wrapped in TLS for https. The target
+    /// must pass the scope guard; the connection goes to an address the guard
+    /// checked.
     pub async fn connect(&self, target: &Target) -> Result<Stream> {
-        let tcp = TcpStream::connect((target.host.as_str(), target.port))
+        let guard = self.opts.guard.as_ref().ok_or_else(|| {
+            Error::OutOfScope("no engagement scope: run `brainproxy engagement start --target HOST ...` first".into())
+        })?;
+        let addrs = guard.resolve(&target.host, target.port).await?;
+        let tcp = TcpStream::connect(&addrs[..])
             .await
             .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?;
         tcp.set_nodelay(true).ok();

@@ -374,7 +374,8 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if let Some(s) = running(&store)? {
         return Err(Error::Conflict(format!("proxy already running on {} (pid {})", s.listen, s.pid)));
     }
-    load_ca(home)?; // Surface CA problems here rather than in the log.
+    load_ca(home)?; // Surface CA and scope problems here rather than in the log.
+    store.guard()?;
     let project = std::fs::canonicalize(project)?;
     let log = args.log.clone().unwrap_or_else(|| project.with_extension("proxy.log"));
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
@@ -436,6 +437,8 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     if let Some(s) = running(&store)?.filter(|s| s.pid != std::process::id()) {
         return Err(Error::Conflict(format!("proxy already running on {} (pid {})", s.listen, s.pid)));
     }
+    // Fail before listening if there is no scope; the scope can't change while we run.
+    let guard = store.guard()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -472,6 +475,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
                 timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
                 verify_tls: args.verify_tls,
                 sni: None,
+                guard: Some(guard),
             },
         };
         let result = brainproxy_core::proxy::run(listener, std::sync::Arc::new(ca), opts, shutdown).await;

@@ -7,6 +7,7 @@ pub mod crawl;
 pub mod diff;
 pub mod error;
 pub mod fuzz;
+pub mod guard;
 pub mod http;
 pub mod jobs;
 pub mod proxy;

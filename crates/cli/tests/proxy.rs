@@ -22,7 +22,9 @@ impl Env {
         let dir = std::env::temp_dir().join(format!("bp-proxy-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Self { project: dir.join("p.bpdb"), home: dir.join("home"), dir }
+        let env = Self { project: dir.join("p.bpdb"), home: dir.join("home"), dir };
+        env.ok(&["engagement", "start", "--target", "127.0.0.1", "--target", "localhost"]);
+        env
     }
 
     fn run(&self, args: &[&str]) -> (i32, Value) {

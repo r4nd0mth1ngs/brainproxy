@@ -14,6 +14,7 @@ pub fn describe(cmd: &Command) -> Value {
             "output": "With --format json (the default when stdout is not a terminal) every command prints one JSON envelope: {ok, command, data} or {ok:false, command, error:{kind, message}}.",
             "stdin": "Commands that take a FILE or INPUT read stdin when it is '-' or omitted.",
             "project": "History is stored in the SQLite project file from --project or BRAINPROXY_PROJECT, created on first use.",
+            "scope": "Nothing is sent until a scope exists. `engagement start --target ...` sets it once per project and it can never be changed; /etc/brainproxy/scope.json, if present, is enforced too. Every outbound request must match.",
         },
         "exit_codes": {
             "0": "success",
@@ -21,6 +22,7 @@ pub fn describe(cmd: &Command) -> Value {
             "2": "invalid input or usage",
             "3": "network error (connect, TLS, timeout, protocol)",
             "4": "not found",
+            "6": "out of scope: target not allowed by the engagement/system scope, or no scope set",
         },
         "env": {
             "BRAINPROXY_PROJECT": "project file path",

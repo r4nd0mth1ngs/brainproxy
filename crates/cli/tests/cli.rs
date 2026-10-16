@@ -77,6 +77,13 @@ fn tmp_project(name: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("p.bpdb");
     let _ = std::fs::remove_file(&p);
+    let status = bin()
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["engagement", "start", "--target", "127.0.0.1", "--target", "localhost"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stdout));
     p
 }
 

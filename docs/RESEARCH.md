@@ -178,7 +178,8 @@ These rules apply to every command, current and future:
    terminal: `{"ok":true,"command":"send","data":{...}}` or
    `{"ok":false,"command":"send","error":{"kind":"connect","message":"..."}}`.
 3. **Stable exit codes:** 0 success, 1 internal/storage error, 2 invalid input or usage,
-   3 network error, 4 not found. Later: 5 findings at or above a `--fail-on` severity.
+   3 network error, 4 not found, 6 out of scope. Later: 5 findings at or above a
+   `--fail-on` severity.
 4. **Self-description.** `brainproxy capabilities` returns every command, flag, default,
    allowed value, env var, exit code, and codec as JSON. An agent learns the whole tool in
    one call.
@@ -305,6 +306,7 @@ brainproxy mcp                                            Phase 6
 | Binary name | `brainproxy` (driven by Braintruder through a Kali runner) |
 | First platform | CLI-only Kali Linux, as a fully static x86_64 binary (musl). arm64 is next. |
 | Capture storage | SQLite, one `.bpdb` file per project, queried with read-only SQL |
+| Scope | Fixed at the start and immutable: `engagement start` (write-once per project) plus an optional root-owned `/etc/brainproxy/scope.json` set by the runner. Enforced in the HTTP client's connect for every outbound request, after DNS resolution. Nothing is sent without a scope. |
 | Project license | Apache 2.0 for now. Closed source may come later. Apache 2.0 allows ZAP-derived code in a closed product, as long as the NOTICE and license text for that code are kept. |
 
 ## Sources

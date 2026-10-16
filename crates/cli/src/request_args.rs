@@ -3,6 +3,9 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use brainproxy_core::guard::Guard;
 use brainproxy_core::http::{RawRequest, SendOptions, Target};
 use brainproxy_core::Error;
 
@@ -57,8 +60,9 @@ impl RequestArgs {
         self.url.is_none() && self.file.as_deref().is_none_or(|f| f == "-")
     }
 
-    pub fn send_options(&self) -> SendOptions {
+    pub fn send_options(&self, guard: Arc<Guard>) -> SendOptions {
         SendOptions {
+            guard: Some(guard),
             timeout: Duration::from_secs_f64(self.timeout.max(0.001)),
             verify_tls: self.verify_tls,
             sni: self.sni.clone(),

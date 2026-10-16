@@ -23,6 +23,35 @@ sudo make install              # -> /usr/local/bin/brainproxy
 
 Or copy the `brainproxy-linux-x86_64` artifact from CI (or a tagged release) onto the runner.
 
+## Engagement scope (required)
+
+brainproxy sends nothing until a scope exists, and every outbound request (send, race,
+fuzz, crawl, proxy upstream, scans) must match it. The check happens at connect time,
+after DNS resolution, and the connection goes to the checked address. Link-local
+addresses such as cloud metadata (169.254.169.254) are refused unless listed by address.
+
+```sh
+brainproxy engagement start --target app.example.com --target '*.api.example.com' \
+    --target 10.0.0.0/24 --exclude 10.0.0.1 --name "ACME pentest"
+brainproxy engagement show
+brainproxy engagement check 10.0.0.7:8443
+```
+
+`engagement start` is write-once: the scope can't be changed or removed afterwards.
+
+**Runner setup (Braintruder / Kali).** The engagement scope protects a project, but an
+agent could start a new project. For a hard lock, the runner writes the scope to
+`/etc/brainproxy/scope.json` (root-owned, not writable by the agent) before handing over:
+
+```json
+{"name": "ACME pentest", "include": ["app.example.com", "*.api.example.com", "10.0.0.0/24"], "exclude": ["10.0.0.1"]}
+```
+
+While that file exists it is always enforced (on top of any engagement scope), and no flag
+or environment variable can override it; an unreadable or invalid file blocks all traffic.
+Run the agent as a non-root user. For defence in depth, also restrict the runner's egress
+with a firewall, since other tools on the box (curl, sqlmap, ...) aren't bound by brainproxy.
+
 ## Usage
 
 ```sh
@@ -98,7 +127,7 @@ brainproxy decode jwt eyJhbGciOi...
 - When stdout isn't a terminal, every command prints one JSON envelope:
   `{"ok":true,"command":...,"data":...}` or `{"ok":false,"command":...,"error":{"kind","message"}}`.
 - Exit codes: `0` success, `1` internal/storage, `2` invalid input or usage, `3` network,
-  `4` not found.
+  `4` not found, `6` out of scope.
 - `brainproxy capabilities` describes the whole CLI as JSON. `brainproxy capabilities send`
   describes one command.
 - Output is bounded: `--max-body`, `--limit`, and `--max-cell`, with `truncated` flags.

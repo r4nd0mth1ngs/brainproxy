@@ -8,6 +8,9 @@ pub enum Error {
     InvalidInput(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The target is outside the engagement scope (or no scope is set).
+    #[error("out of scope: {0}")]
+    OutOfScope(String),
     /// The request conflicts with current state (e.g. already running, not pending).
     #[error("conflict: {0}")]
     Conflict(String),
@@ -31,6 +34,7 @@ impl Error {
             Error::InvalidInput(_) => "invalid_input",
             Error::NotFound(_) => "not_found",
             Error::Conflict(_) => "conflict",
+            Error::OutOfScope(_) => "out_of_scope",
             Error::Connect(_) => "connect",
             Error::Tls(_) => "tls",
             Error::Timeout(_) => "timeout",
@@ -45,6 +49,7 @@ impl Error {
         match self {
             Error::InvalidInput(_) | Error::Conflict(_) => 2,
             Error::NotFound(_) => 4,
+            Error::OutOfScope(_) => 6,
             Error::Connect(_) | Error::Tls(_) | Error::Timeout(_) | Error::Protocol(_) => 3,
             Error::Io(_) | Error::Store(_) => 1,
         }

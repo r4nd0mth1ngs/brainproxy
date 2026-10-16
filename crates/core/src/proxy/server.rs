@@ -43,6 +43,7 @@ struct Live {
 
 struct Ctx {
     ca: Arc<CertAuthority>,
+    guard: Option<Arc<crate::guard::Guard>>,
     client: Client,
     control: Mutex<Store>,
     live: RwLock<Arc<Live>>,
@@ -87,6 +88,7 @@ pub async fn run(
 
     let ctx = Arc::new(Ctx {
         ca,
+        guard: opts.upstream.guard.clone(),
         client: Client::new(opts.upstream),
         control: Mutex::new(control),
         live: RwLock::new(Arc::new(Live { version: -1, ..Default::default() })),
@@ -177,6 +179,12 @@ async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr
     let authority = head.target.clone();
     let target = Target::from_url(&format!("https://{authority}"))
         .map_err(|_| Error::Protocol(format!("bad CONNECT target {authority:?}")))?;
+    // Refuse tunnels to targets that can't be in the engagement scope.
+    if ctx.guard.as_ref().is_none_or(|g| !g.may_allow(&target.host, target.port)) {
+        let msg = format!("{}:{} is outside the engagement scope", target.host, target.port);
+        tcp.write_all(&error_response(403, "out_of_scope", &msg)).await?;
+        return Ok(());
+    }
     tcp.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
     let mut stream = Prefixed::new(reader.into_leftover(), tcp);
 
@@ -268,7 +276,8 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 if record {
                     send_capture(ctx, Capture::new("proxy", &target, &request, None, None, Some(&e.to_string())));
                 }
-                client.write_all(&error_response(502, e.kind(), &e.to_string())).await?;
+                let status = if matches!(e, Error::OutOfScope(_)) { 403 } else { 502 };
+                client.write_all(&error_response(status, e.kind(), &e.to_string())).await?;
                 if client_close {
                     return Ok(());
                 }
@@ -439,6 +448,7 @@ fn wants_close(version: &str, headers: &[(String, String)]) -> bool {
 fn error_response(status: u16, kind: &str, message: &str) -> Vec<u8> {
     let reason = match status {
         400 => "Bad Request",
+        403 => "Forbidden",
         _ => "Bad Gateway",
     };
     let body = format!("brainproxy: {message}\n");

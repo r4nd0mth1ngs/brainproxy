@@ -64,6 +64,10 @@ pub struct CrawlArgs {
 }
 
 pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<(), Error> {
+    let guard = crate::project_guard(project)?;
+    for seed in &args.urls {
+        crate::require_in_scope(&guard, &brainproxy_core::http::Target::from_url(seed)?)?;
+    }
     if args.background {
         return crate::jobs_cmd::spawn_background("crawl", project, home, out);
     }
@@ -86,6 +90,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
             timeout: std::time::Duration::from_secs_f64(args.timeout.max(0.1)),
             verify_tls: args.verify_tls,
             sni: None,
+            guard: Some(guard),
         },
         headers,
         subdomains: args.subdomains,

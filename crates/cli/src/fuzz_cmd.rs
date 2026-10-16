@@ -262,6 +262,8 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
     }
 
     let (req, target) = args.req.prepare(Some(&args.marker))?;
+    let guard = crate::project_guard(project)?;
+    crate::require_in_scope(&guard, &target)?;
     let template = Template::parse(req.as_bytes(), &args.marker)?;
 
     let mut stdin = || crate::read_input(None);
@@ -334,7 +336,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
     let engine_cfg = EngineConfig {
         concurrency: args.concurrency.clamp(1, 1000),
         rate: args.rate,
-        send: args.req.send_options(),
+        send: args.req.send_options(guard),
         grep: args.grep.clone(),
         extract: args.extract.clone(),
         match_status: args.match_status.clone(),

@@ -3,6 +3,7 @@
 
 mod capabilities;
 mod crawl_cmd;
+mod engagement_cmd;
 mod fuzz_cmd;
 mod jobs_cmd;
 mod output;
@@ -58,6 +59,10 @@ enum Cmd {
     #[command(after_help = "The database is opened read-only, so any SQL is safe. Run `schema` for the \
         tables, columns, helper functions (header, regexp, regexp_extract), and example queries.")]
     Query(QueryArgs),
+
+    /// Engagement scope: set once with `engagement start`; every outbound request must match it.
+    #[command(subcommand)]
+    Engagement(engagement_cmd::EngagementCmd),
 
     /// Manage the project file.
     #[command(subcommand)]
@@ -306,6 +311,7 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Diff(_) => "diff",
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
+        Cmd::Engagement(_) => "engagement",
         Cmd::Job(_) => "job",
         Cmd::Findings(_) => "findings",
         Cmd::Scope(_) => "scope",
@@ -354,6 +360,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, cmd, out)?,
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
+        Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
@@ -363,6 +370,21 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Hash(a) => codec_cmd(a, out, |k, b| codec::hash(k, b).map(String::into_bytes))?,
     }
     Ok(())
+}
+
+/// The scope guard every outbound request must pass (system + engagement scope).
+fn project_guard(project: &Path) -> Result<std::sync::Arc<brainproxy_core::guard::Guard>, Error> {
+    Store::open(project)?.guard()
+}
+
+/// Fails with out_of_scope unless `target` passes the guard (resolving DNS like a real request).
+fn require_in_scope(guard: &brainproxy_core::guard::Guard, target: &Target) -> Result<(), Error> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Io)?
+        .block_on(guard.resolve(&target.host, target.port))
+        .map(|_| ())
 }
 
 fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
@@ -378,7 +400,10 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let (req, target) = args.req.prepare(None)?;
-    let client = Client::new(args.req.send_options());
+    let guard = project_guard(project)?;
+    // Refuse out-of-scope targets up front, before any connection is attempted.
+    require_in_scope(&guard, &target)?;
+    let client = Client::new(args.req.send_options(guard));
     if let Some(n) = args.race {
         return race(project, &args, req, target, client, n, out);
     }
