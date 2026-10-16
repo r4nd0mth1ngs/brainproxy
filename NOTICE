@@ -3,6 +3,9 @@ Copyright 2026 the brainproxy authors
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-Parts of this product will be derived from OWASP ZAP and its add-ons
-(https://github.com/zaproxy), Copyright the ZAP development team,
-licensed under the Apache License, Version 2.0. Each ported file credits its origin.
+This product includes software derived from OWASP ZAP and its add-ons
+(https://github.com/zaproxy/zaproxy, https://github.com/zaproxy/zap-extensions),
+Copyright the ZAP development team, licensed under the Apache License, Version 2.0:
+- crates/core/src/scan/passive/rules/: passive scan rules ported from the pscanrules
+  add-on, including their alert texts. Each file names the ZAP class it was ported from.
+- crates/core/src/scan/passive/data/: data files copied from the pscanrules add-on.

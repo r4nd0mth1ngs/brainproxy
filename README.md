@@ -73,6 +73,14 @@ brainproxy send req.http --race 20
 # Compare two captures
 brainproxy diff 12 15 --part response-body --mode words
 
+# Passive scanning (49 rules ported from ZAP) runs automatically on proxy and send traffic
+brainproxy findings list                          # grouped by alert type, highest risk first
+brainproxy findings list --risk medium --all      # one row per instance
+brainproxy findings show 7                        # description, solution, references, evidence
+brainproxy findings mark 7 --state false-positive --note "test cookie"
+brainproxy scan rules                             # list rules; scan disable 10021 to switch one off
+brainproxy scan passive --rescan                  # rescan all history
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -109,7 +117,9 @@ brainproxy decode jwt eyJhbGciOi...
 - **Phase 2 (done):** fuzzer with sniper, battering-ram, pitchfork, and cluster-bomb modes,
   payload sources and processing, grep/extract, outlier summary, background runs;
   race-condition sending (last-byte sync); diff.
-- **Next:** Phase 3, the passive scanner (port of ZAP's passive rules).
+- **Phase 3 (done):** passive scanner with 49 rules ported from ZAP (see
+  [docs/PASSIVE_RULES.md](docs/PASSIVE_RULES.md)), de-duplicated findings, triage.
+- **Next:** Phase 4, crawling and the active scanner.
 
 ## License
 
