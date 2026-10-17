@@ -221,6 +221,9 @@ brainproxy decode jwt eyJhbGciOi...
 - Long-running work runs in the background: `proxy start` returns as soon as the proxy is
   listening. Settings (scope, rules, intercept) live in the project DB and apply to a running
   proxy within a second.
+- `brainproxy mcp serve` offers every command as an MCP tool over stdio (JSON-RPC 2.0),
+  derived from the same definitions and run through the same code, scope, and envelope;
+  see [docs/MCP.md](docs/MCP.md).
 - If `NO_PROXY` covers your target (often `localhost`), pass `--noproxy ''` to curl.
 
 ## Status
@@ -252,8 +255,9 @@ brainproxy decode jwt eyJhbGciOi...
   [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
   All ZAP active rules are ported. Upstream connections are kept alive and reused (inside
   the scope guard) by fuzz, crawl, active scan, import, and the proxy. HTTP/2 client
-  (`--http2`) and the HTTP/2 single-packet race attack.
-- **Next:** HTTP/2 in the proxy, MCP server.
+  (`--http2`) and the HTTP/2 single-packet race attack. MCP server (`mcp serve`, see
+  [docs/MCP.md](docs/MCP.md)).
+- **Next:** HTTP/2 in the proxy, GUI.
 
 ## License
 

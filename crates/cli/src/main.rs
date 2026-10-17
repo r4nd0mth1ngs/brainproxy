@@ -10,6 +10,7 @@ mod engagement_cmd;
 mod fuzz_cmd;
 mod import_cmd;
 mod jobs_cmd;
+mod mcp;
 mod oob_cmd;
 mod output;
 mod proxy_cmd;
@@ -170,6 +171,10 @@ enum Cmd {
 
     /// Hash input.
     Hash(CodecArgs),
+
+    /// MCP server: the CLI's commands as tools for AI agents (stdio, JSON-RPC 2.0).
+    #[command(subcommand)]
+    Mcp(mcp::McpCmd),
 }
 
 #[derive(Subcommand)]
@@ -392,6 +397,7 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Encode(_) => "encode",
         Cmd::Decode(_) => "decode",
         Cmd::Hash(_) => "hash",
+        Cmd::Mcp(_) => "mcp serve",
     }
     .to_string()
 }
@@ -446,6 +452,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Encode(a) => codec_cmd(a, out, codec::encode)?,
         Cmd::Decode(a) => codec_cmd(a, out, codec::decode)?,
         Cmd::Hash(a) => codec_cmd(a, out, |k, b| codec::hash(k, b).map(String::into_bytes))?,
+        Cmd::Mcp(mcp::McpCmd::Serve(args)) => mcp::serve(Cli::command(), &cli.project, cli.home.as_deref(), args)?,
     }
     Ok(())
 }

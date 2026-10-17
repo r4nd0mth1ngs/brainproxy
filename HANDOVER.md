@@ -1,7 +1,7 @@
 # brainproxy handover
 
-State as of branch `feat/checks-inputs` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
-`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, `feat/zap-rules`, `feat/perf`, and `feat/checks-inputs`
+State as of branch `feat/mcp` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
+`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, `feat/zap-rules`, `feat/perf`, `feat/checks-inputs`, and `feat/mcp`
 (each branched from the previous one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
@@ -30,7 +30,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 417 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 423 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -66,14 +66,15 @@ crates/core/src/            engine library (everything testable lives here)
   checks/                   declarative checks: Nuclei HTTP subset parser (mod.rs), DSL parser +
                             evaluator (dsl.rs), runner as an active rule (rule.rs), template
                             stores + `checks update` (store.rs)
-crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group.
-crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs, oob.rs, checks.rs)
+crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group; mcp.rs = MCP server.
+crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs, oob.rs, checks.rs, mcp.rs)
 docs/RESEARCH.md            original research, design, roadmap, AI-first CLI contract
 docs/PASSIVE_RULES.md       passive rules + differences from ZAP
 docs/ACTIVE_RULES.md        active rules + differences from ZAP
 docs/OOB.md                 out-of-band listener design (tokens, NAT, correlation, boundary)
 docs/RULE_UPDATES.md        how ZAP rule changes are tracked; data sync and declarative checks
 docs/CHECKS.md              check format (Nuclei subset + extensions), stores, security boundary
+docs/MCP.md                 MCP server: protocol, tool derivation, bounds
 zap-sync.json               pinned zap-extensions commit, copied data files, skipped rules
 scripts/zap_drift.py        reports upstream ZAP changes vs. our ports (weekly workflow)
 scripts/check.sh            pre-commit checks
@@ -373,12 +374,34 @@ DATA frames (`end_streams` parses frame headers; 2 s cap), and release them in o
 against in-test h2/h2c servers: the lab target doesn't speak HTTP/2 (h2c refused with a
 clear error, exit 3).
 
+## MCP server (done)
+
+Branch `feat/mcp`. `crates/cli/src/mcp.rs`: `brainproxy mcp serve` reads newline-delimited
+JSON-RPC 2.0 from stdin (initialize, ping, tools/list, tools/call; notifications ignored).
+No MCP crate: the protocol surface is small and a hand-written loop needed no new
+dependency. Tools = visible leaf commands of `Cli::command()` (same tree `capabilities`
+walks), minus `mcp serve`, `proxy run`, `oob run`; input schemas come from the clap args
+(id as property name; value parser type -> integer/number/boolean/string; Append -> array;
+possible values -> enum), plus `stdin` where the command's help mentions stdin. A call runs
+`current_exe --format json --project P [--home H] path --flag=value ... -- positionals` as a
+child process (like `jobs_cmd::spawn_background`), so the scope, envelope, and exit codes
+are the CLI's own and process-global state (stdout, exit) needs no refactor. Child stdin is
+the `stdin` argument or null. Bounds: `--max-output` (stdout cap, cut-off marker),
+`--timeout` (kill, `timeout` envelope), stderr up to 4 KB on failure. Calls run serially.
+Tests: unit tests in mcp.rs (argv building, schema types), `crates/cli/tests/mcp.rs`
+(protocol errors, tool list, scope refusal, send via url and stdin, history/query, timeout,
+output cap). Live: initialize/engagement_start/send/findings_list against the lab target.
+
+Ideas: concurrent calls (thread per call, serialized writes) and `notifications/cancelled`
+handling; `readOnlyHint`/`destructiveHint` tool annotations; MCP resources for `schema` and
+reports.
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
 2. Checks: done (see "Checks inputs, payload files, interactsh").
 3. Performance: done except HTTP/2 in the proxy (see "Performance").
-4. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
+4. MCP server: done (see "MCP server"). Next: the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session
 
