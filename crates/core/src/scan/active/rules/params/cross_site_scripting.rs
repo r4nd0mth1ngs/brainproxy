@@ -14,14 +14,8 @@ use super::common::{
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, PointKind, Response, RuleScope};
 use crate::scan::{AlertDef, Confidence, Risk};
 
-static ALERT: AlertDef = AlertDef {
-    alert_ref: "40012",
-    name: "Cross Site Scripting (Reflected)",
-    risk: Risk::High,
-    confidence: Confidence::Medium,
-    cwe: 79,
-    wasc: 8,
-    description: "Cross-site Scripting (XSS) is an attack technique that involves echoing attacker-supplied code into a user's \
+/// WASC-8 texts, shared with the persistent XSS rule.
+pub(super) const XSS_DESCRIPTION: &str = "Cross-site Scripting (XSS) is an attack technique that involves echoing attacker-supplied code into a user's \
         browser instance. A browser instance can be a standard web browser client, or a browser object embedded in a \
         software product such as the browser within WinAmp, an RSS reader, or an email client. The code itself is \
         usually written in HTML/JavaScript, but may also extend to VBScript, ActiveX, Java, Flash, or any other \
@@ -44,8 +38,8 @@ static ALERT: AlertDef = AlertDef {
         period of time. Examples of an attacker's favorite targets often include message board posts, web mail \
         messages, and web chat software. The unsuspecting user is not required to interact with any additional \
         site/link (e.g. an attacker site or a malicious link sent via email), just simply view the web page containing \
-        the code.",
-    solution: "Phase: Architecture and Design\nUse a vetted library or framework that does not allow this weakness to occur or \
+        the code.";
+pub(super) const XSS_SOLUTION: &str = "Phase: Architecture and Design\nUse a vetted library or framework that does not allow this weakness to occur or \
         provides constructs that make this weakness easier to avoid.\nExamples of libraries and frameworks that make it \
         easier to generate properly encoded output include Microsoft's Anti-XSS library, the OWASP ESAPI Encoding \
         module, and Apache Wicket.\n\nPhases: Implementation; Architecture and Design\nUnderstand the context in which \
@@ -82,11 +76,20 @@ static ALERT: AlertDef = AlertDef {
         business rules. As an example of business rule logic, \"boat\" may be syntactically valid because it only \
         contains alphanumeric characters, but it is not valid if you are expecting colors such as \"red\" or \
         \"blue.\"\n\nEnsure that you perform input validation at well-defined interfaces within the application. This \
-        will help protect the application even if a component is reused or moved elsewhere.",
-    references: &[
-        "https://owasp.org/www-community/attacks/xss/",
-        "https://cwe.mitre.org/data/definitions/79.html",
-    ],
+        will help protect the application even if a component is reused or moved elsewhere.";
+pub(super) const XSS_REFERENCES: &[&str] =
+    &["https://owasp.org/www-community/attacks/xss/", "https://cwe.mitre.org/data/definitions/79.html"];
+
+static ALERT: AlertDef = AlertDef {
+    alert_ref: "40012",
+    name: "Cross Site Scripting (Reflected)",
+    risk: Risk::High,
+    confidence: Confidence::Medium,
+    cwe: 79,
+    wasc: 8,
+    description: XSS_DESCRIPTION,
+    solution: XSS_SOLUTION,
+    references: XSS_REFERENCES,
     tags: &["OWASP_2025_A05", "OWASP_2021_A03", "OWASP_2017_A07", "WSTG-v42-INPV-01"],
 };
 

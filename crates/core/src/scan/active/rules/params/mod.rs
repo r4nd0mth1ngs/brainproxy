@@ -9,6 +9,7 @@ mod log4shell;
 mod padding_oracle;
 mod parameter_tamper;
 mod path_traversal;
+mod persistent_xss;
 mod remote_file_include;
 mod server_side_include;
 mod ssti;
@@ -34,6 +35,9 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(padding_oracle::PaddingOracle),
         Box::new(log4shell::Log4Shell),
         Box::new(xslt_injection::XsltInjection),
+        Box::new(persistent_xss::PersistentXssPrime),
+        Box::new(persistent_xss::PersistentXssSpider),
+        Box::new(persistent_xss::PersistentXss),
     ]
 }
 
@@ -51,6 +55,16 @@ mod e2e {
 
     fn escape(s: &str) -> String {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+    }
+
+    /// Guestbooks for the persistent XSS tests: (raw, escaped), the last 20 entries each.
+    static GUESTBOOK: std::sync::Mutex<(Vec<String>, Vec<String>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+    fn sign(book: &mut Vec<String>, text: String) {
+        book.push(text);
+        if book.len() > 20 {
+            book.remove(0);
+        }
     }
 
     fn respond(path: &str, query: &str) -> String {
@@ -93,6 +107,20 @@ mod e2e {
                 let name = param("name");
                 let vendor = if name.contains("xsl") { "Microsoft" } else { "" };
                 ok("text/html", format!("<p>Hello {}{vendor}</p>", escape(&name)))
+            }
+            "/comment" => {
+                sign(&mut GUESTBOOK.lock().unwrap().0, param("text"));
+                ok("text/html", "<p>saved</p>".into())
+            }
+            "/comment-safe" => {
+                sign(&mut GUESTBOOK.lock().unwrap().1, escape(&param("text")));
+                ok("text/html", "<p>saved</p>".into())
+            }
+            "/comments" | "/comments-safe" => {
+                let book = GUESTBOOK.lock().unwrap();
+                let entries = if path == "/comments" { &book.0 } else { &book.1 };
+                let items: String = entries.iter().map(|e| format!("<li>{e}</li>")).collect();
+                ok("text/html", format!("<html><body><ul>{items}</ul></body></html>"))
             }
             "/file-safe" => {
                 if param("name") == "readme.txt" {
@@ -185,11 +213,32 @@ mod e2e {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn finds_persistent_xss_through_its_dependencies() {
+        let port = spawn_app();
+        // Selecting 40014 alone pulls in Prime and Spider.
+        let s = scan("pxss", port, &["/comment?text=hi", "/comments"], Some(vec![40014])).await;
+        assert_eq!(s.rules, 3, "{s:?}");
+        assert_eq!(s.raised.get("40014-1"), Some(&1), "{s:?}");
+        assert_eq!(s.raised.len(), 1, "{s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn safe_endpoints_raise_nothing() {
         let port = spawn_app();
         let ids: Vec<u32> = super::all().iter().map(|r| r.id()).collect();
-        let s =
-            scan("safe", port, &["/xss-safe?q=hi", "/file-safe?name=readme.txt", "/xslt-fp?name=bob"], Some(ids)).await;
+        let s = scan(
+            "safe",
+            port,
+            &[
+                "/xss-safe?q=hi",
+                "/file-safe?name=readme.txt",
+                "/xslt-fp?name=bob",
+                "/comment-safe?text=hi",
+                "/comments-safe",
+            ],
+            Some(ids),
+        )
+        .await;
         assert!(s.raised.is_empty(), "false positives: {s:?}");
         assert!(s.requests > 20, "the rules did attack: {s:?}");
     }

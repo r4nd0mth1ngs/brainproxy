@@ -12,6 +12,7 @@
 
 pub mod points;
 pub mod rules;
+pub mod source_sink;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -30,6 +31,7 @@ use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
 use crate::oob::{self, Endpoint, Payload, ScanPayload};
+use crate::scan::active::source_sink::{Sink, SourceSink};
 use crate::scan::{AlertDef, Finding, Message};
 use crate::store::Store;
 pub use points::{InsertionPoint, PointKind, PointOptions};
@@ -65,6 +67,16 @@ pub trait ActiveRule: Send + Sync {
     fn alerts(&self) -> &'static [&'static AlertDef];
     fn scope(&self) -> RuleScope;
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a>;
+    /// Rules run in phases: every unit of a phase finishes before the next starts
+    /// (ZAP runs a rule's dependencies first).
+    fn phase(&self) -> u8 {
+        0
+    }
+    /// Rules this one needs (ZAP `getDependency`): selected along with it, and
+    /// it is skipped when one of them is excluded.
+    fn depends_on(&self) -> &'static [u32] {
+        &[]
+    }
 }
 
 impl std::fmt::Debug for dyn ActiveRule {
@@ -191,6 +203,8 @@ struct Shared {
     /// The endpoint per target origin (see `Endpoint::for_target`).
     oob_by_origin: Mutex<HashMap<String, Endpoint>>,
     oob_payloads: AtomicU64,
+    /// Stored-input tracking for the persistent XSS rules.
+    source_sink: Mutex<SourceSink>,
 }
 
 /// Everything a rule needs for one unit of work.
@@ -307,7 +321,13 @@ impl Cx {
     /// `sendAndReceive(msg)`); returns the final response. Redirects outside the
     /// engagement scope end with an out-of-scope error.
     pub async fn send_following(&self, request: Vec<u8>) -> Result<Response> {
-        let mut target = self.base.target.clone();
+        let target = self.base.target.clone();
+        self.send_following_to(&target, request).await
+    }
+
+    /// `send_following` for a request to another target (still in scope).
+    pub async fn send_following_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
+        let mut target = target.clone();
         let mut resp = self.send_to(&target, request).await?;
         for _ in 0..5 {
             if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
@@ -362,6 +382,25 @@ impl Cx {
             response: resp.raw.clone(),
             duration_ms: resp.duration.as_millis() as i64,
         });
+    }
+
+    /// A unique marker value for the attacked parameter, remembered as stored input
+    /// from this request (ZAP `SourceSinkUtils.getUniqueValue`).
+    pub fn source_value(&self) -> String {
+        let key = source_sink::source_key(&self.base.msg.url, &self.point().name);
+        self.shared.source_sink.lock().unwrap().unique_value(key)
+    }
+
+    /// Records the base request as a sink for every marker in `resp` (ZAP `testForSink`).
+    pub fn test_for_sink(&self, resp: &Response) {
+        let sink = Sink { target: self.base.target.clone(), request: self.base.request.clone() };
+        self.shared.source_sink.lock().unwrap().test_for_sink(resp.body_str(), &sink);
+    }
+
+    /// Pages that displayed input stored through the attacked parameter.
+    pub fn sinks(&self) -> Vec<Sink> {
+        let key = source_sink::source_key(&self.base.msg.url, &self.point().name);
+        self.shared.source_sink.lock().unwrap().sinks(&key)
     }
 
     /// A fresh out-of-band payload, or None when no OOB listener is running
@@ -505,6 +544,9 @@ pub struct ActiveSummary {
     pub elapsed_ms: u64,
 }
 
+/// One rule run on one target (and insertion point, for Param rules).
+type Unit = (Arc<Base>, &'static dyn ActiveRule, Option<InsertionPoint>);
+
 pub async fn run(
     project: &Path,
     targets: Vec<ScanTarget>,
@@ -521,6 +563,22 @@ pub async fn run(
                 && !cfg.exclude_rules.contains(&r.id())
         })
         .collect();
+    // Pull in dependencies of selected rules, then drop rules missing one (excluded).
+    loop {
+        let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
+        let missing: Vec<&'static dyn ActiveRule> = all_rules()
+            .iter()
+            .map(|r| r.as_ref())
+            .filter(|r| !ids.contains(&r.id()) && !cfg.exclude_rules.contains(&r.id()))
+            .filter(|r| rules.iter().any(|sel| sel.depends_on().contains(&r.id())))
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        rules.extend(missing);
+    }
+    let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
+    rules.retain(|r| r.depends_on().iter().all(|d| ids.contains(d)));
     rules.extend(cfg.checks.iter().copied());
     if rules.is_empty() {
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
@@ -576,10 +634,11 @@ pub async fn run(
         oob: cfg.oob.clone(),
         oob_by_origin: Mutex::new(HashMap::new()),
         oob_payloads: AtomicU64::new(0),
+        source_sink: Mutex::new(SourceSink::default()),
     });
 
     // Build units of work.
-    let mut units: Vec<(Arc<Base>, &'static dyn ActiveRule, Option<InsertionPoint>)> = Vec::new();
+    let mut units: Vec<Unit> = Vec::new();
     let mut hosts_seen = HashSet::new();
     let mut point_count = 0;
     for t in &targets {
@@ -613,28 +672,38 @@ pub async fn run(
     let total = units.len();
     let done = Arc::new(AtomicU64::new(0));
     let sem = Arc::new(tokio::sync::Semaphore::new(cfg.concurrency.max(1)));
-    let mut tasks = Vec::with_capacity(total);
-    for (base, rule, point) in units {
-        let (shared, sem, done, ctl) = (shared.clone(), sem.clone(), done.clone(), ctl.clone());
-        tasks.push(tokio::spawn(async move {
-            let Ok(_permit) = sem.acquire().await else { return };
-            let cx = Cx { base, point, shared: shared.clone() };
-            if !cx.stopped() {
-                rule.scan(&cx).await;
-            }
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 10 == 0 || n as usize == total {
-                ctl.set_progress(serde_json::json!({
-                    "units_done": n,
-                    "units": total,
-                    "requests": shared.requests.load(Ordering::Relaxed),
-                    "raised": shared.raised.lock().unwrap().values().sum::<usize>(),
-                }));
-            }
-        }));
+    units.sort_by_key(|u| u.1.phase());
+    let mut phases: Vec<Vec<Unit>> = Vec::new();
+    for u in units {
+        match phases.last_mut() {
+            Some(p) if p[0].1.phase() == u.1.phase() => p.push(u),
+            _ => phases.push(vec![u]),
+        }
     }
-    for t in tasks {
-        let _ = t.await;
+    for units in phases {
+        let mut tasks = Vec::with_capacity(units.len());
+        for (base, rule, point) in units {
+            let (shared, sem, done, ctl) = (shared.clone(), sem.clone(), done.clone(), ctl.clone());
+            tasks.push(tokio::spawn(async move {
+                let Ok(_permit) = sem.acquire().await else { return };
+                let cx = Cx { base, point, shared: shared.clone() };
+                if !cx.stopped() {
+                    rule.scan(&cx).await;
+                }
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 10 == 0 || n as usize == total {
+                    ctl.set_progress(serde_json::json!({
+                        "units_done": n,
+                        "units": total,
+                        "requests": shared.requests.load(Ordering::Relaxed),
+                        "raised": shared.raised.lock().unwrap().values().sum::<usize>(),
+                    }));
+                }
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
     }
 
     let mut summary_raised: BTreeMap<String, usize> =

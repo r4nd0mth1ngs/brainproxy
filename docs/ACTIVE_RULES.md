@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` runs 44 rules ported from OWASP ZAP's `ascanrules` add-on (and
+`brainproxy scan active` runs 47 rules ported from OWASP ZAP's `ascanrules` add-on (and
 helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
@@ -30,7 +30,13 @@ rules can only reach targets the engagement allows, including when following red
 | 40008 | Parameter Tampering | param | medium | 40008 |
 | 40009 | Server Side Include | param | high | 40009 |
 | 40012 | Cross Site Scripting (Reflected) | param | high | 40012 |
-| 40018 | SQL Injection | param | high | 40018 |
+| 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
+| 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |
+| 40017 | Cross Site Scripting (Persistent) - Spider | page | (none) | |
+| 40018 | SQL Injection | param | high | 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
+| 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |
+| 40017 | Cross Site Scripting (Persistent) - Spider | page | (none) | |
+| 40018 |
 | 40019 | SQL Injection - MySQL (Time Based) | param | high | 40019 |
 | 40020 | SQL Injection - Hypersonic SQL (Time Based) | param | high | 40020 |
 | 40021 | SQL Injection - Oracle (Time Based) | param | high | 40021 |
@@ -60,8 +66,14 @@ rules can only reach targets the engagement allows, including when following red
 Scopes: `param` runs once per insertion point (query, form, JSON; cookies and headers when
 enabled), `page` once per target request, `host` once per scheme://host:port.
 
-Not ported yet (listed in `zap-sync.json`): Persistent XSS (needs cross-request state),
-Heartbleed (raw TLS).
+Not ported (listed in `zap-sync.json`): Heartbleed (raw TLS, see below).
+
+Persistent XSS is three rules, as in ZAP: Prime (40016) stores a unique marker through
+every parameter, Spider (40017) re-requests every target and records which pages show
+which markers, and 40014 stores XSS payloads through each parameter that has such a sink
+page and looks for them there. Rules run in phases (each phase finishes before the next
+starts), and selecting 40014 with `--rules` pulls in 40016 and 40017; excluding one of
+those skips 40014. Prime and Spider never raise alerts themselves.
 
 ## Differences from ZAP
 
@@ -90,6 +102,9 @@ Heartbleed (raw TLS).
   connection always goes to the in-scope target.
 - **SSTI (90035)** checks reflected output only (ZAP also checks pages found by its
   persistent-XSS spider).
+- **Persistent XSS (40014)** follows ZAP's MEDIUM threshold (attacks are looked for anywhere
+  on the sink page; PUT requests are skipped) and stops at the first alert per parameter.
+  Sinks are the target requests themselves, re-sent, rather than ZAP's temporary history.
 - **XSLT Injection (90017)** applies ZAP's per-strength request limit per insertion point
   (ZAP counts it across all parameters of a page).
 - **Per-file references** for Hidden Files (40035) are added to the finding's other-info.

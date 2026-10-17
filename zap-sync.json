@@ -23,9 +23,6 @@
   "skipped": {
     "ZapVersionScanRule": "ZAP-specific",
     "UsernameIdorScanRule": "needs configured usernames",
-    "HeartBleedActiveScanRule": "raw TLS; planned",
-    "PersistentXssScanRule": "needs cross-request state; planned",
-    "PersistentXssPrimeScanRule": "needs cross-request state; planned",
-    "PersistentXssSpiderScanRule": "needs cross-request state; planned"
+    "HeartBleedActiveScanRule": "raw TLS; planned"
   }
 }

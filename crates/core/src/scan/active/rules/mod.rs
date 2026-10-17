@@ -27,7 +27,8 @@ mod tests {
         let mut ids = HashSet::new();
         for r in &rules {
             assert!(ids.insert(r.id()), "duplicate active rule id {}", r.id());
-            assert!(!r.alerts().is_empty(), "rule {} lists no alerts", r.id());
+            // The persistent XSS Prime and Spider rules only prepare the attack rule (as in ZAP).
+            assert!(!r.alerts().is_empty() || [40016, 40017].contains(&r.id()), "rule {} lists no alerts", r.id());
             for a in r.alerts() {
                 assert!(!a.description.is_empty(), "alert {} lacks a description", a.alert_ref);
                 // ZAP leaves the solution empty only for informational alerts (e.g. 10104).
