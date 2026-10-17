@@ -7,6 +7,7 @@
 //! half-run. Checks run as active rules (`rule.rs`): every request goes through
 //! `Cx`, so through the engagement scope guard, auth session, and rate limit.
 
+mod dsl;
 mod rule;
 mod store;
 
@@ -56,6 +57,9 @@ pub struct Check {
     pub(crate) variables: Vec<(String, String)>,
     #[serde(skip)]
     pub(crate) blocks: Vec<Block>,
+    /// `flow:` as a boolean expression over `http(N)` (variables `__http_N`).
+    #[serde(skip)]
+    pub(crate) flow: Option<dsl::Expr>,
 }
 
 /// One entry of `http:` (a request block).
@@ -74,6 +78,10 @@ pub(crate) struct Block {
     pub unsafe_raw: bool,
     pub redirects: bool,
     pub stop_at_first_match: bool,
+    /// Matchers run once after all requests of a payload combination, seeing
+    /// each response as numbered parts (`body_2`, `status_code_1`), like
+    /// Nuclei's `req-condition` (set when numbered parts are used).
+    pub req_condition: bool,
     pub matchers_and: bool,
     pub matchers: Vec<Matcher>,
     pub extractors: Vec<Extractor>,
@@ -95,6 +103,8 @@ pub(crate) enum Part {
     Named(String),
     /// brainproxy extension: the baseline response body of the attacked request.
     BaselineBody,
+    /// A part of the nth (1-based) response of the block (`body_2`).
+    Nth(usize, Box<Part>),
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +114,7 @@ pub(crate) enum MatchKind {
     Status(Vec<u16>),
     Size(Vec<usize>),
     Binary(Vec<Vec<u8>>),
+    Dsl(Vec<dsl::Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -113,12 +124,97 @@ pub(crate) struct Matcher {
     pub and: bool,
     pub negative: bool,
     pub case_insensitive: bool,
+    /// Counts for the block's result (and `flow`) but doesn't report a finding alone.
+    pub internal: bool,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ExtractKind {
     Regex(Regexes, usize),
     Kval(Vec<String>),
+    Dsl(Vec<dsl::Expr>),
+    Json(Vec<Vec<JsonStep>>),
+}
+
+/// A step of the jq path subset `json` extractors support.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum JsonStep {
+    Key(String),
+    Index(usize),
+    /// `[]`: every element (or object value).
+    Each,
+}
+
+/// Parses `.a.b`, `.a[0]`, `.["k"]`, `.[]`, and pipes of these (`.[] | .slug`).
+fn compile_json_path(q: &str) -> Option<Vec<JsonStep>> {
+    let mut steps = Vec::new();
+    for part in q.split('|') {
+        let b = part.trim().as_bytes();
+        if b.first() != Some(&b'.') {
+            return None;
+        }
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'.' if b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') => {
+                    let start = i + 1;
+                    i = start;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    steps.push(JsonStep::Key(String::from_utf8_lossy(&b[start..i]).into_owned()));
+                }
+                b'.' if i + 1 == b.len() || b[i + 1] == b'[' => i += 1,
+                b'[' => {
+                    let end = i + b[i..].iter().position(|c| *c == b']')?;
+                    let inner = std::str::from_utf8(&b[i + 1..end]).ok()?.trim();
+                    steps.push(if inner.is_empty() {
+                        JsonStep::Each
+                    } else if let Ok(n) = inner.parse() {
+                        JsonStep::Index(n)
+                    } else if inner.len() >= 2
+                        && inner.starts_with('"')
+                        && inner.ends_with('"')
+                        && !inner[1..inner.len() - 1].contains(['"', '\\'])
+                    {
+                        JsonStep::Key(inner[1..inner.len() - 1].to_string())
+                    } else {
+                        return None;
+                    });
+                    i = end + 1;
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(steps)
+}
+
+/// Applies a json path; strings come out raw, other values as JSON (like `jq -r`).
+pub(crate) fn json_path(root: &Value, steps: &[JsonStep]) -> Vec<String> {
+    let mut cur = vec![root];
+    for step in steps {
+        cur = cur
+            .into_iter()
+            .flat_map(|v| -> Vec<&Value> {
+                match (step, v) {
+                    (JsonStep::Key(k), Value::Object(m)) => m.get(k).into_iter().collect(),
+                    (JsonStep::Index(n), Value::Array(a)) => a.get(*n).into_iter().collect(),
+                    (JsonStep::Each, Value::Array(a)) => a.iter().collect(),
+                    (JsonStep::Each, Value::Object(m)) => m.values().collect(),
+                    _ => vec![],
+                }
+            })
+            .collect();
+    }
+    cur.into_iter()
+        .filter(|v| !v.is_null())
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            v => v.to_string(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +357,7 @@ fn parse(text: &str, file: &Path) -> std::result::Result<Check, (Option<String>,
     compile(&doc, file).map_err(|p| (id, p))
 }
 
-const TOP_KEYS: &[&str] = &["id", "info", "http", "requests", "variables", "scope"];
+const TOP_KEYS: &[&str] = &["id", "info", "http", "requests", "variables", "scope", "flow"];
 const BLOCK_KEYS: &[&str] = &[
     "method",
     "path",
@@ -288,6 +384,7 @@ const BLOCK_KEYS: &[&str] = &[
     "skip-variables-check",
     "inject",
     "inject-raw",
+    "req-condition",
 ];
 
 fn s(v: &Value) -> Option<String> {
@@ -382,7 +479,11 @@ fn compile(doc: &Value, file: &Path) -> std::result::Result<Check, Problem> {
     if blocks.is_empty() {
         return invalid("no requests");
     }
-    check_placeholders(&variables, &blocks)?;
+    check_placeholders(&variables, &mut blocks)?;
+    let flow = match obj.get("flow") {
+        None => None,
+        Some(f) => Some(compile_flow(&s(f).unwrap_or_default(), blocks.len())?),
+    };
 
     let references = list(info.get("reference"));
     Ok(Check {
@@ -402,7 +503,32 @@ fn compile(doc: &Value, file: &Path) -> std::result::Result<Check, Problem> {
         rule_scope,
         variables,
         blocks,
+        flow,
     })
+}
+
+/// `flow: http(1) && (http(2) || http(3))`: `&&`, `||`, `!`, and parentheses
+/// over request blocks; JavaScript flows are unsupported.
+fn compile_flow(flow: &str, blocks: usize) -> std::result::Result<dsl::Expr, Problem> {
+    static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bhttp\s*\(\s*(\d+)\s*\)").unwrap());
+    let js = || unsupported("flow (JavaScript)");
+    let Ok(expr) = dsl::parse(&CALL.replace_all(flow, "__http_$1")) else { return js() };
+    fn shape(e: &dsl::Expr, blocks: usize) -> bool {
+        match e {
+            dsl::Expr::Var(v) => v
+                .strip_prefix("__http_")
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| (1..=blocks).contains(&n)),
+            dsl::Expr::Not(e) => shape(e, blocks),
+            dsl::Expr::Bin(dsl::Op::And | dsl::Op::Or, a, b) => shape(a, blocks) && shape(b, blocks),
+            _ => false,
+        }
+    }
+    if shape(&expr, blocks) {
+        Ok(expr)
+    } else {
+        js()
+    }
 }
 
 fn compile_block(b: &Value, scope: RuleScope) -> std::result::Result<Block, Problem> {
@@ -491,6 +617,12 @@ fn compile_block(b: &Value, scope: RuleScope) -> std::result::Result<Block, Prob
         unsafe_raw: flag(b, "unsafe"),
         redirects: flag(b, "redirects") || flag(b, "host-redirects"),
         stop_at_first_match: flag(b, "stop-at-first-match"),
+        req_condition: flag(b, "req-condition")
+            || matchers
+                .iter()
+                .map(|m| &m.part)
+                .chain(extractors.iter().map(|e| &e.part))
+                .any(|p| matches!(p, Part::Nth(..))),
         matchers_and,
         matchers,
         extractors,
@@ -512,20 +644,37 @@ const MATCHER_KEYS: &[&str] = &[
     "internal",
     "encoding",
     "match-all",
+    "dsl",
 ];
 
+static NUMBERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"_(\d+)$").unwrap());
+
+/// Splits `body_2` into (`body`, 2).
+pub(crate) fn numbered(name: &str) -> Option<(&str, usize)> {
+    let c = NUMBERED.captures(name)?;
+    let n = c[1].parse().ok().filter(|n| *n > 0)?;
+    Some((&name[..name.len() - c[0].len()], n))
+}
+
 fn compile_part(v: &Value) -> std::result::Result<Part, Problem> {
-    static NUMBERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"_\d+$").unwrap());
     let p = v.get("part").and_then(Value::as_str).unwrap_or("body").to_ascii_lowercase();
-    Ok(match p.as_str() {
+    part_named(&p)
+}
+
+fn part_named(p: &str) -> std::result::Result<Part, Problem> {
+    if let Some((base, n)) = numbered(p) {
+        return match part_named(base)? {
+            part @ (Part::Body | Part::Header | Part::All | Part::Named(_)) => Ok(Part::Nth(n, Box::new(part))),
+            _ => unsupported(format!("part `{p}`")),
+        };
+    }
+    Ok(match p {
         "body" => Part::Body,
-        "header" | "headers" => Part::Header,
+        "header" | "headers" | "all_headers" => Part::Header,
         "all" | "response" | "raw" => Part::All,
         "baseline_body" => Part::BaselineBody,
         p if p.starts_with("interactsh") => return unsupported("interactsh (out-of-band) matchers"),
-        p if NUMBERED.is_match(p)
-            || matches!(p, "request" | "host" | "status_code" | "content_length" | "duration") =>
-        {
+        p if matches!(p, "request" | "host" | "status_code" | "content_length" | "duration") => {
             return unsupported(format!("part `{p}`"))
         }
         p if p.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') => Part::Named(p.replace('_', "-")),
@@ -611,6 +760,7 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
                 .collect::<std::result::Result<_, _>>()
                 .or_else(|_| invalid("bad binary"))?,
         ),
+        "dsl" => MatchKind::Dsl(compile_dsl(m)?),
         "" => return invalid("matcher without type"),
         other => return unsupported(format!("{other} matchers")),
     };
@@ -620,6 +770,7 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
         MatchKind::Status(v) => v.is_empty(),
         MatchKind::Size(v) => v.is_empty(),
         MatchKind::Binary(v) => v.is_empty(),
+        MatchKind::Dsl(v) => v.is_empty(),
     };
     if empty {
         return invalid("matcher without values");
@@ -629,7 +780,17 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
         "or" => false,
         other => return invalid(format!("unknown condition {other:?}")),
     };
-    Ok(Matcher { kind, part: compile_part(m)?, and, negative: flag(m, "negative"), case_insensitive })
+    // DSL expressions name their parts themselves.
+    let part = if matches!(kind, MatchKind::Dsl(_)) { Part::Body } else { compile_part(m)? };
+    Ok(Matcher {
+        kind,
+        part,
+        and,
+        negative: flag(m, "negative"),
+        case_insensitive,
+        internal: flag(m, "internal"),
+        name: m.get("name").and_then(s),
+    })
 }
 
 fn compile_extractor(e: &Value) -> std::result::Result<Extractor, Problem> {
@@ -643,14 +804,45 @@ fn compile_extractor(e: &Value) -> std::result::Result<Extractor, Problem> {
             ExtractKind::Regex(res, group)
         }
         "kval" => ExtractKind::Kval(list(e.get("kval")).iter().map(|k| k.replace('_', "-")).collect()),
+        "dsl" => {
+            let exprs = compile_dsl(e)?;
+            if exprs.is_empty() {
+                return invalid("dsl extractor without expressions");
+            }
+            ExtractKind::Dsl(exprs)
+        }
+        "json" => {
+            let paths = list(e.get("json"))
+                .iter()
+                .map(|q| compile_json_path(q))
+                .collect::<Option<Vec<_>>>()
+                .map_or_else(|| unsupported("json extractor query (beyond .a.b[0][] paths)"), Ok)?;
+            if paths.is_empty() {
+                return invalid("json extractor without queries");
+            }
+            ExtractKind::Json(paths)
+        }
         other => return unsupported(format!("{other} extractors")),
     };
+    let part = if matches!(kind, ExtractKind::Dsl(_)) { Part::Body } else { compile_part(e)? };
     Ok(Extractor {
         kind,
-        part: compile_part(e)?,
+        part,
         name: e.get("name").and_then(Value::as_str).map(str::to_string),
         internal: flag(e, "internal"),
     })
+}
+
+fn compile_dsl(v: &Value) -> std::result::Result<Vec<dsl::Expr>, Problem> {
+    list(v.get("dsl"))
+        .iter()
+        .map(|src| {
+            dsl::parse(src).map_err(|e| match e {
+                dsl::ParseError::Unsupported(r) => Problem::Unsupported(r),
+                dsl::ParseError::Invalid(r) => Problem::Invalid(format!("dsl: {r}")),
+            })
+        })
+        .collect()
 }
 
 /// Names the runtime fills in (see `rule::builtins`).
@@ -661,16 +853,41 @@ pub(crate) static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\
 
 /// Every `{{name}}` must be something the runtime can fill in; Nuclei DSL
 /// expressions (function calls, interactsh-url, ...) make the template unsupported.
-fn check_placeholders(vars: &[(String, String)], blocks: &[Block]) -> std::result::Result<(), Problem> {
-    static RANDSTR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^randstr(_\d+)?$").unwrap());
-    let mut known: HashSet<&str> = BUILTINS.iter().copied().collect();
-    known.extend(vars.iter().map(|(k, _)| k.as_str()));
-    for b in blocks {
-        known.extend(b.payloads.iter().map(|(k, _)| k.as_str()));
-        known.extend(b.extractors.iter().filter_map(|e| e.name.as_deref()));
+pub(crate) static RANDSTR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\brandstr(_\d+)?\b").unwrap());
+
+fn check_placeholders(vars: &[(String, String)], blocks: &mut [Block]) -> std::result::Result<(), Problem> {
+    let is_randstr = |n: &str| RANDSTR.find(n).is_some_and(|m| m.len() == n.len());
+    let mut known: HashSet<String> = BUILTINS.iter().map(|b| b.to_string()).collect();
+    known.extend(vars.iter().map(|(k, _)| k.clone()));
+    for b in blocks.iter() {
+        known.extend(b.payloads.iter().map(|(k, _)| k.clone()));
+        known.extend(b.extractors.iter().filter_map(|e| e.name.clone()));
+    }
+    // DSL variables: response parts, the names above, or a response header
+    // (`content_type`, `set_cookie`); numbered parts (`body_2`) turn on req-condition.
+    for b in blocks.iter_mut() {
+        let mut dsl_vars = Vec::new();
+        for m in &b.matchers {
+            if let MatchKind::Dsl(exprs) = &m.kind {
+                exprs.iter().for_each(|e| e.vars(&mut dsl_vars));
+            }
+        }
+        for e in &b.extractors {
+            if let ExtractKind::Dsl(exprs) = &e.kind {
+                exprs.iter().for_each(|e| e.vars(&mut dsl_vars));
+            }
+        }
+        let mut nth = false;
+        for v in dsl_vars {
+            if v.starts_with("interactsh") {
+                return unsupported("interactsh (out-of-band) matchers");
+            }
+            nth |= !known.contains(v) && numbered(v).is_some();
+        }
+        b.req_condition |= nth;
     }
     let mut texts: Vec<&str> = vars.iter().map(|(_, v)| v.as_str()).collect();
-    for b in blocks {
+    for b in blocks.iter() {
         texts.extend(b.paths.iter().chain(&b.raws).map(String::as_str));
         texts.extend(b.headers.iter().map(|(_, v)| v.as_str()));
         texts.push(&b.body);
@@ -686,8 +903,19 @@ fn check_placeholders(vars: &[(String, String)], blocks: &[Block]) -> std::resul
             if name == "interactsh-url" {
                 return unsupported("interactsh (out-of-band) payloads");
             }
-            if !known.contains(name) && !RANDSTR.is_match(name) {
-                return unsupported("DSL expressions in placeholders");
+            if known.contains(name) || is_randstr(name) {
+                continue;
+            }
+            // A DSL expression over known values, e.g. `{{base64(username)}}`.
+            let expr = match dsl::parse(name) {
+                Ok(e) => e,
+                Err(dsl::ParseError::Unsupported(r)) => return unsupported(r),
+                Err(dsl::ParseError::Invalid(_)) => return unsupported("placeholder syntax"),
+            };
+            let mut used = Vec::new();
+            expr.vars(&mut used);
+            if used.iter().any(|v| !known.contains(*v) && !is_randstr(v)) {
+                return unsupported("placeholders without a value (template inputs)");
             }
         }
     }

@@ -94,20 +94,20 @@ fn checks_validate_list_and_scan() {
     let local = home.join("checks/local");
     std::fs::create_dir_all(&local).unwrap();
     std::fs::write(local.join("env.yaml"), ENV).unwrap();
-    std::fs::write(local.join("dsl.yaml"), "id: d\ninfo: {severity: low}\nhttp:\n  - path: ['{{BaseURL}}']\n    matchers:\n      - type: dsl\n        dsl: ['true']\n").unwrap();
+    std::fs::write(local.join("dsl.yaml"), "id: d\ninfo: {severity: low}\nhttp:\n  - path: ['{{BaseURL}}']\n    matchers:\n      - type: dsl\n        dsl: ['date_time(\"%Y\") != \"\"']\n").unwrap();
 
     let (code, v) = run(&["checks", "validate", local.to_str().unwrap()], &project, &home);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["ok"], 1);
     let bad = v["data"]["files"].as_array().unwrap().iter().find(|f| f["ok"] == false).unwrap();
-    assert_eq!(bad["reason"], "matcher `dsl`");
+    assert_eq!(bad["reason"], "DSL function `date_time`");
     assert_eq!(bad["kind"], "unsupported");
 
     let (code, v) = run(&["checks", "list", "--tags", "exposure"], &project, &home);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["matching"], 1);
     assert_eq!(v["data"]["checks"][0]["id"], "dotenv-exposed");
-    assert_eq!(v["data"]["not_loaded_reasons"][0][0], "matcher `dsl`");
+    assert_eq!(v["data"]["not_loaded_reasons"][0][0], "DSL function `date_time`");
 
     let (code, v) = run(&["checks", "status"], &project, &home);
     assert_eq!(code, 0, "{v}");
@@ -157,7 +157,7 @@ fn checks_update_from_dir_and_scan_nuclei_store() {
     std::fs::write(src.join("http/exposures/configs/env.yaml"), ENV).unwrap();
     std::fs::write(
         src.join("http/exposures/configs/flow.yaml"),
-        "id: f\ninfo: {severity: low}\nflow: http(1)\nhttp: []\n",
+        "id: f\ninfo: {severity: low}\nself-contained: true\nhttp: []\n",
     )
     .unwrap();
     let (code, v) = run(&["checks", "update", "--from", src.to_str().unwrap()], &project, &home);

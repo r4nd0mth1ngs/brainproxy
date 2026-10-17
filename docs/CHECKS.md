@@ -28,9 +28,12 @@ brainproxy checks status
   it (exit 6). There, the provisioner runs `checks update --from DIR` with a
   nuclei-templates checkout. The ref is resolved to a commit first; the manifest records
   the commit and the tarball's sha256, and `--sha256` makes the update fail on a mismatch.
-- Templates are data: nothing in them is executed. Anything outside the supported subset
-  (DSL, code, JavaScript, headless, other protocols) makes the template unsupported; it is
-  listed with a reason, never half-run.
+- Templates are data: nothing in them is executed. DSL expressions are parsed when the
+  template loads and evaluated by a small interpreter whose functions only compute over
+  their arguments (no file, network, or process access; bounded nesting, operator count,
+  and value size). Anything outside the supported subset (unknown DSL functions, code,
+  JavaScript, headless, other protocols) makes the template unsupported; it is listed
+  with a reason, never half-run.
 
 ## Stores and selectors
 
@@ -45,14 +48,16 @@ brainproxy checks status
 `~/.local/share/brainproxy`. Checks only run when `scan active --checks` names them.
 `--check-tags` (any of), `--check-exclude-tags` (default `dos,fuzz,intrusive`),
 `--check-ids`, and `--check-severity` narrow the set; `--no-rules` skips the ZAP rules.
-Loading is parallel and cheap (about 0.6 s for the ~5,900 stored Nuclei templates);
+Loading is parallel and cheap (about 1 s for the ~9,100 stored Nuclei templates);
 regexes compile on first use.
 
 ## Supported Nuclei subset
 
 Top level: `id`, `info` (`name`, `severity` info|low|medium|high|critical|unknown,
 `description`, `remediation`, `reference`, `classification.cwe-id`, `tags`), `variables`
-(strings, may use placeholders), and `http` (or the older `requests`).
+(strings, may use placeholders and DSL expressions), `http` (or the older `requests`),
+and `flow` when it is a boolean combination of request blocks (`http(1) && (http(2) ||
+http(3))`; later blocks only run when needed, JavaScript flows are unsupported).
 
 Request blocks:
 
@@ -61,27 +66,66 @@ Request blocks:
 - `payloads` (inline lists only) with `attack` batteringram | pitchfork | clusterbomb, at
   most 1000 combinations per block.
 - `matchers` with `matchers-condition` and|or: `word` (incl. `encoding: hex`), `regex`,
-  `status`, `size`, `binary`; `condition`, `negative`, `case-insensitive`; parts `body`
-  (default), `header`, `all`/`response`/`raw`, or one response header (`content_type`).
-- `extractors`: `regex` (with `group`) and `kval`; `internal: true` extractors feed later
-  requests as `{{name}}`. A block with only extractors reports what they extract.
+  `status`, `size`, `binary`, `dsl`; `condition`, `negative`, `case-insensitive`,
+  `internal` (counts for the block and `flow`, but a block whose matchers are all
+  internal reports nothing); parts `body` (default), `header`, `all`/`response`/`raw`,
+  one response header (`content_type`), or a numbered part (`body_2`).
+- `extractors`: `regex` (with `group`), `kval`, `dsl`, and `json` with jq paths
+  (`.a.b`, `.a[0]`, `.["k"]`, `.items[]`, and pipes of these; no `select`, `..`, or
+  operators); `internal: true` extractors feed later requests as `{{name}}`, and named
+  extractors are visible to the same response's DSL matchers. A block with only
+  extractors reports what they extract.
+- Multi-request conditions: when a block's matchers use numbered parts (`body_1`,
+  `status_code_2`) or set `req-condition: true`, all its requests run first (internal
+  extractors feed the next one) and the matchers run once over the numbered responses;
+  unnumbered names refer to the last one.
 - `stop-at-first-match`, `redirects`/`host-redirects` (up to 5, in scope).
 - Ignored as harmless: `max-redirects`, `cookie-reuse`, `disable-cookie`, `max-size`,
   `read-all`, `threads`, `skip-variables-check`, `id`, `name`.
 
 Placeholders: `{{BaseURL}}`, `{{RootURL}}`, `{{Hostname}}` (host[:port]), `{{Host}}`,
 `{{Port}}`, `{{Path}}`, `{{File}}`, `{{Scheme}}`, `{{randstr}}`/`{{randstr_N}}`, variables,
-payload names, and extractor names. For the default host scope `BaseURL` is the origin
-(`https://app.test:8443`).
+payload names, extractor names, and DSL expressions over these (`{{base64(user + ":" +
+pass)}}`, `{{to_lower(rand_base(8))}}`). For the default host scope `BaseURL` is the origin
+(`https://app.test:8443`). A placeholder naming a value the template doesn't define
+(e.g. `{{username}}` that Nuclei takes from `-var`) makes the template unsupported.
 
-Not supported (the template is skipped with this reason): DSL matchers/extractors and
-DSL expressions in placeholders, `flow`, `self-contained`, interactsh (out-of-band), payload
-files, numbered parts (`body_2`, multi-request conditions), `json`/`xpath` extractors, regexes
-with lookaround or backreferences, `req-condition`, `race`, `iterate-all`, digest auth,
-`fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
-development (17f5725, Oct 2026), 5,856 of 11,690 HTTP templates load; the top reasons are
-DSL matchers (2,488), `flow` (1,139), and `self-contained` (938). `checks status` shows the
-counts for the stored commit.
+### DSL subset
+
+Nuclei's DSL is govaluate plus helper functions. brainproxy parses it at load time:
+
+- Literals: numbers, `'single'`/`"double"` strings (`\\`, `\"`, `\'` unescape; other
+  backslashes are kept, as templates write regexes both ways), `true`, `false`.
+- Operators by precedence: `||`; `&&`; `==` `!=` `<` `<=` `>` `>=`; `+` `-`; `*` `/` `%`;
+  unary `!` `-`; parentheses. `+` concatenates when either side is a string; comparisons
+  are numeric when both sides are numbers (or numeric strings), else string comparisons.
+  `&&`/`||` short-circuit. Ternary `?:`, `=~`/`!~`, and bit operators are unsupported.
+- Variables: `status_code`, `body`, `header`/`all_headers` (status line and headers),
+  `response`/`raw`, `content_length`, `content_type`, `duration` (seconds), `host`,
+  any other name as a response header (`set_cookie` is `Set-Cookie`, missing means no
+  match), template variables, payloads, extractor values, and numbered forms (`body_2`).
+- Functions: `contains`, `contains_all`, `contains_any`, `starts_with`/`startswith`,
+  `ends_with`/`endswith`, `to_lower`/`tolower`, `to_upper`/`toupper`, `len`, `regex`,
+  `replace`, `replace_regex`, `concat`, `trim`, `trim_space`, `trim_left`, `trim_right`,
+  `trim_prefix`, `trim_suffix`, `to_string`/`tostring`, `to_number`, `substr`, `repeat`,
+  `md5`, `sha1`, `sha256`, `base64`, `base64_decode`, `base64_py` and `mmh3` (favicon
+  hashes), `hex_encode`, `hex_decode`, `url_encode`, `url_decode`, `compare_versions`
+  (hashicorp/go-version constraints such as `'>= 8.0.0, < 8.10.2'`), `rand_base`,
+  `rand_text_alpha`, `rand_text_alphanumeric`, `rand_text_numeric`, `rand_int`, `unix_time`.
+- An evaluation that hits a missing value or a type error doesn't match (like Nuclei).
+  A matcher must evaluate to `true`; a dsl extractor yields each non-empty value.
+- Findings from DSL matchers carry no evidence string; the names of the matchers that
+  fired are listed in the finding's other info (`Matched: x-frame-options, ...`).
+
+Not supported (the template is skipped with this reason): `self-contained`, interactsh
+(out-of-band), payload files, template inputs (`-var`), JavaScript `flow`, `xpath`
+extractors, regexes with lookaround or backreferences, DSL functions outside the list
+(`date_time`, `wait_for`, `generate_jwt`, `hmac`, ...), `race`, `iterate-all`, digest
+auth, `fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
+development (17f5725, Oct 2026), 9,139 of 11,690 HTTP templates load (5,856 before the
+DSL subset); the top reasons are `self-contained` (938), template inputs (556),
+interactsh (535), and payload files (258). `checks status` shows the counts for the
+stored commit.
 
 ## brainproxy extensions
 
@@ -117,8 +161,9 @@ http:
 
 ## Ideas
 
-- A small DSL subset (`status_code`, `contains()`, `len()`, `&&`/`||`) would load about
-  2,500 more templates.
+- `scan active --check-var NAME=VALUE` for template inputs (556 templates, mostly
+  authenticated CVE checks taking `username`/`password`).
+- Payload files: store nuclei-templates' `helpers/` wordlists with the templates (258).
 - `{{interactsh-url}}` could map to the OOB listener (`oob_payload`) with interactsh
   matchers as correlation.
 - An index file in the store would let `checks list` skip parsing.

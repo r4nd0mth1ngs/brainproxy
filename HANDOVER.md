@@ -1,7 +1,8 @@
 # brainproxy handover
 
-State as of branch `feat/rule-updates` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
-`feat/oob`, and `feat/rule-updates` (each branched from the previous one) are local and unpushed; `main` is pushed.
+State as of branch `feat/checks-dsl` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
+`feat/oob`, `feat/rule-updates`, and `feat/checks-dsl` (each branched from the previous one) are local and
+unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -29,7 +30,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 377 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 384 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -60,8 +61,9 @@ crates/core/src/            engine library (everything testable lives here)
   oob/                      out-of-band: tokens, payload/interaction tables, correlate; server.rs listener
   data.rs                   runtime-updatable ZAP data files (embedded or <home>/rules copy)
   fetch.rs                  GitHub-only guarded downloads (resolve ref, raw file, tarball) + tar.gz reader
-  checks/                   declarative checks: Nuclei HTTP subset parser (mod.rs), runner as an
-                            active rule (rule.rs), template stores + `checks update` (store.rs)
+  checks/                   declarative checks: Nuclei HTTP subset parser (mod.rs), DSL parser +
+                            evaluator (dsl.rs), runner as an active rule (rule.rs), template
+                            stores + `checks update` (store.rs)
 crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group.
 crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs, oob.rs, checks.rs)
 docs/RESEARCH.md            original research, design, roadmap, AI-first CLI contract
@@ -192,7 +194,7 @@ zap-extensions ref to a commit and fetches each file at it (or `--from DIR`).
 
 Layer 3: `crates/core/src/checks/` (see docs/CHECKS.md). Templates are parsed from
 `serde_json::Value` (via `apiimport::parse_document`) into `Check`/`Block`/`Matcher`; any
-unknown key, DSL, flow, interactsh, payload file, numbered part, etc. makes the template
+unknown key, interactsh, payload file, unknown DSL function, etc. makes the template
 "unsupported" with a reason. `into_rules` leaks one `AlertDef` per check (`check:<id>`)
 and wraps it as an `ActiveRule` (id 0, scope host/page/param); `ActiveConfig.checks` and
 `no_rules` add them to `active::run`. Requests go through `Cx` (`request_for` keeps the
@@ -206,23 +208,55 @@ update|status`), `scan active --checks nuclei|local|all|PATH`, `--check-tags`,
 in-test server: path, raw + clusterbomb + stop-at-first-match, internal extractor chain,
 param inject with baseline_body), `crates/cli/tests/checks.rs`.
 
-Measured on nuclei-templates 17f5725: 5,856 of 11,690 HTTP templates load (DSL matchers
-2,488, flow 1,139, self-contained 938 are the main gaps); loading all takes ~0.6 s in a
-release build (regexes compile lazily; one template has ~700 Unicode regexes). Live run on
-the lab target: 1,493 exposure/config/misconfig/flask templates, 2,647 requests, no false
-positives; a local check written for its `/console` config dump found the leaked secrets.
+Measured on nuclei-templates 17f5725 (before the DSL subset): 5,856 of 11,690 HTTP
+templates loaded. Live run on the lab target: 1,493 exposure/config/misconfig/flask
+templates, 2,647 requests, no false positives; a local check written for its `/console`
+config dump found the leaked secrets.
+
+## Checks DSL subset (done)
+
+`crates/core/src/checks/dsl.rs`: lexer + recursive-descent parser (govaluate precedence:
+`||`, `&&`, comparisons, `+ -`, `* / %`, unary `! -`, parentheses) into `Expr`, and a pure
+evaluator over `Value` (string/number/bool) with ~40 Nuclei helper functions (contains*,
+regex, case, trim, substr, hashes, base64/base64_py/mmh3, url/hex codecs, compare_versions
+with go-version constraints, rand_*, unix_time). Parsed at load time; unknown functions or
+operators (`?:`, `=~`) make the template unsupported. Limits: 16 KiB per expression,
+nesting 32, 512 binary operators (bounds eval recursion), 32 MiB values. Literal regex
+arguments are syntax-checked at load and compiled lazily.
+
+Wired in `mod.rs`/`rule.rs`: `type: dsl` matchers (`condition`, `negative`, `name`) and
+extractors; DSL in `{{...}}` placeholders and variables (`subst` evaluates expressions over
+template values); `json` extractors with a jq path subset (`compile_json_path`);
+numbered parts (`body_2`, `status_code_1`) and `req-condition` (all requests of a block
+run, internal extractors feed the next, matchers run once over `seen: &[Response]`);
+`flow` as `&&`/`||`/`!` over `http(N)` (`run_flow`, short-circuit); matcher `internal: true`
+(no finding when all matchers are internal); matched matcher names go into other info.
+DSL variables: `dsl_value` (template values, response parts, then any response header).
+
+Coverage on 17f5725: 9,139 of 11,690 load (real `checks update`, ~1 s to load all). Top
+remaining reasons: self-contained 938 (correctly skipped), template inputs 556 (`{{username}}`
+etc. from `-var`), interactsh 535, payload files 258, lookaround regexes 43, JavaScript
+flows 26. Live run on the lab target with the 2,506 stored templates that use DSL/flow/json/
+numbered parts (cves, misconfiguration, exposures, panels, technologies, default-logins;
+osint and credential-stuffing left out): 3,998 requests, one finding,
+`http-missing-security-headers` (true positive: the app sends none of them), no false positives.
+
+`scripts/check.sh` didn't fail on test failures (`! grep` under `set -e`); fixed.
 
 Known limits / ideas:
-- A DSL subset (`status_code`, `contains`, `len`, `&&`/`||`) would add ~2,500 templates.
-- `{{interactsh-url}}` could map to the OOB listener.
+- `scan active --check-var NAME=VALUE` would enable the 556 template-input templates.
+- Payload files: keep nuclei-templates' `helpers/` with the store (258 templates).
+- `{{interactsh-url}}` could map to the OOB listener (535 templates).
+- `date_time`, `wait_for`, `generate_jwt`, `hmac`, xpath extractors, and `select()` in json
+  queries are unsupported (each < 25 templates).
+- In flows, only internal extractor values carry to later blocks (Nuclei shares all named ones).
 - `checks list` parses every template; an index in the store would make it instant.
 - Data files apply to commands started after the update (a running proxy keeps the old ones).
 
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-2. Nuclei DSL subset for checks (see "Rule updates" known limits), if more template
-   coverage is wanted.
+2. Checks: `--check-var`, payload files, interactsh mapping (see "Checks DSL subset").
 3. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
    ViewState rules, CharsetMismatch, Heartbleed.
 4. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.

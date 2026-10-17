@@ -238,8 +238,9 @@ brainproxy decode jwt eyJhbGciOi...
   Postman, and GraphQL introspection. Out-of-band callback listener (HTTP, LDAP, TLS, DNS)
   with Log4Shell, XXE, and blind SSTI callback checks (see [docs/OOB.md](docs/OOB.md)).
   Rule updates without a release: `scan data update` for ZAP's pattern lists and
-  declarative checks in the Nuclei HTTP template format (`checks update`, `scan active
-  --checks`; see [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
+  declarative checks in the Nuclei HTTP template format, including a DSL subset, `flow`,
+  and multi-request conditions (`checks update`, `scan active --checks`; see
+  [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
 - **Next:** remaining ZAP rules, performance (connection pooling, HTTP/2), MCP server.
 
 ## License

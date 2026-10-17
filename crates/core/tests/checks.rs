@@ -262,3 +262,112 @@ http:
     assert_eq!(s.requests, 0);
     assert!(seen.lock().unwrap().is_empty());
 }
+
+#[test]
+fn dsl_matchers_multi_request_conditions_and_flow() {
+    // DSL matchers over status, body, and a response header.
+    const DSL: &str = r#"
+id: dsl-panel
+info: {name: DSL panel, severity: info}
+http:
+  - path: ["{{BaseURL}}/panel"]
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          - 'status_code == 200 && contains_all(tolower(body), "admin", "panel")'
+          - 'contains(x_powered_by, "Express") && len(body) < 100'
+          - '!regex("(?i)error", body)'
+"#;
+    // Numbered parts: a CSRF token from the first response is posted by the
+    // second; the matcher sees both responses.
+    const LOGIN: &str = r#"
+id: dsl-login
+info: {name: Login sequence, severity: high}
+variables:
+  user: "{{to_lower('ADMIN')}}"
+http:
+  - raw:
+      - |
+        GET /form HTTP/1.1
+        Host: {{Hostname}}
+
+      - |
+        POST /form HTTP/1.1
+        Host: {{Hostname}}
+        Content-Type: application/x-www-form-urlencoded
+
+        user={{user}}&csrf={{csrf}}&sig={{md5(csrf)}}
+    extractors:
+      - type: regex
+        name: csrf
+        internal: true
+        group: 1
+        regex: ['name="csrf" value="([a-z0-9]+)"']
+    matchers:
+      - type: dsl
+        dsl:
+          - 'status_code_1 == 200 && contains(body_1, "csrf") && status_code_2 == 302 && contains(set_cookie, "auth=")'
+"#;
+    // flow: block 2 only runs when the internal matcher of block 1 matched;
+    // block 1 alone reports nothing.
+    const FLOW: &str = r#"
+id: flow-app
+info: {name: Flow app, severity: medium}
+flow: http(1) && http(2)
+http:
+  - path: ["{{BaseURL}}/panel"]
+    matchers:
+      - type: word
+        words: ["Admin Panel"]
+        internal: true
+  - path: ["{{BaseURL}}/api/info"]
+    extractors:
+      - type: json
+        name: app_version
+        json: [".app.version"]
+    matchers:
+      - type: dsl
+        dsl: ['compare_versions(app_version, "< 2.0")']
+"#;
+    const FLOW_MISS: &str = r#"
+id: flow-miss
+info: {name: Flow miss, severity: medium}
+flow: http(1) && http(2)
+http:
+  - path: ["{{BaseURL}}/nothing-here"]
+    matchers:
+      - type: status
+        status: [200]
+        internal: true
+  - path: ["{{BaseURL}}/never-requested"]
+    matchers:
+      - type: status
+        status: [404]
+"#;
+    let (port, seen) = spawn(|req| {
+        let line = req.lines().next().unwrap_or("");
+        let path = line.split(' ').nth(1).unwrap_or("");
+        match (line.split(' ').next().unwrap_or(""), path) {
+            (_, "/panel") => resp("200 OK", "X-Powered-By: Express\r\n", "<h1>Admin Panel</h1>"),
+            ("GET", "/form") => resp("200 OK", "", r#"<input name="csrf" value="t0k3n">"#),
+            ("POST", "/form") if req.contains("user=admin&csrf=t0k3n&sig=") => {
+                resp("302 Found", "Set-Cookie: auth=1\r\nLocation: /\r\n", "")
+            }
+            (_, "/api/info") => resp("200 OK", "Content-Type: application/json\r\n", r#"{"app":{"version":"1.9.3"}}"#),
+            _ => resp("404 Not Found", "", "nope"),
+        }
+    });
+    let s = run(port, "/", &[("dsl.yaml", DSL), ("login.yaml", LOGIN), ("flow.yaml", FLOW), ("miss.yaml", FLOW_MISS)]);
+    assert_eq!(s.raised.get("check:dsl-panel"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.get("check:dsl-login"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.get("check:flow-app"), Some(&1), "{s:?}");
+    assert!(!s.raised.contains_key("check:flow-miss"), "{s:?}");
+
+    let seen = seen.lock().unwrap();
+    let post = seen.iter().find(|r| r.starts_with("POST /form ")).unwrap();
+    // {{md5(csrf)}} used the extracted token.
+    assert!(post.contains("&sig=15cc41c9fa82806a0b7ef2ada7c86574"), "{post}");
+    assert!(seen.iter().any(|r| r.starts_with("GET /nothing-here ")));
+    assert!(!seen.iter().any(|r| r.starts_with("GET /never-requested ")));
+}

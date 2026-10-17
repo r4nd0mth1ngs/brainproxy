@@ -63,11 +63,35 @@ fn parses_nuclei_template() {
 fn unsupported_features_are_named() {
     let base = "id: x\ninfo: {name: x, severity: low}\n";
     let block = |extra: &str| format!("{base}http:\n  - path: ['{{{{BaseURL}}}}/']\n{extra}");
+    let dsl = |e: &str| block(&format!("    matchers:\n      - type: dsl\n        dsl:\n          - '{e}'\n"));
+    assert_eq!(unsupported_reason(&dsl("date_time(\"%Y\")")), "DSL function `date_time`");
+    assert_eq!(unsupported_reason(&dsl("contains(interactsh_protocol, \"dns\")")), "interactsh (out-of-band) matchers");
+    assert_eq!(unsupported_reason(&dsl("body =~ \"x\"")), "DSL operator `=~`");
+    assert!(invalid_reason(&dsl("contains(body")).starts_with("dsl: "));
     assert_eq!(
-        unsupported_reason(&block("    matchers:\n      - type: dsl\n        dsl: ['status_code == 200']\n")),
-        "matcher `dsl`"
+        unsupported_reason(&block(
+            "    matchers:\n      - type: word\n        part: status_code_2\n        words: [a]\n"
+        )),
+        "part `status_code`"
     );
-    assert_eq!(unsupported_reason(&format!("{base}flow: http(1)\nhttp: []\n")), "top-level `flow`");
+    assert_eq!(
+        unsupported_reason(&block(
+            "    matchers:\n      - type: status\n        status: [200]\nflow: javascript() && http(1)\n"
+        )),
+        "flow (JavaScript)"
+    );
+    assert_eq!(
+        unsupported_reason(&block(
+            "    matchers:\n      - type: status\n        status: [200]\nflow: http(1) && http(2)\n"
+        )),
+        "flow (JavaScript)"
+    );
+    assert!(parse_str(&block(
+        "    matchers:\n      - type: status\n        status: [200]\nflow: '!http(1) || (http(1))'\n"
+    ))
+    .unwrap()
+    .flow
+    .is_some());
     assert_eq!(unsupported_reason(&format!("{base}dns:\n  - name: x\n")), "top-level `dns`");
     assert_eq!(
         unsupported_reason(&block(
@@ -85,19 +109,15 @@ fn unsupported_features_are_named() {
     );
     assert_eq!(
         unsupported_reason(&format!(
-            "{base}http:\n  - path: ['{{{{BaseURL}}}}/{{{{rand_int(1, 9)}}}}']\n    matchers:\n      - type: status\n        status: [200]\n"
+            "{base}http:\n  - path: ['{{{{BaseURL}}}}/{{{{generate_jwt(a, b)}}}}']\n    matchers:\n      - type: status\n        status: [200]\n"
         )),
-        "DSL expressions in placeholders"
+        "DSL function `generate_jwt`"
     );
     assert_eq!(
-        unsupported_reason(&block("    matchers:\n      - type: word\n        part: body_2\n        words: [a]\n")),
-        "part `body_2`"
-    );
-    assert_eq!(
-        unsupported_reason(&block(
-            "    req-condition: true\n    matchers:\n      - type: status\n        status: [200]\n"
+        unsupported_reason(&format!(
+            "{base}http:\n  - path: ['{{{{BaseURL}}}}/{{{{base64(username)}}}}']\n    matchers:\n      - type: status\n        status: [200]\n"
         )),
-        "request `req-condition`"
+        "placeholders without a value (template inputs)"
     );
 }
 
@@ -192,12 +212,13 @@ async fn store_update_from_dir_keeps_only_loadable_templates() {
     std::fs::create_dir_all(src.join("http/exposures")).unwrap();
     std::fs::create_dir_all(src.join("dns")).unwrap();
     std::fs::write(src.join("http/exposures/git.yaml"), GIT_CONFIG).unwrap();
-    std::fs::write(src.join("http/exposures/flow.yaml"), "id: f\ninfo: {severity: low}\nflow: x\n").unwrap();
+    std::fs::write(src.join("http/exposures/flow.yaml"), "id: f\ninfo: {severity: low}\nself-contained: true\n")
+        .unwrap();
     std::fs::write(src.join("dns/x.yaml"), "id: d\n").unwrap();
     let home = base.join("home");
     let m = update(&home, Source::Dir(src.clone())).await.unwrap();
     assert_eq!((m.templates, m.stored), (2, 1));
-    assert_eq!(m.skipped, vec![("top-level `flow`".to_string(), 1)]);
+    assert_eq!(m.skipped, vec![("top-level `self-contained`".to_string(), 1)]);
     assert!(nuclei_dir(&home).join("http/exposures/git.yaml").is_file());
     assert!(!nuclei_dir(&home).join("http/exposures/flow.yaml").exists());
     assert_eq!(nuclei_status(&home).nuclei.unwrap().stored, 1);
@@ -237,4 +258,23 @@ async fn store_update_from_tarball_layout() {
     })
     .unwrap();
     assert_eq!(seen, ["http/git.yaml"]);
+}
+
+#[test]
+fn json_paths() {
+    let doc: Value = serde_json::from_str(
+        r#"{"version":"1.2","data":{"users":[{"name":"a","id":1},{"name":"b","id":2}]},"setup-token":"t","n":null}"#,
+    )
+    .unwrap();
+    let q = |q: &str| json_path(&doc, &compile_json_path(q).unwrap());
+    assert_eq!(q(".version"), ["1.2"]);
+    assert_eq!(q(".data.users[].name"), ["a", "b"]);
+    assert_eq!(q(".data.users[] | .id"), ["1", "2"]);
+    assert_eq!(q(".data.users[1].name"), ["b"]);
+    assert_eq!(q(".[\"setup-token\"]"), ["t"]);
+    assert_eq!(q(".data.users[0]"), [r#"{"name":"a","id":1}"#]);
+    assert!(q(".missing.x").is_empty() && q(".n").is_empty());
+    for bad in [".[] | select(.a == 1)", "..|objects", ".a // empty", "keys"] {
+        assert!(compile_json_path(bad).is_none(), "{bad}");
+    }
 }
