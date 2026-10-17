@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use brainproxy_core::auth::AuthSession;
+use brainproxy_core::checks;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::findings_db::FindingFilter;
@@ -34,6 +35,25 @@ pub struct ActiveArgs {
     /// Skip these rule ids (comma-separated).
     #[arg(long, value_delimiter = ',')]
     exclude_rules: Vec<u32>,
+    /// Run only the declarative checks from --checks, not the ported ZAP rules.
+    #[arg(long)]
+    no_rules: bool,
+    /// Declarative checks to run as well: `nuclei` (templates from `checks update`), `local`
+    /// (<home>/checks/local), `all`, or a template file/directory. Repeatable or comma-separated.
+    #[arg(long, value_delimiter = ',', value_name = "SELECTOR")]
+    checks: Vec<String>,
+    /// Only checks with any of these tags (comma-separated), e.g. cve,exposure.
+    #[arg(long, value_delimiter = ',')]
+    check_tags: Vec<String>,
+    /// Skip checks with any of these tags.
+    #[arg(long, value_delimiter = ',', default_value = "dos,fuzz,intrusive")]
+    check_exclude_tags: Vec<String>,
+    /// Only these check ids (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    check_ids: Vec<String>,
+    /// Only checks of at least this severity.
+    #[arg(long, value_enum)]
+    check_severity: Option<crate::scan_cmd::RiskArg>,
     /// Also inject into cookies.
     #[arg(long)]
     cookies: bool,
@@ -97,6 +117,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     for u in &args.urls {
         crate::require_in_scope(&guard, &Target::from_url(u)?)?;
     }
+    if args.no_rules && args.checks.is_empty() {
+        return Err(Error::InvalidInput("--no-rules needs --checks".into()));
+    }
+    let (checks, check_summary) = load_checks(home, &args)?;
     if args.background {
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
     }
@@ -133,6 +157,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         points: point_opts,
         rules: (!args.rules.is_empty()).then(|| args.rules.clone()),
         exclude_rules: args.exclude_rules.clone(),
+        no_rules: args.no_rules,
+        checks: brainproxy_core::checks::into_rules(checks),
         max_duration: args.max_minutes.map(|m| Duration::from_secs_f64(m * 60.0)),
         auth: auth.clone(),
         oob: if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) },
@@ -153,6 +179,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         })?;
         let mut v = json!(summary);
         v["skipped_out_of_scope"] = json!(skipped);
+        if !check_summary.is_null() {
+            v["checks"] = check_summary.clone();
+        }
         v["active_findings"] = json!(findings);
         v["hint"] = json!(
             "Details: brainproxy findings show ID; all active findings: brainproxy findings list --source active"
@@ -181,6 +210,36 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         lines.join("\n")
     });
     Ok(())
+}
+
+/// Loads and filters the --checks templates; returns them with a summary for the output.
+fn load_checks(home: &Path, args: &ActiveArgs) -> Result<(Vec<checks::Check>, serde_json::Value), Error> {
+    if args.checks.is_empty() {
+        return Ok((vec![], serde_json::Value::Null));
+    }
+    let loaded = checks::load(&checks::resolve_selectors(home, &args.checks))?;
+    let filter = checks::Filter {
+        ids: args.check_ids.clone(),
+        tags: args.check_tags.clone(),
+        exclude_tags: args.check_exclude_tags.iter().filter(|t| !t.is_empty()).cloned().collect(),
+        min_risk: args.check_severity.map(crate::scan_cmd::RiskArg::get),
+    };
+    let total = loaded.checks.len();
+    let selected: Vec<checks::Check> = loaded.checks.iter().filter(|c| filter.keep(c)).cloned().collect();
+    let summary = json!({
+        "selected": selected.len(),
+        "filtered_out": total - selected.len(),
+        "not_loaded": loaded.skipped.len(),
+        "not_loaded_reasons": loaded.reasons().into_iter().take(5).collect::<Vec<_>>(),
+    });
+    if selected.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "no checks selected from {:?} ({total} loaded, {} not loaded; see `brainproxy checks list`)",
+            args.checks,
+            loaded.skipped.len()
+        )));
+    }
+    Ok((selected, summary))
 }
 
 /// Picks and de-duplicates targets; returns them with the number skipped as out of scope.

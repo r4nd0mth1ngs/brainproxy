@@ -1,7 +1,7 @@
 # brainproxy handover
 
-State as of branch `feat/oob` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`, and `feat/oob`
-(each branched from the previous one) are local and unpushed; `main` is pushed.
+State as of branch `feat/rule-updates` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
+`feat/oob`, and `feat/rule-updates` (each branched from the previous one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -29,7 +29,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 358 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 377 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -58,13 +58,18 @@ crates/core/src/            engine library (everything testable lives here)
   auth.rs                   auth sessions (profiles, login, relogin)
   apiimport/                OpenAPI/Swagger, Postman, GraphQL -> requests; send + record (source "import")
   oob/                      out-of-band: tokens, payload/interaction tables, correlate; server.rs listener
+  data.rs                   runtime-updatable ZAP data files (embedded or <home>/rules copy)
+  fetch.rs                  GitHub-only guarded downloads (resolve ref, raw file, tarball) + tar.gz reader
+  checks/                   declarative checks: Nuclei HTTP subset parser (mod.rs), runner as an
+                            active rule (rule.rs), template stores + `checks update` (store.rs)
 crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group.
-crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs)
+crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs, oob.rs, checks.rs)
 docs/RESEARCH.md            original research, design, roadmap, AI-first CLI contract
 docs/PASSIVE_RULES.md       passive rules + differences from ZAP
 docs/ACTIVE_RULES.md        active rules + differences from ZAP
 docs/OOB.md                 out-of-band listener design (tokens, NAT, correlation, boundary)
-docs/RULE_UPDATES.md        how ZAP rule changes are tracked / auto-update design
+docs/RULE_UPDATES.md        how ZAP rule changes are tracked; data sync and declarative checks
+docs/CHECKS.md              check format (Nuclei subset + extensions), stores, security boundary
 zap-sync.json               pinned zap-extensions commit, copied data files, skipped rules
 scripts/zap_drift.py        reports upstream ZAP changes vs. our ports (weekly workflow)
 scripts/check.sh            pre-commit checks
@@ -177,11 +182,47 @@ Known limits / ideas:
 - Findings are only raised when a scan finishes or on `oob poll` (the listener doesn't raise them).
 - More rules could use it: blind command injection (ZAP doesn't), SSRF-style params, RFI.
 
+## Rule updates and declarative checks (done)
+
+Layer 2: `crates/core/src/data.rs` + `scan data status|update|reset`. The four ZAP data
+files are read through `data::get(name)`; the CLI calls `data::set_home` at startup, so a
+copy in `<home>/rules/` is used when the manifest lists it, its sha256 matches, and it
+validates (rules' own parser, at least half the embedded entries). `update` resolves a
+zap-extensions ref to a commit and fetches each file at it (or `--from DIR`).
+
+Layer 3: `crates/core/src/checks/` (see docs/CHECKS.md). Templates are parsed from
+`serde_json::Value` (via `apiimport::parse_document`) into `Check`/`Block`/`Matcher`; any
+unknown key, DSL, flow, interactsh, payload file, numbered part, etc. makes the template
+"unsupported" with a reason. `into_rules` leaks one `AlertDef` per check (`check:<id>`)
+and wraps it as an `ActiveRule` (id 0, scope host/page/param); `ActiveConfig.checks` and
+`no_rules` add them to `active::run`. Requests go through `Cx` (`request_for` keeps the
+base headers; other origins are skipped). `checks update` (store.rs) downloads the
+nuclei-templates tarball at a resolved commit via `fetch::GitHub` (scope = GitHub hosts,
+system scope still applies, TLS verified), stores only the `http/` templates that load,
+and swaps the store directory. CLI: `crates/cli/src/checks_cmd.rs` (`checks list|validate|
+update|status`), `scan active --checks nuclei|local|all|PATH`, `--check-tags`,
+`--check-exclude-tags` (default dos,fuzz,intrusive), `--check-ids`, `--check-severity`,
+`--no-rules`. Tests: `checks/tests.rs`, `crates/core/tests/checks.rs` (engine against an
+in-test server: path, raw + clusterbomb + stop-at-first-match, internal extractor chain,
+param inject with baseline_body), `crates/cli/tests/checks.rs`.
+
+Measured on nuclei-templates 17f5725: 5,856 of 11,690 HTTP templates load (DSL matchers
+2,488, flow 1,139, self-contained 938 are the main gaps); loading all takes ~0.6 s in a
+release build (regexes compile lazily; one template has ~700 Unicode regexes). Live run on
+the lab target: 1,493 exposure/config/misconfig/flask templates, 2,647 requests, no false
+positives; a local check written for its `/console` config dump found the leaked secrets.
+
+Known limits / ideas:
+- A DSL subset (`status_code`, `contains`, `len`, `&&`/`||`) would add ~2,500 templates.
+- `{{interactsh-url}}` could map to the OOB listener.
+- `checks list` parses every template; an index in the store would make it instant.
+- Data files apply to commands started after the update (a running proxy keeps the old ones).
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-2. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
-   declarative checks incl. a Nuclei template subset.
+2. Nuclei DSL subset for checks (see "Rule updates" known limits), if more template
+   coverage is wanted.
 3. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
    ViewState rules, CharsetMismatch, Heartbleed.
 4. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.

@@ -147,6 +147,8 @@ async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget
         points: PointOptions::default(),
         rules: Some(vec![rule]),
         exclude_rules: vec![],
+        no_rules: false,
+        checks: vec![],
         max_duration: None,
         auth: None,
         oob: None,

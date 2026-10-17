@@ -4,10 +4,13 @@
 pub mod apiimport;
 pub mod auth;
 pub mod capture;
+pub mod checks;
 pub mod codec;
 pub mod crawl;
+pub mod data;
 pub mod diff;
 pub mod error;
+pub mod fetch;
 pub mod fuzz;
 pub mod guard;
 pub mod http;

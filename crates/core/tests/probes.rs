@@ -77,6 +77,8 @@ fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> Act
         points: PointOptions::default(),
         rules: Some(rules.to_vec()),
         exclude_rules: vec![],
+        no_rules: false,
+        checks: vec![],
         max_duration: None,
         auth: None,
         oob: None,

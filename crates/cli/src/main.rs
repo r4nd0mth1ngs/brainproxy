@@ -4,6 +4,7 @@
 mod active_cmd;
 mod auth_cmd;
 mod capabilities;
+mod checks_cmd;
 mod crawl_cmd;
 mod engagement_cmd;
 mod fuzz_cmd;
@@ -126,6 +127,15 @@ enum Cmd {
         --dns-listen for DNS callbacks)."
     )]
     Oob(oob_cmd::OobCmd),
+
+    /// Declarative checks: Nuclei HTTP templates and your own YAML checks, run with `scan active --checks`.
+    #[command(
+        subcommand,
+        after_help = "Checks use the HTTP subset of the Nuclei template format plus brainproxy extensions \
+        (scope: host|request|param, inject, matcher part baseline_body); see docs/CHECKS.md. Templates outside \
+        the subset are listed as not loaded, never half-run. Put your own checks in <home>/checks/local."
+    )]
+    Checks(checks_cmd::ChecksCmd),
 
     /// Background jobs (crawl/scan/import --background): list, status, wait, stop.
     #[command(subcommand)]
@@ -367,6 +377,12 @@ fn command_name(cmd: &Cmd) -> String {
             oob_cmd::OobCmd::Payload { .. } => "oob payload",
             oob_cmd::OobCmd::Poll { .. } => "oob poll",
         },
+        Cmd::Checks(c) => match c {
+            checks_cmd::ChecksCmd::List(_) => "checks list",
+            checks_cmd::ChecksCmd::Validate { .. } => "checks validate",
+            checks_cmd::ChecksCmd::Update(_) => "checks update",
+            checks_cmd::ChecksCmd::Status => "checks status",
+        },
         Cmd::Findings(_) => "findings",
         Cmd::Report(_) => "report",
         Cmd::Scope(_) => "scope",
@@ -380,6 +396,7 @@ fn command_name(cmd: &Cmd) -> String {
 }
 
 fn run(cli: Cli, out: &Out) -> Result<(), Error> {
+    brainproxy_core::data::set_home(&proxy_cmd::resolve_home(cli.home.clone()));
     match cli.command {
         Cmd::Capabilities { command } => {
             let v = if command.is_empty() {
@@ -416,6 +433,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Import(cmd) => import_cmd::import(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
+        Cmd::Checks(cmd) => checks_cmd::checks_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Oob(cmd) => oob_cmd::oob(&cli.project, cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
         Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, cmd, out)?,

@@ -1,7 +1,7 @@
 //! Cookie, parameter, reflection and form rules ported from ZAP's pscanrules
 //! add-on (Apache License 2.0).
 
-mod common;
+pub(crate) mod common;
 mod cookie_loosely_scoped;
 mod cookie_poisoning;
 mod cookie_same_site;

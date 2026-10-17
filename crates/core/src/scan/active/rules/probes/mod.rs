@@ -8,7 +8,7 @@ mod directory_browsing;
 mod elmah;
 mod entity_expansion;
 mod get_for_post;
-mod hidden_files;
+pub(crate) mod hidden_files;
 mod htaccess;
 mod http_only_site;
 mod https_as_http;

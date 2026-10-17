@@ -23,11 +23,16 @@ static ALERT: AlertDef = AlertDef {
 
 static ALERTS: [&AlertDef; 1] = [&ALERT];
 
-const DATA: &str = include_str!("../../data/debug-error-messages.txt");
+pub(crate) const EMBEDDED: &str = include_str!("../../data/debug-error-messages.txt");
 
 /// One case-insensitive literal per message, in file order.
 fn patterns() -> Vec<String> {
-    data_lines(DATA).map(|l| format!("(?i){}", regex::escape(l))).collect()
+    data_lines(crate::data::get("debug-error-messages.txt")).map(|l| format!("(?i){}", regex::escape(l))).collect()
+}
+
+/// Number of messages (data files are validated before use; see `crate::data`).
+pub(crate) fn validate(text: &str) -> crate::Result<usize> {
+    Ok(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).count())
 }
 
 static SET: LazyLock<RegexSet> = LazyLock::new(|| RegexSet::new(patterns()).unwrap());

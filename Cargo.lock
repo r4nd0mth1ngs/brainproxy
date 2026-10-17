@@ -218,6 +218,7 @@ dependencies = [
  "percent-encoding",
  "rcgen",
  "regex",
+ "regex-syntax",
  "rusqlite",
  "rustls",
  "serde",

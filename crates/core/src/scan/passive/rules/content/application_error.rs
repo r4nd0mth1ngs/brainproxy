@@ -27,7 +27,7 @@ static ALERT: AlertDef = AlertDef {
 
 static ALERTS: [&AlertDef; 1] = [&ALERT];
 
-const DATA: &str = include_str!("../../data/application_errors.xml");
+pub(crate) const EMBEDDED: &str = include_str!("../../data/application_errors.xml");
 
 /// ZAP's ContentMatcher patterns: (literal strings, regexes), each in file order.
 struct Matcher {
@@ -43,9 +43,9 @@ fn java_regex_to_rust(p: &str) -> String {
     p.replace(r"\<", "<").replace(r"\>", ">")
 }
 
-fn parse_patterns() -> (Vec<String>, Vec<String>) {
+fn parse_patterns(data: &str) -> (Vec<String>, Vec<String>) {
     let (mut strings, mut regexes) = (Vec::new(), Vec::new());
-    let mut rest = DATA;
+    let mut rest = data;
     while let Some(i) = rest.find("<Pattern ") {
         rest = &rest[i..];
         let Some(gt) = rest.find('>') else { break };
@@ -63,12 +63,19 @@ fn parse_patterns() -> (Vec<String>, Vec<String>) {
 }
 
 static MATCHER: LazyLock<Matcher> = LazyLock::new(|| {
-    let (strings, regex_src) = parse_patterns();
+    let (strings, regex_src) = parse_patterns(crate::data::get("application_errors.xml"));
     let string_set = RegexSet::new(strings.iter().map(|s| regex::escape(s))).unwrap();
     let regexes = regex_src.iter().map(|r| Regex::new(r).unwrap()).collect();
     let regex_set = RegexSet::new(&regex_src).unwrap();
     Matcher { strings, string_set, regexes, regex_set }
 });
+
+/// Number of patterns; every regex must compile (see `crate::data`).
+pub(crate) fn validate(text: &str) -> crate::Result<usize> {
+    let (strings, regexes) = parse_patterns(text);
+    RegexSet::new(&regexes).map_err(|e| crate::Error::InvalidInput(e.to_string()))?;
+    Ok(strings.len() + regexes.len())
+}
 
 /// ResourceIdentificationUtils.responseContainsControlChars: binary content.
 fn contains_control_chars(body: &[u8]) -> bool {

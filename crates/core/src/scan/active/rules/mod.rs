@@ -4,7 +4,7 @@ mod crlf_injection;
 pub(crate) mod env_file;
 mod injection;
 mod params;
-mod probes;
+pub(crate) mod probes;
 
 use crate::scan::active::ActiveRule;
 

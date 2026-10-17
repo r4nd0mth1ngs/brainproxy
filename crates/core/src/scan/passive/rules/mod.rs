@@ -1,9 +1,9 @@
 //! Passive rules, ported from ZAP's pscanrules add-on (Apache License 2.0).
 
-mod content;
+pub(crate) mod content;
 mod cookie_http_only;
 mod headers;
-mod params;
+pub(crate) mod params;
 
 use crate::scan::PassiveRule;
 

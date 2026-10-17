@@ -1,9 +1,9 @@
 //! Response body content rules, ported from ZAP's pscanrules add-on (Apache License 2.0).
 
-mod application_error;
+pub(crate) mod application_error;
 mod common;
 mod cross_domain_script;
-mod debug_errors;
+pub(crate) mod debug_errors;
 mod directory_browsing;
 mod hash_disclosure;
 mod in_page_banner;

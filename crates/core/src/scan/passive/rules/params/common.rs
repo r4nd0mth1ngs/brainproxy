@@ -180,9 +180,19 @@ pub fn response_charset(msg: &Message) -> Option<&str> {
     (!cs.is_empty()).then_some(cs)
 }
 
-/// Default contents of ZAP's URL-information-disclosure-messages.txt.
-pub const SENSITIVE_STRINGS: [&str; 10] =
-    ["user", "username", "pass", "password", "pwd", "token", "ticket", "session", "jsessionid", "sessionid"];
+pub(crate) const SENSITIVE_EMBEDDED: &str = include_str!("../../data/URL-information-disclosure-messages.txt");
+
+fn sensitive_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// ZAP's URL-information-disclosure-messages.txt (embedded or updated, see `crate::data`).
+pub static SENSITIVE_STRINGS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| sensitive_lines(crate::data::get("URL-information-disclosure-messages.txt")).collect());
+
+pub(crate) fn validate_sensitive(text: &str) -> crate::Result<usize> {
+    Ok(sensitive_lines(text).count())
+}
 
 pub static EMAIL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?-u)\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}\b").unwrap());

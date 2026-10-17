@@ -35,11 +35,35 @@ pub enum ScanCmd {
     Enable { ids: Vec<u32> },
     /// Disable passive rules by id.
     Disable { ids: Vec<u32> },
+    /// ZAP data files the rules read (error patterns, hidden files, sensitive names): status, update, reset.
+    #[command(subcommand)]
+    Data(DataCmd),
     /// Choose which history sources are passively scanned (default: proxy,send,crawl).
     Sources {
         #[arg(value_delimiter = ',')]
         sources: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum DataCmd {
+    /// Which copy (embedded or downloaded) each data file uses, with entry counts.
+    Status,
+    /// Fetch the data files from zap-extensions at a ref (resolved to a commit), validate, and store them.
+    #[command(after_help = "Files go to <home>/rules with a manifest (commit, sha256). Each file is parsed with the \
+        rules' own parser and must keep at least half the embedded entries; a rejected file keeps the previous \
+        copy. Downloads go only to GitHub over verified TLS and respect the system scope; offline, use --from \
+        with a zap-extensions checkout or a directory holding the files. New data applies to commands started \
+        afterwards (restart a running proxy).")]
+    Update {
+        /// Branch, tag, or commit of zaproxy/zap-extensions.
+        #[arg(long = "ref", default_value = "main")]
+        reference: String,
+        #[arg(long, value_name = "DIR")]
+        from: Option<std::path::PathBuf>,
+    },
+    /// Delete the downloaded copies; rules use the embedded data again.
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -104,9 +128,12 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
     if let ScanCmd::Active(args) = cmd {
         return crate::active_cmd::active(project, home, *args, out);
     }
+    if let ScanCmd::Data(cmd) = cmd {
+        return data_cmd(home, cmd, out);
+    }
     let mut store = Store::open(project)?;
     match cmd {
-        ScanCmd::Active(_) => unreachable!(),
+        ScanCmd::Active(_) | ScanCmd::Data(_) => unreachable!(),
         ScanCmd::Passive { rescan } => {
             let stats = if rescan { passive::rescan(&mut store)? } else { passive::scan_pending(&mut store)? };
             out.ok(json!(stats), || format!("scanned {} captures, {} new findings", stats.scanned, stats.new_findings));
@@ -281,6 +308,50 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             });
             store.finding_mark(id, state, note.as_deref())?;
             out.ok(json!({"id": id, "state": state, "note": note}), || format!("updated finding {id}"));
+        }
+    }
+    Ok(())
+}
+
+fn data_cmd(home: &Path, cmd: DataCmd, out: &Out) -> Result<(), Error> {
+    use brainproxy_core::data;
+    match cmd {
+        DataCmd::Status => {
+            let s = data::status(home);
+            let v = json!(s);
+            out.ok(v, || {
+                let mut lines = vec![format!("embedded copies from zap-extensions {}", s.embedded_commit)];
+                for f in &s.files {
+                    lines.push(format!("  {:<42} {:<10} {} entries", f.name, f.active, f.entries));
+                }
+                lines.join("\n")
+            });
+        }
+        DataCmd::Update { reference, from } => {
+            let source = match from {
+                Some(d) => data::Source::Dir(d),
+                None => data::Source::GitHub { reference },
+            };
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            let r = rt.block_on(data::update(home, source))?;
+            let v = json!(r);
+            out.ok(v, || {
+                let mut s = format!("updated {:?}, unchanged {:?}", r.updated, r.unchanged);
+                for (f, why) in &r.rejected {
+                    s.push_str(&format!("\nrejected {f}: {why}"));
+                }
+                s
+            });
+        }
+        DataCmd::Reset => {
+            let removed = data::reset(home)?;
+            out.ok(json!({"removed": removed}), || {
+                if removed {
+                    "removed downloaded data; using embedded copies".into()
+                } else {
+                    "nothing to remove".into()
+                }
+            });
         }
     }
     Ok(())

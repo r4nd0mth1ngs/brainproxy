@@ -181,6 +181,14 @@ brainproxy oob payload --note 'ssrf in ?url=' --target https://app.example.com  
 brainproxy oob poll --token bp... --wait 30         # interactions; also raises late scan callbacks
 brainproxy oob stop
 
+# Declarative checks: Nuclei HTTP templates (pinned to a commit) and your own YAML checks in
+# <home>/checks/local, run by the active scanner inside the scope (see docs/CHECKS.md)
+brainproxy checks update                             # or --from DIR with a nuclei-templates checkout
+brainproxy checks list nuclei --tags exposure --severity medium
+brainproxy scan active https://app.example.com/ --checks nuclei --check-tags exposure,misconfig
+brainproxy checks validate my-check.yaml             # loads, or why not
+brainproxy scan data update                          # newer ZAP pattern lists (error messages, hidden files)
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -229,7 +237,10 @@ brainproxy decode jwt eyJhbGciOi...
   Markdown, self-contained HTML, and SARIF 2.1.0. API import from OpenAPI/Swagger,
   Postman, and GraphQL introspection. Out-of-band callback listener (HTTP, LDAP, TLS, DNS)
   with Log4Shell, XXE, and blind SSTI callback checks (see [docs/OOB.md](docs/OOB.md)).
-- **Next:** automation plans, rule updates, remaining ZAP rules.
+  Rule updates without a release: `scan data update` for ZAP's pattern lists and
+  declarative checks in the Nuclei HTTP template format (`checks update`, `scan active
+  --checks`; see [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
+- **Next:** remaining ZAP rules, performance (connection pooling, HTTP/2), MCP server.
 
 ## License
 

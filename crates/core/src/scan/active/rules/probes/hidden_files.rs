@@ -59,10 +59,20 @@ struct HiddenFiles {
     files: Vec<HiddenFile>,
 }
 
+pub(crate) const EMBEDDED: &str = include_str!("data/hidden_files.json");
+
+/// Number of files; each needs a path (see `crate::data`).
+pub(crate) fn validate(text: &str) -> crate::Result<usize> {
+    let f = serde_json::from_str::<HiddenFiles>(text).map_err(|e| crate::Error::InvalidInput(e.to_string()))?;
+    if f.files.iter().any(|f| f.path.is_empty()) {
+        return Err(crate::Error::InvalidInput("a file has no path".into()));
+    }
+    Ok(f.files.len())
+}
+
 static FILES: LazyLock<Vec<HiddenFile>> = LazyLock::new(|| {
-    let mut files = serde_json::from_str::<HiddenFiles>(include_str!("data/hidden_files.json"))
-        .map(|f| f.files)
-        .unwrap_or_default();
+    let mut files =
+        serde_json::from_str::<HiddenFiles>(crate::data::get("hidden_files.json")).map(|f| f.files).unwrap_or_default();
     files.extend(CUSTOM_FILES.iter().map(|p| HiddenFile { path: p.to_string(), custom: true, ..Default::default() }));
     files
 });

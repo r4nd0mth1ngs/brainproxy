@@ -67,6 +67,12 @@ pub trait ActiveRule: Send + Sync {
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a>;
 }
 
+impl std::fmt::Debug for dyn ActiveRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
 /// A response received during scanning.
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -446,6 +452,10 @@ pub struct ActiveConfig {
     /// Only these rule ids (None: all).
     pub rules: Option<Vec<u32>>,
     pub exclude_rules: Vec<u32>,
+    /// Skip the ported rules (run only `checks`).
+    pub no_rules: bool,
+    /// Declarative checks to run as well (see `crate::checks::into_rules`).
+    pub checks: Vec<&'static dyn ActiveRule>,
     pub max_duration: Option<Duration>,
     /// Logged-in session applied to every request (an attacked cookie keeps its payload).
     pub auth: Option<Arc<AuthSession>>,
@@ -502,13 +512,18 @@ pub async fn run(
     ctl: JobControl,
 ) -> Result<ActiveSummary> {
     let started = Instant::now();
-    let rules: Vec<&'static dyn ActiveRule> = all_rules()
+    let mut rules: Vec<&'static dyn ActiveRule> = all_rules()
         .iter()
         .map(|r| r.as_ref())
-        .filter(|r| cfg.rules.as_ref().is_none_or(|ids| ids.contains(&r.id())) && !cfg.exclude_rules.contains(&r.id()))
+        .filter(|r| {
+            !cfg.no_rules
+                && cfg.rules.as_ref().is_none_or(|ids| ids.contains(&r.id()))
+                && !cfg.exclude_rules.contains(&r.id())
+        })
         .collect();
+    rules.extend(cfg.checks.iter().copied());
     if rules.is_empty() {
-        return Err(Error::InvalidInput("no active rules selected".into()));
+        return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }
 
     // Recorder: attack exchanges that back findings go to history, then findings.

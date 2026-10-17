@@ -40,36 +40,44 @@ coding agent in CI (e.g. the Claude Code GitHub Action) that opens a pull reques
 ported change and tests for human review. Detection stays deterministic; only the
 translation uses an LLM, and nothing merges without review and green CI.
 
-## Layer 2: runtime data sync (designed)
+## Layer 2: runtime data sync (implemented)
 
-Pattern lists can update without a new brainproxy release:
+Pattern lists update without a new brainproxy release (`crates/core/src/data.rs`):
 
-- `brainproxy rules update` downloads the data files listed in `zap-sync.json` from
-  zap-extensions at a chosen ref (default: the latest release tag of each add-on), checks
-  them (parse, size limits, sha256 recorded), and stores them under
-  `~/.local/share/brainproxy/rules/` with a manifest.
-- Rules load the downloaded copy when present and valid, else the copy embedded at build
-  time. `brainproxy rules status` shows which version each rule uses.
-- Downloads are pinned to a ref and verified; a bad file is rejected and the embedded copy
-  stays in use. On a locked-down runner this can be done by the provisioner instead of the
-  agent.
+```sh
+brainproxy scan data status                  # embedded or downloaded copy per file, entry counts
+brainproxy scan data update [--ref main]     # zap-extensions at a branch/tag/commit
+brainproxy scan data update --from DIR       # zap-extensions checkout, or a dir with the files
+brainproxy scan data reset                   # back to the embedded copies
+```
 
-This covers new error signatures, hidden-file paths, and sensitive-parameter names, which
-are the most frequent kinds of upstream rule changes.
+- The files are the ones in `zap-sync.json`: `application_errors.xml` (90022),
+  `debug-error-messages.txt` (10023), `URL-information-disclosure-messages.txt`
+  (10024, 10025), and `hidden_files.json` (40035).
+- The ref is resolved to a commit (GitHub API) and every file is fetched at that commit
+  from raw.githubusercontent.com: only GitHub, verified TLS, through the guarded client
+  with the system scope applied (a locked-down runner refuses; the provisioner uses
+  `--from`).
+- Each file is parsed by the rules' own parser (regexes must compile) and must keep at
+  least half the embedded entry count; a rejected file keeps the previous copy. Accepted
+  files go to `<home>/rules/` with `manifest.json` (ref, commit, sha256, entries).
+- At startup a rule uses the stored copy only if the manifest lists it, its sha256 still
+  matches, and it validates; otherwise the embedded copy. New data applies to commands
+  started afterwards (restart a running proxy).
 
-## Layer 3: declarative checks (recommended next feature)
+## Layer 3: declarative checks (implemented)
 
-For checks that should arrive as content, not code, support a declarative format:
+See [CHECKS.md](CHECKS.md). One format, the HTTP subset of Nuclei templates plus
+brainproxy extensions (`scope: host|request|param`, `inject`, `info.confidence`, matcher
+part `baseline_body`), so community templates and checks an agent writes go through the
+same parser and the same engine. Checks run as active rules through `Cx` (scope guard,
+auth, rate limit) and only when `scan active --checks` selects them.
 
-- **brainproxy YAML checks** (our own format, sketched in `docs/RESEARCH.md`): request
-  mutations plus matchers (status, regex on headers/body, timing, extract), loaded from
-  `~/.local/share/brainproxy/checks/` and project directories, run by the active engine
-  through the same scope guard.
-- **Nuclei template subset**: the community `nuclei-templates` repository (MIT) is updated
-  daily with thousands of checks, mostly for known CVEs, exposures, and misconfigurations.
-  Supporting the HTTP subset of the template format (requests with `{{BaseURL}}`
-  placeholders, matchers, extractors) lets `brainproxy checks update` pull those directly.
-  Templates that use unsupported features are skipped and listed, not half-run.
+`brainproxy checks update` pulls the `nuclei-templates` repository (MIT, updated daily,
+thousands of CVE/exposure/misconfiguration checks) at a commit, stores the HTTP templates
+that load in `<home>/checks/nuclei/`, and records the commit, tarball sha256, and skip
+reasons. Templates that use unsupported features (DSL, flow, interactsh, ...) are listed,
+not half-run; about half of the HTTP templates load today.
 
 ZAP itself has no declarative rule format (its scripts are JavaScript/Zest code), so
 layer 3 complements the ZAP ports rather than replacing them: ZAP's generic, logic-heavy
@@ -81,6 +89,6 @@ layer 1; fast-moving CVE and exposure checks come in as data through layer 3.
 | Kind of change | How it reaches brainproxy |
 |---|---|
 | ZAP rule logic changes | Weekly drift issue, then a port (optionally an automated PR) |
-| ZAP pattern list changes | `rules update` at runtime (layer 2) |
-| New CVE/exposure checks | Declarative templates, including Nuclei's (layer 3) |
+| ZAP pattern list changes | `scan data update` at runtime (layer 2) |
+| New CVE/exposure checks | `checks update` (Nuclei templates) and your own checks (layer 3) |
 | New ZAP rules | Listed under "not ported yet" in the drift report |

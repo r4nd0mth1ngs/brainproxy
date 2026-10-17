@@ -41,7 +41,7 @@ impl PassiveRule for InformationDisclosureInUrl {
         }
         for (name, value) in url_params(msg) {
             let lc = name.to_lowercase();
-            if let Some(s) = SENSITIVE_STRINGS.iter().find(|s| lc.contains(*s)) {
+            if let Some(s) = SENSITIVE_STRINGS.iter().find(|s| lc.contains(**s)) {
                 let info = format!(
                     "The URL contains potentially sensitive information. The following string was found via the \
                      pattern: {s}\n{name}"

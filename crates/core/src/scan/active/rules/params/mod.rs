@@ -136,6 +136,8 @@ mod e2e {
             points: PointOptions::default(),
             rules,
             exclude_rules: vec![],
+            no_rules: false,
+            checks: vec![],
             max_duration: Some(Duration::from_secs(120)),
             auth: None,
             oob: None,

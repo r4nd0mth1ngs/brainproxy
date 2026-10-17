@@ -53,7 +53,7 @@ impl PassiveRule for InformationDisclosureReferrer {
         }
         for r in msg.req_headers_named("referer") {
             let lc = r.to_lowercase();
-            if let Some((start, s)) = SENSITIVE_STRINGS.iter().find_map(|s| lc.find(s).map(|i| (i, s))) {
+            if let Some((start, s)) = SENSITIVE_STRINGS.iter().find_map(|s| lc.find(*s).map(|i| (i, s))) {
                 // Report the text as written; fall back to the list entry if lower-casing moved offsets.
                 let evidence = r.get(start..start + s.len()).filter(|e| e.eq_ignore_ascii_case(s)).unwrap_or(s);
                 out.push(
