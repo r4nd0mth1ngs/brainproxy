@@ -1,8 +1,8 @@
 # brainproxy handover
 
-State as of branch `feat/checks-dsl` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
-`feat/oob`, `feat/rule-updates`, and `feat/checks-dsl` (each branched from the previous one) are local and
-unpushed; `main` is pushed.
+State as of branch `feat/zap-rules` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
+`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, and `feat/zap-rules` (each branched from the previous
+one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -30,7 +30,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 384 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 400 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -51,9 +51,10 @@ crates/core/src/            engine library (everything testable lives here)
   race.rs, diff.rs          last-byte-sync race sending; comparer
   crawl.rs                  spider (links, forms, robots, sitemap, JS paths)
   jobs.rs                   background jobs table + JobControl (stop/progress)
-  scan/passive/             49 rules ported from ZAP pscanrules (+ data/ files from ZAP)
-  scan/active/              engine (mod.rs: Cx API), points.rs (insertion points),
-                            rules/ with 43 rules ported from ZAP ascanrules
+  scan/passive/             52 rules ported from ZAP pscanrules (+ data/ files from ZAP)
+  scan/active/              engine (mod.rs: Cx API, phased run), points.rs (insertion points),
+                            source_sink.rs (stored-input tracking), rules/ with 48 rules
+                            ported from ZAP ascanrules (all of them)
   scan/findings_db.rs       de-duplicated findings (hits), finding_types texts
   scan/report.rs            report model (findings + types + history evidence), JSON/MD/HTML/SARIF
   auth.rs                   auth sessions (profiles, login, relogin)
@@ -101,8 +102,8 @@ scripts/check.sh            pre-commit checks
 1. Intercepting proxy (CONNECT, TLS interception, WebSocket pass-through), CA, scope/rules,
    agent-driven intercept queue.
 2. Fuzzer (sniper, battering-ram, pitchfork, cluster-bomb), `send --race`, `diff`.
-3. Passive scanner: 49 ZAP rules, automatic incremental scanning, findings triage.
-4. Crawler, background jobs, immutable engagement scope, active scanner with 42 ZAP rules,
+3. Passive scanner: 49 ZAP rules (52 now), automatic incremental scanning, findings triage.
+4. Crawler, background jobs, immutable engagement scope, active scanner with 42 ZAP rules (48 now),
    ZAP drift detection, arm64 static builds.
 
 ## Authenticated testing (done)
@@ -253,14 +254,35 @@ Known limits / ideas:
 - `checks list` parses every template; an index in the store would make it instant.
 - Data files apply to commands started after the update (a running proxy keeps the old ones).
 
+## Remaining ZAP rules (done)
+
+Branch `feat/zap-rules`. Passive: CharsetMismatch 90011, Viewstate 10032, InsecureJsfViewState
+90001 (`scan/passive/rules/content/`). Active: XSLT Injection 90017, persistent XSS (Prime
+40016, Spider 40017, attack 40014), Heartbleed 20015. Only ZapVersion and UsernameIdor
+(pscanrules) remain unported, on purpose.
+
+Engine changes: `ActiveRule::phase` (units run phase by phase; each finishes before the
+next starts) and `ActiveRule::depends_on` (ZAP `getDependency`: `--rules 40014` pulls in
+40016/40017, excluding one drops the dependents). `source_sink.rs` ports commonlib
+SourceSinkUtils (markers `zApPX<n>sS`, sinks = target requests re-sent); Cx gained
+`source_value`, `test_for_sink`, `sinks`, `send_following_to`. `Cx::connect_raw(host, port)`
+returns a raw TCP stream from the guarded client (Heartbleed speaks TLS records over it;
+the scope still applies). Deviations are in docs/ACTIVE_RULES.md / PASSIVE_RULES.md.
+
+Tests: unit tests per rule, params e2e (XSLT vendor + false-positive trap, guestbook
+persistent XSS raw/escaped), `crates/core/tests/probes.rs` (Heartbleed against a TLS stub).
+Live on the lab target: no findings from the new rules (it isn't ASP.NET/JSF/XSLT; stored
+input is behind a login we have no credentials for; it serves plain HTTP).
+
+Ideas: ZAP's SSTI rule also checks persistent-XSS sink pages (SSTI 90035 here only checks
+reflected output); `source_sink` could feed it.
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
 2. Checks: `--check-var`, payload files, interactsh mapping (see "Checks DSL subset").
-3. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
-   ViewState rules, CharsetMismatch, Heartbleed.
-4. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
-5. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
+3. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
+4. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session
 
@@ -268,7 +290,7 @@ Known limits / ideas:
   merged and removed.
 - Several turns in the cloud session were cut off by an automated safety filter while
   working on the active rules and on auth wiring; the XSLT injection port was abandoned for
-  that reason. Nothing partial was committed (each interrupted step was reverted), and
+  that reason (it was finished later on `feat/zap-rules`). Nothing partial was committed (each interrupted step was reverted), and
   `scripts/check.sh` passes on `main`.
 - `/tmp`-style test projects: tests create their own temp dirs; no external services are
   needed, but `curl` must be installed for `crates/cli/tests/proxy.rs`.
