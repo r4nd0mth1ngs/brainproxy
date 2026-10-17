@@ -204,3 +204,38 @@ fn timeout_and_output_bounds() {
     assert!(text.ends_with("[output cut off at 64 bytes]"), "{text}");
     assert!(r["result"].get("structuredContent").is_none());
 }
+
+#[test]
+fn concurrent_calls_and_cancellation() {
+    // A server that never answers, so `send` hangs until killed; reports when the client hangs up.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (closed_tx, closed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        while s.read(&mut buf).is_ok_and(|n| n > 0) {}
+        let _ = closed_tx.send(());
+    });
+    let mut m = Mcp::start(&tmp_project("cancel"), &[]);
+    m.request("tools/call", json!({"name": "engagement_start", "arguments": {"targets": ["127.0.0.1"]}}));
+    let hang = json!({"name": "send", "arguments": {"url": format!("http://127.0.0.1:{port}/"), "timeout": 20}});
+    m.send_line(&json!({"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": hang}).to_string());
+
+    // Other requests are answered while the call runs.
+    assert_eq!(m.request("ping", Value::Null)["result"], json!({}));
+    let (err, env) = m.call("encode", json!({"kind": "hex", "input": "A"}));
+    assert!(!err);
+    assert_eq!(env["data"]["output"]["content"], "41");
+
+    // A duplicate id is refused while the first call runs.
+    m.send_line(&json!({"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": hang}).to_string());
+    assert_eq!(m.read()["error"]["code"], -32600);
+
+    // Cancelled: the child is killed and no response is sent for it.
+    let started = std::time::Instant::now();
+    m.send_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"slow"}}"#);
+    closed.recv_timeout(std::time::Duration::from_secs(5)).expect("cancelled send still connected");
+    assert!(started.elapsed().as_secs() < 5);
+    assert_eq!(m.request("ping", Value::Null)["result"], json!({}));
+}

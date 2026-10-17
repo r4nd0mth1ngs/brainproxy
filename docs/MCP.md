@@ -35,8 +35,16 @@ the server's working directory.
 
 Notifications (`notifications/initialized`, `notifications/cancelled`, ...) get no reply.
 Errors: `-32700` parse error, `-32600` not a request object, `-32601` unknown method,
-`-32602` unknown tool, unknown argument, or wrongly typed argument. Calls are handled one at
-a time in order.
+`-32602` unknown tool, unknown argument, or wrongly typed argument, `-32000` too many calls.
+
+Tool calls run concurrently, each on its own thread and child process, up to 16 at once
+(more are refused with `-32000`; a second call with the id of a running one gets `-32600`),
+so a long `job_wait` doesn't hold up other calls; replies can arrive out of order. Other
+requests are answered right away. `notifications/cancelled` with a running call's
+`requestId` kills its child process, and no response is sent for that call. When stdin
+closes, running calls are killed and the server exits. The project DB is SQLite in WAL mode
+with a busy timeout, so concurrent commands share it the same way background jobs and the
+proxy do.
 
 ## Tools
 

@@ -30,7 +30,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 423 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 424 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -387,13 +387,15 @@ possible values -> enum), plus `stdin` where the command's help mentions stdin. 
 child process (like `jobs_cmd::spawn_background`), so the scope, envelope, and exit codes
 are the CLI's own and process-global state (stdout, exit) needs no refactor. Child stdin is
 the `stdin` argument or null. Bounds: `--max-output` (stdout cap, cut-off marker),
-`--timeout` (kill, `timeout` envelope), stderr up to 4 KB on failure. Calls run serially.
+`--timeout` (kill, `timeout` envelope), stderr up to 4 KB on failure. Calls run concurrently
+(thread + child each, max 16, replies written under a stdout lock); `notifications/cancelled`
+sets the call's flag, the wait loop kills the child, and the reply is dropped; stdin EOF
+cancels everything and joins.
 Tests: unit tests in mcp.rs (argv building, schema types), `crates/cli/tests/mcp.rs`
 (protocol errors, tool list, scope refusal, send via url and stdin, history/query, timeout,
-output cap). Live: initialize/engagement_start/send/findings_list against the lab target.
+output cap, concurrent calls, cancellation closing the target connection). Live: initialize/engagement_start/send/findings_list against the lab target.
 
-Ideas: concurrent calls (thread per call, serialized writes) and `notifications/cancelled`
-handling; `readOnlyHint`/`destructiveHint` tool annotations; MCP resources for `schema` and
+Ideas: progress notifications for `job_wait`; `readOnlyHint`/`destructiveHint` tool annotations; MCP resources for `schema` and
 reports.
 
 ## Backlog (suggested order)

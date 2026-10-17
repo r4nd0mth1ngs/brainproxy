@@ -6,11 +6,15 @@
 //! arguments, `--format json`, and the server's `--project`/`--home`, so it goes through
 //! exactly the same code, scope checks, and JSON envelope as a shell invocation. The
 //! child's stdin is the call's `stdin` argument or empty, never the server's stdin.
+//! Tool calls run concurrently (one thread each, up to MAX_CALLS) and can be cancelled.
 
 use std::any::TypeId;
+use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use brainproxy_core::Error;
@@ -24,14 +28,17 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// return (their `start` variants run them in the background).
 const EXCLUDED: &[&str] = &["mcp serve", "proxy run", "oob run"];
 
+/// Tool calls that may run at once; more are refused until one finishes.
+const MAX_CALLS: usize = 16;
+
 #[derive(clap::Subcommand)]
 pub enum McpCmd {
     /// Serve the CLI as MCP tools over stdio (JSON-RPC 2.0, one message per line).
     #[command(after_help = "One tool per command (`history list` -> history_list); tool arguments are the \
         command's flags and positionals by name, plus `stdin` where the command reads it. Each call runs \
         `brainproxy --format json --project P ...` as a child process and returns its JSON envelope; isError \
-        is set when the exit code is not 0. Calls run one at a time; use --background and job_wait for long \
-        work. See docs/MCP.md.")]
+        is set when the exit code is not 0. Calls run concurrently and can be cancelled \
+        (notifications/cancelled); use --background and job_wait for long work. See docs/MCP.md.")]
     Serve(ServeArgs),
 }
 
@@ -51,59 +58,113 @@ struct Server {
     home: Option<PathBuf>,
     timeout: Duration,
     max_output: usize,
+    /// Cancel flags of the tool calls in progress, by request id (JSON text).
+    calls: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    stdout: Mutex<std::io::Stdout>,
 }
 
 pub fn serve(root: Command, project: &Path, home: Option<&Path>, args: ServeArgs) -> Result<(), Error> {
-    let server = Server {
+    let server = Arc::new(Server {
         root,
         project: project.to_path_buf(),
         home: home.map(Path::to_path_buf),
         timeout: Duration::from_secs(args.timeout),
         max_output: args.max_output,
-    };
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
+        calls: Mutex::default(),
+        stdout: Mutex::new(std::io::stdout()),
+    });
+    let mut workers = Vec::new();
+    for line in std::io::stdin().lock().lines() {
         let line = line?;
-        if line.trim().is_empty() {
-            continue;
+        if !line.trim().is_empty() {
+            workers.retain(|w: &std::thread::JoinHandle<()>| !w.is_finished());
+            workers.extend(server.handle(&line));
         }
-        if let Some(reply) = server.handle(&line) {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
-        }
+    }
+    // The client hung up: stop what is still running.
+    for flag in server.calls.lock().unwrap().values() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    for w in workers {
+        let _ = w.join();
     }
     Ok(())
 }
 
 impl Server {
-    /// Handles one message; returns the response, or None for notifications.
-    fn handle(&self, line: &str) -> Option<Value> {
+    fn reply(&self, msg: Value) {
+        let mut out = self.stdout.lock().unwrap();
+        let _ = writeln!(out, "{msg}");
+        let _ = out.flush();
+    }
+
+    /// Handles one message. Tool calls run on their own thread, which is returned.
+    fn handle(self: &Arc<Self>, line: &str) -> Option<std::thread::JoinHandle<()>> {
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(e) => return Some(rpc_error(Value::Null, -32700, &format!("parse error: {e}"))),
+            Err(e) => {
+                self.reply(rpc_error(Value::Null, -32700, &format!("parse error: {e}")));
+                return None;
+            }
         };
         let Some(obj) = msg.as_object() else {
-            return Some(rpc_error(Value::Null, -32600, "expected a JSON-RPC request object"));
+            self.reply(rpc_error(Value::Null, -32600, "expected a JSON-RPC request object"));
+            return None;
         };
         let id = obj.get("id").cloned();
+        let params = obj.get("params").cloned().unwrap_or(Value::Null);
         let Some(method) = obj.get("method").and_then(Value::as_str) else {
             // A response from the client (we send no requests) or garbage.
-            return id.map(|id| rpc_error(id, -32600, "missing method"));
+            if let Some(id) = id {
+                self.reply(rpc_error(id, -32600, "missing method"));
+            }
+            return None;
         };
-        let id = id?; // notifications (initialized, cancelled, ...) need no reply
-        let params = obj.get("params").cloned().unwrap_or(Value::Null);
+        let Some(id) = id else {
+            // Notifications need no reply; a cancelled call is killed and gets none either.
+            if method == "notifications/cancelled" {
+                if let Some(flag) = self.calls.lock().unwrap().get(&params["requestId"].to_string()) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            return None;
+        };
         let result = match method {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": self.tools()})),
-            "tools/call" => self.call(&params),
+            "tools/call" => return self.spawn_call(id, params),
             _ => Err((-32601, format!("method not found: {method}"))),
         };
-        Some(match result {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err((code, msg)) => rpc_error(id, code, &msg),
-        })
+        self.reply(response(id, result));
+        None
+    }
+
+    fn spawn_call(self: &Arc<Self>, id: Value, params: Value) -> Option<std::thread::JoinHandle<()>> {
+        let key = id.to_string();
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut calls = self.calls.lock().unwrap();
+            if calls.contains_key(&key) {
+                drop(calls);
+                self.reply(rpc_error(id, -32600, "a call with this id is already running"));
+                return None;
+            }
+            if calls.len() >= MAX_CALLS {
+                drop(calls);
+                self.reply(rpc_error(id, -32000, &format!("too many calls in progress (max {MAX_CALLS})")));
+                return None;
+            }
+            calls.insert(key.clone(), flag.clone());
+        }
+        let server = self.clone();
+        Some(std::thread::spawn(move || {
+            let result = server.call(&params, &flag);
+            server.calls.lock().unwrap().remove(&key);
+            if !flag.load(Ordering::Relaxed) {
+                server.reply(response(id, result));
+            }
+        }))
     }
 
     fn initialize(&self, params: &Value) -> Value {
@@ -131,7 +192,7 @@ impl Server {
         tools
     }
 
-    fn call(&self, params: &Value) -> Result<Value, (i64, String)> {
+    fn call(&self, params: &Value, cancel: &AtomicBool) -> Result<Value, (i64, String)> {
         let name = params["name"].as_str().ok_or((-32602, "missing tool name".to_string()))?;
         let empty = Map::new();
         let args = match &params["arguments"] {
@@ -153,11 +214,11 @@ impl Server {
             Some(Value::String(_)) => return Err((-32602, format!("{name} does not read stdin"))),
             Some(_) => return Err((-32602, "stdin must be a string".into())),
         };
-        Ok(self.run(&path.join(" "), &argv, stdin))
+        Ok(self.run(&path.join(" "), &argv, stdin, cancel))
     }
 
     /// Runs `brainproxy <argv>` with the server's globals and returns an MCP tool result.
-    fn run(&self, command: &str, argv: &[String], stdin: Option<Vec<u8>>) -> Value {
+    fn run(&self, command: &str, argv: &[String], stdin: Option<Vec<u8>>, cancel: &AtomicBool) -> Value {
         let exe = match std::env::current_exe() {
             Ok(e) => e,
             Err(e) => return failure(command, "io", &format!("can't find own executable: {e}")),
@@ -183,7 +244,9 @@ impl Server {
         let status = loop {
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) if Instant::now() < deadline && !cancel.load(Ordering::Relaxed) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -234,6 +297,13 @@ fn drain(pipe: Option<impl Read + Send + 'static>, max: usize) -> std::thread::J
 fn failure(command: &str, kind: &str, message: &str) -> Value {
     let env = json!({"ok": false, "command": command, "error": {"kind": kind, "message": message}});
     json!({"content": [{"type": "text", "text": env.to_string()}], "isError": true, "structuredContent": env})
+}
+
+fn response(id: Value, result: Result<Value, (i64, String)>) -> Value {
+    match result {
+        Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+        Err((code, msg)) => rpc_error(id, code, &msg),
+    }
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
