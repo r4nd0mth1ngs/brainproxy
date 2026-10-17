@@ -250,7 +250,10 @@ impl Guard {
             Err(_) => {
                 // Refuse names no scope could allow before touching DNS.
                 self.precheck_name(bare, port)?;
-                let named = self.scopes.iter().all(|sc| sc.include.iter().any(|e| e.matches_name(&bare.to_ascii_lowercase(), port)));
+                let named = self
+                    .scopes
+                    .iter()
+                    .all(|sc| sc.include.iter().any(|e| e.matches_name(&bare.to_ascii_lowercase(), port)));
                 match tokio::net::lookup_host((bare, port)).await {
                     Ok(addrs) => addrs.map(|a| a.ip()).collect(),
                     // A name that every scope lists by name is in scope; it just doesn't resolve.
