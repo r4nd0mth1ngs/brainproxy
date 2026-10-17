@@ -1,12 +1,12 @@
 //! Ported from ZAP SstiBlindScanRule (ascanrules, Apache License 2.0).
 //!
-//! Only the time based checks are ported; ZAP's out-of-band variant (payloads
-//! running `curl`/`wget` against an OAST callback at HIGH/INSANE strength) needs
-//! a callback service and is omitted.
+//! The out-of-band variant (payloads running `curl`/`wget` against a callback
+//! URL at HIGH/INSANE strength) uses the OOB listener when one is running
+//! (`brainproxy oob start`); an interaction raises the alert later.
 
 use super::common::point;
 use super::timing::{check_timing, fractional_seconds, sleep_seconds, TimingOutcome};
-use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
+use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -26,6 +26,8 @@ static ALERT: AlertDef = AlertDef {
 static ALERTS: [&AlertDef; 1] = [&ALERT];
 
 const SECONDS_PLACEHOLDER: &str = "X_SECONDS_X";
+const WAYS_TO_MAKE_HTTP_REQUESTS_CMD_LINE: [&str; 2] = ["curl X_URL_X", "wget X_URL_X"];
+const CALLBACK_OTHER_INFO: &str = "Received callback from the server.";
 
 // Most of the exploits were created by James Kettle (@albinowax) and the Tplmap author.
 const JAVA_PAYLOADS: &[&str] = &[
@@ -104,11 +106,35 @@ impl ActiveRule for SstiBlind {
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
         Box::pin(async move {
             // As in ZAP, a finding ends the payloads of its language only; the other
-            // languages are still tried. Attack strength only drives the omitted OAST part.
+            // languages are still tried.
             for payloads in LANGUAGES {
+                callback_tests(cx, payloads).await;
                 time_based_tests(cx, payloads).await;
             }
         })
+    }
+}
+
+/// sendPayloadsToMakeCallBack: one command at HIGH, all at INSANE, none below.
+async fn callback_tests(cx: &Cx, payloads: &[&str]) {
+    let commands = match cx.strength() {
+        Strength::High => 1,
+        Strength::Insane => WAYS_TO_MAKE_HTTP_REQUESTS_CMD_LINE.len(),
+        _ => return,
+    };
+    let (param, _) = point(cx);
+    for command in &WAYS_TO_MAKE_HTTP_REQUESTS_CMD_LINE[..commands] {
+        for p in payloads {
+            if cx.stopped() {
+                return;
+            }
+            let Some(oob) = cx.oob_payload() else { return };
+            let attack = p.replace("X_COMMAND_X", command).replace("X_URL_X", &oob.url);
+            let request = cx.payload_request(&attack);
+            let resp = cx.send(request.clone()).await.ok();
+            let finding = ALERT.raise(param.clone(), "").attack(attack).other_info(CALLBACK_OTHER_INFO);
+            cx.oob_register(&oob, finding, &request, resp.as_ref());
+        }
     }
 }
 

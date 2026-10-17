@@ -12,6 +12,7 @@ pub mod fuzz;
 pub mod guard;
 pub mod http;
 pub mod jobs;
+pub mod oob;
 pub mod proxy;
 pub mod race;
 pub mod scan;

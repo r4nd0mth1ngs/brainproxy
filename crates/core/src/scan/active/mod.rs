@@ -5,6 +5,10 @@
 //! Every request goes through the HTTP client and therefore the engagement scope
 //! guard. Attack exchanges are recorded in history (source "scan") only when they
 //! back a finding.
+//!
+//! Out-of-band checks register their payloads (`Cx::oob_payload`/`oob_register`);
+//! after the last unit, `run` waits up to `ActiveConfig::oob_wait` while
+//! correlating interactions the OOB listener received (see `crate::oob`).
 
 pub mod points;
 pub mod rules;
@@ -25,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
+use crate::oob::{self, Endpoint, Payload, ScanPayload};
 use crate::scan::{AlertDef, Finding, Message};
 use crate::store::Store;
 pub use points::{InsertionPoint, PointKind, PointOptions};
@@ -144,12 +149,22 @@ pub struct Base {
     pub response: Response,
 }
 
-struct Report {
-    target: Target,
-    finding: Finding,
-    request: Vec<u8>,
-    response: Vec<u8>,
-    duration_ms: i64,
+enum Report {
+    Finding {
+        target: Target,
+        finding: Finding,
+        request: Vec<u8>,
+        response: Vec<u8>,
+        duration_ms: i64,
+    },
+    Oob {
+        target: Target,
+        token: String,
+        finding: Finding,
+        request: Vec<u8>,
+        response: Option<Vec<u8>>,
+        duration_ms: Option<i64>,
+    },
 }
 
 struct Shared {
@@ -166,6 +181,10 @@ struct Shared {
     once: Mutex<HashSet<String>>,
     /// Soft-404 signatures per origin: (status, body length bucket, body start).
     not_found: tokio::sync::Mutex<HashMap<String, Option<(u16, String)>>>,
+    oob: Option<Endpoint>,
+    /// The endpoint per target origin (see `Endpoint::for_target`).
+    oob_by_origin: Mutex<HashMap<String, Endpoint>>,
+    oob_payloads: AtomicU64,
 }
 
 /// Everything a rule needs for one unit of work.
@@ -330,12 +349,50 @@ impl Cx {
     /// Records a finding with the exchange that proves it.
     pub fn report(&self, finding: Finding, resp: &Response) {
         *self.shared.raised.lock().unwrap().entry(finding.def.alert_ref).or_default() += 1;
-        let _ = self.shared.reports.lock().unwrap().send(Report {
+        let _ = self.shared.reports.lock().unwrap().send(Report::Finding {
             target: self.base.target.clone(),
             finding,
             request: resp.request.clone(),
             response: resp.raw.clone(),
             duration_ms: resp.duration.as_millis() as i64,
+        });
+    }
+
+    /// A fresh out-of-band payload, or None when no OOB listener is running
+    /// (rules then skip their out-of-band checks, like ZAP without OAST).
+    pub fn oob_payload(&self) -> Option<Payload> {
+        let base = self.shared.oob.as_ref()?;
+        let t = &self.base.target;
+        let ep = self
+            .shared
+            .oob_by_origin
+            .lock()
+            .unwrap()
+            .entry(t.origin())
+            .or_insert_with(|| base.for_target(&t.host, t.port))
+            .clone();
+        ep.payload().ok()
+    }
+
+    /// The base request with the insertion point set to `value` (escaped), for
+    /// rules that need the attack request before sending it.
+    pub fn payload_request(&self, value: &str) -> Vec<u8> {
+        points::inject(&self.base.request, self.point(), value, true)
+    }
+
+    /// Registers the attack that carried `payload`: an interaction with its token
+    /// later raises `finding` (evidence and other info are filled in then).
+    /// `request` is the attack as built; the sent request and the response are
+    /// taken from `resp` when the attack got one.
+    pub fn oob_register(&self, payload: &Payload, finding: Finding, request: &[u8], resp: Option<&Response>) {
+        self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
+        let _ = self.shared.reports.lock().unwrap().send(Report::Oob {
+            target: self.base.target.clone(),
+            token: payload.token.clone(),
+            finding,
+            request: resp.map_or_else(|| request.to_vec(), |r| r.request.clone()),
+            response: resp.map(|r| r.raw.clone()),
+            duration_ms: resp.map(|r| r.duration.as_millis() as i64),
         });
     }
 }
@@ -369,6 +426,11 @@ impl Limiter {
     }
 }
 
+/// The active rules' alert definition for `alert_ref`.
+pub fn alert_def(alert_ref: &str) -> Option<&'static AlertDef> {
+    all_rules().iter().flat_map(|r| r.alerts().iter().copied()).find(|a| a.alert_ref == alert_ref)
+}
+
 pub fn all_rules() -> &'static [Box<dyn ActiveRule>] {
     static RULES: OnceLock<Vec<Box<dyn ActiveRule>>> = OnceLock::new();
     RULES.get_or_init(rules::all)
@@ -387,6 +449,21 @@ pub struct ActiveConfig {
     pub max_duration: Option<Duration>,
     /// Logged-in session applied to every request (an attacked cookie keeps its payload).
     pub auth: Option<Arc<AuthSession>>,
+    /// Running OOB listener's public endpoint; None skips out-of-band checks.
+    pub oob: Option<Endpoint>,
+    /// How long to wait for out-of-band interactions after the last unit.
+    pub oob_wait: Duration,
+}
+
+/// Out-of-band part of a scan.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct OobSummary {
+    pub payloads: u64,
+    /// Interactions correlated during this scan (any token).
+    pub interactions: usize,
+    /// Interactions that matched a scan payload and raised a finding hit.
+    pub matched: usize,
+    pub waited_ms: u64,
 }
 
 /// A request to attack, with its baseline response.
@@ -411,6 +488,8 @@ pub struct ActiveSummary {
     /// Findings raised in this run, per alert ref.
     pub raised: BTreeMap<String, usize>,
     pub new_findings: usize,
+    /// None when no OOB listener was running (out-of-band checks skipped).
+    pub oob: Option<OobSummary>,
     pub stopped: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
@@ -435,15 +514,33 @@ pub async fn run(
     // Recorder: attack exchanges that back findings go to history, then findings.
     let (tx, rx) = mpsc::channel::<Report>();
     let mut store = Store::open(project)?;
-    let writer = std::thread::spawn(move || -> Result<usize> {
+    let writer = std::thread::spawn(move || -> Result<(usize, Store)> {
         let mut new = 0;
         while let Ok(r) = rx.recv() {
-            let cap = Capture::new("scan", &r.target, &r.request, Some(&r.response), Some(r.duration_ms), None);
-            let id = store.record(&cap)?;
-            let msg = Message::from_exchange(id, &r.target, &r.request, &r.response);
-            new += store.record_findings("active", &msg, std::slice::from_ref(&r.finding))?;
+            match r {
+                Report::Finding { target, finding, request, response, duration_ms } => {
+                    let cap = Capture::new("scan", &target, &request, Some(&response), Some(duration_ms), None);
+                    let id = store.record(&cap)?;
+                    let msg = Message::from_exchange(id, &target, &request, &response);
+                    new += store.record_findings("active", &msg, std::slice::from_ref(&finding))?;
+                }
+                Report::Oob { target, token, finding, request, response, duration_ms } => {
+                    store.oob_add_scan_payload(&ScanPayload {
+                        token: &token,
+                        alert_ref: finding.def.alert_ref,
+                        rule_id: finding.def.alert_ref.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                        param: &finding.param,
+                        attack: &finding.attack,
+                        other_info: &finding.other_info,
+                        target: &target,
+                        request: &request,
+                        response: response.as_deref(),
+                        duration_ms,
+                    })?;
+                }
+            }
         }
-        Ok(new)
+        Ok((new, store))
     });
 
     let shared = Arc::new(Shared {
@@ -461,6 +558,9 @@ pub async fn run(
         raised: Mutex::new(BTreeMap::new()),
         once: Mutex::new(HashSet::new()),
         not_found: tokio::sync::Mutex::new(HashMap::new()),
+        oob: cfg.oob.clone(),
+        oob_by_origin: Mutex::new(HashMap::new()),
+        oob_payloads: AtomicU64::new(0),
     });
 
     // Build units of work.
@@ -522,16 +622,44 @@ pub async fn run(
         let _ = t.await;
     }
 
-    let summary_raised = shared.raised.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let mut summary_raised: BTreeMap<String, usize> =
+        shared.raised.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let requests = shared.requests.load(Ordering::Relaxed);
     let timed_out = shared.deadline.is_some_and(|d| Instant::now() >= d);
+    let oob_payloads = shared.oob_payloads.load(Ordering::Relaxed);
+    let oob_enabled = shared.oob.is_some();
     // Close the channel so the writer finishes.
     *shared.reports.lock().unwrap() = mpsc::channel().0;
     drop(shared);
-    let new_findings = tokio::task::spawn_blocking(move || writer.join())
+    let (mut new_findings, mut store) = tokio::task::spawn_blocking(move || writer.join())
         .await
         .map_err(|e| Error::Protocol(e.to_string()))?
         .map_err(|_| Error::Protocol("active scan writer panicked".into()))??;
+
+    // Deferred out-of-band check: correlate until the wait is over (not at all
+    // when stopped), so slow callbacks still count without blocking the units.
+    let oob = if oob_enabled {
+        let waited = Instant::now();
+        let wait = if oob_payloads > 0 && !ctl.stopped() { cfg.oob_wait } else { Duration::ZERO };
+        let mut s = OobSummary { payloads: oob_payloads, ..Default::default() };
+        loop {
+            let c = oob::correlate(&mut store, alert_def)?;
+            s.interactions += c.interactions;
+            s.matched += c.matched;
+            new_findings += c.new_findings;
+            for r in c.raised {
+                *summary_raised.entry(r).or_default() += 1;
+            }
+            if waited.elapsed() >= wait || ctl.stopped() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250).min(wait.saturating_sub(waited.elapsed()))).await;
+        }
+        s.waited_ms = waited.elapsed().as_millis() as u64;
+        Some(s)
+    } else {
+        None
+    };
 
     Ok(ActiveSummary {
         targets: targets.len(),
@@ -542,6 +670,7 @@ pub async fn run(
         requests,
         raised: summary_raised,
         new_findings,
+        oob,
         stopped: ctl.stopped(),
         timed_out,
         elapsed_ms: started.elapsed().as_millis() as u64,

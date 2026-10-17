@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` runs 42 rules ported from OWASP ZAP's `ascanrules` add-on (and
+`brainproxy scan active` runs 43 rules ported from OWASP ZAP's `ascanrules` add-on (and
 helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
@@ -42,6 +42,7 @@ rules can only reach targets the engagement allows, including when following red
 | 40034 | .env Information Leak | page | medium | 40034-1 |
 | 40035 | Hidden File Finder | host | medium | 40035 |
 | 40042 | Spring Actuator Information Leak | host | medium | 40042 |
+| 40043 | Log4Shell (needs `oob start`) | param | high | 40043-1, 40043-2 |
 | 40044 | Exponential Entity Expansion (Billion Laughs Attack) | page | medium | 40044 |
 | 40045 | Spring4Shell | page | high | 40045 |
 | 40048 | Remote Code Execution (React2Shell) | host | high | 40048 |
@@ -58,9 +59,8 @@ rules can only reach targets the engagement allows, including when following red
 Scopes: `param` runs once per insertion point (query, form, JSON; cookies and headers when
 enabled), `page` once per target request, `host` once per scheme://host:port.
 
-Not ported yet (listed in `zap-sync.json`): XSLT Injection, Log4Shell and out-of-band
-checks (need a callback server), Persistent XSS (needs cross-request state), Heartbleed
-(raw TLS).
+Not ported yet (listed in `zap-sync.json`): XSLT Injection, Persistent XSS (needs
+cross-request state), Heartbleed (raw TLS).
 
 ## Differences from ZAP
 
@@ -69,8 +69,13 @@ checks (need a callback server), Persistent XSS (needs cross-request state), Hea
   per-strength request budgets.
 - **No technology filtering:** ZAP can skip checks for technologies a site doesn't use;
   brainproxy runs every check (ZAP's default with all technologies in scope).
-- **Out-of-band variants omitted:** XXE's external-entity callback checks, the blind SSTI
-  callback payloads, and similar OAST-only parts aren't run.
+- **Out-of-band checks** use brainproxy's own listener (`brainproxy oob start`, see
+  [OOB.md](OOB.md)) instead of ZAP's OAST add-on; without a running listener they are
+  skipped. Interactions are correlated after the last check (`--oob-wait`) and by
+  `oob poll`; the alert has no evidence (repeat callbacks count as hits) and the
+  interaction goes to other info. Log4Shell puts the token in the JNDI path instead of
+  `abc`, skips the DNS-only patterns in host mode, and has no Java technology filter. XXE's
+  check #1 (ZAP's own callback service) is covered by check #2 and not run separately.
 - **Timing rules** port ZAP's TimingUtils regression; the sleep time is fixed at ZAP's
   default of 5 seconds.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and

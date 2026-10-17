@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -348,6 +348,9 @@ impl Store {
         }
         if version < 7 {
             self.conn.execute_batch(crate::auth::SCHEMA)?;
+        }
+        if version < 8 {
+            self.conn.execute_batch(crate::oob::SCHEMA)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

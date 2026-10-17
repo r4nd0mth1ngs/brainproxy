@@ -9,6 +9,7 @@ mod engagement_cmd;
 mod fuzz_cmd;
 mod import_cmd;
 mod jobs_cmd;
+mod oob_cmd;
 mod output;
 mod proxy_cmd;
 mod report_cmd;
@@ -116,6 +117,15 @@ enum Cmd {
     /// built with example values, sent in scope, and recorded as history source 'import'.
     #[command(subcommand)]
     Import(import_cmd::ImportCmd),
+
+    /// Out-of-band callback listener (HTTP/LDAP/TLS/DNS) to confirm blind issues; payloads and polling.
+    #[command(
+        subcommand,
+        after_help = "Active rules with out-of-band checks (Log4Shell 40043, XXE 90023, blind SSTI 90036) use the \
+        listener automatically while it runs. Behind NAT set --public-host/--public-port (and --domain with \
+        --dns-listen for DNS callbacks)."
+    )]
+    Oob(oob_cmd::OobCmd),
 
     /// Background jobs (crawl/scan/import --background): list, status, wait, stop.
     #[command(subcommand)]
@@ -349,6 +359,14 @@ fn command_name(cmd: &Cmd) -> String {
             auth_cmd::AuthCmd::Remove { .. } => "auth remove",
         },
         Cmd::Job(_) => "job",
+        Cmd::Oob(c) => match c {
+            oob_cmd::OobCmd::Start(_) => "oob start",
+            oob_cmd::OobCmd::Run(_) => "oob run",
+            oob_cmd::OobCmd::Stop => "oob stop",
+            oob_cmd::OobCmd::Status => "oob status",
+            oob_cmd::OobCmd::Payload { .. } => "oob payload",
+            oob_cmd::OobCmd::Poll { .. } => "oob poll",
+        },
         Cmd::Findings(_) => "findings",
         Cmd::Report(_) => "report",
         Cmd::Scope(_) => "scope",
@@ -398,6 +416,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Import(cmd) => import_cmd::import(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
+        Cmd::Oob(cmd) => oob_cmd::oob(&cli.project, cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
         Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
@@ -600,6 +619,8 @@ fn schema_json() -> Value {
             {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
             {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Manage with the auth command."},
             {"name": "jobs", "description": "Background jobs (crawl, active scan).", "columns": cols(brainproxy_core::jobs::JOB_COLUMNS)},
+            {"name": "oob_payloads", "description": "Out-of-band payload tokens: from active rules (source scan) or `oob payload` (manual).", "columns": cols(brainproxy_core::oob::PAYLOAD_COLUMNS)},
+            {"name": "oob_interactions", "description": "Interactions received by the OOB listener. Join oob_payloads ON token.", "columns": cols(brainproxy_core::oob::INTERACTION_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),

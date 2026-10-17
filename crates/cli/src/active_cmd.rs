@@ -66,6 +66,12 @@ pub struct ActiveArgs {
     /// Scan logged in with this auth profile; re-logs in when the session is lost.
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
+    /// Seconds to wait for out-of-band callbacks after the last check (needs `oob start`).
+    #[arg(long, default_value_t = 5.0)]
+    oob_wait: f64,
+    /// Skip out-of-band checks even when an OOB listener is running.
+    #[arg(long)]
+    no_oob: bool,
     /// Run detached; returns a job id for `job wait|status|stop`.
     #[arg(long)]
     background: bool,
@@ -129,6 +135,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         exclude_rules: args.exclude_rules.clone(),
         max_duration: args.max_minutes.map(|m| Duration::from_secs_f64(m * 60.0)),
         auth: auth.clone(),
+        oob: if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) },
+        oob_wait: Duration::from_secs_f64(args.oob_wait.clamp(0.0, 3600.0)),
     };
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -149,6 +157,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         v["hint"] = json!(
             "Details: brainproxy findings show ID; all active findings: brainproxy findings list --source active"
         );
+        if v["oob"].is_null() && !args.no_oob {
+            v["oob_hint"] = json!("Out-of-band checks were skipped: no OOB listener (brainproxy oob start).");
+        } else if !v["oob"].is_null() {
+            v["oob_hint"] = json!("Callbacks that arrive later are raised by `brainproxy oob poll`.");
+        }
         Ok(v)
     })?;
     out.ok(result.clone(), || {

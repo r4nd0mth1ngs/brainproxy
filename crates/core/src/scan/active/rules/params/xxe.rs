@@ -1,10 +1,10 @@
 //! Ported from ZAP XxeScanRule (ascanrules, Apache License 2.0).
 //!
-//! Omitted: ZAP's checks #1 (remote file inclusion through ZAP's callback service)
-//! and #2 (out-of-band via OAST), which need a callback server brainproxy does not
-//! have. At LOW strength ZAP only runs those, so this port sends nothing at LOW.
-//! The local file reflection (MEDIUM and up) and local file inclusion (HIGH and up)
-//! checks are ported. The original body is not passed through `MessageFormat` (ZAP
+//! Check #2 (out-of-band via OAST) uses the OOB listener when one is running
+//! (`brainproxy oob start`); an interaction raises the alert later. Omitted:
+//! check #1 (remote file inclusion through ZAP's own callback service), which
+//! the OOB check covers. The local file reflection (MEDIUM and up) and local file
+//! inclusion (HIGH and up) checks are ported. The original body is not passed through `MessageFormat` (ZAP
 //! would drop single quotes from it); only the `{0}` in the attack header is filled.
 
 use std::sync::LazyLock;
@@ -117,7 +117,20 @@ impl ActiveRule for Xxe {
         Box::pin(async move {
             let is_xml =
                 cx.base().req_headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("xml"));
-            if !is_xml || cx.strength() == Strength::Low {
+            if !is_xml {
+                return;
+            }
+            // Check #2: out-of-band file inclusion, over http and then https with
+            // the same token (registered once, like ZAP).
+            if let Some(p) = cx.oob_payload() {
+                let attack = format!("{}{ATTACK_BODY}", header_for(&p.url));
+                let request = with_body(cx, &attack);
+                let resp = cx.send_following(request.clone()).await.ok();
+                cx.oob_register(&p, ALERT.raise("", "").attack(attack), &request, resp.as_ref());
+                let https = p.url.replacen("http://", "https://", 1);
+                let _ = cx.send_following(with_body(cx, &format!("{}{ATTACK_BODY}", header_for(&https)))).await;
+            }
+            if cx.strength() == Strength::Low || cx.stopped() {
                 return;
             }
             // Check #3: local file reflection.

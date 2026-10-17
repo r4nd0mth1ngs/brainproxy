@@ -149,6 +149,8 @@ async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget
         exclude_rules: vec![],
         max_duration: None,
         auth: None,
+        oob: None,
+        oob_wait: std::time::Duration::ZERO,
     };
     let path = project(name);
     let summary = run(&path, targets, cfg, JobControl::default()).await.unwrap();

@@ -1,7 +1,7 @@
 # brainproxy handover
 
-State as of branch `feat/api-import` (2026-10-17). `feat/auth-wiring`, `feat/reports`, and `feat/api-import` (each
-branched from the previous one) are local and unpushed; `main` is pushed.
+State as of branch `feat/oob` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`, and `feat/oob`
+(each branched from the previous one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -29,7 +29,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 349 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 358 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -43,7 +43,7 @@ status couldn't be checked from the cloud session, so look at the Actions tab fi
 crates/core/src/            engine library (everything testable lives here)
   http/                     raw HTTP/1.x: request/response parsing, WireReader, client (rustls)
   guard.rs                  engagement + system scope; enforced in Client::connect
-  store.rs                  SQLite project store (schema v7, migrations in Store::migrate)
+  store.rs                  SQLite project store (schema v8, migrations in Store::migrate)
   capture.rs                raw exchange -> parsed columns (url, headers JSON, decoded bodies)
   proxy/                    MITM proxy: CA (rcgen), server, scope/rules/intercept settings
   fuzz/                     Intruder: templates, 4 modes, payloads, engine, results summary
@@ -52,16 +52,18 @@ crates/core/src/            engine library (everything testable lives here)
   jobs.rs                   background jobs table + JobControl (stop/progress)
   scan/passive/             49 rules ported from ZAP pscanrules (+ data/ files from ZAP)
   scan/active/              engine (mod.rs: Cx API), points.rs (insertion points),
-                            rules/ with 42 rules ported from ZAP ascanrules
+                            rules/ with 43 rules ported from ZAP ascanrules
   scan/findings_db.rs       de-duplicated findings (hits), finding_types texts
   scan/report.rs            report model (findings + types + history evidence), JSON/MD/HTML/SARIF
   auth.rs                   auth sessions (profiles, login, relogin)
   apiimport/                OpenAPI/Swagger, Postman, GraphQL -> requests; send + record (source "import")
+  oob/                      out-of-band: tokens, payload/interaction tables, correlate; server.rs listener
 crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group.
 crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs)
 docs/RESEARCH.md            original research, design, roadmap, AI-first CLI contract
 docs/PASSIVE_RULES.md       passive rules + differences from ZAP
 docs/ACTIVE_RULES.md        active rules + differences from ZAP
+docs/OOB.md                 out-of-band listener design (tokens, NAT, correlation, boundary)
 docs/RULE_UPDATES.md        how ZAP rule changes are tracked / auto-update design
 zap-sync.json               pinned zap-extensions commit, copied data files, skipped rules
 scripts/zap_drift.py        reports upstream ZAP changes vs. our ports (weekly workflow)
@@ -151,16 +153,39 @@ Known limits / ideas:
 - GraphQL: no fragments on unions/interfaces (they select `__typename`), no batching/aliases.
 - SOAP/WSDL import isn't covered.
 
+## Out-of-band callbacks (done)
+
+Design in docs/OOB.md. `crates/core/src/oob/mod.rs`: tokens (`bp` + 18 base32), `Endpoint`
+(DNS mode `<token>.<domain>`, host mode `<host>:<port>/<token>`; `auto_host` + `for_target`
+picks the local address routing to each target when the public host was guessed),
+`oob_payloads`/`oob_interactions` tables (schema v8), `correlate` (interaction -> finding
+backed by the attack exchange, recorded in history on first hit). `oob/server.rs`: TCP
+listener (HTTP 200, LDAP bind success then search, TLS ClientHello recorded) and UDP DNS
+(A/AAAA with `--public-ip` under `--domain`, REFUSED otherwise); bounded, receive-only.
+`crates/cli/src/oob_cmd.rs`: `oob start|run|stop|status|payload|poll`. Scanner: `Cx::oob_payload`,
+`payload_request`, `oob_register`; `run` correlates for `--oob-wait` after the last unit
+(`--no-oob` skips). Rules: Log4Shell 40043 (new port), XXE 90023 check #2, blind SSTI 90036
+callbacks (HIGH/INSANE). E2E: `crates/cli/tests/oob.rs` (fake Log4j over LDAP + XXE over HTTP).
+
+Smoke-tested against the user's lab target (10.0.1.244:8100, "Cargolink TMS"): 231 payloads,
+no callbacks (the app showed no Log4j/XML/SSTI surface; the listener was reachable on the LAN).
+That run found the default-route bug fixed by `for_target` (VPN default route vs. LAN target).
+
+Known limits / ideas:
+- No interactsh client / remote listener; the listener must write to the project file.
+- No SMTP; HTTPS callbacks are only recorded as a ClientHello (no TLS handshake).
+- Findings are only raised when a scan finishes or on `oob poll` (the listener doesn't raise them).
+- More rules could use it: blind command injection (ZAP doesn't), SSRF-style params, RFI.
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-2. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
-3. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
+2. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
    declarative checks incl. a Nuclei template subset.
-4. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
+3. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
    ViewState rules, CharsetMismatch, Heartbleed.
-5. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
-6. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
+4. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
+5. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session
 

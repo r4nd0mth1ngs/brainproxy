@@ -44,7 +44,7 @@ mod tests {
                 }
             }
         }
-        assert!(rules.len() >= 42, "expected all ported active rules, got {}", rules.len());
+        assert!(rules.len() >= 43, "expected all ported active rules, got {}", rules.len());
         // No active rule id collides with a passive rule id.
         let passive: HashSet<u32> = crate::scan::passive::all_rules().iter().map(|r| r.id()).collect();
         for id in &ids {

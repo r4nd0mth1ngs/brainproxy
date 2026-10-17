@@ -170,6 +170,17 @@ brainproxy report sarif -o brainproxy.sarif       # SARIF 2.1.0 (GitHub code sca
 brainproxy report markdown --risk medium --confidence medium -o report.md
 brainproxy report json --source active --limit 100 --max-evidence 2048
 
+# Out-of-band callbacks (Collaborator-like) for blind issues. While the listener runs, Log4Shell
+# (40043), XXE (90023), and blind SSTI (90036, --strength high|insane) send callback payloads and the
+# scan waits --oob-wait seconds (default 5) for interactions. Behind NAT, pass the address targets
+# can reach (--public-host/--public-port); for DNS callbacks delegate a domain to the runner.
+brainproxy oob start                                # TCP 0.0.0.0:8880 (HTTP, LDAP, TLS ClientHello)
+brainproxy oob start --listen 0.0.0.0:80 --dns-listen 0.0.0.0:53 --domain oob.example.com --public-ip 203.0.113.5
+brainproxy scan active --rules 40043,90023
+brainproxy oob payload --note 'ssrf in ?url=' --target https://app.example.com   # for manual tests
+brainproxy oob poll --token bp... --wait 30         # interactions; also raises late scan callbacks
+brainproxy oob stop
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -209,15 +220,16 @@ brainproxy decode jwt eyJhbGciOi...
 - **Phase 3 (done):** passive scanner with 49 rules ported from ZAP (see
   [docs/PASSIVE_RULES.md](docs/PASSIVE_RULES.md)), de-duplicated findings, triage.
 - **Phase 4 (done):** crawler, background jobs, immutable engagement scope enforced on
-  every connection, active scanner with 42 rules ported from ZAP (see
+  every connection, active scanner with 43 rules ported from ZAP (see
   [docs/ACTIVE_RULES.md](docs/ACTIVE_RULES.md)), ZAP drift detection
   ([docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
 - **Phase 5 (in progress):** authenticated testing is done: login profiles (form, JSON,
   raw request template, CSRF prefetch, bearer tokens, static headers) and `--auth` on send,
   race, fuzz, crawl, active scan, and the proxy, with automatic re-login. Reports in JSON,
   Markdown, self-contained HTML, and SARIF 2.1.0. API import from OpenAPI/Swagger,
-  Postman, and GraphQL introspection.
-- **Next:** out-of-band callbacks and automation plans.
+  Postman, and GraphQL introspection. Out-of-band callback listener (HTTP, LDAP, TLS, DNS)
+  with Log4Shell, XXE, and blind SSTI callback checks (see [docs/OOB.md](docs/OOB.md)).
+- **Next:** automation plans, rule updates, remaining ZAP rules.
 
 ## License
 

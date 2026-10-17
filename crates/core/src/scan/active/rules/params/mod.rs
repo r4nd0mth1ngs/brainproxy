@@ -5,6 +5,7 @@ mod common;
 mod cross_site_scripting;
 mod external_redirect;
 mod format_string;
+mod log4shell;
 mod padding_oracle;
 mod parameter_tamper;
 mod path_traversal;
@@ -30,6 +31,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(external_redirect::ExternalRedirect),
         Box::new(parameter_tamper::ParameterTamper),
         Box::new(padding_oracle::PaddingOracle),
+        Box::new(log4shell::Log4Shell),
     ]
 }
 
@@ -136,6 +138,8 @@ mod e2e {
             exclude_rules: vec![],
             max_duration: Some(Duration::from_secs(120)),
             auth: None,
+            oob: None,
+            oob_wait: std::time::Duration::ZERO,
         };
         let summary = run(&project, targets, cfg, JobControl::default()).await.unwrap();
         let _ = std::fs::remove_file(&project);
