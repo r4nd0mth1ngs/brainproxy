@@ -173,7 +173,7 @@ pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
 pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Capture id, increasing"),
     ("time", "TEXT", "UTC ISO-8601 time the capture was recorded"),
-    ("source", "TEXT", "Tool that produced it: send, proxy, fuzz, scan, crawl"),
+    ("source", "TEXT", "Tool that produced it: send, race, proxy, fuzz, scan, crawl, import"),
     ("scheme", "TEXT", "http or https"),
     ("host", "TEXT", "Target host name or IP"),
     ("port", "INTEGER", "Target port"),

@@ -7,6 +7,7 @@ mod capabilities;
 mod crawl_cmd;
 mod engagement_cmd;
 mod fuzz_cmd;
+mod import_cmd;
 mod jobs_cmd;
 mod output;
 mod proxy_cmd;
@@ -111,7 +112,12 @@ enum Cmd {
     /// Spider a site: links, forms, redirects, robots.txt, sitemap.xml. Results go to history.
     Crawl(crawl_cmd::CrawlArgs),
 
-    /// Background jobs (crawl/scan --background): list, status, wait, stop.
+    /// Import an API description (OpenAPI/Swagger, Postman, GraphQL) as scan targets: requests are
+    /// built with example values, sent in scope, and recorded as history source 'import'.
+    #[command(subcommand)]
+    Import(import_cmd::ImportCmd),
+
+    /// Background jobs (crawl/scan/import --background): list, status, wait, stop.
     #[command(subcommand)]
     Job(jobs_cmd::JobCmd),
 
@@ -327,6 +333,11 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Diff(_) => "diff",
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
+        Cmd::Import(c) => match c {
+            import_cmd::ImportCmd::Openapi(_) => "import openapi",
+            import_cmd::ImportCmd::Postman(_) => "import postman",
+            import_cmd::ImportCmd::Graphql(_) => "import graphql",
+        },
         Cmd::Engagement(_) => "engagement",
         Cmd::Auth(c) => match c {
             auth_cmd::AuthCmd::Add(_) => "auth add",
@@ -385,6 +396,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
         Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
+        Cmd::Import(cmd) => import_cmd::import(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
         Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, cmd, out)?,
@@ -580,7 +592,7 @@ fn schema_json() -> Value {
     };
     json!({
         "tables": [
-            {"name": "history", "description": "One row per request: source is send, race, proxy, fuzz, crawl, or scan.", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "history", "description": "One row per request: source is send, race, proxy, fuzz, crawl, import, or scan.", "columns": cols(store::HISTORY_COLUMNS)},
             {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
             {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},

@@ -1,6 +1,7 @@
 //! brainproxy engine. The CLI, and later the GUI and MCP server, are thin
 //! layers over this crate.
 
+pub mod apiimport;
 pub mod auth;
 pub mod capture;
 pub mod codec;

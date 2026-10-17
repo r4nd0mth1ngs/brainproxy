@@ -1,6 +1,7 @@
 # brainproxy handover
 
-State as of branch `feat/reports` (2026-10-17). `feat/auth-wiring` and `feat/reports` are local and unpushed; `main` is pushed.
+State as of branch `feat/api-import` (2026-10-17). `feat/auth-wiring`, `feat/reports`, and `feat/api-import` (each
+branched from the previous one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -28,7 +29,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 335 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 349 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -55,8 +56,9 @@ crates/core/src/            engine library (everything testable lives here)
   scan/findings_db.rs       de-duplicated findings (hits), finding_types texts
   scan/report.rs            report model (findings + types + history evidence), JSON/MD/HTML/SARIF
   auth.rs                   auth sessions (profiles, login, relogin)
+  apiimport/                OpenAPI/Swagger, Postman, GraphQL -> requests; send + record (source "import")
 crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group.
-crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs)
+crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs, import.rs)
 docs/RESEARCH.md            original research, design, roadmap, AI-first CLI contract
 docs/PASSIVE_RULES.md       passive rules + differences from ZAP
 docs/ACTIVE_RULES.md        active rules + differences from ZAP
@@ -127,17 +129,38 @@ Markdown puts target data in code spans/blocks whose fences outgrow any backtick
 SARIF uses `webRequest`/`webResponse`, `security-severity`, CWE tags, and a
 `partialFingerprints` key per finding. `findings list` also gained `--confidence`.
 
+## API import (done)
+
+`crates/core/src/apiimport/`: `parse_document` (JSON, or YAML via serde-saphyr with its
+alias budget; non-string keys like `200:` become strings), `openapi.rs` (3.x + Swagger 2.0:
+servers with variables, operation > path > document servers, relative servers against the
+spec URL, `$ref`/allOf/oneOf, path/query/header/cookie params, JSON/form/multipart/XML/text
+bodies), `postman.rs` (v2.0/v2.1: folders, `{{vars}}`, `:path` vars, raw/urlencoded/formdata/
+graphql bodies, bearer/basic/apikey auth inherited from folders), `graphql.rs` (introspection
+query, one operation per query/mutation field with arguments as variables, selection depth
+3), `values.rs` (schema -> example value, encoders), and `run` (send in scope, record, passive
+scan). `crates/cli/src/import_cmd.rs` is `import openapi|postman|graphql` with `--base-url`,
+`--var`, `-H`, `--auth`, `--include-destructive`, `--dry-run`, `--max-requests`, `--limit`,
+`--background`. Spec URLs and introspection go through the guarded client and are recorded.
+`scan active` without targets now includes source `import`. `build_raw` rejects non-token
+methods and CR/LF in headers from documents.
+
+Known limits / ideas:
+- Remote `$ref`s aren't fetched; security schemes aren't applied for OpenAPI (pass `-H`/`--auth`).
+- No request chaining (e.g. use the id returned by a create call in later paths).
+- GraphQL: no fragments on unions/interfaces (they select `__typename`), no batching/aliases.
+- SOAP/WSDL import isn't covered.
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-2. API import: OpenAPI/Swagger, GraphQL introspection, Postman as scan targets.
-3. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
-4. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
+2. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
+3. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
    declarative checks incl. a Nuclei template subset.
-5. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
+4. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
    ViewState rules, CharsetMismatch, Heartbleed.
-6. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
-7. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
+5. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
+6. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session
 

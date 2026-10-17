@@ -18,7 +18,7 @@ use crate::output::Out;
 #[derive(clap::Args)]
 pub struct ActiveArgs {
     /// URLs to attack (fetched first as the baseline). Without URLs, --history-id or
-    /// --where, every crawled/proxied/sent request in history is a target.
+    /// --where, every crawled/proxied/sent/imported request in history is a target.
     urls: Vec<String>,
     /// History entry to attack. Repeatable.
     #[arg(long = "history-id")]
@@ -213,7 +213,7 @@ fn select_targets(
     if args.urls.is_empty() && ids.is_empty() && args.where_sql.is_none() {
         let ro = Store::open_read_only(project)?;
         let r = ro.query(
-            "SELECT id FROM history WHERE source IN ('crawl', 'proxy', 'send') AND status IS NOT NULL ORDER BY id",
+            "SELECT id FROM history WHERE source IN ('crawl', 'proxy', 'send', 'import') AND status IS NOT NULL ORDER BY id",
             &[],
             100_000,
             50,

@@ -136,6 +136,15 @@ brainproxy scan active --where "path LIKE '/api/%'" --rules 40018,40012 --backgr
 brainproxy scan rules --active
 brainproxy findings list --source active
 
+# API import: one request per operation with example/typed values, sent in scope and recorded as
+# history source 'import', which `scan active` attacks by default. DELETE and GraphQL mutations
+# only with --include-destructive; --dry-run lists the requests without sending them.
+brainproxy import openapi https://app.example.com/openapi.json      # OpenAPI 3.x / Swagger 2.0, JSON or YAML
+brainproxy import openapi spec.yaml --base-url https://staging.example.com -H 'Authorization: Bearer ...'
+brainproxy import postman collection.json --var baseUrl=https://app.example.com
+brainproxy import graphql https://app.example.com/graphql           # introspection; or --schema result.json
+brainproxy scan active --where "source = 'import'" --auth api
+
 # Authenticated testing: a login profile, then --auth NAME on send, fuzz, crawl, scan active, proxy start.
 # Cookies/tokens are applied to every request, rotated cookies are learned, and a 401, a redirect to the
 # login path, or --logged-out triggers one automatic re-login and a retry.
@@ -206,8 +215,9 @@ brainproxy decode jwt eyJhbGciOi...
 - **Phase 5 (in progress):** authenticated testing is done: login profiles (form, JSON,
   raw request template, CSRF prefetch, bearer tokens, static headers) and `--auth` on send,
   race, fuzz, crawl, active scan, and the proxy, with automatic re-login. Reports in JSON,
-  Markdown, self-contained HTML, and SARIF 2.1.0.
-- **Next:** API import (OpenAPI/GraphQL), out-of-band callbacks, and automation plans.
+  Markdown, self-contained HTML, and SARIF 2.1.0. API import from OpenAPI/Swagger,
+  Postman, and GraphQL introspection.
+- **Next:** out-of-band callbacks and automation plans.
 
 ## License
 

@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 pub const JOB_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Job id"),
     ("time", "TEXT", "UTC start time"),
-    ("kind", "TEXT", "crawl or active-scan"),
+    ("kind", "TEXT", "crawl, active-scan, or import"),
     ("state", "TEXT", "queued, running, stopping, completed, stopped, failed"),
     ("pid", "INTEGER", "Process running the job"),
     ("args", "TEXT", "Command-line arguments as a JSON array"),
