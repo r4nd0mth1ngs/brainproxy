@@ -2,7 +2,7 @@
 
 State as of branch `feat/mcp` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
 `feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, `feat/zap-rules`, `feat/perf`, `feat/checks-inputs`, and `feat/mcp`
-(each branched from the previous one) are local and unpushed; `main` is pushed.
+(each branched from the previous one) are pushed to origin (no PRs yet); `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
