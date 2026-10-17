@@ -261,7 +261,7 @@ brainproxy diff <id1> <id2> [--part] [--mode lines|words|bytes]   ✔
 brainproxy crawl <url>... [--background]                  ✔ spider (headless browser: later)
 brainproxy engagement start|show|check                    ✔ immutable scope
 brainproxy job list|status|wait|stop                      ✔
-brainproxy scan active [URL...] [--where SQL] [--rules] [--strength]   ✔ 47 ZAP active rules
+brainproxy scan active [URL...] [--where SQL] [--rules] [--strength]   ✔ 48 ZAP active rules
 brainproxy findings list|show|mark                        ✔ grouped by alert type, de-duplicated
 brainproxy scan passive|rules|enable|disable|sources       ✔ 52 passive rules from ZAP
 brainproxy report --format html|json|md|sarif             Phase 4

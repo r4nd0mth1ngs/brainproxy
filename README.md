@@ -128,7 +128,7 @@ brainproxy findings mark 7 --state false-positive --note "test cookie"
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off
 brainproxy scan passive --rescan                  # rescan all history
 
-# Crawl, then actively scan (47 rules ported from ZAP); everything stays inside the engagement scope
+# Crawl, then actively scan (48 rules ported from ZAP); everything stays inside the engagement scope
 brainproxy crawl https://app.example.com/ --background         # job id; brainproxy job wait ID
 brainproxy scan active                                         # all crawled/proxied/sent endpoints
 brainproxy scan active https://app.example.com/item?id=1 --strength high
@@ -228,7 +228,7 @@ brainproxy decode jwt eyJhbGciOi...
 - **Phase 3 (done):** passive scanner with 52 rules ported from ZAP (see
   [docs/PASSIVE_RULES.md](docs/PASSIVE_RULES.md)), de-duplicated findings, triage.
 - **Phase 4 (done):** crawler, background jobs, immutable engagement scope enforced on
-  every connection, active scanner with 47 rules ported from ZAP (see
+  every connection, active scanner with 48 rules ported from ZAP (see
   [docs/ACTIVE_RULES.md](docs/ACTIVE_RULES.md)), ZAP drift detection
   ([docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
 - **Phase 5 (in progress):** authenticated testing is done: login profiles (form, JSON,

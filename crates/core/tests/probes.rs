@@ -149,3 +149,46 @@ fn https_as_http_not_applicable_over_http() {
     let s = run_scan(port, "/", &[10047], None);
     assert!(s.raised.is_empty(), "https-as-http should not fire on an http target: {s:?}");
 }
+
+/// A TLS server stub: answers a ClientHello with ServerHelloDone, then the heartbeat
+/// request with an over-long heartbeat (vulnerable) or a fatal alert (patched).
+fn spawn_tls_stub(vulnerable: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                let read_record = |s: &mut std::net::TcpStream| -> Option<(u8, [u8; 2])> {
+                    let mut head = [0u8; 5];
+                    s.read_exact(&mut head).ok()?;
+                    let mut body = vec![0u8; u16::from_be_bytes([head[3], head[4]]) as usize];
+                    s.read_exact(&mut body).ok()?;
+                    Some((head[0], [head[1], head[2]]))
+                };
+                let Some((0x16, v)) = read_record(&mut s) else { return };
+                let _ = s.write_all(&[0x16, v[0], v[1], 0, 4, 0x0e, 0, 0, 0]);
+                let Some((0x18, _)) = read_record(&mut s) else { return };
+                if vulnerable {
+                    let mut resp = vec![0x18, v[0], v[1], 0x40, 0x03, 0x02, 0x40, 0x00];
+                    resp.resize(5 + 0x4003, 0x41);
+                    let _ = s.write_all(&resp);
+                } else {
+                    let _ = s.write_all(&[0x15, v[0], v[1], 0, 2, 2, 10]);
+                }
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn heartbleed_detects_memory_echo() {
+    let port = spawn_tls_stub(true);
+    let s = run_scan(port, "/", &[20015], None);
+    assert_eq!(s.raised.get("20015"), Some(&3), "TLS 1.0, 1.1 and 1.2: {s:?}");
+    let port = spawn_tls_stub(false);
+    let s = run_scan(port, "/", &[20015], None);
+    assert!(s.raised.is_empty(), "{s:?}");
+    assert_eq!(s.requests, 3, "one connection per TLS version: {s:?}");
+}

@@ -8,6 +8,7 @@ mod directory_browsing;
 mod elmah;
 mod entity_expansion;
 mod get_for_post;
+mod heartbleed;
 pub(crate) mod hidden_files;
 mod htaccess;
 mod http_only_site;
@@ -31,6 +32,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(elmah::Elmah),
         Box::new(entity_expansion::EntityExpansion),
         Box::new(get_for_post::GetForPost),
+        Box::new(heartbleed::HeartBleed),
         Box::new(hidden_files::HiddenFilesRule),
         Box::new(htaccess::HtAccess),
         Box::new(http_only_site::HttpOnlySite),

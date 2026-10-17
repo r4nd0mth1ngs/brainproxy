@@ -22,7 +22,6 @@
   ],
   "skipped": {
     "ZapVersionScanRule": "ZAP-specific",
-    "UsernameIdorScanRule": "needs configured usernames",
-    "HeartBleedActiveScanRule": "raw TLS; planned"
+    "UsernameIdorScanRule": "needs configured usernames"
   }
 }

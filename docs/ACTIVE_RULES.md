@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` runs 47 rules ported from OWASP ZAP's `ascanrules` add-on (and
+`brainproxy scan active` runs 48 rules ported from OWASP ZAP's `ascanrules` add-on (and
 helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
@@ -21,7 +21,9 @@ rules can only reach targets the engagement allows, including when following red
 | 10058 | GET for POST | page | info | 10058 |
 | 10104 | User Agent Fuzzer | page | info | 10104 |
 | 10106 | HTTP Only Site | host | medium | 10106 |
-| 20017 | Source Code Disclosure - CVE-2012-1823 | page | high | 20017 |
+| 20015 | Heartbleed OpenSSL Vulnerability | host | high | 20015 |
+| 20017 | Source Code Disclosure - CVE-2012-1823 | page | high | 20015 | Heartbleed OpenSSL Vulnerability | host | high | 20015 |
+| 20017 |
 | 20018 | Remote Code Execution - CVE-2012-1823 | page | high | 20018 |
 | 20019 | External Redirect | param | high | 20019-1, 20019-2, 20019-3, 20019-4 |
 | 30001 | Buffer Overflow | param | medium | 30001 |
@@ -66,7 +68,8 @@ rules can only reach targets the engagement allows, including when following red
 Scopes: `param` runs once per insertion point (query, form, JSON; cookies and headers when
 enabled), `page` once per target request, `host` once per scheme://host:port.
 
-Not ported (listed in `zap-sync.json`): Heartbleed (raw TLS, see below).
+Every rule in ZAP's `ascanrules` add-on is ported (`zap-sync.json` lists the two
+`pscanrules` rules that aren't).
 
 Persistent XSS is three rules, as in ZAP: Prime (40016) stores a unique marker through
 every parameter, Spider (40017) re-requests every target and records which pages show
@@ -105,6 +108,10 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **Persistent XSS (40014)** follows ZAP's MEDIUM threshold (attacks are looked for anywhere
   on the sink page; PUT requests are skipped) and stops at the first alert per parameter.
   Sinks are the target requests themselves, re-sent, rather than ZAP's temporary history.
+- **Heartbleed (20015)** opens its raw TCP connection through the guarded client
+  (`Cx::connect_raw`), so the engagement scope applies; the heartbeat response is only
+  measured (more than 3 bytes back means vulnerable), never stored. Port 80 is tested on
+  443 as in ZAP; other ports are tested as given.
 - **XSLT Injection (90017)** applies ZAP's per-strength request limit per insertion point
   (ZAP counts it across all parameters of a page).
 - **Per-file references** for Hidden Files (40035) are added to the finding's other-info.

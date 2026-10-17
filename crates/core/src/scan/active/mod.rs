@@ -317,6 +317,19 @@ impl Cx {
         Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))
     }
 
+    /// A raw TCP connection to `host:port` for rules that speak another protocol
+    /// (e.g. TLS records). Goes through the client, so the engagement scope applies.
+    pub async fn connect_raw(&self, host: &str, port: u16) -> Result<crate::http::client::Stream> {
+        if self.stopped() {
+            return Err(Error::Protocol("scan stopped".into()));
+        }
+        if let Some(l) = &self.shared.limiter {
+            l.wait().await;
+        }
+        self.shared.requests.fetch_add(1, Ordering::Relaxed);
+        self.shared.client.connect(&Target { scheme: "http".into(), host: host.into(), port }).await
+    }
+
     /// Sends a request and follows up to 5 redirects with GETs (ZAP's default
     /// `sendAndReceive(msg)`); returns the final response. Redirects outside the
     /// engagement scope end with an out-of-scope error.
