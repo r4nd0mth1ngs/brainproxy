@@ -161,7 +161,8 @@ impl JobControl {
         let handle = std::thread::spawn(move || {
             let Ok(store) = Store::open(&project) else { return };
             while !flag.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
+                // Parked rather than slept, so dropping the watcher wakes it at once.
+                std::thread::park_timeout(Duration::from_millis(500));
                 let Some(id) = job_id else { continue };
                 if let Some(p) = ctl.progress.lock().unwrap().take() {
                     let _ = store.job_progress(id, &p);
@@ -184,6 +185,7 @@ impl Drop for Watcher {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
+            h.thread().unpark();
             let _ = h.join();
         }
     }

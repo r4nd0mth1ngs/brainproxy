@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::auth::AuthSession;
 use crate::capture::Capture;
 use crate::error::{Error, Result};
+use crate::http::client::{close_after, final_response, Conn};
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, WireReader};
 use crate::proxy::ca::CertAuthority;
 use crate::proxy::config::{
@@ -277,21 +278,19 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         let generation = auth.map(|a| a.generation()).unwrap_or(0);
         let started = Instant::now();
-        let mut upstream_reader = WireReader::new();
-        let mut upstream = forward(ctx, &target, &request, &method, &mut upstream_reader).await;
+        let mut upstream = forward(ctx, &target, &request, &method).await;
         if let (Some(a), Ok((_, response))) = (auth, &upstream) {
             a.observe(response);
             // Session lost: log in again and replay the request with the new session.
             if a.is_logged_out(response) && a.relogin(generation).await {
                 request = a.apply(&request, &[]);
-                upstream_reader = WireReader::new();
-                upstream = forward(ctx, &target, &request, &method, &mut upstream_reader).await;
+                upstream = forward(ctx, &target, &request, &method).await;
                 if let Ok((_, response)) = &upstream {
                     a.observe(response);
                 }
             }
         }
-        let (mut upstream_stream, response) = match upstream {
+        let (mut upstream_conn, response) = match upstream {
             Ok(v) => v,
             Err(e) => {
                 ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -317,13 +316,15 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
         if status == Some(101) {
             client.write_all(&response).await?;
             let pending_to_upstream = reader.into_leftover();
-            let pending_to_client = upstream_reader.into_leftover();
-            upstream_stream.write_all(&pending_to_upstream).await?;
+            let pending_to_client = upstream_conn.reader.into_leftover();
+            upstream_conn.stream.write_all(&pending_to_upstream).await?;
             client.write_all(&pending_to_client).await?;
-            tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
+            tokio::io::copy_bidirectional(&mut client, &mut upstream_conn.stream).await?;
             return Ok(());
         }
-        drop(upstream_stream);
+        if !close_after(&request, &response, &method) {
+            ctx.client.checkin(&target, upstream_conn);
+        }
 
         let mut response = if in_scope { apply_response_rules(&live.rules, response) } else { response };
         if in_scope && live.intercept.matches(true, &method, &target.host, &path) {
@@ -376,20 +377,10 @@ fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>) -> Result<(Targ
     Ok((target, req.into_bytes()))
 }
 
-async fn forward(
-    ctx: &Arc<Ctx>,
-    target: &Target,
-    request: &[u8],
-    method: &str,
-    reader: &mut WireReader,
-) -> Result<(crate::http::Stream, Vec<u8>)> {
-    let mut stream = ctx.client.connect(target).await?;
-    stream.write_all(request).await?;
-    stream.flush().await?;
-    let response = tokio::time::timeout(Duration::from_secs(120), reader.read_response(&mut stream, method))
+async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str) -> Result<(Conn, Vec<u8>)> {
+    tokio::time::timeout(Duration::from_secs(120), ctx.client.exchange(request, target, method))
         .await
-        .map_err(|_| Error::Timeout(Duration::from_secs(120)))??;
-    Ok((stream, response))
+        .map_err(|_| Error::Timeout(Duration::from_secs(120)))?
 }
 
 /// Holds a message in the intercept queue until it is forwarded (possibly
@@ -444,18 +435,6 @@ async fn hold(
 
 fn send_capture(ctx: &Ctx, capture: Capture) {
     let _ = ctx.recorder.lock().unwrap().send(capture);
-}
-
-fn final_response(resp: &[u8]) -> &[u8] {
-    let mut start = 0;
-    while let Ok(h) = parse_response_head(&resp[start..]) {
-        if (100..200).contains(&h.status) && h.status != 101 {
-            start += crate::http::request::split_head_body(&resp[start..]).0.len();
-        } else {
-            break;
-        }
-    }
-    &resp[start..]
 }
 
 fn wants_close(version: &str, headers: &[(String, String)]) -> bool {

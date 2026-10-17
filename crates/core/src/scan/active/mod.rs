@@ -656,16 +656,13 @@ pub async fn run(
     let mut point_count = 0;
     for t in &targets {
         let duration = Duration::from_millis(t.duration_ms.unwrap_or(0));
-        let Ok(response) = Response::parse(t.request.clone(), t.response.clone(), duration) else { continue };
-        let msg = Message::from_exchange(t.history_id.unwrap_or(0), &t.target, &t.request, &t.response);
-        let base = Arc::new(Base {
-            history_id: t.history_id,
-            target: t.target.clone(),
-            request: t.request.clone(),
-            msg,
-            response,
-        });
-        let pts = points::points(&t.request, &cfg.points);
+        // Requests recorded with `Connection: close` (e.g. from `send --url`) are
+        // re-sent with keep-alive, so the client can reuse connections.
+        let request = keep_alive(&t.request);
+        let Ok(response) = Response::parse(request.clone(), t.response.clone(), duration) else { continue };
+        let msg = Message::from_exchange(t.history_id.unwrap_or(0), &t.target, &request, &t.response);
+        let pts = points::points(&request, &cfg.points);
+        let base = Arc::new(Base { history_id: t.history_id, target: t.target.clone(), request, msg, response });
         point_count += pts.len();
         let first_for_host = hosts_seen.insert(t.target.origin());
         for &rule in &rules {
@@ -772,4 +769,17 @@ pub async fn run(
         timed_out,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// `request` with `Connection: close` replaced by `keep-alive`; other requests unchanged.
+fn keep_alive(request: &[u8]) -> Vec<u8> {
+    let raw = RawRequest::from_bytes(request.to_vec());
+    let close = raw.head().is_ok_and(|h| {
+        h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.trim().eq_ignore_ascii_case("close"))
+    });
+    if close {
+        raw.set_header("Connection", "keep-alive").into_bytes()
+    } else {
+        request.to_vec()
+    }
 }

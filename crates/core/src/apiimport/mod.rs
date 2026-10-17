@@ -223,6 +223,9 @@ pub fn build_raw(req: &ApiRequest, extra: &[(String, String)]) -> Result<(RawReq
     let mut headers: Vec<(String, String)> =
         req.headers.iter().filter(|(k, _)| !extra.iter().any(|(e, _)| e.eq_ignore_ascii_case(k))).cloned().collect();
     headers.extend(extra.iter().cloned());
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")) {
+        headers.push(("Connection".into(), "keep-alive".into()));
+    }
     RawRequest::build(&req.method, &req.url, &headers, &req.body)
 }
 

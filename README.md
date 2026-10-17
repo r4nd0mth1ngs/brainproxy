@@ -241,7 +241,9 @@ brainproxy decode jwt eyJhbGciOi...
   declarative checks in the Nuclei HTTP template format, including a DSL subset, `flow`,
   and multi-request conditions (`checks update`, `scan active --checks`; see
   [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
-- **Next:** remaining ZAP rules, performance (connection pooling, HTTP/2), MCP server.
+  All ZAP active rules are ported. Upstream connections are kept alive and reused (inside
+  the scope guard) by fuzz, crawl, active scan, import, and the proxy.
+- **Next:** performance (HTTP/2, single-packet race), MCP server.
 
 ## License
 

@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use regex::bytes::Regex;
 use serde::Serialize;
-use tokio::io::AsyncWriteExt;
 
 use crate::auth::{request_cookies, AuthSession};
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
 use crate::fuzz::plan::{Plan, Template};
+use crate::http::client::final_response;
 use crate::http::request::split_head_body;
-use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Stream, Target, WireReader};
+use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -164,7 +164,6 @@ pub async fn run(
         let (template, plan, target, cfg, compiled, fuzzed_cookies) =
             (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone(), fuzzed_cookies.clone());
         workers.push(tokio::spawn(async move {
-            let mut conn: Option<Conn> = None;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -182,7 +181,6 @@ pub async fn run(
                 if cfg.update_content_length {
                     request = RawRequest::from_bytes(request).update_content_length().into_bytes();
                 }
-                let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or_default();
                 let keep: Vec<&str> = fuzzed_cookies.iter().map(String::as_str).collect();
                 let rendered = request.clone();
                 let generation = cfg.auth.as_ref().map(|a| a.generation()).unwrap_or(0);
@@ -191,23 +189,14 @@ pub async fn run(
                 }
 
                 let mut started = Instant::now();
-                let mut result =
-                    tokio::time::timeout(cfg.send.timeout, exchange(&client, &target, &mut conn, &request, &method))
-                        .await
-                        .unwrap_or_else(|_| Err(Error::Timeout(cfg.send.timeout)));
+                let mut result = exchange(&client, &target, &request).await;
                 if let (Some(a), Ok(response)) = (&cfg.auth, &result) {
                     a.observe(response);
                     // Session lost: log in again (once across workers) and retry this payload.
                     if a.is_logged_out(response) && a.relogin(generation).await {
-                        conn = None;
                         request = a.apply(&rendered, &keep);
                         started = Instant::now();
-                        result = tokio::time::timeout(
-                            cfg.send.timeout,
-                            exchange(&client, &target, &mut conn, &request, &method),
-                        )
-                        .await
-                        .unwrap_or_else(|_| Err(Error::Timeout(cfg.send.timeout)));
+                        result = exchange(&client, &target, &request).await;
                         if let Ok(r) = &result {
                             a.observe(r);
                         }
@@ -225,9 +214,6 @@ pub async fn run(
                 let capture = match result {
                     Ok(response) => {
                         analyze(&response, &compiled, &cfg.match_status, &mut res);
-                        if close_after(&request, &response, &method) {
-                            conn = None;
-                        }
                         let keep = match cfg.store {
                             StoreMode::All => true,
                             StoreMode::Matches => res.matched,
@@ -236,7 +222,6 @@ pub async fn run(
                         keep.then(|| Capture::new("fuzz", &target, &request, Some(&response), Some(duration), None))
                     }
                     Err(e) => {
-                        conn = None;
                         res.error = Some(e.to_string());
                         (cfg.store == StoreMode::All)
                             .then(|| Capture::new("fuzz", &target, &request, None, None, Some(&e.to_string())))
@@ -271,43 +256,9 @@ pub async fn run(
     })
 }
 
-struct Conn {
-    stream: Stream,
-    reader: WireReader,
-    used: bool,
-}
-
-/// Sends on the worker's kept-alive connection, reconnecting once if a reused
-/// connection turns out to be closed.
-async fn exchange(
-    client: &Client,
-    target: &Target,
-    conn: &mut Option<Conn>,
-    request: &[u8],
-    method: &str,
-) -> Result<Vec<u8>> {
-    loop {
-        if conn.is_none() {
-            *conn = Some(Conn { stream: client.connect(target).await?, reader: WireReader::new(), used: false });
-        }
-        let c = conn.as_mut().unwrap();
-        let reused = c.used;
-        c.used = true;
-        let result = async {
-            c.stream.write_all(request).await?;
-            c.stream.flush().await?;
-            c.reader.read_response(&mut c.stream, method).await
-        }
-        .await;
-        match result {
-            Ok(r) => return Ok(r),
-            Err(_) if reused => *conn = None,
-            Err(e) => {
-                *conn = None;
-                return Err(e);
-            }
-        }
-    }
+/// Sends on the client's kept-alive connections.
+async fn exchange(client: &Client, target: &Target, request: &[u8]) -> Result<Vec<u8>> {
+    Ok(client.send(&RawRequest::from_bytes(request.to_vec()), target).await?.response)
 }
 
 fn analyze(response: &[u8], c: &Compiled, match_status: &[u16], res: &mut FuzzResult) {
@@ -334,34 +285,6 @@ fn analyze(response: &[u8], c: &Compiled, match_status: &[u16], res: &mut FuzzRe
         }
     }
     res.matched = !res.grep.is_empty() || match_status.contains(&head.status);
-}
-
-fn final_response(resp: &[u8]) -> &[u8] {
-    let mut start = 0;
-    while let Ok(h) = parse_response_head(&resp[start..]) {
-        if (100..200).contains(&h.status) && h.status != 101 {
-            start += split_head_body(&resp[start..]).0.len();
-        } else {
-            break;
-        }
-    }
-    &resp[start..]
-}
-
-/// Whether the connection can't be reused after this exchange.
-fn close_after(request: &[u8], response: &[u8], method: &str) -> bool {
-    let req_close = RawRequest::from_bytes(request.to_vec())
-        .head()
-        .map(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")))
-        .unwrap_or(true);
-    let Ok(h) = parse_response_head(final_response(response)) else { return true };
-    req_close
-        || h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
-        || (h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")))
-        || (h.header("content-length").is_none()
-            && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-            && !method.eq_ignore_ascii_case("HEAD")
-            && !matches!(h.status, 100..=199 | 204 | 304))
 }
 
 /// Spaces request starts evenly across all workers.

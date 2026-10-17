@@ -29,6 +29,11 @@ impl WireReader {
         Self::default()
     }
 
+    /// Whether no unread bytes are buffered.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     /// Bytes read past the last message (e.g. the start of a WebSocket stream).
     pub fn into_leftover(self) -> Vec<u8> {
         self.buf

@@ -270,6 +270,9 @@ async fn fetch(client: &Client, auth: Option<&AuthSession>, req: &Req, headers: 
     if req.body.is_some() && !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
         hdrs.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
     }
+    if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")) {
+        hdrs.push(("Connection".into(), "keep-alive".into()));
+    }
     let built = RawRequest::build(&req.method, &req.url, &hdrs, req.body.as_deref().unwrap_or("").as_bytes());
     let (raw, target) = match built {
         Ok(v) => v,

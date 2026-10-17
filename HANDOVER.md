@@ -277,6 +277,30 @@ input is behind a login we have no credentials for; it serves plain HTTP).
 Ideas: ZAP's SSTI rule also checks persistent-XSS sink pages (SSTI 90035 here only checks
 reflected output); `source_sink` could feed it.
 
+## Performance (in progress, branch `feat/perf`)
+
+Connection pooling: `http/client.rs` keeps idle connections in a pool owned by the `Client`
+(shared by its clones; key = tokio runtime id, scheme, host, port; 64 per key, 30 s idle).
+Connections only come from `Client::connect`, and a `Client`'s options (guard included)
+never change, so reuse never skips a scope decision; a new `Client` starts with an empty
+pool. `Client::exchange` checks out, sends, and retries once on a *new* connection when a
+reused one fails before any response byte (server closed it while idle); `close_after`
+decides whether to `checkin` (request/response `Connection: close`, HTTP/1.0 without
+keep-alive, read-until-close bodies, 101, or unread bytes left in the reader). `send`
+uses it; the proxy's upstream side uses `exchange` + `checkin` (101 upgrades keep the
+stream). The fuzzer's own per-worker keep-alive code was replaced by the pool. Crawl and
+import build requests with `Connection: keep-alive`, and the active scanner rewrites a
+base request's `Connection: close` to keep-alive (`keep_alive` in scan/active/mod.rs).
+The runtime id is in the key because `AuthSession` logs in on a short-lived runtime.
+`JobControl::watch` now parks instead of sleeping, so commands no longer wait up to
+500 ms for the watcher thread on exit.
+
+Measured (release builds, crawl of 34 pages + active scan of one URL with all non-time-based
+rules, local Python HTTPS server with keep-alive): 415 -> 24 connections for the scan;
+with a simulated 20 ms per-connection cost, scan 2.0-2.7 s -> 0.53 s and crawl
+0.9-1.1 s -> 0.6 s. The lab target (Werkzeug) answers `Connection: close`, so there is no
+reuse there (scan times unchanged within noise; crawl ~0.6 s faster from the watcher fix).
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
