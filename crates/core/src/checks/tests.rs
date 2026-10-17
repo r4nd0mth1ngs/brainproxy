@@ -1,7 +1,7 @@
 use super::*;
 
 fn unsupported_reason(yaml: &str) -> String {
-    match parse(yaml, Path::new("t.yaml"), &LoadOptions::default()) {
+    match parse(yaml, Path::new("t.yaml"), None, &LoadOptions::default()) {
         Err((_, Problem::Unsupported(r))) => r,
         Err((_, Problem::Invalid(r))) => panic!("expected unsupported, got invalid: {r}"),
         Ok(_) => panic!("expected unsupported, got a check"),
@@ -9,7 +9,7 @@ fn unsupported_reason(yaml: &str) -> String {
 }
 
 fn invalid_reason(yaml: &str) -> String {
-    match parse(yaml, Path::new("t.yaml"), &LoadOptions::default()) {
+    match parse(yaml, Path::new("t.yaml"), None, &LoadOptions::default()) {
         Err((_, Problem::Invalid(r))) => r,
         Err((_, Problem::Unsupported(r))) => panic!("expected invalid, got unsupported: {r}"),
         Ok(_) => panic!("expected invalid, got a check"),
@@ -101,7 +101,7 @@ fn unsupported_features_are_named() {
     );
     assert_eq!(
         unsupported_reason(&block("    payloads:\n      user: helpers/wordlists/users.txt\n    matchers:\n      - type: status\n        status: [200]\n")),
-        "payload files"
+        "payload files (no template directory)"
     );
     assert_eq!(
         unsupported_reason(&block("    matchers:\n      - type: regex\n        regex: ['a(?=b)']\n")),
@@ -128,7 +128,7 @@ fn template_inputs() {
         vars: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         any_inputs: any,
     };
-    let reason = |o: &LoadOptions| match parse(t, Path::new("t.yaml"), o) {
+    let reason = |o: &LoadOptions| match parse(t, Path::new("t.yaml"), None, o) {
         Err((_, Problem::Unsupported(r))) => r,
         _ => panic!("expected unsupported"),
     };
@@ -140,6 +140,7 @@ fn template_inputs() {
     let c = parse(
         t,
         Path::new("t.yaml"),
+        None,
         &opts(&[("password", "p w"), ("token", "1"), ("user", "admin"), ("greeting", "hi"), ("other", "o")], false),
     )
     .unwrap_or_else(|_| panic!("loads"));
@@ -147,7 +148,7 @@ fn template_inputs() {
     names.sort();
     assert_eq!(names, ["greeting", "password", "token", "user"]);
     // `checks update` keeps templates whatever inputs they need.
-    assert!(parse(t, Path::new("t.yaml"), &opts(&[], true)).is_ok());
+    assert!(parse(t, Path::new("t.yaml"), None, &opts(&[], true)).is_ok());
     assert_eq!(parse_var("username=a=b").unwrap(), ("username".into(), "a=b".into()));
     assert!(parse_var("novalue").is_err());
     assert!(parse_var("bad name=x").is_err());
@@ -265,9 +266,19 @@ async fn store_update_from_dir_keeps_only_loadable_templates() {
 
 #[test]
 fn store_paths_are_confined() {
-    assert!(store::tests_store_path("http/a/b.yaml"));
-    for bad in ["../http/a.yaml", "http/../../x.yaml", "/http/a.yaml", "dns/a.yaml", "http/a.sh", "http/a b.yaml"] {
-        assert!(!store::tests_store_path(bad), "{bad}");
+    assert_eq!(store::tests_store_path("http/a/b.yaml"), Some(true));
+    assert_eq!(store::tests_store_path("helpers/wordlists/users.txt"), Some(false));
+    for bad in [
+        "../http/a.yaml",
+        "http/../../x.yaml",
+        "/http/a.yaml",
+        "dns/a.yaml",
+        "http/a.sh",
+        "http/a b.yaml",
+        "helpers/../../x.txt",
+        "helpers/",
+    ] {
+        assert_eq!(store::tests_store_path(bad), None, "{bad}");
     }
 }
 
@@ -278,18 +289,19 @@ async fn store_update_from_tarball_layout() {
         ("nuclei-templates-abc/http/git.yaml", GIT_CONFIG.as_bytes()),
         ("nuclei-templates-abc/http/../../evil.yaml", GIT_CONFIG.as_bytes()),
         ("nuclei-templates-abc/README.md", b"x"),
+        ("nuclei-templates-abc/helpers/wordlists/u.txt", b"admin\n"),
     ]);
     let mut seen = Vec::new();
     crate::fetch::tar_gz_files(&gz, |p, _| {
         if let Some((_, rel)) = p.split_once('/') {
-            if store::tests_store_path(rel) {
+            if store::tests_store_path(rel).is_some() {
                 seen.push(rel.to_string());
             }
         }
         Ok(())
     })
     .unwrap();
-    assert_eq!(seen, ["http/git.yaml"]);
+    assert_eq!(seen, ["http/git.yaml", "helpers/wordlists/u.txt"]);
 }
 
 #[test]
@@ -309,4 +321,48 @@ fn json_paths() {
     for bad in [".[] | select(.a == 1)", "..|objects", ".a // empty", "keys"] {
         assert!(compile_json_path(bad).is_none(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn payload_files_from_helpers() {
+    let base = std::env::temp_dir().join(format!("bp-payload-files-{}", std::process::id()));
+    let src = base.join("nuclei-templates");
+    std::fs::create_dir_all(src.join("http/default-logins")).unwrap();
+    std::fs::create_dir_all(src.join("helpers/wordlists")).unwrap();
+    std::fs::write(src.join("helpers/wordlists/users.txt"), "admin\r\n\nroot\n").unwrap();
+    std::fs::write(base.join("secret.txt"), "outside\n").unwrap();
+    let t = |id: &str, file: &str| {
+        format!("id: {id}\ninfo: {{severity: low}}\nhttp:\n  - path: ['{{{{BaseURL}}}}/{{{{user}}}}']\n    payloads:\n      user: {file}\n    matchers:\n      - type: status\n        status: [200]\n")
+    };
+    let dir = src.join("http/default-logins");
+    std::fs::write(dir.join("ok.yaml"), t("ok", "helpers/wordlists/users.txt")).unwrap();
+    std::fs::write(dir.join("up.yaml"), t("up", "../../../secret.txt")).unwrap();
+    std::fs::write(dir.join("abs.yaml"), t("abs", base.join("secret.txt").to_str().unwrap())).unwrap();
+    std::fs::write(dir.join("missing.yaml"), t("missing", "helpers/nope.txt")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(base.join("secret.txt"), src.join("helpers/wordlists/link.txt")).unwrap();
+    #[cfg(unix)]
+    std::fs::write(dir.join("link.yaml"), t("link", "helpers/wordlists/link.txt")).unwrap();
+
+    // Loading the checkout root: helpers/ resolves from an ancestor directory.
+    let l = load(std::slice::from_ref(&src), &Default::default()).unwrap();
+    assert_eq!(l.checks.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["ok"], "{:?}", l.skipped);
+    assert_eq!(l.checks[0].blocks[0].payloads[0].1, ["admin", "root"]);
+    let reason = |id: &str| l.skipped.iter().find(|s| s.id.as_deref() == Some(id)).unwrap().reason.clone();
+    assert!(reason("up").starts_with("payload file path"), "{}", reason("up"));
+    assert!(reason("abs").starts_with("payload file path"), "{}", reason("abs"));
+    assert!(reason("missing").starts_with("payload file not found"));
+    #[cfg(unix)]
+    assert!(reason("link").starts_with("payload file not found"), "a symlink out of the root is refused");
+    // Loading only http/ can't see helpers/ (outside the root).
+    let l = load(&[src.join("http")], &Default::default()).unwrap();
+    assert!(l.checks.is_empty());
+
+    // `checks update` keeps helpers/ (not the symlink), so the stored template loads.
+    let home = base.join("home");
+    let m = update(&home, Source::Dir(src)).await.unwrap();
+    assert_eq!((m.stored, m.helpers), (1, 1), "{m:?}");
+    let l = load(&resolve_selectors(&home, &["nuclei".into()]), &Default::default()).unwrap();
+    assert_eq!(l.checks[0].blocks[0].payloads[0].1, ["admin", "root"]);
+    std::fs::remove_dir_all(&base).unwrap();
 }

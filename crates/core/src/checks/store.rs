@@ -1,6 +1,7 @@
 //! Check stores under the home directory: `checks/local/` for checks written by
 //! hand (or by an agent), `checks/nuclei/` for the Nuclei HTTP templates that
-//! `checks update` imports. Only templates that load are stored; the manifest
+//! `checks update` imports. Only templates that load are stored, with the
+//! repository's `helpers/` (payload files templates refer to); the manifest
 //! records the source commit, the tarball's sha256, and why others were skipped.
 
 use std::path::{Component, Path, PathBuf};
@@ -32,6 +33,9 @@ pub struct Manifest {
     /// HTTP templates seen in the source.
     pub templates: usize,
     pub stored: usize,
+    /// Files kept from `helpers/` (payload wordlists).
+    #[serde(default)]
+    pub helpers: usize,
     /// Skip reasons with counts, most common first (top 30).
     pub skipped: Vec<(String, usize)>,
 }
@@ -49,14 +53,19 @@ pub enum Source {
 
 pub type UpdateResult = Manifest;
 
-/// A template path inside the store: `http/...yaml`, plain components only.
-fn store_path(rel: &str) -> Option<PathBuf> {
+/// `helpers/` files kept in the store, at most (they are ~5 MiB upstream).
+const MAX_HELPERS: u64 = 64 << 20;
+
+/// A path inside the store: a template (`http/...yaml`) or a helper file
+/// (`helpers/...`), plain components only.
+fn store_path(rel: &str) -> Option<(PathBuf, bool)> {
     let p = Path::new(rel);
+    let template = rel.starts_with("http/") && (rel.ends_with(".yaml") || rel.ends_with(".yml"));
+    let helper = rel.starts_with("helpers/") && !rel.ends_with('/');
     let ok = p.components().all(|c| matches!(c, Component::Normal(_)))
-        && rel.starts_with("http/")
-        && (rel.ends_with(".yaml") || rel.ends_with(".yml"))
+        && (template || helper)
         && rel.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+".contains(&b));
-    ok.then(|| p.to_path_buf())
+    ok.then(|| (p.to_path_buf(), template))
 }
 
 /// Imports templates into `checks/nuclei/`, replacing the previous set only
@@ -70,12 +79,23 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
     }
     std::fs::create_dir_all(&staging)?;
     let mut m = Manifest::default();
+    let mut helper_bytes = 0u64;
     let mut write = |rel: &str, data: &[u8]| -> Result<()> {
-        let Some(p) = store_path(rel) else { return Ok(()) };
+        let Some((p, template)) = store_path(rel) else { return Ok(()) };
+        if !template {
+            helper_bytes += data.len() as u64;
+            if helper_bytes > MAX_HELPERS {
+                return Ok(());
+            }
+        }
         let dest = staging.join(p);
         std::fs::create_dir_all(dest.parent().unwrap())?;
         std::fs::write(dest, data)?;
-        m.templates += 1;
+        if template {
+            m.templates += 1;
+        } else {
+            m.helpers += 1;
+        }
         Ok(())
     };
     let (repository, reference, commit, sha256, source_name) = match source {
@@ -98,6 +118,9 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
             let base = if dir.join("http").is_dir() { dir.clone() } else { dir.join("..") };
             let mut files = Vec::new();
             collect(&base.join("http"), &mut files)?;
+            if base.join("helpers").is_dir() {
+                collect(&base.join("helpers"), &mut files)?;
+            }
             for f in files {
                 let rel = f.strip_prefix(&base).map_err(|e| Error::Protocol(e.to_string()))?;
                 let rel = rel.to_string_lossy().replace('\\', "/");
@@ -112,7 +135,8 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
         std::fs::remove_dir_all(&staging)?;
         return Err(Error::NotFound("no HTTP templates (http/*.yaml) in the source".into()));
     }
-    // Keep only templates that load, so the store is exactly what can run.
+    // Keep only templates that load, so the store is exactly what can run
+    // (payload files resolve against the staging root, later the store).
     // Templates needing inputs stay: `--check-var` enables them at scan time.
     let opts = super::LoadOptions { any_inputs: true, ..Default::default() };
     let loaded = super::load(std::slice::from_ref(&staging), &opts)?;
@@ -181,6 +205,7 @@ pub fn nuclei_status(home: &Path) -> StoreStatus {
 }
 
 #[cfg(test)]
-pub(crate) fn tests_store_path(rel: &str) -> bool {
-    store_path(rel).is_some()
+/// Some(true) for a template path, Some(false) for a helper file, None if refused.
+pub(crate) fn tests_store_path(rel: &str) -> Option<bool> {
+    store_path(rel).map(|(_, template)| template)
 }

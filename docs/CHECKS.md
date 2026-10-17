@@ -39,7 +39,7 @@ brainproxy checks status
 
 | Selector | Location |
 |---|---|
-| `nuclei` | `<home>/checks/nuclei/`, replaced as a whole by `checks update` (only templates that load are stored) |
+| `nuclei` | `<home>/checks/nuclei/`, replaced as a whole by `checks update` (only templates that load are stored, plus the repository's `helpers/` payload files) |
 | `local` | `<home>/checks/local/`, your own checks (any layout, `*.yaml`/`*.yml`) |
 | `all` | both |
 | a path | a template file or a directory (recursive) |
@@ -63,8 +63,15 @@ Request blocks:
 
 - `method` + `path` list, or `raw` requests (line endings normalized, Content-Length fixed
   unless `unsafe: true`); `headers`, `body`.
-- `payloads` (inline lists only) with `attack` batteringram | pitchfork | clusterbomb, at
-  most 1000 combinations per block.
+- `payloads` with `attack` batteringram | pitchfork | clusterbomb, at most 1000
+  combinations per block. A payload is an inline list or a file (one value per non-empty
+  line, at most 4 MiB), e.g. `helpers/wordlists/wp-users.txt`. File names are relative
+  paths of plain components (no `..`, no absolute paths), looked up in the template's
+  directory and its parents up to the load root (the directory given to `--checks` or
+  `checks validate`, or a file's own directory); the resolved file, symlinks followed,
+  must stay inside that root. `checks update` stores nuclei-templates' `helpers/` (about
+  5 MiB, capped at 64 MiB) next to `http/`, so stored templates find them; to validate a
+  checkout, pass its root rather than its `http/` directory.
 - `matchers` with `matchers-condition` and|or: `word` (incl. `encoding: hex`), `regex`,
   `status`, `size`, `binary`, `dsl`; `condition`, `negative`, `case-insensitive`,
   `internal` (counts for the block and `flow`, but a block whose matchers are all
@@ -126,15 +133,15 @@ Nuclei's DSL is govaluate plus helper functions. brainproxy parses it at load ti
   fired are listed in the finding's other info (`Matched: x-frame-options, ...`).
 
 Not supported (the template is skipped with this reason): `self-contained`, interactsh
-(out-of-band), payload files, template inputs without a `--check-var`, JavaScript `flow`, `xpath`
+(out-of-band), payload files that can't be found inside the root, template inputs without a `--check-var`, JavaScript `flow`, `xpath`
 extractors, regexes with lookaround or backreferences, DSL functions outside the list
 (`date_time`, `wait_for`, `generate_jwt`, `hmac`, ...), `race`, `iterate-all`, digest
 auth, `fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
 development (17f5725, Oct 2026), 9,139 of 11,690 HTTP templates load (5,856 before the
-DSL subset); the top reasons are `self-contained` (938), template inputs (554),
-interactsh (535), and payload files (258). With `--check-var username=... --check-var
-password=...` (523 of the 554 need just these), 9,655 load. `checks status` shows the
-counts for the stored commit.
+DSL subset) and 9,392 with payload files; the top remaining reasons are
+`self-contained` (938), interactsh (535), and template inputs (534). With `--check-var
+username=... --check-var password=...` (511 of the 534 need just these), 9,908 load.
+`checks status` shows the counts for the stored commit.
 
 ## brainproxy extensions
 
@@ -170,7 +177,6 @@ http:
 
 ## Ideas
 
-- Payload files: store nuclei-templates' `helpers/` wordlists with the templates (258).
 - `{{interactsh-url}}` could map to the OOB listener (`oob_payload`) with interactsh
   matchers as correlation.
 - An index file in the store would let `checks list` skip parsing.

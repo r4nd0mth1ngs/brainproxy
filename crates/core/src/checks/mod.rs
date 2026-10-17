@@ -29,6 +29,8 @@ pub use store::{local_dir, nuclei_dir, nuclei_status, update, Source, StoreStatu
 const MAX_TEMPLATE: u64 = 512 << 10;
 /// Payload combinations per request block (clusterbomb grows fast).
 const MAX_COMBOS: usize = 1000;
+/// Payload files (`payloads: {name: helpers/wordlists/x.txt}`) bigger than this are unsupported.
+const MAX_PAYLOAD_FILE: u64 = 4 << 20;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
@@ -296,13 +298,17 @@ pub fn parse_var(s: &str) -> Result<(String, String)> {
 
 /// Loads every `.yaml`/`.yml` under `paths` (files or directories, recursively).
 /// Later templates with an id already loaded are skipped.
+/// Payload files resolve relative to an ancestor of the template inside its
+/// root: the directory passed to `load`, or a file's own directory.
 pub fn load(paths: &[PathBuf], opts: &LoadOptions) -> Result<Loaded> {
-    let mut files = Vec::new();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     for p in paths {
         if p.is_dir() {
-            walk(p, &mut files)?;
+            let mut found = Vec::new();
+            walk(p, &mut found)?;
+            files.extend(found.into_iter().map(|f| (f, p.clone())));
         } else if p.is_file() {
-            files.push(p.clone());
+            files.push((p.clone(), p.parent().unwrap_or(Path::new(".")).to_path_buf()));
         } else {
             return Err(Error::NotFound(format!("check file or directory {}", p.display())));
         }
@@ -313,7 +319,9 @@ pub fn load(paths: &[PathBuf], opts: &LoadOptions) -> Result<Loaded> {
     let parsed: Vec<(PathBuf, Parsed)> = std::thread::scope(|sc| {
         let handles: Vec<_> = files
             .chunks(chunk)
-            .map(|c| sc.spawn(move || c.iter().map(|f| (f.clone(), parse_file(f, opts))).collect::<Vec<_>>()))
+            .map(|c| {
+                sc.spawn(move || c.iter().map(|(f, root)| (f.clone(), parse_file(f, root, opts))).collect::<Vec<_>>())
+            })
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     });
@@ -340,14 +348,14 @@ pub fn load(paths: &[PathBuf], opts: &LoadOptions) -> Result<Loaded> {
 
 type Parsed = std::result::Result<Check, (Option<String>, Problem)>;
 
-fn parse_file(file: &Path, opts: &LoadOptions) -> Parsed {
+fn parse_file(file: &Path, root: &Path, opts: &LoadOptions) -> Parsed {
     let bytes = match std::fs::metadata(file) {
         Ok(m) if m.len() > MAX_TEMPLATE => return Err((None, Problem::Invalid("file too large".into()))),
         Ok(_) => std::fs::read(file),
         Err(e) => Err(e),
     };
     match bytes {
-        Ok(b) => parse(&String::from_utf8_lossy(&b), file, opts),
+        Ok(b) => parse(&String::from_utf8_lossy(&b), file, Some(root), opts),
         Err(e) => Err((None, Problem::Invalid(e.to_string()))),
     }
 }
@@ -371,16 +379,21 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Parses one template.
 pub fn parse_str(text: &str) -> Result<Check> {
-    parse(text, Path::new("<inline>"), &LoadOptions::default()).map_err(|(_, p)| match p {
+    parse(text, Path::new("<inline>"), None, &LoadOptions::default()).map_err(|(_, p)| match p {
         Problem::Invalid(r) => Error::InvalidInput(r),
         Problem::Unsupported(r) => Error::InvalidInput(format!("unsupported: {r}")),
     })
 }
 
-fn parse(text: &str, file: &Path, opts: &LoadOptions) -> std::result::Result<Check, (Option<String>, Problem)> {
+fn parse(
+    text: &str,
+    file: &Path,
+    root: Option<&Path>,
+    opts: &LoadOptions,
+) -> std::result::Result<Check, (Option<String>, Problem)> {
     let doc = crate::apiimport::parse_document(text).map_err(|e| (None, Problem::Invalid(e.to_string())))?;
     let id = doc.get("id").and_then(Value::as_str).map(str::to_string);
-    compile(&doc, file, opts).map_err(|p| (id, p))
+    compile(&doc, file, root, opts).map_err(|p| (id, p))
 }
 
 const TOP_KEYS: &[&str] = &["id", "info", "http", "requests", "variables", "scope", "flow"];
@@ -439,7 +452,7 @@ fn flag(v: &Value, key: &str) -> bool {
     }
 }
 
-fn compile(doc: &Value, file: &Path, opts: &LoadOptions) -> std::result::Result<Check, Problem> {
+fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) -> std::result::Result<Check, Problem> {
     let Some(obj) = doc.as_object() else { return invalid("not a mapping") };
     let Some(id) = obj.get("id").and_then(Value::as_str).map(str::to_string) else {
         return invalid("missing id");
@@ -500,7 +513,7 @@ fn compile(doc: &Value, file: &Path, opts: &LoadOptions) -> std::result::Result<
     };
     let mut blocks = Vec::new();
     for b in blocks_v {
-        blocks.push(compile_block(b, rule_scope)?);
+        blocks.push(compile_block(b, rule_scope, file, root)?);
     }
     if blocks.is_empty() {
         return invalid("no requests");
@@ -536,6 +549,42 @@ fn compile(doc: &Value, file: &Path, opts: &LoadOptions) -> std::result::Result<
 
 /// `flow: http(1) && (http(2) || http(3))`: `&&`, `||`, `!`, and parentheses
 /// over request blocks; JavaScript flows are unsupported.
+/// Reads a payload file (one value per non-empty line). `rel` is a relative
+/// path of plain components, looked up in the template's directory and its
+/// ancestors up to `root`; the resolved file must stay inside `root` (no
+/// symlinks out of it).
+fn payload_file(file: &Path, root: Option<&Path>, rel: &str) -> std::result::Result<Vec<String>, Problem> {
+    use std::path::Component;
+    let Some(root) = root else { return unsupported("payload files (no template directory)") };
+    let relp = Path::new(rel);
+    if rel.is_empty() || !relp.components().all(|c| matches!(c, Component::Normal(_))) {
+        return unsupported("payload file path (relative paths inside the template directory only)");
+    }
+    let Ok(root) = root.canonicalize() else { return unsupported("payload files (no template directory)") };
+    let mut dir = file.parent().and_then(|d| d.canonicalize().ok());
+    while let Some(d) = dir.filter(|d| d.starts_with(&root)) {
+        if let Ok(p) = d.join(relp).canonicalize() {
+            if !p.starts_with(&root) || !p.is_file() {
+                break;
+            }
+            return match std::fs::metadata(&p) {
+                Ok(m) if m.len() > MAX_PAYLOAD_FILE => unsupported("payload file too large"),
+                _ => match std::fs::read(&p) {
+                    Ok(b) => Ok(String::from_utf8_lossy(&b)
+                        .lines()
+                        .map(|l| l.trim_end_matches('\r'))
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect()),
+                    Err(_) => unsupported("payload file not readable"),
+                },
+            };
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    unsupported("payload file not found (`checks update` stores nuclei-templates' helpers/)")
+}
+
 fn compile_flow(flow: &str, blocks: usize) -> std::result::Result<dsl::Expr, Problem> {
     static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bhttp\s*\(\s*(\d+)\s*\)").unwrap());
     let js = || unsupported("flow (JavaScript)");
@@ -558,7 +607,7 @@ fn compile_flow(flow: &str, blocks: usize) -> std::result::Result<dsl::Expr, Pro
     }
 }
 
-fn compile_block(b: &Value, scope: RuleScope) -> std::result::Result<Block, Problem> {
+fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) -> std::result::Result<Block, Problem> {
     let Some(obj) = b.as_object() else { return invalid("request block is not a mapping") };
     for k in obj.keys() {
         if !BLOCK_KEYS.contains(&k.as_str()) {
@@ -601,7 +650,8 @@ fn compile_block(b: &Value, scope: RuleScope) -> std::result::Result<Block, Prob
         for (k, v) in m {
             match v {
                 Value::Array(a) => payloads.push((k.clone(), a.iter().filter_map(s).collect())),
-                _ => return unsupported("payload files"),
+                Value::String(rel) => payloads.push((k.clone(), payload_file(file, root, rel)?)),
+                _ => return invalid("payloads must be lists or file names"),
             }
         }
     }
