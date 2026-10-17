@@ -178,6 +178,8 @@ fn capabilities_lists_all_commands() {
         "decode",
         "hash",
         "project",
+        "findings",
+        "report",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }

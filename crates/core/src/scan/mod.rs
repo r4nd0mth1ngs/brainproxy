@@ -8,6 +8,7 @@ pub mod active;
 pub mod findings_db;
 pub mod message;
 pub mod passive;
+pub mod report;
 
 use serde::Serialize;
 
@@ -47,7 +48,7 @@ impl Risk {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     Low,
@@ -56,6 +57,19 @@ pub enum Confidence {
 }
 
 impl Confidence {
+    pub fn level(self) -> i64 {
+        self as i64
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Some(Confidence::Low),
+            "medium" => Some(Confidence::Medium),
+            "high" => Some(Confidence::High),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Confidence::Low => "low",

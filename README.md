@@ -154,6 +154,13 @@ brainproxy scan active --auth app --background
 brainproxy auth status app                        # live check against --check-url
 brainproxy auth headers app --raw                 # Cookie/Authorization lines for sqlmap, ffuf, ...
 
+# Reports: findings grouped by alert type with description, solution, references, and the
+# request/response from history as evidence. False positives are left out by default.
+brainproxy report html -o report.html             # self-contained, no external assets
+brainproxy report sarif -o brainproxy.sarif       # SARIF 2.1.0 (GitHub code scanning, DefectDojo, ...)
+brainproxy report markdown --risk medium --confidence medium -o report.md
+brainproxy report json --source active --limit 100 --max-evidence 2048
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -198,8 +205,9 @@ brainproxy decode jwt eyJhbGciOi...
   ([docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
 - **Phase 5 (in progress):** authenticated testing is done: login profiles (form, JSON,
   raw request template, CSRF prefetch, bearer tokens, static headers) and `--auth` on send,
-  race, fuzz, crawl, active scan, and the proxy, with automatic re-login.
-- **Next:** reports (HTML/JSON/SARIF), API import (OpenAPI/GraphQL), and automation plans.
+  race, fuzz, crawl, active scan, and the proxy, with automatic re-login. Reports in JSON,
+  Markdown, self-contained HTML, and SARIF 2.1.0.
+- **Next:** API import (OpenAPI/GraphQL), out-of-band callbacks, and automation plans.
 
 ## License
 

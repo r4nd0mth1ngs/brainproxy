@@ -6,7 +6,7 @@ use rusqlite::params;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::scan::{Finding, Message, Risk};
+use crate::scan::{Confidence, Finding, Message, Risk};
 use crate::store::Store;
 
 pub(crate) const SCHEMA: &str = "
@@ -292,6 +292,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct FindingFilter {
     pub min_risk: Option<Risk>,
+    pub min_confidence: Option<Confidence>,
     pub host: Option<String>,
     pub alert_ref: Option<String>,
     pub state: Option<String>,
@@ -300,7 +301,7 @@ pub struct FindingFilter {
 }
 
 impl FindingFilter {
-    fn sql(&self) -> (String, Vec<String>) {
+    pub(crate) fn sql(&self) -> (String, Vec<String>) {
         let mut clauses = vec!["1=1".to_string()];
         let mut args: Vec<String> = Vec::new();
         fn bind(args: &mut Vec<String>, v: String) -> String {
@@ -309,6 +310,11 @@ impl FindingFilter {
         }
         if let Some(r) = self.min_risk {
             clauses.push(format!("risk_level >= CAST({} AS INTEGER)", bind(&mut args, r.level().to_string())));
+        }
+        if let Some(c) = self.min_confidence {
+            // Stored as text; rank it so "medium" also matches "high".
+            let rank = "(CASE confidence WHEN 'low' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END)";
+            clauses.push(format!("{rank} >= CAST({} AS INTEGER)", bind(&mut args, c.level().to_string())));
         }
         if let Some(h) = &self.host {
             clauses.push(format!("host = {}", bind(&mut args, h.clone())));

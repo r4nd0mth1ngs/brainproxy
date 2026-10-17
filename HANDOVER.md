@@ -1,6 +1,6 @@
 # brainproxy handover
 
-State as of commit `311e871` on `main` (2026-10-17). Everything below is pushed.
+State as of branch `feat/reports` (2026-10-17). `feat/auth-wiring` and `feat/reports` are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -28,7 +28,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 327 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 335 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -53,9 +53,10 @@ crates/core/src/            engine library (everything testable lives here)
   scan/active/              engine (mod.rs: Cx API), points.rs (insertion points),
                             rules/ with 42 rules ported from ZAP ascanrules
   scan/findings_db.rs       de-duplicated findings (hits), finding_types texts
-  auth.rs                   auth sessions (core only, see "In progress")
+  scan/report.rs            report model (findings + types + history evidence), JSON/MD/HTML/SARIF
+  auth.rs                   auth sessions (profiles, login, relogin)
 crates/cli/src/             thin CLI over core (clap). One *_cmd.rs per command group.
-crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs)
+crates/cli/tests/           end-to-end tests (cli.rs, proxy.rs, scope.rs, auth.rs, report.rs)
 docs/RESEARCH.md            original research, design, roadmap, AI-first CLI contract
 docs/PASSIVE_RULES.md       passive rules + differences from ZAP
 docs/ACTIVE_RULES.md        active rules + differences from ZAP
@@ -113,18 +114,30 @@ Known limits / ideas:
   command run); attacking the session cookie itself can use these up.
 - No multi-user profiles for access-control testing yet (e.g. replay as user B).
 
+## Reports (done)
+
+`crates/core/src/scan/report.rs` builds a `Report` (summary by risk, alert groups with
+ZAP description/solution/references/CWE, instances with the history request/response cut
+to `--max-evidence`) and renders it; `crates/cli/src/report_cmd.rs` is the `report [json|
+markdown|html|sarif]` command with `--output`, `--risk`, `--confidence`, `--source`,
+`--state`, `--host`, `--alert`, `--limit`, `--no-evidence`, `--title`. Without `--output`,
+JSON mode puts the JSON report in `data` (other formats as `data.content`); text mode prints
+the rendered report. HTML escapes all target data and sets a CSP that blocks scripts;
+Markdown puts target data in code spans/blocks whose fences outgrow any backtick run.
+SARIF uses `webRequest`/`webResponse`, `security-severity`, CWE tags, and a
+`partialFingerprints` key per finding. `findings list` also gained `--confidence`.
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-2. Reports: JSON, Markdown, HTML, SARIF from findings.
-3. API import: OpenAPI/Swagger, GraphQL introspection, Postman as scan targets.
-4. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
-5. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
+2. API import: OpenAPI/Swagger, GraphQL introspection, Postman as scan targets.
+3. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
+4. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
    declarative checks incl. a Nuclei template subset.
-6. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
+5. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
    ViewState rules, CharsetMismatch, Heartbleed.
-7. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
-8. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
+6. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
+7. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session
 

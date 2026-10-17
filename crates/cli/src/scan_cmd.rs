@@ -4,7 +4,6 @@ use std::path::Path;
 
 use brainproxy_core::scan::findings_db::FindingFilter;
 use brainproxy_core::scan::passive::{self, PassiveSettings, SETTINGS_KEY};
-use brainproxy_core::scan::Risk;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
 use clap::{Subcommand, ValueEnum};
@@ -50,6 +49,9 @@ pub enum FindingsCmd {
         /// Minimum risk.
         #[arg(long, value_enum)]
         risk: Option<RiskArg>,
+        /// Minimum confidence.
+        #[arg(long, value_enum)]
+        confidence: Option<crate::report_cmd::ConfidenceArg>,
         #[arg(long)]
         host: Option<String>,
         /// Alert ref or rule id, e.g. 10020 or 10020-1.
@@ -94,6 +96,7 @@ pub enum RiskArg {
 pub enum StateArg {
     Open,
     Confirmed,
+    #[value(alias = "false_positive")]
     FalsePositive,
 }
 
@@ -210,14 +213,10 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     // Findings always reflect everything captured so far.
     passive::scan_pending(&mut store)?;
     match cmd {
-        FindingsCmd::List { risk, host, alert, state, source, all, examples, limit } => {
+        FindingsCmd::List { risk, confidence, host, alert, state, source, all, examples, limit } => {
             let filter = FindingFilter {
-                min_risk: risk.map(|r| match r {
-                    RiskArg::Info => Risk::Info,
-                    RiskArg::Low => Risk::Low,
-                    RiskArg::Medium => Risk::Medium,
-                    RiskArg::High => Risk::High,
-                }),
+                min_risk: risk.map(RiskArg::get),
+                min_confidence: confidence.map(|c| c.get()),
                 host,
                 alert_ref: alert,
                 state,

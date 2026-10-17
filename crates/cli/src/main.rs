@@ -10,6 +10,7 @@ mod fuzz_cmd;
 mod jobs_cmd;
 mod output;
 mod proxy_cmd;
+mod report_cmd;
 mod request_args;
 mod scan_cmd;
 
@@ -121,6 +122,12 @@ enum Cmd {
     /// Scanner findings: grouped by alert type, per instance, details, triage.
     #[command(subcommand)]
     Findings(scan_cmd::FindingsCmd),
+
+    /// Generate a report from findings: json, markdown, html (self-contained), or sarif (2.1.0).
+    #[command(after_help = "Findings are grouped by alert type with description, solution, references, and the \
+        request/response from history as evidence. False positives are left out unless --state asks for them. \
+        Use --output FILE for large reports; stdout then only gets a summary.")]
+    Report(report_cmd::ReportArgs),
 
     /// Compare two history entries (Comparer): line, word, or byte diff.
     Diff(fuzz_cmd::DiffArgs),
@@ -332,6 +339,7 @@ fn command_name(cmd: &Cmd) -> String {
         },
         Cmd::Job(_) => "job",
         Cmd::Findings(_) => "findings",
+        Cmd::Report(_) => "report",
         Cmd::Scope(_) => "scope",
         Cmd::Rules(_) => "rules",
         Cmd::Intercept(_) => "intercept",
@@ -381,6 +389,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
         Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
+        Cmd::Report(args) => report_cmd::report(&cli.project, args, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
         Cmd::Intercept(cmd) => proxy_cmd::intercept(&cli.project, cmd, out)?,
