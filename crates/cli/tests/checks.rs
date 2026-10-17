@@ -160,10 +160,13 @@ fn checks_update_from_dir_and_scan_nuclei_store() {
         "id: f\ninfo: {severity: low}\nself-contained: true\nhttp: []\n",
     )
     .unwrap();
+    // A template taking an input (`{{env_file}}`) is stored for later --check-var.
+    let input = ENV.replace("dotenv-exposed", "dotenv-input").replace("/.env", "/{{env_file}}");
+    std::fs::write(src.join("http/exposures/configs/input.yaml"), input).unwrap();
     let (code, v) = run(&["checks", "update", "--from", src.to_str().unwrap()], &project, &home);
     assert_eq!(code, 0, "{v}");
-    assert_eq!(v["data"]["templates"], 2);
-    assert_eq!(v["data"]["stored"], 1);
+    assert_eq!(v["data"]["templates"], 3);
+    assert_eq!(v["data"]["stored"], 2);
 
     let port = serve();
     let url = format!("http://127.0.0.1:{port}/");
@@ -171,6 +174,33 @@ fn checks_update_from_dir_and_scan_nuclei_store() {
         run(&["scan", "active", &url, "--checks", "nuclei", "--no-rules", "--check-severity", "high"], &project, &home);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["raised"]["check:dotenv-exposed"], 1, "{v}");
+    assert!(v["data"]["raised"]["check:dotenv-input"].is_null(), "{v}");
+    assert_eq!(
+        v["data"]["checks"]["not_loaded_reasons"][0][0], "template inputs without a value (--check-var): env_file",
+        "{v}"
+    );
+    let (code, v) = run(&["checks", "list", "nuclei", "--check-var", "env_file=.env"], &project, &home);
+    assert_eq!((code, v["data"]["loaded"].as_i64()), (0, Some(2)), "{v}");
+    let (code, v) = run(
+        &[
+            "scan",
+            "active",
+            &url,
+            "--checks",
+            "nuclei",
+            "--no-rules",
+            "--check-ids",
+            "dotenv-input",
+            "--check-var",
+            "env_file=.env",
+        ],
+        &project,
+        &home,
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["raised"]["check:dotenv-input"], 1, "{v}");
+    let (code, v) = run(&["checks", "list", "--check-var", "no-equals"], &project, &home);
+    assert_eq!(code, 2, "{v}");
 
     // Background mode returns a job.
     let (code, v) = run(&["checks", "update", "--from", src.to_str().unwrap(), "--background"], &project, &home);

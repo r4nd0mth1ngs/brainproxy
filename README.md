@@ -193,6 +193,8 @@ brainproxy checks update                             # or --from DIR with a nucl
 brainproxy checks list nuclei --tags exposure --severity medium
 brainproxy scan active https://app.example.com/ --checks nuclei --check-tags exposure,misconfig
 brainproxy checks validate my-check.yaml             # loads, or why not
+brainproxy scan active https://app.example.com/ --checks nuclei --check-tags cve \
+    --check-var username=admin --check-var password=admin   # template inputs (Nuclei's -var)
 brainproxy scan data update                          # newer ZAP pattern lists (error messages, hidden files)
 
 # Triage state

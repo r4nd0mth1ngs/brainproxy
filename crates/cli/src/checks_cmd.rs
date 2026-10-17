@@ -21,6 +21,9 @@ pub enum ChecksCmd {
         paths: Vec<PathBuf>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// A template input (Nuclei's -var), as for `scan active --check-var`. Repeatable.
+        #[arg(long = "check-var", value_name = "NAME=VALUE", value_parser = check_var)]
+        check_vars: Vec<(String, String)>,
     },
     /// Download the Nuclei HTTP templates (pinned to a commit) into <home>/checks/nuclei, or import a checkout.
     #[command(after_help = "Downloads go only to GitHub over verified TLS and respect the system scope; the ref is \
@@ -49,6 +52,14 @@ pub struct ListArgs {
     skipped: bool,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+    /// A template input (Nuclei's -var), as for `scan active --check-var`. Repeatable.
+    #[arg(long = "check-var", value_name = "NAME=VALUE", value_parser = check_var)]
+    check_vars: Vec<(String, String)>,
+}
+
+/// clap parser for `--check-var NAME=VALUE`.
+pub fn check_var(s: &str) -> Result<(String, String), String> {
+    checks::parse_var(s).map_err(|e| e.to_string())
 }
 
 #[derive(clap::Args)]
@@ -74,8 +85,8 @@ pub struct UpdateArgs {
 pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         ChecksCmd::List(a) => list(home, a, out),
-        ChecksCmd::Validate { paths, limit } => {
-            let loaded = checks::load(&paths)?;
+        ChecksCmd::Validate { paths, limit, check_vars } => {
+            let loaded = checks::load(&paths, &checks::LoadOptions { vars: check_vars, ..Default::default() })?;
             let files: Vec<_> = loaded
                 .checks
                 .iter()
@@ -145,7 +156,8 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
 
 fn list(home: &Path, a: ListArgs, out: &Out) -> Result<(), Error> {
     let selectors = if a.selectors.is_empty() { vec!["all".to_string()] } else { a.selectors.clone() };
-    let loaded = checks::load(&checks::resolve_selectors(home, &selectors))?;
+    let opts = checks::LoadOptions { vars: a.check_vars.clone(), ..Default::default() };
+    let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
     let filter = Filter {
         ids: vec![],
         tags: a.tags.clone(),

@@ -71,11 +71,15 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn run(port: u16, path: &str, templates: &[(&str, &str)]) -> ActiveSummary {
+    run_opts(port, path, templates, &Default::default())
+}
+
+fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::LoadOptions) -> ActiveSummary {
     let dir = tmp(&format!("t{port}"));
     for (name, text) in templates {
         std::fs::write(dir.join(name), text).unwrap();
     }
-    let loaded = checks::load(std::slice::from_ref(&dir)).unwrap();
+    let loaded = checks::load(std::slice::from_ref(&dir), opts).unwrap();
     assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
     let target = Target::from_url(&format!("http://127.0.0.1:{port}{path}")).unwrap();
     let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: sid=abc\r\n\r\n");
@@ -376,4 +380,42 @@ http:
     assert!(post.contains("&sig=15cc41c9fa82806a0b7ef2ada7c86574"), "{post}");
     assert!(seen.iter().any(|r| r.starts_with("GET /nothing-here ")));
     assert!(!seen.iter().any(|r| r.starts_with("GET /never-requested ")));
+}
+
+#[test]
+fn template_inputs_from_check_vars() {
+    // A default-login check taking its credentials from --check-var.
+    const AUTH: &str = r#"
+id: input-login
+info: {name: Input Login, severity: high}
+variables:
+  username: guest
+http:
+  - raw:
+      - |
+        POST /login HTTP/1.1
+        Host: {{Hostname}}
+        Authorization: Basic {{base64(username + ':' + password)}}
+
+        u={{username}}
+    matchers:
+      - type: dsl
+        dsl: ['status_code == 200 && contains(body, "hello " + username)']
+"#;
+    let (port, seen) = spawn(|req| {
+        if req.contains("Authorization: Basic YWRtaW46czNjcjN0") {
+            resp("200 OK", "", "hello admin")
+        } else {
+            resp("401 Unauthorized", "", "no")
+        }
+    });
+    let opts = checks::LoadOptions {
+        vars: vec![("username".into(), "admin".into()), ("password".into(), "s3cr3t".into())],
+        ..Default::default()
+    };
+    let s = run_opts(port, "/", &[("auth.yaml", AUTH)], &opts);
+    assert_eq!(s.raised.get("check:input-login"), Some(&1), "{s:?}");
+    // The input overrides the template's own `username` variable.
+    let reqs = seen.lock().unwrap();
+    assert!(reqs.iter().any(|r| r.ends_with("u=admin")), "{reqs:?}");
 }

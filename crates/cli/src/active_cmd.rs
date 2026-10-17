@@ -54,6 +54,10 @@ pub struct ActiveArgs {
     /// Only checks of at least this severity.
     #[arg(long, value_enum)]
     check_severity: Option<crate::scan_cmd::RiskArg>,
+    /// A template input (Nuclei's -var), e.g. username=admin; templates using
+    /// inputs that aren't given are not loaded. Repeatable.
+    #[arg(long = "check-var", value_name = "NAME=VALUE", value_parser = crate::checks_cmd::check_var)]
+    check_vars: Vec<(String, String)>,
     /// Also inject into cookies.
     #[arg(long)]
     cookies: bool,
@@ -221,7 +225,8 @@ fn load_checks(home: &Path, args: &ActiveArgs) -> Result<(Vec<checks::Check>, se
     if args.checks.is_empty() {
         return Ok((vec![], serde_json::Value::Null));
     }
-    let loaded = checks::load(&checks::resolve_selectors(home, &args.checks))?;
+    let opts = checks::LoadOptions { vars: args.check_vars.clone(), ..Default::default() };
+    let loaded = checks::load(&checks::resolve_selectors(home, &args.checks), &opts)?;
     let filter = checks::Filter {
         ids: args.check_ids.clone(),
         tags: args.check_tags.clone(),

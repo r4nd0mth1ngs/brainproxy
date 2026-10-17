@@ -55,6 +55,10 @@ pub struct Check {
     pub(crate) rule_scope: RuleScope,
     #[serde(skip)]
     pub(crate) variables: Vec<(String, String)>,
+    /// Template inputs given at load time (`--check-var`); they take precedence
+    /// over the template's own variables.
+    #[serde(skip)]
+    pub(crate) inputs: Vec<(String, String)>,
     #[serde(skip)]
     pub(crate) blocks: Vec<Block>,
     /// `flow:` as a boolean expression over `http(N)` (variables `__http_N`).
@@ -268,9 +272,31 @@ fn unsupported<T>(m: impl Into<String>) -> std::result::Result<T, Problem> {
     Err(Problem::Unsupported(m.into()))
 }
 
+/// What a template may rely on when it loads.
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Template inputs (`--check-var NAME=VALUE`, Nuclei's `-var`) for
+    /// placeholders such as `{{username}}` that the template doesn't define.
+    pub vars: Vec<(String, String)>,
+    /// Accept templates whatever inputs they need (`checks update` stores them
+    /// so a later `--check-var` can enable them).
+    pub any_inputs: bool,
+}
+
+/// Parses `NAME=VALUE` (a `--check-var`).
+pub fn parse_var(s: &str) -> Result<(String, String)> {
+    let (k, v) =
+        s.split_once('=').ok_or_else(|| Error::InvalidInput(format!("--check-var {s:?}: expected NAME=VALUE")))?;
+    let k = k.trim();
+    if k.is_empty() || !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+        return Err(Error::InvalidInput(format!("--check-var {s:?}: bad name")));
+    }
+    Ok((k.to_string(), v.to_string()))
+}
+
 /// Loads every `.yaml`/`.yml` under `paths` (files or directories, recursively).
 /// Later templates with an id already loaded are skipped.
-pub fn load(paths: &[PathBuf]) -> Result<Loaded> {
+pub fn load(paths: &[PathBuf], opts: &LoadOptions) -> Result<Loaded> {
     let mut files = Vec::new();
     for p in paths {
         if p.is_dir() {
@@ -287,7 +313,7 @@ pub fn load(paths: &[PathBuf]) -> Result<Loaded> {
     let parsed: Vec<(PathBuf, Parsed)> = std::thread::scope(|sc| {
         let handles: Vec<_> = files
             .chunks(chunk)
-            .map(|c| sc.spawn(move || c.iter().map(|f| (f.clone(), parse_file(f))).collect::<Vec<_>>()))
+            .map(|c| sc.spawn(move || c.iter().map(|f| (f.clone(), parse_file(f, opts))).collect::<Vec<_>>()))
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     });
@@ -314,14 +340,14 @@ pub fn load(paths: &[PathBuf]) -> Result<Loaded> {
 
 type Parsed = std::result::Result<Check, (Option<String>, Problem)>;
 
-fn parse_file(file: &Path) -> Parsed {
+fn parse_file(file: &Path, opts: &LoadOptions) -> Parsed {
     let bytes = match std::fs::metadata(file) {
         Ok(m) if m.len() > MAX_TEMPLATE => return Err((None, Problem::Invalid("file too large".into()))),
         Ok(_) => std::fs::read(file),
         Err(e) => Err(e),
     };
     match bytes {
-        Ok(b) => parse(&String::from_utf8_lossy(&b), file),
+        Ok(b) => parse(&String::from_utf8_lossy(&b), file, opts),
         Err(e) => Err((None, Problem::Invalid(e.to_string()))),
     }
 }
@@ -345,16 +371,16 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Parses one template.
 pub fn parse_str(text: &str) -> Result<Check> {
-    parse(text, Path::new("<inline>")).map_err(|(_, p)| match p {
+    parse(text, Path::new("<inline>"), &LoadOptions::default()).map_err(|(_, p)| match p {
         Problem::Invalid(r) => Error::InvalidInput(r),
         Problem::Unsupported(r) => Error::InvalidInput(format!("unsupported: {r}")),
     })
 }
 
-fn parse(text: &str, file: &Path) -> std::result::Result<Check, (Option<String>, Problem)> {
+fn parse(text: &str, file: &Path, opts: &LoadOptions) -> std::result::Result<Check, (Option<String>, Problem)> {
     let doc = crate::apiimport::parse_document(text).map_err(|e| (None, Problem::Invalid(e.to_string())))?;
     let id = doc.get("id").and_then(Value::as_str).map(str::to_string);
-    compile(&doc, file).map_err(|p| (id, p))
+    compile(&doc, file, opts).map_err(|p| (id, p))
 }
 
 const TOP_KEYS: &[&str] = &["id", "info", "http", "requests", "variables", "scope", "flow"];
@@ -413,7 +439,7 @@ fn flag(v: &Value, key: &str) -> bool {
     }
 }
 
-fn compile(doc: &Value, file: &Path) -> std::result::Result<Check, Problem> {
+fn compile(doc: &Value, file: &Path, opts: &LoadOptions) -> std::result::Result<Check, Problem> {
     let Some(obj) = doc.as_object() else { return invalid("not a mapping") };
     let Some(id) = obj.get("id").and_then(Value::as_str).map(str::to_string) else {
         return invalid("missing id");
@@ -479,7 +505,7 @@ fn compile(doc: &Value, file: &Path) -> std::result::Result<Check, Problem> {
     if blocks.is_empty() {
         return invalid("no requests");
     }
-    check_placeholders(&variables, &mut blocks)?;
+    let inputs = check_placeholders(&variables, &mut blocks, opts)?;
     let flow = match obj.get("flow") {
         None => None,
         Some(f) => Some(compile_flow(&s(f).unwrap_or_default(), blocks.len())?),
@@ -502,6 +528,7 @@ fn compile(doc: &Value, file: &Path) -> std::result::Result<Check, Problem> {
         file: file.to_path_buf(),
         rule_scope,
         variables,
+        inputs,
         blocks,
         flow,
     })
@@ -855,10 +882,18 @@ pub(crate) static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\
 /// expressions (function calls, interactsh-url, ...) make the template unsupported.
 pub(crate) static RANDSTR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\brandstr(_\d+)?\b").unwrap());
 
-fn check_placeholders(vars: &[(String, String)], blocks: &mut [Block]) -> std::result::Result<(), Problem> {
+/// Returns the template inputs (`opts.vars`) the template uses.
+fn check_placeholders(
+    vars: &[(String, String)],
+    blocks: &mut [Block],
+    opts: &LoadOptions,
+) -> std::result::Result<Vec<(String, String)>, Problem> {
     let is_randstr = |n: &str| RANDSTR.find(n).is_some_and(|m| m.len() == n.len());
     let mut known: HashSet<String> = BUILTINS.iter().map(|b| b.to_string()).collect();
     known.extend(vars.iter().map(|(k, _)| k.clone()));
+    let input = |n: &str| opts.vars.iter().any(|(k, _)| k == n);
+    let mut used_inputs: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     for b in blocks.iter() {
         known.extend(b.payloads.iter().map(|(k, _)| k.clone()));
         known.extend(b.extractors.iter().filter_map(|e| e.name.clone()));
@@ -883,6 +918,9 @@ fn check_placeholders(vars: &[(String, String)], blocks: &mut [Block]) -> std::r
                 return unsupported("interactsh (out-of-band) matchers");
             }
             nth |= !known.contains(v) && numbered(v).is_some();
+            if input(v) && !known.contains(v) && !used_inputs.iter().any(|x| x == v) {
+                used_inputs.push(v.to_string());
+            }
         }
         b.req_condition |= nth;
     }
@@ -914,12 +952,20 @@ fn check_placeholders(vars: &[(String, String)], blocks: &mut [Block]) -> std::r
             };
             let mut used = Vec::new();
             expr.vars(&mut used);
-            if used.iter().any(|v| !known.contains(*v) && !is_randstr(v)) {
-                return unsupported("placeholders without a value (template inputs)");
+            for v in used.into_iter().filter(|v| !known.contains(*v) && !is_randstr(v)) {
+                let list = if input(v) { &mut used_inputs } else { &mut missing };
+                if !list.iter().any(|x| x == v) {
+                    list.push(v.to_string());
+                }
             }
         }
     }
-    Ok(())
+    if !missing.is_empty() && !opts.any_inputs {
+        missing.sort();
+        return unsupported(format!("template inputs without a value (--check-var): {}", missing.join(", ")));
+    }
+    // Inputs named like a template variable override it.
+    Ok(opts.vars.iter().filter(|(k, _)| used_inputs.contains(k) || vars.iter().any(|(v, _)| v == k)).cloned().collect())
 }
 
 /// Payload value combinations for a block: name -> value per combination.

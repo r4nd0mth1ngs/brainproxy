@@ -148,8 +148,13 @@ async fn run(rule: &CheckRule, cx: &Cx) {
     let check = &rule.check;
     let mut vars = builtins(cx, check.rule_scope);
     add_randstr(check, &mut vars);
-    // Variables may refer to builtins and to earlier variables.
+    vars.extend(check.inputs.iter().cloned());
+    // Variables may refer to builtins, inputs, and earlier variables; an input
+    // with the same name wins (like Nuclei's `-var`).
     for (k, v) in &check.variables {
+        if check.inputs.iter().any(|(i, _)| i == k) {
+            continue;
+        }
         if let Some(v) = subst(v, &vars) {
             vars.insert(k.clone(), v);
         }

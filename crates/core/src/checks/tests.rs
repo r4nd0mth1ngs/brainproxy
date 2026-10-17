@@ -1,7 +1,7 @@
 use super::*;
 
 fn unsupported_reason(yaml: &str) -> String {
-    match parse(yaml, Path::new("t.yaml")) {
+    match parse(yaml, Path::new("t.yaml"), &LoadOptions::default()) {
         Err((_, Problem::Unsupported(r))) => r,
         Err((_, Problem::Invalid(r))) => panic!("expected unsupported, got invalid: {r}"),
         Ok(_) => panic!("expected unsupported, got a check"),
@@ -9,7 +9,7 @@ fn unsupported_reason(yaml: &str) -> String {
 }
 
 fn invalid_reason(yaml: &str) -> String {
-    match parse(yaml, Path::new("t.yaml")) {
+    match parse(yaml, Path::new("t.yaml"), &LoadOptions::default()) {
         Err((_, Problem::Invalid(r))) => r,
         Err((_, Problem::Unsupported(r))) => panic!("expected invalid, got unsupported: {r}"),
         Ok(_) => panic!("expected invalid, got a check"),
@@ -117,8 +117,40 @@ fn unsupported_features_are_named() {
         unsupported_reason(&format!(
             "{base}http:\n  - path: ['{{{{BaseURL}}}}/{{{{base64(username)}}}}']\n    matchers:\n      - type: status\n        status: [200]\n"
         )),
-        "placeholders without a value (template inputs)"
+        "template inputs without a value (--check-var): username"
     );
+}
+
+#[test]
+fn template_inputs() {
+    let t = "id: x\ninfo: {name: x, severity: low}\nvariables:\n  user: guest\nhttp:\n  - raw:\n      - |\n        POST /login HTTP/1.1\n        Host: {{Hostname}}\n\n        u={{user}}&p={{url_encode(password)}}&t={{token}}\n    matchers:\n      - type: dsl\n        dsl: ['contains(body, greeting)']\n";
+    let opts = |vars: &[(&str, &str)], any| LoadOptions {
+        vars: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        any_inputs: any,
+    };
+    let reason = |o: &LoadOptions| match parse(t, Path::new("t.yaml"), o) {
+        Err((_, Problem::Unsupported(r))) => r,
+        _ => panic!("expected unsupported"),
+    };
+    // Names that are neither defined nor given are listed, sorted.
+    assert_eq!(reason(&opts(&[], false)), "template inputs without a value (--check-var): password, token");
+    assert_eq!(reason(&opts(&[("password", "x")], false)), "template inputs without a value (--check-var): token");
+    // Given inputs are kept when used (in placeholders or DSL) or when they
+    // override a template variable (`user`); others are dropped.
+    let c = parse(
+        t,
+        Path::new("t.yaml"),
+        &opts(&[("password", "p w"), ("token", "1"), ("user", "admin"), ("greeting", "hi"), ("other", "o")], false),
+    )
+    .unwrap_or_else(|_| panic!("loads"));
+    let mut names: Vec<&str> = c.inputs.iter().map(|(k, _)| k.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["greeting", "password", "token", "user"]);
+    // `checks update` keeps templates whatever inputs they need.
+    assert!(parse(t, Path::new("t.yaml"), &opts(&[], true)).is_ok());
+    assert_eq!(parse_var("username=a=b").unwrap(), ("username".into(), "a=b".into()));
+    assert!(parse_var("novalue").is_err());
+    assert!(parse_var("bad name=x").is_err());
 }
 
 #[test]
@@ -190,7 +222,7 @@ fn filter_and_load_dedupes() {
     std::fs::write(dir.join("sub/b.yml"), GIT_CONFIG).unwrap();
     std::fs::write(dir.join("c.yaml"), "id: c\ninfo: {severity: low}\nflow: x\n").unwrap();
     std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
-    let l = load(std::slice::from_ref(&dir)).unwrap();
+    let l = load(std::slice::from_ref(&dir), &Default::default()).unwrap();
     assert_eq!(l.checks.len(), 1);
     assert_eq!(l.skipped.len(), 2);
     assert!(l.skipped.iter().any(|s| s.reason == "duplicate id"));
@@ -227,7 +259,7 @@ async fn store_update_from_dir_keeps_only_loadable_templates() {
     std::fs::write(src.join("http/exposures/git2.yaml"), GIT_CONFIG.replace("id: git-config", "id: git2")).unwrap();
     update(&home, Source::Dir(src)).await.unwrap();
     assert!(!nuclei_dir(&home).join("http/exposures/git.yaml").exists());
-    assert_eq!(load(&resolve_selectors(&home, &["nuclei".into()])).unwrap().checks[0].id, "git2");
+    assert_eq!(load(&resolve_selectors(&home, &["nuclei".into()]), &Default::default()).unwrap().checks[0].id, "git2");
     std::fs::remove_dir_all(&base).unwrap();
 }
 

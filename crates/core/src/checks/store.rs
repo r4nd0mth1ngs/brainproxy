@@ -113,7 +113,9 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
         return Err(Error::NotFound("no HTTP templates (http/*.yaml) in the source".into()));
     }
     // Keep only templates that load, so the store is exactly what can run.
-    let loaded = super::load(std::slice::from_ref(&staging))?;
+    // Templates needing inputs stay: `--check-var` enables them at scan time.
+    let opts = super::LoadOptions { any_inputs: true, ..Default::default() };
+    let loaded = super::load(std::slice::from_ref(&staging), &opts)?;
     for s in &loaded.skipped {
         let _ = std::fs::remove_file(&s.file);
     }
