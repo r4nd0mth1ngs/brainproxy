@@ -3,7 +3,7 @@
 mod anti_clickjacking;
 mod big_redirects;
 mod cache_control;
-mod common;
+pub(crate) mod common;
 mod content_security_policy;
 mod content_type_missing;
 mod cross_domain_misconfiguration;

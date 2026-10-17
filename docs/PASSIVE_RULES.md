@@ -1,6 +1,6 @@
 # Passive rules
 
-brainproxy's passive scanner runs 49 rules ported from OWASP ZAP's `pscanrules` add-on
+brainproxy's passive scanner runs 52 rules ported from OWASP ZAP's `pscanrules` add-on
 (https://github.com/zaproxy/zap-extensions, Apache License 2.0). Each rule file names the
 ZAP class it came from, and alert names, descriptions, solutions, and references are ZAP's.
 
@@ -30,6 +30,7 @@ lists them; `scan disable ID` / `scan enable ID` switch them.
 | 10029 | Cookie Poisoning | info | 10029 |
 | 10030 | User Controllable Charset | info | 10030 |
 | 10031 | User Controllable HTML Element Attribute (Potential XSS) | info | 10031 |
+| 10032 | Viewstate | high | 10032-1, 10032-2, 10032-3, 10032-5, 10032-6 |
 | 10033 | Directory Browsing | medium | 10033 |
 | 10034 | Heartbleed OpenSSL Vulnerability (Indicative) | high | 10034 |
 | 10035 | Strict-Transport-Security Header | low | 10035-1, 10035-2, 10035-3, 10035-5, 10035-6, 10035-7, 10035-8 |
@@ -57,20 +58,23 @@ lists them; `scan disable ID` / `scan enable ID` switch them.
 | 10109 | Modern Web Application | info | 10109 |
 | 10115 | Script Served From Malicious Domain (polyfill) | high | 10115-1, 10115-2 |
 | 10202 | Absence of Anti-CSRF Tokens | medium | 10202 |
-| 90002 | Java Serialization Object | medium | 90002 |
+| 90001 | Insecure JSF ViewState | medium | 90001 |
+| 90002 | Java Serialization Object | medium | 90001 | Insecure JSF ViewState | medium | 90001 |
+| 90002 |
 | 90003 | Sub Resource Integrity Attribute Missing | medium | 90003 |
-| 90022 | Application Error Disclosure | medium | 90022 |
+| 90011 | Charset Mismatch | info | 90011-1, 90011-2, 90011-4 |
+| 90022 | Application Error Disclosure | medium | 90011 | Charset Mismatch | info | 90011-1, 90011-2, 90011-4 |
+| 90022 |
 | 90033 | Loosely Scoped Cookie | info | 90033 |
 
-Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames),
-Viewstate and InsecureJsfViewState (planned), CharsetMismatch (planned).
+Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 
 ## Differences from ZAP
 
 Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
 
 - **Thresholds:** alerts ZAP raises only at LOW threshold are not raised (e.g. 10036-1,
-  10035-4, the low-confidence SHA/MD5 patterns of 10097). There is no threshold setting yet.
+  10035-4, 10032-4, 90011-3, the low-confidence SHA/MD5 patterns of 10097). There is no threshold setting yet.
 - **ZAP configuration and contexts** (trusted domains, cookie/CSRF ignore lists, scope
   checks, custom error pages, BIN list lookups) are not used; lists are empty and PII
   findings stay at Medium confidence.
@@ -90,5 +94,10 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   64-bit range check, and the never-matching LanMan hash pattern is omitted.
 - **Evidence formatting:** raw header blocks are rebuilt as `Name: value` lines, and the
   status-500 evidence of 90022 is always `HTTP/1.1 500 Internal Server Error`.
+- **Charset Mismatch (90011)** doesn't alert on an XML declaration without `encoding` (ZAP
+  reports `null`; such documents are UTF-8 by default), and only looks at a leading XML
+  declaration instead of Jericho's XML detection.
+- **Viewstate (10032)** lists analyzer matches sorted; malformed split viewstates raise
+  nothing instead of aborting the scan.
 - **Findings are de-duplicated:** the same alert, host, method, path, parameter, and
   evidence is one finding with a `hits` count.

@@ -263,7 +263,7 @@ brainproxy engagement start|show|check                    ✔ immutable scope
 brainproxy job list|status|wait|stop                      ✔
 brainproxy scan active [URL...] [--where SQL] [--rules] [--strength]   ✔ 42 ZAP active rules
 brainproxy findings list|show|mark                        ✔ grouped by alert type, de-duplicated
-brainproxy scan passive|rules|enable|disable|sources       ✔ 49 passive rules from ZAP
+brainproxy scan passive|rules|enable|disable|sources       ✔ 52 passive rules from ZAP
 brainproxy report --format html|json|md|sarif             Phase 4
 brainproxy import openapi|graphql|har|postman             Phase 5
 brainproxy run plan.yaml                                  Phase 5 (ZAP-style automation)
@@ -279,7 +279,7 @@ brainproxy mcp                                            Phase 6
 | **0: Skeleton (done)** | Rust workspace, `brainproxy` CLI, JSON envelope and exit codes, `capabilities`, SQLite capture DB with `query`/`schema`, FTS, and SQL helpers, raw HTTP/1.x client (HTTP and HTTPS), `send`, `history`, codecs, static Linux build | Repeater (single request), Decoder, Logger |
 | **1: Proxy (done)** | MITM proxy (HTTP/1.x, CONNECT, TLS interception, WebSocket pass-through), CA generation/export/system install, scope, match-and-replace, intercept queue in the project DB, background lifecycle. Still to do: HTTP/2 to clients, upstream connection pooling, upstream proxy chaining, HAR import/export | Burp Proxy, ZAP proxy |
 | **2: Manual tools (done)** | `send --race` (last-byte sync), `fuzz` (4 Intruder modes, payload sources and processors, grep/extract, match-status, stop-on-match, rate limit, keep-alive workers, background runs, outlier summary), `diff`. Still to do: HTTP/2 single-packet attack, streaming very large wordlists | Repeater, Intruder, Comparer |
-| **3: Passive scanner (done)** | 49 ZAP passive rules ported (see docs/PASSIVE_RULES.md), run automatically on proxy and send traffic, de-duplicated findings with triage states, `findings`/`scan` commands. Still to do: ViewState rules, a threshold setting | ZAP passive scan |
+| **3: Passive scanner (done)** | 52 ZAP passive rules ported (see docs/PASSIVE_RULES.md), run automatically on proxy and send traffic, de-duplicated findings with triage states, `findings`/`scan` commands. Still to do: a threshold setting | ZAP passive scan |
 | **4: Crawl and active scan (done)** | HTTP spider, background jobs, immutable engagement scope, insertion-point engine, 42 ZAP active rules, drift detection. Moved to later: YAML/Nuclei checks, reports | Burp Scanner (core), ZAP active scan |
 | **5: Auth and automation** | Contexts, login flows, session macros, `brainproxy run plan.yaml`, OpenAPI/GraphQL import | ZAP Automation Framework, Burp session rules |
 | **6: Advanced** | OAST server/client, headless browser crawler, Sequencer, WebSocket fuzzing, ZAP beta rules, MCP server for AI agents, plugins | Collaborator, Sequencer, Burp AT/ZAP MCP |
