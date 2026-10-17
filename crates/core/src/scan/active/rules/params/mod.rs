@@ -13,6 +13,7 @@ mod remote_file_include;
 mod server_side_include;
 mod ssti;
 mod xpath_injection;
+mod xslt_injection;
 mod xxe;
 
 use crate::scan::active::ActiveRule;
@@ -32,6 +33,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(parameter_tamper::ParameterTamper),
         Box::new(padding_oracle::PaddingOracle),
         Box::new(log4shell::Log4Shell),
+        Box::new(xslt_injection::XsltInjection),
     ]
 }
 
@@ -74,6 +76,23 @@ mod e2e {
                 } else {
                     not_found
                 }
+            }
+            // Transforms `name` as an XSLT fragment: the vendor function answers, a misspelt one errors.
+            "/xslt" => {
+                let name = param("name");
+                if name.contains("system-property('xsl:vendor')") {
+                    ok("text/html", "<p>Hello libxslt</p>".into())
+                } else if name.contains("system-property('xsl:vedor')") {
+                    ok("text/html", "<p>Hello </p>".into())
+                } else {
+                    ok("text/html", format!("<p>Hello {}</p>", escape(&name)))
+                }
+            }
+            // Mentions a vendor for any XSL-looking input, misspelt or not (a false positive trap).
+            "/xslt-fp" => {
+                let name = param("name");
+                let vendor = if name.contains("xsl") { "Microsoft" } else { "" };
+                ok("text/html", format!("<p>Hello {}{vendor}</p>", escape(&name)))
             }
             "/file-safe" => {
                 if param("name") == "readme.txt" {
@@ -158,10 +177,19 @@ mod e2e {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn finds_xslt_vendor_injection() {
+        let port = spawn_app();
+        let s = scan("xslt", port, &["/xslt?name=bob"], Some(vec![90017])).await;
+        assert_eq!(s.raised.get("90017"), Some(&1), "{s:?}");
+        assert_eq!(s.requests, 3, "error probe, vendor payload, misspelt re-check: {s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn safe_endpoints_raise_nothing() {
         let port = spawn_app();
         let ids: Vec<u32> = super::all().iter().map(|r| r.id()).collect();
-        let s = scan("safe", port, &["/xss-safe?q=hi", "/file-safe?name=readme.txt"], Some(ids)).await;
+        let s =
+            scan("safe", port, &["/xss-safe?q=hi", "/file-safe?name=readme.txt", "/xslt-fp?name=bob"], Some(ids)).await;
         assert!(s.raised.is_empty(), "false positives: {s:?}");
         assert!(s.requests > 20, "the rules did attack: {s:?}");
     }

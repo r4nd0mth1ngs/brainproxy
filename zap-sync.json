@@ -26,7 +26,6 @@
     "HeartBleedActiveScanRule": "raw TLS; planned",
     "PersistentXssScanRule": "needs cross-request state; planned",
     "PersistentXssPrimeScanRule": "needs cross-request state; planned",
-    "PersistentXssSpiderScanRule": "needs cross-request state; planned",
-    "XsltInjectionScanRule": "not ported yet"
+    "PersistentXssSpiderScanRule": "needs cross-request state; planned"
   }
 }

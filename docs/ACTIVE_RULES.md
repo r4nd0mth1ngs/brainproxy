@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` runs 43 rules ported from OWASP ZAP's `ascanrules` add-on (and
+`brainproxy scan active` runs 44 rules ported from OWASP ZAP's `ascanrules` add-on (and
 helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
@@ -46,6 +46,7 @@ rules can only reach targets the engagement allows, including when following red
 | 40044 | Exponential Entity Expansion (Billion Laughs Attack) | page | medium | 40044 |
 | 40045 | Spring4Shell | page | high | 40045 |
 | 40048 | Remote Code Execution (React2Shell) | host | high | 40048 |
+| 90017 | XSLT Injection | param | medium | 90017 |
 | 90019 | Server Side Code Injection | param | high | 90019-1, 90019-2 |
 | 90020 | Remote OS Command Injection | param | high | 90020 |
 | 90021 | XPath Injection | param | high | 90021 |
@@ -59,8 +60,8 @@ rules can only reach targets the engagement allows, including when following red
 Scopes: `param` runs once per insertion point (query, form, JSON; cookies and headers when
 enabled), `page` once per target request, `host` once per scheme://host:port.
 
-Not ported yet (listed in `zap-sync.json`): XSLT Injection, Persistent XSS (needs
-cross-request state), Heartbleed (raw TLS).
+Not ported yet (listed in `zap-sync.json`): Persistent XSS (needs cross-request state),
+Heartbleed (raw TLS).
 
 ## Differences from ZAP
 
@@ -89,6 +90,8 @@ cross-request state), Heartbleed (raw TLS).
   connection always goes to the in-scope target.
 - **SSTI (90035)** checks reflected output only (ZAP also checks pages found by its
   persistent-XSS spider).
+- **XSLT Injection (90017)** applies ZAP's per-strength request limit per insertion point
+  (ZAP counts it across all parameters of a page).
 - **Per-file references** for Hidden Files (40035) are added to the finding's other-info.
 - **Low-threshold-only alerts** (e.g. the 401/403 "may be protected" informational
   alerts of the file probes, the JSON XSS weakness alert) are not raised.
