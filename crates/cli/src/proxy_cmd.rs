@@ -451,6 +451,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard),
+        http2: false,
     };
     let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;

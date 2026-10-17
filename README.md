@@ -114,8 +114,14 @@ brainproxy fuzz status 3          # baseline, outliers, matches, errors
 brainproxy fuzz results 3 --matched
 brainproxy fuzz stop 3
 
-# Race conditions: N requests, last byte released together
+# Race conditions: N requests, last byte released together (HTTP/1.1, N connections)
 brainproxy send req.http --race 20
+# HTTP/2 single-packet attack: one connection, all final frames in one TCP packet
+brainproxy send req.http --race 20 --http2
+
+# HTTP/2 (ALPN h2; h2c prior knowledge for http://) on send, fuzz, crawl, scan active.
+# Recorded as "GET /x HTTP/2"; such a request is re-sent over HTTP/2 automatically.
+brainproxy send --http2 --url https://target.test/
 
 # Compare two captures
 brainproxy diff 12 15 --part response-body --mode words
@@ -242,8 +248,9 @@ brainproxy decode jwt eyJhbGciOi...
   and multi-request conditions (`checks update`, `scan active --checks`; see
   [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
   All ZAP active rules are ported. Upstream connections are kept alive and reused (inside
-  the scope guard) by fuzz, crawl, active scan, import, and the proxy.
-- **Next:** performance (HTTP/2, single-packet race), MCP server.
+  the scope guard) by fuzz, crawl, active scan, import, and the proxy. HTTP/2 client
+  (`--http2`) and the HTTP/2 single-packet race attack.
+- **Next:** HTTP/2 in the proxy, MCP server.
 
 ## License
 

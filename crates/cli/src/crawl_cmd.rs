@@ -59,6 +59,9 @@ pub struct CrawlArgs {
     timeout: f64,
     #[arg(long)]
     verify_tls: bool,
+    /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http).
+    #[arg(long)]
+    http2: bool,
     /// Run detached; returns a job id for `job wait|status|stop`.
     #[arg(long)]
     background: bool,
@@ -87,6 +90,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard),
+        http2: args.http2,
     };
     let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send)?;
     let cfg = CrawlConfig {

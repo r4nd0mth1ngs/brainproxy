@@ -83,6 +83,9 @@ pub struct ActiveArgs {
     max_targets: usize,
     #[arg(long)]
     verify_tls: bool,
+    /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http).
+    #[arg(long)]
+    http2: bool,
     /// Scan logged in with this auth profile; re-logs in when the session is lost.
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
@@ -129,6 +132,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard.clone()),
+        http2: args.http2,
     };
     let point_opts = PointOptions {
         query: !args.no_query,

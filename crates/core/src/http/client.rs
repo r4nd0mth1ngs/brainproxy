@@ -20,6 +20,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::{Error, Result};
 use crate::guard::Guard;
+use crate::http::h2::{setup_error, H2Request};
 use crate::http::request::RawRequest;
 use crate::http::response::parse_response_head;
 use crate::http::target::Target;
@@ -35,11 +36,13 @@ pub struct SendOptions {
     pub sni: Option<String>,
     /// Scope every connection must pass. Without one, nothing is sent.
     pub guard: Option<Arc<Guard>>,
+    /// Send over HTTP/2 (ALPN `h2` for https, prior knowledge for http).
+    pub http2: bool,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(30), verify_tls: false, sni: None, guard: None }
+        Self { timeout: Duration::from_secs(30), verify_tls: false, sni: None, guard: None, http2: false }
     }
 }
 
@@ -74,12 +77,16 @@ type PoolKey = (tokio::runtime::Id, String, String, u16);
 #[derive(Default)]
 struct Pool {
     idle: Mutex<HashMap<PoolKey, Vec<(Stream, Instant)>>>,
+    /// One multiplexed HTTP/2 connection per key.
+    h2: Mutex<HashMap<PoolKey, h2::client::SendRequest<bytes::Bytes>>>,
+    h2_connecting: tokio::sync::Mutex<()>,
     opened: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
 pub struct Client {
     tls: TlsConnector,
+    tls_h2: TlsConnector,
     opts: SendOptions,
     pool: Arc<Pool>,
 }
@@ -103,7 +110,18 @@ impl Client {
         };
         let mut config = config;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self { tls: TlsConnector::from(Arc::new(config)), opts, pool: Arc::default() }
+        let mut h2_config = config.clone();
+        h2_config.alpn_protocols = vec![b"h2".to_vec()];
+        Self {
+            tls: TlsConnector::from(Arc::new(config)),
+            tls_h2: TlsConnector::from(Arc::new(h2_config)),
+            opts,
+            pool: Arc::default(),
+        }
+    }
+
+    pub fn options(&self) -> &SendOptions {
+        &self.opts
     }
 
     /// Connections opened so far (pooled reuse doesn't count).
@@ -142,6 +160,18 @@ impl Client {
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
+        if self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")) {
+            let h2req = H2Request::from_raw(req.as_bytes(), target)?;
+            let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2(&h2req, target))
+                .await
+                .map_err(|_| Error::Timeout(self.opts.timeout))??;
+            return Ok(Exchange {
+                target: target.clone(),
+                request: h2req.recorded,
+                response,
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+        }
         let response = tokio::time::timeout(self.opts.timeout, self.round_trip(req.as_bytes(), target, &method))
             .await
             .map_err(|_| Error::Timeout(self.opts.timeout))??;
@@ -185,10 +215,102 @@ impl Client {
         }
     }
 
+    /// Sends on the pooled HTTP/2 connection to `target`, opening one if there
+    /// is none. If the pooled connection has gone away (checked before anything
+    /// is sent), a new one is opened.
+    async fn round_trip_h2(&self, req: &H2Request, target: &Target) -> Result<Vec<u8>> {
+        let key = pool_key(target);
+        let mut fresh = false;
+        let sender = match self.h2_pooled(&key).await {
+            Some(s) => s,
+            None => {
+                // One handshake at a time, so concurrent senders share a connection.
+                // One lock for all targets: handshakes to different hosts wait for each other.
+                let _connecting = self.pool.h2_connecting.lock().await;
+                match self.h2_pooled(&key).await {
+                    Some(s) => s,
+                    None => {
+                        fresh = true;
+                        self.h2_handshake(target).await.map_err(|e| setup_error(target, e))?
+                    }
+                }
+            }
+        };
+        let result = crate::http::h2::round_trip(sender, req).await;
+        if fresh && result.is_err() {
+            self.pool.h2.lock().unwrap().remove(&key);
+        }
+        result.map_err(|e| if fresh { setup_error(target, e) } else { e })
+    }
+
+    /// The pooled HTTP/2 sender for `key`, unless its connection has closed.
+    async fn h2_pooled(&self, key: &PoolKey) -> Option<h2::client::SendRequest<bytes::Bytes>> {
+        let pooled = self.pool.h2.lock().unwrap().get(key).cloned()?;
+        match pooled.ready().await {
+            Ok(s) => Some(s),
+            Err(_) => {
+                self.pool.h2.lock().unwrap().remove(key);
+                None
+            }
+        }
+    }
+
+    /// Opens an HTTP/2 connection, runs its driver task, and pools the sender.
+    async fn h2_handshake(&self, target: &Target) -> Result<h2::client::SendRequest<bytes::Bytes>> {
+        let stream = self.connect_h2(target).await?;
+        let (sender, conn) = h2::client::handshake(stream).await.map_err(crate::http::h2::h2_error)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        self.pool.h2.lock().unwrap().insert(pool_key(target), sender.clone());
+        Ok(sender)
+    }
+
+    /// A connection ready for HTTP/2 framing: TLS with `h2` negotiated by ALPN
+    /// for https (an error if the server picks anything else), plain TCP for
+    /// http (prior knowledge). Goes through the scope guard like [`Client::connect`].
+    pub async fn connect_h2(&self, target: &Target) -> Result<Stream> {
+        let tcp = self.connect_tcp(target).await?;
+        if !target.is_tls() {
+            return Ok(Box::new(tcp));
+        }
+        let refused = || Error::Protocol(format!("{}:{} did not negotiate HTTP/2 (ALPN h2)", target.host, target.port));
+        let tls = self.tls_handshake(&self.tls_h2, tcp, target).await.map_err(|e| match e {
+            Error::Tls(m) if m.contains("NoApplicationProtocol") => refused(),
+            e => e,
+        })?;
+        if tls.get_ref().1.alpn_protocol() != Some(b"h2") {
+            return Err(refused());
+        }
+        Ok(Box::new(tls))
+    }
+
     /// Opens a connection to the target, wrapped in TLS for https. The target
     /// must pass the scope guard; the connection goes to an address the guard
     /// checked.
     pub async fn connect(&self, target: &Target) -> Result<Stream> {
+        let tcp = self.connect_tcp(target).await?;
+        if !target.is_tls() {
+            return Ok(Box::new(tcp));
+        }
+        Ok(Box::new(self.tls_handshake(&self.tls, tcp, target).await?))
+    }
+
+    async fn tls_handshake(
+        &self,
+        connector: &TlsConnector,
+        tcp: TcpStream,
+        target: &Target,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let name = self.opts.sni.as_deref().unwrap_or(&target.host);
+        let server_name = ServerName::try_from(name.to_string())
+            .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
+        connector.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))
+    }
+
+    /// The only place sockets to targets are opened: resolves through the scope
+    /// guard and connects only to the addresses it checked.
+    async fn connect_tcp(&self, target: &Target) -> Result<TcpStream> {
         let guard = self.opts.guard.as_ref().ok_or_else(|| {
             Error::OutOfScope("no engagement scope: run `brainproxy engagement start --target HOST ...` first".into())
         })?;
@@ -198,14 +320,7 @@ impl Client {
             .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?;
         tcp.set_nodelay(true).ok();
         self.pool.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !target.is_tls() {
-            return Ok(Box::new(tcp));
-        }
-        let name = self.opts.sni.as_deref().unwrap_or(&target.host);
-        let server_name = ServerName::try_from(name.to_string())
-            .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
-        let tls = self.tls.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))?;
-        Ok(Box::new(tls))
+        Ok(tcp)
     }
 }
 

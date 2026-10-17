@@ -21,6 +21,9 @@ regex.workspace = true
 
 [dev-dependencies]
 brainproxy-core = { path = "../core" }
+bytes = "1"
+h2 = "0.4"
+http = "1"
 tokio.workspace = true
 tokio-rustls.workspace = true
 url.workspace = true

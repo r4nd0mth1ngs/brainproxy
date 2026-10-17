@@ -127,6 +127,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         verify_tls: c.verify_tls,
         sni: None,
         guard: Some(guard),
+        http2: false,
     };
     let auth = crate::auth_cmd::maybe_session(project, c.auth.as_deref(), &send)?;
     let fetch = Fetcher { project, send: &send, auth: auth.as_deref(), headers: &headers };

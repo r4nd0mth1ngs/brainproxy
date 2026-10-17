@@ -53,6 +53,10 @@ pub struct RequestArgs {
     /// Override the TLS SNI host name.
     #[arg(long)]
     pub sni: Option<String>,
+    /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http). A raw
+    /// request whose request line says HTTP/2 is sent over HTTP/2 anyway.
+    #[arg(long)]
+    pub http2: bool,
 }
 
 impl RequestArgs {
@@ -66,6 +70,7 @@ impl RequestArgs {
             timeout: Duration::from_secs_f64(self.timeout.max(0.001)),
             verify_tls: self.verify_tls,
             sni: self.sni.clone(),
+            http2: self.http2,
         }
     }
 

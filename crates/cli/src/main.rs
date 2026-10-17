@@ -185,8 +185,9 @@ struct SendArgs {
     #[command(flatten)]
     req: request_args::RequestArgs,
 
-    /// Race mode: send the request N times at once over N connections, releasing the
-    /// last byte of every request together (last-byte sync) to hit race windows.
+    /// Race mode: send the request N times at once. HTTP/1.1: N connections, releasing
+    /// the last byte of every request together (last-byte sync). With --http2: one
+    /// connection, final frames released in one packet (single-packet attack, N <= 100).
     #[arg(long, value_name = "N")]
     race: Option<usize>,
     /// Send with this auth profile's session (cookies/headers; re-login if logged out).
@@ -548,8 +549,14 @@ fn race(
         return Err(Error::InvalidInput("--race must be between 1 and 1000".into()));
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
-    let results =
-        rt.block_on(brainproxy_core::race::last_byte_sync(&client, &target, vec![req.as_bytes().to_vec(); n]));
+    let h2 = args.req.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"));
+    let requests = vec![req.as_bytes().to_vec(); n];
+    let (results, sync, synced) = if h2 {
+        let run = rt.block_on(brainproxy_core::race::single_packet(&client, &target, requests))?;
+        (run.results, "single-packet", Some(run.synced))
+    } else {
+        (rt.block_on(brainproxy_core::race::last_byte_sync(&client, &target, requests)), "last-byte", None)
+    };
     let store = if args.no_store { None } else { Some(Store::open(project)?) };
     let mut items = Vec::new();
     let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
@@ -575,7 +582,8 @@ fn race(
     }
     let data = json!({
         "race": n,
-        "sync": "last-byte",
+        "sync": sync,
+        "synced": synced,
         "target": target.origin(),
         "distinct_responses": shapes,
         "results": items,
@@ -583,7 +591,7 @@ fn race(
     });
     out.ok(data.clone(), || {
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
-        lines.insert(0, format!("race x{n} -> {}", target.origin()));
+        lines.insert(0, format!("race x{n} ({sync}) -> {}", target.origin()));
         lines.join("\n")
     });
     Ok(())

@@ -1,4 +1,5 @@
 pub mod client;
+pub mod h2;
 pub mod request;
 pub mod response;
 pub mod target;

@@ -33,3 +33,6 @@ time = "0.3.55"
 pem = "4.0.0"
 similar = "3.2.0"
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"

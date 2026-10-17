@@ -1,7 +1,7 @@
 # brainproxy handover
 
-State as of branch `feat/zap-rules` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
-`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, and `feat/zap-rules` (each branched from the previous
+State as of branch `feat/perf` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
+`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, `feat/zap-rules`, and `feat/perf` (each branched from the previous
 one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
@@ -30,7 +30,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 400 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 410 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -42,13 +42,14 @@ status couldn't be checked from the cloud session, so look at the Actions tab fi
 
 ```
 crates/core/src/            engine library (everything testable lives here)
-  http/                     raw HTTP/1.x: request/response parsing, WireReader, client (rustls)
+  http/                     raw HTTP/1.x: request/response parsing, WireReader, client (rustls, pool),
+                            h2.rs (HTTP/2 over the guarded client)
   guard.rs                  engagement + system scope; enforced in Client::connect
   store.rs                  SQLite project store (schema v8, migrations in Store::migrate)
   capture.rs                raw exchange -> parsed columns (url, headers JSON, decoded bodies)
   proxy/                    MITM proxy: CA (rcgen), server, scope/rules/intercept settings
   fuzz/                     Intruder: templates, 4 modes, payloads, engine, results summary
-  race.rs, diff.rs          last-byte-sync race sending; comparer
+  race.rs, diff.rs          last-byte sync and HTTP/2 single-packet races; comparer
   crawl.rs                  spider (links, forms, robots, sitemap, JS paths)
   jobs.rs                   background jobs table + JobControl (stop/progress)
   scan/passive/             52 rules ported from ZAP pscanrules (+ data/ files from ZAP)
@@ -277,7 +278,7 @@ input is behind a login we have no credentials for; it serves plain HTTP).
 Ideas: ZAP's SSTI rule also checks persistent-XSS sink pages (SSTI 90035 here only checks
 reflected output); `source_sink` could feed it.
 
-## Performance (in progress, branch `feat/perf`)
+## Performance (done except the HTTP/2 proxy, branch `feat/perf`)
 
 Connection pooling: `http/client.rs` keeps idle connections in a pool owned by the `Client`
 (shared by its clones; key = tokio runtime id, scheme, host, port; 64 per key, 30 s idle).
@@ -301,11 +302,38 @@ with a simulated 20 ms per-connection cost, scan 2.0-2.7 s -> 0.53 s and crawl
 0.9-1.1 s -> 0.6 s. The lab target (Werkzeug) answers `Connection: close`, so there is no
 reuse there (scan times unchanged within noise; crawl ~0.6 s faster from the watcher fix).
 
+HTTP/2 client: `http/h2.rs` (h2 crate). `H2Request::from_raw` turns the HTTP/1.x text
+request into an h2 request (Host -> `:authority`, connection-specific headers dropped,
+chunked bodies de-chunked; header values that h2 can't carry are an error) and keeps the
+text form that is recorded: `METHOD path HTTP/2`, `host:`, sent headers, body. Responses
+are recorded as `HTTP/2 <status>` + headers + body; `parse_response_head` accepts that
+(version "HTTP/2"), so passive rules, history, and diff work unchanged. `SendOptions.http2`
+(CLI `--http2` on send/fuzz/crawl/scan active) or a request line ending in `HTTP/2` routes
+`Client::send` over HTTP/2. `Client::connect_h2` = guarded TCP (`connect_tcp`, the only
+place sockets to targets are opened) + TLS with ALPN `h2` only (error if not negotiated)
+or prior knowledge for http. One multiplexed connection per pool key, created under a
+lock so concurrent workers share it; a dead pooled connection is detected by `ready()`
+before anything is sent. Errors on a new connection are reworded by `setup_error` (with
+an h2c hint for http://). Not done: HTTP/2 in the proxy (browser side needs an h2 server
+behind the MITM TLS with ALPN, and upstream h2 per request; the client pieces are ready
+for the upstream half), `import`/auth login over h2 (they use HTTP/1.1), and h2-specific
+attacks (pseudo-header or CRLF-in-header smuggling: `from_raw` rejects invalid values, and
+the h2 crate normalises framing).
+
+Single-packet race: `race::single_packet` (`send --race N --http2`, N <= 100). All requests
+on one connection through a `Gate` stream under the h2 connection: send every request but
+its final DATA frame (an empty END_STREAM frame for bodiless requests), PING round trip,
+then hold writes, queue the final frames, wait until the held bytes contain N END_STREAM
+DATA frames (`end_streams` parses frame headers; 2 s cap), and release them in one write.
+`synced` in the output = final frames in that write (should equal N). Live-tested only
+against in-test h2/h2c servers: the lab target doesn't speak HTTP/2 (h2c refused with a
+clear error, exit 3).
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
 2. Checks: `--check-var`, payload files, interactsh mapping (see "Checks DSL subset").
-3. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
+3. Performance: done except HTTP/2 in the proxy (see "Performance").
 4. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session

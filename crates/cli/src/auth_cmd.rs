@@ -137,6 +137,7 @@ impl NetArgs {
             verify_tls: self.verify_tls,
             sni: None,
             guard: Some(crate::project_guard(project)?),
+            http2: false,
         })
     }
 }
