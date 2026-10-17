@@ -127,7 +127,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     if args.no_rules && args.checks.is_empty() {
         return Err(Error::InvalidInput("--no-rules needs --checks".into()));
     }
-    let (checks, check_summary) = load_checks(home, &args)?;
+    let oob = if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) };
+    let (checks, check_summary) = load_checks(home, &args, oob.is_some())?;
     if args.background {
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
     }
@@ -169,7 +170,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         checks: brainproxy_core::checks::into_rules(checks),
         max_duration: args.max_minutes.map(|m| Duration::from_secs_f64(m * 60.0)),
         auth: auth.clone(),
-        oob: if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) },
+        oob,
         oob_wait: Duration::from_secs_f64(args.oob_wait.clamp(0.0, 3600.0)),
     };
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
@@ -221,11 +222,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
 }
 
 /// Loads and filters the --checks templates; returns them with a summary for the output.
-fn load_checks(home: &Path, args: &ActiveArgs) -> Result<(Vec<checks::Check>, serde_json::Value), Error> {
+fn load_checks(home: &Path, args: &ActiveArgs, oob: bool) -> Result<(Vec<checks::Check>, serde_json::Value), Error> {
     if args.checks.is_empty() {
         return Ok((vec![], serde_json::Value::Null));
     }
-    let opts = checks::LoadOptions { vars: args.check_vars.clone(), ..Default::default() };
+    let opts = checks::LoadOptions { vars: args.check_vars.clone(), oob, ..Default::default() };
     let loaded = checks::load(&checks::resolve_selectors(home, &args.checks), &opts)?;
     let filter = checks::Filter {
         ids: args.check_ids.clone(),

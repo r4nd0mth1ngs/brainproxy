@@ -247,7 +247,8 @@ brainproxy decode jwt eyJhbGciOi...
   with Log4Shell, XXE, and blind SSTI callback checks (see [docs/OOB.md](docs/OOB.md)).
   Rule updates without a release: `scan data update` for ZAP's pattern lists and
   declarative checks in the Nuclei HTTP template format, including a DSL subset, `flow`,
-  and multi-request conditions (`checks update`, `scan active --checks`; see
+  multi-request conditions, payload files, template inputs (`--check-var`), and
+  `{{interactsh-url}}` over the OOB listener (`checks update`, `scan active --checks`; see
   [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
   All ZAP active rules are ported. Upstream connections are kept alive and reused (inside
   the scope guard) by fuzz, crawl, active scan, import, and the proxy. HTTP/2 client

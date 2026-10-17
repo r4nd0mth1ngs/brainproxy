@@ -137,8 +137,9 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
     }
     // Keep only templates that load, so the store is exactly what can run
     // (payload files resolve against the staging root, later the store).
-    // Templates needing inputs stay: `--check-var` enables them at scan time.
-    let opts = super::LoadOptions { any_inputs: true, ..Default::default() };
+    // Templates needing inputs or an OOB listener stay: `--check-var` and
+    // `oob start` enable them at scan time.
+    let opts = super::LoadOptions { any_inputs: true, oob: true, ..Default::default() };
     let loaded = super::load(std::slice::from_ref(&staging), &opts)?;
     for s in &loaded.skipped {
         let _ = std::fs::remove_file(&s.file);

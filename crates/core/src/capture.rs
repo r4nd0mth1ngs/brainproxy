@@ -50,8 +50,9 @@ impl Capture {
         let (method, req_target, req_headers) =
             head.map(|h| (h.method, h.target, h.headers)).unwrap_or_else(|| (String::new(), String::new(), Vec::new()));
 
-        // Absolute-form targets carry their own origin.
-        let path_and_query = match req_target.find("://") {
+        // Absolute-form targets carry their own origin (origin-form ones start
+        // with `/` and may carry URLs in the query: `/fetch?url=http://x/y`).
+        let path_and_query = match req_target.find("://").filter(|_| !req_target.starts_with('/')) {
             Some(i) => req_target[i + 3..].find('/').map(|j| req_target[i + 3 + j..].to_string()).unwrap_or("/".into()),
             None => req_target.clone(),
         };
@@ -192,6 +193,8 @@ mod tests {
         let c =
             Capture::new("proxy", &target, b"GET http://b.test:8080/x?y HTTP/1.1\r\n\r\n", None, None, Some("boom"));
         assert_eq!(c.url, "http://b.test:8080/x?y");
+        let q = Capture::new("scan", &target, b"GET /f?u=http://o.test/a HTTP/1.1\r\n\r\n", None, None, None);
+        assert_eq!(q.url, "http://b.test:8080/f?u=http://o.test/a");
         assert_eq!(c.status, None);
         assert_eq!(c.error.as_deref(), Some("boom"));
     }

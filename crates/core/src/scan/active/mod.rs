@@ -182,6 +182,7 @@ enum Report {
         request: Vec<u8>,
         response: Option<Vec<u8>>,
         duration_ms: Option<i64>,
+        check: Option<String>,
     },
 }
 
@@ -443,8 +444,22 @@ impl Cx {
     /// `request` is the attack as built; the sent request and the response are
     /// taken from `resp` when the attack got one.
     pub fn oob_register(&self, payload: &Payload, finding: Finding, request: &[u8], resp: Option<&Response>) {
+        self.oob_register_check(payload, finding, request, resp, None);
+    }
+
+    /// `oob_register` for a declarative check: `check` (JSON) holds its alert
+    /// and the interactsh matchers an interaction must pass.
+    pub(crate) fn oob_register_check(
+        &self,
+        payload: &Payload,
+        finding: Finding,
+        request: &[u8],
+        resp: Option<&Response>,
+        check: Option<String>,
+    ) {
         self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
         let _ = self.shared.reports.lock().unwrap().send(Report::Oob {
+            check,
             target: self.base.target.clone(),
             token: payload.token.clone(),
             finding,
@@ -610,7 +625,7 @@ pub async fn run(
                     let msg = Message::from_exchange(id, &target, &request, &response);
                     new += store.record_findings("active", &msg, std::slice::from_ref(&finding))?;
                 }
-                Report::Oob { target, token, finding, request, response, duration_ms } => {
+                Report::Oob { target, token, finding, request, response, duration_ms, check } => {
                     store.oob_add_scan_payload(&ScanPayload {
                         token: &token,
                         alert_ref: finding.def.alert_ref,
@@ -622,6 +637,7 @@ pub async fn run(
                         request: &request,
                         response: response.as_deref(),
                         duration_ms,
+                        check: check.as_deref(),
                     })?;
                 }
             }

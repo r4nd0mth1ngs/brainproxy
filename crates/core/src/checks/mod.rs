@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::scan::active::RuleScope;
 use crate::scan::{Confidence, Risk};
-pub use rule::into_rules;
+pub use rule::{alert_from_json, interaction_matches, into_rules};
 pub use store::{local_dir, nuclei_dir, nuclei_status, update, Source, StoreStatus, UpdateResult};
 
 /// Templates bigger than this are skipped.
@@ -66,6 +66,9 @@ pub struct Check {
     /// `flow:` as a boolean expression over `http(N)` (variables `__http_N`).
     #[serde(skip)]
     pub(crate) flow: Option<dsl::Expr>,
+    /// Requests carry `{{interactsh-url}}` (an OOB payload each).
+    #[serde(skip)]
+    pub(crate) oob_url: bool,
 }
 
 /// One entry of `http:` (a request block).
@@ -91,6 +94,8 @@ pub(crate) struct Block {
     pub matchers_and: bool,
     pub matchers: Vec<Matcher>,
     pub extractors: Vec<Extractor>,
+    /// Some matcher looks at out-of-band interactions (`Matcher::oob`).
+    pub oob: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,6 +116,9 @@ pub(crate) enum Part {
     BaselineBody,
     /// A part of the nth (1-based) response of the block (`body_2`).
     Nth(usize, Box<Part>),
+    /// An out-of-band interaction's `interactsh_protocol`, `_request`,
+    /// `_response`, or `_ip` (evaluated when the interaction is correlated).
+    Oob(String),
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +141,10 @@ pub(crate) struct Matcher {
     /// Counts for the block's result (and `flow`) but doesn't report a finding alone.
     pub internal: bool,
     pub name: Option<String>,
+    /// Matches out-of-band interactions (an interactsh part or DSL variable):
+    /// evaluated at correlation from `src`, the matcher as written.
+    pub oob: bool,
+    pub src: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +295,12 @@ pub struct LoadOptions {
     /// Accept templates whatever inputs they need (`checks update` stores them
     /// so a later `--check-var` can enable them).
     pub any_inputs: bool,
+    /// An OOB listener is available: `{{interactsh-url}}` and interactsh
+    /// matchers are supported (else such templates are unsupported).
+    pub oob: bool,
 }
+
+const NEEDS_OOB: &str = "interactsh (out-of-band): needs an OOB listener (brainproxy oob start)";
 
 /// Parses `NAME=VALUE` (a `--check-var`).
 pub fn parse_var(s: &str) -> Result<(String, String)> {
@@ -518,7 +535,7 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
     if blocks.is_empty() {
         return invalid("no requests");
     }
-    let inputs = check_placeholders(&variables, &mut blocks, opts)?;
+    let (inputs, oob_url) = check_placeholders(&variables, &mut blocks, opts)?;
     let flow = match obj.get("flow") {
         None => None,
         Some(f) => Some(compile_flow(&s(f).unwrap_or_default(), blocks.len())?),
@@ -544,6 +561,7 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
         inputs,
         blocks,
         flow,
+        oob_url,
     })
 }
 
@@ -676,7 +694,16 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
     }
     let mut extractors = Vec::new();
     for e in b.get("extractors").and_then(Value::as_array).into_iter().flatten() {
-        extractors.push(compile_extractor(e)?);
+        let e = compile_extractor(e)?;
+        // Extractors over interactions only print the caller's address, which the
+        // correlated finding shows anyway.
+        let oob = match &e.kind {
+            ExtractKind::Dsl(exprs) => uses_oob_vars(exprs),
+            _ => matches!(e.part, Part::Oob(_)),
+        };
+        if !oob {
+            extractors.push(e);
+        }
     }
     if matchers.is_empty() && extractors.is_empty() {
         return invalid("request block without matchers or extractors");
@@ -701,9 +728,16 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
                 .chain(extractors.iter().map(|e| &e.part))
                 .any(|p| matches!(p, Part::Nth(..))),
         matchers_and,
+        oob: matchers.iter().any(|m| m.oob),
         matchers,
         extractors,
     })
+}
+
+fn uses_oob_vars(exprs: &[dsl::Expr]) -> bool {
+    let mut vars = Vec::new();
+    exprs.iter().for_each(|e| e.vars(&mut vars));
+    vars.iter().any(|v| v.starts_with("interactsh"))
 }
 
 const MATCHER_KEYS: &[&str] = &[
@@ -750,7 +784,8 @@ fn part_named(p: &str) -> std::result::Result<Part, Problem> {
         "header" | "headers" | "all_headers" => Part::Header,
         "all" | "response" | "raw" => Part::All,
         "baseline_body" => Part::BaselineBody,
-        p if p.starts_with("interactsh") => return unsupported("interactsh (out-of-band) matchers"),
+        "interactsh_protocol" | "interactsh_request" | "interactsh_response" | "interactsh_ip" => Part::Oob(p.into()),
+        p if p.starts_with("interactsh") => return unsupported(format!("part `{p}`")),
         p if matches!(p, "request" | "host" | "status_code" | "content_length" | "duration") => {
             return unsupported(format!("part `{p}`"))
         }
@@ -859,7 +894,13 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
     };
     // DSL expressions name their parts themselves.
     let part = if matches!(kind, MatchKind::Dsl(_)) { Part::Body } else { compile_part(m)? };
+    let oob = match &kind {
+        MatchKind::Dsl(exprs) => uses_oob_vars(exprs),
+        _ => matches!(part, Part::Oob(_)),
+    };
     Ok(Matcher {
+        oob,
+        src: oob.then(|| m.clone()),
         kind,
         part,
         and,
@@ -932,12 +973,17 @@ pub(crate) static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\
 /// expressions (function calls, interactsh-url, ...) make the template unsupported.
 pub(crate) static RANDSTR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\brandstr(_\d+)?\b").unwrap());
 
-/// Returns the template inputs (`opts.vars`) the template uses.
+/// Returns the template inputs (`opts.vars`) the template uses, and whether
+/// it uses `{{interactsh-url}}`.
 fn check_placeholders(
     vars: &[(String, String)],
     blocks: &mut [Block],
     opts: &LoadOptions,
-) -> std::result::Result<Vec<(String, String)>, Problem> {
+) -> std::result::Result<(Vec<(String, String)>, bool), Problem> {
+    if blocks.iter().any(|b| b.oob) && !opts.oob {
+        return unsupported(NEEDS_OOB);
+    }
+    let mut oob_url = false;
     let is_randstr = |n: &str| RANDSTR.find(n).is_some_and(|m| m.len() == n.len());
     let mut known: HashSet<String> = BUILTINS.iter().map(|b| b.to_string()).collect();
     known.extend(vars.iter().map(|(k, _)| k.clone()));
@@ -964,9 +1010,6 @@ fn check_placeholders(
         }
         let mut nth = false;
         for v in dsl_vars {
-            if v.starts_with("interactsh") {
-                return unsupported("interactsh (out-of-band) matchers");
-            }
             nth |= !known.contains(v) && numbered(v).is_some();
             if input(v) && !known.contains(v) && !used_inputs.iter().any(|x| x == v) {
                 used_inputs.push(v.to_string());
@@ -989,7 +1032,11 @@ fn check_placeholders(
         for c in PLACEHOLDER.captures_iter(t) {
             let name = &c[1];
             if name == "interactsh-url" {
-                return unsupported("interactsh (out-of-band) payloads");
+                if !opts.oob {
+                    return unsupported(NEEDS_OOB);
+                }
+                oob_url = true;
+                continue;
             }
             if known.contains(name) || is_randstr(name) {
                 continue;
@@ -1015,7 +1062,13 @@ fn check_placeholders(
         return unsupported(format!("template inputs without a value (--check-var): {}", missing.join(", ")));
     }
     // Inputs named like a template variable override it.
-    Ok(opts.vars.iter().filter(|(k, _)| used_inputs.contains(k) || vars.iter().any(|(v, _)| v == k)).cloned().collect())
+    let inputs = opts
+        .vars
+        .iter()
+        .filter(|(k, _)| used_inputs.contains(k) || vars.iter().any(|(v, _)| v == k))
+        .cloned()
+        .collect();
+    Ok((inputs, oob_url))
 }
 
 /// Payload value combinations for a block: name -> value per combination.

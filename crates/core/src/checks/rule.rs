@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use super::dsl::Value;
 use super::{combos, Block, Check, ExtractKind, Extractor, MatchKind, Matcher, Part, MAX_COMBOS, PLACEHOLDER, RANDSTR};
 use crate::http::RawRequest;
+use crate::oob::Payload;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope};
-use crate::scan::AlertDef;
+use crate::scan::{AlertDef, Confidence, Risk};
 
 pub struct CheckRule {
     check: Check,
@@ -221,7 +222,7 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
             }
             let sent = if block.inject_raw { cx.send_payload_raw(value).await } else { cx.send_payload(value).await };
             let Ok(resp) = sent else { continue };
-            if evaluate(rule, cx, block, std::slice::from_ref(&resp), vars, value) {
+            if evaluate(rule, cx, block, std::slice::from_ref(&resp), vars, value, None) {
                 out.matched = true;
                 if block.stop_at_first_match {
                     out.stop = true;
@@ -238,15 +239,35 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
         let requests = block.paths.iter().map(|p| (p, false)).chain(block.raws.iter().map(|r| (r, true)));
         let count = block.paths.len() + block.raws.len();
         let mut history: Vec<Response> = Vec::new();
+        // One OOB payload per request (per sequence with req-condition).
+        let mut oob: Option<Payload> = None;
         for (template, raw) in requests {
             if cx.stopped() {
                 out.stop = true;
                 return out;
             }
+            if rule.check.oob_url && (oob.is_none() || !block.req_condition) {
+                // Without a listener (`--no-oob`, or it stopped) the request tests nothing.
+                let Some(p) = cx.oob_payload() else { continue };
+                set_oob(&rule.check, &mut v, &p);
+                oob = Some(p);
+            }
             let req = if raw { build_raw(cx, block, template, &v) } else { build_path(cx, block, template, &v) };
             let Some(req) = req else { continue };
+            let sent_req = oob.as_ref().map(|_| req.clone());
             let sent = if block.redirects { cx.send_following(req).await } else { cx.send(req).await };
-            let Ok(resp) = sent else { continue };
+            let oob_sent = oob.as_ref().zip(sent_req.as_deref());
+            let resp = match sent {
+                Ok(r) => r,
+                Err(_) => {
+                    // A callback can still arrive (the target may hang while making it).
+                    if let Some(sent) = oob_sent.filter(|_| block.oob && !block.req_condition) {
+                        let immediate = vec![false; block.matchers.iter().filter(|m| !m.oob).count()];
+                        defer_oob(rule, cx, block, &[], &v, &attack, sent, &immediate);
+                    }
+                    continue;
+                }
+            };
             let matched = if block.req_condition {
                 // Internal extractors feed the next request; the matchers wait
                 // for the whole sequence (a missing response means no match).
@@ -256,9 +277,9 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
                         v.insert(name.clone(), first);
                     }
                 }
-                history.len() == count && evaluate(rule, cx, block, &history, &mut v, &attack)
+                history.len() == count && evaluate(rule, cx, block, &history, &mut v, &attack, oob_sent)
             } else {
-                evaluate(rule, cx, block, std::slice::from_ref(&resp), &mut v, &attack)
+                evaluate(rule, cx, block, std::slice::from_ref(&resp), &mut v, &attack, oob_sent)
             };
             // Internal extractor values carry over to later requests.
             for e in block.extractors.iter().filter(|e| e.internal) {
@@ -276,6 +297,180 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
         }
     }
     out
+}
+
+/// The value of `{{interactsh-url}}`: a host name carrying the token in DNS
+/// mode, `host:port/token` in host mode (so `http://{{interactsh-url}}/x`
+/// still works). Variables that use it are evaluated again.
+fn set_oob(check: &Check, vars: &mut HashMap<String, String>, p: &Payload) {
+    let host =
+        if p.dns { p.host.clone() } else { p.url.trim_start_matches("http://").trim_end_matches('/').to_string() };
+    vars.insert("interactsh-url".into(), host);
+    for (k, v) in &check.variables {
+        if v.contains("interactsh-url") && !check.inputs.iter().any(|(i, _)| i == k) {
+            if let Some(x) = subst(v, vars) {
+                vars.insert(k.clone(), x);
+            }
+        }
+    }
+}
+
+/// Registers a request that carried an OOB payload when its interactsh
+/// matchers can still decide the result: `immediate` holds the other
+/// matchers' results (all must hold with matchers-condition and; with or, none
+/// held or the finding was already reported). An interaction with the token
+/// raises the finding at correlation if it passes the interactsh matchers
+/// (`interaction_matches`); DSL values from the response are kept with them.
+#[allow(clippy::too_many_arguments)]
+fn defer_oob(
+    rule: &CheckRule,
+    cx: &Cx,
+    block: &Block,
+    seen: &[Response],
+    vars: &HashMap<String, String>,
+    attack: &str,
+    (payload, request): (&Payload, &[u8]),
+    immediate: &[bool],
+) {
+    if block.matchers_and && !immediate.iter().all(|x| *x) {
+        return;
+    }
+    let mut snapshot: serde_json::Map<String, serde_json::Value> =
+        vars.iter().map(|(k, v)| (k.clone(), v.clone().into())).collect();
+    let mut names = Vec::new();
+    for m in block.matchers.iter().filter(|m| m.oob) {
+        if let MatchKind::Dsl(exprs) = &m.kind {
+            exprs.iter().for_each(|e| e.vars(&mut names));
+        }
+    }
+    for n in names.into_iter().filter(|n| !n.starts_with("interactsh")) {
+        if let Some(v) = dsl_value(cx, seen, vars, n) {
+            snapshot.insert(n.to_string(), dsl_to_json(v));
+        }
+    }
+    let def = rule.alerts[0];
+    let check = serde_json::json!({
+        "alert": {
+            "alert_ref": def.alert_ref, "name": def.name, "risk": def.risk.as_str(),
+            "confidence": def.confidence.as_str(), "cwe": def.cwe, "description": def.description,
+            "solution": def.solution, "references": def.references, "tags": def.tags,
+        },
+        "and": block.matchers_and,
+        "matchers": block.matchers.iter().filter_map(|m| m.src.clone()).collect::<Vec<_>>(),
+        "vars": snapshot,
+    });
+    let c = &rule.check;
+    let param = if c.rule_scope == RuleScope::Param { cx.point().name.clone() } else { String::new() };
+    let attack =
+        if attack.is_empty() { vars.get("interactsh-url").cloned().unwrap_or_default() } else { attack.into() };
+    let finding = def.raise(param, "").attack(attack).other_info(format!("Check {} ({})", c.id, c.file.display()));
+    cx.oob_register_check(payload, finding, request, seen.last(), Some(check.to_string()));
+}
+
+fn dsl_to_json(v: Value) -> serde_json::Value {
+    match v {
+        Value::Str(s) => s.into(),
+        Value::Num(n) => serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, Into::into),
+        Value::Bool(b) => b.into(),
+    }
+}
+
+/// Whether an out-of-band interaction passes a check's interactsh matchers
+/// (`check_json` of its payload, see `defer_oob`). Matchers see
+/// `interactsh_protocol` (dns, http, ldap, tcp; a TLS ClientHello counts as
+/// http, as HTTPS does for interactsh), `interactsh_request` (what was
+/// received), `interactsh_ip`, and an empty `interactsh_response`; DSL
+/// expressions also see the values kept from the attack's response.
+pub fn interaction_matches(check: &serde_json::Value, protocol: &str, remote: &str, raw: &[u8]) -> bool {
+    let Some(srcs) = check["matchers"].as_array() else { return true };
+    let mut vars = HashMap::new();
+    let mut values = HashMap::new();
+    for (k, v) in check["vars"].as_object().into_iter().flatten() {
+        let v = match v {
+            serde_json::Value::String(s) => {
+                vars.insert(k.clone(), s.clone());
+                Value::Str(s.clone())
+            }
+            serde_json::Value::Number(n) => Value::Num(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::Bool(b) => Value::Bool(*b),
+            _ => continue,
+        };
+        values.insert(k.clone(), v);
+    }
+    let protocol = if protocol == "tls" { "http" } else { protocol };
+    let request = String::from_utf8_lossy(raw).into_owned();
+    let ip = remote.rsplit_once(':').map_or(remote, |(h, _)| h).trim_matches(['[', ']']);
+    let field = |name: &str| -> Option<String> {
+        Some(match name {
+            "interactsh_protocol" => protocol.into(),
+            "interactsh_request" => request.clone(),
+            "interactsh_response" => String::new(),
+            "interactsh_ip" => ip.into(),
+            _ => return None,
+        })
+    };
+    let hit = |src: &serde_json::Value| -> bool {
+        let Ok(m) = super::compile_matcher(src) else { return false };
+        let hit = match &m.kind {
+            MatchKind::Dsl(exprs) => {
+                let env = |n: &str| field(n).map(Value::Str).or_else(|| values.get(n).cloned());
+                let h = |e: &super::dsl::Expr| e.matches(&env);
+                if m.and {
+                    exprs.iter().all(h)
+                } else {
+                    exprs.iter().any(h)
+                }
+            }
+            _ => {
+                let text = match &m.part {
+                    Part::Oob(n) => field(n).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                text_match(&m, &text, &vars).0
+            }
+        };
+        hit != m.negative
+    };
+    if check["and"].as_bool().unwrap_or(false) {
+        srcs.iter().all(hit)
+    } else {
+        srcs.iter().any(hit)
+    }
+}
+
+/// The alert of a check's OOB payload (`check_json`), for correlation in a
+/// later process (`oob poll`) that hasn't loaded the check. Leaked like
+/// `into_rules`' definitions: once per correlated interaction.
+pub fn alert_from_json(check: &serde_json::Value) -> Option<&'static AlertDef> {
+    let a = &check["alert"];
+    let s = |k: &str| a[k].as_str().unwrap_or("").to_string();
+    let list = |k: &str| -> &'static [&'static str] {
+        Box::leak(
+            a[k].as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str())
+                .map(|x| leak(x.into()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    };
+    let alert_ref = s("alert_ref");
+    if !alert_ref.starts_with("check:") {
+        return None;
+    }
+    Some(Box::leak(Box::new(AlertDef {
+        alert_ref: leak(alert_ref),
+        name: leak(s("name")),
+        risk: Risk::parse(&s("risk"))?,
+        confidence: Confidence::parse(&s("confidence"))?,
+        cwe: a["cwe"].as_u64().unwrap_or(0) as u32,
+        wasc: 0,
+        description: leak(s("description")),
+        solution: leak(s("solution")),
+        references: list("references"),
+        tags: list("tags"),
+    })))
 }
 
 /// `path:` requests: the base request's headers (cookies, auth) with the
@@ -346,6 +541,8 @@ fn part_text(cx: &Cx, seen: &[Response], part: &Part) -> String {
         Part::All => format!("{}{}", resp.head_text(), resp.body_str()),
         Part::Named(h) => resp.headers_named(h).collect::<Vec<_>>().join("\n"),
         Part::BaselineBody => cx.base_response().body_str().to_string(),
+        // Interactions are matched at correlation (`interaction_matches`).
+        Part::Oob(_) => String::new(),
     }
 }
 
@@ -393,9 +590,21 @@ fn matches(cx: &Cx, seen: &[Response], m: &Matcher, vars: &HashMap<String, Strin
         }
         MatchKind::Status(codes) => (codes.contains(&resp.status), Some(resp.status_line.clone())),
         MatchKind::Size(sizes) => (sizes.contains(&resp.body.len()), None),
+        MatchKind::Binary(_) if m.part == Part::Body => text_match_bytes(m, &resp.body),
+        _ => text_match(m, &part_text(cx, seen, &m.part), vars),
+    };
+    if m.negative {
+        (!hit, None)
+    } else {
+        (hit, evidence.filter(|_| hit))
+    }
+}
+
+/// A word, regex, or binary matcher over `text` (before `negative`), with evidence.
+fn text_match(m: &Matcher, text: &str, vars: &HashMap<String, String>) -> (bool, Option<String>) {
+    match &m.kind {
         MatchKind::Word(words) => {
-            let text = part_text(cx, seen, &m.part);
-            let hay = if m.case_insensitive { text.to_lowercase() } else { text };
+            let hay = if m.case_insensitive { text.to_lowercase() } else { text.to_string() };
             let mut found = None;
             let mut all = true;
             for w in words {
@@ -410,25 +619,19 @@ fn matches(cx: &Cx, seen: &[Response], m: &Matcher, vars: &HashMap<String, Strin
             (if m.and { all } else { found.is_some() }, found)
         }
         MatchKind::Regex(res) => {
-            let text = part_text(cx, seen, &m.part);
             let res = res.get();
-            let found: Vec<String> = res.iter().filter_map(|r| r.find(&text).map(|x| x.as_str().to_string())).collect();
+            let found: Vec<String> = res.iter().filter_map(|r| r.find(text).map(|x| x.as_str().to_string())).collect();
             (if m.and { found.len() == res.len() } else { !found.is_empty() }, found.into_iter().next())
         }
-        MatchKind::Binary(bins) => {
-            let bytes: Vec<u8> = match m.part {
-                Part::Body => resp.body.clone(),
-                _ => part_text(cx, seen, &m.part).into_bytes(),
-            };
-            let has = |b: &Vec<u8>| bytes.windows(b.len().max(1)).any(|w| w == b.as_slice());
-            (if m.and { bins.iter().all(has) } else { bins.iter().any(has) }, None)
-        }
-    };
-    if m.negative {
-        (!hit, None)
-    } else {
-        (hit, evidence.filter(|_| hit))
+        MatchKind::Binary(_) => text_match_bytes(m, text.as_bytes()),
+        _ => (false, None),
     }
+}
+
+fn text_match_bytes(m: &Matcher, bytes: &[u8]) -> (bool, Option<String>) {
+    let MatchKind::Binary(bins) = &m.kind else { return (false, None) };
+    let has = |b: &Vec<u8>| bytes.windows(b.len().max(1)).any(|w| w == b.as_slice());
+    (if m.and { bins.iter().all(has) } else { bins.iter().any(has) }, None)
 }
 
 fn extract(cx: &Cx, seen: &[Response], e: &Extractor, vars: &HashMap<String, String>) -> Vec<String> {
@@ -475,6 +678,7 @@ fn evaluate(
     seen: &[Response],
     vars: &mut HashMap<String, String>,
     attack: &str,
+    oob: Option<(&Payload, &[u8])>,
 ) -> bool {
     let Some(resp) = seen.last() else { return false };
     let mut extracted = Vec::new();
@@ -501,6 +705,17 @@ fn evaluate(
         &mvars
     };
     let results: Vec<(bool, Option<String>)> = block.matchers.iter().map(|m| matches(cx, seen, m, mvars)).collect();
+    if block.oob {
+        // Interactsh matchers decide later, unless (or) another matcher already holds.
+        let immediate: Vec<bool> =
+            results.iter().zip(&block.matchers).filter(|(_, m)| !m.oob).map(|(r, _)| r.0).collect();
+        if block.matchers_and || !immediate.iter().any(|x| *x) {
+            if let Some(sent) = oob {
+                defer_oob(rule, cx, block, seen, mvars, attack, sent, &immediate);
+            }
+            return false;
+        }
+    }
     let matched = if results.is_empty() {
         !extracted.is_empty()
     } else if block.matchers_and {

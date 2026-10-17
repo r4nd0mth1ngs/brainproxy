@@ -38,9 +38,10 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
 - **Tokens**: `bp` + 18 random base32 characters (`/dev/urandom`), unique per attack
   request. The listener extracts the first `bp[a-z2-7]{18}` it sees in the lowercased
   bytes (Host, path, DNS name, SNI, LDAP DN), preferring one that is registered.
-- **Storage** (schema v8): `oob_payloads` (one row per token: source `scan`/`manual`,
-  rule id, alert ref, param, attack, origin, the attack request/response, note,
-  history_id once a finding was recorded) and `oob_interactions` (protocol, remote
+- **Storage** (schema v8, `check_json` added in v9): `oob_payloads` (one row per token:
+  source `scan`/`manual`, rule id, alert ref, param, attack, origin, the attack
+  request/response, note, history_id once a finding was recorded, and for declarative
+  checks `check_json`: the alert and the interactsh matchers an interaction must pass) and `oob_interactions` (protocol, remote
   address, token, summary line, raw bytes, `processed`). Both are visible to `query`.
 - **Attribution**: rules call `cx.oob_payload()` (None when no listener is running: the
   OOB part is skipped, like ZAP without its OAST add-on) and `cx.oob_register(...)` with
@@ -59,6 +60,8 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
 - Log4Shell (40043, CVE-2021-44228 / CVE-2021-45046), ported from ZAP.
 - XXE (90023) check #2 (out-of-band external entity, http and https).
 - Blind SSTI (90036) callback payloads (`curl`/`wget`) at HIGH/INSANE strength.
+- Declarative checks (Nuclei templates) with `{{interactsh-url}}`: one payload per
+  request, interactsh matchers evaluated per interaction at correlation (docs/CHECKS.md).
 
 ## Not done
 

@@ -68,7 +68,8 @@ fn http_get(url: &str) {
     let _ = s.read_to_end(&mut sink);
 }
 
-/// The app: `/log?q=` logs q through "Log4j"; `/xml` resolves external entities.
+/// The app: `/log?q=` logs q through "Log4j"; `/xml` resolves external entities;
+/// `/fetch?url=` fetches the URL (SSRF).
 fn spawn_app() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -108,6 +109,9 @@ fn spawn_app() -> u16 {
                             }
                         }
                     }
+                } else if line.contains(" /fetch?url=http://") {
+                    let url = line.split(" /fetch?url=").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("");
+                    http_get(url);
                 } else if line.contains(" /xml") {
                     if let Some(i) = text.find("SYSTEM \"http://") {
                         let rest = &text[i + "SYSTEM \"".len()..];
@@ -282,4 +286,81 @@ fn oob_run_validates_arguments() {
     let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0", "--domain", "bad/domain"], &project);
     assert_eq!(code, 2, "{v}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Nuclei interactsh templates: `{{interactsh-url}}` becomes a listener
+/// payload, and interactsh matchers decide at correlation.
+#[test]
+fn interactsh_templates_use_the_listener() {
+    let (dir, project) = setup("interactsh");
+    let app = spawn_app();
+    let checks = dir.join("checks");
+    std::fs::create_dir_all(&checks).unwrap();
+    let t = |id: &str, path: &str, matchers: &str| {
+        format!(
+            "id: {id}\ninfo: {{name: {id}, severity: high, tags: oast}}\nhttp:\n  - method: GET\n    path: ['{{{{BaseURL}}}}{path}']\n    matchers-condition: and\n    matchers:\n{matchers}"
+        )
+    };
+    let proto = |p: &str| format!("      - type: word\n        part: interactsh_protocol\n        words: [{p}]\n");
+    let status = |c: u16| format!("      - type: status\n        status: [{c}]\n");
+    let files = [
+        ("ssrf", t("ssrf", "/fetch?url=http://{{interactsh-url}}/a", &(proto("http") + &status(200)))),
+        // The callback is HTTP; host mode has no DNS.
+        (
+            "ssrf-dns",
+            t(
+                "ssrf-dns",
+                "/fetch?url=http://{{interactsh-url}}/b",
+                "      - type: dsl\n        dsl: ['contains(interactsh_protocol, \"dns\") && status_code == 200']\n",
+            ),
+        ),
+        ("no-callback", t("no-callback", "/other?url=http://{{interactsh-url}}/c", &proto("http"))),
+        // The response fails the other matcher: nothing to wait for.
+        ("wrong-status", t("wrong-status", "/fetch?url=http://{{interactsh-url}}/d", &(proto("http") + &status(418)))),
+    ];
+    for (name, text) in &files {
+        std::fs::write(checks.join(format!("{name}.yaml")), text).unwrap();
+    }
+    let dir_arg = checks.to_str().unwrap();
+
+    let (code, v) = run(&["checks", "validate", dir_arg], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["ok"], 0, "{v}");
+    assert_eq!(
+        v["data"]["files"][0]["reason"], "interactsh (out-of-band): needs an OOB listener (brainproxy oob start)",
+        "{v}"
+    );
+
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["checks", "validate", dir_arg], &project);
+    assert_eq!((code, v["data"]["ok"].as_i64()), (0, Some(4)), "{v}");
+
+    let url = format!("http://127.0.0.1:{app}/");
+    let (code, v) = run(
+        &["scan", "active", &url, "--checks", dir_arg, "--no-rules", "--check-exclude-tags", "", "--oob-wait", "3"],
+        &project,
+    );
+    assert_eq!(code, 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["raised"]["check:ssrf"], 1, "{d}");
+    for id in ["ssrf-dns", "no-callback", "wrong-status"] {
+        assert!(d["raised"].get(format!("check:{id}")).is_none(), "{id}: {d}");
+    }
+    assert_eq!(d["oob"]["payloads"], 3, "wrong-status isn't registered: {d}");
+    assert_eq!(d["oob"]["matched"], 1, "{d}");
+
+    let (code, v) = run(&["findings", "list", "--source", "active", "--all"], &project);
+    assert_eq!(code, 0, "{v}");
+    let f = v["data"]["items"].as_array().unwrap().iter().find(|f| f["alert_ref"] == "check:ssrf").cloned().unwrap();
+    assert!(f["url"].as_str().unwrap().contains("/fetch?url=http://127.0.0.1:"), "{f}");
+    let (code, v) = run(&["findings", "show", &f["id"].to_string()], &project);
+    assert_eq!(code, 0, "{v}");
+    let info = v["data"]["other_info"].as_str().unwrap();
+    assert!(info.contains("Check ssrf") && info.contains("Received http interaction"), "{info}");
+    assert_eq!(v["data"]["risk"], "high");
+
+    let (code, _) = run(&["oob", "stop"], &project);
+    assert_eq!(code, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

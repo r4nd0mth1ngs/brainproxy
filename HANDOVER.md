@@ -1,8 +1,8 @@
 # brainproxy handover
 
-State as of branch `feat/perf` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
-`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, `feat/zap-rules`, and `feat/perf` (each branched from the previous
-one) are local and unpushed; `main` is pushed.
+State as of branch `feat/checks-inputs` (2026-10-17). `feat/auth-wiring`, `feat/reports`, `feat/api-import`,
+`feat/oob`, `feat/rule-updates`, `feat/checks-dsl`, `feat/zap-rules`, `feat/perf`, and `feat/checks-inputs`
+(each branched from the previous one) are local and unpushed; `main` is pushed.
 
 brainproxy is an AI-first, non-interactive web security testing CLI in Rust, built for
 Braintruder to drive on a CLI-only Kali runner (arm64 first). It reproduces the core of
@@ -30,7 +30,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 410 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 417 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -45,7 +45,7 @@ crates/core/src/            engine library (everything testable lives here)
   http/                     raw HTTP/1.x: request/response parsing, WireReader, client (rustls, pool),
                             h2.rs (HTTP/2 over the guarded client)
   guard.rs                  engagement + system scope; enforced in Client::connect
-  store.rs                  SQLite project store (schema v8, migrations in Store::migrate)
+  store.rs                  SQLite project store (schema v9, migrations in Store::migrate)
   capture.rs                raw exchange -> parsed columns (url, headers JSON, decoded bodies)
   proxy/                    MITM proxy: CA (rcgen), server, scope/rules/intercept settings
   fuzz/                     Intruder: templates, 4 modes, payloads, engine, results summary
@@ -245,15 +245,59 @@ osint and credential-stuffing left out): 3,998 requests, one finding,
 
 `scripts/check.sh` didn't fail on test failures (`! grep` under `set -e`); fixed.
 
-Known limits / ideas:
-- `scan active --check-var NAME=VALUE` would enable the 556 template-input templates.
-- Payload files: keep nuclei-templates' `helpers/` with the store (258 templates).
-- `{{interactsh-url}}` could map to the OOB listener (535 templates).
+Known limits / ideas (inputs, payload files, and interactsh are done, see below):
 - `date_time`, `wait_for`, `generate_jwt`, `hmac`, xpath extractors, and `select()` in json
   queries are unsupported (each < 25 templates).
 - In flows, only internal extractor values carry to later blocks (Nuclei shares all named ones).
 - `checks list` parses every template; an index in the store would make it instant.
 - Data files apply to commands started after the update (a running proxy keeps the old ones).
+
+## Checks inputs, payload files, interactsh (done, branch `feat/checks-inputs`)
+
+`checks::LoadOptions` (`vars`, `any_inputs`, `oob`) is passed to `checks::load`.
+
+- Template inputs: `--check-var NAME=VALUE` on `scan active`, `checks list`, `checks
+  validate` (`checks::parse_var`). Unknown placeholder/DSL names that are given become
+  `Check.inputs` (also when they override a template variable); missing ones make the
+  template unsupported with the names in the reason. `checks update` loads with
+  `any_inputs` so they are stored.
+- Payload files: `payload_file` in mod.rs resolves `payloads: {x: helpers/...txt}` from
+  the template's directory up to the load root (`load` now pairs each file with the path
+  it was found under), plain components only, canonicalised and confined to the root,
+  4 MiB max. `checks update` keeps `helpers/` (`store_path` accepts `helpers/...`; 64 MiB
+  cap; `Manifest.helpers` counts them).
+- Interactsh: `Part::Oob`, `Matcher.oob`/`src`, `Block.oob`, `Check.oob_url`. Without
+  `LoadOptions.oob` (no running listener, or `--no-oob`) such templates are unsupported;
+  `checks list`/`validate` detect a listener in the project. At run time (rule.rs) each
+  request gets `cx.oob_payload()` as `{{interactsh-url}}` (`set_oob`; host mode is
+  `host:port/token`), and `evaluate` defers when interactsh matchers decide: `defer_oob`
+  registers the payload via `Cx::oob_register_check` with `check_json` (alert definition,
+  interactsh matcher sources, a snapshot of vars and the response values their DSL uses).
+  `oob::correlate` runs `checks::interaction_matches` on each interaction and builds the
+  alert from the JSON (`alert_from_json`) when the active rules don't know it, so `oob
+  poll` in a later process raises check findings too. Schema v9 adds
+  `oob_payloads.check_json`.
+- Fixed on the way: `Capture::new` treated an origin-form target with a URL in its query
+  (`/fetch?url=http://x/y`) as absolute-form and recorded the wrong URL.
+
+Coverage on 17f5725 (stored templates): 9,392 load without inputs or listener (payload
+files +253), 9,870 with a listener, 10,411 with a listener and username/password;
+`checks update` stores 10,434 of 11,690 (938 self-contained, 51 JavaScript flows, 43
+lookaround regexes, ...). Tests: `checks/tests.rs` (inputs, payload files incl. traversal
+and symlink escape, interactsh parsing and matching), `oob` unit test (check payload
+correlation without the rule), `crates/core/tests/checks.rs` (inputs end to end),
+`crates/cli/tests/checks.rs` (stored input template + `--check-var`), `crates/cli/tests/oob.rs`
+(`interactsh_templates_use_the_listener`: real listener, SSRF app, four templates).
+
+Live on the lab target with the listener (auto host 10.0.1.108:8880 via `for_target`):
+290 `oast`-tagged templates, 337 requests, 148 payloads registered, no callbacks, no
+findings (the app has no such surface; nothing it serves needed them).
+
+Limits: interactions are matched one at a time (an `and` over a DNS and an HTTP
+interaction can't combine them); an interactsh block returns false to `flow` until
+correlation, so `http(1) && http(2)` doesn't continue after an OOB-only block; nested
+placeholders (`{{len('... {{interactsh-url}}')}}`) only get the inner one; DNS-only
+templates need `oob start --domain`.
 
 ## Remaining ZAP rules (done)
 
@@ -332,7 +376,7 @@ clear error, exit 3).
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-2. Checks: `--check-var`, payload files, interactsh mapping (see "Checks DSL subset").
+2. Checks: done (see "Checks inputs, payload files, interactsh").
 3. Performance: done except HTTP/2 in the proxy (see "Performance").
 4. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 

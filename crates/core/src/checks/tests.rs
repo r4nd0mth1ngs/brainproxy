@@ -65,7 +65,7 @@ fn unsupported_features_are_named() {
     let block = |extra: &str| format!("{base}http:\n  - path: ['{{{{BaseURL}}}}/']\n{extra}");
     let dsl = |e: &str| block(&format!("    matchers:\n      - type: dsl\n        dsl:\n          - '{e}'\n"));
     assert_eq!(unsupported_reason(&dsl("date_time(\"%Y\")")), "DSL function `date_time`");
-    assert_eq!(unsupported_reason(&dsl("contains(interactsh_protocol, \"dns\")")), "interactsh (out-of-band) matchers");
+    assert_eq!(unsupported_reason(&dsl("contains(interactsh_protocol, \"dns\")")), NEEDS_OOB);
     assert_eq!(unsupported_reason(&dsl("body =~ \"x\"")), "DSL operator `=~`");
     assert!(invalid_reason(&dsl("contains(body")).starts_with("dsl: "));
     assert_eq!(
@@ -97,7 +97,7 @@ fn unsupported_features_are_named() {
         unsupported_reason(&block(
             "    matchers:\n      - type: word\n        part: interactsh_protocol\n        words: [dns]\n"
         )),
-        "interactsh (out-of-band) matchers"
+        NEEDS_OOB
     );
     assert_eq!(
         unsupported_reason(&block("    payloads:\n      user: helpers/wordlists/users.txt\n    matchers:\n      - type: status\n        status: [200]\n")),
@@ -127,6 +127,7 @@ fn template_inputs() {
     let opts = |vars: &[(&str, &str)], any| LoadOptions {
         vars: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         any_inputs: any,
+        oob: false,
     };
     let reason = |o: &LoadOptions| match parse(t, Path::new("t.yaml"), None, o) {
         Err((_, Problem::Unsupported(r))) => r,
@@ -365,4 +366,70 @@ async fn payload_files_from_helpers() {
     let l = load(&resolve_selectors(&home, &["nuclei".into()]), &Default::default()).unwrap();
     assert_eq!(l.checks[0].blocks[0].payloads[0].1, ["admin", "root"]);
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+const OAST: &str = r#"
+id: oast-ssrf
+info: {name: Blind SSRF, severity: high}
+variables:
+  cb: "http://{{interactsh-url}}/x"
+http:
+  - path: ["{{BaseURL}}/?u={{cb}}"]
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words: [http]
+      - type: dsl
+        dsl: ['contains(interactsh_request, "User-Agent: curl") && status_code == 200']
+      - type: status
+        status: [200]
+    extractors:
+      - type: dsl
+        dsl: [interactsh_ip]
+"#;
+
+#[test]
+fn interactsh_templates_need_a_listener() {
+    let oob = LoadOptions { oob: true, ..Default::default() };
+    match parse(OAST, Path::new("t.yaml"), None, &LoadOptions::default()) {
+        Err((_, Problem::Unsupported(r))) => assert_eq!(r, NEEDS_OOB),
+        _ => panic!("needs a listener"),
+    }
+    let c = parse(OAST, Path::new("t.yaml"), None, &oob).unwrap_or_else(|_| panic!("loads with a listener"));
+    assert!(c.oob_url);
+    let b = &c.blocks[0];
+    assert!(b.oob);
+    assert_eq!(b.matchers.iter().map(|m| m.oob).collect::<Vec<_>>(), [true, true, false]);
+    assert!(b.matchers[0].src.is_some() && b.matchers[2].src.is_none());
+    // The interactsh_ip extractor is dropped (correlation shows the caller).
+    assert!(b.extractors.is_empty());
+    // A url without interactsh matchers loads too (fire and forget).
+    assert!(!parse_str_oob("id: x\ninfo: {severity: low}\nhttp:\n  - path: ['{{BaseURL}}/?u={{interactsh-url}}']\n    matchers:\n      - type: status\n        status: [200]\n").blocks[0].oob);
+}
+
+fn parse_str_oob(t: &str) -> Check {
+    parse(t, Path::new("t.yaml"), None, &LoadOptions { oob: true, ..Default::default() }).unwrap_or_else(|_| panic!())
+}
+
+#[test]
+fn interactions_are_matched_against_interactsh_matchers() {
+    let c = parse_str_oob(OAST);
+    let srcs: Vec<Value> = c.blocks[0].matchers.iter().filter_map(|m| m.src.clone()).collect();
+    // As `defer_oob` stores it: the response's status_code kept for the DSL.
+    let check =
+        |status: u16, and: bool| serde_json::json!({"and": and, "matchers": srcs, "vars": {"status_code": status}});
+    let curl = b"GET /bpaaaaaaaaaaaaaaaaaa/x HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: curl/8\r\n\r\n";
+    assert!(interaction_matches(&check(200, true), "http", "10.0.0.5:4242", curl));
+    // HTTPS (a TLS ClientHello) counts as http, like interactsh.
+    assert!(interaction_matches(&check(200, true), "tls", "10.0.0.5:4242", curl));
+    assert!(!interaction_matches(&check(200, true), "dns", "10.0.0.5:53", curl));
+    assert!(!interaction_matches(&check(500, true), "http", "10.0.0.5:4242", curl));
+    assert!(!interaction_matches(&check(200, true), "http", "10.0.0.5:4242", b"GET / HTTP/1.1\r\n\r\n"));
+    assert!(interaction_matches(&check(500, false), "http", "10.0.0.5:4242", b"GET / HTTP/1.1\r\n\r\n"));
+    let ip = serde_json::json!({"matchers": [{"type": "dsl", "dsl": ["interactsh_ip == '10.0.0.5'"]}]});
+    assert!(interaction_matches(&ip, "dns", "10.0.0.5:53", b""));
+    assert!(interaction_matches(&ip, "dns", "[10.0.0.5]:53", b""));
+    let neg = serde_json::json!({"matchers": [{"type": "word", "part": "interactsh_protocol", "words": ["dns"], "negative": true}]});
+    assert!(interaction_matches(&neg, "http", "x:1", b"") && !interaction_matches(&neg, "dns", "x:1", b""));
 }

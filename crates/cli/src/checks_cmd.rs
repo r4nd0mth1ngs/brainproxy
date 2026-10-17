@@ -62,6 +62,16 @@ pub fn check_var(s: &str) -> Result<(String, String), String> {
     checks::parse_var(s).map_err(|e| e.to_string())
 }
 
+/// Whether the project has a running OOB listener (interactsh templates load
+/// then, as they would for `scan active`). A missing project has none.
+fn oob_running(project: &Path) -> bool {
+    project.is_file()
+        && brainproxy_core::store::Store::open(project)
+            .ok()
+            .and_then(|s| crate::oob_cmd::running(&s).ok().flatten())
+            .is_some()
+}
+
 #[derive(clap::Args)]
 pub struct UpdateArgs {
     /// Branch, tag, or commit of the templates repository.
@@ -84,9 +94,10 @@ pub struct UpdateArgs {
 
 pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Result<(), Error> {
     match cmd {
-        ChecksCmd::List(a) => list(home, a, out),
+        ChecksCmd::List(a) => list(project, home, a, out),
         ChecksCmd::Validate { paths, limit, check_vars } => {
-            let loaded = checks::load(&paths, &checks::LoadOptions { vars: check_vars, ..Default::default() })?;
+            let opts = checks::LoadOptions { vars: check_vars, oob: oob_running(project), ..Default::default() };
+            let loaded = checks::load(&paths, &opts)?;
             let files: Vec<_> = loaded
                 .checks
                 .iter()
@@ -154,9 +165,9 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
     }
 }
 
-fn list(home: &Path, a: ListArgs, out: &Out) -> Result<(), Error> {
+fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error> {
     let selectors = if a.selectors.is_empty() { vec!["all".to_string()] } else { a.selectors.clone() };
-    let opts = checks::LoadOptions { vars: a.check_vars.clone(), ..Default::default() };
+    let opts = checks::LoadOptions { vars: a.check_vars.clone(), oob: oob_running(project), ..Default::default() };
     let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
     let filter = Filter {
         ids: vec![],

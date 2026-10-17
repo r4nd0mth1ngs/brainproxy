@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS oob_interactions (
 CREATE INDEX IF NOT EXISTS oob_interactions_token ON oob_interactions(token);
 ";
 
+/// Declarative checks' payloads carry their alert and interactsh matchers.
+pub(crate) const SCHEMA_V9: &str = "ALTER TABLE oob_payloads ADD COLUMN check_json TEXT;";
+
 pub const PAYLOAD_COLUMNS: &[(&str, &str, &str)] = &[
     ("token", "TEXT", "Unique token carried by the payload"),
     ("time", "TEXT", "UTC time the payload was issued"),
@@ -70,6 +73,7 @@ pub const PAYLOAD_COLUMNS: &[(&str, &str, &str)] = &[
     ("response", "BLOB", "Attack response, if one arrived"),
     ("history_id", "INTEGER", "History row of the attack once an interaction raised a finding"),
     ("note", "TEXT", "Note given to `oob payload`"),
+    ("check_json", "TEXT", "Declarative check payloads: alert and interactsh matchers an interaction must pass"),
 ];
 
 pub const INTERACTION_COLUMNS: &[(&str, &str, &str)] = &[
@@ -209,6 +213,8 @@ pub struct ScanPayload<'a> {
     pub request: &'a [u8],
     pub response: Option<&'a [u8]>,
     pub duration_ms: Option<i64>,
+    /// Declarative checks: see `checks::interaction_matches`.
+    pub check: Option<&'a str>,
 }
 
 /// What a correlation pass did.
@@ -228,8 +234,9 @@ impl Store {
     pub fn oob_add_scan_payload(&self, p: &ScanPayload) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO oob_payloads
-                (token, source, rule_id, alert_ref, param, attack, other_info, origin, request, response, duration_ms)
-             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (token, source, rule_id, alert_ref, param, attack, other_info, origin, request, response, duration_ms,
+                 check_json)
+             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 p.token,
                 p.rule_id,
@@ -240,7 +247,8 @@ impl Store {
                 p.target.origin(),
                 p.request,
                 p.response,
-                p.duration_ms
+                p.duration_ms,
+                p.check
             ],
         )?;
         Ok(())
@@ -339,7 +347,9 @@ impl Store {
 
 /// Raises a finding for every unprocessed interaction that carries a scan
 /// payload's token, recording the attack exchange in history the first time.
-/// `lookup` maps an alert ref to its definition (the active rules' alerts).
+/// `lookup` maps an alert ref to its definition (the active rules' alerts);
+/// declarative checks' payloads carry theirs, and their interactsh matchers
+/// decide whether an interaction counts.
 pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static AlertDef>) -> Result<Correlation> {
     struct Row {
         id: i64,
@@ -369,11 +379,23 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
     for row in rows {
         store.conn.execute("UPDATE oob_interactions SET processed = 1 WHERE id = ?1", [row.id])?;
         let Some(token) = &row.token else { continue };
-        type P = (String, String, String, String, String, Vec<u8>, Option<Vec<u8>>, Option<i64>, Option<i64>);
+        type P = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        );
         let p: Option<P> = store
             .conn
             .query_row(
-                "SELECT alert_ref, param, attack, other_info, origin, request, response, duration_ms, history_id
+                "SELECT alert_ref, param, attack, other_info, origin, request, response, duration_ms, history_id,
+                        check_json
                  FROM oob_payloads WHERE token = ?1 AND source = 'scan'",
                 [token],
                 |r| {
@@ -387,14 +409,24 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
                         r.get(6)?,
                         r.get(7)?,
                         r.get(8)?,
+                        r.get(9)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((alert_ref, param, attack, other_info, origin, request, response, duration_ms, history_id)) = p else {
+        let Some((alert_ref, param, attack, other_info, origin, request, response, duration_ms, history_id, check)) = p
+        else {
             continue;
         };
-        let Some(def) = lookup(&alert_ref) else { continue };
+        let check: Option<Value> = check.and_then(|c| serde_json::from_str(&c).ok());
+        if let Some(c) = &check {
+            if !crate::checks::interaction_matches(c, &row.protocol, &row.remote, &row.raw) {
+                continue;
+            }
+        }
+        let Some(def) = lookup(&alert_ref).or_else(|| check.as_ref().and_then(crate::checks::alert_from_json)) else {
+            continue;
+        };
         let target = Target::from_url(&origin)?;
         let response = response.unwrap_or_default();
         let history_id = match history_id {
@@ -511,6 +543,7 @@ mod tests {
                 request: req.as_bytes(),
                 response: Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
                 duration_ms: Some(3),
+                check: None,
             })
             .unwrap();
         let manual = new_token().unwrap();
@@ -546,5 +579,49 @@ mod tests {
         assert_eq!(ro.rows[0][0], "q");
         assert_eq!(ro.rows[0][1], "");
         assert!(ro.rows[0][2].as_str().unwrap().contains("Received dns interaction from 10.0.0.1:5353"));
+    }
+
+    #[test]
+    fn check_payloads_carry_their_alert_and_matchers() {
+        let mut store = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://app.test/").unwrap();
+        let tok = new_token().unwrap();
+        let check = json!({
+            "alert": {"alert_ref": "check:ssrf", "name": "Blind SSRF", "risk": "high", "confidence": "medium",
+                      "cwe": 918, "description": "d", "solution": "s", "references": ["https://r"], "tags": ["oast"]},
+            "and": true,
+            "matchers": [{"type": "word", "part": "interactsh_protocol", "words": ["http"]}],
+            "vars": {},
+        })
+        .to_string();
+        store
+            .oob_add_scan_payload(&ScanPayload {
+                token: &tok,
+                rule_id: 0,
+                alert_ref: "check:ssrf",
+                param: "",
+                attack: "",
+                other_info: "Check ssrf (t.yaml)",
+                target: &target,
+                request: format!("GET /?u=http://{tok}.oob.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_bytes(),
+                response: None,
+                duration_ms: None,
+                check: Some(&check),
+            })
+            .unwrap();
+        // A DNS lookup doesn't pass the matchers; the HTTP request does. The
+        // alert isn't one of the active rules': it comes from the payload.
+        let q = format!("A {tok}.oob.test");
+        store.oob_add_interaction("dns", "10.0.0.1:53", &q, q.as_bytes()).unwrap();
+        let get = format!("GET / HTTP/1.1\r\nHost: {tok}.oob.test\r\n\r\n");
+        store.oob_add_interaction("http", "10.0.0.1:9", "GET /", get.as_bytes()).unwrap();
+        let c = correlate(&mut store, |_| None).unwrap();
+        assert_eq!((c.interactions, c.matched, c.new_findings), (2, 1, 1), "{c:?}");
+        assert_eq!(c.raised, vec!["check:ssrf"]);
+        let ro = store
+            .query("SELECT name, risk, other_info FROM findings WHERE alert_ref = 'check:ssrf'", &[], 10, 1000)
+            .unwrap();
+        assert_eq!(ro.rows[0][0], "Blind SSRF");
+        assert!(ro.rows[0][2].as_str().unwrap().contains("Received http interaction"), "{:?}", ro.rows);
     }
 }

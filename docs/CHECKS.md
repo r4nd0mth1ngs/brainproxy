@@ -96,6 +96,28 @@ payload names, extractor names, and DSL expressions over these (`{{base64(user +
 pass)}}`, `{{to_lower(rand_base(8))}}`). For the default host scope `BaseURL` is the origin
 (`https://app.test:8443`).
 
+Out-of-band: with an OOB listener running (`brainproxy oob start`, docs/OOB.md),
+`{{interactsh-url}}` is a fresh listener payload for every request (one per sequence
+with req-condition): `<token>.<domain>` in DNS mode, `<host>:<port>/<token>` in host
+mode, so `http://{{interactsh-url}}/...` reaches the listener either way (DNS-only uses
+such as `nslookup {{interactsh-url}}` need DNS mode). Variables using it are evaluated
+again per request. Matchers on `interactsh_protocol`, `interactsh_request`,
+`interactsh_response`, `interactsh_ip` (as `part:` or DSL variables) are evaluated when
+an interaction with the request's token is correlated, at the end of the scan
+(`--oob-wait`) or by a later `oob poll`: with `matchers-condition: and`, the request is
+registered only if the other matchers held on its response, and each interaction must
+then pass every interactsh matcher; with `or`, a match of the other matchers reports at
+once, else any interactsh matcher passing raises the finding. DSL interactsh matchers
+also see the response values they use (kept with the payload), and an attack that got no
+response is still registered when the response matchers don't need to hold.
+`interactsh_protocol` is `dns`, `http` (a TLS ClientHello counts, as HTTPS does for
+interactsh), `ldap`, or `tcp`; `interactsh_request` is the received bytes;
+`interactsh_response` is empty. Extractors over interactions are dropped (the finding
+shows the interaction). Each interaction is checked on its own (Nuclei also evaluates per
+interaction). Without a listener, or with `--no-oob`, these templates are not loaded
+(`checks list`/`validate` look for a running listener in the project too); `checks
+update` stores them.
+
 Template inputs: a placeholder or DSL variable the template doesn't define (such as
 `{{username}}`/`{{password}}`, which Nuclei takes from `-var`) is filled from
 `--check-var NAME=VALUE` (repeatable, on `scan active`, `checks list`, and `checks
@@ -133,15 +155,16 @@ Nuclei's DSL is govaluate plus helper functions. brainproxy parses it at load ti
   fired are listed in the finding's other info (`Matched: x-frame-options, ...`).
 
 Not supported (the template is skipped with this reason): `self-contained`, interactsh
-(out-of-band), payload files that can't be found inside the root, template inputs without a `--check-var`, JavaScript `flow`, `xpath`
+without an OOB listener, payload files that can't be found inside the root, template inputs without a `--check-var`, JavaScript `flow`, `xpath`
 extractors, regexes with lookaround or backreferences, DSL functions outside the list
 (`date_time`, `wait_for`, `generate_jwt`, `hmac`, ...), `race`, `iterate-all`, digest
 auth, `fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
 development (17f5725, Oct 2026), 9,139 of 11,690 HTTP templates load (5,856 before the
 DSL subset) and 9,392 with payload files; the top remaining reasons are
-`self-contained` (938), interactsh (535), and template inputs (534). With `--check-var
-username=... --check-var password=...` (511 of the 534 need just these), 9,908 load.
-`checks status` shows the counts for the stored commit.
+`self-contained` (938), interactsh (535), and template inputs (534). With an OOB listener
+9,870 load; with a listener and `--check-var username=... --check-var password=...`,
+10,411 (`checks update` stores 10,434). `checks status` shows the counts for the stored
+commit.
 
 ## brainproxy extensions
 
@@ -177,6 +200,4 @@ http:
 
 ## Ideas
 
-- `{{interactsh-url}}` could map to the OOB listener (`oob_payload`) with interactsh
-  matchers as correlation.
 - An index file in the store would let `checks list` skip parsing.
