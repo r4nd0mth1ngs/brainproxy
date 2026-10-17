@@ -79,6 +79,10 @@ pub struct RunArgs {
     /// Stop after this many requests.
     #[arg(long)]
     max_requests: Option<u64>,
+    /// Fuzz logged in with this auth profile; re-logs in when the session is lost.
+    /// Cookies holding a payload marker keep the payload.
+    #[arg(long, value_name = "NAME")]
+    auth: Option<String>,
 
     /// Regex (Rust syntax) marking a result as matched when found in the response. Repeatable.
     #[arg(long)]
@@ -333,10 +337,18 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
     };
     store.fuzz_set_state(run_id, "running", Some(std::process::id()), None, false)?;
 
+    let send = args.req.send_options(guard);
+    let auth = match crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send) {
+        Ok(a) => a,
+        Err(e) => {
+            store.fuzz_set_state(run_id, "failed", None, Some(&e.to_string()), true)?;
+            return Err(e);
+        }
+    };
     let engine_cfg = EngineConfig {
         concurrency: args.concurrency.clamp(1, 1000),
         rate: args.rate,
-        send: args.req.send_options(guard),
+        send,
         grep: args.grep.clone(),
         extract: args.extract.clone(),
         match_status: args.match_status.clone(),
@@ -348,10 +360,14 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
         },
         update_content_length: !args.req.verbatim,
         max_requests: args.max_requests,
+        auth: auth.clone(),
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let started = Instant::now();
     let result = rt.block_on(fuzz::run(project, run_id, template, plan, target, engine_cfg));
+    if let Some(a) = &auth {
+        a.save()?;
+    }
     match result {
         Ok(outcome) => {
             let state = if outcome == Outcome::Stopped { "stopped" } else { "completed" };

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::auth::AuthSession;
 use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, WireReader};
@@ -30,6 +31,8 @@ const SETTINGS_REFRESH: Duration = Duration::from_millis(300);
 pub struct ProxyOptions {
     pub project: PathBuf,
     pub upstream: SendOptions,
+    /// Logged-in session applied to in-scope requests (re-login on logout).
+    pub auth: Option<Arc<AuthSession>>,
 }
 
 /// Settings in effect, reloaded whenever the project's settings version changes.
@@ -43,6 +46,7 @@ struct Live {
 
 struct Ctx {
     ca: Arc<CertAuthority>,
+    auth: Option<Arc<AuthSession>>,
     guard: Option<Arc<crate::guard::Guard>>,
     client: Client,
     control: Mutex<Store>,
@@ -89,6 +93,7 @@ pub async fn run(
     let ctx = Arc::new(Ctx {
         ca,
         guard: opts.upstream.guard.clone(),
+        auth: opts.auth.clone(),
         client: Client::new(opts.upstream),
         control: Mutex::new(control),
         live: RwLock::new(Arc::new(Live { version: -1, ..Default::default() })),
@@ -250,8 +255,12 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
         let in_scope = live.scope.allows(&target.host);
         let record = in_scope || live.scope.record_out_of_scope;
 
+        let auth = ctx.auth.as_ref().filter(|_| in_scope);
         if in_scope {
             request = apply_request_rules(&live.rules, request);
+            if let Some(a) = auth {
+                request = a.apply(&request, &[]);
+            }
             if live.intercept.matches(false, &method, &target.host, &path) {
                 match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
                     Some(edited) => request = edited,
@@ -266,9 +275,22 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
         }
 
+        let generation = auth.map(|a| a.generation()).unwrap_or(0);
         let started = Instant::now();
         let mut upstream_reader = WireReader::new();
-        let upstream = forward(ctx, &target, &request, &method, &mut upstream_reader).await;
+        let mut upstream = forward(ctx, &target, &request, &method, &mut upstream_reader).await;
+        if let (Some(a), Ok((_, response))) = (auth, &upstream) {
+            a.observe(response);
+            // Session lost: log in again and replay the request with the new session.
+            if a.is_logged_out(response) && a.relogin(generation).await {
+                request = a.apply(&request, &[]);
+                upstream_reader = WireReader::new();
+                upstream = forward(ctx, &target, &request, &method, &mut upstream_reader).await;
+                if let Ok((_, response)) = &upstream {
+                    a.observe(response);
+                }
+            }
+        }
         let (mut upstream_stream, response) = match upstream {
             Ok(v) => v,
             Err(e) => {

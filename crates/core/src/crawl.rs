@@ -13,6 +13,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 use url::Url;
 
+use crate::auth::AuthSession;
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
 use crate::http::request::split_head_body;
@@ -42,6 +43,8 @@ pub struct CrawlConfig {
     pub submit_forms: bool,
     pub robots: bool,
     pub sitemap: bool,
+    /// Logged-in session applied to every request (re-login on logout).
+    pub auth: Option<Arc<AuthSession>>,
 }
 
 pub const DEFAULT_EXCLUDE: &str = r"(?i)(log|sign)[-_]?out|/logoff";
@@ -172,7 +175,8 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
         let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
         let mut tasks = Vec::new();
         for (i, req) in batch.iter().cloned().enumerate() {
-            let (sem, client, headers, ctl) = (sem.clone(), client.clone(), cfg.headers.clone(), ctl.clone());
+            let (sem, client, headers, ctl, auth) =
+                (sem.clone(), client.clone(), cfg.headers.clone(), ctl.clone(), cfg.auth.clone());
             let delay = limiter.map(|d| d * (i as u32 / cfg.concurrency.max(1) as u32));
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.ok()?;
@@ -182,7 +186,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                 if let Some(d) = delay {
                     tokio::time::sleep(d).await;
                 }
-                Some(fetch(&client, &req, &headers).await)
+                Some(fetch(&client, auth.as_deref(), &req, &headers).await)
             }));
         }
 
@@ -261,7 +265,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
 
 type FetchResult = (Target, Vec<u8>, Result<(Vec<u8>, u64)>);
 
-async fn fetch(client: &Client, req: &Req, headers: &[(String, String)]) -> FetchResult {
+async fn fetch(client: &Client, auth: Option<&AuthSession>, req: &Req, headers: &[(String, String)]) -> FetchResult {
     let mut hdrs = headers.to_vec();
     if req.body.is_some() && !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
         hdrs.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
@@ -275,8 +279,15 @@ async fn fetch(client: &Client, req: &Req, headers: &[(String, String)]) -> Fetc
             return (target, Vec::new(), Err(e));
         }
     };
-    let result = client.send(&raw, &target).await.map(|ex| (ex.response, ex.duration_ms));
-    (target, raw.into_bytes(), result)
+    let sent = match auth {
+        Some(a) => a.send(&raw, &target).await,
+        None => client.send(&raw, &target).await,
+    };
+    match sent {
+        // Record the request actually sent (with the session applied).
+        Ok(ex) => (target, ex.request, Ok((ex.response, ex.duration_ms))),
+        Err(e) => (target, raw.into_bytes(), Err(e)),
+    }
 }
 
 fn endpoint(req: &Req, page: &Url) -> Endpoint {

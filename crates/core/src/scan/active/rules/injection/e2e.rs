@@ -148,6 +148,7 @@ async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget
         rules: Some(vec![rule]),
         exclude_rules: vec![],
         max_duration: None,
+        auth: None,
     };
     let path = project(name);
     let summary = run(&path, targets, cfg, JobControl::default()).await.unwrap();

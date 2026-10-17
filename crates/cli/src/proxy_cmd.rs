@@ -68,6 +68,9 @@ pub struct ProxyRunArgs {
     /// Log file for `start` (default: next to the project file).
     #[arg(long)]
     log: Option<PathBuf>,
+    /// Add this auth profile's session to in-scope requests and re-login when it is lost.
+    #[arg(long, value_name = "NAME")]
+    auth: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -392,6 +395,10 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if args.verify_tls {
         cmd.arg("--verify-tls");
     }
+    if let Some(name) = &args.auth {
+        store.auth_profile(name)?; // Fail fast on an unknown profile.
+        cmd.args(["--auth", name]);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -439,6 +446,13 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     }
     // Fail before listening if there is no scope; the scope can't change while we run.
     let guard = store.guard()?;
+    let upstream = SendOptions {
+        timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
+        verify_tls: args.verify_tls,
+        sni: None,
+        guard: Some(guard),
+    };
+    let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -469,18 +483,13 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             #[cfg(not(unix))]
             let _ = tokio::signal::ctrl_c().await;
         };
-        let opts = ProxyOptions {
-            project: project.to_path_buf(),
-            upstream: SendOptions {
-                timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
-                verify_tls: args.verify_tls,
-                sni: None,
-                guard: Some(guard),
-            },
-        };
+        let opts = ProxyOptions { project: project.to_path_buf(), upstream, auth: auth.clone() };
         let result = brainproxy_core::proxy::run(listener, std::sync::Arc::new(ca), opts, shutdown).await;
         if read_state(&store)?.is_some_and(|s| s.pid == std::process::id()) {
             store.meta_set(STATE_KEY, None)?;
+        }
+        if let Some(a) = &auth {
+            a.save()?;
         }
         result
     })

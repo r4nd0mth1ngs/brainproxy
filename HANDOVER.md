@@ -28,7 +28,7 @@ export BRAINPROXY_PROJECT=/tmp/t.bpdb BRAINPROXY_FORMAT=json
 ./target/debug/brainproxy capabilities      # full machine-readable command list
 ```
 
-Toolchain used: Rust 1.97 (edition 2021). Tests: 318 (`cargo test`), including end-to-end
+Toolchain used: Rust 1.97 (edition 2021). Tests: 327 (`cargo test`), including end-to-end
 tests that run the real binary against in-process HTTP/HTTPS servers and curl.
 
 **Rule:** run `scripts/check.sh` before every commit. CI (`.github/workflows/ci.yml`) runs
@@ -93,53 +93,38 @@ scripts/check.sh            pre-commit checks
 4. Crawler, background jobs, immutable engagement scope, active scanner with 42 ZAP rules,
    ZAP drift detection, arm64 static builds.
 
-## In progress: authenticated scanning
+## Authenticated testing (done)
 
-Done (`crates/core/src/auth.rs`, unit-tested, **not wired into any command yet**):
-`AuthProfile` (login URL/body or raw login request template with `{{username}}`,
-`{{password}}`, `{{csrf}}`; optional CSRF prefetch; token extraction + header template;
-logged-in/logged-out regexes; check URL; static headers; password literal or env var),
-stored in table `auth_profiles` (schema v7). `AuthSession` with `apply(raw, keep_cookies)`,
-`observe(response)`, `is_logged_out(response)`, `send(req, target)` (apply, send, observe,
-re-login once on logout), `relogin(seen_generation)` (rate-limited, generation counter so
-concurrent workers re-login once), `login()`, `headers()`, `save()`.
+`crates/core/src/auth.rs` (profiles, `AuthSession`) and `crates/cli/src/auth_cmd.rs`
+(`auth add|login|status|headers|list|show|remove`, plus `load_session` / `maybe_session`,
+which build the session on the guarded client and log in if needed). `--auth NAME` is wired
+into `send` (and `--race`, applied once), `fuzz run`, `crawl`, `scan active` (including the
+URL baselines), and `proxy start|run`. Each site applies the session, observes responses,
+and on `is_logged_out` calls `relogin(generation)` and retries once. Fuzzed cookies (marker
+in the value) and the cookie being attacked by an active rule keep their payload. Commands
+call `session.save()` when they finish. E2E tests: `crates/cli/tests/auth.rs` (local app
+with CSRF form login, expiring sessions, JSON bearer login, crawl/fuzz/active/proxy).
 
-Remaining work:
-1. CLI `auth` command group (`crates/cli/src/auth_cmd.rs`, not created): `add` (flags
-   mirroring `AuthProfile` fields; `--password-env` preferred), `login`, `status`, `headers
-   [--raw]`, `list`, `show` (use `AuthProfile::redacted()`), `remove`; a
-   `load_session(project, name, send_opts) -> Arc<AuthSession>` helper that builds the
-   session on the guarded client and calls `ensure()`; register in `main.rs` (enum,
-   `command_name`, `run`) and add the `auth_profiles` table to `schema_json`.
-2. `--auth NAME` wiring, then `session.save()` at the end of each command:
-   - `crawl`: add `auth: Option<Arc<AuthSession>>` to `CrawlConfig`; in `fetch()` use
-     `auth.send(&raw, &target)` and record `ex.request` (the request actually sent).
-   - `send` / `send --race`: apply the session to the prepared request (race: once).
-   - `fuzz`: `EngineConfig.auth`; per request `apply` (keep cookies that contain the fuzz
-     marker), `observe`, and on `is_logged_out` call `relogin(gen)` and retry once.
-   - `scan active`: `Shared.auth` in `scan/active/mod.rs`; in `Cx::send_to` apply (keep the
-     attacked cookie when the insertion point is a cookie), observe, relogin + retry once.
-   - `proxy start --auth NAME`: `ProxyOptions.auth`; apply to in-scope requests in
-     `serve_http`, observe responses, relogin + retry once.
-3. End-to-end tests (`crates/cli/tests/`): a local test app with a login form (CSRF token),
-   a session cookie, a protected page, a session that expires after N requests (assert the
-   automatic re-login), a JSON login returning a bearer token, and `crawl --auth` reaching
-   protected pages.
-4. Docs: README usage, capabilities, roadmap.
+Known limits / ideas:
+- `auth_profiles.state` (session cookies) and literal passwords are readable through
+  `query`; `--password-env` avoids storing the password.
+- The proxy observes browser responses too, so a browser logout clears the shared jar.
+- Relogin is bounded by `--relogin-interval` (default 5 s) and `--max-relogins` (20 per
+  command run); attacking the session cookie itself can use these up.
+- No multi-user profiles for access-control testing yet (e.g. replay as user B).
 
 ## Backlog (suggested order)
 
-1. Finish authenticated scanning (above).
-2. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
-3. Reports: JSON, Markdown, HTML, SARIF from findings.
-4. API import: OpenAPI/Swagger, GraphQL introspection, Postman as scan targets.
-5. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
-6. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
+1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
+2. Reports: JSON, Markdown, HTML, SARIF from findings.
+3. API import: OpenAPI/Swagger, GraphQL introspection, Postman as scan targets.
+4. Out-of-band callback server (Collaborator-like) to enable Log4Shell, blind SSRF/XXE.
+5. Rule updates layers 2–3 (docs/RULE_UPDATES.md): `rules update` for ZAP data files;
    declarative checks incl. a Nuclei template subset.
-7. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
+6. Remaining ZAP rules (see `zap-sync.json` "skipped"): XSLT injection, persistent XSS,
    ViewState rules, CharsetMismatch, Heartbleed.
-8. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
-9. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
+7. Performance: upstream connection pooling, HTTP/2 client/proxy, single-packet race.
+8. MCP server exposing the CLI as tools; later the GUI (Tauri) on the same core.
 
 ## Notes from the cloud session
 

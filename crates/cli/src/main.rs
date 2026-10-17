@@ -2,6 +2,7 @@
 //! `brainproxy capabilities` for the machine-readable command list.
 
 mod active_cmd;
+mod auth_cmd;
 mod capabilities;
 mod crawl_cmd;
 mod engagement_cmd;
@@ -64,6 +65,10 @@ enum Cmd {
     /// Engagement scope: set once with `engagement start`; every outbound request must match it.
     #[command(subcommand)]
     Engagement(engagement_cmd::EngagementCmd),
+
+    /// Login profiles and sessions; use one with `--auth NAME` on send, fuzz, crawl, scan active, proxy.
+    #[command(subcommand)]
+    Auth(auth_cmd::AuthCmd),
 
     /// Manage the project file.
     #[command(subcommand)]
@@ -151,6 +156,9 @@ struct SendArgs {
     /// last byte of every request together (last-byte sync) to hit race windows.
     #[arg(long, value_name = "N")]
     race: Option<usize>,
+    /// Send with this auth profile's session (cookies/headers; re-login if logged out).
+    #[arg(long, value_name = "NAME")]
+    auth: Option<String>,
     /// Don't record the exchange in history.
     #[arg(long)]
     no_store: bool,
@@ -313,6 +321,15 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
         Cmd::Engagement(_) => "engagement",
+        Cmd::Auth(c) => match c {
+            auth_cmd::AuthCmd::Add(_) => "auth add",
+            auth_cmd::AuthCmd::Login { .. } => "auth login",
+            auth_cmd::AuthCmd::Status { .. } => "auth status",
+            auth_cmd::AuthCmd::Headers { .. } => "auth headers",
+            auth_cmd::AuthCmd::List => "auth list",
+            auth_cmd::AuthCmd::Show { .. } => "auth show",
+            auth_cmd::AuthCmd::Remove { .. } => "auth remove",
+        },
         Cmd::Job(_) => "job",
         Cmd::Findings(_) => "findings",
         Cmd::Scope(_) => "scope",
@@ -362,6 +379,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
+        Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
@@ -404,12 +422,26 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let guard = project_guard(project)?;
     // Refuse out-of-scope targets up front, before any connection is attempted.
     require_in_scope(&guard, &target)?;
-    let client = Client::new(args.req.send_options(guard));
+    let send_opts = args.req.send_options(guard);
+    let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
+    let client = Client::new(send_opts);
     if let Some(n) = args.race {
+        // Every racing request carries the same session, applied once.
+        let req = match &session {
+            Some(s) => RawRequest::from_bytes(s.apply(req.as_bytes(), &[])),
+            None => req,
+        };
         return race(project, &args, req, target, client, n, out);
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-    let result = rt.block_on(client.send(&req, &target));
+    let result = match &session {
+        Some(s) => {
+            let r = rt.block_on(s.send(&req, &target));
+            s.save()?;
+            r
+        }
+        None => rt.block_on(client.send(&req, &target)),
+    };
 
     let store = if args.no_store { None } else { Some(Store::open(project)?) };
     let ex = match result {
@@ -545,6 +577,7 @@ fn schema_json() -> Value {
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
             {"name": "findings", "description": "Scanner findings, de-duplicated (hits counts repeats). Join finding_types ON alert_ref for description/solution.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_COLUMNS)},
             {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
+            {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Manage with the auth command."},
             {"name": "jobs", "description": "Background jobs (crawl, active scan).", "columns": cols(brainproxy_core::jobs::JOB_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
         ],

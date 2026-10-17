@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+use brainproxy_core::auth::AuthSession;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::findings_db::FindingFilter;
@@ -62,6 +63,9 @@ pub struct ActiveArgs {
     max_targets: usize,
     #[arg(long)]
     verify_tls: bool,
+    /// Scan logged in with this auth profile; re-logs in when the session is lost.
+    #[arg(long, value_name = "NAME")]
+    auth: Option<String>,
     /// Run detached; returns a job id for `job wait|status|stop`.
     #[arg(long)]
     background: bool,
@@ -103,7 +107,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         cookies: args.cookies,
         headers: args.inject_headers.clone(),
     };
-    let (targets, skipped) = select_targets(project, &args, &send, &point_opts)?;
+    let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send)?;
+    let (targets, skipped) = select_targets(project, &args, &send, &point_opts, auth.as_deref())?;
     if targets.is_empty() {
         return Err(Error::InvalidInput(
             "no in-scope targets: pass URLs, --history-id, --where, or crawl/proxy the target first".into(),
@@ -123,10 +128,15 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         rules: (!args.rules.is_empty()).then(|| args.rules.clone()),
         exclude_rules: args.exclude_rules.clone(),
         max_duration: args.max_minutes.map(|m| Duration::from_secs_f64(m * 60.0)),
+        auth: auth.clone(),
     };
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let summary = rt.block_on(active::run(project, targets, cfg, ctl))?;
+        let summary = rt.block_on(active::run(project, targets, cfg, ctl));
+        if let Some(a) = &auth {
+            a.save()?;
+        }
+        let summary = summary?;
         let store = Store::open(project)?;
         let findings = store.findings_grouped(&FindingFilter {
             source: Some("active".into()),
@@ -166,6 +176,7 @@ fn select_targets(
     args: &ActiveArgs,
     send: &SendOptions,
     opts: &PointOptions,
+    auth: Option<&AuthSession>,
 ) -> Result<(Vec<ScanTarget>, usize), Error> {
     let store = Store::open(project)?;
     let mut ids: Vec<i64> = args.history_ids.clone();
@@ -185,7 +196,10 @@ fn select_targets(
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
-            let ex = rt.block_on(client.send(&req, &target))?;
+            let ex = match auth {
+                Some(a) => rt.block_on(a.send(&req, &target))?,
+                None => rt.block_on(client.send(&req, &target))?,
+            };
             let id = store.record_exchange("scan", &ex)?;
             targets.push(ScanTarget {
                 history_id: Some(id),

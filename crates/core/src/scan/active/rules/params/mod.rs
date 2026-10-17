@@ -135,6 +135,7 @@ mod e2e {
             rules,
             exclude_rules: vec![],
             max_duration: Some(Duration::from_secs(120)),
+            auth: None,
         };
         let summary = run(&project, targets, cfg, JobControl::default()).await.unwrap();
         let _ = std::fs::remove_file(&project);

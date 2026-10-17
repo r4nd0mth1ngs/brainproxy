@@ -78,6 +78,7 @@ fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> Act
         rules: Some(rules.to_vec()),
         exclude_rules: vec![],
         max_duration: None,
+        auth: None,
     };
     let targets = vec![ScanTarget {
         history_id: None,

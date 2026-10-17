@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::auth::AuthSession;
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
 use crate::http::request::split_head_body;
@@ -153,6 +154,7 @@ struct Report {
 
 struct Shared {
     client: Client,
+    auth: Option<Arc<AuthSession>>,
     strength: Strength,
     ctl: JobControl,
     deadline: Option<Instant>,
@@ -260,8 +262,19 @@ impl Cx {
             l.wait().await;
         }
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
-        let req = RawRequest::from_bytes(request);
-        let ex = self.shared.client.send(&req, target).await?;
+        let Some(auth) = &self.shared.auth else {
+            let ex = self.shared.client.send(&RawRequest::from_bytes(request), target).await?;
+            return Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms));
+        };
+        let attacked_cookie = self.point.as_ref().filter(|p| p.kind == PointKind::Cookie).map(|p| p.name.as_str());
+        let keep: Vec<&str> = attacked_cookie.into_iter().collect();
+        let generation = auth.generation();
+        let mut ex = self.shared.client.send(&RawRequest::from_bytes(auth.apply(&request, &keep)), target).await?;
+        auth.observe(&ex.response);
+        if auth.is_logged_out(&ex.response) && auth.relogin(generation).await {
+            ex = self.shared.client.send(&RawRequest::from_bytes(auth.apply(&request, &keep)), target).await?;
+            auth.observe(&ex.response);
+        }
         Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))
     }
 
@@ -372,6 +385,8 @@ pub struct ActiveConfig {
     pub rules: Option<Vec<u32>>,
     pub exclude_rules: Vec<u32>,
     pub max_duration: Option<Duration>,
+    /// Logged-in session applied to every request (an attacked cookie keeps its payload).
+    pub auth: Option<Arc<AuthSession>>,
 }
 
 /// A request to attack, with its baseline response.
@@ -433,6 +448,7 @@ pub async fn run(
 
     let shared = Arc::new(Shared {
         client: Client::new(cfg.send.clone()),
+        auth: cfg.auth.clone(),
         strength: cfg.strength,
         ctl: ctl.clone(),
         deadline: cfg.max_duration.map(|d| started + d),

@@ -136,6 +136,24 @@ brainproxy scan active --where "path LIKE '/api/%'" --rules 40018,40012 --backgr
 brainproxy scan rules --active
 brainproxy findings list --source active
 
+# Authenticated testing: a login profile, then --auth NAME on send, fuzz, crawl, scan active, proxy start.
+# Cookies/tokens are applied to every request, rotated cookies are learned, and a 401, a redirect to the
+# login path, or --logged-out triggers one automatic re-login and a retry.
+export APP_PW='...'                                # read at each login, never stored
+brainproxy auth add app --login-url https://app.example.com/login \
+    --login-body 'user={{username}}&pass={{password}}&csrf={{csrf}}' --username alice --password-env APP_PW \
+    --csrf-url https://app.example.com/login --csrf-regex 'name="csrf" value="([^"]+)"' \
+    --logged-in 'Sign out' --check-url https://app.example.com/account
+brainproxy auth add api --login-url https://app.example.com/api/login \
+    --login-body '{"username":"{{username}}","password":"{{password}}"}' --username alice --password-env APP_PW \
+    --token-regex '"token":"([^"]+)"' --token-header 'Authorization: Bearer {{token}}'
+brainproxy auth add key -H 'X-Api-Key: ...'       # static headers only
+brainproxy auth login app                         # verify; failures list the history ids to inspect
+brainproxy crawl https://app.example.com/ --auth app
+brainproxy scan active --auth app --background
+brainproxy auth status app                        # live check against --check-url
+brainproxy auth headers app --raw                 # Cookie/Authorization lines for sqlmap, ffuf, ...
+
 # Triage state
 brainproxy history tag 12 --add idor-candidate
 brainproxy history note 12 "user id in path, try other ids"
@@ -178,8 +196,10 @@ brainproxy decode jwt eyJhbGciOi...
   every connection, active scanner with 42 rules ported from ZAP (see
   [docs/ACTIVE_RULES.md](docs/ACTIVE_RULES.md)), ZAP drift detection
   ([docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
-- **Next:** Phase 5: reports (HTML/JSON/SARIF), authenticated scanning (login flows and
-  session handling), API import (OpenAPI/GraphQL), and automation plans.
+- **Phase 5 (in progress):** authenticated testing is done: login profiles (form, JSON,
+  raw request template, CSRF prefetch, bearer tokens, static headers) and `--auth` on send,
+  race, fuzz, crawl, active scan, and the proxy, with automatic re-login.
+- **Next:** reports (HTML/JSON/SARIF), API import (OpenAPI/GraphQL), and automation plans.
 
 ## License
 

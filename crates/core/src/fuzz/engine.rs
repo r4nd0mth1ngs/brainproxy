@@ -11,6 +11,7 @@ use regex::bytes::Regex;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
+use crate::auth::{request_cookies, AuthSession};
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
 use crate::fuzz::plan::{Plan, Template};
@@ -42,6 +43,8 @@ pub struct EngineConfig {
     pub store: StoreMode,
     pub update_content_length: bool,
     pub max_requests: Option<u64>,
+    /// Logged-in session applied to every request; fuzzed cookies are left alone.
+    pub auth: Option<Arc<AuthSession>>,
 }
 
 /// Outcome of one request.
@@ -122,6 +125,18 @@ pub async fn run(
     let matched_stop = Arc::new(AtomicBool::new(false));
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Arc::new(Limiter::new(r)));
     let client = Arc::new(Client::new(cfg.send.clone()));
+    // Cookies that carry a payload must keep it rather than get the session's value.
+    let fuzzed_cookies: Arc<Vec<String>> = Arc::new(if cfg.auth.is_some() {
+        const SENTINEL: &str = "BPFUZZSENTINEL7q";
+        let values = vec![SENTINEL.as_bytes(); template.positions()];
+        request_cookies(&template.render(&values))
+            .into_iter()
+            .filter(|(_, v)| v.contains(SENTINEL))
+            .map(|(k, _)| k)
+            .collect()
+    } else {
+        Vec::new()
+    });
     let (template, plan, target, cfg) = (Arc::new(template), Arc::new(plan), Arc::new(target), Arc::new(cfg));
 
     let watcher = {
@@ -146,8 +161,8 @@ pub async fn run(
     for _ in 0..cfg.concurrency.max(1).min(total.max(1) as usize) {
         let (next, stop, matched_stop, limiter, client, tx) =
             (next.clone(), stop.clone(), matched_stop.clone(), limiter.clone(), client.clone(), tx.clone());
-        let (template, plan, target, cfg, compiled) =
-            (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone());
+        let (template, plan, target, cfg, compiled, fuzzed_cookies) =
+            (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone(), fuzzed_cookies.clone());
         workers.push(tokio::spawn(async move {
             let mut conn: Option<Conn> = None;
             loop {
@@ -168,12 +183,36 @@ pub async fn run(
                     request = RawRequest::from_bytes(request).update_content_length().into_bytes();
                 }
                 let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or_default();
+                let keep: Vec<&str> = fuzzed_cookies.iter().map(String::as_str).collect();
+                let rendered = request.clone();
+                let generation = cfg.auth.as_ref().map(|a| a.generation()).unwrap_or(0);
+                if let Some(a) = &cfg.auth {
+                    request = a.apply(&rendered, &keep);
+                }
 
-                let started = Instant::now();
-                let result =
+                let mut started = Instant::now();
+                let mut result =
                     tokio::time::timeout(cfg.send.timeout, exchange(&client, &target, &mut conn, &request, &method))
                         .await
                         .unwrap_or_else(|_| Err(Error::Timeout(cfg.send.timeout)));
+                if let (Some(a), Ok(response)) = (&cfg.auth, &result) {
+                    a.observe(response);
+                    // Session lost: log in again (once across workers) and retry this payload.
+                    if a.is_logged_out(response) && a.relogin(generation).await {
+                        conn = None;
+                        request = a.apply(&rendered, &keep);
+                        started = Instant::now();
+                        result = tokio::time::timeout(
+                            cfg.send.timeout,
+                            exchange(&client, &target, &mut conn, &request, &method),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(Error::Timeout(cfg.send.timeout)));
+                        if let Ok(r) = &result {
+                            a.observe(r);
+                        }
+                    }
+                }
                 let duration = started.elapsed().as_millis() as i64;
 
                 let mut res = FuzzResult {

@@ -32,6 +32,9 @@ pub struct CrawlArgs {
     /// Header for every request, e.g. "Cookie: session=..." for a logged-in crawl. Repeatable.
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
+    /// Crawl logged in with this auth profile (see `auth add`); re-logs in when the session is lost.
+    #[arg(long, value_name = "NAME")]
+    auth: Option<String>,
     /// Also crawl subdomains of the seed hosts.
     #[arg(long)]
     subdomains: bool,
@@ -79,6 +82,13 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         exclude.push(Regex::new(e).map_err(|err| Error::InvalidInput(format!("--exclude {e:?}: {err}")))?);
     }
     let headers = args.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
+    let send = SendOptions {
+        timeout: std::time::Duration::from_secs_f64(args.timeout.max(0.1)),
+        verify_tls: args.verify_tls,
+        sni: None,
+        guard: Some(guard),
+    };
+    let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send)?;
     let cfg = CrawlConfig {
         seeds: args.urls.clone(),
         max_depth: args.depth,
@@ -86,12 +96,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         max_per_path: args.max_per_path.max(1),
         concurrency: args.concurrency.clamp(1, 200),
         rate: args.rate,
-        send: SendOptions {
-            timeout: std::time::Duration::from_secs_f64(args.timeout.max(0.1)),
-            verify_tls: args.verify_tls,
-            sni: None,
-            guard: Some(guard),
-        },
+        send,
         headers,
         subdomains: args.subdomains,
         path_prefix: args.path_prefix.clone(),
@@ -99,11 +104,15 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         submit_forms: !args.no_forms,
         robots: !args.no_robots,
         sitemap: !args.no_sitemap,
+        auth: auth.clone(),
     };
     let summary = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let s = rt.block_on(crawl::crawl(project, cfg, ctl))?;
-        Ok(json!(s))
+        let s = rt.block_on(crawl::crawl(project, cfg, ctl));
+        if let Some(a) = &auth {
+            a.save()?;
+        }
+        Ok(json!(s?))
     })?;
     out.ok(summary.clone(), || {
         let mut lines = vec![format!(

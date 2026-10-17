@@ -235,6 +235,33 @@ pub struct LoginResult {
     pub history_ids: Vec<i64>,
 }
 
+/// Outcome of `AuthSession::check`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckResult {
+    pub url: String,
+    pub status: Option<u16>,
+    pub logged_in: bool,
+    pub history_id: Option<i64>,
+}
+
+/// Cookie name/value pairs from a raw request's Cookie headers.
+pub fn request_cookies(raw: &[u8]) -> Vec<(String, String)> {
+    RawRequest::from_bytes(raw.to_vec())
+        .head()
+        .map(|h| {
+            h.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                .flat_map(|(_, v)| v.split(';').map(str::to_string).collect::<Vec<_>>())
+                .filter_map(|c| {
+                    let (k, v) = c.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 struct Compiled {
     csrf: Option<Regex>,
     token: Option<Regex>,
@@ -254,6 +281,12 @@ pub struct AuthSession {
     relogins: AtomicU32,
     last_login: Mutex<Option<Instant>>,
     login_lock: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for AuthSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSession").field("profile", &self.profile.name).finish_non_exhaustive()
+    }
 }
 
 impl AuthSession {
@@ -339,20 +372,7 @@ impl AuthSession {
         let st = self.state.lock().unwrap();
         let mut req = RawRequest::from_bytes(raw.to_vec());
         if !st.cookies.is_empty() {
-            let existing: Vec<(String, String)> = req
-                .head()
-                .map(|h| {
-                    h.headers
-                        .iter()
-                        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
-                        .flat_map(|(_, v)| v.split(';').map(str::to_string).collect::<Vec<_>>())
-                        .filter_map(|c| {
-                            let (k, v) = c.split_once('=')?;
-                            Some((k.trim().to_string(), v.trim().to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let existing = request_cookies(raw);
             let mut merged: Vec<(String, String)> = Vec::new();
             for (k, v) in &existing {
                 let replaced = !keep.contains(&k.as_str()) && st.cookies.iter().any(|(n, _)| n == k);
@@ -377,6 +397,25 @@ impl AuthSession {
             req = req.set_header(k, v);
         }
         req.into_bytes()
+    }
+
+    /// Fetches the profile's check URL with the session applied and reports
+    /// whether it still looks logged in. None when the profile has no check URL.
+    pub async fn check(&self) -> Result<Option<CheckResult>> {
+        let Some(url) = &self.profile.check_url else { return Ok(None) };
+        let (req, target) = RawRequest::build("GET", url, &[], b"")?;
+        let ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+        self.observe(&ex.response);
+        let history_id = self.record(&ex);
+        let logged_in = !self.is_logged_out(&ex.response)
+            && self.re.logged_in.as_ref().is_none_or(|re| re.is_match(&response_text(&ex.response)));
+        self.state.lock().unwrap().logged_in = logged_in;
+        Ok(Some(CheckResult {
+            url: url.clone(),
+            status: parse_response_head(&ex.response).ok().map(|h| h.status),
+            logged_in,
+            history_id,
+        }))
     }
 
     /// Learns cookies set by a response (all Set-Cookie headers, including on
