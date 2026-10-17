@@ -11,7 +11,25 @@ See [docs/RESEARCH.md](docs/RESEARCH.md) for the feature research, design, and r
 
 ## Install on Kali (CLI only)
 
-brainproxy builds into one static binary with no runtime dependencies.
+brainproxy builds into one static binary with no runtime dependencies, for **arm64**
+(Braintruder's Kali target) and x86_64. Tagged releases attach both
+(`brainproxy-linux-arm64`, `brainproxy-linux-x86_64`) with `.sha256` files:
+
+```sh
+curl -LO https://github.com/r4nd0mth1ngs/brainproxy/releases/latest/download/brainproxy-linux-arm64
+sha256sum -c <(curl -sL https://github.com/r4nd0mth1ngs/brainproxy/releases/latest/download/brainproxy-linux-arm64.sha256)
+sudo install -m755 brainproxy-linux-arm64 /usr/local/bin/brainproxy
+```
+
+Build an arm64 binary from any Linux machine:
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+pip install ziglang && cargo install cargo-zigbuild
+make static-arm64              # -> target/aarch64-unknown-linux-musl/release/brainproxy
+```
+
+Or build x86_64:
 
 ```sh
 # Build once (on Kali or any Linux box with Rust installed)

@@ -250,11 +250,18 @@ impl Guard {
             Err(_) => {
                 // Refuse names no scope could allow before touching DNS.
                 self.precheck_name(bare, port)?;
-                tokio::net::lookup_host((bare, port))
-                    .await
-                    .map_err(|e| Error::Connect(format!("{bare}: {e}")))?
-                    .map(|a| a.ip())
-                    .collect()
+                let named = self.scopes.iter().all(|sc| sc.include.iter().any(|e| e.matches_name(&bare.to_ascii_lowercase(), port)));
+                match tokio::net::lookup_host((bare, port)).await {
+                    Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+                    // A name that every scope lists by name is in scope; it just doesn't resolve.
+                    Err(e) if named => return Err(Error::Connect(format!("{bare}: {e}"))),
+                    // Otherwise only its addresses could make it allowed, and we can't check them.
+                    Err(e) => {
+                        return Err(Error::OutOfScope(format!(
+                            "{bare} could not be resolved to check it against the scope ({e})"
+                        )))
+                    }
+                }
             }
         };
         let mut allowed = addrs.clone();
