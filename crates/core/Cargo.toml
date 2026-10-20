@@ -29,7 +29,7 @@ sha2.workspace = true
 url.workspace = true
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
 time = "0.3.55"
-getrandom = "0.2.17"
+getrandom = "0.4.3"
 pem = "4.0.0"
 similar = "3.2.0"
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
