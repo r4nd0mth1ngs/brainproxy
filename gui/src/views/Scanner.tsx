@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { run, withScheme, type Risk } from "../api";
 import type { ChecksStatus } from "./Updates";
+import { quickCheckArgs } from "./feed";
 import { useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
@@ -355,7 +356,8 @@ export async function loadSuggestions(): Promise<Suggestions> {
 
 function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id: number) => void }) {
   const app = useApp();
-  const [kind, setKind] = useState<"scan" | "crawl" | "php2shell">("scan");
+  // `quick:<id>`: a quick check from brainproxy's feed (tagged quick-check).
+  const [kind, setKind] = useState<"scan" | "crawl" | "php2shell" | `quick:${string}`>("scan");
   const [f, setF] = useState(SCAN_DEFAULTS);
   const [hints, setHints] = useState<Suggestions | null>(null);
   // Downloaded Nuclei templates join active scans by default (high severity and up).
@@ -364,6 +366,14 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   const [useNuclei, setUseNuclei] = useState(true);
   const [nucleiSeverity, setNucleiSeverity] = useState("high");
   const nucleiOn = kind === "scan" && !!nucleiInstalled && useNuclei && !/\b(nuclei|all)\b/.test(f.checks);
+  const quickChecks = checksStatus?.brainproxy?.installed?.quick_checks ?? [];
+  const quick = kind.startsWith("quick:") ? quickChecks.find((q) => `quick:${q.id}` === kind) ?? null : null;
+  // One-click checks: a few requests per site, no crawl.
+  const oneClick = kind === "php2shell" || quick != null;
+  // A quick check that left the feed falls back to the active scan form.
+  useEffect(() => {
+    if (kind.startsWith("quick:") && checksStatus && !quick) setKind("scan");
+  }, [kind, checksStatus, quick]);
   // Active scan: crawl the listed sites then attack what's found, attack everything already
   // recorded, or attack only the listed URLs.
   const [mode, setMode] = useState<"crawl" | "recorded" | "urls">("crawl");
@@ -385,12 +395,12 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   }, [picked]);
 
   const args = (): string[] =>
-    kind === "php2shell"
+    oneClick
       ? [
           "scan",
           "active",
           ...urls(f.urls),
-          "--rules=100002",
+          ...(quick ? quickCheckArgs(quick.id) : ["--rules=100002"]),
           ...opt("--auth", f.auth),
           ...opt("--concurrency", f.concurrency),
           ...opt("--rate", f.rate),
@@ -453,7 +463,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
     if (kind === "scan" && mode !== "recorded" && !list(f.urls).length) return app.toast("Give at least one URL, or audit everything recorded", "error");
     try {
       const d = await run<{ job: number }>([...args(), "--background"]);
-      app.toast(`${kind === "crawl" ? "Crawl" : kind === "php2shell" ? "PHP2Shell check" : "Active scan"} started (job ${d.job})`);
+      app.toast(`${kind === "crawl" ? "Crawl" : quick ? quick.name : kind === "php2shell" ? "PHP2Shell check" : "Active scan"} started (job ${d.job})`);
       onLaunched(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -485,6 +495,11 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           <button className={kind === "php2shell" ? "on" : ""} onClick={() => setKind("php2shell")} title="CVE-2026-109618, CVE-2026-109619">
             PHP2Shell check
           </button>
+          {quickChecks.map((q) => (
+            <button key={q.id} className={kind === `quick:${q.id}` ? "on" : ""} onClick={() => setKind(`quick:${q.id}`)} title={`${q.id} (brainproxy checks feed)`}>
+              {q.name}
+            </button>
+          ))}
         </div>
         <span className="muted small grow">Runs in the background; every request stays inside the engagement scope.</span>
         <button className="btn small" onClick={() => app.openWizard(true)} title="Opens the step-by-step scan on the Overview">
@@ -552,10 +567,15 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           suspected, so confirm the PHP version on the server.
         </p>
       )}
+      {quick && (
+        <p className="muted small sc-all">
+          {quick.description || quick.name} From brainproxy's checks feed ({quick.id}); only this check runs on each site.
+        </p>
+      )}
       {kind !== "scan" || mode !== "recorded" ? (
         <label className="sc-field">
           <span className="label">
-            {kind === "php2shell"
+            {oneClick
               ? "Sites to check"
               : kind === "crawl" || mode === "crawl"
                 ? "Sites to crawl (start URLs)"
@@ -659,7 +679,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       </div>
       <div className="row gap">
         <button className="btn primary" onClick={launch}>
-          Start {kind === "crawl" ? "crawl" : kind === "php2shell" ? "check" : "scan"}
+          Start {kind === "crawl" ? "crawl" : oneClick ? "check" : "scan"}
         </button>
         <button className="btn" onClick={() => setF({ ...SCAN_DEFAULTS, urls: hints?.origins.join("\n") ?? "" })}>
           Reset

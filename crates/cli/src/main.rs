@@ -136,12 +136,14 @@ enum Cmd {
     )]
     Oob(oob_cmd::OobCmd),
 
-    /// Declarative checks: Nuclei HTTP templates and your own YAML checks, run with `scan active --checks`.
+    /// Declarative checks: brainproxy's feed, Nuclei HTTP templates, and your own YAML checks.
     #[command(
         subcommand,
         after_help = "Checks use the HTTP subset of the Nuclei template format plus brainproxy extensions \
-        (scope: host|request|param, inject, matcher part baseline_body); see docs/CHECKS.md. Templates outside \
-        the subset are listed as not loaded, never half-run. Put your own checks in <home>/checks/local."
+        (scope: host|request|param, inject, matcher part baseline_body, passive: true); see docs/CHECKS.md. \
+        Templates outside the subset are listed as not loaded, never half-run. Active checks run with \
+        `scan active --checks`; passive ones from the brainproxy feed and <home>/checks/local run in the \
+        passive scanner. Put your own checks in <home>/checks/local."
     )]
     Checks(checks_cmd::ChecksCmd),
 
@@ -407,6 +409,11 @@ fn command_name(cmd: &Cmd) -> String {
             checks_cmd::ChecksCmd::Validate { .. } => "checks validate",
             checks_cmd::ChecksCmd::Update(_) => "checks update",
             checks_cmd::ChecksCmd::Status => "checks status",
+            checks_cmd::ChecksCmd::Feed(f) => match f {
+                checks_cmd::FeedCmd::Keygen { .. } => "checks feed keygen",
+                checks_cmd::FeedCmd::Sign { .. } => "checks feed sign",
+                checks_cmd::FeedCmd::Verify { .. } => "checks feed verify",
+            },
         },
         Cmd::Update(c) => match c {
             update_cmd::UpdateCmd::Check { .. } => "update check",

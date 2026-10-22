@@ -56,8 +56,10 @@ pub struct ActiveArgs {
     /// Run only the declarative checks from --checks, not the ported ZAP rules.
     #[arg(long)]
     no_rules: bool,
-    /// Declarative checks to run as well: `nuclei` (templates from `checks update`), `local`
+    /// Declarative checks to run as well: `brainproxy` (the signed feed from `checks update
+    /// --source brainproxy`), `nuclei` (templates from `checks update`), `local`
     /// (<home>/checks/local), `all`, or a template file/directory. Repeatable or comma-separated.
+    /// Passive checks among them are left out (the passive scanner runs them).
     #[arg(long, value_delimiter = ',', value_name = "SELECTOR")]
     checks: Vec<String>,
     /// Only checks with any of these tags (comma-separated), e.g. cve,exposure.
@@ -310,10 +312,24 @@ fn load_checks(home: &Path, args: &ActiveArgs, oob: bool) -> Result<(Vec<checks:
         min_risk: args.check_severity.map(crate::scan_cmd::RiskArg::get),
         include_tags: args.check_include_tags.clone(),
     };
-    let total = loaded.checks.len();
-    let selected: Vec<checks::Check> = loaded.checks.iter().filter(|c| filter.keep(c)).cloned().collect();
+    // Only the signed feed may replace a built-in rule.
+    let feed = checks::feed_dir(home);
+    let (passive, active): (Vec<checks::Check>, Vec<checks::Check>) =
+        loaded.checks.iter().cloned().partition(|c| c.passive);
+    let total = active.len();
+    let selected: Vec<checks::Check> = active
+        .into_iter()
+        .filter(|c| filter.keep(c))
+        .map(|mut c| {
+            if !c.file.starts_with(&feed) {
+                c.replaces = None;
+            }
+            c
+        })
+        .collect();
     let summary = json!({
         "selected": selected.len(),
+        "passive": passive.len(),
         "filtered_out": total - selected.len(),
         "not_loaded": loaded.skipped.len(),
         "not_loaded_reasons": loaded.reasons().into_iter().take(5).collect::<Vec<_>>(),

@@ -199,6 +199,8 @@ attack type, and pick payloads:
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
     templates* (on when installed, high severity and above by default).
 - **New scan › Crawl:** explore only, no attacks.
+- **New scan › quick checks from the feed:** once brainproxy's checks feed is installed, each
+  of its checks tagged `quick-check` gets a button here that runs only that check.
 - **New scan › PHP2Shell check:** checks the listed sites for PHP2Shell (CVE-2026-109618,
   CVE-2026-109619) with active rule 100002 only, a few requests per site. See
   [ACTIVE_RULES.md](ACTIVE_RULES.md#brainproxys-own-rules).
@@ -379,6 +381,12 @@ The agent works under the same engagement scope; it cannot reach anything outsid
   end-of-life checks (outdated PHP, nginx, Apache httpd, WordPress, Drupal, Exchange, ...),
   which `checks update` keeps current. Version headers (`Server`, `X-Powered-By`) are
   reported by their own rules, and many Nuclei CVE templates check versions too.
+- **brainproxy checks.** brainproxy's own detections for new vulnerabilities come as a
+  signed feed (*Rules and checks › brainproxy checks*, or `checks update --source
+  brainproxy`), so they arrive without reinstalling; the app updates it daily when update
+  checks are on. Guided scans use its active checks, the passive scanner its passive ones,
+  and checks tagged as quick checks get their own button under *Scans › New scan*. See
+  [CHECKS.md](CHECKS.md#the-brainproxy-feed).
 - **Nuclei templates.** brainproxy runs Nuclei's HTTP templates itself. Most templates load
   (10,434 of 11,690 at the pinned version); the rest use features it doesn't support yet,
   and `checks list --skipped` says why. Templates needing a username, password, or other

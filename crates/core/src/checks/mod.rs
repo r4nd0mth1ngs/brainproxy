@@ -8,6 +8,8 @@
 //! `Cx`, so through the engagement scope guard, auth session, and rate limit.
 
 mod dsl;
+mod feed;
+mod passive;
 mod rule;
 mod store;
 
@@ -22,6 +24,11 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::scan::active::RuleScope;
 use crate::scan::{Confidence, Risk};
+pub use feed::{
+    feed_dir, feed_status, keygen, public_key, sign_feed, trusted_keys, update_feed, verify_dir, Change, FeedManifest,
+    FeedSource, FeedState, FeedStatus, FeedUpdate, QuickCheck, FEED_PATH, FEED_REPO,
+};
+pub use passive::{passive_rules, CheckPassiveRule};
 pub use rule::{alert_from_json, interaction_matches, into_rules};
 pub use store::{local_dir, nuclei_dir, nuclei_status, update, Source, StoreStatus, UpdateResult};
 
@@ -53,6 +60,18 @@ pub struct Check {
     pub scope: &'static str,
     pub requests: usize,
     pub file: PathBuf,
+    /// brainproxy extension `passive: true`: matchers run on recorded traffic
+    /// by the passive scanner; no requests are sent.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub passive: bool,
+    /// `info.replaces`: the built-in rule id this check takes over (findings keep
+    /// that rule's alert ref). Honoured for the signed brainproxy feed only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<u32>,
+    /// `info.defer-to`: a built-in rule that does this check's job better; the
+    /// check is dropped from a scan that runs that rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_to: Option<u32>,
     #[serde(skip)]
     pub(crate) rule_scope: RuleScope,
     #[serde(skip)]
@@ -415,7 +434,7 @@ fn parse(
     compile(&doc, file, root, opts).map_err(|p| (id, p))
 }
 
-const TOP_KEYS: &[&str] = &["id", "info", "http", "requests", "variables", "scope", "flow"];
+const TOP_KEYS: &[&str] = &["id", "info", "http", "requests", "variables", "scope", "flow", "passive"];
 const BLOCK_KEYS: &[&str] = &[
     "method",
     "path",
@@ -506,6 +525,23 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
         .first()
         .and_then(|c| c.trim_start_matches(|ch: char| !ch.is_ascii_digit()).parse().ok())
         .unwrap_or(0);
+    let passive = flag(doc, "passive");
+    if passive && obj.contains_key("scope") {
+        return invalid("passive checks have no scope (they read recorded traffic)");
+    }
+    if passive && obj.contains_key("flow") {
+        return invalid("passive checks have no flow");
+    }
+    let rule_id = |key: &str| -> std::result::Result<Option<u32>, Problem> {
+        match info.get(key).and_then(s) {
+            None => Ok(None),
+            Some(v) => match v.trim().parse::<u32>() {
+                Ok(n) if n > 0 => Ok(Some(n)),
+                _ => invalid(format!("info.{key} must be a rule id")),
+            },
+        }
+    };
+    let (replaces, defer_to) = (rule_id("replaces")?, rule_id("defer-to")?);
     let (rule_scope, scope) = match obj.get("scope").and_then(Value::as_str).unwrap_or("host") {
         "host" => (RuleScope::Host, "host"),
         "request" => (RuleScope::Page, "request"),
@@ -532,7 +568,7 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
     };
     let mut blocks = Vec::new();
     for b in blocks_v {
-        blocks.push(compile_block(b, rule_scope, file, root)?);
+        blocks.push(compile_block(b, rule_scope, passive, file, root)?);
     }
     if blocks.is_empty() {
         return invalid("no requests");
@@ -556,8 +592,11 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
         cwe,
         tags,
         scope,
-        requests: blocks.iter().map(|b| b.paths.len() + b.raws.len() + b.inject.len()).sum(),
+        requests: if passive { 0 } else { blocks.iter().map(|b| b.paths.len() + b.raws.len() + b.inject.len()).sum() },
         file: file.to_path_buf(),
+        passive,
+        replaces,
+        defer_to,
         rule_scope,
         variables,
         inputs,
@@ -627,9 +666,21 @@ fn compile_flow(flow: &str, blocks: usize) -> std::result::Result<dsl::Expr, Pro
     }
 }
 
-fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) -> std::result::Result<Block, Problem> {
+/// What a passive block may contain: it only looks at a recorded exchange.
+const PASSIVE_BLOCK_KEYS: &[&str] = &["matchers", "matchers-condition", "extractors", "id", "name"];
+
+fn compile_block(
+    b: &Value,
+    scope: RuleScope,
+    passive: bool,
+    file: &Path,
+    root: Option<&Path>,
+) -> std::result::Result<Block, Problem> {
     let Some(obj) = b.as_object() else { return invalid("request block is not a mapping") };
     for k in obj.keys() {
+        if passive && !PASSIVE_BLOCK_KEYS.contains(&k.as_str()) {
+            return invalid(format!("passive checks send no requests (`{k}`)"));
+        }
         if !BLOCK_KEYS.contains(&k.as_str()) {
             return unsupported(format!("request `{k}`"));
         }
@@ -653,7 +704,7 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
         }
         RuleScope::Param => {}
         _ if !inject.is_empty() => return invalid("`inject` needs scope: param"),
-        _ if paths.is_empty() && raws.is_empty() => return invalid("request block without path or raw"),
+        _ if paths.is_empty() && raws.is_empty() && !passive => return invalid("request block without path or raw"),
         _ => {}
     }
     if raws.iter().chain(&paths).any(|r| r.contains('§')) {
@@ -715,6 +766,18 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
     }
     if matchers.is_empty() && extractors.is_empty() {
         return invalid("request block without matchers or extractors");
+    }
+    if passive {
+        let parts = matchers.iter().map(|m| &m.part).chain(extractors.iter().map(|e| &e.part));
+        if matchers.iter().any(|m| m.oob) || parts.clone().any(|p| matches!(p, Part::Oob(_))) {
+            return invalid("passive checks have no out-of-band interactions");
+        }
+        if let Some(p) = parts.into_iter().find(|p| matches!(p, Part::BaselineBody | Part::Nth(..))) {
+            return invalid(format!(
+                "passive checks see one recorded response (no {})",
+                if matches!(p, Part::BaselineBody) { "baseline_body" } else { "numbered parts" }
+            ));
+        }
     }
     Ok(Block {
         method,
@@ -1161,20 +1224,22 @@ impl Filter {
     }
 }
 
-/// Resolves `--checks` selectors: `nuclei`, `local`, `all`, or a path.
+/// Resolves `--checks` selectors: `brainproxy`, `nuclei`, `local`, `all`, or a path.
+/// `all` lists the brainproxy feed first, so its checks win an id clash.
 pub fn resolve_selectors(home: &Path, selectors: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for s in selectors {
         match s.as_str() {
             "nuclei" => out.push(nuclei_dir(home)),
             "local" => out.push(local_dir(home)),
-            "all" => out.extend([nuclei_dir(home), local_dir(home)]),
+            "brainproxy" => out.push(feed_dir(home)),
+            "all" => out.extend([feed_dir(home), nuclei_dir(home), local_dir(home)]),
             p => out.push(PathBuf::from(p)),
         }
     }
     // A store that doesn't exist yet is empty, not an error.
-    let (nuclei, local) = (nuclei_dir(home), local_dir(home));
-    out.retain(|p| p.exists() || (*p != nuclei && *p != local));
+    let stores = [feed_dir(home), nuclei_dir(home), local_dir(home)];
+    out.retain(|p| p.exists() || !stores.contains(p));
     out.dedup();
     out
 }

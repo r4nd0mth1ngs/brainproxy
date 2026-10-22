@@ -81,6 +81,11 @@ pub trait ActiveRule: Send + Sync {
             _ => 2,
         }
     }
+    /// A built-in rule that covers what this one does better: when that rule
+    /// runs in the same scan, this one is dropped (feed checks, `info.defer-to`).
+    fn defers_to(&self) -> Option<u32> {
+        None
+    }
 }
 
 impl std::fmt::Debug for dyn ActiveRule {
@@ -106,6 +111,20 @@ pub struct Response {
 }
 
 impl Response {
+    /// A response recorded earlier (passive checks run over history).
+    pub(crate) fn recorded(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            status_line: format!("HTTP/1.1 {status}"),
+            headers,
+            body,
+            duration: Duration::ZERO,
+            request: Vec::new(),
+            raw: Vec::new(),
+            text: OnceLock::new(),
+        }
+    }
+
     pub(crate) fn parse(request: Vec<u8>, raw: Vec<u8>, duration: Duration) -> Result<Self> {
         let mut start = 0;
         while let Ok(h) = parse_response_head(&raw[start..]) {
@@ -672,7 +691,18 @@ pub async fn run(
     }
     let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
     rules.retain(|r| r.depends_on().iter().all(|d| ids.contains(d)));
-    rules.extend(cfg.checks.iter().copied());
+    // A feed check that replaces a built-in rule (`info.replaces`) carries its id:
+    // it runs instead of that rule, and excluding the id excludes it too.
+    let checks: Vec<&'static dyn ActiveRule> = cfg
+        .checks
+        .iter()
+        .copied()
+        .filter(|c| c.id() == 0 || !cfg.exclude_rules.contains(&c.id()))
+        .filter(|c| c.defers_to().is_none_or(|id| !ids.contains(&id)))
+        .collect();
+    let replaced: HashSet<u32> = checks.iter().map(|c| c.id()).filter(|id| *id != 0).collect();
+    rules.retain(|r| !replaced.contains(&r.id()));
+    rules.extend(checks);
     if rules.is_empty() {
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }

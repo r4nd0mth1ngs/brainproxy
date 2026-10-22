@@ -6,6 +6,8 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { feedHasActive } from "./feed";
+import type { ChecksStatus } from "./Updates";
 
 export function TargetView({ active }: { active: boolean }) {
   const [sub, setSub] = useState<"map" | "scope">("map");
@@ -205,11 +207,15 @@ function SiteMap({ active }: { active: boolean }) {
       .then(({ raw, binary, entry: e }) => app.sendToRepeater({ raw, binary, target: originOf(e.url), title: pathOf(e.url).slice(0, 24) }))
       .catch((e) => app.toast(e.message, "error"));
 
-  // Installed Nuclei templates (high severity and up) join active scans started from here.
+  // Installed checks join active scans started from here: brainproxy's feed, and the Nuclei
+  // templates of high severity and up.
   const [nucleiArgs, setNucleiArgs] = useState<string[]>([]);
   useEffect(() => {
-    run<{ nuclei: unknown }>(["checks", "status"])
-      .then((d) => setNucleiArgs(d.nuclei ? ["--checks", "nuclei", "--check-severity", "high"] : []))
+    run<ChecksStatus>(["checks", "status"])
+      .then((d) => {
+        const sources = [feedHasActive(d.brainproxy?.installed) ? "brainproxy" : "", d.nuclei ? "nuclei" : ""].filter(Boolean);
+        setNucleiArgs(sources.length ? ["--checks", sources.join(","), ...(d.nuclei ? ["--check-severity", "high"] : [])] : []);
+      })
       .catch(() => {});
   }, []);
 

@@ -1,11 +1,13 @@
 # Declarative checks
 
-Checks are YAML files that the active scanner runs next to the ported ZAP rules. The
-format is the HTTP subset of [Nuclei templates](https://docs.projectdiscovery.io/templates/introduction)
-plus a few brainproxy extensions, so community templates and checks you (or an agent)
-write load through the same parser and engine.
+Checks are YAML files that the active scanner runs next to the ported ZAP rules (and,
+for passive checks, the passive scanner next to its rules). The format is the HTTP subset
+of [Nuclei templates](https://docs.projectdiscovery.io/templates/introduction) plus a few
+brainproxy extensions, so community templates, brainproxy's own feed, and checks you (or an
+agent) write load through the same parser and engine.
 
 ```sh
+brainproxy checks update --source brainproxy     # brainproxy's own signed checks feed
 brainproxy checks update                         # Nuclei HTTP templates, pinned to a commit
 brainproxy checks list nuclei --tags exposure --severity medium
 brainproxy checks validate my-checks/            # per file: loads, or why not
@@ -39,9 +41,10 @@ brainproxy checks status
 
 | Selector | Location |
 |---|---|
+| `brainproxy` | `<home>/checks/brainproxy/`, brainproxy's own signed feed, replaced as a whole by `checks update --source brainproxy` (see [The brainproxy feed](#the-brainproxy-feed)) |
 | `nuclei` | `<home>/checks/nuclei/`, replaced as a whole by `checks update` (only templates that load are stored, plus the repository's `helpers/` payload files) |
 | `local` | `<home>/checks/local/`, your own checks (any layout, `*.yaml`/`*.yml`) |
-| `all` | both |
+| `all` | all three (the feed first, so its checks win an id clash) |
 | a path | a template file or a directory (recursive) |
 
 `<home>` is `--home`/`BRAINPROXY_HOME`, else `$XDG_DATA_HOME/brainproxy`, else
@@ -204,6 +207,110 @@ http:
 - `path` requests reuse the attacked request's headers (cookies, auth) with the
   template's method, path, headers, and body.
 - `info.confidence` sets the finding confidence (Nuclei has none; default medium).
+
+### Passive checks
+
+```yaml
+id: CVE-2026-109618-php-version
+passive: true
+info:
+  name: PHP2Shell PHP Remote Code Execution (Indicative)
+  severity: high
+http:
+  - extractors:
+      - type: regex
+        part: header
+        group: 1
+        regex: ['(?im)^(?:x-powered-by|server):[^\r\n]*?\b(PHP/\d+\.\d+\.\d+\S*)']
+    matchers: ...
+```
+
+- `passive: true`: the check sends nothing. Its blocks hold only `matchers`,
+  `matchers-condition`, and `extractors`, which run on every recorded exchange the passive
+  scanner sees (proxy, Replay, crawl, as `scan sources` sets), like a built-in passive rule.
+  They see that one response: no `baseline_body`, numbered parts, `flow`, `scope`, or
+  out-of-band matchers. Variables and placeholders work (`{{Host}}`, `{{Path}}`, ...
+  from the recorded request).
+- The passive scanner runs the passive checks of the brainproxy feed and of
+  `<home>/checks/local/` (loaded once per process: restart a running proxy after an
+  update). Findings have source `passive` and alert ref `check:<id>`. `scan active
+  --checks` leaves passive checks out (its summary counts them as `passive`).
+
+### Feed checks and built-in rules
+
+- `info.replaces: <rule id>`: the check takes over a built-in rule. When it is loaded, the
+  rule doesn't run; the check's findings keep the rule's id and alert ref, and `scan disable
+  <id>` / `--exclude-rules <id>` switch the check off too. Only honoured for the signed
+  brainproxy feed (elsewhere it is ignored), so a feed release can correct a built-in rule
+  without a brainproxy release. Passive check `CVE-2026-109618-php-version` replaces passive
+  rule 100001 and flags the same versions (a test runs both on the same cases).
+- `info.defer-to: <rule id>`: a built-in rule does this check's job better; a scan that runs
+  that rule drops the check. The feed's `CVE-2026-109619-php2shell-multipart` defers to
+  active rule 100002, which also reads the scanned page's own headers and tells soft 404s
+  apart, which the format can't yet.
+
+## The brainproxy feed
+
+brainproxy's own detections are published as checks in the `checks/` folder of the
+brainproxy repository (`http/` active, `passive/` passive, `helpers/` payload files), so a
+new detection for a fast-moving CVE arrives with an update, not a reinstall:
+
+```sh
+brainproxy checks update --source brainproxy           # r4nd0mth1ngs/brainproxy@main, checks/
+brainproxy checks update --source brainproxy --ref v0.4.0
+brainproxy checks update --source brainproxy --from ~/src/brainproxy   # offline: a checkout or its checks/
+brainproxy checks status                               # serial, commit, counts, skipped
+brainproxy scan active https://app.test/ --checks brainproxy
+```
+
+`checks update` prints what was added, changed, and removed (with check ids). In the
+desktop app the Overview's *Rules and checks* card and *Settings › Rules & data* show the
+installed feed and update it; with the daily update check on (*Settings › Rules & data*,
+"Check GitHub for a new version once a day") the feed updates itself once a day, telling you
+only when checks changed.
+Guided scans (all depths) and active scans started from the Target tree add `--checks
+brainproxy` once the feed is installed, and an active check tagged `quick-check` (and not
+deferring to a built-in rule) gets its own one-click scan under *Scans › New scan*, like
+*PHP2Shell check*: `scan active URL --no-rules --checks brainproxy --check-ids <id>`.
+
+### Security
+
+The feed decides what every install sends to its targets, so it is signed, and verified
+before anything is stored:
+
+- `feed.json` lists every file of the feed with its sha256, a format version, and a
+  serial that grows with every release; `feed.sig` is an Ed25519 signature over it
+  (prefixed with a fixed context string) by a key whose public half is compiled into
+  brainproxy (`crates/core/src/checks/feed_keys.txt`; several may be listed for rotation).
+  A pinned commit and tarball sha256 only prove what was downloaded; the signature proves
+  who published it.
+- An update refuses a feed that is unsigned, signed by an unknown key, or whose manifest
+  doesn't match its signature, and any listed file that is missing or doesn't match its
+  sha256. Files the manifest doesn't list are ignored; paths are plain relative ones under
+  `http/`, `passive/`, or `helpers/`. Nothing is written until all of this checks out
+  (tests tamper with files, the manifest, and the signature). An older serial than the
+  installed one is refused as a rollback unless `--allow-downgrade`.
+- `--from DIR` (air-gapped runners) goes through the same checks. The download itself is
+  GitHub only, over verified TLS, inside the system scope, like the Nuclei templates.
+- Feed checks are checks like any other: data, no code, every request through `Cx` (scope
+  guard, rate limit, auth, stop), passive ones send nothing.
+- A brainproxy build without a feed key (`feed_keys.txt` empty) accepts no feed.
+
+### Signing the feed (maintainers)
+
+```sh
+brainproxy checks feed keygen --out ~/brainproxy-feed.key   # once; prints the public key
+brainproxy checks feed sign checks --key ~/brainproxy-feed.key
+brainproxy checks feed verify checks                        # against this build's keys
+```
+
+`keygen` writes the secret key owner-only and never overwrites one; keep it off the
+repository and CI, on the maintainer's machine or in a password manager. Add the public key
+to `crates/core/src/checks/feed_keys.txt` in a release before the first feed it signs, and
+keep a retired key listed until every supported release knows its successor. `sign` refuses
+a feed with a check that doesn't load, writes `feed.json` with a new serial, and signs it:
+every change to `checks/` needs a new signature in the same pull request. Review feed pull
+requests like code (two approvals): they decide what scanners send.
 
 ## Ideas
 

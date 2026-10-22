@@ -83,6 +83,12 @@ reasons. Templates that use unsupported features (interactsh, payload files, Jav
 flows, ...) are listed, not half-run; with the DSL subset about 78% of the HTTP templates
 load today.
 
+`brainproxy checks update --source brainproxy` pulls brainproxy's own checks the same way
+from the `checks/` folder of this repository: signed (Ed25519, key compiled into the
+binary) and verified before storing, with passive checks for the passive scanner and
+`info.replaces` to take over a built-in rule. PHP2Shell's passive rule 100001 is
+re-expressed there; see [CHECKS.md](CHECKS.md#the-brainproxy-feed).
+
 ZAP itself has no declarative rule format (its scripts are JavaScript/Zest code), so
 layer 3 complements the ZAP ports rather than replacing them: ZAP's generic, logic-heavy
 checks (SQL injection, XSS, path traversal) stay as maintained Rust ports tracked by
@@ -95,4 +101,5 @@ layer 1; fast-moving CVE and exposure checks come in as data through layer 3.
 | ZAP rule logic changes | Weekly drift issue, then a port (optionally an automated PR) |
 | ZAP pattern list changes | `scan data update` at runtime (layer 2) |
 | New CVE/exposure checks | `checks update` (Nuclei templates) and your own checks (layer 3) |
+| brainproxy's own new or corrected detections | `checks update --source brainproxy` (signed feed, layer 3), daily in the desktop app |
 | New ZAP rules | Listed under "not ported yet" in the drift report |

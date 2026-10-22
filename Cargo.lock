@@ -227,6 +227,7 @@ dependencies = [
  "rcgen",
  "regex",
  "regex-syntax",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

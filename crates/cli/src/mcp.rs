@@ -26,9 +26,10 @@ use serde_json::{json, Map, Value};
 /// Protocol versions we can speak; the first is offered when the client asks for another.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// Commands not offered as tools: the server itself, and foreground servers that never
-/// return (their `start` variants run them in the background).
-const EXCLUDED: &[&str] = &["mcp serve", "proxy run", "oob run"];
+/// Commands not offered as tools: the server itself, foreground servers that never
+/// return (their `start` variants run them in the background), and the maintainers'
+/// feed signing (a signing key is not for agents).
+const EXCLUDED: &[&str] = &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign"];
 
 /// Tool calls that may run at once; more are refused until one finishes.
 const MAX_CALLS: usize = 16;
@@ -126,6 +127,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("checks validate", READ),
     ("checks update", FETCH),
     ("checks status", READ),
+    ("checks feed verify", READ),
     ("update check", READ_NET),
     // Saves an installer or binary to the Downloads folder (replacing one of that name).
     ("update download", FETCH),

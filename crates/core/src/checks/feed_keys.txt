@@ -1,0 +1,6 @@
+# Public keys trusted to sign the brainproxy checks feed (checks/ in the
+# brainproxy repository), one base64 Ed25519 key per line. `checks update
+# --source brainproxy` refuses a feed that none of them signed; with no key here,
+# this build accepts no feed. A new key comes from `brainproxy checks feed keygen`
+# (docs/CHECKS.md, "Signing the feed"); keep an old key listed until every
+# supported release knows its successor.

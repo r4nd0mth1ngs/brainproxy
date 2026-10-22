@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::checks::CheckPassiveRule;
 use crate::error::Result;
 use crate::scan::{Finding, Message, PassiveRule};
 use crate::store::Store;
@@ -42,12 +43,32 @@ pub fn all_rules() -> &'static [Box<dyn PassiveRule>] {
     RULES.get_or_init(rules::all)
 }
 
-/// Runs enabled rules over one message.
+/// Passive checks (`passive: true`) from the brainproxy feed and `checks/local/`
+/// (docs/CHECKS.md), loaded once per process from the home the CLI set; unit
+/// tests set none, so they see the built-in rules only.
+pub fn check_rules() -> &'static [CheckPassiveRule] {
+    static RULES: OnceLock<Vec<CheckPassiveRule>> = OnceLock::new();
+    RULES.get_or_init(|| crate::data::home().map(crate::checks::passive_rules).unwrap_or_default())
+}
+
+/// Runs enabled rules over one message: the built-in rules, then the passive
+/// checks. A feed check that replaces a built-in rule runs in its place and is
+/// switched off with that rule's id.
 pub fn scan_message(msg: &Message, disabled: &[u32]) -> Vec<Finding> {
+    scan_with(msg, disabled, check_rules())
+}
+
+pub(crate) fn scan_with(msg: &Message, disabled: &[u32], checks: &[CheckPassiveRule]) -> Vec<Finding> {
     let mut out = Vec::new();
+    let replaced = |id: u32| checks.iter().any(|c| c.id() == id);
     for rule in all_rules() {
-        if !disabled.contains(&rule.id()) {
+        if !disabled.contains(&rule.id()) && !replaced(rule.id()) {
             rule.scan(msg, &mut out);
+        }
+    }
+    for check in checks {
+        if check.id() == 0 || !disabled.contains(&check.id()) {
+            check.scan(msg, &mut out);
         }
     }
     out

@@ -7,17 +7,8 @@ import { run, withScheme, type Risk } from "../api";
 import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
 import { loadSuggestions, type Job, type Suggestions } from "./Scanner";
+import { guidedChecks, type Depth } from "./feed";
 import type { ChecksStatus } from "./Updates";
-
-type Depth = "quick" | "standard" | "thorough";
-
-/** Nuclei templates per depth when installed (none for Quick: thousands of extra requests). */
-const NUCLEI: Record<Depth, string[]> = {
-  quick: [],
-  // Plus the end-of-life checks (outdated PHP, nginx, WordPress, ...), which are rated info.
-  standard: ["--checks", "nuclei", "--check-severity", "high", "--check-include-tags", "eol"],
-  thorough: ["--checks", "nuclei", "--check-severity", "medium", "--check-include-tags", "eol"],
-};
 
 const DEPTHS: { id: Depth; title: string; time: string; text: string; args: string[] }[] = [
   {
@@ -78,7 +69,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const [speed, setSpeed] = useState<Speed>("normal");
   const [busy, setBusy] = useState(false);
   const [checks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 30000);
-  const nuclei = checks?.nuclei ? NUCLEI[depth] : [];
+  const extra = guidedChecks(depth, !!checks?.nuclei, checks?.brainproxy?.installed);
   const [profiles] = usePoll<{ profiles: { name: string; session?: { logged_in?: boolean } }[] }>(() => run(["auth", "list"]), 10000);
 
   useEffect(() => {
@@ -117,7 +108,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
     setBusy(true);
     try {
       const depthArgs = DEPTHS.find((d) => d.id === depth)!.args;
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...SPEEDS.find((s) => s.id === speed)!.args, ...extra.args, ...(login ? [`--auth=${login}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -245,11 +236,12 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             <dd className={speed === "fast" ? "s5" : ""}>{SPEEDS.find((s) => s.id === speed)!.title}</dd>
             <dt>Extra checks</dt>
             <dd>
+              {extra.text || "none"}
               {!checks?.nuclei
-                ? "none (download the Nuclei templates on the Overview for thousands more)"
-                : nuclei.length
-                  ? `Nuclei templates, ${nuclei[3]} severity and above, plus end-of-life checks`
-                  : "none (Quick skips the Nuclei templates)"}
+                ? " (download the Nuclei templates on the Overview for thousands more)"
+                : depth === "quick"
+                  ? " (Quick skips the Nuclei templates)"
+                  : ""}
             </dd>
           </dl>
           {speed === "fast" && (

@@ -10,6 +10,7 @@ import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
 import { usePoll } from "../ui/usePoll";
 import { RecordLogin } from "./RecordLogin";
 import { AppUpdateSettings } from "./AppUpdate";
+import { FEED_UPDATE, type FeedStatus } from "./feed";
 import NOTICE from "../../../NOTICE?raw";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "ca" | "data" | "project" | "licenses";
@@ -821,6 +822,7 @@ interface ChecksStatus {
   nuclei?: { repository: string; ref: string; commit: string; source: string; updated_unix: number; templates: number; stored: number; skipped: [string, number][] };
   local_dir: string;
   local_files: number;
+  brainproxy?: FeedStatus;
 }
 
 interface DataFile {
@@ -836,7 +838,7 @@ function RuleData() {
   const exec = useRunner();
   const [checks, setChecks] = useState<ChecksStatus | null>(null);
   const [data, setData] = useState<{ dir: string; embedded_commit: string; files: DataFile[] } | null>(null);
-  const [opts, setOpts] = useState({ checksRef: "main", checksFrom: "", dataRef: "main", dataFrom: "" });
+  const [opts, setOpts] = useState({ checksRef: "main", checksFrom: "", dataRef: "main", dataFrom: "", feedRef: "main", feedFrom: "" });
   const [busy, setBusy] = useState("");
 
   const load = async () => {
@@ -857,9 +859,63 @@ function RuleData() {
 
   const from = (flag: string, ref: string, dir: string) => [dir.trim() ? `--from=${dir.trim()}` : `${flag}=${ref.trim() || "main"}`];
   const n = checks?.nuclei;
+  const feed = checks?.brainproxy;
+  const fi = feed?.installed;
   return (
     <div className="detail">
       <div className="detail-head">
+        <h2>brainproxy checks feed</h2>
+      </div>
+      {feed && (
+        <dl className="facts">
+          <dt>Checks</dt>
+          <dd>
+            {fi ? (
+              <>
+                {fi.checks} checks ({fi.passive} passive) · {fi.repository || fi.source}
+                {fi.commit ? ` (${fi.commit.slice(0, 10)})` : ""} · serial {fi.serial} · updated{" "}
+                {new Date(fi.updated_unix * 1000).toLocaleString()}
+              </>
+            ) : (
+              "not downloaded"
+            )}
+          </dd>
+          <dt>Signature</dt>
+          <dd>
+            {feed.trusted_keys === 0
+              ? "this version trusts no feed signing key yet, so it can't install the feed"
+              : fi
+                ? `verified before install (key ${fi.key})`
+                : `checked against ${feed.trusted_keys} key(s) built into this version`}
+          </dd>
+          <dt>Directory</dt>
+          <dd className="mono">{feed.dir}</dd>
+          {!!fi?.quick_checks.length && (
+            <>
+              <dt>Quick checks</dt>
+              <dd>{fi.quick_checks.map((q) => q.name).join(" · ")}</dd>
+            </>
+          )}
+          {!!fi?.skipped.length && (
+            <>
+              <dt>Not loaded</dt>
+              <dd>{fi.skipped.slice(0, 8).map(([file, why]) => `${file}: ${why}`).join(" · ")}</dd>
+            </>
+          )}
+        </dl>
+      )}
+      <div className="toolbar flat">
+        <input className="input" title="Branch, tag, or commit" value={opts.feedRef} onChange={(e) => setOpts({ ...opts, feedRef: e.target.value })} />
+        <input className="input grow" placeholder="or import a local brainproxy checkout (same signature check)" value={opts.feedFrom} onChange={(e) => setOpts({ ...opts, feedFrom: e.target.value })} />
+        <ConfirmButton
+          label={busy === "Feed update" ? "Updating…" : opts.feedFrom ? "Import" : fi ? "Update" : "Download"}
+          disabled={!!busy || feed?.trusted_keys === 0}
+          question={opts.feedFrom ? "Import the feed from this directory?" : "Download brainproxy's checks feed from GitHub?"}
+          onConfirm={() => job("Feed update", [...FEED_UPDATE, ...from("--ref", opts.feedRef, opts.feedFrom)])}
+        />
+      </div>
+
+      <div className="detail-head set-section">
         <h2>Declarative checks (Nuclei templates)</h2>
       </div>
       {checks && (

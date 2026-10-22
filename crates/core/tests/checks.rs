@@ -75,6 +75,17 @@ fn run(port: u16, path: &str, templates: &[(&str, &str)]) -> ActiveSummary {
 }
 
 fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::LoadOptions) -> ActiveSummary {
+    run_with_rules(port, path, templates, opts, None)
+}
+
+/// As `run_opts`, also running these built-in rules (none when None).
+fn run_with_rules(
+    port: u16,
+    path: &str,
+    templates: &[(&str, &str)],
+    opts: &checks::LoadOptions,
+    rules: Option<Vec<u32>>,
+) -> ActiveSummary {
     let dir = tmp(&format!("t{port}"));
     for (name, text) in templates {
         std::fs::write(dir.join(name), text).unwrap();
@@ -97,9 +108,9 @@ fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::Lo
             http2: false,
         },
         points: PointOptions::default(),
-        rules: None,
+        no_rules: rules.is_none(),
+        rules,
         exclude_rules: vec![],
-        no_rules: true,
         checks: checks::into_rules(loaded.checks, Duration::from_secs(10)),
         max_duration: None,
         auth: None,
@@ -457,4 +468,77 @@ fn too_many_requests_pauses_and_retries() {
     assert_eq!(s.raised.get("check:git-config"), Some(&1), "{s:?}");
     assert_eq!(s.requests, 2);
     assert!(started.elapsed() >= Duration::from_secs(1));
+}
+
+/// The feed's PHP2Shell check (checks/http in the repository).
+fn feed_check(name: &str) -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../checks/http/cves/2026").join(name);
+    std::fs::read_to_string(p).unwrap()
+}
+
+/// A PHP site: `version` in X-Powered-By (or none), multipart POSTs answered with `post`.
+fn php_site(version: Option<&'static str>, post: &'static str) -> u16 {
+    spawn(move |req| {
+        let line = req.lines().next().unwrap_or("");
+        let powered = version.map(|v| format!("X-Powered-By: PHP/{v}\r\n")).unwrap_or_default();
+        let path = line.split(' ').nth(1).unwrap_or("");
+        if line.starts_with("POST ") {
+            assert!(req.contains("multipart/form-data; boundary=----brainproxy"), "{req}");
+            return resp(post, &powered, "ok");
+        }
+        match path {
+            "/" | "/index.php" => resp("200 OK", &powered, "<html>home</html>"),
+            _ if path.ends_with(".php") => resp("404 Not Found", "", "No input file specified.\n"),
+            _ => resp("404 Not Found", "", "nope"),
+        }
+    })
+    .0
+}
+
+#[test]
+fn feed_php2shell_check_and_defer_to() {
+    let check = feed_check("CVE-2026-109619-php2shell-multipart.yaml");
+    let templates = [("php2shell.yaml", check.as_str())];
+    let id = "check:CVE-2026-109619-php2shell-multipart";
+    // An affected version, multipart accepted.
+    let s = run(php_site(Some("8.3.10"), "200 OK"), "/", &templates);
+    assert_eq!(s.raised.get(id), Some(&1), "{s:?}");
+    // The version hidden: the handler error for a missing .php file gives PHP away.
+    let s = run(php_site(None, "403 Forbidden"), "/", &templates);
+    assert_eq!(s.raised.get(id), Some(&1), "{s:?}");
+    // A fixed version: nothing to report.
+    let s = run(php_site(Some("8.4.27"), "200 OK"), "/", &templates);
+    assert!(s.raised.is_empty(), "{s:?}");
+    // Not PHP at all.
+    let (port, _) = spawn(|_| resp("404 Not Found", "", "nope"));
+    assert!(run(port, "/", &templates).raised.is_empty());
+    // With built-in rule 100002 in the scan, the check defers to it.
+    let s =
+        run_with_rules(php_site(Some("8.3.10"), "200 OK"), "/", &templates, &Default::default(), Some(vec![100002]));
+    assert_eq!(s.raised.get("100002"), Some(&1), "{s:?}");
+    assert!(!s.raised.contains_key(id), "{s:?}");
+}
+
+#[test]
+fn a_check_that_replaces_a_rule_runs_instead_of_it() {
+    const REPLACES: &str = r#"
+id: php-root
+info: {name: PHP at the root, severity: high, replaces: 100002}
+http:
+  - path: ["{{BaseURL}}/"]
+    matchers:
+      - type: word
+        part: header
+        words: ["PHP/"]
+"#;
+    let s = run_with_rules(
+        php_site(Some("8.3.10"), "200 OK"),
+        "/",
+        &[("r.yaml", REPLACES)],
+        &Default::default(),
+        Some(vec![100002]),
+    );
+    // One finding under the rule's own alert ref: the check's, not the rule's.
+    assert_eq!(s.raised.get("100002"), Some(&1), "{s:?}");
+    assert_eq!(s.rules, 1, "{s:?}");
 }

@@ -21,6 +21,9 @@ These use IDs from 100000, so they never clash with ZAP's.
   get through or look filtered (the suggested stop-gap). Nothing it sends triggers the bug.
   The passive rule 100001 flags affected versions seen in any traffic. In the app:
   **Scans › New scan › PHP2Shell check**.
+  The brainproxy checks feed carries a simpler version of this check
+  (`CVE-2026-109619-php2shell-multipart`), which steps aside whenever this rule runs
+  ([CHECKS.md](CHECKS.md#feed-checks-and-built-in-rules)).
 
 ## Rules
 

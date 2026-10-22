@@ -80,6 +80,11 @@ pub fn set_home(home: &Path) {
     let _ = HOME.set(home.to_path_buf());
 }
 
+/// The home `set_home` set (None in unit tests).
+pub(crate) fn home() -> Option<&'static Path> {
+    HOME.get().map(PathBuf::as_path)
+}
+
 pub fn rules_dir(home: &Path) -> PathBuf {
     home.join("rules")
 }
