@@ -14,9 +14,11 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
 - **Every engine call is a CLI invocation** returning the JSON envelope, exactly like
   `mcp serve` runs tools. The GUI has no second code path into the engine: scope checks,
   errors, and output are the CLI's, and anything the GUI can do an agent can do too.
-- The shell (`src-tauri/src/main.rs`) has one command, `cli(project, args, stdin, env)`. The
-  binary is `$BRAINPROXY_BIN`, else a `brainproxy` next to the app executable (bundle the
-  sidecar there), else `brainproxy` on PATH.
+- The shell (`src-tauri/src/main.rs`) has two commands: `cli(project, args, stdin, env)`,
+  and `app_pid()`, the app's pid, which owns its temporary projects. `--project` is left
+  out while no project is open (an empty `project`). The binary is `$BRAINPROXY_BIN`, else
+  a `brainproxy` next to the app executable (bundle the sidecar there), else `brainproxy`
+  on PATH.
   - `stdin` is bytes (a number array, `Vec<u8>`), written to the child unchanged; `api.ts`
     sends text as UTF-8. Bodies the CLI returns as base64 are shown one char per byte
     (`bodyText`), and `textBytes(text, true)` turns them back into the same bytes, so
@@ -47,6 +49,15 @@ checked and shown as a chip), optional exclusions, an explicit note that the sco
 change later, and an "I have permission to test these targets" check. It runs
 `engagement start` on the new file and opens it. Recent and existing projects are below.
 
+"Temporary engagement" is the same form without the file step: it runs `project temp
+--owner <app pid>`, then `engagement start` on that path (discarding it if that fails).
+Temporary projects never go in Recent. The welcome screen runs `project sweep` on show,
+which wipes temporary projects left by a crashed app and says whether new ones are
+RAM-backed. While one is open the top bar shows a **temp** badge (click: Save as…), and
+the sidebar has *Save as…*: `project save --output FILE`, then `project discard` and open
+FILE. Switching project or closing the window asks first (an in-app dialog, `ui/Confirm.tsx`:
+native ones differ per OS), then runs `project discard`.
+
 ## Layout
 
 Top bar: brainproxy, the project and its engagement scope chips; on the right the intercept
@@ -75,7 +86,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles, match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `ca init/export`, `checks *`, `scan data *`, `project info`, `engagement show` |
+| | Settings | Auth profiles, match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary projects), `engagement show` |
 
 ### Guided scan
 

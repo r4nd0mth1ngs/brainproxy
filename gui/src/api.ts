@@ -46,6 +46,13 @@ export async function cli<T = any>(args: string[], input: string | Uint8Array | 
   return res.json();
 }
 
+/** The desktop app's pid, which owns its temporary projects (none under the dev bridge). */
+export async function appPid(): Promise<number | null> {
+  if (!inTauri) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("app_pid");
+}
+
 /** Runs a command and returns its data, throwing CliError when ok is false. */
 export async function run<T = any>(args: string[], input?: string | Uint8Array | CliInput): Promise<T> {
   const env = await cli<T>(args, input);

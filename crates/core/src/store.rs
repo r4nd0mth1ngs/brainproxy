@@ -291,17 +291,35 @@ impl Store {
     /// Opens the project, first creating its folder (owner-only) if it is missing. For commands
     /// that create a project; `open` refuses a missing folder so a mistyped path fails instead.
     pub fn create(path: &Path) -> Result<Self> {
-        let dir = project_dir(path);
-        if !dir.exists() {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder.create(dir).map_err(|e| {
-                Error::Io(std::io::Error::new(e.kind(), format!("cannot create folder {}: {e}", dir.display())))
-            })?;
-        }
+        make_project_dir(path)?;
         Self::open(path)
+    }
+
+    /// Writes a consistent copy of the project to `path` (a new file; missing folders are
+    /// created owner-only). Safe while other processes are using the project.
+    pub fn save_as(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            return Err(Error::Conflict(format!("{} already exists; choose a new file", path.display())));
+        }
+        make_project_dir(path)?;
+        let target =
+            path.to_str().ok_or_else(|| Error::InvalidInput(format!("{} isn't valid UTF-8", path.display())))?;
+        self.conn.execute("VACUUM INTO ?1", [target])?;
+        // The proxy, listener and unfinished work recorded in the copy belong to this project:
+        // without this, the copy would report them as its own (and `proxy stop` would stop them).
+        // Stale stop requests are harmless: a process clears them when it starts.
+        let copy = Connection::open(path)?;
+        copy.execute("DELETE FROM meta WHERE key IN (?1, ?2)", [crate::proxy::STATE_KEY, crate::oob::STATE_KEY])?;
+        copy.execute_batch(
+            "UPDATE jobs SET state = 'failed', error = 'still running when the project was saved',
+                 finished_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE state IN ('queued', 'running', 'stopping');
+             UPDATE fuzz_runs SET state = 'failed', error = 'still running when the project was saved',
+                 finished_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE state IN ('queued', 'running', 'stopping');",
+        )?;
+        owner_only(path);
+        Ok(())
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -873,6 +891,21 @@ impl Store {
         }
         Ok(QueryResult { row_count: rows.len(), columns, rows, truncated })
     }
+}
+
+/// Creates the folder for the project file (owner-only) if it is missing.
+fn make_project_dir(path: &Path) -> Result<()> {
+    let dir = project_dir(path);
+    if !dir.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir).map_err(|e| {
+            Error::Io(std::io::Error::new(e.kind(), format!("cannot create folder {}: {e}", dir.display())))
+        })?;
+    }
+    Ok(())
 }
 
 /// The folder holding the project file; "." for a bare file name.

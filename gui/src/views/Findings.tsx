@@ -104,7 +104,7 @@ export function FindingsView({ active }: { active: boolean }) {
   // A readable HTML report (summary, how to fix, evidence folded away) saved where the user picks.
   const [reporting, setReporting] = useState(false);
   const saveReport = async () => {
-    const name = app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
+    const name = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
     const dialog = await import("@tauri-apps/plugin-dialog");
     const path = await dialog.save({ defaultPath: `${name}-report.html`, filters: [{ name: "HTML report", extensions: ["html"] }] });
     if (typeof path !== "string") return;

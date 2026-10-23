@@ -187,6 +187,15 @@ select {
   filter: brightness(1.08);
   box-shadow: var(--glow);
 }
+.btn.danger {
+  border-color: var(--high);
+  color: var(--high);
+  font-weight: 600;
+}
+.btn.danger:hover:not(:disabled) {
+  background: var(--high);
+  color: var(--accent-ink);
+}
 .btn.small {
   height: 22px;
   padding: 0 8px;
@@ -349,6 +358,12 @@ select {
   color: var(--medium);
   border-color: var(--medium);
   font-family: inherit;
+}
+/* Temporary project badge: clicking it saves the project to a file. */
+.chip.temp {
+  color: var(--medium);
+  border-color: var(--medium);
+  flex-shrink: 0;
 }
 
 /* Clickable AssertiveInfosec logo (Welcome screen and sidebar). */
@@ -931,6 +946,34 @@ select {
   margin: 4px 6px;
   background: var(--border);
 }
+/* In-app confirmation (ui/Confirm.tsx). */
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: oklch(0 0 0 / 0.5);
+}
+.confirm-dialog {
+  width: min(440px, 100%);
+  padding: 20px 22px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+.confirm-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+.confirm-dialog p {
+  margin: 0 0 18px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .toasts {
   position: fixed;
   right: 14px;

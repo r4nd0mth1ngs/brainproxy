@@ -1059,6 +1059,19 @@ function Project() {
       <dl className="facts">
         <dt>File</dt>
         <dd className="mono">{info?.path ?? app.project}</dd>
+        <dt>Storage</dt>
+        <dd>
+          {app.temp ? (
+            <>
+              Temporary, {app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"}: wiped when it closes.{" "}
+              <button className="link" onClick={() => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"))}>
+                Save as…
+              </button>
+            </>
+          ) : (
+            "Saved project file"
+          )}
+        </dd>
         <dt>History</dt>
         <dd>{info ? `${info.history_count} requests` : "…"}</dd>
       </dl>

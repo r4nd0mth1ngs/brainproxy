@@ -1,8 +1,8 @@
-// Welcome screen: start a new engagement (project file + write-once scope) or open an
-// existing project.
+// Welcome screen: start a new engagement (project file + write-once scope), a temporary one
+// (no file to pick; wiped when it closes), or open an existing project.
 
-import { useMemo, useState } from "react";
-import { inTauri, run, setProject } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { appPid, inTauri, run, setProject } from "../api";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
 
@@ -43,6 +43,21 @@ const isAbsolute = (path: string) =>
   (navigator.userAgent.includes("Windows") ? /^([a-z]:[\\/]|\\\\)/i : /^\//).test(path);
 const FULL_PATH = "Use a full path, e.g. /home/you/engagements";
 
+/** Where to save a project named after the engagement; null if the user cancels. */
+export async function chooseProjectFile(name: string): Promise<string | null> {
+  let p: string | null;
+  if (inTauri) {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    p = await dialog.save({ filters: FILTERS, defaultPath: fileName(name) });
+  } else {
+    const dir = dirOf(recent()[0] ?? "");
+    p = window.prompt("Save the engagement as (full path):", dir ? `${dir}/${fileName(name)}` : "")?.trim() || null;
+    if (p && !isAbsolute(p)) throw new Error(`${FULL_PATH}/${fileName(name)}.`);
+  }
+  if (typeof p !== "string") return null;
+  return p.endsWith(".bpdb") ? p : `${p}.bpdb`;
+}
+
 const TARGET = /^(\*\.)?([a-z0-9-]+\.)*[a-z0-9-]+(\/\d{1,3})?(:\d{1,5})?$|^\[[0-9a-f:]+\](:\d{1,5})?$/i;
 
 /** One scope entry from a line: pasted URLs become host[:port]; returns null for blanks. */
@@ -61,10 +76,15 @@ export function parseTarget(line: string): { value: string; ok: boolean } | null
   return { value: t, ok: TARGET.test(t) };
 }
 
-export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
-  const [mode, setMode] = useState<"home" | "new">("home");
+export function Welcome({ open, notice }: { open: (path: string) => Promise<void>; notice?: string }) {
+  const [mode, setMode] = useState<"home" | "new" | "temp">("home");
   const [error, setError] = useState("");
   const [path, setPath] = useState("");
+  // Wipes temporary projects left by a crashed app, and says whether new ones go to RAM.
+  const [ramBacked, setRamBacked] = useState<boolean | null>(null);
+  useEffect(() => {
+    run<{ ram_backed: boolean }>(["project", "sweep"]).then((d) => setRamBacked(d.ram_backed), () => {});
+  }, []);
   const tryOpen = (p: string) =>
     isAbsolute(p) ? open(p).catch((e) => setError(String(e.message ?? e))) : setError(`${FULL_PATH}/project.bpdb.`);
 
@@ -79,7 +99,7 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
       <div className="picker-madeby">
         <MadeBy />
       </div>
-      <div className={`picker-card ${mode === "new" ? "wide" : ""}`}>
+      <div className={`picker-card ${mode !== "home" ? "wide" : ""}`}>
         <div className="picker-brand">
           <Logo size={40} />
           <div>
@@ -87,14 +107,21 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
             <p className="muted">Web security testing workbench</p>
           </div>
         </div>
-        {mode === "new" ? (
-          <NewEngagement open={open} cancel={() => setMode("home")} />
+        {mode !== "home" ? (
+          <NewEngagement open={open} cancel={() => setMode("home")} temp={mode === "temp" ? { ramBacked } : null} />
         ) : (
           <>
             <div className="welcome-actions">
               <button className="welcome-action primary" onClick={() => setMode("new")}>
                 <span className="welcome-action-title">New engagement</span>
                 <span className="welcome-action-sub">Create a project and set the targets you're allowed to test</span>
+              </button>
+              <button className="welcome-action" onClick={() => setMode("temp")}>
+                <span className="welcome-action-title">Temporary engagement</span>
+                <span className="welcome-action-sub">
+                  No file: {ramBacked == null ? "" : ramBacked ? "kept in memory and " : "kept in the temp folder and "}wiped when you
+                  close it
+                </span>
               </button>
               {inTauri && (
                 <button className="welcome-action" onClick={browse}>
@@ -116,6 +143,7 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
               </form>
             )}
             {error && <div className="error">{error}</div>}
+            {notice && <div className="error">{notice}</div>}
             {recent().length > 0 && (
               <div className="recent">
                 <div className="label">Recent</div>
@@ -138,7 +166,18 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
   );
 }
 
-function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>; cancel: () => void }) {
+/** Where a temporary project will live; `ramBacked` is null until the CLI has said. */
+type TempPlace = { ramBacked: boolean | null };
+
+function NewEngagement({
+  open,
+  cancel,
+  temp,
+}: {
+  open: (path: string) => Promise<void>;
+  cancel: () => void;
+  temp: TempPlace | null;
+}) {
   const [name, setName] = useState("");
   const [dir, setDir] = useState(() => dirOf(recent()[0] ?? ""));
   const [file, setFile] = useState<string | null>(null); // set when the user picked a file explicitly
@@ -155,7 +194,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
   const valid = included.filter((t) => t.ok).length;
   const projectPath = file ?? (dir ? `${dir.replace(/\/$/, "")}/${fileName(name)}` : "");
   const relative = !!projectPath && !isAbsolute(projectPath);
-  const ready = included.length > 0 && bad.length === 0 && !!projectPath && !relative && authorized && !busy;
+  const ready = included.length > 0 && bad.length === 0 && (temp ? true : !!projectPath && !relative) && authorized && !busy;
 
   const chooseLocation = async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
@@ -163,18 +202,43 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
     if (typeof p === "string") setFile(p.endsWith(".bpdb") ? p : `${p}.bpdb`);
   };
 
+  const engagementStart = () =>
+    run([
+      "engagement",
+      "start",
+      ...(name.trim() ? [`--name=${name.trim()}`] : []),
+      ...included.map((t) => `--target=${t.value}`),
+      ...excluded.map((t) => `--exclude=${t.value}`),
+    ]);
+
+  const createTemp = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      // Owned by the app, so a crash leaves nothing behind for long: the next launch sweeps it.
+      const pid = await appPid();
+      const t = await run<{ path: string }>(["project", "temp", ...(pid ? [`--owner=${pid}`] : [])]);
+      setProject(t.path);
+      try {
+        await engagementStart();
+      } catch (e) {
+        await run(["project", "discard"]).catch(() => {});
+        throw e;
+      }
+      await open(t.path);
+    } catch (e: any) {
+      setError(e.message);
+      setBusy(false);
+    }
+  };
+
   const create = async () => {
+    if (temp) return createTemp();
     setBusy(true);
     setError("");
     setProject(projectPath);
     try {
-      await run([
-        "engagement",
-        "start",
-        ...(name.trim() ? [`--name=${name.trim()}`] : []),
-        ...included.map((t) => `--target=${t.value}`),
-        ...excluded.map((t) => `--exclude=${t.value}`),
-      ]);
+      await engagementStart();
       remember(projectPath);
       await open(projectPath);
     } catch (e: any) {
@@ -197,6 +261,23 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
         </div>
       </div>
 
+      {temp ? (
+        <div className="engage-step">
+          <span className="step-n">2</span>
+          <div className="grow">
+            <label className="label">Storage</label>
+            <div className="hint">
+              No file to choose.{" "}
+              {temp.ramBacked == null
+                ? ""
+                : temp.ramBacked
+                  ? "The project is kept in memory (a RAM-backed folder, not a disk filesystem). "
+                  : "The project goes in the system temp folder, on disk, as this OS has no memory-backed folder. "}
+              It is wiped when you switch project or close brainproxy. Use Save as… to keep it.
+            </div>
+          </div>
+        </div>
+      ) : (
       <div className="engage-step">
         <span className="step-n">2</span>
         <div className="grow">
@@ -217,6 +298,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
           {relative && <div className="error">{FULL_PATH} (missing folders are created).</div>}
         </div>
       </div>
+      )}
 
       <div className="engage-step">
         <span className="step-n">3</span>
@@ -291,7 +373,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
         </button>
         <span className="grow" />
         <button className="btn primary" disabled={!ready} onClick={create}>
-          {busy ? "Creating…" : `Create engagement${valid ? ` · ${valid} target${valid === 1 ? "" : "s"}` : ""}`}
+          {busy ? "Creating…" : `Create ${temp ? "temporary " : ""}engagement${valid ? ` · ${valid} target${valid === 1 ? "" : "s"}` : ""}`}
         </button>
       </div>
     </div>

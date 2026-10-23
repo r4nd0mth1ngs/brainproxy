@@ -15,6 +15,7 @@ mod mcp;
 mod oob_cmd;
 mod output;
 mod process;
+mod project_cmd;
 mod proxy_cmd;
 mod report_cmd;
 mod request_args;
@@ -80,7 +81,7 @@ enum Cmd {
 
     /// Manage the project file.
     #[command(subcommand)]
-    Project(ProjectCmd),
+    Project(project_cmd::ProjectCmd),
 
     /// Send one HTTP request and record it in history (Repeater).
     #[command(after_help = "Request sources, in order: --url (build a request like curl), FILE, or stdin. \
@@ -190,14 +191,6 @@ enum Cmd {
     /// MCP server: the CLI's commands as tools for AI agents (stdio, JSON-RPC 2.0).
     #[command(subcommand)]
     Mcp(mcp::McpCmd),
-}
-
-#[derive(Subcommand)]
-enum ProjectCmd {
-    /// Create the project file if missing and report its location.
-    Init,
-    /// Show project statistics.
-    Info,
 }
 
 #[derive(clap::Args)]
@@ -350,8 +343,14 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Capabilities { .. } => "capabilities",
         Cmd::Schema => "schema",
         Cmd::Query(_) => "query",
-        Cmd::Project(ProjectCmd::Init) => "project init",
-        Cmd::Project(ProjectCmd::Info) => "project info",
+        Cmd::Project(c) => match c {
+            project_cmd::ProjectCmd::Init => "project init",
+            project_cmd::ProjectCmd::Info => "project info",
+            project_cmd::ProjectCmd::Temp { .. } => "project temp",
+            project_cmd::ProjectCmd::Discard => "project discard",
+            project_cmd::ProjectCmd::Save { .. } => "project save",
+            project_cmd::ProjectCmd::Sweep => "project sweep",
+        },
         Cmd::Send(_) => "send",
         Cmd::History(HistoryCmd::List { .. }) => "history list",
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
@@ -448,16 +447,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
             out.ok(v.clone(), || serde_json::to_string_pretty(&v).unwrap_or_default());
         }
         Cmd::Query(args) => query(&cli.project, args, out)?,
-        Cmd::Project(cmd) => {
-            let store = Store::open(&cli.project)?;
-            let path = std::fs::canonicalize(&cli.project).unwrap_or(cli.project.clone());
-            let count = store.count()?;
-            let data = json!({"path": path, "history_count": count});
-            match cmd {
-                ProjectCmd::Init => out.ok(data, || format!("project ready: {}", path.display())),
-                ProjectCmd::Info => out.ok(data, || format!("{}\nhistory entries: {count}", path.display())),
-            }
-        }
+        Cmd::Project(cmd) => project_cmd::project(&cli.project, cmd, out)?,
         Cmd::Send(args) => send(&cli.project, args, out)?,
         Cmd::History(cmd) => history(&cli.project, cmd, out)?,
         Cmd::Proxy(cmd) => proxy_cmd::proxy(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,

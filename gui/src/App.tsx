@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { inTauri, run, setProject } from "./api";
-import { AppProvider, autoProxy, useApp, type Tab } from "./store";
+import { AppProvider, autoProxy, useApp, type Tab, type TempInfo } from "./store";
 import { ProxyView } from "./views/Proxy";
 import { RepeaterView } from "./views/Repeater";
 import { FindingsView } from "./views/Findings";
@@ -17,12 +17,19 @@ import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
 import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
-import { Welcome, remember } from "./views/Welcome";
+import { ConfirmHost, confirm } from "./ui/Confirm";
+import { Welcome, chooseProjectFile, remember } from "./views/Welcome";
 import { usePoll } from "./ui/usePoll";
 import { version } from "../package.json";
 
+const DISCARD_TITLE = "Discard this temporary engagement?";
+const DISCARD = "Its traffic, findings and settings are deleted for good. Use Save as… first to keep them.";
+
 export function App() {
   const [project, setProj] = useState<string | null>(null);
+  const [temp, setTemp] = useState<TempInfo | null>(null);
+  /** Shown on the welcome screen, e.g. when a temporary project couldn't be wiped. */
+  const [notice, setNotice] = useState("");
   const [theme, setTheme] = useState(() => {
     try {
       return localStorage.getItem("theme") ?? "dark";
@@ -41,17 +48,49 @@ export function App() {
 
   const open = useCallback(async (path: string) => {
     setProject(path);
-    await run(["project", "init"]);
-    remember(path);
+    const info = await run<{ temp: boolean; ram_backed?: boolean }>(["project", "init"]);
+    // A temporary project is gone once closed, so it never goes in Recent.
+    if (!info.temp) remember(path);
+    setTemp(info.temp ? { ramBacked: !!info.ram_backed } : null);
+    setNotice("");
     setProj(path);
   }, []);
 
+  // Leaving the project unmounts the shell, which stops a proxy it started. `discard` also
+  // stops the proxy, OOB listener and jobs of a temporary project before wiping it.
+  const close = useCallback(async () => {
+    if (temp && !(await confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"))) return;
+    setProj(null);
+    setTemp(null);
+    if (temp) await run(["project", "discard"]).catch((e) => setNotice(`The temporary engagement wasn't wiped: ${e.message}`));
+  }, [temp]);
+
+  // Copies the temporary project to a file, then carries on in that file.
+  const saveAs = useCallback(async () => {
+    const eng = await run<{ engagement: { name: string | null } | null }>(["engagement", "show"]).catch(() => null);
+    const dest = await chooseProjectFile(eng?.engagement?.name ?? "");
+    if (!dest) return;
+    await run(["project", "save", `--output=${dest}`]);
+    setProj(null);
+    setTemp(null);
+    // The saved file has everything; if this fails the leftover is swept once the app exits.
+    await run(["project", "discard"]).catch(() => {});
+    // The shell is gone by now, so a failure is shown on the welcome screen.
+    await open(dest).catch((e) => setNotice(`Saved to ${dest}, but it didn't open: ${e.message}`));
+  }, [open]);
+
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
-  if (!project) return <Welcome open={open} />;
   return (
-    <AppProvider project={project}>
-      <Shell onClose={() => setProj(null)} toggleTheme={toggleTheme} />
-    </AppProvider>
+    <>
+      {project ? (
+        <AppProvider project={project} temp={temp} saveAs={saveAs}>
+          <Shell onClose={close} toggleTheme={toggleTheme} />
+        </AppProvider>
+      ) : (
+        <Welcome open={open} notice={notice} />
+      )}
+      <ConfirmHost />
+    </>
   );
 }
 
@@ -102,12 +141,16 @@ interface ProxyStatus {
 function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () => void }) {
   const app = useApp();
   const [scope, setScope] = useState<string[] | null>(null);
+  const [engName, setEngName] = useState("");
   const [status, refreshStatus] = usePoll<ProxyStatus>(() => run(["proxy", "status"]), 2000);
 
   useEffect(() => {
     const load = () =>
       run(["engagement", "show"])
-        .then((d) => setScope(d.engagement?.include ?? []))
+        .then((d) => {
+          setScope(d.engagement?.include ?? []);
+          setEngName(d.engagement?.name ?? "");
+        })
         .catch(() => setScope([]));
     load();
     window.addEventListener(ENGAGEMENT_CHANGED, load);
@@ -167,18 +210,40 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     };
   }, [app.project, refreshStatus]);
 
+  const tempRef = useRef(app.temp);
+  tempRef.current = app.temp;
   useEffect(() => {
     if (!inTauri) return;
+    // Registering is async: a shell unmounted before it finishes (StrictMode's double mount, a
+    // quick project switch) removes its listener once it arrives, so only one ever asks.
+    let disposed = false;
     let unlisten: (() => void) | undefined;
-    import("@tauri-apps/api/window").then(({ getCurrentWindow }) =>
-      getCurrentWindow()
-        .onCloseRequested(async () => {
-          if (startedHere.current) await run(["proxy", "stop"]).catch(() => {});
-        })
-        .then((u) => (unlisten = u)),
-    );
-    return () => unlisten?.();
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onCloseRequested(async (event) => {
+          if (tempRef.current) {
+            // Held open while the question is in the window; closed explicitly on "discard".
+            event.preventDefault();
+            if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
+            // Stops its proxy too. If it fails, the next launch's sweep wipes it.
+            await run(["project", "discard"]).catch(() => {});
+            await getCurrentWindow().destroy();
+          } else if (startedHere.current) {
+            await run(["proxy", "stop"]).catch(() => {});
+          }
+        }),
+      )
+      .then((u) => (disposed ? u() : (unlisten = u)));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
+
+  const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
+  const tempTitle = app.temp
+    ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and wiped when it closes. Click to save it as a project file.`
+    : "";
 
   const proxyToggle = async () => {
     try {
@@ -225,8 +290,13 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
             <span className="brand-name">brainproxy</span>
           </div>
           <span className="project" title={app.project}>
-            {app.project.split("/").pop()}
+            {app.temp ? engName || "Temporary engagement" : app.project.split("/").pop()}
           </span>
+          {app.temp && (
+            <button className="chip temp" onClick={save} title={tempTitle}>
+              {app.temp.ramBacked ? "temp · in memory" : "temp · on disk"}
+            </button>
+          )}
           <div className="scope">
             {scope == null ? null : scope.length === 0 ? (
               <span className="chip warn" title="Nothing can be sent until engagement start sets the targets">
@@ -281,6 +351,12 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
           </nav>
           <div className="nav-foot">
             {navItem({ id: "settings", label: "Settings", icon: "settings" })}
+            {app.temp && (
+              <button className="nav-item" onClick={save} title={collapsed ? "Save as…" : tempTitle}>
+                <Icon name="save" />
+                <span className="nav-label">Save as…</span>
+              </button>
+            )}
             <button className="nav-item" onClick={onClose} title={collapsed ? "Switch project" : undefined}>
               <Icon name="switch" />
               <span className="nav-label">Switch project</span>

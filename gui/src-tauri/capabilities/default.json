@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: the cli command (allowed by default as an app command), file dialogs, opening assertivesolutions.io and brainproxy release links in the browser, and opening or showing a downloaded brainproxy installer.",
+  "description": "The main window: the cli and app_pid commands (allowed by default as app commands), file dialogs, opening assertivesolutions.io and brainproxy release links in the browser, and opening or showing a downloaded brainproxy installer.",
   "windows": ["main"],
   "permissions": [
     "core:default",

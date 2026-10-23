@@ -112,6 +112,28 @@ impl Store {
     }
 }
 
+/// SQL for the jobs and fuzz runs that haven't finished, as (what, id, pid).
+const UNFINISHED: &str = "SELECT 'job', id, pid FROM jobs WHERE state IN ('queued', 'running', 'stopping')
+    UNION ALL SELECT 'fuzz run', id, pid FROM fuzz_runs WHERE state IN ('queued', 'running', 'stopping')";
+
+impl Store {
+    /// Jobs and fuzz runs that haven't finished, as (what, id, pid).
+    pub fn unfinished_work(&self) -> Result<Vec<(String, i64, Option<u32>)>> {
+        let mut stmt = self.conn.prepare(UNFINISHED)?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Asks every unfinished job and fuzz run to stop (their processes poll for this).
+    pub fn stop_all_work(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "UPDATE jobs SET state = 'stopping' WHERE state IN ('queued', 'running');
+             UPDATE fuzz_runs SET state = 'stopping' WHERE state IN ('queued', 'running');",
+        )?;
+        Ok(())
+    }
+}
+
 fn job_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
     let mut v = json!({

@@ -106,6 +106,16 @@ pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
     }
 }
 
+/// Stops this project's listener if one runs: its pid, and whether it had to be killed.
+pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
+    let Some(state) = running(store)? else { return Ok(None) };
+    process::request_stop(store, STOP_KEY, state.pid)?;
+    let forced = process::terminate(state.pid, state.start_time, "OOB listener")?;
+    store.meta_set(STATE_KEY, None)?;
+    store.meta_set(STOP_KEY, None)?;
+    Ok(Some((state.pid, forced)))
+}
+
 fn not_running() -> Error {
     Error::NotFound("no OOB listener running for this project (start one with `brainproxy oob start`)".into())
 }
@@ -138,14 +148,8 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
         OobCmd::Run(args) => run_foreground(project, args, out),
         OobCmd::Stop => {
             let store = Store::open(project)?;
-            let state = running(&store)?.ok_or_else(not_running)?;
-            process::request_stop(&store, STOP_KEY, state.pid)?;
-            let forced = process::terminate(state.pid, state.start_time, "OOB listener")?;
-            store.meta_set(STATE_KEY, None)?;
-            store.meta_set(STOP_KEY, None)?;
-            out.ok(json!({"stopped": state.pid, "forced": forced}), || {
-                format!("stopped OOB listener (pid {})", state.pid)
-            });
+            let (pid, forced) = stop(&store)?.ok_or_else(not_running)?;
+            out.ok(json!({"stopped": pid, "forced": forced}), || format!("stopped OOB listener (pid {pid})"));
             Ok(())
         }
         OobCmd::Status => {

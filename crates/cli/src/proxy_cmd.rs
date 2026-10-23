@@ -351,6 +351,16 @@ pub(crate) fn running(store: &Store) -> Result<Option<ProxyState>, Error> {
     Ok(current(store)?.map(|s| s.state))
 }
 
+/// Stops this project's proxy if one runs: its pid, and whether it had to be killed.
+pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
+    let Some(Saved { state, start_time }) = current(store)? else { return Ok(None) };
+    process::request_stop(store, STOP_KEY, state.pid)?;
+    let forced = process::terminate(state.pid, start_time, "proxy")?;
+    store.meta_set(STATE_KEY, None)?;
+    store.meta_set(STOP_KEY, None)?;
+    Ok(Some((state.pid, forced)))
+}
+
 fn usage_hints(state: &ProxyState) -> Value {
     let url = format!("http://{}", state.listen);
     let ca = state.ca_cert.display();
@@ -380,13 +390,9 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
         ProxyCmd::Run(args) => run_foreground(project, home, args, out),
         ProxyCmd::Stop => {
             let store = Store::open(project)?;
-            let Saved { state, start_time } =
-                current(&store)?.ok_or_else(|| Error::NotFound("no proxy running for this project".into()))?;
-            process::request_stop(&store, STOP_KEY, state.pid)?;
-            let forced = process::terminate(state.pid, start_time, "proxy")?;
-            store.meta_set(STATE_KEY, None)?;
-            store.meta_set(STOP_KEY, None)?;
-            out.ok(json!({"stopped": state.pid, "forced": forced}), || format!("stopped proxy (pid {})", state.pid));
+            let (pid, forced) =
+                stop(&store)?.ok_or_else(|| Error::NotFound("no proxy running for this project".into()))?;
+            out.ok(json!({"stopped": pid, "forced": forced}), || format!("stopped proxy (pid {pid})"));
             Ok(())
         }
         ProxyCmd::Status => {

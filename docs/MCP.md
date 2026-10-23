@@ -5,6 +5,7 @@ tools over stdio: JSON-RPC 2.0, one message per line, no interactive prompts.
 
 ```sh
 brainproxy --project /work/app.bpdb mcp serve [--timeout 600] [--max-output 1000000]
+brainproxy mcp serve --temp     # a temporary project for this session, wiped on exit
 ```
 
 Client configuration (Claude Code, Claude Desktop, and similar):
@@ -23,6 +24,12 @@ Client configuration (Claude Code, Claude Desktop, and similar):
 `--project` and `--home` (or `BRAINPROXY_PROJECT` / `BRAINPROXY_HOME`) are fixed for the
 whole server; tools don't take them. Relative file paths in tool arguments resolve against
 the server's working directory.
+
+`--temp` (refused with an explicit `--project`; `BRAINPROXY_PROJECT` is ignored) makes a temporary project owned by the server, in
+RAM where the OS allows (see `project temp`). It is wiped, after stopping its proxy, OOB
+listener and jobs, when stdin closes; if the server is killed instead, the next `project
+sweep` wipes it. The `initialize` instructions then tell the agent to call `project_save`
+before the session ends if the results should be kept.
 
 ## Protocol
 
@@ -62,7 +69,10 @@ proxy do.
 One tool per leaf command of the clap definition, so the list can't drift from the CLI or
 from `capabilities`: `send`, `history_list`, `scan_active`, `job_wait`, ... (the command path
 joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy run` and
-`oob run`, which never return (use `proxy_start` / `oob_start`).
+`oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
+and `project temp`, `project discard` and `project sweep`, since the server's project is
+fixed (a new temp project would go unused, and discarding the server's own would wipe it
+mid-session).
 
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it

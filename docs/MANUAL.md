@@ -59,6 +59,14 @@ than the download limit; get it from the release page.
 traffic, findings, scans, settings, and login profiles. Copy it to share or archive the
 work. Several tools (the app, the CLI, an agent) can use the same project at the same time.
 
+**Temporary project.** For a quick or sensitive engagement you don't want to keep, a
+temporary project needs no file: it is kept in memory (a RAM-backed folder on Linux:
+`$XDG_RUNTIME_DIR` or `/dev/shm`, whichever has more room) and wiped, with its logs and browser profiles, when you close it.
+macOS and Windows have no such folder, so there it goes in the system temp folder on disk
+(still wiped on close); `BRAINPROXY_TEMP_DIR` picks another place, e.g. a RAM disk. It still
+has a locked engagement scope. *Save as…* turns it into a normal project file. If the app
+or agent that owns it crashes, the next start wipes it.
+
 **Engagement scope.** Each project has a fixed list of targets that may be contacted,
 such as `app.example.com`, `*.example.com`, `10.0.0.0/24`, or `api.example.com:8443`, plus
 optional exclusions. It is set once, when the project is created, and **can never be
@@ -110,6 +118,10 @@ permissions of the folder it is saved in: keep it in your own folders on a share
    report.html` (also `markdown`, `json`, `sarif`).
 7. **Retest.** After fixes, scan again and use the Findings comparison: *Not found again
    by* a scan lists what that scan covered but no longer finds, likely fixed.
+
+*Temporary engagement* on the welcome screen is the same without step 1's file: the top bar
+shows a **temp** badge, and switching project or closing the window asks before wiping it.
+Click the badge (or *Save as…* in the sidebar) to save it to a file and carry on there.
 
 ---
 
@@ -289,8 +301,8 @@ byte, side by side or unified.
 - **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.
 - **Rules & data:** update the ZAP rule data and Nuclei templates; check for a new
   brainproxy daily, download it automatically, or check now.
-- **Project:** project information, the engagement, and *Start the proxy when a project
-  opens*.
+- **Project:** project information (including whether it is temporary, with *Save as…*),
+  the engagement, and *Start the proxy when a project opens*.
 - **Open source licenses:** credits for the projects the rules, checks and wordlists come
   from (OWASP ZAP, Nuclei, SecLists, ...) and the full NOTICE.
 
@@ -300,7 +312,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 90 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 101 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -334,6 +346,20 @@ brainproxy findings show 12
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy report html -o acme-report.html
 ```
+
+Temporary projects:
+
+```sh
+export BRAINPROXY_PROJECT=$(brainproxy --format json project temp | jq -r .data.path)
+brainproxy engagement start --target app.acme.test
+# ... work as usual ...
+brainproxy project save --output ~/work/acme.bpdb   # optional: keep a copy
+brainproxy project discard                           # stops its proxy, listener and jobs, then wipes it
+```
+
+`project temp --owner PID` ties it to a process: once that exits, `project sweep` (run by
+`project temp` and `mcp serve --temp`, and by the app on start) wipes it. `project discard`
+refuses a project that isn't temporary.
 
 Crawl and active-scan scope and safety flags:
 
@@ -370,7 +396,9 @@ and capabilities are available as resources. Add it to an MCP client:
 { "mcpServers": { "brainproxy": { "command": "brainproxy", "args": ["--project", "/work/acme.bpdb", "mcp", "serve"] } } }
 ```
 
-The agent works under the same engagement scope; it cannot reach anything outside it.
+The agent works under the same engagement scope; it cannot reach anything outside it. With
+`mcp serve --temp` instead of `--project`, the server makes a temporary project for the
+session and wipes it when it exits; the agent can keep a copy with `project_save`.
 
 ---
 

@@ -30,11 +30,16 @@ fn failure(message: String) -> Value {
     json!({"ok": false, "command": "gui", "error": {"kind": "gui", "message": message}})
 }
 
+/// The only commands that may run while no project is open (the welcome screen's). Anything
+/// else would fall back to `brainproxy.bpdb` in the app's working directory.
+const WITHOUT_PROJECT: &[&[&str]] = &[&["project", "temp"], &["project", "sweep"]];
+
 /// Prefix of the only variables the frontend may set on the child (`env`): secrets the CLI
 /// reads through options like `--password-env`, so they never appear in argv.
 const SECRET_ENV_PREFIX: &str = "BRAINPROXY_SECRET_";
 
-/// Runs `brainproxy --format json --project PROJECT ARGS...` and returns its JSON envelope.
+/// Runs `brainproxy --format json --project PROJECT ARGS...` and returns its JSON envelope
+/// (no `--project` while none is open, e.g. `project temp` from the welcome screen).
 /// `stdin` is written byte for byte; `env` adds BRAINPROXY_SECRET_* variables to the child.
 #[tauri::command]
 async fn cli(
@@ -47,8 +52,16 @@ async fn cli(
     if let Some(bad) = env.keys().find(|k| !k.starts_with(SECRET_ENV_PREFIX)) {
         return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
     }
+    let head: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
+    if project.is_empty() && !WITHOUT_PROJECT.iter().any(|c| *c == head.as_slice()) {
+        return failure("no project is open".into());
+    }
     let mut cmd = Command::new(binary());
-    cmd.args(["--format", "json", "--project"]).arg(&project).args(&args).envs(&env);
+    cmd.args(["--format", "json"]);
+    if !project.is_empty() {
+        cmd.arg("--project").arg(&project);
+    }
+    cmd.args(&args).envs(&env);
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -74,11 +87,18 @@ async fn cli(
     }
 }
 
+/// This process's pid: the owner of the app's temporary projects, so one left behind by a
+/// crash is wiped by the next `project sweep`.
+#[tauri::command]
+fn app_pid() -> u32 {
+    std::process::id()
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![cli])
+        .invoke_handler(tauri::generate_handler![cli, app_pid])
         .run(tauri::generate_context!())
         .expect("error while running brainproxy");
 }

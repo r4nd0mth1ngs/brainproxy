@@ -36,8 +36,17 @@ interface Toast {
   kind: "info" | "error";
 }
 
+/** An open temporary project: wiped when it closes. Not RAM-backed where the OS has no RAM folder. */
+export interface TempInfo {
+  ramBacked: boolean;
+}
+
 interface State {
   project: string;
+  /** Set when the project is temporary. */
+  temp: TempInfo | null;
+  /** Saves a temporary project to a file the user picks, then switches to it. */
+  saveAs: () => Promise<void>;
   tab: Tab;
   setTab: (t: Tab) => void;
   repeater: RepeaterTab[];
@@ -65,7 +74,17 @@ export function useApp(): State {
   return s;
 }
 
-export function AppProvider({ project, children }: { project: string; children: ReactNode }) {
+export function AppProvider({
+  project,
+  temp,
+  saveAs,
+  children,
+}: {
+  project: string;
+  temp: TempInfo | null;
+  saveAs: () => Promise<void>;
+  children: ReactNode;
+}) {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [repeater, setRepeaterState] = useState<RepeaterTab[]>([]);
   const [repeaterActive, setRepeaterActive] = useState(0);
@@ -113,6 +132,8 @@ export function AppProvider({ project, children }: { project: string; children: 
   const value = useMemo<State>(
     () => ({
       project,
+      temp,
+      saveAs,
       tab,
       setTab,
       repeater,
@@ -130,7 +151,7 @@ export function AppProvider({ project, children }: { project: string; children: 
       wizardOpen,
       openWizard,
     }),
-    [project, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard],
+    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

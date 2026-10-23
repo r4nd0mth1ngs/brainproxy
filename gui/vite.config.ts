@@ -29,9 +29,15 @@ function cliBridge(): Plugin {
             stdin?: number[] | null;
             env?: Record<string, string> | null;
           };
-          // Same rule as the Tauri command: only BRAINPROXY_SECRET_* variables may be set.
+          // Same rules as the Tauri command: without a project only `project temp|sweep` run, and
+          // only BRAINPROXY_SECRET_* variables may be set.
+          if (!project && !["project temp", "project sweep"].includes(args.slice(0, 2).join(" "))) {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ ok: false, error: { kind: "gui", message: "no project is open" } }));
+            return;
+          }
           const extra = Object.fromEntries(Object.entries(env ?? {}).filter(([k]) => k.startsWith("BRAINPROXY_SECRET_")));
-          const child = spawn(bin, ["--format", "json", "--project", project, ...args], {
+          const child = spawn(bin, ["--format", "json", ...(project ? ["--project", project] : []), ...args], {
             stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"],
             env: { ...process.env, ...extra },
           });

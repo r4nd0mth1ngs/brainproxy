@@ -17,6 +17,7 @@ const PATHS: Record<string, string> = {
   expand: "M9 6l6 6-6 6",
   theme: "M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z",
   switch: "M4 7h13l-3-3 M20 17H7l3 3",
+  save: "M5 3h11l3 3v15H5z M8 3v5h7V3 M8 21v-7h8v7",
   arrow: "M5 12h14 M13 6l6 6-6 6",
   globe: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M3 12h18 M12 3c2.5 2.7 3.5 5.7 3.5 9s-1 6.3-3.5 9c-2.5-2.7-3.5-5.7-3.5-9s1-6.3 3.5-9z",
 };
