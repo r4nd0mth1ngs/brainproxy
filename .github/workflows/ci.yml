@@ -51,6 +51,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
+      - run: python3 scripts/test_zap_drift.py
+        if: runner.os == 'Linux'
 
   static:
     needs: check

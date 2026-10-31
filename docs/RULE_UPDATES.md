@@ -29,9 +29,16 @@ Know exactly when upstream changes something we ported, with no manual tracking.
 - `scripts/zap_drift.py` maps the headers to upstream Java paths and reports:
   rules changed since the pinned commit (with upstream commit subjects), rules removed or
   renamed upstream, changed data files, feed checks to regenerate (their rule or data
-  changed), and upstream rules not ported yet.
+  changed), and upstream rules not ported yet, each with its add-on and ZAP status
+  (release, beta, alpha).
+- The not-ported list covers `pscanrules` and `ascanrules`, their Beta and Alpha add-ons,
+  and the other add-ons that hold scan rules (`RULE_ADDONS` in the script). Only the first
+  two count as drift. The rest is an informational backlog: it is printed, but on its own
+  it doesn't open or hold open the issue, and the script exits 0. In `--json` these entries
+  carry `"informational": true`.
 - `.github/workflows/zap-drift.yml` runs it weekly and keeps one open issue
-  ("ZAP rule drift", label `zap-drift`) updated, closing it when in sync.
+  ("ZAP rule drift", label `zap-drift`) updated, closing it when in sync. The whole report,
+  backlog included, is also on the run's summary page.
 
 Porting a change then means: read the upstream diff, update the Rust rule and its tests,
 bump `commit` in `zap-sync.json`. The specs-then-port workflow used for the initial ports
@@ -97,4 +104,4 @@ layer 1; fast-moving CVE and exposure checks come in as data through layer 3.
 | ZAP rule logic changes | Weekly drift issue, then a port (optionally an automated PR) |
 | ZAP pattern list changes | `scan data update` at runtime (layer 2) |
 | New CVE/exposure checks | `checks update` (Nuclei templates), `checks update --source brainproxy` (brainproxy's signed feed, also daily from the app), and your own checks (layer 3) |
-| New ZAP rules | Listed under "not ported yet" in the drift report |
+| New ZAP rules | Listed under "not ported yet" in the drift report (informational outside `pscanrules` and `ascanrules`) |
