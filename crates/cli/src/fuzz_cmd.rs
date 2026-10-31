@@ -12,6 +12,7 @@ use clap::{Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::output::Out;
+use crate::process;
 use crate::request_args::RequestArgs;
 
 #[derive(Subcommand)]
@@ -218,16 +219,24 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
     }
 }
 
+/// A fuzz run's lock file (see `process::work_lock`).
+pub(crate) fn lock_name(run: i64) -> String {
+    format!("fuzz-{run}")
+}
+
 /// Marks a run whose process died as failed.
 fn reap_if_dead(store: &Store, run: i64) -> Result<(), Error> {
     let info = store.fuzz_run(run)?;
-    let state = info["state"].as_str().unwrap_or("");
-    if matches!(state, "running" | "stopping") {
-        if let Some(pid) = info["pid"].as_u64() {
-            if !crate::process::alive(pid as u32) {
-                store.fuzz_set_state(run, "failed", None, Some("fuzz process exited unexpectedly"), true)?;
-            }
-        }
+    if !matches!(info["state"].as_str().unwrap_or(""), "running" | "stopping") {
+        return Ok(());
+    }
+    let Some(pid) = info["pid"].as_u64() else { return Ok(()) };
+    let name = lock_name(run);
+    // It may have finished, and exited, since the state above was read.
+    if process::work_gone(store, &name, pid as u32) && matches!(store.fuzz_state(run)?.as_str(), "running" | "stopping")
+    {
+        store.fuzz_set_state(run, "failed", None, Some("fuzz process exited unexpectedly"), true)?;
+        process::forget_work_lock(store, &name);
     }
     Ok(())
 }
@@ -352,13 +361,21 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             req.as_bytes(),
         )?,
     };
+    // A foreground run; a `--background` child already has its parent's.
+    let name = lock_name(run_id);
+    let _lock = process::work_lock(&store, &name);
     store.fuzz_set_state(run_id, "running", Some(std::process::id()), None, false)?;
+    let finish = |state: &str, error: Option<&str>| {
+        store.fuzz_set_state(run_id, state, None, error, true)?;
+        process::forget_work_lock(&store, &name);
+        Ok::<_, Error>(())
+    };
 
     let send = args.req.send_options(guard);
     let auth = match crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send) {
         Ok(a) => a,
         Err(e) => {
-            store.fuzz_set_state(run_id, "failed", None, Some(&e.to_string()), true)?;
+            finish("failed", Some(&e.to_string()))?;
             return Err(e);
         }
     };
@@ -388,8 +405,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     }
     match result {
         Ok(outcome) => {
-            let state = if outcome == Outcome::Stopped { "stopped" } else { "completed" };
-            store.fuzz_set_state(run_id, state, None, None, true)?;
+            finish(if outcome == Outcome::Stopped { "stopped" } else { "completed" }, None)?;
             let mut summary = store.fuzz_summary(run_id, args.top)?;
             summary["outcome"] = json!(outcome);
             summary["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
@@ -397,7 +413,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             Ok(())
         }
         Err(e) => {
-            store.fuzz_set_state(run_id, "failed", None, Some(&e.to_string()), true)?;
+            finish("failed", Some(&e.to_string()))?;
             Err(e)
         }
     }
@@ -423,9 +439,12 @@ fn spawn_background(
     let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
-    crate::process::detach(&mut cmd);
+    process::detach(&mut cmd);
+    let stdin = process::work_lock_stdin(store, &lock_name(run_id));
     let mut child =
-        cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
+        cmd.stdin(stdin).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
+    // Our copy of the lock goes with it: the child's is the one that counts.
+    drop(cmd);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let state = store.fuzz_state(run_id)?;
@@ -435,6 +454,7 @@ fn spawn_background(
         if let Some(status) = child.try_wait()? {
             let msg = std::fs::read_to_string(&log).unwrap_or_default();
             store.fuzz_set_state(run_id, "failed", None, Some(msg.trim()), true)?;
+            process::forget_work_lock(store, &lock_name(run_id));
             return Err(crate::jobs_cmd::child_failure("fuzz process", status, &msg));
         }
         if Instant::now() > deadline {

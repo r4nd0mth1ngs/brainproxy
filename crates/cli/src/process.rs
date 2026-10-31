@@ -9,12 +9,12 @@
 //! means nothing: it isn't visible, or is some other process. A listener therefore records
 //! its PID namespace and holds a lock file while it runs ([`RunLock`]). From another
 //! namespace the lock says whether it still runs, and the database flag is the only way to
-//! stop it.
+//! stop it. A job or fuzz run does the same with a lock file of its own ([`work_lock`]).
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use brainproxy_core::store::Store;
@@ -185,6 +185,72 @@ fn lock_held(store: &Store, what: &str) -> Option<bool> {
         Ok(()) => Some(false),
         Err(TryLockError::WouldBlock) => Some(true),
         Err(TryLockError::Error(_)) => None,
+    }
+}
+
+/// Takes `<project>-<name>.lock` for a job or fuzz run, before its pid is recorded, and writes
+/// the PID namespace into it. `None` where it can't be taken, which leaves its pid to go by,
+/// and when it is already held: only a `--background` child finds that, as it was handed the
+/// lock through [`work_lock_stdin`]. Nothing else takes a lock with this name.
+pub(crate) fn work_lock(store: &Store, name: &str) -> Option<File> {
+    let ns = pid_namespace()?;
+    let path = lock_path(store, name)?;
+    let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path).ok()?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::Error(_)) => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    }
+    if file.set_len(0).and_then(|()| file.write_all(ns.as_bytes())).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(file)
+}
+
+/// Stdin for a `--background` child: its lock instead of /dev/null. A lock belongs to the open
+/// file, so the child holds it from its first instruction and the parent can exit, leaving no
+/// moment when a child that is starting looks dead. It reads as empty, like /dev/null, since
+/// the file's position is past what was written. Nothing the child starts inherits it: they
+/// all get a stdin of their own.
+pub(crate) fn work_lock_stdin(store: &Store, name: &str) -> Stdio {
+    work_lock(store, name).map_or_else(Stdio::null, Stdio::from)
+}
+
+/// The namespace a job or fuzz run recorded in its lock file. None without one (state from an
+/// older version, or no locks here), which leaves its pid to go by.
+fn work_namespace(store: &Store, name: &str) -> std::io::Result<Option<String>> {
+    let Some(path) = lock_path(store, name) else { return Ok(None) };
+    match std::fs::read_to_string(path) {
+        Ok(ns) => Ok(Some(ns).filter(|ns| !ns.is_empty())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the process of a job or fuzz run is certainly gone. One in another namespace is
+/// judged by its lock; if that can't be read, it counts as running. A job's final state is
+/// written before it exits, so once it is gone that state can be trusted: read it after this.
+pub(crate) fn work_gone(store: &Store, name: &str, pid: u32) -> bool {
+    match work_namespace(store, name) {
+        Ok(ns) if elsewhere(ns.as_deref()) => lock_held(store, name) == Some(false),
+        Ok(_) => !alive(pid),
+        Err(_) => false,
+    }
+}
+
+/// The pid of a job or fuzz run, for people to read.
+pub(crate) fn work_pid_text(store: &Store, name: &str, pid: u32) -> String {
+    pid_text(pid, work_namespace(store, name).ok().flatten().as_deref())
+}
+
+/// Removes the lock file of a job or fuzz run that has finished. Nothing looks at it any more.
+pub(crate) fn forget_work_lock(store: &Store, name: &str) {
+    if let Some(path) = lock_path(store, name) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -442,6 +508,43 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert!(RunLock::acquire(&store, "proxy").unwrap().is_none());
         assert_eq!(lock_held(&store, "proxy"), None);
+        assert!(work_lock(&store, "job-1").is_none());
+        assert!(work_gone(&store, "job-1", 0));
+        assert!(!work_gone(&store, "job-1", std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_lock_tells_whether_work_elsewhere_runs() {
+        let (dir, store) = store("work");
+        let (name, dead, me) = ("job-1", i32::MAX as u32, std::process::id());
+        // No lock file (an older version, or no locks there): the pid decides.
+        assert!(work_gone(&store, name, dead));
+        assert!(!work_gone(&store, name, me));
+
+        // In this namespace the pid still decides, whatever the lock says.
+        let held = work_lock(&store, name).expect("lock");
+        assert_eq!(work_namespace(&store, name).unwrap(), pid_namespace());
+        assert!(work_gone(&store, name, dead));
+        assert!(!work_gone(&store, name, me));
+        assert_eq!(work_pid_text(&store, name, 7), "pid 7");
+        // Already held: this is how a `--background` child finds the lock its parent gave it.
+        assert!(work_lock(&store, name).is_none());
+
+        // Elsewhere the lock does, and the pid means nothing.
+        let path = lock_path(&store, name).unwrap();
+        std::fs::write(&path, "pid:[1]").unwrap();
+        assert!(!work_gone(&store, name, dead));
+        assert!(work_pid_text(&store, name, 7).contains("another container"));
+        drop(held);
+        assert!(work_gone(&store, name, me));
+
+        // A lock file left behind by a crash is taken over.
+        assert!(work_lock(&store, name).is_some());
+        assert_eq!(work_namespace(&store, name).unwrap(), pid_namespace());
+        forget_work_lock(&store, name);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Here the pid decides, as it does for state from an older version.

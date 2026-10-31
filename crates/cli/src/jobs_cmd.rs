@@ -12,6 +12,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
+use crate::process;
 
 #[derive(Subcommand)]
 pub enum JobCmd {
@@ -95,16 +96,26 @@ fn text(j: &Value) -> String {
     )
 }
 
+/// A job's lock file (see `process::work_lock`).
+pub(crate) fn lock_name(id: i64) -> String {
+    format!("job-{id}")
+}
+
 /// Marks a job whose process died as failed. One that died while still queued (before
 /// it marked itself running) failed setting up: its error is the last one in its log.
 pub(crate) fn reap(project: &Path, store: &Store, id: i64) -> Result<(), Error> {
     let j = store.job_get(id)?;
-    let state = j["state"].as_str().unwrap_or("");
-    if !matches!(state, "queued" | "running" | "stopping") {
+    if !matches!(j["state"].as_str().unwrap_or(""), "queued" | "running" | "stopping") {
         return Ok(());
     }
     let Some(pid) = j["pid"].as_u64() else { return Ok(()) };
-    if crate::process::alive(pid as u32) {
+    let name = lock_name(id);
+    if !process::work_gone(store, &name, pid as u32) {
+        return Ok(());
+    }
+    // It may have finished, and exited, since the state above was read.
+    let state = store.job_state(id)?;
+    if is_finished(&state) {
         return Ok(());
     }
     let logged = || {
@@ -112,11 +123,12 @@ pub(crate) fn reap(project: &Path, store: &Store, id: i64) -> Result<(), Error> 
         let log = std::fs::read_to_string(project.with_extension(format!("job-{id}.log"))).ok()?;
         logged_error(&log).map(|(_, message)| message)
     };
-    let error = match state {
+    let error = match state.as_str() {
         "queued" => logged().unwrap_or_else(|| "job process exited before it started".into()),
         _ => "job process exited unexpectedly".into(),
     };
     store.job_set_state(id, "failed", None, Some(&error), true)?;
+    process::forget_work_lock(store, &name);
     Ok(())
 }
 
@@ -160,9 +172,12 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&child_argv);
-    crate::process::detach(&mut cmd);
+    process::detach(&mut cmd);
+    let stdin = process::work_lock_stdin(&store, &lock_name(id));
     let mut child =
-        cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
+        cmd.stdin(stdin).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
+    // Our copy of the lock goes with it: the child's is the one that counts.
+    drop(cmd);
     // Set up work (loading checks, logging in) can outlast the wait below; with the pid
     // recorded, a child that then fails before starting the job is reaped as failed.
     store.job_set_pid(id, child.id())?;
@@ -171,6 +186,7 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
         if let Some(status) = child.try_wait()? {
             let msg = std::fs::read_to_string(&log).unwrap_or_default();
             store.job_set_state(id, "failed", None, Some(msg.trim()), true)?;
+            process::forget_work_lock(&store, &lock_name(id));
             return Err(child_failure(kind, status, &msg));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -224,6 +240,8 @@ pub fn run_job(
 ) -> Result<Value, Error> {
     let store = Store::open(project)?;
     let ctl = JobControl::default();
+    // A job run by this process rather than a `--background` child (an authz run).
+    let _lock = job_id.and_then(|id| process::work_lock(&store, &lock_name(id)));
     if let Some(id) = job_id {
         // A stop requested while the job was queued stands: the job starts stopped.
         if !store.job_start(id, std::process::id())? && store.job_state(id)? == "stopping" {
@@ -241,6 +259,7 @@ pub fn run_job(
             }
             Err(e) => store.job_set_state(id, "failed", None, Some(&e.to_string()), true)?,
         }
+        process::forget_work_lock(&store, &lock_name(id));
     }
     result
 }

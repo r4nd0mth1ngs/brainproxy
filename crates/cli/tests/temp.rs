@@ -168,3 +168,127 @@ fn mcp_serve_cannot_make_or_wipe_temporary_projects() {
     assert!(!names.contains(&"project_save"), "{names:?}");
     assert!(env.project.exists());
 }
+
+/// What another container on the same volume would see: the lock file naming another PID
+/// namespace, and the saved pid not there.
+#[cfg(target_os = "linux")]
+fn pretend_other_namespace(env: &Env, lock: &str, set_pid: impl FnOnce(&brainproxy_core::store::Store, u32)) {
+    let path = env.dir.join(format!("p.bpdb-{lock}.lock"));
+    assert!(std::fs::read_to_string(&path).unwrap().starts_with("pid:["), "{path:?}");
+    std::fs::write(&path, "pid:[1]").unwrap();
+    set_pid(&brainproxy_core::store::Store::open(&env.project).unwrap(), i32::MAX as u32);
+}
+
+/// Accepts connections and never answers, for a job that runs until it is killed.
+#[cfg(target_os = "linux")]
+fn silent_server() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+#[cfg(target_os = "linux")]
+fn kill(pid: u64) {
+    assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fuzz_run_in_another_namespace_is_not_taken_for_dead() {
+    let env = Env::new("fuzz-ns");
+    let port = slow_server(Duration::from_millis(200));
+    let url = format!("http://127.0.0.1:{port}/§x§");
+    let start = || {
+        let args = ["fuzz", "run", "--url", &url, "-p", "range:1-5000", "-c", "2", "--background"];
+        let run = env.ok(&env.project, &args)["run"].clone();
+        let id = run["id"].as_i64().unwrap();
+        pretend_other_namespace(&env, &format!("fuzz-{id}"), |store, pid| {
+            store.fuzz_set_state(id, "running", Some(pid), None, false).unwrap();
+        });
+        (id, run["pid"].as_u64().unwrap())
+    };
+    let state = |id: i64| env.ok(&env.project, &["fuzz", "status", &id.to_string()])["run"]["state"].clone();
+
+    // Being looked at, however many times, changes nothing, and it can still be stopped.
+    let (run, _) = start();
+    for _ in 0..2 {
+        assert_eq!(state(run), "running");
+    }
+    let d = env.ok(&env.project, &["project", "stop"]);
+    assert!(d["work"].as_array().unwrap().iter().any(|w| w["id"] == run), "{d}");
+    // `project stop` waited for it, so it is done by now, and has cleaned up after itself.
+    assert_eq!(state(run), "stopped");
+    assert!(!env.dir.join(format!("p.bpdb-fuzz-{run}.lock")).exists());
+
+    // Once it is killed outright, it is told from a running one right away.
+    let (run, pid) = start();
+    assert_eq!(state(run), "running");
+    kill(pid);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while state(run) == "running" {
+        assert!(std::time::Instant::now() < deadline, "the dead run still looks like it runs");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(state(run), "failed");
+    assert!(!env.dir.join(format!("p.bpdb-fuzz-{run}.lock")).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn job_in_another_namespace_is_not_taken_for_dead() {
+    let env = Env::new("job-ns");
+    let site = format!("http://127.0.0.1:{}/", silent_server());
+    let args = ["crawl", &site, "--no-robots", "--no-sitemap", "--timeout", "600", "--background"];
+    let id = env.ok(&env.project, &args)["job"].as_i64().unwrap();
+    let id_text = id.to_string();
+    let status = || env.ok(&env.project, &["job", "status", &id_text]);
+    let pid = status()["pid"].as_u64().unwrap();
+    pretend_other_namespace(&env, &format!("job-{id}"), |store, pid| {
+        store.job_set_state(id, "running", Some(pid), None, false).unwrap();
+    });
+
+    for _ in 0..2 {
+        assert_eq!(status()["state"], "running");
+    }
+    let waited = env.ok(&env.project, &["job", "wait", &id_text, "--timeout", "0.5"]);
+    assert_eq!((&waited["state"], &waited["timed_out"]), (&"running".into(), &true.into()), "{waited}");
+
+    kill(pid);
+    let waited = env.ok(&env.project, &["job", "wait", &id_text, "--timeout", "5"]);
+    assert_eq!(waited["state"], "failed", "{waited}");
+    assert_eq!(waited["error"], "job process exited unexpectedly");
+    assert!(!env.dir.join(format!("p.bpdb-job-{id}.lock")).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_work_cleans_up_its_lock_when_it_finishes() {
+    let env = Env::new("job-done");
+    let site = format!("http://127.0.0.1:{}/", slow_server(Duration::ZERO));
+    let args = ["crawl", &site, "--no-robots", "--no-sitemap", "--background"];
+    let id = env.ok(&env.project, &args)["job"].as_i64().unwrap();
+    let done = env.ok(&env.project, &["job", "wait", &id.to_string(), "--timeout", "30"]);
+    assert_eq!(done["state"], "completed", "{done}");
+    assert!(!env.dir.join(format!("p.bpdb-job-{id}.lock")).exists());
+
+    let url = format!("{site}§x§");
+    let args = ["fuzz", "run", "--url", &url, "-p", "range:1-3", "--background"];
+    let run = env.ok(&env.project, &args)["run"]["id"].as_i64().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let finished = loop {
+        let status = env.ok(&env.project, &["fuzz", "status", &run.to_string()]);
+        if !matches!(status["run"]["state"].as_str(), Some("queued" | "running")) {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(finished["run"]["state"], "completed", "{finished}");
+    assert!(!env.dir.join(format!("p.bpdb-fuzz-{run}.lock")).exists());
+}
