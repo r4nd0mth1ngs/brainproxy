@@ -663,7 +663,9 @@ function Auth() {
                 </Fragment>
               ))}
           </dl>
+          {/* Keyed: an open form belongs to its profile and mustn't save to the next one. */}
           <SessionHandling
+            key={shown.profile.name}
             profile={shown.profile.name}
             macros={shown.macros ?? []}
             rules={shown.rules ?? []}
