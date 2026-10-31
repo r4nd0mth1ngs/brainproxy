@@ -771,6 +771,7 @@ pub async fn run(
     // Build units of work.
     let mut units: Vec<Unit> = Vec::new();
     let mut hosts_seen = HashSet::new();
+    let mut fixed_segments = HashSet::new();
     let mut point_count = 0;
     for t in &targets {
         let duration = Duration::from_millis(t.duration_ms.unwrap_or(0));
@@ -779,7 +780,11 @@ pub async fn run(
         let request = keep_alive(&t.request);
         let Ok(response) = Response::parse(request.clone(), t.response.clone(), duration) else { continue };
         let msg = Message::from_exchange(t.history_id.unwrap_or(0), &t.target, &request, &t.response);
-        let pts = points::points(&request, &cfg.points);
+        let mut pts = points::points(&request, &cfg.points);
+        // A fixed URL path segment (`/api`) is attacked once per origin, not on every target.
+        pts.retain(|p| {
+            points::fixed_segment(&request, p).is_none_or(|prefix| fixed_segments.insert((t.target.origin(), prefix)))
+        });
         let base = Arc::new(Base { history_id: t.history_id, target: t.target.clone(), request, msg, response });
         point_count += pts.len();
         let first_for_host = hosts_seen.insert(t.target.origin());

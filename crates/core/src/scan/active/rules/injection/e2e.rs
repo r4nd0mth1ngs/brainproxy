@@ -82,6 +82,21 @@ fn handle(path: &str, query: &str) -> String {
         }
         // Safe: the same page whatever the parameter is.
         "/safe" => html("<p>static content</p>"),
+        // Safe: small pages that echo what they were sent.
+        "/echo" => html(&format!("<p>{}</p>", param("q"))),
+        p if p.starts_with("/echo/") => html(&format!("<p>You are at {}</p>", url_decode(p))),
+        p if p.starts_with("/nowhere/") => format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{p}",
+            p.len()
+        ),
+        // A quote in the ID leaks an SQL error.
+        p if p.starts_with("/rest/item/") => {
+            if url_decode(p).contains('\'') {
+                html("You have an error in your SQL syntax; check the manual")
+            } else {
+                html("<p>item</p>")
+            }
+        }
         _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
     }
 }
@@ -137,6 +152,16 @@ type Found = Vec<(String, String, String, String)>;
 /// Runs one rule over `targets`; returns the summary and the stored findings
 /// (alert ref, name, param, attack).
 async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget>) -> (ActiveSummary, Found) {
+    scan_points(name, rule, strength, PointOptions::default(), targets).await
+}
+
+async fn scan_points(
+    name: &str,
+    rule: u32,
+    strength: Strength,
+    points: PointOptions,
+    targets: Vec<ScanTarget>,
+) -> (ActiveSummary, Found) {
     let guard =
         Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }]).unwrap();
     let cfg = ActiveConfig {
@@ -144,7 +169,7 @@ async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget
         concurrency: 4,
         rate: None,
         send: SendOptions { timeout: Duration::from_secs(20), guard: Some(guard), ..Default::default() },
-        points: PointOptions::default(),
+        points,
         rules: Some(vec![rule]),
         exclude_rules: vec![],
         no_rules: false,
@@ -218,6 +243,33 @@ async fn safe_endpoint_raises_nothing() {
         assert!(s.raised.is_empty(), "rule {rule}: {s:?}");
         assert!(s.requests > 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_ignores_pages_that_echo_their_input() {
+    let port = spawn_app();
+    let paths = PointOptions { path: true, ..Default::default() };
+    let targets = vec![target(port, "/echo/1"), target(port, "/echo/about"), target(port, "/nowhere/x")];
+    // Insane is where it counts: the other strengths run out of boolean attacks earlier.
+    for strength in [Strength::Medium, Strength::Insane] {
+        let (s, found) = scan_points("echopath", 40018, strength, paths.clone(), targets.clone()).await;
+        assert!(s.raised.is_empty(), "{s:?} {found:?}");
+        let (s, found) = scan("echoq", 40018, strength, vec![target(port, "/echo?q=1")]).await;
+        assert!(s.raised.is_empty(), "{s:?} {found:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_path_segments_are_attacked_once_per_origin() {
+    let port = spawn_app();
+    let paths = PointOptions { path: true, ..Default::default() };
+    let targets = vec![target(port, "/rest/item/1"), target(port, "/rest/item/2"), target(port, "/rest/other/about")];
+    let (s, found) = scan_points("fixed", 40018, Strength::Medium, paths, targets).await;
+    // rest, item, 1 and 2, other, about: `rest` and `item` aren't repeated.
+    assert_eq!(s.insertion_points, 6, "{s:?}");
+    // Each ID is still attacked, and the fault found through it (the two are stored as one).
+    assert_eq!(s.raised.get("40018"), Some(&2), "{s:?}");
+    assert_eq!(found[0].2, "path[2]", "{found:?}");
 }
 
 #[test]

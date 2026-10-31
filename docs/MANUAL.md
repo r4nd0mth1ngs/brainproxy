@@ -220,7 +220,10 @@ attack type, and pick payloads:
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them
     (the guided Standard and Thorough scans do), and *Inject into URL paths* to attack each
     path segment, such as the ID in `/users/42` (`scan active --url-path`; it sends many more
-    requests). XML and multipart bodies are attacked by default, including the file name of
+    requests). To keep that down, `/users/1` and `/users/2` count as one route (numbers, UUIDs
+    and long hex IDs; give URLs or `--history-id` to attack each), a fixed segment such as
+    `/api` is attacked once per site, and script, style, image, font and media files keep
+    their paths unattacked. XML and multipart bodies are attacked by default, including the file name of
     an upload but not its content. For single-page apps, tick *Run JavaScript (browser)* (see
     below).
     The crawl stays on the site URLs' origins (scheme, host and port); an `http://` site

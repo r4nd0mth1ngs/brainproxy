@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
-use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
+use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::findings_db::FindingFilter;
 use brainproxy_core::session::Tool;
@@ -109,7 +109,10 @@ pub struct ActiveArgs {
     no_multipart: bool,
     #[arg(long)]
     no_xml: bool,
-    /// Also inject into URL path segments, such as IDs in REST paths.
+    /// Also inject into URL path segments, such as IDs in REST paths. Requests that differ
+    /// only by an ID (/users/1, /users/2) or an asset's file name count as one target unless
+    /// named by URL or --history-id; a fixed segment is attacked once per origin; a static
+    /// asset's path isn't attacked.
     #[arg(long)]
     url_path: bool,
     /// Concurrent rule units.
@@ -457,6 +460,8 @@ fn select_targets(
         ids.extend(r.rows.iter().filter_map(|row| row[0].as_i64()));
     }
     let mut targets = Vec::new();
+    // The requests asked for by URL or history id, not by a filter.
+    let mut named: HashSet<i64> = args.history_ids.iter().copied().collect();
     if !args.urls.is_empty() {
         let client = Client::new(send.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -467,6 +472,7 @@ fn select_targets(
                 None => rt.block_on(client.send(&req, &target))?,
             };
             let id = store.record_exchange("scan", &ex)?;
+            named.insert(id);
             targets.push(ScanTarget {
                 history_id: Some(id),
                 target,
@@ -505,7 +511,16 @@ fn select_targets(
             duration_ms: item.entry.duration_ms.map(|d| d.max(0) as u64),
         });
     }
-    // One target per method + origin + path + parameter names.
+    // With URL path attacks, a route is attacked through one request, so make that one
+    // that worked: requests with a 2xx response come first, and those the user named.
+    if opts.path {
+        targets.sort_by_key(|t| {
+            let ok = parse_response_head(&t.response).is_ok_and(|h| (200..300).contains(&h.status));
+            !(ok || t.history_id.is_some_and(|id| named.contains(&id)))
+        });
+    }
+    // One target per method + origin + path + parameter names. With URL path attacks the
+    // path is the route (`/users/{id}`), unless the user named this very request.
     let mut seen = HashSet::new();
     let mut skipped_methods = 0;
     let all_methods = args.include_methods.iter().any(|m| m == "ALL");
@@ -521,7 +536,10 @@ fn select_targets(
             skipped_methods += 1;
             return false;
         }
-        let path = head.map(|h| h.target.split('?').next().unwrap_or("").to_string()).unwrap_or_default();
+        let by_route = opts.path && !t.history_id.is_some_and(|id| named.contains(&id));
+        let path = head
+            .map(|h| if by_route { points::route(&h.target) } else { h.target.split('?').next().unwrap_or("").into() })
+            .unwrap_or_default();
         let mut names: Vec<String> = points::points(&t.request, opts).into_iter().map(|p| p.name).collect();
         names.sort();
         seen.insert((method, t.target.origin(), path, names))
