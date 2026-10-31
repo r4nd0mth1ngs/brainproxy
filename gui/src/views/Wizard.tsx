@@ -32,16 +32,17 @@ const DEPTHS: { id: Depth; title: string; time: string; text: string; args: stri
   {
     id: "standard",
     title: "Standard",
-    time: "about 5 to 20 minutes",
-    text: "A balanced scan of the whole site. Good for a first assessment.",
-    args: ["--strength", "high", "--crawl-depth", "5", "--crawl-max-pages", "500", "--cookies"],
+    // Attacking path segments adds many requests, so a large site can take an hour.
+    time: "about 10 to 60 minutes",
+    text: "A balanced scan of the whole site, including IDs in its addresses. Good for a first assessment, but sends many requests.",
+    args: ["--strength", "high", "--crawl-depth", "5", "--crawl-max-pages", "500", "--cookies", "--url-path"],
   },
   {
     id: "thorough",
     title: "Thorough",
     time: "30 minutes or more",
     text: "Goes deeper and tries many more attack variations. Sends a lot of requests.",
-    args: ["--strength", "insane", "--crawl-depth", "8", "--crawl-max-pages", "1500", "--cookies"],
+    args: ["--strength", "insane", "--crawl-depth", "8", "--crawl-max-pages", "1500", "--cookies", "--url-path"],
   },
 ];
 
