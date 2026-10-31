@@ -253,7 +253,7 @@ impl Chrome {
             .rev()
             .collect();
         let mut hint = if lines.is_empty() { String::new() } else { format!(": {}", lines.join(" / ")) };
-        if log.contains("No usable sandbox") || log.contains("Running as root without --no-sandbox") {
+        if sandbox_refused(&log) {
             hint.push_str(
                 " (Chromium's sandbox isn't available here: install your distribution's chromium-sandbox \
                  package or enable user namespaces, or set BRAINPROXY_BROWSER_NO_SANDBOX=1 to run without it)",
@@ -413,9 +413,30 @@ fn args(opts: &LaunchOptions, profile: &Path) -> Vec<String> {
     a
 }
 
+/// Whether the browser's log says its sandbox couldn't start. "Failed to move to new
+/// namespace" is what Docker's default seccomp profile gets.
+fn sandbox_refused(log: &str) -> bool {
+    ["No usable sandbox", "Running as root without --no-sandbox", "Failed to move to new namespace"]
+        .iter()
+        .any(|m| log.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_failures_are_recognised() {
+        for log in [
+            "FATAL:zygote_host_impl_linux.cc(128)] No usable sandbox! Update your kernel",
+            "ERROR: Running as root without --no-sandbox is not supported",
+            "FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:128] Failed to move to new namespace: \
+             PID namespaces supported, Network namespace supported, but failed: errno = Operation not permitted",
+        ] {
+            assert!(sandbox_refused(log), "{log}");
+        }
+        assert!(!sandbox_refused("ERROR: cannot open display"));
+    }
 
     #[test]
     fn read_message_splits_and_drops_long_messages() {

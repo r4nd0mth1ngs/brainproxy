@@ -815,3 +815,52 @@ fn auth_record_turns_a_browser_login_into_a_working_profile() {
     let status = env.ok(&["auth", "status", "app"]);
     assert_eq!(status["check"]["logged_in"], true, "{status}");
 }
+
+/// Rewrites the saved state as another container would see it: the same pid, another namespace.
+#[cfg(target_os = "linux")]
+fn pretend_other_namespace(project: &Path, key: &str) {
+    let store = brainproxy_core::store::Store::open(project).unwrap();
+    let saved = store.meta_get(key).unwrap().unwrap();
+    let mut state: Value = serde_json::from_str(&saved).unwrap();
+    assert!(state["pid_ns"].as_str().is_some_and(|ns| ns.starts_with("pid:[")), "{state}");
+    state["pid_ns"] = "pid:[1]".into();
+    store.meta_set(key, Some(&state.to_string())).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proxy_in_another_namespace_is_not_taken_for_dead() {
+    use brainproxy_core::proxy::STATE_KEY;
+    let env = Env::new("namespace");
+    let pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["other_pid_namespace"]), (&true.into(), &false.into()));
+
+    // Its state survives being looked at, however many times, and blocks a second proxy.
+    pretend_other_namespace(&env.project, STATE_KEY);
+    for _ in 0..2 {
+        let status = env.ok(&["proxy", "status"]);
+        assert_eq!((&status["running"], &status["other_pid_namespace"]), (&true.into(), &true.into()), "{status}");
+    }
+    let (code, v) = env.run(&["proxy", "run", "--listen", "127.0.0.1:0"]);
+    assert_ne!(code, 0, "{v}");
+    assert!(v.to_string().contains("another container"), "{v}");
+
+    // A stop can't signal it, so it goes through the project file.
+    let stopped = env.ok(&["proxy", "stop"]);
+    assert_eq!((stopped["stopped"].as_u64(), &stopped["forced"]), (Some(pid), &false.into()));
+    assert_eq!(env.ok(&["proxy", "status"])["running"], false);
+
+    // Once it is killed outright, it is told from a running one right away, and the state goes.
+    let pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    pretend_other_namespace(&env.project, STATE_KEY);
+    assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.ok(&["proxy", "status"])["running"] == true {
+        assert!(Instant::now() < deadline, "the dead proxy still looks like it runs");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    assert_eq!(store.meta_get(STATE_KEY).unwrap(), None);
+    env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+}

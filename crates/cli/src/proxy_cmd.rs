@@ -23,6 +23,7 @@ use crate::process;
 
 /// `proxy stop` asks the proxy to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "proxy.stop";
+const LOCK_NAME: &str = "proxy";
 
 /// How long a proxy may take to exit when asked to. With a live authz run it also has to
 /// finish its tests and save the run.
@@ -398,6 +399,9 @@ struct Saved {
     state: ProxyState,
     #[serde(default)]
     start_time: Option<u64>,
+    /// The proxy's PID namespace, recorded if it holds its lock file: see `process`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_ns: Option<String>,
 }
 
 fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
@@ -407,7 +411,7 @@ fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
 /// The running proxy's saved state, clearing stale state left by a crash.
 fn current(store: &Store) -> Result<Option<Saved>, Error> {
     match read_state(store)? {
-        Some(s) if process::still_running(s.state.pid, s.start_time) != Some(false) => Ok(Some(s)),
+        Some(s) if !process::gone(store, LOCK_NAME, s.state.pid, s.start_time, s.pid_ns.as_deref()) => Ok(Some(s)),
         Some(_) => {
             store.meta_set(STATE_KEY, None)?;
             Ok(None)
@@ -421,12 +425,22 @@ pub(crate) fn running(store: &Store) -> Result<Option<ProxyState>, Error> {
     Ok(current(store)?.map(|s| s.state))
 }
 
+/// The running proxy if it is in this container, so that its address can be connected to.
+pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
+    Ok(current(store)?.filter(|s| !process::elsewhere(s.pid_ns.as_deref())).map(|s| s.state))
+}
+
 /// Stops this project's proxy if one runs: its pid, and whether it had to be killed.
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
-    let Some(Saved { state, start_time }) = current(store)? else { return Ok(None) };
+    let Some(Saved { state, start_time, pid_ns }) = current(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
     let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
-    let forced = process::terminate(state.pid, start_time, "proxy", wait)?;
+    let forced = if process::elsewhere(pid_ns.as_deref()) {
+        process::await_exit_elsewhere(store, LOCK_NAME, state.pid, wait)?;
+        false
+    } else {
+        process::terminate(state.pid, start_time, "proxy", wait)?
+    };
     // Killed, it couldn't save its run; the rows recorded so far stay.
     if let Some(id) = state.authz_run.filter(|_| forced) {
         if !is_finished(&store.job_state(id)?) {
@@ -474,7 +488,9 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
         }
         ProxyCmd::Status => {
             let store = Store::open(project)?;
-            let state = running(&store)?;
+            let saved = current(&store)?;
+            let pid_ns = saved.as_ref().and_then(|s| s.pid_ns.clone());
+            let state = saved.map(|s| s.state);
             let captures = store.list(&HistoryFilter { source: Some("proxy".into()), ..Default::default() })?.len();
             let pending = store.intercept_list(Some("pending"), u32::MAX)?.len();
             let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
@@ -491,6 +507,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             let data = json!({
                 "running": state.is_some(),
                 "proxy": state.as_ref().map(state_json),
+                "other_pid_namespace": process::elsewhere(pid_ns.as_deref()),
                 "proxy_captures": captures,
                 "pending_intercepts": pending,
                 "intercept_enabled": intercept.enabled,
@@ -500,9 +517,9 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             });
             out.ok(data, || match &state {
                 Some(s) => format!(
-                    "running on {} (pid {}), {captures} captures, {pending} pending{}",
+                    "running on {} ({}), {captures} captures, {pending} pending{}",
                     s.listen,
-                    s.pid,
+                    process::pid_text(s.pid, pid_ns.as_deref()),
                     live_text(s.authz_run)
                 ),
                 None => "not running".into(),
@@ -514,8 +531,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
 
 fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
-    if let Some(s) = running(&store)? {
-        return Err(Error::Conflict(format!("proxy already running on {} (pid {})", s.listen, s.pid)));
+    if let Some(s) = current(&store)? {
+        return Err(already_running(&s));
     }
     load_ca(home)?; // Surface CA and scope problems here rather than in the log.
     store.guard()?;
@@ -584,6 +601,11 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     }
 }
 
+fn already_running(s: &Saved) -> Error {
+    let pid = process::pid_text(s.state.pid, s.pid_ns.as_deref());
+    Error::Conflict(format!("proxy already running on {} ({pid})", s.state.listen))
+}
+
 fn live_text(run: Option<i64>) -> String {
     run.map(|id| format!("; live authz run {id} (brainproxy authz matrix {id})")).unwrap_or_default()
 }
@@ -599,8 +621,10 @@ struct LiveRun {
 fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
     let (ca, info) = load_ca(home)?;
     let store = Store::open(project)?;
-    if let Some(s) = running(&store)?.filter(|s| s.pid != std::process::id()) {
-        return Err(Error::Conflict(format!("proxy already running on {} (pid {})", s.listen, s.pid)));
+    // Its own pid is its own state, unless that is the same pid in another container.
+    let me = std::process::id();
+    if let Some(s) = current(&store)?.filter(|s| s.state.pid != me || process::elsewhere(s.pid_ns.as_deref())) {
+        return Err(already_running(&s));
     }
     // Fail before listening if there is no scope; the scope can't change while we run.
     let guard = store.guard()?;
@@ -694,7 +718,12 @@ fn serve(
             authz_run: authz.as_ref().map(|l| l.run_id()),
             args: crate::jobs_cmd::child_args(),
         };
-        let saved = Saved { state, start_time: process::start_time(std::process::id()) };
+        let lock = process::RunLock::acquire(&store, LOCK_NAME)?;
+        let saved = Saved {
+            state,
+            start_time: process::start_time(std::process::id()),
+            pid_ns: lock.as_ref().and_then(|_| process::pid_namespace()),
+        };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&saved).unwrap_or_default()))?;
         let state = saved.state;
         out.ok(state_json(&state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));

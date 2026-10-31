@@ -277,6 +277,37 @@ fn oob_confirms_log4shell_and_xxe_and_manual_payloads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn listener_in_another_namespace_is_not_taken_for_dead() {
+    use brainproxy_core::oob::STATE_KEY;
+    let (dir, project) = setup("namespace");
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_eq!(code, 0, "{v}");
+
+    // As another container sees it: the same pid, another namespace.
+    let store = brainproxy_core::store::Store::open(&project).unwrap();
+    let mut state: Value = serde_json::from_str(&store.meta_get(STATE_KEY).unwrap().unwrap()).unwrap();
+    assert!(state["pid_ns"].as_str().is_some_and(|ns| ns.starts_with("pid:[")), "{state}");
+    state["pid_ns"] = "pid:[1]".into();
+    store.meta_set(STATE_KEY, Some(&state.to_string())).unwrap();
+
+    for _ in 0..2 {
+        let (code, v) = run(&["oob", "status"], &project);
+        assert_eq!(code, 0, "{v}");
+        assert_eq!((&v["data"]["running"], &v["data"]["other_pid_namespace"]), (&true.into(), &true.into()), "{v}");
+    }
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_ne!(code, 0, "{v}");
+    assert!(v.to_string().contains("another container"), "{v}");
+
+    let (code, v) = run(&["oob", "stop"], &project);
+    assert_eq!((code, &v["data"]["forced"]), (0, &false.into()), "{v}");
+    let (_, v) = run(&["oob", "status"], &project);
+    assert_eq!(v["data"]["running"], false, "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn oob_run_validates_arguments() {
     let (dir, project) = setup("args");

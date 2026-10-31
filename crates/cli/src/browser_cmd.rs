@@ -210,7 +210,7 @@ pub(crate) fn open(
         })?,
     };
     let store = Store::open(project)?;
-    let state = crate::proxy_cmd::running(&store)?.ok_or_else(|| {
+    let state = crate::proxy_cmd::running_here(&store)?.ok_or_else(|| {
         Error::Conflict("the proxy isn't running for this project; start it with `brainproxy proxy start`".into())
     })?;
     // A wildcard listen address isn't something to connect to.

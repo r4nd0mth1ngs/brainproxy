@@ -15,10 +15,11 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::process::{self, start_time, still_running};
+use crate::process::{self, start_time};
 
 /// `oob stop` asks the listener to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "oob.stop";
+const LOCK_NAME: &str = "oob";
 
 #[derive(Subcommand)]
 pub enum OobCmd {
@@ -97,7 +98,7 @@ pub struct OobRunArgs {
 /// The running listener for this project, clearing stale state left by a crash.
 pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
     match oob::read_state(store)? {
-        Some(s) if still_running(s.pid, s.start_time) != Some(false) => Ok(Some(s)),
+        Some(s) if !process::gone(store, LOCK_NAME, s.pid, s.start_time, s.pid_ns.as_deref()) => Ok(Some(s)),
         Some(_) => {
             store.meta_set(STATE_KEY, None)?;
             Ok(None)
@@ -110,10 +111,21 @@ pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     let Some(state) = running(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
-    let forced = process::terminate(state.pid, state.start_time, "OOB listener", std::time::Duration::from_secs(5))?;
+    let wait = std::time::Duration::from_secs(5);
+    let forced = if process::elsewhere(state.pid_ns.as_deref()) {
+        process::await_exit_elsewhere(store, LOCK_NAME, state.pid, wait)?;
+        false
+    } else {
+        process::terminate(state.pid, state.start_time, "OOB listener", wait)?
+    };
     store.meta_set(STATE_KEY, None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some((state.pid, forced)))
+}
+
+fn already_running(s: &OobState) -> Error {
+    let pid = process::pid_text(s.pid, s.pid_ns.as_deref());
+    Error::Conflict(format!("OOB listener already running on {} ({pid})", s.tcp_listen))
 }
 
 fn not_running() -> Error {
@@ -159,6 +171,7 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
             let data = json!({
                 "running": state.is_some(),
                 "listener": state.as_ref().map(state_json),
+                "other_pid_namespace": state.as_ref().is_some_and(|s| process::elsewhere(s.pid_ns.as_deref())),
                 "payloads": payloads,
                 "interactions": interactions,
                 "unmatched_interactions": unmatched,
@@ -167,8 +180,9 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
             });
             out.ok(data, || match &state {
                 Some(s) => format!(
-                    "listening on {} (pid {}), {payloads} payloads, {interactions} interactions",
-                    s.tcp_listen, s.pid
+                    "listening on {} ({}), {payloads} payloads, {interactions} interactions",
+                    s.tcp_listen,
+                    process::pid_text(s.pid, s.pid_ns.as_deref())
                 ),
                 None => format!("not running; {payloads} payloads, {interactions} interactions"),
             });
@@ -276,7 +290,7 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
 fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     if let Some(s) = running(&store)? {
-        return Err(Error::Conflict(format!("OOB listener already running on {} (pid {})", s.tcp_listen, s.pid)));
+        return Err(already_running(&s));
     }
     let project = std::fs::canonicalize(project)?;
     let log = args.log.clone().unwrap_or_else(|| project.with_extension("oob.log"));
@@ -348,8 +362,10 @@ fn check_domain(d: &str) -> Result<String, Error> {
 
 fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
-    if let Some(s) = running(&store)?.filter(|s| s.pid != std::process::id()) {
-        return Err(Error::Conflict(format!("OOB listener already running on {} (pid {})", s.tcp_listen, s.pid)));
+    // Its own pid is its own state, unless that is the same pid in another container.
+    let me = std::process::id();
+    if let Some(s) = running(&store)?.filter(|s| s.pid != me || process::elsewhere(s.pid_ns.as_deref())) {
+        return Err(already_running(&s));
     }
     let domain = args.domain.as_deref().map(check_domain).transpose()?;
     if args.dns_listen.is_some() && domain.is_none() {
@@ -384,6 +400,7 @@ fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Err
             auto_host: args.public_host.is_none() && addr.ip().is_unspecified(),
         };
         let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let lock = process::RunLock::acquire(&store, LOCK_NAME)?;
         let state = OobState {
             pid: std::process::id(),
             started: started.to_string(),
@@ -393,6 +410,7 @@ fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Err
             endpoint,
             log: args.log.clone(),
             start_time: start_time(std::process::id()),
+            pid_ns: lock.as_ref().and_then(|_| process::pid_namespace()),
         };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&state).unwrap_or_default()))?;
         out.ok(state_json(&state), || match exposure_warning(&state) {

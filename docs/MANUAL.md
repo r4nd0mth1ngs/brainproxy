@@ -95,15 +95,20 @@ Things that work differently in a container:
   your own machine only:
 
   ```sh
-  docker run -d --init --name proxy -v brainproxy:/work -p 127.0.0.1:8080:8080 brainproxy proxy run --listen 0.0.0.0:8080
+  docker run -d --name proxy -v brainproxy:/work -p 127.0.0.1:8080:8080 brainproxy proxy run --listen 0.0.0.0:8080
   ```
 
-  Keep `--init`: brainproxy never treats PID 1 as a running proxy, so without it `proxy
-  status` says the proxy isn't running even though it is. Ask only its own container
-  (`docker exec proxy brainproxy proxy status`), and stop it with `docker stop proxy`. A
-  different container on the same volume can't see the process, and running `proxy status`
-  there clears the saved state, so `docker exec` then says it isn't running too. The proxy
-  itself keeps working.
+  `--init` isn't needed here: brainproxy looks at PID 1 like any other process, it just never
+  sends it a signal. `docker exec proxy brainproxy proxy status` reports it, and so does a
+  different container on the same volume, where the process can't be seen: the proxy holds
+  `brainproxy.bpdb-proxy.lock` while it runs, and that is what `proxy status` goes by there
+  (`oob run` does the same with `-oob.lock`). This needs a volume where file locks work between
+  containers, as on a local disk. The address and PID shown are the ones inside the proxy's
+  container, so from elsewhere connect by container name.
+
+  Stop it with `docker stop proxy`. `proxy stop` works too, by asking through the project file,
+  and only if the proxy answers. Through `docker exec` it ends with exit code 137 and no output,
+  because the container is gone as soon as its main process is.
 
 - **`crawl --browser`:** needs a Chromium-based browser, which the image leaves out because it
   takes the image from about 30 MB to over 800 MB. Without one, `--browser` stops with an
