@@ -94,6 +94,10 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth rule add", ADD),
     ("auth rule list", READ),
     ("auth rule remove", REPLACE),
+    // Adds or replaces a signer of that name; holds where its key is, not the key.
+    ("auth sign add", REPLACE),
+    ("auth sign list", READ),
+    ("auth sign remove", REPLACE),
     ("project init", SET),
     ("project info", READ),
     // Stops the proxy, OOB listener and background work; deletes nothing.

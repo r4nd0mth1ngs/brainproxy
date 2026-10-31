@@ -181,6 +181,8 @@ pub(crate) enum Func {
     Md5,
     Sha1,
     Sha256,
+    Hmac,
+    GenerateJwt,
     Base64,
     Base64Py,
     Base64Decode,
@@ -226,6 +228,8 @@ fn func(name: &str) -> Option<(Func, usize, Option<usize>)> {
         "md5" => (Md5, 1, Some(1)),
         "sha1" => (Sha1, 1, Some(1)),
         "sha256" => (Sha256, 1, Some(1)),
+        "hmac" => (Hmac, 3, Some(3)),
+        "generate_jwt" => (GenerateJwt, 3, Some(4)),
         "base64" => (Base64, 1, Some(1)),
         "base64_py" => (Base64Py, 1, Some(1)),
         "base64_decode" => (Base64Decode, 1, Some(1)),
@@ -679,6 +683,16 @@ fn call(f: Func, args: Vec<Value>, re: &LazyRegex) -> Option<Value> {
             use sha2::Digest;
             str_v(hex::encode(sha2::Sha256::digest(s(0).as_bytes())))
         }
+        // Like Nuclei: hmac(hash, data, key) in hex; generate_jwt(json, alg, key[, max age]).
+        Hmac => {
+            let alg = crate::sign::HmacAlg::parse(&s(0)).ok()?;
+            str_v(hex::encode(crate::sign::hmac_digest(alg, s(2).as_bytes(), s(1).as_bytes())))
+        }
+        GenerateJwt => {
+            let alg = crate::sign::JwtAlg::parse(&s(1)).ok()?;
+            let age = args.get(3).map(|a| a.as_num().map(|n| n.max(0.0) as u64)).unwrap_or(Some(0))?;
+            str_v(crate::sign::generate_jwt(&s(0), alg, s(2).as_bytes(), (age > 0).then_some(age)).ok()?)
+        }
         Base64 => str_v(base64::engine::general_purpose::STANDARD.encode(s(0).as_bytes())),
         Base64Py => str_v(base64_py(s(0).as_bytes())),
         Base64Decode => {
@@ -938,6 +952,20 @@ mod tests {
         assert_eq!(mmh3_32(b"foo", 0) as i32, -156908512);
         assert_eq!(base64_py(b"hi"), "aGk=\n");
         assert_eq!(base64_py(&[0u8; 60]).lines().next().unwrap().len(), 76);
+    }
+
+    #[test]
+    fn signing_functions_match_published_vectors() {
+        // RFC 4231 test case 2, and the HS256 example on jwt.io (keys in sorted order here).
+        assert!(yes("hmac('sha256', 'what do ya want for nothing?', 'Jefe') == \
+             '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843'"));
+        assert_eq!(eval("hmac('md4', 'a', 'b')"), None);
+        let jwt = |src: &str| crate::codec::decode_jwt(&eval(src).unwrap().into_string()).unwrap();
+        let v = jwt(r#"generate_jwt('{"sub":"1"}', 'HS256', 'k')"#);
+        assert_eq!((v["header"]["alg"].as_str(), v["payload"]["sub"].as_str()), (Some("HS256"), Some("1")));
+        assert!(v["payload"].get("exp").is_none());
+        assert!(jwt(r#"generate_jwt('{}', 'HS512', 'k', 60)"#)["payload"]["exp"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(eval("generate_jwt('not json', 'HS256', 'k')"), None);
     }
 
     #[test]

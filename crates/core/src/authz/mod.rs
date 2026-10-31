@@ -264,8 +264,10 @@ fn detect_owner(request: &[u8], known: &[Arc<AuthSession>]) -> Option<Arc<AuthSe
 }
 
 /// The request without credentials: no Authorization header, no header any known
-/// session sets or that carries an auth placeholder, and no cookies except `keep`.
+/// session sets or that carries an auth placeholder, no query parameter that does (a
+/// signature or token placed there), and no cookies except `keep`.
 pub(crate) fn strip_auth(raw: &[u8], known: &[Arc<AuthSession>], keep: &[String]) -> Vec<u8> {
+    let raw = &*strip_query_auth(raw);
     let req = RawRequest::from_bytes(raw.to_vec());
     let Ok(head) = req.head() else { return raw.to_vec() };
     let mut names = credential_headers(known.iter().map(|s| &s.profile));
@@ -287,6 +289,25 @@ pub(crate) fn strip_auth(raw: &[u8], known: &[Arc<AuthSession>], keep: &[String]
         .collect();
     req = if kept.is_empty() { req.remove_header("Cookie") } else { req.set_header("Cookie", &kept.join("; ")) };
     req.into_bytes()
+}
+
+/// The request without query parameters that carry an auth placeholder.
+fn strip_query_auth(raw: &[u8]) -> Vec<u8> {
+    let (head, body) = crate::http::request::split_head_body(raw);
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = String::from_utf8_lossy(&head[..line_end]);
+    let mut words: Vec<&str> = line.split(' ').collect();
+    let Some((path, query)) = words.get(1).and_then(|u| u.split_once('?')) else { return raw.to_vec() };
+    if !query.contains("«auth:") {
+        return raw.to_vec();
+    }
+    let kept: Vec<&str> = query.split('&').filter(|p| !p.contains("«auth:")).collect();
+    let uri = if kept.is_empty() { path.to_string() } else { format!("{path}?{}", kept.join("&")) };
+    words[1] = &uri;
+    let mut out = words.join(" ").into_bytes();
+    out.extend_from_slice(&head[line_end..]);
+    out.extend_from_slice(body);
+    out
 }
 
 /// Requests recorded with `Connection: close` are re-sent with keep-alive.
@@ -723,12 +744,13 @@ impl Tester {
 pub fn has_credentials<'a>(request: &[u8], profiles: impl IntoIterator<Item = &'a AuthProfile>) -> bool {
     let Ok(head) = RawRequest::from_bytes(request.to_vec()).head() else { return false };
     let names = credential_headers(profiles);
-    head.headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("cookie")
-            || k.eq_ignore_ascii_case("authorization")
-            || v.contains("«auth:")
-            || names.contains(&k.to_ascii_lowercase())
-    })
+    head.target.contains("«auth:")
+        || head.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("cookie")
+                || k.eq_ignore_ascii_case("authorization")
+                || v.contains("«auth:")
+                || names.contains(&k.to_ascii_lowercase())
+        })
 }
 
 /// Lowercase names of the headers the profiles send: static headers and the token header.
@@ -1071,6 +1093,13 @@ mod tests {
         let key = session("key", AuthProfile { headers: vec![("X-Api-Key".into(), "k".into())], ..Default::default() });
         let req = "GET /a HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer x\r\nX-Api-Key: k\r\n\
                    X-Other: «auth:app:header:X-Other»\r\nCookie: sid=1; lang=en\r\nAccept: */*\r\n\r\n";
+        let signed = "GET /a?x=1&sig=«auth:k:sign:s» HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert!(has_credentials(signed.as_bytes(), [&key.profile]));
+        let out = String::from_utf8(strip_auth(signed.as_bytes(), &[], &[])).unwrap();
+        assert!(out.starts_with("GET /a?x=1 HTTP/1.1\r\n"), "{out}");
+        let only =
+            String::from_utf8(strip_query_auth("GET /a?sig=«auth:k:sign:s» HTTP/1.1\r\n\r\n".as_bytes())).unwrap();
+        assert!(only.starts_with("GET /a HTTP/1.1\r\n"), "{only}");
         let out = String::from_utf8(strip_auth(req.as_bytes(), std::slice::from_ref(&key), &["lang".into()])).unwrap();
         assert_eq!(out, "GET /a HTTP/1.1\r\nHost: a.test\r\nCookie: lang=en\r\nAccept: */*\r\n\r\n");
         let out = String::from_utf8(strip_auth(req.as_bytes(), &[key], &[])).unwrap();

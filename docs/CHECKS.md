@@ -164,7 +164,9 @@ Nuclei's DSL is govaluate plus helper functions. brainproxy parses it at load ti
   `ends_with`/`endswith`, `to_lower`/`tolower`, `to_upper`/`toupper`, `len`, `regex`,
   `replace`, `replace_regex`, `concat`, `trim`, `trim_space`, `trim_left`, `trim_right`,
   `trim_prefix`, `trim_suffix`, `to_string`/`tostring`, `to_number`, `substr`, `repeat`,
-  `md5`, `sha1`, `sha256`, `base64`, `base64_decode`, `base64_py` and `mmh3` (favicon
+  `md5`, `sha1`, `sha256`, `hmac` (`hmac('sha256', data, key)`, in hex), `generate_jwt`
+  (`generate_jwt('{"sub":"1"}', 'HS256', key[, max_age_seconds])`; HS256/384/512, RS256 with
+  a PEM key), `base64`, `base64_decode`, `base64_py` and `mmh3` (favicon
   hashes), `hex_encode`, `hex_decode`, `url_encode`, `url_decode`, `compare_versions`
   (hashicorp/go-version constraints such as `'>= 8.0.0, < 8.10.2'`), `rand_base`,
   `rand_text_alpha`, `rand_text_alphanumeric`, `rand_text_numeric`, `rand_int`, `unix_time`.
@@ -176,7 +178,7 @@ Nuclei's DSL is govaluate plus helper functions. brainproxy parses it at load ti
 Not supported (the template is skipped with this reason): `self-contained`, interactsh
 without an OOB listener, payload files that can't be found inside the root, template inputs without a `--check-var`, JavaScript `flow`, `xpath`
 extractors, regexes with lookaround or backreferences, DSL functions outside the list
-(`date_time`, `wait_for`, `generate_jwt`, `hmac`, ...), `race`, `iterate-all`, digest
+(`date_time`, `wait_for`, ...), `race`, `iterate-all`, digest
 auth, the raw annotations `@Host` and `@tls-sni`, `fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
 development (17f5725, Oct 2026), 9,139 of 11,690 HTTP templates load (5,856 before the
 DSL subset) and 9,392 with payload files; the top remaining reasons are

@@ -26,7 +26,8 @@ export type Action =
   | { action: "check"; every: number }
   | { action: "run_macro"; macro: string; every: number }
   | { action: "update"; params: [string, string][] }
-  | { action: "login" };
+  | { action: "login" }
+  | { action: "sign"; signer: string };
 
 export interface SessionRule {
   id: number;
@@ -75,6 +76,8 @@ export function actionSpec(a: Action): string {
       return a.params.length ? `update:${a.params.map(([p, v]) => (p === v ? p : `${p}=${v}`)).join(",")}` : "update";
     case "login":
       return "login";
+    case "sign":
+      return `sign:${a.signer}`;
   }
 }
 
@@ -95,6 +98,8 @@ export function actionLabel(a: Action): string {
         : "update parameters named like this rule's macro values";
     case "login":
       return "log in again if not logged in";
+    case "sign":
+      return `sign the request with ${a.signer}`;
   }
 }
 

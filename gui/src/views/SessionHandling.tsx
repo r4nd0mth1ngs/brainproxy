@@ -447,6 +447,7 @@ function RuleBuilder(p: {
               />
             )}
             {a.action === "login" && <span className="muted">with the profile, if not logged in</span>}
+            {a.action === "sign" && <span className="mono">{a.signer}</span>}
             <button className="btn small" onClick={() => set({ actions: f.actions.filter((_, k) => k !== i) })}>
               ✕
             </button>

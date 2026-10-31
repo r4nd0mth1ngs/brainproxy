@@ -1,7 +1,7 @@
 //! Authentication profiles: how to log in, and the live session that other
 //! commands use with `--auth NAME`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,9 +9,10 @@ use brainproxy_core::auth::{AuthProfile, AuthSession, Secret, SessionState};
 use brainproxy_core::auth_record::{Mode, Recorded};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool};
+use brainproxy_core::sign::{HmacAlg, JwtAlg, KeySource, Place, SignKind, Signer};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use serde_json::json;
 
 use crate::output::Out;
@@ -75,6 +76,10 @@ pub enum AuthCmd {
     /// go out with `--auth NAME` (check the session, run a macro, update the request, log in).
     #[command(subcommand)]
     Rule(RuleCmd),
+    /// A profile's request signers: HMAC signatures and JWTs computed as requests go out,
+    /// for a session rule's `sign:NAME` action. Keys stay in the environment or a file.
+    #[command(subcommand)]
+    Sign(SignCmd),
 }
 
 #[derive(Subcommand)]
@@ -129,7 +134,8 @@ pub enum RuleCmd {
         update[:P[=VAR],...]    put macro values into the request: each query, form, JSON or multipart \
         parameter, header or cookie P gets VAR (default: the variables of this rule's macros, into \
         parameters of their names)\n  \
-        login                   log in again with the profile if the session is not logged in\n\
+        login                   log in again with the profile if the session is not logged in\n  \
+        sign:NAME               sign the request as it goes out, with a signer of `auth sign add`\n\
         A response that looks logged out, or matches --invalid, refreshes the rule's macros (and \
         logs in again) and the request is sent once more.\n\
         Fresh CSRF token per request during a scan or fuzz run:\n  \
@@ -138,7 +144,7 @@ pub enum RuleCmd {
         brainproxy auth rule add app --action check:20 --action login")]
     Add {
         profile: String,
-        /// check[:N], macro:NAME[:each|:N], update[:PARAM[=VAR],...], or login. Repeatable, in order.
+        /// check[:N], macro:NAME[:each|:N], update[:PARAM[=VAR],...], login, or sign:NAME. Repeatable, in order.
         #[arg(long = "action", required = true)]
         actions: Vec<String>,
         /// Only for these tools: proxy, send, fuzz, crawl (also import), scan, checks (default: all).
@@ -158,6 +164,81 @@ pub enum RuleCmd {
     List { profile: String },
     /// Delete a session rule by id.
     Remove { profile: String, id: u32 },
+}
+
+#[derive(Subcommand)]
+pub enum SignCmd {
+    /// Add or replace a signer. A profile that doesn't exist yet is made, with no login.
+    /// Add a rule with `--action sign:NAME` to use it.
+    #[command(after_help = "Templates (--canonical, --claims, --set-header) can use {{method}}, {{host}}, \
+        {{path}}, {{query}}, {{body}}, {{body_sha256}}, {{body_sha256_base64}}, {{timestamp}}, \
+        {{timestamp_ms}}, {{nonce}} and {{header:NAME}}. In --canonical, \\n \\r \\t and \\\\ are read \
+        as escapes. The value is computed last, over the request as it is sent; history keeps a placeholder.\n\
+        An HMAC of the request, with the time it covers in its own header:\n  \
+        brainproxy auth sign add api hm --secret-env API_SECRET --origin https://api.test \\\n    \
+        --to header:X-Signature --set-header 'X-Timestamp: {{timestamp}}' \\\n    \
+        --canonical '{{method}}\\n{{path}}\\n{{query}}\\n{{header:X-Timestamp}}\\n{{body_sha256}}'\n  \
+        brainproxy auth rule add api --action sign:hm\n\
+        A JWT with chosen claims, good for five minutes:\n  \
+        brainproxy auth sign add api tok --jwt HS256 --secret-env JWT_KEY --origin https://api.test \\\n    \
+        --to header:Authorization --wrap 'Bearer {{signature}}' --claims '{\"sub\":\"admin\"}' --ttl 300")]
+    Add(Box<SignAddArgs>),
+    /// The profile's signers (they hold where a key is, not the key).
+    List { profile: String },
+    /// Delete a signer (refused while a session rule uses it).
+    Remove { profile: String, name: String },
+}
+
+#[derive(Args)]
+pub struct SignAddArgs {
+    pub profile: String,
+    /// Signer name.
+    pub name: String,
+    /// Environment variable holding the key (never stored).
+    #[arg(long, conflicts_with = "secret_file", required_unless_present = "secret_file")]
+    pub secret_env: Option<String>,
+    /// File holding the key (never stored), e.g. a PEM private key for RS256.
+    #[arg(long)]
+    pub secret_file: Option<PathBuf>,
+    /// How the key is written: raw, hex, or base64.
+    #[arg(long, default_value = "raw")]
+    pub secret_encoding: String,
+    /// Origin it may sign for (scheme://host[:port]). Repeatable.
+    #[arg(long = "origin", required = true)]
+    pub origins: Vec<String>,
+    /// Where the value goes: header:NAME or query:NAME.
+    #[arg(long)]
+    pub to: String,
+    /// A header's value around the signature, e.g. 'Bearer {{signature}}'.
+    #[arg(long)]
+    pub wrap: Option<String>,
+    /// 'NAME: TEMPLATE' header set before signing. Repeatable.
+    #[arg(long = "set-header")]
+    pub set_headers: Vec<String>,
+    /// The string to HMAC.
+    #[arg(long, conflicts_with = "jwt", required_unless_present = "jwt")]
+    pub canonical: Option<String>,
+    /// HMAC hash: sha1, sha256, sha384, or sha512.
+    #[arg(long, default_value = "sha256")]
+    pub hash: String,
+    /// HMAC output: hex, base64, or base64url.
+    #[arg(long, default_value = "hex")]
+    pub output: String,
+    /// Make a JWT with this algorithm: HS256, HS384, HS512, or RS256.
+    #[arg(long)]
+    pub jwt: Option<String>,
+    /// JWT claims, a JSON object template.
+    #[arg(long, requires = "jwt", default_value = "{}")]
+    pub claims: String,
+    /// Seconds a JWT is valid: sets iat and exp unless the claims do.
+    #[arg(long, requires = "jwt")]
+    pub ttl: Option<u64>,
+    /// JWT kid header.
+    #[arg(long, requires = "jwt")]
+    pub kid: Option<String>,
+    /// Start from the JWT already in the request (its header and claims, --claims on top).
+    #[arg(long, requires = "jwt")]
+    pub resign: bool,
 }
 
 #[derive(Subcommand)]
@@ -319,6 +400,7 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
         AuthCmd::Record(cmd) => record(project, home, cmd, out)?,
         AuthCmd::Macro(cmd) => macro_cmd(project, cmd, out)?,
         AuthCmd::Rule(cmd) => rule_cmd(project, cmd, out)?,
+        AuthCmd::Sign(cmd) => sign_cmd(project, cmd, out)?,
         AuthCmd::Add(a) => {
             let parse = |list: &[String]| {
                 list.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()
@@ -469,6 +551,7 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 "session": state_json(&state),
                 "macros": handling.macros.iter().map(macro_summary).collect::<Vec<_>>(),
                 "rules": handling.rules,
+                "signers": handling.signers,
             });
             out.ok(data.clone(), || serde_json::to_string_pretty(&data).unwrap_or_default());
         }
@@ -767,6 +850,7 @@ fn rule_line(r: &SessionRule) -> String {
                     .join(",")
             ),
             Action::Login => "login".into(),
+            Action::Sign { signer } => format!("sign {signer}"),
         })
         .collect();
     format!("#{:<3} {:<28} {:<24} {}", r.id, tools, r.url.as_deref().unwrap_or("any URL"), actions.join(" -> "))
@@ -811,6 +895,120 @@ fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
             }
             store.auth_save_handling(&profile, &h)?;
             out.ok(json!({"profile": profile, "id": id, "removed": true}), || format!("session rule {id} removed"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_choice<T: serde::de::DeserializeOwned>(what: &str, s: &str, valid: &str) -> Result<T, Error> {
+    serde_json::from_value(json!(s.trim().to_ascii_lowercase()))
+        .map_err(|_| Error::InvalidInput(format!("unknown {what} {s:?}; one of {valid}")))
+}
+
+fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    match cmd {
+        SignCmd::Add(args) => {
+            let SignAddArgs {
+                profile,
+                name,
+                secret_env,
+                secret_file,
+                secret_encoding,
+                origins,
+                to,
+                wrap,
+                set_headers,
+                canonical,
+                hash,
+                output,
+                jwt,
+                claims,
+                ttl,
+                kid,
+                resign,
+            } = *args;
+            let key = match (secret_env, secret_file) {
+                (Some(var), _) => KeySource::Env(var),
+                (_, Some(path)) => KeySource::File(path),
+                _ => return Err(Error::InvalidInput("give --secret-env or --secret-file".into())),
+            };
+            let kind = match jwt {
+                Some(alg) => SignKind::Jwt { alg: JwtAlg::parse(&alg)?, claims, ttl, kid, resign },
+                None => SignKind::Hmac {
+                    alg: HmacAlg::parse(&hash)?,
+                    canonical: canonical.unwrap_or_default(),
+                    output: parse_choice("output", &output, "hex, base64, base64url")?,
+                },
+            };
+            let headers = set_headers
+                .iter()
+                .map(|h| {
+                    h.split_once(':')
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                        .ok_or_else(|| Error::InvalidInput(format!("--set-header {h:?}: use 'NAME: TEMPLATE'")))
+                })
+                .collect::<Result<_, _>>()?;
+            let origins =
+                origins.iter().map(|o| Target::from_url(o).map(|t| t.origin())).collect::<Result<Vec<_>, _>>()?;
+            let signer = Signer {
+                name: name.clone(),
+                key,
+                key_encoding: parse_choice("key encoding", &secret_encoding, "raw, hex, base64")?,
+                origins,
+                to: Place::parse(&to)?,
+                format: wrap,
+                headers,
+                kind,
+            };
+            let mut h = store.auth_handling(&profile)?;
+            let replaced = h.signers.iter().any(|s| s.name == name);
+            h.signers.retain(|s| s.name != name);
+            h.signers.push(signer.clone());
+            let created = matches!(store.auth_profile(&profile), Err(Error::NotFound(_)));
+            if created {
+                store.auth_create_for_macros(&profile, &h)?;
+            } else {
+                store.auth_save_handling(&profile, &h)?;
+            }
+            out.ok(
+                json!({"profile": profile, "profile_created": created, "signer": signer, "replaced": replaced}),
+                || {
+                    format!(
+                        "signer {name:?} {}; use it: brainproxy auth rule add {profile} --action sign:{name}",
+                        if replaced { "replaced" } else { "saved" }
+                    )
+                },
+            );
+        }
+        SignCmd::List { profile } => {
+            store.auth_profile(&profile)?;
+            let signers = store.auth_handling(&profile)?.signers;
+            out.ok(json!({"profile": profile, "signers": signers}), || {
+                if signers.is_empty() {
+                    format!("{profile} has no signers")
+                } else {
+                    signers
+                        .iter()
+                        .map(|s| format!("{} -> {:?} for {}", s.name, s.to, s.origins.join(", ")))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            });
+        }
+        SignCmd::Remove { profile, name } => {
+            let mut h = store.auth_handling(&profile)?;
+            if h.rules.iter().any(|r| r.actions.iter().any(|a| matches!(a, Action::Sign { signer } if signer == &name)))
+            {
+                return Err(Error::InvalidInput(format!("a session rule uses signer {name:?}; remove the rule first")));
+            }
+            let before = h.signers.len();
+            h.signers.retain(|s| s.name != name);
+            if h.signers.len() == before {
+                return Err(Error::NotFound(format!("signer {name:?} of profile {profile:?}")));
+            }
+            store.auth_save_handling(&profile, &h)?;
+            out.ok(json!({"profile": profile, "name": name, "removed": true}), || format!("signer {name:?} removed"));
         }
     }
     Ok(())

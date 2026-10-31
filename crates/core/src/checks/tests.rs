@@ -110,9 +110,9 @@ fn unsupported_features_are_named() {
     );
     assert_eq!(
         unsupported_reason(&format!(
-            "{base}http:\n  - path: ['{{{{BaseURL}}}}/{{{{generate_jwt(a, b)}}}}']\n    matchers:\n      - type: status\n        status: [200]\n"
+            "{base}http:\n  - path: ['{{{{BaseURL}}}}/{{{{aes_gcm(a, b)}}}}']\n    matchers:\n      - type: status\n        status: [200]\n"
         )),
-        "DSL function `generate_jwt`"
+        "DSL function `aes_gcm`"
     );
     assert_eq!(
         unsupported_reason(&format!(

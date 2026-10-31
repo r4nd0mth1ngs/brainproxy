@@ -24,6 +24,7 @@ pub mod proxy;
 pub mod race;
 pub mod scan;
 pub mod session;
+pub mod sign;
 pub mod store;
 pub mod update;
 pub mod wordlists;

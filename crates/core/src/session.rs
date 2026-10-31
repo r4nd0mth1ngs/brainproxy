@@ -75,6 +75,9 @@ pub struct Handling {
     pub macros: Vec<Macro>,
     #[serde(default)]
     pub rules: Vec<SessionRule>,
+    /// Request signers a rule's `sign` action can use (see [`crate::sign`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signers: Vec<crate::sign::Signer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -183,6 +186,8 @@ pub enum Action {
     /// Log in again with the profile when the session is not logged in (or a check
     /// before this action just failed).
     Login,
+    /// Sign the request as it goes on the wire, whatever the rule's other actions did.
+    Sign { signer: String },
 }
 
 fn one() -> u32 {
@@ -190,7 +195,8 @@ fn one() -> u32 {
 }
 
 impl Action {
-    /// Parses `check[:N]`, `macro:NAME[:each|:N]`, `update[:PARAM[=VAR],...]`, `login`.
+    /// Parses `check[:N]`, `macro:NAME[:each|:N]`, `update[:PARAM[=VAR],...]`, `login`,
+    /// `sign:NAME`.
     pub fn parse(spec: &str) -> Result<Action> {
         let (kind, rest) = spec.split_once(':').map_or((spec, None), |(k, r)| (k, Some(r)));
         let count = |s: &str| {
@@ -222,9 +228,15 @@ impl Action {
                     .collect(),
             },
             "login" => Action::Login,
+            "sign" => Action::Sign {
+                signer: rest
+                    .filter(|r| !r.is_empty())
+                    .ok_or_else(|| Error::InvalidInput(format!("{spec:?}: name the signer, e.g. sign:api")))?
+                    .to_string(),
+            },
             _ => {
                 return Err(Error::InvalidInput(format!(
-                    "unknown action {spec:?}; one of check[:N], macro:NAME[:each|:N], update[:PARAM[=VAR],...], login"
+                    "unknown action {spec:?}; one of check[:N], macro:NAME[:each|:N], update[:PARAM[=VAR],...], login, sign:NAME"
                 )))
             }
         })
@@ -323,6 +335,12 @@ impl Handling {
                 return Err(Error::InvalidInput(format!("two macros are named {:?}", m.name)));
             }
         }
+        for (i, s) in self.signers.iter().enumerate() {
+            s.validate()?;
+            if self.signers[..i].iter().any(|o| o.name == s.name) {
+                return Err(Error::InvalidInput(format!("two signers are named {:?}", s.name)));
+            }
+        }
         for r in &self.rules {
             let what = |e: String| Error::InvalidInput(format!("session rule {}: {e}", r.id));
             if r.actions.is_empty() {
@@ -350,6 +368,9 @@ impl Handling {
                     }
                     Action::RunMacro { name, .. } if !self.macros.iter().any(|m| &m.name == name) => {
                         return Err(what(format!("no macro {name:?} (auth macro add)")))
+                    }
+                    Action::Sign { signer } if !self.signers.iter().any(|s| &s.name == signer) => {
+                        return Err(what(format!("no signer {signer:?} (auth sign add)")))
                     }
                     _ => {}
                 }
@@ -566,6 +587,9 @@ impl AuthSession {
                 counters: r.actions.iter().map(|_| AtomicU64::new(0)).collect(),
             });
         }
+        if let Some(g) = &self.client.options().guard {
+            g.vault.put_signers(&self.profile.name, &cfg.signers);
+        }
         self.handling = Runtime { cfg, compiled, ..Default::default() };
         Ok(self)
     }
@@ -620,6 +644,14 @@ impl AuthSession {
         let mut request = self.apply(&request, &keep);
         for (k, v) in &headers {
             request = RawRequest::from_bytes(request).set_header(k, v).into_bytes();
+        }
+        // Last, so nothing above moves them; the vault signs when the request is sent.
+        let signers = rules.iter().flat_map(|&i| &self.handling.cfg.rules[i].actions).filter_map(|a| match a {
+            Action::Sign { signer } => self.handling.cfg.signers.iter().find(|s| &s.name == signer),
+            _ => None,
+        });
+        for s in signers.filter(|s| s.origins.iter().any(|o| crate::sign::same_origin(o, target))) {
+            request = s.place(&request, &self.profile.name, keep_params);
         }
         Prepared { request, generation, macro_generation, rules }
     }
@@ -714,6 +746,8 @@ impl AuthSession {
                         self.relogin(generation).await;
                     }
                 }
+                // Applied by `prepare`, after the session goes on.
+                Action::Sign { .. } => {}
             }
         }
         request
@@ -1178,6 +1212,8 @@ mod tests {
         );
         assert_eq!(Action::parse("update").unwrap(), Action::Update { params: vec![] });
         assert_eq!(Action::parse("login").unwrap(), Action::Login);
+        assert_eq!(Action::parse("sign:api").unwrap(), Action::Sign { signer: "api".into() });
+        assert!(Action::parse("sign").is_err());
         assert!(
             Action::parse("macro").is_err() && Action::parse("dance").is_err() && Action::parse("check:x").is_err()
         );
@@ -1271,7 +1307,7 @@ mod tests {
         };
         let s = AuthSession::new(&dir.join("p.bpdb"), profile, state, crate::http::Client::new(opts))
             .unwrap()
-            .with_handling(Handling { macros: vec![], rules: vec![rule] })
+            .with_handling(Handling { rules: vec![rule], ..Default::default() })
             .unwrap();
         let target = Target::from_url("https://a.test").unwrap();
         let raw = b"GET /?csrf=old HTTP/1.1\r\nHost: a.test\r\nCookie: csrf=PAYLOAD\r\nX-Csrf: x\r\n\r\n";

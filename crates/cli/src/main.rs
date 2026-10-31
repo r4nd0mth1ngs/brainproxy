@@ -432,6 +432,11 @@ fn command_name(cmd: &Cmd) -> String {
                 auth_cmd::RuleCmd::List { .. } => "auth rule list",
                 auth_cmd::RuleCmd::Remove { .. } => "auth rule remove",
             },
+            auth_cmd::AuthCmd::Sign(c) => match c {
+                auth_cmd::SignCmd::Add(_) => "auth sign add",
+                auth_cmd::SignCmd::List { .. } => "auth sign list",
+                auth_cmd::SignCmd::Remove { .. } => "auth sign remove",
+            },
         },
         Cmd::Authz(c) => match c {
             authz_cmd::AuthzCmd::Run(_) => "authz run",
