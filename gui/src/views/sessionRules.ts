@@ -269,7 +269,7 @@ export function signerAddArgs(profile: string, f: SignerForm, keepPlace = false)
     args.push(`--jwt=${f.jwtAlg}`);
     if (f.claims.trim()) args.push(`--claims=${f.claims}`);
     if (f.ttl.trim()) args.push(`--ttl=${f.ttl.trim()}`);
-    if (f.kid.trim()) args.push(`--kid=${f.kid.trim()}`);
+    if (f.kid) args.push(`--kid=${f.kid}`);
     if (f.resign) args.push("--resign");
   }
   args.push("--", profile, f.name.trim());

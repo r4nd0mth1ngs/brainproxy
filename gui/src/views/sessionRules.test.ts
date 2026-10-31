@@ -163,6 +163,8 @@ test("editing a signer from auth show gives back the same arguments", () => {
     "auth", "sign", "add", "--secret-file=/keys/api.pem", "--origin=https://api.test", "--to=query:token",
     "--jwt=RS256", '--claims={"sub":"{{nonce}}"}', "--ttl=60", "--kid=k1", "--resign", "--", "api", "tok",
   ]);
+  // The JWT header carries a kid as written.
+  assert.ok(signerAddArgs("api", signerForm({ ...jwt, kid: " k1 " })).includes("--kid= k1 "));
   assert.deepEqual(signerProblems(signerForm(hmac), []), []);
   assert.deepEqual(signerProblems(signerForm(jwt), []), []);
   assert.equal(signerLabel(hmac), "HMAC-SHA512 (base64url) → header X-Signature · key in $API_SECRET");
