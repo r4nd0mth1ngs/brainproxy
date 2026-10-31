@@ -400,3 +400,46 @@ fn a_missing_key_fails_the_send_and_signers_stay_on_their_origins() {
     let raw = srv.seen.lock().unwrap().raw.last().cloned().unwrap();
     assert!(header(&raw, "x-signature").is_none(), "{raw}");
 }
+
+/// The arguments the desktop app builds (`signerAddArgs` in sessionRules.ts) and the JSON its
+/// signer form reads back.
+#[test]
+fn a_replaced_signer_runs_last_or_keeps_its_place_and_auth_show_lists_what_the_app_edits() {
+    let p = tmp_project("replace");
+    let add = |name: &str, tail: &[&str]| {
+        let mut args = vec![
+            "auth",
+            "sign",
+            "add",
+            "--secret-env=SIGN_TEST_HMAC",
+            "--origin=https://api.test",
+            "--to=header:X-Signature",
+        ];
+        args.extend_from_slice(tail);
+        args.extend_from_slice(&["--", "api", name]);
+        ok(&p, &args);
+    };
+    add("first", &["--canonical={{path}} ", "--hash=sha1", "--output=base64url"]);
+    add("later", &["--jwt=RS256", "--claims={\"sub\":\"a\"}", "--ttl=60", "--kid=k1", "--resign"]);
+    add("first", &["--keep-place", "--canonical={{path}} ", "--hash=sha512", "--output=base64"]);
+    let shown = ok(&p, &["auth", "show", "api"]);
+    let signers = shown["signers"].as_array().unwrap();
+    assert_eq!(signers.len(), 2, "{shown}");
+    assert_eq!(signers[0]["name"], "first", "{shown}");
+    assert_eq!(signers[0]["key"]["env"], "SIGN_TEST_HMAC");
+    assert_eq!(signers[0]["to"]["header"], "X-Signature");
+    assert_eq!(signers[0]["kind"], "hmac");
+    assert_eq!(signers[0]["alg"], "sha512");
+    assert_eq!(signers[0]["output"], "base64");
+    assert_eq!(signers[0]["canonical"], "{{path}} ");
+    assert_eq!(signers[1]["kind"], "jwt");
+    assert_eq!(signers[1]["alg"], "RS256");
+    assert_eq!(signers[1]["ttl"], 60);
+    assert_eq!(signers[1]["kid"], "k1");
+    assert_eq!(signers[1]["resign"], true);
+    // Without --keep-place, adding it again runs it last, as a send's error advises.
+    add("first", &["--canonical={{path}}"]);
+    let shown = ok(&p, &["auth", "show", "api"]);
+    assert_eq!(shown["signers"][0]["name"], "later", "{shown}");
+    assert_eq!(shown["signers"][1]["name"], "first", "{shown}");
+}

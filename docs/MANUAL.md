@@ -404,6 +404,18 @@ byte, side by side or unified.
     a sign-in host used on an API host), give the rule a URL: it then also goes to the requests
     that URL matches, from then on. A rule with no URL leaves requests to other origins as they
     are. Macro requests are checked against the engagement scope like any other request.
+  - **Request signers:** an HMAC signature or a JWT computed as a request goes on the wire,
+    for APIs that reject a request whose signature doesn't match (see *Request signing* under
+    the CLI options below). *New signer* asks for a name, the origins it may sign for, where the
+    value goes, and what to make: for an HMAC the string to sign, the hash (SHA-1, SHA-256,
+    SHA-384 or SHA-512) and the output, for a JWT the algorithm (HS256, HS384, HS512 or RS256)
+    and the claims. There is no field for the key itself: give the name of an environment
+    variable, or the full path of a file, and it is read when the signer first signs. A variable
+    has to be set where the app was started, so a key file is simpler for an app started from
+    a desktop launcher. *Edit* replaces the signer and keeps its place and name, since rules use
+    it by name; *Run last* moves it after the others, for one that covers another's signature; a
+    signer a rule uses can't be removed until the rule is. A session rule's *Sign request*
+    action turns a signer on.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
@@ -584,7 +596,9 @@ and targets that want a JWT you choose the claims of:
   an HMAC, or `--jwt HS256|HS384|HS512|RS256 [--claims JSON] [--ttl SECONDS] [--kid ID] [--resign]`
   for a JWT. `--secret-encoding hex|base64` decodes the key; RS256 takes a PEM private key.
   `auth sign list/remove`. Then `auth rule add PROFILE --action sign:NAME [--tool ...] [--url ...]`
-  turns it on; a rule's `check` doesn't skip its `sign`.
+  turns it on; a rule's `check` doesn't skip its `sign`. Adding a name that exists replaces the
+  signer and runs it last, or keeps its place with `--keep-place`. Settings › Auth profiles has
+  all of this too.
 - Templates use `{{method}}`, `{{host}}`, `{{path}}`, `{{query}}`, `{{body}}`, `{{body_sha256}}`,
   `{{body_sha256_base64}}`, `{{timestamp}}`, `{{timestamp_ms}}`, `{{nonce}}` and `{{header:NAME}}`;
   anything else is refused when the signer is saved. `--canonical` reads `\n`, `\r`, `\t` and `\\`

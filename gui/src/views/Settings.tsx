@@ -27,7 +27,7 @@ import {
   type UpstreamForm,
 } from "./connection";
 import { MacroBuilder, SessionHandling } from "./SessionHandling";
-import type { MacroSummary, SessionRule } from "./sessionRules";
+import type { MacroSummary, SessionRule, Signer } from "./sessionRules";
 import NOTICE from "../../../NOTICE?raw";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "data" | "project" | "licenses";
@@ -283,6 +283,7 @@ interface Shown {
   session: Session;
   macros: MacroSummary[];
   rules: SessionRule[];
+  signers: Signer[];
 }
 
 function Auth() {
@@ -666,6 +667,7 @@ function Auth() {
             profile={shown.profile.name}
             macros={shown.macros ?? []}
             rules={shown.rules ?? []}
+            signers={shown.signers ?? []}
             hasCheckUrl={!!shown.profile.check_url}
             hasLogin={!!shown.profile.login_url}
             onChange={() => show(shown.profile.name)}

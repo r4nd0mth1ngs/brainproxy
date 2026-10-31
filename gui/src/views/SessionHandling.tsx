@@ -1,25 +1,37 @@
-// Settings › Auth profiles › a profile's macros and session rules. A macro is built by
-// picking requests from Traffic in order and saying what to extract from each response; a
-// rule says, for some tools and URLs, what to do before each request goes out.
+// Settings › Auth profiles › a profile's macros, session rules and request signers. A macro
+// is built by picking requests from Traffic in order and saying what to extract from each
+// response; a rule says, for some tools and URLs, what to do before each request goes out; a
+// signer says how to compute a rule's signature or JWT, and where its key is.
 
 import { useEffect, useState } from "react";
 import { run } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import {
+  EMPTY_SIGNER,
   EXTRACT_FROM,
+  HMAC_HASHES,
+  HMAC_OUTPUTS,
+  JWT_ALGS,
+  KEY_ENCODINGS,
   TOOLS,
   actionLabel,
   macroAddArgs,
   parseParams,
   ruleAddArgs,
   ruleProblems,
+  signerAddArgs,
+  signerForm,
+  signerLabel,
+  signerProblems,
   type Action,
   type ExtractRow,
   type MacroRun,
   type MacroSummary,
   type RuleForm,
   type SessionRule,
+  type Signer,
+  type SignerForm,
   type Tool,
 } from "./sessionRules";
 
@@ -27,6 +39,7 @@ interface Props {
   profile: string;
   macros: MacroSummary[];
   rules: SessionRule[];
+  signers: Signer[];
   hasCheckUrl: boolean;
   hasLogin: boolean;
   /** Reload the profile after a change. */
@@ -49,6 +62,7 @@ export function SessionHandling(p: Props) {
   const exec = useExec();
   const [building, setBuilding] = useState(false);
   const [ruleForm, setRuleForm] = useState<RuleForm | null>(null);
+  const [signer, setSigner] = useState<{ form: SignerForm; editing: boolean } | null>(null);
   const [runs, setRuns] = useState<Record<string, MacroRun | string>>({});
   const [busy, setBusy] = useState("");
 
@@ -71,6 +85,14 @@ export function SessionHandling(p: Props) {
   const removeRule = async (id: number) => {
     if (await exec(["auth", "rule", "remove", "--", p.profile, String(id)])) p.onChange();
   };
+  const removeSigner = async (name: string) => {
+    if (!(await confirm(`Remove signer ${name}?`, "Session rules that use it must be removed first.", "Remove", "Cancel"))) return;
+    if (await exec(["auth", "sign", "remove", "--", p.profile, name])) {
+      if (signer?.editing && signer.form.name === name) setSigner(null);
+      p.onChange();
+    }
+  };
+  const signerNames = p.signers.map((s) => s.name);
 
   return (
     <>
@@ -179,7 +201,8 @@ export function SessionHandling(p: Props) {
           form={ruleForm}
           setForm={setRuleForm}
           macros={p.macros.map((m) => m.name)}
-          problems={ruleProblems(ruleForm, p.macros.map((m) => m.name), p.hasCheckUrl, p.hasLogin)}
+          signers={signerNames}
+          problems={ruleProblems(ruleForm, p.macros.map((m) => m.name), signerNames, p.hasCheckUrl, p.hasLogin)}
           onSave={async () => {
             if (await exec(ruleAddArgs(p.profile, ruleForm))) {
               setRuleForm(null);
@@ -208,6 +231,61 @@ export function SessionHandling(p: Props) {
             }
           >
             New session rule
+          </button>
+        </div>
+      )}
+
+      <h3>Request signers</h3>
+      <p className="muted small">
+        An HMAC signature or a JWT, computed as a request goes on the wire. A session rule's <em>Sign request</em> action turns
+        one on. A signer holds where its key is, never the key, and history keeps a placeholder.
+      </p>
+      {p.signers.length === 0 && !signer && <div className="muted small">No signers.</div>}
+      {p.signers.map((s, i) => (
+        <div key={s.name} className="sh-card">
+          <div className="row gap">
+            <strong className="mono">{s.name}</strong>
+            <span className="muted small">{signerLabel(s)}</span>
+            <span className="grow" />
+            {i < p.signers.length - 1 && (
+              <button
+                className="btn small"
+                title="Signers run in this order. One that covers another's signature has to run after it."
+                onClick={async () => {
+                  if (await exec(signerAddArgs(p.profile, signerForm(s)))) p.onChange();
+                }}
+              >
+                Run last
+              </button>
+            )}
+            <button className="btn small" onClick={() => setSigner({ form: signerForm(s), editing: true })}>
+              Edit
+            </button>
+            <button className="btn small" onClick={() => removeSigner(s.name)}>
+              Remove
+            </button>
+          </div>
+          <div className="mono small muted">{s.origins.join(", ")}</div>
+        </div>
+      ))}
+      {signer ? (
+        <SignerBuilder
+          form={signer.form}
+          editing={signer.editing}
+          setForm={(form) => setSigner({ ...signer, form })}
+          problems={signerProblems(signer.form, signer.editing ? [] : signerNames)}
+          onSave={async () => {
+            if (await exec(signerAddArgs(p.profile, signer.form, signer.editing))) {
+              setSigner(null);
+              p.onChange();
+            }
+          }}
+          onCancel={() => setSigner(null)}
+        />
+      ) : (
+        <div className="row gap set-actions">
+          <button className="btn" onClick={() => setSigner({ form: EMPTY_SIGNER, editing: false })}>
+            New signer
           </button>
         </div>
       )}
@@ -360,6 +438,7 @@ function RuleBuilder(p: {
   form: RuleForm;
   setForm: (f: RuleForm) => void;
   macros: string[];
+  signers: string[];
   problems: string[];
   onSave: () => void;
   onCancel: () => void;
@@ -376,7 +455,9 @@ function RuleBuilder(p: {
           ? { action: "run_macro", macro: p.macros[0] ?? "", every: 1 }
           : kind === "update"
             ? { action: "update", params: [] }
-            : { action: "login" };
+            : kind === "sign"
+              ? { action: "sign", signer: p.signers[0] ?? "" }
+              : { action: "login" };
     set({ actions: [...f.actions, a] });
   };
   return (
@@ -447,7 +528,13 @@ function RuleBuilder(p: {
               />
             )}
             {a.action === "login" && <span className="muted">with the profile, if not logged in</span>}
-            {a.action === "sign" && <span className="mono">{a.signer}</span>}
+            {a.action === "sign" && (
+              <select className="input" value={a.signer} onChange={(e) => setAction(i, { ...a, signer: e.target.value })}>
+                {p.signers.map((s) => (
+                  <option key={s}>{s}</option>
+                ))}
+              </select>
+            )}
             <button className="btn small" onClick={() => set({ actions: f.actions.filter((_, k) => k !== i) })}>
               ✕
             </button>
@@ -468,6 +555,9 @@ function RuleBuilder(p: {
         <button className="btn small" onClick={() => add("login")}>
           Log in
         </button>
+        <button className="btn small" disabled={!p.signers.length} onClick={() => add("sign")}>
+          Sign request
+        </button>
       </div>
       {p.problems.map((m) => (
         <div key={m} className="set-err small">
@@ -477,6 +567,170 @@ function RuleBuilder(p: {
       <div className="row gap set-actions">
         <button className="btn primary" disabled={p.problems.length > 0} onClick={p.onSave}>
           Save rule
+        </button>
+        <button className="btn" onClick={p.onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SignerBuilder(p: {
+  form: SignerForm;
+  editing: boolean;
+  setForm: (f: SignerForm) => void;
+  problems: string[];
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  const f = p.form;
+  const set = (patch: Partial<SignerForm>) => p.setForm({ ...f, ...patch });
+  return (
+    <div className="sh-card">
+      <div className="form">
+        <label>
+          <span className="label">{p.editing ? "Signer name (session rules use it, so it stays)" : "Signer name"}</span>
+          <input className="input mono" value={f.name} disabled={p.editing} placeholder="api-hmac" onChange={(e) => set({ name: e.target.value })} />
+        </label>
+        <div>
+          <span className="label">Makes</span>
+          <div className="seg">
+            <button className={f.kind === "hmac" ? "on" : ""} onClick={() => set({ kind: "hmac" })}>
+              HMAC
+            </button>
+            <button className={f.kind === "jwt" ? "on" : ""} onClick={() => set({ kind: "jwt" })}>
+              JWT
+            </button>
+          </div>
+        </div>
+        <div>
+          <span className="label">Key is in</span>
+          <div className="seg">
+            <button className={f.keyFrom === "env" ? "on" : ""} onClick={() => set({ keyFrom: "env" })}>
+              Env variable
+            </button>
+            <button className={f.keyFrom === "file" ? "on" : ""} onClick={() => set({ keyFrom: "file" })}>
+              File
+            </button>
+          </div>
+        </div>
+        <label>
+          <span className="label">{f.keyFrom === "env" ? "Environment variable (of the app, read when signing, never stored)" : "Full path of the file (read when signing, never stored)"}</span>
+          <input
+            className="input mono"
+            value={f.key}
+            placeholder={f.keyFrom === "env" ? "API_SECRET" : "/home/me/keys/api.pem"}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(e) => set({ key: e.target.value })}
+          />
+        </label>
+        <label>
+          <span className="label">Key is written as</span>
+          <select className="input" value={f.keyEncoding} onChange={(e) => set({ keyEncoding: e.target.value as SignerForm["keyEncoding"] })}>
+            {KEY_ENCODINGS.map((k) => (
+              <option key={k}>{k}</option>
+            ))}
+          </select>
+        </label>
+        <label className="wide">
+          <span className="label">Origins it may sign for, one per line</span>
+          <textarea className="input area mono" value={f.origins} placeholder="https://api.test" onChange={(e) => set({ origins: e.target.value })} />
+        </label>
+        <div>
+          <span className="label">Value goes in</span>
+          <div className="seg">
+            <button className={f.toKind === "header" ? "on" : ""} onClick={() => set({ toKind: "header" })}>
+              Header
+            </button>
+            <button className={f.toKind === "query" ? "on" : ""} onClick={() => set({ toKind: "query" })}>
+              Query
+            </button>
+          </div>
+        </div>
+        <label>
+          <span className="label">{f.toKind === "header" ? "Header name" : "Query parameter"}</span>
+          <input className="input mono" value={f.toName} placeholder={f.toKind === "header" ? "X-Signature" : "sig"} onChange={(e) => set({ toName: e.target.value })} />
+        </label>
+        {f.toKind === "header" && (
+          <label>
+            <span className="label">Header format</span>
+            <input className="input mono" value={f.wrap} placeholder="Bearer {{signature}}" onChange={(e) => set({ wrap: e.target.value })} />
+          </label>
+        )}
+        <label className="wide">
+          <span className="label">Headers to set before signing, NAME: TEMPLATE, one per line</span>
+          <textarea className="input area mono" value={f.headers} placeholder="X-Timestamp: {{timestamp}}" onChange={(e) => set({ headers: e.target.value })} />
+        </label>
+        {f.kind === "hmac" ? (
+          <>
+            <label className="wide">
+              <span className="label">String to sign (\n, \r, \t and \\ are escapes)</span>
+              <textarea
+                className="input area mono"
+                value={f.canonical}
+                placeholder={"{{method}}\\n{{path}}\\n{{query}}\\n{{header:X-Timestamp}}\\n{{body_sha256}}"}
+                onChange={(e) => set({ canonical: e.target.value })}
+              />
+            </label>
+            <label>
+              <span className="label">Hash</span>
+              <select className="input" value={f.hash} onChange={(e) => set({ hash: e.target.value as SignerForm["hash"] })}>
+                {HMAC_HASHES.map((h) => (
+                  <option key={h}>{h}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span className="label">Output</span>
+              <select className="input" value={f.output} onChange={(e) => set({ output: e.target.value as SignerForm["output"] })}>
+                {HMAC_OUTPUTS.map((o) => (
+                  <option key={o}>{o}</option>
+                ))}
+              </select>
+            </label>
+          </>
+        ) : (
+          <>
+            <label>
+              <span className="label">Algorithm (RS256 takes a PEM private key)</span>
+              <select className="input" value={f.jwtAlg} onChange={(e) => set({ jwtAlg: e.target.value as SignerForm["jwtAlg"] })}>
+                {JWT_ALGS.map((a) => (
+                  <option key={a}>{a}</option>
+                ))}
+              </select>
+            </label>
+            <label className="wide">
+              <span className="label">Claims, a JSON object template</span>
+              <textarea className="input area mono" value={f.claims} placeholder={'{"sub":"admin"}'} onChange={(e) => set({ claims: e.target.value })} />
+            </label>
+            <label>
+              <span className="label">Valid for, seconds (sets iat and exp)</span>
+              <input className="input" value={f.ttl} placeholder="300" onChange={(e) => set({ ttl: e.target.value })} />
+            </label>
+            <label>
+              <span className="label">kid header</span>
+              <input className="input mono" value={f.kid} onChange={(e) => set({ kid: e.target.value })} />
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={f.resign} onChange={(e) => set({ resign: e.target.checked })} />
+              Start from the JWT in the request, claims on top
+            </label>
+          </>
+        )}
+      </div>
+      <p className="muted small">
+        Templates can use <span className="mono">{"{{method}} {{host}} {{path}} {{query}} {{body}} {{body_sha256}} {{body_sha256_base64}} {{timestamp}} {{timestamp_ms}} {{nonce}} {{header:NAME}}"}</span>.
+      </p>
+      {p.problems.map((m) => (
+        <div key={m} className="set-err small">
+          {m}
+        </div>
+      ))}
+      <div className="row gap set-actions">
+        <button className="btn primary" disabled={p.problems.length > 0} onClick={p.onSave}>
+          Save signer
         </button>
         <button className="btn" onClick={p.onCancel}>
           Cancel
