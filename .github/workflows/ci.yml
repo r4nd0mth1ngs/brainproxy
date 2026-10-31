@@ -130,6 +130,29 @@ jobs:
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
 
+  # The container image: built and smoke-tested here, not pushed anywhere.
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t brainproxy:ci .
+      - name: Smoke test
+        run: |
+          docker run --rm brainproxy:ci --version
+          docker run --rm brainproxy:ci --format json capabilities > /dev/null
+          # A project on a bind mount owned by the runner's user.
+          mkdir smoke
+          run="docker run --rm --user $(id -u):$(id -g) -v $PWD/smoke:/work brainproxy:ci --format json"
+          $run engagement start --target 127.0.0.1
+          $run ca init > /dev/null
+          ls -la smoke
+          test -f smoke/brainproxy.bpdb
+          test -d smoke/.brainproxy/ca
+
   windows:
     needs: check
     runs-on: windows-latest
