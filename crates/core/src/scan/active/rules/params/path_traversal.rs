@@ -323,8 +323,15 @@ impl ActiveRule for PathTraversal {
                     return;
                 }
                 let attack = format!("{prefix}{file_name}");
+                // The original request, as on a URL path's last segment: it proves nothing.
+                if attack == cx.point().value {
+                    continue;
+                }
                 let Ok(resp) = common::send_following(cx, &attack).await else { continue };
-                if resp.status == 200 && !ERROR_PATTERN.is_match(resp.body_str()) {
+                // The same page as the original request (a server that normalises `/x` to `x`)
+                // is not the file's contents.
+                let unchanged = resp.body_str() == cx.base_response().body_str();
+                if resp.status == 200 && !unchanged && !ERROR_PATTERN.is_match(resp.body_str()) {
                     let f = ALERT_5.raise(cx.point().name.clone(), "").attack(attack).confidence(Confidence::Low);
                     cx.report(f, &resp);
                     return;
