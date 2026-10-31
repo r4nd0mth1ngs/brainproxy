@@ -29,9 +29,9 @@ use serde_json::Value;
 use crate::auth::{encode, placeholder, request_cookies, response_text, AuthProfile, AuthSession, Enc};
 use crate::capture::decode_body;
 use crate::error::{Error, Result};
-use crate::http::request::{find, split_head_body};
+use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, RawRequest, Target};
-use crate::scan::active::points::{inject, points, PointKind, PointOptions};
+use crate::scan::active::points::{inject, multipart_parts, points, PointKind, PointOptions};
 use crate::scan::message::SetCookie;
 use crate::store::Store;
 
@@ -980,7 +980,8 @@ fn fill_vars(tpl: &str, value: impl Fn(&str, Enc) -> Option<String>) -> String {
 /// header and cookie named `name` set to the placeholder for its context.
 fn set_param(raw: &[u8], name: &str, cookies: bool, ph: impl Fn(Enc) -> String) -> Vec<u8> {
     let mut out = raw.to_vec();
-    let opts = PointOptions { cookies, ..Default::default() };
+    // Multipart fields are set below; a session value has no place in XML.
+    let opts = PointOptions { cookies, multipart: false, xml: false, ..Default::default() };
     // Values change, not positions; re-read the points after each change all the same.
     let mut done = 0;
     loop {
@@ -1020,48 +1021,7 @@ fn set_param(raw: &[u8], name: &str, cookies: bool, ph: impl Fn(Enc) -> String) 
 /// The non-file fields of a multipart/form-data request: name and the byte range of
 /// its value in `raw`.
 pub(crate) fn multipart_fields(raw: &[u8]) -> Vec<(String, std::ops::Range<usize>)> {
-    let boundary = RawRequest::from_bytes(raw.to_vec()).head().ok().and_then(|h| {
-        let ct = h.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type"))?.1.clone();
-        if !ct.to_ascii_lowercase().starts_with("multipart/form-data") {
-            return None;
-        }
-        ct.split(';').find_map(|p| p.trim().strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string()))
-    });
-    let Some(boundary) = boundary.filter(|b| !b.is_empty()) else { return vec![] };
-    let body_start = split_head_body(raw).0.len();
-    let delim = format!("--{boundary}").into_bytes();
-    // Where each delimiter starts, in `raw`.
-    let mut marks = Vec::new();
-    let mut at = body_start;
-    while let Some(i) = find(&raw[at..], &delim) {
-        marks.push(at + i);
-        at += i + delim.len();
-    }
-    let mut out = Vec::new();
-    for pair in marks.windows(2) {
-        let (start, end) = (pair[0] + delim.len(), pair[1]);
-        let part = &raw[start..end];
-        let Some(h) = find(part, b"\r\n\r\n") else { continue };
-        let headers = String::from_utf8_lossy(&part[..h]);
-        let Some(disposition) = headers.lines().find(|l| l.to_ascii_lowercase().starts_with("content-disposition"))
-        else {
-            continue;
-        };
-        let params: Vec<(String, String)> = disposition
-            .split(';')
-            .skip(1)
-            .filter_map(|p| p.split_once('='))
-            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string()))
-            .collect();
-        if params.iter().any(|(k, _)| k == "filename") {
-            continue;
-        }
-        let Some((_, name)) = params.into_iter().find(|(k, _)| k == "name") else { continue };
-        // The value runs to the CRLF before the next delimiter.
-        let value_end = if part.ends_with(b"\r\n") { end - 2 } else { end };
-        out.push((name, start + h + 4..value_end.max(start + h + 4)));
-    }
-    out
+    multipart_parts(raw).into_iter().filter(|p| p.filename.is_none()).map(|p| (p.name, p.value)).collect()
 }
 
 /// A multipart/form-data body with the (non-file) field `name` set to `value`; every
@@ -1143,6 +1103,7 @@ fn json_path(v: &Value, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::request::find;
 
     fn x(from: ExtractFrom, expr: &str) -> Extractor {
         Extractor { var: "v".into(), from, expr: expr.into() }

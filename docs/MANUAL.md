@@ -218,8 +218,11 @@ attack type, and pick payloads:
     and URL paths mentioned in page text or scripts (error pages included); placeholder
     values such as `?key=…` or `/users/{id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them
-    (the guided Standard and Thorough scans do). For single-page apps, tick *Run JavaScript
-    (browser)* (see below).
+    (the guided Standard and Thorough scans do), and *Inject into URL paths* to attack each
+    path segment, such as the ID in `/users/42` (`scan active --url-path`; it sends many more
+    requests). XML and multipart bodies are attacked by default, including the file name of
+    an upload but not its content. For single-page apps, tick *Run JavaScript (browser)* (see
+    below).
     The crawl stays on the site URLs' origins (scheme, host and port); an `http://` site
     also covers `https://` on port 443 of the same host, since sites redirect there.
   - **Audit everything recorded:** attacks all traffic already in the project.

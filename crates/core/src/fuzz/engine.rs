@@ -139,13 +139,8 @@ pub async fn run(
         let mut params: Vec<String> = crate::scan::active::points::points(&rendered, &Default::default())
             .into_iter()
             .filter(|p| p.value.contains(SENTINEL))
-            .map(|p| p.name.rsplit('.').next().unwrap_or(&p.name).to_string())
+            .map(|p| p.session_name().to_string())
             .collect();
-        for (name, range) in crate::session::multipart_fields(&rendered) {
-            if String::from_utf8_lossy(&rendered[range]).contains(SENTINEL) {
-                params.push(name);
-            }
-        }
         if let Ok(h) = RawRequest::from_bytes(rendered).head() {
             params.extend(h.headers.into_iter().filter(|(_, v)| v.contains(SENTINEL)).map(|(k, _)| k));
         }

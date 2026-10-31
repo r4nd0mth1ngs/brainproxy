@@ -162,8 +162,6 @@ mod e2e {
     }
 
     async fn scan(name: &str, port: u16, paths: &[&str], rules: Option<Vec<u32>>) -> ActiveSummary {
-        let project = std::env::temp_dir().join(format!("bp-params-{name}-{}.bpdb", std::process::id()));
-        let _ = std::fs::remove_file(&project);
         let targets = paths
             .iter()
             .map(|p| {
@@ -172,6 +170,17 @@ mod e2e {
                 ScanTarget { history_id: None, target, request, response, duration_ms: None }
             })
             .collect();
+        scan_targets(name, targets, PointOptions::default(), rules).await
+    }
+
+    async fn scan_targets(
+        name: &str,
+        targets: Vec<ScanTarget>,
+        points: PointOptions,
+        rules: Option<Vec<u32>>,
+    ) -> ActiveSummary {
+        let project = std::env::temp_dir().join(format!("bp-params-{name}-{}.bpdb", std::process::id()));
+        let _ = std::fs::remove_file(&project);
         let guard =
             Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }])
                 .unwrap();
@@ -180,7 +189,7 @@ mod e2e {
             concurrency: 4,
             rate: None,
             send: SendOptions { guard: Some(guard), timeout: Duration::from_secs(10), ..Default::default() },
-            points: PointOptions::default(),
+            points,
             rules,
             exclude_rules: vec![],
             no_rules: false,
@@ -193,6 +202,68 @@ mod e2e {
         let summary = run(&project, targets, cfg, JobControl::default()).await.unwrap();
         let _ = std::fs::remove_file(&project);
         summary
+    }
+
+    /// Reflects the request unescaped: the decoded path, or a body as the app would read
+    /// it, with XML entities resolved.
+    fn spawn_reflector() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65536];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (head, body) = req.split_once("\r\n\r\n").unwrap_or((&req, ""));
+                    let path = url_decode(head.split(' ').nth(1).unwrap_or("/"));
+                    let body = body.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"");
+                    let page = format!("<html><body><p>{path}</p><p>{body}</p></body></html>");
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                            page.len()
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attacks_reach_multipart_xml_and_path() {
+        let port = spawn_reflector();
+        let post = |path: &str, ct: &str, body: &str| {
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes();
+            ScanTarget {
+                history_id: None,
+                target: Target::from_url(&format!("http://127.0.0.1:{port}{path}")).unwrap(),
+                request,
+                response: b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                duration_ms: None,
+            }
+        };
+        let multipart = "--b\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--b--\r\n";
+        let targets = vec![
+            post("/m", "multipart/form-data; boundary=b", multipart),
+            post("/x", "application/xml", "<note>hi</note>"),
+        ];
+        let s = scan_targets("bodies", targets, PointOptions::default(), Some(vec![40012])).await;
+        assert_eq!(s.raised.get("40012"), Some(&2), "{s:?}");
+
+        let target = |path: &str| post(path, "text/plain", "");
+        let opts = PointOptions { path: true, ..Default::default() };
+        let s = scan_targets("path", vec![target("/users/42")], opts, Some(vec![40012])).await;
+        assert_eq!(s.raised.get("40012"), Some(&2), "one per path segment: {s:?}");
+        let s = scan_targets("nopath", vec![target("/users/42")], PointOptions::default(), Some(vec![40012])).await;
+        assert_eq!(s.raised.get("40012"), None, "URL paths are opt-in: {s:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

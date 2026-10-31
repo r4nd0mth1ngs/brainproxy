@@ -211,8 +211,9 @@ http:
 
 - `scope: host` runs once per origin (Nuclei's behaviour); `request` once per target
   request, with `{{BaseURL}}` = that request's URL without the query; `param` once per
-  insertion point (query, form, JSON, and with `scan active --cookies`/`--inject-header`
-  cookies and headers), sending each `inject` value.
+  insertion point (query, form, JSON, XML, multipart, and with `scan active`'s `--cookies`,
+  `--inject-header` and `--url-path`, cookies, headers and URL path segments), sending each
+  `inject` value.
 - `path` requests reuse the attacked request's headers (cookies, auth) with the
   template's method, path, headers, and body.
 - `info.confidence` sets the finding confidence (Nuclei has none; default medium).

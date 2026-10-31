@@ -208,8 +208,8 @@ fn oob_confirms_log4shell_and_xxe_and_manual_payloads() {
     assert_eq!(d["raised"]["40043-1"], 1, "{d}");
     assert_eq!(d["raised"]["90023"], 1, "{d}");
     assert!(d["raised"].get("40043-2").is_none(), "45046 patterns need DNS mode: {d}");
-    // 10 Log4Shell patterns minus jndi:dns, plus one XXE payload.
-    assert_eq!(d["oob"]["payloads"], 10, "{d}");
+    // 10 Log4Shell patterns minus jndi:dns at each of `q` and the XML value, plus one XXE payload.
+    assert_eq!(d["oob"]["payloads"], 19, "{d}");
     assert!(d["oob"]["matched"].as_u64().unwrap() >= 2, "{d}");
     assert!(d["new_findings"].as_u64().unwrap() >= 2, "{d}");
 
@@ -269,7 +269,7 @@ fn oob_confirms_log4shell_and_xxe_and_manual_payloads() {
     let (code, v) = run(&["oob", "status"], &project);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["running"], true);
-    assert_eq!(v["data"]["payloads"], 11, "{v}");
+    assert_eq!(v["data"]["payloads"], 20, "{v}");
     let (code, v) = run(&["oob", "stop"], &project);
     assert_eq!(code, 0, "{v}");
     let (_, v) = run(&["oob", "status"], &project);

@@ -355,7 +355,7 @@ impl Cx {
         // The attacked cookie or parameter keeps its payload.
         let (cookie, param): (Vec<&str>, Vec<&str>) = match &self.point {
             Some(p) if p.kind == PointKind::Cookie => (vec![p.name.as_str()], vec![]),
-            Some(p) => (vec![], vec![p.name.rsplit('.').next().unwrap_or(&p.name)]),
+            Some(p) => (vec![], vec![p.session_name()]),
             None => (vec![], vec![]),
         };
         let prepared = auth.prepare(self.tool, target, &request, &cookie, &param).await;

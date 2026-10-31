@@ -105,6 +105,13 @@ pub struct ActiveArgs {
     no_form: bool,
     #[arg(long)]
     no_json: bool,
+    #[arg(long)]
+    no_multipart: bool,
+    #[arg(long)]
+    no_xml: bool,
+    /// Also inject into URL path segments, such as IDs in REST paths.
+    #[arg(long)]
+    url_path: bool,
     /// Concurrent rule units.
     #[arg(short = 'c', long, default_value_t = 10)]
     concurrency: usize,
@@ -187,6 +194,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         query: !args.no_query,
         form: !args.no_form,
         json: !args.no_json,
+        multipart: !args.no_multipart,
+        xml: !args.no_xml,
+        path: args.url_path,
         cookies: args.cookies,
         headers: args.inject_headers.clone(),
     };

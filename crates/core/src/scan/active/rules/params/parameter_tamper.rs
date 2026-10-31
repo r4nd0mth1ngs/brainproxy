@@ -2,7 +2,9 @@
 //!
 //! ZAP's first attack removes the parameter (`setParameter(msg, null, null)`). The
 //! insertion point API cannot remove values, so [`remove_point`] builds that request
-//! locally: a marker is injected, then the pair carrying it is dropped.
+//! locally: a marker is injected, then the pair carrying it is dropped. A multipart
+//! part goes whole. XML and path values are emptied instead, since dropping them would
+//! change the structure the request is parsed by rather than leave out one parameter.
 
 use std::sync::LazyLock;
 
@@ -95,6 +97,11 @@ pub(crate) fn remove_point(raw: &[u8], point: &InsertionPoint) -> Vec<u8> {
     if point.kind == PointKind::Header {
         return RawRequest::from_bytes(raw.to_vec()).remove_header(&point.name).into_bytes();
     }
+    match point.kind {
+        PointKind::Multipart => return points::remove_multipart_part(raw, point),
+        PointKind::Xml | PointKind::Path => return points::inject(raw, point, "", false),
+        _ => {}
+    }
     let marked = points::inject(raw, point, MARKER, false);
     let (head, body) = split_head_body(&marked);
     let mut head = String::from_utf8_lossy(head).into_owned();
@@ -143,7 +150,7 @@ pub(crate) fn remove_point(raw: &[u8], point: &InsertionPoint) -> Vec<u8> {
                 .collect();
             head = format!("{}\r\n\r\n", lines.join("\r\n"));
         }
-        PointKind::Header => {}
+        PointKind::Header | PointKind::Multipart | PointKind::Xml | PointKind::Path => {}
     }
     RawRequest::from_bytes([head.as_bytes(), &body].concat()).update_content_length().into_bytes()
 }

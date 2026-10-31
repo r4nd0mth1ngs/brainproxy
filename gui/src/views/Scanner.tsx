@@ -314,6 +314,9 @@ const SCAN_DEFAULTS = {
   noQuery: false,
   noForm: false,
   noJson: false,
+  noMultipart: false,
+  noXml: false,
+  urlPath: false,
   noRules: false,
   noOob: false,
   http2: false,
@@ -589,6 +592,9 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...flag("--no-query", f.noQuery),
           ...flag("--no-form", f.noForm),
           ...flag("--no-json", f.noJson),
+          ...flag("--no-multipart", f.noMultipart),
+          ...flag("--no-xml", f.noXml),
+          ...flag("--url-path", f.urlPath),
           ...flag("--no-oob", f.noOob),
           ...flag("--http2", f.http2),
           ...flag("--verify-tls", f.verifyTls),
@@ -852,9 +858,12 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         ) : kind === "scan" ? (
           <>
             {check("Inject into cookies", "cookies")}
+            {check("Inject into URL paths", "urlPath")}
             {check("Skip query", "noQuery")}
             {check("Skip form bodies", "noForm")}
             {check("Skip JSON bodies", "noJson")}
+            {check("Skip multipart bodies", "noMultipart")}
+            {check("Skip XML bodies", "noXml")}
             {check("Checks only (no rules)", "noRules")}
             {check("No out-of-band", "noOob")}
             {mode === "crawl" && browserCheck()}
