@@ -2078,6 +2078,9 @@ button.chip {
   background: color-mix(in oklch, var(--high) 12%, var(--panel-2));
   margin-bottom: 8px;
 }
+.wiz-warn.replay {
+  margin-bottom: 8px;
+}
 .wiz-bar {
   height: 8px;
   border-radius: 999px;

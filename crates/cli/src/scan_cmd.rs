@@ -14,6 +14,10 @@ use crate::output::Out;
 #[derive(Subcommand)]
 pub enum ScanCmd {
     /// Active scan: attack targets with the active rules (all requests stay inside the engagement scope).
+    #[command(after_help = "From history, GET, HEAD, OPTIONS and POST requests are attacked by default; others \
+        need --include-methods or --history-id. POST requests are replayed with attack payloads, often many \
+        times, and can change data or trigger side effects such as email. \
+        When any are attacked, the result has post_targets (how many) and post_hint.")]
     Active(Box<crate::active_cmd::ActiveArgs>),
     /// Run the passive rules over captures not scanned yet (this also happens
     /// automatically after send, proxy traffic, and before `findings`).
