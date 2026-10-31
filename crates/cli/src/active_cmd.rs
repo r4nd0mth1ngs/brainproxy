@@ -306,6 +306,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                         "blocked_requests": b.blocked_count,
                     });
                 }
+                // The scan's own clock starts after this, so its timed_out won't say.
+                if cfg.max_duration.is_some_and(|d| crawl_started.elapsed() >= d) {
+                    crawled["timed_out"] = json!(true);
+                }
                 if ctl.stopped() {
                     return Ok(json!({"crawl": crawled, "stopped": true}));
                 }

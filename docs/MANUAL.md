@@ -661,11 +661,11 @@ These don't pass a gate:
   first run: every finding is new, so the gate still sees them all, and `data.baseline.missing` is
   true. A file that exists but can't be read as a baseline always fails.
 - A `--project` that doesn't exist fails with `4` rather than being created empty.
-- A scan that failed or was stopped found less than it should have, so `--fail-on` refuses it with
-  `2`. Without `--fail-on` the comparison runs with a warning.
+- A scan that failed, was stopped, or ran out of `--max-minutes` found less than it should have, so
+  `--fail-on` refuses it with `2`. Without `--fail-on` the comparison runs with a warning.
 
-Lists are cut at `--limit` per group (`summary.truncated` says so); counts and the gate always cover
-every finding.
+Lists, including `data.gate.findings`, are cut at `--limit` per group (`summary.truncated` says so);
+counts and the gate always cover every finding.
 
 ### Access control across users (`authz`)
 

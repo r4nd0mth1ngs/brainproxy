@@ -114,7 +114,8 @@ pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
         listed(&comparison.unchanged, &a.state),
         listed(&comparison.fixed, &a.state),
     );
-    let truncated = [&new, &unchanged, &fixed].iter().any(|l| l.len() > a.limit);
+    let gate_cut = gate.as_ref().is_some_and(|(_, hits)| hits.len() > a.limit);
+    let truncated = gate_cut || [&new, &unchanged, &fixed].iter().any(|l| l.len() > a.limit);
     let data = json!({
         "baseline": baseline,
         "current": current,
@@ -174,13 +175,21 @@ fn scan_baseline(
     if kind != "active-scan" {
         return Err(Error::InvalidInput(format!("job {id} is a {kind} job, not an active scan")));
     }
-    if gating && state != "completed" {
-        return Err(Error::Conflict(format!(
-            "job {id} is {state}, so a gate can't vouch for it; wait for a scan that completes"
-        )));
-    }
-    if state != "completed" {
-        warnings.push(format!("job {id} is {state}: it may not have covered everything, so \"fixed\" may overstate"));
+    // --max-minutes ends a scan early, yet it completes: only its result says so.
+    let result = &job["result"];
+    let timed_out = result["timed_out"] == true || result["crawl"]["timed_out"] == true;
+    let incomplete = match state {
+        "completed" if timed_out => Some("timed out".to_string()),
+        "completed" => None,
+        other => Some(other.to_string()),
+    };
+    if let Some(how) = incomplete {
+        if gating {
+            return Err(Error::Conflict(format!(
+                "job {id} is {how}, so a gate can't vouch for it; wait for a scan that completes"
+            )));
+        }
+        warnings.push(format!("job {id} is {how}: it may not have covered everything, so \"fixed\" may overstate"));
     }
     let args: Vec<String> = serde_json::from_value(job["args"].clone()).unwrap_or_default();
     let mut scope = match crate::Cli::try_parse_from(std::iter::once("brainproxy".to_string()).chain(args)) {

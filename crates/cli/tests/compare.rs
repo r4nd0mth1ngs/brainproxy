@@ -185,6 +185,13 @@ fn no_baseline_means_every_finding_is_new() {
     assert_eq!(v["data"]["baseline"]["kind"], "none");
     assert_eq!(v["data"]["summary"]["unchanged"], 0);
     assert!(ends_with(&v["data"]["new"], "/a"));
+    // A gate list cut at --limit says so, even when the groups listed aren't cut.
+    let (code, v) = env.compare(&["--state", "confirmed", "--fail-on", "info", "--limit", "1"]);
+    assert_eq!(code, 5, "{v}");
+    assert_eq!(v["data"]["summary"]["new"], 0);
+    assert_eq!(v["data"]["gate"]["findings"].as_array().unwrap().len(), 1);
+    assert!(v["data"]["gate"]["count"].as_u64().unwrap() > 1);
+    assert_eq!(v["data"]["summary"]["truncated"], true);
     // The plain severity gate, with no baseline at all.
     assert_eq!(env.compare(&["--fail-on", "high"]).0, 0);
     assert_eq!(env.compare(&["--fail-on", "info"]).0, 5);
@@ -379,6 +386,19 @@ fn compare_with_a_scan_and_gate_it() {
     let (code, v) = env.compare(&["--scan", &failed, "--fail-on", "high"]);
     assert_eq!(code, 2, "{v}");
     assert_eq!(v["error"]["kind"], "conflict");
+
+    // --max-minutes ends a scan early and it still completes: only the result says so.
+    for result in [serde_json::json!({"timed_out": true}), serde_json::json!({"crawl": {"timed_out": true}})] {
+        let timed = scan_job(&env, &args, "completed", || {});
+        Store::open(&env.project).unwrap().job_result(timed, &result).unwrap();
+        let timed = timed.to_string();
+        let (code, v) = env.compare(&["--scan", &timed]);
+        assert_eq!(code, 0, "{v}");
+        assert!(v["data"]["warnings"][0].as_str().unwrap().contains("timed out"), "{v}");
+        let (code, v) = env.compare(&["--scan", &timed, "--fail-on", "high"]);
+        assert_eq!(code, 2, "{v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("timed out"), "{v}");
+    }
 }
 
 #[test]
