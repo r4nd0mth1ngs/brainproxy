@@ -96,6 +96,15 @@ pub enum FindingsCmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Compare findings with a baseline (new, unchanged, fixed) and optionally fail on a risk (exit code 5).
+    #[command(
+        after_help = "The baseline is a file (`report json --state all --no-evidence`), a background active scan of this project (--scan), or nothing, when every finding is new. Findings \
+        match by alert, method, URL without its query, and parameter. A false-positive mark on either side stays \
+        with the finding. Exit codes: 5 when --fail-on finds something; 4 when the baseline, project, or job \
+        doesn't exist (--allow-missing-baseline treats a missing baseline file as empty); 2 for a baseline that \
+        isn't usable or a --fail-on on a scan that didn't complete. The full result is printed in every case."
+    )]
+    Compare(crate::compare_cmd::CompareArgs),
     /// One finding with description, solution, references, and evidence.
     Show { id: i64 },
     /// Triage a finding.
@@ -265,10 +274,14 @@ fn update_disabled(store: &Store, ids: &[String], disable: bool, out: &Out) -> R
 }
 
 pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error> {
+    if let FindingsCmd::Compare(args) = cmd {
+        return crate::compare_cmd::compare(project, args, out);
+    }
     let mut store = Store::open(project)?;
     // Findings always reflect everything captured so far.
     passive::scan_pending(&mut store)?;
     match cmd {
+        FindingsCmd::Compare(_) => unreachable!(),
         FindingsCmd::List { risk, confidence, host, alert, state, source, all, examples, limit } => {
             let filter = FindingFilter {
                 min_risk: risk.map(RiskArg::get),

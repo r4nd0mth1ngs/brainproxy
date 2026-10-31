@@ -8,6 +8,7 @@ use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
+use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
 use brainproxy_core::session::Tool;
 use brainproxy_core::store::Store;
@@ -150,6 +151,33 @@ pub struct ActiveArgs {
     background: bool,
     #[arg(long, hide = true)]
     job_id: Option<i64>,
+}
+
+impl ActiveArgs {
+    /// What these arguments cover, for comparing findings with the scan. Sites are read the way
+    /// the scan reads them; the scan's time window is the job's.
+    pub fn scope(&self) -> ScanScope {
+        let picked = !self.history_ids.is_empty() || self.where_sql.is_some();
+        let origins = if !self.urls.is_empty() {
+            Some(self.urls.iter().filter_map(|u| Target::from_url(u).ok()).map(|t| t.origin()).collect())
+        } else if picked {
+            Some(vec![])
+        } else {
+            None
+        };
+        let by_id_only =
+            self.check_severity.is_none() && self.check_severity_max.is_none() && self.check_tags.is_empty();
+        let numbers = |ids: &[u32]| ids.iter().map(|&id| i64::from(id)).collect::<Vec<_>>();
+        ScanScope {
+            origins,
+            rules: (!self.rules.is_empty()).then(|| numbers(&self.rules)),
+            exclude_rules: numbers(&self.exclude_rules),
+            ported_rules: !self.no_rules,
+            check_ids: if !self.checks.is_empty() && by_id_only { self.check_ids.clone() } else { vec![] },
+            crawled: self.crawl,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]

@@ -4,12 +4,12 @@ import { originOf, useApp } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { compareSql, scanScope, type ScanJob, type Seen } from "./compare";
+import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
 
 const RISKS: Risk[] = ["high", "medium", "low", "info"];
 const RANK: Record<Risk, number> = { high: 0, medium: 1, low: 2, info: 3 };
 
-type Compare = "all" | Exclude<Seen, "other">;
+type Compare = "all" | Seen;
 const COMPARE: { id: Compare; label: string; title: string }[] = [
   { id: "all", label: "All findings", title: "Every finding in the project" },
   { id: "new", label: "New in", title: "First found by this scan" },
@@ -47,13 +47,13 @@ export function FindingsView({ active }: { active: boolean }) {
   const [jobs] = usePoll<{ jobs: (ScanJob & { kind: string; state: string })[] }>(() => run(["job", "list", "--limit", "100"]), 10000, active);
   const scans = useMemo(() => (jobs?.jobs ?? []).filter((j) => j.kind === "active-scan" && (j.state === "completed" || j.state === "stopped")), [jobs]);
   const scan = scans.find((j) => j.id === scanId) ?? scans[0];
-  const [seenRows, refreshSeen] = usePoll<{ rows: [number, Seen][] }>(
-    () => (scan && compare !== "all" ? run(["query", "--limit", "10000", compareSql(scanScope(scan))]) : Promise.resolve({ rows: [] })),
+  const [compared, refreshSeen] = usePoll<ScanCompare | null>(
+    () => (scan && compare !== "all" ? run<ScanCompare>(compareArgs(scan.id)) : Promise.resolve(null)),
     5000,
     active && compare !== "all",
   );
   useEffect(refreshSeen, [scan?.id, compare, refreshSeen]);
-  const seen = useMemo(() => new Map(seenRows?.rows ?? []), [seenRows]);
+  const seen = useMemo(() => seenById(compared), [compared]);
   const comparing = compare !== "all" && scan != null;
 
   const groups = useMemo(() => {
