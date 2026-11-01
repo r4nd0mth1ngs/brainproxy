@@ -701,6 +701,47 @@ pub fn inject(raw: &[u8], point: &InsertionPoint, value: &str, encode: bool) -> 
     RawRequest::from_bytes(out).update_content_length().into_bytes()
 }
 
+/// The request with the query or form pair of `point` renamed to `name` and set to
+/// `value`, both URL-encoded; None for other points. PHP and qs read `a[$ne]=` as an
+/// operator on `a`.
+pub fn inject_named(raw: &[u8], point: &InsertionPoint, name: &str, value: &str) -> Option<Vec<u8>> {
+    let Loc::Pair(i) = point.loc else { return None };
+    let pair = format!("{}={}", form_encode(name), form_encode(value));
+    let (raw_head, body) = split_head_body(raw);
+    let head = String::from_utf8_lossy(raw_head).into_owned();
+    let out = match point.kind {
+        PointKind::Query => {
+            let (method, target, version) = split_target(&head);
+            let (path, q) = target.split_once('?')?;
+            let line_end = find(raw, b"\r\n").unwrap_or(raw.len());
+            let new_q = replace_whole_pair(q, i, &pair);
+            [format!("{method} {path}?{new_q} {version}").as_bytes(), &raw[line_end..]].concat()
+        }
+        PointKind::Form => {
+            let new_b = replace_whole_pair(&String::from_utf8_lossy(body), i, &pair);
+            [head.as_bytes(), new_b.as_bytes()].concat()
+        }
+        _ => return None,
+    };
+    Some(RawRequest::from_bytes(out).update_content_length().into_bytes())
+}
+
+/// The request with the JSON value of `point` replaced by what `value` makes of the
+/// original, so it can be any JSON type; None for other points.
+pub fn inject_json(raw: &[u8], point: &InsertionPoint, value: impl FnOnce(Value) -> Value) -> Option<Vec<u8>> {
+    let Loc::Json(path) = &point.loc else { return None };
+    let (raw_head, body) = split_head_body(raw);
+    let mut v = serde_json::from_slice::<Value>(body).ok()?;
+    let slot = json_slot(&mut v, path)?;
+    *slot = value(slot.take());
+    let out = [raw_head, serde_json::to_string(&v).ok()?.as_bytes()].concat();
+    Some(RawRequest::from_bytes(out).update_content_length().into_bytes())
+}
+
+fn replace_whole_pair(s: &str, index: usize, pair: &str) -> String {
+    s.split('&').enumerate().map(|(i, p)| if i == index { pair } else { p }).collect::<Vec<_>>().join("&")
+}
+
 fn replace_pair(s: &str, index: usize, raw_value: &str) -> String {
     s.split('&')
         .enumerate()
@@ -768,6 +809,34 @@ mod tests {
         assert!(out.contains("Content-Length: 18\r\n"), "{out}");
         let out = s(inject(raw, &pts[0], "a b", false));
         assert!(out.starts_with("POST /p?a=a b&b=x%20y"), "{out}");
+    }
+
+    #[test]
+    fn renamed_pairs_and_typed_json() {
+        let raw = b"POST /p?a=1&b=2 HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nc=3";
+        let raw_form = b"POST /p HTTP/1.1\r\nHost: h\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\nc=3&d=4";
+        let pts = points(raw, &PointOptions::default());
+        let out = s(inject_named(raw, &pts[1], "b[$ne]", "x y").unwrap());
+        assert!(out.starts_with("POST /p?a=1&b%5B%24ne%5D=x+y HTTP/1.1\r\nHost: h\r\n"), "{out}");
+        let pts = points(raw_form, &PointOptions::default());
+        let out = s(inject_named(raw_form, &pts[0], "c[$gt]", "0").unwrap());
+        assert!(out.ends_with("\r\n\r\nc%5B%24gt%5D=0&d=4"), "{out}");
+        assert!(out.contains("Content-Length: 18\r\n"), "{out}");
+
+        let body = r#"{"user":{"id":7}}"#;
+        let raw = format!(
+            "POST /j HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let pts = points(&raw, &PointOptions::default());
+        let out = s(inject_json(&raw, &pts[0], |original| serde_json::json!({ "$eq": original })).unwrap());
+        assert!(out.ends_with(r#"{"user":{"id":{"$eq":7}}}"#), "{out}");
+        assert!(out.contains("Content-Length: 25\r\n"), "{out}");
+        // Each helper only takes its own kind of point.
+        assert!(inject_named(&raw, &pts[0], "x", "y").is_none());
+        let pts = points(raw_form, &PointOptions::default());
+        assert!(inject_json(raw_form, &pts[0], |v| v).is_none());
     }
 
     #[test]

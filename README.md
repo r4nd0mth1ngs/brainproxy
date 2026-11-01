@@ -277,7 +277,7 @@ brainproxy findings mark 7 --state false-positive --note "test cookie"
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off
 brainproxy scan passive --rescan                  # rescan all history
 
-# Crawl, then actively scan (48 rules ported from ZAP); everything stays inside the engagement scope.
+# Crawl, then actively scan (52 rules ported from ZAP); everything stays inside the engagement scope.
 # The crawler follows links, forms, robots.txt, sitemaps, and URL paths written in page text or
 # scripts (also on 4xx pages; placeholders like ?key=… or /users/{id} get test values), and keeps
 # the cookies the site sets. It doesn't run JavaScript; --browser does (single-page apps, below).
