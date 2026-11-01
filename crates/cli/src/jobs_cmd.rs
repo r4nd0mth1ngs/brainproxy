@@ -56,7 +56,7 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
         }
         JobCmd::Status { id } => {
             reap(project, &store, id)?;
-            let j = store.job_get(id)?;
+            let j = shown(&store, id)?;
             out.ok(j.clone(), || text(&j));
         }
         JobCmd::Wait { id, timeout } => {
@@ -69,7 +69,7 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let mut j = store.job_get(id)?;
+            let mut j = shown(&store, id)?;
             j["timed_out"] = json!(!is_finished(j["state"].as_str().unwrap_or("")));
             out.ok(j.clone(), || text(&j));
         }
@@ -83,6 +83,13 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// A job, and whether its pid means anything here.
+fn shown(store: &Store, id: i64) -> Result<Value, Error> {
+    let mut j = store.job_get(id)?;
+    j["other_pid_namespace"] = json!(process::work_elsewhere(store, &lock_name(id)));
+    Ok(j)
 }
 
 fn text(j: &Value) -> String {

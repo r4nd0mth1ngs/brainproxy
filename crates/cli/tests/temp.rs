@@ -220,6 +220,8 @@ fn fuzz_run_in_another_namespace_is_not_taken_for_dead() {
     for _ in 0..2 {
         assert_eq!(state(run), "running");
     }
+    let status = env.ok(&env.project, &["fuzz", "status", &run.to_string()]);
+    assert_eq!(status["run"]["other_pid_namespace"], true, "{status}");
     let d = env.ok(&env.project, &["project", "stop"]);
     assert!(d["work"].as_array().unwrap().iter().any(|w| w["id"] == run), "{d}");
     // `project stop` waited for it, so it is done by now, and has cleaned up after itself.
@@ -249,6 +251,8 @@ fn job_in_another_namespace_is_not_taken_for_dead() {
     let id_text = id.to_string();
     let status = || env.ok(&env.project, &["job", "status", &id_text]);
     let pid = status()["pid"].as_u64().unwrap();
+    assert_eq!(status()["other_pid_namespace"], false);
+    assert_stdin_is_not_the_lock(pid, &env.dir.join(format!("p.bpdb-job-{id}.lock")));
     pretend_other_namespace(&env, &format!("job-{id}"), |store, pid| {
         store.job_set_state(id, "running", Some(pid), None, false).unwrap();
     });
@@ -256,6 +260,7 @@ fn job_in_another_namespace_is_not_taken_for_dead() {
     for _ in 0..2 {
         assert_eq!(status()["state"], "running");
     }
+    assert_eq!(status()["other_pid_namespace"], true);
     let waited = env.ok(&env.project, &["job", "wait", &id_text, "--timeout", "0.5"]);
     assert_eq!((&waited["state"], &waited["timed_out"]), (&"running".into(), &true.into()), "{waited}");
 
@@ -264,6 +269,39 @@ fn job_in_another_namespace_is_not_taken_for_dead() {
     assert_eq!(waited["state"], "failed", "{waited}");
     assert_eq!(waited["error"], "job process exited unexpectedly");
     assert!(!env.dir.join(format!("p.bpdb-job-{id}.lock")).exists());
+}
+
+/// Whatever a job starts doesn't inherit its lock, which would keep it held after the job died.
+#[cfg(target_os = "linux")]
+fn assert_stdin_is_not_the_lock(pid: u64, lock: &Path) {
+    let fds = PathBuf::from(format!("/proc/{pid}/fd"));
+    assert_eq!(std::fs::read_link(fds.join("0")).unwrap(), PathBuf::from("/dev/null"));
+    let lock = std::fs::canonicalize(lock).unwrap();
+    let held = std::fs::read_dir(&fds)
+        .unwrap()
+        .flatten()
+        .find(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock))
+        .expect("the job holds its lock");
+    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", held.file_name().display())).unwrap();
+    let flags = info.lines().find_map(|l| l.strip_prefix("flags:")).unwrap().trim();
+    assert_ne!(u32::from_str_radix(flags, 8).unwrap() & 0o2000000, 0, "not close-on-exec: {info}");
+}
+
+/// Its pid can be reused, or its namespace's number: a free lock still says it is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_free_lock_beats_a_live_pid() {
+    let env = Env::new("job-reuse");
+    let site = format!("http://127.0.0.1:{}/", silent_server());
+    let args = ["crawl", &site, "--no-robots", "--no-sitemap", "--timeout", "600", "--background"];
+    let id = env.ok(&env.project, &args)["job"].as_i64().unwrap();
+    let id_text = id.to_string();
+    let pid = env.ok(&env.project, &["job", "status", &id_text])["pid"].as_u64().unwrap();
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    store.job_set_state(id, "running", Some(std::process::id()), None, false).unwrap();
+    kill(pid);
+    let waited = env.ok(&env.project, &["job", "wait", &id_text, "--timeout", "5"]);
+    assert_eq!(waited["state"], "failed", "{waited}");
 }
 
 #[cfg(target_os = "linux")]

@@ -189,21 +189,24 @@ fn lock_held(store: &Store, what: &str) -> Option<bool> {
 }
 
 /// Takes `<project>-<name>.lock` for a job or fuzz run, before its pid is recorded, and writes
-/// the PID namespace into it. `None` where it can't be taken, which leaves its pid to go by,
-/// and when it is already held: only a `--background` child finds that, as it was handed the
-/// lock through [`work_lock_stdin`]. Nothing else takes a lock with this name.
+/// the PID namespace into it. `None` where it can't be taken, which leaves its pid to go by.
+/// Already held, it is a `--background` child's own, handed over through [`work_lock_stdin`]:
+/// nothing else takes a lock with this name. The child then keeps it where nothing it starts
+/// can inherit it, and gets /dev/null on stdin.
 pub(crate) fn work_lock(store: &Store, name: &str) -> Option<File> {
     let ns = pid_namespace()?;
     let path = lock_path(store, name)?;
     let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path).ok()?;
     match file.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::WouldBlock) => return sys::take_stdin_if_same(&file),
         Err(TryLockError::Error(_)) => {
             let _ = std::fs::remove_file(&path);
             return None;
         }
     }
+    // Readable by a container running as another user: the umask would leave it to its owner.
+    sys::readable_by_all(&file);
     if file.set_len(0).and_then(|()| file.write_all(ns.as_bytes())).is_err() {
         let _ = std::fs::remove_file(&path);
         return None;
@@ -213,9 +216,9 @@ pub(crate) fn work_lock(store: &Store, name: &str) -> Option<File> {
 
 /// Stdin for a `--background` child: its lock instead of /dev/null. A lock belongs to the open
 /// file, so the child holds it from its first instruction and the parent can exit, leaving no
-/// moment when a child that is starting looks dead. It reads as empty, like /dev/null, since
-/// the file's position is past what was written. Nothing the child starts inherits it: they
-/// all get a stdin of their own.
+/// moment when a child that is starting looks dead. Until the child moves it (see
+/// [`work_lock`]) it reads as empty, like /dev/null: the file's position is past what was
+/// written.
 pub(crate) fn work_lock_stdin(store: &Store, name: &str) -> Stdio {
     work_lock(store, name).map_or_else(Stdio::null, Stdio::from)
 }
@@ -231,15 +234,23 @@ fn work_namespace(store: &Store, name: &str) -> std::io::Result<Option<String>> 
     }
 }
 
-/// Whether the process of a job or fuzz run is certainly gone. One in another namespace is
-/// judged by its lock; if that can't be read, it counts as running. A job's final state is
-/// written before it exits, so once it is gone that state can be trusted: read it after this.
+/// Whether the process of a job or fuzz run is certainly gone. With a lock file the lock
+/// decides, in any namespace: a pid can be reused, and so can a namespace's number. Without
+/// one, or if the lock can't be read here, the pid does, as far as it means anything here;
+/// if it doesn't, the work counts as running. A job's final state is written before it exits,
+/// so once it is gone that state can be trusted: read it after this.
 pub(crate) fn work_gone(store: &Store, name: &str, pid: u32) -> bool {
-    match work_namespace(store, name) {
-        Ok(ns) if elsewhere(ns.as_deref()) => lock_held(store, name) == Some(false),
-        Ok(_) => !alive(pid),
-        Err(_) => false,
+    let Ok(ns) = work_namespace(store, name) else { return false };
+    let held = ns.as_ref().and_then(|_| lock_held(store, name));
+    match held {
+        Some(held) => !held,
+        None => !elsewhere(ns.as_deref()) && !alive(pid),
     }
+}
+
+/// Whether a job or fuzz run runs in another container or PID namespace.
+pub(crate) fn work_elsewhere(store: &Store, name: &str) -> bool {
+    elsewhere(work_namespace(store, name).ok().flatten().as_deref())
 }
 
 /// The pid of a job or fuzz run, for people to read.
@@ -336,6 +347,25 @@ mod sys {
         }
     }
 
+    /// Moves `lock` off stdin if that is where it is: to a descriptor no child inherits
+    /// (`try_clone_to_owned` sets close-on-exec), with /dev/null on stdin instead.
+    pub fn take_stdin_if_same(lock: &std::fs::File) -> Option<std::fs::File> {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::fs::MetadataExt;
+        let held = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
+        let (a, b) = (held.metadata().ok()?, lock.metadata().ok()?);
+        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            return None;
+        }
+        let null = std::fs::File::open("/dev/null").ok()?;
+        (unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } == libc::STDIN_FILENO).then_some(held)
+    }
+
+    pub fn readable_by_all(file: &std::fs::File) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o644));
+    }
+
     #[cfg(target_os = "linux")]
     pub fn pid_namespace() -> Option<String> {
         std::fs::read_link("/proc/self/ns/pid").ok()?.into_os_string().into_string().ok()
@@ -407,6 +437,13 @@ mod sys {
     pub fn pid_namespace() -> Option<String> {
         None
     }
+
+    /// There are no namespaces here, so no locks are taken to hand over.
+    pub fn take_stdin_if_same(_: &std::fs::File) -> Option<std::fs::File> {
+        None
+    }
+
+    pub fn readable_by_all(_: &std::fs::File) {}
 
     /// Nothing to send: the caller's `request_stop` flag is how a Windows process is asked.
     pub fn ask_to_exit(_: u32) {}
@@ -522,21 +559,31 @@ mod tests {
         assert!(work_gone(&store, name, dead));
         assert!(!work_gone(&store, name, me));
 
-        // In this namespace the pid still decides, whatever the lock says.
+        // With a lock file the lock decides, whatever the pid looks like.
         let held = work_lock(&store, name).expect("lock");
         assert_eq!(work_namespace(&store, name).unwrap(), pid_namespace());
-        assert!(work_gone(&store, name, dead));
-        assert!(!work_gone(&store, name, me));
+        assert!(!work_gone(&store, name, dead));
+        assert!(!work_elsewhere(&store, name));
         assert_eq!(work_pid_text(&store, name, 7), "pid 7");
-        // Already held: this is how a `--background` child finds the lock its parent gave it.
+        // Held by something other than our stdin: not ours to take.
         assert!(work_lock(&store, name).is_none());
-
-        // Elsewhere the lock does, and the pid means nothing.
         let path = lock_path(&store, name).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        }
+
+        // The same goes elsewhere.
         std::fs::write(&path, "pid:[1]").unwrap();
         assert!(!work_gone(&store, name, dead));
+        assert!(work_elsewhere(&store, name));
         assert!(work_pid_text(&store, name, 7).contains("another container"));
         drop(held);
+        assert!(work_gone(&store, name, me));
+
+        // A free lock in "our" namespace: its number was reused, or the pid was. Gone.
+        std::fs::write(&path, pid_namespace().unwrap()).unwrap();
         assert!(work_gone(&store, name, me));
 
         // A lock file left behind by a crash is taken over.

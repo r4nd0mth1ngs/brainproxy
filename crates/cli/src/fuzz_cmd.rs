@@ -165,7 +165,8 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
         FuzzCmd::Status { run, top } => {
             let store = Store::open(project)?;
             reap_if_dead(&store, run)?;
-            let summary = store.fuzz_summary(run, top)?;
+            let mut summary = store.fuzz_summary(run, top)?;
+            summary["run"]["other_pid_namespace"] = json!(process::work_elsewhere(&store, &lock_name(run)));
             out.ok(summary.clone(), || text_summary(&summary));
             Ok(())
         }
