@@ -1,9 +1,15 @@
 //! Example values from JSON Schema (OpenAPI/Swagger flavour) and body encoders.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 /// Deepest schema nesting followed; deeper objects become `{}`.
 const MAX_DEPTH: usize = 8;
+
+/// Schema nodes followed for one example. Depth alone doesn't stop a few wide schemas
+/// that refer to each other from growing to billions of values.
+const MAX_NODES: usize = 10_000;
 
 pub const MULTIPART_BOUNDARY: &str = "----brainproxyBoundary7MA4YWxkTrZu0gW";
 
@@ -23,20 +29,69 @@ pub fn resolve<'a>(root: &'a Value, v: &'a Value) -> &'a Value {
     &Value::Null
 }
 
+/// Whether `text` appears in any string, or object key, of `v`.
+pub fn mentions(v: &Value, text: &str) -> bool {
+    match v {
+        Value::String(s) => s.contains(text),
+        Value::Array(a) => a.iter().any(|x| mentions(x, text)),
+        Value::Object(m) => m.iter().any(|(k, x)| k.contains(text) || mentions(x, text)),
+        _ => false,
+    }
+}
+
+/// The `$ref`s reachable from `v` that [`resolve`] can't follow: external ones
+/// and local ones that point nowhere.
+pub fn ref_problems(root: &Value, v: &Value) -> Vec<String> {
+    // A stack of its own: a chain of refs is as long as the document allows, not as deep as the parser's limit.
+    let mut stack = vec![v];
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Array(a) => stack.extend(a.iter().rev()),
+            Value::Object(m) => {
+                stack.extend(m.iter().filter(|(k, _)| *k != "$ref").map(|(_, x)| x));
+                let Some(r) = m.get("$ref").and_then(Value::as_str) else { continue };
+                // Already reported, or a circular type.
+                if !seen.insert(r) {
+                    continue;
+                }
+                match r.strip_prefix('#').map(|p| root.pointer(p)) {
+                    Some(Some(target)) => stack.push(target),
+                    Some(None) => out.push(format!("broken $ref {r:?}")),
+                    None => out.push(format!("external $ref {r:?} is not followed")),
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// An example value for `schema`: its example/default/enum/const if present,
 /// otherwise a typed default.
 pub fn example(root: &Value, schema: &Value) -> Value {
-    gen(root, schema, 0, &mut Vec::new())
+    gen(root, schema, 0, &mut Walk { refs: Vec::new(), nodes: 0 })
 }
 
-fn gen(root: &Value, schema: &Value, depth: usize, refs: &mut Vec<String>) -> Value {
+/// Where an example's walk has been.
+struct Walk {
+    refs: Vec<String>,
+    nodes: usize,
+}
+
+fn gen(root: &Value, schema: &Value, depth: usize, refs: &mut Walk) -> Value {
+    refs.nodes += 1;
+    if refs.nodes > MAX_NODES {
+        return Value::Null;
+    }
     if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
-        if refs.iter().any(|x| x == r) || depth > MAX_DEPTH {
+        if refs.refs.iter().any(|x| x == r) || depth > MAX_DEPTH {
             return Value::Null; // recursive type: stop here
         }
-        refs.push(r.to_string());
+        refs.refs.push(r.to_string());
         let v = gen(root, resolve(root, schema), depth + 1, refs);
-        refs.pop();
+        refs.refs.pop();
         return v;
     }
     if let Some(v) = explicit(schema) {
@@ -92,10 +147,13 @@ fn gen(root: &Value, schema: &Value, depth: usize, refs: &mut Vec<String>) -> Va
     }
 }
 
-fn object(root: &Value, schema: &Value, depth: usize, refs: &mut Vec<String>) -> Option<Value> {
+fn object(root: &Value, schema: &Value, depth: usize, refs: &mut Walk) -> Option<Value> {
     let props = schema.get("properties")?.as_object()?;
     let mut out = Map::new();
     for (k, s) in props {
+        if refs.nodes > MAX_NODES {
+            break;
+        }
         if resolve(root, s).get("readOnly").and_then(Value::as_bool) == Some(true) {
             continue;
         }
@@ -201,6 +259,10 @@ fn quote(s: &str) -> String {
 
 /// Minimal XML for an example value: objects become elements, arrays repeat.
 pub fn xml(root_name: &str, v: &Value) -> Vec<u8> {
+    // An example given as a whole document.
+    if let Some(text) = v.as_str().filter(|t| t.trim_start().starts_with('<')) {
+        return text.as_bytes().to_vec();
+    }
     fn el(name: &str, v: &Value, out: &mut String) {
         match v {
             Value::Array(items) => items.iter().for_each(|i| el(name, i, out)),

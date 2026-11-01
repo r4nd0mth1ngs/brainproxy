@@ -194,7 +194,7 @@ pub fn points(raw: &[u8], opts: &PointOptions) -> Vec<InsertionPoint> {
     if opts.query {
         if let Some((_, q)) = target.split_once('?') {
             for (i, (k, v)) in pairs(q).into_iter().enumerate() {
-                if !k.is_empty() {
+                if !k.is_empty() && !crate::auth::is_query_key_placeholder(v) {
                     out.push(InsertionPoint {
                         kind: PointKind::Query,
                         name: url_decode(k),
@@ -744,6 +744,16 @@ mod tests {
 
     fn s(b: Vec<u8>) -> String {
         String::from_utf8(b).unwrap()
+    }
+
+    #[test]
+    fn a_query_keys_placeholder_is_not_a_point_but_keeps_the_others_in_place() {
+        let raw = "GET /x?a=1&api_key=«auth:p:query:api_key»&b=2&sig=«auth:p:sign:s» HTTP/1.1\r\nHost: h\r\n\r\n";
+        let opts = PointOptions { query: true, ..Default::default() };
+        let names: Vec<String> = points(raw.as_bytes(), &opts).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["a", "b", "sig"], "a signer's slot stays attackable");
+        let b = points(raw.as_bytes(), &opts).into_iter().find(|p| p.name == "b").unwrap();
+        assert!(matches!(b.loc, Loc::Pair(2)));
     }
 
     #[test]

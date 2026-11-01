@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brainproxy_core::auth::{AuthProfile, AuthSession, Secret, SessionState};
+use brainproxy_core::auth::{AuthProfile, AuthSession, QueryKey, Secret, SessionState};
 use brainproxy_core::auth_record::{Mode, Recorded};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool};
@@ -25,7 +25,10 @@ pub enum AuthCmd {
         --username alice --password-env APP_PW. JSON bodies (starting with '{') are sent as application/json.\n\
         CSRF: --csrf-url PAGE --csrf-regex 'name=\"csrf\" value=\"([^\"]+)\"' fills {{csrf}}.\n\
         Bearer token: --token-regex '\"token\":\"([^\"]+)\"' --token-header 'Authorization: Bearer {{token}}'.\n\
-        Static API key only: --header 'X-Api-Key: ...' (no --login-url).\n\
+        Static API key only: --header 'X-Api-Key: ...', or --header-env 'X-Api-Key=ENV_VAR' to keep it off the \
+        command line (no --login-url). A bearer token is --header-env 'Authorization=ENV_VAR' with the value \
+        'Bearer abc' in the variable. In the query string: --query-key 'api_key=ENV_VAR' --key-origin https://api.test; \
+        history keeps a placeholder, and the key goes only to the origins given.\n\
         Platform auth (HTTP Basic, Digest, NTLM): --platform ntlm --platform-host '*.corp.test' --username 'CORP\\bob' \
         --password-env BOB_PW. It answers those hosts' 401 challenges on every command, no --auth needed, and is added \
         on the wire only (history keeps the request without it).\n\
@@ -326,6 +329,20 @@ pub struct AddArgs {
     /// Header added to every request (API key, static bearer token). Repeatable.
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
+    /// NAME=ENV_VAR: a header like --header, its value read once from the environment
+    /// variable and stored in the project. Repeatable.
+    #[arg(long = "header-env", value_name = "NAME=ENV_VAR")]
+    header_env: Vec<String>,
+    /// NAME=ENV_VAR: an API key sent as this query parameter, read once from the environment
+    /// variable and stored in the project. Needs --key-origin. Repeatable.
+    #[arg(long = "query-key", value_name = "NAME=ENV_VAR", requires = "key_origins")]
+    query_keys: Vec<String>,
+    /// An origin (scheme://host[:port]) the --query-key values may go to. Repeatable.
+    #[arg(long = "key-origin", value_name = "ORIGIN", requires = "query_keys")]
+    key_origins: Vec<String>,
+    /// When replacing a profile, keep its --query-key values. For an edit that can't see them.
+    #[arg(long, conflicts_with = "query_keys")]
+    keep_query_keys: bool,
     /// Minimum seconds between automatic re-logins.
     #[arg(long, default_value_t = 5)]
     relogin_interval: u64,
@@ -387,6 +404,31 @@ pub fn maybe_session(
     name.map(|n| load_session(project, n, send.clone())).transpose()
 }
 
+/// `NAME=ENV_VAR` with the variable read. Errors name the variable, never a value.
+fn env_pair(flag: &str, spec: &str) -> Result<(String, String), Error> {
+    let bad = || Error::InvalidInput(format!("{flag}: expected NAME=ENV_VAR"));
+    let (name, var) = spec.split_once('=').ok_or_else(bad)?;
+    let (name, var) = (name.trim(), var.trim());
+    if name.is_empty() || var.is_empty() {
+        return Err(bad());
+    }
+    // Only a name that looks like one is repeated: a key given here by mistake must not be.
+    let shown = if var.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+        var
+    } else {
+        "the variable after NAME="
+    };
+    let value = std::env::var(var).map_err(|_| Error::InvalidInput(format!("{flag}: {shown} is not set")))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidInput(format!("{flag}: {shown} is empty")));
+    }
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(Error::InvalidInput(format!("{flag}: {shown} holds a line break")));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
 fn state_json(state: &SessionState) -> serde_json::Value {
     json!({
         "logged_in": state.logged_in,
@@ -419,6 +461,24 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             if login_request.is_some() && a.login_url.is_none() {
                 return Err(Error::InvalidInput("--login-request needs --login-url (where to send it)".into()));
             }
+            let mut headers = parse(&a.headers)?;
+            for spec in &a.header_env {
+                let (name, value) = env_pair("--header-env", spec)?;
+                if name.is_empty() || name.contains([':', ' ', '\r', '\n']) {
+                    return Err(Error::InvalidInput(format!("--header-env: bad header name {name:?}")));
+                }
+                headers.push((name, value));
+            }
+            let origins =
+                a.key_origins.iter().map(|o| Target::from_url(o).map(|t| t.origin())).collect::<Result<Vec<_>, _>>()?;
+            let query_keys = a
+                .query_keys
+                .iter()
+                .map(|spec| {
+                    let (name, value) = env_pair("--query-key", spec)?;
+                    Ok(QueryKey { name, value, origins: origins.clone() })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
             let mut profile = AuthProfile {
                 name: a.name,
                 login_url: a.login_url,
@@ -435,7 +495,8 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 logged_in: a.logged_in,
                 logged_out: a.logged_out,
                 check_url: a.check_url,
-                headers: parse(&a.headers)?,
+                headers,
+                query_keys,
                 relogin_interval_secs: a.relogin_interval,
                 max_relogins: a.max_relogins,
                 platform: a
@@ -460,6 +521,9 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                     {
                         *v = stored.clone();
                     }
+                }
+                if a.keep_query_keys {
+                    profile.query_keys = old.query_keys;
                 }
             }
             store.auth_save_profile(&profile)?;

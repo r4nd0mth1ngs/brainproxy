@@ -3,6 +3,7 @@ import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
 import { useState } from "react";
 import { duration, isLive, progress, stateClass, type Job } from "./Scanner";
+import { ApiWizard } from "./ApiWizard";
 import { ScanWizard } from "./Wizard";
 import { UpdatesCard } from "./Updates";
 import { AppUpdateCard } from "./AppUpdate";
@@ -50,6 +51,8 @@ export function DashboardView({ active }: { active: boolean }) {
   };
   const [wizardJob, setWizardJob] = useState<number | null>(() => Number(stored("job")) || null);
   const [wizardOff, setWizardOff] = useState(() => stored("off") === "1");
+  // The guided scan's API flow, in the same slot with the same job id.
+  const [apiWizard, setApiWizard] = useState(false);
   // Scans run from the CLI in the foreground leave findings but no job.
   const [activeFindings] = usePoll<{ rows: [number][] }>(() => run(["query", "SELECT count(*) FROM findings WHERE source = 'active'"]), 10000, active);
   const hasScan = jobs?.jobs.some((j) => j.kind === "active-scan" && j.state !== "failed") || (activeFindings?.rows[0]?.[0] ?? 0) > 0;
@@ -57,25 +60,26 @@ export function DashboardView({ active }: { active: boolean }) {
 
   const s = stats?.rows[0];
   const live = jobs?.jobs.filter(isLive).length ?? 0;
+  const hosted = {
+    jobId: wizardJob,
+    onStarted: (id: number) => {
+      setWizardJob(id);
+      store("job", String(id));
+      app.openWizard(false);
+    },
+    onDismiss: () => {
+      setWizardOff(true);
+      setWizardJob(null);
+      setApiWizard(false);
+      app.openWizard(false);
+      store("off", "1");
+      store("job", "");
+    },
+  };
   return (
     <div className="dash">
-      {showWizard && (
-        <ScanWizard
-          jobId={wizardJob}
-          onStarted={(id) => {
-            setWizardJob(id);
-            store("job", String(id));
-            app.openWizard(false);
-          }}
-          onDismiss={() => {
-            setWizardOff(true);
-            setWizardJob(null);
-            app.openWizard(false);
-            store("off", "1");
-            store("job", "");
-          }}
-        />
-      )}
+      {showWizard &&
+        (apiWizard ? <ApiWizard {...hosted} onBack={() => setApiWizard(false)} /> : <ScanWizard {...hosted} onApi={() => setApiWizard(true)} />)}
       <AppUpdateCard />
       <UpdatesCard />
       <section className="dash-card">

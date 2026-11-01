@@ -406,6 +406,7 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
         Cmd::Import(c) => match c {
+            import_cmd::ImportCmd::Api(_) => "import api",
             import_cmd::ImportCmd::Openapi(_) => "import openapi",
             import_cmd::ImportCmd::Postman(_) => "import postman",
             import_cmd::ImportCmd::Graphql(_) => "import graphql",

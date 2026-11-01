@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use brainproxy_core::apiimport::api::{self, DEFAULT_METHODS};
+use brainproxy_core::apiimport::{self, RunConfig};
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
@@ -24,6 +26,26 @@ pub struct ActiveArgs {
     /// URLs to attack (fetched first as the baseline). Without URLs, --history-id or
     /// --where, every crawled/proxied/sent/imported request in history is a target.
     urls: Vec<String>,
+    /// Scan an API from its description (OpenAPI 3.x, Swagger 2.0, or Postman v2.0/v2.1; a file or
+    /// an http(s) URL): build requests as `import api` does, send each selected in-scope
+    /// operation once as a baseline, then attack exactly those.
+    #[arg(long, value_name = "SOURCE", conflicts_with_all = ["urls", "crawl", "history_ids", "where_sql"])]
+    api: Option<String>,
+    /// With --api: send to this server instead: scheme://host[:port] replaces the origin; with a path, the whole base.
+    #[arg(long, requires = "api")]
+    base_url: Option<String>,
+    /// With --api: use the document's Nth server (from 0) instead of the first.
+    #[arg(long, value_name = "N", requires = "api")]
+    server: Option<usize>,
+    /// With --api: Postman variable, NAME=VALUE. Repeatable.
+    #[arg(long = "var", value_name = "NAME=VALUE", requires = "api")]
+    vars: Vec<String>,
+    /// With --api: only the requests at these indexes (comma-separated), as `import api --dry-run` numbers them.
+    #[arg(long, value_delimiter = ',', value_name = "INDEXES", requires = "api")]
+    only: Option<Vec<usize>>,
+    /// With --api: refuse a document whose sha256 isn't this.
+    #[arg(long, value_name = "HEX", requires = "api")]
+    expect_sha256: Option<String>,
     /// Crawl and audit: crawl from each URL first (in scope, forms submitted, same auth and
     /// limits), then attack every recorded request on those sites, not only the URLs.
     #[arg(long)]
@@ -140,9 +162,10 @@ pub struct ActiveArgs {
     /// Stop the scan after this many minutes.
     #[arg(long)]
     max_minutes: Option<f64>,
-    /// Maximum distinct targets (after de-duplication).
-    #[arg(long, default_value_t = 200)]
-    max_targets: usize,
+    /// Maximum distinct targets, after de-duplication [default: 200; with --api, every
+    /// selected operation, and those a cap leaves out are reported as targets_dropped].
+    #[arg(long)]
+    max_targets: Option<usize>,
     #[arg(long)]
     verify_tls: bool,
     /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http).
@@ -168,7 +191,7 @@ impl ActiveArgs {
     /// What these arguments cover, for comparing findings with the scan. Sites are read the way
     /// the scan reads them; the scan's time window is the job's.
     pub fn scope(&self) -> ScanScope {
-        let picked = !self.history_ids.is_empty() || self.where_sql.is_some();
+        let picked = !self.history_ids.is_empty() || self.where_sql.is_some() || self.api.is_some();
         let origins = if !self.urls.is_empty() {
             Some(self.urls.iter().filter_map(|u| Target::from_url(u).ok()).map(|t| t.origin()).collect())
         } else if picked {
@@ -192,6 +215,35 @@ impl ActiveArgs {
 }
 
 impl ActiveArgs {
+    fn api_options(&self) -> Result<api::Options, Error> {
+        Ok(api::Options {
+            base_url: self.base_url.clone(),
+            server: self.server,
+            vars: crate::import_cmd::parse_vars(&self.vars)?,
+            expect_sha256: self.expect_sha256.clone(),
+            spec_url: None,
+        })
+    }
+
+    /// Clap's `requires` doesn't catch these next to a URL, which conflicts with --api.
+    fn check_api_flags(&self) -> Result<(), Error> {
+        let given = self.base_url.is_some()
+            || self.server.is_some()
+            || !self.vars.is_empty()
+            || self.only.is_some()
+            || self.expect_sha256.is_some();
+        if given && self.api.is_none() {
+            return Err(Error::InvalidInput(
+                "--base-url, --server, --var, --only and --expect-sha256 need --api".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn api_selection(&self) -> api::Selection {
+        crate::import_cmd::selection(&self.include_methods, self.only.clone())
+    }
+
     fn preset(&self) -> Option<Preset> {
         self.preset.map(PresetArg::get)
     }
@@ -275,6 +327,7 @@ pub enum StrengthArg {
 }
 
 pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Result<(), Error> {
+    args.check_api_flags()?;
     let guard = crate::project_guard(project)?;
     let band = crate::checks_cmd::severity_band(args.check_severity, args.check_severity_max, "--check-severity")?;
     if let Some(bad) =
@@ -284,6 +337,15 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     }
     for u in &args.urls {
         crate::require_in_scope(&guard, &Target::from_url(u)?)?;
+    }
+    if let Some(source) = &args.api {
+        api::check_source(source)?;
+        if crate::import_cmd::is_url(source) {
+            crate::require_in_scope(&guard, &Target::from_url(source)?)?;
+        }
+        if source == "-" && args.background {
+            return Err(Error::InvalidInput("--background can't read stdin; pass a file".into()));
+        }
     }
     if args.crawl && args.urls.is_empty() {
         return Err(Error::InvalidInput("--crawl needs at least one URL to start from".into()));
@@ -295,6 +357,27 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     let (checks, check_summary) = load_checks(home, &args, band, oob.is_some())?;
     let browser = args.browser.then(|| crate::browser_cmd::chromium(args.browser_id.as_deref())).transpose()?;
     if args.background {
+        if let Some(source) = &args.api {
+            crate::import_cmd::check_background_args(&crate::import_cmd::parse_vars(&args.vars)?, &[])?;
+            if let Some(b) = &args.base_url {
+                api::check_base_url(b)?;
+            }
+            // A local file can be checked now, so the caller gets the error and not a failed job.
+            if !crate::import_cmd::is_url(source) {
+                let loaded = api::load(&crate::import_cmd::read_local(source)?, &args.api_options()?)?;
+                crate::import_cmd::check_background_doc(&loaded)?;
+                loaded.check_runnable(&loaded.plan(&args.api_selection(), &guard)?)?;
+            } else {
+                let from = crate::import_cmd::RemoteFetch {
+                    auth: args.auth.as_deref(),
+                    headers: &[],
+                    tool: Tool::Scan,
+                    timeout: args.timeout,
+                    verify_tls: args.verify_tls,
+                };
+                crate::import_cmd::check_remote_vars(project, &guard, source, args.api_options()?, from)?;
+            }
+        }
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
     }
     let send = SendOptions {
@@ -315,8 +398,25 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         headers: args.inject_headers.clone(),
     };
     let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send)?;
-    // With --crawl the targets are chosen after the crawl, inside the job.
-    let selected = if args.crawl {
+    let api_import = match &args.api {
+        Some(source) => {
+            let fetch = crate::import_cmd::Fetcher {
+                project,
+                send: &send,
+                record: false,
+                auth: auth.as_deref(),
+                headers: &[],
+                tool: Tool::Scan,
+            };
+            let loaded = crate::import_cmd::load_api(&fetch, source, args.api_options()?)?;
+            let plan = loaded.plan(&args.api_selection(), &guard)?;
+            loaded.check_runnable(&plan)?;
+            Some((loaded, plan))
+        }
+        None => None,
+    };
+    // With --crawl or --api the targets are chosen inside the job.
+    let selected = if args.crawl || api_import.is_some() {
         None
     } else {
         Some(select_targets(project, &Selection::from_args(&args), &send, &point_opts, auth.as_deref())?)
@@ -347,9 +447,68 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let mut crawled = serde_json::Value::Null;
-        let (targets, skipped, skipped_methods) = match selected {
-            Some(s) => s,
-            None => {
+        let mut imported = serde_json::Value::Null;
+        let mut targets_dropped = 0;
+        let (targets, skipped, skipped_methods) = match (selected, api_import) {
+            (Some(s), _) => s,
+            (None, Some((loaded, plan))) => {
+                let (requests, _) = plan.to_send(usize::MAX);
+                let run_cfg = RunConfig {
+                    send: cfg.send.clone(),
+                    headers: vec![],
+                    concurrency: cfg.concurrency,
+                    rate: args.rate,
+                    auth: auth.clone(),
+                    list_limit: usize::MAX,
+                    tool: Tool::Scan,
+                    stage: Some("baseline"),
+                };
+                let baselines = rt.block_on(apiimport::run(project, requests, run_cfg, ctl.clone()));
+                if let Some(a) = &auth {
+                    a.save()?;
+                }
+                let baselines = baselines?;
+                baselines.check_any_in_scope()?;
+                imported = json!({
+                    "format": loaded.format,
+                    "built": loaded.requests.len(),
+                    "selected": plan.selected(),
+                    "sent": baselines.sent,
+                    "by_status": baselines.by_status,
+                    "errors": baselines.errors,
+                    "skipped_out_of_scope": baselines.skipped_out_of_scope,
+                    "out_of_scope_hosts": baselines.out_of_scope_hosts,
+                    "skipped": loaded.skipped,
+                    "warnings": loaded.warnings,
+                    "credentials": loaded.credentials,
+                });
+                if ctl.stopped() {
+                    return Ok(json!({"import": imported, "stopped": true}));
+                }
+                // A baseline that got no response has nothing to compare an attack with.
+                let ids: Vec<i64> =
+                    baselines.requests.iter().filter(|r| r.error.is_none()).map(|r| r.history_id).collect();
+                if ids.is_empty() {
+                    return Err(Error::Connect(format!(
+                        "none of the {} baseline requests got a response, so there is nothing to scan",
+                        baselines.sent
+                    )));
+                }
+                let selection = Selection {
+                    urls: vec![],
+                    history_ids: ids.clone(),
+                    where_sql: None,
+                    max_targets: usize::MAX,
+                    include_methods: vec![],
+                };
+                let mut picked = select_targets(project, &selection, &cfg.send, &cfg.points, auth.as_deref())?;
+                if let Some(cap) = args.max_targets {
+                    targets_dropped = picked.0.len().saturating_sub(cap);
+                    picked.0.truncate(cap);
+                }
+                picked
+            }
+            (None, None) => {
                 let crawl_cfg = brainproxy_core::crawl::CrawlConfig {
                     seeds: args.urls.clone(),
                     max_depth: args.crawl_depth(),
@@ -436,6 +595,12 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         if !crawled.is_null() {
             v["crawl"] = crawled;
         }
+        if !imported.is_null() {
+            v["import"] = imported;
+        }
+        if targets_dropped > 0 {
+            v["targets_dropped"] = json!(targets_dropped);
+        }
         if !check_summary.is_null() {
             v["checks"] = check_summary.clone();
         }
@@ -517,11 +682,6 @@ struct Selection {
     include_methods: Vec<String>,
 }
 
-/// Methods attacked by default. Not all safe: POST can change data or send email, but a scan
-/// without it misses too much, so it stays on and `POST_HINT` warns. Replaying the others
-/// (DELETE, PUT, PATCH, ...) is opt-in.
-const DEFAULT_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST"];
-
 const POST_HINT: &str = "POST requests are replayed with attack payloads, often many times, and can change data or trigger side effects such as email.";
 
 /// Targets replayed as POST.
@@ -540,7 +700,7 @@ impl Selection {
             urls: args.urls.clone(),
             history_ids: args.history_ids.clone(),
             where_sql: args.where_sql.clone(),
-            max_targets: args.max_targets,
+            max_targets: args.max_targets.unwrap_or(200),
             include_methods: args.include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(),
         }
     }
@@ -729,6 +889,55 @@ mod tests {
         }
         // Without a preset, the defaults.
         assert_eq!(settings(&parse(&[])), (StrengthArg::Medium, 5, 500, false, false));
+    }
+
+    #[test]
+    fn api_flags_need_api_and_exclude_other_targets() {
+        let parsed = |args: &[&str]| {
+            let argv = ["brainproxy", "scan", "active"].iter().chain(args).map(|s| s.to_string());
+            match crate::Cli::try_parse_from(argv) {
+                Ok(crate::Cli { command: crate::Cmd::Scan(crate::scan_cmd::ScanCmd::Active(a)), .. }) => Some(*a),
+                _ => None,
+            }
+        };
+        let all = [
+            "--api",
+            "s.yaml",
+            "--base-url",
+            "http://a.test",
+            "--server",
+            "1",
+            "--var",
+            "a=b",
+            "--only",
+            "0,3",
+            "--expect-sha256",
+            "ab",
+            "--preset",
+            "quick",
+            "--include-methods",
+            "PUT",
+        ];
+        assert!(parsed(&all).unwrap().check_api_flags().is_ok());
+        for bad in [
+            &["--api", "s.yaml", "http://a.test/"][..],
+            &["--api", "s.yaml", "--crawl"],
+            &["--api", "s.yaml", "--history-id", "1"],
+            &["--api", "s.yaml", "--where", "1=1"],
+            &["--server", "1"],
+        ] {
+            assert!(parsed(bad).is_none(), "{bad:?}");
+        }
+        for flag in [
+            &["--server", "1"][..],
+            &["--base-url", "http://b.test"],
+            &["--var", "a=b"],
+            &["--only", "1"],
+            &["--expect-sha256", "ab"],
+        ] {
+            let args: Vec<&str> = ["http://a.test/"].iter().chain(flag).copied().collect();
+            assert!(parsed(&args).unwrap().check_api_flags().is_err(), "{flag:?}");
+        }
     }
 
     #[test]

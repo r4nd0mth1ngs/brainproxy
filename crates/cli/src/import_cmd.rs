@@ -1,12 +1,14 @@
-//! `import openapi|postman|graphql`: build requests from an API description,
+//! `import api|openapi|postman|graphql`: build requests from an API description,
 //! send them (in scope only) and record them as history source "import".
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use brainproxy_core::apiimport::{self, graphql, openapi, postman, ApiRequest, Built, RunConfig};
+use brainproxy_core::apiimport::{self, api, graphql, openapi, postman, ApiRequest, Built, RunConfig};
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::capture::decode_body;
+use brainproxy_core::guard::Guard;
 use brainproxy_core::http::request::split_head_body;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use brainproxy_core::session::Tool;
@@ -19,6 +21,13 @@ use crate::output::{body_value, Out};
 
 #[derive(Subcommand)]
 pub enum ImportCmd {
+    /// An API description, its format detected: OpenAPI 3.x, Swagger 2.0, or Postman v2.0/v2.1.
+    /// `--dry-run` is the preview: every request built, and which would go out.
+    #[command(after_help = "Sends GET, HEAD, OPTIONS, and POST; --include-methods opts in to others. Credentials \
+        in the document are never sent or stored, only listed under `credentials`: use `auth add` and --auth \
+        for them. Indexes for --only count the built requests in document order, so they hold for one document \
+        and one set of options; --expect-sha256 proves the document is the one previewed.")]
+    Api(ApiArgs),
     /// OpenAPI 3.x or Swagger 2.0 document (JSON or YAML): one request per operation.
     #[command(after_help = "Parameters get their example, default, or first enum value, else a typed default \
         (1, 1.5, true, \"test\", or a value matching the format). Servers: the operation's, the path's, then the \
@@ -39,7 +48,7 @@ pub enum ImportCmd {
 
 #[derive(clap::Args)]
 pub struct DocArgs {
-    /// Document file, '-' for stdin, or an http(s) URL (fetched in scope, recorded in history).
+    /// Document file, '-' for stdin, or an http(s) URL (fetched in scope; recorded in history, except by `import api`).
     source: String,
     /// Send to this server instead: scheme://host[:port] replaces the origin; with a path, the whole base.
     #[arg(long)]
@@ -49,6 +58,25 @@ pub struct DocArgs {
     vars: Vec<String>,
     #[command(flatten)]
     common: Common,
+}
+
+#[derive(clap::Args)]
+pub struct ApiArgs {
+    #[command(flatten)]
+    doc: DocArgs,
+    /// Also send these methods (comma-separated, or `all`). By default GET, HEAD, OPTIONS, and POST.
+    #[arg(long, value_delimiter = ',', value_name = "METHODS")]
+    include_methods: Vec<String>,
+    /// Only the requests at these indexes (comma-separated), as the preview numbers them.
+    #[arg(long, value_delimiter = ',', value_name = "INDEXES")]
+    only: Option<Vec<usize>>,
+    /// Use the document's Nth server (from 0, see `servers`) instead of the first. Operation
+    /// and path servers still win; --base-url overrides everything.
+    #[arg(long, value_name = "N")]
+    server: Option<usize>,
+    /// Refuse a document whose sha256 isn't this: it proves the file is the one previewed.
+    #[arg(long, value_name = "HEX")]
+    expect_sha256: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -104,12 +132,17 @@ pub struct Common {
 
 pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<(), Error> {
     let (kind, c, stdin) = match &cmd {
+        ImportCmd::Api(a) => ("api", &a.doc.common, a.doc.source == "-"),
         ImportCmd::Openapi(a) => ("openapi", &a.common, a.source == "-"),
         ImportCmd::Postman(a) => ("postman", &a.common, a.source == "-"),
         ImportCmd::Graphql(a) => ("graphql", &a.common, a.schema.as_deref() == Some("-")),
     };
+    if let ImportCmd::Api(a) = &cmd {
+        api::check_source(&a.doc.source)?;
+    }
     let guard = crate::project_guard(project)?;
     let remote = match &cmd {
+        ImportCmd::Api(a) => is_url(&a.doc.source).then_some(a.doc.source.as_str()),
         ImportCmd::Openapi(a) | ImportCmd::Postman(a) => is_url(&a.source).then_some(a.source.as_str()),
         ImportCmd::Graphql(a) => Some(a.url.as_str()),
     };
@@ -119,6 +152,29 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
     if c.background {
         if stdin {
             return Err(Error::InvalidInput("--background can't read stdin; pass a file".into()));
+        }
+        if let ImportCmd::Api(a) = &cmd {
+            check_background_args(&parse_vars(&a.doc.vars)?, &c.headers)?;
+            if let Some(b) = &a.doc.base_url {
+                api::check_base_url(b)?;
+            }
+            // A local file can be checked now, so the caller gets the error and not a failed job.
+            if remote.is_none() {
+                let loaded = api::load(&read_local(&a.doc.source)?, &a.options()?)?;
+                check_background_doc(&loaded)?;
+                loaded.check_runnable(&loaded.plan(&a.selection(), &guard)?)?;
+            } else {
+                let headers =
+                    c.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
+                let from = RemoteFetch {
+                    auth: c.auth.as_deref(),
+                    headers: &headers,
+                    tool: Tool::Crawl,
+                    timeout: c.timeout,
+                    verify_tls: c.verify_tls,
+                };
+                check_remote_vars(project, &guard, &a.doc.source, a.options()?, from)?;
+            }
         }
         return crate::jobs_cmd::spawn_background("import", project, home, out);
     }
@@ -131,28 +187,25 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         http2: false,
     };
     let auth = crate::auth_cmd::maybe_session(project, c.auth.as_deref(), &send)?;
-    let fetch = Fetcher { project, send: &send, auth: auth.as_deref(), headers: &headers };
+    let record = !matches!(cmd, ImportCmd::Api(_));
+    let fetch = Fetcher { project, send: &send, record, auth: auth.as_deref(), headers: &headers, tool: Tool::Crawl };
+    if let ImportCmd::Api(a) = &cmd {
+        return import_api(project, a, &fetch, auth.clone(), &headers, out);
+    }
 
     let built = match &cmd {
+        ImportCmd::Api(_) => unreachable!("handled above"),
         ImportCmd::Openapi(a) => {
             let (text, spec_url) = fetch.document(&a.source)?;
             let doc = apiimport::parse_document(&text)?;
-            openapi::build(&doc, &openapi::Options { base_url: a.base_url.clone(), spec_url })?
+            openapi::build(&doc, &openapi::Options { base_url: a.base_url.clone(), spec_url, ..Default::default() })?
         }
         ImportCmd::Postman(a) => {
             let (text, _) = fetch.document(&a.source)?;
-            let vars = a
-                .vars
-                .iter()
-                .map(|v| {
-                    v.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .ok_or_else(|| Error::InvalidInput(format!("--var {v:?} must look like NAME=VALUE")))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let vars = parse_vars(&a.vars)?;
             postman::build(
                 &apiimport::parse_document(&text)?,
-                &postman::Options { base_url: a.base_url.clone(), vars },
+                &postman::Options { base_url: a.base_url.clone(), vars, ..Default::default() },
             )?
         }
         ImportCmd::Graphql(a) => {
@@ -163,7 +216,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
             graphql::build(&apiimport::parse_document(&text)?, &a.url, c.include_destructive)?
         }
     };
-    let Built { mut requests, mut warnings } = built;
+    let Built { mut requests, mut warnings, .. } = built;
     let total = requests.len();
     requests.retain(|r| match apiimport::build_raw(r, &headers) {
         Ok(_) => true,
@@ -207,6 +260,8 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         rate: c.rate,
         auth: auth.clone(),
         list_limit: c.limit,
+        tool: Tool::Crawl,
+        stage: None,
     };
     let summary = crate::jobs_cmd::run_job(project, c.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -226,6 +281,172 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
     })?;
     out.ok(summary.clone(), || text(&summary));
     Ok(())
+}
+
+impl ApiArgs {
+    fn options(&self) -> Result<api::Options, Error> {
+        Ok(api::Options {
+            base_url: self.doc.base_url.clone(),
+            server: self.server,
+            vars: parse_vars(&self.doc.vars)?,
+            expect_sha256: self.expect_sha256.clone(),
+            spec_url: None,
+        })
+    }
+
+    fn selection(&self) -> api::Selection {
+        let mut include_methods = self.include_methods.clone();
+        if self.doc.common.include_destructive {
+            include_methods.push("DELETE".into());
+        }
+        selection(&include_methods, self.only.clone())
+    }
+}
+
+/// `import api`, once the arguments are checked.
+fn import_api(
+    project: &Path,
+    a: &ApiArgs,
+    fetch: &Fetcher<'_>,
+    auth: Option<std::sync::Arc<AuthSession>>,
+    headers: &[(String, String)],
+    out: &Out,
+) -> Result<(), Error> {
+    let c = &a.doc.common;
+    let guard = fetch.send.guard.clone().ok_or_else(|| Error::OutOfScope("no scope set".into()))?;
+    let loaded = load_api(fetch, &a.doc.source, a.options()?)?;
+    let plan = loaded.plan(&a.selection(), &guard)?;
+    let preview = loaded.preview(&plan, c.limit);
+    let bodies: Vec<Value> = preview.requests.iter().map(|r| body_value(&r.body, c.max_body)).collect();
+    let mut result = json!(preview);
+    if c.dry_run {
+        for (row, body) in result["requests"].as_array_mut().into_iter().flatten().zip(bodies) {
+            row["body"] = body;
+        }
+        result["hint"] = json!(if loaded.base_url_required {
+            "Some operations have no server: pass --base-url and preview again."
+        } else {
+            "Run again without --dry-run to send the included requests and record them for `scan active`."
+        });
+        out.ok(result.clone(), || text(&result));
+        return Ok(());
+    }
+    loaded.check_runnable(&plan)?;
+    let (requests, over_limit) = plan.to_send(c.max_requests);
+    let cfg = RunConfig {
+        send: fetch.send.clone(),
+        headers: headers.to_vec(),
+        concurrency: c.concurrency.clamp(1, 200),
+        rate: c.rate,
+        auth: auth.clone(),
+        list_limit: c.limit,
+        tool: Tool::Crawl,
+        stage: None,
+    };
+    let summary = crate::jobs_cmd::run_job(project, c.job_id, |ctl| {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let s = rt.block_on(apiimport::run(project, requests, cfg, ctl));
+        if let Some(a) = &auth {
+            a.save()?;
+        }
+        let s = s?;
+        s.check_any_in_scope()?;
+        let mut v = json!(s);
+        for (k, val) in result.as_object().into_iter().flatten().filter(|(k, _)| !k.starts_with("requests")) {
+            v[k] = val.clone();
+        }
+        v["skipped_over_limit"] = json!(over_limit);
+        v["hint"] = json!("Imported requests are history source 'import'; `scan active --api` attacks exactly these.");
+        Ok(v)
+    })?;
+    out.ok(summary.clone(), || text(&summary));
+    Ok(())
+}
+
+/// Reads and builds an `import api` document, recording where it came from.
+pub(crate) fn load_api(fetch: &Fetcher<'_>, source: &str, mut opts: api::Options) -> Result<api::Loaded, Error> {
+    let (text, spec_url) = fetch.document(source)?;
+    opts.spec_url = spec_url;
+    api::load(&text, &opts)
+}
+
+pub(crate) fn selection(include_methods: &[String], only: Option<Vec<usize>>) -> api::Selection {
+    api::Selection { include_methods: include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(), only }
+}
+
+pub(crate) fn parse_vars(vars: &[String]) -> Result<Vec<(String, String)>, Error> {
+    vars.iter()
+        .map(|v| {
+            // Not the whole argument: its value may be a credential.
+            let name = v.split('=').next().unwrap_or_default();
+            v.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .ok_or_else(|| Error::InvalidInput(format!("--var {name:?} must look like NAME=VALUE")))
+        })
+        .collect()
+}
+
+/// The job table stores a background job's arguments, so credentials can't be among them.
+pub(crate) fn check_background_args(vars: &[(String, String)], headers: &[String]) -> Result<(), Error> {
+    if let Some((k, _)) = vars.iter().find(|(k, _)| apiimport::looks_secret(k)) {
+        return Err(Error::InvalidInput(format!(
+            "--var {k} looks like a credential and --background would store it with the job; use an auth profile"
+        )));
+    }
+    for h in headers {
+        let name = h.split(':').next().unwrap_or_default().trim();
+        if apiimport::looks_secret(name) {
+            return Err(Error::InvalidInput(format!(
+                "-H {name} looks like a credential and --background would store it with the job; use an auth profile"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// As `check_background_args`, for a --var only the document shows to be a credential.
+pub(crate) fn check_background_doc(loaded: &api::Loaded) -> Result<(), Error> {
+    match loaded.variables.iter().find(|v| v.secret && v.source == "cli") {
+        Some(v) => Err(Error::InvalidInput(format!(
+            "--var {} holds a credential in this document and --background would store it with the job; use an auth profile",
+            v.name
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// How the command itself would fetch a remote document.
+pub(crate) struct RemoteFetch<'a> {
+    pub auth: Option<&'a str>,
+    pub headers: &'a [(String, String)],
+    pub tool: Tool,
+    pub timeout: f64,
+    pub verify_tls: bool,
+}
+
+/// Which `--var` may go in the job table depends on the document, so a remote one that
+/// has any is fetched first (not kept), and a fetch that fails refuses them too.
+pub(crate) fn check_remote_vars(
+    project: &Path,
+    guard: &Arc<Guard>,
+    source: &str,
+    opts: api::Options,
+    from: RemoteFetch<'_>,
+) -> Result<(), Error> {
+    if opts.vars.is_empty() {
+        return Ok(());
+    }
+    let send = SendOptions {
+        timeout: Duration::from_secs_f64(from.timeout.max(0.1)),
+        verify_tls: from.verify_tls,
+        sni: None,
+        guard: Some(guard.clone()),
+        http2: false,
+    };
+    let auth = crate::auth_cmd::maybe_session(project, from.auth, &send)?;
+    let fetch =
+        Fetcher { project, send: &send, record: false, auth: auth.as_deref(), headers: from.headers, tool: from.tool };
+    check_background_doc(&load_api(&fetch, source, opts)?)
 }
 
 fn warnings_hint(w: &Value) -> String {
@@ -251,7 +472,7 @@ fn text(v: &Value) -> String {
         v["kind"].as_str().unwrap_or(""),
         v["built"],
         v.get("sent").cloned().unwrap_or(json!(0)),
-        v["skipped_destructive"],
+        v.get("skipped_destructive").cloned().unwrap_or(json!(0)),
         v.get("skipped_out_of_scope").cloned().unwrap_or(json!(0)),
         v.get("new_findings").cloned().unwrap_or(json!(0)),
     )];
@@ -264,18 +485,25 @@ fn text(v: &Value) -> String {
             r["name"].as_str().unwrap_or("")
         ));
     }
+    for r in v["skipped"].as_array().into_iter().flatten().take(20) {
+        lines.push(format!(
+            "  skipped: {}: {}",
+            r["operation"].as_str().unwrap_or(""),
+            r["reason"].as_str().unwrap_or("")
+        ));
+    }
     for w in v["warnings"].as_array().into_iter().flatten().take(20) {
         lines.push(format!("  warning: {}", w.as_str().unwrap_or("")));
     }
     lines.join("\n")
 }
 
-fn is_url(s: &str) -> bool {
+pub(crate) fn is_url(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
     l.starts_with("http://") || l.starts_with("https://")
 }
 
-fn read_local(source: &str) -> Result<String, Error> {
+pub(crate) fn read_local(source: &str) -> Result<String, Error> {
     let bytes = if source == "-" {
         crate::read_input(None)?
     } else {
@@ -293,11 +521,15 @@ fn read_local(source: &str) -> Result<String, Error> {
 }
 
 /// Fetches specs and introspection results through the guarded client.
-struct Fetcher<'a> {
-    project: &'a Path,
-    send: &'a SendOptions,
-    auth: Option<&'a AuthSession>,
-    headers: &'a [(String, String)],
+pub(crate) struct Fetcher<'a> {
+    pub project: &'a Path,
+    pub send: &'a SendOptions,
+    /// Keep the fetch in history. `import api` and `scan active --api` don't: a document may hold credentials.
+    pub record: bool,
+    pub auth: Option<&'a AuthSession>,
+    pub headers: &'a [(String, String)],
+    /// Whose session rules apply to the fetch.
+    pub tool: Tool,
 }
 
 impl Fetcher<'_> {
@@ -321,10 +553,12 @@ impl Fetcher<'_> {
         let (req, target): (RawRequest, Target) = RawRequest::build(method, url, &headers, body)?;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let ex = match self.auth {
-            Some(a) => rt.block_on(a.send_as(Tool::Crawl, &req, &target))?,
+            Some(a) => rt.block_on(a.send_as(self.tool, &req, &target))?,
             None => rt.block_on(Client::new(self.send.clone()).send(&req, &target))?,
         };
-        Store::open(self.project)?.record_exchange(apiimport::SOURCE, &ex)?;
+        if self.record {
+            Store::open(self.project)?.record_exchange(apiimport::SOURCE, &ex)?;
+        }
         let head = parse_response_head(&ex.response)?;
         let body = decode_body(&head.headers, split_head_body(&ex.response).1);
         if body.len() > apiimport::MAX_DOCUMENT {
@@ -337,5 +571,27 @@ impl Fetcher<'_> {
             return Err(Error::InvalidInput(format!("{method} {url} returned HTTP {}", head.status)));
         }
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_stay_out_of_arguments_and_messages() {
+        assert!(api::check_source("spec.yaml").is_ok() && api::check_source("https://a.test/spec?v=1").is_ok());
+        let e = api::check_source("https://u:SECRET@a.test/spec").unwrap_err().to_string();
+        assert!(!e.contains("SECRET"), "{e}");
+        let e = api::check_source("https://a.test/spec?api_key=SECRET").unwrap_err().to_string();
+        assert!(e.contains("api_key") && !e.contains("SECRET"), "{e}");
+        let vars = parse_vars(&["tenant=a".into()]).unwrap();
+        assert!(check_background_args(&vars, &["X-Trace: 1".into()]).is_ok());
+        let vars = parse_vars(&["apiKey=SECRET".into()]).unwrap();
+        let e = check_background_args(&vars, &[]).unwrap_err().to_string();
+        assert!(e.contains("apiKey") && !e.contains("SECRET"), "{e}");
+        let e = check_background_args(&[], &["Authorization: SECRET".into()]).unwrap_err().to_string();
+        assert!(e.contains("Authorization") && !e.contains("SECRET"), "{e}");
+        assert!(!parse_vars(&["noequals".into()]).is_ok());
     }
 }
