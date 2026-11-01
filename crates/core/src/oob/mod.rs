@@ -132,6 +132,10 @@ pub struct OobState {
     /// taken for it. States written by older versions lack it.
     #[serde(default)]
     pub start_time: Option<u64>,
+    /// The listener's PID namespace, recorded if it holds its lock file, so that another
+    /// container on the same volume doesn't take the unknown `pid` for a dead process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_ns: Option<String>,
 }
 
 /// One payload: put `host` or `url` into an attack.

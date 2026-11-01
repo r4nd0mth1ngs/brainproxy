@@ -732,10 +732,11 @@ fn stop_never_signals_a_process_it_cannot_verify() {
         json!({"pid": pid, "started": "0", "tcp_listen": "127.0.0.1:1", "dns_listen": null, "public_ip": null,
                "endpoint": {"domain": null, "public_host": "127.0.0.1", "public_port": 1}, "log": null})
     };
-    // kill(-1) / kill(0) / init, and a reused pid (this test, with another start time):
-    // none is taken for a running proxy or listener, so nothing gets signalled.
+    // kill(-1) / kill(0) / init that can't be verified or is another process, and a reused
+    // pid (this test, with another start time): none is taken for a running proxy or
+    // listener, so nothing gets signalled.
     let me = std::process::id() as u64;
-    for (pid, start) in [(4294967295, None), (0, None), (1, None), (me, Some(1))] {
+    for (pid, start) in [(4294967295, None), (0, None), (1, None), (1, Some(1)), (me, Some(1))] {
         set("proxy.state", &proxy(pid, start));
         let (_, v) = run(&["proxy", "status"], &project, None);
         assert_eq!(v["data"]["running"], false, "{pid}: {v}");

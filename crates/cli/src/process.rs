@@ -4,7 +4,16 @@
 //! A stop is requested through the project database (`request_stop`), which the process
 //! polls (`shutdown`); on Unix it also gets SIGTERM. Windows has no SIGTERM, so the
 //! database flag is how it learns to flush and exit there.
+//!
+//! A project on a shared volume can be opened from another container, where the saved pid
+//! means nothing: it isn't visible, or is some other process. A listener therefore records
+//! its PID namespace and holds a lock file while it runs ([`RunLock`]). From another
+//! namespace the lock says whether it still runs, and the database flag is the only way to
+//! stop it.
 
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -92,17 +101,176 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
 
 /// Whether the process recorded as `pid`, started at `start`, still runs: `Some(false)`
 /// when it is gone or the pid now belongs to another process, `None` when the pid is
-/// alive but there is no start time to compare (state from an older version).
+/// alive but there is no start time to compare (state from an older version). Pid 1 always
+/// exists, so without a start time it says nothing, and older versions never ran as it.
 pub(crate) fn still_running(pid: u32, start: Option<u64>) -> Option<bool> {
-    if !alive(pid) {
+    if !alive(pid) || (pid == 1 && start.is_none()) {
         return Some(false);
     }
     start.map(|s| start_time(pid) == Some(s))
 }
 
+/// This process's PID namespace; pids only mean something inside one. `None` where there
+/// are no such namespaces to tell apart, or `/proc` isn't there to ask.
+pub(crate) fn pid_namespace() -> Option<String> {
+    sys::pid_namespace()
+}
+
+/// Whether a pid saved along with `pid_ns` belongs to another PID namespace, such as another
+/// container on the same volume. State without one has a pid to go by, as it always had.
+pub(crate) fn elsewhere(pid_ns: Option<&str>) -> bool {
+    pid_ns.is_some_and(|ns| pid_namespace().as_deref() != Some(ns))
+}
+
+/// A saved pid for people to read, since one from another namespace can't be looked up here.
+pub(crate) fn pid_text(pid: u32, pid_ns: Option<&str>) -> String {
+    if elsewhere(pid_ns) {
+        format!("pid {pid} in another container or PID namespace")
+    } else {
+        format!("pid {pid}")
+    }
+}
+
+/// What is known about a saved listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    Running,
+    /// Certainly gone, so its state can be cleared.
+    Gone,
+    /// In another namespace, with a lock that can't be read. Its state stays, and only
+    /// `stop --forget` clears it.
+    Unverified,
+}
+
+/// A listener in another namespace is judged by its lock, any other by its pid.
+pub(crate) fn liveness(store: &Store, what: &str, pid: u32, start: Option<u64>, pid_ns: Option<&str>) -> Liveness {
+    if elsewhere(pid_ns) {
+        match lock_held(store, what) {
+            Some(true) => Liveness::Running,
+            Some(false) => Liveness::Gone,
+            None => Liveness::Unverified,
+        }
+    } else if still_running(pid, start) == Some(false) {
+        Liveness::Gone
+    } else {
+        Liveness::Running
+    }
+}
+
+fn label(what: &str) -> &str {
+    if what == "oob" {
+        "OOB listener"
+    } else {
+        what
+    }
+}
+
+/// Why a saved listener can't be verified, and the way out.
+pub(crate) fn unverified_text(what: &str, pid: u32) -> String {
+    format!(
+        "can't verify the {} recorded as pid {pid} in another container or PID namespace: its lock file isn't \
+         readable here. If it is no longer running, `brainproxy {what} stop --forget` clears the record",
+        label(what)
+    )
+}
+
+/// A listener's hold on `<project>-<what>.lock`, for as long as it runs. The kernel releases
+/// it the moment the process dies, however that happens, and it works across PID namespaces.
+///
+/// Never open this file again from the process holding the lock: on NFS `flock` becomes a
+/// per-process POSIX lock, which closing any descriptor for the file releases.
+pub(crate) struct RunLock(#[allow(dead_code)] File);
+
+impl RunLock {
+    /// Takes the lock, or fails if another listener holds it. `None` where it can't be taken
+    /// (no namespaces to tell apart, a filesystem without locks): a listener then records no
+    /// namespace, and is judged by its pid.
+    pub(crate) fn acquire(store: &Store, what: &str) -> Result<Option<Self>, Error> {
+        let Some(path) = lock_path(store, what).filter(|_| pid_namespace().is_some()) else { return Ok(None) };
+        // `flock` needs no write access, so a lock file left by another user will do.
+        let opened = OpenOptions::new().create(true).truncate(false).write(true).open(&path);
+        let Ok(file) = opened.or_else(|_| File::open(&path)) else { return Ok(None) };
+        // Store::open's umask makes it owner-only, but it holds no data and listeners and
+        // probes can run as different users (`docker run --user`), which must all be able to
+        // open it. Failing is fine: then it isn't ours, and its owner has set this already.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o644));
+        }
+        // A probe holds it for an instant, so being refused once proves nothing.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self(file))),
+                Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                    return Err(Error::Conflict(format!(
+                        "another {} is already running for this project",
+                        label(what)
+                    )));
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+                Err(TryLockError::Error(_)) => return Ok(None),
+            }
+        }
+    }
+}
+
+fn lock_path(store: &Store, what: &str) -> Option<PathBuf> {
+    let mut path = store.path()?.as_os_str().to_owned();
+    path.push(format!("-{what}.lock"));
+    Some(path.into())
+}
+
+/// Whether a listener holds its lock: `None` when that can't be found out. A shared lock, so
+/// that probes don't get in each other's way.
+fn lock_held(store: &Store, what: &str) -> Option<bool> {
+    let file = match File::open(lock_path(store, what)?) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Some(false),
+        Err(TryLockError::WouldBlock) => Some(true),
+        Err(TryLockError::Error(_)) => None,
+    }
+}
+
+/// Waits for a listener in another namespace to act on the caller's `request_stop`: its lock
+/// is released, or if that can't be read, it has cleared its record under `state_key`. Its
+/// pid means something else here, so it is never signalled.
+pub(crate) fn await_exit_elsewhere(
+    store: &Store,
+    what: &str,
+    state_key: &str,
+    pid: u32,
+    wait: Duration,
+) -> Result<(), Error> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let held = lock_held(store, what);
+        if held == Some(false) || store.meta_get(state_key)?.is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Conflict(match held {
+                Some(_) => format!(
+                    "the {} (pid {pid} in another container or PID namespace) is still running after being asked to \
+                     stop, and can't be signalled from here; stop it where it runs",
+                    label(what)
+                ),
+                None => unverified_text(what, pid),
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Stops the process recorded as (`pid`, `start`), after the caller's `request_stop`: on
 /// Unix SIGTERM too, then a forced kill after 5 s. Returns whether the kill was needed. A
-/// process that can't be verified is never killed.
+/// process that can't be verified is never killed, and neither is pid 1, which is never
+/// signalled at all and has only the database flag to go by.
 pub(crate) fn terminate(pid: u32, start: Option<u64>, what: &str, wait: Duration) -> Result<bool, Error> {
     let gone = || still_running(pid, start) == Some(false);
     if gone() {
@@ -115,6 +283,12 @@ pub(crate) fn terminate(pid: u32, start: Option<u64>, what: &str, wait: Duration
     }
     if gone() {
         return Ok(false);
+    }
+    if pid == 1 {
+        return Err(Error::Conflict(format!(
+            "the {what} is still running after being asked to stop. It is pid 1, which brainproxy never signals; \
+             stop its container instead"
+        )));
     }
     if start.is_none() {
         return Err(Error::Conflict(format!(
@@ -129,10 +303,16 @@ pub(crate) fn terminate(pid: u32, start: Option<u64>, what: &str, wait: Duration
 
 #[cfg(unix)]
 mod sys {
-    /// `pid` as a pid_t that is safe to signal: 0, 1 and anything that turns negative
-    /// (`kill(0|-1|-n)` hits a process group or every process) are refused.
-    fn pid_t(pid: u32) -> Option<libc::pid_t> {
-        libc::pid_t::try_from(pid).ok().filter(|&p| p > 1)
+    /// `pid` as a pid_t to look at: 0 and anything that turns negative (`kill(0|-1|-n)` hits
+    /// a process group or every process) are refused.
+    pub(super) fn pid_t(pid: u32) -> Option<libc::pid_t> {
+        libc::pid_t::try_from(pid).ok().filter(|&p| p > 0)
+    }
+
+    /// `pid` as a pid_t that is safe to signal: not 1 either. A `proxy run` that is a
+    /// container's main command is pid 1 and can be looked at, but init never gets a signal.
+    pub(super) fn signal_target(pid: u32) -> Option<libc::pid_t> {
+        pid_t(pid).filter(|&p| p > 1)
     }
 
     /// Signal 0 checks without delivering anything; EPERM means another user's process,
@@ -142,15 +322,25 @@ mod sys {
     }
 
     pub fn ask_to_exit(pid: u32) {
-        if let Some(p) = pid_t(pid) {
+        if let Some(p) = signal_target(pid) {
             unsafe { libc::kill(p, libc::SIGTERM) };
         }
     }
 
     pub fn kill(pid: u32) {
-        if let Some(p) = pid_t(pid) {
+        if let Some(p) = signal_target(pid) {
             unsafe { libc::kill(p, libc::SIGKILL) };
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn pid_namespace() -> Option<String> {
+        std::fs::read_link("/proc/self/ns/pid").ok()?.into_os_string().into_string().ok()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn pid_namespace() -> Option<String> {
+        None
     }
 
     #[cfg(target_os = "macos")]
@@ -211,6 +401,10 @@ mod sys {
         (unsafe { GetExitCodeProcess(p.0, &mut code) } != 0) && code == STILL_ACTIVE
     }
 
+    pub fn pid_namespace() -> Option<String> {
+        None
+    }
+
     /// Nothing to send: the caller's `request_stop` flag is how a Windows process is asked.
     pub fn ask_to_exit(_: u32) {}
 
@@ -235,7 +429,7 @@ mod tests {
 
     #[test]
     fn process_identity() {
-        for bad in [0, 1, u32::MAX, i32::MAX as u32 + 1] {
+        for bad in [0, u32::MAX, i32::MAX as u32 + 1] {
             assert!(!alive(bad) && start_time(bad).is_none(), "{bad}");
         }
         let me = std::process::id();
@@ -244,5 +438,122 @@ mod tests {
         assert_eq!(still_running(me, start), Some(true));
         assert_eq!(still_running(me, start.map(|s| s + 1)), Some(false));
         assert_eq!(still_running(me, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_1_can_be_looked_at_but_not_signalled() {
+        assert_eq!(sys::pid_t(1), Some(1));
+        assert_eq!(sys::signal_target(1), None);
+        for bad in [0, u32::MAX, i32::MAX as u32 + 1] {
+            assert_eq!(sys::pid_t(bad), None, "{bad}");
+            assert_eq!(sys::signal_target(bad), None, "{bad}");
+        }
+        assert_eq!(sys::signal_target(2), Some(2));
+    }
+
+    #[test]
+    fn another_namespace_is_told_from_this_one() {
+        assert!(elsewhere(Some("pid:[1]")));
+        assert!(!elsewhere(None));
+        assert_eq!(pid_text(7, None), "pid 7");
+        assert!(pid_text(7, Some("pid:[1]")).contains("another container"));
+        if let Some(here) = pid_namespace() {
+            assert!(!elsewhere(Some(&here)));
+            assert_eq!(pid_text(7, Some(&here)), "pid 7");
+        }
+    }
+
+    /// A project in a fresh folder.
+    fn store(name: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!("bp-process-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("p.bpdb")).unwrap();
+        (dir, store)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_lock_tells_whether_a_listener_elsewhere_runs() {
+        let (dir, store) = store("lock");
+        let other = Some("pid:[1]");
+        // No listener has ever run here: there is no lock, and nothing holds it.
+        assert_eq!(lock_held(&store, "proxy"), Some(false));
+        assert_eq!(liveness(&store, "proxy", 1, Some(1), other), Liveness::Gone);
+
+        let lock = RunLock::acquire(&store, "proxy").unwrap().expect("lock");
+        assert_eq!(lock_held(&store, "proxy"), Some(true));
+        // Neither a pid that isn't there nor an unknown start time says anything elsewhere.
+        assert_eq!(liveness(&store, "proxy", i32::MAX as u32, None, other), Liveness::Running);
+        assert!(matches!(RunLock::acquire(&store, "proxy"), Err(Error::Conflict(_))));
+        // Each listener has its own.
+        assert_eq!(lock_held(&store, "oob"), Some(false));
+        store.meta_set("state", Some("{}")).unwrap();
+        let err = await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap_err();
+        assert!(err.to_string().contains("still running"), "{err}");
+
+        drop(lock);
+        assert_eq!(lock_held(&store, "proxy"), Some(false));
+        assert_eq!(liveness(&store, "proxy", 1, Some(1), other), Liveness::Gone);
+        await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap();
+        assert!(RunLock::acquire(&store, "proxy").unwrap().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Being unable to read the lock says nothing, and other users can read a lock it made.
+    /// Permissions don't bind root, so that part only runs for other users.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_file_that_cannot_be_read_says_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = store("unreadable");
+        let path = lock_path(&store, "proxy").unwrap();
+        let chmod = |mode| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let lock = RunLock::acquire(&store, "proxy").unwrap().expect("lock");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        drop(lock);
+
+        // It can be taken without write access, as with a file left by another user.
+        chmod(0o444);
+        let lock = RunLock::acquire(&store, "proxy").unwrap().expect("a read-only lock file will do");
+        assert_eq!(lock_held(&store, "proxy"), Some(true));
+        drop(lock);
+
+        chmod(0o000);
+        if File::open(&path).is_err() {
+            store.meta_set("state", Some("{}")).unwrap();
+            assert_eq!(lock_held(&store, "proxy"), None);
+            assert_eq!(liveness(&store, "proxy", 1, Some(1), Some("pid:[1]")), Liveness::Unverified);
+            let err = await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap_err();
+            assert!(err.to_string().contains("stop --forget"), "{err}");
+            // A listener that answers clears its record, whatever the lock says.
+            store.meta_set("state", None).unwrap();
+            await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap();
+        }
+        chmod(0o644);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_project_without_a_file_has_no_lock() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(RunLock::acquire(&store, "proxy").unwrap().is_none());
+        assert_eq!(lock_held(&store, "proxy"), None);
+    }
+
+    /// Here the pid decides, as it does for state from an older version.
+    #[test]
+    fn this_namespace_goes_by_the_pid() {
+        let (dir, store) = store("pid");
+        let me = std::process::id();
+        let start = start_time(me);
+        for ns in [None, pid_namespace()] {
+            assert_eq!(liveness(&store, "proxy", me, start, ns.as_deref()), Liveness::Running);
+            assert_eq!(liveness(&store, "proxy", me, start.map(|s| s + 1), ns.as_deref()), Liveness::Gone);
+            assert_eq!(liveness(&store, "proxy", 0, start, ns.as_deref()), Liveness::Gone);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

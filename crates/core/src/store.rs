@@ -396,6 +396,11 @@ impl Store {
         Self::init(conn)
     }
 
+    /// The project file; `None` for an in-memory project.
+    pub fn path(&self) -> Option<&Path> {
+        self.conn.path().filter(|p| !p.is_empty()).map(Path::new)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         register_functions(&conn)?;
