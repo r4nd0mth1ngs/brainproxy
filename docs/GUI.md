@@ -118,13 +118,13 @@ people who don't work with HTTP: the website (prefilled only from recorded traff
 checked with one GET before moving on, with a plain explanation if it doesn't answer or is
 out of scope), login (none, or an existing auth profile, with a pointer to Settings), depth
 (Quick: medium strength, crawl depth 3, 150 pages; Standard: high, 5, 500; Thorough:
-insane, 8, 1500; Standard and Thorough also attack cookies (`--cookies`); once the Nuclei templates are downloaded, Standard adds those of high
+insane, 8, 1500; Standard and Thorough also attack cookies (`--cookies`) and URL path segments (`--url-path`); once the Nuclei templates are downloaded, Standard adds those of high
 severity and Thorough those of medium and above, both plus the end-of-life checks via
 `--check-include-tags eol`; Thorough also crawls with JavaScript in a hidden browser
 (`--browser`) when `browser list` finds a Chromium-based one, and says so on its card and
 in the review), speed (Gentle `-c 3`, Normal, Fast `-c 30`),
-and a review with warnings about replayed POST requests and real
-attack traffic. It runs
+and a review with warnings about replayed POST requests, attacked page addresses (at
+Standard and Thorough) and real attack traffic. It runs
 `scan active URL --crawl ... --background`, shows progress as "exploring" then "testing",
 and ends with counts per risk level explained in plain words and a link to Findings. "I'll
 set it up myself" hides it for that project.
