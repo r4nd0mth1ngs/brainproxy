@@ -88,9 +88,10 @@ auth, rate limit) and only when `scan active --checks` selects them.
 `brainproxy checks update` pulls the `nuclei-templates` repository (MIT, updated daily,
 thousands of CVE/exposure/misconfiguration checks) at a commit, stores the HTTP templates
 that load in `<home>/checks/nuclei/`, and records the commit, tarball sha256, and skip
-reasons. Templates that use unsupported features (interactsh, payload files, JavaScript
-flows, ...) are listed, not half-run; with the DSL subset about 78% of the HTTP templates
-load today.
+reasons. Templates that use unsupported features (JavaScript flows, `self-contained`, ...)
+are listed, not half-run. Templates that need an out-of-band listener or inputs are kept and
+load when `brainproxy oob start` is running or `--check-var` is passed; about 89% of the HTTP
+templates are stored (10,434 of 11,690 at the pinned version).
 
 ZAP itself has no declarative rule format (its scripts are JavaScript/Zest code), so
 layer 3 complements the ZAP ports rather than replacing them: ZAP's generic, logic-heavy

@@ -269,7 +269,7 @@ brainproxy send --http2 --url https://target.test/
 # Compare two captures
 brainproxy diff 12 15 --part response-body --mode words
 
-# Passive scanning (52 rules ported from ZAP) runs automatically on proxy and send traffic
+# Passive scanning (53 rules ported from ZAP) runs automatically on proxy and send traffic
 brainproxy findings list                          # grouped by alert type, highest risk first
 brainproxy findings list --risk medium --all      # one row per instance
 brainproxy findings show 7                        # description, solution, references, evidence
