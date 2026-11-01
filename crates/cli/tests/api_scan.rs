@@ -1564,3 +1564,39 @@ fn a_login_carries_the_query_key() {
     assert!(!q.contains("FAKE-LOGIN-KEY"), "{q}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_declared_query_key_leaves_a_parameter_differing_in_case() {
+    let (dir, p) = setup("query-case", "127.0.0.1");
+    let api = Api::start();
+    let doc = json!({"openapi": "3.0.0", "servers": [{"url": api.origin()}],
+        "components": {"securitySchemes": {"K": {"type": "apiKey", "in": "query", "name": "id"}}},
+        "paths": {"/i": {"get": {"parameters": [
+            {"name": "id", "in": "query", "example": "FAKE-ID-KEY"},
+            {"name": "ID", "in": "query", "example": "42"}]}}}});
+    let d = preview(&p, &write_doc(&dir, "case.json", &doc.to_string()), &[]);
+    let url = d["requests"][0]["url"].as_str().unwrap();
+    assert!(url.ends_with("/i?ID=42"), "{url}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_background_scan_reads_a_remote_document_as_the_scan_would() {
+    let (dir, p) = setup("remote-rules", "127.0.0.1");
+    let api = Api::with(
+        Some(
+            json!({"info": {"name": "r"}, "item": [
+        {"name": "a", "request": {"method": "GET", "url": "{{base}}/a"}}]})
+            .to_string(),
+        ),
+        false,
+    );
+    let url = format!("{}/spec", api.origin());
+    let var = format!("--var=base={}", api.origin());
+    // A header the document's server wants reaches the check as it reaches the run.
+    let o = run(&p, &["import", "api", &var, "--background", "-H", "X-Tenant: acme", "--", &url]);
+    assert_eq!(o.code, 0, "{}", o.all);
+    let first = api.hits().into_iter().find(|h| h.path() == "/spec").unwrap();
+    assert_eq!(first.header("X-Tenant"), Some("acme"), "{}", first.head);
+    let _ = std::fs::remove_dir_all(dir);
+}

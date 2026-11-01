@@ -368,15 +368,14 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 crate::import_cmd::check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&args.api_selection(), &guard)?)?;
             } else {
-                let net = (args.timeout, args.verify_tls);
-                crate::import_cmd::check_remote_vars(
-                    project,
-                    &guard,
-                    source,
-                    args.api_options()?,
-                    args.auth.as_deref(),
-                    net,
-                )?;
+                let from = crate::import_cmd::RemoteFetch {
+                    auth: args.auth.as_deref(),
+                    headers: &[],
+                    tool: Tool::Scan,
+                    timeout: args.timeout,
+                    verify_tls: args.verify_tls,
+                };
+                crate::import_cmd::check_remote_vars(project, &guard, source, args.api_options()?, from)?;
             }
         }
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);

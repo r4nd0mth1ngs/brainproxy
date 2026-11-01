@@ -304,7 +304,11 @@ fn security_schemes(doc: &Value) -> Vec<Credential> {
 fn harden(built: &mut Built, format: Format, declared: &[Credential]) {
     let is_declared = |place: &str, name: &str| {
         declared.iter().any(|c| {
-            c.location.as_deref() == Some(place) && c.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))
+            c.location.as_deref() == Some(place)
+                && c.name.as_deref().is_some_and(|n| {
+                    // Header names ignore case; query parameter names don't.
+                    n == name || (place == "header" && n.eq_ignore_ascii_case(name))
+                })
         })
     };
     for mut r in std::mem::take(&mut built.requests) {

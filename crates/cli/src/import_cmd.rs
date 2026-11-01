@@ -164,8 +164,16 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                 check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&a.selection(), &guard)?)?;
             } else {
-                let net = (c.timeout, c.verify_tls);
-                check_remote_vars(project, &guard, &a.doc.source, a.options()?, c.auth.as_deref(), net)?;
+                let headers =
+                    c.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
+                let from = RemoteFetch {
+                    auth: c.auth.as_deref(),
+                    headers: &headers,
+                    tool: Tool::Crawl,
+                    timeout: c.timeout,
+                    verify_tls: c.verify_tls,
+                };
+                check_remote_vars(project, &guard, &a.doc.source, a.options()?, from)?;
             }
         }
         return crate::jobs_cmd::spawn_background("import", project, home, out);
@@ -407,6 +415,15 @@ pub(crate) fn check_background_doc(loaded: &api::Loaded) -> Result<(), Error> {
     }
 }
 
+/// How the command itself would fetch a remote document.
+pub(crate) struct RemoteFetch<'a> {
+    pub auth: Option<&'a str>,
+    pub headers: &'a [(String, String)],
+    pub tool: Tool,
+    pub timeout: f64,
+    pub verify_tls: bool,
+}
+
 /// Which `--var` may go in the job table depends on the document, so a remote one that
 /// has any is fetched first (not kept), and a fetch that fails refuses them too.
 pub(crate) fn check_remote_vars(
@@ -414,21 +431,21 @@ pub(crate) fn check_remote_vars(
     guard: &Arc<Guard>,
     source: &str,
     opts: api::Options,
-    auth: Option<&str>,
-    (timeout, verify_tls): (f64, bool),
+    from: RemoteFetch<'_>,
 ) -> Result<(), Error> {
     if opts.vars.is_empty() {
         return Ok(());
     }
     let send = SendOptions {
-        timeout: Duration::from_secs_f64(timeout.max(0.1)),
-        verify_tls,
+        timeout: Duration::from_secs_f64(from.timeout.max(0.1)),
+        verify_tls: from.verify_tls,
         sni: None,
         guard: Some(guard.clone()),
         http2: false,
     };
-    let auth = crate::auth_cmd::maybe_session(project, auth, &send)?;
-    let fetch = Fetcher { project, send: &send, record: false, auth: auth.as_deref(), headers: &[], tool: Tool::Crawl };
+    let auth = crate::auth_cmd::maybe_session(project, from.auth, &send)?;
+    let fetch =
+        Fetcher { project, send: &send, record: false, auth: auth.as_deref(), headers: from.headers, tool: from.tool };
     check_background_doc(&load_api(&fetch, source, opts)?)
 }
 
