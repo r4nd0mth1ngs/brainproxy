@@ -401,6 +401,73 @@ fn compare_with_a_scan_and_gate_it() {
     }
 }
 
+/// A finding first seen by a run that failed is found again by the next one. Against that run
+/// alone it is unchanged, so a new-only gate never sees it; since the last completed scan, new.
+#[test]
+fn since_scan_counts_what_a_failed_run_saw_first_as_new() {
+    let env = Env::new("since");
+    env.send("/old");
+    let url = format!("http://127.0.0.1:{}/", env.port);
+    let args: Vec<String> = ["scan", "active", "--crawl", &url].iter().map(|s| s.to_string()).collect();
+    let good = scan_job(&env, &args, "completed", || env.send("/old"));
+    let _failed = scan_job(&env, &args, "failed", || env.send("/sqli"));
+    let job = scan_job(&env, &args, "completed", || {
+        env.send("/old");
+        env.send("/sqli");
+    });
+    let (job, good) = (job.to_string(), good.to_string());
+
+    // Without --since-scan: unchanged, and the new-only gate passes.
+    let (code, v) = env.compare(&["--scan", &job, "--fail-on", "info", "--new-only"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["summary"]["new"], 0);
+    assert!(urls(&v["data"]["unchanged"]).iter().any(|u| u.ends_with("/sqli")), "{v}");
+    assert!(v["data"]["baseline"].get("since_scan").is_none(), "{v}");
+
+    // Since the last completed scan: new, and the gate fails on it alone.
+    let (code, v) = env.compare(&["--scan", &job, "--since-scan", &good, "--fail-on", "info", "--new-only"]);
+    assert_eq!(code, 5, "{v}");
+    let d = &v["data"];
+    assert!(ends_with(&d["new"], "/sqli"), "{d}");
+    assert!(ends_with(&d["gate"]["findings"], "/sqli"), "{d}");
+    assert!(ends_with(&d["unchanged"], "/old"), "{d}");
+    assert_eq!(d["baseline"]["since_scan"]["job"], good.parse::<i64>().unwrap());
+    assert_eq!(d["baseline"]["scope"]["new_since"], d["baseline"]["since_scan"]["start"]);
+}
+
+#[test]
+fn since_scan_must_be_a_completed_scan_before_the_compared_one() {
+    let env = Env::new("since-refused");
+    let url = format!("http://127.0.0.1:{}/", env.port);
+    let args: Vec<String> = ["scan", "active", "--crawl", &url].iter().map(|s| s.to_string()).collect();
+    let store = Store::open(&env.project).unwrap();
+    let running = store.job_create("active-scan", "running", &args).unwrap();
+    let failed = scan_job(&env, &args, "failed", || {});
+    let stopped = scan_job(&env, &args, "stopped", || {});
+    let timed = scan_job(&env, &args, "completed", || {});
+    store.job_result(timed, &serde_json::json!({"timed_out": true})).unwrap();
+    let crawl = store.job_create("crawl", "completed", &[]).unwrap();
+    let job = scan_job(&env, &args, "completed", || {});
+    let later = scan_job(&env, &args, "completed", || {});
+    let job = job.to_string();
+
+    for (since, kind) in [
+        (running, "conflict"),
+        (failed, "conflict"),
+        (stopped, "conflict"),
+        (timed, "conflict"),
+        (crawl, "invalid_input"),
+        (later, "invalid_input"),
+        (job.parse().unwrap(), "invalid_input"),
+    ] {
+        let (code, v) = env.compare(&["--scan", &job, "--since-scan", &since.to_string()]);
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some(kind)), "since {since}: {v}");
+    }
+    assert_eq!(env.compare(&["--scan", &job, "--since-scan", "999"]).0, 4);
+    // Only with --scan.
+    assert_eq!(env.compare(&["--since-scan", &later.to_string()]).0, 2);
+}
+
 #[test]
 fn described_in_capabilities_and_offered_over_mcp() {
     let env = Env::new("described");
@@ -408,7 +475,7 @@ fn described_in_capabilities_and_offered_over_mcp() {
     assert!(caps["data"]["exit_codes"]["5"].as_str().unwrap().contains("--fail-on"));
     let one = ok(&env.project, &["capabilities", "findings", "compare"]);
     let flags: Vec<&str> = one["data"]["args"].as_array().unwrap().iter().filter_map(|a| a["flag"].as_str()).collect();
-    for flag in ["--baseline", "--scan", "--fail-on", "--new-only", "--allow-missing-baseline"] {
+    for flag in ["--baseline", "--scan", "--since-scan", "--fail-on", "--new-only", "--allow-missing-baseline"] {
         assert!(flags.contains(&flag), "{flags:?}");
     }
 

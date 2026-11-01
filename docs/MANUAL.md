@@ -768,12 +768,26 @@ brainproxy --project app.bpdb findings compare --baseline baseline.json --fail-o
 there: new and unchanged ones, or with `--new-only` just the new ones. False positives never count,
 whatever `--state` lists. With `--scan`, only what that scan found counts.
 
+`--scan JOB --since-scan EARLIER` is for a pipeline that scans the same project again and again.
+"New" against one scan means first found by that scan, so a finding first seen by a run that failed
+or was stopped, and found again by the next run, would count as unchanged and never trip
+`--new-only`. With `--since-scan`, a finding the scan found that was first seen at or after
+`EARLIER` started is new as well. Give the last scan that completed. "Unchanged" and "fixed" are
+still against `JOB`, and `data.baseline.since_scan` shows the job and its start. `EARLIER` must be
+an active scan that completed (not failed, stopped, or out of `--max-minutes`) and finished before
+`JOB` started; anything else is refused with `2`.
+
+```bash
+# Job 12 completed; job 13 failed after finding something; job 14 completed.
+brainproxy --project app.bpdb findings compare --scan 14 --since-scan 12 --fail-on high --new-only
+```
+
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Compared, and the gate (if any) passed |
 | `5` | Compared, and the gate found something. The output is complete: `ok` is true, and `data.gate` has `passed: false`, the `count`, and the `findings` |
-| `4` | The baseline file, project, or scan job doesn't exist |
-| `2` | Bad arguments; a file that isn't usable (not a report, cut off, or the baseline and the findings compared being the same file); or `--fail-on` with a filtered `--current` or a scan that didn't complete |
+| `4` | The baseline file, project, or scan job (`--scan` or `--since-scan`) doesn't exist |
+| `2` | Bad arguments; a file that isn't usable (not a report, cut off, or the baseline and the findings compared being the same file); `--fail-on` with a filtered `--current` or a scan that didn't complete; or a `--since-scan` job that didn't complete before the `--scan` one started |
 
 These don't pass a gate:
 

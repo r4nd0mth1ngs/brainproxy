@@ -109,10 +109,14 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
 /// less `exclude_rules`). `check_ids`: the declarative checks known to have run: those named by
 /// id. Without ids, which checks ran depends on their severity and tags, which findings don't
 /// record, so no check finding is taken as covered. `end` is None while the scan runs.
+/// `new_since`, before `start`, widens "new" to a finding the scan found again that was first
+/// seen since then: by a scan that failed in between, say, whose findings no gate looked at.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ScanScope {
     pub start: String,
     pub end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_since: Option<String>,
     pub origins: Option<Vec<String>>,
     pub rules: Option<Vec<i64>>,
     pub exclude_rules: Vec<i64>,
@@ -172,7 +176,11 @@ impl ScanScope {
         } else if f.time >= self.start.as_str() {
             Seen::New
         } else if f.last >= self.start.as_str() {
-            Seen::Still
+            if self.new_since.as_deref().is_some_and(|since| f.time >= since) {
+                Seen::New
+            } else {
+                Seen::Still
+            }
         } else if self.covers(f) {
             Seen::Gone
         } else {
@@ -475,6 +483,18 @@ mod tests {
         assert_eq!(seen(&ScanScope { origins: None, ..scope() }, 4), Gone);
         // While a scan runs nothing is after its end.
         assert_eq!(seen(&ScanScope { end: None, ..scope() }, 7), New);
+    }
+
+    #[test]
+    fn new_since_an_earlier_scan_counts_what_a_failed_run_saw_first() {
+        use Seen::*;
+        let after = |since: &str| ScanScope { new_since: Some(since.into()), ..scope() };
+        // Since before /'s first sighting: found again, it is new; not found again, still gone.
+        assert_eq!(all(&after("2026-10-21T08:00:00.000Z")), [New, New, Gone, Other, Other, Other, Other, Other]);
+        // At the very time it was first seen, too.
+        assert_eq!(seen(&after(BEFORE), 2), New);
+        // Since after it: unchanged, as without.
+        assert_eq!(all(&after("2026-10-21T10:00:00.000Z")), all(&scope()));
     }
 
     fn store_with_findings() -> Store {
