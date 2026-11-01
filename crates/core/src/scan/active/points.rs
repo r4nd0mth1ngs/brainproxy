@@ -17,6 +17,12 @@ use crate::scan::passive::util::decode_entities;
 /// Everything but RFC 3986 unreserved characters is escaped in a path segment.
 const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
 
+/// File extensions of static assets: one file per directory is enough to attack.
+const ASSET_EXT: &[&str] = &[
+    "js", "mjs", "css", "map", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "bmp", "woff", "woff2",
+    "ttf", "otf", "eot", "mp3", "mp4", "webm", "wasm",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PointKind {
@@ -130,6 +136,53 @@ fn path_range(target: &str) -> Range<usize> {
         None => 0,
     };
     start..end
+}
+
+/// Whether a path segment looks like a generated value rather than part of the route:
+/// a number, a UUID or a long hex ID.
+fn is_id_segment(seg: &str) -> bool {
+    let hex_run = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let uuid = seg.len() == 36 && {
+        let groups: Vec<&str> = seg.split('-').collect();
+        groups.len() == 5 && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, len)| hex_run(g, len))
+    };
+    let number = !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit());
+    number || uuid || (seg.len() >= 16 && hex_run(seg, seg.len()))
+}
+
+/// Whether a request target names a static asset, by the extension of its last segment.
+/// Documents and archives don't count: `/files/report.pdf` is often a parameter.
+fn is_asset(target: &str) -> bool {
+    let path = &target[path_range(target)];
+    let file = path.rsplit('/').next().unwrap_or("");
+    file.rsplit_once('.').is_some_and(|(_, ext)| ASSET_EXT.iter().any(|a| ext.eq_ignore_ascii_case(a)))
+}
+
+/// The route of a request target's path: IDs and an asset's file name are replaced,
+/// so `/users/1` and `/users/2` are one route, and so are `/js/a.js` and `/js/b.js`.
+pub fn route(target: &str) -> String {
+    let path = &target[path_range(target)];
+    let mut segments: Vec<&str> = path.split('/').map(|seg| if is_id_segment(seg) { "{id}" } else { seg }).collect();
+    if let Some(file) = segments.last_mut().filter(|_| is_asset(target)) {
+        *file = "{asset}";
+    }
+    segments.join("/")
+}
+
+/// The route up to a fixed URL path segment, for attacking it once per origin and method; None for
+/// other points. `/api` under `/api/users` is the same place as under `/api/orders`, while
+/// an ID isn't fixed: its one target per route (see `route`) already limits it.
+pub(crate) fn fixed_segment(raw: &[u8], point: &InsertionPoint) -> Option<String> {
+    let Loc::Segment(i) = point.loc else { return None };
+    let head = String::from_utf8_lossy(split_head_body(raw).0).into_owned();
+    let (_, target, _) = split_target(&head);
+    let path = &target[path_range(target)];
+    let seg = path.split('/').nth(i)?;
+    if is_id_segment(seg) {
+        return None;
+    }
+    let prefix = path.split('/').take(i + 1).collect::<Vec<_>>().join("/");
+    Some(route(&prefix))
 }
 
 /// All insertion points of a raw request.
@@ -889,6 +942,52 @@ mod tests {
         let p = b"GET /go/http://h.example/d HTTP/1.1\r\nHost: h\r\n\r\n";
         assert_eq!(points(p, &opts).len(), 4);
         assert!(points(b"OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", &opts).is_empty());
+    }
+
+    #[test]
+    fn id_segments() {
+        for id in ["1", "007", "550e8400-e29b-41d4-a716-446655440000", "507f1f77bcf86cd799439011", "ABCDEF0123456789"] {
+            assert!(is_id_segment(id), "{id}");
+        }
+        for seg in ["", "v1", "users", "abc123", "deadbeef", "550e8400-e29b-41d4-a716", "1.5", "42%27", "2fa"] {
+            assert!(!is_id_segment(seg), "{seg}");
+        }
+    }
+
+    #[test]
+    fn routes() {
+        assert_eq!(route("/users/42"), "/users/{id}");
+        assert_eq!(route("/users/42/orders/550e8400-e29b-41d4-a716-446655440000/"), "/users/{id}/orders/{id}/");
+        assert_eq!(route("/users/alice?x=1"), "/users/alice");
+        assert_eq!(route("/api/v1/users"), "/api/v1/users");
+        assert_eq!(route("http://h.example/users/42?u=http://x/1"), "/users/{id}");
+        assert_eq!(route("/"), "/");
+        assert_eq!(route("/assets/js/app.JS?v=3"), "/assets/js/{asset}");
+        assert_eq!(route("/app.css"), "/{asset}");
+        // A file served by the application can be a parameter.
+        assert_eq!(route("/files/report.pdf"), "/files/report.pdf");
+        assert_eq!(route("/js/app.js/edit"), "/js/app.js/edit");
+    }
+
+    #[test]
+    fn fixed_segments() {
+        let opts = PointOptions { path: true, ..Default::default() };
+        let keys =
+            |raw: &[u8]| -> Vec<Option<String>> { points(raw, &opts).iter().map(|p| fixed_segment(raw, p)).collect() };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            keys(b"GET /api/users/42/profile?a=1 HTTP/1.1\r\nHost: h\r\n\r\n"),
+            [None, some("/api"), some("/api/users"), None, some("/api/users/{id}/profile")]
+        );
+        assert_eq!(keys(b"GET http://h.example/a/b HTTP/1.1\r\nHost: h\r\n\r\n"), [some("/a"), some("/a/b")]);
+        // Any file of a directory is the same place, attacked once.
+        assert_eq!(keys(b"GET /js/app.js?v=3 HTTP/1.1\r\nHost: h\r\n\r\n"), [None, some("/js"), some("/js/{asset}")]);
+        assert_eq!(
+            keys(b"GET /files/report.pdf HTTP/1.1\r\nHost: h\r\n\r\n"),
+            [some("/files"), some("/files/report.pdf")]
+        );
+        // A segment that looks the same under another parent is another place.
+        assert_eq!(keys(b"GET /b/x HTTP/1.1\r\nHost: h\r\n\r\n"), [some("/b"), some("/b/x")]);
     }
 
     #[test]

@@ -647,7 +647,10 @@ impl Scan<'_> {
             let and_false = format!("{orig}{}", SQL_LOGIC_AND_FALSE[i]);
             let Some(resp) = self.send(&or_true).await else { continue };
             self.n_boolean += 1;
-            if (java_len(resp.body_str()) as f64) <= java_len(normal_unstripped) as f64 * 1.2 {
+            // Unlike ZAP, without the values sent: a small page that echoes its input or
+            // path would otherwise look like it returned more data.
+            let or_stripped = strip_off_both(resp.body_str(), &orig, &or_true);
+            if (java_len(&or_stripped) as f64) <= java_len(&normal_stripped) as f64 * 1.2 {
                 continue;
             }
             let Some(false_resp) = self.send(&and_false).await else { continue };

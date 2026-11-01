@@ -1,12 +1,13 @@
 //! `scan active`: choose targets, run the active rules, summarise findings.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
-use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
+use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
@@ -111,7 +112,9 @@ pub struct ActiveArgs {
     no_multipart: bool,
     #[arg(long)]
     no_xml: bool,
-    /// Also inject into URL path segments, such as IDs in REST paths.
+    /// Also inject into URL path segments, such as IDs in REST paths. Requests that differ
+    /// only by an ID (/users/1, /users/2) or an asset's file name count as one target unless
+    /// named by URL or --history-id; a fixed segment is attacked once per origin and method.
     #[arg(long)]
     url_path: bool,
     /// Concurrent rule units.
@@ -513,6 +516,8 @@ fn select_targets(
         ids.extend(r.rows.iter().filter_map(|row| row[0].as_i64()));
     }
     let mut targets = Vec::new();
+    // The requests asked for by URL or history id, not by a filter.
+    let mut named: HashSet<i64> = args.history_ids.iter().copied().collect();
     if !args.urls.is_empty() {
         let client = Client::new(send.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -523,6 +528,7 @@ fn select_targets(
                 None => rt.block_on(client.send(&req, &target))?,
             };
             let id = store.record_exchange("scan", &ex)?;
+            named.insert(id);
             targets.push(ScanTarget {
                 history_id: Some(id),
                 target,
@@ -561,11 +567,16 @@ fn select_targets(
             duration_ms: item.entry.duration_ms.map(|d| d.max(0) as u64),
         });
     }
-    // One target per method + origin + path + parameter names.
-    let mut seen = HashSet::new();
+    // One target per method + origin + path + parameter names. With URL path attacks the
+    // path is the route (`/users/{id}`), unless the user named this very request, and the
+    // route is attacked through a request that worked, if any: it keeps its place in the
+    // list, so --max-targets cuts the same routes whatever they answered.
+    let ok = |t: &ScanTarget| parse_response_head(&t.response).is_ok_and(|h| (200..300).contains(&h.status));
+    let mut seen = HashMap::new();
+    let mut kept: Vec<ScanTarget> = Vec::new();
     let mut skipped_methods = 0;
     let all_methods = args.include_methods.iter().any(|m| m == "ALL");
-    targets.retain(|t| {
+    for t in targets {
         let head = RawRequest::from_bytes(t.request.clone()).head().ok();
         let method = head.as_ref().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default();
         let explicit = t.history_id.is_some_and(|id| args.history_ids.contains(&id));
@@ -575,13 +586,26 @@ fn select_targets(
             || args.include_methods.contains(&method))
         {
             skipped_methods += 1;
-            return false;
+            continue;
         }
-        let path = head.map(|h| h.target.split('?').next().unwrap_or("").to_string()).unwrap_or_default();
+        let by_route = opts.path && !t.history_id.is_some_and(|id| named.contains(&id));
+        let path = head
+            .map(|h| if by_route { points::route(&h.target) } else { h.target.split('?').next().unwrap_or("").into() })
+            .unwrap_or_default();
         let mut names: Vec<String> = points::points(&t.request, opts).into_iter().map(|p| p.name).collect();
         names.sort();
-        seen.insert((method, t.target.origin(), path, names))
-    });
-    targets.truncate(args.max_targets);
-    Ok((targets, skipped, skipped_methods))
+        match seen.entry((method, t.target.origin(), path, names)) {
+            Entry::Vacant(e) => {
+                e.insert(kept.len());
+                kept.push(t);
+            }
+            Entry::Occupied(e) => {
+                if opts.path && ok(&t) && !ok(&kept[*e.get()]) {
+                    kept[*e.get()] = t;
+                }
+            }
+        }
+    }
+    kept.truncate(args.max_targets);
+    Ok((kept, skipped, skipped_methods))
 }

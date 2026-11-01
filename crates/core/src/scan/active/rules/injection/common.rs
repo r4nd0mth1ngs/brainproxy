@@ -123,13 +123,14 @@ pub(super) fn strip_off(body: &str, pattern: &str) -> String {
     let html1 = zap_html_encode(pattern);
     let html2 = zap_html_encode(&url);
     let xml = escape_xml10(pattern);
-    let mut result = body.replace(pattern, "");
-    for p in [&url, &html1, &html2, &xml] {
+    // Unlike ZAP, the value as sent goes last: `x%` would leave `25` of an echoed `x%25`.
+    let mut result = body.to_string();
+    for p in [&url, &html2, &html1, &xml] {
         if !p.is_empty() {
             result = result.replace(p.as_str(), "");
         }
     }
-    result
+    result.replace(pattern, "")
 }
 
 /// ZAP `stripOffOriginalAndAttackParam`.
@@ -264,6 +265,7 @@ mod tests {
         assert_eq!(strip_off("x &#60;x&#62; y", "<x>"), "x  y");
         assert_eq!(strip_off("a 'q' &apos;q&apos;", "'q'"), "a  ");
         assert_eq!(strip_off("keep", ""), "keep");
+        assert_eq!(strip_off("/a/x%25", "x%"), "/a/");
         // Original and attack both go, so a value always on the page doesn't skew results.
         assert_eq!(strip_off_both("about cats. You sent cats AND 1=1", "cats", "cats AND 1=1"), "about . You sent ");
     }

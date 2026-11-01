@@ -342,11 +342,14 @@ fn serve_site() -> u16 {
                 let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
                 let body = if line.starts_with("GET / ") {
                     "<html><body><a href=\"/item?id=1\">item</a></body></html>"
+                } else if line.contains("/users/1%27") {
+                    "You have an error in your SQL syntax"
                 } else {
                     "<html><body>item</body></html>"
                 };
+                let status = if line.contains("/users/999") { "404 Not Found" } else { "200 OK" };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
@@ -669,6 +672,53 @@ fn scan_active_help_warns_about_post() {
     let o = bin().args(["scan", "active", "--help"]).output().unwrap();
     let help = String::from_utf8_lossy(&o.stdout);
     assert!(help.contains("side effects such as email"), "{help}");
+}
+
+#[test]
+fn scan_active_url_path_attacks_each_route_once() {
+    let port = serve_site();
+    let project = tmp_project("routes");
+    // No passive scan of what's sent: it takes seconds per request in a debug build.
+    run(&["scan", "sources", "proxy"], &project, None);
+    let mut ids = vec![];
+    for path in ["/users/999", "/users/1", "/users/2", "/assets/js/a.js", "/assets/js/b.js", "/files/a.pdf"] {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+        ids.push(v["data"]["id"].as_i64().unwrap_or_else(|| panic!("{v}")).to_string());
+    }
+    let scan = ["scan", "active", "--rules", "40018", "--no-oob"];
+    let (_, v) = run(&scan, &project, None);
+    assert_eq!(v["data"]["targets"], 6, "only with --url-path: {v}");
+    let (code, v) = run(&[&scan[..], &["--url-path"]].concat(), &project, None);
+    assert_eq!(code, 0, "{v}");
+    // /users/{id}, /assets/js/{asset} and /files/a.pdf, with 2 + 3 + 2 segments.
+    assert_eq!(v["data"]["targets"], 3, "{v}");
+    assert_eq!(v["data"]["insertion_points"], 7, "{v}");
+    // The route's request that worked is the one attacked, not the 404 seen first.
+    assert!(v["data"]["raised"].as_object().is_some_and(|r| !r.is_empty()), "{v}");
+    // Requests asked for by id are all attacked.
+    let named = ["--url-path", "--history-id", &ids[0], "--history-id", &ids[1], "--history-id", &ids[2]];
+    let (code, v) = run(&[&scan[..], &named].concat(), &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["targets"], 3, "{v}");
+}
+
+#[test]
+fn scan_active_url_path_keeps_the_history_order_under_the_target_cap() {
+    let port = serve_site();
+    let project = tmp_project("routecap");
+    run(&["scan", "sources", "proxy"], &project, None);
+    // A route that only ever answered 404 comes first, and isn't cut for it.
+    for path in ["/old/users/999", "/users/1"] {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+    }
+    let scan = ["scan", "active", "--rules", "40018", "--no-oob", "--url-path", "--max-targets", "1"];
+    let (code, v) = run(&scan, &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["insertion_points"], 3, "{v}");
 }
 
 #[test]
