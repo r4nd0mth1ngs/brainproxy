@@ -180,10 +180,10 @@ permissions of the folder it is saved in: keep it in your own folders on a share
    checks* until you've done it once. Download both the ZAP rule data and the Nuclei
    templates.
 3. **Explore the site.** The proxy starts automatically when a project opens (port 8080, or
-   the next free one). Click **Open browser** in the top bar and pick a browser. It opens
-   in its own profile, sends everything through the proxy, and trusts brainproxy's
-   certificate. Your everyday browser is untouched. Log in and click through the
-   application; requests appear in **Proxy › Traffic** and the **Site map**.
+   the next free one, unless you chose a port in **Settings › Proxy**). Click **Open
+   browser** in the top bar and pick a browser. It opens in its own profile, sends
+   everything through the proxy, and trusts brainproxy's certificate. Your everyday
+   browser is untouched. Log in and click through the application; requests appear in **Proxy › Traffic** and the **Site map**.
 4. **Scan.**
    - **Guided:** the Overview's *Guided scan* asks for the website, whether to log in, and
      how thorough to be (Quick, Standard, Thorough) and how hard it may push the site
@@ -517,7 +517,13 @@ byte, side by side or unified.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
-  Chromium, curl, or a shell at it.
+  Chromium, curl, or a shell at it. *Port* sets the port on 127.0.0.1 the app uses, for every
+  project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
+  is used as is: if it's taken, the proxy stays off and says why. A running proxy on another
+  port keeps it until you press *Restart on port N*, which keeps its bind address and
+  options (a custom log file goes back to the default). Browsers opened earlier keep the old port until you close them and open them
+  again; reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
+  still defaults to 8080 unless given `--listen`.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,
   the fuzzer, logins, and the proxy's upstream side). A running proxy picks up a change
   within a second. None of them widens the engagement scope.
@@ -553,7 +559,7 @@ byte, side by side or unified.
 - **Rules & data:** update the ZAP rule data and Nuclei templates; check for a new
   brainproxy daily, download it automatically, or check now.
 - **Project:** project information, the engagement, and *Start the proxy when a project
-  opens*.
+  opens* (on the port set under *Proxy*).
 - **Open source licenses:** credits for the projects the rules, checks and wordlists come
   from (OWASP ZAP, Nuclei, SecLists, ...) and the full NOTICE.
 
@@ -945,7 +951,9 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | Container: "can't verify job N" (or fuzz run) | The same for a job or fuzz run: `brainproxy job stop --forget N` (or `fuzz stop --forget N`) marks it failed. |
 | Container: "can't open the proxy lock file" | A lock file is there that this user can't open, so starting would go unseen from other containers. Make it readable (`chmod 644`), or remove it if no proxy (or OOB listener) runs for this project anywhere. |
 | Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
-| "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
+| "The proxy didn't start: none of ports 8080-8089 could be opened" | Other programs hold or block those ports. Stop them, or choose a port in **Settings › Proxy**. From a shell: `brainproxy proxy start --listen 127.0.0.1:9090`. |
+| "cannot listen on …: the port is already in use" | Another program or another project's proxy holds that port. Stop it, or choose another port in **Settings › Proxy** (or with `--listen`). A chosen port is never swapped for another, so the proxy stays off until then. |
+| "cannot listen on …: permission denied" | Ports below 1024 usually need elevated privileges, and the system can reserve others (Windows does, in ranges that change). Choose another port in **Settings › Proxy** (or with `--listen`). |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
 | Windows says "Windows protected your PC" | The installer isn't signed yet: More info → Run anyway. |
 | Windows: tools other than the opened browser reject the CA | `brainproxy ca install-system` adds it to your user's Trusted Root store (Windows asks you to confirm). Firefox keeps its own store; import it there. |

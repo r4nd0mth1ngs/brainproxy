@@ -7,7 +7,9 @@ import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
+import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
+import { DEFAULT_PROXY_PORT, lowPortNote, moveProxy, portOf, portProblem, proxyListen, saveProxyPort, savedProxyPort, startProxy } from "./proxyPort";
 import { RecordLogin } from "./RecordLogin";
 import { AppUpdateSettings } from "./AppUpdate";
 import {
@@ -1289,20 +1291,128 @@ interface ProxyStatus {
   running: boolean;
   proxy: {
     listen: string;
+    args?: string[];
+    authz_run?: number;
     ca_cert?: string;
     usage?: { proxy_url: string; curl: string; env: string; trust_ca_for_tools: string; chromium: string; note?: string };
   } | null;
+  other_pid_namespace?: boolean;
   proxy_captures: number;
   pending_intercepts: number;
   intercept_enabled: boolean;
 }
 
+/** The port the app starts the proxy on, and moving a running proxy to it. */
+function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: boolean; setBusy: (busy: boolean) => void }) {
+  const app = useApp();
+  const [saved, setSaved] = useState(savedProxyPort);
+  const [text, setText] = useState(saved == null ? "" : String(saved));
+  const problem = portProblem(text);
+  const port = text.trim() ? Number(text) : null;
+  const note = port != null && !problem && lowPortNote(port);
+
+  const running = p.proxy?.running ? p.proxy.proxy : null;
+  const save = () => {
+    if (problem || port === saved) return;
+    if (!saveProxyPort(port)) return app.toast("The port wasn't saved: this app's settings storage is unavailable.", "error");
+    setSaved(port);
+    app.toast(
+      port != null
+        ? `Saved. The proxy will listen on ${proxyListen(port)} when it next starts.`
+        : `Saved. ${running ? `The proxy stays on ${running.listen} until it stops. After that it` : "The proxy"} will use port ${DEFAULT_PROXY_PORT}, or the next free one, when a project opens.`,
+    );
+    p.refresh();
+  };
+
+  const blocked = p.proxy?.other_pid_namespace
+    ? "This proxy runs in another container: restart it there."
+    : running?.authz_run != null
+      ? "A live access-control test is running on this proxy. To move it, stop the proxy from the top bar, which ends the test, and start it again."
+      : null;
+  const restart = async () => {
+    if (saved == null) return;
+    p.setBusy(true);
+    try {
+      // The polled status can be seconds old; if it no longer applies, the refresh below shows that.
+      const now = await run<ProxyStatus>(["proxy", "status"]);
+      const held = now.pending_intercepts;
+      if (
+        now.running &&
+        now.proxy &&
+        now.proxy.authz_run == null &&
+        !now.other_pid_namespace &&
+        (held === 0 || (await confirm("Restart the proxy?", `${held} held request${held === 1 ? "" : "s"} will be dropped.`, "Restart", "Keep running")))
+      ) {
+        app.toast(`The proxy is now listening on ${await moveProxy(run, now.proxy, saved)}.`);
+      }
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    p.setBusy(false);
+    p.refresh();
+  };
+
+  return (
+    <>
+      <h3>Port</h3>
+      <form
+        className="row gap"
+        onSubmit={(e) => {
+          e.preventDefault();
+          save();
+        }}
+      >
+        <input
+          className="input mono"
+          style={{ width: 100 }}
+          inputMode="numeric"
+          aria-label="Proxy port"
+          placeholder={String(DEFAULT_PROXY_PORT)}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <button className="btn small primary" disabled={!!problem || port === saved}>
+          Save
+        </button>
+      </form>
+      {problem && <div className="set-err small">{problem}</div>}
+      {note && <p className="muted small">{note}</p>}
+      <p className="muted small">
+        Empty means port {DEFAULT_PROXY_PORT}, or the next free one when a project opens. A chosen port is used as is, for
+        every project: if it's taken, the proxy stays off and says why. This sets the port on 127.0.0.1 for the app;{" "}
+        <span className="mono">brainproxy proxy start</span> from a shell or MCP still defaults to {DEFAULT_PROXY_PORT} unless given{" "}
+        <span className="mono">--listen</span>.
+      </p>
+      {running && saved != null && portOf(running.listen) !== saved && (
+        <>
+          <p>
+            The proxy is still listening on <span className="mono">{running.listen}</span>. It has to restart to use port {saved}.
+            Browsers opened earlier keep the old port until you close them and open them again; reconfigure tools you set up by hand.
+          </p>
+          {blocked && <p className="muted">{blocked}</p>}
+          <button className="btn small primary" disabled={p.busy || !!blocked} onClick={restart}>
+            Restart on port {saved}
+          </button>
+        </>
+      )}
+    </>
+  );
+}
+
 /** Whether the proxy runs, and how to point a browser, curl, or a shell at it. */
 function ProxySetup() {
-  const exec = useRunner();
+  const app = useApp();
   const [proxy, refresh] = usePoll<ProxyStatus>(() => run(["proxy", "status"]), 3000);
+  // Set while the proxy starts or moves: a status poll can catch it off, mid-restart.
+  const [busy, setBusy] = useState(false);
   const start = async () => {
-    await exec(["proxy", "start"]);
+    setBusy(true);
+    try {
+      await startProxy(run);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    setBusy(false);
     refresh();
   };
   const usage = proxy?.proxy?.usage;
@@ -1312,7 +1422,7 @@ function ProxySetup() {
         <h2>Proxy</h2>
         <span className={proxy?.running ? "s2" : "muted"}>{proxy?.running ? `listening on ${proxy.proxy?.listen}` : "off"}</span>
         {!proxy?.running && proxy && (
-          <button className="btn small primary" onClick={start}>
+          <button className="btn small primary" disabled={busy} onClick={start}>
             Start proxy
           </button>
         )}
@@ -1341,8 +1451,9 @@ function ProxySetup() {
           </dd>
         </dl>
       ) : (
-        <p className="muted">Start the proxy, then point a browser at it to record traffic into this project.</p>
+        <p className="muted">Start the proxy (it will listen on {proxyListen()}), then point a browser at it to record traffic into this project.</p>
       )}
+      <ProxyPort proxy={proxy} refresh={refresh} busy={busy} setBusy={setBusy} />
     </div>
   );
 }
@@ -1386,7 +1497,7 @@ function Project() {
               }
             }}
           />{" "}
-          Start the proxy when a project opens (port 8080, or the next free one), and stop it when the project closes
+          Start the proxy when a project opens (on the port set in Settings › Proxy), and stop it when the project closes
         </label>
       </div>
       <dl className="facts">

@@ -13,6 +13,7 @@ import { DashboardView } from "./views/Dashboard";
 import { ENGAGEMENT_CHANGED, TargetView } from "./views/Target";
 import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
+import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, withPortHint } from "./views/proxyPort";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -135,9 +136,6 @@ const NAV: { group: string; items: { id: Tab; label: string; icon: string }[] }[
   },
 ];
 
-/** Ports tried in order when the app starts the proxy (another project may hold 8080). */
-const PROXY_PORTS = [8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089];
-
 interface ProxyStatus {
   running: boolean;
   proxy: { listen?: string; pid?: number } | null;
@@ -174,7 +172,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   const openBrowser = async (id: string) => {
     try {
       if (!status?.running) {
-        await run(["proxy", "start"]);
+        await startProxy(run);
         refreshStatus();
       }
       const d = await run<{ browser: { name: string }; note: string | null }>(["browser", "open", `--browser=${id}`]);
@@ -196,17 +194,20 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     (async () => {
       const s = await run<ProxyStatus>(["proxy", "status"]).catch(() => null);
       if (cancelled || !s || s.running) return;
-      for (const port of PROXY_PORTS) {
+      // Also if it fails: one started by hand after that takes its place, and stops with the project too.
+      startedHere.current = true;
+      const chosen = savedProxyPort();
+      for (const port of startPorts(chosen)) {
+        if (cancelled) return;
         try {
-          await run(["proxy", "start", `--listen=127.0.0.1:${port}`]);
-          startedHere.current = true;
+          await run(["proxy", "start", `--listen=${proxyListen(port)}`]);
           refreshStatus();
           return;
         } catch (e: any) {
-          if (!/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${e.message}`, "error");
+          if (chosen || !/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${withPortHint(e.message)}`, "error");
         }
       }
-      toastRef.current(`The proxy didn't start: ports ${PROXY_PORTS.join(", ")} are all in use. Start it from the Proxy pill.`, "error");
+      toastRef.current(`The proxy didn't start: none of ports ${PROXY_PORTS[0]}-${PROXY_PORTS.at(-1)} could be opened. Choose a port in Settings › Proxy.`, "error");
     })();
     return () => {
       cancelled = true;
@@ -258,14 +259,14 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   const proxyToggle = async () => {
     try {
       if (status?.running) await run(["proxy", "stop"]);
-      else await run(["proxy", "start"]);
+      else await startProxy(run);
       refreshStatus();
     } catch (e: any) {
       app.toast(e.message, "error");
     }
   };
 
-  const listen = status?.proxy?.listen ?? "127.0.0.1:8080";
+  const listen = status?.proxy?.listen ?? proxyListen();
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("sidebar") === "collapsed";
