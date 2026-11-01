@@ -182,6 +182,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("scan data reset", REPLACE),
     ("scan sources", SET),
     ("findings list", READ),
+    ("findings compare", READ),
     ("findings show", READ),
     ("findings mark", SET),
     // --output writes a file (refused if it exists unless --force).

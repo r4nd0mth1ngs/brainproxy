@@ -5,6 +5,7 @@
 //! names the ZAP class it was ported from; alert texts are ZAP's.
 
 pub mod active;
+pub mod compare;
 pub mod findings_db;
 pub mod message;
 pub mod passive;

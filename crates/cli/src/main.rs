@@ -7,6 +7,7 @@ mod authz_cmd;
 mod browser_cmd;
 mod capabilities;
 mod checks_cmd;
+mod compare_cmd;
 mod connection_cmd;
 mod crawl_cmd;
 mod engagement_cmd;

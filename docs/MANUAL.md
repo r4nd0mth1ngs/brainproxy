@@ -389,7 +389,8 @@ Access control across users: does the app let bob read alice's data? See
   first time (*New in*), what it found again (*Still found by*), or what it covered but
   didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
   tested the finding's site (scheme, host and port) and, for active findings, its rule;
-  passive findings (headers, cookies) count only when the scan crawled.
+  passive findings (headers, cookies) count only when the scan crawled. The command line
+  has the same comparison: [`findings compare`](#comparing-findings-and-failing-a-build-findings-compare).
 - **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
   and shows it in Finder or Explorer.
 
@@ -689,6 +690,60 @@ and targets that want a JWT you choose the claims of:
   missing or unreadable key fails the send, naming the variable or file and nothing more.
 - Signers are data: templates name request parts and nothing is executed. A signer can read any
   file the process can as its key, but only the HMAC or signature made with it leaves the machine.
+
+### Comparing findings and failing a build (`findings compare`)
+
+`findings compare` reports which findings are new, unchanged, or fixed against a baseline, and
+`--fail-on` turns that into an exit code for CI. The baseline can be:
+
+- **A file** (`--baseline FILE`): `report json` output, to compare runs in different project files.
+  Findings match by alert, method, URL without its query, and parameter, so the URL's
+  scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
+  doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
+  coverage.
+- **A scan** (`--scan JOB`): a `scan active --background` job in this project, using the same logic
+  as the app's *Compare with a scan*: first found by it, found again by it, or covered by it and not
+  found again. Foreground scans have no job to name.
+- **Nothing**: every finding is new, which makes `--fail-on` a plain severity gate.
+
+Write the baseline with `--state all`, so that false positives you've triaged stay triaged when a
+later run finds them again, and a `--limit` above the number of findings: a report cut off at its
+limit is refused, because what it left out would look new. A report written with `--risk`, `--host`
+and similar filters is accepted with a warning in `warnings`, except as `--current` with `--fail-on`,
+where it is refused because the gate wouldn't see what it left out. Project files are refused: run
+`report json` on them.
+
+```bash
+# On the main branch: save what is known
+brainproxy --project app.bpdb report json --state all --no-evidence --limit 100000 --output baseline.json
+
+# On each pull request: scan, then fail only on new high-risk findings
+brainproxy --project app.bpdb scan active https://staging.example.test/ --crawl
+brainproxy --project app.bpdb findings compare --baseline baseline.json --fail-on high --new-only > compare.json
+```
+
+`--fail-on RISK` fails on findings at or above `info`, `low`, `medium`, or `high` that are still
+there: new and unchanged ones, or with `--new-only` just the new ones. False positives never count,
+whatever `--state` lists. With `--scan`, only what that scan found counts.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Compared, and the gate (if any) passed |
+| `5` | Compared, and the gate found something. The output is complete: `ok` is true, and `data.gate` has `passed: false`, the `count`, and the `findings` |
+| `4` | The baseline file, project, or scan job doesn't exist |
+| `2` | Bad arguments; a file that isn't usable (not a report, cut off, or the baseline and the findings compared being the same file); or `--fail-on` with a filtered `--current` or a scan that didn't complete |
+
+These don't pass a gate:
+
+- A missing baseline file fails with `4`. With `--allow-missing-baseline` it counts as empty, for a
+  first run: every finding is new, so the gate still sees them all, and `data.baseline.missing` is
+  true. A file that exists but can't be read as a baseline always fails.
+- A `--project` that doesn't exist fails with `4` rather than being created empty.
+- A scan that failed, was stopped, or ran out of `--max-minutes` found less than it should have, so
+  `--fail-on` refuses it with `2`. Without `--fail-on` the comparison runs with a warning.
+
+Lists, including `data.gate.findings`, are cut at `--limit` per group (`summary.truncated` says so);
+counts and the gate always cover every finding.
 
 ### Access control across users (`authz`)
 

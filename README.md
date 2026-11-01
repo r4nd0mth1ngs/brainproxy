@@ -423,7 +423,7 @@ brainproxy decode jwt eyJhbGciOi...
 - When stdout isn't a terminal, every command prints one JSON envelope:
   `{"ok":true,"command":...,"data":...}` or `{"ok":false,"command":...,"error":{"kind","message"}}`.
 - Exit codes: `0` success, `1` internal/storage, `2` invalid input or usage, `3` network,
-  `4` not found, `6` out of scope.
+  `4` not found, `5` a `findings compare --fail-on` gate found something, `6` out of scope.
 - `brainproxy capabilities` describes the whole CLI as JSON. `brainproxy capabilities send`
   describes one command.
 - Output is bounded: `--max-body`, `--limit`, and `--max-cell`, with `truncated` flags.
