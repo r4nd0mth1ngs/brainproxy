@@ -5,6 +5,7 @@
 import { useEffect, useState } from "react";
 import { run, withScheme } from "../api";
 import { useApp } from "../store";
+import { startProxy } from "./proxyPort";
 import { loadSuggestions } from "./Scanner";
 
 interface Proposal {
@@ -70,7 +71,7 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
   const start = () =>
     guard(async () => {
       const status = await run<{ running: boolean }>(["proxy", "status"]);
-      if (!status.running) await run(["proxy", "start"]);
+      if (!status.running) await startProxy(run);
       await run(["auth", "record", "start", url]);
       setStep("recording");
     });

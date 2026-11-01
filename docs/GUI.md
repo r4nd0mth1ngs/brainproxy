@@ -83,11 +83,11 @@ CLI has no command for it, so a project a script or agent starts always keeps it
 ## Layout
 
 Top bar: brainproxy, the project and its engagement scope chips; on the right the intercept
-and proxy pills (the proxy pill starts/stops `proxy start` on 127.0.0.1:8080) and the theme
-toggle, and **Open browser**: a menu of the installed browsers (`browser list`) that starts
-the proxy if needed and runs `browser open`, a separate browser instance in a per-project
-profile (`<project>.browsers/<id>`) going through the proxy, loopback included; Chromium-based
-browsers trust the brainproxy CA in that profile only (by its key, via
+and proxy pills (the proxy pill starts/stops `proxy start` on 127.0.0.1, on the port set in
+Settings › Proxy, 8080 by default) and the theme toggle, and **Open browser**: a menu of the
+installed browsers (`browser list`) that starts the proxy if needed and runs `browser open`,
+a separate browser instance in a per-project profile (`<project>.browsers/<id>`) going through
+the proxy, loopback included; Chromium-based browsers trust the brainproxy CA in that profile only (by its key, via
 `--ignore-certificate-errors-spki-list`), Firefox gets the proxy prefs and a one-time CA import
 note. Traffic hides requests refused as out of scope by default (mostly browser background
 calls), and so does the Site map ("In scope only"); the proxy never holds an out-of-scope
@@ -109,7 +109,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port the app uses and restarting on it, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 
