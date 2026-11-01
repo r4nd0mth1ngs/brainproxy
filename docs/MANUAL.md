@@ -55,6 +55,79 @@ command line, `brainproxy update check` says whether a newer release exists and
 folder). Neither installs anything. The AppImage is larger
 than the download limit; get it from the release page.
 
+### Container image
+
+The `Dockerfile` packages the command-line tool for headless and CI use: a small Alpine
+image (about 30 MB) that runs as a non-root user (UID 1000). No image is published, so build
+it from a checkout:
+
+```sh
+docker build -t brainproxy .
+docker run --rm brainproxy --version
+```
+
+Arguments go straight to `brainproxy`. It works in `/work`, so that's where to mount a
+volume: the project file (`brainproxy.bpdb` unless `--project` or `BRAINPROXY_PROJECT` says
+otherwise) goes there. So does the [data folder](#concepts), at `/work/.brainproxy`
+(`BRAINPROXY_HOME`). It holds the CA's private key, so keep it out of anything you commit or
+publish: if you mount a Git checkout, add `.brainproxy/` and `*.bpdb*` to its `.gitignore`.
+Without a volume, everything is lost with the container.
+
+```sh
+# A named volume needs no setup.
+docker run --rm -v brainproxy:/work brainproxy engagement start --target app.example.com
+docker run --rm -v brainproxy:/work brainproxy crawl https://app.example.com/
+
+# A host folder: run as its owner, or the user in the image may not be able to write to it.
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" brainproxy report html -o report.html
+```
+
+Things that work differently in a container:
+
+- **Addresses:** `127.0.0.1` is the container itself, not your machine. To reach a target in
+  another container, put both on one Docker network (`docker run --network ...`) and scope
+  the target's exact name (`engagement start --target web:8000`). A wildcard doesn't cover
+  a private address, as everywhere else.
+- **Servers and background jobs:** `proxy start`, `oob start`, and `--background` run in the
+  background, and the container stops, taking them with it, as soon as its main command
+  returns. Use the foreground `proxy run` or `oob run`, and leave `--background` off. To reach
+  the proxy from outside, listen on all of the container's addresses and publish the port on
+  your own machine only:
+
+  ```sh
+  docker run -d --init --name proxy -v brainproxy:/work -p 127.0.0.1:8080:8080 brainproxy proxy run --listen 0.0.0.0:8080
+  ```
+
+  Keep `--init`: brainproxy never treats PID 1 as a running proxy, so without it `proxy
+  status` says the proxy isn't running even though it is. Ask only its own container
+  (`docker exec proxy brainproxy proxy status`), and stop it with `docker stop proxy`. A
+  different container on the same volume can't see the process, and running `proxy status`
+  there clears the saved state, so `docker exec` then says it isn't running too. The proxy
+  itself keeps working.
+
+- **`crawl --browser`:** needs a Chromium-based browser, which the image leaves out because it
+  takes the image from about 30 MB to over 800 MB. Without one, `--browser` stops with an
+  error and the plain crawler still works. To add it, build on the image (here tagged
+  `brainproxy-chromium`):
+
+  ```dockerfile
+  FROM brainproxy
+  USER root
+  RUN apk add --no-cache chromium
+  USER brainproxy
+  ```
+
+  Docker's default seccomp profile stops Chromium's sandbox from starting, so the browser
+  fails with `Failed to move to new namespace`. `-e BRAINPROXY_BROWSER_NO_SANDBOX=1` runs it
+  without the sandbox, which leaves the container as the only barrier around pages from the
+  target, so test only sites you trust that far. Also pass `--init`, which cleans up the
+  browser's exited processes:
+
+  ```sh
+  docker run --rm --init -e BRAINPROXY_BROWSER_NO_SANDBOX=1 -v brainproxy:/work brainproxy-chromium \
+      crawl https://app.example.com/ --browser
+  ```
+
 ---
 
 ## Concepts
@@ -276,7 +349,12 @@ Passive rules run automatically on everything recorded. Active scans send real a
 requests that can change data: prefer a test environment.
 By default an active scan only replays GET, HEAD, OPTIONS and POST requests from history;
 DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
-you include them.
+you include them. POST stays on because a scan misses too much without it, but it isn't
+safe: POST requests are replayed with attack payloads, often many times, and can change data
+or trigger side effects such as email; `--crawl` also submits the forms it finds. When any
+are attacked, the result says how many (`post_targets`) with a warning (`post_hint`), which
+with JSON output or `--background` comes only once the scan is over. Text output warns before
+the attack starts, and the scan wizard says so on its last step.
 
 ### Access
 Access control across users: does the app let bob read alice's data? See
@@ -311,7 +389,8 @@ Access control across users: does the app let bob read alice's data? See
   first time (*New in*), what it found again (*Still found by*), or what it covered but
   didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
   tested the finding's site (scheme, host and port) and, for active findings, its rule;
-  passive findings (headers, cookies) count only when the scan crawled.
+  passive findings (headers, cookies) count only when the scan crawled. The command line
+  has the same comparison: [`findings compare`](#comparing-findings-and-failing-a-build-findings-compare).
 - **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
   and shows it in Finder or Explorer.
 
@@ -404,6 +483,18 @@ byte, side by side or unified.
     a sign-in host used on an API host), give the rule a URL: it then also goes to the requests
     that URL matches, from then on. A rule with no URL leaves requests to other origins as they
     are. Macro requests are checked against the engagement scope like any other request.
+  - **Request signers:** an HMAC signature or a JWT computed as a request goes on the wire,
+    for APIs that reject a request whose signature doesn't match (see *Request signing* under
+    the CLI options below). *New signer* asks for a name, the origins it may sign for, where the
+    value goes, and what to make: for an HMAC the string to sign, the hash (SHA-1, SHA-256,
+    SHA-384 or SHA-512) and the output, for a JWT the algorithm (HS256, HS384, HS512 or RS256)
+    and the claims. There is no field for the key itself: give the name of an environment
+    variable, or the full path of a file, and it is read when the signer first signs. A variable
+    has to be set where the app was started, so a key file is simpler for an app started from
+    a desktop launcher. *Edit* replaces the signer and keeps its place and name, since rules use
+    it by name; *Run last* moves it after the others, for one that covers another's signature; a
+    signer a rule uses can't be removed until the rule is. A session rule's *Sign request*
+    action turns a signer on.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
@@ -453,7 +544,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 130 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 133 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -584,7 +675,9 @@ and targets that want a JWT you choose the claims of:
   an HMAC, or `--jwt HS256|HS384|HS512|RS256 [--claims JSON] [--ttl SECONDS] [--kid ID] [--resign]`
   for a JWT. `--secret-encoding hex|base64` decodes the key; RS256 takes a PEM private key.
   `auth sign list/remove`. Then `auth rule add PROFILE --action sign:NAME [--tool ...] [--url ...]`
-  turns it on; a rule's `check` doesn't skip its `sign`.
+  turns it on; a rule's `check` doesn't skip its `sign`. Adding a name that exists replaces the
+  signer and runs it last, or keeps its place with `--keep-place`. Settings › Auth profiles has
+  all of this too.
 - Templates use `{{method}}`, `{{host}}`, `{{path}}`, `{{query}}`, `{{body}}`, `{{body_sha256}}`,
   `{{body_sha256_base64}}`, `{{timestamp}}`, `{{timestamp_ms}}`, `{{nonce}}` and `{{header:NAME}}`;
   anything else is refused when the signer is saved. `--canonical` reads `\n`, `\r`, `\t` and `\\`
@@ -611,6 +704,60 @@ and targets that want a JWT you choose the claims of:
   missing or unreadable key fails the send, naming the variable or file and nothing more.
 - Signers are data: templates name request parts and nothing is executed. A signer can read any
   file the process can as its key, but only the HMAC or signature made with it leaves the machine.
+
+### Comparing findings and failing a build (`findings compare`)
+
+`findings compare` reports which findings are new, unchanged, or fixed against a baseline, and
+`--fail-on` turns that into an exit code for CI. The baseline can be:
+
+- **A file** (`--baseline FILE`): `report json` output, to compare runs in different project files.
+  Findings match by alert, method, URL without its query, and parameter, so the URL's
+  scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
+  doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
+  coverage.
+- **A scan** (`--scan JOB`): a `scan active --background` job in this project, using the same logic
+  as the app's *Compare with a scan*: first found by it, found again by it, or covered by it and not
+  found again. Foreground scans have no job to name.
+- **Nothing**: every finding is new, which makes `--fail-on` a plain severity gate.
+
+Write the baseline with `--state all`, so that false positives you've triaged stay triaged when a
+later run finds them again, and a `--limit` above the number of findings: a report cut off at its
+limit is refused, because what it left out would look new. A report written with `--risk`, `--host`
+and similar filters is accepted with a warning in `warnings`, except as `--current` with `--fail-on`,
+where it is refused because the gate wouldn't see what it left out. Project files are refused: run
+`report json` on them.
+
+```bash
+# On the main branch: save what is known
+brainproxy --project app.bpdb report json --state all --no-evidence --limit 100000 --output baseline.json
+
+# On each pull request: scan, then fail only on new high-risk findings
+brainproxy --project app.bpdb scan active https://staging.example.test/ --crawl
+brainproxy --project app.bpdb findings compare --baseline baseline.json --fail-on high --new-only > compare.json
+```
+
+`--fail-on RISK` fails on findings at or above `info`, `low`, `medium`, or `high` that are still
+there: new and unchanged ones, or with `--new-only` just the new ones. False positives never count,
+whatever `--state` lists. With `--scan`, only what that scan found counts.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Compared, and the gate (if any) passed |
+| `5` | Compared, and the gate found something. The output is complete: `ok` is true, and `data.gate` has `passed: false`, the `count`, and the `findings` |
+| `4` | The baseline file, project, or scan job doesn't exist |
+| `2` | Bad arguments; a file that isn't usable (not a report, cut off, or the baseline and the findings compared being the same file); or `--fail-on` with a filtered `--current` or a scan that didn't complete |
+
+These don't pass a gate:
+
+- A missing baseline file fails with `4`. With `--allow-missing-baseline` it counts as empty, for a
+  first run: every finding is new, so the gate still sees them all, and `data.baseline.missing` is
+  true. A file that exists but can't be read as a baseline always fails.
+- A `--project` that doesn't exist fails with `4` rather than being created empty.
+- A scan that failed, was stopped, or ran out of `--max-minutes` found less than it should have, so
+  `--fail-on` refuses it with `2`. Without `--fail-on` the comparison runs with a warning.
+
+Lists, including `data.gate.findings`, are cut at `--limit` per group (`summary.truncated` says so);
+counts and the gate always cover every finding.
 
 ### Access control across users (`authz`)
 
@@ -749,6 +896,7 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | `browser open` says it can only open http(s) URLs | Give a full `http://` or `https://` address (or none for a blank page). Other schemes and anything starting with `-` are refused so they can't be read as browser options. |
 | `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` (Windows: Task Manager, Details tab) and stop it yourself. |
 | curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
+| Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
 | Windows says "Windows protected your PC" | The installer isn't signed yet: More info → Run anyway. |

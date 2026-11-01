@@ -77,7 +77,7 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
 /// services on one host are different findings) and drops the query (parameters are `param`).
-fn dedupe_key(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
+pub(crate) fn dedupe_key(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
     let base = url.split('?').next().unwrap_or(url);
     format!("{alert_ref}|{method}|{base}|{param}")
 }

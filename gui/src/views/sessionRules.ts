@@ -1,5 +1,6 @@
-// Session handling for auth profiles (macros and session rules): the shapes `auth show`
-// returns, and the `auth macro` / `auth rule` arguments the Settings view builds.
+// Session handling for auth profiles (macros, session rules and request signers): the shapes
+// `auth show` returns, and the `auth macro` / `auth rule` / `auth sign` arguments the Settings
+// view builds.
 
 export type Tool = "proxy" | "send" | "fuzz" | "crawl" | "scan" | "checks";
 export const TOOLS: Tool[] = ["proxy", "send", "fuzz", "crawl", "scan", "checks"];
@@ -147,7 +148,7 @@ export function ruleAddArgs(profile: string, r: RuleForm): string[] {
 }
 
 /** Problems that keep a rule from saving, in plain words (empty when it can be saved). */
-export function ruleProblems(r: RuleForm, macros: string[], hasCheckUrl: boolean, hasLogin: boolean): string[] {
+export function ruleProblems(r: RuleForm, macros: string[], signers: string[], hasCheckUrl: boolean, hasLogin: boolean): string[] {
   const out: string[] = [];
   if (!r.actions.length) out.push("Add at least one action.");
   r.actions.forEach((a, i) => {
@@ -156,6 +157,152 @@ export function ruleProblems(r: RuleForm, macros: string[], hasCheckUrl: boolean
     if (a.action === "check" && !hasCheckUrl) out.push("A session check needs the profile's check URL.");
     if (a.action === "login" && !hasLogin) out.push("Log in needs a profile with a login URL.");
     if (a.action === "run_macro" && !macros.includes(a.macro)) out.push(`No macro named "${a.macro}".`);
+    if (a.action === "sign" && !signers.includes(a.signer)) out.push(`No signer named "${a.signer}".`);
   });
   return [...new Set(out)];
+}
+
+export const HMAC_HASHES = ["sha1", "sha256", "sha384", "sha512"] as const;
+export const HMAC_OUTPUTS = ["hex", "base64", "base64url"] as const;
+export const JWT_ALGS = ["HS256", "HS384", "HS512", "RS256"] as const;
+export const KEY_ENCODINGS = ["raw", "hex", "base64"] as const;
+
+/** A signer as `auth show` lists it: where its key is, never the key. */
+export type Signer = {
+  name: string;
+  key: { env: string } | { file: string };
+  key_encoding?: (typeof KEY_ENCODINGS)[number];
+  origins: string[];
+  to: { header: string } | { query: string };
+  format?: string;
+  headers?: [string, string][];
+} & (
+  | { kind: "hmac"; alg: (typeof HMAC_HASHES)[number]; canonical: string; output?: (typeof HMAC_OUTPUTS)[number] }
+  | { kind: "jwt"; alg: (typeof JWT_ALGS)[number]; claims: string; ttl?: number; kid?: string; resign?: boolean }
+);
+
+export interface SignerForm {
+  name: string;
+  keyFrom: "env" | "file";
+  /** The variable's name or the file's path, never the key. */
+  key: string;
+  keyEncoding: (typeof KEY_ENCODINGS)[number];
+  origins: string;
+  toKind: "header" | "query";
+  toName: string;
+  wrap: string;
+  /** "NAME: TEMPLATE", one per line. */
+  headers: string;
+  kind: "hmac" | "jwt";
+  canonical: string;
+  hash: (typeof HMAC_HASHES)[number];
+  output: (typeof HMAC_OUTPUTS)[number];
+  jwtAlg: (typeof JWT_ALGS)[number];
+  claims: string;
+  ttl: string;
+  kid: string;
+  resign: boolean;
+}
+
+export const EMPTY_SIGNER: SignerForm = {
+  name: "",
+  keyFrom: "env",
+  key: "",
+  keyEncoding: "raw",
+  origins: "",
+  toKind: "header",
+  toName: "",
+  wrap: "",
+  headers: "",
+  kind: "hmac",
+  canonical: "",
+  hash: "sha256",
+  output: "hex",
+  jwtAlg: "HS256",
+  claims: "",
+  ttl: "",
+  kid: "",
+  resign: false,
+};
+
+/** The form to edit a signer. */
+export function signerForm(s: Signer): SignerForm {
+  const f: SignerForm = {
+    ...EMPTY_SIGNER,
+    name: s.name,
+    keyFrom: "env" in s.key ? "env" : "file",
+    key: "env" in s.key ? s.key.env : s.key.file,
+    keyEncoding: s.key_encoding ?? "raw",
+    origins: s.origins.join("\n"),
+    toKind: "header" in s.to ? "header" : "query",
+    toName: "header" in s.to ? s.to.header : s.to.query,
+    wrap: s.format ?? "",
+    headers: (s.headers ?? []).map(([k, v]) => `${k}: ${v}`).join("\n"),
+    kind: s.kind,
+  };
+  if (s.kind === "hmac") return { ...f, canonical: s.canonical, hash: s.alg, output: s.output ?? "hex" };
+  return { ...f, jwtAlg: s.alg, claims: s.claims, ttl: s.ttl == null ? "" : String(s.ttl), kid: s.kid ?? "", resign: !!s.resign };
+}
+
+const lines = (text: string) =>
+  text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+/**
+ * `auth sign add` arguments, which add a signer or replace the one of that name, running it last
+ * unless `keepPlace`. Values go as --flag=value, names after "--". Templates go as typed: a
+ * canonical string's spaces are signed.
+ */
+export function signerAddArgs(profile: string, f: SignerForm, keepPlace = false): string[] {
+  const args = ["auth", "sign", "add", f.keyFrom === "env" ? `--secret-env=${f.key.trim()}` : `--secret-file=${f.key.trim()}`];
+  if (keepPlace) args.push("--keep-place");
+  if (f.keyEncoding !== "raw") args.push(`--secret-encoding=${f.keyEncoding}`);
+  for (const o of lines(f.origins)) args.push(`--origin=${o}`);
+  args.push(`--to=${f.toKind}:${f.toName.trim()}`);
+  if (f.toKind === "header" && f.wrap) args.push(`--wrap=${f.wrap}`);
+  for (const h of lines(f.headers)) args.push(`--set-header=${h}`);
+  if (f.kind === "hmac") {
+    args.push(`--canonical=${f.canonical}`, `--hash=${f.hash}`, `--output=${f.output}`);
+  } else {
+    args.push(`--jwt=${f.jwtAlg}`);
+    if (f.claims.trim()) args.push(`--claims=${f.claims}`);
+    if (f.ttl.trim()) args.push(`--ttl=${f.ttl.trim()}`);
+    if (f.kid) args.push(`--kid=${f.kid}`);
+    if (f.resign) args.push("--resign");
+  }
+  args.push("--", profile, f.name.trim());
+  return args;
+}
+
+/**
+ * Problems that keep a signer from saving, in plain words (empty when it can be saved). The CLI
+ * checks templates and origins itself. None of these repeat the key field: a key pasted there
+ * by mistake stops here, off the screen and out of the project.
+ */
+export function signerProblems(f: SignerForm, taken: string[]): string[] {
+  const out: string[] = [];
+  const name = f.name.trim();
+  const key = f.key.trim();
+  if (!/^[A-Za-z0-9_.-]+$/.test(name)) out.push("Name the signer with letters, digits, '_', '-' and '.'.");
+  if (taken.includes(name)) out.push(`A signer named "${name}" already exists.`);
+  if (f.keyFrom === "env" && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) out.push("Give the name of the environment variable that holds the key, not the key.");
+  // Read by whichever process signs, each with its own working directory.
+  if (f.keyFrom === "file" && !/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(key)) out.push("Give the full path of the file that holds the key.");
+  if (!lines(f.origins).length) out.push("Name at least one origin it may sign for.");
+  if (!f.toName.trim()) out.push(`Name the ${f.toKind} the value goes in.`);
+  if (f.toKind === "header" && f.wrap && f.wrap.split("{{signature}}").length !== 2) out.push("The header format needs {{signature}} once.");
+  if (lines(f.headers).some((h) => !h.includes(":"))) out.push("Write each header to set as NAME: TEMPLATE.");
+  if (f.kind === "hmac" && !f.canonical) out.push("Say what to sign.");
+  if (f.kind === "jwt" && f.ttl.trim() && !/^\d+$/.test(f.ttl.trim())) out.push("Give the JWT's lifetime in whole seconds.");
+  return out;
+}
+
+/** What a signer makes and where its key is, in plain words. */
+export function signerLabel(s: Signer): string {
+  const made = s.kind === "hmac" ? `HMAC-${s.alg.toUpperCase()} (${s.output ?? "hex"})` : `JWT ${s.alg}${s.resign ? ", re-signed" : ""}`;
+  const to = "header" in s.to ? `header ${s.to.header}` : `query ${s.to.query}`;
+  const key = "env" in s.key ? `$${s.key.env}` : s.key.file;
+  return `${made} → ${to} · key in ${key}`;
 }

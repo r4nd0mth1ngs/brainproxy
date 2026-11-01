@@ -1,8 +1,9 @@
 # Passive rules
 
-brainproxy's passive scanner runs 52 rules ported from OWASP ZAP's `pscanrules` add-on
-(https://github.com/zaproxy/zap-extensions, Apache License 2.0). Each rule file names the
-ZAP class it came from, and alert names, descriptions, solutions, and references are ZAP's.
+brainproxy's passive scanner runs 52 rules ported from OWASP ZAP's `pscanrules` add-on and
+one (10003) from its `retire` add-on (https://github.com/zaproxy/zap-extensions, Apache
+License 2.0). Each rule file names the ZAP class it came from, and alert names, descriptions,
+solutions, and references are ZAP's.
 
 Rules run automatically on proxy traffic and `send` results (sources are configurable with
 `brainproxy scan sources`), and before every `findings` command. `brainproxy scan rules`
@@ -20,6 +21,7 @@ without changing it, and a server that hides its version isn't flagged.
 |---|---|---|---|
 | 2 | Private IP Disclosure | low | 2 |
 | 3 | Session ID in URL Rewrite | medium | 3-1, 3-2, 3-3 |
+| 10003 | Vulnerable JS Library (Powered by Retire.js) | medium | 10003 |
 | 10009 | In Page Banner Information Leak | low | 10009 |
 | 10010 | Cookie No HttpOnly Flag | low | 10010 |
 | 10011 | Cookie Without Secure Flag | low | 10011 |

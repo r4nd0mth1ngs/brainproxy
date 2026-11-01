@@ -18,6 +18,23 @@ updates:
     commit-message:
       prefix: ci
 
+  # The base images pinned in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: daily
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns: ["*"]
+      docker-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+
   # The CLI workspace and the Tauri app are separate Cargo workspaces;
   # one grouped PR covers both.
   - package-ecosystem: cargo

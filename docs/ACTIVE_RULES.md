@@ -36,8 +36,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 10104 | User Agent Fuzzer | page | info | 10104 |
 | 10106 | HTTP Only Site | host | medium | 10106 |
 | 20015 | Heartbleed OpenSSL Vulnerability | host | high | 20015 |
-| 20017 | Source Code Disclosure - CVE-2012-1823 | page | high | 20015 | Heartbleed OpenSSL Vulnerability | host | high | 20015 |
-| 20017 |
+| 20017 | Source Code Disclosure - CVE-2012-1823 | page | high | 20017 |
 | 20018 | Remote Code Execution - CVE-2012-1823 | page | high | 20018 |
 | 20019 | External Redirect | param | high | 20019-1, 20019-2, 20019-3, 20019-4 |
 | 30001 | Buffer Overflow | param | medium | 30001 |
@@ -49,10 +48,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
 | 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |
 | 40017 | Cross Site Scripting (Persistent) - Spider | page | (none) | |
-| 40018 | SQL Injection | param | high | 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
-| 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |
-| 40017 | Cross Site Scripting (Persistent) - Spider | page | (none) | |
-| 40018 |
+| 40018 | SQL Injection | param | high | 40018 |
 | 40019 | SQL Injection - MySQL (Time Based) | param | high | 40019 |
 | 40020 | SQL Injection - Hypersonic SQL (Time Based) | param | high | 40020 |
 | 40021 | SQL Injection - Oracle (Time Based) | param | high | 40021 |

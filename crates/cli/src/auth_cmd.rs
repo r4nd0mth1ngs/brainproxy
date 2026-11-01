@@ -239,6 +239,9 @@ pub struct SignAddArgs {
     /// Start from the JWT already in the request (its header and claims, --claims on top).
     #[arg(long, requires = "jwt")]
     pub resign: bool,
+    /// Replacing a signer, keep its place in the order instead of running it last.
+    #[arg(long)]
+    pub keep_place: bool,
 }
 
 #[derive(Subcommand)]
@@ -927,6 +930,7 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 ttl,
                 kid,
                 resign,
+                keep_place,
             } = *args;
             let key = match (secret_env, secret_file) {
                 (Some(var), _) => KeySource::Env(var),
@@ -962,9 +966,13 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 kind,
             };
             let mut h = store.auth_handling(&profile)?;
-            let replaced = h.signers.iter().any(|s| s.name == name);
+            let place = h.signers.iter().position(|s| s.name == name);
+            let replaced = place.is_some();
             h.signers.retain(|s| s.name != name);
-            h.signers.push(signer.clone());
+            match place.filter(|_| keep_place) {
+                Some(i) => h.signers.insert(i, signer.clone()),
+                None => h.signers.push(signer.clone()),
+            }
             let created = matches!(store.auth_profile(&profile), Err(Error::NotFound(_)));
             if created {
                 store.auth_create_for_macros(&profile, &h)?;

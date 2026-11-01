@@ -271,9 +271,14 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
               server you can afford to disrupt, never on a production or shared site.
             </div>
           )}
+          <div className="wiz-warn replay">
+            <b>Forms and other POST requests are replayed.</b> Whatever the scan finds is sent again with attack data,
+            often many times, and that can change data or trigger side effects: one contact form can send a lot of
+            emails.
+          </div>
           <div className="wiz-warn">
-            The scan sends real attack requests, as an attacker would. It can create test data, send emails through
-            forms, or slow down a fragile site. Prefer a test environment, and only scan systems you have permission to
+            The scan sends real attack requests, as an attacker would. It can create test data or slow down a fragile
+            site. Prefer a test environment, and only scan systems you have permission to
             test.
           </div>
         </div>

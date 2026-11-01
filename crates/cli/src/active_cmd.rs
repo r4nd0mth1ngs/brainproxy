@@ -8,6 +8,7 @@ use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
+use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
 use brainproxy_core::session::Tool;
 use brainproxy_core::store::Store;
@@ -45,7 +46,8 @@ pub struct ActiveArgs {
     #[arg(long, value_name = "ID", requires = "browser")]
     browser_id: Option<String>,
     /// Also attack requests from history with these methods (comma-separated, or `all`).
-    /// By default only GET, HEAD, OPTIONS and POST are replayed; --history-id is always attacked.
+    /// By default only GET, HEAD, OPTIONS and POST are replayed, and POST can change data or
+    /// trigger side effects such as email; --history-id is always attacked.
     #[arg(long, value_delimiter = ',', value_name = "METHODS")]
     include_methods: Vec<String>,
     /// History entry to attack. Repeatable.
@@ -150,6 +152,33 @@ pub struct ActiveArgs {
     background: bool,
     #[arg(long, hide = true)]
     job_id: Option<i64>,
+}
+
+impl ActiveArgs {
+    /// What these arguments cover, for comparing findings with the scan. Sites are read the way
+    /// the scan reads them; the scan's time window is the job's.
+    pub fn scope(&self) -> ScanScope {
+        let picked = !self.history_ids.is_empty() || self.where_sql.is_some();
+        let origins = if !self.urls.is_empty() {
+            Some(self.urls.iter().filter_map(|u| Target::from_url(u).ok()).map(|t| t.origin()).collect())
+        } else if picked {
+            Some(vec![])
+        } else {
+            None
+        };
+        let by_id_only =
+            self.check_severity.is_none() && self.check_severity_max.is_none() && self.check_tags.is_empty();
+        let numbers = |ids: &[u32]| ids.iter().map(|&id| i64::from(id)).collect::<Vec<_>>();
+        ScanScope {
+            origins,
+            rules: (!self.rules.is_empty()).then(|| numbers(&self.rules)),
+            exclude_rules: numbers(&self.exclude_rules),
+            ported_rules: !self.no_rules,
+            check_ids: if !self.checks.is_empty() && by_id_only { self.check_ids.clone() } else { vec![] },
+            crawled: self.crawl,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -278,6 +307,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                         "blocked_requests": b.blocked_count,
                     });
                 }
+                // The scan's own clock starts after this, so its timed_out won't say.
+                if cfg.max_duration.is_some_and(|d| crawl_started.elapsed() >= d) {
+                    crawled["timed_out"] = json!(true);
+                }
                 if ctl.stopped() {
                     return Ok(json!({"crawl": crawled, "stopped": true}));
                 }
@@ -288,6 +321,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             return Err(Error::InvalidInput(
                 "no in-scope targets: pass URLs, --history-id, --where, or crawl/proxy the target first".into(),
             ));
+        }
+        // Before the attack, while a person at the terminal can still stop it.
+        let posts = post_targets(&targets);
+        if posts > 0 && !out.json() {
+            eprintln!("warning: {posts} POST target(s). {POST_HINT}");
         }
         let summary = rt.block_on(active::run(project, targets, cfg, ctl));
         if let Some(a) = &auth {
@@ -305,6 +343,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         if skipped_methods > 0 {
             v["skipped_methods"] = json!(skipped_methods);
             v["methods_hint"] = json!("Requests other than GET, HEAD, OPTIONS and POST were not attacked; add --include-methods to attack them.");
+        }
+        if posts > 0 {
+            v["post_targets"] = json!(posts);
+            v["post_hint"] = json!(POST_HINT);
         }
         if !crawled.is_null() {
             v["crawl"] = crawled;
@@ -390,8 +432,22 @@ struct Selection {
     include_methods: Vec<String>,
 }
 
-/// Methods attacked by default: replaying others (DELETE, PUT, PATCH, ...) can change data.
-const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST"];
+/// Methods attacked by default. Not all safe: POST can change data or send email, but a scan
+/// without it misses too much, so it stays on and `POST_HINT` warns. Replaying the others
+/// (DELETE, PUT, PATCH, ...) is opt-in.
+const DEFAULT_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST"];
+
+const POST_HINT: &str = "POST requests are replayed with attack payloads, often many times, and can change data or trigger side effects such as email.";
+
+/// Targets replayed as POST.
+fn post_targets(targets: &[ScanTarget]) -> usize {
+    targets
+        .iter()
+        .filter(|t| {
+            RawRequest::from_bytes(t.request.clone()).head().is_ok_and(|h| h.method.eq_ignore_ascii_case("POST"))
+        })
+        .count()
+}
 
 impl Selection {
     fn from_args(args: &ActiveArgs) -> Self {
@@ -515,7 +571,7 @@ fn select_targets(
         let explicit = t.history_id.is_some_and(|id| args.history_ids.contains(&id));
         if !(all_methods
             || explicit
-            || SAFE_METHODS.contains(&method.as_str())
+            || DEFAULT_METHODS.contains(&method.as_str())
             || args.include_methods.contains(&method))
         {
             skipped_methods += 1;

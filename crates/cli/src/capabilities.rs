@@ -23,6 +23,7 @@ pub fn describe(cmd: &Command) -> Value {
             "2": "invalid input or usage",
             "3": "network error (connect, TLS, timeout, protocol)",
             "4": "not found",
+            "5": "findings compare --fail-on: findings at or above that risk (the command itself succeeded; its output is complete)",
             "6": "out of scope: target not allowed by the engagement/system scope, or no scope set",
         },
         "env": {

@@ -26,6 +26,7 @@ jobs:
           code=$?
           set -e
           cat drift.md
+          { echo '```'; cat drift.md; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           if [ "$code" = "10" ]; then echo "found=true" >> "$GITHUB_OUTPUT"; elif [ "$code" = "0" ]; then echo "found=false" >> "$GITHUB_OUTPUT"; else exit "$code"; fi
       - name: Open or update the drift issue
         if: steps.drift.outputs.found == 'true'

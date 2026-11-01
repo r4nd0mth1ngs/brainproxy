@@ -39,6 +39,6 @@ mod tests {
                 }
             }
         }
-        assert!(rules.len() >= 49, "expected all ported rules, got {}", rules.len());
+        assert_eq!(rules.len(), 54, "expected all passive rules");
     }
 }

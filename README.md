@@ -98,6 +98,20 @@ sudo make install              # -> /usr/local/bin/brainproxy
 
 Or copy the `brainproxy-<version>-linux-x86_64` artifact from CI (or a tagged release) onto the runner.
 
+## Container image
+
+For headless and CI use, the `Dockerfile` builds a small non-root image of the CLI. No image is
+published, so build it yourself. Project files and the CA go in `/work`, so mount a volume there:
+
+```sh
+docker build -t brainproxy .
+docker run --rm -v brainproxy:/work brainproxy engagement start --target app.example.com
+docker run --rm -v brainproxy:/work brainproxy crawl https://app.example.com/
+```
+
+It leaves out Chromium, which `crawl --browser` needs. See
+[Container image](docs/MANUAL.md#container-image) for host folders, running the proxy, and adding Chromium.
+
 ## Engagement scope (required)
 
 brainproxy sends nothing until a scope exists, and every outbound request (send, race,
@@ -255,7 +269,7 @@ brainproxy send --http2 --url https://target.test/
 # Compare two captures
 brainproxy diff 12 15 --part response-body --mode words
 
-# Passive scanning (52 rules ported from ZAP) runs automatically on proxy and send traffic
+# Passive scanning (53 rules ported from ZAP) runs automatically on proxy and send traffic
 brainproxy findings list                          # grouped by alert type, highest risk first
 brainproxy findings list --risk medium --all      # one row per instance
 brainproxy findings show 7                        # description, solution, references, evidence
@@ -409,7 +423,7 @@ brainproxy decode jwt eyJhbGciOi...
 - When stdout isn't a terminal, every command prints one JSON envelope:
   `{"ok":true,"command":...,"data":...}` or `{"ok":false,"command":...,"error":{"kind","message"}}`.
 - Exit codes: `0` success, `1` internal/storage, `2` invalid input or usage, `3` network,
-  `4` not found, `6` out of scope.
+  `4` not found, `5` a `findings compare --fail-on` gate found something, `6` out of scope.
 - `brainproxy capabilities` describes the whole CLI as JSON. `brainproxy capabilities send`
   describes one command.
 - Output is bounded: `--max-body`, `--limit`, and `--max-cell`, with `truncated` flags.

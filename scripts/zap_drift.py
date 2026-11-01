@@ -5,11 +5,14 @@ Every ported rule file starts with a header like
     //! Ported from ZAP CrlfInjectionScanRule (ascanrules, Apache License 2.0).
 This script finds those headers, maps each to its Java file in zaproxy/zap-extensions,
 and compares the pinned commit (zap-sync.json) with upstream HEAD. It also lists rules
-that exist upstream but are not ported yet, and changes to the data files we copied.
+that exist upstream but are not ported yet, each with its add-on and ZAP status, and
+changes to the data files we copied.
 
 Usage: scripts/zap_drift.py [--repo PATH_TO_ZAP_EXTENSIONS_CLONE] [--json]
 Without --repo it clones zap-extensions (blobless, sparse) into a temp dir.
 Exit code 0: no drift; 10: drift found (report printed); other: error.
+Unported rules outside pscanrules and ascanrules are informational: they are reported
+(also in --json, with "informational": true) but don't count as drift.
 """
 
 import argparse
@@ -28,9 +31,44 @@ ADDON_JAVA = {
     "ascanrules": "addOns/ascanrules/src/main/java/org/zaproxy/zap/extension/ascanrules/{}.java",
     "ascanrulesBeta": "addOns/ascanrulesBeta/src/main/java/org/zaproxy/zap/extension/ascanrulesBeta/{}.java",
     "pscanrulesBeta": "addOns/pscanrulesBeta/src/main/java/org/zaproxy/zap/extension/pscanrulesBeta/{}.java",
+    "ascanrulesAlpha": "addOns/ascanrulesAlpha/src/main/java/org/zaproxy/zap/extension/ascanrulesAlpha/{}.java",
+    "pscanrulesAlpha": "addOns/pscanrulesAlpha/src/main/java/org/zaproxy/zap/extension/pscanrulesAlpha/{}.java",
+    "domxss": "addOns/domxss/src/main/java/org/zaproxy/zap/extension/domxss/{}.java",
+    "sqliplugin": "addOns/sqliplugin/src/main/java/org/zaproxy/zap/extension/sqliplugin/{}.java",
+    "soap": "addOns/soap/src/main/java/org/zaproxy/zap/extension/soap/{}.java",
+    "imagelocationscanner": "addOns/imagelocationscanner/src/main/java/org/zaproxy/zap/extension/imagelocationscanner/{}.java",
+    "httpsInfo": "addOns/httpsInfo/src/main/java/org/zaproxy/zap/extension/httpsinfo/{}.java",
+    "client": "addOns/client/src/main/java/org/zaproxy/addon/client/pscan/{}.java",
+    "saml": "addOns/saml/src/main/java/org/zaproxy/zap/extension/saml/{}.java",
+    "wappalyzer": "addOns/wappalyzer/src/main/java/org/zaproxy/zap/extension/wappalyzer/{}.java",
     "commonlib": "addOns/commonlib/src/main/java/org/zaproxy/addon/commonlib/{}.java",
     "retire": "addOns/retire/src/main/java/org/zaproxy/addon/retire/{}.java",
 }
+# Add-ons searched for unported rules, with ZAP's status for each (addOnStatus in the
+# add-on's gradle.kts; alpha when unset). Left out: add-ons whose "rules" only wrap
+# scripts (scripts, websocket) or serve ZAP itself (authhelper, params, pscan, foxhound).
+RULE_ADDONS = {
+    "pscanrules": "release",
+    "ascanrules": "release",
+    "pscanrulesBeta": "beta",
+    "ascanrulesBeta": "beta",
+    "pscanrulesAlpha": "alpha",
+    "ascanrulesAlpha": "alpha",
+    "domxss": "release",
+    "retire": "release",
+    "wappalyzer": "release",
+    "imagelocationscanner": "beta",
+    "soap": "beta",
+    "sqliplugin": "beta",
+    "client": "alpha",
+    "httpsInfo": "alpha",
+    "saml": "alpha",
+}
+# We aim to port everything in these; an unported rule anywhere else is informational,
+# or the drift issue could never close.
+DRIFT_ADDONS = {"pscanrules", "ascanrules"}
+RULES_WITHOUT_SUFFIX = {"Base64Disclosure", "SAMLPassiveScanner", "TechPassiveScanner"}
+NOT_RULES = {"ClientPassiveScanRule", "ClientPassiveAbstractScanRule"}
 
 
 def git(repo, *args):
@@ -56,6 +94,26 @@ def ported_classes():
     return found
 
 
+def is_rule(cls):
+    return (cls.endswith("ScanRule") or cls in RULES_WITHOUT_SUFFIX) and cls not in NOT_RULES
+
+
+def unported_rules(tree, ported, skipped):
+    """Rules in RULE_ADDONS neither ported from that add-on nor skipped, and the add-ons gone from tree."""
+    unported, missing = [], []
+    for addon, status in RULE_ADDONS.items():
+        informational = addon not in DRIFT_ADDONS
+        base = ADDON_JAVA[addon].rsplit("/", 1)[0] + "/"
+        names = [t.removeprefix(base) for t in tree if t.startswith(base)]
+        if not names:
+            missing.append({"addon": addon, "informational": informational})
+        for name in names:
+            cls = name.removesuffix(".java")
+            if "/" not in name and is_rule(cls) and (addon, cls) not in ported and cls not in skipped:
+                unported.append({"addon": addon, "class": cls, "status": status, "informational": informational})
+    return unported, missing
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", help="existing zap-extensions clone")
@@ -72,7 +130,7 @@ def main():
         subprocess.run(["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", sync["repository"], str(repo)], check=True)
     head = git(repo, "rev-parse", f"origin/{sync.get('branch', 'main')}").strip()
 
-    report = {"pinned": pinned, "upstream": head, "changed": [], "missing_upstream": [], "data_changed": [], "feed_changed": [], "unported": []}
+    report = {"pinned": pinned, "upstream": head, "changed": [], "missing_upstream": [], "data_changed": [], "feed_changed": [], "unported": [], "missing_addons": []}
     ported = ported_classes()
     tree = git(repo, "ls-tree", "-r", "--name-only", head).splitlines()
     for (addon, cls), ours in sorted(ported.items()):
@@ -105,17 +163,12 @@ def main():
         if log:
             report["feed_changed"].append({"class": cls, "generator": rule["generator"], "ours": rule["ours"], "commits": log})
 
-    # Upstream release rules we haven't ported (or deliberately skipped).
+    # Upstream rules we haven't ported (or deliberately skipped).
     skipped = set(sync.get("skipped", {})) | set(feed_rules)
-    ported_names = {cls for (_, cls) in ported}
-    for addon in ("pscanrules", "ascanrules"):
-        listing = git(repo, "ls-tree", "--name-only", f"{head}:{ADDON_JAVA[addon].rsplit('/', 1)[0]}")
-        for name in listing.split():
-            cls = name.removesuffix(".java")
-            if cls.endswith("ScanRule") and cls not in ported_names and cls not in skipped:
-                report["unported"].append({"addon": addon, "class": cls})
+    report["unported"], report["missing_addons"] = unported_rules(tree, ported, skipped)
 
-    drift = report["changed"] or report["missing_upstream"] or report["data_changed"] or report["feed_changed"] or report["unported"]
+    counted = [x for x in report["unported"] + report["missing_addons"] if not x["informational"]]
+    drift = report["changed"] or report["missing_upstream"] or report["data_changed"] or report["feed_changed"] or counted
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -132,10 +185,14 @@ def main():
             print(f"\n## Feed checks to regenerate: {c['class']} -> {c['ours']} (python3 {c['generator']}, then sign the feed)")
             for line in c["commits"]:
                 print(f"  - {line}")
-        if report["unported"]:
-            print("\n## Not ported yet:")
-            for u in report["unported"]:
-                print(f"  - {u['addon']}/{u['class']}")
+        for a in report["missing_addons"]:
+            print(f"\n## Add-on not found upstream: {a['addon']}{' (informational)' if a['informational'] else ''}")
+        for title, informational in (("Not ported yet", False), ("Not ported yet, informational (not counted as drift)", True)):
+            rules = [u for u in report["unported"] if u["informational"] == informational]
+            if rules:
+                print(f"\n## {title}:")
+            for u in rules:
+                print(f"  - {u['addon']}/{u['class']} ({u['status']})")
         if not drift:
             print("No drift.")
     sys.exit(10 if drift else 0)

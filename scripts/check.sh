@@ -11,4 +11,5 @@ if grep -qE "FAILED|panicked|^error" "$log"; then
     echo "tests failed (see $log)" >&2
     exit 1
 fi
+python3 -q scripts/test_zap_drift.py
 echo "checks passed"
