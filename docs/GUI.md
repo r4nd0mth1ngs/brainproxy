@@ -123,8 +123,8 @@ severity and Thorough those of medium and above, both plus the end-of-life check
 `--check-include-tags eol`; Thorough also crawls with JavaScript in a hidden browser
 (`--browser`) when `browser list` finds a Chromium-based one, and says so on its card and
 in the review), speed (Gentle `-c 3`, Normal, Fast `-c 30`),
-and a review with warnings about replayed POST requests and real
-attack traffic. It runs
+and a review with warnings about replayed POST requests, attacked page addresses (at
+Standard and Thorough) and real attack traffic. It runs
 `scan active URL --crawl ... --background`, shows progress as "exploring" then "testing",
 and ends with counts per risk level explained in plain words and a link to Findings. "I'll
 set it up myself" hides it for that project.

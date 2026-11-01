@@ -9,8 +9,7 @@ import { usePoll } from "../ui/usePoll";
 import { loadSuggestions, type Job, type Suggestions } from "./Scanner";
 import { hasChromium, wizardBrowserArgs, type BrowserList } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
-
-type Depth = "quick" | "standard" | "thorough";
+import { attacksPaths, DEPTHS, type Depth } from "./wizardDepths";
 
 /** Nuclei templates per depth when installed (none for Quick: thousands of extra requests). */
 const NUCLEI: Record<Depth, string[]> = {
@@ -19,32 +18,6 @@ const NUCLEI: Record<Depth, string[]> = {
   standard: ["--checks", "nuclei,brainproxy", "--check-severity", "high", "--check-include-tags", "eol"],
   thorough: ["--checks", "nuclei,brainproxy", "--check-severity", "medium", "--check-include-tags", "eol"],
 };
-
-const DEPTHS: { id: Depth; title: string; time: string; text: string; args: string[] }[] = [
-  {
-    id: "quick",
-    title: "Quick check",
-    time: "a few minutes",
-    text: "Explores the main pages and tries the most common attacks with few requests.",
-    // Medium, not low: low strength skips the SQL injection payloads that matter most.
-    args: ["--strength", "medium", "--crawl-depth", "3", "--crawl-max-pages", "150"],
-  },
-  {
-    id: "standard",
-    title: "Standard",
-    // Attacking path segments adds many requests, so a large site can take an hour.
-    time: "about 10 to 60 minutes",
-    text: "A balanced scan of the whole site, including IDs in its addresses. Good for a first assessment, but sends many requests.",
-    args: ["--strength", "high", "--crawl-depth", "5", "--crawl-max-pages", "500", "--cookies", "--url-path"],
-  },
-  {
-    id: "thorough",
-    title: "Thorough",
-    time: "30 minutes or more",
-    text: "Goes deeper and tries many more attack variations. Sends a lot of requests.",
-    args: ["--strength", "insane", "--crawl-depth", "8", "--crawl-max-pages", "1500", "--cookies", "--url-path"],
-  },
-];
 
 type Speed = "gentle" | "normal" | "fast";
 
@@ -276,6 +249,13 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             often many times, and that can change data or trigger side effects: one contact form can send a lot of
             emails.
           </div>
+          {attacksPaths(depth) && (
+            <div className="wiz-warn replay">
+              <b>Page addresses are attacked too.</b> Each part of an address, such as the 42 in /users/42, is changed and
+              requested.
+              {login && " While logged in, a changed link can still change or delete data if the site does that on a plain link."}
+            </div>
+          )}
           <div className="wiz-warn">
             The scan sends real attack requests, as an attacker would. It can create test data or slow down a fragile
             site. Prefer a test environment, and only scan systems you have permission to
