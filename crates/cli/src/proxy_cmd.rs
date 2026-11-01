@@ -19,7 +19,7 @@ use clap::{Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::output::{body_value, Out};
-use crate::process;
+use crate::process::{self, Liveness};
 
 /// `proxy stop` asks the proxy to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "proxy.stop";
@@ -64,7 +64,12 @@ pub enum ProxyCmd {
     /// Run the proxy in the foreground until SIGINT/SIGTERM.
     Run(ProxyRunArgs),
     /// Stop the background proxy for this project.
-    Stop,
+    Stop {
+        /// Only clear a record that can't be verified (its lock file isn't readable from this
+        /// container). Nothing is signalled, and a proxy known to be running is left alone.
+        #[arg(long)]
+        forget: bool,
+    },
     /// Show whether a proxy is running, with capture and intercept counts.
     Status,
 }
@@ -408,16 +413,21 @@ fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
     Ok(store.meta_get(STATE_KEY)?.and_then(|s| serde_json::from_str(&s).ok()))
 }
 
-/// The running proxy's saved state, clearing stale state left by a crash.
-fn current(store: &Store) -> Result<Option<Saved>, Error> {
-    match read_state(store)? {
-        Some(s) if !process::gone(store, LOCK_NAME, s.state.pid, s.start_time, s.pid_ns.as_deref()) => Ok(Some(s)),
-        Some(_) => {
+/// The saved state and what is known about it, clearing stale state left by a crash.
+fn recorded(store: &Store) -> Result<Option<(Saved, Liveness)>, Error> {
+    let Some(s) = read_state(store)? else { return Ok(None) };
+    match process::liveness(store, LOCK_NAME, s.state.pid, s.start_time, s.pid_ns.as_deref()) {
+        Liveness::Gone => {
             store.meta_set(STATE_KEY, None)?;
             Ok(None)
         }
-        None => Ok(None),
+        known => Ok(Some((s, known))),
     }
+}
+
+/// The running proxy's saved state, clearing stale state left by a crash.
+fn current(store: &Store) -> Result<Option<Saved>, Error> {
+    Ok(recorded(store)?.filter(|(_, known)| *known == Liveness::Running).map(|(s, _)| s))
 }
 
 /// The running proxy for this project, clearing stale state left by a crash.
@@ -432,11 +442,11 @@ pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
 
 /// Stops this project's proxy if one runs: its pid, and whether it had to be killed.
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
-    let Some(Saved { state, start_time, pid_ns }) = current(store)? else { return Ok(None) };
+    let Some((Saved { state, start_time, pid_ns }, _)) = recorded(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
     let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
     let forced = if process::elsewhere(pid_ns.as_deref()) {
-        process::await_exit_elsewhere(store, LOCK_NAME, state.pid, wait)?;
+        process::await_exit_elsewhere(store, LOCK_NAME, STATE_KEY, state.pid, wait)?;
         false
     } else {
         process::terminate(state.pid, start_time, "proxy", wait)?
@@ -450,6 +460,20 @@ pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     store.meta_set(STATE_KEY, None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some((state.pid, forced)))
+}
+
+/// Clears a record that can't be verified: its pid, or `None` if there is no record.
+fn forget(store: &Store) -> Result<Option<u32>, Error> {
+    let Some((saved, known)) = recorded(store)? else { return Ok(None) };
+    if known == Liveness::Running {
+        return Err(Error::Conflict(format!(
+            "the proxy is running ({}), so its record stays; use `brainproxy proxy stop`",
+            process::pid_text(saved.state.pid, saved.pid_ns.as_deref())
+        )));
+    }
+    store.meta_set(STATE_KEY, None)?;
+    store.meta_set(STOP_KEY, None)?;
+    Ok(Some(saved.state.pid))
 }
 
 fn usage_hints(state: &ProxyState) -> Value {
@@ -479,7 +503,13 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
     match cmd {
         ProxyCmd::Start(args) => start(project, home, args, out),
         ProxyCmd::Run(args) => run_foreground(project, home, args, out),
-        ProxyCmd::Stop => {
+        ProxyCmd::Stop { forget: true } => {
+            let store = Store::open(project)?;
+            let pid = forget(&store)?.ok_or_else(|| Error::NotFound("no proxy recorded for this project".into()))?;
+            out.ok(json!({"forgotten": pid}), || format!("cleared the record of the proxy (pid {pid})"));
+            Ok(())
+        }
+        ProxyCmd::Stop { forget: false } => {
             let store = Store::open(project)?;
             let (pid, forced) =
                 stop(&store)?.ok_or_else(|| Error::NotFound("no proxy running for this project".into()))?;
@@ -488,9 +518,14 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
         }
         ProxyCmd::Status => {
             let store = Store::open(project)?;
-            let saved = current(&store)?;
+            let (saved, known) = recorded(&store)?.unzip();
+            let unverified = saved.as_ref().filter(|_| known == Some(Liveness::Unverified)).map(|s| {
+                json!({"pid": s.state.pid, "listen": s.state.listen,
+                    "reason": process::unverified_text(LOCK_NAME, s.state.pid),
+                    "next": "brainproxy proxy stop --forget"})
+            });
             let pid_ns = saved.as_ref().and_then(|s| s.pid_ns.clone());
-            let state = saved.map(|s| s.state);
+            let state = saved.filter(|_| known == Some(Liveness::Running)).map(|s| s.state);
             let captures = store.list(&HistoryFilter { source: Some("proxy".into()), ..Default::default() })?.len();
             let pending = store.intercept_list(Some("pending"), u32::MAX)?.len();
             let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
@@ -508,6 +543,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "running": state.is_some(),
                 "proxy": state.as_ref().map(state_json),
                 "other_pid_namespace": process::elsewhere(pid_ns.as_deref()),
+                "unverified": unverified,
                 "proxy_captures": captures,
                 "pending_intercepts": pending,
                 "intercept_enabled": intercept.enabled,
@@ -522,7 +558,10 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                     process::pid_text(s.pid, pid_ns.as_deref()),
                     live_text(s.authz_run)
                 ),
-                None => "not running".into(),
+                None => match &unverified {
+                    Some(u) => u["reason"].as_str().unwrap_or_default().to_string(),
+                    None => "not running".into(),
+                },
             });
             Ok(())
         }
@@ -531,8 +570,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
 
 fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
-    if let Some(s) = current(&store)? {
-        return Err(already_running(&s));
+    if let Some((s, known)) = recorded(&store)? {
+        return Err(already_running(&s, known));
     }
     load_ca(home)?; // Surface CA and scope problems here rather than in the log.
     store.guard()?;
@@ -601,7 +640,10 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     }
 }
 
-fn already_running(s: &Saved) -> Error {
+fn already_running(s: &Saved, known: Liveness) -> Error {
+    if known == Liveness::Unverified {
+        return Error::Conflict(process::unverified_text(LOCK_NAME, s.state.pid));
+    }
     let pid = process::pid_text(s.state.pid, s.pid_ns.as_deref());
     Error::Conflict(format!("proxy already running on {} ({pid})", s.state.listen))
 }
@@ -623,8 +665,10 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     let store = Store::open(project)?;
     // Its own pid is its own state, unless that is the same pid in another container.
     let me = std::process::id();
-    if let Some(s) = current(&store)?.filter(|s| s.state.pid != me || process::elsewhere(s.pid_ns.as_deref())) {
-        return Err(already_running(&s));
+    if let Some((s, known)) =
+        recorded(&store)?.filter(|(s, _)| s.state.pid != me || process::elsewhere(s.pid_ns.as_deref()))
+    {
+        return Err(already_running(&s, known));
     }
     // Fail before listening if there is no scope; the scope can't change while we run.
     let guard = store.guard()?;
@@ -744,7 +788,9 @@ fn serve(
             Some(w) => w.finish().await,
             None => Ok(Value::Null),
         };
-        if read_state(&store)?.is_some_and(|s| s.state.pid == std::process::id()) {
+        if read_state(&store)?
+            .is_some_and(|s| s.state.pid == std::process::id() && !process::elsewhere(s.pid_ns.as_deref()))
+        {
             store.meta_set(STATE_KEY, None)?;
         }
         if let Some(a) = &auth {

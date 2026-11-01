@@ -308,6 +308,44 @@ fn listener_in_another_namespace_is_not_taken_for_dead() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Its lock file can't be read here: see the proxy's test. Permissions don't bind root.
+#[cfg(target_os = "linux")]
+#[test]
+fn listener_record_that_cannot_be_verified() {
+    use brainproxy_core::oob::STATE_KEY;
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, project) = setup("unverified");
+    let lock = dir.join("p.bpdb-oob.lock");
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_eq!(code, 0, "{v}");
+    let pid = v["data"]["pid"].as_u64().unwrap();
+
+    let store = brainproxy_core::store::Store::open(&project).unwrap();
+    let mut state: Value = serde_json::from_str(&store.meta_get(STATE_KEY).unwrap().unwrap()).unwrap();
+    state["pid_ns"] = "pid:[1]".into();
+    store.meta_set(STATE_KEY, Some(&state.to_string())).unwrap();
+
+    let (code, v) = run(&["oob", "stop", "--forget"], &project);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+
+    assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&lock).is_err() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (_, v) = run(&["oob", "status"], &project);
+        assert_eq!(v["data"]["running"], false, "{v}");
+        assert_eq!(v["data"]["unverified"]["pid"].as_u64(), Some(pid), "{v}");
+        let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+        assert_ne!(code, 0, "{v}");
+        assert!(v.to_string().contains("stop --forget"), "{v}");
+        let (code, v) = run(&["oob", "stop", "--forget"], &project);
+        assert_eq!((code, v["data"]["forgotten"].as_u64()), (0, Some(pid)), "{v}");
+        let (_, v) = run(&["oob", "status"], &project);
+        assert_eq!(v["data"]["unverified"], Value::Null, "{v}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn oob_run_validates_arguments() {
     let (dir, project) = setup("args");

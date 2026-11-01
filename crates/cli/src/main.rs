@@ -382,7 +382,7 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Proxy(c) => match c {
             proxy_cmd::ProxyCmd::Start(_) => "proxy start",
             proxy_cmd::ProxyCmd::Run(_) => "proxy run",
-            proxy_cmd::ProxyCmd::Stop => "proxy stop",
+            proxy_cmd::ProxyCmd::Stop { .. } => "proxy stop",
             proxy_cmd::ProxyCmd::Status => "proxy status",
         },
         Cmd::Ca(_) => "ca",
@@ -448,7 +448,7 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Oob(c) => match c {
             oob_cmd::OobCmd::Start(_) => "oob start",
             oob_cmd::OobCmd::Run(_) => "oob run",
-            oob_cmd::OobCmd::Stop => "oob stop",
+            oob_cmd::OobCmd::Stop { .. } => "oob stop",
             oob_cmd::OobCmd::Status => "oob status",
             oob_cmd::OobCmd::Payload { .. } => "oob payload",
             oob_cmd::OobCmd::Poll { .. } => "oob poll",

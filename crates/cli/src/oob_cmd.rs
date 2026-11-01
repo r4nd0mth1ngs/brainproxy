@@ -15,7 +15,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::process::{self, start_time};
+use crate::process::{self, start_time, Liveness};
 
 /// `oob stop` asks the listener to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "oob.stop";
@@ -28,7 +28,12 @@ pub enum OobCmd {
     /// Run the listener in the foreground until SIGINT/SIGTERM.
     Run(OobRunArgs),
     /// Stop the background listener for this project.
-    Stop,
+    Stop {
+        /// Only clear a record that can't be verified (its lock file isn't readable from this
+        /// container). Nothing is signalled, and a listener known to be running is left alone.
+        #[arg(long)]
+        forget: bool,
+    },
     /// Whether the listener runs, its public endpoint, and payload/interaction counts.
     Status,
     /// Issue payloads for manual testing (blind SSRF, XXE, command injection, ...).
@@ -95,25 +100,30 @@ pub struct OobRunArgs {
     log: Option<PathBuf>,
 }
 
-/// The running listener for this project, clearing stale state left by a crash.
-pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
-    match oob::read_state(store)? {
-        Some(s) if !process::gone(store, LOCK_NAME, s.pid, s.start_time, s.pid_ns.as_deref()) => Ok(Some(s)),
-        Some(_) => {
+/// The saved state and what is known about it, clearing stale state left by a crash.
+fn recorded(store: &Store) -> Result<Option<(OobState, Liveness)>, Error> {
+    let Some(s) = oob::read_state(store)? else { return Ok(None) };
+    match process::liveness(store, LOCK_NAME, s.pid, s.start_time, s.pid_ns.as_deref()) {
+        Liveness::Gone => {
             store.meta_set(STATE_KEY, None)?;
             Ok(None)
         }
-        None => Ok(None),
+        known => Ok(Some((s, known))),
     }
+}
+
+/// The running listener for this project, clearing stale state left by a crash.
+pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
+    Ok(recorded(store)?.filter(|(_, known)| *known == Liveness::Running).map(|(s, _)| s))
 }
 
 /// Stops this project's listener if one runs: its pid, and whether it had to be killed.
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
-    let Some(state) = running(store)? else { return Ok(None) };
+    let Some((state, _)) = recorded(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
     let wait = std::time::Duration::from_secs(5);
     let forced = if process::elsewhere(state.pid_ns.as_deref()) {
-        process::await_exit_elsewhere(store, LOCK_NAME, state.pid, wait)?;
+        process::await_exit_elsewhere(store, LOCK_NAME, STATE_KEY, state.pid, wait)?;
         false
     } else {
         process::terminate(state.pid, state.start_time, "OOB listener", wait)?
@@ -123,7 +133,24 @@ pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     Ok(Some((state.pid, forced)))
 }
 
-fn already_running(s: &OobState) -> Error {
+/// Clears a record that can't be verified: its pid, or `None` if there is no record.
+fn forget(store: &Store) -> Result<Option<u32>, Error> {
+    let Some((state, known)) = recorded(store)? else { return Ok(None) };
+    if known == Liveness::Running {
+        return Err(Error::Conflict(format!(
+            "the OOB listener is running ({}), so its record stays; use `brainproxy oob stop`",
+            process::pid_text(state.pid, state.pid_ns.as_deref())
+        )));
+    }
+    store.meta_set(STATE_KEY, None)?;
+    store.meta_set(STOP_KEY, None)?;
+    Ok(Some(state.pid))
+}
+
+fn already_running(s: &OobState, known: Liveness) -> Error {
+    if known == Liveness::Unverified {
+        return Error::Conflict(process::unverified_text(LOCK_NAME, s.pid));
+    }
     let pid = process::pid_text(s.pid, s.pid_ns.as_deref());
     Error::Conflict(format!("OOB listener already running on {} ({pid})", s.tcp_listen))
 }
@@ -158,7 +185,14 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         OobCmd::Start(args) => start(project, args, out),
         OobCmd::Run(args) => run_foreground(project, args, out),
-        OobCmd::Stop => {
+        OobCmd::Stop { forget: true } => {
+            let store = Store::open(project)?;
+            let pid =
+                forget(&store)?.ok_or_else(|| Error::NotFound("no OOB listener recorded for this project".into()))?;
+            out.ok(json!({"forgotten": pid}), || format!("cleared the record of the OOB listener (pid {pid})"));
+            Ok(())
+        }
+        OobCmd::Stop { forget: false } => {
             let store = Store::open(project)?;
             let (pid, forced) = stop(&store)?.ok_or_else(not_running)?;
             out.ok(json!({"stopped": pid, "forced": forced}), || format!("stopped OOB listener (pid {pid})"));
@@ -166,12 +200,19 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
         }
         OobCmd::Status => {
             let store = Store::open(project)?;
-            let state = running(&store)?;
+            let (saved, known) = recorded(&store)?.unzip();
+            let unverified = saved.as_ref().filter(|_| known == Some(Liveness::Unverified)).map(|s| {
+                json!({"pid": s.pid, "tcp_listen": s.tcp_listen,
+                    "reason": process::unverified_text(LOCK_NAME, s.pid),
+                    "next": "brainproxy oob stop --forget"})
+            });
+            let state = saved.filter(|_| known == Some(Liveness::Running));
             let (payloads, interactions, unmatched, dropped) = store.oob_counts()?;
             let data = json!({
                 "running": state.is_some(),
                 "listener": state.as_ref().map(state_json),
                 "other_pid_namespace": state.as_ref().is_some_and(|s| process::elsewhere(s.pid_ns.as_deref())),
+                "unverified": unverified,
                 "payloads": payloads,
                 "interactions": interactions,
                 "unmatched_interactions": unmatched,
@@ -184,7 +225,13 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
                     s.tcp_listen,
                     process::pid_text(s.pid, s.pid_ns.as_deref())
                 ),
-                None => format!("not running; {payloads} payloads, {interactions} interactions"),
+                None => match &unverified {
+                    Some(u) => format!(
+                        "{}; {payloads} payloads, {interactions} interactions",
+                        u["reason"].as_str().unwrap_or_default()
+                    ),
+                    None => format!("not running; {payloads} payloads, {interactions} interactions"),
+                },
             });
             Ok(())
         }
@@ -289,8 +336,8 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
 
 fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
-    if let Some(s) = running(&store)? {
-        return Err(already_running(&s));
+    if let Some((s, known)) = recorded(&store)? {
+        return Err(already_running(&s, known));
     }
     let project = std::fs::canonicalize(project)?;
     let log = args.log.clone().unwrap_or_else(|| project.with_extension("oob.log"));
@@ -364,8 +411,9 @@ fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Err
     let store = Store::open(project)?;
     // Its own pid is its own state, unless that is the same pid in another container.
     let me = std::process::id();
-    if let Some(s) = running(&store)?.filter(|s| s.pid != me || process::elsewhere(s.pid_ns.as_deref())) {
-        return Err(already_running(&s));
+    if let Some((s, known)) = recorded(&store)?.filter(|(s, _)| s.pid != me || process::elsewhere(s.pid_ns.as_deref()))
+    {
+        return Err(already_running(&s, known));
     }
     let domain = args.domain.as_deref().map(check_domain).transpose()?;
     if args.dns_listen.is_some() && domain.is_none() {
@@ -421,7 +469,9 @@ fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Err
         let shutdown = process::shutdown(&store, STOP_KEY);
         let opts = ServeOptions { project: project.to_path_buf(), domain, public_ip };
         let result = serve(tcp, dns, opts, shutdown).await;
-        if oob::read_state(&store)?.is_some_and(|s| s.pid == std::process::id()) {
+        if oob::read_state(&store)?
+            .is_some_and(|s| s.pid == std::process::id() && !process::elsewhere(s.pid_ns.as_deref()))
+        {
             store.meta_set(STATE_KEY, None)?;
         }
         result

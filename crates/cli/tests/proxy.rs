@@ -864,3 +864,59 @@ fn proxy_in_another_namespace_is_not_taken_for_dead() {
     assert_eq!(store.meta_get(STATE_KEY).unwrap(), None);
     env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
 }
+
+/// A proxy elsewhere whose lock file can't be read here: not called running, not cleared, and
+/// `stop --forget` is the way out. Permissions don't bind root, so that part is skipped there.
+#[cfg(target_os = "linux")]
+#[test]
+fn proxy_record_that_cannot_be_verified() {
+    use brainproxy_core::proxy::STATE_KEY;
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("unverified");
+    let lock = env.dir.join("p.bpdb-proxy.lock");
+    let chmod = |mode| std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+
+    assert_eq!(env.run(&["proxy", "stop", "--forget"]).0, 4, "nothing recorded");
+    let pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o644);
+    pretend_other_namespace(&env.project, STATE_KEY);
+
+    // Known to be running: its record stays.
+    let (code, v) = env.run(&["proxy", "stop", "--forget"]);
+    assert_ne!(code, 0, "{v}");
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    assert_eq!(env.ok(&["proxy", "status"])["running"], true);
+
+    assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+    chmod(0o000);
+    if std::fs::File::open(&lock).is_ok() {
+        chmod(0o644);
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(Instant::now() < deadline, "the proxy survived SIGKILL");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    for _ in 0..2 {
+        let status = env.ok(&["proxy", "status"]);
+        assert_eq!(status["running"], false, "{status}");
+        assert_eq!(status["unverified"]["pid"].as_u64(), Some(pid), "{status}");
+        assert_eq!(status["unverified"]["next"], "brainproxy proxy stop --forget", "{status}");
+    }
+    for args in [&["proxy", "start", "--listen", "127.0.0.1:0"][..], &["proxy", "run", "--listen", "127.0.0.1:0"]] {
+        let (code, v) = env.run(args);
+        assert_ne!(code, 0, "{v}");
+        assert!(v.to_string().contains("stop --forget"), "{v}");
+    }
+    let (code, v) = env.run(&["proxy", "stop"]);
+    assert_ne!(code, 0, "{v}");
+    assert!(v.to_string().contains("stop --forget"), "{v}");
+
+    assert_eq!(env.ok(&["proxy", "stop", "--forget"])["forgotten"].as_u64(), Some(pid));
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["unverified"]), (&false.into(), &Value::Null), "{status}");
+    chmod(0o644);
+    env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+}

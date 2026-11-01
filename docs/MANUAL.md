@@ -110,6 +110,10 @@ Things that work differently in a container:
   and only if the proxy answers. Through `docker exec` it ends with exit code 137 and no output,
   because the container is gone as soon as its main process is.
 
+  Two things this doesn't cover: an older brainproxy in another container on the same volume
+  still clears the record of a running proxy, and on macOS and Windows hosts the lock isn't
+  taken, so a proxy on the host and one in a container aren't kept apart for the same project.
+
 - **`crawl --browser`:** needs a Chromium-based browser, which the image leaves out because it
   takes the image from about 30 MB to over 800 MB. Without one, `--browser` stops with an
   error and the plain crawler still works. To add it, build on the image (here tagged
@@ -827,6 +831,7 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | `browser open` says it can only open http(s) URLs | Give a full `http://` or `https://` address (or none for a blank page). Other schemes and anything starting with `-` are refused so they can't be read as browser options. |
 | `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` (Windows: Task Manager, Details tab) and stop it yourself. |
 | curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
+| Container: "can't verify the proxy" (or OOB listener) | It was started in another container, and this one can't read its lock file, so brainproxy can't tell whether it still runs. If it doesn't, `brainproxy proxy stop --forget` (or `oob stop --forget`) clears the record. Nothing is signalled, and a proxy known to be running is left alone. |
 | Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |

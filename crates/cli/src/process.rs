@@ -131,18 +131,54 @@ pub(crate) fn pid_text(pid: u32, pid_ns: Option<&str>) -> String {
     }
 }
 
-/// Whether the saved listener is certainly gone, so that its state can be cleared. A listener
-/// in another namespace is judged by its lock; if that can't be read, its state stays.
-pub(crate) fn gone(store: &Store, what: &str, pid: u32, start: Option<u64>, pid_ns: Option<&str>) -> bool {
+/// What is known about a saved listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    Running,
+    /// Certainly gone, so its state can be cleared.
+    Gone,
+    /// In another namespace, with a lock that can't be read. Its state stays, and only
+    /// `stop --forget` clears it.
+    Unverified,
+}
+
+/// A listener in another namespace is judged by its lock, any other by its pid.
+pub(crate) fn liveness(store: &Store, what: &str, pid: u32, start: Option<u64>, pid_ns: Option<&str>) -> Liveness {
     if elsewhere(pid_ns) {
-        lock_held(store, what) == Some(false)
+        match lock_held(store, what) {
+            Some(true) => Liveness::Running,
+            Some(false) => Liveness::Gone,
+            None => Liveness::Unverified,
+        }
+    } else if still_running(pid, start) == Some(false) {
+        Liveness::Gone
     } else {
-        still_running(pid, start) == Some(false)
+        Liveness::Running
     }
+}
+
+fn label(what: &str) -> &str {
+    if what == "oob" {
+        "OOB listener"
+    } else {
+        what
+    }
+}
+
+/// Why a saved listener can't be verified, and the way out.
+pub(crate) fn unverified_text(what: &str, pid: u32) -> String {
+    format!(
+        "can't verify the {} recorded as pid {pid} in another container or PID namespace: its lock file isn't \
+         readable here. If it is no longer running, `brainproxy {what} stop --forget` clears the record",
+        label(what)
+    )
 }
 
 /// A listener's hold on `<project>-<what>.lock`, for as long as it runs. The kernel releases
 /// it the moment the process dies, however that happens, and it works across PID namespaces.
+///
+/// Never open this file again from the process holding the lock: on NFS `flock` becomes a
+/// per-process POSIX lock, which closing any descriptor for the file releases.
 pub(crate) struct RunLock(#[allow(dead_code)] File);
 
 impl RunLock {
@@ -151,14 +187,27 @@ impl RunLock {
     /// namespace, and is judged by its pid.
     pub(crate) fn acquire(store: &Store, what: &str) -> Result<Option<Self>, Error> {
         let Some(path) = lock_path(store, what).filter(|_| pid_namespace().is_some()) else { return Ok(None) };
-        let Ok(file) = OpenOptions::new().create(true).truncate(false).write(true).open(path) else { return Ok(None) };
+        // `flock` needs no write access, so a lock file left by another user will do.
+        let opened = OpenOptions::new().create(true).truncate(false).write(true).open(&path);
+        let Ok(file) = opened.or_else(|_| File::open(&path)) else { return Ok(None) };
+        // Store::open's umask makes it owner-only, but it holds no data and listeners and
+        // probes can run as different users (`docker run --user`), which must all be able to
+        // open it. Failing is fine: then it isn't ours, and its owner has set this already.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o644));
+        }
         // A probe holds it for an instant, so being refused once proves nothing.
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Some(Self(file))),
                 Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
-                    return Err(Error::Conflict(format!("another {what} is already running for this project")));
+                    return Err(Error::Conflict(format!(
+                        "another {} is already running for this project",
+                        label(what)
+                    )));
                 }
                 Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
                 Err(TryLockError::Error(_)) => return Ok(None),
@@ -188,20 +237,34 @@ fn lock_held(store: &Store, what: &str) -> Option<bool> {
     }
 }
 
-/// Waits for a listener in another namespace to act on the caller's `request_stop`. Its pid
-/// means something else here, so it is never signalled.
-pub(crate) fn await_exit_elsewhere(store: &Store, what: &str, pid: u32, wait: Duration) -> Result<(), Error> {
+/// Waits for a listener in another namespace to act on the caller's `request_stop`: its lock
+/// is released, or if that can't be read, it has cleared its record under `state_key`. Its
+/// pid means something else here, so it is never signalled.
+pub(crate) fn await_exit_elsewhere(
+    store: &Store,
+    what: &str,
+    state_key: &str,
+    pid: u32,
+    wait: Duration,
+) -> Result<(), Error> {
     let deadline = Instant::now() + wait;
-    while lock_held(store, what) != Some(false) {
+    loop {
+        let held = lock_held(store, what);
+        if held == Some(false) || store.meta_get(state_key)?.is_none() {
+            return Ok(());
+        }
         if Instant::now() >= deadline {
-            return Err(Error::Conflict(format!(
-                "the {what} (pid {pid} in another container or PID namespace) is still running after being asked to \
-                 stop, and can't be signalled from here; stop it where it runs"
-            )));
+            return Err(Error::Conflict(match held {
+                Some(_) => format!(
+                    "the {} (pid {pid} in another container or PID namespace) is still running after being asked to \
+                     stop, and can't be signalled from here; stop it where it runs",
+                    label(what)
+                ),
+                None => unverified_text(what, pid),
+            }));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
 }
 
 /// Stops the process recorded as (`pid`, `start`), after the caller's `request_stop`: on
@@ -417,23 +480,59 @@ mod tests {
         let other = Some("pid:[1]");
         // No listener has ever run here: there is no lock, and nothing holds it.
         assert_eq!(lock_held(&store, "proxy"), Some(false));
-        assert!(gone(&store, "proxy", 1, Some(1), other));
+        assert_eq!(liveness(&store, "proxy", 1, Some(1), other), Liveness::Gone);
 
         let lock = RunLock::acquire(&store, "proxy").unwrap().expect("lock");
         assert_eq!(lock_held(&store, "proxy"), Some(true));
         // Neither a pid that isn't there nor an unknown start time says anything elsewhere.
-        assert!(!gone(&store, "proxy", i32::MAX as u32, None, other));
+        assert_eq!(liveness(&store, "proxy", i32::MAX as u32, None, other), Liveness::Running);
         assert!(matches!(RunLock::acquire(&store, "proxy"), Err(Error::Conflict(_))));
         // Each listener has its own.
         assert_eq!(lock_held(&store, "oob"), Some(false));
-        let err = await_exit_elsewhere(&store, "proxy", 1, Duration::from_millis(100)).unwrap_err();
+        store.meta_set("state", Some("{}")).unwrap();
+        let err = await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap_err();
         assert!(err.to_string().contains("still running"), "{err}");
 
         drop(lock);
         assert_eq!(lock_held(&store, "proxy"), Some(false));
-        assert!(gone(&store, "proxy", 1, Some(1), other));
-        await_exit_elsewhere(&store, "proxy", 1, Duration::from_millis(100)).unwrap();
+        assert_eq!(liveness(&store, "proxy", 1, Some(1), other), Liveness::Gone);
+        await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap();
         assert!(RunLock::acquire(&store, "proxy").unwrap().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Being unable to read the lock says nothing, and other users can read a lock it made.
+    /// Permissions don't bind root, so that part only runs for other users.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_file_that_cannot_be_read_says_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = store("unreadable");
+        let path = lock_path(&store, "proxy").unwrap();
+        let chmod = |mode| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let lock = RunLock::acquire(&store, "proxy").unwrap().expect("lock");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        drop(lock);
+
+        // It can be taken without write access, as with a file left by another user.
+        chmod(0o444);
+        let lock = RunLock::acquire(&store, "proxy").unwrap().expect("a read-only lock file will do");
+        assert_eq!(lock_held(&store, "proxy"), Some(true));
+        drop(lock);
+
+        chmod(0o000);
+        if File::open(&path).is_err() {
+            store.meta_set("state", Some("{}")).unwrap();
+            assert_eq!(lock_held(&store, "proxy"), None);
+            assert_eq!(liveness(&store, "proxy", 1, Some(1), Some("pid:[1]")), Liveness::Unverified);
+            let err = await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap_err();
+            assert!(err.to_string().contains("stop --forget"), "{err}");
+            // A listener that answers clears its record, whatever the lock says.
+            store.meta_set("state", None).unwrap();
+            await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap();
+        }
+        chmod(0o644);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -451,9 +550,9 @@ mod tests {
         let me = std::process::id();
         let start = start_time(me);
         for ns in [None, pid_namespace()] {
-            assert!(!gone(&store, "proxy", me, start, ns.as_deref()));
-            assert!(gone(&store, "proxy", me, start.map(|s| s + 1), ns.as_deref()));
-            assert!(gone(&store, "proxy", 0, start, ns.as_deref()));
+            assert_eq!(liveness(&store, "proxy", me, start, ns.as_deref()), Liveness::Running);
+            assert_eq!(liveness(&store, "proxy", me, start.map(|s| s + 1), ns.as_deref()), Liveness::Gone);
+            assert_eq!(liveness(&store, "proxy", 0, start, ns.as_deref()), Liveness::Gone);
         }
         let _ = std::fs::remove_dir_all(dir);
     }
