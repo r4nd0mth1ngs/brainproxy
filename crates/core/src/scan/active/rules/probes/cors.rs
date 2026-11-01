@@ -3,11 +3,13 @@
 //! Differences: only `Access-Control-Allow-Credentials: true` raises the risk, since
 //! browsers ignore any other value (ZAP accepts any value); only the literal `null`
 //! counts as the null origin (ZAP matches `nullsoft.example` too), and only a bare `*` as
-//! the wildcard, since browsers don't support patterns like `https://*.example.com`; the
+//! the wildcard, since browsers don't support patterns like `https://*.example.com`; a
+//! list of origins or repeated header is only informational, since browsers refuse it; the
 //! rule keeps probing after an informational answer, which ZAP takes as its result, since
 //! a server can answer other origins with its trusted one and still accept `null`; origins
 //! built on the host keep the port after the changed name, so they are valid URLs (ZAP
-//! writes `a.test:8080.x.com`); and the evidence is rebuilt from the header values, so it
+//! writes `a.test:8080.x.com`), and are left out where an IP address makes them invalid;
+//! and the evidence is rebuilt from the header values, so it
 //! doesn't depend on how the server cases them.
 
 use crate::http::RawRequest;
@@ -80,24 +82,31 @@ fn split_port(authority: &str) -> (&str, &str) {
 }
 
 /// `Origin` values in order of likelihood and severity; None sends no `Origin`.
-fn origins(scheme: &str, authority: &str, random: &str) -> [Option<String>; 7] {
+fn origins(scheme: &str, authority: &str, random: &str) -> Vec<Option<String>> {
     let base = format!("{scheme}://");
     let (host, port) = split_port(authority);
-    [
-        Some(format!("{base}{random}.com")),
-        Some("null".to_string()),
-        Some(format!("{base}{random}.{host}{port}")),
-        Some(format!("{base}{host}.{random}.com{port}")),
+    let ipv6 = host.starts_with('[');
+    let ip = ipv6 || host.parse::<std::net::Ipv4Addr>().is_ok();
+    let mut out = vec![Some(format!("{base}{random}.com")), Some("null".to_string())];
+    // A host name can't end in a number, and brackets can't be part of one.
+    if !ip {
+        out.push(Some(format!("{base}{random}.{host}{port}")));
+    }
+    if !ipv6 {
+        out.push(Some(format!("{base}{host}.{random}.com{port}")));
         // An encoded backtick gets past weak regexes that only allow alphanumerics in the domain.
-        Some(format!("{base}{host}%60{random}.com{port}")),
-        (scheme == "https").then(|| format!("http://{authority}")),
-        Some(format!("{base}{authority}")),
-    ]
+        out.push(Some(format!("{base}{host}%60{random}.com{port}")));
+    }
+    out.push((scheme == "https").then(|| format!("http://{authority}")));
+    out.push(Some(format!("{base}{authority}")));
+    out
 }
 
 /// The alert for an `Access-Control-Allow-Origin` value and any `-Credentials` value.
 fn assess(acao: &str, acac: Option<&str>, random: &str, https: bool) -> &'static AlertDef {
-    if acao.trim() == "*" {
+    if acao.contains(',') {
+        &INFO
+    } else if acao.trim() == "*" {
         &MEDIUM
     } else if acao.contains(random) || acao.trim() == "null" || (https && acao.contains("http:")) {
         if acac.is_some_and(|v| v.trim() == "true") {
@@ -151,11 +160,14 @@ impl ActiveRule for Cors {
                     None => base.remove_header("Origin"),
                 };
                 let Ok(resp) = cx.send(req.into_bytes()).await else { continue };
-                let Some(acao) = resp.header("Access-Control-Allow-Origin") else { continue };
+                let acao = resp.headers_named("Access-Control-Allow-Origin").collect::<Vec<_>>().join(", ");
+                if acao.is_empty() {
+                    continue;
+                }
                 let acac = resp.header("Access-Control-Allow-Credentials");
-                let alert = assess(acao, acac, &random, target.scheme == "https");
+                let alert = assess(&acao, acac, &random, target.scheme == "https");
                 let finding = alert
-                    .raise("", evidence(acao, acac))
+                    .raise("", evidence(&acao, acac))
                     .attack(format!("Origin: {}", origin.as_deref().unwrap_or("")));
                 if alert.risk != Risk::Info {
                     cx.report(finding, &resp);
@@ -187,6 +199,20 @@ mod tests {
         let https = origins("https", "a.test", "rnd");
         assert_eq!(https[3].as_deref(), Some("https://a.test.rnd.com"));
         assert_eq!(https[5].as_deref(), Some("http://a.test"));
+        // An IPv4 address can't take a prefix, and an IPv6 one can't change at all.
+        let v4: Vec<_> = origins("http", "10.0.0.1:81", "rnd").into_iter().flatten().collect();
+        assert_eq!(
+            v4,
+            [
+                "http://rnd.com",
+                "null",
+                "http://10.0.0.1.rnd.com:81",
+                "http://10.0.0.1%60rnd.com:81",
+                "http://10.0.0.1:81"
+            ]
+        );
+        let v6: Vec<_> = origins("http", "[::1]:81", "rnd").into_iter().flatten().collect();
+        assert_eq!(v6, ["http://rnd.com", "null", "http://[::1]:81"]);
     }
 
     #[test]
@@ -203,6 +229,7 @@ mod tests {
         assert_eq!(refs("*", None, false), "40040-2");
         assert_eq!(refs("*", Some("true"), false), "40040-2", "browsers refuse credentials with a wildcard");
         assert_eq!(refs("https://*.a.test", None, true), "40040-1", "browsers don't support patterns");
+        assert_eq!(refs("https://rnd.com, https://a.test", Some("true"), true), "40040-1", "browsers refuse a list");
         assert_eq!(refs("http://rnd.com", None, false), "40040-2");
         assert_eq!(refs("http://rnd.com", Some("true"), false), "40040-3");
         assert_eq!(refs("null", Some("true"), false), "40040-3");

@@ -187,7 +187,20 @@ fn cors_risk_follows_what_the_server_allows() {
     });
     let s = run_scan(prefix, "/", &[40040], None);
     assert_eq!(s.raised.get("40040-3"), Some(&1), "{s:?}");
-    assert_eq!(s.requests, 4, "{s:?}");
+    assert_eq!(s.requests, 3, "no prefix on an IP address: {s:?}");
+
+    // Two origins in one answer: browsers refuse it, so it proves nothing.
+    let list = spawn_raw(|req| {
+        match origin_of(req) {
+        Some(o) => with_headers(&format!(
+            "Access-Control-Allow-Origin: {o}\r\nAccess-Control-Allow-Origin: https://trusted.example\r\nAccess-Control-Allow-Credentials: true\r\n"
+        )),
+        None => with_headers(""),
+    }
+    });
+    let s = run_scan(list, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-1"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.len(), 1, "{s:?}");
 
     // Only its own origin: CORS is in use, nothing is wrong.
     let own = spawn_raw(move |req| match origin_of(req) {
@@ -198,13 +211,13 @@ fn cors_risk_follows_what_the_server_allows() {
     });
     let s = run_scan(own, "/", &[40040], None);
     assert_eq!(s.raised.get("40040-1"), Some(&1), "{s:?}");
-    assert_eq!(s.requests, 7, "{s:?}");
+    assert_eq!(s.requests, 6, "{s:?}");
 
     // No CORS headers at all.
     let none = spawn(|_| with_headers(""));
     let s = run_scan(none, "/", &[40040], None);
     assert!(s.raised.is_empty(), "{s:?}");
-    assert_eq!(s.requests, 7, "{s:?}");
+    assert_eq!(s.requests, 6, "{s:?}");
 }
 
 #[test]

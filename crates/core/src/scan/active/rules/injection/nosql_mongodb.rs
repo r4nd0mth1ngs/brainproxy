@@ -6,6 +6,8 @@
 //!   operator. The counter-proof is `{"$eq":<original>}`, which must answer like the
 //!   original, where ZAP sends an unknown operator that a real server would reject. It
 //!   runs at every strength: ZAP skips it at LOW, where any changed answer raises an alert.
+//! - `name[$eq]=` is only the counter-proof. ZAP also attacks with an empty value, which
+//!   shows no more than the plain parameter can.
 //! - The not-handled error check stops at the first alert. ZAP raises one per payload.
 //! - No check for an authentication page bypass: scans don't know of a login page.
 //! - No technology filter: ZAP only runs this against targets it knows use MongoDB,
@@ -55,7 +57,7 @@ const JSON_INFO: &str = "In some NodeJS based back end implementations, messages
     simple text.\nThrough this, the queries made to MongoDB will always be true.";
 
 /// Parameter name suffix and value.
-const ALL_DATA: [(&str, &str); 4] = [("[$ne]", ""), ("[$regex]", ".*"), ("[$gt]", "0"), ("[$eq]", "")];
+const ALL_DATA: [(&str, &str); 3] = [("[$ne]", ""), ("[$regex]", ".*"), ("[$gt]", "0")];
 const CRASH: [&str; 5] = ["\"", "'", "//", "});", ");"];
 const JSON_OPERATORS: [(&str, &str); 3] = [("$ne", "0"), ("$gt", ""), ("$regex", ".*")];
 /// Lower case: ZAP matches them case-insensitively.
