@@ -2,8 +2,13 @@
 //!
 //! Differences: only `Access-Control-Allow-Credentials: true` raises the risk, since
 //! browsers ignore any other value (ZAP accepts any value); only the literal `null`
-//! counts as the null origin (ZAP matches `nullsoft.example` too); and the evidence is
-//! rebuilt from the header values, so it doesn't depend on how the server cases them.
+//! counts as the null origin (ZAP matches `nullsoft.example` too), and only a bare `*` as
+//! the wildcard, since browsers don't support patterns like `https://*.example.com`; the
+//! rule keeps probing after an informational answer, which ZAP takes as its result, since
+//! a server can answer other origins with its trusted one and still accept `null`; origins
+//! built on the host keep the port after the changed name, so they are valid URLs (ZAP
+//! writes `a.test:8080.x.com`); and the evidence is rebuilt from the header values, so it
+//! doesn't depend on how the server cases them.
 
 use crate::http::RawRequest;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
@@ -66,16 +71,25 @@ static HIGH: AlertDef = AlertDef {
 
 static ALERTS: [&AlertDef; 3] = [&INFO, &MEDIUM, &HIGH];
 
+/// `host[:port]` as host and `:port` (empty without one); an IPv6 host stays in its brackets.
+fn split_port(authority: &str) -> (&str, &str) {
+    match authority.rfind(':') {
+        Some(i) if !authority[i..].contains(']') => authority.split_at(i),
+        _ => (authority, ""),
+    }
+}
+
 /// `Origin` values in order of likelihood and severity; None sends no `Origin`.
 fn origins(scheme: &str, authority: &str, random: &str) -> [Option<String>; 7] {
     let base = format!("{scheme}://");
+    let (host, port) = split_port(authority);
     [
         Some(format!("{base}{random}.com")),
         Some("null".to_string()),
-        Some(format!("{base}{random}.{authority}")),
-        Some(format!("{base}{authority}.{random}.com")),
+        Some(format!("{base}{random}.{host}{port}")),
+        Some(format!("{base}{host}.{random}.com{port}")),
         // An encoded backtick gets past weak regexes that only allow alphanumerics in the domain.
-        Some(format!("{base}{authority}%60{random}.com")),
+        Some(format!("{base}{host}%60{random}.com{port}")),
         (scheme == "https").then(|| format!("http://{authority}")),
         Some(format!("{base}{authority}")),
     ]
@@ -83,7 +97,7 @@ fn origins(scheme: &str, authority: &str, random: &str) -> [Option<String>; 7] {
 
 /// The alert for an `Access-Control-Allow-Origin` value and any `-Credentials` value.
 fn assess(acao: &str, acac: Option<&str>, random: &str, https: bool) -> &'static AlertDef {
-    if acao.contains('*') {
+    if acao.trim() == "*" {
         &MEDIUM
     } else if acao.contains(random) || acao.trim() == "null" || (https && acao.contains("http:")) {
         if acac.is_some_and(|v| v.trim() == "true") {
@@ -126,9 +140,10 @@ impl ActiveRule for Cors {
         Box::pin(async move {
             let target = cx.target();
             let random = format!("bp{:08x}", crate::scan::active::rand_u64() as u32);
+            let mut info = None;
             for origin in origins(&target.scheme, &target.host_header(), &random) {
                 if cx.stopped() {
-                    return;
+                    break;
                 }
                 let base = RawRequest::from_bytes(cx.base_request().to_vec());
                 let req = match &origin {
@@ -142,8 +157,14 @@ impl ActiveRule for Cors {
                 let finding = alert
                     .raise("", evidence(acao, acac))
                     .attack(format!("Origin: {}", origin.as_deref().unwrap_or("")));
+                if alert.risk != Risk::Info {
+                    cx.report(finding, &resp);
+                    return;
+                }
+                info.get_or_insert((finding, resp));
+            }
+            if let Some((finding, resp)) = info {
                 cx.report(finding, &resp);
-                return;
             }
         })
     }
@@ -159,11 +180,21 @@ mod tests {
         assert_eq!(http[0].as_deref(), Some("http://rnd.com"));
         assert_eq!(http[1].as_deref(), Some("null"));
         assert_eq!(http[2].as_deref(), Some("http://rnd.a.test:8080"));
-        assert_eq!(http[3].as_deref(), Some("http://a.test:8080.rnd.com"));
-        assert_eq!(http[4].as_deref(), Some("http://a.test:8080%60rnd.com"));
+        assert_eq!(http[3].as_deref(), Some("http://a.test.rnd.com:8080"));
+        assert_eq!(http[4].as_deref(), Some("http://a.test%60rnd.com:8080"));
         assert_eq!(http[5], None, "no Origin at all");
         assert_eq!(http[6].as_deref(), Some("http://a.test:8080"));
-        assert_eq!(origins("https", "a.test", "rnd")[5].as_deref(), Some("http://a.test"));
+        let https = origins("https", "a.test", "rnd");
+        assert_eq!(https[3].as_deref(), Some("https://a.test.rnd.com"));
+        assert_eq!(https[5].as_deref(), Some("http://a.test"));
+    }
+
+    #[test]
+    fn port_comes_off_the_host() {
+        assert_eq!(split_port("a.test:8080"), ("a.test", ":8080"));
+        assert_eq!(split_port("a.test"), ("a.test", ""));
+        assert_eq!(split_port("[::1]:8080"), ("[::1]", ":8080"));
+        assert_eq!(split_port("[::1]"), ("[::1]", ""));
     }
 
     #[test]
@@ -171,6 +202,7 @@ mod tests {
         let refs = |acao, acac, https| assess(acao, acac, "rnd", https).alert_ref;
         assert_eq!(refs("*", None, false), "40040-2");
         assert_eq!(refs("*", Some("true"), false), "40040-2", "browsers refuse credentials with a wildcard");
+        assert_eq!(refs("https://*.a.test", None, true), "40040-1", "browsers don't support patterns");
         assert_eq!(refs("http://rnd.com", None, false), "40040-2");
         assert_eq!(refs("http://rnd.com", Some("true"), false), "40040-3");
         assert_eq!(refs("null", Some("true"), false), "40040-3");

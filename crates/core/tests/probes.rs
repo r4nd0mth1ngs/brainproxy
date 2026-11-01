@@ -165,6 +165,30 @@ fn cors_risk_follows_what_the_server_allows() {
     assert_eq!(s.raised.get("40040-2"), Some(&1), "{s:?}");
     assert_eq!(s.requests, 2, "{s:?}");
 
+    // A fixed trusted origin for most, which doesn't hide that `null` is accepted too.
+    let fixed = spawn_raw(|req| match origin_of(req) {
+        Some("null") => with_headers("Access-Control-Allow-Origin: null\r\n"),
+        _ => with_headers("Access-Control-Allow-Origin: https://trusted.example\r\n"),
+    });
+    let s = run_scan(fixed, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-2"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.get("40040-1"), None, "{s:?}");
+    assert_eq!(s.requests, 2, "{s:?}");
+
+    // Allows anything starting with its host, on a port: the origin must still parse.
+    let prefix = spawn_raw(|req| match origin_of(req) {
+        Some(o)
+            if o.starts_with("http://127.0.0.1.")
+                && o.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) =>
+        {
+            with_headers(&format!("Access-Control-Allow-Origin: {o}\r\nAccess-Control-Allow-Credentials: true\r\n"))
+        }
+        _ => with_headers(""),
+    });
+    let s = run_scan(prefix, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-3"), Some(&1), "{s:?}");
+    assert_eq!(s.requests, 4, "{s:?}");
+
     // Only its own origin: CORS is in use, nothing is wrong.
     let own = spawn_raw(move |req| match origin_of(req) {
         Some(o) if !o.contains("bp") && o != "null" && !o.contains("%60") => {
