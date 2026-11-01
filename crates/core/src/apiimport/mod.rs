@@ -3,6 +3,7 @@
 //! every parameter), sends them through the guarded client, and records them in
 //! history (source "import") so `scan active` and `fuzz` can work from them.
 
+pub mod api;
 pub mod graphql;
 pub mod openapi;
 pub mod postman;
@@ -24,6 +25,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
+use crate::session::Tool;
 use crate::store::Store;
 
 /// History source for imported requests.
@@ -31,6 +33,9 @@ pub const SOURCE: &str = "import";
 
 /// Largest spec, collection, or schema accepted.
 pub const MAX_DOCUMENT: usize = 32 << 20;
+
+/// The most a guarded build holds in requests.
+const MAX_BUILT: usize = 64 << 20;
 
 /// One request built from an API description.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -48,18 +53,115 @@ fn lossy<S: serde::Serializer>(b: &[u8], s: S) -> std::result::Result<S::Ok, S::
     s.serialize_str(&String::from_utf8_lossy(b))
 }
 
+/// An operation that could not be turned into a request.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Skipped {
+    pub operation: String,
+    pub reason: String,
+}
+
+/// A credential a document asks for or holds. Never its value.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Credential {
+    /// api_key, bearer, basic, oauth2, openid, mutual_tls, or other.
+    pub kind: String,
+    /// header, query, cookie, or none.
+    #[serde(rename = "in")]
+    pub location: Option<String>,
+    pub name: Option<String>,
+    pub source: String,
+    /// The document holds a value (which was not used).
+    pub embedded: bool,
+}
+
 /// Requests built from a document, plus what could not be turned into a request.
+/// Only guarded builds (`import api`) fill `skipped`, `credentials` and `base_url_required`.
 #[derive(Debug, Default, Serialize)]
 pub struct Built {
     pub requests: Vec<ApiRequest>,
     pub warnings: Vec<String>,
+    pub skipped: Vec<Skipped>,
+    pub credentials: Vec<Credential>,
+    pub base_url_required: bool,
+    /// Bytes in `requests`, for a guarded build's limit.
+    #[serde(skip)]
+    size: usize,
 }
 
 impl Built {
+    /// Adds a request. A guarded build stops at `MAX_BUILT`, as a small document can
+    /// repeat a large example or variable any number of times.
+    fn keep(&mut self, guarded: bool, operation: String, r: ApiRequest) {
+        let size = r.url.len() + r.body.len() + r.headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        if guarded && self.size + size > MAX_BUILT {
+            self.skip(operation, format!("the document's requests add up to more than {} MiB", MAX_BUILT >> 20));
+        } else {
+            self.size += size;
+            self.requests.push(r);
+        }
+    }
+
     fn warn(&mut self, w: String) {
         if self.warnings.len() < 100 {
             self.warnings.push(w);
         }
+    }
+
+    fn skip(&mut self, operation: String, reason: String) {
+        self.skipped.push(Skipped { operation, reason });
+    }
+
+    /// A guarded build lists the operation as skipped; the others warn.
+    fn fail(&mut self, guarded: bool, operation: String, e: &Error) {
+        if guarded {
+            let text = e.to_string();
+            let reason = text.strip_prefix("invalid input: ").unwrap_or(&text).to_string();
+            self.skip(operation, reason);
+        } else {
+            self.warn(format!("{operation}: {e}"));
+        }
+    }
+
+    fn credential(&mut self, c: Credential) {
+        merge_credential(&mut self.credentials, c);
+    }
+}
+
+/// Adds `c`, one entry per location and name.
+fn merge_credential(list: &mut Vec<Credential>, c: Credential) {
+    let same = |o: &Credential| {
+        o.location == c.location
+            && match (&o.name, &c.name) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => o.kind == c.kind,
+                _ => false,
+            }
+    };
+    match list.iter_mut().find(|o| same(o)) {
+        Some(o) => o.embedded |= c.embedded,
+        None => list.push(c),
+    }
+}
+
+/// Whether a header, parameter, or variable name looks like it holds a credential.
+pub fn looks_secret(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase().replace('_', "-");
+    n.starts_with("x-auth")
+        || ["authorization", "cookie", "token", "secret", "api-key", "apikey", "password", "passwd"]
+            .iter()
+            .any(|s| n.contains(s))
+}
+
+/// A URL for messages: no userinfo, query, or fragment, which can hold credentials.
+pub(crate) fn shown_url(url: &str) -> String {
+    let bare = url.split(['?', '#']).next().unwrap_or_default();
+    match bare.split_once("://") {
+        Some((scheme, rest)) => {
+            let end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(end);
+            format!("{scheme}://{}{path}", authority.rsplit('@').next().unwrap_or_default())
+        }
+        None => bare.to_string(),
     }
 }
 
@@ -150,24 +252,27 @@ impl<'de> Visitor<'de> for AnyVisitor {
 /// Replaces the scheme/host/port of `url` with those of `base`. A path in
 /// `base` (other than "/") is put in front of the URL's path.
 pub fn rebase(url: &str, base: &str) -> Result<String> {
-    let mut u = url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("invalid URL {url:?}: {e}")))?;
+    let shown = shown_url(url);
+    let mut u = url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("invalid URL {shown:?}: {e}")))?;
     let b = parse_base(base)?;
     let prefix = b.path().trim_end_matches('/');
     if !prefix.is_empty() {
         let p = format!("{prefix}{}", u.path());
         u.set_path(&p);
     }
-    u.set_scheme(b.scheme()).map_err(|_| Error::InvalidInput(format!("cannot rebase {url:?} onto {base:?}")))?;
+    let onto = shown_url(base);
+    u.set_scheme(b.scheme()).map_err(|_| Error::InvalidInput(format!("cannot rebase {shown:?} onto {onto:?}")))?;
     u.set_host(b.host_str()).map_err(|e| Error::InvalidInput(format!("bad base URL host: {e}")))?;
-    u.set_port(b.port()).map_err(|_| Error::InvalidInput(format!("cannot rebase {url:?} onto {base:?}")))?;
+    u.set_port(b.port()).map_err(|_| Error::InvalidInput(format!("cannot rebase {shown:?} onto {onto:?}")))?;
     Ok(u.to_string())
 }
 
 fn parse_base(base: &str) -> Result<url::Url> {
     let s = if base.contains("://") { base.to_string() } else { format!("https://{base}") };
-    let u = url::Url::parse(&s).map_err(|e| Error::InvalidInput(format!("invalid base URL {base:?}: {e}")))?;
+    let shown = shown_url(base);
+    let u = url::Url::parse(&s).map_err(|e| Error::InvalidInput(format!("invalid base URL {shown:?}: {e}")))?;
     if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
-        return Err(Error::InvalidInput(format!("base URL {base:?} must be http(s)://host[:port][/path]")));
+        return Err(Error::InvalidInput(format!("base URL {shown:?} must be http(s)://host[:port][/path]")));
     }
     Ok(u)
 }
@@ -182,6 +287,11 @@ pub struct RunConfig {
     pub auth: Option<Arc<AuthSession>>,
     /// Requests listed in the summary.
     pub list_limit: usize,
+    /// Whose session rules apply: requests made from a spec count as crawl traffic,
+    /// and as scan traffic when they are a scan's baselines.
+    pub tool: Tool,
+    /// Report progress after every response under this stage, not every 25 responses.
+    pub stage: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +317,20 @@ pub struct RunSummary {
     pub requests: Vec<Sent>,
     pub requests_truncated: bool,
     pub elapsed_ms: u64,
+}
+
+impl RunSummary {
+    /// Nothing went out, because the scope refused all of it (some only once the name was
+    /// resolved, so a plan can't tell beforehand).
+    pub fn check_any_in_scope(&self) -> Result<()> {
+        if self.sent == 0 && self.skipped_out_of_scope > 0 && !self.stopped {
+            return Err(Error::OutOfScope(format!(
+                "none of the requests is in scope (hosts: {}); nothing was sent",
+                self.out_of_scope_hosts.join(", ")
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Applies `extra` headers over `req`'s and builds the raw request.
@@ -249,7 +373,11 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
     }
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Duration::from_secs_f64(1.0 / r));
     let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
-    let total = work.len();
+    let mut total = work.len();
+    let tool = cfg.tool;
+    if let Some(stage) = cfg.stage {
+        ctl.set_progress(serde_json::json!({"stage": stage, "sent": 0, "total": total}));
+    }
     // ponytail: one batch of tasks; fine for spec-sized inputs (thousands), stream if specs get huge.
     let mut tasks = Vec::new();
     for (i, (req, raw, target)) in work.into_iter().enumerate() {
@@ -264,8 +392,7 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
                 return None;
             }
             let sent = match auth.as_deref() {
-                // Requests made from a spec count as crawl traffic for session rules.
-                Some(a) => a.send_as(crate::session::Tool::Crawl, &raw, &target).await,
+                Some(a) => a.send_as(tool, &raw, &target).await,
                 None => client.send(&raw, &target).await,
             };
             Some((req, raw, target, sent))
@@ -277,6 +404,7 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
         if let Err(Error::OutOfScope(_)) = &sent {
             summary.skipped_out_of_scope += 1;
             oos.insert(target.host.clone());
+            total -= 1;
             continue;
         }
         summary.sent += 1;
@@ -316,7 +444,9 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
         } else {
             summary.requests_truncated = true;
         }
-        if summary.sent % 25 == 0 {
+        if let Some(stage) = cfg.stage {
+            ctl.set_progress(serde_json::json!({"stage": stage, "sent": summary.sent, "total": total}));
+        } else if summary.sent % 25 == 0 {
             ctl.set_progress(serde_json::json!({"sent": summary.sent, "total": total}));
         }
     }
@@ -375,6 +505,20 @@ mod tests {
         let header = ApiRequest { headers: vec![("X-A".into(), "1\r\nHost: evil.test".into())], ..ok.clone() };
         assert!(build_raw(&ok, &[]).is_ok());
         assert!(build_raw(&method, &[]).is_err() && build_raw(&header, &[]).is_err());
+    }
+
+    #[test]
+    fn secret_names_and_shown_urls() {
+        for n in
+            ["Authorization", "Cookie", "X-Auth-User", "x_auth", "api_key", "X-API-KEY", "apikey", "my_token", "PASSWD"]
+        {
+            assert!(looks_secret(n), "{n}");
+        }
+        for n in ["Accept", "limit", "author", "id", "X-Trace", "monkey"] {
+            assert!(!looks_secret(n), "{n}");
+        }
+        assert_eq!(shown_url("https://u:p@a.test:8/x?k=v#f"), "https://a.test:8/x");
+        assert_eq!(shown_url("/api?k=v"), "/api");
     }
 
     #[test]

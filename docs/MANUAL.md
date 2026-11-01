@@ -188,6 +188,8 @@ permissions of the folder it is saved in: keep it in your own folders on a share
    - **Guided:** the Overview's *Guided scan* asks for the website, whether to log in, and
      how thorough to be (Quick, Standard, Thorough) and how hard it may push the site
      (Gentle, Normal, Fast), then runs and explains the results.
+   - **Guided, for an API:** from the guided scan's first step, *Testing an API?* takes an
+     API definition instead of a website. See *Guided API scan* under **Scans**.
    - **Yourself:** in **Scans › New scan**, *Crawl and audit* is the default. It crawls the
      site, then attacks every request it found, with the Nuclei templates included at high
      severity and above.
@@ -301,6 +303,27 @@ attack type, and pick payloads:
   files and folders such as `.git`, `.env`, backups, admin panels, and debug consoles.
 
 ### Scans
+- **Guided API scan:** in the guided scan, *Testing an API?* tests an API from its definition: an
+  OpenAPI 3 or Swagger 2.0 file (JSON or YAML) or a Postman collection, by file or URL. A URL is
+  fetched when you preview it, in scope only; nothing else is sent until you ask.
+  - **Definition:** shows what was read, which operations were skipped and why, and warnings
+    such as an external `$ref` that isn't followed or Postman scripts that aren't run.
+  - **Server:** pick one of the listed servers or give a base URL, which is needed when the file
+    has none or only relative ones, and fill in Postman variables. Hosts outside the engagement
+    are listed and those operations skipped; this flow can't widen the scope.
+  - **Authentication** is optional and defaults to none. Add an API key or bearer token, in a
+    header or the query string, or pick an auth profile. The value is kept in the auth profile,
+    as static headers are, and history holds a placeholder. If the API needs every request
+    signed, tick that and pick a signer or set one up; it gets a session rule. A key and a
+    signer can share a profile. Credentials found in the file are listed by name and not used.
+    *Try one request* sends one read-only operation and says whether the API accepted it and
+    whether the key or signature was on it.
+  - **Operations:** lists every operation with its example request. GET, HEAD, OPTIONS and POST in
+    scope are ticked. PUT, PATCH and DELETE stay off until you opt in and tick them. POST requests are
+    replayed with attack data, so the same warning as the website scan applies.
+  - **Depth and speed:** as in the guided scan. Each chosen operation is sent once, then attacked.
+    Parameters without an example get a typed test value. An operation that answers 401 or 403 is
+    still scanned, and the results point out that those baselines were rejected.
 - **New scan › Active scan:**
   - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
@@ -663,6 +686,20 @@ Crawl and active-scan scope and safety flags:
   waits at most 10 s for a page to settle.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. Requests picked with `--history-id` are attacked whatever their method.
+- `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, detected
+  from its contents. `--dry-run` previews and sends nothing for a local file: servers,
+  declared credentials, variables, every operation with its index and whether it would be sent,
+  and which operations were skipped and why. `--server N` picks a listed server, `--base-url`
+  overrides them, `--var NAME=VALUE` sets a Postman variable, `--only 0,3,7` picks operations by
+  index, and `--expect-sha256 HEX` refuses a document that changed since the preview. It sends
+  GET, HEAD, OPTIONS and POST unless `--include-methods` adds others. Credentials in the
+  document (Postman auth, secret-named headers, query parameters and body fields, and variables
+  they use) are reported by name in `credentials` and never sent or stored; use an auth profile.
+  A document fetched from a URL isn't kept in history either.
+- `scan active --api SOURCE`: the same document flags in one job: send each chosen in-scope
+  operation once as a baseline (history source `import`), then attack exactly those. Baselines
+  count as the `scan` tool for session rules. A scan with nothing in scope exits 6 and sends
+  nothing. The result has an `import` object with what was sent and skipped.
 - `scan active --preset quick|standard|thorough`: the guided scan's depths, for scripts and CI.
   Flags given as well win, so `--preset thorough --strength high` scans with high strength.
   `--preset` doesn't crawl by itself; pair it with `--crawl`, as the guided scan does.
@@ -695,6 +732,15 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   `:each` runs it for every request, which a scan or fuzz run with `-c 10` does ten at a
   time: use it when tokens are single-use, and lower `-c` if the site keeps only the
   latest token per session.
+
+API keys in an auth profile: `auth add NAME --header-env 'X-Api-Key=VAR'` reads the variable once
+and stores the value as `--header` does, so it stays off the command line (for a bearer token,
+`'Authorization=VAR'` with `Bearer ...` in the variable). `auth add NAME --query-key 'api_key=VAR'
+--key-origin ORIGIN` is for a key in the query string: history and findings hold
+`«auth:NAME:query:api_key»`, the value goes only into the request line of requests to those
+origins, and scans don't attack it. `auth show` and `auth list` mask both. `auth add` on an
+existing name replaces the profile's fields, query keys (unless `--keep-query-keys`) and session,
+and keeps its signers, rules and macros.
 
 Request signing (`auth sign`), for APIs that reject a request whose signature doesn't match
 and targets that want a JWT you choose the claims of:

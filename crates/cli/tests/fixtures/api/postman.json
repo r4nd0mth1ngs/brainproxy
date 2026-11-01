@@ -1,0 +1,50 @@
+{
+  "info": {
+    "name": "Shop",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {"key": "baseUrl", "value": "http://127.0.0.1:18080"},
+    {"key": "version", "value": "v3"},
+    {"key": "tenant", "value": ""},
+    {"key": "apiKey", "value": "FAKE-POSTMAN-VARIABLE-KEY"},
+    {"key": "hidden", "value": "FAKE-POSTMAN-MARKED-SECRET", "type": "secret"},
+    {"key": "viaAuth", "value": "FAKE-POSTMAN-AUTH-VARIABLE"}
+  ],
+  "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{viaAuth}}"}]},
+  "event": [{"listen": "prerequest", "script": {"exec": ["pm.environment.set('a', 1)"]}}],
+  "item": [
+    {
+      "name": "Catalog",
+      "item": [
+        {
+          "name": "List items",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/{{version}}/items?t={{tenant}}&k={{hidden}}",
+            "header": [
+              {"key": "X-Client", "value": "postman"},
+              {"key": "X-Api-Key", "value": "{{apiKey}}"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Add item",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/{{version}}/items",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\": \"{{version}}\", \"key\": \"{{apiKey}}\"}",
+          "options": {"raw": {"language": "json"}}
+        }
+      }
+    },
+    {
+      "name": "Remove item",
+      "request": {"method": "DELETE", "url": "{{baseUrl}}/{{version}}/items/1"}
+    }
+  ]
+}

@@ -54,6 +54,15 @@ impl Secret {
     }
 }
 
+/// An API key sent in the query string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueryKey {
+    pub name: String,
+    pub value: String,
+    /// The only origins it is sent to.
+    pub origins: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AuthProfile {
     pub name: String,
@@ -97,6 +106,9 @@ pub struct AuthProfile {
     /// Headers added to every request (API keys, bearer tokens, basic auth).
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    /// API keys added to the query string of requests to their origins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_keys: Vec<QueryKey>,
     /// Minimum seconds between automatic re-logins.
     #[serde(default = "five")]
     pub relogin_interval_secs: u64,
@@ -145,13 +157,14 @@ impl AuthProfile {
     pub fn validate_with(&self, handling: &crate::session::Handling) -> Result<()> {
         if !self.has_login()
             && self.headers.is_empty()
+            && self.query_keys.is_empty()
             && self.platform.is_none()
             && handling.macros.is_empty()
             && handling.rules.is_empty()
             && handling.signers.is_empty()
         {
             return Err(Error::InvalidInput(format!(
-                "profile needs --login-url, --platform, at least one --header, or a macro \
+                "profile needs --login-url, --platform, at least one --header or --query-key, or a macro \
                  (`auth macro add {} MACRO --step ...` makes a profile with no login)",
                 self.name
             )));
@@ -160,6 +173,20 @@ impl AuthProfile {
     }
 
     fn validate_fields(&self) -> Result<()> {
+        for q in &self.query_keys {
+            // Sent as written, so nothing that means something in a query.
+            let name_ok = !q.name.is_empty()
+                && q.name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
+            if !name_ok {
+                return Err(Error::InvalidInput(format!("bad query key name {:?}", q.name)));
+            }
+            if q.origins.is_empty() {
+                return Err(Error::InvalidInput(format!("query key {:?} needs --key-origin", q.name)));
+            }
+            for o in &q.origins {
+                Target::from_url(o)?;
+            }
+        }
         if let Some(p) = &self.platform {
             p.validate(self.username.as_deref(), self.password.as_ref())?;
         }
@@ -182,7 +209,7 @@ impl AuthProfile {
         Ok(())
     }
 
-    /// The profile with the password and static header values hidden, for display.
+    /// The profile with the password, static header values, and query keys hidden, for display.
     pub fn redacted(&self) -> AuthProfile {
         let mut p = self.clone();
         if let Some(Secret::Literal(_)) = p.password {
@@ -190,6 +217,9 @@ impl AuthProfile {
         }
         for (_, v) in &mut p.headers {
             *v = "********".into();
+        }
+        for q in &mut p.query_keys {
+            q.value = "********".into();
         }
         p
     }
@@ -280,12 +310,17 @@ impl Store {
 }
 
 /// The text that stands in for a secret value: `«auth:PROFILE:KIND»`, where KIND is
-/// `header:NAME`, `cookie:NAME`, `token`, `password`, `password:form` or `password:json`.
+/// `header:NAME`, `query:NAME`, `cookie:NAME`, `token`, `password`, `password:form` or `password:json`.
 pub fn placeholder(profile: &str, kind: &str) -> String {
     format!("«auth:{profile}:{kind}»")
 }
 
 pub(crate) const MARK: &str = "«auth:";
+
+/// Whether a parameter's value is a query key's placeholder, which is not for attacking.
+pub(crate) fn is_query_key_placeholder(value: &str) -> bool {
+    value.starts_with(MARK) && value.contains(":query:")
+}
 
 #[derive(Clone)]
 struct VaultEntry {
@@ -295,6 +330,8 @@ struct VaultEntry {
     header: Option<String>,
     /// Origins an anywhere value may be sent to.
     origins: Vec<String>,
+    /// A query key: filled only into the request line, for `origins`.
+    request_line: bool,
 }
 
 /// Values of per-run macro placeholders kept at most; older ones fall back to the
@@ -333,8 +370,12 @@ impl std::fmt::Debug for Vault {
 
 impl Vault {
     fn put(&self, ph: String, value: &str, header: Option<&str>, origins: Vec<String>) {
-        let entry =
-            VaultEntry { value: value.to_string(), header: header.map(|h| h.trim().to_ascii_lowercase()), origins };
+        let entry = VaultEntry {
+            value: value.to_string(),
+            header: header.map(|h| h.trim().to_ascii_lowercase()),
+            origins,
+            request_line: false,
+        };
         self.0.lock().unwrap().entries.insert(ph, entry);
     }
 
@@ -354,7 +395,7 @@ impl Vault {
         let mut inner = self.0.lock().unwrap();
         for enc in [Enc::Raw, Enc::Form, Enc::Json] {
             let value = encode(&var.value, enc);
-            let entry = VaultEntry { value, header: None, origins: var.origins.clone() };
+            let entry = VaultEntry { value, header: None, origins: var.origins.clone(), request_line: false };
             let run = placeholder(profile, &crate::session::var_kind(&var.name, Some(var.run), enc));
             if inner.entries.insert(run.clone(), entry.clone()).is_none() {
                 inner.runs.push_back(run);
@@ -384,6 +425,15 @@ impl Vault {
         }
         for (k, v) in p.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
             self.put(placeholder(&p.name, &format!("header:{k}")), v, Some(k), vec![]);
+        }
+        for q in &p.query_keys {
+            let entry = VaultEntry {
+                value: encode(&q.value, Enc::Form),
+                header: None,
+                origins: q.origins.iter().filter_map(|o| Target::from_url(o).ok()).map(|t| t.origin()).collect(),
+                request_line: true,
+            };
+            self.0.lock().unwrap().entries.insert(placeholder(&p.name, &format!("query:{}", q.name)), entry);
         }
         for var in &st.vars {
             self.put_var(&p.name, var);
@@ -417,7 +467,7 @@ impl Vault {
     /// The request with placeholders replaced by their values. A header value is only
     /// filled into its own header, and a password or macro value only into requests to
     /// the origins it belongs to, so a placeholder can't be moved somewhere that
-    /// reflects it back. Fails on a placeholder left over (profile removed, never logged
+    /// reflects it back; a query key goes only into the request line to its origins. Fails on a placeholder left over (profile removed, never logged
     /// in, password variable unset, or the placeholder moved out of its header). Signers
     /// run last, over the request as it will be sent; their placeholders only count in the head.
     pub fn resolve<'a>(&self, raw: &'a [u8], target: &Target) -> Result<Cow<'a, [u8]>> {
@@ -426,15 +476,18 @@ impl Vault {
         }
         let inner = self.0.lock().unwrap();
         let origin = target.origin();
-        let anywhere = |e: &VaultEntry| e.header.is_none() && e.origins.iter().any(|o| o == &origin);
+        let to_origin = |e: &VaultEntry| e.header.is_none() && e.origins.iter().any(|o| o == &origin);
+        let anywhere = |e: &VaultEntry| !e.request_line && to_origin(e);
         let (head, body) = split_head_body(raw);
         let mut out = Vec::with_capacity(raw.len());
-        for line in head.split_inclusive(|&b| b == b'\n') {
+        for (i, line) in head.split_inclusive(|&b| b == b'\n').enumerate() {
             let name = line
                 .iter()
                 .position(|&b| b == b':')
                 .map(|i| String::from_utf8_lossy(&line[..i]).trim().to_ascii_lowercase());
-            let allowed = |e: &VaultEntry| anywhere(e) || (e.header.is_some() && e.header == name);
+            let allowed = |e: &VaultEntry| {
+                anywhere(e) || (e.header.is_some() && e.header == name) || (i == 0 && e.request_line && to_origin(e))
+            };
             out.extend(fill(&inner.entries, &inner.sign_marks, line, allowed)?);
         }
         let new_body = fill(&inner.entries, &Default::default(), body, anywhere)?;
@@ -720,12 +773,25 @@ impl AuthSession {
         req.into_bytes()
     }
 
+    /// [`AuthSession::apply`] plus the query keys for `target`'s origin, as placeholders.
+    pub fn apply_to(&self, raw: &[u8], keep: &[&str], target: &Target) -> Vec<u8> {
+        let mut out = self.apply(raw, keep);
+        for q in &self.profile.query_keys {
+            if q.origins.iter().any(|o| crate::sign::same_origin(o, target)) {
+                let ph = placeholder(&self.profile.name, &format!("query:{}", q.name));
+                out = crate::sign::set_query(&out, &q.name, |_| ph.clone());
+            }
+        }
+        out
+    }
+
     /// Fetches the profile's check URL with the session applied and reports
     /// whether it still looks logged in. None when the profile has no check URL.
     pub async fn check(&self) -> Result<Option<CheckResult>> {
         let Some(url) = &self.profile.check_url else { return Ok(None) };
         let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-        let ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+        let ex =
+            self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
         self.observe(&ex.response);
         let history_id = self.record(&ex);
         let logged_in = !self.is_logged_out(&ex.response)
@@ -947,7 +1013,7 @@ impl AuthSession {
         let (verify_text, status) = match &p.check_url {
             Some(u) => {
                 let (r, t) = RawRequest::build("GET", u, &[], b"")?;
-                let cex = self.client.send(&RawRequest::from_bytes(self.apply(r.as_bytes(), &[])), &t).await?;
+                let cex = self.client.send(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await?;
                 self.observe(&cex.response);
                 history.push(self.record(&cex));
                 let logged_out = self.is_logged_out(&cex.response);
@@ -1181,6 +1247,65 @@ mod tests {
         // Deletion cookies are forgotten.
         s.observe(b"HTTP/1.1 200 OK\r\nSet-Cookie: theme=; Max-Age=0\r\n\r\n");
         assert_eq!(s.state().cookies, vec![("sid".to_string(), "new".to_string())]);
+    }
+
+    #[test]
+    fn query_keys_stay_on_the_request_line_of_their_origin() {
+        let p = AuthProfile {
+            name: "t".into(),
+            query_keys: vec![QueryKey {
+                name: "api_key".into(),
+                value: "a b&c".into(),
+                origins: vec!["https://a.test".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok(), "a query key alone is enough");
+        let s = session(p.clone());
+        let a = Target::from_url("https://a.test").unwrap();
+        let applied = s.apply_to(b"GET /x?api_key=old&b=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", &[], &a);
+        let out = String::from_utf8(applied.clone()).unwrap();
+        assert!(out.starts_with("GET /x?b=1&api_key=«auth:t:query:api_key» HTTP/1.1\r\n"), "{out}");
+        let sent = wire(&s, &applied).unwrap();
+        assert!(sent.starts_with("GET /x?b=1&api_key=a+b%26c HTTP/1.1\r\n"), "{sent}");
+        // Another origin gets no key, and can't be made to take one.
+        let b = Target::from_url("https://b.test").unwrap();
+        let out = String::from_utf8(s.apply_to(b"GET /x HTTP/1.1\r\nHost: b.test\r\n\r\n", &[], &b)).unwrap();
+        assert!(!out.contains("api_key"), "{out}");
+        assert!(s.client.fill_auth(&applied, &b).is_err());
+        // Nor is it filled outside the request line.
+        let ph = "«auth:t:query:api_key»";
+        assert!(wire(&s, format!("GET / HTTP/1.1\r\nX-Reflect: {ph}\r\n\r\n").as_bytes()).is_err());
+        assert!(wire(&s, format!("POST / HTTP/1.1\r\nContent-Length: 22\r\n\r\n{ph}").as_bytes()).is_err());
+        // Shown masked.
+        assert_eq!(p.redacted().query_keys[0].value, "********");
+        assert!(!format!("{:?}", p.redacted()).contains("a b&c"));
+        // Bad names and missing origins are refused.
+        let bad = |name: &str, origins: Vec<String>| AuthProfile {
+            name: "t".into(),
+            query_keys: vec![QueryKey { name: name.into(), value: "v".into(), origins }],
+            ..Default::default()
+        };
+        assert!(bad("a b", vec!["https://a.test".into()]).validate().is_err());
+        assert!(bad("a", vec![]).validate().is_err());
+    }
+
+    #[test]
+    fn query_keys_load_for_requests_from_history() {
+        let p = AuthProfile {
+            name: "t".into(),
+            query_keys: vec![QueryKey {
+                name: "k".into(),
+                value: "v1".into(),
+                origins: vec!["https://a.test:443".into()],
+            }],
+            ..Default::default()
+        };
+        let vault = Vault::default();
+        vault.put_session(&p, &SessionState::default());
+        let raw = "GET /?k=«auth:t:query:k» HTTP/1.1\r\n\r\n";
+        let filled = vault.resolve(raw.as_bytes(), &Target::from_url("https://a.test").unwrap()).unwrap();
+        assert!(String::from_utf8_lossy(&filled).starts_with("GET /?k=v1 "));
     }
 
     #[test]

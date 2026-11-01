@@ -15,6 +15,10 @@ Only use it against systems you are authorized to test.
 - **Guided scan.** Pick the sites and a depth (Quick, Standard, Thorough) and the Overview
   crawls, attacks, and shows the results. Open it again any time from the Overview or
   Scans › New scan.
+- **Guided API scan.** Give it an OpenAPI 3 or Swagger 2.0 file (JSON or YAML) or a Postman
+  collection, choose the server, add an API key, bearer token or request signer if the API
+  needs one, and tick the operations to test. PUT, PATCH and DELETE stay off until you opt
+  in, and nothing is sent outside the engagement's scope.
 - **Targeted scans.** Search the ZAP scan rules and the Nuclei and brainproxy checks by
   name, CVE, or tag (Scans › New scan › Targeted), pick a few, and run only those.
 - **Checks for new CVEs between releases.** brainproxy's own checks come from a signed
@@ -318,6 +322,12 @@ brainproxy import postman collection.json --var baseUrl=https://app.example.com
 brainproxy import graphql https://app.example.com/graphql           # introspection; or --schema result.json
 brainproxy scan active --where "source = 'import'" --auth api
 
+# API scan in one job: `import api` detects the format and previews, `scan active --api` sends each
+# chosen operation once and attacks those. GET, HEAD, OPTIONS and POST unless --include-methods says
+# otherwise; credentials in the file are reported, never sent.
+brainproxy import api spec.yaml --dry-run --server 1
+brainproxy scan active --api spec.yaml --server 1 --only 0,2,5 --auth key --preset standard --background
+
 # Authenticated testing: a login profile, then --auth NAME on send, fuzz, crawl, scan active, proxy start.
 # Cookies/tokens are applied to every request, rotated cookies are learned, and a 401, a redirect to the
 # login path, or --logged-out triggers one automatic re-login and a retry.
@@ -334,6 +344,8 @@ brainproxy auth add api --login-url https://app.example.com/api/login \
     --login-body '{"username":"{{username}}","password":"{{password}}"}' --username alice --password-env APP_PW \
     --token-regex '"token":"([^"]+)"' --token-header 'Authorization: Bearer {{token}}'
 brainproxy auth add key -H 'X-Api-Key: ...'       # static headers only
+brainproxy auth add key --header-env 'X-Api-Key=API_KEY'   # the same, read from a variable once
+brainproxy auth add key --query-key 'api_key=API_KEY' --key-origin https://api.example.com   # key in the query string
 brainproxy auth add corp --platform digest --platform-host intranet.example.com \
     --username alice --password-env APP_PW        # Basic/Digest/NTLM, answered on every command
 brainproxy auth login app                         # verify; failures list the history ids to inspect

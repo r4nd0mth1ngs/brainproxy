@@ -676,7 +676,7 @@ fn replace(raw: &[u8], mark: &[u8], trailing: usize, value: &[u8]) -> Vec<u8> {
 
 /// The request with the query parameter `name` set to what `value` makes of its old
 /// value, and no other parameter of that name.
-fn set_query(raw: &[u8], name: &str, value: impl Fn(Option<&str>) -> String) -> Vec<u8> {
+pub(crate) fn set_query(raw: &[u8], name: &str, value: impl Fn(Option<&str>) -> String) -> Vec<u8> {
     let (head, body) = split_head_body(raw);
     let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
     let line = String::from_utf8_lossy(&head[..line_end]);

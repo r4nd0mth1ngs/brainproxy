@@ -266,6 +266,8 @@ function addArgs(f: Form): string[] {
   opt("--relogin-interval", f.reloginInterval);
   opt("--max-relogins", f.maxRelogins);
   args.push(...platformArgs(f.platform));
+  // This form doesn't show query keys, so saving it mustn't drop them.
+  args.push("--keep-query-keys");
   args.push("--", f.name.trim());
   return args;
 }

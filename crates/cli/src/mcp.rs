@@ -152,6 +152,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("fuzz list", READ),
     ("fuzz stop", REPLACE),
     ("crawl", NET),
+    ("import api", NET),
     ("import openapi", NET),
     ("import postman", NET),
     ("import graphql", NET),

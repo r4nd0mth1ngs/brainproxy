@@ -2167,6 +2167,101 @@ button.chip {
   background: var(--panel-2);
   line-height: 1.5;
 }
+/* The API guided scan. */
+.wiz-steps {
+  flex-wrap: wrap;
+}
+.wiz-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.wiz-row .wiz-input {
+  flex: 1 1 260px;
+  width: auto;
+}
+.wiz-list {
+  margin: 0;
+  padding-left: 18px;
+  line-height: 1.55;
+}
+.wiz-good {
+  padding: 9px 12px;
+  border-radius: 10px;
+  border-left: 3px solid var(--ok);
+  background: var(--panel-2);
+  line-height: 1.5;
+}
+.wiz-wrap {
+  white-space: normal;
+  align-items: flex-start;
+}
+.wiz-wrap input {
+  margin-top: 3px;
+}
+.wiz-sign {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wiz-ops-box {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.wiz-ops {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.wiz-ops th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+}
+.wiz-ops th,
+.wiz-ops td {
+  padding: 6px 8px;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.wiz-ops tbody tr {
+  border-top: 1px solid var(--border);
+}
+.wiz-ops tr.off {
+  color: var(--faint);
+}
+.wiz-ops .tick {
+  width: 30px;
+}
+.wiz-ops .method {
+  width: 68px;
+}
+.wiz-ops .more {
+  width: 74px;
+}
+.wiz-ops pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 700px) {
+  .wiz-ops thead {
+    display: none;
+  }
+  .wiz-ops tr {
+    display: grid;
+    grid-template-columns: 30px 68px minmax(0, 1fr) 74px;
+  }
+  .wiz-ops td.wide {
+    grid-column: 1 / -1;
+  }
+}
 .dash-card.wizard {
   display: flex;
   flex-direction: column;

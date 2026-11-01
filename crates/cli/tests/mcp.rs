@@ -112,7 +112,9 @@ fn protocol_and_tool_list() {
 
     let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
     let tool = |name: &str| tools.iter().find(|t| t["name"] == name).cloned();
-    for name in ["send", "history_list", "engagement_start", "scan_active", "job_wait", "query", "capabilities"] {
+    for name in
+        ["send", "history_list", "engagement_start", "scan_active", "import_api", "job_wait", "query", "capabilities"]
+    {
         assert!(tool(name).is_some(), "missing {name}");
     }
     for name in ["mcp_serve", "proxy_run", "oob_run"] {
@@ -125,6 +127,9 @@ fn protocol_and_tool_list() {
     assert_eq!(props["max_body"]["type"], "integer");
     assert_eq!(props["no_store"]["type"], "boolean");
     assert!(props.get("project").is_none() && props.get("format").is_none());
+    let import_api = tool("import_api").unwrap();
+    assert_eq!(import_api["annotations"]["openWorldHint"], true, "{import_api}");
+    assert!(tool("scan_active").unwrap()["inputSchema"]["properties"].get("api").is_some());
     let start = tool("engagement_start").unwrap();
     assert_eq!(start["inputSchema"]["required"], json!(["targets"]));
     assert!(tool("crawl").unwrap()["inputSchema"]["properties"].get("job_id").is_none());

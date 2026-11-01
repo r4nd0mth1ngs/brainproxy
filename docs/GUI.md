@@ -129,6 +129,14 @@ Standard and Thorough) and real attack traffic. It runs
 and ends with counts per risk level explained in plain words and a link to Findings. "I'll
 set it up myself" hides it for that project.
 
+The first step also links to the API flow (`views/ApiWizard.tsx`, with its logic in
+`views/apiScan.ts`), which shares the slot and `WizardProgress`. It previews with `import api
+SOURCE --dry-run`, then asks for the server and Postman variables, optional authentication
+(API key or bearer token via `auth add --header-env|--query-key`, with the value passed as
+`BRAINPROXY_SECRET_API_KEY`; an existing profile; optional signing via `SignerBuilder` and a
+session rule), and the operations to send, and offers a one-request check (`import api --only N
+--auth P`). It runs `scan active --api SOURCE --expect-sha256 ... --only ... --background`.
+
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).
 

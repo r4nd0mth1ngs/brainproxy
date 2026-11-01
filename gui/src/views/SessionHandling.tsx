@@ -576,7 +576,7 @@ function RuleBuilder(p: {
   );
 }
 
-function SignerBuilder(p: {
+export function SignerBuilder(p: {
   form: SignerForm;
   editing: boolean;
   setForm: (f: SignerForm) => void;

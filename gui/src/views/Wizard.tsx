@@ -7,6 +7,7 @@ import { run, withScheme, type Risk } from "../api";
 import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
 import { loadSuggestions, type Job, type Suggestions } from "./Scanner";
+import { apiResultNotes, baselineText, isApiJob } from "./apiScan";
 import { hasChromium, wizardBrowserArgs, type BrowserList } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
 import { attacksPaths, DEPTHS, depthArgs, type Depth } from "./wizardDepths";
@@ -19,10 +20,10 @@ const NUCLEI: Record<Depth, string[]> = {
   thorough: ["--checks", "nuclei,brainproxy", "--check-severity", "medium", "--check-include-tags", "eol"],
 };
 
-type Speed = "gentle" | "normal" | "fast";
+export type Speed = "gentle" | "normal" | "fast";
 
 /** Requests in flight at once. More only helps when the site keeps up, and it is louder. */
-const SPEEDS: { id: Speed; title: string; text: string; args: string[]; danger?: boolean }[] = [
+export const SPEEDS: { id: Speed; title: string; text: string; args: string[]; danger?: boolean }[] = [
   { id: "gentle", title: "Gentle", text: "For fragile or shared sites. Slower.", args: ["-c", "3"] },
   { id: "normal", title: "Normal", text: "Suits most sites.", args: [] },
   {
@@ -43,7 +44,18 @@ const RISK_TEXT: Record<Risk, string> = {
 
 const RISK_SQL = `SELECT risk, count(*) FROM findings WHERE state <> 'false_positive' GROUP BY risk`;
 
-export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) => void; onDismiss: () => void }) {
+/** The warning at the Start step, in every guided scan. */
+export function PostWarning() {
+  return (
+    <div className="wiz-warn replay">
+      <b>Forms and other POST requests are replayed.</b> Whatever the scan finds is sent again with attack data,
+      often many times, and that can change data or trigger side effects: one contact form can send a lot of
+      emails.
+    </div>
+  );
+}
+
+export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) => void; onDismiss: () => void; onApi?: () => void }) {
   const app = useApp();
   const [step, setStep] = useState(0);
   const [hints, setHints] = useState<Suggestions | null>(null);
@@ -155,6 +167,13 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             We start from this address and follow its links and forms. Only addresses in this project's approved scope
             {hints?.scope.length ? ` (${hints.scope.join(", ")})` : ""} are ever contacted.
           </p>
+          {p.onApi && (
+            <p className="muted">
+              <button className="link" onClick={p.onApi}>
+                Testing an API? Import its definition
+              </button>
+            </p>
+          )}
         </div>
       )}
 
@@ -243,11 +262,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
               server you can afford to disrupt, never on a production or shared site.
             </div>
           )}
-          <div className="wiz-warn replay">
-            <b>Forms and other POST requests are replayed.</b> Whatever the scan finds is sent again with attack data,
-            often many times, and that can change data or trigger side effects: one contact form can send a lot of
-            emails.
-          </div>
+          <PostWarning />
           {attacksPaths(depth) && (
             <div className="wiz-warn replay">
               <b>Page addresses are attacked too.</b> Each part of an address, such as the 42 in /users/42, is changed and
@@ -285,14 +300,17 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
 }
 
 /** The wizard's scan as it runs, then what it found, in plain words. */
-function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void }) {
+export function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void }) {
   const app = useApp();
   const [job] = usePoll<Job>(() => run(["job", "status", String(jobId)]), 1500);
   const done = job != null && !["queued", "running", "stopping"].includes(job.state);
   const [risks] = usePoll<{ rows: [Risk, number][] }>(() => run(["query", RISK_SQL]), 3000, done);
-  const pr = job?.progress ?? {};
-  const testing = pr.units != null;
-  const frac = testing && pr.units ? (pr.units_done ?? 0) / pr.units : null;
+  const pr: Record<string, any> = job?.progress ?? {}; // numbers, and an API scan's `stage`
+  const api = isApiJob(job?.args);
+  const baseline = pr.stage === "baseline";
+  const testing = !baseline && pr.units != null;
+  const frac = baseline ? (pr.total ? (pr.sent ?? 0) / pr.total : null) : testing && pr.units ? (pr.units_done ?? 0) / pr.units : null;
+  const apiNotes = api && done ? apiResultNotes(job?.result?.import) : [];
   const count = (r: Risk) => risks?.rows.find((x) => x[0] === r)?.[1] ?? 0;
 
   return (
@@ -300,7 +318,7 @@ function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void
       <header>
         <div>
           <div className="wiz-kicker">Guided scan</div>
-          <h2>{!job ? "Starting…" : !done ? (testing ? "Testing for vulnerabilities…" : "Exploring the website…") : job.state === "completed" ? "Scan finished" : `Scan ${job.state}`}</h2>
+          <h2>{!job ? "Starting…" : !done ? (baseline ? "Sending the API's operations…" : testing ? "Testing for vulnerabilities…" : api ? "Preparing to test the operations…" : "Exploring the website…") : job.state === "completed" ? "Scan finished" : `Scan ${job.state}`}</h2>
         </div>
         {!done && job && (
           <button className="btn" onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
@@ -319,7 +337,11 @@ function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void
             <span style={{ width: frac == null ? "100%" : `${Math.round(frac * 100)}%` }} className={frac == null ? "indeterminate" : ""} />
           </div>
           <p className="muted">
-            {testing
+            {baseline
+              ? baselineText(pr)
+              : api && !testing
+                ? "Getting the operations ready to attack."
+                : testing
               ? `Trying attacks on what was found: ${pr.units_done ?? 0} of ${pr.units} checks done, ${pr.requests ?? 0} requests sent${pr.raised ? `, ${pr.raised} possible problem${pr.raised === 1 ? "" : "s"} so far` : ""}.`
               : `Following links and forms to map the site: ${pr.requests ?? 0} pages visited, ${pr.endpoints ?? 0} distinct pages and forms found.`}
           </p>
@@ -331,6 +353,11 @@ function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void
         </div>
       ) : (
         <div className="wiz-body wiz-done">
+          {apiNotes.map((n) => (
+            <div key={n} className="wiz-warn replay">
+              {n}
+            </div>
+          ))}
           <div className="wiz-results">
             {(["high", "medium", "low", "info"] as Risk[]).map((r) => (
               <div key={r} className="wiz-result">

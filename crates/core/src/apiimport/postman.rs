@@ -1,12 +1,15 @@
 //! Postman collections (v2.0 and v2.1) to requests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::LazyLock;
 
 use base64::Engine;
+use regex::Regex;
 use serde_json::{json, Value};
 
-use super::values::{self, Part, MULTIPART_BOUNDARY};
-use super::{rebase, ApiRequest, Built};
+use super::values::{self, mentions, Part, MULTIPART_BOUNDARY};
+use super::{looks_secret, merge_credential, rebase, shown_url, ApiRequest, Built, Credential};
+use crate::auth::MARK;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default, Clone)]
@@ -15,7 +18,13 @@ pub struct Options {
     pub base_url: Option<String>,
     /// Variable values; they override the collection's `variable` list.
     pub vars: Vec<(String, String)>,
+    /// The `import api` rules: failures go in `skipped`, the collection's auth isn't
+    /// applied, and `withheld` variables aren't substituted.
+    pub guarded: bool,
+    pub withheld: Vec<String>,
 }
+
+const HOST_VARIABLE: &str = "unresolved variable in host";
 
 /// Folders nested deeper than this are ignored.
 const MAX_DEPTH: usize = 32;
@@ -32,7 +41,10 @@ pub fn build(doc: &Value, opts: &Options) -> Result<Built> {
         }
     }
     vars.extend(opts.vars.iter().cloned());
-    let cx = Cx { vars, base: opts.base_url.clone() };
+    for name in &opts.withheld {
+        vars.remove(name);
+    }
+    let cx = Cx { vars, base: opts.base_url.clone(), guarded: opts.guarded };
     let mut out = Built::default();
     walk(&cx, items, "", doc.get("auth"), 0, &mut out);
     Ok(out)
@@ -41,6 +53,7 @@ pub fn build(doc: &Value, opts: &Options) -> Result<Built> {
 struct Cx {
     vars: HashMap<String, String>,
     base: Option<String>,
+    guarded: bool,
 }
 
 impl Cx {
@@ -54,7 +67,7 @@ impl Cx {
             match after.find("}}") {
                 Some(j) => {
                     let name = after[..j].trim();
-                    match self.vars.get(name) {
+                    match self.vars.get(name).filter(|v| out.len() + v.len() <= super::MAX_DOCUMENT) {
                         Some(v) => out.push_str(v),
                         None => out.push_str(&rest[i..i + 2 + j + 2]),
                     }
@@ -73,6 +86,9 @@ impl Cx {
 
 fn walk(cx: &Cx, items: &[Value], prefix: &str, auth: Option<&Value>, depth: usize, out: &mut Built) {
     if depth > MAX_DEPTH {
+        if cx.guarded {
+            out.warn(format!("{prefix}: folders nested deeper than {MAX_DEPTH} levels were ignored"));
+        }
         return;
     }
     for it in items {
@@ -84,9 +100,16 @@ fn walk(cx: &Cx, items: &[Value], prefix: &str, auth: Option<&Value>, depth: usi
             continue;
         }
         let Some(req) = it.get("request") else { continue };
+        if cx.guarded && mentions(it, MARK) {
+            out.skip(path, "contains a reserved placeholder".into());
+            continue;
+        }
         match request(cx, &path, req, req.get("auth").or(auth)) {
-            Ok(r) => out.requests.push(r),
-            Err(e) => out.warn(format!("{path}: {e}")),
+            Ok(r) => out.keep(cx.guarded, path, r),
+            Err(e) => {
+                out.base_url_required |= cx.guarded && e.to_string().contains(HOST_VARIABLE);
+                out.fail(cx.guarded, path, &e)
+            }
         }
     }
 }
@@ -181,7 +204,7 @@ fn request(cx: &Cx, name: &str, req: &Value, auth: Option<&Value>) -> Result<Api
     if let Some(ct) = content_type.filter(|_| !has(&headers, "content-type")) {
         headers.push(("Content-Type".into(), ct.into()));
     }
-    if let Some(a) = auth {
+    if let Some(a) = auth.filter(|_| !cx.guarded) {
         apply_auth(cx, a, &mut headers, &mut url);
     }
     if !url.contains("://") {
@@ -192,7 +215,8 @@ fn request(cx: &Cx, name: &str, req: &Value, auth: Option<&Value>) -> Result<Api
     if host.contains("{{") {
         if cx.base.is_none() {
             return Err(Error::InvalidInput(format!(
-                "unresolved variable in host of {url:?}; pass --var or --base-url"
+                "{HOST_VARIABLE} of {:?}; set the variable or a base URL",
+                shown_url(&url)
             )));
         }
         // --base-url supplies the origin.
@@ -201,7 +225,7 @@ fn request(cx: &Cx, name: &str, req: &Value, auth: Option<&Value>) -> Result<Api
     if let Some(b) = &cx.base {
         url = rebase(&url, b)?;
     }
-    url::Url::parse(&url).map_err(|e| Error::InvalidInput(format!("invalid URL {url:?}: {e}")))?;
+    url::Url::parse(&url).map_err(|e| Error::InvalidInput(format!("invalid URL {:?}: {e}", shown_url(&url))))?;
     Ok(ApiRequest { name: name.to_string(), method, url, headers, body })
 }
 
@@ -322,12 +346,304 @@ fn apply_auth(cx: &Cx, a: &Value, headers: &mut Vec<(String, String)>, url: &mut
     }
 }
 
+/// A collection variable, for the `import api` preview.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct Variable {
+    pub name: String,
+    /// None when secret.
+    pub value: Option<String>,
+    /// collection, cli (--var), or document (referenced, not declared).
+    pub source: &'static str,
+    pub secret: bool,
+    pub used: bool,
+}
+
+/// What a collection holds besides requests.
+#[derive(Debug, Default)]
+pub struct Analysis {
+    pub variables: Vec<Variable>,
+    pub unresolved: Vec<String>,
+    pub credentials: Vec<Credential>,
+    pub warnings: Vec<String>,
+    /// Variables a guarded build must not substitute.
+    pub withheld: Vec<String>,
+}
+
+#[derive(Default)]
+struct Refs {
+    all: BTreeSet<String>,
+    /// Referenced by auth or by a header or parameter with a secret name.
+    secret: BTreeSet<String>,
+    scripts: usize,
+    file_bodies: usize,
+}
+
+fn refs_in(s: &str, into: &mut BTreeSet<String>) {
+    let mut rest = s;
+    while let Some((_, after)) = rest.split_once("{{") {
+        let Some((name, tail)) = after.split_once("}}") else { break };
+        if !name.trim().is_empty() {
+            into.insert(name.trim().to_string());
+        }
+        rest = tail;
+    }
+}
+
+/// The variables given to a secret name in text: a raw URL's `token={{t}}`, a raw body's `"password": "{{p}}"`.
+fn secret_refs_in(s: &str, into: &mut BTreeSet<String>) {
+    static PAIR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"([A-Za-z0-9_.~-]+)["']?\s*[:=]\s*["']?([^"'&\s,}]*\{\{[^}]*\}\})"#).expect("valid regex")
+    });
+    if s.contains("{{") {
+        PAIR.captures_iter(s).filter(|c| looks_secret(&c[1])).for_each(|c| refs_in(&c[2], into));
+    }
+}
+
+/// The variables referenced by every string in `v`.
+fn strings_in(v: &Value, into: &mut BTreeSet<String>) {
+    match v {
+        Value::String(s) => refs_in(s, into),
+        Value::Array(a) => a.iter().for_each(|x| strings_in(x, into)),
+        Value::Object(m) => m.values().for_each(|x| strings_in(x, into)),
+        _ => {}
+    }
+}
+
+fn auth_credential(a: &Value, label: &str) -> Option<Credential> {
+    let ty = a.get("type").and_then(Value::as_str)?;
+    let header = |kind: &str| (kind.to_string(), Some("header".to_string()), Some("Authorization".to_string()));
+    let param = |key: &str| {
+        let section = a.get("apikey")?;
+        match section {
+            Value::Array(items) => {
+                items.iter().find(|i| i.get("key").and_then(Value::as_str) == Some(key))?.get("value")?.as_str()
+            }
+            _ => section.get(key)?.as_str(),
+        }
+    };
+    let (kind, location, name) = match ty {
+        "noauth" => return None,
+        "bearer" => header("bearer"),
+        "basic" => header("basic"),
+        "apikey" => {
+            let at = if param("in") == Some("query") { "query" } else { "header" };
+            ("api_key".to_string(), Some(at.to_string()), param("key").map(str::to_string))
+        }
+        "oauth2" => ("oauth2".to_string(), None, None),
+        _ => ("other".to_string(), None, None),
+    };
+    let values: Vec<&str> = match a.get(ty) {
+        Some(Value::Array(items)) => items.iter().filter_map(|i| i.get("value")?.as_str()).collect(),
+        Some(Value::Object(m)) => m.values().filter_map(Value::as_str).collect(),
+        _ => vec![],
+    };
+    let embedded = values.iter().any(|v| !v.is_empty() && !v.contains("{{"));
+    Some(Credential { kind, location, name, source: format!("auth:{label}"), embedded })
+}
+
+fn scan(v: &Value, label: &str, refs: &mut Refs, credentials: &mut Vec<Credential>) {
+    match v {
+        Value::String(s) => {
+            refs_in(s, &mut refs.all);
+            secret_refs_in(s, &mut refs.secret);
+        }
+        Value::Array(a) => a.iter().for_each(|x| scan(x, label, refs, credentials)),
+        Value::Object(m) => {
+            let named = m.get("item").is_some() || m.get("request").is_some();
+            let label = match m.get("name").and_then(Value::as_str).filter(|_| named) {
+                Some(n) if label == "collection" => n.to_string(),
+                Some(n) => format!("{label}/{n}"),
+                None => label.to_string(),
+            };
+            // The collection's own name isn't part of an item's path.
+            let label = if m.contains_key("info") { "collection" } else { label.as_str() };
+            if m.get("key").and_then(Value::as_str).is_some_and(looks_secret) {
+                m.values().for_each(|x| strings_in(x, &mut refs.secret));
+            }
+            for (k, x) in m {
+                match k.as_str() {
+                    "event" => {
+                        let has_exec = |e: &Value| match e.pointer("/script/exec") {
+                            Some(Value::Array(lines)) => {
+                                lines.iter().any(|l| l.as_str().is_some_and(|l| !l.trim().is_empty()))
+                            }
+                            Some(Value::String(s)) => !s.trim().is_empty(),
+                            _ => false,
+                        };
+                        refs.scripts += x.as_array().into_iter().flatten().filter(|e| has_exec(e)).count();
+                    }
+                    "auth" => {
+                        strings_in(x, &mut refs.secret);
+                        strings_in(x, &mut refs.all);
+                        if let Some(c) = auth_credential(x, label) {
+                            merge_credential(credentials, c);
+                        }
+                    }
+                    "body" if x.get("mode").and_then(Value::as_str) == Some("file") => refs.file_bodies += 1,
+                    _ => scan(x, label, refs, credentials),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reads a collection's variables, auth, and scripts for the `import api` rules, with
+/// `vars` (from --var) on top of its `variable` list.
+pub fn analyze(doc: &Value, vars: &[(String, String)]) -> Analysis {
+    let mut out = Analysis::default();
+    let mut refs = Refs::default();
+    scan(doc, "collection", &mut refs, &mut out.credentials);
+    // Name, value, source, marked secret by the collection.
+    let mut declared: Vec<(String, String, &'static str, bool)> = Vec::new();
+    for v in doc.get("variable").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(k) = v.get("key").or(v.get("id")).and_then(Value::as_str) {
+            let value = v.get("value").map(values::scalar).unwrap_or_default();
+            let marked = v.get("type").and_then(Value::as_str) == Some("secret");
+            declared.push((k.to_string(), value, "collection", marked));
+        }
+    }
+    for (k, v) in vars {
+        let marked = declared.iter().any(|d| &d.0 == k && d.3);
+        declared.retain(|d| &d.0 != k);
+        declared.push((k.clone(), v.clone(), "cli", marked));
+    }
+    for (name, value, source, marked) in declared {
+        let used = refs.all.contains(&name);
+        let secret = marked || looks_secret(&name) || refs.secret.contains(&name);
+        if secret {
+            out.withheld.push(name.clone());
+            if source == "cli" {
+                out.warnings.push(format!(
+                    "--var {name} looks like a credential and was not substituted; set it up with an auth profile"
+                ));
+            } else if !value.is_empty() {
+                out.credentials.push(Credential {
+                    kind: "other".into(),
+                    location: None,
+                    name: Some(name.clone()),
+                    source: format!("variable:{name}"),
+                    embedded: !value.contains("{{"),
+                });
+            }
+        } else if value.is_empty() {
+            out.withheld.push(name.clone());
+            if used {
+                out.unresolved.push(name.clone());
+            }
+        }
+        // A URL with a password in it stays usable (the password is stripped later), but isn't shown.
+        let hidden = secret || shown_url(&value) != value.split(['?', '#']).next().unwrap_or_default();
+        out.variables.push(Variable { name, value: (!hidden).then_some(value), source, secret: hidden, used });
+    }
+    for name in &refs.all {
+        if out.variables.iter().any(|v| &v.name == name) {
+            continue;
+        }
+        if looks_secret(name) || refs.secret.contains(name) {
+            out.withheld.push(name.clone());
+            out.variables.push(Variable {
+                name: name.clone(),
+                value: None,
+                source: "document",
+                secret: true,
+                used: true,
+            });
+        } else {
+            out.unresolved.push(name.clone());
+        }
+    }
+    out.unresolved.sort();
+    if refs.scripts > 0 {
+        out.warnings.push(format!("{} pre-request or test script(s) were not run", refs.scripts));
+    }
+    if refs.file_bodies > 0 {
+        out.warnings.push(format!("{} file body/bodies can't be read and were sent empty", refs.file_bodies));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn header<'a>(r: &'a ApiRequest, name: &str) -> Option<&'a str> {
         r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn analysis_keeps_secrets_out() {
+        let doc = json!({
+        "info": {"name": "c"},
+        "variable": [
+            {"key": "base", "value": "http://api.test"},
+            {"key": "apiKey", "value": "LITERALKEY"},
+            {"key": "k", "value": "USEDBYAUTH"},
+            {"key": "hidden", "value": "MARKED", "type": "secret"},
+            {"key": "blank", "value": ""},
+            {"key": "withpw", "value": "http://u:PW@api.test"}],
+        "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{k}}"}]},
+        "event": [{"listen": "prerequest", "script": {"exec": ["pm.test()"]}}],
+        "item": [
+            {"name": "Folder", "item": [
+                {"name": "One", "request": {"method": "GET", "url": "{{base}}/a/{{tenant}}?x={{blank}}",
+                    "auth": {"type": "apikey", "apikey": [
+                        {"key": "key", "value": "X-Key"}, {"key": "value", "value": "ITEMKEY"}, {"key": "in", "value": "header"}]},
+                    "header": [{"key": "X-Token", "value": "{{viaheader}}"}],
+                    "body": {"mode": "raw", "raw": "{\"a\": \"{{apiKey}}\"}"}}},
+                {"name": "Two", "request": "{{nohost}}/x"}]},
+            {"name": "Three", "request": {"method": "POST", "url": "{{base}}/f", "body": {"mode": "file", "file": {"src": "/etc/passwd"}}}}
+        ]});
+        let a = analyze(&doc, &[("password".into(), "CLISECRET".into()), ("region".into(), "eu".into())]);
+        let text = format!("{a:?}");
+        for secret in ["LITERALKEY", "USEDBYAUTH", "MARKED", "ITEMKEY", "CLISECRET", ":PW"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        let var = |n: &str| a.variables.iter().find(|v| v.name == n).unwrap();
+        assert_eq!(var("base").value.as_deref(), Some("http://api.test"));
+        assert_eq!(var("region").source, "cli");
+        assert!(!var("region").used);
+        for n in ["apiKey", "k", "hidden", "password", "withpw"] {
+            assert!(var(n).secret && var(n).value.is_none(), "{n}");
+        }
+        assert!(var("viaheader").secret, "referenced by a secret header");
+        assert_eq!(a.unresolved, ["blank", "nohost", "tenant"]);
+        for n in ["apiKey", "k", "hidden", "password", "viaheader", "blank"] {
+            assert!(a.withheld.iter().any(|w| w == n), "{n}");
+        }
+        assert!(!a.withheld.iter().any(|w| w == "withpw"));
+        let c = |n: &str| a.credentials.iter().find(|c| c.name.as_deref() == Some(n)).unwrap();
+        assert_eq!((c("Authorization").kind.as_str(), c("Authorization").embedded), ("bearer", false));
+        assert_eq!(c("Authorization").source, "auth:collection");
+        assert_eq!((c("X-Key").kind.as_str(), c("X-Key").embedded), ("api_key", true));
+        assert_eq!(c("X-Key").source, "auth:Folder/One");
+        assert_eq!(c("X-Key").location.as_deref(), Some("header"));
+        assert!(a.warnings.iter().any(|w| w.starts_with("1 pre-request")), "{:?}", a.warnings);
+        assert!(a.warnings.iter().any(|w| w.starts_with("1 file body")), "{:?}", a.warnings);
+        assert!(a.warnings.iter().any(|w| w.starts_with("--var password")), "{:?}", a.warnings);
+
+        // Guarded: no auth applied, secrets not substituted, a marker skips the item.
+        let o = Options { guarded: true, withheld: a.withheld.clone(), ..Default::default() };
+        let b = build(&doc, &o).unwrap();
+        let text = format!("{:?}", b.requests);
+        assert!(!text.contains("USEDBYAUTH") && !text.contains("LITERALKEY") && !text.contains("ITEMKEY"), "{text}");
+        assert_eq!(String::from_utf8_lossy(&b.requests[0].body), "{\"a\": \"{{apiKey}}\"}");
+        assert!(b.base_url_required);
+        assert_eq!(b.skipped[0].operation, "Folder/Two");
+
+        let doc =
+            json!({"item": [{"name": "x", "request": {"url": "http://a.test/", "description": "«auth:p:password»"}}]});
+        let b = build(&doc, &o).unwrap();
+        assert!(b.requests.is_empty() && b.skipped[0].reason == "contains a reserved placeholder");
+    }
+
+    #[test]
+    fn errors_leave_out_credentials_in_urls() {
+        let doc = json!({"item": [{"name": "x", "request": "{{h}}/a?api_key=KEYVALUE"}]});
+        let b = build(&doc, &Options { guarded: true, ..Default::default() }).unwrap();
+        assert!(!format!("{b:?}").contains("KEYVALUE"), "{b:?}");
+        let b = build(&doc, &Options::default()).unwrap();
+        assert!(!format!("{b:?}").contains("KEYVALUE"), "{b:?}");
     }
 
     #[test]
