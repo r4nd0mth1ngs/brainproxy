@@ -272,6 +272,17 @@ async fn fixed_path_segments_are_attacked_once_per_origin() {
     assert_eq!(found[0].2, "path[2]", "{found:?}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_path_segments_are_attacked_for_each_method() {
+    let port = spawn_app();
+    let paths = PointOptions { path: true, ..Default::default() };
+    let get = target(port, "/rest/orders");
+    let mut post = get.clone();
+    post.request = String::from_utf8(post.request).unwrap().replacen("GET ", "POST ", 1).into_bytes();
+    let (s, _) = scan_points("methods", 40018, Strength::Low, paths, vec![get, post]).await;
+    assert_eq!(s.insertion_points, 4, "{s:?}");
+}
+
 #[test]
 fn eval_helper() {
     assert_eq!(eval("1"), Some(1));

@@ -647,9 +647,9 @@ fn scan_active_url_path_attacks_each_route_once() {
     assert_eq!(v["data"]["targets"], 6, "only with --url-path: {v}");
     let (code, v) = run(&[&scan[..], &["--url-path"]].concat(), &project, None);
     assert_eq!(code, 0, "{v}");
-    // /users/{id}, /assets/js/{asset} and /files/a.pdf; the asset's path has no points.
+    // /users/{id}, /assets/js/{asset} and /files/a.pdf, with 2 + 3 + 2 segments.
     assert_eq!(v["data"]["targets"], 3, "{v}");
-    assert_eq!(v["data"]["insertion_points"], 4, "{v}");
+    assert_eq!(v["data"]["insertion_points"], 7, "{v}");
     // The route's request that worked is the one attacked, not the 404 seen first.
     assert!(v["data"]["raised"].as_object().is_some_and(|r| !r.is_empty()), "{v}");
     // Requests asked for by id are all attacked.
@@ -657,6 +657,23 @@ fn scan_active_url_path_attacks_each_route_once() {
     let (code, v) = run(&[&scan[..], &named].concat(), &project, None);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["targets"], 3, "{v}");
+}
+
+#[test]
+fn scan_active_url_path_keeps_the_history_order_under_the_target_cap() {
+    let port = serve_site();
+    let project = tmp_project("routecap");
+    run(&["scan", "sources", "proxy"], &project, None);
+    // A route that only ever answered 404 comes first, and isn't cut for it.
+    for path in ["/old/users/999", "/users/1"] {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+    }
+    let scan = ["scan", "active", "--rules", "40018", "--no-oob", "--url-path", "--max-targets", "1"];
+    let (code, v) = run(&scan, &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["insertion_points"], 3, "{v}");
 }
 
 #[test]

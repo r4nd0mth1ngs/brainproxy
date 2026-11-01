@@ -1,6 +1,7 @@
 //! `scan active`: choose targets, run the active rules, summarise findings.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -111,8 +112,7 @@ pub struct ActiveArgs {
     no_xml: bool,
     /// Also inject into URL path segments, such as IDs in REST paths. Requests that differ
     /// only by an ID (/users/1, /users/2) or an asset's file name count as one target unless
-    /// named by URL or --history-id; a fixed segment is attacked once per origin; a static
-    /// asset's path isn't attacked.
+    /// named by URL or --history-id; a fixed segment is attacked once per origin and method.
     #[arg(long)]
     url_path: bool,
     /// Concurrent rule units.
@@ -511,20 +511,16 @@ fn select_targets(
             duration_ms: item.entry.duration_ms.map(|d| d.max(0) as u64),
         });
     }
-    // With URL path attacks, a route is attacked through one request, so make that one
-    // that worked: requests with a 2xx response come first, and those the user named.
-    if opts.path {
-        targets.sort_by_key(|t| {
-            let ok = parse_response_head(&t.response).is_ok_and(|h| (200..300).contains(&h.status));
-            !(ok || t.history_id.is_some_and(|id| named.contains(&id)))
-        });
-    }
     // One target per method + origin + path + parameter names. With URL path attacks the
-    // path is the route (`/users/{id}`), unless the user named this very request.
-    let mut seen = HashSet::new();
+    // path is the route (`/users/{id}`), unless the user named this very request, and the
+    // route is attacked through a request that worked, if any: it keeps its place in the
+    // list, so --max-targets cuts the same routes whatever they answered.
+    let ok = |t: &ScanTarget| parse_response_head(&t.response).is_ok_and(|h| (200..300).contains(&h.status));
+    let mut seen = HashMap::new();
+    let mut kept: Vec<ScanTarget> = Vec::new();
     let mut skipped_methods = 0;
     let all_methods = args.include_methods.iter().any(|m| m == "ALL");
-    targets.retain(|t| {
+    for t in targets {
         let head = RawRequest::from_bytes(t.request.clone()).head().ok();
         let method = head.as_ref().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default();
         let explicit = t.history_id.is_some_and(|id| args.history_ids.contains(&id));
@@ -534,7 +530,7 @@ fn select_targets(
             || args.include_methods.contains(&method))
         {
             skipped_methods += 1;
-            return false;
+            continue;
         }
         let by_route = opts.path && !t.history_id.is_some_and(|id| named.contains(&id));
         let path = head
@@ -542,8 +538,18 @@ fn select_targets(
             .unwrap_or_default();
         let mut names: Vec<String> = points::points(&t.request, opts).into_iter().map(|p| p.name).collect();
         names.sort();
-        seen.insert((method, t.target.origin(), path, names))
-    });
-    targets.truncate(args.max_targets);
-    Ok((targets, skipped, skipped_methods))
+        match seen.entry((method, t.target.origin(), path, names)) {
+            Entry::Vacant(e) => {
+                e.insert(kept.len());
+                kept.push(t);
+            }
+            Entry::Occupied(e) => {
+                if opts.path && ok(&t) && !ok(&kept[*e.get()]) {
+                    kept[*e.get()] = t;
+                }
+            }
+        }
+    }
+    kept.truncate(args.max_targets);
+    Ok((kept, skipped, skipped_methods))
 }

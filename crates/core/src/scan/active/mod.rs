@@ -781,9 +781,11 @@ pub async fn run(
         let Ok(response) = Response::parse(request.clone(), t.response.clone(), duration) else { continue };
         let msg = Message::from_exchange(t.history_id.unwrap_or(0), &t.target, &request, &t.response);
         let mut pts = points::points(&request, &cfg.points);
-        // A fixed URL path segment (`/api`) is attacked once per origin, not on every target.
+        // A fixed URL path segment (`/api`) is attacked once per method and origin, not on
+        // every target: GET and POST can reach different code.
         pts.retain(|p| {
-            points::fixed_segment(&request, p).is_none_or(|prefix| fixed_segments.insert((t.target.origin(), prefix)))
+            points::fixed_segment(&request, p)
+                .is_none_or(|prefix| fixed_segments.insert((msg.method.clone(), t.target.origin(), prefix)))
         });
         let base = Arc::new(Base { history_id: t.history_id, target: t.target.clone(), request, msg, response });
         point_count += pts.len();
