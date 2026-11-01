@@ -3,3 +3,4 @@ target/
 *.bpdb-*
 .claude/worktrees/
 HANDOVER.md
+research/
