@@ -131,17 +131,22 @@ mod e2e {
                     not_found
                 }
             }
-            // A page that differs on every request, with no parameters of its own.
-            "/own/clock" => {
+            // Cleans the decoded path, as many routers do: `/own/%2Fstatus` is `/own/status`.
+            "/own/status" | "/own/%2Fstatus" => ok("application/json", "{\"status\":\"ok\"}".into()),
+            // The same, on a page that differs on every request.
+            "/own/clock" | "/own/%2Fclock" => {
                 let tick = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 ok("application/json", format!("{{\"tick\":{tick}}}"))
             }
-            // Cleans the decoded path, as many routers do: `/own/%2Fstatus` is `/own/status`.
-            "/own/status" | "/own/%2Fstatus" => ok("application/json", "{\"status\":\"ok\"}".into()),
             // Reads `page` as a file relative to the script, so it can read itself.
             "/view" => match param("page").as_str() {
                 "home" => ok("text/plain", "welcome home".into()),
                 "view" => ok("text/plain", "the source of view".into()),
+                _ => not_found,
+            },
+            // The same, already reading itself: the attack returns the original page.
+            "/view.jsp" => match param("file").as_str() {
+                "view.jsp" => ok("text/plain", "the source of view.jsp".into()),
                 _ => not_found,
             },
             _ => not_found,
@@ -291,7 +296,7 @@ mod e2e {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn path_traversal_own_file_name_needs_a_changed_response() {
+    async fn path_traversal_own_file_name_comes_from_the_probe() {
         let port = spawn_app();
         let target = |path: &str| {
             let (request, response) = fetch(port, path);
@@ -300,15 +305,18 @@ mod e2e {
         };
         let opts = PointOptions { path: true, ..Default::default() };
 
-        // Attacking a last segment with itself is the original request, even on a page that changes.
-        let s = scan_targets("own-clock", vec![target("/own/clock")], opts.clone(), Some(vec![6])).await;
-        assert!(s.raised.is_empty(), "{s:?}");
-        // `/status` comes back as the original page.
+        // A last segment is never attacked with its own value, with or without a slash.
         let s = scan_targets("own-status", vec![target("/own/status")], opts.clone(), Some(vec![6])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+        let s = scan_targets("own-clock", vec![target("/own/clock")], opts.clone(), Some(vec![6])).await;
         assert!(s.raised.is_empty(), "{s:?}");
 
         // A query parameter that reads the script is still found; the path segment is not.
-        let s = scan_targets("own-view", vec![target("/view?page=home")], opts, Some(vec![6])).await;
+        let s = scan_targets("own-view", vec![target("/view?page=home")], opts.clone(), Some(vec![6])).await;
+        assert_eq!(s.raised.get("6-5"), Some(&1), "{s:?}");
+        assert_eq!(s.raised.len(), 1, "{s:?}");
+        // Also when the value is already the script's name and the attack is the original page.
+        let s = scan_targets("own-jsp", vec![target("/view.jsp?file=view.jsp")], opts, Some(vec![6])).await;
         assert_eq!(s.raised.get("6-5"), Some(&1), "{s:?}");
         assert_eq!(s.raised.len(), 1, "{s:?}");
     }

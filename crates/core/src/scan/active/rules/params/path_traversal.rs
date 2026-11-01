@@ -8,7 +8,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::common;
-use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
+use crate::http::RawRequest;
+use crate::scan::active::{points, ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
 use crate::scan::passive::util::decode_entities;
 use crate::scan::{AlertDef, Confidence, Risk};
 
@@ -314,7 +315,11 @@ impl ActiveRule for PathTraversal {
             // Check 5 (LOW and MEDIUM threshold): the URL's own file name as the value,
             // when a random value does not give a 200 (or gives an error page).
             let Ok(resp) = common::send_following(cx, NON_EXISTANT_FILENAME).await else { return };
-            let file_name = url_file_name(&cx.base().path);
+            // The name comes from the probe's URL, as in ZAP: a URL path's last segment holds
+            // the random value there, so its own value is never sent as an attack.
+            let probe = points::inject(cx.base_request(), cx.point(), NON_EXISTANT_FILENAME, true);
+            let probe_target = RawRequest::from_bytes(probe).head().map(|h| h.target).unwrap_or_default();
+            let file_name = url_file_name(probe_target.split('?').next().unwrap_or(""));
             if file_name.is_empty() || (resp.status == 200 && !ERROR_PATTERN.is_match(resp.body_str())) {
                 return;
             }
@@ -323,15 +328,8 @@ impl ActiveRule for PathTraversal {
                     return;
                 }
                 let attack = format!("{prefix}{file_name}");
-                // The original request, as on a URL path's last segment: it proves nothing.
-                if attack == cx.point().value {
-                    continue;
-                }
                 let Ok(resp) = common::send_following(cx, &attack).await else { continue };
-                // The same page as the original request (a server that normalises `/x` to `x`)
-                // is not the file's contents.
-                let unchanged = resp.body_str() == cx.base_response().body_str();
-                if resp.status == 200 && !unchanged && !ERROR_PATTERN.is_match(resp.body_str()) {
+                if resp.status == 200 && !ERROR_PATTERN.is_match(resp.body_str()) {
                     let f = ALERT_5.raise(cx.point().name.clone(), "").attack(attack).confidence(Confidence::Low);
                     cx.report(f, &resp);
                     return;
