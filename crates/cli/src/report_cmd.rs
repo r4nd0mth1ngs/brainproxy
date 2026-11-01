@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use brainproxy_core::scan::compare;
 use brainproxy_core::scan::findings_db::FindingFilter;
 use brainproxy_core::scan::passive;
 use brainproxy_core::scan::report::{self, ReportKind, ReportOptions};
@@ -46,6 +47,10 @@ pub struct ReportArgs {
     /// Alert ref or rule id, e.g. 10020 or 10020-1.
     #[arg(long)]
     alert: Option<String>,
+    /// Only what this background active scan found, for the first time or again (`findings
+    /// compare --scan`'s new and unchanged), not findings from before it that it didn't see again.
+    #[arg(long, value_name = "JOB")]
+    scan: Option<i64>,
     /// Maximum findings to include; the summary says when more matched.
     #[arg(long, default_value_t = 500)]
     limit: usize,
@@ -104,6 +109,14 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         KindArg::Html => ReportKind::Html,
         KindArg::Sarif => ReportKind::Sarif,
     };
+    let ids = match a.scan {
+        Some(job) => {
+            let (scope, _) = crate::compare_cmd::scan_baseline(&store, job, false, &mut vec![])?;
+            let found = compare::compare_scan(&store, &scope)?;
+            Some(found.new.iter().chain(&found.unchanged).filter_map(|f| f.id).collect())
+        }
+        None => None,
+    };
     let opts = ReportOptions {
         filter: FindingFilter {
             min_risk: a.risk.map(RiskArg::get),
@@ -112,12 +125,14 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
             alert_ref: a.alert,
             state: a.state,
             source: a.source,
+            ids,
             examples: 0,
         },
         title: a.title,
         limit: a.limit,
         evidence: !a.no_evidence,
         max_evidence: a.max_evidence,
+        scan: a.scan,
     };
     let r = report::build(&store, &opts)?;
     let summary = json!({

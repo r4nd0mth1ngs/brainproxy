@@ -359,6 +359,8 @@ pub struct FindingFilter {
     pub alert_ref: Option<String>,
     pub state: Option<String>,
     pub source: Option<String>,
+    /// Only these findings.
+    pub ids: Option<Vec<i64>>,
     pub examples: usize,
 }
 
@@ -393,6 +395,10 @@ impl FindingFilter {
         }
         if let Some(s) = &self.source {
             clauses.push(format!("source = {}", bind(&mut args, s.clone())));
+        }
+        if let Some(ids) = &self.ids {
+            let list = serde_json::to_string(ids).unwrap_or_default();
+            clauses.push(format!("id IN (SELECT value FROM json_each({}))", bind(&mut args, list)));
         }
         (clauses.join(" AND "), args)
     }

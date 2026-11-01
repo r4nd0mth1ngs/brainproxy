@@ -174,7 +174,7 @@ fn refuse_same_file(baseline: &Path, current: &Path) -> Result<(), Error> {
 
 /// The job's scope and how it is shown as the baseline. A gate needs the scan to have finished:
 /// a failed one found nothing, which would otherwise pass.
-fn scan_baseline(
+pub(crate) fn scan_baseline(
     store: &Store,
     id: i64,
     gating: bool,

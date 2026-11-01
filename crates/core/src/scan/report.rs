@@ -45,11 +45,20 @@ pub struct ReportOptions {
     pub evidence: bool,
     /// Maximum bytes of each request/response body in the evidence.
     pub max_evidence: usize,
+    /// The scan job whose findings `filter.ids` are, to say so in the report.
+    pub scan: Option<i64>,
 }
 
 impl Default for ReportOptions {
     fn default() -> Self {
-        Self { filter: FindingFilter::default(), title: None, limit: 500, evidence: true, max_evidence: 4096 }
+        Self {
+            filter: FindingFilter::default(),
+            title: None,
+            limit: 500,
+            evidence: true,
+            max_evidence: 4096,
+            scan: None,
+        }
     }
 }
 
@@ -270,7 +279,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
 
     let generated: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
     let f = &opts.filter;
-    let filters = json!({
+    let mut filters = json!({
         "min_risk": f.min_risk.map(|r| r.as_str()),
         "min_confidence": f.min_confidence.map(|c| c.as_str()),
         "host": f.host,
@@ -278,6 +287,9 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         "state": f.state.clone().unwrap_or_else(|| "open,confirmed".into()),
         "source": f.source,
     });
+    if let Some(job) = opts.scan {
+        filters["scan"] = json!(job);
+    }
     Ok(Report {
         title: opts.title.clone().unwrap_or_else(|| "brainproxy security report".into()),
         generated,
@@ -416,6 +428,9 @@ fn markdown(r: &Report) -> String {
             let _ = write!(s, " (excluding {})", exc.join(", "));
         }
         s.push_str("\n\n");
+    }
+    if let Some(job) = r.filters["scan"].as_i64() {
+        let _ = writeln!(s, "Only the findings scan job {job} found, for the first time or again.\n");
     }
     s.push_str("## Summary\n\n| Risk | Findings |\n|---|---:|\n");
     for rc in &r.summary.by_risk {
@@ -622,6 +637,9 @@ fn html(r: &Report) -> String {
         } else {
             format!("issues found {} to {}", esc(day(a)), esc(day(b)))
         });
+    }
+    if let Some(job) = r.filters["scan"].as_i64() {
+        facts.push(format!("only the findings of scan job {job}"));
     }
     let _ = writeln!(s, "<p class=\"muted\">{} · {} {}</p></header>", facts.join(" · "), r.tool.name, r.tool.version);
 

@@ -294,6 +294,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 alert_ref: alert,
                 state,
                 source,
+                ids: None,
                 examples,
             };
             if all {

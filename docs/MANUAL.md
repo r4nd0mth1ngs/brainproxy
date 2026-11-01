@@ -198,7 +198,9 @@ permissions of the folder it is saved in: keep it in your own folders on a share
    positives: a summary in plain words, what to fix first, then each issue with what it
    means, how to fix it, and where it was found, with the technical evidence folded away.
    Print it from a browser to make a PDF. On the command line: `brainproxy report html -o
-   report.html` (also `markdown`, `json`, `sarif`).
+   report.html` (also `markdown`, `json`, `sarif`). A project collects findings across
+   scans; `report html --scan JOB` lists only what that background scan found, for the
+   first time or again, and leaves out older findings it didn't see again.
 7. **Retest.** After fixes, scan again and use the Findings comparison: *Not found again
    by* a scan lists what that scan covered but no longer finds, likely fixed.
 

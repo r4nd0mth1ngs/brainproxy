@@ -468,6 +468,42 @@ fn since_scan_must_be_a_completed_scan_before_the_compared_one() {
     assert_eq!(env.compare(&["--since-scan", &later.to_string()]).0, 2);
 }
 
+/// A report of one scan leaves out what the project knew before and the scan didn't see again.
+#[test]
+fn report_of_a_scan_lists_what_it_found() {
+    let env = Env::new("report-scan");
+    env.send("/still");
+    env.send("/gone");
+    let url = format!("http://127.0.0.1:{}/", env.port);
+    let args: Vec<String> = ["scan", "active", "--crawl", &url].iter().map(|s| s.to_string()).collect();
+    let job = scan_job(&env, &args, "completed", || {
+        env.send("/still");
+        env.send("/new");
+    })
+    .to_string();
+    let reported = |extra: &[&str]| -> Vec<String> {
+        let v = ok(&env.project, &[&["report", "json", "--no-evidence"], extra].concat());
+        let mut u: Vec<String> = v["data"]["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["instances"].as_array().unwrap().iter())
+            .map(|i| i["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+            .collect();
+        u.sort();
+        u.dedup();
+        u
+    };
+    assert_eq!(reported(&[]), ["gone", "new", "still"]);
+    assert_eq!(reported(&["--scan", &job]), ["new", "still"]);
+    let v = ok(&env.project, &["report", "json", "--scan", &job, "--no-evidence"]);
+    assert_eq!(v["data"]["filters"]["scan"], job.parse::<i64>().unwrap());
+    let v = ok(&env.project, &["report", "markdown", "--scan", &job]);
+    assert!(v["data"]["content"].as_str().unwrap().contains(&format!("scan job {job} found")), "{v}");
+    let (code, _) = run(&env.project, &["report", "json", "--scan", "999"]);
+    assert_eq!(code, 4);
+}
+
 #[test]
 fn described_in_capabilities_and_offered_over_mcp() {
     let env = Env::new("described");
