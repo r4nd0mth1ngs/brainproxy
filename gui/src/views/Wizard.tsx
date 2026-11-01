@@ -9,7 +9,7 @@ import { usePoll } from "../ui/usePoll";
 import { loadSuggestions, type Job, type Suggestions } from "./Scanner";
 import { hasChromium, wizardBrowserArgs, type BrowserList } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
-import { attacksPaths, DEPTHS, type Depth } from "./wizardDepths";
+import { attacksPaths, DEPTHS, depthArgs, type Depth } from "./wizardDepths";
 
 /** Nuclei templates per depth when installed (none for Quick: thousands of extra requests). */
 const NUCLEI: Record<Depth, string[]> = {
@@ -95,8 +95,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const start = async () => {
     setBusy(true);
     try {
-      const depthArgs = DEPTHS.find((d) => d.id === depth)!.args;
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs(depth), ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");

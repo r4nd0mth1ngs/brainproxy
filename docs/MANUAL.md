@@ -661,6 +661,17 @@ Crawl and active-scan scope and safety flags:
   waits at most 10 s for a page to settle.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. Requests picked with `--history-id` are attacked whatever their method.
+- `scan active --preset quick|standard|thorough`: the guided scan's depths, for scripts and CI.
+  Flags given as well win, so `--preset thorough --strength high` scans with high strength.
+  `--preset` doesn't crawl by itself; pair it with `--crawl`, as the guided scan does.
+
+  | Preset | Same as |
+  |--------|---------|
+  | `quick` | `--strength medium --crawl-depth 3 --crawl-max-pages 150` |
+  | `standard` | `--strength high --crawl-depth 5 --crawl-max-pages 500 --cookies --url-path` |
+  | `thorough` | `--strength insane --crawl-depth 8 --crawl-max-pages 1500 --cookies --url-path` |
+
+  The guided Thorough scan also adds `--browser` when a browser is installed.
 
 Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles above):
 

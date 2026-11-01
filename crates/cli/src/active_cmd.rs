@@ -28,12 +28,18 @@ pub struct ActiveArgs {
     /// limits), then attack every recorded request on those sites, not only the URLs.
     #[arg(long)]
     crawl: bool,
-    /// Link depth for --crawl.
-    #[arg(long, default_value_t = 5, requires = "crawl")]
-    crawl_depth: usize,
-    /// Maximum crawl requests for --crawl.
-    #[arg(long, default_value_t = 500, requires = "crawl")]
-    crawl_max_pages: usize,
+    /// A scan depth, as the app's guided scan offers them: `quick` (--strength medium
+    /// --crawl-depth 3 --crawl-max-pages 150), `standard` (--strength high --crawl-depth 5
+    /// --crawl-max-pages 500 --cookies --url-path), or `thorough` (--strength insane
+    /// --crawl-depth 8 --crawl-max-pages 1500 --cookies --url-path). Flags given as well win.
+    #[arg(long, value_enum, value_name = "DEPTH")]
+    preset: Option<PresetArg>,
+    /// Link depth for --crawl [default: 5].
+    #[arg(long, requires = "crawl")]
+    crawl_depth: Option<usize>,
+    /// Maximum crawl requests for --crawl [default: 500].
+    #[arg(long, requires = "crawl")]
+    crawl_max_pages: Option<usize>,
     /// Let --crawl follow links to any port and scheme on the URLs' hosts (and attack
     /// what it finds there), not only the URLs' origins.
     #[arg(long, requires = "crawl")]
@@ -57,8 +63,9 @@ pub struct ActiveArgs {
     /// SQL condition selecting history rows to attack, e.g. "host = 'app.test' AND path LIKE '/api/%'".
     #[arg(long = "where")]
     where_sql: Option<String>,
-    #[arg(long, value_enum, default_value = "medium")]
-    strength: StrengthArg,
+    /// Attack strength [default: medium].
+    #[arg(long, value_enum)]
+    strength: Option<StrengthArg>,
     /// Only these rule ids (comma-separated).
     #[arg(long, value_delimiter = ',')]
     rules: Vec<u32>,
@@ -184,7 +191,82 @@ impl ActiveArgs {
     }
 }
 
+impl ActiveArgs {
+    fn preset(&self) -> Option<Preset> {
+        self.preset.map(PresetArg::get)
+    }
+
+    fn strength(&self) -> StrengthArg {
+        self.strength.or(self.preset().map(|p| p.strength)).unwrap_or(StrengthArg::Medium)
+    }
+
+    fn crawl_depth(&self) -> usize {
+        self.crawl_depth.or(self.preset().map(|p| p.crawl_depth)).unwrap_or(5)
+    }
+
+    fn crawl_max_pages(&self) -> usize {
+        self.crawl_max_pages.or(self.preset().map(|p| p.crawl_max_pages)).unwrap_or(500)
+    }
+
+    fn cookies(&self) -> bool {
+        self.cookies || self.preset().is_some_and(|p| p.cookies)
+    }
+
+    fn url_path(&self) -> bool {
+        self.url_path || self.preset().is_some_and(|p| p.url_path)
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
+pub enum PresetArg {
+    Quick,
+    Standard,
+    Thorough,
+}
+
+/// The settings a --preset stands for. The app's guided scan passes the preset, so this is the
+/// one definition of its depths.
+#[derive(Clone, Copy)]
+struct Preset {
+    strength: StrengthArg,
+    crawl_depth: usize,
+    crawl_max_pages: usize,
+    cookies: bool,
+    url_path: bool,
+}
+
+impl PresetArg {
+    fn get(self) -> Preset {
+        match self {
+            // Medium, not low: low strength skips the SQL injection payloads that matter most.
+            PresetArg::Quick => Preset {
+                strength: StrengthArg::Medium,
+                crawl_depth: 3,
+                crawl_max_pages: 150,
+                cookies: false,
+                url_path: false,
+            },
+            // Attacking path segments adds many requests, so a site that fills --max-targets can
+            // take half an hour.
+            PresetArg::Standard => Preset {
+                strength: StrengthArg::High,
+                crawl_depth: 5,
+                crawl_max_pages: 500,
+                cookies: true,
+                url_path: true,
+            },
+            PresetArg::Thorough => Preset {
+                strength: StrengthArg::Insane,
+                crawl_depth: 8,
+                crawl_max_pages: 1500,
+                cookies: true,
+                url_path: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
 pub enum StrengthArg {
     Low,
     Medium,
@@ -228,8 +310,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         json: !args.no_json,
         multipart: !args.no_multipart,
         xml: !args.no_xml,
-        path: args.url_path,
-        cookies: args.cookies,
+        path: args.url_path(),
+        cookies: args.cookies(),
         headers: args.inject_headers.clone(),
     };
     let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send)?;
@@ -240,7 +322,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         Some(select_targets(project, &Selection::from_args(&args), &send, &point_opts, auth.as_deref())?)
     };
     let cfg = ActiveConfig {
-        strength: match args.strength {
+        strength: match args.strength() {
             StrengthArg::Low => Strength::Low,
             StrengthArg::Medium => Strength::Medium,
             StrengthArg::High => Strength::High,
@@ -270,8 +352,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             None => {
                 let crawl_cfg = brainproxy_core::crawl::CrawlConfig {
                     seeds: args.urls.clone(),
-                    max_depth: args.crawl_depth,
-                    max_pages: args.crawl_max_pages,
+                    max_depth: args.crawl_depth(),
+                    max_pages: args.crawl_max_pages(),
                     max_per_path: 30,
                     concurrency: cfg.concurrency,
                     rate: args.rate,
@@ -608,4 +690,52 @@ fn select_targets(
     }
     kept.truncate(args.max_targets);
     Ok((kept, skipped, skipped_methods))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> ActiveArgs {
+        let argv =
+            ["brainproxy", "scan", "active", "http://a.test/", "--crawl"].iter().chain(args).map(|s| s.to_string());
+        match crate::Cli::try_parse_from(argv) {
+            Ok(crate::Cli { command: crate::Cmd::Scan(crate::scan_cmd::ScanCmd::Active(a)), .. }) => *a,
+            _ => panic!("bad args {args:?}"),
+        }
+    }
+
+    fn settings(a: &ActiveArgs) -> (StrengthArg, usize, usize, bool, bool) {
+        (a.strength(), a.crawl_depth(), a.crawl_max_pages(), a.cookies(), a.url_path())
+    }
+
+    /// Each preset is exactly the flags the app's guided scan passed before it had presets.
+    #[test]
+    fn presets_expand_to_the_guided_scans_flags() {
+        let golden: [(&str, &[&str]); 3] = [
+            ("quick", &["--strength", "medium", "--crawl-depth", "3", "--crawl-max-pages", "150"]),
+            (
+                "standard",
+                &["--strength", "high", "--crawl-depth", "5", "--crawl-max-pages", "500", "--cookies", "--url-path"],
+            ),
+            (
+                "thorough",
+                &["--strength", "insane", "--crawl-depth", "8", "--crawl-max-pages", "1500", "--cookies", "--url-path"],
+            ),
+        ];
+        for (preset, flags) in golden {
+            assert_eq!(settings(&parse(&["--preset", preset])), settings(&parse(flags)), "{preset}");
+        }
+        // Without a preset, the defaults.
+        assert_eq!(settings(&parse(&[])), (StrengthArg::Medium, 5, 500, false, false));
+    }
+
+    #[test]
+    fn explicit_flags_override_the_preset() {
+        let a = parse(&["--preset", "thorough", "--strength", "low", "--crawl-max-pages", "20"]);
+        assert_eq!(settings(&a), (StrengthArg::Low, 8, 20, true, true));
+        let a = parse(&["--crawl-depth", "1", "--preset=quick", "--cookies"]);
+        assert_eq!(settings(&a), (StrengthArg::Medium, 1, 150, true, false));
+    }
 }

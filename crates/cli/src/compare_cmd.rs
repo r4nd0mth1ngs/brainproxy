@@ -278,6 +278,9 @@ mod tests {
         // A site after a flag, and the default port, as the scan itself reads them.
         assert_eq!(scope(&["--strength", "low", "http://a.test:80/"]).origins.unwrap(), ["http://a.test"]);
         assert_eq!(scope(&[]).origins, None);
+        // A preset changes how hard the scan attacks, not what it covers.
+        let p = scope(&["http://a.test:8080/x", "--crawl", "--preset", "standard"]);
+        assert_eq!((p.origins.unwrap(), p.crawled), (vec!["http://a.test:8080".to_string()], true));
         // Requests picked by a filter: no site counts as covered.
         assert_eq!(scope(&["--history-id", "5"]).origins.unwrap(), Vec::<String>::new());
         assert_eq!(scope(&["--where", "1=1"]).origins.unwrap(), Vec::<String>::new());
