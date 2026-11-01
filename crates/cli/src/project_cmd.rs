@@ -10,7 +10,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::process;
+use crate::process::{self, Liveness};
 
 #[derive(Subcommand)]
 pub enum ProjectCmd {
@@ -91,13 +91,26 @@ fn stop_all(path: &Path) -> Result<Value, Error> {
         std::thread::sleep(Duration::from_millis(100));
         left = busy()?;
     }
-    // Work that never got a process has nothing to stop.
+    // Work that never got a process has nothing to stop. Work that can't be verified may well be
+    // gone, and its pid may be another process here: point to `stop --forget`, not to the pid.
     let stuck: Vec<String> = left
         .iter()
         .filter_map(|(what, id, pid)| {
-            pid.map(|pid| format!("{what} {id} ({})", process::work_pid_text(&store, &lock(what, *id), pid)))
+            let pid = (*pid)?;
+            let name = lock(what, *id);
+            Some(match process::work_liveness(&store, &name, pid) {
+                Liveness::Unverified => {
+                    process::work_unverified_text(if what == "job" { "job" } else { "fuzz" }, *id, pid)
+                }
+                _ => format!("{what} {id} ({})", process::work_pid_text(&store, &name, pid)),
+            })
         })
         .collect();
+    if left.iter().any(|(what, id, pid)| {
+        pid.is_some_and(|pid| process::work_liveness(&store, &lock(what, *id), pid) == Liveness::Unverified)
+    }) {
+        return Err(Error::Conflict(format!("still not known to have stopped: {}", stuck.join("; "))));
+    }
     if !stuck.is_empty() {
         return Err(Error::Conflict(format!(
             "still running after being asked to stop: {}; wait for them to finish (or stop those processes)",

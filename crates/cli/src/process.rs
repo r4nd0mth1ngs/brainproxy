@@ -182,14 +182,27 @@ pub(crate) fn unverified_text(what: &str, pid: u32) -> String {
 pub(crate) struct RunLock(#[allow(dead_code)] File);
 
 impl RunLock {
-    /// Takes the lock, or fails if another listener holds it. `None` where it can't be taken
-    /// (no namespaces to tell apart, a filesystem without locks): a listener then records no
-    /// namespace, and is judged by its pid.
+    /// Takes the lock, or fails if another listener holds it, or if the lock file is there but
+    /// can't be opened: running without it would let a second listener start elsewhere. `None`
+    /// where it can't be taken (no namespaces to tell apart, a filesystem without locks): a
+    /// listener then records no namespace, and is judged by its pid.
     pub(crate) fn acquire(store: &Store, what: &str) -> Result<Option<Self>, Error> {
         let Some(path) = lock_path(store, what).filter(|_| pid_namespace().is_some()) else { return Ok(None) };
         // `flock` needs no write access, so a lock file left by another user will do.
         let opened = OpenOptions::new().create(true).truncate(false).write(true).open(&path);
-        let Ok(file) = opened.or_else(|_| File::open(&path)) else { return Ok(None) };
+        let file = match opened.or_else(|_| File::open(&path)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::Conflict(format!(
+                    "can't open the {} lock file {} ({e}). Make it readable (chmod 644), or remove it if no {} \
+                     runs for this project anywhere",
+                    label(what),
+                    path.display(),
+                    label(what)
+                )));
+            }
+        };
         // Store::open's umask makes it owner-only, but it holds no data and listeners and
         // probes can run as different users (`docker run --user`), which must all be able to
         // open it. Failing is fine: then it isn't ours, and its owner has set this already.
@@ -283,18 +296,36 @@ fn work_namespace(store: &Store, name: &str) -> std::io::Result<Option<String>> 
     }
 }
 
-/// Whether the process of a job or fuzz run is certainly gone. With a lock file the lock
-/// decides, in any namespace: a pid can be reused, and so can a namespace's number. Without
-/// one, or if the lock can't be read here, the pid does, as far as it means anything here;
-/// if it doesn't, the work counts as running. A job's final state is written before it exits,
-/// so once it is gone that state can be trusted: read it after this.
-pub(crate) fn work_gone(store: &Store, name: &str, pid: u32) -> bool {
-    let Ok(ns) = work_namespace(store, name) else { return false };
-    let held = ns.as_ref().and_then(|_| lock_held(store, name));
-    match held {
-        Some(held) => !held,
-        None => !elsewhere(ns.as_deref()) && !alive(pid),
+/// What is known about the process of a job or fuzz run. With a lock file the lock decides,
+/// in any namespace: a pid can be reused, and so can a namespace's number. Without one, or
+/// if the lock can't be probed here, the pid does, as far as it means anything here. A lock
+/// file that can't be read, or a pid from another namespace with no lock to probe, leaves it
+/// unverified: only `stop --forget` settles it.
+pub(crate) fn work_liveness(store: &Store, name: &str, pid: u32) -> Liveness {
+    let Ok(ns) = work_namespace(store, name) else { return Liveness::Unverified };
+    match ns.as_ref().and_then(|_| lock_held(store, name)) {
+        Some(true) => Liveness::Running,
+        Some(false) => Liveness::Gone,
+        None if elsewhere(ns.as_deref()) => Liveness::Unverified,
+        None if alive(pid) => Liveness::Running,
+        None => Liveness::Gone,
     }
+}
+
+/// Whether the process of a job or fuzz run is certainly gone (see [`work_liveness`]). A
+/// job's final state is written before it exits, so once it is gone that state can be
+/// trusted: read it after this.
+pub(crate) fn work_gone(store: &Store, name: &str, pid: u32) -> bool {
+    work_liveness(store, name, pid) == Liveness::Gone
+}
+
+/// Why a job or fuzz run can't be verified, and the way out. `cmd` is `job` or `fuzz`.
+pub(crate) fn work_unverified_text(cmd: &str, id: i64, pid: u32) -> String {
+    let what = if cmd == "job" { "job" } else { "fuzz run" };
+    format!(
+        "can't verify {what} {id} (pid {pid}): its lock file isn't readable here, so it may run in another \
+         container. If it is no longer running, `brainproxy {cmd} stop --forget {id}` marks it failed"
+    )
 }
 
 /// Whether a job or fuzz run runs in another container or PID namespace.
@@ -315,8 +346,9 @@ pub(crate) fn forget_work_lock(store: &Store, name: &str) {
 }
 
 /// Waits for a listener in another namespace to act on the caller's `request_stop`: its lock
-/// is released, or if that can't be read, it has cleared its record under `state_key`. Its
-/// pid means something else here, so it is never signalled.
+/// is released, or if that can't be read, it has cleared its record under `state_key`. A
+/// listener clears its record before it exits, so while the lock can be read only the lock
+/// counts. Its pid means something else here, so it is never signalled.
 pub(crate) fn await_exit_elsewhere(
     store: &Store,
     what: &str,
@@ -327,7 +359,7 @@ pub(crate) fn await_exit_elsewhere(
     let deadline = Instant::now() + wait;
     loop {
         let held = lock_held(store, what);
-        if held == Some(false) || store.meta_get(state_key)?.is_none() {
+        if held == Some(false) || (held.is_none() && store.meta_get(state_key)?.is_none()) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -634,6 +666,9 @@ mod tests {
             // A listener that answers clears its record, whatever the lock says.
             store.meta_set("state", None).unwrap();
             await_exit_elsewhere(&store, "proxy", "state", 1, Duration::from_millis(100)).unwrap();
+            // Nor does a listener start without it: one elsewhere would then go unseen.
+            let err = RunLock::acquire(&store, "proxy").err().expect("refused");
+            assert!(err.to_string().contains("chmod 644"), "{err}");
         }
         chmod(0o644);
         let _ = std::fs::remove_dir_all(dir);
@@ -690,6 +725,29 @@ mod tests {
         assert_eq!(work_namespace(&store, name).unwrap(), pid_namespace());
         forget_work_lock(&store, name);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A job's lock file that can't be read leaves it unverified, never running for good or gone.
+    /// Permissions don't bind root, so that part only runs for other users.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn work_with_a_lock_file_that_cannot_be_read_is_unverified() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = store("work-unreadable");
+        let (name, me) = ("job-1", std::process::id());
+        let held = work_lock(&store, name).expect("lock");
+        assert_eq!(work_liveness(&store, name, me), Liveness::Running);
+        let path = lock_path(&store, name).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&path).is_err() {
+            assert_eq!(work_liveness(&store, name, me), Liveness::Unverified);
+            assert!(!work_gone(&store, name, me));
+            assert!(work_unverified_text("fuzz", 3, 7).contains("`brainproxy fuzz stop --forget 3`"));
+        }
+        drop(held);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(work_liveness(&store, name, me), Liveness::Gone);
         let _ = std::fs::remove_dir_all(dir);
     }
 

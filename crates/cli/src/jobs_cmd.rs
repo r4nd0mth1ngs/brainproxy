@@ -12,7 +12,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::process;
+use crate::process::{self, Liveness};
 
 #[derive(Subcommand)]
 pub enum JobCmd {
@@ -31,7 +31,13 @@ pub enum JobCmd {
         timeout: f64,
     },
     /// Ask a running job to stop.
-    Stop { id: i64 },
+    Stop {
+        id: i64,
+        /// Only mark failed a job that can't be verified (its lock file isn't readable from
+        /// this container). Nothing is signalled, and a job known to be running is left alone.
+        #[arg(long)]
+        forget: bool,
+    },
 }
 
 pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
@@ -73,7 +79,25 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
             j["timed_out"] = json!(!is_finished(j["state"].as_str().unwrap_or("")));
             out.ok(j.clone(), || text(&j));
         }
-        JobCmd::Stop { id } => {
+        JobCmd::Stop { id, forget: true } => {
+            let state = store.job_state(id)?;
+            if is_finished(&state) {
+                return Err(Error::Conflict(format!("job {id} is {state}")));
+            }
+            let pid = store.job_get(id)?["pid"].as_u64().map(|p| p as u32);
+            if let Some(pid) =
+                pid.filter(|&pid| process::work_liveness(&store, &lock_name(id), pid) == Liveness::Running)
+            {
+                return Err(Error::Conflict(format!(
+                    "job {id} is running ({}), so it stays; use `brainproxy job stop {id}`",
+                    process::work_pid_text(&store, &lock_name(id), pid)
+                )));
+            }
+            store.job_set_state(id, "failed", None, Some("cleared with `job stop --forget`"), true)?;
+            process::forget_work_lock(&store, &lock_name(id));
+            out.ok(json!({"id": id, "state": "failed", "forgotten": true}), || format!("marked job {id} failed"));
+        }
+        JobCmd::Stop { id, forget: false } => {
             let state = store.job_state(id)?;
             if is_finished(&state) {
                 return Err(Error::Conflict(format!("job {id} is {state}")));
@@ -89,6 +113,15 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
 fn shown(store: &Store, id: i64) -> Result<Value, Error> {
     let mut j = store.job_get(id)?;
     j["other_pid_namespace"] = json!(process::work_elsewhere(store, &lock_name(id)));
+    let pid = j["pid"].as_u64().filter(|_| !is_finished(j["state"].as_str().unwrap_or("")));
+    if let Some(pid) =
+        pid.filter(|&pid| process::work_liveness(store, &lock_name(id), pid as u32) == Liveness::Unverified)
+    {
+        j["unverified"] = json!({
+            "reason": process::work_unverified_text("job", id, pid as u32),
+            "next": format!("brainproxy job stop --forget {id}"),
+        });
+    }
     Ok(j)
 }
 

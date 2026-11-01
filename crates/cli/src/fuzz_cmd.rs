@@ -12,7 +12,7 @@ use clap::{Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::process;
+use crate::process::{self, Liveness};
 use crate::request_args::RequestArgs;
 
 #[derive(Subcommand)]
@@ -52,7 +52,13 @@ pub enum FuzzCmd {
         limit: usize,
     },
     /// Ask a running attack to stop (it finishes in-flight requests).
-    Stop { run: i64 },
+    Stop {
+        run: i64,
+        /// Only mark failed a run that can't be verified (its lock file isn't readable from
+        /// this container). Nothing is signalled, and a run known to be running is left alone.
+        #[arg(long)]
+        forget: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -167,6 +173,16 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
             reap_if_dead(&store, run)?;
             let mut summary = store.fuzz_summary(run, top)?;
             summary["run"]["other_pid_namespace"] = json!(process::work_elsewhere(&store, &lock_name(run)));
+            let live = matches!(summary["run"]["state"].as_str(), Some("running" | "stopping"));
+            let pid = summary["run"]["pid"].as_u64().filter(|_| live).map(|p| p as u32);
+            if let Some(pid) =
+                pid.filter(|&pid| process::work_liveness(&store, &lock_name(run), pid) == Liveness::Unverified)
+            {
+                summary["run"]["unverified"] = json!({
+                    "reason": process::work_unverified_text("fuzz", run, pid),
+                    "next": format!("brainproxy fuzz stop --forget {run}"),
+                });
+            }
             out.ok(summary.clone(), || text_summary(&summary));
             Ok(())
         }
@@ -207,7 +223,27 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
             });
             Ok(())
         }
-        FuzzCmd::Stop { run } => {
+        FuzzCmd::Stop { run, forget: true } => {
+            let store = Store::open(project)?;
+            let state = store.fuzz_state(run)?;
+            if !matches!(state.as_str(), "running" | "stopping" | "queued") {
+                return Err(Error::Conflict(format!("fuzz run {run} is {state}")));
+            }
+            let pid = store.fuzz_run(run)?["pid"].as_u64().map(|p| p as u32);
+            if let Some(pid) =
+                pid.filter(|&pid| process::work_liveness(&store, &lock_name(run), pid) == Liveness::Running)
+            {
+                return Err(Error::Conflict(format!(
+                    "fuzz run {run} is running ({}), so it stays; use `brainproxy fuzz stop {run}`",
+                    process::work_pid_text(&store, &lock_name(run), pid)
+                )));
+            }
+            store.fuzz_set_state(run, "failed", None, Some("cleared with `fuzz stop --forget`"), true)?;
+            process::forget_work_lock(&store, &lock_name(run));
+            out.ok(json!({"run": run, "state": "failed", "forgotten": true}), || format!("marked run {run} failed"));
+            Ok(())
+        }
+        FuzzCmd::Stop { run, forget: false } => {
             let store = Store::open(project)?;
             let state = store.fuzz_state(run)?;
             if state != "running" && state != "queued" {
