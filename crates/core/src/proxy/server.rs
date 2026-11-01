@@ -27,7 +27,7 @@ use crate::auth::AuthSession;
 use crate::authz::live::Live as LiveAuthz;
 use crate::capture::Capture;
 use crate::error::{Error, Result};
-use crate::http::client::{close_after, final_response, Conn};
+use crate::http::client::{close_after, cut_short, final_response, Conn};
 use crate::http::h2::h2_error;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, WireReader};
 use crate::proxy::ca::CertAuthority;
@@ -566,13 +566,16 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
         client.flush().await?;
 
         let resp_head = parse_response_head(final_response(&response)).ok();
-        let server_close = resp_head.as_ref().is_none_or(|h| {
-            wants_close(&h.version, &h.headers)
-                || (h.header("content-length").is_none()
-                    && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-                    && !method.eq_ignore_ascii_case("HEAD")
-                    && !matches!(h.status, 100..=199 | 204 | 304))
-        });
+        // A body cut short (the server closed early) ends the connection, as it did upstream:
+        // the client would otherwise wait for the rest.
+        let server_close = cut_short(&response, &method)
+            || resp_head.as_ref().is_none_or(|h| {
+                wants_close(&h.version, &h.headers)
+                    || (h.header("content-length").is_none()
+                        && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+                        && !method.eq_ignore_ascii_case("HEAD")
+                        && !matches!(h.status, 100..=199 | 204 | 304))
+            });
         if client_close || server_close {
             let _ = client.shutdown().await;
             return Ok(());

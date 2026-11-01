@@ -241,6 +241,41 @@ fn proxy_end_to_end() {
     assert_eq!(env.ok(&["proxy", "status"])["running"], false);
 }
 
+/// A server that closes before sending all of its Content-Length: the client gets what came,
+/// then the connection ends, as it would without the proxy, instead of waiting for the rest.
+#[test]
+fn a_body_cut_short_ends_the_connection() {
+    let env = Env::new("short");
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for tcp in upstream.incoming() {
+            let mut tcp = tcp.unwrap();
+            let mut buf = [0; 4096];
+            let _ = tcp.read(&mut buf);
+            let _ = tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\nshort");
+        }
+    });
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut s = tokio::net::TcpStream::connect(&listen).await.unwrap();
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut got))
+            .await
+            .expect("the proxy keeps the connection open")
+            .unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("short"), "{got}");
+    });
+    assert_eq!(env.count("SELECT COUNT(*) FROM history"), 1);
+}
+
 #[test]
 fn proxy_websocket_upgrade_and_intercept_timeout() {
     let env = Env::new("ws");

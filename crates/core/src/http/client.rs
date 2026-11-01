@@ -655,6 +655,7 @@ pub fn close_after(request: &[u8], response: &[u8], method: &str) -> bool {
     }
     let Ok(h) = parse_response_head(final_response(response)) else { return true };
     h.status == 101
+        || cut_short(response, method)
         || h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
         || (h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")))
         || (h.header("content-length").is_none()
@@ -708,6 +709,20 @@ fn chunked_len(body: &[u8]) -> Option<usize> {
 }
 
 /// The final response after any interim 1xx responses.
+/// Whether the final response in `resp` to a `method` request has less body than its
+/// Content-Length says: the server closed early. Whoever reads it as a whole would wait for the
+/// rest on a kept-alive connection.
+pub fn cut_short(resp: &[u8], method: &str) -> bool {
+    let resp = final_response(resp);
+    let Ok(h) = parse_response_head(resp) else { return false };
+    if method.eq_ignore_ascii_case("HEAD") || matches!(h.status, 100..=199 | 204 | 304) {
+        return false;
+    }
+    let Some(len) = h.header("content-length").and_then(|v| v.trim().parse::<usize>().ok()) else { return false };
+    let (head, body) = crate::http::request::split_head_body(resp);
+    !head.is_empty() && body.len() < len
+}
+
 pub fn final_response(resp: &[u8]) -> &[u8] {
     let mut start = 0;
     while let Ok(h) = parse_response_head(&resp[start..]) {
