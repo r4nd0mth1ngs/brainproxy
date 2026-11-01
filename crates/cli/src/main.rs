@@ -154,7 +154,7 @@ enum Cmd {
     /// Out-of-band callback listener (HTTP/LDAP/TLS/DNS) to confirm blind issues; payloads and polling.
     #[command(
         subcommand,
-        after_help = "Active rules with out-of-band checks (Log4Shell 40043, XXE 90023, blind SSTI 90036) use the \
+        after_help = "Active rules with out-of-band checks (Log4Shell 40043, SSRF 40046, XXE 90023, blind SSTI 90036) use the \
         listener automatically while it runs. Behind NAT set --public-host/--public-port (and --domain with \
         --dns-listen for DNS callbacks)."
     )]

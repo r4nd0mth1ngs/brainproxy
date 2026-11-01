@@ -1,4 +1,5 @@
-//! Per-parameter active rules ported from ZAP's ascanrules add-on (Apache License 2.0).
+//! Per-parameter active rules ported from ZAP's ascanrules and ascanrulesBeta add-ons
+//! (Apache License 2.0).
 
 mod buffer_overflow;
 mod common;
@@ -12,6 +13,7 @@ mod path_traversal;
 mod persistent_xss;
 mod remote_file_include;
 mod server_side_include;
+mod ssrf;
 mod ssti;
 mod xpath_injection;
 mod xslt_injection;
@@ -34,6 +36,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(parameter_tamper::ParameterTamper),
         Box::new(padding_oracle::PaddingOracle),
         Box::new(log4shell::Log4Shell),
+        Box::new(ssrf::Ssrf),
         Box::new(xslt_injection::XsltInjection),
         Box::new(persistent_xss::PersistentXssPrime),
         Box::new(persistent_xss::PersistentXssSpider),

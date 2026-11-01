@@ -80,6 +80,43 @@ fn handle(path: &str, query: &str) -> String {
             }
             html("<p>item</p>")
         }
+        // Bracketed names reach MongoDB as operators, as with PHP or qs.
+        "/mongo" => {
+            let pairs: Vec<(String, String)> = query
+                .split('&')
+                .filter_map(|p| p.split_once('='))
+                .map(|(k, v)| (url_decode(k).replace('+', " "), url_decode(v)))
+                .collect();
+            match pairs.first().map(|(k, v)| (k.as_str(), v.as_str())) {
+                Some(("id", "1") | ("id[$eq]", "1")) => html("<ul><li>mine</li></ul>"),
+                Some(("id[$ne]" | "id[$regex]" | "id[$gt]", _)) => html("<ul><li>mine</li><li>theirs</li></ul>"),
+                _ => html("<ul></ul>"),
+            }
+        }
+        // A plain string column: brackets only ever find nothing, whichever operator.
+        "/mongoplain" => {
+            if query == "id=1" {
+                html("<ul><li>mine</li></ul>")
+            } else {
+                html("<ul></ul>")
+            }
+        }
+        "/mongocrash" => {
+            if param("id").contains('\'') {
+                html("com.mongodb.MongoResultException: bad query")
+            } else {
+                html("<p>item</p>")
+            }
+        }
+        // $where running JavaScript over 1,000 documents: sleep() takes milliseconds.
+        "/mongosleep" => {
+            let id = param("id");
+            let ms = id.split("sleep(").nth(1).and_then(|r| r.split(')').next()).and_then(|n| n.parse::<f64>().ok());
+            if let Some(ms) = ms {
+                std::thread::sleep(Duration::from_secs_f64(ms));
+            }
+            html("<p>item</p>")
+        }
         // Safe: the same page whatever the parameter is.
         "/safe" => html("<p>static content</p>"),
         // Safe: small pages that echo what they were sent.
@@ -101,6 +138,44 @@ fn handle(path: &str, query: &str) -> String {
     }
 }
 
+/// `/mongojson` queries with the JSON value as sent: operators work. `/jsonstrict` takes
+/// any object for bad input and answers the same for each, so nothing proves an operator.
+fn handle_json(path: &str, body: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let id = &v["id"];
+    match path {
+        "/mongojson" if *id == serde_json::json!(1) || id["$eq"] == serde_json::json!(1) => {
+            html("<ul><li>mine</li></ul>")
+        }
+        "/mongojson" if id.get("$ne").is_some() || id.get("$gt").is_some() || id.get("$regex").is_some() => {
+            html("<ul><li>mine</li><li>theirs</li></ul>")
+        }
+        "/mongojson" => html("<ul></ul>"),
+        _ if id.is_object() => html("<p>bad input</p>"),
+        _ if *id == serde_json::json!(1) => html("<ul><li>mine</li></ul>"),
+        _ => html("<ul></ul>"),
+    }
+}
+
+fn json_target(port: u16, path: &str, body: &str) -> ScanTarget {
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes();
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(&req).unwrap();
+    let mut response = Vec::new();
+    s.read_to_end(&mut response).unwrap();
+    ScanTarget {
+        history_id: None,
+        target: Target::from_url(&format!("http://127.0.0.1:{port}")).unwrap(),
+        request: req,
+        response,
+        duration_ms: None,
+    }
+}
+
 fn spawn_app() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -113,7 +188,12 @@ fn spawn_app() -> u16 {
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
                 let target = req.split(' ').nth(1).unwrap_or("/").to_string();
                 let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-                let _ = s.write_all(handle(path, query).as_bytes());
+                let response = if req.starts_with("POST ") {
+                    handle_json(path, req.split_once("\r\n\r\n").map_or("", |(_, b)| b))
+                } else {
+                    handle(path, query)
+                };
+                let _ = s.write_all(response.as_bytes());
             });
         }
     });
@@ -220,6 +300,61 @@ async fn command_injection_output_based() {
     assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("host", "cat /etc/passwd"));
     // The safe endpoint got every payload of every OS list (7 each at MEDIUM, 5 for PowerShell).
     assert!(s.requests >= 7 + 7 + 5, "{s:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_operators_in_parameter_names() {
+    let port = spawn_app();
+    let (s, found) = scan(
+        "mongo",
+        40033,
+        Strength::Medium,
+        vec![target(port, "/mongo?id=1"), target(port, "/mongoplain?id=1"), target(port, "/safe?id=1")],
+    )
+    .await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!(found[0].2, "id");
+    assert_eq!(found[0].3, "id[$ne]");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_unhandled_error_needs_more_than_low_strength() {
+    let port = spawn_app();
+    let (s, found) = scan("mongoerr", 40033, Strength::Medium, vec![target(port, "/mongocrash?id=1")]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "'");
+    let (s, _) = scan("mongoerrlow", 40033, Strength::Low, vec![target(port, "/mongocrash?id=1")]).await;
+    assert!(s.raised.is_empty(), "{s:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_operators_as_json_values() {
+    let port = spawn_app();
+    let (s, found) =
+        scan("mongojson", 40033, Strength::Medium, vec![json_target(port, "/mongojson", r#"{"id":1}"#)]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "$ne0");
+    // The counter-proof rejects a server that treats every object as bad input.
+    let (s, found) =
+        scan("jsonstrict", 40033, Strength::Medium, vec![json_target(port, "/jsonstrict", r#"{"id":1}"#)]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
+    // LOW proves it too, and still finds the real one.
+    let (s, _) = scan("jsonlow", 40033, Strength::Low, vec![json_target(port, "/jsonstrict", r#"{"id":1}"#)]).await;
+    assert!(s.raised.is_empty(), "{s:?}");
+    let (s, _) = scan("jsonlow2", 40033, Strength::Low, vec![json_target(port, "/mongojson", r#"{"id":1}"#)]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{s:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_time_based() {
+    // Tests sleep 2s for the high delay.
+    let port = spawn_app();
+    let (s, found) =
+        scan("mongosleep", 90039, Strength::Low, vec![target(port, "/mongosleep?id=1"), target(port, "/safe?id=1")])
+            .await;
+    assert_eq!(s.raised.get("90039"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "\"); sleep(2); print(\"");
+    assert_eq!(s.requests, 4 + 6, "{s:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
