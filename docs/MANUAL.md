@@ -106,6 +106,11 @@ Things that work differently in a container:
   containers, as on a local disk. The address and PID shown are the ones inside the proxy's
   container, so from elsewhere connect by container name.
 
+  Background jobs and fuzz runs do the same, each with a lock file of its own while it runs
+  (`brainproxy.bpdb-job-1.lock`, `-fuzz-1.lock`), so they can be watched and stopped from a
+  different container: `job status|wait|stop`, `fuzz status|stop` and `project stop` work there.
+  If its container is killed, the next look from anywhere marks it failed.
+
   Stop it with `docker stop proxy`. `proxy stop` works too, by asking through the project file,
   and only if the proxy answers. Through `docker exec` it ends with exit code 137 and no output,
   because the container is gone as soon as its main process is.

@@ -69,11 +69,21 @@ fn stop_all(path: &Path) -> Result<Value, Error> {
     // Jobs and fuzz runs poll for the stop request and exit. It is repeated while waiting: one
     // still queued has no process yet and marks itself running once its process starts. They
     // are never signalled: no start time is recorded for them, so a pid reused by another
-    // process can't be told apart.
+    // process can't be told apart, and one in another container can't be reached anyway.
+    let lock = |what: &str, id: i64| {
+        if what == "job" {
+            crate::jobs_cmd::lock_name(id)
+        } else {
+            crate::fuzz_cmd::lock_name(id)
+        }
+    };
     let busy = || -> Result<Vec<(String, i64, Option<u32>)>, Error> {
         store.stop_all_work()?;
         let work = store.unfinished_work()?;
-        Ok(work.into_iter().filter(|(_, _, pid)| pid.is_none_or(process::alive)).collect())
+        Ok(work
+            .into_iter()
+            .filter(|(what, id, pid)| pid.is_none_or(|pid| !process::work_gone(&store, &lock(what, *id), pid)))
+            .collect())
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut left = busy()?;
@@ -82,8 +92,12 @@ fn stop_all(path: &Path) -> Result<Value, Error> {
         left = busy()?;
     }
     // Work that never got a process has nothing to stop.
-    let stuck: Vec<String> =
-        left.iter().filter_map(|(what, id, pid)| pid.map(|pid| format!("{what} {id} (pid {pid})"))).collect();
+    let stuck: Vec<String> = left
+        .iter()
+        .filter_map(|(what, id, pid)| {
+            pid.map(|pid| format!("{what} {id} ({})", process::work_pid_text(&store, &lock(what, *id), pid)))
+        })
+        .collect();
     if !stuck.is_empty() {
         return Err(Error::Conflict(format!(
             "still running after being asked to stop: {}; wait for them to finish (or stop those processes)",
