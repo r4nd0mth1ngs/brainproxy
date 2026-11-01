@@ -98,6 +98,20 @@ sudo make install              # -> /usr/local/bin/brainproxy
 
 Or copy the `brainproxy-<version>-linux-x86_64` artifact from CI (or a tagged release) onto the runner.
 
+## Container image
+
+For headless and CI use, the `Dockerfile` builds a small non-root image of the CLI. No image is
+published, so build it yourself. Project files and the CA go in `/work`, so mount a volume there:
+
+```sh
+docker build -t brainproxy .
+docker run --rm -v brainproxy:/work brainproxy engagement start --target app.example.com
+docker run --rm -v brainproxy:/work brainproxy crawl https://app.example.com/
+```
+
+It leaves out Chromium, which `crawl --browser` needs. See
+[Container image](docs/MANUAL.md#container-image) for host folders, running the proxy, and adding Chromium.
+
 ## Engagement scope (required)
 
 brainproxy sends nothing until a scope exists, and every outbound request (send, race,

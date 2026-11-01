@@ -1,0 +1,10 @@
+# Allowlist: only what the image build copies, so project files, keys and the GUI stay out.
+# .cargo/ stays out too: its musl-gcc setting is for Debian-style hosts and Alpine has no musl-gcc.
+*
+!Cargo.toml
+!Cargo.lock
+!zap-sync.json
+!LICENSE
+!NOTICE
+!crates
+crates/*/tests

@@ -55,6 +55,79 @@ command line, `brainproxy update check` says whether a newer release exists and
 folder). Neither installs anything. The AppImage is larger
 than the download limit; get it from the release page.
 
+### Container image
+
+The `Dockerfile` packages the command-line tool for headless and CI use: a small Alpine
+image (about 30 MB) that runs as a non-root user (UID 1000). No image is published, so build
+it from a checkout:
+
+```sh
+docker build -t brainproxy .
+docker run --rm brainproxy --version
+```
+
+Arguments go straight to `brainproxy`. It works in `/work`, so that's where to mount a
+volume: the project file (`brainproxy.bpdb` unless `--project` or `BRAINPROXY_PROJECT` says
+otherwise) goes there. So does the [data folder](#concepts), at `/work/.brainproxy`
+(`BRAINPROXY_HOME`). It holds the CA's private key, so keep it out of anything you commit or
+publish: if you mount a Git checkout, add `.brainproxy/` and `*.bpdb*` to its `.gitignore`.
+Without a volume, everything is lost with the container.
+
+```sh
+# A named volume needs no setup.
+docker run --rm -v brainproxy:/work brainproxy engagement start --target app.example.com
+docker run --rm -v brainproxy:/work brainproxy crawl https://app.example.com/
+
+# A host folder: run as its owner, or the user in the image may not be able to write to it.
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" brainproxy report html -o report.html
+```
+
+Things that work differently in a container:
+
+- **Addresses:** `127.0.0.1` is the container itself, not your machine. To reach a target in
+  another container, put both on one Docker network (`docker run --network ...`) and scope
+  the target's exact name (`engagement start --target web:8000`). A wildcard doesn't cover
+  a private address, as everywhere else.
+- **Servers and background jobs:** `proxy start`, `oob start`, and `--background` run in the
+  background, and the container stops, taking them with it, as soon as its main command
+  returns. Use the foreground `proxy run` or `oob run`, and leave `--background` off. To reach
+  the proxy from outside, listen on all of the container's addresses and publish the port on
+  your own machine only:
+
+  ```sh
+  docker run -d --init --name proxy -v brainproxy:/work -p 127.0.0.1:8080:8080 brainproxy proxy run --listen 0.0.0.0:8080
+  ```
+
+  Keep `--init`: brainproxy never treats PID 1 as a running proxy, so without it `proxy
+  status` says the proxy isn't running even though it is. Ask only its own container
+  (`docker exec proxy brainproxy proxy status`), and stop it with `docker stop proxy`. A
+  different container on the same volume can't see the process, and running `proxy status`
+  there clears the saved state, so `docker exec` then says it isn't running too. The proxy
+  itself keeps working.
+
+- **`crawl --browser`:** needs a Chromium-based browser, which the image leaves out because it
+  takes the image from about 30 MB to over 800 MB. Without one, `--browser` stops with an
+  error and the plain crawler still works. To add it, build on the image (here tagged
+  `brainproxy-chromium`):
+
+  ```dockerfile
+  FROM brainproxy
+  USER root
+  RUN apk add --no-cache chromium
+  USER brainproxy
+  ```
+
+  Docker's default seccomp profile stops Chromium's sandbox from starting, so the browser
+  fails with `Failed to move to new namespace`. `-e BRAINPROXY_BROWSER_NO_SANDBOX=1` runs it
+  without the sandbox, which leaves the container as the only barrier around pages from the
+  target, so test only sites you trust that far. Also pass `--init`, which cleans up the
+  browser's exited processes:
+
+  ```sh
+  docker run --rm --init -e BRAINPROXY_BROWSER_NO_SANDBOX=1 -v brainproxy:/work brainproxy-chromium \
+      crawl https://app.example.com/ --browser
+  ```
+
 ---
 
 ## Concepts
@@ -749,6 +822,7 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | `browser open` says it can only open http(s) URLs | Give a full `http://` or `https://` address (or none for a blank page). Other schemes and anything starting with `-` are refused so they can't be read as browser options. |
 | `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` (Windows: Task Manager, Details tab) and stop it yourself. |
 | curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
+| Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
 | Windows says "Windows protected your PC" | The installer isn't signed yet: More info → Run anyway. |
