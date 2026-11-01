@@ -1,7 +1,7 @@
 {
   "name": "brainproxy-gui",
   "private": true,
-  "version": "0.4.5",
+  "version": "0.4.6",
   "type": "module",
   "engines": {
     "node": ">=23.6"

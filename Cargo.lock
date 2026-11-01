@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "brainproxy"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "brainproxy-core",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "brainproxy-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64",
