@@ -14,8 +14,8 @@ export const DEPTHS: { id: Depth; title: string; time: string; text: string; arg
   {
     id: "standard",
     title: "Standard",
-    // Attacking path segments adds many requests, so a large site can take an hour.
-    time: "about 10 to 60 minutes",
+    // Attacking path segments adds many requests, so a site that fills --max-targets can take half an hour.
+    time: "about 5 to 30 minutes",
     text: "A balanced scan of the whole site, including IDs in its addresses. Good for a first assessment, but sends many requests.",
     args: ["--strength", "high", "--crawl-depth", "5", "--crawl-max-pages", "500", "--cookies", "--url-path"],
   },
