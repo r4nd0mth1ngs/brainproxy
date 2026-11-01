@@ -409,30 +409,38 @@ fn since_scan_counts_what_a_failed_run_saw_first_as_new() {
     env.send("/old");
     let url = format!("http://127.0.0.1:{}/", env.port);
     let args: Vec<String> = ["scan", "active", "--crawl", &url].iter().map(|s| s.to_string()).collect();
-    let good = scan_job(&env, &args, "completed", || env.send("/old"));
+    let good = scan_job(&env, &args, "completed", || {
+        env.send("/old");
+        env.send("/good");
+    });
     let _failed = scan_job(&env, &args, "failed", || env.send("/sqli"));
     let job = scan_job(&env, &args, "completed", || {
         env.send("/old");
+        env.send("/good");
         env.send("/sqli");
     });
     let (job, good) = (job.to_string(), good.to_string());
+    let unchanged = |v: &Value| {
+        urls(&v["data"]["unchanged"]).iter().map(|u| u.rsplit('/').next().unwrap().to_string()).collect::<Vec<_>>()
+    };
 
     // Without --since-scan: unchanged, and the new-only gate passes.
     let (code, v) = env.compare(&["--scan", &job, "--fail-on", "info", "--new-only"]);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["summary"]["new"], 0);
-    assert!(urls(&v["data"]["unchanged"]).iter().any(|u| u.ends_with("/sqli")), "{v}");
+    assert_eq!(unchanged(&v), ["good", "old", "sqli"], "{v}");
     assert!(v["data"]["baseline"].get("since_scan").is_none(), "{v}");
 
-    // Since the last completed scan: new, and the gate fails on it alone.
+    // Since the last completed scan: new, and the gate fails on it alone. What that scan found
+    // first itself isn't new again.
     let (code, v) = env.compare(&["--scan", &job, "--since-scan", &good, "--fail-on", "info", "--new-only"]);
     assert_eq!(code, 5, "{v}");
     let d = &v["data"];
     assert!(ends_with(&d["new"], "/sqli"), "{d}");
     assert!(ends_with(&d["gate"]["findings"], "/sqli"), "{d}");
-    assert!(ends_with(&d["unchanged"], "/old"), "{d}");
+    assert_eq!(unchanged(&v), ["good", "old"], "{v}");
     assert_eq!(d["baseline"]["since_scan"]["job"], good.parse::<i64>().unwrap());
-    assert_eq!(d["baseline"]["scope"]["new_since"], d["baseline"]["since_scan"]["start"]);
+    assert_eq!(d["baseline"]["scope"]["new_after"], d["baseline"]["since_scan"]["end"]);
 }
 
 #[test]

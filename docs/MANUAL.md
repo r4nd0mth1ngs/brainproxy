@@ -773,9 +773,10 @@ whatever `--state` lists. With `--scan`, only what that scan found counts.
 `--scan JOB --since-scan EARLIER` is for a pipeline that scans the same project again and again.
 "New" against one scan means first found by that scan, so a finding first seen by a run that failed
 or was stopped, and found again by the next run, would count as unchanged and never trip
-`--new-only`. With `--since-scan`, a finding the scan found that was first seen at or after
-`EARLIER` started is new as well. Give the last scan that completed. "Unchanged" and "fixed" are
-still against `JOB`, and `data.baseline.since_scan` shows the job and its start. `EARLIER` must be
+`--new-only`. With `--since-scan`, a finding the scan found that was first seen after `EARLIER`
+finished is new as well; what `EARLIER` found itself is not. Give the last scan that completed.
+"Unchanged" and "fixed" are still against `JOB`, and `data.baseline.since_scan` shows the job and
+when it finished. `EARLIER` must be
 an active scan that completed (not failed, stopped, or out of `--max-minutes`) and finished before
 `JOB` started; anything else is refused with `2`.
 

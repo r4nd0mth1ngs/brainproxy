@@ -34,9 +34,9 @@ pub struct CompareArgs {
     /// found again by it, or covered by it and not found again.
     #[arg(long, value_name = "JOB", conflicts_with = "baseline")]
     scan: Option<i64>,
-    /// With --scan: also count as new what it found again that was first seen since this earlier
-    /// scan started, such as findings of a failed run in between. The earlier scan must have
-    /// completed (not timed out) before the --scan one started.
+    /// With --scan: also count as new what it found again that was first seen after this earlier
+    /// scan, such as findings of a failed run in between. The earlier scan must have completed
+    /// (not timed out) before the --scan one started.
     #[arg(long, value_name = "JOB", requires = "scan")]
     since_scan: Option<i64>,
     /// Exit with code 5 when a finding at or above this risk is present (false positives never
@@ -63,8 +63,8 @@ pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
         let store = open_project(project)?;
         let (mut scope, mut scan) = scan_baseline(&store, job, a.fail_on.is_some(), &mut warnings)?;
         if let Some(since) = a.since_scan {
-            scope.new_since = Some(since_scan(&store, since, job, &scope.start)?);
-            scan["since_scan"] = json!({"job": since, "start": scope.new_since});
+            scope.new_after = Some(since_scan(&store, since, job, &scope.start)?);
+            scan["since_scan"] = json!({"job": since, "end": scope.new_after});
             scan["scope"] = json!(scope);
         }
         baseline = scan;
@@ -227,15 +227,16 @@ fn incomplete(job: &Value) -> Option<String> {
     }
 }
 
-/// When --since-scan's job started. It has to have completed before job `scan` started: the
+/// When --since-scan's job finished. It has to have completed before job `scan` started: the
 /// findings of an incomplete one were never all seen, and a later one would hide what it found.
+/// What it found itself isn't new: its own comparison already counted that.
 fn since_scan(store: &Store, id: i64, scan: i64, scan_start: &str) -> Result<String, Error> {
     let job = active_scan(store, id)?;
     if let Some(how) = incomplete(&job) {
         return Err(Error::Conflict(format!("--since-scan job {id} is {how}; name a scan that completed")));
     }
     match job["finished_time"].as_str() {
-        Some(end) if end < scan_start => Ok(job["time"].as_str().unwrap_or_default().to_string()),
+        Some(end) if end < scan_start => Ok(end.to_string()),
         _ => Err(Error::InvalidInput(format!("--since-scan job {id} didn't finish before job {scan} started"))),
     }
 }
