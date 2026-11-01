@@ -612,7 +612,7 @@ fn crawl_rate_holds_across_concurrency() {
 }
 
 #[test]
-fn scan_active_skips_state_changing_methods_by_default() {
+fn scan_active_skips_methods_outside_the_defaults() {
     let port = serve_site();
     let project = tmp_project("methods");
     let req = format!("DELETE /item?id=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
@@ -624,6 +624,51 @@ fn scan_active_skips_state_changing_methods_by_default() {
         run(&["scan", "active", "--rules", "40018", "--no-oob", "--include-methods", "delete"], &project, None);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["targets"], 1, "{v}");
+    assert!(v["data"].get("post_hint").is_none(), "{v}");
+}
+
+#[test]
+fn scan_active_attacks_post_by_default_and_warns() {
+    let port = serve_site();
+    let project = tmp_project("post-warning");
+    for req in [
+        format!("POST /contact HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 5\r\n\r\nmsg=1"),
+        format!("GET /item?id=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    ] {
+        let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+    }
+    let (code, v) = run(&["scan", "active", "--rules", "40018", "--no-oob"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["targets"], 2, "{v}");
+    assert_eq!(v["data"]["post_targets"], 1, "{v}");
+    let hint = v["data"]["post_hint"].as_str().unwrap();
+    assert!(hint.contains("side effects such as email"), "{v}");
+    assert!(v["data"].get("skipped_methods").is_none(), "{v}");
+    // No POST target, nothing to warn about.
+    let (code, v) =
+        run(&["scan", "active", "--rules", "40018", "--no-oob", "--where", "method <> 'POST'"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["targets"], 1, "{v}");
+    assert!(v["data"].get("post_targets").is_none(), "{v}");
+    assert!(v["data"].get("post_hint").is_none(), "{v}");
+    // Text mode warns on stderr, before the attack; stdout stays the summary.
+    let o = bin()
+        .args(["--format", "text", "--project"])
+        .arg(&project)
+        .args(["scan", "active", "--rules", "40018", "--no-oob"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("warning: 1 POST target(s). POST requests are replayed"));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("POST"));
+}
+
+#[test]
+fn scan_active_help_warns_about_post() {
+    let o = bin().args(["scan", "active", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&o.stdout);
+    assert!(help.contains("side effects such as email"), "{help}");
 }
 
 #[test]

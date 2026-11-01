@@ -349,7 +349,12 @@ Passive rules run automatically on everything recorded. Active scans send real a
 requests that can change data: prefer a test environment.
 By default an active scan only replays GET, HEAD, OPTIONS and POST requests from history;
 DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
-you include them.
+you include them. POST stays on because a scan misses too much without it, but it isn't
+safe: POST requests are replayed with attack payloads, often many times, and can change data
+or trigger side effects such as email; `--crawl` also submits the forms it finds. When any
+are attacked, the result says how many (`post_targets`) with a warning (`post_hint`), which
+with JSON output or `--background` comes only once the scan is over. Text output warns before
+the attack starts, and the scan wizard says so on its last step.
 
 ### Access
 Access control across users: does the app let bob read alice's data? See
