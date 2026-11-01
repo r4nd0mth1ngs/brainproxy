@@ -367,6 +367,16 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 let loaded = api::load(&crate::import_cmd::read_local(source)?, &args.api_options()?)?;
                 crate::import_cmd::check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&args.api_selection(), &guard)?)?;
+            } else {
+                let net = (args.timeout, args.verify_tls);
+                crate::import_cmd::check_remote_vars(
+                    project,
+                    &guard,
+                    source,
+                    args.api_options()?,
+                    args.auth.as_deref(),
+                    net,
+                )?;
             }
         }
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
@@ -489,11 +499,14 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     urls: vec![],
                     history_ids: ids.clone(),
                     where_sql: None,
-                    max_targets: args.max_targets.unwrap_or(ids.len()),
+                    max_targets: usize::MAX,
                     include_methods: vec![],
                 };
-                let picked = select_targets(project, &selection, &cfg.send, &cfg.points, auth.as_deref())?;
-                targets_dropped = ids.len() - picked.0.len();
+                let mut picked = select_targets(project, &selection, &cfg.send, &cfg.points, auth.as_deref())?;
+                if let Some(cap) = args.max_targets {
+                    targets_dropped = picked.0.len().saturating_sub(cap);
+                    picked.0.truncate(cap);
+                }
                 picked
             }
             (None, None) => {

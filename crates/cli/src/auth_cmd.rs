@@ -406,19 +406,25 @@ pub fn maybe_session(
 
 /// `NAME=ENV_VAR` with the variable read. Errors name the variable, never a value.
 fn env_pair(flag: &str, spec: &str) -> Result<(String, String), Error> {
-    let bad = || Error::InvalidInput(format!("{flag} {spec:?}: expected NAME=ENV_VAR"));
+    let bad = || Error::InvalidInput(format!("{flag}: expected NAME=ENV_VAR"));
     let (name, var) = spec.split_once('=').ok_or_else(bad)?;
     let (name, var) = (name.trim(), var.trim());
     if name.is_empty() || var.is_empty() {
         return Err(bad());
     }
-    let value = std::env::var(var).map_err(|_| Error::InvalidInput(format!("{flag}: {var} is not set")))?;
+    // Only a name that looks like one is repeated: a key given here by mistake must not be.
+    let shown = if var.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+        var
+    } else {
+        "the variable after NAME="
+    };
+    let value = std::env::var(var).map_err(|_| Error::InvalidInput(format!("{flag}: {shown} is not set")))?;
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::InvalidInput(format!("{flag}: {var} is empty")));
+        return Err(Error::InvalidInput(format!("{flag}: {shown} is empty")));
     }
     if value.contains(['\r', '\n', '\0']) {
-        return Err(Error::InvalidInput(format!("{flag}: {var} holds a line break")));
+        return Err(Error::InvalidInput(format!("{flag}: {shown} holds a line break")));
     }
     Ok((name.to_string(), value.to_string()))
 }

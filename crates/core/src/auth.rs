@@ -467,8 +467,9 @@ impl Vault {
     /// The request with placeholders replaced by their values. A header value is only
     /// filled into its own header, and a password or macro value only into requests to
     /// the origins it belongs to, so a placeholder can't be moved somewhere that
-    /// reflects it back; a query key goes only into the request line to its origins. Fails on a placeholder left over (profile removed, never logged
-    /// in, password variable unset, or the placeholder moved out of its header). Signers
+    /// reflects it back; a query key goes only into the request line to its origins. Fails
+    /// on a placeholder left over (profile removed, never logged in, password variable
+    /// unset, or the placeholder moved out of its header). Signers
     /// run last, over the request as it will be sent; their placeholders only count in the head.
     pub fn resolve<'a>(&self, raw: &'a [u8], target: &Target) -> Result<Cow<'a, [u8]>> {
         if find(raw, MARK.as_bytes()).is_none() {
@@ -934,7 +935,8 @@ impl AuthSession {
         let mut csrf = String::new();
         if let (Some(url), Some(re)) = (&p.csrf_url, &self.re.csrf) {
             let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-            let ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+            let ex =
+                self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
             self.observe(&ex.response);
             history.push(self.record(&ex));
             csrf = re
@@ -976,7 +978,8 @@ impl AuthSession {
             }
         };
         // Send, following redirects (with cookies) like a browser would.
-        let mut ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+        let mut ex =
+            self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
         self.observe(&ex.response);
         find_token(&ex.response);
         history.push(self.record(&ex));
@@ -998,7 +1001,7 @@ impl AuthSession {
                 }
                 _ => RawRequest::build("GET", current.as_str(), &[], b"")?,
             };
-            ex = self.client.send(&RawRequest::from_bytes(self.apply(r.as_bytes(), &[])), &t).await?;
+            ex = self.client.send(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await?;
             self.observe(&ex.response);
             find_token(&ex.response);
             history.push(self.record(&ex));

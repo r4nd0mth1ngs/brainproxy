@@ -907,6 +907,14 @@ fn a_cap_on_targets_is_reported_and_nothing_selected_is_refused() {
     assert_eq!((r["targets"].as_u64(), r["import"]["sent"].as_u64()), (Some(205), Some(205)), "{r}");
     assert!(r.get("targets_dropped").is_none(), "{r}");
 
+    // Two requests that are one target aren't "dropped": nothing capped them.
+    let req = json!({"name": "same", "request": {"method": "GET", "url": format!("{}/same", api.origin())}});
+    let doc = json!({"info": {"name": "dup"}, "item": [req, req]});
+    let dup = format!("--api={}", write_doc(&dir, "dup.json", &doc.to_string()));
+    let r = ok(&p, &["scan", "active", &dup, "--rules", "40012", "--strength", "low"]);
+    assert_eq!(r["targets"], 1, "{r}");
+    assert!(r.get("targets_dropped").is_none(), "{r}");
+
     let e = refused(&p, &["scan", "active", &arg, "--only=4"], 2, "invalid_input");
     assert!(e.contains("--include-methods"), "{e}");
     let e = refused(
@@ -1464,5 +1472,95 @@ fn indexes_hold_across_a_preview_and_a_run_of_the_same_options() {
         let r = ok(&p, &["import", "api", &format!("--only={i}"), "--", &src]);
         assert_eq!(r["requests"][0]["name"].as_str(), Some(name.as_str()), "{r}");
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_key_given_where_a_variable_name_goes_is_not_repeated() {
+    let (dir, p) = setup("env-echo", "127.0.0.1");
+    for spec in ["X-Api-Key=fakeKEYvalue", "X-Api-Key: fakeKEYvalue"] {
+        let o = run(&p, &["auth", "add", &format!("--header-env={spec}"), "--", "k"]);
+        assert_ne!(o.code, 0, "{}", o.all);
+        assert!(!o.all.contains("fakeKEYvalue"), "{}", o.all);
+    }
+    let e = refused(&p, &["auth", "add", "--header-env=X-Api-Key=UNSET_VAR_FOR_TEST", "--", "k"], 2, "invalid_input");
+    assert!(e.contains("UNSET_VAR_FOR_TEST is not set"), "{e}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn credentials_the_document_declares_or_hides_are_kept_out() {
+    let (dir, p) = setup("declared", "127.0.0.1");
+    let api = Api::start();
+    // Names that don't look secret, but the document says are; and a password in an XML body.
+    let doc = json!({"openapi": "3.0.0", "servers": [{"url": api.origin()}],
+        "components": {"securitySchemes": {
+            "H": {"type": "apiKey", "in": "header", "name": "X-Thing"},
+            "Q": {"type": "apiKey", "in": "query", "name": "thing"}}},
+        "paths": {"/d": {"post": {"operationId": "d",
+            "parameters": [
+                {"name": "X-Thing", "in": "header", "example": "FAKE-DECLARED-H"},
+                {"name": "thing", "in": "query", "example": "FAKE-DECLARED-Q"},
+                {"name": "limit", "in": "query", "example": 3}],
+            "requestBody": {"content": {"application/xml": {"example": "<a><n>x</n><p:password k=\"v\">FAKE-XML</p:password></a>"}}}}}}});
+    let src = write_doc(&dir, "declared.json", &doc.to_string());
+    let shown = preview(&p, &src, &[]).to_string();
+    assert!(!shown.contains("FAKE"), "{shown}");
+    assert!(shown.contains("limit=3") && shown.contains("<n>x</n>"), "{shown}");
+    ok(&p, &["import", "api", "--", &src]);
+    let hit = api.hits().into_iter().find(|h| h.path() == "/d").unwrap();
+    assert!(!hit.head.contains("FAKE") && hit.header("X-Thing").is_none(), "{}", hit.head);
+    assert!(!hit.body.contains("FAKE-XML"), "the XML value isn't sent: {}", hit.body);
+
+    // A URL-valued variable shows no key, though the request still uses its address.
+    let doc = json!({"info": {"name": "v"},
+        "variable": [{"key": "base", "value": format!("{}/?api_key=FAKE-IN-URL", api.origin())}],
+        "item": [{"name": "a", "request": {"method": "GET", "url": "{{base}}"}}]});
+    let shown = preview(&p, &write_doc(&dir, "urlvar.json", &doc.to_string()), &[]).to_string();
+    assert!(!shown.contains("FAKE-IN-URL"), "{shown}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_remote_documents_secret_variable_is_refused_before_the_job_stores_it() {
+    let (dir, p) = setup("remote-var", "127.0.0.1");
+    let doc = json!({"info": {"name": "r"},
+        "auth": {"type": "apikey", "apikey": [{"key": "key", "value": "X-K"}, {"key": "value", "value": "{{viaAuth}}"}]},
+        "item": [{"name": "a", "request": {"method": "GET", "url": "http://127.0.0.1:1/a"}}]});
+    let api = Api::with(Some(doc.to_string()), false);
+    let url = format!("{}/spec", api.origin());
+    let var = "--var=viaAuth=FAKE-REMOTE-VAR";
+    for args in [
+        &["import", "api", var, "--background", "--", &url][..],
+        &["scan", "active", var, "--background", &format!("--api={url}")],
+    ] {
+        let o = run(&p, args);
+        assert_ne!(o.code, 0, "{}", o.all);
+        assert!(!o.all.contains("FAKE-REMOTE-VAR"), "{}", o.all);
+    }
+    let jobs = ok(&p, &["job", "list"]);
+    assert_eq!(jobs["jobs"].as_array().unwrap().len(), 0, "{jobs}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_login_carries_the_query_key() {
+    let (dir, p) = setup("login-key", "127.0.0.1");
+    let api = Api::start();
+    let login = format!("--login-url={}/login", api.origin());
+    let origin = format!("--key-origin={}", api.origin());
+    let key = format!("--query-key=k={KEY_ENV}");
+    let o = command(
+        &p,
+        &["auth", "add", &login, "--login-body=a=1", &key, &origin, "--", "lk"],
+        &[(KEY_ENV, "FAKE-LOGIN-KEY")],
+        "json",
+    );
+    assert_eq!(o.code, 0, "{}", o.all);
+    let _ = run(&p, &["auth", "login", "lk"]);
+    let hit = api.hits().into_iter().find(|h| h.path() == "/login").expect("the login request");
+    assert!(hit.target.contains("k=FAKE-LOGIN-KEY"), "{}", hit.target);
+    let q = ok(&p, &["query", "SELECT CAST(request AS TEXT) FROM history WHERE url LIKE '%/login%'"]).to_string();
+    assert!(!q.contains("FAKE-LOGIN-KEY"), "{q}");
     let _ = std::fs::remove_dir_all(dir);
 }

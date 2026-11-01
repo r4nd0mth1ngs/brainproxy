@@ -259,6 +259,10 @@ fn quote(s: &str) -> String {
 
 /// Minimal XML for an example value: objects become elements, arrays repeat.
 pub fn xml(root_name: &str, v: &Value) -> Vec<u8> {
+    // An example given as a whole document.
+    if let Some(text) = v.as_str().filter(|t| t.trim_start().starts_with('<')) {
+        return text.as_bytes().to_vec();
+    }
     fn el(name: &str, v: &Value, out: &mut String) {
         match v {
             Value::Array(items) => items.iter().for_each(|i| el(name, i, out)),

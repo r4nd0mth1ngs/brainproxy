@@ -2,11 +2,13 @@
 //! send them (in scope only) and record them as history source "import".
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use brainproxy_core::apiimport::{self, api, graphql, openapi, postman, ApiRequest, Built, RunConfig};
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::capture::decode_body;
+use brainproxy_core::guard::Guard;
 use brainproxy_core::http::request::split_head_body;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use brainproxy_core::session::Tool;
@@ -161,6 +163,9 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                 let loaded = api::load(&read_local(&a.doc.source)?, &a.options()?)?;
                 check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&a.selection(), &guard)?)?;
+            } else {
+                let net = (c.timeout, c.verify_tls);
+                check_remote_vars(project, &guard, &a.doc.source, a.options()?, c.auth.as_deref(), net)?;
             }
         }
         return crate::jobs_cmd::spawn_background("import", project, home, out);
@@ -400,6 +405,31 @@ pub(crate) fn check_background_doc(loaded: &api::Loaded) -> Result<(), Error> {
         ))),
         None => Ok(()),
     }
+}
+
+/// Which `--var` may go in the job table depends on the document, so a remote one that
+/// has any is fetched first (not kept), and a fetch that fails refuses them too.
+pub(crate) fn check_remote_vars(
+    project: &Path,
+    guard: &Arc<Guard>,
+    source: &str,
+    opts: api::Options,
+    auth: Option<&str>,
+    (timeout, verify_tls): (f64, bool),
+) -> Result<(), Error> {
+    if opts.vars.is_empty() {
+        return Ok(());
+    }
+    let send = SendOptions {
+        timeout: Duration::from_secs_f64(timeout.max(0.1)),
+        verify_tls,
+        sni: None,
+        guard: Some(guard.clone()),
+        http2: false,
+    };
+    let auth = crate::auth_cmd::maybe_session(project, auth, &send)?;
+    let fetch = Fetcher { project, send: &send, record: false, auth: auth.as_deref(), headers: &[], tool: Tool::Crawl };
+    check_background_doc(&load_api(&fetch, source, opts)?)
 }
 
 fn warnings_hint(w: &Value) -> String {

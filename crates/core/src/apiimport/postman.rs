@@ -215,8 +215,9 @@ fn request(cx: &Cx, name: &str, req: &Value, auth: Option<&Value>) -> Result<Api
     if host.contains("{{") {
         if cx.base.is_none() {
             return Err(Error::InvalidInput(format!(
-                "{HOST_VARIABLE} of {:?}; set the variable or a base URL",
-                shown_url(&url)
+                "{HOST_VARIABLE} of {:?}; {}",
+                shown_url(&url),
+                if cx.guarded { "set the variable or a base URL" } else { "pass --var or --base-url" }
             )));
         }
         // --base-url supplies the origin.
@@ -532,8 +533,9 @@ pub fn analyze(doc: &Value, vars: &[(String, String)]) -> Analysis {
                 out.unresolved.push(name.clone());
             }
         }
-        // A URL with a password in it stays usable (the password is stripped later), but isn't shown.
-        let hidden = secret || shown_url(&value) != value.split(['?', '#']).next().unwrap_or_default();
+        // A URL with a password or key in it stays usable (they are stripped later), but isn't shown.
+        let in_url = url::Url::parse(&value).is_ok_and(|u| u.query_pairs().any(|(k, _)| looks_secret(&k)));
+        let hidden = secret || in_url || shown_url(&value) != value.split(['?', '#']).next().unwrap_or_default();
         out.variables.push(Variable { name, value: (!hidden).then_some(value), source, secret: hidden, used });
     }
     for name in &refs.all {

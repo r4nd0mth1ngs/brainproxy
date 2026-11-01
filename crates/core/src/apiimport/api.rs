@@ -180,7 +180,7 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
             openapi::build(&doc, &o)?
         }
     };
-    harden(&mut built, format);
+    harden(&mut built, format, &loaded.credentials);
     built.credentials.drain(..).for_each(|c| merge_credential(&mut loaded.credentials, c));
     loaded.warnings.append(&mut built.warnings);
     loaded.base_url_required = built.base_url_required;
@@ -299,8 +299,14 @@ fn security_schemes(doc: &Value) -> Vec<Credential> {
 }
 
 /// Removes every credential from the built requests, reporting each, and skips those
-/// holding the auth placeholder marker or that can't be sent.
-fn harden(built: &mut Built, format: Format) {
+/// holding the auth placeholder marker or that can't be sent. `declared` adds the names the
+/// document itself says are credentials, whatever they look like.
+fn harden(built: &mut Built, format: Format, declared: &[Credential]) {
+    let is_declared = |place: &str, name: &str| {
+        declared.iter().any(|c| {
+            c.location.as_deref() == Some(place) && c.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+    };
     for mut r in std::mem::take(&mut built.requests) {
         let label = match url::Url::parse(&r.url) {
             Ok(u) => format!("{} {}", r.method, percent_decoded(u.path())),
@@ -313,7 +319,7 @@ fn harden(built: &mut Built, format: Format) {
         let authority = r.url.split("://").nth(1).unwrap_or_default().split(['/', '?']).next().unwrap_or_default();
         if authority.contains('{') {
             built.base_url_required = true;
-            built.skip(label, "the server's host has an unfilled variable; pass --base-url".into());
+            built.skip(label, "the server's host has an unfilled variable, so it needs a base URL".into());
             continue;
         }
         let mut u = match url::Url::parse(&r.url) {
@@ -348,7 +354,7 @@ fn harden(built: &mut Built, format: Format) {
             let mut kept = Vec::new();
             for part in q.split('&') {
                 let names = part.split(';').map(|p| form_decoded(p.split('=').next().unwrap_or_default()));
-                match names.into_iter().find(|n| looks_secret(n)) {
+                match names.into_iter().find(|n| looks_secret(n) || is_declared("query", n)) {
                     Some(name) => {
                         let value = part.split_once('=').map_or("", |(_, v)| v);
                         built.credential(Credential {
@@ -356,7 +362,7 @@ fn harden(built: &mut Built, format: Format) {
                             location: Some("query".into()),
                             name: Some(name),
                             source: source.clone(),
-                            embedded: !value.is_empty() && !value.contains("%7B%7B") && !value.contains("{{"),
+                            embedded: !value.contains("%7B%7B") && !is_stand_in(value),
                         });
                     }
                     None => kept.push(part),
@@ -365,11 +371,11 @@ fn harden(built: &mut Built, format: Format) {
             u.set_query((!kept.is_empty()).then(|| kept.join("&")).as_deref());
         }
         for (k, v) in std::mem::take(&mut r.headers) {
-            if !looks_secret(&k) {
+            if !looks_secret(&k) && !is_declared("header", &k) {
                 r.headers.push((k, v));
                 continue;
             }
-            let embedded = !v.is_empty() && !v.contains("{{");
+            let embedded = !is_stand_in(&v);
             if k.eq_ignore_ascii_case("cookie") {
                 for name in v.split(';').filter_map(|c| c.split('=').next()).map(str::trim).filter(|n| !n.is_empty()) {
                     built.credential(Credential {
@@ -584,8 +590,7 @@ impl Loaded {
         }
         let wanted = plan.items.iter().any(|i| i.excluded_reason == Some("scope"));
         if wanted || !plan.items.iter().any(|i| i.in_scope) {
-            let hosts: Vec<&str> = plan.items.iter().filter(|i| !i.in_scope).map(|i| i.host.as_str()).collect();
-            let mut hosts = hosts;
+            let mut hosts: Vec<&str> = plan.items.iter().filter(|i| !i.in_scope).map(|i| i.host.as_str()).collect();
             hosts.sort_unstable();
             hosts.dedup();
             return Err(Error::OutOfScope(format!(
@@ -727,6 +732,9 @@ fn replace_fields(headers: &[(String, String)], body: &[u8], with: &mut Replace<
             Err(_) => replace_pairs(&text, with).into_bytes(),
         };
     }
+    if ct.contains("xml") {
+        return replace_xml(&text, with).into_bytes();
+    }
     if ct.contains("x-www-form-urlencoded") {
         let mut changed = false;
         let pairs: Vec<(String, String)> = url::form_urlencoded::parse(body)
@@ -786,6 +794,22 @@ fn replace_pairs(text: &str, with: &mut Replace<'_>) -> String {
         }
     })
     .into_owned()
+}
+
+/// `<name attrs>value</name>` elements of an XML body.
+fn replace_xml(text: &str, with: &mut Replace<'_>) -> String {
+    static ELEMENT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<([\w.:-]+)([^<>]*)>([^<]*)</([\w.:-]+)>").expect("valid regex"));
+    ELEMENT
+        .replace_all(text, |c: &regex::Captures| {
+            let local = c[1].rsplit(':').next().unwrap_or_default();
+            let new = if c[1] == c[4] && looks_secret(local) { with(local, &c[3]) } else { None };
+            match new {
+                Some(new) => format!("<{}{}>{new}</{}>", &c[1], &c[2], &c[4]),
+                None => c[0].to_string(),
+            }
+        })
+        .into_owned()
 }
 
 fn replace_parts(text: &str, with: &mut Replace<'_>) -> String {
