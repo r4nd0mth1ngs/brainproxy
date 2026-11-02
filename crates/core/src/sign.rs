@@ -652,8 +652,8 @@ impl Signer {
             out = with_header_values(out, k, &after);
         }
         let mut out = RawRequest::from_bytes(out);
-        let templates =
-            b.templates.iter().find(|t| t.matches(parts.method, parts.path)).map_or(&[][..], |t| t.headers.as_slice());
+        let templates = crate::sign_script::templates_for(&b.templates, parts.method, parts.path)
+            .map_or(&[][..], |t| t.headers.as_slice());
         for (k, tpl) in templates {
             let used = done.set.iter().any(|(n, _)| tpl.contains(&format!("{{{{{n}}}}}")));
             if used && value_of(&done.headers, k).is_none() {

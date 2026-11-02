@@ -140,20 +140,34 @@ pub(crate) struct Templates {
 }
 
 impl Templates {
-    /// Whether a request is this one: its method, and its path ending in this one's (the
-    /// base URL a variable gives can add segments in front).
-    pub(crate) fn matches(&self, method: &str, path: &str) -> bool {
+    /// How closely a request fits: its method, and its path ending in this one's (the base
+    /// URL a variable gives can add segments in front). Segments matched, then how many of
+    /// them literally; None when it doesn't fit. Both sides are compared decoded: a
+    /// collection may write `a%20b`.
+    fn score(&self, method: &str, path: &str) -> Option<(usize, usize)> {
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if !self.method.eq_ignore_ascii_case(method) || segs.len() < self.path.len() {
-            return false;
+            return None;
         }
+        let decoded = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned();
         let tail = &segs[segs.len() - self.path.len()..];
-        self.path.iter().zip(tail).all(|(want, got)| {
-            want.contains("{{")
-                || want.starts_with(':')
-                || percent_encoding::percent_decode_str(got).decode_utf8_lossy() == want.as_str()
-        })
+        let mut literal = 0;
+        for (want, got) in self.path.iter().zip(tail) {
+            if want.contains("{{") || want.starts_with(':') {
+                continue;
+            }
+            if decoded(want) != decoded(got) {
+                return None;
+            }
+            literal += 1;
+        }
+        Some((self.path.len(), literal))
     }
+}
+
+/// The collection request a sent request is: of those that fit, the most specific.
+pub(crate) fn templates_for<'a>(all: &'a [Templates], method: &str, path: &str) -> Option<&'a Templates> {
+    all.iter().filter_map(|t| Some((t.score(method, path)?, t))).max_by_key(|(s, _)| *s).map(|(_, t)| t)
 }
 
 fn auth_param<'a>(auth: &'a Value, kind: &str, key: &str) -> Option<&'a str> {
@@ -591,7 +605,21 @@ mod tests {
         let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
         assert_eq!(t[0].headers, [pair("Authorization", "Bearer {{tok}}"), pair("X-Sig", "First {{sig}}")]);
         assert_eq!(t[1].headers, [pair("X-Sig", "Second {{sig}}")], "the folder's noauth wins");
-        assert!(t[0].matches("post", "/api/v1/items/42") && !t[0].matches("GET", "/api/v1/items/42"));
-        assert!(!t[0].matches("POST", "/two") && t[1].matches("GET", "/two") && !t[1].matches("GET", "/v1/items/42"));
+        assert!(t[0].score("post", "/api/v1/items/42").is_some() && t[0].score("GET", "/api/v1/items/42").is_none());
+        assert!(
+            t[0].score("POST", "/two").is_none()
+                && t[1].score("GET", "/two").is_some()
+                && t[1].score("GET", "/v1/items/42").is_none()
+        );
+        // The most specific fits, and encoded segments compare decoded on both sides.
+        let tpl = |path: &[&str], h: &str| Templates {
+            method: "GET".into(),
+            path: path.iter().map(|s| s.to_string()).collect(),
+            headers: vec![(h.to_string(), "{{sig}}".to_string())],
+        };
+        let all = [tpl(&["users"], "X-User-Sig"), tpl(&["admin", "users"], "X-Admin-Sig"), tpl(&["a%20b"], "X-Space")];
+        assert_eq!(templates_for(&all, "GET", "/api/admin/users").unwrap().headers[0].0, "X-Admin-Sig");
+        assert_eq!(templates_for(&all, "GET", "/api/users").unwrap().headers[0].0, "X-User-Sig");
+        assert_eq!(templates_for(&all, "GET", "/a%20b").unwrap().headers[0].0, "X-Space");
     }
 }

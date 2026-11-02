@@ -299,9 +299,15 @@ impl AuthSession {
             return;
         }
         let _guard = self.login_lock.lock().await;
-        // After a failed renewal, or for a token that lives less than the margin, the next
-        // attempt waits out the re-login interval: never a token request per request.
-        if due(&self.state.lock().unwrap()) && !self.logged_in_within_interval() {
+        let (due_now, expired, renewed) = {
+            let st = self.state.lock().unwrap();
+            (due(&st), st.token_expires.is_some_and(|at| at <= now_secs()), st.logged_in)
+        };
+        // Within the re-login interval, a failed attempt waits it out, and a token that lives
+        // less than the margin is used until it really expires: never a token request per
+        // request, and never an expired token kept because of the interval.
+        let wait = self.logged_in_within_interval() && (!renewed || !expired);
+        if due_now && !wait {
             let _ = self.oauth_login().await;
         }
     }
