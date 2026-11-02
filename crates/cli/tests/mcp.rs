@@ -140,6 +140,13 @@ fn protocol_and_tool_list() {
     assert_eq!(start["inputSchema"]["required"], json!(["targets"]));
     assert!(tool("crawl").unwrap()["inputSchema"]["properties"].get("job_id").is_none());
     assert!(tool("history_list").unwrap()["inputSchema"]["properties"].get("stdin").is_none());
+    // Saving Replay tabs replaces the set but sends nothing; listing only reads.
+    let save = tool("replay_tabs_save").unwrap();
+    assert_eq!(save["inputSchema"]["properties"]["stdin"]["type"], "string");
+    assert_eq!(save["annotations"]["readOnlyHint"], false);
+    assert_eq!(save["annotations"]["destructiveHint"], true);
+    assert_eq!(save["annotations"]["openWorldHint"], false);
+    assert_eq!(tool("replay_tabs_list").unwrap()["annotations"]["readOnlyHint"], true);
 
     // JSON-RPC errors.
     assert_eq!(m.request("nope", json!({}))["error"]["code"], -32601);

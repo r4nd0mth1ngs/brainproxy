@@ -552,6 +552,62 @@ fn target_content_is_marked_untrusted() {
 }
 
 #[test]
+fn replay_tabs_are_saved_in_the_project() {
+    let project = tmp_project("replay-tabs");
+    let (code, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!((code, v["data"]["count"].as_u64()), (0, Some(0)), "{v}");
+
+    let req = "GET /?k=«auth:app:query:k» HTTP/1.1\nHost: 127.0.0.1\n\n";
+    let set = serde_json::json!({"tabs": [
+        {"title": "one", "target": "http://127.0.0.1", "request": req},
+        {"kind": "ws", "title": "WS 2", "target": "ws://127.0.0.1", "request": "GET / HTTP/1.1\n\n", "messages": ["hi"], "wait": 1},
+    ], "active": 1});
+    let (code, v) = run(&["replay", "tabs", "save"], &project, Some(set.to_string().as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["count"], 2);
+    // Only counts come back, so no untrusted mark; the list carries request text, so it has one.
+    assert!(v.get("_meta").is_none(), "{v}");
+
+    let (code, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["count"], 2);
+    assert_eq!(v["data"]["active"], 1);
+    assert_eq!(v["data"]["tabs"][0]["request"], req);
+    assert_eq!(v["data"]["tabs"][1]["messages"][0], "hi");
+    assert_eq!(v["_meta"]["provenance"]["untrusted_content"], true);
+
+    // A refused set leaves the saved one alone.
+    let (code, v) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": [{"title": "no request"}]}"#));
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    // It stops reading at the cap, so the rest of the write fails (the app ignores that too).
+    let big = serde_json::json!({"tabs": [{"request": "a".repeat(17 * 1024 * 1024)}]}).to_string();
+    let mut child = bin()
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["replay", "tabs", "save"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(big.as_bytes());
+    let out = child.wait_with_output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("over 16 MB"), "{v}");
+    assert_eq!(run(&["replay", "tabs", "list"], &project, None).1["data"]["count"], 2);
+
+    // The tabs travel with a saved copy; an empty set removes them.
+    let copy = project.with_file_name("copy.bpdb");
+    let _ = std::fs::remove_file(&copy);
+    let (code, v) = run(&["project", "save", "--output", copy.to_str().unwrap()], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(run(&["replay", "tabs", "list"], &copy, None).1["data"]["tabs"][0]["title"], "one");
+    let (code, _) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
+    assert_eq!(code, 0);
+    assert_eq!(run(&["replay", "tabs", "list"], &project, None).1["data"]["count"], 0);
+}
+
+#[test]
 fn output_files_are_not_overwritten_without_force() {
     let project = tmp_project("overwrite");
     let dir = project.parent().unwrap();

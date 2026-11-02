@@ -72,6 +72,7 @@ const LOCAL_ONLY: &[&str] = &[
     "auth add",
     "auth list",
     "auth remove",
+    "replay tabs save",
 ];
 
 pub struct Out {

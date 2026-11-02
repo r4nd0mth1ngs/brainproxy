@@ -130,6 +130,9 @@ const HINTS: &[(&str, Hints)] = &[
     // Stops the proxy, OOB listener and background work; deletes nothing.
     ("project stop", REPLACE),
     ("send", NET),
+    ("replay tabs list", READ),
+    // Replaces the saved set; sends nothing (a person sends a tab from Replay).
+    ("replay tabs save", REPLACE),
     ("proxy start", ADD),
     ("proxy stop", REPLACE),
     ("proxy status", READ),
