@@ -419,66 +419,83 @@ fn parse_answer(response: &[u8], origin: &str) -> Result<Answer> {
     })
 }
 
+/// Connections to the loopback port answered at once; more wait to be accepted.
+const MAX_CALLBACK_CONNECTIONS: usize = 32;
+
 /// Waits for the redirect carrying `state`. Anything else gets a 400 and the wait goes on,
-/// so a stray connection or a guessed URL can't end the sign-in.
+/// so a stray connection or a guessed URL can't end the sign-in. Each connection is
+/// answered on its own task, so one that sends nothing holds up no other.
 async fn wait_for_code(listener: &tokio::net::TcpListener, state: &str) -> Result<String> {
+    let mut answering = tokio::task::JoinSet::new();
     loop {
-        let (mut socket, _) = listener.accept().await?;
-        let mut buf = vec![0u8; 16384];
-        let mut len = 0;
-        // A client that sends nothing mustn't hold up the real redirect.
-        let _ = tokio::time::timeout(Duration::from_secs(5), async {
-            while len < buf.len() {
-                match socket.read(&mut buf[len..]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        len += n;
-                        if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
+        tokio::select! {
+            accepted = listener.accept(), if answering.len() < MAX_CALLBACK_CONNECTIONS => {
+                let (socket, _) = accepted?;
+                answering.spawn(answer_callback(socket, state.to_string()));
+            }
+            Some(done) = answering.join_next() => {
+                if let Ok(Some(result)) = done {
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+/// Answers one connection to the loopback port: the code or the refusal of a redirect with
+/// the right `state`, or None for anything else.
+async fn answer_callback(mut socket: tokio::net::TcpStream, state: String) -> Option<Result<String>> {
+    let mut buf = vec![0u8; 16384];
+    let mut len = 0;
+    // A client that sends nothing gives up its task after a while.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while len < buf.len() {
+            match socket.read(&mut buf[len..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    len += n;
+                    if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
                     }
                 }
             }
-        })
-        .await;
-        let text = String::from_utf8_lossy(&buf[..len]);
-        let uri = text.lines().next().and_then(|l| l.split(' ').nth(1)).unwrap_or_default();
-        let parsed = url::Url::parse(&format!("http://127.0.0.1{uri}")).ok();
-        let params: Vec<(String, String)> = parsed
-            .as_ref()
-            .filter(|u| u.path() == "/callback")
-            .map(|u| u.query_pairs().into_owned().collect())
-            .unwrap_or_default();
-        let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        let matches = get("state").is_some_and(|s| ct_eq(s.as_bytes(), state.as_bytes()));
-        let (status, page) = if !matches {
-            ("400 Bad Request", "This isn't the sign-in brainproxy is waiting for.")
-        } else if get("code").is_some() {
-            ("200 OK", "Signed in. You can close this window and go back to brainproxy.")
-        } else {
-            ("200 OK", "The sign-in was refused. You can close this window.")
-        };
-        let reply = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
-            page.len()
-        );
-        let _ = socket.write_all(reply.as_bytes()).await;
-        let _ = socket.shutdown().await;
-        if !matches {
-            continue;
         }
-        return match (get("code"), get("error")) {
-            (Some(code), _) if !code.is_empty() => Ok(code.to_string()),
-            (_, Some(e)) => {
-                let word = e.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && e.len() <= 64;
-                Err(Error::InvalidInput(format!(
-                    "the sign-in was refused: {}",
-                    if word { e } else { "see the browser" }
-                )))
-            }
-            _ => Err(Error::InvalidInput("the sign-in came back with no code".into())),
-        };
+    })
+    .await;
+    let text = String::from_utf8_lossy(&buf[..len]);
+    let uri = text.lines().next().and_then(|l| l.split(' ').nth(1)).unwrap_or_default();
+    let parsed = url::Url::parse(&format!("http://127.0.0.1{uri}")).ok();
+    let params: Vec<(String, String)> = parsed
+        .as_ref()
+        .filter(|u| u.path() == "/callback")
+        .map(|u| u.query_pairs().into_owned().collect())
+        .unwrap_or_default();
+    let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let matches = get("state").is_some_and(|s| ct_eq(s.as_bytes(), state.as_bytes()));
+    let (status, page) = if !matches {
+        ("400 Bad Request", "This isn't the sign-in brainproxy is waiting for.")
+    } else if get("code").is_some() {
+        ("200 OK", "Signed in. You can close this window and go back to brainproxy.")
+    } else {
+        ("200 OK", "The sign-in was refused. You can close this window.")
+    };
+    let reply = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    let _ = socket.write_all(reply.as_bytes()).await;
+    let _ = socket.shutdown().await;
+    if !matches {
+        return None;
     }
+    Some(match (get("code"), get("error")) {
+        (Some(code), _) if !code.is_empty() => Ok(code.to_string()),
+        (_, Some(e)) => {
+            let word = e.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && e.len() <= 64;
+            Err(Error::InvalidInput(format!("the sign-in was refused: {}", if word { e } else { "see the browser" })))
+        }
+        _ => Err(Error::InvalidInput("the sign-in came back with no code".into())),
+    })
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -555,7 +572,11 @@ mod tests {
             out
         };
         let waiting = tokio::spawn(async move { wait_for_code(&listener, "GOOD").await });
+        // A connection that sends nothing holds up no other.
+        let _idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let started = std::time::Instant::now();
         assert!(hit("/callback?code=EVIL&state=BAD").await.starts_with("HTTP/1.1 400"));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
         assert!(hit("/other?code=EVIL&state=GOOD").await.starts_with("HTTP/1.1 400"));
         assert!(hit("/callback?code=REAL&state=GOOD").await.starts_with("HTTP/1.1 200"));
         assert_eq!(waiting.await.unwrap().unwrap(), "REAL");
