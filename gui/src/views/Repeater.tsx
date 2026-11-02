@@ -3,7 +3,8 @@ import { bodyText, isBinary, run, textBytes, withScheme, type HistoryEntry } fro
 import { useApp, type RepeaterTab } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
-import { autoEncodeRequest } from "../ui/urlencode";
+import { activeLabels, optionsProblem, requestToSend, sendArgs } from "./replayOptions";
+import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
@@ -11,7 +12,7 @@ type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response">;
 
 interface Sent {
   raw: string;
-  /** What was actually sent (after auto URL-encoding) and how many characters were encoded. */
+  /** What was actually sent (after auto URL-encoding, or with CRLF when sent as typed) and how many characters were encoded. */
   sent: string;
   encoded: number;
   result: SendResult | null;
@@ -52,7 +53,13 @@ export function RepeaterView() {
     <div className="col fill">
       <div className="subtabs">
         {tabs.map((t) => (
-          <button key={t.key} className={t.key === active?.key ? "on" : ""} onClick={() => app.setRepeaterActive(t.key)} onAuxClick={(e) => e.button === 1 && closeTab(t.key)}>
+          <button
+            key={t.key}
+            className={t.key === active?.key ? "on" : ""}
+            title={activeLabels(t.options, t.ws ? "ws" : "http").join(", ") || undefined}
+            onClick={() => app.setRepeaterActive(t.key)}
+            onAuxClick={(e) => e.button === 1 && closeTab(t.key)}
+          >
             {t.title}
             <span
               className="x"
@@ -110,6 +117,8 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const [target, setTarget] = useState(tab.target);
   const [busy, setBusy] = useState(false);
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
+  const [options, setOptions] = useSendOptions(tab);
+  const [showOptions, setShowOptions] = useState(false);
   const [sent, setSent] = useState(() => sentByTab.get(tab.key) ?? { list: [], at: -1 });
   const current = sent.list[sent.at];
 
@@ -137,12 +146,14 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const send = async () => {
     const to = withScheme(guessTarget(raw, target));
     if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
+    const problem = optionsProblem(options);
+    if (problem) return app.toast(problem, "error");
     setTarget(to);
     setBusy(true);
-    const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+    const { text: sent, encoded } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
     let entry: Sent;
     try {
-      const result = await run<SendResult>(["send", `--target=${to}`, "-"], textBytes(sent, tab.binary));
+      const result = await run<SendResult>(sendArgs(to, options), textBytes(sent, tab.binary));
       entry = { raw, sent, encoded, result, error: null };
     } catch (e: any) {
       entry = { raw, sent, encoded, result: null, error: e.message };
@@ -188,10 +199,18 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         </div>
         <span className="label">Target</span>
         <input className="input mono" style={{ width: 300 }} placeholder="https://example.com" value={target} onChange={(e) => setTarget(e.target.value)} />
-        <label className="check" title="Before sending, percent-encode characters that aren't valid in a URL (spaces, quotes, <>, #, non-ASCII) in the request line and in form bodies. & = ? / and existing %XX stay as typed.">
+        <label
+          className="check"
+          title={
+            options.verbatim
+              ? "Off while this tab sends as typed (Options)"
+              : "Before sending, percent-encode characters that aren't valid in a URL (spaces, quotes, <>, #, non-ASCII) in the request line and in form bodies. & = ? / and existing %XX stay as typed."
+          }
+        >
           <input
             type="checkbox"
-            checked={autoEncode}
+            checked={autoEncode && !options.verbatim}
+            disabled={options.verbatim}
             onChange={(e) => {
               setAutoEncode(e.target.checked);
               try {
@@ -203,6 +222,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           />{" "}
           Auto URL-encode
         </label>
+        <OptionsToggle options={options} kind="http" open={showOptions} onToggle={() => setShowOptions(!showOptions)} />
         <span className="grow" />
         {!!current?.encoded && (
           <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>
@@ -211,10 +231,12 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         )}
         {r?.response && (
           <span className="muted">
-            {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms · history #{r.id}
+            {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms ·{" "}
+            {r.id != null ? `history #${r.id}` : "not recorded"}
           </span>
         )}
       </div>
+      {showOptions && <OptionsRow options={options} set={setOptions} kind="http" />}
       <Split id="repeater" dir="row">
         <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} />
         <HttpView

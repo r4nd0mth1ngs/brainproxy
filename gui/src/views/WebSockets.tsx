@@ -9,6 +9,8 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { optionsProblem } from "./replayOptions";
+import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
 
 const PREVIEW = 300;
@@ -208,6 +210,8 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<WsSendResult | string | null>(() => resultsByTab.get(tab.key) ?? null);
   const [current, setCurrent] = useState<number | null>(null);
+  const [options, setOptions] = useSendOptions(tab);
+  const [showOptions, setShowOptions] = useState(false);
 
   const { setRepeater } = app;
   useEffect(() => {
@@ -228,11 +232,13 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
     const host = /^host:\s*(\S+)/im.exec(raw)?.[1];
     const to = target || (host ? `${/:443$/.test(host) ? "https" : "http"}://${host.replace(/:443$/, "")}` : "");
     if (!to) return app.toast("Set a target (ws://, wss://, http:// or https://host[:port]) or a Host header", "error");
+    const problem = optionsProblem(options);
+    if (problem) return app.toast(problem, "error");
     setTarget(to);
     setBusy(true);
     let r: WsSendResult | string;
     try {
-      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined }), wsSendInput(raw, splitMessages(text)));
+      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), wsSendInput(raw, splitMessages(text)));
     } catch (e: any) {
       r = e.message as string;
     }
@@ -270,9 +276,11 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
           Until
         </span>
         <input className="input mono" style={{ width: 160 }} placeholder="regex (optional)" value={until} onChange={(e) => setUntil(e.target.value)} />
+        <OptionsToggle options={options} kind="ws" open={showOptions} onToggle={() => setShowOptions(!showOptions)} />
         <span className="grow" />
         <span className="muted">{status}</span>
       </div>
+      {showOptions && <OptionsRow options={options} set={setOptions} kind="ws" />}
       <Split id="ws-replay" dir="row">
         <Split id="ws-replay-in" dir="col" initial={0.5}>
           <HttpView title="Handshake" value={raw} onChange={setRaw} />

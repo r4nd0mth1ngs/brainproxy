@@ -2,6 +2,7 @@
 // WebSockets tab and Replay's WebSocket mode share.
 
 import type { Body } from "../api";
+import { optionArgs, type ReplayOptions } from "./replayOptions.ts";
 
 export interface WsConnection {
   id: number;
@@ -75,7 +76,7 @@ export function joinMessages(messages: string[]): string {
 }
 
 /** `ws send` arguments; the handshake and messages go on stdin (see `wsSendInput`), out of the process list. */
-export function wsSendArgs(o: { target: string; wait: number; until?: string }): string[] {
+export function wsSendArgs(o: { target: string; wait: number; until?: string; options?: Partial<ReplayOptions> }): string[] {
   return [
     "ws",
     "send",
@@ -83,6 +84,7 @@ export function wsSendArgs(o: { target: string; wait: number; until?: string }):
     "--wait",
     String(o.wait),
     ...(o.until ? [`--until=${o.until}`] : []),
+    ...optionArgs(o.options, "ws"),
     "--input-json",
     "--max-body=2000000",
   ];

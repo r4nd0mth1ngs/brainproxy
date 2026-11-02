@@ -271,11 +271,23 @@ Edit a raw request and send it as often as you like, in separate tabs.
   `?q=x'%20OR%201=1--`.
 - **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
   works in every request editor.
+- **Options** (per tab): each option that isn't the default shows as a chip next to the
+  button, so you can see how the tab sends.
+  - **HTTP/2**: send over HTTP/2 (`send --http2`). The request line can stay `HTTP/1.1`.
+  - **Send as typed** (`send --verbatim`): for request smuggling and other malformed
+    requests. Content-Length isn't updated, auto URL-encode is skipped, and no blank line is
+    added after the headers. The editor can't hold a CR, so every line break goes out as
+    CRLF, in the body too; a binary body keeps its bytes.
+  - **SNI**: the TLS server name to send instead of the target's host.
+  - **Timeout**: seconds the request may take (30 by default).
+  - **Verify TLS**: refuse a server certificate that isn't valid (off by default).
+  - **Don't record**: the exchange isn't saved in history (`--no-store`).
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
-  reply matches **Until**. Each run is recorded like proxied traffic.
+  reply matches **Until**. Each run is recorded like proxied traffic, unless **Don't
+  record** is on. Their Options are SNI, Timeout, Verify TLS and Don't record.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an

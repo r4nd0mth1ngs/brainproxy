@@ -3,6 +3,7 @@
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
+import type { ReplayOptions } from "./views/replayOptions";
 
 export type Tab =
   | "dashboard"
@@ -32,6 +33,8 @@ export interface Handoff {
 export interface RepeaterTab extends Handoff {
   key: number;
   title: string;
+  /** Send options (HTTP/2, as typed, SNI, ...); missing means the CLI's defaults. */
+  options?: Partial<ReplayOptions>;
 }
 
 interface Toast {
