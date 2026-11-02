@@ -333,6 +333,54 @@ test("an import's progress and what it says when done", () => {
   assert.equal(r.notes.length, 6);
 });
 
+test("the import's arguments in the edge cases", () => {
+  const plan = { source: "/s.yaml", sha256: SHA, target: EMPTY_TARGET, operations: OPS, selected: [2], profile: "" };
+  // Nothing an import never needs, and nothing that could carry a credential.
+  for (const args of [importArgs(plan), importArgs({ ...plan, selected: [1, 3, 6], profile: "p" })])
+    assert.ok(!args.some((a) => a === "--dry-run" || a === "--include-destructive" || a === "-H" || a.startsWith("--header") || a.startsWith("--max-requests") || a.startsWith("--api")), args.join(" "));
+  // No server chosen and no environment: no --server, and no environment pin without its file.
+  assert.deepEqual(importArgs(plan), ["import", "api", `--expect-sha256=${SHA}`, "--only=2", "--background", "--", "/s.yaml"]);
+  // Indexes sort as numbers, and the selection passed in is left as it was.
+  const selected = [100, 9, 10];
+  assert.ok(importArgs({ ...plan, operations: Array.from({ length: 101 }, (_, i) => op(i, "GET")), selected }).includes("--only=9,10,100"));
+  assert.deepEqual(selected, [100, 9, 10]);
+  // A base URL, variables and an odd file name each stay one argument, as typed.
+  const odd = importArgs({ ...plan, source: "  /my specs/a;b $(x).yaml ", target: { ...EMPTY_TARGET, server: 1, baseUrl: " http://a.test/v1 ", vars: { tenant: "a b", empty: "" } } });
+  assert.deepEqual(odd.slice(3, -3), ["--base-url=http://a.test/v1", "--var=tenant=a b", "--only=2"]);
+  assert.deepEqual(odd.slice(-2), ["--", "/my specs/a;b $(x).yaml"]);
+  // A GraphQL endpoint: introspected, and a mutation goes only when ticked, named MUTATION.
+  const gql = [gqlOp(0, "mutation drop", "MUTATION"), gqlOp(1, "query me")];
+  const g = { ...plan, source: "https://a.test/graphql", target: { ...EMPTY_TARGET, graphql: true }, operations: gql };
+  assert.deepEqual(importArgs({ ...g, selected: [1] }), ["import", "api", `--expect-sha256=${SHA}`, "--graphql", "--only=1", "--background", "--", "https://a.test/graphql"]);
+  assert.ok(importArgs({ ...g, selected: [0, 1] }).includes("--include-methods=MUTATION"));
+});
+
+test("an import's progress and result in the edge cases", () => {
+  assert.equal(importProgressText({ sent: 0, total: 0 }), "Sending each operation once and recording it.");
+  assert.equal(importProgressText({ total: 3 }), "Sending each operation once and recording it: 0 of 3 sent.");
+  assert.deepEqual(importResultText(undefined), { headline: "Nothing was recorded.", notes: [] });
+  // Stopped before anything went out: nothing recorded, and it says why.
+  assert.deepEqual(importResultText({ sent: 0, stopped: true }), { headline: "Nothing was recorded.", notes: ["Stopped before every operation was sent."] });
+  // Every request is recorded, those without a response too: they count in the headline.
+  const r = importResultText({ sent: 2, by_status: { "403": 1, error: 1 }, errors: 1, skipped_out_of_scope: 2, out_of_scope_hosts: [], new_findings: 1 });
+  assert.equal(r.headline, "2 requests recorded in history.");
+  assert.deepEqual(r.notes, [
+    "1 operation was rejected (401 or 403). The responses are recorded too, but check the authentication before working on them.",
+    "1 operation got no response, and is recorded with the error.",
+    "2 operations outside the project's scope were not sent.",
+    "The passive checks found 1 issue in the responses. See Findings.",
+  ]);
+  assert.match(importResultText({ sent: 3, errors: 3 }).notes[0], /^3 operations got no response, and are recorded with the error\.$/);
+  // An "error" status alone, or empty lists, add no note.
+  assert.deepEqual(importResultText({ sent: 1, by_status: { error: 1 }, errors: 0, skipped: [], out_of_scope_hosts: ["o.test"], new_findings: 0, stopped: false }).notes, []);
+  // The scan's notes are unchanged by the shared plural helper.
+  assert.deepEqual(apiResultNotes({ sent: 1, by_status: { "401": 1 }, errors: 2, skipped_out_of_scope: 1, out_of_scope_hosts: [] }), [
+    "1 operation was rejected (401 or 403) of 1 sent. They were scanned anyway, but what's behind authentication was not reached, so check the authentication.",
+    "2 operations got no response and couldn't be scanned.",
+    "1 operation outside the project's scope was skipped.",
+  ]);
+});
+
 test("what the key form starts on", () => {
   const cred = (patch: Partial<ApiCredential>): ApiCredential => ({ kind: "api_key", in: "header", name: "X-K", source: "s", embedded: false, ...patch });
   assert.deepEqual(keyDefaults([]), { keyKind: "api_key", place: "header", keyName: "" });
@@ -417,6 +465,13 @@ test("signer coverage", () => {
   assert.match(scanOnly.message, /the import would send unsigned/);
   assert.match(signerCoverage([], signer, urls, "crawl").message, /the import would send/);
   assert.match(signerCoverage([rule({ url: "https://api.test/v2/" })], signer, urls, "crawl").message, /every address being sent/);
+  // A rule for every tool covers both; the scan stays the default; the signer's origins still bind an import.
+  assert.equal(signerCoverage([rule({ tools: ["scan", "crawl"] })], signer, urls, "crawl").state, "covered");
+  assert.deepEqual(signerCoverage([rule({ tools: ["crawl"] })], signer, urls), signerCoverage([rule({ tools: ["crawl"] })], signer, urls, "scan"));
+  assert.equal(signerCoverage([], signer, urls, "crawl").checkCovered, false);
+  const away = signerCoverage([rule({ tools: ["crawl"] })], signer, ["https://other.test/x"], "crawl");
+  assert.equal(away.state, "origin_limited");
+  assert.match(away.message, /other\.test would go unsigned/);
 
   assert.equal(signerCoverage([rule({ url: "https://api.test/v1/" })], signer, urls).state, "covered");
   assert.equal(signerCoverage([rule({ url: "https://api.test/v2/" })], signer, urls).state, "url_limited");

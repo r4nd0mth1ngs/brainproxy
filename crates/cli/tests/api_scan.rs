@@ -1029,6 +1029,62 @@ fn background_jobs_read_the_file_where_they_were_started_and_report_progress() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Import API in the app (gui/src/views/apiScan.ts importArgs): the ticked operations, pinned to
+/// the document previewed, as a job whose result the app reads when it's done.
+#[test]
+fn an_import_job_as_the_app_starts_it_records_only_the_ticked_operations() {
+    let (dir, p) = setup("import-job", "127.0.0.1");
+    let api = Api::start();
+    let src = fixture(&dir, "openapi3.json", api.port);
+    let d = preview(&p, &src, &[]);
+    let pin = format!("--expect-sha256={}", d["document_sha256"].as_str().unwrap());
+    let mut ticked = [index_of(&d, "getPet"), index_of(&d, "deletePet"), index_of(&d, "elsewhere")];
+    ticked.sort();
+    let only = format!("--only={}", ticked.map(|i| i.to_string()).join(","));
+    let args = ["import", "api", &pin, "--server=0", &only, "--include-methods=DELETE", "--background", "--", &src];
+    let job = ok(&p, &args)["job"].as_i64().unwrap().to_string();
+    ok(&p, &["job", "wait", &job, "--timeout", "60"]);
+    let j = ok(&p, &["job", "status", &job]);
+    assert_eq!((j["kind"].as_str(), j["state"].as_str()), (Some("import"), Some("completed")), "{j}");
+    let r = &j["result"];
+    // What importResultText reads.
+    assert_eq!(
+        (r["sent"].as_u64(), r["errors"].as_u64(), r["stopped"].as_bool()),
+        (Some(2), Some(0), Some(false)),
+        "{r}"
+    );
+    assert_eq!(r["by_status"], json!({"200": 2}), "{r}");
+    assert_eq!(
+        (r["skipped_out_of_scope"].as_u64(), &r["out_of_scope_hosts"]),
+        (Some(1), &json!(["elsewhere.example.test"])),
+        "{r}"
+    );
+    assert!(r["new_findings"].is_u64(), "{r}");
+    let mut sent: Vec<(String, String)> = api.hits().into_iter().map(|h| (h.method, h.target)).collect();
+    sent.sort();
+    assert_eq!(sent, [("DELETE".into(), "/v1/pets/7".into()), ("GET".into(), "/v1/pets/7".into())], "nothing unticked");
+    let hist =
+        ok(&p, &["query", "SELECT source, method, count(*) FROM history GROUP BY source, method ORDER BY method"]);
+    assert_eq!(hist["rows"], json!([["import", "DELETE", 1], ["import", "GET", 1]]));
+    // The job keeps the pin and the selection with its arguments.
+    let kept: Vec<&str> = j["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    assert!(kept.contains(&pin.as_str()) && kept.contains(&only.as_str()), "{kept:?}");
+
+    // A destructive operation ticked without the opt-in that comes with it is refused up front.
+    let n = api.hits().len();
+    let del = format!("--only={}", index_of(&d, "deletePet"));
+    let e = refused(&p, &["import", "api", &pin, &del, "--background", "--", &src], 2, "invalid_input");
+    assert!(e.contains("--include-methods"), "{e}");
+    // A document changed since the preview is refused at once, not in a failed job.
+    let jobs = ok(&p, &["job", "list"])["jobs"].as_array().unwrap().len();
+    std::fs::write(&src, std::fs::read_to_string(&src).unwrap() + "\n").unwrap();
+    let e = refused(&p, &args, 2, "invalid_input");
+    assert!(e.contains("changed"), "{e}");
+    assert_eq!(ok(&p, &["job", "list"])["jobs"].as_array().unwrap().len(), jobs);
+    assert_eq!(api.hits().len(), n);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_changed_file_fails_a_job_started_with_its_hash() {
     let (dir, p) = setup("changed", "127.0.0.1");
