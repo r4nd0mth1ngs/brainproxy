@@ -523,6 +523,7 @@ fn env_pair(flag: &str, spec: &str) -> Result<(String, String), Error> {
     if name.is_empty() || var.is_empty() {
         return Err(bad());
     }
+    crate::mcp::check_secret_env(flag, var)?;
     // Only a name that looks like one is repeated: a key given here by mistake must not be.
     let shown = if var.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
         var
@@ -559,6 +560,7 @@ fn oauth_from_args(a: &AddArgs) -> Result<Option<OAuth>, Error> {
     let Some(flow) = &a.oauth_flow else { return Ok(None) };
     let secret = |flag: &str, var: &Option<String>| -> Result<Option<Secret>, Error> {
         let Some(var) = var else { return Ok(None) };
+        crate::mcp::check_secret_env(flag, var)?;
         if !a.oauth_store_secrets {
             return Ok(Some(Secret::Env(var.clone())));
         }
@@ -569,11 +571,19 @@ fn oauth_from_args(a: &AddArgs) -> Result<Option<OAuth>, Error> {
         .oauth_params
         .iter()
         .map(|p| {
-            p.split_once('=')
+            let (k, v) = p
+                .split_once('=')
                 .map(|(k, v)| (k.trim().to_string(), v.to_string()))
-                .ok_or_else(|| Error::InvalidInput("--oauth-param: expected NAME=VALUE".into()))
+                .ok_or_else(|| Error::InvalidInput("--oauth-param: expected NAME=VALUE".into()))?;
+            if secret_param(&k) {
+                return Err(Error::InvalidInput(format!(
+                    "--oauth-param {k} looks like a credential and would be stored as given; use \
+                     --oauth-client-secret-env or --oauth-refresh-token-env"
+                )));
+            }
+            Ok((k, v))
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, Error>>()?;
     Ok(Some(OAuth {
         flow: Flow::parse(flow)?,
         token_url: a.oauth_token_url.clone().unwrap_or_default(),
@@ -587,6 +597,12 @@ fn oauth_from_args(a: &AddArgs) -> Result<Option<OAuth>, Error> {
         authorize_url: a.oauth_authorize_url.clone(),
         redirect_port: a.oauth_redirect_port,
     }))
+}
+
+/// A token request field that holds a credential: refused by --oauth-param, masked by `auth show`.
+fn secret_param(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    brainproxy_core::apiimport::looks_secret(&n) || n.contains("assertion") || n.contains("credential")
 }
 
 /// Opens `url` in the system browser, passed as one argument with no shell between.
@@ -615,7 +631,8 @@ fn oauth_cmd(project: &Path, cmd: OauthCmd, out: &Out) -> Result<(), Error> {
             let result = runtime()?.block_on(session.oauth_authorize(Duration::from_secs(wait), |url| {
                 // On stderr: the JSON on stdout comes when the sign-in is done.
                 eprintln!("Sign in at: {url}");
-                if !no_open && open_browser(url).is_err() {
+                // An agent mustn't open the user's browser at a page it chose.
+                if !no_open && !crate::mcp::in_tool_call() && open_browser(url).is_err() {
                     eprintln!("Could not open a browser; open the URL above yourself.");
                 }
             }))?;
@@ -674,6 +691,9 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 .transpose()?;
             if login_request.is_some() && a.login_url.is_none() {
                 return Err(Error::InvalidInput("--login-request needs --login-url (where to send it)".into()));
+            }
+            if let Some(var) = &a.password_env {
+                crate::mcp::check_secret_env("--password-env", var)?;
             }
             let mut headers = parse(&a.headers)?;
             for spec in &a.header_env {
@@ -849,8 +869,14 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             let store = Store::open(project)?;
             let (profile, state) = store.auth_profile(&name)?;
             let handling = store.auth_handling(&name)?;
+            let mut profile = profile.redacted();
+            for (k, v) in profile.oauth.iter_mut().flat_map(|o| o.params.iter_mut()) {
+                if secret_param(k) {
+                    *v = "********".into();
+                }
+            }
             let data = json!({
-                "profile": profile.redacted(),
+                "profile": profile,
                 "session": state_json(&state),
                 "macros": handling.macros.iter().map(macro_summary).collect::<Vec<_>>(),
                 "rules": handling.rules,
@@ -912,6 +938,7 @@ fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), 
                 .collect();
             let mut p = brainproxy_core::auth_record::analyze(&recorded, &name, started["url"].as_str());
             if let Some(var) = &password_env {
+                crate::mcp::check_secret_env("--password-env", var)?;
                 if p.profile.password.is_some() {
                     p.profile.password = Some(Secret::Env(var.clone()));
                 }
@@ -1243,6 +1270,22 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 script_vars,
                 keep_place,
             } = *args;
+            if script.is_some() && crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "--script runs code from a collection, so it isn't offered through MCP: a person must read the \
+                     script (`import api --show-scripts`) and add the signer in the app or a terminal"
+                        .into(),
+                ));
+            }
+            for (flag, var) in [
+                ("--secret-env", &secret_env),
+                ("--access-key-env", &access_key_env),
+                ("--session-token-env", &session_token_env),
+            ] {
+                if let Some(var) = var {
+                    crate::mcp::check_secret_env(flag, var)?;
+                }
+            }
             let key = match (secret_env, secret_file.or(environment)) {
                 (Some(var), _) => KeySource::Env(var),
                 (_, Some(path)) => KeySource::File(path),
