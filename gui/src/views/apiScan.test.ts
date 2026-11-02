@@ -10,6 +10,8 @@ import {
   oauthProblems,
   scriptSignerForm,
   scriptTextArgs,
+  hiddenCharacters,
+  revealHidden,
   EMPTY_TARGET,
   KEY_ENV,
   apiResultNotes,
@@ -525,4 +527,24 @@ test("new signer kinds round-trip through their form", () => {
   assert.equal(form.name, "postman-script-abcdef01");
   assert.ok(signerAddArgs("p", form).includes("--secret-file=/e.json"));
   assert.ok(signerProblems({ ...EMPTY_SIGNER, name: "a", kind: "sigv4", keyFrom: "env", key: "SK", origins: "https://a.test" }, []).some((m) => m.includes("region")));
+});
+
+test("hidden characters in a script are flagged and written out", () => {
+  const text = 'const ok = 1;\nif (user !== "admin‮ ⁦// check⁩ ⁦") {​}\n';
+  const found = hiddenCharacters(text);
+  assert.deepEqual(
+    found.map((f) => [f.code, f.line, f.count]),
+    [
+      ["U+202E", 2, 1],
+      ["U+2066", 2, 2],
+      ["U+2069", 2, 1],
+      ["U+200B", 2, 1],
+    ],
+  );
+  assert.equal(found[0].name, "right-to-left override");
+  const shown = revealHidden(text);
+  assert.ok(shown.includes("admin⟦U+202E⟧"), shown);
+  assert.equal(hiddenCharacters(shown).length, 0);
+  assert.deepEqual(hiddenCharacters("plain ascii\nand émoji \u{1F642}"), []);
+  assert.equal(hiddenCharacters("tag \u{E0041}")[0].code, "U+E0041");
 });

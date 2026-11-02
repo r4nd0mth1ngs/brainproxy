@@ -2,9 +2,10 @@
 // signer, tick the operations, then a `scan active --api` job. Hosted where the website wizard
 // is. The logic is in apiScan.ts; this file holds the screens and the CLI calls.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { bodyText, inTauri, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
+import { confirm } from "../ui/Confirm";
 import { loadSuggestions } from "./Scanner";
 import { OAuthFields, ScriptChoice } from "./ApiAuthExtras";
 import { SignerBuilder } from "./SessionHandling";
@@ -72,6 +73,7 @@ import {
   type ApiOperation,
   type ApiPreview,
   type ApiTarget,
+  type AuthPatch,
   type AuthState,
   type KeyKind,
 } from "./apiScan";
@@ -245,7 +247,8 @@ export function ApiWizard(p: Props) {
   // After every hook above: the hook count must not change between renders.
   if (p.jobId != null) return <WizardProgress jobId={p.jobId} onClose={p.onDismiss} />;
 
-  const previewed = !!preview && source === typed.trim();
+  // The GraphQL tick changes what the URL is read as, so a preview without it is of something else.
+  const previewed = !!preview && source === typed.trim() && target.graphql === (graphqlEndpoint && sourceKind(source) === "url");
   const blockers: string[] =
     !preview
       ? []
@@ -370,6 +373,7 @@ function DefinitionStep(p: {
         </button>
         <input
           className="input wiz-input"
+          aria-label="API definition URL"
           placeholder="or paste a URL, e.g. https://api.example.com/openapi.json"
           value={p.typed}
           spellCheck={false}
@@ -498,19 +502,20 @@ function ServerStep(p: {
       <label className="label">Where is the API?</label>
       <div className="wiz-choices">
         {d.servers.map((s) => (
-          <button key={s.index} className={`wiz-choice ${!p.customBase && t.server === s.index ? "on" : ""}`} onClick={() => useServer(s.index)}>
+          <button key={s.index} className={`wiz-choice ${!p.customBase && t.server === s.index ? "on" : ""}`} aria-pressed={!p.customBase && t.server === s.index} onClick={() => useServer(s.index)}>
             <b className="mono">{s.url}</b>
             {s.description && <span>{s.description}</span>}
           </button>
         ))}
         {!d.servers.length && !d.base_url_required && (
-          <button className={`wiz-choice ${!p.customBase ? "on" : ""}`} onClick={() => useServer(null)}>
+          <button className={`wiz-choice ${!p.customBase ? "on" : ""}`} aria-pressed={!p.customBase} onClick={() => useServer(null)}>
             <b>The addresses in the definition</b>
             <span>Each operation goes where the definition says.</span>
           </button>
         )}
         <button
           className={`wiz-choice ${p.customBase ? "on" : ""}`}
+          aria-pressed={p.customBase}
           onClick={() => {
             p.setCustomBase(true);
             p.setTarget({ ...t, server: null });
@@ -523,6 +528,7 @@ function ServerStep(p: {
       {p.customBase && (
         <input
           className="input full wiz-input"
+          aria-label={d.format === "graphql" ? "GraphQL endpoint URL" : "Base URL"}
           placeholder="https://api.example.com/v1"
           value={t.baseUrl}
           spellCheck={false}
@@ -606,7 +612,7 @@ function AuthStep(p: {
   target: ApiTarget;
   selected: number[];
   auth: AuthState;
-  setAuth: (a: AuthState) => void;
+  setAuth: Dispatch<SetStateAction<AuthState>>;
   draft: SignerForm | null;
   setDraft: (f: SignerForm | null) => void;
 }) {
@@ -616,7 +622,8 @@ function AuthStep(p: {
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
   const a = p.auth;
-  const set = (patch: Partial<AuthState>) => p.setAuth({ ...a, ...patch });
+  // From the latest state: saves finish after the user may have changed something else.
+  const set = (patch: AuthPatch) => p.setAuth((prev) => ({ ...prev, ...(typeof patch === "function" ? patch(prev) : patch) }));
   const ops = p.preview.requests;
   const inScope = ops.filter((o) => o.in_scope);
   const origins = operationOrigins(likelyInScope(ops));
@@ -637,14 +644,15 @@ function AuthStep(p: {
 
   useEffect(() => {
     reload().then((d) => {
-      if (d && !a.profileName) set({ profileName: defaultProfileName(p.preview.title, d.profiles.map((x) => x.name)) });
+      if (d) set((prev) => (prev.profileName ? {} : { profileName: defaultProfileName(p.preview.title, d.profiles.map((x) => x.name)) }));
     });
   }, []);
 
   const scriptOrigins = operationOrigins(likelyInScope(ops));
   const scriptSaved = async (name: string, sha: string) => {
+    // The profile ScriptChoice saved it in.
     const home = signerHome(a);
-    p.setAuth({ ...a, signing: true, signer: { profile: home, name }, script: sha });
+    set({ signing: true, signer: { profile: home, name }, script: sha });
     p.setDraft(null);
     await reload();
   };
@@ -656,7 +664,7 @@ function AuthStep(p: {
   const pickSigner = (profile: string, name: string) => {
     // A scan uses one profile, and `auth add` can't add a key to one that exists: pick its profile.
     const moved = authProfile(a) !== profile;
-    p.setAuth({ ...a, signing: true, signer: { profile, name }, ...(moved ? { mode: "profile" as const, existing: profile } : {}) });
+    set({ signing: true, signer: { profile, name }, ...(moved ? { mode: "profile" as const, existing: profile } : {}) });
     p.setDraft(null);
     setNote(moved ? `Selected the profile "${profile}", which holds this signer. The scan runs with that profile's credentials.` : "");
   };
@@ -669,7 +677,7 @@ function AuthStep(p: {
       const name = f.name.trim();
       // The session rule is what turns a signer on. If it fails, the coverage check below offers it again.
       for (const args of signRuleArgs(home, name, signerFormOrigins(f))) await run(args);
-      p.setAuth({ ...a, signing: true, signer: { profile: home, name } });
+      set({ signing: true, signer: { profile: home, name } });
       p.setDraft(null);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -690,6 +698,34 @@ function AuthStep(p: {
     setSaving(false);
   };
 
+  /** Before other credentials replace the saved ones: their profile holds stored secrets, so offer to remove it. */
+  const leaveSaved = async () => {
+    const saved = a.savedProfile;
+    if (!saved || (a.mode !== "key" && a.mode !== "oauth")) return;
+    const withSigner = a.signer?.profile === saved;
+    const what = a.mode === "oauth" ? "the OAuth client secret and tokens" : "the key";
+    const remove = await confirm(
+      `Remove the profile "${saved}"?`,
+      `It holds ${what} you saved${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. Keep it to choose it later as an existing profile.`,
+      "Remove it",
+      "Keep it",
+    );
+    if (!remove) return;
+    try {
+      await run(["auth", "remove", "--", saved]);
+      if (withSigner) set((prev) => (prev.signer?.profile === saved ? { signer: null, script: null } : {}));
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    await reload();
+  };
+
+  const choose = async (mode: AuthState["mode"]) => {
+    if (mode === a.mode) return;
+    await leaveSaved();
+    set({ mode, savedProfile: "" });
+  };
+
   const signerNames = data?.signers.filter((s) => s.profile === signerHome(a)).map((s) => s.signer.name) ?? [];
   const draftProblems = p.draft ? [...(data ? [] : ["Profiles are still loading."]), ...newSignerProblems(a, taken), ...signerProblems(p.draft, signerNames)] : [];
 
@@ -698,27 +734,27 @@ function AuthStep(p: {
       <label className="label">Does the API need authentication?</label>
       {loadProblem && <div className="wiz-problem">Couldn't read the auth profiles: {loadProblem}</div>}
       <div className="wiz-choices four">
-        <button className={`wiz-choice ${a.mode === "none" ? "on" : ""}`} onClick={() => set({ mode: "none" })}>
+        <button className={`wiz-choice ${a.mode === "none" ? "on" : ""}`} aria-pressed={a.mode === "none"} onClick={() => choose("none")}>
           <b>No authentication</b>
           <span>Test what anyone can reach. A good start.</span>
         </button>
-        <button className={`wiz-choice ${a.mode === "key" ? "on" : ""}`} onClick={() => set({ mode: "key", savedProfile: a.mode === "key" ? a.savedProfile : "" })}>
+        <button className={`wiz-choice ${a.mode === "key" ? "on" : ""}`} aria-pressed={a.mode === "key"} onClick={() => choose("key")}>
           <b>API key or bearer token</b>
           <span>The usual way. Stored in a new auth profile.</span>
         </button>
-        <button className={`wiz-choice ${a.mode === "oauth" ? "on" : ""}`} onClick={() => set({ mode: "oauth", savedProfile: a.mode === "oauth" ? a.savedProfile : "" })}>
+        <button className={`wiz-choice ${a.mode === "oauth" ? "on" : ""}`} aria-pressed={a.mode === "oauth"} onClick={() => choose("oauth")}>
           <b>OAuth 2</b>
           <span>Gets a token, and a new one as it runs out.</span>
         </button>
-        <button className={`wiz-choice ${a.mode === "profile" ? "on" : ""}`} onClick={() => set({ mode: "profile" })}>
+        <button className={`wiz-choice ${a.mode === "profile" ? "on" : ""}`} aria-pressed={a.mode === "profile"} onClick={() => choose("profile")}>
           <b>Existing auth profile</b>
           <span>{taken.length ? "One you already set up." : "This project has none yet."}</span>
         </button>
       </div>
 
-      {a.mode === "key" && <KeyFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} origins={origins} reload={reload} />}
+      {a.mode === "key" && <KeyFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} origins={origins} reload={reload} leave={leaveSaved} />}
 
-      {a.mode === "oauth" && <OAuthFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} reload={reload} />}
+      {a.mode === "oauth" && <OAuthFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} reload={reload} leave={leaveSaved} />}
 
       {a.mode === "profile" && (
         <label>
@@ -770,6 +806,7 @@ function AuthStep(p: {
                   <button
                     key={`${s.profile}/${s.signer.name}`}
                     className={`wiz-choice ${a.signer?.profile === s.profile && a.signer.name === s.signer.name ? "on" : ""}`}
+                    aria-pressed={a.signer?.profile === s.profile && a.signer.name === s.signer.name}
                     onClick={() => pickSigner(s.profile, s.signer.name)}
                   >
                     <b>
@@ -820,12 +857,14 @@ function AuthStep(p: {
 /** The key's input stays out of React state: it lives in the DOM until saved, then it's cleared. */
 function KeyFields(p: {
   auth: AuthState;
-  set: (patch: Partial<AuthState>) => void;
+  set: (patch: AuthPatch) => void;
   preview: ApiPreview;
   taken: string[];
   loaded: boolean;
   origins: string[];
   reload: () => Promise<unknown>;
+  /** Before another key replaces the saved one: offers to remove the profile holding it. */
+  leave: () => Promise<void>;
 }) {
   const a = p.auth;
   const input = useRef<HTMLInputElement>(null);
@@ -837,7 +876,13 @@ function KeyFields(p: {
     return (
       <div className="wiz-good">
         Saved in the profile "{a.savedProfile}". The value isn't shown again.{" "}
-        <button className="link" onClick={() => p.set({ savedProfile: "", profileName: defaultProfileName(p.preview.title, p.taken) })}>
+        <button
+          className="link"
+          onClick={async () => {
+            await p.leave();
+            p.set({ savedProfile: "", profileName: defaultProfileName(p.preview.title, p.taken) });
+          }}
+        >
           Enter a different one
         </button>
       </div>
@@ -868,7 +913,7 @@ function KeyFields(p: {
         <span className="label">Type</span>
         <div className="seg">
           {(["api_key", "bearer"] as KeyKind[]).map((k) => (
-            <button key={k} className={a.keyKind === k ? "on" : ""} onClick={() => p.set(keyKindDefaults(p.preview.credentials, k))}>
+            <button key={k} className={a.keyKind === k ? "on" : ""} aria-pressed={a.keyKind === k} onClick={() => p.set(keyKindDefaults(p.preview.credentials, k))}>
               {k === "bearer" ? "Bearer token" : "API key"}
             </button>
           ))}
@@ -878,10 +923,10 @@ function KeyFields(p: {
         <div>
           <span className="label">Goes in</span>
           <div className="seg">
-            <button className={a.place === "header" ? "on" : ""} onClick={() => p.set({ place: "header" })}>
+            <button className={a.place === "header" ? "on" : ""} aria-pressed={a.place === "header"} onClick={() => p.set({ place: "header" })}>
               Header
             </button>
-            <button className={a.place === "query" ? "on" : ""} onClick={() => p.set({ place: "query" })}>
+            <button className={a.place === "query" ? "on" : ""} aria-pressed={a.place === "query"} onClick={() => p.set({ place: "query" })}>
               Query
             </button>
           </div>
@@ -1118,7 +1163,7 @@ function StartStep(p: {
       <label className="label">How thorough should it be?</label>
       <div className="wiz-choices three">
         {DEPTHS.map((x) => (
-          <button key={x.id} className={`wiz-choice ${p.depth === x.id ? "on" : ""}`} onClick={() => p.setDepth(x.id)}>
+          <button key={x.id} className={`wiz-choice ${p.depth === x.id ? "on" : ""}`} aria-pressed={p.depth === x.id} onClick={() => p.setDepth(x.id)}>
             <b>{x.title}</b>
             <span className="wiz-time">{x.time}</span>
             <span>{apiDepthText(x.id)}</span>
@@ -1128,7 +1173,7 @@ function StartStep(p: {
       <label className="label">How hard may it push the API?</label>
       <div className="wiz-choices three">
         {SPEEDS.map((s) => (
-          <button key={s.id} className={`wiz-choice ${p.speed === s.id ? "on" : ""} ${s.danger ? "danger" : ""}`} onClick={() => p.setSpeed(s.id)}>
+          <button key={s.id} className={`wiz-choice ${p.speed === s.id ? "on" : ""} ${s.danger ? "danger" : ""}`} aria-pressed={p.speed === s.id} onClick={() => p.setSpeed(s.id)}>
             <b>{s.title}</b>
             <span>{apiSpeedText(s.id)}</span>
           </button>

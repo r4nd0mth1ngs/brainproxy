@@ -394,7 +394,10 @@ export interface AuthState {
   script: string | null;
 }
 
-export type OAuthFlow = "client_credentials" | "password" | "refresh_token" | "authorization_code";
+/** A change to the auth state: fields, or fields worked out from the latest state. */
+export type AuthPatch = Partial<AuthState> | ((prev: AuthState) => Partial<AuthState>);
+
+export type OAuthFlow ="client_credentials" | "password" | "refresh_token" | "authorization_code";
 
 /** No secrets: those stay in their inputs until saved. */
 export interface OAuthForm {
@@ -486,6 +489,47 @@ export function oauthDefaults(hints: ApiOAuthHint[]): OAuthForm {
   if (!h) return EMPTY_OAUTH;
   return { ...EMPTY_OAUTH, flow: h.flow ?? "client_credentials", tokenUrl: h.token_url ?? "", authorizeUrl: h.authorize_url ?? "", scope: h.scopes.join(" ") };
 }
+
+// Text-direction controls and characters that show as nothing: code can read differently from
+// how it looks ("Trojan Source"), so a script holding them is flagged before it can be chosen.
+const HIDDEN = /[­͏؜ᅟᅠ឴឵᠎​-‏‪-‮⁠-⁤⁦-⁯ㅤ﻿ﾠ\u{E0000}-\u{E007F}]/gu;
+
+const HIDDEN_NAMES: Record<number, string> = {
+  0x200b: "zero-width space",
+  0x200c: "zero-width non-joiner",
+  0x200d: "zero-width joiner",
+  0x200e: "left-to-right mark",
+  0x200f: "right-to-left mark",
+  0x202a: "left-to-right embedding",
+  0x202b: "right-to-left embedding",
+  0x202c: "pop directional formatting",
+  0x202d: "left-to-right override",
+  0x202e: "right-to-left override",
+  0x2066: "left-to-right isolate",
+  0x2067: "right-to-left isolate",
+  0x2068: "first strong isolate",
+  0x2069: "pop directional isolate",
+  0xfeff: "zero-width no-break space",
+};
+
+const codePoint = (c: string) => `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+
+/** The hidden characters in a script, one entry per kind: where it first appears and what it is. */
+export function hiddenCharacters(text: string): { code: string; name: string; line: number; count: number }[] {
+  const found = new Map<string, { code: string; name: string; line: number; count: number }>();
+  text.split("\n").forEach((line, i) => {
+    for (const m of line.matchAll(HIDDEN)) {
+      const code = codePoint(m[0]);
+      const seen = found.get(code);
+      if (seen) seen.count++;
+      else found.set(code, { code, name: HIDDEN_NAMES[m[0].codePointAt(0)!] ?? "invisible character", line: i + 1, count: 1 });
+    }
+  });
+  return [...found.values()];
+}
+
+/** A script's text with each hidden character written out as ⟦U+XXXX⟧, so what's shown is what runs. */
+export const revealHidden = (text: string): string => text.replace(HIDDEN, (c) => `⟦${codePoint(c)}⟧`);
 
 /** A script signer's form: the collection's file, pinned to the script's hash. */
 export const scriptSignerForm = (source: string, sha256: string, environment: string, origins: string[]): SignerForm => ({

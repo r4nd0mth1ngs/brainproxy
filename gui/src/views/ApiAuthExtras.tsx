@@ -1,12 +1,14 @@
 // The API guided scan's OAuth setup and Postman script choice. The logic is in apiScan.ts.
 
 import { useRef, useState } from "react";
-import { run } from "../api";
+import { cancelCli, run } from "../api";
 import {
+  hiddenCharacters,
   oauthAddArgs,
   oauthDefaults,
   oauthEnv,
   oauthProblems,
+  revealHidden,
   scriptSignerForm,
   scriptTextArgs,
   scrubSecret,
@@ -14,6 +16,7 @@ import {
   sourceKind,
   type ApiPreview,
   type ApiTarget,
+  type AuthPatch,
   type AuthState,
   type OAuthFlow,
   type OAuthForm,
@@ -28,22 +31,39 @@ const FLOWS: { id: OAuthFlow; label: string; text: string }[] = [
 ];
 
 /** The secrets' inputs stay out of React state: they live in the DOM until saved, then they're cleared. */
-export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState>) => void; preview: ApiPreview; taken: string[]; loaded: boolean; reload: () => Promise<unknown> }) {
+export function OAuthFields(p: {
+  auth: AuthState;
+  set: (patch: AuthPatch) => void;
+  preview: ApiPreview;
+  taken: string[];
+  loaded: boolean;
+  reload: () => Promise<unknown>;
+  /** Before other settings replace the saved ones: offers to remove the profile holding them. */
+  leave: () => Promise<void>;
+}) {
   const a = p.auth;
   const f = a.oauth;
-  const setForm = (patch: Partial<OAuthForm>) => p.set({ oauth: { ...f, ...patch } });
+  const setForm = (patch: Partial<OAuthForm>) => p.set((prev) => ({ oauth: { ...prev.oauth, ...patch } }));
   const secret = useRef<HTMLInputElement>(null);
   const refresh = useRef<HTMLInputElement>(null);
   const password = useRef<HTMLInputElement>(null);
   const [has, setHas] = useState({ secret: false, refresh: false, password: false });
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState("");
+  // The browser sign-in's call, which Cancel stops.
+  const signIn = useRef<string | null>(null);
 
   if (a.savedProfile) {
     return (
       <div className="wiz-good">
         Token obtained, and saved in the profile "{a.savedProfile}". It's renewed during the scan as it runs out. The values aren't shown again.{" "}
-        <button className="link" onClick={() => p.set({ savedProfile: "", profileName: "" })}>
+        <button
+          className="link"
+          onClick={async () => {
+            await p.leave();
+            p.set({ savedProfile: "", profileName: "" });
+          }}
+        >
           Enter different ones
         </button>
       </div>
@@ -58,7 +78,7 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
     setProblem("");
     try {
       const d = await run<{ token_url: string | null; authorize_url: string | null }>(["auth", "oauth", "discover", "--", url]);
-      setForm({ tokenUrl: d.token_url ?? f.tokenUrl, authorizeUrl: d.authorize_url ?? f.authorizeUrl });
+      setForm({ ...(d.token_url ? { tokenUrl: d.token_url } : {}), ...(d.authorize_url ? { authorizeUrl: d.authorize_url } : {}) });
     } catch (e: any) {
       setProblem(e.message);
     }
@@ -74,11 +94,18 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
       await run(oauthAddArgs(name, f, { secret: !!values.secret.trim(), refresh: !!values.refresh.trim() }), { env: oauthEnv(values) });
       // A profile that can't get a token isn't worth keeping: the check below would only fail later.
       try {
-        const r = await run<{ login?: { success: boolean; reason: string } }>(browser ? ["auth", "oauth", "authorize", "--", name] : ["auth", "login", "--", name]);
-        if (r.login && !r.login.success) throw new Error(r.login.reason);
+        if (browser) {
+          signIn.current = `oauth-sign-in-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          await run(["auth", "oauth", "authorize", "--", name], { call: signIn.current });
+        } else {
+          const r = await run<{ login?: { success: boolean; reason: string } }>(["auth", "login", "--", name]);
+          if (r.login && !r.login.success) throw new Error(r.login.reason);
+        }
       } catch (e) {
         await run(["auth", "remove", "--", name]).catch(() => {});
         throw e;
+      } finally {
+        signIn.current = null;
       }
       for (const input of [secret, refresh, password]) if (input.current) input.current.value = "";
       setHas({ secret: false, refresh: false, password: false });
@@ -86,9 +113,13 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
       await p.reload();
     } catch (e: any) {
       const scope = e.kind === "out_of_scope" ? " The token endpoint has to be in the engagement's scope, and the scope can't be widened here." : "";
-      setProblem(clean(e.message) + scope);
+      setProblem(e.kind === "cancelled" ? "The sign-in was cancelled, so the profile wasn't kept." : clean(e.message) + scope);
     }
     setSaving(false);
+  };
+
+  const cancel = () => {
+    if (signIn.current) cancelCli(signIn.current).catch(() => {});
   };
 
   return (
@@ -104,7 +135,7 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
                   <span>Reads {h.openid_url}, in scope only.</span>
                 </button>
               ) : (
-                <button key={i} className="wiz-choice" onClick={() => p.set({ oauth: { ...f, ...oauthDefaults([h]) } })}>
+                <button key={i} className="wiz-choice" onClick={() => p.set((prev) => ({ oauth: { ...prev.oauth, ...oauthDefaults([h]) } }))}>
                   <b>{FLOWS.find((x) => x.id === h.flow)?.label ?? "OAuth 2"}</b>
                   <span>{h.token_url ?? h.authorize_url ?? h.source}</span>
                 </button>
@@ -117,7 +148,7 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
         <span className="label">How does the API give out tokens?</span>
         <div className="seg">
           {FLOWS.map((x) => (
-            <button key={x.id} className={f.flow === x.id ? "on" : ""} title={x.text} onClick={() => setForm({ flow: x.id })}>
+            <button key={x.id} className={f.flow === x.id ? "on" : ""} aria-pressed={f.flow === x.id} title={x.text} onClick={() => setForm({ flow: x.id })}>
               {x.label}
             </button>
           ))}
@@ -154,10 +185,10 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
       <div>
         <span className="label">Client secret goes</span>
         <div className="seg">
-          <button className={f.clientAuth === "body" ? "on" : ""} onClick={() => setForm({ clientAuth: "body" })}>
+          <button className={f.clientAuth === "body" ? "on" : ""} aria-pressed={f.clientAuth === "body"} onClick={() => setForm({ clientAuth: "body" })}>
             In the form
           </button>
-          <button className={f.clientAuth === "basic" ? "on" : ""} onClick={() => setForm({ clientAuth: "basic" })}>
+          <button className={f.clientAuth === "basic" ? "on" : ""} aria-pressed={f.clientAuth === "basic"} onClick={() => setForm({ clientAuth: "basic" })}>
             HTTP Basic
           </button>
         </div>
@@ -193,16 +224,23 @@ export function OAuthFields(p: { auth: AuthState; set: (patch: Partial<AuthState
         <input className="input mono" value={a.profileName} onChange={(e) => p.set({ profileName: e.target.value })} />
       </label>
       <div className="wide">
-        <p className="muted small">{browser ? "This opens your browser and waits for you to sign in, up to five minutes." : "This asks for a token now, from the token URL above, to prove the setup works."} The secrets are stored in the project file, like other keys. Token requests aren't recorded in history.</p>
+        <p className="muted small">{browser ? "This opens your browser and waits for you to sign in, up to five minutes, or until you cancel." : "This asks for a token now, from the token URL above, to prove the setup works."} The secrets are stored in the project file, like other keys. Token requests aren't recorded in history.</p>
         {problem && <div className="wiz-problem">{problem}</div>}
         {problems.map((m) => (
           <div key={m} className="set-err small">
             {m}
           </div>
         ))}
-        <button className="btn" disabled={saving || !p.loaded || problems.length > 0} onClick={save}>
-          {saving ? (browser ? "Waiting for the sign-in…" : "Asking for a token…") : browser ? "Save and sign in" : "Save and get a token"}
-        </button>
+        <div className="wiz-row">
+          <button className="btn" disabled={saving || !p.loaded || problems.length > 0} onClick={save}>
+            {saving ? (browser ? "Waiting for the sign-in…" : "Asking for a token…") : browser ? "Save and sign in" : "Save and get a token"}
+          </button>
+          {saving && browser && (
+            <button className="btn" onClick={cancel}>
+              Cancel
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -263,27 +301,37 @@ export function ScriptChoice(p: {
           Read {scripts.length === 1 ? "the script" : "the scripts"}
         </button>
       )}
-      {scripts.map((s) => (
-        <div key={s.sha256}>
-          <div className="small">
-            <span className="mono">{s.scopes.join(", ")}</span>: {s.lines} line{s.lines === 1 ? "" : "s"}, for {s.requests} request{s.requests === 1 ? "" : "s"}
-            {s.signs ? ", seems to sign" : ""}
+      {scripts.map((s) => {
+        const text = texts[s.sha256];
+        const hidden = text === undefined ? [] : hiddenCharacters(text);
+        return (
+          <div key={s.sha256}>
+            <div className="small">
+              <span className="mono">{s.scopes.join(", ")}</span>: {s.lines} line{s.lines === 1 ? "" : "s"}, for {s.requests} request{s.requests === 1 ? "" : "s"}
+              {s.signs ? ", seems to sign" : ""}
+            </div>
+            {s.unsupported.length > 0 && <div className="set-err small">It uses {s.unsupported.join(", ")}, which can't run here, so requests would fail.</div>}
+            {text !== undefined && (
+              <>
+                {hidden.length > 0 && (
+                  <div className="wiz-warn danger" role="alert">
+                    <b>This script holds characters you can't see.</b> Text-direction controls and invisible characters can make code run differently from how it reads. They're written out below as ⟦U+…⟧:{" "}
+                    {hidden.map((h) => `${h.code} (${h.name}, ${h.count === 1 ? "" : `${h.count} times, first `}on line ${h.line})`).join("; ")}. Don't run it unless you know why they're there.
+                  </div>
+                )}
+                <pre className="mono small wiz-script">{revealHidden(text)}</pre>
+                {p.chosen === s.sha256 ? (
+                  <div className="wiz-good">Runs for every request.</div>
+                ) : (
+                  <button className="btn small" disabled={busy || p.blockers.length > 0 || s.unsupported.length > 0 || !p.origins.length} onClick={() => use(s.sha256)}>
+                    {hidden.length ? "Run it anyway, for every request" : "Run this one for every request"}
+                  </button>
+                )}
+              </>
+            )}
           </div>
-          {s.unsupported.length > 0 && <div className="set-err small">It uses {s.unsupported.join(", ")}, which can't run here, so requests would fail.</div>}
-          {texts[s.sha256] !== undefined && (
-            <>
-              <pre className="mono small wiz-script">{texts[s.sha256]}</pre>
-              {p.chosen === s.sha256 ? (
-                <div className="wiz-good">Runs for every request.</div>
-              ) : (
-                <button className="btn small" disabled={busy || p.blockers.length > 0 || s.unsupported.length > 0 || !p.origins.length} onClick={() => use(s.sha256)}>
-                  Run this one for every request
-                </button>
-              )}
-            </>
-          )}
-        </div>
-      ))}
+        );
+      })}
       {p.blockers.map((m) => (
         <div key={m} className="set-err small">
           {m}
