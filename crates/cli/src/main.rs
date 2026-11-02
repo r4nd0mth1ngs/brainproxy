@@ -205,7 +205,8 @@ enum Cmd {
     /// Encode input. Chain encodings with commas, applied left to right (e.g. url,base64).
     Encode(CodecArgs),
 
-    /// Decode input. Chain decodings with commas, applied left to right.
+    /// Decode input. Chain decodings with commas, applied left to right. `auto` finds and
+    /// undoes the layers itself (URL, base64, hex, HTML, JWT, gzip, zlib); `steps` lists them.
     Decode(CodecArgs),
 
     /// Hash input.
@@ -548,7 +549,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Intercept(cmd) => proxy_cmd::intercept(&cli.project, cmd, out)?,
         Cmd::Wordlists(cmd) => fuzz_cmd::wordlists(cmd, out)?,
         Cmd::Encode(a) => codec_cmd(a, out, codec::encode)?,
-        Cmd::Decode(a) => codec_cmd(a, out, codec::decode)?,
+        Cmd::Decode(a) => decode_cmd(a, out)?,
         Cmd::Hash(a) => codec_cmd(a, out, |k, b| codec::hash(k, b).map(String::into_bytes))?,
         Cmd::Mcp(mcp::McpCmd::Serve(args)) => mcp::serve(Cli::command(), &cli.project, cli.home.as_deref(), args)?,
         // For Jean-Luc Picard.
@@ -894,6 +895,30 @@ fn codec_cmd(a: CodecArgs, out: &Out, f: impl Fn(&str, &[u8]) -> Result<Vec<u8>,
         return Ok(());
     }
     let data = json!({"chain": a.kind, "output": body_value(&value, usize::MAX)});
+    out.ok(data, || String::from_utf8_lossy(&value).into_owned());
+    Ok(())
+}
+
+/// `decode`: like `codec_cmd`, plus `steps`, the decodings applied with each `auto`
+/// expanded to what it found, so the chain can be replayed or edited one step at a time.
+fn decode_cmd(a: CodecArgs, out: &Out) -> Result<(), Error> {
+    let mut value = read_input(a.input.as_deref())?;
+    let mut steps: Vec<&str> = Vec::new();
+    for kind in a.kind.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        if kind == "auto" {
+            let found = codec::smart_decode(&value);
+            steps.extend(found.steps);
+            value = found.output;
+        } else {
+            value = codec::decode(kind, &value)?;
+            steps.push(kind);
+        }
+    }
+    if a.raw {
+        out.raw(&value);
+        return Ok(());
+    }
+    let data = json!({"chain": a.kind, "steps": steps, "output": body_value(&value, usize::MAX)});
     out.ok(data, || String::from_utf8_lossy(&value).into_owned());
     Ok(())
 }

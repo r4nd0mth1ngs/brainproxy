@@ -160,6 +160,26 @@ fn codecs_chain() {
     assert_eq!(v["data"]["output"]["content"], "a b");
     let (_, v) = run(&["hash", "sha1", "abc"], &project, None);
     assert_eq!(v["data"]["output"]["content"], "a9993e364706816aba3e25717850c26c9cd0d89d");
+
+    // Compression output is binary, so it comes back as base64.
+    let (code, v) = run(&["encode", "gzip,base64,url", "-"], &project, Some(b"{\"role\":\"admin\"}"));
+    assert_eq!(code, 0);
+    let layered = v["data"]["output"]["content"].as_str().unwrap().to_string();
+    let (code, v) = run(&["decode", "auto", &layered], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["url", "base64", "gzip"]));
+    assert_eq!(v["data"]["output"]["content"], "{\"role\":\"admin\"}");
+    let (_, v) = run(&["decode", "url,auto", &layered], &project, None);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["url", "base64", "gzip"]));
+    // Nothing to undo: no steps, the input unchanged.
+    let (code, v) = run(&["decode", "auto", "password"], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!(
+        (v["data"]["steps"].clone(), v["data"]["output"]["content"].clone()),
+        (serde_json::json!([]), serde_json::json!("password"))
+    );
+    let (code, v) = run(&["decode", "gzip", "not gzip"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")));
 }
 
 #[test]

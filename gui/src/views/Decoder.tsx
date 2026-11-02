@@ -1,26 +1,16 @@
 // Stacked transform pipeline: the input, then one panel per step, each step applied to the
-// previous panel's output by `brainproxy encode|decode|hash KIND -`.
+// previous panel's output by `brainproxy encode|decode|hash KIND -`. Smart decode asks
+// `brainproxy decode auto -` which decodings apply and makes them the steps.
 
 import { useEffect, useState } from "react";
 import { bodyText, isBinary, run, textBytes, type Body } from "../api";
-
-type Op = "encode" | "decode" | "hash";
-
-const KINDS: Record<Op, string[]> = {
-  encode: ["base64", "base64url", "url", "url-all", "hex", "html"],
-  decode: ["base64", "base64url", "url", "hex", "html", "jwt"],
-  hash: ["md5", "sha1", "sha256", "sha512"],
-};
-
-interface Step {
-  op: Op;
-  kind: string;
-}
+import { KINDS, smartNote, smartSteps, type Op, type Step } from "./codec";
 
 export function DecoderView() {
   const [input, setInput] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ op: "decode", kind: "url" }]);
   const [outputs, setOutputs] = useState<{ text: string; error?: string }[]>([]);
+  const [note, setNote] = useState<{ text: string; error?: boolean } | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -62,13 +52,44 @@ export function DecoderView() {
       }),
     );
 
+  const smartDecode = async () => {
+    setNote(null);
+    try {
+      const d = await run<{ steps?: unknown }>(["decode", "auto", "-"], textBytes(input));
+      const found = smartSteps(d.steps);
+      if (found.length) setSteps(found);
+      setNote({ text: smartNote(found) });
+    } catch (e: any) {
+      setNote({ text: e.message, error: true });
+    }
+  };
+
   return (
     <div className="decoder">
       <div className="dec-panel">
         <div className="dec-head">
           <span className="label">Input</span>
+          {note && <span className={note.error ? "error" : "muted small"}>{note.text}</span>}
+          <span className="grow" />
+          <button
+            className="btn small"
+            onClick={smartDecode}
+            disabled={!input}
+            title="Find the URL, Base64, hex, HTML, JWT, gzip, and zlib layers and make them the steps below"
+          >
+            Smart decode
+          </button>
         </div>
-        <textarea className="code dec-text" spellCheck={false} value={input} onChange={(e) => setInput(e.target.value)} placeholder="Paste text to transform" />
+        <textarea
+          className="code dec-text"
+          spellCheck={false}
+          value={input}
+          onChange={(e) => {
+            setInput(e.target.value);
+            setNote(null);
+          }}
+          placeholder="Paste text to transform"
+        />
       </div>
       {steps.map((s, i) => (
         <div className="dec-panel" key={i}>

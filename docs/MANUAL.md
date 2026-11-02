@@ -473,6 +473,27 @@ Active scans use the listener automatically when it runs.
 Stacked transforms: encode, decode (base64, URL, hex, HTML, JWT), or hash, each step
 working on the previous output.
 
+- **Compression:** gzip, zlib, and raw deflate encode and decode; Brotli only decodes.
+  Decoding `deflate` also takes the zlib-wrapped form servers send as
+  `Content-Encoding: deflate`. Output over 16 MB is refused, so a small "zip bomb" can't
+  fill memory.
+- **Smart decode** finds the layers on the input and puts them in as steps, so you can see
+  what it did and change it. It tries, in turn: gzip and zlib (by their first bytes), a JWT,
+  URL escapes, HTML entities, hex, and Base64, up to 8 layers, and stops when nothing
+  applies. It is cautious: hex and Base64 count only when the whole input is one and it
+  decodes to readable text, JSON, or compressed data. Short inputs also need a clear sign:
+  for Base64, padding, a symbol, or mixed case with digits; for hex, a `0x` prefix or
+  spaces or colons between bytes. So words like `password` or `deadbeef` stay as they
+  are. When it misses a layer, add the step by hand.
+
+On the command line, `decode auto` does the same and lists what it applied in `steps`:
+
+```sh
+brainproxy decode auto 'H4sIAAAAAAAA%2F6tWKsrPSVWyUkpMyc3MU6oFAOdvn34QAAAA'
+# {"role":"admin"}, with "steps": ["url", "base64", "gzip"] in the JSON output
+brainproxy encode gzip,base64,url '{"role":"admin"}'    # and back again
+```
+
 ### Diff
 Compare two requests or responses (sent from other tools or pasted) by line, word, or
 byte, side by side or unified.
