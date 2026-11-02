@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bodyText, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
+import { confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { highlightArgs, scanArgs, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
@@ -133,12 +135,37 @@ function History() {
       (e) => app.toast(e.message, "error"),
     );
 
-  const rowMenu = (r: HistoryItem, ev: React.MouseEvent) =>
+  // Attack traffic: asked first, then started in the background and shown in Scans › Tasks on a click.
+  const scan = async (picks: HistoryPick[]) => {
+    const q = scanConfirm(picks);
+    if (!(await confirm(q.title, q.message, q.ok, q.cancel))) return;
+    try {
+      const checks = await run<{ nuclei: unknown }>(["checks", "status"]).catch(() => ({ nuclei: null }));
+      const d = await run<{ job: number }>(scanArgs(picks, { nuclei: !!checks.nuclei }));
+      app.toast(`Active scan started (job ${d.job}). Click to follow it in Scans.`, "info", () => app.showJob(d.job));
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  const highlight = (r: HistoryItem, on: boolean) =>
+    run(highlightArgs(r.id, on))
+      .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, tags: withHighlight(x.tags, on) } : x))))
+      .catch((e) => app.toast(e.message, "error"));
+
+  const rowMenu = (r: HistoryItem, ev: React.MouseEvent) => {
+    const pick = { id: r.id, method: r.method, url: r.url };
+    // The proxy refused it (outside the engagement scope), so there is nothing to replay.
+    const refused = !!r.error?.startsWith("out of scope");
+    const highlighted = r.tags.includes("highlight");
     open(ev, [
       { label: "Send to Replay", action: () => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
       { label: "Send to Fuzzer", action: () => handoff(r.id, app.sendToFuzzer) },
       { label: "Send request to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(h.raw)) },
       { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
+      "-",
+      { label: "Scan this request…", action: () => scan([pick]), disabled: refused },
+      { label: "Test access control…", action: () => app.sendToAccess([pick]), disabled: refused },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       {
@@ -151,14 +178,9 @@ function History() {
             .catch((e) => app.toast(e.message, "error"));
         },
       },
-      {
-        label: "Highlight",
-        action: () =>
-          run(["history", "tag", String(r.id), "--add", "highlight"])
-            .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, tags: [...new Set([...x.tags, "highlight"])] } : x))))
-            .catch((e) => app.toast(e.message, "error")),
-      },
+      { label: highlighted ? "Remove highlight" : "Highlight", action: () => highlight(r, !highlighted) },
     ]);
+  };
 
   const toggleSource = (s: string) =>
     setFilter((f) => {

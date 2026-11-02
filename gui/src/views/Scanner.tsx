@@ -77,6 +77,11 @@ export function ScannerView({ active }: { active: boolean }) {
     setSub("tasks");
   };
 
+  // A job another tool started and asked to show (Traffic's Scan this request).
+  useEffect(() => {
+    if (app.jobFocus) launched(app.jobFocus.id);
+  }, [app.jobFocus]);
+
   return (
     <div className="col fill">
       <div className="subtabs">

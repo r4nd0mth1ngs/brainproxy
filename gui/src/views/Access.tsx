@@ -11,8 +11,9 @@ import { usePoll } from "../ui/usePoll";
 import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { proxyListen, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
+import { unsafeMethods } from "./trafficActions";
 
-const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
+const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
 
 /** The cell being compared: the run's baseline and the identity's replay. */
 interface Picked {
@@ -66,6 +67,11 @@ export function AccessView({ active }: { active: boolean }) {
   useEffect(() => {
     if (current && !live) refreshMatrix();
   }, [current?.state, live, refreshMatrix]);
+
+  // Requests handed over from Traffic open the new-run form.
+  useEffect(() => {
+    if (app.accessInput) setShowNew(true);
+  }, [app.accessInput]);
 
   const g = useMemo(() => (matrix && matrix.run_id === runId ? grid(matrix, { only, worstFirst }) : null), [matrix, runId, only, worstFirst]);
 
@@ -299,6 +305,12 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
     );
   }, []);
 
+  // Requests handed over from Traffic: test exactly those.
+  useEffect(() => {
+    if (app.accessInput) set({ select: "history", history: app.accessInput });
+  }, [app.accessInput]);
+  const unsafe = unsafeMethods(f.history);
+
   const toggle = (name: string) => set({ identities: f.identities.includes(name) ? f.identities.filter((n) => n !== name) : [...f.identities, name] });
 
   const start = async () => {
@@ -410,6 +422,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
                 ["host", "One site"],
                 ["tag", "Tag"],
                 ["where", "SQL condition"],
+                ...(f.history.length ? ([["history", `From Traffic (${f.history.length})`]] as const) : []),
               ] as const
             ).map(([k, label]) => (
               <button key={k} className={f.select === k ? "on" : ""} onClick={() => set({ select: k })}>
@@ -430,6 +443,19 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
           {f.select === "tag" && <input className="input mono" value={f.tag} placeholder="api" onChange={(e) => set({ tag: e.target.value })} />}
           {f.select === "where" && <input className="input mono az-where" value={f.where} placeholder="host = 'app.example.com' AND path LIKE '/api/%'" onChange={(e) => set({ where: e.target.value })} />}
         </div>
+        {f.select === "history" && (
+          <div className="az-picked">
+            {f.history.map((h) => (
+              <div key={h.id} className="mono ellipsis small" title={h.url}>
+                #{h.id} <span className="method">{h.method}</span> {h.url}
+              </div>
+            ))}
+            <p className="muted small">
+              Tested whatever the method and also without credentials.
+              {unsafe.length > 0 && <b> {unsafe.join(", ")} requests are sent again as each identity: they may change data, now as another user.</b>}
+            </p>
+          </div>
+        )}
       </div>
       <div className="row gap">
         <button className="btn primary" disabled={busy} onClick={start}>

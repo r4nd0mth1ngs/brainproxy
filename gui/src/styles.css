@@ -2492,6 +2492,11 @@ button.chip {
 .az-where {
   min-width: 420px;
 }
+.az-picked {
+  margin-top: 6px;
+  max-height: 120px;
+  overflow: auto;
+}
 .az-legend {
   flex-wrap: wrap;
   gap: 6px;

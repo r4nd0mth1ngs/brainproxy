@@ -1,6 +1,8 @@
 // Access control across users (`authz`): the arguments for a run, and `authz matrix` as a grid
 // of requests by identities, each cell coloured by its verdict.
 
+import type { HistoryPick } from "./trafficActions.ts";
+
 export interface MatrixCell {
   verdict: string;
   confidence: string | null;
@@ -131,7 +133,8 @@ export function runLabel(r: AuthzRun): string {
   return `#${r.run_id} · ${time}${live} · ${r.state}${bypasses ? ` · ${bypasses} bypass${bypasses === 1 ? "" : "es"}` : ""}`;
 }
 
-export type Selection = "all" | "host" | "tag" | "where";
+/** `history`: the requests handed over from Traffic. */
+export type Selection = "all" | "host" | "tag" | "where" | "history";
 
 export interface RunForm {
   identities: string[];
@@ -142,6 +145,8 @@ export interface RunForm {
   host: string;
   tag: string;
   where: string;
+  /** Requests picked in Traffic (right-click › Test access control…), tested whatever their method. */
+  history: HistoryPick[];
   /** Comma-separated cookie names that aren't credentials. */
   keepCookies: string;
   rate: string;
@@ -188,6 +193,9 @@ export function runArgs(f: RunForm): string[] {
   } else if (f.select === "where") {
     if (!f.where.trim()) throw new Error("Enter a SQL condition on history");
     args.push(`--where=${f.where.trim()}`);
+  } else if (f.select === "history") {
+    if (!f.history.length) throw new Error("No request picked: right-click one in Proxy › Traffic");
+    for (const h of f.history) args.push(`--history-id=${h.id}`);
   }
   const cookies = cookieNames(f.keepCookies);
   if (cookies.length) args.push(`--keep-cookie=${cookies.join(",")}`);

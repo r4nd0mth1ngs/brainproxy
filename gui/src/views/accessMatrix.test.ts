@@ -100,7 +100,7 @@ test("rows can be filtered by kind and sorted worst first", () => {
   assert.deepEqual(grid(matrix, { worstFirst: true }).rows.map((r) => r.url.split("/").pop()), ["1", "dashboard", "me", "9"]);
 });
 
-const form: RunForm = { identities: ["bob", "carol"], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
+const form: RunForm = { identities: ["bob", "carol"], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
 
 test("a run's arguments come from the form", () => {
   assert.deepEqual(runArgs(form), ["authz", "run", "--as=bob,carol"]);
@@ -119,6 +119,13 @@ test("a run's arguments come from the form", () => {
   assert.throws(() => runArgs({ ...form, identities: [], anonymous: false }), /at least one identity/);
   assert.throws(() => runArgs({ ...form, select: "host", host: " " }), /host/);
   assert.throws(() => runArgs({ ...form, rate: "oops" }), /Rate/);
+  // Requests handed over from Traffic, tested by id.
+  const history = [
+    { id: 4, method: "GET", url: "https://shop.test/orders/4" },
+    { id: 8, method: "POST", url: "https://shop.test/orders" },
+  ];
+  assert.deepEqual(runArgs({ ...form, select: "history", history }), ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8"]);
+  assert.throws(() => runArgs({ ...form, select: "history" }), /No request picked/);
 });
 
 test("live testing options, and the running proxy's options kept on a restart", () => {

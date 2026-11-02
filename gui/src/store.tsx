@@ -3,6 +3,7 @@
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
+import type { HistoryPick } from "./views/trafficActions";
 
 export type Tab =
   | "dashboard"
@@ -62,6 +63,12 @@ interface State {
   sendToRepeater: (h: Handoff) => void;
   fuzzerInput: Handoff | null;
   sendToFuzzer: (h: Handoff) => void;
+  /** Requests handed to Access to test as other users; a new array each time. */
+  accessInput: HistoryPick[] | null;
+  sendToAccess: (picks: HistoryPick[]) => void;
+  /** A job to show in Scans › Tasks; a new object each time, so the same job can be shown again. */
+  jobFocus: { id: number } | null;
+  showJob: (id: number) => void;
   comparer: string[];
   sendToComparer: (text: string) => void;
   setComparer: (items: string[]) => void;
@@ -97,6 +104,8 @@ export function AppProvider({
   const [repeater, setRepeaterState] = useState<RepeaterTab[]>([]);
   const [repeaterActive, setRepeaterActive] = useState(0);
   const [fuzzerInput, setFuzzerInput] = useState<Handoff | null>(null);
+  const [accessInput, setAccessInput] = useState<HistoryPick[] | null>(null);
+  const [jobFocus, setJobFocus] = useState<{ id: number } | null>(null);
   const [comparer, setComparer] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -126,6 +135,16 @@ export function AppProvider({
     setTab("fuzzer");
   }, []);
 
+  const sendToAccess = useCallback((picks: HistoryPick[]) => {
+    setAccessInput([...picks]);
+    setTab("access");
+  }, []);
+
+  const showJob = useCallback((id: number) => {
+    setJobFocus({ id });
+    setTab("scanner");
+  }, []);
+
   const openWizard = useCallback((open: boolean) => {
     setWizardOpen(open);
     if (open) setTab("dashboard");
@@ -153,6 +172,10 @@ export function AppProvider({
       sendToRepeater,
       fuzzerInput,
       sendToFuzzer,
+      accessInput,
+      sendToAccess,
+      jobFocus,
+      showJob,
       comparer,
       sendToComparer,
       setComparer,
@@ -162,7 +185,7 @@ export function AppProvider({
       openWizard,
       proxy,
     }),
-    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
+    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, accessInput, sendToAccess, jobFocus, showJob, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

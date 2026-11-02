@@ -241,7 +241,15 @@ The sidebar groups the tools by what you are doing.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
-  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
+  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight
+    (*Remove highlight* on a highlighted row).
+  - **Scan this request…** asks first, naming the request, then runs an active scan of just
+    that request in the background (`scan active --history-id`, medium strength, plus the
+    Nuclei templates of high severity and up once they are downloaded). It is attacked
+    whatever its method, so a POST is replayed with attack data too. Click the toast to
+    follow it in **Scans › Tasks**.
+  - **Test access control…** opens **Access** with a new run set to test that request
+    (`authz run --history-id`). Pick the identities and start it.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
   ones Replay opened. Select a connection to see its messages in both directions (→ to the
   server, ← to the client), with pings, pongs and the close; select a message to read its
@@ -424,7 +432,10 @@ Access control across users: does the app let bob read alice's data? See
   user) and keep *anonymous* on to also send with no session. *Owner* is worked out per
   request unless you pick one. Choose which requests to test: all recorded requests that
   carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
-  OPTIONS requests are replayed, and logout paths never are.
+  OPTIONS requests are replayed, and logout paths never are. A request sent from
+  **Traffic** (right-click › *Test access control…*) shows as *From Traffic*: it is tested
+  whatever its method and also without credentials, and the form warns when it is a POST or
+  another method that may change data.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
   those identities in the background. If it doesn't start, the
