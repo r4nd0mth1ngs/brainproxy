@@ -56,7 +56,10 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   (`--listen=127.0.0.1:PORT`, or `0.0.0.0:PORT` after a warning that anyone on the network can
   then use the proxy), `--invisible`, and a `--redirect=ORIGIN` that `engagement check` must
   allow when it is saved. The port, the network choice and invisible mode are kept for every
-  project; the redirect for its project only, since it has to be in that engagement's scope.
+  project; the redirect for its project only, since it has to be in that engagement's scope
+  (Save as… moves it to the new path, discarding a temporary engagement forgets it). On a
+  wildcard address the proxy pill says "open to the network" in every project, and Settings
+  › Proxy warns and says other devices use this computer's LAN address on that port.
   A running proxy that differs is restarted with them on request, like a port move, keeping
   its other options (and an address that already fits, such as `[::1]`).
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member

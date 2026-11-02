@@ -476,8 +476,13 @@ fn forget(store: &Store) -> Result<Option<u32>, Error> {
     Ok(Some(saved.state.pid))
 }
 
+/// An address to connect to the proxy on: a wildcard listen address isn't one, so its loopback.
+pub(crate) fn connect_addr(listen: &str) -> String {
+    listen.replace("0.0.0.0:", "127.0.0.1:").replace("[::]:", "[::1]:")
+}
+
 fn usage_hints(state: &ProxyState) -> Value {
-    let url = format!("http://{}", state.listen);
+    let url = format!("http://{}", connect_addr(&state.listen));
     let ca = state.ca_cert.display();
     json!({
         "proxy_url": url,
@@ -1014,6 +1019,36 @@ mod tests {
             conflict_text(ErrorKind::PermissionDenied),
             "cannot listen on 127.0.0.1:80: permission denied (ports below 1024 usually need elevated privileges, and the system can reserve others)"
         );
+    }
+
+    #[test]
+    fn usage_hints_point_at_loopback_for_a_wildcard_listen_address() {
+        let state = |listen: &str| ProxyState {
+            pid: 1,
+            listen: listen.into(),
+            started: "0".into(),
+            ca_cert: "ca.pem".into(),
+            log: None,
+            authz_run: None,
+            args: vec![],
+        };
+        for (listen, url) in [
+            ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("0.0.0.0:8080", "http://127.0.0.1:8080"),
+            ("[::]:8080", "http://[::1]:8080"),
+            ("[::1]:8080", "http://[::1]:8080"),
+            ("10.0.0.5:8080", "http://10.0.0.5:8080"),
+        ] {
+            let hints = usage_hints(&state(listen));
+            assert_eq!(hints["proxy_url"], url, "{listen}");
+            for key in ["curl", "env", "chromium"] {
+                let text = hints[key].as_str().unwrap();
+                assert!(
+                    text.contains(url) && !text.contains("0.0.0.0") && !text.contains("[::]:"),
+                    "{listen} {key}: {text}"
+                );
+            }
+        }
     }
 
     #[test]

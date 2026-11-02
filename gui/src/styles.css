@@ -416,6 +416,10 @@ select {
   background: var(--ok);
   box-shadow: 0 0 0 3px oklch(0.72 0.16 160 / 0.2);
 }
+.pill.exposed {
+  border-color: var(--high);
+  color: var(--high);
+}
 .pill.hold {
   border-color: var(--medium);
   color: var(--medium);

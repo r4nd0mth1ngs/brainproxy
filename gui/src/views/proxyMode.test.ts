@@ -5,9 +5,13 @@ import {
   PROXY_INVISIBLE,
   PROXY_NETWORK,
   PROXY_REDIRECT,
+  forgetRedirect,
   hostOf,
   isLoopback,
   isWildcard,
+  moveRedirect,
+  networkNote,
+  redirectError,
   redirectOrigin,
   redirectProblem,
   runningSetup,
@@ -319,4 +323,48 @@ test("setupChanges: the redirect differs from the running one", () => {
   const path = { listen: "127.0.0.1:8080", args: ["proxy", "run", "--redirect", "https://app.acme.test/api"] };
   assert.equal(runningSetup(path).redirect, "https://app.acme.test/api");
   assert.deepEqual(setupChanges(path, null, { ...DEFAULT_SETUP, redirect: "https://app.acme.test" }), ["everything sent to https://app.acme.test"]);
+});
+
+test("redirectError: a refusal counts only for the origin it was made for", () => {
+  const refused = { origin: "https://evil.test", why: "It isn't in this engagement's scope." };
+  assert.equal(redirectError("https://evil.test", refused), refused.why);
+  // The same origin typed differently.
+  assert.equal(redirectError(" HTTPS://Evil.Test:443/ ", refused), refused.why);
+  // Edited while the check ran: the refusal isn't the new text's.
+  assert.equal(redirectError("https://app.acme.test", refused), null);
+  assert.equal(redirectError("", refused), null);
+  assert.equal(redirectError("https://evil.test", null), null);
+  // An invalid URL says why, whatever was refused before.
+  assert.match(redirectError("https://evil.test/api", refused)!, /scheme, host and port/);
+});
+
+test("Save as… carries the redirect to the new path; a discarded project's is forgotten", () => {
+  const items = stubStorage({ [PROXY_REDIRECT + PROJECT]: "https://app.acme.test", [PROXY_NETWORK]: "all" });
+  const dest = "/work/saved.bpdb";
+  assert.equal(moveRedirect(PROJECT, dest), true);
+  assert.equal(items.has(PROXY_REDIRECT + PROJECT), false);
+  assert.equal(savedProxySetup(dest).redirect, "https://app.acme.test");
+  // Nothing to carry: nothing is written.
+  assert.equal(moveRedirect("/work/none.bpdb", "/work/none2.bpdb"), true);
+  assert.equal(items.has(PROXY_REDIRECT + "/work/none2.bpdb"), false);
+
+  forgetRedirect(dest);
+  assert.equal(items.has(PROXY_REDIRECT + dest), false);
+  // Only that project's key.
+  assert.equal(items.get(PROXY_NETWORK), "all");
+});
+
+test("moveRedirect and forgetRedirect with storage that throws", () => {
+  const fail = () => {
+    throw new Error("denied");
+  };
+  stubStorage({}, { getItem: fail, setItem: fail, removeItem: fail });
+  assert.equal(moveRedirect(PROJECT, "/work/saved.bpdb"), false);
+  assert.doesNotThrow(() => forgetRedirect(PROJECT));
+});
+
+test("networkNote: what other devices connect to, for a wildcard address only", () => {
+  assert.match(networkNote("0.0.0.0:8080")!, /this computer's address on their network.*port 8080: http:\/\/LAN-IP:8080/);
+  assert.match(networkNote("[::]:80")!, /port 80:/);
+  for (const listen of ["127.0.0.1:8080", "[::1]:8080", "192.168.1.5:8080"]) assert.equal(networkNote(listen), null, listen);
 });

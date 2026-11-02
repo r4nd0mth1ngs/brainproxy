@@ -11,8 +11,9 @@ import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
 import { DEFAULT_PROXY_PORT, lowPortNote, moveProxy, portOf, portProblem, proxyListen, saveProxyPort, savedProxyPort, startProxy } from "./proxyPort";
 import {
+  networkNote,
+  redirectError,
   redirectOrigin,
-  redirectProblem,
   runningSetup,
   saveProxySetup,
   savedProxySetup,
@@ -20,6 +21,7 @@ import {
   scopeProblem,
   setupChanges,
   type ProxySetup,
+  type Refusal,
 } from "./proxyMode";
 import { RecordLogin } from "./RecordLogin";
 import { AppUpdateSettings } from "./AppUpdate";
@@ -1406,12 +1408,12 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
   const [invisible, setInvisible] = useState(p.saved.invisible);
   const [redirect, setRedirect] = useState(p.saved.redirect ?? "");
   const [checking, setChecking] = useState(false);
-  // Why the redirect was refused by the scope check.
-  const [refused, setRefused] = useState<string | null>(null);
+  // The scope check's refusal, for the origin it was made for: a later edit doesn't inherit it.
+  const [refused, setRefused] = useState<Refusal | null>(null);
   // Bumped when Save is pressed with an invalid or refused redirect, so the error is announced again.
   const [attempt, setAttempt] = useState(0);
   const input = useRef<HTMLInputElement>(null);
-  const problem = redirectProblem(redirect) ?? refused;
+  const problem = redirectError(redirect, refused);
   const origin = redirectOrigin(redirect);
   const draft: ProxySetup = { allInterfaces: all, invisible, redirect: origin };
   const changed = all !== p.saved.allInterfaces || invisible !== p.saved.invisible || origin !== p.saved.redirect;
@@ -1428,7 +1430,7 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
       if (origin && origin !== p.saved.redirect) {
         const why = scopeProblem(await run(scopeCheckArgs(origin)));
         if (why) {
-          setRefused(why);
+          setRefused({ origin, why });
           setAttempt((n) => n + 1);
           return;
         }
@@ -1438,7 +1440,8 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
       p.onSaved(draft);
       app.toast("Saved. The proxy uses these settings when it next starts.");
     } catch (e: any) {
-      setRefused(`It couldn't be checked against the engagement scope: ${e.message}`);
+      // Not a refusal: Save tries again.
+      app.toast(`Not saved: the redirect couldn't be checked against the engagement scope: ${e.message}`, "error");
     } finally {
       setChecking(false);
     }
@@ -1487,12 +1490,10 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
           style={{ width: 320 }}
           placeholder="https://app.example.test:8443"
           value={redirect}
+          readOnly={checking}
           aria-invalid={!!problem}
           aria-describedby={[problem ? `${id}-err` : null, `${id}-help`].filter(Boolean).join(" ")}
-          onChange={(e) => {
-            setRedirect(e.target.value);
-            setRefused(null);
-          }}
+          onChange={(e) => setRedirect(e.target.value)}
         />
       </div>
       {problem && (
@@ -1604,6 +1605,7 @@ function ProxySetup() {
   };
   const usage = proxy?.proxy?.usage;
   const mode = proxy?.running && proxy.proxy ? runningSetup(proxy.proxy) : null;
+  const elsewhere = proxy?.running && proxy.proxy ? networkNote(proxy.proxy.listen) : null;
   return (
     <div className="detail">
       <div className="detail-head">
@@ -1615,10 +1617,22 @@ function ProxySetup() {
           </button>
         )}
       </div>
+      {elsewhere && (
+        <div className="wiz-warn danger">
+          Listening on every network interface, as chosen under Who can connect for every project: anyone who can reach this
+          computer can use the proxy.
+        </div>
+      )}
       {usage ? (
         <dl className="facts">
           <dt>Proxy URL</dt>
           <dd className="mono">{usage.proxy_url}</dd>
+          {elsewhere && (
+            <>
+              <dt>Other devices</dt>
+              <dd>{elsewhere}</dd>
+            </>
+          )}
           {proxy?.proxy?.ca_cert && (
             <>
               <dt>CA certificate</dt>

@@ -8,6 +8,7 @@ import type { TempInfo } from "../store";
 import { confirm } from "../ui/Confirm";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
+import { forgetRedirect, moveRedirect } from "./proxyMode";
 
 const RECENT = "recent-projects";
 
@@ -211,6 +212,7 @@ function Leftovers({ open }: { open: Open }) {
     act(async () => {
       const dest = await saveTempAs(l.path, l.name);
       if (!dest) return;
+      moveRedirect(l.path, dest);
       await tempProjects.discard(l.path).catch(() => {});
       await open(dest);
     });
@@ -224,6 +226,7 @@ function Leftovers({ open }: { open: Open }) {
       );
       if (!yes) return;
       await tempProjects.discard(l.path);
+      forgetRedirect(l.path);
       await load();
     });
 

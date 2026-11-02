@@ -14,6 +14,7 @@ import { ENGAGEMENT_CHANGED, TargetView } from "./views/Target";
 import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
 import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, stopOwned, stopProxy } from "./views/proxyPort";
+import { forgetRedirect, hostOf, isWildcard, moveRedirect } from "./views/proxyMode";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -68,7 +69,10 @@ export function App() {
     setProj(null);
     setTemp(null);
     if (temp && leaving)
-      await tempProjects.discard(leaving).catch((e) => setNotice(`The temporary engagement wasn't deleted: ${e}`));
+      await tempProjects.discard(leaving).then(
+        () => forgetRedirect(leaving),
+        (e) => setNotice(`The temporary engagement wasn't deleted: ${e}`),
+      );
   }, [temp, project]);
 
   // Copies the temporary project to a file, then carries on in that file.
@@ -80,6 +84,8 @@ export function App() {
     if (!dest) return;
     setProj(null);
     setTemp(null);
+    // The redirect (Settings › Proxy) is kept by path; the copy opens with it.
+    moveRedirect(leaving, dest);
     // The saved file has everything; if this fails it is offered again on the next launch.
     await tempProjects.discard(leaving).catch(() => {});
     // The shell is gone by now, so a failure is shown on the welcome screen.
@@ -239,7 +245,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
             event.preventDefault();
             if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
             // Stops its proxy too. If it fails, it is kept and offered on the next launch.
-            await tempProjects.discard(tempProject).catch(() => {});
+            await tempProjects.discard(tempProject).then(() => forgetRedirect(tempProject), () => {});
             await getCurrentWindow().destroy();
           } else {
             await stopOnClose();
@@ -272,6 +278,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   };
 
   const listen = status?.proxy?.listen ?? proxyListen();
+  // On 0.0.0.0 or [::]: set in Settings › Proxy for every project, so it is shown in each.
+  const exposed = !!status?.running && isWildcard(hostOf(listen));
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("sidebar") === "collapsed";
@@ -346,9 +354,19 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
               Open browser
             </button>
           )}
-          <button className={`pill ${status?.running ? "live" : ""}`} onClick={proxyToggle} title={status?.running ? "Stop the proxy" : "Start the proxy"}>
+          <button
+            className={`pill ${status?.running ? "live" : ""} ${exposed ? "exposed" : ""}`}
+            onClick={proxyToggle}
+            title={
+              exposed
+                ? "Listening on every network interface: anyone who can reach this computer can use the proxy (Settings › Proxy). Click to stop it."
+                : status?.running
+                  ? "Stop the proxy"
+                  : "Start the proxy"
+            }
+          >
             <span className="dot" />
-            {status?.running ? `Proxy ${listen}` : "Proxy off"}
+            {status?.running ? `Proxy ${listen}${exposed ? " · open to the network" : ""}` : "Proxy off"}
           </button>
           <button className="icon-btn" onClick={toggleTheme} title="Toggle light/dark">
             <Icon name="theme" />
