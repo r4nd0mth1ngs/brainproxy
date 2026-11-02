@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bodyText, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
+import { copyAsCurl } from "../ui/CurlDialog";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
@@ -141,6 +142,7 @@ function History() {
       { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
+      { label: "Copy as cURL", action: () => handoff(r.id, (h) => copyAsCurl(h.raw, h.target, h.binary, app.toast)) },
       {
         label: "Add note…",
         action: () => {

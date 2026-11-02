@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { bodyText, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
+import { copyAsCurl, CurlDialog } from "../ui/CurlDialog";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { autoEncodeRequest } from "../ui/urlencode";
@@ -37,6 +38,7 @@ export function RepeaterView() {
   const app = useApp();
   const tabs = app.repeater;
   const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
+  const [pasting, setPasting] = useState(false);
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
@@ -72,6 +74,9 @@ export function RepeaterView() {
         <button onClick={newWsTab} title="New WebSocket tab">
           + WS
         </button>
+        <button onClick={() => setPasting(true)} title="New tab from a pasted cURL command">
+          + cURL
+        </button>
       </div>
       {active ? (
         // key: each tab has its own editor state and send history.
@@ -85,8 +90,12 @@ export function RepeaterView() {
           <button className="btn" onClick={newWsTab}>
             Start a WebSocket connection
           </button>
+          <button className="btn" onClick={() => setPasting(true)}>
+            Paste a cURL command
+          </button>
         </div>
       )}
+      {pasting && <CurlDialog close={() => setPasting(false)} />}
     </div>
   );
 }
@@ -151,6 +160,9 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     setSent((s) => ({ list: [...s.list, entry], at: s.list.length }));
   };
 
+  // The request as Send would send it, auto URL-encoding included.
+  const copyCurl = () => copyAsCurl(autoEncode ? autoEncodeRequest(raw).text : raw, withScheme(guessTarget(raw, target)), tab.binary, app.toast);
+
   const go = (d: number) => {
     const at = sent.at + d;
     if (at < 0 || at >= sent.list.length) return;
@@ -203,6 +215,9 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           />{" "}
           Auto URL-encode
         </label>
+        <button className="btn" onClick={copyCurl} title="Copy this request as a curl command (POSIX shell)">
+          Copy as cURL
+        </button>
         <span className="grow" />
         {!!current?.encoded && (
           <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>

@@ -112,9 +112,9 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Group | Tool | Parts | CLI used |
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
-| Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
+| Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node, copy a request as cURL), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response, copy as cURL), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor; **+ cURL** opens a pasted curl command as a tab and *Copy as cURL* copies the request (both below). WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
@@ -162,6 +162,34 @@ and written out, and a session rule), and the operations to send
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).
+
+### cURL
+
+`ui/curl.ts` converts between curl commands and raw requests in the UI, with no CLI call: a
+paste only opens a tab, and sending it is Replay's `send` as usual, so the scope applies. An
+agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
+
+- **Paste** (**+ cURL** in Replay): reads POSIX shell quoting (`'…'`, `"…"`, `$'…'`, `\`
+  line breaks) and Windows cmd as Chrome's *Copy as cURL (cmd)* writes it (`^` escapes and
+  line breaks). It follows curl's rules for the method (POST with data, GET with `-G`, HEAD
+  with `-I`), joins several `-d` with `&`, builds `-F` fields as multipart, turns `-u` into
+  Basic auth, and keeps curl's own `Host` and `Accept` headers unless the command replaces or
+  removes them (it adds no `User-Agent`). Options that don't change the request (`-k`, `-s`,
+  `-L`, `-o`, timeouts) are ignored; a proxy, `--resolve`, `--connect-to` and client
+  certificates are left out with a note. Anything that reads a file (`-d @file`, `-F f=@file`,
+  `-b file`, `-T`, `-K`), shell variables or command substitution, a NUL byte, challenge
+  auth (`--digest`, `--ntlm`) and unknown options are refused with the reason, so nothing that
+  changes the request is dropped silently.
+- **Copy as cURL** (Replay, and right-click a request in Traffic or the Site map): a POSIX
+  shell command with every value in single quotes, or `$'…'` with `\xNN` escapes for control,
+  bidi and non-UTF-8 bytes, so a header or body from the target can't run anything in the
+  shell. The body goes in `--data-raw` (which never reads a file, even for a body starting
+  with `@`); one with a NUL byte goes through `printf '…' | curl … --data-binary @-`. It adds
+  `--http2` for an HTTP/2 request, `--globoff` for `[]{}` in the URL, `--path-as-is` for `..`
+  segments, `--request-target` for a target a URL can't hold, and empty `-H 'Name:'` to
+  remove the headers curl would add. Replay copies what Send would send (auto URL-encoding
+  included). A body over 128 KB gets a warning (Linux limits one argument to that size); one
+  over 2 MB is refused.
 
 ## Look
 

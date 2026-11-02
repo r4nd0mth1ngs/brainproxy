@@ -990,6 +990,19 @@ select {
   line-height: 1.5;
 }
 
+/* New tab from cURL (ui/CurlDialog.tsx). */
+.curl-dialog {
+  width: min(720px, 100%);
+}
+.curl-dialog textarea {
+  margin-bottom: 12px;
+}
+.curl-dialog p.curl-error {
+  margin: 0 0 12px;
+  color: var(--high);
+  white-space: pre-wrap;
+}
+
 .toasts {
   position: fixed;
   right: 14px;

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { bodyText, historyRequest, isBinary, MAX_BODY, pathOf, rawResponse, run, type HistoryEntry, type HistoryItem, type Risk } from "../api";
 import { originOf, useApp } from "../store";
+import { copyAsCurl } from "../ui/CurlDialog";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
@@ -205,6 +206,11 @@ function SiteMap({ active }: { active: boolean }) {
       .then(({ raw, binary, entry: e }) => app.sendToRepeater({ raw, binary, target: originOf(e.url), title: pathOf(e.url).slice(0, 24) }))
       .catch((e) => app.toast(e.message, "error"));
 
+  const copyCurl = (id: number) =>
+    historyRequest(id)
+      .then(({ raw, binary, entry: e }) => copyAsCurl(raw, originOf(e.url), binary, app.toast))
+      .catch((e) => app.toast(e.message, "error"));
+
   // Installed Nuclei templates (high severity and up) join active scans started from here.
   const [nucleiArgs, setNucleiArgs] = useState<string[]>([]);
   useEffect(() => {
@@ -311,7 +317,7 @@ function SiteMap({ active }: { active: boolean }) {
               selected={selected}
               onSelect={(r) => setSelected(r.id)}
               onActivate={(r) => toRepeater(r.id)}
-              onContextMenu={(r, e) => open(e, actions(r.url, r.id, ["--history-id", String(r.id)]))}
+              onContextMenu={(r, e) => open(e, [...actions(r.url, r.id, ["--history-id", String(r.id)]), { label: "Copy as cURL", action: () => copyCurl(r.id) }])}
               initialSort={{ key: "id", desc: true }}
               empty="No requests under this node."
             />
