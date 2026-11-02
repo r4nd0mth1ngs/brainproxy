@@ -421,3 +421,90 @@ test("moveProxy with a setup that fails: the proxy goes back as it was, its old 
   ]);
   assert.equal(ctl.owned, 9);
 });
+
+test("moveProxy back to this computer only: a proxy on every interface doesn't stay there", async () => {
+  for (const host of ["0.0.0.0", "[::]", "192.168.1.5"]) {
+    const running = { listen: `${host}:8080`, args: ["proxy", "run", "--listen", `${host}:8080`, "--invisible", "--redirect", "https://old.test", "--auth", "alice"] };
+    const { calls, cli } = fakeCli();
+    assert.equal(await moveProxy(cli, proxyControl(), running, 8080, { allInterfaces: false, invisible: false, redirect: null }), "127.0.0.1:8080", host);
+    assert.deepEqual(calls[1], ["proxy", "start", "--listen=127.0.0.1:8080", "--auth=alice"], host);
+  }
+});
+
+test("moveProxy with a setup: the app's proxy stays the app's, another's doesn't become it", async () => {
+  const setup = { allInterfaces: true, invisible: true, redirect: null };
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  let fake = proxyCli(() => ({}), [8]);
+  await moveProxy(fake.cli, ctl, { listen: "127.0.0.1:8080", pid: 7 }, 8080, setup);
+  assert.equal(ctl.owned, 8);
+
+  const other = proxyControl();
+  fake = proxyCli(() => ({}), [9]);
+  await moveProxy(fake.cli, other, { listen: "127.0.0.1:8080", pid: 7 }, 8080, setup);
+  assert.equal(other.owned, null);
+});
+
+test("moveProxy without a setup keeps a shell's invisible mode and redirect, as one option each", async () => {
+  const running = { listen: "0.0.0.0:80", args: ["proxy", "run", "--listen", "0.0.0.0:80", "--invisible", "--redirect", "https://app.acme.test", "--no-http2"] };
+  const { calls, cli } = fakeCli();
+  assert.equal(await moveProxy(cli, proxyControl(), running, 8080), "0.0.0.0:8080");
+  assert.deepEqual(calls[1], ["proxy", "start", "--listen=0.0.0.0:8080", "--invisible", "--redirect=https://app.acme.test", "--no-http2"]);
+});
+
+test("startProxy: a saved redirect that isn't a plain origin never reaches the start", async () => {
+  for (const stored of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "https://app.acme.test --listen=0.0.0.0:80"]) {
+    stubStorage({ [PROXY_REDIRECT + "/work/a.bpdb"]: stored });
+    const { calls, cli } = fakeCli();
+    await startProxy(cli, proxyControl("/work/a.bpdb"));
+    assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8080"]], stored);
+  }
+});
+
+test("startProxy without a project: the saved host and invisible mode, never a redirect", async () => {
+  stubStorage({ [PROXY_INVISIBLE]: "on", [PROXY_NETWORK]: "all", [PROXY_REDIRECT]: "https://app.acme.test", [PROXY_REDIRECT + "undefined"]: "https://app.acme.test" });
+  const { calls, cli } = fakeCli();
+  await startProxy(cli, proxyControl(), 9090);
+  assert.deepEqual(calls, [["proxy", "start", "--listen=0.0.0.0:9090", "--invisible"]]);
+});
+
+test("startProxy: corrupt or unreadable setup storage starts on this computer only", async () => {
+  stubStorage({ [PROXY_NETWORK]: "ALL", [PROXY_INVISIBLE]: "1" });
+  let fake = fakeCli();
+  await startProxy(fake.cli, proxyControl("/work/a.bpdb"), 9090);
+  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
+
+  const fail = () => {
+    throw new Error("denied");
+  };
+  stubStorage({}, { getItem: fail });
+  fake = fakeCli();
+  await startProxy(fake.cli, proxyControl("/work/a.bpdb"), 9090);
+  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
+});
+
+test("a start waiting on a setup move that left the proxy off starts it with the saved setup", async () => {
+  stubStorage({ [PROXY_NETWORK]: "all", [PROXY_REDIRECT + "/work/a.bpdb"]: "https://app.acme.test" });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const { calls, cli } = fakeCli(async (args) => {
+    if (args[1] === "stop") await held;
+    if (args[1] === "status") return { running: false, proxy: null };
+    if (isStart(args)) throw new Error(BIND_FAILURE);
+    return {};
+  });
+  const ctl = proxyControl("/work/a.bpdb");
+  const moved = moveProxy(cli, ctl, { listen: "127.0.0.1:8080" }, 80, { allInterfaces: true, invisible: false, redirect: "https://app.acme.test" });
+  const started = startProxy(cli, ctl, 8080).catch((e) => e);
+  release();
+  await assert.rejects(moved);
+  await started;
+  // The move's two starts, then the waiting start's status check and its own start.
+  assert.deepEqual(calls.at(-1), ["proxy", "start", "--listen=0.0.0.0:8080", "--redirect=https://app.acme.test"]);
+});
+
+test("lowPortNote says what privileges a low port needs", () => {
+  assert.match(lowPortNote(80)!, /CAP_NET_BIND_SERVICE/);
+  assert.match(lowPortNote(1)!, /stays off/);
+  assert.equal(lowPortNote(65535), null);
+});
