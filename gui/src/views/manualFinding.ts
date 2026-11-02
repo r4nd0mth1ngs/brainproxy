@@ -91,15 +91,23 @@ export function findingAddArgs(f: FindingForm): { args: string[]; stdin?: string
   return { args: [...args, "--input-json"], stdin: JSON.stringify(texts) };
 }
 
-/** A draft from a Replay tab: its last response's history entry if there is one, else the request line. */
+/**
+ * A draft from a Replay tab: its last response's history entry if there is one, else the
+ * request line. The path is kept as written: resolving it as a URL would turn
+ * `/public/%2e%2e/admin` into `/admin`, and that path is often the finding.
+ */
 export function draftFromRequest(raw: string, target: string, historyId?: number, url?: string): FindingDraft {
   const [method, path] = (raw.split(/\r?\n/, 1)[0] ?? "").split(/\s+/);
   let where = url ?? "";
-  if (!where && target && path) {
-    try {
-      where = new URL(path, target).toString();
-    } catch {
-      where = "";
+  if (!where && path) {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) where = path;
+    else if (target && path.startsWith("/")) {
+      try {
+        const t = new URL(target);
+        where = `${t.protocol}//${t.host}${path}`;
+      } catch {
+        where = "";
+      }
     }
   }
   return { method: method || undefined, url: where || undefined, history: historyId != null ? [historyId] : [] };

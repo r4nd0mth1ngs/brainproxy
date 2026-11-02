@@ -939,12 +939,16 @@ brainproxy findings remove 17
 - `--title` and `--risk` are required; `--confidence` defaults to medium.
 - `--url` must be an absolute http(s) or ws(s) URL, without a user name or password. Without it,
   the URL and method are those of the first `--history-id` entry. A URL outside the engagement
-  scope is recorded with a warning.
+  scope is recorded with a warning. The path and query are kept as given (`/public/%2e%2e/admin`
+  is not resolved to `/admin`); only the scheme, host and port are normalised, and a space or
+  non-ASCII character is percent-encoded.
 - `--history-id` (repeatable or comma-separated) links the history entries that show the issue;
   the first is the request and response in reports.
 - `--description`, `--solution` and `--evidence` take the text; `--description-file`,
   `--solution-file` and `--evidence-file` read it from a file, or stdin with `-` (one of them).
   Through MCP the file flags only take `-`, the call's stdin.
+- In Markdown reports and SARIF help, HTML in the description and solution shows as text and
+  links and images are left out; code spans and fenced code blocks keep their text as written.
 - `--input-json` reads all three from stdin instead, as
   `{"description": "...", "solution": "...", "evidence": "..."}` (each optional). Text on the
   command line is visible in the process list, so use it for evidence that holds a token.

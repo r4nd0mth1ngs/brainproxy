@@ -128,3 +128,15 @@ test("Replay drafts read CRLF requests and absolute request lines", () => {
   assert.equal(draftFromRequest("GET /old HTTP/1.1\n\n", "https://app.test", 5, "https://app.test/new").url, "https://app.test/new");
   assert.deepEqual(draftFromRequest("GET", "https://app.test"), { method: "GET", url: undefined, history: [] });
 });
+
+test("Replay drafts keep the path and query as written", () => {
+  const url = (line: string, target = "https://app.test") => draftFromRequest(`${line}\nHost: app.test\n\n`, target).url;
+  assert.equal(url("GET /public/%2e%2e/admin HTTP/1.1"), "https://app.test/public/%2e%2e/admin");
+  assert.equal(url("GET /a/../b/./c?ids[]=1&x=%41 HTTP/1.1", "http://app.test:8080"), "http://app.test:8080/a/../b/./c?ids[]=1&x=%41");
+  assert.equal(url("GET http://other.test/x/%2e%2e/y HTTP/1.1"), "http://other.test/x/%2e%2e/y");
+  // Only the target's scheme, host and port are used.
+  assert.equal(url("GET /x HTTP/1.1", "https://app.test/base/"), "https://app.test/x");
+  // Anything else isn't a URL to record.
+  assert.equal(url("OPTIONS * HTTP/1.1"), undefined);
+  assert.equal(url("GET /x HTTP/1.1", "not a url"), undefined);
+});

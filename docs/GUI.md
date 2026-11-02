@@ -171,7 +171,9 @@ The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findi
 risk, confidence, method and URL (or only history entries, whose first gives both), parameter,
 CWE, history entries, description, solution and evidence. The description, solution and
 evidence go on stdin as JSON (`--input-json`), so a token in the evidence stays out of the
-process list; the rest are arguments. Nothing is sent. A warning (outside the scope, or a
+process list; the rest are arguments. From Replay, an unsent request's URL is its request line
+on the target's scheme, host and port, with the path as written (`%2e%2e` is not resolved).
+Nothing is sent. A warning (outside the scope, or a
 replaced description or solution that findings of the same title share) shows with the
 confirmation. Findings added by hand are grouped by title, tagged *by hand*, show *Added by
 hand* and their history entries instead of a rule, and have *Remove* (`findings remove`, after

@@ -394,7 +394,7 @@ impl Store {
             (None, Some((_, u))) => u.clone(),
             (None, None) => return Err(Error::InvalidInput("give --url or --history-id".into())),
         };
-        let parsed = manual_url(&url)?;
+        let (parsed, url) = manual_url(&url)?;
         let method = match (&f.method, &first) {
             (Some(m), _) => m.trim().to_ascii_uppercase(),
             (None, Some((m, _))) => m.clone(),
@@ -406,7 +406,6 @@ impl Store {
         {
             return Err(Error::InvalidInput(format!("{method:?} is not an HTTP method")));
         }
-        let url = parsed.to_string();
         let host = parsed.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
         let dedupe = dedupe_key(&alert_ref, &method, &url, &f.param);
         if let Some(id) =
@@ -588,9 +587,16 @@ pub(crate) fn manual_alert_ref(title: &str) -> Result<String> {
 }
 
 /// An absolute http(s) or ws(s) URL with a host and no user name or password (it would show
-/// in every list and report).
-fn manual_url(url: &str) -> Result<url::Url> {
+/// in every list and report), and the URL as stored: the scheme, host and port as the parser
+/// writes them, the path and query as given. The parser would resolve `/public/%2e%2e/admin`
+/// to `/admin`, and that path is often the finding.
+fn manual_url(url: &str) -> Result<(url::Url, String)> {
+    use std::fmt::Write as _;
     let bad = || Error::InvalidInput(format!("{url:?} is not an http(s) or ws(s) URL with a host"));
+    // The parser drops tabs and line breaks anywhere, so the URL it checked wouldn't be the one kept.
+    if url.chars().any(char::is_control) {
+        return Err(Error::InvalidInput("the URL has a control character or line break in it".into()));
+    }
     let parsed = url::Url::parse(url).map_err(|_| bad())?;
     if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") || parsed.host_str().is_none_or(str::is_empty) {
         return Err(bad());
@@ -600,7 +606,31 @@ fn manual_url(url: &str) -> Result<url::Url> {
             "the URL has a user name or password; leave them out (they would show in every report)".into(),
         ));
     }
-    Ok(parsed)
+    // What follows the authority, found the way the parser finds it for these schemes.
+    let after_scheme = &url[url.find(':').map_or(0, |i| i + 1)..];
+    let authority = after_scheme.trim_start_matches(['/', '\\']);
+    let rest = &authority[authority.find(['/', '\\', '?', '#']).unwrap_or(authority.len())..];
+    let mut kept = parsed[..url::Position::BeforePath].to_string();
+    if !rest.starts_with(['/', '\\']) {
+        kept.push('/');
+    }
+    // A space or non-ASCII character can't go in a request as it is; it gets percent-encoded.
+    for c in rest.chars() {
+        if c == ' ' || !c.is_ascii() {
+            let mut buf = [0; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                let _ = write!(kept, "%{b:02X}");
+            }
+        } else {
+            kept.push(c);
+        }
+    }
+    // The kept URL must still point at the host and port that were checked.
+    match url::Url::parse(&kept) {
+        Ok(k) if k.host_str() == parsed.host_str() && k.port_or_known_default() == parsed.port_or_known_default() => {}
+        _ => return Err(bad()),
+    }
+    Ok((parsed, kept))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -912,6 +942,37 @@ mod tests {
         let two = s.finding_add(&manual("Pair", Some("http://a.test/"), vec![other, h])).unwrap();
         assert_eq!(s.finding_history_ids(two).unwrap(), [other, h]);
         assert_eq!(s.meta_get(&history_key(two)).unwrap(), None);
+    }
+
+    #[test]
+    fn the_path_and_query_are_kept_as_given() {
+        let (mut s, _) = store();
+        let mut add = |title: &str, url: &str| {
+            let id = s.finding_add(&manual(title, Some(url), vec![])).unwrap();
+            s.finding_get(id).unwrap()["url"].as_str().unwrap().to_string()
+        };
+        // Dot segments, encoded dots and slashes, and brackets are often the finding itself.
+        assert_eq!(add("Traversal", "https://app.test/public/%2e%2e/admin"), "https://app.test/public/%2e%2e/admin");
+        assert_eq!(add("Dots", " HTTPS://App.Test:443/a/../b/./c "), "https://app.test/a/../b/./c");
+        assert_eq!(
+            add("Slash", "http://app.test:8080/files/..%2f..%2fetc?ids[]=1&a=%41"),
+            "http://app.test:8080/files/..%2f..%2fetc?ids[]=1&a=%41"
+        );
+        assert_eq!(add("Backslash", "http://app.test/a\\..\\b"), "http://app.test/a\\..\\b");
+        // Only the root is added; a query or fragment right after the host stays as it was.
+        assert_eq!(add("Root", "https://app.test"), "https://app.test/");
+        assert_eq!(add("Query", "https://app.test?q='"), "https://app.test/?q='");
+        assert_eq!(add("Unicode", "https://app.test/ä?q=a b"), "https://app.test/%C3%A4?q=a%20b");
+        // Same path, other query: still one finding.
+        let dup = s.finding_add(&manual("Traversal", Some("https://app.test/public/%2e%2e/admin?x=1"), vec![]));
+        assert!(matches!(dup, Err(Error::Conflict(_))), "{dup:?}");
+        // The parser would drop a line break, so the URL it checked wouldn't be the one kept.
+        for url in ["https://app.test/a\nb", "https://app.test/a\tb", "https://app.test/\u{7f}"] {
+            assert!(
+                matches!(s.finding_add(&manual("Control", Some(url), vec![])), Err(Error::InvalidInput(_))),
+                "{url:?}"
+            );
+        }
     }
 
     #[test]
