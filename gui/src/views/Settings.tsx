@@ -10,6 +10,17 @@ import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
 import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
 import { DEFAULT_PROXY_PORT, lowPortNote, moveProxy, portOf, portProblem, proxyListen, saveProxyPort, savedProxyPort, startProxy } from "./proxyPort";
+import {
+  redirectOrigin,
+  redirectProblem,
+  runningSetup,
+  saveProxySetup,
+  savedProxySetup,
+  scopeCheckArgs,
+  scopeProblem,
+  setupChanges,
+  type ProxySetup,
+} from "./proxyMode";
 import { RecordLogin } from "./RecordLogin";
 import { AppUpdateSettings } from "./AppUpdate";
 import {
@@ -1306,10 +1317,10 @@ interface ProxyStatus {
   intercept_enabled: boolean;
 }
 
-/** The port the app starts the proxy on, and moving a running proxy to it. */
-function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: boolean; setBusy: (busy: boolean) => void }) {
+/** The port the app starts the proxy on. */
+function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => void; running: string | null }) {
   const app = useApp();
-  const [saved, setSaved] = useState(savedProxyPort);
+  const saved = p.saved;
   const [text, setText] = useState(saved == null ? "" : String(saved));
   const problem = portProblem(text);
   const port = text.trim() ? Number(text) : null;
@@ -1319,7 +1330,6 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
   // Bumped when Save is pressed with an invalid port, so the error is announced again.
   const [attempt, setAttempt] = useState(0);
 
-  const running = p.proxy?.running ? p.proxy.proxy : null;
   const save = () => {
     if (problem) {
       setAttempt((n) => n + 1);
@@ -1328,44 +1338,12 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
     }
     if (port === saved) return;
     if (!saveProxyPort(port)) return app.toast("The port wasn't saved: this app's settings storage is unavailable.", "error");
-    setSaved(port);
+    p.onSaved(port);
     app.toast(
       port != null
         ? `Saved. The proxy will listen on ${proxyListen(port)} when it next starts.`
-        : `Saved. ${running ? `The proxy stays on ${running.listen} until it stops. After that it` : "The proxy"} will use port ${DEFAULT_PROXY_PORT}, or the next free one, when a project opens.`,
+        : `Saved. ${p.running ? `The proxy stays on ${p.running} until it stops. After that it` : "The proxy"} will use port ${DEFAULT_PROXY_PORT}, or the next free one, when a project opens.`,
     );
-    p.refresh();
-  };
-
-  const blocked = p.proxy?.other_pid_namespace
-    ? "This proxy runs in another container: restart it there."
-    : running?.authz_run != null
-      ? "A live access-control test is running on this proxy. To move it, stop the proxy from the top bar, which ends the test, and start it again."
-      : null;
-  const restart = async () => {
-    if (saved == null) return;
-    p.setBusy(true);
-    try {
-      // The polled status can be seconds old; if it no longer applies, the refresh below shows that.
-      const now = await run<ProxyStatus>(["proxy", "status"]);
-      const held = now.pending_intercepts;
-      if (
-        now.running &&
-        now.proxy &&
-        now.proxy.authz_run == null &&
-        !now.other_pid_namespace &&
-        (held === 0 || (await confirm("Restart the proxy?", `${held} held request${held === 1 ? "" : "s"} will be dropped.`, "Restart", "Keep running")))
-      ) {
-        const was = now.proxy.listen;
-        app.toast(
-          `The proxy is now listening on ${await moveProxy(run, app.proxy, now.proxy, saved)}. Browsers opened earlier still send traffic to ${was}: close them, and use Open browser again. Otherwise they go through whatever proxy starts on ${was} later, maybe another project's.`,
-        );
-      }
-    } catch (e: any) {
-      app.toast(e.message, "error");
-    }
-    p.setBusy(false);
-    p.refresh();
   };
 
   return (
@@ -1409,23 +1387,199 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
       )}
       <p id={`${id}-help`} className="muted small">
         Empty means port {DEFAULT_PROXY_PORT}, or the next free one when a project opens. A chosen port is used as is, for
-        every project: if it's taken, the proxy stays off and says why. This sets the port on 127.0.0.1 for the app;{" "}
-        <span className="mono">brainproxy proxy start</span> from a shell or MCP still defaults to {DEFAULT_PROXY_PORT} unless given{" "}
+        every project: if it's taken, the proxy stays off and says why. This sets the port the app's proxy listens on;{" "}
+        <span className="mono">brainproxy proxy start</span> from a shell or MCP still defaults to 127.0.0.1:{DEFAULT_PROXY_PORT} unless given{" "}
         <span className="mono">--listen</span>.
       </p>
-      {running && saved != null && portOf(running.listen) !== saved && (
-        <>
-          <p>
-            The proxy is still listening on <span className="mono">{running.listen}</span>. It has to restart to use port {saved}.
-            Browsers opened earlier stay on {running.listen} after the restart: close them and open them again, or their traffic goes
-            to whatever proxy starts on that port later, maybe another project's. Reconfigure tools you set up by hand.
-          </p>
-          {blocked && <p className="muted">{blocked}</p>}
-          <button className="btn small primary" disabled={p.busy || !!blocked} onClick={restart}>
-            Restart on port {saved}
-          </button>
-        </>
+    </>
+  );
+}
+
+const EXPOSED =
+  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours and are recorded in this project. Use it only on a network you trust, or block the port in a firewall.";
+
+/** Who can connect to the proxy, invisible mode and the redirect (proxyMode.ts). */
+function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => void }) {
+  const app = useApp();
+  const id = useId();
+  const [all, setAll] = useState(p.saved.allInterfaces);
+  const [invisible, setInvisible] = useState(p.saved.invisible);
+  const [redirect, setRedirect] = useState(p.saved.redirect ?? "");
+  const [checking, setChecking] = useState(false);
+  // Why the redirect was refused by the scope check.
+  const [refused, setRefused] = useState<string | null>(null);
+  // Bumped when Save is pressed with an invalid or refused redirect, so the error is announced again.
+  const [attempt, setAttempt] = useState(0);
+  const input = useRef<HTMLInputElement>(null);
+  const problem = redirectProblem(redirect) ?? refused;
+  const origin = redirectOrigin(redirect);
+  const draft: ProxySetup = { allInterfaces: all, invisible, redirect: origin };
+  const changed = all !== p.saved.allInterfaces || invisible !== p.saved.invisible || origin !== p.saved.redirect;
+
+  const save = async () => {
+    if (problem) {
+      setAttempt((n) => n + 1);
+      input.current?.focus();
+      return;
+    }
+    if (!changed) return;
+    setChecking(true);
+    try {
+      if (origin && origin !== p.saved.redirect) {
+        const why = scopeProblem(await run(scopeCheckArgs(origin)));
+        if (why) {
+          setRefused(why);
+          setAttempt((n) => n + 1);
+          return;
+        }
+      }
+      if (all && !p.saved.allInterfaces && !(await confirm("Listen on every network interface?", EXPOSED, "Listen on every interface", "Cancel"))) return;
+      if (!saveProxySetup(draft, app.project)) return app.toast("The settings weren't saved: this app's settings storage is unavailable.", "error");
+      p.onSaved(draft);
+      app.toast("Saved. The proxy uses these settings when it next starts.");
+    } catch (e: any) {
+      setRefused(`It couldn't be checked against the engagement scope: ${e.message}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        save();
+      }}
+    >
+      <h3>
+        <label htmlFor={`${id}-net`}>Who can connect</label>
+      </h3>
+      <select id={`${id}-net`} className="input" value={all ? "all" : "local"} onChange={(e) => setAll(e.target.value === "all")}>
+        <option value="local">This computer only (127.0.0.1)</option>
+        <option value="all">Every network interface (0.0.0.0)</option>
+      </select>
+      {all && (
+        <div className="wiz-warn danger" style={{ marginTop: 8 }}>
+          {EXPOSED}
+        </div>
       )}
+      <h3>Invisible mode</h3>
+      <label className="check">
+        <input type="checkbox" checked={invisible || !!origin} disabled={!!origin} onChange={(e) => setInvisible(e.target.checked)} /> Also serve
+        clients that can't be told about a proxy
+      </label>
+      <p className="muted small">
+        For a device or program with no proxy setting: point the target's name at this computer with DNS or the hosts file
+        (<span className="mono">/etc/hosts</span>, on Windows <span className="mono">C:\Windows\System32\drivers\etc\hosts</span>), and
+        it connects here as if to the site. Plain requests go to the host in their Host header, TLS to the name the client asks
+        for (SNI) on port 443, and the client has to trust the brainproxy CA (TLS / CA). Ordinary proxy requests still work. Such
+        clients use the site's own port, usually 80 or 443: set Port to match, and choose every network interface for another
+        device. {lowPortNote(80)}
+      </p>
+      <h3>
+        <label htmlFor={`${id}-redirect`}>Send everything to</label>
+      </h3>
+      <div className="row gap">
+        <input
+          ref={input}
+          id={`${id}-redirect`}
+          className="input mono"
+          style={{ width: 320 }}
+          placeholder="https://app.example.test:8443"
+          value={redirect}
+          aria-invalid={!!problem}
+          aria-describedby={[problem ? `${id}-err` : null, `${id}-help`].filter(Boolean).join(" ")}
+          onChange={(e) => {
+            setRedirect(e.target.value);
+            setRefused(null);
+          }}
+        />
+      </div>
+      {problem && (
+        <div key={attempt} id={`${id}-err`} role="alert" className="set-err small">
+          {problem}
+        </div>
+      )}
+      <p id={`${id}-help`} className="muted small">
+        Optional. Every request from the listener goes to this origin, whatever host it names, like a reverse proxy; each keeps
+        its path. It turns invisible mode on, and browsers opened with Open browser go there too. It has to be in this
+        engagement's scope (checked when you save) and is kept for this project only.
+      </p>
+      {/* Enabled with an invalid redirect too: pressing it (or Enter) points at the error. */}
+      <button className="btn small primary" disabled={checking || (!problem && !changed)}>
+        {checking ? "Checking…" : "Save"}
+      </button>
+    </form>
+  );
+}
+
+/** Restarting a running proxy with the saved port and setup. */
+function ProxyRestart(p: { proxy: ProxyStatus | null; port: number | null; setup: ProxySetup; refresh: () => void; busy: boolean; setBusy: (busy: boolean) => void }) {
+  const app = useApp();
+  const running = p.proxy?.running ? p.proxy.proxy : null;
+  if (!running) return null;
+  const changes = setupChanges(running, p.port, p.setup);
+  if (!changes.length) return null;
+  const portNow = portOf(running.listen);
+  const port = p.port ?? portNow ?? DEFAULT_PROXY_PORT;
+  const movesPort = portNow !== port;
+  const portOnly = movesPort && changes.length === 1;
+
+  const blocked = p.proxy?.other_pid_namespace
+    ? "This proxy runs in another container: restart it there."
+    : running.authz_run != null
+      ? "A live access-control test is running on this proxy. To restart it, stop the proxy from the top bar, which ends the test, and start it again."
+      : null;
+  const restart = async () => {
+    p.setBusy(true);
+    try {
+      // The polled status can be seconds old; if it no longer applies, the refresh below shows that.
+      const now = await run<ProxyStatus>(["proxy", "status"]);
+      const held = now.pending_intercepts;
+      if (
+        now.running &&
+        now.proxy &&
+        now.proxy.authz_run == null &&
+        !now.other_pid_namespace &&
+        (held === 0 || (await confirm("Restart the proxy?", `${held} held request${held === 1 ? "" : "s"} will be dropped.`, "Restart", "Keep running")))
+      ) {
+        const was = now.proxy.listen;
+        const target = await moveProxy(run, app.proxy, now.proxy, p.port ?? portOf(was) ?? DEFAULT_PROXY_PORT, p.setup);
+        app.toast(
+          portOf(target) !== portOf(was)
+            ? `The proxy is now listening on ${target}. Browsers opened earlier still send traffic to ${was}: close them, and use Open browser again. Otherwise they go through whatever proxy starts on ${was} later, maybe another project's.`
+            : `The proxy restarted on ${target} with the new settings.`,
+        );
+      }
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    p.setBusy(false);
+    p.refresh();
+  };
+
+  return (
+    <>
+      {portOnly ? (
+        <p>
+          The proxy is still listening on <span className="mono">{running.listen}</span>. It has to restart to use port {port}.
+        </p>
+      ) : (
+        <p>
+          The proxy on <span className="mono">{running.listen}</span> runs with other settings. It has to restart to use:{" "}
+          {changes.join(", ")}.
+        </p>
+      )}
+      {movesPort && (
+        <p>
+          Browsers opened earlier stay on {running.listen} after the restart: close them and open them again, or their traffic goes
+          to whatever proxy starts on that port later, maybe another project's. Reconfigure tools you set up by hand.
+        </p>
+      )}
+      {blocked && <p className="muted">{blocked}</p>}
+      <button className="btn small primary" disabled={p.busy || !!blocked} onClick={restart}>
+        {portOnly ? `Restart on port ${port}` : "Restart with these settings"}
+      </button>
     </>
   );
 }
@@ -1436,6 +1590,8 @@ function ProxySetup() {
   const [proxy, refresh] = usePoll<ProxyStatus>(() => run(["proxy", "status"]), 3000);
   // Set while the proxy starts or moves: a status poll can catch it off, mid-restart.
   const [busy, setBusy] = useState(false);
+  const [port, setPort] = useState(savedProxyPort);
+  const [setup, setSetup] = useState(() => savedProxySetup(app.project));
   const start = async () => {
     setBusy(true);
     try {
@@ -1447,6 +1603,7 @@ function ProxySetup() {
     refresh();
   };
   const usage = proxy?.proxy?.usage;
+  const mode = proxy?.running && proxy.proxy ? runningSetup(proxy.proxy) : null;
   return (
     <div className="detail">
       <div className="detail-head">
@@ -1468,6 +1625,12 @@ function ProxySetup() {
               <dd className="mono">{proxy.proxy.ca_cert}</dd>
             </>
           )}
+          {mode?.invisible && (
+            <>
+              <dt>Invisible mode</dt>
+              <dd>{mode.redirect ? <>on, sending everything to <span className="mono">{mode.redirect}</span></> : "on"}</dd>
+            </>
+          )}
           <dt>Browser</dt>
           <dd>Set the HTTP and HTTPS proxy to {usage.proxy_url} and trust the CA certificate above (or import it into the browser; see TLS / CA).</dd>
           <dt>Chromium</dt>
@@ -1482,9 +1645,24 @@ function ProxySetup() {
           </dd>
         </dl>
       ) : (
-        <p className="muted">Start the proxy (it will listen on {proxyListen()}), then point a browser at it to record traffic into this project.</p>
+        <p className="muted">Start the proxy (it will listen on {proxyListen(port, setup)}), then point a browser at it to record traffic into this project.</p>
       )}
-      <ProxyPort proxy={proxy} refresh={refresh} busy={busy} setBusy={setBusy} />
+      <ProxyPort
+        saved={port}
+        running={proxy?.running ? (proxy.proxy?.listen ?? null) : null}
+        onSaved={(n) => {
+          setPort(n);
+          refresh();
+        }}
+      />
+      <ProxyListen
+        saved={setup}
+        onSaved={(s) => {
+          setSetup(s);
+          refresh();
+        }}
+      />
+      <ProxyRestart proxy={proxy} port={port} setup={setup} refresh={refresh} busy={busy} setBusy={setBusy} />
     </div>
   );
 }

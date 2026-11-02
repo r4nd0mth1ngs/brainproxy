@@ -52,6 +52,13 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   then start), the control marks a move: Open browser, Record a login and Start proxy wait
   for it, and the pill and Access's live restart ask to try again. A failed move reports
   where the proxy is from a fresh `proxy status`.
+- Every start also uses the rest of Settings › Proxy (`views/proxyMode.ts`): who can connect
+  (`--listen=127.0.0.1:PORT`, or `0.0.0.0:PORT` after a warning that anyone on the network can
+  then use the proxy), `--invisible`, and a `--redirect=ORIGIN` that `engagement check` must
+  allow when it is saved. The port, the network choice and invisible mode are kept for every
+  project; the redirect for its project only, since it has to be in that engagement's scope.
+  A running proxy that differs is restarted with them on request, like a port move, keeping
+  its other options (and an address that already fits, such as `[::1]`).
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 
@@ -96,8 +103,8 @@ CLI has no command for it, so a project a script or agent starts always keeps it
 ## Layout
 
 Top bar: brainproxy, the project and its engagement scope chips; on the right the intercept
-and proxy pills (the proxy pill starts/stops `proxy start` on 127.0.0.1, on the port set in
-Settings › Proxy, 8080 by default) and the theme toggle, and **Open browser**: a menu of the
+and proxy pills (the proxy pill starts/stops `proxy start` on the address and with the options
+set in Settings › Proxy, 127.0.0.1:8080 by default) and the theme toggle, and **Open browser**: a menu of the
 installed browsers (`browser list`) that starts the proxy if needed and runs `browser open`,
 a separate browser instance in a per-project profile (`<project>.browsers/<id>`) going through
 the proxy, loopback included; Chromium-based browsers trust the brainproxy CA in that profile only (by its key, via
@@ -122,7 +129,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port the app uses and restarting on it, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port, who can connect, invisible mode and a redirect the app uses, and restarting with them, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop` (incl. `--invisible`, `--redirect`), `engagement check` (the redirect), `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 

@@ -10,6 +10,7 @@ import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { proxyListen, withPortHint } from "./proxyPort";
+import { savedProxySetup, setupOptions } from "./proxyMode";
 import { stateClass, type Job } from "./Scanner";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
@@ -324,7 +325,8 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       setBusy(true);
       const s = await run<ProxyStatus>(["proxy", "status"]);
       const listen = `--listen=${s.proxy?.listen ?? proxyListen()}`;
-      const before = proxyOptions(s.proxy?.args ?? []);
+      // A proxy that isn't running starts with the saved invisible mode and redirect, as elsewhere.
+      const before = s.proxy ? proxyOptions(s.proxy.args ?? []) : setupOptions(savedProxySetup(app.project));
       // The app's proxy (one it starts here, or restarts) stops when the project closes; not one a shell or an agent started.
       const ours = !s.running || (app.proxy.owned != null && app.proxy.owned === s.proxy?.pid);
       if (s.running) await run(["proxy", "stop"]);

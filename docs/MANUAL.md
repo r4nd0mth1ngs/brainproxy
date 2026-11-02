@@ -559,14 +559,30 @@ byte, side by side or unified.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
-  Chromium, curl, or a shell at it. *Port* sets the port on 127.0.0.1 the app uses, for every
+  Chromium, curl, or a shell at it. *Port* sets the port the app's proxy listens on, for every
   project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
   is used as is: if it's taken, the proxy stays off and says why. A running proxy on another
-  port keeps it until you press *Restart on port N*, which keeps its bind address and
+  port keeps it until you press *Restart on port N*, which keeps its bind address (when it fits *Who can connect*) and
   options (a custom log file goes back to the default). Browsers opened earlier still point
   at the old port: close them and open them again, or their traffic goes to whatever proxy
   starts on that port later, maybe another project's. Reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
-  still defaults to 8080 unless given `--listen`.
+  still defaults to 8080 unless given `--listen`. Ports below 1024 may need elevated
+  privileges (on Linux, root or the `CAP_NET_BIND_SERVICE` capability); if the system
+  refuses, the proxy stays off and says why.
+  - *Who can connect:* this computer only (127.0.0.1, the default) or every network
+    interface (0.0.0.0), for another device. The second asks first: anyone who can reach
+    your computer can then use the proxy without a password, and their requests are
+    recorded in the project.
+  - *Invisible mode* (`--invisible`): for a device or program with no proxy setting. Point
+    the target's name at this computer with DNS or the hosts file, set *Port* to the site's
+    own (usually 80 or 443), and the client connects here as if to the site; it has to trust
+    the brainproxy CA. How it routes requests is under *Connection options* in [Command line](#command-line).
+  - *Send everything to* (`--redirect`): every request from the listener goes to this origin
+    (`https://host[:port]`), whatever host it names; it turns invisible mode on, and browsers
+    opened with *Open browser* go there too. It must be in the engagement scope (checked
+    with `engagement check` when you save) and is kept for this project only.
+  - These apply the next time the proxy starts. A running proxy that differs shows what would
+    change and *Restart with these settings*, which works like the port restart.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,
   the fuzzer, logins, and the proxy's upstream side). A running proxy picks up a change
   within a second. None of them widens the engagement scope.

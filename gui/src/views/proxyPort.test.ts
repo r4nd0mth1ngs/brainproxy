@@ -19,6 +19,7 @@ import {
   withPort,
   withPortHint,
 } from "./proxyPort.ts";
+import { PROXY_INVISIBLE, PROXY_NETWORK, PROXY_REDIRECT } from "./proxyMode.ts";
 
 // localStorage: a small stub on globalThis, put back after each test.
 const realStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -371,4 +372,52 @@ test("moveProxy: a proxy the app didn't start doesn't become the app's", async (
   const { cli } = proxyCli(() => ({}), [8]);
   await moveProxy(cli, ctl, { listen: "127.0.0.1:8080", pid: 7 }, 9090);
   assert.equal(ctl.owned, null);
+});
+
+// The setup (proxyMode.ts): who can connect, invisible mode and the redirect.
+
+test("startProxy starts with the saved setup, the redirect from the control's project", async () => {
+  stubStorage({ [PROXY_PORT]: "80", [PROXY_NETWORK]: "all", [PROXY_INVISIBLE]: "on", [PROXY_REDIRECT + "/work/a.bpdb"]: "https://app.acme.test" });
+  let fake = fakeCli();
+  await startProxy(fake.cli, proxyControl("/work/a.bpdb"));
+  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=0.0.0.0:80", "--redirect=https://app.acme.test"]]);
+  assert.equal(proxyListen(), "0.0.0.0:80");
+
+  // Another project's redirect isn't used.
+  fake = fakeCli();
+  await startProxy(fake.cli, proxyControl("/work/b.bpdb"));
+  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=0.0.0.0:80", "--invisible"]]);
+});
+
+test("moveProxy with a setup: its host, invisible mode and redirect, the other options kept", async () => {
+  const running = { listen: "127.0.0.1:8080", args: ["proxy", "run", "--listen", "127.0.0.1:8080", "--timeout", "30", "--invisible"] };
+  const { calls, cli } = fakeCli();
+  const setup = { allInterfaces: true, invisible: false, redirect: "https://app.acme.test" };
+  assert.equal(await moveProxy(cli, proxyControl(), running, 443, setup), "0.0.0.0:443");
+  assert.deepEqual(calls, [
+    ["proxy", "stop"],
+    ["proxy", "start", "--listen=0.0.0.0:443", "--timeout=30", "--redirect=https://app.acme.test"],
+  ]);
+});
+
+test("moveProxy with a setup on the same port: only the mode changes", async () => {
+  const { calls, cli } = fakeCli();
+  const setup = { allInterfaces: false, invisible: true, redirect: null };
+  assert.equal(await moveProxy(cli, proxyControl(), { listen: "[::1]:8080" }, 8080, setup), "[::1]:8080");
+  assert.deepEqual(calls[1], ["proxy", "start", "--listen=[::1]:8080", "--invisible"]);
+});
+
+test("moveProxy with a setup that fails: the proxy goes back as it was, its old options included", async () => {
+  const running = { listen: "127.0.0.1:8080", pid: 7, args: ["proxy", "run", "--listen", "127.0.0.1:8080", "--redirect", "https://old.test"] };
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { calls, cli } = proxyCli(() => runningAs(9), [9], (args) => args.includes("--listen=0.0.0.0:80"));
+  await assert.rejects(moveProxy(cli, ctl, running, 80, { allInterfaces: true, invisible: true, redirect: null }), {
+    message: `${HINTED} The proxy is back on 127.0.0.1:8080.`,
+  });
+  assert.deepEqual(calls.slice(1, 3), [
+    ["proxy", "start", "--listen=0.0.0.0:80", "--invisible"],
+    ["proxy", "start", "--listen=127.0.0.1:8080", "--redirect=https://old.test"],
+  ]);
+  assert.equal(ctl.owned, 9);
 });
