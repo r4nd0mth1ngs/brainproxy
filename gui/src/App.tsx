@@ -224,6 +224,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
 
   const tempRef = useRef(app.temp ? app.project : null);
   tempRef.current = app.temp ? app.project : null;
+  // Stable for the project's lifetime, so the close handler below can keep it.
+  const { flushReplayTabs } = app;
   useEffect(() => {
     if (!inTauri) return;
     // Registering is async: a shell unmounted before it finishes (StrictMode's double mount, a
@@ -242,7 +244,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
             await tempProjects.discard(tempProject).catch(() => {});
             await getCurrentWindow().destroy();
           } else {
-            await stopOnClose();
+            // Replay's last edits, which would otherwise be saved a moment later.
+            await Promise.all([flushReplayTabs().catch(() => {}), stopOnClose()]);
           }
         }),
       )

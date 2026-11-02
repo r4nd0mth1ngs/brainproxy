@@ -107,14 +107,15 @@ calls), and so does the Site map ("In scope only"); the proxy never holds an out
 request for interception. Tools sit in a grouped, collapsible sidebar, with the clickable
 AssertiveInfosec logo above Collapse and on the welcome screen (just the mark when collapsed; links open in the system browser
 via tauri-plugin-opener, limited to assertivesolutions.io); tools with several parts have sub-tabs.
-Views stay mounted when hidden, so state (selection, edits, Replay tabs) survives switching.
+Views stay mounted when hidden, so state (selection, edits, Replay tabs) survives switching;
+Replay tabs are also kept in the project file (below).
 
 | Group | Tool | Parts | CLI used |
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
 | Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer. Tabs are kept in the project (below) | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin), `replay tabs list/save` |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
@@ -162,6 +163,30 @@ and written out, and a session rule), and the operations to send
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).
+
+### Replay tabs in the project
+
+`store.tsx` keeps Replay's tabs in the project file through `replay tabs list` and `replay
+tabs save` (JSON on stdin, replacing the saved set; stored under one key of the `meta`
+table), with the logic in `views/replayTabs.ts`:
+
+- **Opening:** the saved tabs are read when the project opens, with new keys, and the saved
+  active tab is shown. Tabs sent to Replay while they load stay, after them. Nothing is saved
+  until the read succeeds, so a failed read (a toast says so) never replaces the saved set.
+- **Saving:** one second after the tabs stop changing (the editors pass their text up after
+  300 ms), on the CLI in the background, so typing never waits. One save runs at a time and
+  an unchanged set isn't sent again. Closing the project or the window saves what is
+  waiting; so does *Save as…*, before it copies the file. A temporary project being discarded
+  isn't saved.
+- **What:** per tab its kind, title, target, the request (or handshake and messages), the
+  binary flag, and a WebSocket tab's Listen and Until (now kept when switching tabs too).
+  Never responses or the send history. Text goes as typed, auth placeholders included.
+- **Failures:** a refused save (over 500 tabs or 16 MB) is a toast, shown once per distinct
+  error; the tabs stay open, and the next change or closing tries again.
+- **Agents:** `replay_tabs_save` is an MCP tool (not read-only, destructive: it replaces the
+  set; it sends nothing), so an agent can prepare tabs for a person to review and send.
+  `replay_tabs_list` is read-only and its output is marked untrusted, since requests often
+  come from the target's traffic.
 
 ## Look
 
@@ -231,6 +256,10 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   off), so Settings briefly turns intercept on and off again when it is off.
 - Replay's WebSocket tabs send text messages only (binary: `ws send --binary` or `--resend ID`
   from the CLI), and show one run at a time (each run is in Proxy › WebSockets).
+- Replay tabs are read only when the project opens. Tabs saved from elsewhere (an agent,
+  another window) while it is open are replaced by the app's next save, which follows any
+  change to its own tabs; reopen the project to see them first. In the browser build (`npm
+  run dev`) closing the tab can lose the last second of edits.
 - Proxy › WebSockets reloads the newest 5,000 connections every 2 s (`ws list --newest`);
   older ones are reachable with `ws list` or `query`. Messages are fetched incrementally.
   Only text messages can be sent to Replay; Copy payload refuses messages over 2 MB.

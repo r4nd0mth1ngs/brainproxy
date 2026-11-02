@@ -203,8 +203,8 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
   const [text, setText] = useState(joinMessages(tab.ws ?? []));
-  const [wait, setWait] = useState(3);
-  const [until, setUntil] = useState("");
+  const [wait, setWait] = useState(tab.wsWait ?? 3);
+  const [until, setUntil] = useState(tab.wsUntil ?? "");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<WsSendResult | string | null>(() => resultsByTab.get(tab.key) ?? null);
   const [current, setCurrent] = useState<number | null>(null);
@@ -216,13 +216,14 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
         setRepeater((ts) => {
           const cur = ts.find((x) => x.key === tab.key);
           const ws = splitMessages(text);
-          if (!cur || (cur.raw === raw && cur.target === target && joinMessages(cur.ws ?? []) === joinMessages(ws))) return ts;
-          return ts.map((x) => (x.key === tab.key ? { ...x, raw, target, ws } : x));
+          const same = cur && cur.raw === raw && cur.target === target && joinMessages(cur.ws ?? []) === joinMessages(ws);
+          if (!cur || (same && cur.wsWait === wait && (cur.wsUntil ?? "") === until)) return ts;
+          return ts.map((x) => (x.key === tab.key ? { ...x, raw, target, ws, wsWait: wait, wsUntil: until } : x));
         }),
       300,
     );
     return () => clearTimeout(t);
-  }, [raw, target, text, tab.key, setRepeater]);
+  }, [raw, target, text, wait, until, tab.key, setRepeater]);
 
   const send = async () => {
     const host = /^host:\s*(\S+)/im.exec(raw)?.[1];

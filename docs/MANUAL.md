@@ -276,6 +276,15 @@ Edit a raw request and send it as often as you like, in separate tabs.
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
   reply matches **Until**. Each run is recorded like proxied traffic.
+- **Kept with the project:** open tabs are saved in the project file a moment after you
+  change them and when you close it, and come back when you open it again (copies made with
+  `project save` or *Save as…* have them too). A tab keeps its title, target, request (or
+  handshake and messages) and Listen and Until; responses and the ‹ › send history are not
+  kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
+  (more than 500 tabs or 16 MB), the app says so and the tabs stay open. From the command
+  line or an agent: `replay tabs list` and `replay tabs save`, so an agent can prepare tabs
+  for you to send. The app reads them when the project opens; while it is open, its own next
+  save replaces tabs saved from elsewhere.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -614,7 +623,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 133 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 137 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -647,6 +656,10 @@ brainproxy ws list                                        # WebSocket connection
 brainproxy ws messages 3 --contains token                 # their messages, both ways
 brainproxy ws send --from 3 -m '{"op":"whoami"}' --until whoami   # replay with a new connection
 echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   # messages off the command line
+
+brainproxy replay tabs list                               # the app's Replay tabs, saved in the project
+echo '{"tabs":[{"title":"search","target":"https://app.acme.test","request":"GET /search?q=x HTTP/1.1\nHost: app.acme.test\n\n"}]}' \
+    | brainproxy replay tabs save                         # replaces them; sends nothing
 
 brainproxy findings list
 brainproxy findings show 12
