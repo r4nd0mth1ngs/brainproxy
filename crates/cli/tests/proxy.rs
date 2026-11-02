@@ -955,3 +955,35 @@ fn proxy_record_that_cannot_be_verified() {
     chmod(0o644);
     env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
 }
+
+#[test]
+fn proxy_start_on_a_port_in_use_says_so() {
+    let env = Env::new("port-in-use");
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = holder.local_addr().unwrap().to_string();
+
+    let (code, v) = env.run(&["proxy", "start", "--listen", &listen]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("cannot listen on {listen}")), "{message}");
+    assert!(message.contains("already in use"), "{message}");
+    assert_eq!(env.ok(&["proxy", "status"])["running"], false);
+}
+
+#[test]
+fn proxy_start_on_a_chosen_port() {
+    let env = Env::new("chosen-port");
+    // Free the port just before asking for it: another process could take it in between.
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = free.local_addr().unwrap().to_string();
+    drop(free);
+
+    let started = env.ok(&["proxy", "start", "--listen", &listen]);
+    assert_eq!(started["listen"].as_str(), Some(listen.as_str()), "{started}");
+    assert_eq!(started["usage"]["proxy_url"].as_str(), Some(format!("http://{listen}").as_str()), "{started}");
+
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!(status["running"], true, "{status}");
+    assert_eq!(status["proxy"]["listen"].as_str(), Some(listen.as_str()), "{status}");
+    assert_eq!(status["proxy"]["usage"]["proxy_url"].as_str(), Some(format!("http://{listen}").as_str()), "{status}");
+}

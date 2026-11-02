@@ -9,6 +9,7 @@ import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
+import { proxyListen, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
@@ -279,7 +280,7 @@ function Compare({ runId, picked, onClose }: { runId: number; picked: Picked; on
 
 interface ProxyStatus {
   running: boolean;
-  proxy: { listen?: string; authz_run?: number; args?: string[] } | null;
+  proxy: { listen?: string; pid?: number; authz_run?: number; args?: string[] } | null;
 }
 
 function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
@@ -317,25 +318,33 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
   // Restarts the proxy on the same address and with the same options, plus live testing. If it
   // doesn't come up, the previous proxy is started again.
   const startLive = async () => {
+    if (app.proxy.moving) return app.toast("The proxy is restarting on another port. Try again in a moment.");
     try {
       const live = liveArgs(f);
       setBusy(true);
       const s = await run<ProxyStatus>(["proxy", "status"]);
-      const listen = `--listen=${s.proxy?.listen ?? "127.0.0.1:8080"}`;
+      const listen = `--listen=${s.proxy?.listen ?? proxyListen()}`;
       const before = proxyOptions(s.proxy?.args ?? []);
+      // The app's proxy (one it starts here, or restarts) stops when the project closes; not one a shell or an agent started.
+      const ours = !s.running || (app.proxy.owned != null && app.proxy.owned === s.proxy?.pid);
       if (s.running) await run(["proxy", "stop"]);
-      let d: { authz_run?: number };
+      if (ours) app.proxy.owned = null;
+      let d: { pid?: number; authz_run?: number };
       try {
-        d = await run<{ authz_run?: number }>(["proxy", "start", listen, ...withLive(before, live)]);
+        d = await run<{ pid?: number; authz_run?: number }>(["proxy", "start", listen, ...withLive(before, live)]);
       } catch (e) {
-        if (s.running) await run(["proxy", "start", listen, ...before]).catch(() => {});
+        if (s.running) {
+          const back = await run<{ pid?: number }>(["proxy", "start", listen, ...before]).catch(() => null);
+          if (ours && back) app.proxy.owned = back.pid ?? null;
+        }
         throw e;
       }
+      if (ours) app.proxy.owned = d.pid ?? null;
       const who = [...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(", ");
       app.toast(`Proxy restarted on ${listen.slice(9)}: requests you browse are now also tried as ${who}`);
       if (d.authz_run != null) onStarted(d.authz_run);
     } catch (e: any) {
-      app.toast(e.message, "error");
+      app.toast(withPortHint(e.message), "error");
     } finally {
       setBusy(false);
     }
