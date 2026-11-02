@@ -172,8 +172,11 @@ side lists each request's status, length, time since the release and history id;
 status or length (or error) differ from request #1's are highlighted. Selecting a row opens that
 response (`history show ID`); the first is opened when the race ends. A race is one step in
 ‹ › like a send. Send history and the running send or race are kept per tab outside the tab's
-view (`views/replayTabs.ts`), so a race that ends after the user switched tabs still lands in its
-tab. It races copies of one request; racing different requests against each other isn't offered.
+view (`views/replayState.ts`), so a race that ends after the user switched tabs still lands in its
+tab. That store belongs to the open project's Replay view, and the send, race and `history show`
+run against the project they started in: a race that ends after the project closed is dropped,
+and the next project's tabs start empty. It races copies of one request; racing different
+requests against each other isn't offered.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).

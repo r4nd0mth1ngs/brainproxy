@@ -23,7 +23,7 @@ import {
   type RaceResult,
   type RaceRow,
 } from "./race";
-import { tabStore } from "./replayTabs";
+import { tabStore, type TabStore } from "./replayState";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
@@ -58,6 +58,9 @@ function guessTarget(raw: string, current: string): string {
 export function RepeaterView() {
   const app = useApp();
   const tabs = app.repeater;
+  // This project's send history and running sends; see TabState.
+  const [store] = useState(() => tabStore<TabState>(EMPTY_TAB));
+  useEffect(() => store.start(), [store]);
   const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
@@ -97,7 +100,7 @@ export function RepeaterView() {
       </div>
       {active ? (
         // key: each tab has its own editor state and send history.
-        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} />
+        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} store={store} />
       ) : (
         <div className="blank">
           <p>Send a request here from Traffic (right-click → Send to Replay, or double-click), or</p>
@@ -135,20 +138,23 @@ function storedAutoEncode(): boolean {
 
 // Send history, and whether a send or race is running, survive switching tabs (the tab view
 // remounts), keyed by tab. A race can run for a while: its result lands here even if the user
-// switched away, and coming back shows it still running.
+// switched away, and coming back shows it still running. The store belongs to the open project's
+// Replay view, so the next project starts with none of it.
 interface TabState {
   list: Sent[];
   at: number;
   busy: false | "send" | "race";
 }
-const replayTabs = tabStore<TabState>({ list: [], at: -1, busy: false });
+const EMPTY_TAB: TabState = { list: [], at: -1, busy: false };
 
-function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
+function RepeaterTabView({ tab, store }: { tab: RepeaterTab; store: TabStore<TabState> }) {
   const app = useApp();
+  // Pinned to this project: another may be open by the time a send or race ends.
+  const { project } = app;
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
-  const [sent, setSent] = useState(() => replayTabs.get(tab.key));
+  const [sent, setSent] = useState(() => store.get(tab.key));
   const { busy } = sent;
   const [raceCount, setRaceCount] = useState(() => {
     try {
@@ -158,12 +164,12 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     }
   });
   const current = sent.list[sent.at];
-  const update = (f: (s: TabState) => TabState) => replayTabs.update(tab.key, f);
+  const update = (f: (s: TabState) => TabState) => store.update(tab.key, f);
 
   useEffect(() => {
-    setSent(replayTabs.get(tab.key));
-    return replayTabs.listen(tab.key, setSent);
-  }, [tab.key]);
+    setSent(store.get(tab.key));
+    return store.listen(tab.key, setSent);
+  }, [tab.key, store]);
 
   // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
   // tabs return the same array, so React skips the update; a new array every time changed
@@ -190,7 +196,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
     let entry: Sent;
     try {
-      const result = await run<SendResult>(["send", `--target=${to}`, "-"], textBytes(sent, tab.binary));
+      const result = await run<SendResult>(["send", `--target=${to}`, "-"], { stdin: textBytes(sent, tab.binary), project });
       entry = { raw, sent, encoded, result, error: null };
     } catch (e: any) {
       entry = { raw, sent, encoded, result: null, error: e.message };
@@ -214,13 +220,14 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     update((s) => ({ ...s, busy: "race" }));
     let entry: Sent;
     try {
-      const result = await run<RaceResult>(raceArgs(to, n), textBytes(sent, tab.binary));
+      const result = await run<RaceResult>(raceArgs(to, n), { stdin: textBytes(sent, tab.binary), project });
       entry = { raw, sent, encoded, result: null, error: null, race: { result, open: null } };
     } catch (e: any) {
       entry = { raw, sent, encoded, result: null, error: e.message };
     }
     update((s) => ({ list: [...s.list, entry], at: s.list.length, busy: false }));
-    if (entry.race) {
+    // The project closed while it ran: nothing to show the response in.
+    if (entry.race && store.live()) {
       const first = firstOpenable(raceRows(entry.race.result));
       if (first != null) openRaced(first, entry.race.result);
     }
@@ -235,7 +242,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     if (item.id == null) return;
     const patch = (p: Partial<Sent>) => update((s) => ({ ...s, list: patchOpen(s.list, result, idx, p) }));
     try {
-      const entry = await run<HistoryEntry>(["history", "show", String(item.id), MAX_BODY]);
+      const entry = await run<HistoryEntry>(["history", "show", String(item.id), MAX_BODY], { project });
       patch({ result: entry, error: null });
     } catch (e: any) {
       patch({ error: e.message });
