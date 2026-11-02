@@ -278,7 +278,9 @@ Edit a raw request and send it as often as you like, in separate tabs.
   Send. Options that only change curl's output (`-k`, `-s`, `-L`, `-o`) are ignored; a proxy,
   `--resolve` or a client certificate is left out with a note (set those in Settings ›
   Connections). A command that reads a file (`-d @file`, `-F field=@file`), uses shell
-  variables, or has an option brainproxy doesn't know is refused with the reason.
+  variables, has an option brainproxy doesn't know, or has a URL that curl's globbing turns
+  into several requests (`{a,b}`, `[1-3]`; add `-g` to send it as written) is refused with
+  the reason.
 - **Copy as cURL:** copies the request, as Send would send it, as a curl command for a POSIX
   shell (it works in fish too). It goes to the tab's target, as Send does. Every value is
   quoted, so headers or a body that came from the target can't run anything when you paste it.

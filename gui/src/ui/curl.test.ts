@@ -238,11 +238,11 @@ test("Chrome's Copy as cURL (cmd)", () => {
 
 test("toCurl writes a request curl sends the same way", () => {
   const raw = lines("GET /a?b=1 HTTP/1.1", "Host: h.test", "User-Agent: ua", "Accept: */*", "", "");
-  assert.equal(toCurl(raw, "https://h.test").command, "curl 'https://h.test/a?b=1' \\\n  -H 'User-Agent: ua' \\\n  -H 'Accept: */*'");
+  assert.equal(toCurl(raw, "https://h.test").command, "curl 'https://h.test/a?b=1' \\\n  --http1.1 \\\n  -H 'User-Agent: ua' \\\n  -H 'Accept: */*'");
   const post = "POST /login HTTP/1.1\r\nHost: h.test:8443\r\nContent-Length: 7\r\n\r\nu=a&p=b";
   assert.equal(
     toCurl(post, "https://h.test:8443/").command,
-    ["curl 'https://h.test:8443/login'", "-H 'User-Agent:'", "-H 'Accept:'", "-H 'Content-Type:'", "--data-raw 'u=a&p=b'"].join(" \\\n  "),
+    ["curl 'https://h.test:8443/login'", "--http1.1", "-H 'User-Agent:'", "-H 'Accept:'", "-H 'Content-Type:'", "--data-raw 'u=a&p=b'"].join(" \\\n  "),
   );
   // A Host that differs from the target is kept; methods other than GET/POST get -X.
   const put = toCurl("PUT /x HTTP/1.1\nHost: other.test\nX-Empty:\n\n", "http://h.test").command;
@@ -260,10 +260,16 @@ test("toCurl flags: HTTP/2, globbing, dot segments, request targets", () => {
   assert.match(toCurl("GET / HTTP/2\nhost: h.test\n\n", "http://h.test").command, /--http2-prior-knowledge/);
   assert.match(toCurl("GET / HTTP/1.0\n\n", "http://h.test").command, /--http1\.0/);
   assert.doesNotMatch(toCurl("GET / HTTP/1.1\n\n", "http://h.test").command, /--http/);
+  // Over https curl would negotiate HTTP/2, so an HTTP/1.x request keeps its version.
+  assert.match(toCurl("GET / HTTP/1.1\n\n", "https://h.test").command, /--http1\.1/);
+  assert.match(toCurl("GET / HTTP/1.0\n\n", "https://h.test").command, /--http1\.0/);
+  assert.doesNotMatch(toCurl("GET / HTTP/1.0\n\n", "https://h.test").command, /--http1\.1/);
+  assert.doesNotMatch(toCurl("GET / HTTP/2\n\n", "https://h.test").command, /--http1/);
+  assert.match(parseCurl(toCurl("GET / HTTP/1.1\n\n", "https://h.test").command).raw, /^GET \/ HTTP\/1\.1\n/);
   assert.match(toCurl("GET /?a[0]=1&b={x} HTTP/1.1\n\n", "https://h.test").command, /--globoff/);
   assert.match(toCurl("GET /a/../../etc/passwd HTTP/1.1\n\n", "https://h.test").command, /--path-as-is/);
   assert.doesNotMatch(toCurl("GET /a/..b/c HTTP/1.1\n\n", "https://h.test").command, /--path-as-is/);
-  assert.match(toCurl("OPTIONS * HTTP/1.1\n\n", "https://h.test").command, /^curl 'https:\/\/h\.test\/' \\\n {2}--request-target '\*' \\\n {2}-X 'OPTIONS'/);
+  assert.match(toCurl("OPTIONS * HTTP/1.1\n\n", "https://h.test").command, /^curl 'https:\/\/h\.test\/' \\\n {2}--request-target '\*' \\\n {2}--http1\.1 \\\n {2}-X 'OPTIONS'/);
   // An absolute URL goes to the target, as Send sends it, not to the host it names.
   assert.match(toCurl("GET http://h.test/abs HTTP/1.1\n\n", "https://other.test").command, /^curl 'https:\/\/other\.test\/' \\\n {2}--request-target 'http:\/\/h\.test\/abs'/);
   // A fragment or a space would be dropped or encoded in a URL, so the target goes as is.
@@ -551,8 +557,6 @@ test("more shell syntax is refused or read as the shell would", () => {
 });
 
 test("options are read as curl reads them, or refused", () => {
-  // curl has no --name=value form, so such a word isn't silently read as --name.
-  assert.match(refusal("curl --data=x https://h.test"), /Unknown curl option --data=x/);
   assert.match(refusal("curl https://h.test -H"), /--header needs a value/);
   assert.match(refusal("curl https://h.test -X"), /--request needs a value/);
   // A value attached to a route option is that option's, not the URL.
@@ -571,9 +575,15 @@ test("options are read as curl reads them, or refused", () => {
   const auth = parseCurl("curl -u a:b --oauth2-bearer t -H 'Authorization: Custom' https://h.test").raw;
   assert.equal(auth.match(/authorization/gi)?.length, 1);
   assert.match(auth, /\nAuthorization: Custom\n/);
-  // -u wins over a bearer token, which wins over user info in the URL.
-  assert.match(parseCurl("curl -u a:b --oauth2-bearer t https://x:y@h.test").raw, /Authorization: Basic YTpi\n/);
+  // A bearer token wins over -u (curl asks for Bearer auth alone), and -u over user info in the URL.
+  assert.match(parseCurl("curl -u a:b --oauth2-bearer t https://x:y@h.test").raw, /Authorization: Bearer t\n/);
+  assert.match(parseCurl("curl --oauth2-bearer t -u a:b https://h.test").raw, /Authorization: Bearer t\n/);
   assert.match(parseCurl("curl --oauth2-bearer t https://x:y@h.test").raw, /Authorization: Bearer t\n/);
+  assert.match(parseCurl("curl -u a:b https://x:y@h.test").raw, /Authorization: Basic YTpi\n/);
+  assert.match(parseCurl("curl -u a:b --basic https://h.test").raw, /Authorization: Basic YTpi\n/);
+  // With --basic as well curl sends neither until the server's challenge.
+  assert.match(refusal("curl -u a:b --basic --oauth2-bearer t https://h.test"), /challenge/);
+  assert.match(parseCurl("curl -u a:b --basic --oauth2-bearer t --no-basic https://h.test").raw, /Authorization: Bearer t\n/);
   // --no-get turns -G back off.
   assert.match(parseCurl("curl -G --no-get -d a=1 https://h.test").raw, /^POST \/ /);
 });
@@ -782,4 +792,51 @@ test("toCurl keeps an absolute-form request on the target, as Send does", () => 
   assert.equal(back.target, "https://x.test");
   assert.match(back.raw, /^GET http:\/\/other\.test\/p HTTP\/1\.1\nHost: other\.test\n/);
   assert.match(toCurl("GET http://other.test/p HTTP/2\n\n", "https://x.test").command, /--http2 /);
+});
+
+test("URL globbing is read as curl reads it, unless -g", () => {
+  // A set or a range with several values is several requests.
+  for (const url of ["http://h.test/{a,b}", "http://h.test/[1-3]", "http://h.test/[a-c]", "http://h.test/x[1-9:2]", "http://{a,b}.h.test/"]) {
+    assert.match(refusal(`curl '${url}'`), /several requests/, url);
+    assert.match(parseCurl(`curl -g '${url}'`).raw, /^GET /, url);
+  }
+  assert.match(parseCurl("curl --globoff 'http://h.test/{a,b}[1-3]'").raw, /^GET \/\{a,b\}\[1-3\] /);
+  assert.match(parseCurl("curl -sg 'http://h.test/{a,b}'").raw, /^GET \/\{a,b\} /);
+  // One value is written out; \ quotes a bracket; an IPv6 address and [] stay as they are.
+  assert.match(parseCurl("curl 'http://h.test/{a}'").raw, /^GET \/a /);
+  assert.match(parseCurl("curl 'http://h.test/{a\\,b}'").raw, /^GET \/a,b /);
+  assert.match(parseCurl("curl 'http://h.test/[1-1]x[05-5][c-c]'").raw, /^GET \/1x05c /);
+  assert.match(parseCurl("curl 'http://h.test/\\{a\\}\\[1-3\\]'").raw, /^GET \/\{a\}\[1-3\] /);
+  assert.match(parseCurl("curl 'http://h.test/?a[]=1'").raw, /^GET \/\?a\[\]=1 /);
+  assert.equal(parseCurl("curl 'http://[::1]:8080/x'").target, "http://[::1]:8080");
+  assert.equal(parseCurl("curl 'http://[fe80::1%25eth0]/'").target, "http://[fe80::1%25eth0]");
+  // What curl can't read as a glob is refused too ("bad range", "unmatched brace").
+  for (const url of ["http://h.test/{}", "http://h.test/{a", "http://h.test/a}", "http://h.test/]", "http://h.test/[x]", "http://h.test/[3-1]", "http://h.test/[1-2:5]", "http://h.test/{a,[1-2]}"]) {
+    assert.match(refusal(`curl '${url}'`), /-g/, url);
+  }
+  // The URL a copied command holds goes back as it was.
+  assert.match(parseCurl(toCurl("GET /?a[0]=1&b={x,y} HTTP/1.1\n\n", "https://h.test").command).raw, /^GET \/\?a\[0\]=1&b=\{x,y\} /);
+});
+
+test("long options take a value after =", () => {
+  assert.match(parseCurl("curl --data=x https://h.test").raw, /^POST [^]*\n\nx$/);
+  // An empty value is a value, and only the first = splits.
+  assert.match(parseCurl("curl --data= https://h.test").raw, /Content-Length: 0\n/);
+  assert.match(parseCurl("curl --header==X:1 --header=Y:a=b https://h.test").raw, /\n=X: 1\nY: a=b\n/);
+  assert.match(parseCurl("curl --url=https://h.test/u --request=PUT").raw, /^PUT \/u /);
+  assert.equal(parseCurl("curl --output=/dev/null --max-time=5 --proxy=http://p.test https://h.test").warnings.length, 1);
+  // A switch ignores a value, as curl does.
+  assert.match(parseCurl("curl --get=x -d a https://h.test").raw, /^GET \/\?a /);
+  assert.match(refusal("curl --bogus=1 https://h.test"), /Unknown curl option --bogus/);
+  assert.match(refusal("curl --upload-file=f https://h.test"), /-T uploads a file/);
+  // A short option keeps = in its value.
+  assert.match(parseCurl("curl -d=x https://h.test").raw, /\n\n=x$/);
+});
+
+test("-G and --url-query add & only after a query with something in it", () => {
+  assert.match(parseCurl("curl -G -d x 'http://h.test/a?'").raw, /^GET \/a\?x /);
+  assert.match(parseCurl("curl -G -d x 'http://h.test/a?b=1&'").raw, /^GET \/a\?b=1&x /);
+  assert.match(parseCurl("curl -G -d x 'http://h.test/a?b=1'").raw, /^GET \/a\?b=1&x /);
+  assert.match(parseCurl("curl --url-query y 'http://h.test/a?'").raw, /^GET \/a\?y /);
+  assert.match(parseCurl("curl --url-query y --url-query z 'http://h.test/a?#f'").raw, /^GET \/a\?y&z /);
 });

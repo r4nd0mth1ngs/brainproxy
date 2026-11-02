@@ -518,7 +518,7 @@ function readOptions(words: string[], stdin?: string): Options {
   const o: Options = { urls: [], headers: [], data: [], form: [], cookies: [], urlQuery: [], version: "HTTP/1.1", flags: new Set(), warnings: [] };
   let i = 0;
   const value = (name: string, attached?: string): string => {
-    if (attached) return attached;
+    if (attached !== undefined) return attached;
     if (i >= words.length) throw new CurlError(`--${name} needs a value.`);
     return words[i++];
   };
@@ -630,8 +630,13 @@ function readOptions(words: string[], stdin?: string): Options {
       o.urls.push(...words.slice(i));
       break;
     }
-    if (w.startsWith("--")) apply(w.slice(2), decodeOr(w));
-    else if (w.length > 1 && w.startsWith("-")) {
+    if (w.startsWith("--")) {
+      // --name=value (curl 8.16 and later): no option's name holds =, so split at the first one.
+      // A switch ignores the value, as curl does.
+      const eq = w.indexOf("=");
+      if (eq > 2) apply(w.slice(2, eq), decodeOr(w.slice(0, eq)), w.slice(eq + 1));
+      else apply(w.slice(2), decodeOr(w));
+    } else if (w.length > 1 && w.startsWith("-")) {
       // Short options cluster (-sSL); a value may follow in the same word (-XPOST).
       for (let k = 1; k < w.length; k++) {
         const name = entry(SHORT, w[k]);
@@ -722,6 +727,68 @@ function removeDots(path: string): string {
   return (out.join("/") || "/") + query;
 }
 
+/**
+ * The URL curl requests for a URL it globs (without -g): a {a,b} set or a [1-3] or [a-c:2] range
+ * stands for one request per value, \ quotes []{} (and anything inside a set), and an IPv6
+ * address or [] stays as it is. A pattern with one value ({a}, [1-1]) is written out; one with
+ * more is refused, as only one request is pasted at a time.
+ */
+function unglob(url: string): string {
+  const bad = (): never => {
+    throw new CurlError(`curl can't read the {…} or […] in ${decodeOr(url)} (URL globbing); add -g to send them as they are.`);
+  };
+  const many = (): never => {
+    throw new CurlError("The URL uses curl's globbing ({a,b} or [1-3]), which makes several requests; paste one request at a time, or add -g to send the brackets as they are.");
+  };
+  let out = "";
+  for (let i = 0; i < url.length; ) {
+    const c = url[i];
+    if (c === "\\" && /[[\]{}]/.test(url[i + 1] ?? "")) {
+      out += url[i + 1];
+      i += 2;
+    } else if (c === "{") {
+      const items: string[] = [];
+      let cur = "";
+      let k = i + 1;
+      for (; ; k++) {
+        const d = url[k];
+        if (d === undefined || d === "{" || d === "[" || d === "]" || (d === "}" && k === i + 1)) bad();
+        if (d === "}" || d === ",") {
+          items.push(cur);
+          cur = "";
+          if (d === "}") break;
+        } else if (d === "\\" && k + 1 < url.length) cur += url[++k];
+        else cur += d;
+      }
+      if (items.length > 1) many();
+      out += items[0];
+      i = k + 1;
+    } else if (c === "[") {
+      const rest = url.slice(i);
+      const literal = rest.startsWith("[]") ? "[]" : /^\[(?=[^\]]*:[^\]]*:)[0-9A-Fa-f:.]+(%[^\]]*)?\]/.exec(rest)?.[0];
+      if (literal) {
+        out += literal;
+        i += literal.length;
+        continue;
+      }
+      // [a-z] or [0-9], with an optional :step. curl pads numbers to a leading 0's width.
+      const m = /^\[(?:([A-Za-z])-([^]))?(?:(\d+)-[ \t]*(\d+))?(?::(\d+))?\]/.exec(rest);
+      if (!m || !(m[1] ?? m[3]) || (m[1] && m[3])) bad();
+      const [lo, hi] = m![1] ? [m![1].charCodeAt(0), m![2].charCodeAt(0)] : [Number(m![3]), Number(m![4])];
+      const step = m![5] === undefined ? 1 : Number(m![5]);
+      if (!step || (lo === hi && step !== 1) || lo > hi || (lo < hi && step > hi - lo) || (m![1] && hi - lo > 25)) bad();
+      if (lo !== hi) many();
+      out += m![1] ?? (m![3].startsWith("0") ? String(lo).padStart(m![3].length, "0") : String(lo));
+      i += m![0].length;
+    } else if (c === "}" || c === "]") bad();
+    else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 const percentDecode = (s: string) => s.replace(/%([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
 
 const basic = (credentials: string) => "Basic " + btoa(credentials);
@@ -785,9 +852,10 @@ export function parseCurl(command: string): ParsedCurl {
   const hasBody = !get && (o.data.length > 0 || o.form.length > 0);
   if (o.flags.has("head") && hasBody) throw new CurlError("curl can't send data with -I (HEAD); use -X HEAD.");
 
-  const url = splitUrl(o.urls[0], o.protoDefault);
+  const urlText = o.flags.has("globoff") ? o.urls[0] : unglob(o.urls[0]);
+  const url = splitUrl(urlText, o.protoDefault);
   // curl refuses such a URL ("Malformed input"); --request-target sends one as is.
-  if (/[\x00-\x20\x7f]/.test(o.urls[0])) throw new CurlError("The URL holds a space or control character, which curl refuses; encode it (%20).");
+  if (/[\x00-\x20\x7f]/.test(urlText)) throw new CurlError("The URL holds a space or control character, which curl refuses; encode it (%20).");
   if (o.version === "HTTP/2" && o.h2Upgrade && url.scheme === "http") {
     o.version = "HTTP/1.1";
     o.warnings.push("curl --http2 only asks an http:// server to upgrade, so the request is sent over HTTP/1.1 (use --http2-prior-knowledge for HTTP/2).");
@@ -795,7 +863,8 @@ export function parseCurl(command: string): ParsedCurl {
   let path = o.flags.has("path-as-is") ? url.path : removeDots(url.path);
   const joined = o.data.map((d, n) => (n > 0 && !d.json ? "&" : "") + d.bytes).join("");
   const query = [...(get && o.data.length ? [joined] : []), ...o.urlQuery];
-  for (const q of query) path += (path.includes("?") ? "&" : "?") + q;
+  // curl adds & only after a query that has something in it and doesn't already end in &.
+  for (const q of query) path += (!path.includes("?") ? "?" : /[?&]$/.test(path) ? "" : "&") + q;
 
   const method = o.method ?? (o.flags.has("head") ? "HEAD" : hasBody ? "POST" : "GET");
   if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) throw new CurlError(`-X ${decodeOr(method)} isn't a valid method.`);
@@ -821,10 +890,12 @@ export function parseCurl(command: string): ParsedCurl {
   }
 
   // curl's own headers, in its order; a custom header of the same name replaces one.
-  // -u wins over a bearer token, which wins over user:password in the URL.
+  // A bearer token wins over -u, which wins over user:password in the URL: curl asks for Bearer
+  // auth alone. With --basic too it waits for the server's challenge to pick one.
+  if (o.bearer != null && o.flags.has("basic")) throw new CurlError("--oauth2-bearer with --basic makes curl wait for the server's challenge before it sends either; keep one of them.");
   const defaults: [string, string][] = [["Host", url.host]];
-  if (o.user != null) defaults.push(["Authorization", basic(o.user)]);
-  else if (o.bearer != null) defaults.push(["Authorization", `Bearer ${o.bearer}`]);
+  if (o.bearer != null) defaults.push(["Authorization", `Bearer ${o.bearer}`]);
+  else if (o.user != null) defaults.push(["Authorization", basic(o.user)]);
   else if (url.userinfo != null) defaults.push(["Authorization", basic(url.userinfo.includes(":") ? url.userinfo : url.userinfo + ":")]);
   if (o.userAgent) defaults.push(["User-Agent", o.userAgent]);
   if (o.range) defaults.push(["Range", `bytes=${o.range}`]);
@@ -1000,6 +1071,8 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   if (/(^|\/)\.\.?(\/|$)/.test(path)) args.push("--path-as-is");
   if (h2) args.push(scheme === "http" ? "--http2-prior-knowledge" : "--http2");
   else if (/^HTTP\/1\.0$/i.test(version)) args.push("--http1.0");
+  // Over https curl negotiates HTTP/2 when the server offers it.
+  else if (scheme === "https") args.push("--http1.1");
 
   const hasLength = lines.some((l) => /^content-length\s*:/i.test(l));
   const hasData = body.length > 0 || hasLength;
