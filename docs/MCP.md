@@ -97,6 +97,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
+- `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
+  would copy any file the server can read into the project for the agent to read back; pass the
+  text as the call's `stdin` instead.
 
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep

@@ -3,7 +3,7 @@
 //! missing header seen 500 times on a page is one finding, and a response with two
 //! versioned Server headers is one finding, not two. The first evidence is kept.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS finding_types (
 pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Finding id"),
     ("time", "TEXT", "When first seen"),
-    ("source", "TEXT", "passive, active, or authz"),
+    ("source", "TEXT", "passive, active, authz, or manual (added by hand with `findings add`)"),
     ("rule_id", "INTEGER", "Rule id (ZAP plugin id for ported rules)"),
     ("alert_ref", "TEXT", "Alert type id; join finding_types for description/solution"),
     ("name", "TEXT", "Alert name"),
@@ -277,7 +277,7 @@ impl Store {
         let (where_sql, args) = filter.sql();
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
-                hits, history_id, state
+                hits, history_id, state, source
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -296,6 +296,7 @@ impl Store {
                 "hits": r.get::<_, i64>(10)?,
                 "history_id": r.get::<_, Option<i64>>(11)?,
                 "state": r.get::<_, String>(12)?,
+                "source": r.get::<_, String>(13)?,
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -319,6 +320,9 @@ impl Store {
                 obj.insert(k.into(), v);
             }
         }
+        if obj.get("source").and_then(Value::as_str) == Some(MANUAL_SOURCE) {
+            obj.insert("history_ids".into(), json!(self.finding_history_ids(id)?));
+        }
         Ok(Value::Object(obj))
     }
 
@@ -338,6 +342,227 @@ impl Store {
     pub fn findings_reset(&self, source: &str) -> Result<usize> {
         Ok(self.conn.execute("DELETE FROM findings WHERE source = ?1", [source])?)
     }
+
+    /// Records a finding a person found by hand; returns its id. Nothing is sent. Findings with
+    /// the same title share an alert type (`manual:<title>`), which holds the description and
+    /// solution: one given here replaces the type's, one left out keeps it.
+    pub fn finding_add(&mut self, f: &ManualFinding) -> Result<i64> {
+        let title = f.title.trim();
+        if title.is_empty() || title.len() > MANUAL_TITLE_MAX {
+            return Err(Error::InvalidInput(format!("the title must be 1 to {MANUAL_TITLE_MAX} bytes")));
+        }
+        let alert_ref = manual_alert_ref(title)?;
+        for (what, text, max) in [
+            ("evidence", &f.evidence, MANUAL_EVIDENCE_MAX),
+            ("parameter", &f.param, MANUAL_EVIDENCE_MAX),
+            ("description", &f.description, MANUAL_TEXT_MAX),
+            ("solution", &f.solution, MANUAL_TEXT_MAX),
+        ] {
+            if text.len() > max {
+                return Err(Error::InvalidInput(format!("the {what} is over {max} bytes")));
+            }
+        }
+        if f.history.len() > MANUAL_HISTORY_MAX {
+            return Err(Error::InvalidInput(format!("link at most {MANUAL_HISTORY_MAX} history entries")));
+        }
+        let mut history: Vec<i64> = Vec::new();
+        for &id in &f.history {
+            if !history.contains(&id) {
+                history.push(id);
+            }
+        }
+        let tx = self.write_tx()?;
+        // The linked entries must exist; the first gives the URL and method when none are given.
+        let mut first: Option<(String, String)> = None;
+        for &id in &history {
+            let row: Option<(String, String)> = tx
+                .query_row("SELECT method, url FROM history WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            match row {
+                Some(r) => {
+                    first.get_or_insert(r);
+                }
+                None => return Err(Error::NotFound(format!("history entry {id}"))),
+            }
+        }
+        let url = match (&f.url, &first) {
+            (Some(u), _) => u.trim().to_string(),
+            (None, Some((_, u))) => u.clone(),
+            (None, None) => return Err(Error::InvalidInput("give --url or --history-id".into())),
+        };
+        let parsed = manual_url(&url)?;
+        let method = match (&f.method, &first) {
+            (Some(m), _) => m.trim().to_ascii_uppercase(),
+            (None, Some((m, _))) => m.clone(),
+            (None, None) => "GET".to_string(),
+        };
+        if method.is_empty()
+            || method.len() > 32
+            || !method.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(Error::InvalidInput(format!("{method:?} is not an HTTP method")));
+        }
+        let url = parsed.to_string();
+        let host = parsed.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
+        let dedupe = dedupe_key(&alert_ref, &method, &url, &f.param);
+        if let Some(id) =
+            tx.query_row("SELECT id FROM findings WHERE dedupe = ?1", [&dedupe], |r| r.get::<_, i64>(0)).optional()?
+        {
+            return Err(Error::Conflict(format!(
+                "finding {id} is already this issue (same title, method, URL without its query, and parameter)"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
+             VALUES (?1, 0, ?2, ?3, ?4, '[]', '[\"manual\"]')
+             ON CONFLICT(alert_ref) DO UPDATE SET
+                description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END,
+                solution = CASE WHEN excluded.solution != '' THEN excluded.solution ELSE solution END",
+            params![alert_ref, title, f.description.trim(), f.solution.trim()],
+        )?;
+        tx.execute(
+            "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, host,
+                method, url, param, evidence, history_id, last_history_id, dedupe)
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                MANUAL_SOURCE,
+                alert_ref,
+                title,
+                f.risk.as_str(),
+                f.risk.level(),
+                f.confidence.as_str(),
+                f.cwe.filter(|&c| c > 0),
+                host,
+                method,
+                url,
+                f.param,
+                f.evidence,
+                history.first(),
+                history.last(),
+                dedupe,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        // The table holds a first and a last entry; the whole list goes in meta.
+        if history.len() > 2 {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                params![history_key(id), serde_json::to_string(&history).unwrap_or_default()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Removes findings added by hand; scanner findings are refused (mark them instead), and
+    /// nothing is removed unless every id can be. Returns how many were removed.
+    pub fn findings_remove(&mut self, ids: &[i64]) -> Result<usize> {
+        let tx = self.write_tx()?;
+        for &id in ids {
+            let source: Option<String> =
+                tx.query_row("SELECT source FROM findings WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+            match source.as_deref() {
+                None => return Err(Error::NotFound(format!("finding {id}"))),
+                Some(MANUAL_SOURCE) => {}
+                Some(s) => {
+                    return Err(Error::InvalidInput(format!(
+                        "finding {id} came from the {s} scanner; only findings added by hand can be removed \
+                         (mark it false_positive instead)"
+                    )))
+                }
+            }
+        }
+        let mut removed = 0;
+        for &id in ids {
+            removed += tx.execute("DELETE FROM findings WHERE id = ?1", [id])?;
+            tx.execute("DELETE FROM meta WHERE key = ?1", [history_key(id)])?;
+        }
+        tx.execute(
+            "DELETE FROM finding_types WHERE alert_ref LIKE 'manual:%'
+                AND alert_ref NOT IN (SELECT alert_ref FROM findings)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// The history entries a finding added by hand links to, in the order given.
+    pub fn finding_history_ids(&self, id: i64) -> Result<Vec<i64>> {
+        if let Some(list) = self.meta_get(&history_key(id))? {
+            return Ok(serde_json::from_str(&list).unwrap_or_default());
+        }
+        let (first, last): (Option<i64>, Option<i64>) = self
+            .conn
+            .query_row("SELECT history_id, last_history_id FROM findings WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?
+            .unwrap_or_default();
+        let mut ids: Vec<i64> = first.into_iter().collect();
+        ids.extend(last.filter(|l| Some(*l) != first));
+        Ok(ids)
+    }
+}
+
+/// `findings.source` of a finding added by hand.
+pub const MANUAL_SOURCE: &str = "manual";
+const MANUAL_TITLE_MAX: usize = 300;
+const MANUAL_EVIDENCE_MAX: usize = 10_000;
+const MANUAL_TEXT_MAX: usize = 100_000;
+const MANUAL_HISTORY_MAX: usize = 100;
+
+/// A finding a person records by hand (`findings add`).
+#[derive(Debug, Clone)]
+pub struct ManualFinding {
+    pub title: String,
+    pub risk: Risk,
+    pub confidence: Confidence,
+    /// Default: the first history entry's URL.
+    pub url: Option<String>,
+    /// Default: the first history entry's method, else GET.
+    pub method: Option<String>,
+    pub param: String,
+    pub evidence: String,
+    pub description: String,
+    pub solution: String,
+    pub cwe: Option<u32>,
+    /// History entries it was seen in; the first is the report's evidence.
+    pub history: Vec<i64>,
+}
+
+fn history_key(id: i64) -> String {
+    format!("finding.{id}.history")
+}
+
+/// `manual:` and the title in lower case, words joined by `-`, so findings with the same
+/// title group together and never share a type with a scanner's.
+pub(crate) fn manual_alert_ref(title: &str) -> Result<String> {
+    let mut slug = String::new();
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.chars().count() >= 64 {
+            break;
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        return Err(Error::InvalidInput("the title needs at least one letter or digit".into()));
+    }
+    Ok(format!("manual:{slug}"))
+}
+
+/// An absolute http(s) or ws(s) URL with a host.
+fn manual_url(url: &str) -> Result<url::Url> {
+    let bad = || Error::InvalidInput(format!("{url:?} is not an http(s) or ws(s) URL with a host"));
+    let parsed = url::Url::parse(url).map_err(|_| bad())?;
+    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") || parsed.host_str().is_none_or(str::is_empty) {
+        return Err(bad());
+    }
+    Ok(parsed)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -401,5 +626,138 @@ impl FindingFilter {
             clauses.push(format!("id IN (SELECT value FROM json_each({}))", bind(&mut args, list)));
         }
         (clauses.join(" AND "), args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::Capture;
+    use crate::http::Target;
+
+    fn manual(title: &str, url: Option<&str>, history: Vec<i64>) -> ManualFinding {
+        ManualFinding {
+            title: title.into(),
+            risk: Risk::Medium,
+            confidence: Confidence::Medium,
+            url: url.map(str::to_string),
+            method: None,
+            param: String::new(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history,
+        }
+    }
+
+    fn store() -> (Store, i64) {
+        let s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "https".into(), host: "app.test".into(), port: 443 };
+        let req = b"POST /orders/7?x=1 HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let id = s.record(&Capture::new("send", &target, req, None, None, None)).unwrap();
+        (s, id)
+    }
+
+    #[test]
+    fn titles_become_alert_refs() {
+        assert_eq!(manual_alert_ref("  SQL Injection (login)! ").unwrap(), "manual:sql-injection-login");
+        assert_eq!(manual_alert_ref("Überprüfung fehlt").unwrap(), "manual:überprüfung-fehlt");
+        assert!(manual_alert_ref("!!!").is_err());
+        assert_eq!(manual_alert_ref(&"a".repeat(500)).unwrap().len(), "manual:".len() + 64);
+    }
+
+    #[test]
+    fn a_finding_added_by_hand() {
+        let (mut s, h) = store();
+        // URL and method come from the first linked entry when not given.
+        let mut f = manual("Order IDOR", None, vec![h]);
+        f.description = "Read anyone's order.".into();
+        let id = s.finding_add(&f).unwrap();
+        let v = s.finding_get(id).unwrap();
+        assert_eq!(v["source"], "manual");
+        assert_eq!(v["alert_ref"], "manual:order-idor");
+        assert_eq!((v["method"].as_str(), v["url"].as_str()), (Some("POST"), Some("https://app.test/orders/7?x=1")));
+        assert_eq!((v["host"].as_str(), v["history_id"].as_i64()), (Some("app.test"), Some(h)));
+        assert_eq!(v["history_ids"], json!([h]));
+        assert_eq!((v["description"].as_str(), v["tags"].clone()), (Some("Read anyone's order."), json!(["manual"])));
+
+        // The same issue again (the query isn't part of it) is refused, not counted as a hit.
+        let mut again = manual("order idor", Some("https://app.test/orders/7?x=2"), vec![]);
+        again.method = Some("post".into());
+        let e = s.finding_add(&again).unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        // Another URL with the same title joins the type; a new description replaces its text,
+        // none keeps it.
+        let other = s.finding_add(&manual("Order IDOR", Some("https://app.test/orders/8"), vec![])).unwrap();
+        assert_eq!(s.finding_get(other).unwrap()["description"], "Read anyone's order.");
+        assert_eq!(s.finding_get(other).unwrap()["method"], "GET");
+        let mut f = manual("Order IDOR", Some("https://app.test/orders/9"), vec![]);
+        f.description = "Newer text.".into();
+        s.finding_add(&f).unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["description"], "Newer text.");
+        let groups =
+            s.findings_grouped(&FindingFilter { source: Some("manual".into()), ..Default::default() }).unwrap();
+        assert_eq!((groups.len(), groups[0]["instances"].as_i64()), (1, Some(3)));
+        // Marked like any other.
+        s.finding_mark(id, Some("confirmed"), Some("checked")).unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["state"], "confirmed");
+    }
+
+    #[test]
+    fn bad_input_is_refused() {
+        let (mut s, h) = store();
+        for url in ["app.test/x", "ftp://app.test/", "file:///etc/passwd", "http://", "javascript:alert(1)"] {
+            let e = s.finding_add(&manual("X", Some(url), vec![])).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput(_)), "{url}: {e}");
+        }
+        assert!(matches!(s.finding_add(&manual("X", None, vec![])), Err(Error::InvalidInput(_))));
+        assert!(matches!(s.finding_add(&manual("X", None, vec![h, 999])), Err(Error::NotFound(_))));
+        assert!(matches!(s.finding_add(&manual(" ", Some("http://a.test/"), vec![])), Err(Error::InvalidInput(_))));
+        let mut f = manual("X", Some("http://a.test/"), vec![]);
+        f.method = Some("GET /".into());
+        assert!(matches!(s.finding_add(&f), Err(Error::InvalidInput(_))));
+        f.method = None;
+        f.evidence = "x".repeat(MANUAL_EVIDENCE_MAX + 1);
+        assert!(matches!(s.finding_add(&f), Err(Error::InvalidInput(_))));
+        // Nothing was stored on the way.
+        assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn links_and_removal() {
+        let (mut s, h) = store();
+        let target = Target { scheme: "https".into(), host: "app.test".into(), port: 443 };
+        let more: Vec<i64> = (0..3)
+            .map(|_| {
+                s.record(&Capture::new("send", &target, b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", None, None, None))
+                    .unwrap()
+            })
+            .collect();
+        let links = vec![h, more[0], h, more[1], more[2]];
+        let id = s.finding_add(&manual("Many", None, links)).unwrap();
+        let want = vec![h, more[0], more[1], more[2]];
+        assert_eq!(s.finding_history_ids(id).unwrap(), want);
+        let two = s.finding_add(&manual("Two", None, vec![more[1], h])).unwrap();
+        assert_eq!(s.finding_history_ids(two).unwrap(), [more[1], h]);
+
+        // A scanner's finding can't be removed, and then nothing is.
+        s.conn
+            .execute(
+                "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method, url, dedupe)
+                 VALUES ('passive', 10037, '10037', 'X', 'low', 1, 'medium', 'app.test', 'GET', 'https://app.test/', 'k')",
+                [],
+            )
+            .unwrap();
+        let scanner = s.conn.last_insert_rowid();
+        assert!(matches!(s.findings_remove(&[id, scanner]), Err(Error::InvalidInput(_))));
+        assert!(matches!(s.findings_remove(&[id, 999]), Err(Error::NotFound(_))));
+        assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 3);
+        assert_eq!(s.findings_remove(&[id]).unwrap(), 1);
+        assert_eq!(s.meta_get(&history_key(id)).unwrap(), None);
+        let types = |s: &Store| s.query("SELECT alert_ref FROM finding_types", &[], 10, 100).unwrap().rows.len();
+        assert_eq!(types(&s), 1);
+        s.findings_remove(&[two]).unwrap();
+        assert_eq!(types(&s), 0);
     }
 }

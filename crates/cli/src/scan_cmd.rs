@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use brainproxy_core::scan::findings_db::FindingFilter;
+use brainproxy_core::scan::findings_db::{FindingFilter, ManualFinding};
 use brainproxy_core::scan::passive::{self, PassiveSettings, SETTINGS_KEY};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -88,8 +88,8 @@ pub enum FindingsCmd {
         /// open, confirmed, false_positive, or all (default hides false positives).
         #[arg(long)]
         state: Option<String>,
-        /// Only findings from this scanner.
-        #[arg(long, value_parser = ["passive", "active", "authz"])]
+        /// Only findings from this scanner, or those added by hand (manual).
+        #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
         source: Option<String>,
         /// One row per instance instead of grouping.
         #[arg(long)]
@@ -104,7 +104,8 @@ pub enum FindingsCmd {
     #[command(
         after_help = "The baseline is a file (`report json --state all --no-evidence`), a background active scan of this project (--scan), or nothing, when every finding is new. Findings \
         match by alert, method, URL without its query, and parameter. A false-positive mark on either side stays \
-        with the finding. Exit codes: 5 when --fail-on finds something; 4 when the baseline, project, or job \
+        with the finding. Findings added by hand are outside every --scan (no scan looks for them); against a \
+        file they compare like any other. Exit codes: 5 when --fail-on finds something; 4 when the baseline, project, or job \
         doesn't exist (--allow-missing-baseline treats a missing baseline file as empty); 2 for a baseline that \
         isn't usable or a --fail-on on a scan that didn't complete. The full result is printed in every case."
     )]
@@ -119,6 +120,107 @@ pub enum FindingsCmd {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
+    #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
+        description and solution: a new one replaces the type's, leaving it out keeps it. The same title, method, \
+        URL without its query, and parameter as an existing finding is refused (kind conflict). Without \
+        --url, the URL and method are the first --history-id entry's. The first linked entry is the report's \
+        evidence. Through MCP, the *-file flags only take '-' (the call's stdin).")]
+    Add(Box<AddArgs>),
+    /// Remove findings added by hand (`findings add`); scanner findings can only be marked.
+    Remove {
+        #[arg(required = true)]
+        ids: Vec<i64>,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct AddArgs {
+    /// The issue's name, as reports show it.
+    #[arg(long)]
+    title: String,
+    #[arg(long, value_enum)]
+    risk: RiskArg,
+    #[arg(long, value_enum, default_value = "medium")]
+    confidence: crate::report_cmd::ConfidenceArg,
+    /// Where it is: an http(s) or ws(s) URL. Default: the first --history-id entry's.
+    #[arg(long)]
+    url: Option<String>,
+    /// Request method. Default: the first --history-id entry's, else GET.
+    #[arg(long)]
+    method: Option<String>,
+    /// Affected parameter, header, or cookie.
+    #[arg(long, default_value = "")]
+    param: String,
+    #[arg(long, value_name = "ID")]
+    cwe: Option<u32>,
+    /// History entries that show it (repeatable or comma-separated); the first is the evidence.
+    #[arg(long = "history-id", value_name = "ID", value_delimiter = ',')]
+    history: Vec<i64>,
+    /// What the issue is and why it matters.
+    #[arg(long, conflicts_with = "description_file")]
+    description: Option<String>,
+    /// Read the description from FILE ('-' reads stdin).
+    #[arg(long, value_name = "FILE")]
+    description_file: Option<String>,
+    /// How to fix it.
+    #[arg(long, conflicts_with = "solution_file")]
+    solution: Option<String>,
+    /// Read the solution from FILE ('-' reads stdin).
+    #[arg(long, value_name = "FILE")]
+    solution_file: Option<String>,
+    /// What shows it, such as a line of the response.
+    #[arg(long, conflicts_with = "evidence_file")]
+    evidence: Option<String>,
+    /// Read the evidence from FILE ('-' reads stdin).
+    #[arg(long, value_name = "FILE")]
+    evidence_file: Option<String>,
+}
+
+impl AddArgs {
+    /// The finding, with long texts read from their files or stdin.
+    fn finding(self) -> Result<ManualFinding, Error> {
+        let stdin_readers = [&self.description_file, &self.solution_file, &self.evidence_file]
+            .iter()
+            .filter(|f| f.as_deref() == Some("-"))
+            .count();
+        if stdin_readers > 1 {
+            return Err(Error::InvalidInput(
+                "only one of --description-file, --solution-file and --evidence-file can read stdin".into(),
+            ));
+        }
+        Ok(ManualFinding {
+            title: self.title,
+            risk: self.risk.get(),
+            confidence: self.confidence.get(),
+            url: self.url,
+            method: self.method,
+            param: self.param,
+            evidence: text_arg("--evidence-file", self.evidence, self.evidence_file)?,
+            description: text_arg("--description-file", self.description, self.description_file)?,
+            solution: text_arg("--solution-file", self.solution, self.solution_file)?,
+            cwe: self.cwe,
+            history: self.history,
+        })
+    }
+}
+
+/// A text flag's value, or its file's ('-' reads stdin). Through MCP only stdin: a file would
+/// copy anything the server can read into the project, for the agent to read back.
+fn text_arg(flag: &str, text: Option<String>, file: Option<String>) -> Result<String, Error> {
+    match file.as_deref() {
+        None => Ok(text.unwrap_or_default()),
+        Some("-") => String::from_utf8(crate::read_input(None)?)
+            .map_err(|_| Error::InvalidInput(format!("{flag}: stdin is not UTF-8 text"))),
+        Some(_) if crate::mcp::in_tool_call() => Err(Error::InvalidInput(format!(
+            "{flag}: through MCP only '-' is accepted (pass the text as the call's stdin)"
+        ))),
+        Some(path) => match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8(bytes).map_err(|_| Error::InvalidInput(format!("{flag}: not UTF-8 text"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound(format!("{flag} {path}"))),
+            Err(e) => Err(e.into()),
+        },
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -356,8 +458,33 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             store.finding_mark(id, state, note.as_deref())?;
             out.ok(json!({"id": id, "state": state, "note": note}), || format!("updated finding {id}"));
         }
+        FindingsCmd::Add(args) => {
+            let id = store.finding_add(&args.finding()?)?;
+            let finding = store.finding_get(id)?;
+            let url = finding["url"].as_str().unwrap_or_default();
+            let warnings: Vec<String> = outside_scope(&store, url).into_iter().collect();
+            let text = format!("added finding {id} ({})", finding["alert_ref"].as_str().unwrap_or_default());
+            out.ok(json!({"id": id, "finding": finding, "warnings": warnings}), || {
+                warnings.iter().map(|w| format!("warning: {w}\n")).collect::<String>() + &text
+            });
+        }
+        FindingsCmd::Remove { ids } => {
+            let removed = store.findings_remove(&ids)?;
+            out.ok(json!({"removed": removed, "ids": ids}), || format!("removed {removed} finding(s)"));
+        }
     }
     Ok(())
+}
+
+/// A warning when a finding's URL can't be in the engagement scope. Nothing is sent, so it is
+/// recorded anyway; the report would still show a site that wasn't to be tested.
+fn outside_scope(store: &Store, url: &str) -> Option<String> {
+    store.engagement().ok().flatten()?;
+    let http = url.strip_prefix("ws").map_or_else(|| url.to_string(), |rest| format!("http{rest}"));
+    let target = brainproxy_core::http::Target::from_url(&http).ok()?;
+    let guard = store.guard().ok()?;
+    (!guard.may_allow(&target.host, target.port))
+        .then(|| format!("{}:{} is outside the engagement scope", target.host, target.port))
 }
 
 fn data_cmd(home: &Path, cmd: DataCmd, out: &Out) -> Result<(), Error> {

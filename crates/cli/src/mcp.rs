@@ -213,6 +213,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings compare", READ),
     ("findings show", READ),
     ("findings mark", SET),
+    ("findings add", ADD),
+    ("findings remove", REPLACE),
     // --output writes a file (refused if it exists unless --force).
     ("report", REPLACE),
     ("diff", READ),

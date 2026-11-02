@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::scan::findings_db::dedupe_key;
+use crate::scan::findings_db::{dedupe_key, MANUAL_SOURCE};
 use crate::scan::Risk;
 use crate::store::Store;
 
@@ -169,9 +169,10 @@ impl ScanScope {
         }
     }
 
-    /// Timestamps are all the same UTC format, so they compare as text.
+    /// Timestamps are all the same UTC format, so they compare as text. A finding added by
+    /// hand is outside every scan: no scan finds it, so it is neither new, unchanged, nor fixed.
     pub fn classify(&self, f: &Sighting) -> Seen {
-        if self.end.as_deref().is_some_and(|end| f.time > end) {
+        if f.source == MANUAL_SOURCE || self.end.as_deref().is_some_and(|end| f.time > end) {
             Seen::Other
         } else if f.time >= self.start.as_str() {
             Seen::New
@@ -455,6 +456,9 @@ mod tests {
         (6, BEFORE, BEFORE, "passive", 10020, "10020", "http://a.test/"), // Passive, scan didn't crawl.
         (7, AFTER, AFTER, "active", 40018, "40018", "http://a.test/"),    // After the scan.
         (8, BEFORE, BEFORE, "active", 0, "check:cve-1", "http://a.test/"), // A declarative check.
+        (9, DURING, DURING, "manual", 0, "manual:idor", "http://a.test/x"), // Added by hand during the scan.
+        (10, BEFORE, DURING, "manual", 0, "manual:idor", "http://a.test/"), // Linked to a request it sent.
+        (11, BEFORE, BEFORE, "manual", 0, "manual:idor", "http://a.test/y"), // On a site it covered.
     ];
 
     fn seen(s: &ScanScope, id: i64) -> Seen {
@@ -469,11 +473,14 @@ mod tests {
     #[test]
     fn findings_are_new_still_gone_or_outside_the_scan() {
         use Seen::*;
-        assert_eq!(all(&scope()), [New, Still, Gone, Other, Other, Other, Other, Other]);
+        assert_eq!(all(&scope()), [New, Still, Gone, Other, Other, Other, Other, Other, Other, Other, Other]);
         // A crawl with every rule covers passive findings and every active rule on the site,
         // not checks it didn't run.
         let crawl = ScanScope { rules: None, crawled: true, ..scope() };
-        assert_eq!(all(&crawl), [New, Still, Gone, Other, Gone, Gone, Other, Other]);
+        assert_eq!(all(&crawl), [New, Still, Gone, Other, Gone, Gone, Other, Other, Other, Other, Other]);
+        // Whatever a scan covered, findings added by hand stay outside it.
+        let everything = ScanScope { origins: None, rules: None, crawled: true, end: None, ..scope() };
+        assert_eq!([seen(&everything, 9), seen(&everything, 10), seen(&everything, 11)], [Other, Other, Other]);
         // Excluded rules, and ported rules under --no-rules, aren't covered; the checks named are.
         assert_eq!(seen(&ScanScope { rules: None, exclude_rules: vec![40018], ..scope() }, 3), Other);
         let checks_only = ScanScope { rules: None, ported_rules: false, check_ids: vec!["cve-1".into()], ..scope() };
@@ -491,7 +498,10 @@ mod tests {
         let after = |end: &str| ScanScope { new_after: Some(end.into()), ..scope() };
         // An earlier scan that ended before /'s first sighting: found again, it is new; not
         // found again, still gone.
-        assert_eq!(all(&after("2026-10-21T08:00:00.000Z")), [New, New, Gone, Other, Other, Other, Other, Other]);
+        assert_eq!(
+            all(&after("2026-10-21T08:00:00.000Z")),
+            [New, New, Gone, Other, Other, Other, Other, Other, Other, Other, Other]
+        );
         // One that ended as it was first seen found it: unchanged, as without.
         assert_eq!(seen(&after(BEFORE), 2), Still);
         assert_eq!(all(&after("2026-10-21T10:00:00.000Z")), all(&scope()));
@@ -591,5 +601,40 @@ mod tests {
         let c =
             compare_scan(&s, &ScanScope { start: "2000-01-01T00:00:00.000Z".into(), ..Default::default() }).unwrap();
         assert_eq!((c.new.len(), c.fixed.len()), (total, 0));
+    }
+
+    #[test]
+    fn findings_added_by_hand_are_outside_scans_but_in_sets() {
+        let mut s = store_with_findings();
+        let scanned = project_items(&s).unwrap();
+        let manual = crate::scan::findings_db::ManualFinding {
+            title: "IDOR on orders".into(),
+            risk: Risk::High,
+            confidence: crate::scan::Confidence::High,
+            url: None,
+            method: None,
+            param: "id".into(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history: vec![1],
+        };
+        s.finding_add(&manual).unwrap();
+        // No scan finds it, so it is never fixed and never trips a --scan gate.
+        let window = ScanScope { start: "2000-01-01T00:00:00.000Z".into(), ..Default::default() };
+        let later =
+            ScanScope { start: "2999-01-01T00:00:00.000Z".into(), crawled: true, ported_rules: true, ..window.clone() };
+        for scope in [window, later] {
+            let c = compare_scan(&s, &scope).unwrap();
+            assert_eq!(c.other, 1, "{c:?}");
+            assert!(c.new.iter().chain(&c.unchanged).chain(&c.fixed).all(|f| f.source != "manual"));
+        }
+        // Against a saved set it is new until a baseline has it, and the plain gate sees it.
+        let c = compare_sets(scanned.clone(), project_items(&s).unwrap());
+        assert_eq!((c.new.len(), c.new[0].source.as_str()), (1, "manual"));
+        assert_eq!(c.gate(Risk::High, true).len(), 1);
+        let c = compare_sets(project_items(&s).unwrap(), scanned);
+        assert_eq!(c.fixed.len(), 1);
     }
 }

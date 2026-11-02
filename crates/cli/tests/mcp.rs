@@ -413,3 +413,35 @@ fn an_agent_cannot_add_a_script_open_a_browser_or_read_any_variable() {
     let url = std::fs::read_to_string(&opened).unwrap_or_default();
     assert!(url.starts_with("https://id.test/authorize?"), "{url}");
 }
+
+#[test]
+fn an_agent_adds_findings_from_stdin_but_reads_no_files() {
+    let p = tmp_project("manual-findings");
+    let notes = p.parent().unwrap().join("notes.txt");
+    std::fs::write(&notes, "FAKE-PRIVATE-NOTES").unwrap();
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let list = m.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}")).clone();
+    assert!(tool("findings_add")["inputSchema"]["properties"]["stdin"].is_object());
+    assert_eq!(tool("findings_add")["annotations"]["destructiveHint"], false);
+    assert_eq!(tool("findings_remove")["annotations"]["destructiveHint"], true);
+
+    let base = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7"});
+    let mut from_file = base.clone();
+    from_file["description_file"] = json!(notes.to_str().unwrap());
+    let (err, e) = m.call("findings_add", from_file);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--description-file"), "{e}");
+    assert!(!e.to_string().contains("FAKE-PRIVATE-NOTES"), "{e}");
+
+    let mut from_stdin = base;
+    from_stdin["description_file"] = json!("-");
+    from_stdin["stdin"] = json!("Any user can read any order.");
+    let (err, e) = m.call("findings_add", from_stdin);
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["finding"]["description"], "Any user can read any order.");
+    let id = e["data"]["id"].as_i64().unwrap();
+    let (err, e) = m.call("findings_remove", json!({"ids": [id]}));
+    assert!(!err && e["data"]["removed"] == 1, "{e}");
+}

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::guard::ScopeSpec;
-use crate::scan::findings_db::FindingFilter;
+use crate::scan::findings_db::{FindingFilter, MANUAL_SOURCE};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +132,9 @@ pub struct Instance {
     pub state: String,
     pub note: Option<String>,
     pub history_id: Option<i64>,
+    /// For a finding added by hand: every history entry it links to (the first is the evidence).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history_ids: Vec<i64>,
     pub request: Option<HttpRequest>,
     pub response: Option<HttpResponse>,
 }
@@ -238,6 +241,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             state: r.get(13)?,
             note: r.get(14)?,
             history_id: r.get(15)?,
+            history_ids: Vec::new(),
             request: None,
             response: None,
         };
@@ -265,6 +269,12 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     }
     drop(rows);
     drop(stmt);
+
+    for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
+        if inst.source == MANUAL_SOURCE {
+            inst.history_ids = store.finding_history_ids(inst.id)?;
+        }
+    }
 
     if opts.evidence {
         for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
@@ -411,9 +421,33 @@ fn longest_run(s: &str, c: char) -> usize {
     best
 }
 
+/// Whether an alert type is one a person added by hand (`findings add`).
+fn is_manual(g: &AlertGroup) -> bool {
+    g.alert_ref.starts_with("manual:")
+}
+
+/// "#3, #7": the history entries a finding links to.
+fn history_list(ids: &[i64]) -> String {
+    ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Markdown whose HTML is shown as text, not rendered.
+fn md_no_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Text from our own rule definitions; only table pipes and line breaks need care.
 fn md_text(s: &str) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+/// An alert type's name for a heading or table cell; a tester's title gets no raw HTML.
+fn md_name(g: &AlertGroup) -> String {
+    if is_manual(g) {
+        md_no_html(&md_text(&g.name))
+    } else {
+        md_text(&g.name)
+    }
 }
 
 fn markdown(r: &Report) -> String {
@@ -450,11 +484,11 @@ fn markdown(r: &Report) -> String {
     }
     s.push_str("| # | Risk | Alert | Instances |\n|---:|---|---|---:|\n");
     for (i, g) in r.alerts.iter().enumerate() {
-        let _ = writeln!(s, "| {} | {} | {} | {} |", i + 1, risk_title(&g.risk), md_text(&g.name), g.instances.len());
+        let _ = writeln!(s, "| {} | {} | {} | {} |", i + 1, risk_title(&g.risk), md_name(g), g.instances.len());
     }
     s.push('\n');
     for (i, g) in r.alerts.iter().enumerate() {
-        let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_text(&g.name), risk_title(&g.risk));
+        let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_name(g), risk_title(&g.risk));
         let mut meta = vec![format!("**Alert:** `{}`", g.alert_ref)];
         if let Some(c) = g.cwe {
             meta.push(format!("**CWE:** [{c}]({})", cwe_url(c)));
@@ -463,11 +497,13 @@ fn markdown(r: &Report) -> String {
             meta.push(format!("**WASC:** {w}"));
         }
         let _ = writeln!(s, "{}\n", meta.join(" · "));
+        // A tester's own text keeps its Markdown, but not raw HTML: it may quote the target.
+        let prose = |t: &str| if is_manual(g) { md_no_html(t.trim()) } else { t.trim().to_string() };
         if !g.description.is_empty() {
-            let _ = writeln!(s, "### Description\n\n{}\n", g.description.trim());
+            let _ = writeln!(s, "### Description\n\n{}\n", prose(&g.description));
         }
         if !g.solution.is_empty() {
-            let _ = writeln!(s, "### Solution\n\n{}\n", g.solution.trim());
+            let _ = writeln!(s, "### Solution\n\n{}\n", prose(&g.solution));
         }
         if !g.references.is_empty() {
             s.push_str("### References\n\n");
@@ -495,6 +531,9 @@ fn markdown(r: &Report) -> String {
             }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 let _ = writeln!(s, "- Note: {}", md_code(n));
+            }
+            if inst.history_ids.len() > 1 {
+                let _ = writeln!(s, "- History: {}", history_list(&inst.history_ids));
             }
             s.push('\n');
             if !inst.other_info.is_empty() {
@@ -749,10 +788,14 @@ fn html(r: &Report) -> String {
             "<table class=\"where\"><thead><tr><th>Address</th><th>Field</th><th>Certainty</th></tr></thead><tbody>",
         );
         for inst in &g.instances {
-            let state = match inst.state.as_str() {
+            let mut state = match inst.state.as_str() {
                 "confirmed" => " <span class=\"tag\">confirmed</span>",
                 _ => "",
-            };
+            }
+            .to_string();
+            if inst.source == MANUAL_SOURCE {
+                state.push_str(" <span class=\"tag\">found by hand</span>");
+            }
             let _ = write!(
                 s,
                 "<tr><td><code>{} {}</code>{state}</td><td>{}</td><td>{}</td></tr>",
@@ -807,6 +850,9 @@ fn html(r: &Report) -> String {
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 row("Note", esc(n));
             }
+            if inst.history_ids.len() > 1 {
+                row("History", history_list(&inst.history_ids));
+            }
             s.push_str("</dl>");
             if !inst.other_info.is_empty() {
                 let _ = write!(s, "<pre>{}</pre>", esc(&inst.other_info));
@@ -831,8 +877,15 @@ fn html(r: &Report) -> String {
          attacker would. <strong>Certainty</strong> says how sure a test is: low-certainty findings need a person to \
          confirm them, and some may turn out not to be real. A finding marked <span class=\"tag\">confirmed</span> was \
          checked by the tester. Automated tests can't find every problem (for example flaws in business logic), so \
-         a short or empty report doesn't prove a site is secure.</p>\n",
+         a short or empty report doesn't prove a site is secure.",
     );
+    if r.alerts.iter().flat_map(|g| &g.instances).any(|i| i.source == MANUAL_SOURCE) {
+        s.push_str(
+            " A finding marked <span class=\"tag\">found by hand</span> was found and written up by the tester, \
+             not by an automated test.",
+        );
+    }
+    s.push_str("</p>\n");
     s.push_str("</main></body></html>\n");
     s
 }
@@ -963,6 +1016,9 @@ fn sarif(r: &Report) -> Value {
                     "historyId": inst.history_id,
                 },
             });
+            if !inst.history_ids.is_empty() {
+                res["properties"]["historyIds"] = json!(inst.history_ids);
+            }
             if let Some(n) = &inst.note {
                 res["properties"]["note"] = json!(n);
             }
@@ -1165,5 +1221,73 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t.as_str().unwrap().starts_with("external/cwe/")));
+    }
+
+    #[test]
+    fn findings_added_by_hand_in_every_format() {
+        let mut s = store_with_findings();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let entry = |path: &str| {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: app.test\r\n\r\n");
+            s.record(&Capture::new("send", &target, req.as_bytes(), None, None, None)).unwrap()
+        };
+        let (second, third) = (entry("/b"), entry("/c"));
+        let id = s
+            .finding_add(&crate::scan::findings_db::ManualFinding {
+                title: "Order IDOR".into(),
+                risk: Risk::High,
+                confidence: crate::scan::Confidence::High,
+                url: Some("http://app.test/orders/7".into()),
+                method: None,
+                param: "id".into(),
+                evidence: "another user's <order>".into(),
+                description: "Any **user** can read <script>x</script> orders.".into(),
+                solution: "Check the owner.".into(),
+                cwe: Some(639),
+                history: vec![1, second, third],
+            })
+            .unwrap();
+        s.finding_add(&crate::scan::findings_db::ManualFinding {
+            title: "<img src=x> | note".into(),
+            risk: Risk::Low,
+            confidence: crate::scan::Confidence::Low,
+            url: Some("http://app.test/".into()),
+            method: None,
+            param: String::new(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history: vec![],
+        })
+        .unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
+        assert_eq!((g.cwe, g.tags.clone()), (Some(639), vec!["manual".to_string()]));
+        assert_eq!(g.solution, "Check the owner.");
+        let inst = &g.instances[0];
+        assert_eq!((inst.id, inst.source.as_str(), inst.history_ids.clone()), (id, "manual", vec![1, second, third]));
+        // The first linked entry is the evidence.
+        assert_eq!(inst.request.as_ref().unwrap().url, "http://app.test/a?q=1");
+
+        let md = render(&r, ReportKind::Markdown);
+        assert!(md.contains("Any **user** can read &lt;script&gt;x&lt;/script&gt; orders."), "{md}");
+        assert!(md.contains(&format!("- History: #1, #{second}, #{third}")));
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("found by hand") && !html.contains("<script>x"));
+        assert!(html.contains("<code>another user&#39;s &lt;order&gt;</code>"));
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let res = results.iter().find(|x| x["ruleId"] == "manual:order-idor").unwrap();
+        assert_eq!(res["properties"]["source"], "manual");
+        assert_eq!(res["properties"]["historyIds"], json!([1, second, third]));
+        let only = |source: &str| {
+            let filter = FindingFilter { source: Some(source.into()), ..Default::default() };
+            build(&s, &ReportOptions { filter, ..Default::default() }).unwrap().summary.total
+        };
+        assert_eq!(only("manual"), 2);
+        assert_eq!(only("passive") + 2, r.summary.total);
+        // A title is the tester's text: no raw HTML in Markdown either.
+        assert!(md.contains("&lt;img src=x&gt; \\| note") && !md.contains("<img"), "{md}");
     }
 }
