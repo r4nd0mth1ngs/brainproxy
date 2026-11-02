@@ -101,3 +101,105 @@ test("techniques are named, and a partial single packet is pointed out", () => {
   assert.equal(syncNote(result([ok, ok], "last-byte")), null);
   assert.match(syncNote(result([ok, ok, ok], "single-packet", 1)) ?? "", /^1 of 3 final frames/);
 });
+
+test("the HTTP/2 check reads only the request line, like the CLI", () => {
+  assert.equal(isHttp2Request("get / http/2\n"), true); // the CLI ignores case too
+  assert.equal(isHttp2Request("GET / HTTP/2"), true);
+  assert.equal(isHttp2Request("GET / HTTP/1.1\nX-Via: HTTP/2\n\nupgrade to HTTP/2"), false);
+  assert.equal(isHttp2Request("GET /HTTP/2 HTTP/1.1\n"), false);
+  assert.equal(isHttp2Request(""), false);
+  assert.equal(parseRaceCount("1000", ""), 1000);
+});
+
+test("counts that only look like numbers are refused", () => {
+  for (const s of ["1e3", "0x10", "+5", "20ms", "2 0", "１０", "Infinity", "NaN", "99999999999999999999"]) {
+    assert.equal(parseRaceCount(s, H1), null, s);
+  }
+  assert.equal(parseRaceCount("020", H1), 20);
+  assert.equal(parseRaceCount("2", H2), 2);
+});
+
+test("the target stays one argument, so it can't add flags", () => {
+  const args = raceArgs("--project=/tmp/other --no-store", 5);
+  assert.deepEqual(args, ["send", "--target=--project=/tmp/other --no-store", "--race=5", "-"]);
+  assert.equal(args.at(-1), "-"); // the request comes on stdin
+});
+
+test("an empty race has no rows, no spread and nothing to open", () => {
+  const r = result([]);
+  assert.deepEqual(raceRows(r), []);
+  assert.deepEqual(raceSummary(r), { responses: 0, errors: 0, spread: null, fastest: null, slowest: null, differing: 0, distinct: 0 });
+  assert.equal(firstOpenable(raceRows(r)), null);
+  assert.equal(syncNote(result([], "single-packet", 0)), null);
+});
+
+test("responses that weren't recorded can't be opened", () => {
+  // --no-store, or a race where every request failed: no history ids.
+  const rows = raceRows(
+    result([
+      { id: null, status: 200, length: 2, duration_ms: 3 },
+      { error: "refused", kind: "connect" },
+    ]),
+  );
+  assert.equal(firstOpenable(rows), null);
+  assert.equal(rows[0].id, null);
+});
+
+test("failures are compared by kind, not by message", () => {
+  const rows = raceRows(
+    result([
+      { error: "connection refused (os error 111)", kind: "connect" },
+      { error: "connection refused at 10:01", kind: "connect" },
+      { error: "timed out", kind: "timeout" },
+    ]),
+  );
+  assert.deepEqual(
+    rows.map((r) => r.differs),
+    [false, false, true],
+  );
+});
+
+test("an unparsed response (no status or length) differs from a parsed one", () => {
+  const rows = raceRows(
+    result([
+      { id: 1, status: 200, length: 0, duration_ms: 1 },
+      { id: 2, status: null, length: null, duration_ms: 1 },
+      { id: 3, status: 200, length: 0, duration_ms: 1 },
+    ]),
+  );
+  assert.deepEqual(
+    rows.map((r) => r.differs),
+    [false, true, false],
+  );
+});
+
+test("the summary's distinct count matches the CLI's distinct_responses", () => {
+  // Output of `send --race 5` as the CLI prints it.
+  const r: RaceResult = {
+    race: 5,
+    sync: "last-byte",
+    synced: null,
+    target: "https://shop.test",
+    distinct_responses: { "200 12B": 3, "409 3B": 1, "error: io": 1 },
+    results: [
+      { id: 7, status: 200, length: 12, duration_ms: 0 },
+      { id: 8, status: 409, length: 3, duration_ms: 0 },
+      { id: 9, status: 200, length: 12, duration_ms: 0 },
+      { error: "reset", kind: "io" },
+      { id: 10, status: 200, length: 12, duration_ms: 0 },
+    ],
+  };
+  const s = raceSummary(r);
+  assert.equal(s.distinct, Object.keys(r.distinct_responses).length);
+  assert.equal(s.spread, 0); // all at once is a spread of 0, not "no responses"
+  assert.equal(s.differing, 2);
+  assert.equal(firstOpenable(raceRows(r)), 0);
+});
+
+test("a single-packet race that synced all, or reported nothing, has no note", () => {
+  const ok = { id: 1, status: 200, length: 1, duration_ms: 1 };
+  assert.equal(techniqueLabel("single-packet"), "single-packet attack (HTTP/2)");
+  assert.equal(syncNote(result([ok, ok], "single-packet", null)), null);
+  assert.equal(syncNote(result([ok, ok], "single-packet", 3)), null);
+  assert.equal(syncNote(result([ok, ok], "single-packet", 0)), "0 of 2 final frames went in the single packet; the rest were sent separately");
+});
