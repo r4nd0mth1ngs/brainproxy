@@ -86,6 +86,11 @@ pub struct OAuth {
     /// The loopback port the sign-in redirects to; 0 or none picks a free one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_port: Option<u16>,
+    /// Set by `--oauth-store-secrets`: a refresh token the server sends is kept in the
+    /// project for the next command. Otherwise it lives only as long as the command, and
+    /// the project holds no more than the short-lived access token.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub store_secrets: bool,
 }
 
 impl OAuth {
@@ -519,6 +524,7 @@ mod tests {
             refresh_token: None,
             authorize_url: None,
             redirect_port: None,
+            store_secrets: false,
         };
         let check = |o: OAuth| o.validate(None, None).is_ok();
         assert!(check(base.clone()));

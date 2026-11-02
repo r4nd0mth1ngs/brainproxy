@@ -734,9 +734,19 @@ impl AuthSession {
         *self.last_login.lock().unwrap() = Some(Instant::now());
     }
 
-    /// Persists the current cookies/token so the next command can reuse them.
+    /// Persists the current cookies/token so the next command can reuse them. An OAuth
+    /// refresh token stays in memory unless the profile stores its secrets.
     pub fn save(&self) -> Result<()> {
-        Store::open(&self.project)?.auth_save_state(&self.profile.name, &self.state())
+        Store::open(&self.project)?.auth_save_state(&self.profile.name, &self.persisted_state())
+    }
+
+    /// The state as it goes in the project.
+    fn persisted_state(&self) -> SessionState {
+        let mut st = self.state();
+        if !self.profile.oauth.as_ref().is_some_and(|o| o.store_secrets) {
+            st.refresh_token = None;
+        }
+        st
     }
 
     /// Logs in if the profile has a login and no session yet.
@@ -1264,6 +1274,41 @@ mod tests {
             ..Default::default()
         };
         AuthSession::new(&dir.join("p.bpdb"), profile, SessionState::default(), Client::new(opts)).unwrap()
+    }
+
+    #[test]
+    fn a_refresh_token_is_stored_only_with_the_secrets() {
+        for store_secrets in [false, true] {
+            let name = format!("oauth-store-{store_secrets}");
+            let oauth = crate::oauth::OAuth {
+                flow: crate::oauth::Flow::ClientCredentials,
+                token_url: "https://a.test/token".into(),
+                client_id: "c".into(),
+                client_secret: Some(Secret::Env("UNUSED".into())),
+                client_auth: Default::default(),
+                scope: None,
+                audience: None,
+                params: vec![],
+                refresh_token: None,
+                authorize_url: None,
+                redirect_port: None,
+                store_secrets,
+            };
+            let s = session(AuthProfile { name: name.clone(), oauth: Some(oauth), ..Default::default() });
+            let store = Store::open(&s.project).unwrap();
+            store.auth_save_profile(&s.profile).unwrap();
+            {
+                let mut st = s.state.lock().unwrap();
+                st.token = Some("ACCESS".into());
+                st.refresh_token = Some("REFRESH".into());
+            }
+            s.save().unwrap();
+            let (_, stored) = store.auth_profile(&name).unwrap();
+            assert_eq!(stored.token.as_deref(), Some("ACCESS"));
+            assert_eq!(stored.refresh_token.is_some(), store_secrets);
+            // The command itself keeps using it either way.
+            assert_eq!(s.state().refresh_token.as_deref(), Some("REFRESH"));
+        }
     }
 
     fn vault_of(s: &AuthSession) -> &Vault {

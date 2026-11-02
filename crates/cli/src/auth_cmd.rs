@@ -596,6 +596,7 @@ fn oauth_from_args(a: &AddArgs) -> Result<Option<OAuth>, Error> {
         refresh_token: secret("--oauth-refresh-token-env", &a.oauth_refresh_token_env)?,
         authorize_url: a.oauth_authorize_url.clone(),
         redirect_port: a.oauth_redirect_port,
+        store_secrets: a.oauth_store_secrets,
     }))
 }
 

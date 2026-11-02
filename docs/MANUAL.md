@@ -789,7 +789,13 @@ OAuth 2.0 in an auth profile, in place of a login:
   a password), `refresh_token` (with `--oauth-refresh-token-env VAR`) or `authorization_code` (with
   `--oauth-authorize-url URL`, then `auth oauth authorize NAME`). Variables are read at each token
   request and never stored, unless `--oauth-store-secrets` reads them once and stores the values in
-  the project, for background jobs that won't have them (the desktop app does this). `--oauth-param`
+  the project, for background jobs that won't have them (the desktop app does this). The access
+  token is kept in the project like a login's token. A refresh token the server sends is kept only
+  for the command that got it, unless `--oauth-store-secrets` is set: without it, the next command
+  starts from the flow's own grant (the refresh token variable for `refresh_token`, a new
+  `auth oauth authorize` for `authorization_code` once the access token has expired). A server that
+  rotates refresh tokens needs `--oauth-store-secrets` for the `refresh_token` flow to carry on past
+  one command. `--oauth-param`
   is stored as given, so a name that looks like a credential (`client_assertion`, `*_token`,
   `*secret*`, ...) is refused; `auth show` masks such a value if one is there.
 - `auth oauth authorize NAME [--no-open] [--wait SECONDS]` prints the sign-in URL on stderr, opens
