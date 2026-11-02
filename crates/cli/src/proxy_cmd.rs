@@ -725,6 +725,19 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     Ok(())
 }
 
+/// Why the address can't be bound, by error kind: the system's own text is localised on Windows.
+fn listen_error(addr: &str, e: &std::io::Error) -> Error {
+    Error::Conflict(match e.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            format!("cannot listen on {addr}: the port is already in use (by another program, or another project's proxy)")
+        }
+        std::io::ErrorKind::PermissionDenied => format!(
+            "cannot listen on {addr}: permission denied (ports below 1024 usually need elevated privileges, and the system can reserve others)"
+        ),
+        _ => format!("cannot listen on {addr}: {e}"),
+    })
+}
+
 /// Runs the proxy until it is asked to stop. Returns the live testing summary, if on.
 #[allow(clippy::too_many_arguments)]
 fn serve(
@@ -741,9 +754,7 @@ fn serve(
     let redirect = args.redirect.as_deref().map(Target::from_url).transpose()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&args.listen)
-            .await
-            .map_err(|e| Error::Conflict(format!("cannot listen on {}: {e}", args.listen)))?;
+        let listener = tokio::net::TcpListener::bind(&args.listen).await.map_err(|e| listen_error(&args.listen, &e))?;
         let addr = listener.local_addr()?;
         let (authz, worker) = match live {
             Some(l) => {
@@ -978,4 +989,36 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error as IoError, ErrorKind};
+
+    use super::*;
+
+    fn conflict_text(kind: ErrorKind) -> String {
+        match listen_error("127.0.0.1:80", &IoError::from(kind)) {
+            Error::Conflict(text) => text,
+            other => panic!("not a conflict: {other}"),
+        }
+    }
+
+    #[test]
+    fn listen_error_says_why_by_kind() {
+        assert_eq!(
+            conflict_text(ErrorKind::AddrInUse),
+            "cannot listen on 127.0.0.1:80: the port is already in use (by another program, or another project's proxy)"
+        );
+        assert_eq!(
+            conflict_text(ErrorKind::PermissionDenied),
+            "cannot listen on 127.0.0.1:80: permission denied (ports below 1024 usually need elevated privileges, and the system can reserve others)"
+        );
+    }
+
+    #[test]
+    fn listen_error_keeps_the_system_text_for_other_kinds() {
+        let kind = ErrorKind::AddrNotAvailable;
+        assert_eq!(conflict_text(kind), format!("cannot listen on 127.0.0.1:80: {}", IoError::from(kind)));
+    }
 }

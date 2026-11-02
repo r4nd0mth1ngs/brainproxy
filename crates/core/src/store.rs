@@ -381,7 +381,7 @@ impl Store {
         if !path.exists() {
             return Err(Error::NotFound(format!("project {}", path.display())));
         }
-        let conn =
+        let mut conn =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         conn.pragma_update(None, "query_only", true)?;
         // Agent-written SQL must not read stored passwords, API-key headers or session tokens.
@@ -926,7 +926,7 @@ impl Store {
             }
             Error::InvalidInput(format!("SQL: {e}"))
         })?;
-        let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let columns: Vec<String> = stmt.column_names().map(str::to_string).collect();
         let mut rows_iter = stmt
             .query(rusqlite::params_from_iter(params.iter().map(|p| bind_value(p))))
             .map_err(|e| Error::InvalidInput(format!("SQL: {e}")))?;

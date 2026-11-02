@@ -69,6 +69,9 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
 - Log4Shell (40043, CVE-2021-44228 / CVE-2021-45046), ported from ZAP.
 - XXE (90023) check #2 (out-of-band external entity, http and https).
 - Blind SSTI (90036) callback payloads (`curl`/`wget`) at HIGH/INSANE strength.
+- SSRF (40046), ported from ZAP's beta rules: an http and an https callback URL per parameter.
+  In host mode only the http one is sent (the token in the https URL's path would be inside
+  TLS); the https one needs DNS mode (`--domain`).
 - Declarative checks (Nuclei templates) with `{{interactsh-url}}`: one payload per
   request, interactsh matchers evaluated per interaction at correlation (docs/CHECKS.md).
 

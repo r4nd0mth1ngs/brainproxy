@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` runs 48 rules ported from OWASP ZAP's `ascanrules` add-on (and
+`brainproxy scan active` runs 52 rules ported from OWASP ZAP's `ascanrules` and `ascanrulesBeta` add-ons (and
 helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
@@ -57,12 +57,15 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 40028 | ELMAH Information Leak | host | medium | 40028-1 |
 | 40029 | Trace.axd Information Leak | page | medium | 40029-1 |
 | 40032 | .htaccess Information Leak | page | medium | 40032-1 |
+| 40033 | NoSQL Injection - MongoDB | param | high | 40033 |
 | 40034 | .env Information Leak | page | medium | 40034-1 |
 | 40035 | Hidden File Finder | host | medium | 40035 |
+| 40040 | CORS Header / CORS Misconfiguration | page | high | 40040-1, 40040-2, 40040-3 |
 | 40042 | Spring Actuator Information Leak | host | medium | 40042 |
 | 40043 | Log4Shell (needs `oob start`) | param | high | 40043-1, 40043-2 |
 | 40044 | Exponential Entity Expansion (Billion Laughs Attack) | page | medium | 40044 |
 | 40045 | Spring4Shell | page | high | 40045 |
+| 40046 | Server Side Request Forgery (needs `oob start`) | param | high | 40046 |
 | 40048 | Remote Code Execution (React2Shell) | host | high | 40048 |
 | 90017 | XSLT Injection | param | medium | 90017 |
 | 90019 | Server Side Code Injection | param | high | 90019-1, 90019-2 |
@@ -74,13 +77,18 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 90035 | Server Side Template Injection | param | high | 90035 |
 | 90036 | Server Side Template Injection (Blind) | param | high | 90036 |
 | 90037 | Remote OS Command Injection (Time Based) | param | high | 90037 |
+| 90039 | NoSQL Injection - MongoDB (Time Based) | param | high | 90039 |
 | 100002 | PHP2Shell PHP Remote Code Execution (Suspected) | host | high | 100002 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
 headers and URL path segments when enabled), `page` once per target request, `host` once per scheme://host:port.
 
 Every rule in ZAP's `ascanrules` add-on is ported (`zap-sync.json` lists the two
-`pscanrules` rules that aren't).
+`pscanrules` rules that aren't). From `ascanrulesBeta` so far: CORS (40040), Server Side
+Request Forgery (40046), and the two MongoDB rules (40033, 90039). Each file's header
+lists where it differs from ZAP; for example, JSON attacks send a real operator object.
+The time based MongoDB rule keeps ZAP's small delay, because `sleep()` runs per document:
+the stall stays small, but it only fires on collections of roughly 1,000 documents.
 
 Persistent XSS is three rules, as in ZAP: Prime (40016) stores a unique marker through
 every parameter, Spider (40017) re-requests every target and records which pages show
