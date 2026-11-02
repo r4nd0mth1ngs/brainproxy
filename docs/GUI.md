@@ -167,14 +167,18 @@ GraphQL mutations opt-in in the same way), then a review in place of depth and s
 [--auth P] --background -- SOURCE`, which sends each ticked operation once, in scope, and records
 it as history source `import`; nothing is attacked. Its own progress card (`job status`, *Stop*)
 ends with how many requests were recorded, any rejected (401/403), unanswered or out-of-scope
-operations, what the passive checks found, and links to the Site map and Proxy › Traffic. The
-guided API scan's first step links to it too (`openApiImport` in `store.tsx`), with the definition
-typed so far. Since an import sends as the crawl tool, its signer check looks for a session rule
-that applies to crawls rather than scans.
+operations, what the passive checks found, and links to the Site map and Proxy › Traffic (shown
+filtered to source `import`, `openTraffic` in `store.tsx`). *Hide* shows the map while the job
+runs, with a *Show* link in the toolbar. The Site map keeps the job id per project, so the card
+comes back after a reload. One import runs at a time. The guided API scan's first step links to it
+too (`openApiImport`), with the definition typed so far and the *GraphQL endpoint* tick; that never
+replaces a running import, and replaces one being set up only after asking. Since an import sends
+as the crawl tool, its signer check looks for a session rule that applies to crawls rather than
+scans, and says so when the check goes out unsigned.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
-`sendToComparer` (right-click a history row, or buttons in Intercept and Findings), and
-`openApiImport`.
+`sendToComparer` (right-click a history row, or buttons in Intercept and Findings),
+`openApiImport` and `openTraffic`.
 
 ## Look
 

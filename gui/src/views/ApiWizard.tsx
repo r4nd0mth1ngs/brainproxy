@@ -9,7 +9,7 @@ import { bodyText, inTauri, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
-import { loadSuggestions, type Job } from "./Scanner";
+import { isLive, loadSuggestions, type Job } from "./Scanner";
 import { OAuthFields, ScriptChoice } from "./ApiAuthExtras";
 import { SignerBuilder } from "./SessionHandling";
 import { PostWarning, SPEEDS, WizardProgress, type Speed } from "./Wizard";
@@ -104,16 +104,19 @@ export type ApiMode = "scan" | "import";
 
 interface Props {
   mode?: ApiMode;
-  /** The scan's job, kept by the host. An import keeps its own. */
+  /** The scan's job, kept by the host. An import's job is shown by the host (the Site map). */
   jobId?: number | null;
+  /** The job started: the host keeps its id, so it outlives this card and a reload. */
   onStarted?: (id: number) => void;
   onDismiss: () => void;
   /** Back to the website guided scan. */
   onBack?: () => void;
-  /** Hands the definition typed so far to Import API. */
-  onImport?: (source: string) => void;
+  /** Hands the definition typed so far, and the GraphQL endpoint tick, to Import API. */
+  onImport?: (source: string, graphql: boolean) => void;
   /** The definition to start on. */
   initialSource?: string;
+  /** Start with "GraphQL endpoint" ticked. */
+  initialGraphql?: boolean;
 }
 
 const STEPS: Record<ApiMode, string[]> = {
@@ -133,7 +136,7 @@ export function ApiWizard(p: Props) {
   const [problem, setProblem] = useState("");
   const [docChanged, setDocChanged] = useState(false);
   const [target, setTarget] = useState<ApiTarget>(EMPTY_TARGET);
-  const [graphqlEndpoint, setGraphqlEndpoint] = useState(false);
+  const [graphqlEndpoint, setGraphqlEndpoint] = useState(p.initialGraphql ?? false);
   const [customBase, setCustomBase] = useState(false);
   const [previewedKey, setPreviewedKey] = useState("");
   const [scope, setScope] = useState<string[]>([]);
@@ -145,7 +148,6 @@ export function ApiWizard(p: Props) {
   const [speed, setSpeed] = useState<Speed>("normal");
   const [busy, setBusy] = useState(false);
   const [startProblem, setStartProblem] = useState("");
-  const [importJob, setImportJob] = useState<number | null>(null);
   const seq = useRef(0);
 
   useEffect(() => {
@@ -254,12 +256,8 @@ export function ApiWizard(p: Props) {
         selected,
         profile: authProfile(auth),
       };
-      if (mode === "import") {
-        setImportJob((await run<{ job: number }>(importArgs(plan))).job);
-      } else {
-        const d = await run<{ job: number }>(scanArgs({ ...plan, depth, speedArgs: SPEEDS.find((s) => s.id === speed)!.args }));
-        p.onStarted?.(d.job);
-      }
+      const d = await run<{ job: number }>(mode === "import" ? importArgs(plan) : scanArgs({ ...plan, depth, speedArgs: SPEEDS.find((s) => s.id === speed)!.args }));
+      p.onStarted?.(d.job);
     } catch (e: any) {
       setStartProblem(e.message);
     }
@@ -268,7 +266,6 @@ export function ApiWizard(p: Props) {
 
   // After every hook above: the hook count must not change between renders.
   if (mode === "scan" && p.jobId != null) return <WizardProgress jobId={p.jobId} onClose={p.onDismiss} />;
-  if (importJob != null) return <ImportProgress jobId={importJob} onClose={p.onDismiss} />;
 
   // The GraphQL tick changes what the URL is read as, so a preview without it is of something else.
   const previewed = !!preview && source === typed.trim() && target.graphql === (graphqlEndpoint && sourceKind(source) === "url");
@@ -329,7 +326,7 @@ export function ApiWizard(p: Props) {
           environment={target.environment}
           chooseEnvironment={chooseEnvironment}
           dropEnvironment={dropEnvironment}
-          onImport={mode === "scan" && p.onImport ? () => p.onImport!(typed.trim()) : undefined}
+          onImport={mode === "scan" && p.onImport ? () => p.onImport!(typed.trim(), graphqlEndpoint) : undefined}
         />
       )}
       {step === 1 && preview && (
@@ -907,8 +904,7 @@ function AuthStep(p: {
         )}
       </div>
 
-      {/* The check is sent as the import is, so whatever it shows holds for the import. */}
-      <TryOne preview={p.preview} source={p.source} target={p.target} selected={p.selected} auth={a} ruleApplies={p.mode === "import" || (coverage?.checkCovered ?? true)} />
+      <TryOne preview={p.preview} source={p.source} target={p.target} selected={p.selected} auth={a} ruleApplies={coverage?.checkCovered ?? true} mode={p.mode} />
     </div>
   );
 }
@@ -1021,7 +1017,7 @@ interface TryResult {
   text: string;
 }
 
-function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; selected: number[]; auth: AuthState; ruleApplies: boolean }) {
+function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; selected: number[]; auth: AuthState; ruleApplies: boolean; mode: ApiMode }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<TryResult | null>(null);
   const [problem, setProblem] = useState("");
@@ -1060,6 +1056,7 @@ function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; sel
             credentialOn: raw == null ? null : credentialOnRequest(raw, profile),
             signerOn: signer ? (raw == null ? null : signerOnRequest(raw, profile, signer)) : null,
             signerRuleApplies: p.ruleApplies,
+            run: p.mode,
           }),
         });
       }
@@ -1337,11 +1334,38 @@ function ImportStep(p: { preview: ApiPreview; source: string; target: ApiTarget;
   );
 }
 
-/** An import job: progress, then how many requests are in history and where to find them. */
-function ImportProgress({ jobId, onClose }: { jobId: number; onClose: () => void }) {
+/**
+ * An import job's status, read every 1.5 s while `active` until it ends; null until read, and for
+ * no job. `onGone` runs when the job doesn't exist (a remembered id from another copy of the project).
+ */
+export function useImportJob(jobId: number | null, active: boolean, onGone: () => void): Job | null {
+  const [ended, setEnded] = useState<number | null>(null);
+  const gone = useRef(onGone);
+  gone.current = onGone;
+  const [job] = usePoll<Job | null>(
+    () =>
+      jobId == null
+        ? Promise.resolve(null)
+        : run<Job>(["job", "status", String(jobId)]).catch((e) => {
+            if (e.kind === "not_found") gone.current();
+            throw e;
+          }),
+    1500,
+    jobId != null && active && ended !== jobId,
+  );
+  // A poll for an earlier job can land after a new one starts.
+  const current = job && job.id === jobId ? job : null;
+  const final = current != null && !isLive(current);
+  useEffect(() => {
+    if (final) setEnded(jobId);
+  }, [final, jobId]);
+  return current;
+}
+
+/** An import job: progress, then how many requests are in history and where to find them. The Site map polls it. */
+export function ImportProgress({ jobId, job, onClose, onHide }: { jobId: number; job: Job | null; onClose: () => void; onHide: () => void }) {
   const app = useApp();
-  const [job] = usePoll<Job>(() => run(["job", "status", String(jobId)]), 1500);
-  const done = job != null && !["queued", "running", "stopping"].includes(job.state);
+  const done = job != null && !isLive(job);
   const pr: { sent?: number; total?: number } = job?.progress ?? {};
   const frac = pr.total ? (pr.sent ?? 0) / pr.total : null;
   const result = done && job?.state !== "failed" ? importResultText(job?.result) : null;
@@ -1353,10 +1377,17 @@ function ImportProgress({ jobId, onClose }: { jobId: number; onClose: () => void
           <div className="wiz-kicker">Import API</div>
           <h2>{!job ? "Starting…" : !done ? "Sending the API's operations…" : job.state === "completed" ? "Import finished" : `Import ${job.state}`}</h2>
         </div>
-        {!done && job && (
-          <button className="btn" onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
-            Stop
-          </button>
+        {!done && (
+          <div className="wiz-row">
+            <button className="link" onClick={onHide}>
+              Hide
+            </button>
+            {job && (
+              <button className="btn" onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
+                Stop
+              </button>
+            )}
+          </div>
         )}
         {done && (
           <button className="link" onClick={onClose}>
@@ -1370,7 +1401,7 @@ function ImportProgress({ jobId, onClose }: { jobId: number; onClose: () => void
             <span style={{ width: frac == null ? "100%" : `${Math.round(frac * 100)}%` }} className={frac == null ? "indeterminate" : ""} />
           </div>
           <p className="muted">{importProgressText(pr)}</p>
-          <p className="muted small">You can use other tools meanwhile; the import keeps running in the background.</p>
+          <p className="muted small">The import keeps running in the background. Hide this to watch the Site map fill up, or use other tools meanwhile.</p>
         </div>
       ) : job?.state === "failed" ? (
         <div className="wiz-body">
@@ -1385,16 +1416,10 @@ function ImportProgress({ jobId, onClose }: { jobId: number; onClose: () => void
             </div>
           ))}
           <div className="row gap wiz-next">
-            <button
-              className="btn primary"
-              onClick={() => {
-                onClose();
-                app.setTab("target");
-              }}
-            >
+            <button className="btn primary" onClick={onClose}>
               Show in the Site map
             </button>
-            <button className="btn" onClick={() => app.setTab("proxy")}>
+            <button className="btn" onClick={() => app.openTraffic("import")}>
               Open Proxy › Traffic
             </button>
             <span className="muted small">

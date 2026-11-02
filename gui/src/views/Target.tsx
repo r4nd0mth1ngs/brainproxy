@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { bodyText, historyRequest, isBinary, MAX_BODY, pathOf, rawResponse, run, type HistoryEntry, type HistoryItem, type Risk } from "../api";
 import { originOf, useApp } from "../store";
+import { confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { ApiWizard } from "./ApiWizard";
+import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
+import type { Job } from "./Scanner";
+import { importLive, importRequest } from "./apiScan";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -167,11 +170,56 @@ function SiteMap({ active }: { active: boolean }) {
   const [selected, setSelected] = useState<number | null>(null);
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const { menu, open, close } = useMenu();
-  // Import API: an API definition's operations, sent once each and recorded, in place of the map while open.
-  const [importing, setImporting] = useState<{ source: string; key: number } | null>(null);
+  // Import API: an API definition's operations, sent once each and recorded. The wizard, then its
+  // job's card, show in place of the map; the card can be hidden while the job runs. The job id is
+  // remembered per project, so the result is still there after a reload.
+  const [importing, setImporting] = useState<{ source: string; graphql: boolean; key: number } | null>(null);
+  const jobKey = `api-import-job:${app.project}`;
+  const [importJob, setImportJobState] = useState<number | null>(() => {
+    try {
+      return Number(localStorage.getItem(jobKey)) || null;
+    } catch {
+      return null;
+    }
+  });
+  const [jobShown, setJobShown] = useState(true);
+  const setImportJob = (id: number | null) => {
+    setImportJobState(id);
+    setJobShown(true);
+    try {
+      localStorage.setItem(jobKey, id == null ? "" : String(id));
+    } catch {
+      /* storage unavailable */
+    }
+  };
+  const job = useImportJob(importJob, active, () => setImportJob(null));
+  const importRunning = importLive(importJob, job?.state);
+  const openImport = (next: { source: string; graphql: boolean; key: number }, jobLive = importRunning) => {
+    // A finished import's card makes way for the new one.
+    if (importJob != null && !jobLive) setImportJob(null);
+    setImporting(next);
+  };
+  // Asked for from the guided API scan. A running import is never replaced, and one being set up only if the user agrees.
   useEffect(() => {
-    if (app.apiImport) setImporting(app.apiImport);
+    const req = app.apiImport;
+    if (!req) return;
+    decide(req);
   }, [app.apiImport]);
+  const decide = async (req: { source: string; graphql: boolean; key: number }) => {
+    // A remembered job that hasn't been read yet (the map not shown since a reload) is read first.
+    let state: string | undefined = job?.state;
+    if (importJob != null && state == null) state = await run<Job>(["job", "status", String(importJob)]).then((j) => j.state, (e) => (e.kind === "not_found" ? "gone" : undefined));
+    if (state === "gone") setImportJob(null);
+    const what = importRequest({ live: state !== "gone" && importLive(importJob, state), wizardOpen: !!importing });
+    if (what === "show_job") {
+      setJobShown(true);
+      app.toast("An API import is still running here. Start another when it has finished.");
+    } else if (what === "open") {
+      openImport(req, false);
+    } else {
+      if (await confirm("Replace the import being set up?", "Import API is already open in the Site map. Starting over with this definition loses what was chosen there.", "Start over", "Keep it")) openImport(req, false);
+    }
+  };
 
   const tree = useMemo(() => buildTree(data?.rows ?? []), [data]);
 
@@ -307,13 +355,40 @@ function SiteMap({ active }: { active: boolean }) {
         <span className="muted">
           {tree.length} host{tree.length === 1 ? "" : "s"} · right-click a node to crawl or scan it
         </span>
-        <button className="btn small" disabled={!!importing} onClick={() => setImporting({ source: "", key: 0 })} title="Send an API definition's operations once each and record them, without scanning">
+        {importJob != null && !jobShown && (
+          <span className="muted">
+            {importRunning ? "API import running" : "API import finished"} ·{" "}
+            <button className="link" onClick={() => setJobShown(true)}>
+              Show
+            </button>
+          </span>
+        )}
+        <button
+          className="btn small"
+          disabled={!!importing || importRunning}
+          onClick={() => openImport({ source: "", graphql: false, key: 0 })}
+          title={importRunning ? "An API import is running" : "Send an API definition's operations once each and record them, without scanning"}
+        >
           Import API…
         </button>
       </div>
       {importing ? (
         <div className="st-import">
-          <ApiWizard key={importing.key} mode="import" initialSource={importing.source} onDismiss={() => setImporting(null)} />
+          <ApiWizard
+            key={importing.key}
+            mode="import"
+            initialSource={importing.source}
+            initialGraphql={importing.graphql}
+            onStarted={(id) => {
+              setImportJob(id);
+              setImporting(null);
+            }}
+            onDismiss={() => setImporting(null)}
+          />
+        </div>
+      ) : importJob != null && jobShown ? (
+        <div className="st-import">
+          <ImportProgress jobId={importJob} job={job} onClose={() => setImportJob(null)} onHide={() => setJobShown(false)} />
         </div>
       ) : (
         <Split id="sitemap" dir="row" initial={0.32}>

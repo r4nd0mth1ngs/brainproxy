@@ -34,7 +34,9 @@ import {
   likelyInScope,
   hostScopeText,
   importArgs,
+  importLive,
   importProgressText,
+  importRequest,
   importResultText,
   includeMethods,
   isApiJob,
@@ -381,6 +383,21 @@ test("an import's progress and result in the edge cases", () => {
   ]);
 });
 
+test("a running import in the Site map is never replaced", () => {
+  // A remembered job not read back yet counts as running.
+  assert.ok(importLive(4, null));
+  assert.ok(importLive(4, undefined));
+  for (const st of ["queued", "running", "stopping"]) assert.ok(importLive(4, st), st);
+  for (const st of ["completed", "stopped", "failed"]) assert.ok(!importLive(4, st), st);
+  assert.ok(!importLive(null, "running"));
+  // Asked for from the guided API scan while a job runs: only its card is shown, whatever is open.
+  assert.equal(importRequest({ live: true, wizardOpen: false }), "show_job");
+  assert.equal(importRequest({ live: true, wizardOpen: true }), "show_job");
+  // One being set up is replaced only if the user agrees; otherwise it opens.
+  assert.equal(importRequest({ live: false, wizardOpen: true }), "ask");
+  assert.equal(importRequest({ live: false, wizardOpen: false }), "open");
+});
+
 test("what the key form starts on", () => {
   const cred = (patch: Partial<ApiCredential>): ApiCredential => ({ kind: "api_key", in: "header", name: "X-K", source: "s", embedded: false, ...patch });
   assert.deepEqual(keyDefaults([]), { keyKind: "api_key", place: "header", keyName: "" });
@@ -540,6 +557,18 @@ test("what the check found, in plain words", () => {
   assert.equal(rejected.tone, "warn");
   assert.match(rejected.text, /unsigned/);
   assert.doesNotMatch(rejected.text, /check the key/);
+  // An import is sent as the check is: unsigned there means unsigned in the import, and the fix is the rule.
+  const importOnly = { ...scanOnly, run: "import" as const };
+  assert.equal(m(importOnly).tone, "ok");
+  assert.match(m(importOnly).text, /doesn't apply to crawls\. The import is sent the same way, so it would go unsigned too/);
+  assert.match(m(importOnly).text, /Add a rule for every tool/);
+  assert.doesNotMatch(m(importOnly).text, /A scan may still sign/);
+  const importRejected = m({ ...importOnly, status: 403 });
+  assert.equal(importRejected.tone, "bad");
+  assert.match(importRejected.text, /^403: rejected, because it went unsigned\./);
+  assert.doesNotMatch(importRejected.text, /check the key/);
+  // With a rule that applies, an import reads as a scan does.
+  assert.deepEqual(m({ ...signed, status: 401, credentialOn: false, signerOn: false, run: "import" }), m({ ...signed, status: 401, credentialOn: false, signerOn: false }));
   // A signature that should have been there and wasn't is a real failure.
   assert.equal(m({ ...signed, status: 401, credentialOn: false, signerOn: false }).tone, "bad");
 });

@@ -231,10 +231,11 @@ The sidebar groups the tools by what you are doing.
 - **Import API…:** puts an API's operations in history without scanning them, to work on by
   hand. It takes the same steps as the *Guided API scan* (definition, server, authentication,
   operations; PUT, PATCH, DELETE and GraphQL mutations stay off unless you opt in), then sends
-  each ticked operation once, as written, in scope only (`import api`). It ends with how many
-  requests were recorded and links to the Site map and **Proxy › Traffic**, where they have the
-  source `import`; right-click one to send it to Replay. The guided API scan's first step links
-  here too.
+  each ticked operation once, as written, in scope only (`import api`). *Hide* shows the map while
+  it runs; *Show* in the toolbar brings the progress back. It ends with how many requests were
+  recorded and links to the Site map and **Proxy › Traffic**, which opens showing only the source
+  `import`; right-click one to send it to Replay. One import runs at a time. The guided API scan's
+  first step links here too.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
   the proxy scope.
 

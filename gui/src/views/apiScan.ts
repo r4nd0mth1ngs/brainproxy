@@ -733,6 +733,8 @@ export interface CheckFacts {
   signerOn: boolean | null;
   /** False when a signer's rule doesn't apply to this check, though a scan might sign. */
   signerRuleApplies: boolean;
+  /** What runs after the check. An import is sent as the check is, so it goes unsigned too. Defaults to a scan. */
+  run?: "scan" | "import";
 }
 
 /** What "Try one request" found, in plain words. Holds no value from the request. */
@@ -741,13 +743,21 @@ export function checkMeaning(c: CheckFacts): { tone: "ok" | "warn" | "bad"; text
   if (c.profile && c.credentialOn === true) on.push(`The credentials from "${c.profile}" were on it.`);
   if (c.profile && c.credentialOn === false && !c.signer) on.push(`Nothing from "${c.profile}" was on it.`);
   if (c.signer && c.signerOn === true) on.push(`The signature from "${c.signer}" was on it.`);
+  const importing = c.run === "import";
   if (c.signer && c.signerOn === false)
-    on.push(c.signerRuleApplies ? `The signature from "${c.signer}" was not on it.` : `It went unsigned, because the session rule for "${c.signer}" doesn't apply to this check. A scan may still sign.`);
+    on.push(
+      c.signerRuleApplies
+        ? `The signature from "${c.signer}" was not on it.`
+        : importing
+          ? `It went unsigned, because the session rule for "${c.signer}" doesn't apply to crawls. The import is sent the same way, so it would go unsigned too: use "Add a rule for every tool" above.`
+          : `It went unsigned, because the session rule for "${c.signer}" doesn't apply to this check. A scan may still sign.`,
+    );
   if (c.credentialOn === null && c.signerOn === null && (c.profile || c.signer)) on.push("The recorded request couldn't be read to confirm what was on it.");
   const tail = on.length ? ` ${on.join(" ")}` : "";
   const s = c.status;
   if (s == null) return { tone: "bad", text: `No response${c.error ? `: ${c.error}` : ""}. Check the server address.${tail}` };
   if (s >= 200 && s < 300) return { tone: "ok", text: `${s}: accepted.${c.profile ? "" : " The API answers this operation without authentication."}${tail}` };
+  if ((s === 401 || s === 403) && c.signer && c.signerOn === false && !c.signerRuleApplies && importing) return { tone: "bad", text: `${s}: rejected, because it went unsigned.${tail}` };
   if ((s === 401 || s === 403) && c.signer && c.signerOn === false && !c.signerRuleApplies) return { tone: "warn", text: `${s}: rejected, which an API that needs signatures does to an unsigned request, so this doesn't show whether the scan will work.${tail}` };
   if (s === 401 || s === 403) return { tone: "bad", text: `${s}: rejected. The API refused this request${c.profile ? ", so check the key and where it goes" : " without authentication"}.${tail}` };
   if (s >= 300 && s < 400) return { tone: "warn", text: `${s}: redirected. The API may be sending this request to a login page.${tail}` };
@@ -893,6 +903,18 @@ export function apiResultNotes(r: ImportSummary | null | undefined): string[] {
     out.push(`${n(r.skipped_out_of_scope, "operation")} outside the project's scope ${r.skipped_out_of_scope === 1 ? "was" : "were"} skipped${r.out_of_scope_hosts?.length ? ` (${r.out_of_scope_hosts.join(", ")})` : ""}.`);
   if (r.skipped?.length) out.push(`${n(r.skipped.length, "operation")} in the definition couldn't be built.`);
   return out;
+}
+
+/** Whether the Site map's import may still be sending. A job not read back yet counts as running. */
+export const importLive = (jobId: number | null, state: string | null | undefined): boolean => jobId != null && (state == null || ["queued", "running", "stopping"].includes(state));
+
+/**
+ * What the Site map does when Import API is asked for from elsewhere (the guided API scan): a
+ * running import is never replaced, only shown; an Import API already open is replaced if the user agrees.
+ */
+export function importRequest(s: { live: boolean; wizardOpen: boolean }): "show_job" | "ask" | "open" {
+  if (s.live) return "show_job";
+  return s.wizardOpen ? "ask" : "open";
 }
 
 /** An import's progress. The job reports it every 25 requests. */

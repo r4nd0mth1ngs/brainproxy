@@ -9,7 +9,12 @@ import { usePoll } from "../ui/usePoll";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
+  const app = useApp();
   const [sub, setSub] = useState<"history" | "intercept" | "ws">("history");
+  // Traffic opened from elsewhere (an import's requests).
+  useEffect(() => {
+    if (app.traffic) setSub("history");
+  }, [app.traffic]);
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -87,6 +92,10 @@ function History() {
   const [filter, setFilter] = useState({ text: "", sources: new Set<string>(), hideErrors: false, hideAssets: false, hideRefused: true });
   const lastId = useRef(0);
   const { menu, open, close } = useMenu();
+  // Opened to show one source's requests: that source alone, and none of them hidden by another filter.
+  useEffect(() => {
+    if (app.traffic) setFilter({ text: "", sources: new Set([app.traffic.source]), hideErrors: false, hideAssets: false, hideRefused: true });
+  }, [app.traffic]);
 
   // Fetch only new rows each tick (ids only grow).
   usePoll(async () => {
