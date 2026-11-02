@@ -34,9 +34,13 @@ test("the form says what is missing before anything runs", () => {
   assert.match(formProblem(filled({ method: "GET /" }))!, /method/);
   assert.match(formProblem(filled({ cwe: "CWE-639" }))!, /CWE/);
   assert.equal(formProblem(filled({ url: "wss://app.test/socket", cwe: "639" })), null);
+  // The CLI refuses a user name or password in the URL; the form says so first.
+  for (const url of ["https://admin:hunter2@app.test/x", "https://admin@app.test/x", "https://:pw@app.test/x"]) {
+    assert.match(formProblem(filled({ url }))!, /user name and password/, url);
+  }
 });
 
-test("the form becomes one findings add call, the description on stdin", () => {
+test("the form becomes one findings add call, the texts on stdin", () => {
   const { args, stdin } = findingAddArgs(
     filled({ risk: "high", confidence: "high", param: "id", cwe: " 639 ", history: "12, 15", description: " Any user can read any order. ", solution: "Check the owner.", evidence: "-leading dash" }),
   );
@@ -51,11 +55,9 @@ test("the form becomes one findings add call, the description on stdin", () => {
     "--history-id=12,15",
     "--param=id",
     "--cwe=639",
-    "--solution=Check the owner.",
-    "--evidence=-leading dash",
-    "--description-file=-",
+    "--input-json",
   ]);
-  assert.equal(stdin, "Any user can read any order.");
+  assert.deepEqual(JSON.parse(stdin!), { description: "Any user can read any order.", solution: "Check the owner.", evidence: "-leading dash" });
   // Nothing optional: no empty flags and no stdin; without a URL the history entry gives it and its method.
   const bare = findingAddArgs(filled({ url: "", history: "12" }));
   assert.deepEqual(bare, { args: ["findings", "add", "--title=Order IDOR", "--risk=medium", "--confidence=medium", "--history-id=12"] });
@@ -90,18 +92,27 @@ test("odd history ids are refused, repeats dropped", () => {
   assert.deepEqual(historyIds(" , "), []);
 });
 
+test("evidence and write-ups never go on the command line", () => {
+  const secret = "Set-Cookie: session=FAKE-SESSION-TOKEN";
+  const { args, stdin } = findingAddArgs(filled({ evidence: secret, solution: "Rotate FAKE-SESSION-TOKEN.", description: "Leaks FAKE-SESSION-TOKEN." }));
+  assert.ok(!args.some((a) => a.includes("FAKE-SESSION-TOKEN")), args.join(" "));
+  assert.equal(JSON.parse(stdin!).evidence, secret);
+});
+
 test("flags can't be confused with values", () => {
   // Every value is joined to its flag, so text that starts with a dash stays text.
   const { args, stdin } = findingAddArgs(
     filled({ title: "--risk=info", param: "--url", solution: "-x", evidence: "  kept as typed ", description: "   " }),
   );
   assert.ok(args.every((a, i) => i < 2 || a.startsWith("--")));
-  assert.ok(args.includes("--title=--risk=info") && args.includes("--param=--url") && args.includes("--solution=-x"));
-  assert.ok(args.includes("--evidence=  kept as typed "));
+  assert.ok(args.includes("--title=--risk=info") && args.includes("--param=--url"));
   assert.equal(args.filter((a) => a.startsWith("--risk=")).length, 1);
-  // A blank description is no description, and nothing reads stdin.
-  assert.equal(stdin, undefined);
-  assert.ok(!args.includes("--description-file=-"));
+  // A blank description is no description; the evidence is kept as typed.
+  assert.deepEqual(JSON.parse(stdin!), { solution: "-x", evidence: "  kept as typed " });
+  // No text, no stdin.
+  const none = findingAddArgs(filled({ description: "  ", solution: " ", evidence: "" }));
+  assert.equal(none.stdin, undefined);
+  assert.ok(!none.args.includes("--input-json"));
   // History ids the form can't read are left out (formProblem stops the save first).
   assert.ok(!findingAddArgs(filled({ history: "x" })).args.some((a) => a.startsWith("--history-id")));
 });

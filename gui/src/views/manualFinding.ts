@@ -63,6 +63,7 @@ export function formProblem(f: FindingForm): string | null {
       return "The URL must be absolute, such as https://app.example.com/orders/7.";
     }
     if (!["http:", "https:", "ws:", "wss:"].includes(u.protocol) || !u.hostname) return "The URL must start with http://, https://, ws:// or wss://.";
+    if (u.username || u.password) return "Leave the user name and password out of the URL: they would show in every report.";
   }
   if (f.url.trim() && !/^[A-Za-z0-9_-]+$/.test(f.method.trim())) return "The method is one word, such as GET or POST.";
   if (f.cwe.trim() && !/^[1-9]\d*$/.test(f.cwe.trim())) return "The CWE is a number, such as 639.";
@@ -70,8 +71,9 @@ export function formProblem(f: FindingForm): string | null {
 }
 
 /**
- * The `findings add` call. The description, the longest text, goes on stdin, so it stays off the
- * command line (limited in size on Windows); the rest are flags.
+ * The `findings add` call. The description, solution and evidence go on stdin as JSON
+ * (`--input-json`): evidence is often copied from a response and may hold a token, and
+ * arguments are visible in the process list. The rest are flags.
  */
 export function findingAddArgs(f: FindingForm): { args: string[]; stdin?: string } {
   const args = ["findings", "add", `--title=${f.title.trim()}`, `--risk=${f.risk}`, `--confidence=${f.confidence}`];
@@ -81,10 +83,12 @@ export function findingAddArgs(f: FindingForm): { args: string[]; stdin?: string
   if (ids.length) args.push(`--history-id=${ids.join(",")}`);
   if (f.param) args.push(`--param=${f.param}`);
   if (f.cwe.trim()) args.push(`--cwe=${f.cwe.trim()}`);
-  if (f.solution.trim()) args.push(`--solution=${f.solution.trim()}`);
-  if (f.evidence) args.push(`--evidence=${f.evidence}`);
-  if (!f.description.trim()) return { args };
-  return { args: [...args, "--description-file=-"], stdin: f.description.trim() };
+  const texts: Record<string, string> = {};
+  if (f.description.trim()) texts.description = f.description.trim();
+  if (f.solution.trim()) texts.solution = f.solution.trim();
+  if (f.evidence) texts.evidence = f.evidence;
+  if (!Object.keys(texts).length) return { args };
+  return { args: [...args, "--input-json"], stdin: JSON.stringify(texts) };
 }
 
 /** A draft from a Replay tab: its last response's history entry if there is one, else the request line. */

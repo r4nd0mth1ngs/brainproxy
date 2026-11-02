@@ -169,11 +169,13 @@ and history entry.
 
 The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findings add`: title,
 risk, confidence, method and URL (or only history entries, whose first gives both), parameter,
-CWE, history entries, description, solution and evidence. The description goes on stdin
-(`--description-file=-`); the rest are arguments. Nothing is sent. Findings added by hand are
-grouped by title, tagged *by hand*, show *Added by hand* and their history entries instead of a
-rule, and have *Remove* (`findings remove`, after asking). The scan comparison leaves them out,
-since no scan looks for them.
+CWE, history entries, description, solution and evidence. The description, solution and
+evidence go on stdin as JSON (`--input-json`), so a token in the evidence stays out of the
+process list; the rest are arguments. Nothing is sent. A warning (outside the scope, or a
+replaced description or solution that findings of the same title share) shows with the
+confirmation. Findings added by hand are grouped by title, tagged *by hand*, show *Added by
+hand* and their history entries instead of a rule, and have *Remove* (`findings remove`, after
+asking). The scan comparison leaves them out, since no scan looks for them.
 
 ## Look
 
@@ -256,6 +258,5 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
 - A finding added by hand can't be edited: mark it like any other, or remove it and add it
-  again. Its solution and evidence go on the command line, so on Windows (about 32,000
-  characters for the whole command) a very long one fails; the description has no such limit.
+  again.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).
