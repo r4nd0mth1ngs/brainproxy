@@ -361,3 +361,210 @@ test("a real shell passes the exact bytes to curl", { skip: !hasBash && "bash no
   assert.deepEqual([...piped.stdin], [...textBytes(withNul, true)]);
   assert.equal(piped.args[piped.args.length - 1].toString(), "@-");
 });
+
+// ---------- edge cases and refusals ----------
+
+test("every header curl builds refuses a line break", () => {
+  for (const cmd of [
+    "curl -b $'a=1\\r\\nX: y' https://h.test",
+    "curl --oauth2-bearer $'t\\nX: y' https://h.test",
+    "curl -r $'0-1\\nX: y' https://h.test",
+    "curl -e $'https://r.test/\\nX: y' https://h.test",
+    "curl -H $'X: a\\nY: b' https://h.test",
+    "curl --request-target $'/a\\r\\nX: y' https://h.test",
+  ]) {
+    assert.match(refusal(cmd), /line break/, cmd);
+  }
+  // A method can't carry a request line or a header.
+  assert.match(refusal("curl -X 'GET / HTTP/1.1' https://h.test"), /isn't a valid method/);
+  assert.match(refusal("curl -X $'GET\\r\\nX: y' https://h.test"), /isn't a valid method/);
+  // -u always ends up base64, so its bytes can't break a line.
+  assert.match(parseCurl("curl -u $'a:b\\r\\nX: y' https://h.test").raw, /^Authorization: Basic YTpiDQpYOiB5$/m);
+});
+
+test("the target is the host curl would connect to", () => {
+  // A fragment or user info can't move the request to another host than curl's.
+  assert.equal(parseCurl("curl 'https://evil.test#@h.test/'").target, "https://evil.test");
+  assert.equal(parseCurl("curl 'https://evil.test?@h.test/'").target, "https://evil.test");
+  assert.equal(parseCurl("curl 'https://u:p@h.test@evil.test/'").target, "https://evil.test");
+  assert.equal(parseCurl("curl 'https://h.test/?x=a@b.test'").target, "https://h.test");
+  assert.equal(parseCurl("curl 'https://h.test/a@b.test'").target, "https://h.test");
+  // The scheme is case-insensitive; a host with a port and no scheme is http.
+  assert.equal(parseCurl("curl HTTPS://h.test").target, "https://h.test");
+  assert.equal(parseCurl("curl h.test:8443").target, "http://h.test:8443");
+  assert.equal(parseCurl("curl https://h.test:80/").target, "https://h.test:80");
+  for (const url of ["file:///etc/passwd", "gopher://h.test/", "dict://h.test/", "ldap://h.test/"]) {
+    assert.match(refusal(`curl '${url}'`), /Only http and https/, url);
+  }
+  assert.match(refusal("curl https://h.test:0/"), /Bad port/);
+  assert.match(refusal("curl 'http://::1/'"), /host/);
+  assert.match(refusal("curl 'https://:443/'"), /host/);
+  assert.match(refusal("curl $'https://h.test\\t.evil/'"), /host/);
+});
+
+test("more shell syntax is refused or read as the shell would", () => {
+  assert.match(refusal('curl "https://h.test/${HOME}"'), /shell variables/);
+  assert.match(refusal('curl "https://h.test/$1"'), /shell variables/);
+  assert.match(refusal("curl https://h.test > out.txt"), /Unquoted ">"/);
+  assert.match(refusal("curl https://h.test | sh"), /Unquoted "\|"/);
+  assert.match(refusal("curl https://h.test && echo"), /Unquoted "&"/);
+  assert.match(refusal("curl $(echo https://h.test)"), /shell variables/);
+  assert.match(refusal('curl "https://h.test'), /Unterminated " quote/);
+  assert.match(refusal("curl $'https://h.test"), /Unterminated \$' quote/);
+  assert.match(refusal("curl $'\\U00110000' https://h.test"), /isn't a Unicode character/);
+  // A $ that starts no expansion is a plain character, quoted or not.
+  assert.match(parseCurl(`curl -H "X: a$" -H 'Y: $(id)' https://h.test/$`).raw, /^GET \/\$ [^]*\nX: a\$\nY: \$\(id\)\n/);
+  // A comment after the command, and a #fragment in the URL, aren't sent.
+  assert.equal(parseCurl("curl https://h.test/a#b # -H 'X: y'").raw, "GET /a HTTP/1.1\nHost: h.test\nAccept: */*\n\n");
+  // Backslash quotes the next character outside quotes.
+  assert.match(parseCurl("curl -H X:\\ a\\&b https://h.test").raw, /\nX: a&b\n/);
+});
+
+test("options are read as curl reads them, or refused", () => {
+  // curl has no --name=value form, so such a word isn't silently read as --name.
+  assert.match(refusal("curl --data=x https://h.test"), /Unknown curl option --data=x/);
+  assert.match(refusal("curl https://h.test -H"), /--header needs a value/);
+  assert.match(refusal("curl https://h.test -X"), /--request needs a value/);
+  // A value attached to a route option is that option's, not the URL.
+  const x = parseCurl("curl -xhttp://p.test:8 https://h.test");
+  assert.equal(x.target, "https://h.test");
+  assert.match(x.warnings[0], /proxy/);
+  assert.match(parseCurl("curl -E cert.pem https://h.test").warnings[0], /client certificate/);
+  assert.match(parseCurl("curl --unix-socket /run/docker.sock http://h.test/").warnings[0], /Unix socket/);
+  // A warning is given once, however often the option repeats.
+  assert.equal(parseCurl("curl -x a -x b --proxy c https://h.test").warnings.length, 1);
+  for (const opt of ["--ntlm", "--negotiate", "--anyauth", "--netrc", "-n", "--netrc-file f", "--next", "-:", "--config f", "--upload-file f"]) {
+    assert.notEqual(refusal(`curl ${opt} https://h.test`), "", opt);
+  }
+  // Repeated headers are all sent; a custom Authorization replaces -u and a bearer token.
+  assert.match(parseCurl("curl -H 'X-A: 1' -H 'x-a: 2' https://h.test").raw, /\nX-A: 1\nx-a: 2\n/);
+  const auth = parseCurl("curl -u a:b --oauth2-bearer t -H 'Authorization: Custom' https://h.test").raw;
+  assert.equal(auth.match(/authorization/gi)?.length, 1);
+  assert.match(auth, /\nAuthorization: Custom\n/);
+  // -u wins over a bearer token, which wins over user info in the URL.
+  assert.match(parseCurl("curl -u a:b --oauth2-bearer t https://x:y@h.test").raw, /Authorization: Basic YTpi\n/);
+  assert.match(parseCurl("curl --oauth2-bearer t https://x:y@h.test").raw, /Authorization: Bearer t\n/);
+  // --no-get turns -G back off.
+  assert.match(parseCurl("curl -G --no-get -d a=1 https://h.test").raw, /^POST \/ /);
+});
+
+test("bodies: byte lengths, -G with --url-query, multipart details", () => {
+  // Content-Length counts UTF-8 bytes, not characters.
+  assert.match(parseCurl("curl -d é€ https://h.test").raw, /Content-Length: 5\n/);
+  assert.match(parseCurl("curl -G -d a --url-query b=c https://h.test/?z").raw, /^GET \/\?z&a&b=c /);
+  // --form-string keeps @, < and ;type= as text.
+  const fs = parseCurl("curl --form-string 'a=@x;type=y' --form-string 'b=<z' https://h.test").raw;
+  assert.match(fs, /name="a"\r\n\r\n@x;type=y\r\n/);
+  assert.match(fs, /name="b"\r\n\r\n<z\r\n/);
+  assert.match(refusal("curl --form-string novalue https://h.test"), /name=value/);
+  assert.match(refusal("curl -F =x https://h.test"), /name=value/);
+  assert.match(refusal("curl -G -F a=1 https://h.test"), /-F with -G/);
+  assert.match(refusal("curl -F 'a=1;encoder=quoted-printable' https://h.test"), /encoder=/);
+  assert.match(parseCurl("curl -F 'a=1;foo=bar' https://h.test").warnings[0], /unknown -F field: foo=bar/);
+  // A value holding the boundary gets a longer one.
+  const clash = parseCurl("curl -F 'a=--------------------------brainproxy' https://h.test").raw;
+  const boundary = /boundary=(\S+)/.exec(clash)![1];
+  assert.notEqual(boundary, "------------------------brainproxy");
+  assert.equal(clash.split(`--${boundary}`).length - 1, 2);
+  // A field name or file name can't break out of its Content-Disposition.
+  const esc = parseCurl(`curl --form-string $'a"\\r\\nX: y=1' -F $'f=v;filename=n\\r"x.txt' https://h.test`).raw;
+  assert.match(esc, /name="a%22%0D%0AX: y"\r\n/);
+  assert.match(esc, /; filename="n%0D%22x\.txt"\r\n/);
+  assert.doesNotMatch(esc, /\r\nX: y"/);
+});
+
+test("pasted commands that arrive with stray whitespace", () => {
+  // Leading prompt-less whitespace, tabs and a trailing continuation all read the same.
+  const want = "GET /a HTTP/1.1\nHost: h.test\nAccept: */*\n\n";
+  assert.equal(parseCurl("  \tcurl\thttps://h.test/a \\\n").raw, want);
+  assert.equal(parseCurl("curl \\\r\n  https://h.test/a").raw, want);
+  assert.equal(parseCurl('curl.exe "https://h.test/a"').raw, want);
+  assert.match(refusal("   "), /Paste a curl command/);
+  assert.match(refusal("curlx https://h.test"), /start with curl/);
+});
+
+test("toCurl: a target, method or header can't add shell syntax", () => {
+  const m = toCurl("$(id) / HTTP/1.1\nHost: h.test\n\n", "https://h.test").command;
+  assert.match(m, /-X '\$\(id\)'/);
+  assert.match(toCurl("GET / HTTP/1.1\n\n", "https://h'$(id).test").command, /^curl 'https:\/\/h'\\''\$\(id\)\.test\/'/);
+  // Control characters in a header name or the request target go in $'…' with hex escapes.
+  assert.match(toCurl("GET / HTTP/1.1\nX\x1b[2J: v\n\n", "https://h.test").command, /-H \$'X\\x1b\[2J: v'/);
+  assert.match(toCurl("GET /a\x01b HTTP/1.1\n\n", "https://h.test").command, /--request-target \$'\/a\\x01b'/);
+  // Placeholders (an auth macro's values) are copied as they are, never resolved.
+  assert.match(toCurl("GET / HTTP/1.1\nCookie: «auth:main:var:csrf#7»\n\n", "https://h.test").command, /-H 'Cookie: «auth:main:var:csrf#7»'/);
+  // Targets other than http(s)://host[:port] are refused.
+  for (const t of ["ftp://h.test", "https://h.test/path", "https://h.test?x", "h.test", "https://h test"]) {
+    assert.throws(() => toCurl("GET / HTTP/1.1\n\n", t), CurlError, t);
+  }
+  assert.match(toCurl("GET / HTTP/1.1\n\n", "  https://h.test///  ").command, /^curl 'https:\/\/h\.test\/'/);
+});
+
+test("toCurl: headers it skips, keeps and warns about", () => {
+  const c = toCurl("GET / HTTP/1.1\nHost: H.TEST\nX-A: 1\n folded\nX-A: 2\nContent-Length: 99\n\n", "https://h.test");
+  // Host matching the target (any case) and Content-Length are curl's to write.
+  assert.doesNotMatch(c.command, /Host:|Content-Length/);
+  assert.match(c.command, /-H 'X-A: 1' \\\n {2}-H 'X-A: 2'/);
+  assert.match(c.warnings[0], /isn't a header: {2}folded/);
+  // A Host with the default port written out differs from the URL's, so it's kept.
+  assert.match(toCurl("GET / HTTP/1.1\nHost: h.test:443\n\n", "https://h.test").command, /-H 'Host: h\.test:443'/);
+  // Content-Length: 0 sends an empty body; a POST without one gets -X.
+  assert.match(toCurl("POST / HTTP/1.1\nContent-Length: 0\n\n", "https://h.test").command, /--data-raw ''$/);
+  assert.match(toCurl("POST / HTTP/1.1\n\n", "https://h.test").command, /-X 'POST'/);
+  assert.doesNotMatch(toCurl("POST / HTTP/1.1\n\n", "https://h.test").command, /--data/);
+  // A HEAD with a body keeps the body and says HEAD with -X.
+  assert.match(toCurl("HEAD / HTTP/1.1\nContent-Length: 1\n\nx", "https://h.test").command, /-X 'HEAD'[^]*--data-raw 'x'/);
+  // The request's own Content-Type, User-Agent and Accept aren't removed.
+  const own = toCurl("POST / HTTP/1.1\nUser-Agent: u\nAccept: a\nContent-Type: c\n\nx", "https://h.test").command;
+  assert.doesNotMatch(own, /-H '(User-Agent|Accept|Content-Type):'/);
+});
+
+test("toCurl: size limits count bytes", () => {
+  const head = "POST / HTTP/1.1\nContent-Type: x\nExpect:\n\n";
+  // Up to the limit is written; one byte more is refused.
+  assert.ok(toCurl(head + "a".repeat(2_000_000), "https://h.test").command.length > 2_000_000);
+  assert.throws(() => toCurl(head + "a".repeat(2_000_001), "https://h.test"), CurlError);
+  // Multi-byte text counts as its UTF-8 bytes.
+  assert.throws(() => toCurl(head + "é".repeat(1_000_001), "https://h.test"), /2000002 bytes/);
+  assert.deepEqual(toCurl(head + "a".repeat(CURL_ARG_WARN), "https://h.test").warnings, []);
+  assert.equal(toCurl(head + "é".repeat(CURL_ARG_WARN / 2 + 1), "https://h.test").warnings.length, 1);
+});
+
+test("toCurl then parseCurl: more requests come back the same", () => {
+  const cases: [string, string, boolean][] = [
+    ["HEAD /h HTTP/1.1\nHost: h.test\n\n", "https://h.test", false],
+    ["GET /old HTTP/1.0\nHost: h.test\nUser-Agent: u\n\n", "http://h.test", false],
+    ["OPTIONS * HTTP/1.1\nHost: h.test\n\n", "https://h.test", false],
+    ["POST /at HTTP/1.1\nHost: h.test\nContent-Type: text/plain\n\n@/etc/passwd", "https://h.test", false],
+    ["GET /q?a[1]={b} HTTP/1.1\nHost: h.test\n\n", "https://h.test:8443", false],
+    ["DELETE /x HTTP/1.1\nHost: h.test\nX-Bidi: a\u202Eb\nX-Q: '\"$`\\\n\n", "https://h.test", false],
+    ["GET /with-body HTTP/1.1\nHost: h.test\nContent-Type: text/plain\n\nbody", "https://h.test", false],
+  ];
+  for (const [raw, target, binary] of cases) {
+    const { command } = toCurl(raw, target, binary);
+    const back = parseCurl(command);
+    assert.equal(back.target, target, command);
+    const [line, ...hs] = back.raw.split("\n\n")[0].split("\n");
+    const [wantLine, ...wantHs] = raw.split("\n\n")[0].split("\n");
+    assert.equal(line, wantLine, command);
+    const norm = (h: string[]) => h.filter((x) => !/^(content-length|host):/i.test(x)).map((x) => x.toLowerCase()).sort();
+    assert.deepEqual(norm(hs), norm(wantHs), command);
+    assert.equal(back.raw.split("\n\n").slice(1).join("\n\n"), raw.split("\n\n").slice(1).join("\n\n"), command);
+  }
+});
+
+test("a real shell passes a hostile method, target and headers exactly", { skip: !hasBash && "bash not found" }, () => {
+  const method = "$(touch${IFS}/tmp/pwned)";
+  const target = "https://h'`id`$(id).test:8443";
+  const ctrl = "X-C: a\x1b]0;title\x07\u202Eb\x7f";
+  const placeholder = "Cookie: «auth:main:var:csrf#7»; s=$HOME";
+  const raw = `${method} /p?q=$(id)&r=\`id\` HTTP/1.1\nHost: h.test\n${ctrl}\n${placeholder}\n\n`;
+  const { args } = underBash(toCurl(raw, target).command);
+  assert.equal(args[0].toString(), `${target}/p?q=$(id)&r=\`id\``);
+  const x = args.findIndex((a) => a.toString() === "-X");
+  assert.equal(args[x + 1].toString(), method);
+  assert.ok(args.some((a) => a.equals(Buffer.from(ctrl))));
+  assert.ok(args.some((a) => a.equals(Buffer.from(placeholder))));
+  // A request target the URL can't hold arrives as is.
+  const rt = underBash(toCurl("GET /a b#c\x01 HTTP/1.1\n\n", "https://h.test").command).args;
+  assert.equal(rt[rt.findIndex((a) => a.toString() === "--request-target") + 1].toString(), "/a b#c\x01");
+});
