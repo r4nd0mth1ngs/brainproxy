@@ -46,7 +46,7 @@ test("the view offers the CLI's kinds, less auto", () => {
 });
 
 test("every layer Smart decode can find becomes a step", () => {
-  const found = ["url", "html", "base64", "base64url", "hex", "jwt", "gzip", "zlib"];
+  const found = ["url", "percent", "html", "base64", "base64url", "hex", "jwt", "gzip", "zlib"];
   assert.deepEqual(smartSteps(found).map((s) => s.kind), found);
   assert.ok(smartSteps(found).every((s) => s.op === "decode"));
   assert.deepEqual(smartSteps([]), []);

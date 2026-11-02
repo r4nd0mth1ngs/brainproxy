@@ -11,7 +11,7 @@ export interface Step {
 // `decode auto` isn't offered as a step: Smart decode runs it and shows the steps it found.
 export const KINDS: Record<Op, string[]> = {
   encode: ["base64", "base64url", "url", "url-all", "hex", "html", "gzip", "zlib", "deflate"],
-  decode: ["base64", "base64url", "url", "hex", "html", "jwt", "gzip", "zlib", "deflate", "brotli"],
+  decode: ["base64", "base64url", "url", "percent", "hex", "html", "jwt", "gzip", "zlib", "deflate", "brotli"],
   hash: ["md5", "sha1", "sha256", "sha512"],
 };
 

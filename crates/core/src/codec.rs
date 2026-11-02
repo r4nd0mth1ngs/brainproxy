@@ -16,7 +16,7 @@ const URL_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').rem
 
 pub const ENCODINGS: &[&str] = &["base64", "base64url", "url", "url-all", "hex", "html", "gzip", "zlib", "deflate"];
 pub const DECODINGS: &[&str] =
-    &["base64", "base64url", "url", "hex", "html", "jwt", "gzip", "zlib", "deflate", "brotli", "auto"];
+    &["base64", "base64url", "url", "percent", "hex", "html", "jwt", "gzip", "zlib", "deflate", "brotli", "auto"];
 pub const HASHES: &[&str] = &["md5", "sha1", "sha256", "sha512"];
 
 /// Most bytes a decompression may produce, so a small "bomb" can't fill memory.
@@ -80,6 +80,8 @@ pub fn decode(kind: &str, input: &[u8]) -> Result<Vec<u8>> {
             let plus_as_space: Vec<u8> = input.iter().map(|&b| if b == b'+' { b' ' } else { b }).collect();
             percent_decode(&plus_as_space).collect()
         }
+        // %XX escapes only: a '+' stays a '+', as in paths, cookies, and headers.
+        "percent" => percent_decode(input).collect(),
         "hex" => {
             let s: Vec<u8> = trimmed.iter().copied().filter(|b| !b.is_ascii_whitespace() && *b != b':').collect();
             let s = s.strip_prefix(b"0x").unwrap_or(&s);
@@ -168,6 +170,10 @@ fn smart_step(v: &[u8]) -> Option<(&'static str, Vec<u8>)> {
     // Escapes count when they decode to text; base64 and hex need more (see looks_decoded).
     let text_out = |found: &(&'static str, Vec<u8>)| compressed(&found.1) || is_text(&found.1);
     let decoded_out = |found: &(&'static str, Vec<u8>)| looks_decoded(&found.1);
+    let base64_inside = |found: &(&'static str, Vec<u8>)| {
+        std::str::from_utf8(&found.1).ok().and_then(|s| looks_like_base64(s.trim())) == Some("base64")
+            && decode("base64", &found.1).is_ok_and(|out| looks_decoded(&out))
+    };
     if v.starts_with(&[0x1f, 0x8b]) {
         return attempt("gzip");
     }
@@ -181,6 +187,13 @@ fn smart_step(v: &[u8]) -> Option<(&'static str, Vec<u8>)> {
         return attempt("jwt");
     }
     if has_percent_escape(text) {
+        // '+' means a space only in form data. Base64 in a cookie or header often has a raw
+        // '+' and only its '=' escaped: undo the escapes and keep the '+'.
+        if text.contains('+') {
+            if let Some(found) = attempt("percent").filter(base64_inside) {
+                return Some(found);
+            }
+        }
         if let Some(found) = attempt("url").filter(text_out) {
             return Some(found);
         }
@@ -255,8 +268,13 @@ fn looks_like_base64(s: &str) -> Option<&'static str> {
     ok.then_some(if url_safe { "base64url" } else { "base64" })
 }
 
+/// Whether `v` is a gzip or zlib stream that unpacks, or would but for `MAX_INFLATED` (a
+/// bomb is still compressed data). The first bytes alone aren't enough: about 1 in 2000
+/// random byte pairs is a valid zlib header, so random IDs would decode to garbage.
 fn compressed(v: &[u8]) -> bool {
-    v.starts_with(&[0x1f, 0x8b]) || zlib_header(v)
+    let unpacks = |r: &mut dyn Read| std::io::copy(&mut r.take(MAX_INFLATED + 1), &mut std::io::sink()).is_ok();
+    (v.starts_with(&[0x1f, 0x8b]) && unpacks(&mut flate2::read::MultiGzDecoder::new(v)))
+        || (zlib_header(v) && unpacks(&mut flate2::read::ZlibDecoder::new(v)))
 }
 
 /// UTF-8 with no control characters but tabs and line breaks.
@@ -389,6 +407,8 @@ mod tests {
         }
         assert_eq!(encode("url-all", b"ab").unwrap(), b"%61%62");
         assert_eq!(decode("url", b"%61+b").unwrap(), b"a b");
+        assert_eq!(decode("percent", b"%61+b%2B").unwrap(), b"a+b+");
+        assert_eq!(decode("percent", &encode("url", "a b/é".as_bytes()).unwrap()).unwrap(), "a b/é".as_bytes());
     }
 
     #[test]
@@ -523,6 +543,9 @@ mod tests {
             "McDonald",
             "circumstantially",
             "userName",
+            // Decode to bytes that start like a zlib header but don't unpack.
+            "789c00112233445566778899aabbccdd",
+            "SMdYmAPoi73dreeA",
         ];
         for word in plain {
             let s = smart_decode(word.as_bytes());
@@ -629,6 +652,9 @@ mod tests {
         let cases: &[(&[u8], &[&str], &[u8])] = &[
             // A form value: '+' is a space once there is an escape to undo.
             (b"q=hello+world&x=%2F", &["url"], b"q=hello world&x=/"),
+            // Base64 with a raw '+' and an escaped '=', as cookies often carry it.
+            (b"SGk+dGhlcmU%3D", &["percent", "base64"], b"Hi>there"),
+            (b"a+b%3D", &["url"], b"a b="),
             (b"%253Cb%253E", &["url", "url"], b"<b>"),
             (b"%E2%9C%93", &["url"], "\u{2713}".as_bytes()),
             (b"&amp;lt;b&amp;gt;", &["html", "html"], b"<b>"),
