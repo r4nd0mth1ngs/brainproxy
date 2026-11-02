@@ -30,24 +30,40 @@ export interface CliInput {
   env?: Record<string, string>;
   /** Run against this project instead of the open one. */
   project?: string;
+  /** An id `cancelCli` can stop the call by; it then fails with kind "cancelled". */
+  call?: string;
 }
 
 export async function cli<T = any>(args: string[], input: string | Uint8Array | CliInput = {}): Promise<Envelope<T>> {
-  const { stdin, env, project: target } =
-    typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined, project: undefined } : input;
+  const { stdin, env, project: target, call } =
+    typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined, project: undefined, call: undefined } : input;
   const proj = target ?? project;
   // Bytes go as a number array (Vec<u8> in Tauri, a Buffer in the dev bridge), so nothing is re-encoded.
   const bytes = stdin == null ? null : Array.from(typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin);
   if (inTauri) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<Envelope<T>>("cli", { project: proj, args, stdin: bytes, env: env ?? null });
+    return invoke<Envelope<T>>("cli", { project: proj, args, stdin: bytes, env: env ?? null, call: call ?? null });
   }
   const res = await fetch("/api/cli", {
     method: "POST",
     headers: { "content-type": "application/json", "x-brainproxy": "1" },
-    body: JSON.stringify({ project: proj, args, stdin: bytes, env }),
+    body: JSON.stringify({ project: proj, args, stdin: bytes, env, call }),
   });
   return res.json();
+}
+
+/** Stops the call started with `call` (its CLI process is killed), if it is still running. */
+export async function cancelCli(call: string): Promise<void> {
+  if (inTauri) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("cli_cancel", { call });
+    return;
+  }
+  await fetch("/api/cli-cancel", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-brainproxy": "1" },
+    body: JSON.stringify({ call }),
+  });
 }
 
 /** A temporary engagement left by an app that exited without discarding it. */
