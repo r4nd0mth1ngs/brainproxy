@@ -234,4 +234,76 @@ mod tests {
         let fits = json!({"tabs": [{"request": "a".repeat(MAX_BYTES - 100)}]}).to_string();
         assert_eq!(parse(fits.as_bytes()).unwrap().1, 1);
     }
+
+    #[test]
+    fn the_cap_counts_what_is_stored() {
+        // Under the cap as sent, over it once the left-out kind, title and target are filled in.
+        let per_tab = (MAX_BYTES - 1000) / MAX_TABS - r#"{"request":""},"#.len();
+        let tab = format!(r#"{{"request":"{}"}}"#, "a".repeat(per_tab));
+        let input = format!(r#"{{"tabs":[{}]}}"#, vec![tab; MAX_TABS].join(","));
+        assert!(input.len() <= MAX_BYTES);
+        assert!(err(&input).contains("over 16 MB"), "{}", err(&input));
+    }
+
+    #[test]
+    fn limits_are_inclusive_and_count_characters() {
+        let ok = |v: Value| parse(v.to_string().as_bytes()).map(|(_, n)| n).map_err(|e| e.to_string());
+        let all = json!({"tabs": (0..MAX_TABS).map(|_| json!({"request": ""})).collect::<Vec<_>>()});
+        assert_eq!(ok(all), Ok(MAX_TABS));
+        // Characters, not bytes: 200 two-byte characters are a 200-character title.
+        assert_eq!(ok(json!({"tabs": [{"request": "", "title": "é".repeat(MAX_TITLE)}]})), Ok(1));
+        assert_eq!(ok(json!({"tabs": [{"request": "", "target": "t".repeat(MAX_TARGET)}]})), Ok(1));
+        let e = ok(json!({"tabs": [{"request": "", "target": "t".repeat(MAX_TARGET + 1)}]})).unwrap_err();
+        assert!(e.contains("target is longer"), "{e}");
+        assert_eq!(ok(json!({"tabs": [{"kind": "ws", "request": "", "until": "u".repeat(MAX_UNTIL)}]})), Ok(1));
+        let e = ok(json!({"tabs": [{"kind": "ws", "request": "", "until": "u".repeat(MAX_UNTIL + 1)}]})).unwrap_err();
+        assert!(e.contains("until is longer"), "{e}");
+    }
+
+    #[test]
+    fn edge_values() {
+        // JSON.stringify writes NaN and Infinity as null: no wait, which is fine.
+        let (json, _) = parse(br#"{"tabs": [{"kind": "ws", "request": "", "wait": null, "messages": []}]}"#).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v["tabs"][0].get("wait").is_none(), "{v}");
+        assert_eq!(v["tabs"][0]["messages"], json!([]));
+        let (json, _) = parse(br#"{"tabs": [{"kind": "ws", "request": "", "wait": 0}]}"#).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["tabs"][0]["wait"], 0.0);
+        // Defaults are filled in and an unset binary is left out.
+        let (json, count) = parse(br#"{"tabs": [{"request": "x", "binary": false}]}"#).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(json, r#"{"tabs":[{"kind":"http","title":"","target":"","request":"x"}]}"#);
+        // Nothing open: nothing can be active.
+        assert_eq!(parse(br#"{"tabs": []}"#).unwrap(), (r#"{"tabs":[]}"#.to_string(), 0));
+        assert!(err(r#"{"tabs": [], "active": 0}"#).contains("active is 0"));
+        assert!(err(r#"{"tabs": [{"request": ""}], "active": -1}"#).contains("Replay tabs"));
+        assert!(err(r#"{"tabs": [], "responses": []}"#).contains("unknown field"));
+        assert!(err(r#"{"active": 0}"#).contains("tabs"));
+        assert!(err(r#"{"tabs": [{"request": "", "kind": "WS"}]}"#).contains("unknown variant"));
+        assert!(err(r#"{"tabs": [{"request": "", "wait": 1}]}"#).contains("WebSocket tabs"));
+        assert!(err(r#"{"tabs": [{"request": "", "until": "x"}]}"#).contains("WebSocket tabs"));
+        assert!(err(r#"{"tabs": [{"request": 1}]}"#).contains("Replay tabs"));
+    }
+
+    #[test]
+    fn an_error_shows_a_title_escaped() {
+        // A title from target traffic can't write terminal escapes into the error.
+        let e =
+            err(&json!({"tabs": [{"request": "", "title": "\u{1b}[2Jx", "kind": "ws", "binary": true}]}).to_string());
+        assert!(!e.contains('\u{1b}'), "{e:?}");
+        assert!(e.contains(r"\u{1b}[2Jx"), "{e}");
+    }
+
+    #[test]
+    fn load_lists_newer_sets_and_reports_broken_ones() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(load(&store).unwrap(), json!({"tabs": []}));
+        // Saved by a newer version: listed as stored, not re-checked.
+        let newer = json!({"tabs": [{"kind": "grpc", "request": "", "extra": 1}], "active": 0, "v": 2});
+        store.meta_set(KEY, Some(&newer.to_string())).unwrap();
+        assert_eq!(load(&store).unwrap(), newer);
+        store.meta_set(KEY, Some("{")).unwrap();
+        let e = load(&store).unwrap_err().to_string();
+        assert!(e.contains("not valid JSON") && e.contains("save new ones"), "{e}");
+    }
 }

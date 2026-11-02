@@ -160,6 +160,34 @@ fn protocol_and_tool_list() {
 }
 
 #[test]
+fn an_agent_can_prepare_replay_tabs() {
+    let mut m = Mcp::start(&tmp_project("replay-tabs"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    // No scope needed: saving sends nothing.
+    let set = json!({"tabs": [{"kind": "ws", "title": "feed", "target": "wss://a.test", "request": "GET / HTTP/1.1\n\n",
+        "messages": ["«auth:app:header:X»"], "until": "done"}], "active": 0});
+    let (err, env) = m.call("replay_tabs_save", json!({"stdin": set.to_string()}));
+    assert!(!err, "{env}");
+    assert_eq!(env["data"]["count"], 1);
+    let r = m.request("tools/call", json!({"name": "replay_tabs_list", "arguments": {}}));
+    assert_eq!(r["result"]["_meta"]["provenance"]["untrusted_content"], true, "{r}");
+    let (err, env) = m.call("replay_tabs_list", json!({}));
+    assert!(!err, "{env}");
+    assert_eq!(env["data"]["tabs"], set["tabs"]);
+    assert_eq!(env["data"]["active"], 0);
+
+    // A bad set is a tool error and leaves the saved one alone; list takes no stdin.
+    let (err, env) = m.call("replay_tabs_save", json!({"stdin": r#"{"tabs": [{"request": "", "response": "x"}]}"#}));
+    assert!(err);
+    assert_eq!(env["error"]["kind"], "invalid_input", "{env}");
+    let (err, env) = m.call("replay_tabs_save", json!({}));
+    assert!(err, "no stdin is no set: {env}");
+    let r = m.request("tools/call", json!({"name": "replay_tabs_list", "arguments": {"stdin": "{}"}}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert_eq!(m.call("replay_tabs_list", json!({})).1["data"]["count"], 1);
+}
+
+#[test]
 fn calls_run_the_cli_in_scope() {
     let port = serve(2);
     let mut m = Mcp::start(&tmp_project("calls"), &[]);

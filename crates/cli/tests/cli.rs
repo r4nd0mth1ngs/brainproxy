@@ -608,6 +608,58 @@ fn replay_tabs_are_saved_in_the_project() {
 }
 
 #[test]
+fn replay_tabs_keep_bytes_and_placeholders_and_send_nothing() {
+    let project = tmp_project("replay-tabs-text");
+    let (code, v) = run(&["auth", "add", "p1", "-H", "Authorization: Bearer APIKEY123"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    // A binary request holds one character per byte, every byte value included.
+    let binary: String = "POST / HTTP/1.1\r\n\r\n".chars().chain((0u8..=255).map(char::from)).collect();
+    let typed =
+        "GET /é?q=«auth:p1:header:Authorization» HTTP/1.1\r\nAuthorization: «auth:p1:header:Authorization»\r\n\r\n";
+    // Out of scope: kept, since saving sends nothing (a person sends from Replay, through scope).
+    let set = serde_json::json!({"tabs": [
+        {"title": "bin", "target": "http://10.255.255.1", "request": binary, "binary": true},
+        {"title": "auth", "target": "http://127.0.0.1", "request": typed},
+    ]});
+    let (code, v) = run(&["replay", "tabs", "save"], &project, Some(set.to_string().as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(v["data"]["tabs"][0]["request"], binary.as_str());
+    assert_eq!(v["data"]["tabs"][0]["binary"], true);
+    assert_eq!(v["data"]["tabs"][1]["request"], typed);
+    assert!(!v.to_string().contains("APIKEY123"), "{v}");
+    assert_eq!(v["data"]["active"], Value::Null);
+    let (_, v) = run(&["history", "list"], &project, None);
+    assert_eq!(v["data"]["count"], 0, "{v}");
+
+    // Text output: one line per tab; none left says so.
+    let text = |args: &[&str]| {
+        let out = bin().args(["--format", "text", "--project"]).arg(&project).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let list = text(&["replay", "tabs", "list"]);
+    assert_eq!(
+        list.lines().collect::<Vec<_>>(),
+        ["  1  http  bin  http://10.255.255.1", "  2  http  auth  http://127.0.0.1"]
+    );
+    let mut child = bin()
+        .args(["--format", "text", "--project"])
+        .arg(&project)
+        .args(["replay", "tabs", "save"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"tabs": [{"kind": "ws", "request": ""}]}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "saved 1 Replay tab\n");
+    assert_eq!(text(&["replay", "tabs", "list"]), "  1  ws      \n");
+    run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
+    assert_eq!(text(&["replay", "tabs", "list"]), "no saved Replay tabs\n");
+}
+
+#[test]
 fn output_files_are_not_overwritten_without_force() {
     let project = tmp_project("overwrite");
     let dir = project.parent().unwrap();
