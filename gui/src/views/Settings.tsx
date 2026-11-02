@@ -1,7 +1,7 @@
 // Project and tool settings: auth profiles, match & replace, intercept options, proxy setup,
 // connection options, the CA, rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
 
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { run, type CliInput } from "../api";
 import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -1311,10 +1311,19 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
   const problem = portProblem(text);
   const port = text.trim() ? Number(text) : null;
   const note = port != null && !problem && lowPortNote(port);
+  const id = useId();
+  const input = useRef<HTMLInputElement>(null);
+  // Bumped when Save is pressed with an invalid port, so the error is announced again.
+  const [attempt, setAttempt] = useState(0);
 
   const running = p.proxy?.running ? p.proxy.proxy : null;
   const save = () => {
-    if (problem || port === saved) return;
+    if (problem) {
+      setAttempt((n) => n + 1);
+      input.current?.focus();
+      return;
+    }
+    if (port === saved) return;
     if (!saveProxyPort(port)) return app.toast("The port wasn't saved: this app's settings storage is unavailable.", "error");
     setSaved(port);
     app.toast(
@@ -1355,7 +1364,9 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
 
   return (
     <>
-      <h3>Port</h3>
+      <h3>
+        <label htmlFor={`${id}-port`}>Port</label>
+      </h3>
       <form
         className="row gap"
         onSubmit={(e) => {
@@ -1364,21 +1375,33 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
         }}
       >
         <input
+          ref={input}
+          id={`${id}-port`}
           className="input mono"
           style={{ width: 100 }}
           inputMode="numeric"
-          aria-label="Proxy port"
           placeholder={String(DEFAULT_PROXY_PORT)}
           value={text}
+          aria-invalid={!!problem}
+          aria-describedby={[problem ? `${id}-err` : note ? `${id}-note` : null, `${id}-help`].filter(Boolean).join(" ")}
           onChange={(e) => setText(e.target.value)}
         />
-        <button className="btn small primary" disabled={!!problem || port === saved}>
+        {/* Enabled with an invalid port too: pressing it (or Enter) points at the error. */}
+        <button className="btn small primary" disabled={!problem && port === saved}>
           Save
         </button>
       </form>
-      {problem && <div className="set-err small">{problem}</div>}
-      {note && <p className="muted small">{note}</p>}
-      <p className="muted small">
+      {problem && (
+        <div key={attempt} id={`${id}-err`} role="alert" className="set-err small">
+          {problem}
+        </div>
+      )}
+      {note && (
+        <p id={`${id}-note`} className="muted small">
+          {note}
+        </p>
+      )}
+      <p id={`${id}-help`} className="muted small">
         Empty means port {DEFAULT_PROXY_PORT}, or the next free one when a project opens. A chosen port is used as is, for
         every project: if it's taken, the proxy stays off and says why. This sets the port on 127.0.0.1 for the app;{" "}
         <span className="mono">brainproxy proxy start</span> from a shell or MCP still defaults to {DEFAULT_PROXY_PORT} unless given{" "}
