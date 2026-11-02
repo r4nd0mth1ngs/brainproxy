@@ -57,6 +57,54 @@ export function scanConfirm(picks: HistoryPick[]): { title: string; message: str
   };
 }
 
+/** What a row needs for the actions here: its status, and the proxy's error if any. */
+export interface HistoryRow {
+  status: number | null;
+  error?: string | null;
+}
+
+/** Why a refused row's actions are disabled. */
+export const REFUSED_HINT = "Out of scope: the proxy refused this request";
+
+/** The proxy refused it (outside the engagement scope), so there is nothing to replay. */
+export function isRefused(r: HistoryRow): boolean {
+  return !!r.error?.startsWith("out of scope");
+}
+
+/**
+ * Why a row can't be scanned, or null when it can. A scan needs the recorded response to compare
+ * against, so a request that got none (a connection error, a timeout, dropped in Intercept) has
+ * nothing to scan.
+ */
+export function scanBlocker(r: HistoryRow): string | null {
+  if (isRefused(r)) return REFUSED_HINT;
+  if (r.status == null) return "No response recorded to scan";
+  return null;
+}
+
+/**
+ * The question asked before an access-control run of requests picked in Traffic, or null when
+ * they are all GET, HEAD or OPTIONS. The others are replayed as each identity, which can change
+ * data as another user.
+ */
+export function accessConfirm(
+  picks: HistoryPick[],
+  identities: string[],
+  anonymous: boolean,
+): { title: string; message: string; ok: string; cancel: string } | null {
+  const unsafe = unsafeMethods(picks);
+  if (!unsafe.length) return null;
+  const names = identities.length > 1 ? `${identities.slice(0, -1).join(", ")} and ${identities.at(-1)}` : identities[0];
+  const who = [...(names ? [`as ${names}`] : []), ...(anonymous ? ["with no session"] : [])].join(" and ");
+  const what = picks.length === 1 ? `This ${unsafe[0]}` : `The ${unsafe.join(", ")} requests`;
+  return {
+    title: picks.length === 1 ? `Replay this ${unsafe[0]}?` : "Replay requests that can change data?",
+    message: `${what} ${picks.length === 1 ? "is" : "are"} sent again ${who}. That can change data or trigger side effects, now as another user. Every request stays inside the engagement scope.`,
+    ok: "Start run",
+    cancel: "Cancel",
+  };
+}
+
 /** `history tag` adding or removing the highlight. */
 export function highlightArgs(id: number, on: boolean): string[] {
   return ["history", "tag", String(id), on ? "--add" : "--remove", "highlight"];

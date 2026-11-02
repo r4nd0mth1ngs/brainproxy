@@ -247,7 +247,8 @@ The sidebar groups the tools by what you are doing.
     that request in the background (`scan active --history-id`, medium strength, plus the
     Nuclei templates of high severity and up once they are downloaded). It is attacked
     whatever its method, so a POST is replayed with attack data too. Click the toast to
-    follow it in **Scans › Tasks**.
+    follow it in **Scans › Tasks**. A request that got no response (a connection error, a
+    timeout, or dropped in **Intercept**) has nothing to scan, so the item is greyed out.
   - **Test access control…** opens **Access** with a new run set to test that request
     (`authz run --history-id`). Pick the identities and start it.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
@@ -434,8 +435,8 @@ Access control across users: does the app let bob read alice's data? See
   carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
   OPTIONS requests are replayed, and logout paths never are. A request sent from
   **Traffic** (right-click › *Test access control…*) shows as *From Traffic*: it is tested
-  whatever its method and also without credentials, and the form warns when it is a POST or
-  another method that may change data.
+  whatever its method, and even if it carries no credentials. The form warns when it is a POST
+  or another method that may change data, and *Start run* asks first.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
   those identities in the background. If it doesn't start, the

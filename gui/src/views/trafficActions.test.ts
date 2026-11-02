@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { highlightArgs, scanArgs, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { accessConfirm, highlightArgs, isRefused, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
 
 const get: HistoryPick = { id: 7, method: "GET", url: "https://shop.test/search?q=x" };
 const post: HistoryPick = { id: 9, method: "post", url: "https://shop.test/contact" };
@@ -122,4 +122,27 @@ test("highlight: only that tag changes, and the row's tags are not changed in pl
   assert.deepEqual(withHighlight([], true), ["highlight"]);
   assert.deepEqual(withHighlight([], false), []);
   assert.deepEqual(withHighlight(["api"], false), ["api"]);
+});
+
+test("a request with no response, or one the proxy refused, can't be scanned", () => {
+  assert.equal(scanBlocker({ status: 200 }), null);
+  assert.equal(scanBlocker({ status: 500, error: null }), null);
+  // select_targets skips an entry with no response even when named by id, so the job would fail.
+  assert.equal(scanBlocker({ status: null }), "No response recorded to scan");
+  assert.equal(scanBlocker({ status: null, error: "connection refused" }), "No response recorded to scan");
+  assert.match(scanBlocker({ status: null, error: "out of scope: other.test" }) ?? "", /Out of scope/);
+  assert.ok(isRefused({ status: null, error: "out of scope: other.test" }));
+  assert.ok(!isRefused({ status: null, error: "timed out" }));
+});
+
+test("an access-control run of a POST from Traffic asks first, naming who sends it", () => {
+  assert.equal(accessConfirm([get], ["alice"], true), null);
+  const one = accessConfirm([post], ["alice", "bob"], true);
+  assert.equal(one?.title, "Replay this POST?");
+  assert.match(one?.message ?? "", /^This POST is sent again as alice and bob and with no session\. That can change data/);
+  assert.match(one?.message ?? "", /engagement scope/);
+  const many = accessConfirm([get, post, { ...post, id: 11, method: "DELETE" }], ["alice", "bob", "carol"], false);
+  assert.equal(many?.title, "Replay requests that can change data?");
+  assert.match(many?.message ?? "", /^The POST, DELETE requests are sent again as alice, bob and carol\. /);
+  assert.match(accessConfirm([post], [], true)?.message ?? "", /^This POST is sent again with no session\./);
 });

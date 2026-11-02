@@ -164,7 +164,8 @@ Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings),
 `sendToAccess` (Traffic's *Test access control…*: Access opens its new-run form set to those
 history ids) and `showJob` (opens Scans › Tasks on a job, e.g. from the toast after Traffic's
-*Scan this request…*). The arguments, and the question asked before a scan, are built in
+*Scan this request…*). The arguments, which rows can be scanned (not one with no response),
+and the questions asked before a scan or before Access replays a POST, are built in
 `views/trafficActions.ts`. The table selects one row at a time, so these act on one request.
 
 ## Look

@@ -6,6 +6,8 @@ export interface MenuItem {
   label: string;
   action: () => void;
   disabled?: boolean;
+  /** Tooltip, such as why the item is disabled. */
+  hint?: string;
 }
 
 export type MenuState = { x: number; y: number; items: (MenuItem | "-")[] } | null;
@@ -43,6 +45,7 @@ export function Menu({ menu, close }: { menu: MenuState; close: () => void }) {
             key={i}
             className="menu-item"
             disabled={it.disabled}
+            title={it.hint}
             onClick={() => {
               close();
               it.action();

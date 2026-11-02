@@ -5,13 +5,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { bodyText, rawResponse, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
+import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { proxyListen, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
-import { unsafeMethods } from "./trafficActions";
+import { accessConfirm, unsafeMethods } from "./trafficActions";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
 
@@ -316,6 +317,9 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
   const start = async () => {
     try {
       const args = runArgs(f);
+      // Requests from Traffic are replayed whatever their method: a POST is asked about first.
+      const q = f.select === "history" ? accessConfirm(f.history, f.identities, f.anonymous) : null;
+      if (q && !(await confirm(q.title, q.message, q.ok, q.cancel))) return;
       setBusy(true);
       const d = await run<{ job: number }>([...args, "--background"]);
       app.toast(`Access-control run #${d.job} started`);
@@ -451,7 +455,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
               </div>
             ))}
             <p className="muted small">
-              Tested whatever the method and also without credentials.
+              Tested whatever its method, and even if it carries no credentials.
               {unsafe.length > 0 && <b> {unsafe.join(", ")} requests are sent again as each identity: they may change data, now as another user.</b>}
             </p>
           </div>

@@ -7,7 +7,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { highlightArgs, scanArgs, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
+import { highlightArgs, isRefused, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
@@ -155,8 +155,8 @@ function History() {
 
   const rowMenu = (r: HistoryItem, ev: React.MouseEvent) => {
     const pick = { id: r.id, method: r.method, url: r.url };
-    // The proxy refused it (outside the engagement scope), so there is nothing to replay.
-    const refused = !!r.error?.startsWith("out of scope");
+    const refused = isRefused(r);
+    const noScan = scanBlocker(r);
     const highlighted = r.tags.includes("highlight");
     open(ev, [
       { label: "Send to Replay", action: () => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
@@ -164,8 +164,8 @@ function History() {
       { label: "Send request to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(h.raw)) },
       { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
       "-",
-      { label: "Scan this request…", action: () => scan([pick]), disabled: refused },
-      { label: "Test access control…", action: () => app.sendToAccess([pick]), disabled: refused },
+      { label: "Scan this request…", action: () => scan([pick]), disabled: !!noScan, hint: noScan ?? undefined },
+      { label: "Test access control…", action: () => app.sendToAccess([pick]), disabled: refused, hint: refused ? REFUSED_HINT : undefined },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       {
