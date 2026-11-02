@@ -271,6 +271,16 @@ Edit a raw request and send it as often as you like, in separate tabs.
   `?q=x'%20OR%201=1--`.
 - **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
   works in every request editor.
+- **Race:** set how many copies to send (2 to 1000) and click **Race** to send the request
+  that many times at once, to look for race conditions such as a coupon redeemed twice. Over
+  HTTP/1.1 each copy gets its own connection and the last byte of every copy is released
+  together (last-byte sync). When the request line ends in `HTTP/2`, all copies go on one
+  connection and their final frames leave in a single packet (single-packet attack, up to 100
+  copies). The toolbar shows which was used, the spread between the fastest and slowest
+  response, and how many responses differ from the first. Each response is listed with its
+  status, length and time; ones whose status or length differ from the first are highlighted.
+  Select one to open it. Every copy is recorded in Traffic. The same as
+  `brainproxy send req.http --race 20` (add `--http2` for the single-packet attack).
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the

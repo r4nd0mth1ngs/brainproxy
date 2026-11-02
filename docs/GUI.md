@@ -114,7 +114,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
 | Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. Race (below). WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `send --target T --race N -`, `history show`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
@@ -159,6 +159,20 @@ and written out, and a session rule), and the operations to send
 (GraphQL mutations are opt-in, as MUTATION), and offers a one-request check (`import api --only N
 --auth P`, which may use a GraphQL query). It runs `scan active --api SOURCE --expect-sha256 ...
 [--expect-environment-sha256 ...] --only ... --background`.
+
+### Race
+
+**Race ×N** next to Send in Replay (`views/race.ts`) runs `send --target T --race N -` with the
+tab's request, prepared exactly as Send prepares it (auto URL-encode, binary bodies). N is 2 to
+1000, or up to 100 when the request line ends in `HTTP/2`, since `send` then uses HTTP/2 and the
+single-packet attack; otherwise it is last-byte sync over HTTP/1.1. The toolbar names the
+technique the CLI reports (and when a single-packet race couldn't put every final frame in one
+packet), the spread between the fastest and slowest response, and how many differ. The response
+side lists each request's status, length, time since the release and history id; rows whose
+status or length (or error) differ from request #1's are highlighted. Selecting a row opens that
+response (`history show ID`); the first is opened when the race ends. A race is one step in
+‹ › like a send. It races copies of one request; racing different requests against each other
+isn't offered.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).

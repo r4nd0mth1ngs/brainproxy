@@ -1653,6 +1653,20 @@ select {
   color: var(--low);
 }
 
+/* ---------- replay race ---------- */
+
+.race-ctl {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.tr.race-differs {
+  background: var(--hl);
+}
+.race-differs-tag {
+  color: var(--low);
+}
+
 /* ---------- comparer ---------- */
 
 .cmp-items {
