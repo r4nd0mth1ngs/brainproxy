@@ -285,7 +285,8 @@ enum HistoryCmd {
         source: Option<String>,
         #[arg(long)]
         tag: Option<String>,
-        /// Substring to search for in raw requests and responses.
+        /// Text to search for (case-sensitive) in raw requests and responses, and in their
+        /// decoded bodies (gzip, deflate, br, chunked).
         #[arg(long)]
         contains: Option<String>,
         /// Only entries with an id greater than this (for incremental polling).

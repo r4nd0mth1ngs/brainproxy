@@ -264,7 +264,8 @@ pub struct HistoryFilter {
     pub status: Option<u16>,
     pub source: Option<String>,
     pub tag: Option<String>,
-    /// Substring searched in the raw request and response.
+    /// Substring searched in the raw request and response, and in their decoded bodies
+    /// (so a gzip or chunked body matches too). Case-sensitive.
     pub contains: Option<String>,
     pub after_id: Option<i64>,
     pub limit: Option<u32>,
@@ -844,7 +845,10 @@ impl Store {
         if let Some(c) = &f.contains {
             args.push(Box::new(c.clone().into_bytes()));
             let n = args.len();
-            sql.push_str(&format!(" AND (instr(request, ?{n}) > 0 OR instr(response, ?{n}) > 0)"));
+            sql.push_str(&format!(
+                " AND (instr(request, ?{n}) > 0 OR instr(response, ?{n}) > 0 \
+                 OR instr(req_body, ?{n}) > 0 OR instr(resp_body, ?{n}) > 0)"
+            ));
         }
         sql.push_str(" ORDER BY id");
         if let Some(l) = f.limit {
@@ -1244,6 +1248,28 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let hits = s.list(&HistoryFilter { method: Some("post".into()), ..Default::default() }).unwrap();
         assert_eq!(hits[0].error.as_deref(), Some("boom"));
+
+        // Compressed and chunked bodies are searched decoded.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, b"{\"session\":\"hidden-in-gzip\"}").unwrap();
+        let gz = gz.finish().unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            gz.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&gz);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let target = Target::from_url("http://a.test").unwrap();
+        let request =
+            b"POST /z HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nuser\r\n4\r\n=bob\r\n0\r\n\r\n".to_vec();
+        let gz_id = s.record_exchange("proxy", &Exchange { target, request, response, duration_ms: 1 }).unwrap();
+        for needle in ["hidden-in-gzip", "user=bob", "Content-Encoding: gzip"] {
+            let hits = s.list(&HistoryFilter { contains: Some(needle.into()), ..Default::default() }).unwrap();
+            assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [gz_id], "{needle}");
+        }
+        let hits = s.list(&HistoryFilter { contains: Some("HIDDEN-IN-GZIP".into()), ..Default::default() }).unwrap();
+        assert!(hits.is_empty(), "case-sensitive");
 
         s.set_note(id, Some("interesting")).unwrap();
         assert_eq!(s.get(id).unwrap().entry.note.as_deref(), Some("interesting"));
