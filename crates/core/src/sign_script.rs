@@ -165,9 +165,18 @@ impl Templates {
     }
 }
 
-/// The collection request a sent request is: of those that fit, the most specific.
+/// The collection request a sent request is: of those that fit, the most specific, and of
+/// equally specific ones the first in the collection.
 pub(crate) fn templates_for<'a>(all: &'a [Templates], method: &str, path: &str) -> Option<&'a Templates> {
-    all.iter().filter_map(|t| Some((t.score(method, path)?, t))).max_by_key(|(s, _)| *s).map(|(_, t)| t)
+    let mut best: Option<((usize, usize), &Templates)> = None;
+    for t in all {
+        if let Some(s) = t.score(method, path) {
+            if best.is_none_or(|(b, _)| s > b) {
+                best = Some((s, t));
+            }
+        }
+    }
+    best.map(|(_, t)| t)
 }
 
 fn auth_param<'a>(auth: &'a Value, kind: &str, key: &str) -> Option<&'a str> {
@@ -621,5 +630,11 @@ mod tests {
         assert_eq!(templates_for(&all, "GET", "/api/admin/users").unwrap().headers[0].0, "X-Admin-Sig");
         assert_eq!(templates_for(&all, "GET", "/api/users").unwrap().headers[0].0, "X-User-Sig");
         assert_eq!(templates_for(&all, "GET", "/a%20b").unwrap().headers[0].0, "X-Space");
+        let tie = [tpl(&["users"], "X-First"), tpl(&["users"], "X-Second")];
+        assert_eq!(
+            templates_for(&tie, "GET", "/users").unwrap().headers[0].0,
+            "X-First",
+            "a tie keeps collection order"
+        );
     }
 }
