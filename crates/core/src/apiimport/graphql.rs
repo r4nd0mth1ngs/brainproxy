@@ -22,6 +22,8 @@ ofType { kind name ofType { kind name ofType { kind name } } } } } } } }";
 /// Selection depth below the root field.
 const MAX_SELECTION_DEPTH: usize = 3;
 const MAX_INPUT_DEPTH: usize = 4;
+/// `[[[...]]]` levels a schema file may nest.
+const MAX_LIST_NESTING: usize = 32;
 
 /// Body for the introspection request.
 pub fn introspection_body() -> Vec<u8> {
@@ -203,12 +205,24 @@ impl Schema<'_> {
 /// Whether `text` reads as GraphQL SDL rather than JSON or YAML.
 pub fn looks_like_sdl(text: &str) -> bool {
     let mut t = text.trim_start_matches('\u{feff}').trim_start();
-    while let Some(rest) = t.strip_prefix('#') {
-        t = rest.split_once('\n').map_or("", |(_, r)| r).trim_start();
+    // Comments and descriptions come before the first definition.
+    loop {
+        let rest = if let Some(r) = t.strip_prefix('#') {
+            r.split_once('\n').map_or("", |(_, r)| r)
+        } else if let Some(r) = t.strip_prefix("\"\"\"") {
+            r.split_once("\"\"\"").map_or("", |(_, r)| r)
+        } else if let Some(r) = t.strip_prefix('"') {
+            match r.split_once('"') {
+                Some((line, r)) if !line.contains('\n') => r,
+                _ => break,
+            }
+        } else {
+            break;
+        };
+        t = rest.trim_start();
     }
     let first = t.split_whitespace().next().unwrap_or_default();
-    (t.starts_with("\"\"\"")
-        || ["type", "schema", "scalar", "input", "enum", "interface", "union", "directive", "extend"].contains(&first))
+    ["type", "schema", "scalar", "input", "enum", "interface", "union", "directive", "extend"].contains(&first)
         && t.contains('{')
 }
 
@@ -349,8 +363,16 @@ impl Sdl {
     }
 
     fn type_ref(&mut self) -> Result<Value> {
+        self.type_ref_at(0)
+    }
+
+    /// Lists nest by recursion, so an untrusted schema gets a limit, not the stack's.
+    fn type_ref_at(&mut self, depth: usize) -> Result<Value> {
+        if depth > MAX_LIST_NESTING {
+            return Err(Error::InvalidInput("the GraphQL schema nests list types too deeply".into()));
+        }
         let inner = if self.eat('[') {
-            let of = self.type_ref()?;
+            let of = self.type_ref_at(depth + 1)?;
             if !self.eat(']') {
                 return Err(Error::InvalidInput("the GraphQL schema has an unclosed list type".into()));
             }
@@ -643,6 +665,10 @@ mod tests {
         "#;
         assert!(looks_like_sdl(sdl));
         assert!(!looks_like_sdl("{\"openapi\": \"3.0.0\"}"));
+        assert!(looks_like_sdl("\"The API's root\"\ntype Query { version: String }"));
+        assert!(!looks_like_sdl("\"just a string\""));
+        let deep = format!("type Query {{ a(x: {}Int{}): Int }}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(parse_sdl(&deep).unwrap_err().to_string().contains("too deeply"));
         let b = build(&parse_sdl(sdl).unwrap(), "http://g.test/graphql", true).unwrap();
         let names: Vec<&str> = b.requests.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["query user", "query search", "query version", "mutation deleteUser"]);

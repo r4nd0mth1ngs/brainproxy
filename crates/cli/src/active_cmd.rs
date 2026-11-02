@@ -390,6 +390,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     tool: Tool::Scan,
                     timeout: args.timeout,
                     verify_tls: args.verify_tls,
+                    graphql: args.graphql,
                 };
                 crate::import_cmd::check_remote_vars(project, &guard, source, args.api_options()?, from)?;
             }

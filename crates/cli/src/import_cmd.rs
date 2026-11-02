@@ -190,6 +190,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                     tool: Tool::Crawl,
                     timeout: c.timeout,
                     verify_tls: c.verify_tls,
+                    graphql: a.graphql,
                 };
                 check_remote_vars(project, &guard, &a.doc.source, a.options()?, from)?;
             }
@@ -334,14 +335,17 @@ fn import_api(
 ) -> Result<(), Error> {
     let c = &a.doc.common;
     let guard = fetch.send.guard.clone().ok_or_else(|| Error::OutOfScope("no scope set".into()))?;
-    let mut loaded = if a.graphql {
+    let loaded = if a.graphql {
         load_graphql_endpoint(fetch, &a.doc.source, a.options()?)?
     } else {
-        load_api(fetch, &a.doc.source, a.options()?)?
+        // Read once: the script text must come from the document the preview is of.
+        let (text, spec_url) = fetch.document(&a.doc.source)?;
+        let mut loaded = api::load(&text, &api::Options { spec_url, ..a.options()? })?;
+        if a.show_scripts {
+            api::add_script_text(&mut loaded, &text);
+        }
+        loaded
     };
-    if a.show_scripts && !a.graphql {
-        api::add_script_text(&mut loaded, &fetch.document(&a.doc.source)?.0);
-    }
     let plan = loaded.plan(&a.selection(), &guard)?;
     let preview = loaded.preview(&plan, c.limit);
     let bodies: Vec<Value> = preview.requests.iter().map(|r| body_value(&r.body, c.max_body)).collect();
@@ -478,6 +482,8 @@ pub(crate) struct RemoteFetch<'a> {
     pub tool: Tool,
     pub timeout: f64,
     pub verify_tls: bool,
+    /// The source is a GraphQL endpoint, where --var doesn't apply.
+    pub graphql: bool,
 }
 
 /// Which `--var` may go in the job table depends on the document, so a remote one that
@@ -489,7 +495,7 @@ pub(crate) fn check_remote_vars(
     opts: api::Options,
     from: RemoteFetch<'_>,
 ) -> Result<(), Error> {
-    if opts.vars.is_empty() {
+    if opts.vars.is_empty() || from.graphql {
         return Ok(());
     }
     let send = SendOptions {

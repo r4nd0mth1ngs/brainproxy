@@ -48,8 +48,9 @@ impl Secret {
     pub(crate) fn resolve(&self) -> Result<String> {
         match self {
             Secret::Literal(s) => Ok(s.clone()),
-            Secret::Env(var) => std::env::var(var)
-                .map_err(|_| Error::InvalidInput(format!("password environment variable {var} is not set"))),
+            Secret::Env(var) => {
+                std::env::var(var).map_err(|_| Error::InvalidInput(format!("environment variable {var} is not set")))
+            }
         }
     }
 }
@@ -517,16 +518,19 @@ impl Vault {
         }
         if find(&out, MARK.as_bytes()).is_some() {
             // Every generated header first: a signer may cover another's.
+            // Signing can take a while (a script, an RSA key), so not with every other send waiting.
+            let (signers, marks) = (inner.signers.clone(), inner.sign_marks.clone());
+            drop(inner);
             let stamp = crate::sign::Stamp::new()?;
-            for signer in &inner.signers {
+            for signer in &signers {
                 out = signer.set_headers(out, target, &stamp)?;
             }
-            for signer in &inner.signers {
+            for signer in &signers {
                 out = signer.sign(out, target, &stamp)?;
             }
             // A signer replaced since the placeholder was written leaves it unfilled.
             let head = split_head_body(&out).0;
-            if let Some(mark) = inner.sign_marks.iter().find(|m| find(head, m.as_bytes()).is_some()) {
+            if let Some(mark) = marks.iter().find(|m| find(head, m.as_bytes()).is_some()) {
                 return Err(Error::InvalidInput(format!("no signer fills {mark} in this request")));
             }
         }
@@ -709,6 +713,12 @@ impl AuthSession {
 
     pub(crate) fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether the last login or token request was within the profile's re-login interval.
+    pub(crate) fn logged_in_within_interval(&self) -> bool {
+        let interval = Duration::from_secs(self.profile.relogin_interval_secs);
+        self.last_login.lock().unwrap().is_some_and(|t| t.elapsed() < interval)
     }
 
     pub(crate) fn mark_login_time(&self) {

@@ -338,7 +338,11 @@ export const methodSummary = (ops: ApiOperation[], selected: number[]): string =
     .map(([m, n]) => `${n} ${m}`)
     .join(", ") || "none";
 
-export const sendsPost = (ops: ApiOperation[], selected: number[]): boolean => ticked(ops, selected).some((o) => o.method.toUpperCase() === "POST" && !o.name.startsWith("query "));
+/** A GraphQL query only reads, though it travels as POST. */
+const graphqlQuery = (o: ApiOperation, format?: ApiPreview["format"]): boolean => format === "graphql" && o.name.startsWith("query ");
+
+export const sendsPost = (ops: ApiOperation[], selected: number[], format?: ApiPreview["format"]): boolean =>
+  ticked(ops, selected).some((o) => o.method.toUpperCase() === "POST" && !graphqlQuery(o, format));
 
 export const sendsStateChanging = (ops: ApiOperation[], selected: number[]): boolean => ticked(ops, selected).some((o) => needsOptIn(o) || o.state_changing);
 
@@ -362,7 +366,7 @@ export const selectionProblems = (selected: number[]): string[] => (selected.len
 export function pickCheckOperation(ops: ApiOperation[], selected: number[], format?: ApiPreview["format"]): ApiOperation | null {
   const likely = likelyInScope(ops);
   const safe = (o: ApiOperation, methods: string[]) => likely.includes(o) && !o.state_changing && methods.includes(o.method.toUpperCase());
-  const query = format === "graphql" ? ops.find((o) => likely.includes(o) && !o.state_changing && o.name.startsWith("query ")) : undefined;
+  const query = ops.find((o) => likely.includes(o) && !o.state_changing && graphqlQuery(o, format));
   return ops.find((o) => safe(o, ["GET", "HEAD"])) ?? query ?? ticked(ops, selected).find((o) => safe(o, ["OPTIONS"])) ?? null;
 }
 

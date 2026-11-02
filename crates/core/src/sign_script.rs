@@ -125,57 +125,118 @@ pub fn check_syntax(text: &str) -> std::result::Result<(), String> {
 pub(crate) struct Bundle {
     pub script: String,
     pub vars: Vec<(String, String)>,
-    /// Headers the collection fills from variables, as `{{name}}` templates. The importer
-    /// strips those as credentials; a variable the script sets brings them back.
-    pub templates: Vec<(String, String)>,
+    /// Headers each request of the collection fills from variables, as `{{name}}` templates.
+    /// The importer strips those as credentials; a variable the script sets brings them back.
+    pub templates: Vec<Templates>,
 }
 
-/// The header templates in a collection's requests and auth blocks.
-pub(crate) fn header_templates(doc: &Value) -> Vec<(String, String)> {
-    fn add(out: &mut Vec<(String, String)>, k: &str, v: &str) {
-        if v.contains("{{") && !out.iter().any(|(a, b)| a.eq_ignore_ascii_case(k) && b == v) {
-            out.push((k.to_string(), v.to_string()));
+/// One collection request's header templates, and how to know it again on the wire.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct Templates {
+    pub method: String,
+    /// Its path segments; one with a variable in it matches any.
+    pub path: Vec<String>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Templates {
+    /// Whether a request is this one: its method, and its path ending in this one's (the
+    /// base URL a variable gives can add segments in front).
+    pub(crate) fn matches(&self, method: &str, path: &str) -> bool {
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if !self.method.eq_ignore_ascii_case(method) || segs.len() < self.path.len() {
+            return false;
         }
+        let tail = &segs[segs.len() - self.path.len()..];
+        self.path.iter().zip(tail).all(|(want, got)| {
+            want.contains("{{")
+                || want.starts_with(':')
+                || percent_encoding::percent_decode_str(got).decode_utf8_lossy() == want.as_str()
+        })
     }
-    fn params<'a>(auth: &'a Value, kind: &str, key: &str) -> Option<&'a str> {
-        match auth.get(kind)? {
-            Value::Array(items) => {
-                items.iter().find(|i| i.get("key").and_then(Value::as_str) == Some(key))?.get("value")?.as_str()
-            }
-            section => section.get(key)?.as_str(),
+}
+
+fn auth_param<'a>(auth: &'a Value, kind: &str, key: &str) -> Option<&'a str> {
+    match auth.get(kind)? {
+        Value::Array(items) => {
+            items.iter().find(|i| i.get("key").and_then(Value::as_str) == Some(key))?.get("value")?.as_str()
         }
+        section => section.get(key)?.as_str(),
     }
-    fn walk(node: &Value, out: &mut Vec<(String, String)>) {
-        match node {
-            Value::Object(m) => {
-                if let Some(auth) = m.get("auth") {
-                    if let Some(t) = params(auth, "bearer", "token") {
-                        add(out, "Authorization", &format!("Bearer {t}"));
-                    }
-                    if params(auth, "apikey", "in") != Some("query") {
-                        if let (Some(k), Some(v)) = (params(auth, "apikey", "key"), params(auth, "apikey", "value")) {
-                            add(out, k, v);
-                        }
-                    }
+}
+
+/// The path segments of a Postman request URL, with whatever gives its origin left out.
+fn url_path(url: &Value) -> Vec<String> {
+    if let Some(parts) = url.get("path").and_then(Value::as_array) {
+        return parts
+            .iter()
+            .filter_map(|p| p.as_str().or_else(|| p.get("value")?.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    let raw = url.as_str().or_else(|| url.get("raw")?.as_str()).unwrap_or_default();
+    let raw = raw.split(['?', '#']).next().unwrap_or_default();
+    let rest = if raw.starts_with("{{") {
+        raw.split_once("}}").map_or("", |(_, r)| r)
+    } else if let Some((_, r)) = raw.split_once("://") {
+        r.split_once('/').map_or("", |(_, p)| p)
+    } else {
+        raw.split_once('/').map_or("", |(_, p)| p)
+    };
+    rest.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+/// Each request's header templates: its own headers, and the auth it has or inherits.
+pub(crate) fn header_templates(doc: &Value) -> Vec<Templates> {
+    fn from_auth(auth: Option<&Value>, out: &mut Vec<(String, String)>) {
+        let Some(auth) = auth else { return };
+        match auth.get("type").and_then(Value::as_str) {
+            Some("bearer") => {
+                if let Some(t) = auth_param(auth, "bearer", "token") {
+                    out.push(("Authorization".into(), format!("Bearer {t}")));
                 }
-                for h in m.get("header").and_then(Value::as_array).into_iter().flatten() {
-                    if h.get("disabled").and_then(Value::as_bool) == Some(true) {
-                        continue;
-                    }
-                    if let (Some(k), Some(v)) =
-                        (h.get("key").and_then(Value::as_str), h.get("value").and_then(Value::as_str))
-                    {
-                        add(out, k, v);
-                    }
-                }
-                m.iter().filter(|(k, _)| k.as_str() != "event").for_each(|(_, v)| walk(v, out));
             }
-            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            Some("apikey") if auth_param(auth, "apikey", "in") != Some("query") => {
+                if let (Some(k), Some(v)) = (auth_param(auth, "apikey", "key"), auth_param(auth, "apikey", "value")) {
+                    out.push((k.to_string(), v.to_string()));
+                }
+            }
             _ => {}
         }
     }
+    fn own(a: Option<&Value>) -> Option<&Value> {
+        a.filter(|a| a.get("type").and_then(Value::as_str) != Some("inherit"))
+    }
+    fn walk<'a>(node: &'a Value, inherited: Option<&'a Value>, out: &mut Vec<Templates>) {
+        let auth = own(node.get("auth")).or(inherited);
+        if let Some(request) = node.get("request") {
+            let auth = own(request.get("auth")).or(auth);
+            let mut headers = Vec::new();
+            from_auth(auth, &mut headers);
+            for h in request.get("header").and_then(Value::as_array).into_iter().flatten() {
+                if h.get("disabled").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                if let (Some(k), Some(v)) =
+                    (h.get("key").and_then(Value::as_str), h.get("value").and_then(Value::as_str))
+                {
+                    headers.push((k.to_string(), v.to_string()));
+                }
+            }
+            headers.retain(|(_, v)| v.contains("{{"));
+            if !headers.is_empty() {
+                let method = request.get("method").and_then(Value::as_str).unwrap_or("GET").to_ascii_uppercase();
+                let url = if request.is_string() { request } else { request.get("url").unwrap_or(&Value::Null) };
+                out.push(Templates { method, path: url_path(url), headers });
+            }
+        }
+        for item in node.get("item").and_then(Value::as_array).into_iter().flatten() {
+            walk(item, auth, out);
+        }
+    }
     let mut out = Vec::new();
-    walk(doc, &mut out);
+    walk(doc, None, &mut out);
     out
 }
 
@@ -514,16 +575,23 @@ mod tests {
     }
 
     #[test]
-    fn templates_are_taken_from_headers_and_auth() {
+    fn templates_belong_to_their_request() {
         let doc = json!({
             "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{tok}}"}]},
-            "item": [{"name": "R", "request": {"url": "http://a.test",
-                "header": [{"key": "X-Sig", "value": "{{sig}}"}, {"key": "X-Plain", "value": "1"},
-                           {"key": "X-Off", "value": "{{off}}", "disabled": true}]}}]
+            "item": [
+                {"name": "R", "request": {"method": "POST", "url": "{{base}}/v1/items/:id",
+                    "header": [{"key": "X-Sig", "value": "First {{sig}}"}, {"key": "X-Plain", "value": "1"},
+                               {"key": "X-Off", "value": "{{off}}", "disabled": true}]}},
+                {"name": "F", "auth": {"type": "noauth"}, "item": [
+                    {"name": "S", "request": {"url": {"raw": "http://a.test/two", "path": ["two"]},
+                        "header": [{"key": "X-Sig", "value": "Second {{sig}}"}]}}]}
+            ]
         });
-        assert_eq!(
-            header_templates(&doc),
-            [("Authorization".to_string(), "Bearer {{tok}}".to_string()), ("X-Sig".to_string(), "{{sig}}".to_string())]
-        );
+        let t = header_templates(&doc);
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(t[0].headers, [pair("Authorization", "Bearer {{tok}}"), pair("X-Sig", "First {{sig}}")]);
+        assert_eq!(t[1].headers, [pair("X-Sig", "Second {{sig}}")], "the folder's noauth wins");
+        assert!(t[0].matches("post", "/api/v1/items/42") && !t[0].matches("GET", "/api/v1/items/42"));
+        assert!(!t[0].matches("POST", "/two") && t[1].matches("GET", "/two") && !t[1].matches("GET", "/v1/items/42"));
     }
 }

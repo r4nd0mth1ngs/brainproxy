@@ -480,8 +480,9 @@ test("a GraphQL mutation is opted in to by name, and only a query is tried", () 
   assert.equal(pickCheckOperation(ops, [0, 1], "graphql")?.name, "query me");
   assert.equal(pickCheckOperation([ops[0]], [0], "graphql"), null);
   assert.equal(pickCheckOperation([{ ...ops[1], name: "query x" }], [0], "openapi3"), null, "a POST elsewhere is never tried");
-  assert.equal(sendsPost(ops, [1]), false);
-  assert.equal(sendsPost(ops, [0]), true);
+  assert.equal(sendsPost(ops, [1], "graphql"), false);
+  assert.equal(sendsPost(ops, [0], "graphql"), true);
+  assert.equal(sendsPost(ops, [1], "postman"), true, "a POST named query elsewhere is still a POST");
 });
 
 test("OAuth settings build `auth add` with secrets named, never given", () => {

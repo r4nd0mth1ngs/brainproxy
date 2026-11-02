@@ -732,7 +732,10 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             let store = Store::open(project)?;
             // `auth show` redacts header values; re-saving one unchanged (the GUI's edit form does)
             // keeps the stored value instead of storing the mask.
-            if let Ok((old, _)) = store.auth_profile(&profile.name) {
+            // The tokens of an OAuth setup kept as it was: saving the profile clears its session,
+            // and a browser sign-in can't be got back without the user.
+            let mut kept_tokens = None;
+            if let Ok((old, old_state)) = store.auth_profile(&profile.name) {
                 for (k, v) in &mut profile.headers {
                     if let Some((_, stored)) =
                         old.headers.iter().find(|(o, _)| v == "********" && o.eq_ignore_ascii_case(k))
@@ -743,12 +746,23 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 if a.keep_query_keys {
                     profile.query_keys = old.query_keys;
                 }
-                if a.keep_oauth {
+                if a.keep_oauth && old.oauth.is_some() {
                     profile.oauth = old.oauth;
                     profile.token_header = old.token_header;
+                    kept_tokens = Some(SessionState {
+                        token: old_state.token,
+                        refresh_token: old_state.refresh_token,
+                        token_expires: old_state.token_expires,
+                        logged_in: old_state.logged_in,
+                        last_login: old_state.last_login,
+                        ..Default::default()
+                    });
                 }
             }
             store.auth_save_profile(&profile)?;
+            if let Some(state) = kept_tokens {
+                store.auth_save_state(&profile.name, &state)?;
+            }
             let shown = profile.redacted();
             out.ok(json!({"profile": shown, "next": format!("brainproxy auth login {}", shown.name)}), || {
                 format!("profile {:?} saved; run: brainproxy auth login {}", shown.name, shown.name)

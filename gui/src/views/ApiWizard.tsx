@@ -305,7 +305,7 @@ export function ApiWizard(p: Props) {
       {step === 2 && preview && (
         <AuthStep preview={preview} source={source} target={target} selected={selected} auth={auth} setAuth={setAuth} draft={signerDraft} setDraft={setSignerDraft} />
       )}
-      {step === 3 && preview && <OperationsStep operations={preview.requests} truncated={preview.requests_truncated} selected={selected} setSelected={setSelected} optIn={optIn} setOptIn={setOptIn} />}
+      {step === 3 && preview && <OperationsStep operations={preview.requests} format={preview.format} truncated={preview.requests_truncated} selected={selected} setSelected={setSelected} optIn={optIn} setOptIn={setOptIn} />}
       {step === 4 && preview && (
         <StartStep preview={preview} source={source} target={target} auth={auth} selected={selected} depth={depth} setDepth={setDepth} speed={speed} setSpeed={setSpeed} problem={startProblem} />
       )}
@@ -989,6 +989,7 @@ function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; sel
 
 function OperationsStep(p: {
   operations: ApiOperation[];
+  format: ApiPreview["format"];
   truncated: boolean;
   selected: number[];
   setSelected: (s: number[]) => void;
@@ -1059,7 +1060,7 @@ function OperationsStep(p: {
           <b>You ticked operations that change or delete data ({listWords(includeMethods(ops, p.selected))}).</b> They are sent as written and then many times with attack data. Real records can be overwritten or deleted, and that can't be undone. Use a test environment you can restore.
         </div>
       )}
-      {sendsPost(ops, p.selected) && <PostWarning />}
+      {sendsPost(ops, p.selected, p.format) && <PostWarning />}
     </div>
   );
 }
@@ -1172,7 +1173,7 @@ function StartStep(p: {
           <b>This scan sends operations that change or delete data ({listWords(includeMethods(d.requests, p.selected))}).</b> They are sent as written and then many times with attack data. Real records can be overwritten or deleted, and that can't be undone.
         </div>
       )}
-      {sendsPost(d.requests, p.selected) && <PostWarning />}
+      {sendsPost(d.requests, p.selected, d.format) && <PostWarning />}
       {attacksPaths(p.depth) && (
         <div className="wiz-warn replay">
           <b>Paths are attacked too.</b> Each part of a path, such as the 42 in /users/42, is changed and requested.

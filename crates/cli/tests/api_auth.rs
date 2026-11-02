@@ -37,6 +37,8 @@ struct Api {
     hits: Arc<Mutex<Vec<Hit>>>,
     issued: Arc<AtomicUsize>,
     ttl: Arc<Mutex<u64>>,
+    /// The token endpoint answers 503.
+    down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Api {
@@ -47,6 +49,7 @@ impl Api {
             hits: Arc::default(),
             issued: Arc::default(),
             ttl: Arc::new(Mutex::new(ttl)),
+            down: Arc::default(),
         };
         let shared = api.clone();
         std::thread::spawn(move || {
@@ -85,7 +88,9 @@ impl Api {
                 body: String::from_utf8_lossy(body).into_owned(),
             };
             self.hits.lock().unwrap().push(hit.clone());
-            let reply = if target == "/token" {
+            let reply = if target == "/token" && self.down.load(Ordering::SeqCst) {
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
+            } else if target == "/token" {
                 let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
                 let ttl = *self.ttl.lock().unwrap();
                 let text = json!({"access_token": format!("tok-{n}"), "token_type": "bearer", "expires_in": ttl,
@@ -686,4 +691,128 @@ fn a_graphql_schema_runs_with_mutations_opted_in() {
 
 fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn a_failing_token_endpoint_is_asked_once_and_the_refresh_token_kept() {
+    let api = Api::start(3600);
+    let (dir, p) = setup("down");
+    let doc = write(&dir, "api.json", &api_doc(&api));
+    let token_url = format!("{}/token", api.origin());
+    ok(
+        &p,
+        &[
+            "auth",
+            "add",
+            "d",
+            "--oauth-flow",
+            "client_credentials",
+            "--oauth-token-url",
+            &token_url,
+            "--oauth-client-id",
+            "c",
+            "--oauth-client-secret-env",
+            "CLIENT_SECRET",
+            "--oauth-store-secrets",
+        ],
+        &[("CLIENT_SECRET", "FAKE-CLIENT-SECRET")],
+    );
+    *api.ttl.lock().unwrap() = 10;
+    ok(&p, &["auth", "login", "d"], &[]);
+    api.down.store(true, Ordering::SeqCst);
+    let before = api.at("/token").len();
+    run(&p, &["import", "api", "--auth", "d", "--concurrency", "1", "--", &doc], &[]);
+    // One attempt (the refresh, then the flow's own grant) for both requests, not one each.
+    assert_eq!(api.at("/token").len(), before + 2, "one renewal per re-login interval, not one per request");
+    // A 503 says nothing about the refresh token: it stays for the next try.
+    let status = ok(&p, &["auth", "status", "d", "--offline"], &[]);
+    assert_eq!(status["session"]["refresh_token"], true, "{status}");
+    // The Settings form saves with --keep-oauth: the tokens stay too.
+    ok(&p, &["auth", "add", "d", "--keep-oauth", "--keep-query-keys", "--header", "X-Extra: 1"], &[]);
+    let status = ok(&p, &["auth", "status", "d", "--offline"], &[]);
+    assert_eq!(
+        (status["session"]["token"].as_bool(), status["session"]["refresh_token"].as_bool()),
+        (Some(true), Some(true)),
+        "{status}"
+    );
+    // A profile with no OAuth keeps the token header it is given.
+    ok(
+        &p,
+        &[
+            "auth",
+            "add",
+            "plain",
+            "--login-url",
+            &format!("{}/login", api.origin()),
+            "--token-regex",
+            "t=(.*)",
+            "--token-header",
+            "X-Token: {{token}}",
+            "--keep-oauth",
+        ],
+        &[],
+    );
+    let shown = ok(&p, &["auth", "show", "plain"], &[]);
+    assert!(shown.to_string().contains("X-Token: {{token}}"), "{shown}");
+}
+
+#[test]
+fn a_script_fills_only_its_own_requests_templates() {
+    let api = Api::start(3600);
+    let (dir, p) = setup("tpl");
+    let doc = json!({
+        "info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "event": [{"listen": "prerequest", "script": {"exec": ["pm.variables.set('sig', 'computed');"]}}],
+        "item": [
+            {"name": "One", "request": {"method": "GET", "url": format!("{}/one?a=1", api.origin()),
+                "header": [{"key": "X-Auth-Sig", "value": "First {{sig}}"}, {"key": "X-Dup", "value": "1"}, {"key": "X-Dup", "value": "2"}]}},
+            {"name": "Two", "request": {"method": "GET", "url": format!("{}/two", api.origin()),
+                "header": [{"key": "X-Auth-Sig", "value": "Second {{sig}}"}]}}
+        ]
+    })
+    .to_string();
+    let doc = write(&dir, "c.json", &doc);
+    ok(&p, &["auth", "sign", "add", "t", "sig", "--script", &doc, "--origin", &api.origin()], &[]);
+    ok(&p, &["auth", "rule", "add", "t", "--action", "sign:sig"], &[]);
+    ok(&p, &["import", "api", "--auth", "t", "--", &doc], &[]);
+    let one = &api.at("/one")[0];
+    assert_eq!(one.header("X-Auth-Sig"), Some("First computed"), "{one:?}");
+    assert_eq!(one.head.matches("X-Dup:").count(), 2, "a header sent twice stays twice: {one:?}");
+    assert_eq!(api.at("/two")[0].header("X-Auth-Sig"), Some("Second computed"));
+}
+
+#[test]
+fn a_query_signer_after_a_script_still_signs() {
+    let api = Api::start(3600);
+    let (dir, p) = setup("order");
+    let doc = write(&dir, "c.json", &collection(&["pm.request.url.query.add({key: 'ts', value: '1'});"]));
+    let env = write(&dir, "prod.json", &environment(&api));
+    ok(
+        &p,
+        &["auth", "sign", "add", "o", "sig", "--script", &doc, "--environment", &env, "--origin", &api.origin()],
+        &[],
+    );
+    ok(
+        &p,
+        &[
+            "auth",
+            "sign",
+            "add",
+            "o",
+            "hm",
+            "--secret-env",
+            "HM",
+            "--origin",
+            &api.origin(),
+            "--to",
+            "query:mac",
+            "--canonical",
+            "{{path}}",
+        ],
+        &[],
+    );
+    ok(&p, &["auth", "rule", "add", "o", "--action", "sign:sig", "--action", "sign:hm"], &[]);
+    ok(&p, &["import", "api", "--auth", "o", "--environment", &env, "--", &doc], &[("HM", "FAKE-HM")]);
+    let hit = &api.at("/v1/a")[0];
+    assert!(hit.target.contains("ts=1") && hit.target.contains("mac="), "{hit:?}");
 }

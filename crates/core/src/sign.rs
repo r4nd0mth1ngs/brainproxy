@@ -627,29 +627,34 @@ impl Signer {
             }
             out
         };
-        let mut out = RawRequest::from_bytes(raw.to_vec()).remove_header(SCRIPT_MARK_HEADER);
-        for (k, v) in &done.headers {
-            let v = fill(v, false);
-            if !valid_token(k) || v.contains(['\r', '\n']) {
-                return Err(what(format!("its script set a bad header {:?}", k.chars().take(60).collect::<String>())));
+        let mut out = RawRequest::from_bytes(raw.to_vec()).remove_header(SCRIPT_MARK_HEADER).into_bytes();
+        // Name by name, with every value: a header sent twice stays twice.
+        let values = |list: &[(String, String)], k: &str| -> Vec<String> {
+            list.iter().filter(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone()).collect()
+        };
+        let mut names: Vec<&String> = Vec::new();
+        for (k, _) in before.iter().chain(&done.headers) {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(k)) {
+                names.push(k);
             }
-            if value_of(&before, k).as_deref() == Some(v.as_str()) {
+        }
+        for k in names {
+            let after: Vec<String> = values(&done.headers, k).iter().map(|v| fill(v, false)).collect();
+            if after == values(&before, k) {
                 continue;
+            }
+            if !valid_token(k) || after.iter().any(|v| v.contains(['\r', '\n'])) {
+                return Err(what(format!("its script set a bad header {:?}", k.chars().take(60).collect::<String>())));
             }
             if is_reserved(k) {
                 return Err(what(format!("its script can't change {k}")));
             }
-            out = out.set_header(k, &v);
+            out = with_header_values(out, k, &after);
         }
-        for (k, _) in &before {
-            if value_of(&done.headers, k).is_none() {
-                if is_reserved(k) {
-                    return Err(what(format!("its script can't change {k}")));
-                }
-                out = out.remove_header(k);
-            }
-        }
-        for (k, tpl) in &b.templates {
+        let mut out = RawRequest::from_bytes(out);
+        let templates =
+            b.templates.iter().find(|t| t.matches(parts.method, parts.path)).map_or(&[][..], |t| t.headers.as_slice());
+        for (k, tpl) in templates {
             let used = done.set.iter().any(|(n, _)| tpl.contains(&format!("{{{{{n}}}}}")));
             if used && value_of(&done.headers, k).is_none() {
                 let v = fill(tpl, true);
@@ -664,10 +669,43 @@ impl Signer {
             if done.query.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'#') {
                 return Err(what("its script made a bad query".into()));
             }
-            bytes = set_whole_query(&bytes, &done.query);
+            // The script never saw parameters holding placeholders (other signers' marks):
+            // they go back, so those signers still find them.
+            let held = request_query(&bytes);
+            let mut query = done.query.clone();
+            for p in held.split('&').filter(|p| p.contains(crate::auth::MARK)) {
+                if !query.split('&').any(|q| q == p) {
+                    query = if query.is_empty() { p.to_string() } else { format!("{query}&{p}") };
+                }
+            }
+            bytes = set_whole_query(&bytes, &query);
         }
         Ok(fill_request_line(bytes, &done.set))
     }
+}
+
+/// The query of a request's target, as written.
+fn request_query(raw: &[u8]) -> String {
+    let head = split_head_body(raw).0;
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = String::from_utf8_lossy(&head[..line_end]);
+    let uri = line.trim_end().split(' ').nth(1).unwrap_or_default();
+    uri.split_once('?').map_or("", |(_, q)| q).to_string()
+}
+
+/// The request with header `name` given exactly `values`, the last of its headers.
+fn with_header_values(raw: Vec<u8>, name: &str, values: &[String]) -> Vec<u8> {
+    let stripped = RawRequest::from_bytes(raw).remove_header(name).into_bytes();
+    let (head, body) = split_head_body(&stripped);
+    // Before the blank line that ends the head (the request is normalized to CRLF by now).
+    let Some(head) = head.strip_suffix(b"\r\n") else { return stripped };
+    let mut out = head.to_vec();
+    for v in values {
+        out.extend_from_slice(format!("{name}: {v}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    out
 }
 
 /// The request with its query replaced.
@@ -693,7 +731,8 @@ fn fill_request_line(raw: Vec<u8>, set: &[(String, String)]) -> Vec<u8> {
     let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
     let mut line = String::from_utf8_lossy(&head[..line_end]).into_owned();
     for (k, v) in set {
-        let enc: String = url::form_urlencoded::byte_serialize(v.as_bytes()).collect();
+        // Percent-encoded: a `+` for a space would be a plus in a path.
+        let enc = percent_encoding::utf8_percent_encode(v, AWS_ENCODE).to_string();
         line = line.replace(&format!("%7B%7B{k}%7D%7D"), &enc).replace(&format!("{{{{{k}}}}}"), &enc);
     }
     let mut out = line.into_bytes();
@@ -885,7 +924,8 @@ pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
 pub(crate) struct Loaded {
     pub profile: String,
     pub signer: Signer,
-    key: std::sync::OnceLock<std::result::Result<Vec<u8>, String>>,
+    /// Shared by the copies a send makes, so a key is read once.
+    key: std::sync::Arc<std::sync::OnceLock<std::result::Result<Vec<u8>, String>>>,
 }
 
 impl Loaded {
@@ -1291,7 +1331,8 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     }
 
     fn signed(s: &Signer, raw: &[u8], key: &[u8]) -> Result<String> {
-        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(key.to_vec()).into() };
+        let loaded =
+            Loaded { profile: "p".into(), signer: s.clone(), key: std::sync::Arc::new(Ok(key.to_vec()).into()) };
         let target = Target::from_url("https://a.test").unwrap();
         Ok(String::from_utf8(applied(&loaded, s.place(raw, "p", &[]), &target)?).unwrap())
     }
@@ -1619,8 +1660,11 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     #[test]
     fn a_signer_can_cover_the_headers_of_a_signer_after_it_but_not_an_unmade_signature() {
         let target = Target::from_url("https://a.test").unwrap();
-        let load =
-            |signer: &Signer| Loaded { profile: "p".into(), signer: signer.clone(), key: Ok(b"k".to_vec()).into() };
+        let load = |signer: &Signer| Loaded {
+            profile: "p".into(),
+            signer: signer.clone(),
+            key: std::sync::Arc::new(Ok(b"k".to_vec()).into()),
+        };
         let mut covers = hmac_signer("{{header:X-Time}}", Place::Header("X-Sig".into()));
         covers.name = "covers".into();
         let mut sets = hmac_signer("{{path}}", Place::Header("X-Other".into()));
@@ -1660,11 +1704,15 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
         let other = Target::from_url("https://b.test").unwrap();
-        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(b"k".to_vec()).into() };
+        let loaded =
+            Loaded { profile: "p".into(), signer: s.clone(), key: std::sync::Arc::new(Ok(b"k".to_vec()).into()) };
         assert!(applied(&loaded, raw.clone(), &other).is_err());
         let here = Target::from_url("https://a.test").unwrap();
-        let loaded =
-            Loaded { profile: "p".into(), signer: s, key: Err("environment variable K is not set".to_string()).into() };
+        let loaded = Loaded {
+            profile: "p".into(),
+            signer: s,
+            key: std::sync::Arc::new(Err("environment variable K is not set".to_string()).into()),
+        };
         assert!(applied(&loaded, raw, &here).unwrap_err().to_string().contains("K is not set"));
     }
 
@@ -1672,7 +1720,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     fn signing_alone_checks_the_origin() {
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
-        let loaded = Loaded { profile: "p".into(), signer: s, key: Ok(b"k".to_vec()).into() };
+        let loaded = Loaded { profile: "p".into(), signer: s, key: std::sync::Arc::new(Ok(b"k".to_vec()).into()) };
         let (other, stamp) = (Target::from_url("https://b.test").unwrap(), Stamp::new().unwrap());
         assert!(loaded.sign(raw, &other, &stamp).unwrap_err().to_string().contains("doesn't sign for"));
     }
@@ -1697,7 +1745,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let mut second = hmac_signer("{{path}}", Place::Query("b".into()));
         second.name = "second".into();
         let raw = second.place(&first.place(b"GET /?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]), "p", &[]);
-        let loaded = Loaded { profile: "p".into(), signer: first, key: Ok(b"k".to_vec()).into() };
+        let loaded = Loaded { profile: "p".into(), signer: first, key: std::sync::Arc::new(Ok(b"k".to_vec()).into()) };
         let e = applied(&loaded, raw, &Target::from_url("https://a.test").unwrap()).unwrap_err().to_string();
         assert!(e.contains("not computed yet"), "{e}");
     }

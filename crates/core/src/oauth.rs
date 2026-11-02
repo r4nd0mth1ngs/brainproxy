@@ -256,7 +256,10 @@ impl AuthSession {
                 }
                 Err(e @ Error::OutOfScope(_)) => return Err(e),
                 Err(e) => {
-                    self.state.lock().unwrap().refresh_token = None;
+                    // A timeout or a server error says nothing of the token: keep it for next time.
+                    if rejects_grant(&e) {
+                        self.state.lock().unwrap().refresh_token = None;
+                    }
                     failure = Some(e.to_string());
                 }
             }
@@ -296,7 +299,9 @@ impl AuthSession {
             return;
         }
         let _guard = self.login_lock.lock().await;
-        if due(&self.state.lock().unwrap()) {
+        // After a failed renewal, or for a token that lives less than the margin, the next
+        // attempt waits out the re-login interval: never a token request per request.
+        if due(&self.state.lock().unwrap()) && !self.logged_in_within_interval() {
             let _ = self.oauth_login().await;
         }
     }
@@ -353,6 +358,12 @@ impl AuthSession {
             Err(e) => self.finish_login(Err(e.to_string())),
         }
     }
+}
+
+/// Whether the token endpoint refused the grant itself, as [`parse_answer`] words it: only
+/// then is a refresh token known to be dead.
+fn rejects_grant(e: &Error) -> bool {
+    matches!(e, Error::InvalidInput(m) if m.ends_with(": invalid_grant"))
 }
 
 fn random_token() -> Result<String> {
