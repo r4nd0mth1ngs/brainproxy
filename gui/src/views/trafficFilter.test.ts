@@ -244,3 +244,148 @@ test("the search note says when it is still running or failed", () => {
   assert.equal(searchNote(mergePage(s, [], 10), 10), "");
   assert.equal(searchNote({ ...s, error: "boom" }, 10), "Search failed: boom");
 });
+
+// ---------------- Edge cases ----------------
+
+test("the contents search keeps the text as typed, case and spaces included", () => {
+  assert.deepEqual(searchFor(filter({ contents: true, text: " Token " })), { query: " Token ", source: null });
+  // Outside contents mode the same text is matched case-insensitively here.
+  assert.ok(matchesFilter(row(1, { url: "https://a.test/TOKEN" }), filter({ text: "token" })));
+});
+
+test("search text stays one argument whatever it holds", () => {
+  for (const q of ["--format=text", "a b", 'x" ; rm -rf /', "line\nbreak", "k=v=w", "«auth:p:password:form»", "$(id)"]) {
+    const args = searchArgs(newSearch(q, null));
+    assert.equal(args.length, 5, q);
+    assert.equal(args[2], `--contains=${q}`);
+    assert.ok(!args.includes(q), q);
+  }
+  assert.equal(searchArgs(newSearch("a", "proxy"))[3], "--source=proxy");
+});
+
+test("a cap reached in the middle of a page stops at the last match kept", () => {
+  const ids = Array.from({ length: MAX_MATCHES - 1 }, (_, i) => i + 1);
+  let s = { ...newSearch("a", null), matches: new Set(ids), cursor: MAX_MATCHES - 1 };
+  s = mergePage(s, [row(20001), row(20005), row(20009)], 30000);
+  assert.ok(s.capped);
+  assert.equal(s.matches.size, MAX_MATCHES);
+  assert.ok(s.matches.has(20001) && !s.matches.has(20005));
+  assert.equal(s.cursor, 20001);
+  // Capped: later polls don't search on.
+  assert.ok(!needsSearch(s, 40000));
+  assert.match(searchNote(s, 40000), /up to #20001/);
+  const all = [row(20001), row(20005), row(20009)];
+  assert.deepEqual(
+    visibleRows(all, filter({ contents: true, text: "a" }), s).map((r) => r.id),
+    [20001],
+  );
+});
+
+test("a full page followed by a short one covers everything up to the polled id", () => {
+  let s = mergePage(newSearch("a", null), rows(1, SEARCH_PAGE), 5000);
+  assert.equal(s.cursor, SEARCH_PAGE);
+  assert.ok(needsSearch(s, 5000));
+  assert.equal(searchArgs(s)[3], `--after=${SEARCH_PAGE}`);
+  s = mergePage(s, [row(4000)], 5000);
+  assert.equal(s.cursor, 5000);
+  assert.equal(s.matches.size, SEARCH_PAGE + 1);
+  assert.ok(!needsSearch(s, 5000));
+  assert.equal(searchNote(s, 5000), "");
+});
+
+test("a full page past the polled rows waits for the poll to catch up", () => {
+  // Rows were recorded during the call: the page ends after the newest polled id.
+  const s = mergePage(newSearch("a", null), rows(1, SEARCH_PAGE), 10);
+  assert.equal(s.cursor, SEARCH_PAGE);
+  assert.ok(!needsSearch(s, 10));
+  assert.ok(needsSearch(s, SEARCH_PAGE + 1));
+});
+
+test("a failed search keeps its matches, stops, and says why", () => {
+  const s = { ...mergePage(newSearch("a", null), [row(2)], 5), error: "database is locked" };
+  assert.ok(!needsSearch(s, 100));
+  assert.equal(searchNote(s, 100), "Search failed: database is locked");
+  // The error wins over the cap note.
+  assert.match(searchNote({ ...s, capped: true }, 100), /^Search failed/);
+  assert.deepEqual(
+    visibleRows(rows(1, 6), filter({ contents: true, text: "a" }), s).map((r) => r.id),
+    [2],
+  );
+});
+
+test("matches the poll hasn't fetched yet show once their rows arrive", () => {
+  const f = filter({ contents: true, text: "a" });
+  const s = mergePage(newSearch("a", null), [row(3), row(8)], 5);
+  assert.equal(s.cursor, 8);
+  assert.deepEqual(
+    visibleRows(rows(1, 5), f, s).map((r) => r.id),
+    [3],
+  );
+  assert.deepEqual(
+    visibleRows(rows(1, 8), f, s).map((r) => r.id),
+    [3, 8],
+  );
+});
+
+test("contents mode still hides out-of-scope matches by default", () => {
+  const f = filter({ contents: true, text: "a" });
+  const all = [row(1), row(2, { status: null, error: "out of scope: b.test" })];
+  const s = mergePage(newSearch("a", null), all, 2);
+  assert.deepEqual(
+    visibleRows(all, f, s).map((r) => r.id),
+    [1],
+  );
+  assert.equal(visibleRows(all, { ...f, hideRefused: false }, s).length, 2);
+});
+
+test("a search is only current for the filter that asked for it", () => {
+  const s = newSearch("a", "send");
+  assert.ok(isCurrent(s, filter({ contents: true, text: "a", sources: ["send"] })));
+  assert.ok(!isCurrent(s, filter({ text: "a", sources: ["send"] })));
+  assert.ok(!isCurrent(s, filter({ contents: true, text: "A", sources: ["send"] })));
+  assert.ok(!isCurrent(s, filter({ contents: true, text: "a", sources: ["send", "proxy"] })));
+  assert.ok(!isCurrent(null, filter({ contents: true, text: "a" })));
+});
+
+test("a saved filter is a copy of the filter it was saved from", () => {
+  const f = filter({ sources: ["send"] });
+  const list = withSaved([], "mine", f);
+  f.sources.push("proxy");
+  assert.deepEqual(list[0].filter.sources, ["send"]);
+  assert.equal(savedMatching(list, filter({ sources: ["send"] })), "mine");
+  assert.equal(savedMatching([], DEFAULT_FILTER), null);
+  // Deleting a name that isn't saved changes nothing.
+  assert.deepEqual(withoutSaved(list, "other"), list);
+});
+
+test("stored filters can't set fields through __proto__", () => {
+  const f = parseFilter(JSON.parse('{"__proto__":{"hideErrors":true,"text":"x"},"constructor":{"prototype":{"y":1}}}'));
+  assert.deepEqual(f, DEFAULT_FILTER);
+  const list = parseSaved('[{"name":"__proto__","filter":{"__proto__":{"contents":true}}}]');
+  assert.deepEqual(list, [{ name: "__proto__", filter: DEFAULT_FILTER }]);
+  assert.equal(({} as any).contents, undefined);
+});
+
+test("saved filters survive a round trip through storage, odd names included", () => {
+  const items = stubStorage();
+  let list = withSaved([], "tokens «auth» / ünïcode", filter({ contents: true, text: 'a"b\\c\n', sources: ["proxy", "send"] }));
+  list = withSaved(list, "<script>", filter({ hideAssets: true }));
+  assert.ok(storeSaved("C:\\proj\\a.bpdb", list));
+  assert.deepEqual(loadSaved("C:\\proj\\a.bpdb"), list);
+  assert.notEqual(savedKey("/w/a.bpdb"), savedKey("/w/a.bpdb2"));
+  // Garbage written by something else loads as nothing.
+  items.set(savedKey("/w/x.bpdb"), "{broken");
+  assert.deepEqual(loadSaved("/w/x.bpdb"), []);
+});
+
+test("no storage at all loads nothing and reports a failed save", () => {
+  delete (globalThis as any).localStorage;
+  Object.defineProperty(globalThis, "localStorage", {
+    get() {
+      throw new Error("SecurityError");
+    },
+    configurable: true,
+  });
+  assert.deepEqual(loadSaved("/w/a.bpdb"), []);
+  assert.equal(storeSaved("/w/a.bpdb", withSaved([], "x", DEFAULT_FILTER)), false);
+});
