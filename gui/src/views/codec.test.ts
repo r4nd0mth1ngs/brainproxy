@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { KINDS, smartNote, smartSteps } from "./codec.ts";
+import { KINDS, SmartRuns, smartNote, smartSteps } from "./codec.ts";
 
 test("Smart decode's steps become editable decode steps", () => {
   assert.deepEqual(smartSteps(["url", "base64", "gzip"]), [
@@ -55,4 +55,26 @@ test("every layer Smart decode can find becomes a step", () => {
 
 test("the note counts repeated layers", () => {
   assert.equal(smartNote(smartSteps(["url", "url"])), "Found 2 layers: url → url");
+});
+
+test("an edit drops a pending Smart decode; a new run supersedes an old one", () => {
+  const runs = new SmartRuns();
+  const first = runs.start();
+  assert.ok(runs.current(first));
+  runs.edit();
+  assert.ok(!runs.current(first));
+  const second = runs.start();
+  const third = runs.start();
+  assert.ok(!runs.current(second) && runs.current(third));
+});
+
+test("the Codec view edits steps only through editSteps, which drops a pending run", () => {
+  const view = readFileSync(new URL("./Decoder.tsx", import.meta.url), "utf8");
+  const edit = view.match(/const editSteps = [^]*?\n  \};/);
+  assert.ok(edit && edit[0].includes("smartRuns.edit()"));
+  // The only other setSteps is Smart decode applying its own, still current, answer.
+  const rest = view.replace(edit[0], "");
+  const calls = [...rest.matchAll(/setSteps\(/g)];
+  assert.equal(calls.length, 1);
+  assert.match(rest, /if \(!smartRuns\.current\(id\)\) return;[^]*?setSteps\(found\)/);
 });

@@ -26,3 +26,20 @@ export function smartNote(steps: Step[]): string {
   if (!steps.length) return "Nothing to decode: no URL, Base64, hex, HTML, JWT, gzip, or zlib layer found.";
   return `Found ${steps.length === 1 ? "1 layer" : `${steps.length} layers`}: ${steps.map((s) => s.kind).join(" → ")}`;
 }
+
+/** Tells a Smart decode answer from a stale one. Any edit to the input or the steps after a
+ * run starts makes its answer stale, so a slow CLI can't overwrite what the user just did. */
+export class SmartRuns {
+  private n = 0;
+  /** Starts a run; check its id with `current` when the answer arrives. */
+  start(): number {
+    return ++this.n;
+  }
+  /** Drops the run in progress, if any. */
+  edit(): void {
+    this.n++;
+  }
+  current(id: number): boolean {
+    return id === this.n;
+  }
+}

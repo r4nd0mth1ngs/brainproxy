@@ -93,15 +93,20 @@ pub fn decode(kind: &str, input: &[u8]) -> Result<Vec<u8>> {
         // Compressed data is binary: use the input as given, untrimmed.
         "gzip" => inflate("gzip", flate2::read::MultiGzDecoder::new(input))?,
         "zlib" => inflate("zlib", flate2::read::ZlibDecoder::new(input))?,
-        // Raw DEFLATE, or zlib-wrapped as HTTP's Content-Encoding: deflate usually is. With a
-        // zlib header, the zlib error (such as the size limit) is the one worth reporting.
-        "deflate" => inflate("zlib", flate2::read::ZlibDecoder::new(input)).or_else(|e| {
-            if zlib_header(input) {
-                Err(e)
-            } else {
-                inflate("deflate", flate2::read::DeflateDecoder::new(input))
-            }
-        })?,
+        // Raw DEFLATE, or zlib-wrapped as HTTP's Content-Encoding: deflate usually is. A raw
+        // stream can start with bytes that pass as a zlib header, so raw is tried whenever
+        // zlib fails, except at the size limit. If both fail, a zlib header means the zlib
+        // error is the one worth reporting.
+        "deflate" => match read_inflated(flate2::read::ZlibDecoder::new(input)) {
+            Ok(out) => out,
+            Err(zlib @ Inflate::TooBig) => return Err(zlib.error("zlib")),
+            Err(zlib) => match read_inflated(flate2::read::DeflateDecoder::new(input)) {
+                Ok(out) => out,
+                Err(raw @ Inflate::TooBig) => return Err(raw.error("deflate")),
+                Err(_) if zlib_header(input) => return Err(zlib.error("zlib")),
+                Err(raw) => return Err(raw.error("deflate")),
+            },
+        },
         "brotli" => inflate("brotli", brotli_decompressor::Decompressor::new(input, 4096))?,
         "auto" => smart_decode(input).output,
         other => return Err(unknown("decoding", other, DECODINGS)),
@@ -170,9 +175,11 @@ fn smart_step(v: &[u8]) -> Option<(&'static str, Vec<u8>)> {
     // Escapes count when they decode to text; base64 and hex need more (see looks_decoded).
     let text_out = |found: &(&'static str, Vec<u8>)| compressed(&found.1) || is_text(&found.1);
     let decoded_out = |found: &(&'static str, Vec<u8>)| looks_decoded(&found.1);
+    // Only the syntax counts here, not what the base64 holds: if it holds binary, reading
+    // the '+' as a space would turn base64 into neither base64 nor text.
     let base64_inside = |found: &(&'static str, Vec<u8>)| {
         std::str::from_utf8(&found.1).ok().and_then(|s| looks_like_base64(s.trim())) == Some("base64")
-            && decode("base64", &found.1).is_ok_and(|out| looks_decoded(&out))
+            && decode("base64", &found.1).is_ok()
     };
     if v.starts_with(&[0x1f, 0x8b]) {
         return attempt("gzip");
@@ -188,7 +195,8 @@ fn smart_step(v: &[u8]) -> Option<(&'static str, Vec<u8>)> {
     }
     if has_percent_escape(text) {
         // '+' means a space only in form data. Base64 in a cookie or header often has a raw
-        // '+' and only its '=' escaped: undo the escapes and keep the '+'.
+        // '+' and only its '=' escaped: undo the escapes and keep the '+', even when the
+        // base64 itself goes no further.
         if text.contains('+') {
             if let Some(found) = attempt("percent").filter(base64_inside) {
                 return Some(found);
@@ -282,11 +290,12 @@ fn is_text(v: &[u8]) -> bool {
     std::str::from_utf8(v).is_ok_and(|s| s.chars().all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r')))
 }
 
-/// Whether base64 or hex output looks like progress: compressed data to unpack, JSON, or
-/// printable ASCII. Under 12 bytes, chance printable output is common, so short text must
-/// also be at least half letters, digits, and spaces.
+/// Whether base64 or hex output looks like progress: compressed data to unpack, a JSON
+/// object or array (UTF-8, so non-ASCII strings count), or printable ASCII. Under 12 bytes,
+/// chance printable output is common, so short text must also be at least half letters,
+/// digits, and spaces.
 fn looks_decoded(v: &[u8]) -> bool {
-    if compressed(v) {
+    if compressed(v) || serde_json::from_slice::<serde_json::Value>(v).is_ok_and(|j| j.is_object() || j.is_array()) {
         return true;
     }
     if !v.iter().all(|&b| b.is_ascii_graphic() || matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
@@ -294,7 +303,6 @@ fn looks_decoded(v: &[u8]) -> bool {
     }
     let wordy = v.iter().filter(|&&b| b.is_ascii_alphanumeric() || b == b' ').count();
     wordy > 0 && (v.len() >= 12 || wordy * 2 >= v.len())
-        || serde_json::from_slice::<serde_json::Value>(v).is_ok_and(|j| j.is_object() || j.is_array())
 }
 
 fn compress(mut encoder: impl Read) -> Result<Vec<u8>> {
@@ -305,13 +313,31 @@ fn compress(mut encoder: impl Read) -> Result<Vec<u8>> {
 
 /// Reads a decompressor to the end, refusing output over `MAX_INFLATED`.
 fn inflate(name: &str, decoder: impl Read) -> Result<Vec<u8>> {
+    read_inflated(decoder).map_err(|e| e.error(name))
+}
+
+/// Why a decompression failed: bad data, or output over `MAX_INFLATED`.
+enum Inflate {
+    Bad(std::io::Error),
+    TooBig,
+}
+
+impl Inflate {
+    fn error(self, name: &str) -> Error {
+        Error::InvalidInput(match self {
+            Inflate::Bad(e) => format!("{name}: {e}"),
+            Inflate::TooBig => {
+                format!("{name}: output is over the {} MB limit (a decompression bomb?)", MAX_INFLATED / (1024 * 1024))
+            }
+        })
+    }
+}
+
+fn read_inflated(decoder: impl Read) -> std::result::Result<Vec<u8>, Inflate> {
     let mut out = Vec::new();
-    decoder.take(MAX_INFLATED + 1).read_to_end(&mut out).map_err(|e| Error::InvalidInput(format!("{name}: {e}")))?;
+    decoder.take(MAX_INFLATED + 1).read_to_end(&mut out).map_err(Inflate::Bad)?;
     if out.len() as u64 > MAX_INFLATED {
-        return Err(Error::InvalidInput(format!(
-            "{name}: output is over the {} MB limit (a decompression bomb?)",
-            MAX_INFLATED / (1024 * 1024)
-        )));
+        return Err(Inflate::TooBig);
     }
     Ok(out)
 }
@@ -683,6 +709,40 @@ mod tests {
         let s = smart_decode(&encode("base64url", &encode("gzip", &[0xff, 0x00, 0xfe]).unwrap()).unwrap());
         assert_eq!(s.steps.last(), Some(&"gzip"));
         assert_eq!(s.output, [0xff, 0x00, 0xfe]);
+    }
+
+    #[test]
+    fn deflate_tries_raw_after_zlib() {
+        // A raw stored block whose first bytes pass as a zlib header (78 9c): 156 bytes of
+        // 'A', then an empty final block.
+        let mut raw = vec![0x78, 0x9c, 0x00, 0x63, 0xff];
+        raw.extend([b'A'; 156]);
+        raw.extend([0x01, 0x00, 0x00, 0xff, 0xff]);
+        assert!(zlib_header(&raw));
+        assert!(decode("zlib", &raw).is_err());
+        assert_eq!(decode("deflate", &raw).unwrap(), [b'A'; 156]);
+        // When neither reads it, a zlib header still gets the zlib error.
+        let err = decode("deflate", &raw[..40]).unwrap_err().to_string();
+        assert!(err.contains("zlib: corrupt"), "{err}");
+    }
+
+    #[test]
+    fn smart_decode_keeps_plus_in_binary_base64() {
+        // Base64 of an emoji: binary, so it stops there, but its '+' isn't read as a space.
+        let s = smart_decode(b"8J+YgA%3D%3D");
+        assert_eq!((s.steps, s.output), (vec!["percent"], b"8J+YgA==".to_vec()));
+        assert_eq!(decode("auto", b"8J+YgA%3D%3D").unwrap(), b"8J+YgA==");
+        // Not base64: a form value, with '+' as a space.
+        assert_eq!(smart_decode(b"hello+world%21").output, b"hello world!");
+    }
+
+    #[test]
+    fn smart_decode_json_with_non_ascii() {
+        let s = smart_decode(b"eyJuYW1lIjoiSm9zw6kifQ==");
+        assert_eq!(s.steps, ["base64"]);
+        assert_eq!(s.output, r#"{"name":"José"}"#.as_bytes());
+        let hex = encode("hex", r#"["café"]"#.as_bytes()).unwrap();
+        assert_eq!(smart_decode(&hex).output, r#"["café"]"#.as_bytes());
     }
 
     #[test]
