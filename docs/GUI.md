@@ -27,13 +27,17 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     bodies exact.
   - `env` adds variables to the child, only names starting with `BRAINPROXY_SECRET_`, for
     secrets that shouldn't be in argv (visible in `ps`).
+  - `call` names the call, so `cli_cancel(call)` can kill its process (`cancelCli` in
+    `api.ts`); it then fails with kind `cancelled`. For a command that waits on the user,
+    such as the browser sign-in.
 - Value flags are passed as `--flag=value` and free-text positionals after `--`, so values
   starting with `-` aren't read as flags.
 - Messages the GUI edits or resends are loaded with `--max-body=2000000`. One larger than
   that arrives truncated; the GUI then refuses to send it to Replay or the Fuzzer and shows
   an intercepted one read-only (forward or drop it as is).
 - `npm run dev` also serves the UI to a plain browser: `vite.config.ts` adds `POST /api/cli`
-  (dev server only; localhost Host and an `X-Brainproxy: 1` header required). It runs
+  and `POST /api/cli-cancel` (dev server only; localhost Host and an `X-Brainproxy: 1` header
+  required). It runs
   `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
   1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue
@@ -137,10 +141,12 @@ and Postman variables, optional authentication (API key or bearer token via `aut
 --header-env|--query-key`, with the value passed as `BRAINPROXY_SECRET_API_KEY`; OAuth 2 via
 `views/ApiAuthExtras.tsx`, `auth add --oauth-* --oauth-store-secrets` with the secrets in
 `BRAINPROXY_SECRET_OAUTH_*` and `BRAINPROXY_SECRET_PASSWORD`, prefilled from the definition's `oauth`,
-then `auth login` or `auth oauth authorize`, and the profile removed again if no token comes; an
+then `auth login` or `auth oauth authorize` (which *Cancel* stops), and the profile removed again
+if no token comes; entering other credentials offers to remove the profile saved before; an
 existing profile; optional signing via `SignerBuilder` (HMAC, private key, JWT or AWS SigV4,
 prefilled from a collection's `aws`) or a collection's pre-request script, shown with
-`--show-scripts` before it can be chosen, and a session rule), and the operations to send
+`--show-scripts` before it can be chosen, with text-direction and invisible characters flagged
+and written out, and a session rule), and the operations to send
 (GraphQL mutations are opt-in, as MUTATION), and offers a one-request check (`import api --only N
 --auth P`, which may use a GraphQL query). It runs `scan active --api SOURCE --expect-sha256 ...
 [--expect-environment-sha256 ...] --only ... --background`.
