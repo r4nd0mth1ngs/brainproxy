@@ -265,8 +265,10 @@ The sidebar groups the tools by what you are doing.
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
 - **Sending:** ⌘/Ctrl+Enter sends; **Stop** gives up on a request that is still waiting.
-  ‹ › step back and forward through what you sent. A step sent with other options than the
-  tab has now says which, next to the response.
+  A send carries on while you look at another tab, and its response lands in its own tab;
+  closing the tab (or the project) stops it. ‹ › step back and forward through what you
+  sent. A step sent with other options than the tab has now says which, next to the
+  response.
 - **Auto URL-encode** (on by default): on send, characters that aren't valid in a URL
   (spaces, quotes, `<>`, `#`, non-ASCII) are encoded in the request line and in form bodies.
   `&`, `=`, `'` and existing `%XX` stay as typed, so `?q=x' OR 1=1--` arrives as

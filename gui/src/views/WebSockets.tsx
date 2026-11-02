@@ -9,6 +9,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { beginCall, endCall, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { optionsProblem } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
@@ -197,8 +198,9 @@ export function WebSockets({ active }: { active: boolean }) {
 
 // ---------------- Replay: WebSocket mode ----------------
 
-// Results survive switching tabs (the tab view remounts), keyed by tab.
-const resultsByTab = new Map<number, WsSendResult | string>();
+// Results survive switching tabs (the tab view remounts), keyed by tab; so does a run in
+// flight, so its result lands in its tab and Stop stays (replayCalls.ts).
+const resultsByTab = tabSlot<WsSendResult | string | null>(null);
 
 export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const app = useApp();
@@ -207,13 +209,16 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [text, setText] = useState(joinMessages(tab.ws ?? []));
   const [wait, setWait] = useState(3);
   const [until, setUntil] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<WsSendResult | string | null>(() => resultsByTab.get(tab.key) ?? null);
+  const [result] = useTabSlot(resultsByTab, tab.key);
   const [current, setCurrent] = useState<number | null>(null);
   const [options, setOptions] = useSendOptions(tab);
   const [showOptions, setShowOptions] = useState(false);
-  // The id of the send in flight, so Stop can cancel it.
-  const call = useRef<string | null>(null);
+  // The run in flight, so Stop can cancel it.
+  const [call] = useTabSlot(replayCalls, tab.key);
+  const busy = call != null;
+
+  // A new result's rows aren't the old one's.
+  useEffect(() => setCurrent(null), [result]);
 
   const { setRepeater } = app;
   useEffect(() => {
@@ -237,19 +242,16 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
     const problem = optionsProblem(options);
     if (problem) return app.toast(problem, "error");
     setTarget(to);
-    setBusy(true);
+    const key = tab.key;
+    const id = beginCall(key, "replay-ws-send");
     let r: WsSendResult | string;
-    call.current = `replay-ws-send-${tab.key}-${Date.now()}`;
     try {
-      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), { stdin: wsSendInput(raw, splitMessages(text)), call: call.current });
+      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), { stdin: wsSendInput(raw, splitMessages(text)), call: id });
     } catch (e: any) {
       r = e.kind === "cancelled" ? "Stopped" : (e.message as string);
     }
-    call.current = null;
-    resultsByTab.set(tab.key, r);
-    setResult(r);
-    setCurrent(null);
-    setBusy(false);
+    // Into the tab even if the view was remounted meanwhile; not if the tab closed.
+    if (endCall(key, id)) resultsByTab.update(key, () => r);
   };
 
   const msgs = typeof result === "object" && result ? result.messages ?? [] : [];
@@ -271,7 +273,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
           {busy ? "Connected…" : "Connect and send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => call.current && cancelCli(call.current).catch(() => {})} title="Stop the connection">
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop the connection">
             Stop
           </button>
         )}

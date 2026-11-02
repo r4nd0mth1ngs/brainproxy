@@ -1,8 +1,10 @@
 // App-wide state: the open project, the active tool tab, cross-tool "send to" actions,
 // and toasts. Each view keeps its own data and fetches it through api.ts.
 
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { cancelCli } from "./api";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
+import { clearReplayTabs } from "./views/replayCalls";
 import type { ReplayOptions } from "./views/replayOptions";
 
 export type Tab =
@@ -106,6 +108,9 @@ export function AppProvider({
   const nextKey = useRef(1);
   // Mutated in place: the views read it when they act, nothing renders from it.
   const proxy = useRef(proxyControl()).current;
+  // Replay keeps sends in flight and results outside its views, keyed by tab; the next
+  // project's tabs reuse the keys, so they go (and the sends stop) with this project.
+  useEffect(() => () => clearReplayTabs(cancelCli), []);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info", onClick?: () => void) => {
     const id = nextKey.current++;

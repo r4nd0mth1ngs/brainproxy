@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { bodyText, cancelCli, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
+import { beginCall, endCall, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { activeLabels, optionsProblem, requestToSend, sendArgs, sentWithNote } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { BLANK_HANDSHAKE } from "./ws";
@@ -44,6 +45,7 @@ export function RepeaterView() {
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
   const closeTab = (key: number) => {
+    forgetTab(key, cancelCli);
     app.setRepeater((ts) => ts.filter((t) => t.key !== key));
     if (key === active?.key) {
       const rest = tabs.filter((t) => t.key !== key);
@@ -110,25 +112,22 @@ function storedAutoEncode(): boolean {
   }
 }
 
-// Send history survives switching tabs (the tab view remounts), keyed by tab.
-const sentByTab = new Map<number, { list: Sent[]; at: number }>();
+// Send history survives switching tabs (the tab view remounts), keyed by tab; so does a send
+// in flight, so its result lands in its tab and Stop stays (replayCalls.ts).
+const sentByTab = tabSlot<{ list: Sent[]; at: number }>({ list: [], at: -1 });
 
 function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const app = useApp();
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
-  const [busy, setBusy] = useState(false);
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
   const [options, setOptions] = useSendOptions(tab);
   const [showOptions, setShowOptions] = useState(false);
-  const [sent, setSent] = useState(() => sentByTab.get(tab.key) ?? { list: [], at: -1 });
+  const [sent, setSent] = useTabSlot(sentByTab, tab.key);
   const current = sent.list[sent.at];
-  // The id of the send in flight, so Stop can cancel it (a long timeout would otherwise hold the tab).
-  const call = useRef<string | null>(null);
-
-  useEffect(() => {
-    sentByTab.set(tab.key, sent);
-  }, [tab.key, sent]);
+  // The send in flight, so Stop can cancel it (a long timeout would otherwise hold the tab).
+  const [call] = useTabSlot(replayCalls, tab.key);
+  const busy = call != null;
 
   // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
   // tabs return the same array, so React skips the update; a new array every time changed
@@ -153,26 +152,25 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const problem = optionsProblem(options);
     if (problem) return app.toast(problem, "error");
     setTarget(to);
-    setBusy(true);
     const { text: sent, encoded } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
     const labels = activeLabels(options, "http");
-    call.current = `replay-send-${tab.key}-${Date.now()}`;
+    const key = tab.key;
+    const id = beginCall(key, "replay-send");
     let entry: Sent;
     try {
-      const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: call.current });
+      const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: id });
       entry = { raw, sent, encoded, labels, result, error: null };
     } catch (e: any) {
       entry = { raw, sent, encoded, labels, result: null, error: e.kind === "cancelled" ? "Stopped before a response arrived" : e.message };
     }
-    call.current = null;
-    setBusy(false);
-    setSent((s) => ({ list: [...s.list, entry], at: s.list.length }));
+    // Into the tab's history even if the view was remounted meanwhile; not if the tab closed.
+    if (endCall(key, id)) sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
   };
 
   const go = (d: number) => {
     const at = sent.at + d;
     if (at < 0 || at >= sent.list.length) return;
-    setSent({ ...sent, at });
+    setSent((s) => ({ ...s, at }));
     setRaw(sent.list[at].raw);
   };
 
@@ -198,7 +196,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           {busy ? "Sending…" : "Send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => call.current && cancelCli(call.current).catch(() => {})} title="Stop waiting for this request">
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request">
             Stop
           </button>
         )}
