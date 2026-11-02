@@ -204,21 +204,88 @@ const movable = { listen: "127.0.0.1:8080", args: ["proxy", "run", "--listen", "
 test("moveProxy: when the new port fails the proxy goes back where it was", async () => {
   const { calls, cli } = fakeCli((args) => {
     if (args.includes("--listen=127.0.0.1:9090")) throw new Error(BIND_FAILURE);
+    if (args[1] === "status") return { running: true, proxy: { listen: "127.0.0.1:8080" } };
   });
   await assert.rejects(moveProxy(cli, proxyControl(), movable, 9090), { message: `${HINTED} The proxy is back on 127.0.0.1:8080.` });
   assert.deepEqual(calls, [
     ["proxy", "stop"],
     ["proxy", "start", "--listen=127.0.0.1:9090", "--timeout=30"],
     ["proxy", "start", "--listen=127.0.0.1:8080", "--timeout=30"],
+    ["proxy", "status"],
   ]);
 });
 
-test("moveProxy: when going back fails too, the error says the proxy is off", async () => {
-  const { calls, cli } = fakeCli((args) => {
-    if (isStart(args)) throw new Error(BIND_FAILURE);
+test("moveProxy: when going back fails too, the error says where the proxy is now", async () => {
+  const cases: [object | null, string][] = [
+    [{ running: false, proxy: null }, "The proxy is off."],
+    // Started meanwhile by a shell or an agent.
+    [{ running: true, proxy: { listen: "127.0.0.1:9090" } }, "The proxy is on 127.0.0.1:9090."],
+    [{ running: true, proxy: { listen: "127.0.0.1:8080" } }, "The proxy is back on 127.0.0.1:8080."],
+    [null, "Check in the top bar whether the proxy is running."],
+  ];
+  for (const [status, where] of cases) {
+    const { calls, cli } = fakeCli((args) => {
+      if (isStart(args)) throw new Error(BIND_FAILURE);
+      if (args[1] === "status") {
+        if (!status) throw new Error("status failed");
+        return status;
+      }
+    });
+    await assert.rejects(moveProxy(cli, proxyControl(), movable, 9090), { message: `${HINTED} ${where}` });
+    assert.equal(calls.length, 4);
+  }
+});
+
+test("during a move, other starts wait for it and start nothing if the proxy is up", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const { calls, cli } = fakeCli(async (args) => {
+    if (args[1] === "stop") await held;
+    if (args[1] === "status") return { running: true, proxy: { listen: "127.0.0.1:9090" } };
+    return {};
   });
-  await assert.rejects(moveProxy(cli, proxyControl(), movable, 9090), { message: `${HINTED} The proxy is off.` });
-  assert.equal(calls.length, 3);
+  const ctl = proxyControl();
+  const moved = moveProxy(cli, ctl, movable, 9090);
+  assert.ok(ctl.moving);
+  const started = startProxy(cli, ctl);
+  await Promise.resolve();
+  assert.deepEqual(calls, [["proxy", "stop"]]);
+  release();
+  assert.equal(await moved, "127.0.0.1:9090");
+  assert.equal(await started, false);
+  assert.deepEqual(calls.slice(1), [
+    ["proxy", "start", "--listen=127.0.0.1:9090", "--timeout=30"],
+    ["proxy", "status"],
+  ]);
+  assert.equal(ctl.moving, null);
+});
+
+test("closing during a move stops the app's proxy where the move put it", async () => {
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { calls, cli } = proxyCli(() => ({ running: true, proxy: { listen: "127.0.0.1:9090", pid: 8 } }), [8]);
+  const moved = moveProxy(cli, ctl, { ...movable, pid: 7 }, 9090);
+  await stopOwned(cli, ctl);
+  await moved;
+  assert.deepEqual(calls.slice(-2), [
+    ["proxy", "status"],
+    ["proxy", "stop"],
+  ]);
+});
+
+test("during a move that leaves the proxy off, a start waits and then starts it", async () => {
+  stubStorage();
+  const { calls, cli } = fakeCli((args) => {
+    if (isStart(args) && calls.filter(isStart).length <= 2) throw new Error(BIND_FAILURE);
+    if (args[1] === "status") return { running: false, proxy: null };
+    return {};
+  });
+  const ctl = proxyControl();
+  const moved = moveProxy(cli, ctl, movable, 9090);
+  assert.equal(await startProxy(cli, ctl), true);
+  await assert.rejects(moved);
+  assert.deepEqual(calls.at(-1), ["proxy", "start", "--listen=127.0.0.1:8080"]);
+  assert.equal(ctl.moving, null);
 });
 
 // Ownership: only a proxy the app started is stopped when the project closes.

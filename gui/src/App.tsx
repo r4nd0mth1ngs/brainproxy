@@ -171,7 +171,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   // Starts the proxy if needed, then a browser in this project's profile.
   const openBrowser = async (id: string) => {
     try {
-      if (!status?.running) {
+      // During a port move the polled status is stale; startProxy waits for the move.
+      if (!status?.running || app.proxy.moving) {
         await startProxy(run, app.proxy);
         refreshStatus();
       }
@@ -260,6 +261,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     : "";
 
   const proxyToggle = async () => {
+    if (app.proxy.moving) return app.toast("The proxy is restarting on another port. Try again in a moment.");
     try {
       if (status?.running) await stopProxy(run, app.proxy);
       else await startProxy(run, app.proxy);

@@ -44,7 +44,10 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
   proxy when a project opens* on, closing the project or the window stops the proxy only if
   `proxy status` still shows that pid running here, so one a shell, an agent or another
-  container started is left alone.
+  container started is left alone. While Settings moves the proxy to another port (stop,
+  then start), the control marks a move: Open browser, Record a login and Start proxy wait
+  for it, and the pill and Access's live restart ask to try again. A failed move reports
+  where the proxy is from a fresh `proxy status`.
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 

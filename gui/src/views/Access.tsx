@@ -318,6 +318,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
   // Restarts the proxy on the same address and with the same options, plus live testing. If it
   // doesn't come up, the previous proxy is started again.
   const startLive = async () => {
+    if (app.proxy.moving) return app.toast("The proxy is restarting on another port. Try again in a moment.");
     try {
       const live = liveArgs(f);
       setBusy(true);
