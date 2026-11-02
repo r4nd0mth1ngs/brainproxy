@@ -68,8 +68,12 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("evidence", "TEXT", "Matched evidence"),
     ("other_info", "TEXT", "Extra detail"),
     ("attack", "TEXT", "Payload that triggered an active finding"),
-    ("history_id", "INTEGER", "history.id where first seen"),
-    ("last_history_id", "INTEGER", "history.id where last seen"),
+    ("history_id", "INTEGER", "history.id where first seen (source manual: the first linked entry)"),
+    (
+        "last_history_id",
+        "INTEGER",
+        "history.id where last seen (source manual: the last linked entry; `findings show` lists them all in history_ids)",
+    ),
     ("hits", "INTEGER", "Times seen (same alert, method, URL without query, param)"),
     ("state", "TEXT", "open, confirmed, false_positive"),
     ("note", "TEXT", "Free-text note"),
@@ -486,6 +490,30 @@ impl Store {
         Ok(removed)
     }
 
+    /// Which texts of its alert type adding `f` would replace ("description", "solution"): those
+    /// the type already has, shared with every finding of the same title, and `f` changes.
+    pub fn manual_texts_replaced(&self, f: &ManualFinding) -> Result<Vec<&'static str>> {
+        let alert_ref = manual_alert_ref(f.title.trim())?;
+        let old: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT coalesce(description, ''), coalesce(solution, '') FROM finding_types WHERE alert_ref = ?1",
+                [&alert_ref],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((description, solution)) = old else { return Ok(Vec::new()) };
+        let changed = |old: &str, new: &str| !old.is_empty() && !new.trim().is_empty() && old != new.trim();
+        let mut replaced = Vec::new();
+        if changed(&description, &f.description) {
+            replaced.push("description");
+        }
+        if changed(&solution, &f.solution) {
+            replaced.push("solution");
+        }
+        Ok(replaced)
+    }
+
     /// The history entries a finding added by hand links to, in the order given.
     pub fn finding_history_ids(&self, id: i64) -> Result<Vec<i64>> {
         if let Some(list) = self.meta_get(&history_key(id))? {
@@ -535,8 +563,10 @@ fn history_key(id: i64) -> String {
 }
 
 /// `manual:` and the title in lower case, words joined by `-`, so findings with the same
-/// title group together and never share a type with a scanner's.
+/// title group together and never share a type with a scanner's. A slug over 64 characters is
+/// cut and ends in a hash of the whole slug, so titles that differ only near the end stay apart.
 pub(crate) fn manual_alert_ref(title: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
     let mut slug = String::new();
     for c in title.chars().flat_map(char::to_lowercase) {
         if c.is_alphanumeric() {
@@ -544,23 +574,31 @@ pub(crate) fn manual_alert_ref(title: &str) -> Result<String> {
         } else if !slug.is_empty() && !slug.ends_with('-') {
             slug.push('-');
         }
-        if slug.chars().count() >= 64 {
-            break;
-        }
     }
     let slug = slug.trim_end_matches('-');
     if slug.is_empty() {
         return Err(Error::InvalidInput("the title needs at least one letter or digit".into()));
     }
-    Ok(format!("manual:{slug}"))
+    if slug.chars().count() <= 64 {
+        return Ok(format!("manual:{slug}"));
+    }
+    let head: String = slug.chars().take(55).collect();
+    let hash = hex::encode(&Sha256::digest(slug.as_bytes())[..4]);
+    Ok(format!("manual:{}-{hash}", head.trim_end_matches('-')))
 }
 
-/// An absolute http(s) or ws(s) URL with a host.
+/// An absolute http(s) or ws(s) URL with a host and no user name or password (it would show
+/// in every list and report).
 fn manual_url(url: &str) -> Result<url::Url> {
     let bad = || Error::InvalidInput(format!("{url:?} is not an http(s) or ws(s) URL with a host"));
     let parsed = url::Url::parse(url).map_err(|_| bad())?;
     if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") || parsed.host_str().is_none_or(str::is_empty) {
         return Err(bad());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::InvalidInput(
+            "the URL has a user name or password; leave them out (they would show in every report)".into(),
+        ));
     }
     Ok(parsed)
 }
@@ -664,7 +702,44 @@ mod tests {
         assert_eq!(manual_alert_ref("  SQL Injection (login)! ").unwrap(), "manual:sql-injection-login");
         assert_eq!(manual_alert_ref("Überprüfung fehlt").unwrap(), "manual:überprüfung-fehlt");
         assert!(manual_alert_ref("!!!").is_err());
-        assert_eq!(manual_alert_ref(&"a".repeat(500)).unwrap().len(), "manual:".len() + 64);
+        // Long slugs are cut and hashed: 55 characters, '-', 8 hex digits.
+        let long = manual_alert_ref(&"a".repeat(500)).unwrap();
+        assert_eq!(long.len(), "manual:".len() + 64);
+        assert!(long.starts_with(&format!("manual:{}-", "a".repeat(55))), "{long}");
+        let exact = "b".repeat(64);
+        assert_eq!(manual_alert_ref(&exact).unwrap(), format!("manual:{exact}"));
+        // Only titles that come out the same share a type.
+        let a = "Stored XSS in the account settings display name field on the profile page";
+        let b = "Stored XSS in the account settings display name field on the admin page";
+        assert_ne!(manual_alert_ref(a).unwrap(), manual_alert_ref(b).unwrap());
+        assert_eq!(manual_alert_ref(a).unwrap(), manual_alert_ref(&format!("  {}!", a.to_uppercase())).unwrap());
+    }
+
+    #[test]
+    fn titles_that_differ_are_different_issues() {
+        let (mut s, _) = store();
+        let a = "Stored cross-site scripting in the user profile page through the display name";
+        let b = "Stored cross-site scripting in the user profile page through the biography";
+        let mut f = manual(a, Some("https://app.test/profile"), vec![]);
+        f.description = "Display name.".into();
+        let first = s.finding_add(&f).unwrap();
+        f.title = b.into();
+        f.description = "Biography.".into();
+        let second = s.finding_add(&f).unwrap();
+        let (x, y) = (s.finding_get(first).unwrap(), s.finding_get(second).unwrap());
+        assert_ne!(x["alert_ref"], y["alert_ref"]);
+        assert_eq!((x["description"].as_str(), y["description"].as_str()), (Some("Display name."), Some("Biography.")));
+        assert_eq!((x["name"].as_str(), y["name"].as_str()), (Some(a), Some(b)));
+    }
+
+    #[test]
+    fn urls_keep_no_credentials() {
+        let (mut s, _) = store();
+        for url in ["https://admin:hunter2@app.test/x", "https://admin@app.test/x", "https://:pw@app.test/x"] {
+            let e = s.finding_add(&manual("X", Some(url), vec![])).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput(ref m) if !m.contains("hunter2")), "{url}: {e}");
+        }
+        assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 0);
     }
 
     #[test]
@@ -693,6 +768,10 @@ mod tests {
         assert_eq!(s.finding_get(other).unwrap()["description"], "Read anyone's order.");
         assert_eq!(s.finding_get(other).unwrap()["method"], "GET");
         let mut f = manual("Order IDOR", Some("https://app.test/orders/9"), vec![]);
+        f.description = "Newer text.".into();
+        assert_eq!(s.manual_texts_replaced(&f).unwrap(), ["description"]);
+        f.description = " Read anyone's order. ".into();
+        assert!(s.manual_texts_replaced(&f).unwrap().is_empty());
         f.description = "Newer text.".into();
         s.finding_add(&f).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["description"], "Newer text.");

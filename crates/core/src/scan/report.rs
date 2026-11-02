@@ -135,6 +135,9 @@ pub struct Instance {
     /// For a finding added by hand: every history entry it links to (the first is the evidence).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub history_ids: Vec<i64>,
+    /// For a finding added by hand: its own CWE, when it isn't its alert type's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwe: Option<i64>,
     pub request: Option<HttpRequest>,
     pub response: Option<HttpResponse>,
 }
@@ -242,13 +245,18 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             note: r.get(14)?,
             history_id: r.get(15)?,
             history_ids: Vec::new(),
+            cwe: r.get::<_, Option<i64>>(19)?.filter(|&c| c > 0),
             request: None,
             response: None,
         };
         let alert_ref: String = r.get(16)?;
         // Rows are sorted by risk, so the first instance of a type carries its highest risk.
         match groups.iter_mut().find(|g| g.alert_ref == alert_ref) {
-            Some(g) => g.instances.push(inst),
+            Some(g) => {
+                // Each finding added by hand has its own CWE; the type takes the first one given.
+                g.cwe = g.cwe.or(inst.cwe);
+                g.instances.push(inst)
+            }
             None => {
                 let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
                 groups.push(AlertGroup {
@@ -256,7 +264,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                     rule_id: r.get(17)?,
                     name: r.get(18)?,
                     risk: inst.risk.clone(),
-                    cwe: r.get::<_, Option<i64>>(19)?.filter(|&c| c > 0),
+                    cwe: inst.cwe,
                     wasc: r.get::<_, Option<i64>>(20)?.filter(|&w| w > 0),
                     description: r.get(21)?,
                     solution: r.get(22)?,
@@ -270,9 +278,16 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     drop(rows);
     drop(stmt);
 
-    for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
-        if inst.source == MANUAL_SOURCE {
-            inst.history_ids = store.finding_history_ids(inst.id)?;
+    for g in &mut groups {
+        let group_cwe = g.cwe;
+        for inst in &mut g.instances {
+            // An instance's CWE is shown only when it isn't the type's.
+            if inst.source != MANUAL_SOURCE || inst.cwe == group_cwe {
+                inst.cwe = None;
+            }
+            if inst.source == MANUAL_SOURCE {
+                inst.history_ids = store.finding_history_ids(inst.id)?;
+            }
         }
     }
 
@@ -431,9 +446,15 @@ fn history_list(ids: &[i64]) -> String {
     ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ")
 }
 
-/// Markdown whose HTML is shown as text, not rendered.
+/// Markdown whose HTML is shown as text, not rendered, and with no links or images, which
+/// would load or point to anything quoted (`![x](https://...)`). Emphasis, lists and code stay.
 fn md_no_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Text from our own rule definitions; only table pipes and line breaks need care.
@@ -444,7 +465,7 @@ fn md_text(s: &str) -> String {
 /// An alert type's name for a heading or table cell; a tester's title gets no raw HTML.
 fn md_name(g: &AlertGroup) -> String {
     if is_manual(g) {
-        md_no_html(&md_text(&g.name))
+        md_text(&md_no_html(&g.name))
     } else {
         md_text(&g.name)
     }
@@ -531,6 +552,9 @@ fn markdown(r: &Report) -> String {
             }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 let _ = writeln!(s, "- Note: {}", md_code(n));
+            }
+            if let Some(c) = inst.cwe {
+                let _ = writeln!(s, "- CWE: [{c}]({})", cwe_url(c));
             }
             if inst.history_ids.len() > 1 {
                 let _ = writeln!(s, "- History: {}", history_list(&inst.history_ids));
@@ -850,6 +874,9 @@ fn html(r: &Report) -> String {
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 row("Note", esc(n));
             }
+            if let Some(c) = inst.cwe {
+                row("CWE", link(&cwe_url(c), &c.to_string()));
+            }
             if inst.history_ids.len() > 1 {
                 row("History", history_list(&inst.history_ids));
             }
@@ -966,7 +993,9 @@ fn sarif(r: &Report) -> Value {
                 },
             });
             if !g.solution.is_empty() {
-                rule["help"] = json!({"text": g.solution, "markdown": g.solution});
+                // A tester's text may quote the target: no raw HTML or remote images.
+                let markdown = if is_manual(g) { md_no_html(&g.solution) } else { g.solution.clone() };
+                rule["help"] = json!({"text": g.solution, "markdown": markdown});
             }
             if let Some(u) = g.references.iter().find(|u| u.starts_with("http")) {
                 rule["helpUri"] = json!(u);
@@ -1018,6 +1047,9 @@ fn sarif(r: &Report) -> Value {
             });
             if !inst.history_ids.is_empty() {
                 res["properties"]["historyIds"] = json!(inst.history_ids);
+            }
+            if let Some(c) = inst.cwe {
+                res["properties"]["cwe"] = json!(c);
             }
             if let Some(n) = &inst.note {
                 res["properties"]["note"] = json!(n);
@@ -1289,6 +1321,78 @@ mod tests {
         assert_eq!(only("passive") + 2, r.summary.total);
         // A title is the tester's text: no raw HTML in Markdown either.
         assert!(md.contains("&lt;img src=x&gt; \\| note") && !md.contains("<img"), "{md}");
+    }
+
+    #[test]
+    fn each_finding_added_by_hand_keeps_its_cwe() {
+        let mut s = store_with_findings();
+        // The first (high) has no CWE, the second (medium) has one.
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.risk = Risk::High;
+        s.finding_add(&f).unwrap();
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.url = Some("http://app.test/y".into());
+        f.cwe = Some(639);
+        s.finding_add(&f).unwrap();
+        // A third with another CWE says so itself.
+        f.url = Some("http://app.test/z".into());
+        f.cwe = Some(284);
+        s.finding_add(&f).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
+        assert_eq!(g.cwe, Some(639));
+        let cwes: Vec<Option<i64>> = g.instances.iter().map(|i| i.cwe).collect();
+        assert_eq!(cwes, [None, None, Some(284)]);
+        let md = render(&r, ReportKind::Markdown);
+        assert!(md.contains("**CWE:** [639]") && md.contains("- CWE: [284]"), "{md}");
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("<dt>CWE</dt><dd><a href=\"https://cwe.mitre.org/data/definitions/284.html\""));
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "manual:order-idor")
+            .unwrap()
+            .clone();
+        assert!(rule["properties"]["tags"].as_array().unwrap().contains(&json!("external/cwe/cwe-639")), "{rule}");
+        assert_eq!(rule["relationships"][0]["target"]["id"], "639");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let own: Vec<&Value> = results.iter().filter_map(|x| x["properties"].get("cwe")).collect();
+        assert_eq!(own, [&json!(284)]);
+        // Scanner instances never carry their own.
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        for g in json["alerts"].as_array().unwrap().iter().filter(|g| g["alert_ref"] != "manual:order-idor") {
+            assert!(g["instances"].as_array().unwrap().iter().all(|i| i.get("cwe").is_none()), "{g}");
+        }
+    }
+
+    #[test]
+    fn a_tester_solution_is_no_raw_html_in_sarif_markdown() {
+        let mut s = store_with_findings();
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.solution = "Check the owner. <img src=x onerror=alert(1)> ![p](https://attacker.test/p?d=1)".into();
+        f.description = "See [here](https://attacker.test/) and \\[x](https://attacker.test/b).".into();
+        s.finding_add(&f).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "manual:order-idor")
+            .unwrap()
+            .clone();
+        let help = rule["help"]["markdown"].as_str().unwrap();
+        assert!(!help.contains("<img") && help.contains("&lt;img"), "{help}");
+        assert!(!help.contains("![p](") && help.contains("!\\[p\\](https://attacker.test"), "{help}");
+        // The plain text stays as written.
+        assert!(rule["help"]["text"].as_str().unwrap().contains("<img src=x"));
+        // The Markdown report has no link or image either, even after a backslash.
+        let md = render(&r, ReportKind::Markdown);
+        assert!(md.contains("See \\[here\\](https://attacker.test/)"), "{md}");
+        assert!(md.contains("and \\\\\\[x\\](https://attacker.test/b)"), "{md}");
+        assert!(!md.contains("![p]("), "{md}");
     }
 
     fn by_hand(title: &str, history: Vec<i64>) -> crate::scan::findings_db::ManualFinding {

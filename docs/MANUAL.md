@@ -937,21 +937,30 @@ brainproxy findings remove 17
 ```
 
 - `--title` and `--risk` are required; `--confidence` defaults to medium.
-- `--url` must be an absolute http(s) or ws(s) URL. Without it, the URL and method are those of
-  the first `--history-id` entry. A URL outside the engagement scope is recorded with a warning.
+- `--url` must be an absolute http(s) or ws(s) URL, without a user name or password. Without it,
+  the URL and method are those of the first `--history-id` entry. A URL outside the engagement
+  scope is recorded with a warning.
 - `--history-id` (repeatable or comma-separated) links the history entries that show the issue;
   the first is the request and response in reports.
 - `--description`, `--solution` and `--evidence` take the text; `--description-file`,
   `--solution-file` and `--evidence-file` read it from a file, or stdin with `-` (one of them).
   Through MCP the file flags only take `-`, the call's stdin.
+- `--input-json` reads all three from stdin instead, as
+  `{"description": "...", "solution": "...", "evidence": "..."}` (each optional). Text on the
+  command line is visible in the process list, so use it for evidence that holds a token.
 - Findings with the same title share an alert type, `manual:<title>` (`manual:order-idor`), so
-  reports group them. The type holds the description and solution: a new one replaces it, and
-  leaving it out keeps it.
+  reports group them. The type holds the description and solution: a new one replaces it (with a
+  warning), and leaving it out keeps it. A long title is shortened and ends in a short hash, so
+  only titles that are the same apart from case and punctuation share a type.
+- Each finding keeps its own `--cwe`. Reports show the first one given for the type, and an
+  instance's own when it differs.
 - The same title, method, URL without its query, and parameter as an existing finding is refused
   with `conflict`.
 - `findings mark` triages them like any other. `findings remove ID...` deletes findings added by
   hand; scanner findings are refused (mark them false positive instead), and then nothing is
   removed.
+- `findings show` lists every linked entry in `history_ids`; in the `findings` table (`query`),
+  `history_id` is the first and `last_history_id` the last.
 - `findings list`, `report` and `findings compare` show them with `source: manual`; `--source
   manual` picks only them. `findings compare --scan` leaves them out (no scan looks for them, so
   a scan never "fixes" them and its gate doesn't count them), while a file baseline and the plain

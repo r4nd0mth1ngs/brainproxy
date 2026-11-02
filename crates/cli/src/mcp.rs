@@ -213,7 +213,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings compare", READ),
     ("findings show", READ),
     ("findings mark", SET),
-    ("findings add", ADD),
+    // A description or solution replaces the one every finding of that title shares.
+    ("findings add", REPLACE),
     ("findings remove", REPLACE),
     // --output writes a file (refused if it exists unless --force).
     ("report", REPLACE),

@@ -125,7 +125,8 @@ pub enum FindingsCmd {
         description and solution: a new one replaces the type's, leaving it out keeps it. The same title, method, \
         URL without its query, and parameter as an existing finding is refused (kind conflict). Without \
         --url, the URL and method are the first --history-id entry's. The first linked entry is the report's \
-        evidence. Through MCP, the *-file flags only take '-' (the call's stdin).")]
+        evidence. Through MCP, the *-file flags only take '-' (the call's stdin). Text on the command line is \
+        visible in the process list; --input-json keeps evidence and write-ups off it.")]
     Add(Box<AddArgs>),
     /// Remove findings added by hand (`findings add`); scanner findings can only be marked.
     Remove {
@@ -175,6 +176,24 @@ pub struct AddArgs {
     /// Read the evidence from FILE ('-' reads stdin).
     #[arg(long, value_name = "FILE")]
     evidence_file: Option<String>,
+    /// Read JSON from stdin: {"description": "...", "solution": "...", "evidence": "..."}. Each is
+    /// optional; use it instead of the text flags above.
+    #[arg(long, conflicts_with_all = [
+        "description", "description_file", "solution", "solution_file", "evidence", "evidence_file",
+    ])]
+    input_json: bool,
+}
+
+/// What `--input-json` reads from stdin.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextInput {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    solution: String,
+    #[serde(default)]
+    evidence: String,
 }
 
 impl AddArgs {
@@ -189,6 +208,16 @@ impl AddArgs {
                 "only one of --description-file, --solution-file and --evidence-file can read stdin".into(),
             ));
         }
+        let texts = if self.input_json {
+            serde_json::from_slice(&crate::read_input(None)?)
+                .map_err(|e| Error::InvalidInput(format!("--input-json: {e}")))?
+        } else {
+            TextInput {
+                description: text_arg("--description-file", self.description, self.description_file)?,
+                solution: text_arg("--solution-file", self.solution, self.solution_file)?,
+                evidence: text_arg("--evidence-file", self.evidence, self.evidence_file)?,
+            }
+        };
         Ok(ManualFinding {
             title: self.title,
             risk: self.risk.get(),
@@ -196,9 +225,9 @@ impl AddArgs {
             url: self.url,
             method: self.method,
             param: self.param,
-            evidence: text_arg("--evidence-file", self.evidence, self.evidence_file)?,
-            description: text_arg("--description-file", self.description, self.description_file)?,
-            solution: text_arg("--solution-file", self.solution, self.solution_file)?,
+            evidence: texts.evidence,
+            description: texts.description,
+            solution: texts.solution,
             cwe: self.cwe,
             history: self.history,
         })
@@ -459,10 +488,19 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             out.ok(json!({"id": id, "state": state, "note": note}), || format!("updated finding {id}"));
         }
         FindingsCmd::Add(args) => {
-            let id = store.finding_add(&args.finding()?)?;
+            let f = args.finding()?;
+            let replaced = store.manual_texts_replaced(&f)?;
+            let id = store.finding_add(&f)?;
             let finding = store.finding_get(id)?;
             let url = finding["url"].as_str().unwrap_or_default();
-            let warnings: Vec<String> = outside_scope(&store, url).into_iter().collect();
+            let mut warnings: Vec<String> = outside_scope(&store, url).into_iter().collect();
+            if !replaced.is_empty() {
+                warnings.push(format!(
+                    "replaced the {} that every finding titled {:?} shares",
+                    replaced.join(" and "),
+                    f.title.trim()
+                ));
+            }
             let text = format!("added finding {id} ({})", finding["alert_ref"].as_str().unwrap_or_default());
             out.ok(json!({"id": id, "finding": finding, "warnings": warnings}), || {
                 warnings.iter().map(|w| format!("warning: {w}\n")).collect::<String>() + &text

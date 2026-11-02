@@ -1011,6 +1011,23 @@ fn findings_add_reads_texts_from_files_and_stdin() {
     // None of these was stored.
     let (_, v) = run(&["findings", "list", "--source", "manual", "--all"], &project, None);
     assert_eq!(v["data"]["items"].as_array().unwrap().len(), 1, "{v}");
+    // --input-json takes the texts from stdin as JSON, and not with a text flag too.
+    let (code, v) = run(
+        &args(&with(&["--param", "g", "--input-json"])),
+        &project,
+        Some(br#"{"solution": "Check the owner, always.", "evidence": "token=abc"}"#),
+    );
+    assert_eq!(code, 0, "{v}");
+    let f = &v["data"]["finding"];
+    assert_eq!((f["evidence"].as_str(), f["solution"].as_str()), (Some("token=abc"), Some("Check the owner, always.")));
+    let w = v["data"]["warnings"].as_array().unwrap();
+    assert!(w.len() == 1 && w[0].as_str().unwrap().contains("replaced the solution"), "{v}");
+    let (code, kind, _) = fail(&["--param", "h", "--input-json", "--evidence", "x"], Some(b"{}"));
+    assert_eq!((code, kind.as_str()), (2, "usage"));
+    let (code, _, msg) = fail(&["--param", "h", "--input-json"], Some(br#"{"notes": "x"}"#));
+    assert!(code == 2 && msg.contains("--input-json"), "{msg}");
+    let (_, v) = run(&["findings", "remove", &v["data"]["id"].to_string()], &project, None);
+    assert_eq!(v["data"]["removed"], 1, "{v}");
     // Removing one that isn't there removes nothing.
     let (code, v) = run(&["findings", "remove", &id, "99"], &project, None);
     assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
