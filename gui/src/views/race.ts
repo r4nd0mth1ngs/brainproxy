@@ -1,6 +1,8 @@
 // Replay's Race: `send --race N` with the tab's request, and its results. No DOM, so it can be
 // tested on its own (race.test.ts).
 
+import { autoEncodeRequest } from "../ui/urlencode.ts";
+
 /** One request of a race, as `send --race` returns it: a response, or why it failed. */
 export type RaceItem =
   | { id: number | null; status: number | null; length: number | null; duration_ms: number }
@@ -22,10 +24,23 @@ export const RACE_MIN = 2;
 export const RACE_MAX = 1000;
 export const RACE_MAX_HTTP2 = 100;
 
-/** Whether the request line says HTTP/2, which makes `send` (and so the race) use HTTP/2. */
+/**
+ * Whether the request line says HTTP/2, which makes `send` (and so the race) use HTTP/2. Reads
+ * the line as the CLI does: the version is everything after the second space, and only exactly
+ * "HTTP/2" (any case) counts, so "GET  / HTTP/2" or a trailing space means HTTP/1.1.
+ */
 export function isHttp2Request(raw: string): boolean {
-  const line = raw.split("\n", 1)[0].trim();
-  return /\sHTTP\/2$/i.test(line);
+  const line = raw.split("\n", 1)[0].replace(/\r$/, "");
+  const a = line.indexOf(" ");
+  if (a <= 0) return false; // no method: the CLI refuses the request
+  const b = line.indexOf(" ", a + 1);
+  return b >= 0 && /^HTTP\/2$/i.test(line.slice(b + 1));
+}
+
+/** The request line as Replay will send it: auto URL-encoding can move where the version starts. */
+export function sentRequestLine(raw: string, autoEncode: boolean): string {
+  const line = raw.split("\n", 1)[0].replace(/\r$/, "");
+  return autoEncode ? autoEncodeRequest(line).text : line;
 }
 
 export function raceMax(raw: string): number {
@@ -121,4 +136,18 @@ export function syncNote(r: RaceResult): string | null {
 /** The row to open first: the first request with a recorded response. */
 export function firstOpenable(rows: RaceRow[]): number | null {
   return rows.find((x) => x.id != null)?.idx ?? null;
+}
+
+/** What Replay keeps per race: its results and the response open in the response pane. */
+export interface Raced {
+  result: RaceResult;
+  open: number | null;
+}
+
+/**
+ * Applies `patch` to the entry holding this race, but only while response `idx` is still the one
+ * open in it: a response that comes back after the user opened another one is dropped.
+ */
+export function patchOpen<T extends { race?: Raced }>(list: T[], result: RaceResult, idx: number, patch: Partial<T>): T[] {
+  return list.map((e) => (e.race?.result === result && e.race.open === idx ? { ...e, ...patch } : e));
 }

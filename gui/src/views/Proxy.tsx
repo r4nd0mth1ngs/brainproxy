@@ -76,7 +76,7 @@ const COLUMNS: Column<HistoryItem>[] = [
   },
 ];
 
-const SOURCES = ["proxy", "send", "crawl", "crawl-browser", "fuzz", "scan", "import", "auth", "ws"];
+const SOURCES = ["proxy", "send", "crawl", "crawl-browser", "fuzz", "scan", "import", "auth", "race", "ws"];
 
 function History() {
   const app = useApp();

@@ -4,11 +4,13 @@ import {
   firstOpenable,
   isHttp2Request,
   parseRaceCount,
+  patchOpen,
   plannedTechnique,
   raceArgs,
   raceMax,
   raceRows,
   raceSummary,
+  sentRequestLine,
   syncNote,
   techniqueLabel,
   type RaceResult,
@@ -202,4 +204,44 @@ test("a single-packet race that synced all, or reported nothing, has no note", (
   assert.equal(syncNote(result([ok, ok], "single-packet", null)), null);
   assert.equal(syncNote(result([ok, ok], "single-packet", 3)), null);
   assert.equal(syncNote(result([ok, ok], "single-packet", 0)), "0 of 2 final frames went in the single packet; the rest were sent separately");
+});
+
+test("only a version of exactly HTTP/2 after the second space means HTTP/2, as in the CLI", () => {
+  // The CLI splits the request line on the first two spaces; anything else races last-byte.
+  for (const line of ["GET / HTTP/2 ", "GET /\tHTTP/2", "GET  / HTTP/2", "GET HTTP/2", " GET / HTTP/2", "GET /a b HTTP/2"]) {
+    const raw = line + "\nHost: a\n\n";
+    assert.equal(isHttp2Request(raw), false, JSON.stringify(line));
+    assert.equal(raceMax(raw), 1000, JSON.stringify(line));
+  }
+  assert.equal(isHttp2Request("GET / HTTP/2\r\nHost: a\r\n\r\n"), true);
+  assert.equal(isHttp2Request("GET /a?b=c HTTP/2\n"), true);
+});
+
+test("the HTTP/2 check reads the request line as it will be sent", () => {
+  // Auto URL-encoding turns the space in the path into %20, which leaves HTTP/2 as the version.
+  const raw = "GET /a b HTTP/2\nHost: a\n\n";
+  assert.equal(sentRequestLine(raw, false), "GET /a b HTTP/2");
+  assert.equal(isHttp2Request(sentRequestLine(raw, false)), false);
+  assert.equal(sentRequestLine(raw, true), "GET /a%20b HTTP/2");
+  assert.equal(raceMax(sentRequestLine(raw, true)), 100);
+  // A trailing space is encoded as part of the path, so there is no version at all.
+  assert.equal(isHttp2Request(sentRequestLine("GET / HTTP/2 \r\n\r\n", true)), false);
+  assert.equal(sentRequestLine("GET / HTTP/2\r\nHost: a", true), "GET / HTTP/2");
+});
+
+test("a raced response only lands if its row is still open", () => {
+  const a = result([{ id: 1, status: 200, length: 1, duration_ms: 1 }]);
+  const b = result([{ id: 2, status: 200, length: 1, duration_ms: 1 }]);
+  type E = { name: string; race?: { result: RaceResult; open: number | null } };
+  const list: E[] = [{ name: "send" }, { name: "a", race: { result: a, open: 0 } }, { name: "b", race: { result: b, open: 1 } }];
+  // Race A's row 0 is still open: its response fills A's entry, whatever B is doing.
+  assert.deepEqual(
+    patchOpen(list, a, 0, { name: "a filled" }).map((e) => e.name),
+    ["send", "a filled", "b"],
+  );
+  // The user opened row 1 of race B since: a late response for row 0 is dropped.
+  assert.deepEqual(
+    patchOpen(list, b, 0, { name: "b filled" }).map((e) => e.name),
+    ["send", "a", "b"],
+  );
 });

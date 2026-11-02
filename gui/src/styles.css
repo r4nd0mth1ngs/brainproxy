@@ -1660,7 +1660,7 @@ select {
   align-items: center;
   gap: 4px;
 }
-.tr.race-differs {
+.tr.race-differs:not(.selected) {
   background: var(--hl);
 }
 .race-differs-tag {

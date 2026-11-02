@@ -279,7 +279,8 @@ Edit a raw request and send it as often as you like, in separate tabs.
   copies). The toolbar shows which was used, the spread between the fastest and slowest
   response, and how many responses differ from the first. Each response is listed with its
   status, length and time; ones whose status or length differ from the first are highlighted.
-  Select one to open it. Every copy is recorded in Traffic. The same as
+  Select one to open it. Every copy is recorded in Traffic (source `race`). You can switch
+  tabs while a race runs; its results show up in its tab when it ends. The same as
   `brainproxy send req.http --race 20` (add `--http2` for the single-packet attack).
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then

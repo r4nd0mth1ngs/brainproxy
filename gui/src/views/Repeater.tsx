@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { bodyText, isBinary, MAX_BODY, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -8,17 +8,22 @@ import { autoEncodeRequest } from "../ui/urlencode";
 import {
   firstOpenable,
   parseRaceCount,
+  patchOpen,
   plannedTechnique,
+  RACE_MAX_HTTP2,
   RACE_MIN,
   raceArgs,
   raceMax,
   raceRows,
   raceSummary,
+  sentRequestLine,
   syncNote,
   techniqueLabel,
+  type Raced,
   type RaceResult,
   type RaceRow,
 } from "./race";
+import { tabStore } from "./replayTabs";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
@@ -32,7 +37,7 @@ interface Sent {
   result: SendResult | null;
   error: string | null;
   /** A race (`send --race`): its results and the one open in the response pane. */
-  race?: { result: RaceResult; open: number | null };
+  race?: Raced;
 }
 
 const BLANK = "GET / HTTP/1.1\nHost: \nUser-Agent: brainproxy\nAccept: */*\n\n";
@@ -128,16 +133,23 @@ function storedAutoEncode(): boolean {
   }
 }
 
-// Send history survives switching tabs (the tab view remounts), keyed by tab.
-const sentByTab = new Map<number, { list: Sent[]; at: number }>();
+// Send history, and whether a send or race is running, survive switching tabs (the tab view
+// remounts), keyed by tab. A race can run for a while: its result lands here even if the user
+// switched away, and coming back shows it still running.
+interface TabState {
+  list: Sent[];
+  at: number;
+  busy: false | "send" | "race";
+}
+const replayTabs = tabStore<TabState>({ list: [], at: -1, busy: false });
 
 function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const app = useApp();
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
-  const [busy, setBusy] = useState<false | "send" | "race">(false);
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
-  const [sent, setSent] = useState(() => sentByTab.get(tab.key) ?? { list: [], at: -1 });
+  const [sent, setSent] = useState(() => replayTabs.get(tab.key));
+  const { busy } = sent;
   const [raceCount, setRaceCount] = useState(() => {
     try {
       return localStorage.getItem(RACE_COUNT) || "20";
@@ -146,10 +158,12 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     }
   });
   const current = sent.list[sent.at];
+  const update = (f: (s: TabState) => TabState) => replayTabs.update(tab.key, f);
 
   useEffect(() => {
-    sentByTab.set(tab.key, sent);
-  }, [tab.key, sent]);
+    setSent(replayTabs.get(tab.key));
+    return replayTabs.listen(tab.key, setSent);
+  }, [tab.key]);
 
   // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
   // tabs return the same array, so React skips the update; a new array every time changed
@@ -172,7 +186,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const to = withScheme(guessTarget(raw, target));
     if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
     setTarget(to);
-    setBusy("send");
+    update((s) => ({ ...s, busy: "send" }));
     const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
     let entry: Sent;
     try {
@@ -181,13 +195,14 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     } catch (e: any) {
       entry = { raw, sent, encoded, result: null, error: e.message };
     }
-    setBusy(false);
-    setSent((s) => ({ list: [...s.list, entry], at: s.list.length }));
+    update((s) => ({ list: [...s.list, entry], at: s.list.length, busy: false }));
   };
 
   const race = async () => {
-    const n = parseRaceCount(raceCount, raw);
-    if (n == null) return app.toast(`Race takes ${RACE_MIN} to ${raceMax(raw)} requests (${plannedTechnique(raw)})`, "error");
+    // The limit depends on the request line as sent (HTTP/2 or not), after auto URL-encoding.
+    const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+    const n = parseRaceCount(raceCount, sent);
+    if (n == null) return app.toast(`Race takes ${RACE_MIN} to ${raceMax(sent)} requests (${plannedTechnique(sent)})`, "error");
     const to = withScheme(guessTarget(raw, target));
     if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
     setTarget(to);
@@ -196,8 +211,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     } catch {
       /* storage unavailable */
     }
-    setBusy("race");
-    const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+    update((s) => ({ ...s, busy: "race" }));
     let entry: Sent;
     try {
       const result = await run<RaceResult>(raceArgs(to, n), textBytes(sent, tab.binary));
@@ -205,36 +219,33 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     } catch (e: any) {
       entry = { raw, sent, encoded, result: null, error: e.message };
     }
-    setBusy(false);
-    setSent((s) => ({ list: [...s.list, entry], at: s.list.length }));
+    update((s) => ({ list: [...s.list, entry], at: s.list.length, busy: false }));
     if (entry.race) {
       const first = firstOpenable(raceRows(entry.race.result));
       if (first != null) openRaced(first, entry.race.result);
     }
   };
 
-  // Opens one raced response in the response pane (`history show`). Only the latest click counts.
-  const opening = useRef(0);
+  // Opens one raced response in the response pane (`history show`). The race's entry is found by
+  // its result (the list may have grown since), and the response only lands if that row is
+  // still the one open in it.
   const openRaced = async (idx: number, result: RaceResult) => {
-    const ticket = ++opening.current;
-    // The race's entry in the send list, found by its result (the list may have grown since).
-    const setEntry = (patch: Partial<Sent>) =>
-      setSent((s) => ({ ...s, list: s.list.map((e) => (e.race?.result === result ? { ...e, ...patch } : e)) }));
     const item = raceRows(result)[idx];
-    setEntry({ race: { result, open: idx }, result: null, error: item.error });
+    update((s) => ({ ...s, list: s.list.map((e) => (e.race?.result === result ? { ...e, race: { result, open: idx }, result: null, error: item.error } : e)) }));
     if (item.id == null) return;
+    const patch = (p: Partial<Sent>) => update((s) => ({ ...s, list: patchOpen(s.list, result, idx, p) }));
     try {
       const entry = await run<HistoryEntry>(["history", "show", String(item.id), MAX_BODY]);
-      if (ticket === opening.current) setEntry({ result: entry, error: null });
+      patch({ result: entry, error: null });
     } catch (e: any) {
-      if (ticket === opening.current) setEntry({ error: e.message });
+      patch({ error: e.message });
     }
   };
 
   const go = (d: number) => {
     const at = sent.at + d;
     if (at < 0 || at >= sent.list.length) return;
-    setSent({ ...sent, at });
+    update((s) => ({ ...s, at }));
     setRaw(sent.list[at].raw);
   };
 
@@ -253,6 +264,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
 
   const r = current?.result;
   const raced = current?.race;
+  const line = sentRequestLine(raw, autoEncode);
   const rows = raced ? raceRows(raced.result) : [];
   const summary = raced ? raceSummary(raced.result) : null;
   const note = raced ? syncNote(raced.result) : null;
@@ -277,12 +289,12 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         <button className="btn primary" disabled={!!busy} onClick={send} title="Send (⌘/Ctrl+Enter)">
           {busy === "send" ? "Sending…" : "Send"}
         </button>
-        <div className="race-ctl" title={`Send the request ${raceCount || "N"} times at once to look for race conditions: ${plannedTechnique(raw)}. A request line ending in HTTP/2 uses the single-packet attack (up to ${raceMax(raw)}).`}>
+        <div className="race-ctl" title={`Send the request ${raceCount || "N"} times at once to look for race conditions: ${plannedTechnique(line)}. A request line ending in HTTP/2 uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}>
           <button className="btn" disabled={!!busy} onClick={race}>
             {busy === "race" ? "Racing…" : "Race"}
           </button>
           <span className="label">×</span>
-          <input className="input mono" type="number" min={RACE_MIN} max={raceMax(raw)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+          <input className="input mono" type="number" min={RACE_MIN} max={raceMax(line)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
         </div>
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
