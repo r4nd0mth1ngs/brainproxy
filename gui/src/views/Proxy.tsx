@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bodyText, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
-import { confirm } from "../ui/Confirm";
+import { ask, confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
@@ -234,7 +234,7 @@ function History() {
     if (!storeSaved(app.project, list)) app.toast("Saved filters can't be stored here; they last until the app closes.", "error");
   };
   const saveFilter = async () => {
-    const name = window.prompt("Save the current filter as:", applied ?? "")?.trim();
+    const name = (await ask("Save the current filter", "Name it to apply it again later.", "Save", "Cancel", applied ?? ""))?.trim();
     if (!name) return;
     if (name !== applied && saved.some((s) => s.name === name) && !(await confirm(`Replace the filter ${name}?`, "A saved filter already has that name.", "Replace", "Cancel"))) return;
     keepSaved(withSaved(saved, name, filter));

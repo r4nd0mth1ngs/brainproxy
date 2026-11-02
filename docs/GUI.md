@@ -86,7 +86,8 @@ CLI has no command for it, so a project a script or agent starts always keeps it
   Save as…), and the sidebar and Settings › Project have *Save as…*: `project save --output
   FILE` (refused inside a temp folder, `temp_is_inside`), then discard, then open FILE.
 - **Discarding:** Switch project or closing the window asks first (an in-app dialog,
-  `ui/Confirm.tsx`, since native ones differ per OS). `temp_discard` then runs `project stop`
+  `ui/Confirm.tsx`, since native ones differ per OS; its `ask` takes typed answers such as a
+  saved filter's name, because the macOS webview has no `window.prompt`). `temp_discard` then runs `project stop`
   (proxy, OOB listener, jobs and fuzz runs; it deletes nothing) and, once everything has
   stopped, deletes the folder. If something won't stop, the folder is kept.
 - **Leftovers:** the OS releases `owner.lock` when the app exits or crashes, so a folder
