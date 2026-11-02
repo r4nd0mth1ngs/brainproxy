@@ -1,5 +1,6 @@
-// The API guided scan's pure logic: what `import api --dry-run` returns, the arguments the flow
-// builds, default selections, summaries and problem checks. No DOM, so bun and node can test it.
+// The API guided scan's pure logic, shared with Import API (the same steps, recording the
+// operations instead of scanning them): what `import api --dry-run` returns, the arguments the
+// flow builds, default selections, summaries and problem checks. No DOM, so bun and node can test it.
 // Secrets never pass through an args builder: an API key goes by `keyEnv`, off the command line.
 
 import { depthArgs, type Depth } from "./wizardDepths.ts";
@@ -638,7 +639,7 @@ export function authProblems(a: AuthState): string[] {
   if (a.signing && !a.signer) out.push('Choose or set up a signer, or untick "Every request must be signed".');
   const profile = authProfile(a);
   if (a.signing && a.signer && profile && a.signer.profile !== profile)
-    out.push(`The signer is in profile "${a.signer.profile}", but "${profile}" is selected. A scan uses one profile, so choose that one or set up a new signer.`);
+    out.push(`The signer is in profile "${a.signer.profile}", but "${profile}" is selected. A scan or an import uses one profile, so choose that one or set up a new signer.`);
   return out;
 }
 
@@ -689,16 +690,21 @@ export interface SignerCoverage {
   checkCovered: boolean;
 }
 
-/** Whether a signer's rules make a scan of these URLs sign its requests. */
-export function signerCoverage(rules: SessionRule[], signer: { name: string; origins: string[] }, urls: string[]): SignerCoverage {
+/**
+ * Whether a signer's rules make a run on these URLs sign its requests: a scan (the scan tool's
+ * rules), or an import, which `import api` sends as the crawl tool, like the check.
+ */
+export function signerCoverage(rules: SessionRule[], signer: { name: string; origins: string[] }, urls: string[], tool: "scan" | "crawl" = "scan"): SignerCoverage {
   const uses = rules.filter((r) => r.actions.some((a) => a.action === "sign" && a.signer === signer.name));
-  const forTool = (tool: string) => uses.filter((r) => !r.tools?.length || (r.tools as string[]).includes(tool));
+  const forTool = (t: string) => uses.filter((r) => !r.tools?.length || (r.tools as string[]).includes(t));
   const reach = (r: SessionRule, u: string) => !r.url || urlPatternMatches(r.url, u);
   const checkCovered = forTool("crawl").length > 0;
-  if (!uses.length) return { state: "no_rule", checkCovered, message: `No session rule uses "${signer.name}", so a scan would send unsigned requests.` };
-  const scan = forTool("scan");
-  if (!scan.length) return { state: "tool_limited", checkCovered, message: `The session rule for "${signer.name}" is limited to other tools, so a scan would send unsigned requests.` };
-  if (!urls.every((u) => scan.some((r) => reach(r, u)))) return { state: "url_limited", checkCovered, message: `The session rule for "${signer.name}" doesn't cover every address being scanned, so some requests would go unsigned.` };
+  const who = tool === "scan" ? "a scan" : "the import";
+  if (!uses.length) return { state: "no_rule", checkCovered, message: `No session rule uses "${signer.name}", so ${who} would send unsigned requests.` };
+  const run = forTool(tool);
+  if (!run.length) return { state: "tool_limited", checkCovered, message: `The session rule for "${signer.name}" is limited to other tools, so ${who} would send unsigned requests.` };
+  if (!urls.every((u) => run.some((r) => reach(r, u))))
+    return { state: "url_limited", checkCovered, message: `The session rule for "${signer.name}" doesn't cover every address being ${tool === "scan" ? "scanned" : "sent"}, so some requests would go unsigned.` };
   const outside = operationOrigins(urls.map((url) => ({ url }))).filter((o) => !signer.origins.includes(o));
   if (outside.length) return { state: "origin_limited", checkCovered, message: `"${signer.name}" may only sign for ${signer.origins.join(", ")}, so requests to ${outside.join(", ")} would go unsigned. Change its origins in Settings → Auth profiles.` };
   return { state: "covered", checkCovered, message: "" };
@@ -829,24 +835,27 @@ export interface ScanPlan {
   speedArgs: string[];
 }
 
-/** `scan active --api`: in one job, baselines then the attacks, on exactly the ticked operations. */
-export function scanArgs(p: ScanPlan): string[] {
+/** What a scan and an import both need: the previewed document, the server, the ticked operations, the profile. */
+export type RunPlan = Omit<ScanPlan, "depth" | "speedArgs">;
+
+/** The arguments both commands take for a plan, pinned to the document previewed. */
+function planArgs(p: RunPlan): string[] {
   const include = includeMethods(p.operations, p.selected);
   return [
-    "scan",
-    "active",
-    `--api=${p.source.trim()}`,
     `--expect-sha256=${p.sha256}`,
     ...pinEnvironment(p.environmentSha),
     ...targetArgs(p.target),
     `--only=${[...p.selected].sort((a, b) => a - b).join(",")}`,
     ...(include.length ? [`--include-methods=${include.join(",")}`] : []),
     ...(p.profile ? [`--auth=${p.profile}`] : []),
-    ...depthArgs(p.depth),
-    ...p.speedArgs,
-    "--background",
   ];
 }
+
+/** `scan active --api`: in one job, baselines then the attacks, on exactly the ticked operations. */
+export const scanArgs = (p: ScanPlan): string[] => ["scan", "active", `--api=${p.source.trim()}`, ...planArgs(p), ...depthArgs(p.depth), ...p.speedArgs, "--background"];
+
+/** `import api`: sends each ticked operation once, in scope, and records it in history. Nothing is attacked. */
+export const importArgs = (p: RunPlan): string[] => ["import", "api", ...planArgs(p), "--background", "--", p.source.trim()];
 
 /** Whether a job is a `scan active --api` run. Its args survive a reload; this flow's state doesn't. */
 export const isApiJob = (args: string[] | null | undefined): boolean => !!args?.some((a) => a === "--api" || a.startsWith("--api="));
@@ -862,7 +871,13 @@ export interface ImportSummary {
   skipped_out_of_scope?: number;
   out_of_scope_hosts?: string[];
   skipped?: { operation: string; reason: string }[];
+  /** An import job: what the passive checks raised on the responses. */
+  new_findings?: number;
+  stopped?: boolean;
 }
+
+/** "1 operation", "2 operations". */
+const count = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 /** What a finished API scan should say besides its findings: a clean result behind 401s isn't clean. */
 export function apiResultNotes(r: ImportSummary | null | undefined): string[] {
@@ -870,7 +885,7 @@ export function apiResultNotes(r: ImportSummary | null | undefined): string[] {
   const out: string[] = [];
   const by = r.by_status ?? {};
   const rejected = (by["401"] ?? 0) + (by["403"] ?? 0);
-  const n = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
+  const n = count;
   if (rejected)
     out.push(`${n(rejected, "operation was", "operations were")} rejected (401 or 403) of ${r.sent ?? rejected} sent. They were scanned anyway, but what's behind authentication was not reached, so check the authentication.`);
   if (r.errors) out.push(`${n(r.errors, "operation")} got no response and couldn't be scanned.`);
@@ -878,4 +893,26 @@ export function apiResultNotes(r: ImportSummary | null | undefined): string[] {
     out.push(`${n(r.skipped_out_of_scope, "operation")} outside the project's scope ${r.skipped_out_of_scope === 1 ? "was" : "were"} skipped${r.out_of_scope_hosts?.length ? ` (${r.out_of_scope_hosts.join(", ")})` : ""}.`);
   if (r.skipped?.length) out.push(`${n(r.skipped.length, "operation")} in the definition couldn't be built.`);
   return out;
+}
+
+/** An import's progress. The job reports it every 25 requests. */
+export const importProgressText = (pr: { sent?: number; total?: number }): string =>
+  pr.total ? `Sending each operation once and recording it: ${pr.sent ?? 0} of ${pr.total} sent.` : "Sending each operation once and recording it.";
+
+/** What a finished import says: how many requests are in history, and what to look at before using them. */
+export function importResultText(r: ImportSummary | null | undefined): { headline: string; notes: string[] } {
+  const sent = r?.sent ?? 0;
+  const headline = sent ? `${count(sent, "request")} recorded in history.` : "Nothing was recorded.";
+  if (!r) return { headline, notes: [] };
+  const notes: string[] = [];
+  const by = r.by_status ?? {};
+  const rejected = (by["401"] ?? 0) + (by["403"] ?? 0);
+  if (r.stopped) notes.push("Stopped before every operation was sent.");
+  if (rejected) notes.push(`${count(rejected, "operation was", "operations were")} rejected (401 or 403). The responses are recorded too, but check the authentication before working on them.`);
+  if (r.errors) notes.push(`${count(r.errors, "operation")} got no response, and ${r.errors === 1 ? "is" : "are"} recorded with the error.`);
+  if (r.skipped_out_of_scope)
+    notes.push(`${count(r.skipped_out_of_scope, "operation")} outside the project's scope ${r.skipped_out_of_scope === 1 ? "was" : "were"} not sent${r.out_of_scope_hosts?.length ? ` (${r.out_of_scope_hosts.join(", ")})` : ""}.`);
+  if (r.skipped?.length) notes.push(`${count(r.skipped.length, "operation")} in the definition couldn't be built.`);
+  if (r.new_findings) notes.push(`The passive checks found ${count(r.new_findings, "issue")} in the responses. See Findings.`);
+  return { headline, notes };
 }

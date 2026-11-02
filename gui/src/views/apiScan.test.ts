@@ -33,6 +33,9 @@ import {
   hostLabel,
   likelyInScope,
   hostScopeText,
+  importArgs,
+  importProgressText,
+  importResultText,
   includeMethods,
   isApiJob,
   keyAddArgs,
@@ -134,6 +137,7 @@ test("a secret never goes in any argument", () => {
   assert.ok(!checkArgs("/s", SHA, t, 0, "p").join(" ").includes(secret));
   const plan = { source: "/s", sha256: SHA, target: t, operations: OPS, selected: [2], profile: "p", depth: "quick" as const, speedArgs: [] };
   assert.ok(!scanArgs(plan).join(" ").includes(secret));
+  assert.ok(!importArgs(plan).join(" ").includes(secret));
 
   for (const a of [{ ...EMPTY_AUTH, keyName: "X-Api-Key", profileName: "k" }, { ...EMPTY_AUTH, keyKind: "bearer" as const, profileName: "k" }, { ...EMPTY_AUTH, place: "query" as const, keyName: "api_key", profileName: "k" }]) {
     const args = keyAddArgs(a, ["https://api.test"]);
@@ -277,6 +281,58 @@ test("the scan's arguments", () => {
   assert.ok(!isApiJob(null) && !isApiJob(undefined));
 });
 
+test("the import's arguments: the scan's selection, pinned the same way, and no attack options", () => {
+  const plan = { source: " /s.yaml ", sha256: SHA, target: { ...EMPTY_TARGET, server: 0 }, operations: OPS, selected: [5, 0, 2], profile: "" };
+  assert.deepEqual(importArgs(plan), ["import", "api", `--expect-sha256=${SHA}`, "--server=0", "--only=0,2,5", "--background", "--", "/s.yaml"]);
+  // Destructive methods only when ticked, which needs the opt-in, exactly as for the scan.
+  const risky = importArgs({ ...plan, selected: [1, 3, 6], profile: "p", environmentSha: "e".repeat(64), target: { ...EMPTY_TARGET, server: 0, environment: "/e.json" } });
+  assert.deepEqual(risky, [
+    "import",
+    "api",
+    `--expect-sha256=${SHA}`,
+    `--expect-environment-sha256=${"e".repeat(64)}`,
+    "--server=0",
+    "--environment=/e.json",
+    "--only=1,3,6",
+    "--include-methods=PUT,PATCH,DELETE",
+    "--auth=p",
+    "--background",
+    "--",
+    "/s.yaml",
+  ]);
+  const scan = scanArgs({ ...plan, selected: [1, 3, 6], profile: "p", depth: "quick", speedArgs: [] });
+  assert.deepEqual(importArgs({ ...plan, selected: [1, 3, 6], profile: "p" }).slice(2, -3), scan.slice(3, -3), "the same selection as the scan");
+  assert.ok(!importArgs(plan).some((a) => a === "--include-destructive" || a.startsWith("--preset")));
+  // A file named like a flag stays a file, and the job isn't taken for an API scan.
+  assert.equal(importArgs({ ...plan, source: "-x.yaml" }).at(-2), "--");
+  assert.ok(!isApiJob(importArgs(plan)));
+});
+
+test("an import's progress and what it says when done", () => {
+  assert.equal(importProgressText({ sent: 25, total: 40 }), "Sending each operation once and recording it: 25 of 40 sent.");
+  assert.equal(importProgressText({}), "Sending each operation once and recording it.");
+  assert.deepEqual(importResultText(null), { headline: "Nothing was recorded.", notes: [] });
+  assert.deepEqual(importResultText({ sent: 1, by_status: { "200": 1 }, errors: 0, skipped_out_of_scope: 0, new_findings: 0 }), { headline: "1 request recorded in history.", notes: [] });
+  const r = importResultText({
+    sent: 6,
+    by_status: { "401": 2, "403": 1, "200": 2, error: 1 },
+    errors: 1,
+    skipped_out_of_scope: 1,
+    out_of_scope_hosts: ["o.test"],
+    skipped: [{ operation: "GET /x", reason: "r" }],
+    new_findings: 2,
+    stopped: true,
+  });
+  assert.equal(r.headline, "6 requests recorded in history.");
+  assert.match(r.notes[0], /Stopped before every operation was sent/);
+  assert.match(r.notes[1], /3 operations were rejected \(401 or 403\)/);
+  assert.match(r.notes[2], /1 operation got no response, and is recorded with the error/);
+  assert.match(r.notes[3], /1 operation outside the project's scope was not sent \(o\.test\)/);
+  assert.match(r.notes[4], /1 operation in the definition couldn't be built/);
+  assert.match(r.notes[5], /found 2 issues/);
+  assert.equal(r.notes.length, 6);
+});
+
 test("what the key form starts on", () => {
   const cred = (patch: Partial<ApiCredential>): ApiCredential => ({ kind: "api_key", in: "header", name: "X-K", source: "s", embedded: false, ...patch });
   assert.deepEqual(keyDefaults([]), { keyKind: "api_key", place: "header", keyName: "" });
@@ -325,7 +381,7 @@ test("which profile a scan runs with", () => {
   assert.match(authProblems({ ...EMPTY_AUTH, mode: "key" })[0], /Save the key/);
   assert.match(authProblems({ ...EMPTY_AUTH, mode: "profile" })[0], /Choose a profile/);
   assert.match(authProblems({ ...EMPTY_AUTH, signing: true })[0], /signer/);
-  assert.match(authProblems({ ...EMPTY_AUTH, mode: "key", savedProfile: "k", signing: true, signer })[0], /A scan uses one profile/);
+  assert.match(authProblems({ ...EMPTY_AUTH, mode: "key", savedProfile: "k", signing: true, signer })[0], /A scan or an import uses one profile/);
   assert.deepEqual(authProblems({ ...EMPTY_AUTH, mode: "key", savedProfile: "s", signing: true, signer }), []);
 
   assert.match(newSignerProblems({ ...EMPTY_AUTH, mode: "key" }, [])[0], /Save the key first/);
@@ -352,7 +408,15 @@ test("signer coverage", () => {
   const crawl = signerCoverage([rule({ tools: ["crawl"] })], signer, urls);
   assert.equal(crawl.state, "tool_limited");
   assert.ok(crawl.checkCovered);
-  assert.match(crawl.message, /unsigned/);
+  assert.match(crawl.message, /a scan would send unsigned/);
+
+  // An import sends as the crawl tool, as the check does: the other way round.
+  assert.deepEqual(signerCoverage([rule({ tools: ["crawl"] })], signer, urls, "crawl"), { state: "covered", checkCovered: true, message: "" });
+  const scanOnly = signerCoverage([rule({ tools: ["scan"] })], signer, urls, "crawl");
+  assert.equal(scanOnly.state, "tool_limited");
+  assert.match(scanOnly.message, /the import would send unsigned/);
+  assert.match(signerCoverage([], signer, urls, "crawl").message, /the import would send/);
+  assert.match(signerCoverage([rule({ url: "https://api.test/v2/" })], signer, urls, "crawl").message, /every address being sent/);
 
   assert.equal(signerCoverage([rule({ url: "https://api.test/v1/" })], signer, urls).state, "covered");
   assert.equal(signerCoverage([rule({ url: "https://api.test/v2/" })], signer, urls).state, "url_limited");

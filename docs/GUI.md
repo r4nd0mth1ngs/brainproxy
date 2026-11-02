@@ -112,7 +112,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Group | Tool | Parts | CLI used |
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
-| Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
+| Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), *Import API…* (an API definition's operations sent once each and recorded, below), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `import api` (`--dry-run`, then `--background`), `job status/stop`, `engagement *`, `scope *` |
 | Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
@@ -160,8 +160,21 @@ and written out, and a session rule), and the operations to send
 --auth P`, which may use a GraphQL query). It runs `scan active --api SOURCE --expect-sha256 ...
 [--expect-environment-sha256 ...] --only ... --background`.
 
+*Import API…* in the Site map toolbar is the same flow with `mode="import"`, for an API to work on
+by hand: the same definition, server, authentication and operations steps (destructive methods and
+GraphQL mutations opt-in in the same way), then a review in place of depth and speed. It runs
+`import api --expect-sha256 ... [--expect-environment-sha256 ...] --only ... [--include-methods ...]
+[--auth P] --background -- SOURCE`, which sends each ticked operation once, in scope, and records
+it as history source `import`; nothing is attacked. Its own progress card (`job status`, *Stop*)
+ends with how many requests were recorded, any rejected (401/403), unanswered or out-of-scope
+operations, what the passive checks found, and links to the Site map and Proxy › Traffic. The
+guided API scan's first step links to it too (`openApiImport` in `store.tsx`), with the definition
+typed so far. Since an import sends as the crawl tool, its signer check looks for a session rule
+that applies to crawls rather than scans.
+
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
-`sendToComparer` (right-click a history row, or buttons in Intercept and Findings).
+`sendToComparer` (right-click a history row, or buttons in Intercept and Findings), and
+`openApiImport`.
 
 ## Look
 

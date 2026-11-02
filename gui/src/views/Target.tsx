@@ -6,9 +6,15 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { ApiWizard } from "./ApiWizard";
 
 export function TargetView({ active }: { active: boolean }) {
+  const app = useApp();
   const [sub, setSub] = useState<"map" | "scope">("map");
+  // Import API opened from elsewhere shows in the map.
+  useEffect(() => {
+    if (app.apiImport) setSub("map");
+  }, [app.apiImport]);
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -161,6 +167,11 @@ function SiteMap({ active }: { active: boolean }) {
   const [selected, setSelected] = useState<number | null>(null);
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const { menu, open, close } = useMenu();
+  // Import API: an API definition's operations, sent once each and recorded, in place of the map while open.
+  const [importing, setImporting] = useState<{ source: string; key: number } | null>(null);
+  useEffect(() => {
+    if (app.apiImport) setImporting(app.apiImport);
+  }, [app.apiImport]);
 
   const tree = useMemo(() => buildTree(data?.rows ?? []), [data]);
 
@@ -296,34 +307,43 @@ function SiteMap({ active }: { active: boolean }) {
         <span className="muted">
           {tree.length} host{tree.length === 1 ? "" : "s"} · right-click a node to crawl or scan it
         </span>
+        <button className="btn small" disabled={!!importing} onClick={() => setImporting({ source: "", key: 0 })} title="Send an API definition's operations once each and record them, without scanning">
+          Import API…
+        </button>
       </div>
-      <Split id="sitemap" dir="row" initial={0.32}>
-        <div className="tree">
-          {tree.length === 0 && <div className="empty">No traffic yet. Crawl a target from Scans, or browse through the proxy.</div>}
-          {tree.map((n) => renderNode(n, 0))}
+      {importing ? (
+        <div className="st-import">
+          <ApiWizard key={importing.key} mode="import" initialSource={importing.source} onDismiss={() => setImporting(null)} />
         </div>
-        {node ? (
-          <Split id="sitemap-detail" dir="col" initial={0.4}>
-            <DataTable
-              rows={rows}
-              columns={COLUMNS}
-              rowKey={(r) => r.id}
-              selected={selected}
-              onSelect={(r) => setSelected(r.id)}
-              onActivate={(r) => toRepeater(r.id)}
-              onContextMenu={(r, e) => open(e, actions(r.url, r.id, ["--history-id", String(r.id)]))}
-              initialSort={{ key: "id", desc: true }}
-              empty="No requests under this node."
-            />
-            <Split id="sitemap-msg" dir="row">
-              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
-              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder={entry?.entry.error ?? ""} />
+      ) : (
+        <Split id="sitemap" dir="row" initial={0.32}>
+          <div className="tree">
+            {tree.length === 0 && <div className="empty">No traffic yet. Crawl a target from Scans, or browse through the proxy.</div>}
+            {tree.map((n) => renderNode(n, 0))}
+          </div>
+          {node ? (
+            <Split id="sitemap-detail" dir="col" initial={0.4}>
+              <DataTable
+                rows={rows}
+                columns={COLUMNS}
+                rowKey={(r) => r.id}
+                selected={selected}
+                onSelect={(r) => setSelected(r.id)}
+                onActivate={(r) => toRepeater(r.id)}
+                onContextMenu={(r, e) => open(e, actions(r.url, r.id, ["--history-id", String(r.id)]))}
+                initialSort={{ key: "id", desc: true }}
+                empty="No requests under this node."
+              />
+              <Split id="sitemap-msg" dir="row">
+                <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
+                <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder={entry?.entry.error ?? ""} />
+              </Split>
             </Split>
-          </Split>
-        ) : (
-          <div className="blank">Select a host or path to see its requests.</div>
-        )}
-      </Split>
+          ) : (
+            <div className="blank">Select a host or path to see its requests.</div>
+          )}
+        </Split>
+      )}
       <Menu menu={menu} close={close} />
     </div>
   );

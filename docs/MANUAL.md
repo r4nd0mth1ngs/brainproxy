@@ -228,6 +228,13 @@ The sidebar groups the tools by what you are doing.
   traffic too.
 - **Actions:** right-click a node or request to send it to Replay, crawl from there, run an
   active scan of that branch or request, or copy the URL.
+- **Import API…:** puts an API's operations in history without scanning them, to work on by
+  hand. It takes the same steps as the *Guided API scan* (definition, server, authentication,
+  operations; PUT, PATCH, DELETE and GraphQL mutations stay off unless you opt in), then sends
+  each ticked operation once, as written, in scope only (`import api`). It ends with how many
+  requests were recorded and links to the Site map and **Proxy › Traffic**, where they have the
+  source `import`; right-click one to send it to Replay. The guided API scan's first step links
+  here too.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
   the proxy scope.
 
@@ -307,7 +314,8 @@ attack type, and pick payloads:
   OpenAPI 3 or Swagger 2.0 file (JSON or YAML), a Postman collection, or a GraphQL schema (SDL file
   or introspection result), by file or URL; or a GraphQL endpoint, which is asked for its schema
   when you tick *GraphQL endpoint*. A URL is fetched when you preview it, in scope only; nothing
-  else is sent until you ask.
+  else is sent until you ask. To only record the operations, without scanning, use *Import it
+  without scanning* (the Site map's *Import API…*).
   - **Definition:** shows what was read, which operations were skipped and why, and warnings
     such as an external `$ref` that isn't followed. A Postman collection can take its
     **environment file**, which fills its variables; values the environment marks secret, or whose

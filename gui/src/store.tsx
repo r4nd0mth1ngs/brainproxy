@@ -70,6 +70,9 @@ interface State {
   /** The guided scan on the Overview, opened on request (it also shows by itself until a project has a scan). */
   wizardOpen: boolean;
   openWizard: (open: boolean) => void;
+  /** Import API, opened in the Site map from elsewhere (the guided API scan) with the definition typed there. */
+  apiImport: { source: string; key: number } | null;
+  openApiImport: (source: string) => void;
   /** The proxy the app started in this project (stopped when it closes); pass it to proxyPort.ts's helpers. */
   proxy: ProxyControl;
 }
@@ -100,6 +103,7 @@ export function AppProvider({
   const [comparer, setComparer] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [apiImport, setApiImport] = useState<State["apiImport"]>(null);
   const nextKey = useRef(1);
   // Mutated in place: the views read it when they act, nothing renders from it.
   const proxy = useRef(proxyControl()).current;
@@ -131,6 +135,11 @@ export function AppProvider({
     if (open) setTab("dashboard");
   }, []);
 
+  const openApiImport = useCallback((source: string) => {
+    setApiImport({ source, key: nextKey.current++ });
+    setTab("target");
+  }, []);
+
   const sendToComparer = useCallback(
     (text: string) => {
       setComparer((items) => [...items, text].slice(-12));
@@ -160,9 +169,11 @@ export function AppProvider({
       toast,
       wizardOpen,
       openWizard,
+      apiImport,
+      openApiImport,
       proxy,
     }),
-    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
+    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, apiImport, openApiImport, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
