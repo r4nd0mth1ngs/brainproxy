@@ -48,15 +48,42 @@ export interface ApiOperation {
   headers: string[];
   body?: { encoding: "utf8" | "base64"; content: string; length?: number; truncated?: boolean } | null;
   state_changing: boolean;
+  /** What opting in calls it, when its method doesn't say: a GraphQL MUTATION. */
+  opt_in?: string;
   in_scope: boolean;
   scope_confirmed: boolean;
   included: boolean;
   excluded_reason: "method" | "scope" | "not_selected" | null;
 }
 
+export interface ApiScript {
+  sha256: string;
+  scopes: string[];
+  requests: number;
+  lines: number;
+  signs: boolean;
+  unsupported: string[];
+  text?: string;
+}
+
+export interface ApiOAuthHint {
+  source: string;
+  flow: OAuthFlow | null;
+  token_url: string | null;
+  authorize_url: string | null;
+  scopes: string[];
+  openid_url: string | null;
+}
+
+export interface ApiAwsHint {
+  source: string;
+  region: string | null;
+  service: string | null;
+}
+
 export interface ApiPreview {
   kind: "api";
-  format: "openapi3" | "swagger2" | "postman";
+  format: "openapi3" | "swagger2" | "postman" | "graphql";
   title: string | null;
   version: string | null;
   document_sha256: string;
@@ -65,6 +92,10 @@ export interface ApiPreview {
   variables: ApiVariable[];
   unresolved_variables: string[];
   credentials: ApiCredential[];
+  environment?: { name: string | null; sha256: string; variables: number } | null;
+  scripts?: ApiScript[];
+  oauth?: ApiOAuthHint[];
+  aws?: ApiAwsHint[];
   built: number;
   selected: number;
   skipped: { operation: string; reason: string }[];
@@ -82,14 +113,18 @@ export interface ApiTarget {
   /** Overrides `server` when set. */
   baseUrl: string;
   vars: Record<string, string>;
+  /** A Postman environment file's path. */
+  environment: string;
+  /** The source is a GraphQL endpoint to ask for its schema. */
+  graphql: boolean;
 }
 
-export const EMPTY_TARGET: ApiTarget = { server: null, baseUrl: "", vars: {} };
+export const EMPTY_TARGET: ApiTarget = { server: null, baseUrl: "", vars: {}, environment: "", graphql: false };
 
 /** Requests listed by the preview: every operation, up to this many. */
 export const PREVIEW_LIMIT = 1000;
 
-const FORMATS: Record<ApiPreview["format"], string> = { openapi3: "OpenAPI 3", swagger2: "Swagger 2", postman: "Postman collection" };
+const FORMATS: Record<ApiPreview["format"], string> = { openapi3: "OpenAPI 3", swagger2: "Swagger 2", postman: "Postman collection", graphql: "GraphQL schema" };
 
 export const formatLabel = (f: ApiPreview["format"]): string => FORMATS[f] ?? f;
 
@@ -138,6 +173,8 @@ export function targetArgs(t: ApiTarget): string[] {
   const base = t.baseUrl.trim();
   if (base) args.push(`--base-url=${base}`);
   else if (t.server != null) args.push(`--server=${t.server}`);
+  if (t.environment.trim()) args.push(`--environment=${t.environment.trim()}`);
+  if (t.graphql) args.push("--graphql");
   for (const [name, value] of Object.entries(t.vars)) {
     if (value !== "" && !looksSecret(name)) args.push(`--var=${name}=${value}`);
   }
@@ -155,8 +192,17 @@ export const previewArgs = (source: string, t: ApiTarget): string[] => [
   source.trim(),
 ];
 
+/** The preview once more, with each pre-request script's text: only for showing to whoever chooses one. */
+export const scriptTextArgs = (source: string, t: ApiTarget): string[] => ["import", "api", "--dry-run", "--limit=1", "--show-scripts", ...targetArgs(t), "--", source.trim()];
+
 /** The target a fresh preview starts on: the document's first server, if it has one. */
-export const defaultTarget = (p: Pick<ApiPreview, "servers">): ApiTarget => ({ ...EMPTY_TARGET, server: p.servers[0]?.index ?? null });
+export const defaultTarget = (p: Pick<ApiPreview, "servers">, from: Partial<ApiTarget> = {}): ApiTarget => ({ ...EMPTY_TARGET, ...from, server: p.servers[0]?.index ?? null });
+
+/** Pins the environment file to the one previewed. */
+const pinEnvironment = (sha: string | undefined): string[] => (sha ? [`--expect-environment-sha256=${sha}`] : []);
+
+/** What's wrong with an environment file's path ("" when fine). */
+export const environmentProblem = (path: string): string => (!path.trim() || /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(path.trim()) ? "" : "Give the environment file's full path.");
 
 export interface VariableInput {
   name: string;
@@ -218,12 +264,15 @@ export function operationOrigins(ops: Pick<ApiOperation, "url">[]): string[] {
 // --- Operations ---
 
 const DEFAULT_METHODS = ["GET", "HEAD", "OPTIONS", "POST"];
-const METHOD_ORDER = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+const METHOD_ORDER = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "MUTATION"];
 
-/** Not sent unless asked for: PUT, PATCH, DELETE, and anything else outside the default four. */
-export const needsOptIn = (op: Pick<ApiOperation, "method">): boolean => !DEFAULT_METHODS.includes(op.method.toUpperCase());
+/** What an operation is opted in to by, and counted as: its method, or GraphQL's MUTATION. */
+const opName = (op: Pick<ApiOperation, "method" | "opt_in">): string => op.opt_in ?? op.method.toUpperCase();
 
-export const tickable = (op: Pick<ApiOperation, "method" | "in_scope">, optIn: boolean): boolean => op.in_scope && (optIn || !needsOptIn(op));
+/** Not sent unless asked for: PUT, PATCH, DELETE, GraphQL mutations, and anything else outside the default four. */
+export const needsOptIn = (op: Pick<ApiOperation, "method" | "opt_in">): boolean => !DEFAULT_METHODS.includes(opName(op));
+
+export const tickable = (op: Pick<ApiOperation, "method" | "opt_in" | "in_scope">, optIn: boolean): boolean => op.in_scope && (optIn || !needsOptIn(op));
 
 /** Ticked to begin with: in scope, and a method sent by default. */
 /** Operations the scope surely allows; when it can't say for any (only IP or CIDR targets), all it may allow. */
@@ -269,17 +318,17 @@ const ticked = (ops: ApiOperation[], selected: number[]): ApiOperation[] => {
 };
 
 /** The methods that need opting in to, among all operations in scope: what the opt-in control names. */
-export const optInMethods = (ops: ApiOperation[]): string[] => orderMethods(ops.filter((o) => o.in_scope && needsOptIn(o)).map((o) => o.method.toUpperCase()));
+export const optInMethods = (ops: ApiOperation[]): string[] => orderMethods(ops.filter((o) => o.in_scope && needsOptIn(o)).map(opName));
 
 /** `--include-methods` values: the opt-in methods actually ticked. */
-export const includeMethods = (ops: ApiOperation[], selected: number[]): string[] => orderMethods(ticked(ops, selected).filter(needsOptIn).map((o) => o.method.toUpperCase()));
+export const includeMethods = (ops: ApiOperation[], selected: number[]): string[] => orderMethods(ticked(ops, selected).filter(needsOptIn).map(opName));
 
 /** "PUT, PATCH and DELETE". */
 export const listWords = (words: string[]): string => (words.length < 2 ? (words[0] ?? "") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`);
 
 /** [method, count] of the ticked operations, in a sensible order. */
 export function methodCounts(ops: ApiOperation[], selected: number[]): [string, number][] {
-  const on = ticked(ops, selected).map((o) => o.method.toUpperCase());
+  const on = ticked(ops, selected).map(opName);
   return orderMethods(on).map((m) => [m, on.filter((x) => x === m).length]);
 }
 
@@ -289,7 +338,7 @@ export const methodSummary = (ops: ApiOperation[], selected: number[]): string =
     .map(([m, n]) => `${n} ${m}`)
     .join(", ") || "none";
 
-export const sendsPost = (ops: ApiOperation[], selected: number[]): boolean => ticked(ops, selected).some((o) => o.method.toUpperCase() === "POST");
+export const sendsPost = (ops: ApiOperation[], selected: number[]): boolean => ticked(ops, selected).some((o) => o.method.toUpperCase() === "POST" && !o.name.startsWith("query "));
 
 export const sendsStateChanging = (ops: ApiOperation[], selected: number[]): boolean => ticked(ops, selected).some((o) => needsOptIn(o) || o.state_changing);
 
@@ -299,7 +348,7 @@ export const operationCount = (n: number): string => `${n} operation${n === 1 ? 
 export function excludedText(op: ApiOperation, isTicked: boolean): string {
   if (!op.in_scope || op.excluded_reason === "scope") return "Outside the project's scope. Never sent.";
   if (isTicked) return "";
-  if (op.excluded_reason === "method" || needsOptIn(op)) return `${op.method.toUpperCase()} isn't sent unless you allow it.`;
+  if (op.excluded_reason === "method" || needsOptIn(op)) return `${opName(op)} isn't sent unless you allow it.`;
   return "";
 }
 
@@ -307,17 +356,19 @@ export const selectionProblems = (selected: number[]): string[] => (selected.len
 
 /**
  * The operation for "Try one request": the first in scope that's GET or HEAD, else the first ticked
- * OPTIONS. POST and anything state-changing is never tried, even if nothing else exists.
+ * OPTIONS. POST and anything state-changing is never tried, even if nothing else exists, except a
+ * GraphQL query, which only reads and has no other way to travel.
  */
-export function pickCheckOperation(ops: ApiOperation[], selected: number[]): ApiOperation | null {
+export function pickCheckOperation(ops: ApiOperation[], selected: number[], format?: ApiPreview["format"]): ApiOperation | null {
   const likely = likelyInScope(ops);
   const safe = (o: ApiOperation, methods: string[]) => likely.includes(o) && !o.state_changing && methods.includes(o.method.toUpperCase());
-  return ops.find((o) => safe(o, ["GET", "HEAD"])) ?? ticked(ops, selected).find((o) => safe(o, ["OPTIONS"])) ?? null;
+  const query = format === "graphql" ? ops.find((o) => likely.includes(o) && !o.state_changing && o.name.startsWith("query ")) : undefined;
+  return ops.find((o) => safe(o, ["GET", "HEAD"])) ?? query ?? ticked(ops, selected).find((o) => safe(o, ["OPTIONS"])) ?? null;
 }
 
 // --- Authentication ---
 
-export type AuthMode = "none" | "key" | "profile";
+export type AuthMode = "none" | "key" | "oauth" | "profile";
 export type KeyKind = "api_key" | "bearer";
 export type KeyPlace = "header" | "query";
 
@@ -334,7 +385,27 @@ export interface AuthState {
   savedProfile: string;
   signing: boolean;
   signer: { profile: string; name: string } | null;
+  oauth: OAuthForm;
+  /** The hash of the Postman script chosen as the signer. */
+  script: string | null;
 }
+
+export type OAuthFlow = "client_credentials" | "password" | "refresh_token" | "authorization_code";
+
+/** No secrets: those stay in their inputs until saved. */
+export interface OAuthForm {
+  flow: OAuthFlow;
+  tokenUrl: string;
+  authorizeUrl: string;
+  clientId: string;
+  clientAuth: "body" | "basic";
+  scope: string;
+  audience: string;
+  username: string;
+  redirectPort: string;
+}
+
+export const EMPTY_OAUTH: OAuthForm = { flow: "client_credentials", tokenUrl: "", authorizeUrl: "", clientId: "", clientAuth: "body", scope: "", audience: "", username: "", redirectPort: "" };
 
 export const EMPTY_AUTH: AuthState = {
   mode: "none",
@@ -346,6 +417,8 @@ export const EMPTY_AUTH: AuthState = {
   savedProfile: "",
   signing: false,
   signer: null,
+  oauth: EMPTY_OAUTH,
+  script: null,
 };
 
 /** The variable an API key travels in, read once by `auth add`. */
@@ -356,6 +429,71 @@ export function keyEnv(kind: KeyKind, value: string): Record<string, string> {
   const v = value.trim();
   return { [KEY_ENV]: kind === "bearer" && !/^bearer\s/i.test(v) ? `Bearer ${v}` : v };
 }
+
+const OAUTH_SECRET_ENV = "BRAINPROXY_SECRET_OAUTH_CLIENT";
+const OAUTH_REFRESH_ENV = "BRAINPROXY_SECRET_OAUTH_REFRESH";
+
+/** The `env` input for an OAuth `auth add`: only what was entered. `--password` reads its own variable. */
+export function oauthEnv(v: { secret: string; refresh: string; password: string }): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (v.secret.trim()) out[OAUTH_SECRET_ENV] = v.secret.trim();
+  if (v.refresh.trim()) out[OAUTH_REFRESH_ENV] = v.refresh.trim();
+  if (v.password) out.BRAINPROXY_SECRET_PASSWORD = v.password;
+  return out;
+}
+
+/** `auth add` for OAuth: secrets stay in the environment, named here, and are stored once read. */
+export function oauthAddArgs(profile: string, f: OAuthForm, has: { secret: boolean; refresh: boolean }): string[] {
+  const args = ["auth", "add", `--oauth-flow=${f.flow}`, `--oauth-token-url=${f.tokenUrl.trim()}`, `--oauth-client-id=${f.clientId.trim()}`, `--oauth-client-auth=${f.clientAuth}`, "--oauth-store-secrets"];
+  if (has.secret) args.push(`--oauth-client-secret-env=${OAUTH_SECRET_ENV}`);
+  if (has.refresh && f.flow === "refresh_token") args.push(`--oauth-refresh-token-env=${OAUTH_REFRESH_ENV}`);
+  if (f.scope.trim()) args.push(`--oauth-scope=${f.scope.trim()}`);
+  if (f.audience.trim()) args.push(`--oauth-audience=${f.audience.trim()}`);
+  if (f.flow === "password") args.push(`--username=${f.username.trim()}`);
+  if (f.flow === "authorization_code") {
+    args.push(`--oauth-authorize-url=${f.authorizeUrl.trim()}`);
+    if (f.redirectPort.trim()) args.push(`--oauth-redirect-port=${f.redirectPort.trim()}`);
+  }
+  args.push("--", profile.trim());
+  return args;
+}
+
+/** What keeps OAuth settings from being saved. `has`, not the values: none of these repeat one. */
+export function oauthProblems(f: OAuthForm, profile: string, taken: string[], has: { secret: boolean; refresh: boolean; password: boolean }): string[] {
+  const out = profileProblems(profile, taken);
+  const http = (u: string) => {
+    const p = parseUrl(u.trim());
+    return !!p && ["http:", "https:"].includes(p.protocol) && !p.username && !p.password;
+  };
+  if (!http(f.tokenUrl)) out.push("Give the token URL, starting with http:// or https://.");
+  if (!f.clientId.trim()) out.push("Give the client id.");
+  if (f.clientAuth === "basic" && !has.secret) out.push("HTTP Basic needs the client secret.");
+  if (f.flow === "client_credentials" && !has.secret) out.push("Enter the client secret.");
+  if (f.flow === "password" && (!f.username.trim() || !has.password)) out.push("Enter the username and password.");
+  if (f.flow === "refresh_token" && !has.refresh) out.push("Enter the refresh token.");
+  if (f.flow === "authorization_code" && !http(f.authorizeUrl)) out.push("Give the sign-in page's URL.");
+  if (f.redirectPort.trim() && !/^\d{1,5}$/.test(f.redirectPort.trim())) out.push("The redirect port is a number.");
+  return out;
+}
+
+/** The OAuth form from what a definition declares: its first flow this can run. */
+export function oauthDefaults(hints: ApiOAuthHint[]): OAuthForm {
+  const h = hints.find((x) => x.flow === "client_credentials") ?? hints.find((x) => x.flow) ?? hints[0];
+  if (!h) return EMPTY_OAUTH;
+  return { ...EMPTY_OAUTH, flow: h.flow ?? "client_credentials", tokenUrl: h.token_url ?? "", authorizeUrl: h.authorize_url ?? "", scope: h.scopes.join(" ") };
+}
+
+/** A script signer's form: the collection's file, pinned to the script's hash. */
+export const scriptSignerForm = (source: string, sha256: string, environment: string, origins: string[]): SignerForm => ({
+  ...EMPTY_SIGNER,
+  name: `postman-script-${sha256.slice(0, 8)}`,
+  kind: "script",
+  keyFrom: environment.trim() ? "file" : "none",
+  key: environment.trim(),
+  origins: origins.join("\n"),
+  scriptFile: source.trim(),
+  scriptSha: sha256,
+});
 
 /** Takes a key back out of a message, should an error ever quote it. */
 export const scrubSecret = (message: string, secret: string): string => (secret.trim() ? message.split(secret.trim()).join("********") : message);
@@ -424,21 +562,21 @@ export function keyAddArgs(a: AuthState, origins: string[]): string[] {
 
 /** The profile the scan runs with ("" for none). */
 export function authProfile(a: AuthState): string {
-  if (a.mode === "key") return a.savedProfile;
+  if (a.mode === "key" || a.mode === "oauth") return a.savedProfile;
   if (a.mode === "profile") return a.existing;
   return a.signing && a.signer ? a.signer.profile : "";
 }
 
 /** The profile a new signer goes in. */
 export function signerHome(a: AuthState): string {
-  if (a.mode === "key") return a.savedProfile;
+  if (a.mode === "key" || a.mode === "oauth") return a.savedProfile;
   if (a.mode === "profile") return a.existing;
   return a.profileName.trim();
 }
 
 /** What keeps a new signer from being saved, beyond the form's own `signerProblems`. */
 export function newSignerProblems(a: AuthState, taken: string[]): string[] {
-  if (a.mode === "key") return a.savedProfile ? [] : ["Save the key first: the signer goes in the same profile."];
+  if (a.mode === "key" || a.mode === "oauth") return a.savedProfile ? [] : [`Save the ${a.mode === "key" ? "key" : "OAuth settings"} first: the signer goes in the same profile.`];
   if (a.mode === "profile") return a.existing ? [] : ["Choose the profile first: the signer goes in it."];
   return profileProblems(a.profileName, taken);
 }
@@ -447,6 +585,7 @@ export function newSignerProblems(a: AuthState, taken: string[]): string[] {
 export function authProblems(a: AuthState): string[] {
   const out: string[] = [];
   if (a.mode === "key" && !a.savedProfile) out.push("Save the key, or choose No authentication.");
+  if (a.mode === "oauth" && !a.savedProfile) out.push("Save the OAuth settings, or choose No authentication.");
   if (a.mode === "profile" && !a.existing) out.push("Choose a profile, or choose No authentication.");
   if (a.signing && !a.signer) out.push('Choose or set up a signer, or untick "Every request must be signed".');
   const profile = authProfile(a);
@@ -456,7 +595,11 @@ export function authProblems(a: AuthState): string[] {
 }
 
 /** The form for a new signer: origins default to the operations' hosts. */
-export const newSignerForm = (origins: string[]): SignerForm => ({ ...EMPTY_SIGNER, origins: origins.join("\n") });
+export const newSignerForm = (origins: string[], aws?: ApiAwsHint): SignerForm => ({
+  ...EMPTY_SIGNER,
+  origins: origins.join("\n"),
+  ...(aws ? { kind: "sigv4" as const, region: aws.region ?? "", service: aws.service ?? "" } : {}),
+});
 
 /** A `sign:NAME` session rule for one origin, any tool. */
 export const signRuleForm = (signer: string, origin: string): RuleForm => ({
@@ -559,13 +702,14 @@ export function checkMeaning(c: CheckFacts): { tone: "ok" | "warn" | "bad"; text
 }
 
 /** `import api --only N --max-requests 1`: sends one request. */
-export function checkArgs(source: string, sha256: string, t: ApiTarget, index: number, profile: string): string[] {
+export function checkArgs(source: string, sha256: string, t: ApiTarget, index: number, profile: string, environmentSha?: string): string[] {
   return [
     "import",
     "api",
     `--only=${index}`,
     "--max-requests=1",
     `--expect-sha256=${sha256}`,
+    ...pinEnvironment(environmentSha),
     ...targetArgs(t),
     ...(profile ? [`--auth=${profile}`] : []),
     "--",
@@ -575,6 +719,7 @@ export function checkArgs(source: string, sha256: string, t: ApiTarget, index: n
 
 export function authSummary(a: AuthState): string {
   if (a.mode === "profile") return `existing profile "${a.existing}"`;
+  if (a.mode === "oauth") return `OAuth 2 (${a.oauth.flow.replace(/_/g, " ")}), saved in profile "${a.savedProfile}"`;
   if (a.mode === "key") {
     const what = a.keyKind === "bearer" ? "bearer token" : a.place === "query" ? `API key in query parameter ${a.keyName.trim()}` : `API key in header ${a.keyName.trim()}`;
     return `${what}, saved in profile "${a.savedProfile}"`;
@@ -598,7 +743,8 @@ export function credentialText(c: ApiCredential): string {
   };
   const head = label[c.kind] ?? c.kind;
   if (c.embedded) return `${head}: the file held this credential. It will not be used. Set one up here if the API needs it.`;
-  if (c.kind === "oauth2" || c.kind === "openid" || c.kind === "mutual_tls") return `${head}: can't be set up here. A token obtained elsewhere can be used as a bearer token, if the API accepts one.`;
+  if (c.kind === "oauth2" || c.kind === "openid") return `${head}: the definition asks for this. Choose OAuth 2 above.`;
+  if (c.kind === "mutual_tls") return `${head}: can't be set up here. Add the client certificate under Settings → Connection.`;
   if (c.kind === "basic" || c.kind === "other" || (c.kind === "api_key" && c.in === "cookie")) return `${head}: not set up here. Create a profile in Settings → Auth profiles and pick it as an existing profile.`;
   return `${head}: the definition asks for this.`;
 }
@@ -625,6 +771,7 @@ export const apiSpeedText = (id: string): string => SPEED_TEXT[id] ?? "";
 export interface ScanPlan {
   source: string;
   sha256: string;
+  environmentSha?: string;
   target: ApiTarget;
   operations: ApiOperation[];
   selected: number[];
@@ -642,6 +789,7 @@ export function scanArgs(p: ScanPlan): string[] {
     "active",
     `--api=${p.source.trim()}`,
     `--expect-sha256=${p.sha256}`,
+    ...pinEnvironment(p.environmentSha),
     ...targetArgs(p.target),
     `--only=${[...p.selected].sort((a, b) => a - b).join(",")}`,
     ...(include.length ? [`--include-methods=${include.join(",")}`] : []),

@@ -347,13 +347,50 @@ fn apply_auth(cx: &Cx, a: &Value, headers: &mut Vec<(String, String)>, url: &mut
     }
 }
 
+/// A Postman environment file: its name and enabled values, and which it marks secret.
+#[derive(Debug, Clone, Default)]
+pub struct Environment {
+    pub name: Option<String>,
+    pub values: Vec<EnvironmentValue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvironmentValue {
+    pub name: String,
+    pub value: String,
+    pub secret: bool,
+}
+
+/// Reads an environment export. Messages never quote the file: it holds secrets.
+pub fn parse_environment(text: &str) -> Result<Environment> {
+    let bad = |what: &str| Error::InvalidInput(format!("the Postman environment file {what}"));
+    let doc: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| bad("is not JSON"))?;
+    let Some(items) = doc.get("values").and_then(Value::as_array) else {
+        return Err(if doc.get("item").is_some() {
+            bad("is a collection, not an environment")
+        } else {
+            bad("has no \"values\" list")
+        });
+    };
+    let mut out = Vec::new();
+    for v in items.iter().filter(|v| v.get("enabled").and_then(Value::as_bool) != Some(false)) {
+        let Some(name) = v.get("key").and_then(Value::as_str) else { continue };
+        out.push(EnvironmentValue {
+            name: name.to_string(),
+            value: v.get("value").map(values::scalar).unwrap_or_default(),
+            secret: v.get("type").and_then(Value::as_str) == Some("secret"),
+        });
+    }
+    Ok(Environment { name: doc.get("name").and_then(Value::as_str).map(str::to_string), values: out })
+}
+
 /// A collection variable, for the `import api` preview.
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct Variable {
     pub name: String,
     /// None when secret.
     pub value: Option<String>,
-    /// collection, cli (--var), or document (referenced, not declared).
+    /// collection, environment (--environment), cli (--var), or document (referenced, not declared).
     pub source: &'static str,
     pub secret: bool,
     pub used: bool,
@@ -491,7 +528,7 @@ fn scan(v: &Value, label: &str, refs: &mut Refs, credentials: &mut Vec<Credentia
 
 /// Reads a collection's variables, auth, and scripts for the `import api` rules, with
 /// `vars` (from --var) on top of its `variable` list.
-pub fn analyze(doc: &Value, vars: &[(String, String)]) -> Analysis {
+pub fn analyze(doc: &Value, env: &Environment, vars: &[(String, String)]) -> Analysis {
     let mut out = Analysis::default();
     let mut refs = Refs::default();
     scan(doc, "collection", &mut refs, &mut out.credentials);
@@ -503,6 +540,11 @@ pub fn analyze(doc: &Value, vars: &[(String, String)]) -> Analysis {
             let marked = v.get("type").and_then(Value::as_str) == Some("secret");
             declared.push((k.to_string(), value, "collection", marked));
         }
+    }
+    for v in &env.values {
+        let marked = v.secret || declared.iter().any(|d| d.0 == v.name && d.3);
+        declared.retain(|d| d.0 != v.name);
+        declared.push((v.name.clone(), v.value.clone(), "environment", marked));
     }
     for (k, v) in vars {
         let marked = declared.iter().any(|d| &d.0 == k && d.3);
@@ -557,7 +599,10 @@ pub fn analyze(doc: &Value, vars: &[(String, String)]) -> Analysis {
     }
     out.unresolved.sort();
     if refs.scripts > 0 {
-        out.warnings.push(format!("{} pre-request or test script(s) were not run", refs.scripts));
+        out.warnings.push(format!(
+            "{} pre-request or test script(s) were not run; one that signs requests can be chosen under authentication",
+            refs.scripts
+        ));
     }
     if refs.file_bodies > 0 {
         out.warnings.push(format!("{} file body/bodies can't be read and were sent empty", refs.file_bodies));
@@ -596,7 +641,11 @@ mod tests {
                 {"name": "Two", "request": "{{nohost}}/x"}]},
             {"name": "Three", "request": {"method": "POST", "url": "{{base}}/f", "body": {"mode": "file", "file": {"src": "/etc/passwd"}}}}
         ]});
-        let a = analyze(&doc, &[("password".into(), "CLISECRET".into()), ("region".into(), "eu".into())]);
+        let a = analyze(
+            &doc,
+            &Environment::default(),
+            &[("password".into(), "CLISECRET".into()), ("region".into(), "eu".into())],
+        );
         let text = format!("{a:?}");
         for secret in ["LITERALKEY", "USEDBYAUTH", "MARKED", "ITEMKEY", "CLISECRET", ":PW"] {
             assert!(!text.contains(secret), "{secret} in {text}");

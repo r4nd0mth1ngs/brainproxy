@@ -39,6 +39,7 @@ serde-saphyr = { version = "2.0.0", default-features = false, features = ["deser
 h2 = "0.4"
 http = "1"
 bytes = "1"
+boa_engine = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"

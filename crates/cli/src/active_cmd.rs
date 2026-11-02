@@ -46,6 +46,15 @@ pub struct ActiveArgs {
     /// With --api: refuse a document whose sha256 isn't this.
     #[arg(long, value_name = "HEX", requires = "api")]
     expect_sha256: Option<String>,
+    /// With --api: a Postman environment file for the collection's variables.
+    #[arg(long, value_name = "FILE", requires = "api")]
+    environment: Option<String>,
+    /// With --api: refuse an environment file whose sha256 isn't this.
+    #[arg(long, value_name = "HEX", requires = "environment")]
+    expect_environment_sha256: Option<String>,
+    /// With --api: the source is a GraphQL endpoint to introspect.
+    #[arg(long, requires = "api")]
+    graphql: bool,
     /// Crawl and audit: crawl from each URL first (in scope, forms submitted, same auth and
     /// limits), then attack every recorded request on those sites, not only the URLs.
     #[arg(long)]
@@ -221,6 +230,8 @@ impl ActiveArgs {
             server: self.server,
             vars: crate::import_cmd::parse_vars(&self.vars)?,
             expect_sha256: self.expect_sha256.clone(),
+            environment: self.environment.as_deref().map(crate::import_cmd::read_environment).transpose()?,
+            expect_environment_sha256: self.expect_environment_sha256.clone(),
             spec_url: None,
         })
     }
@@ -231,10 +242,12 @@ impl ActiveArgs {
             || self.server.is_some()
             || !self.vars.is_empty()
             || self.only.is_some()
-            || self.expect_sha256.is_some();
+            || self.expect_sha256.is_some()
+            || self.environment.is_some()
+            || self.graphql;
         if given && self.api.is_none() {
             return Err(Error::InvalidInput(
-                "--base-url, --server, --var, --only and --expect-sha256 need --api".into(),
+                "--base-url, --server, --var, --only, --expect-sha256, --environment and --graphql need --api".into(),
             ));
         }
         Ok(())
@@ -364,6 +377,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             }
             // A local file can be checked now, so the caller gets the error and not a failed job.
             if !crate::import_cmd::is_url(source) {
+                if args.graphql {
+                    return Err(Error::InvalidInput("--graphql needs the endpoint's http(s) URL".into()));
+                }
                 let loaded = api::load(&crate::import_cmd::read_local(source)?, &args.api_options()?)?;
                 crate::import_cmd::check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&args.api_selection(), &guard)?)?;
@@ -408,7 +424,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 headers: &[],
                 tool: Tool::Scan,
             };
-            let loaded = crate::import_cmd::load_api(&fetch, source, args.api_options()?)?;
+            let loaded = if args.graphql {
+                crate::import_cmd::load_graphql_endpoint(&fetch, source, args.api_options()?)?
+            } else {
+                crate::import_cmd::load_api(&fetch, source, args.api_options()?)?
+            };
             let plan = loaded.plan(&args.api_selection(), &guard)?;
             loaded.check_runnable(&plan)?;
             Some((loaded, plan))

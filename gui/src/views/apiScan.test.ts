@@ -2,6 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   EMPTY_AUTH,
+  environmentProblem,
+  EMPTY_OAUTH,
+  oauthAddArgs,
+  oauthDefaults,
+  oauthEnv,
+  oauthProblems,
+  scriptSignerForm,
+  scriptTextArgs,
   EMPTY_TARGET,
   KEY_ENV,
   apiResultNotes,
@@ -67,7 +75,7 @@ import {
   type AuthState,
   type CheckFacts,
 } from "./apiScan.ts";
-import type { SessionRule } from "./sessionRules.ts";
+import { EMPTY_SIGNER, signerAddArgs, signerForm, signerLabel, signerProblems, type SessionRule, type Signer } from "./sessionRules.ts";
 
 const op = (index: number, method: string, patch: Partial<ApiOperation> = {}): ApiOperation => {
   const m = method.toUpperCase();
@@ -103,9 +111,9 @@ const SHA = "a".repeat(64);
 
 test("the preview and its target's arguments", () => {
   assert.deepEqual(previewArgs(" /a/spec.yaml ", EMPTY_TARGET), ["import", "api", "--dry-run", "--limit=1000", "--", "/a/spec.yaml"]);
-  assert.deepEqual(targetArgs({ server: 1, baseUrl: "", vars: {} }), ["--server=1"]);
-  assert.deepEqual(targetArgs({ server: 0, baseUrl: " http://a.test/v1 ", vars: {} }), ["--base-url=http://a.test/v1"], "a base URL overrides the server");
-  assert.deepEqual(targetArgs({ server: null, baseUrl: "", vars: { tenant: "-acme", empty: "" } }), ["--var=tenant=-acme"], "a value may start with a dash; an empty one isn't sent");
+  assert.deepEqual(targetArgs({ ...EMPTY_TARGET, server: 1, baseUrl: "", vars: {} }), ["--server=1"]);
+  assert.deepEqual(targetArgs({ ...EMPTY_TARGET, server: 0, baseUrl: " http://a.test/v1 ", vars: {} }), ["--base-url=http://a.test/v1"], "a base URL overrides the server");
+  assert.deepEqual(targetArgs({ ...EMPTY_TARGET, server: null, baseUrl: "", vars: { tenant: "-acme", empty: "" } }), ["--var=tenant=-acme"], "a value may start with a dash; an empty one isn't sent");
   // A file named like a flag stays a file.
   assert.equal(previewArgs("-x.yaml", EMPTY_TARGET).at(-2), "--");
 });
@@ -118,7 +126,7 @@ test("the same names count as secret here and in the CLI", () => {
 
 test("a secret never goes in any argument", () => {
   const secret = "FAKE-TOP-SECRET";
-  const t = { server: null, baseUrl: "", vars: { apiKey: secret, password: secret, x_auth: secret, tenant: "a" } };
+  const t = { ...EMPTY_TARGET, server: null, baseUrl: "", vars: { apiKey: secret, password: secret, x_auth: secret, tenant: "a" } };
   assert.deepEqual(targetArgs(t), ["--var=tenant=a"]);
   assert.ok(!previewArgs("/s", t).join(" ").includes(secret));
   assert.ok(!checkArgs("/s", SHA, t, 0, "p").join(" ").includes(secret));
@@ -159,8 +167,8 @@ test("URLs on the command line hold no credentials", () => {
 
 test("the server step", () => {
   const preview = (patch: Partial<ApiPreview>) => ({ base_url_required: false, requests: OPS, hosts: [], ...patch });
-  assert.deepEqual(defaultTarget({ servers: [{ index: 0, url: "https://a.test" }] }), { server: 0, baseUrl: "", vars: {} });
-  assert.deepEqual(defaultTarget({ servers: [] }), { server: null, baseUrl: "", vars: {} });
+  assert.deepEqual(defaultTarget({ servers: [{ index: 0, url: "https://a.test" }] }), { ...EMPTY_TARGET, server: 0, baseUrl: "", vars: {} });
+  assert.deepEqual(defaultTarget({ servers: [] }), { ...EMPTY_TARGET, server: null, baseUrl: "", vars: {} });
   assert.deepEqual(serverProblems(preview({}), EMPTY_TARGET), []);
   assert.match(serverProblems(preview({ base_url_required: true }), EMPTY_TARGET)[0], /base URL/);
   assert.deepEqual(serverProblems(preview({ base_url_required: true }), { ...EMPTY_TARGET, baseUrl: "https://a.test" }), []);
@@ -420,7 +428,7 @@ test("credentials, in plain words and without values", () => {
   assert.equal(credentialText(c({})), "API key (header X-K): the definition asks for this.");
   assert.match(credentialText(c({ embedded: true })), /the file held this credential\. It will not be used/);
   assert.match(credentialText(c({ in: "cookie", name: "sid" })), /Create a profile/);
-  assert.match(credentialText(c({ kind: "oauth2", in: null, name: null })), /OAuth 2: can't be set up here/);
+  assert.match(credentialText(c({ kind: "oauth2", in: null, name: null })), /OAuth 2: the definition asks for this/);
   assert.match(credentialText(c({ kind: "other", in: null, name: "password", embedded: true })), /Other \(password\)/);
   assert.match(credentialText(c({ kind: "bearer", in: "header", name: "Authorization" })), /Bearer token: the definition asks/);
 });
@@ -444,4 +452,76 @@ test("a host only an IP scope might allow isn't ticked next to one the scope lis
   // With nothing listed by name there's no better guess: the scope's own check decides at send.
   assert.deepEqual(defaultSelection([unlisted]), [1]);
   assert.deepEqual(likelyInScope([{ in_scope: false, scope_confirmed: false }]), []);
+});
+
+test("the environment and GraphQL choices reach every command, pinned to what was previewed", () => {
+  const t = { ...EMPTY_TARGET, environment: "/e/prod.json", graphql: false };
+  assert.ok(previewArgs("/c.json", t).includes("--environment=/e/prod.json"));
+  const check = checkArgs("/c.json", "abc", t, 2, "", "env-sha");
+  assert.ok(check.includes("--environment=/e/prod.json") && check.includes("--expect-environment-sha256=env-sha"));
+  const scan = scanArgs({ source: "/c.json", sha256: "abc", environmentSha: "env-sha", target: t, operations: [], selected: [1], profile: "", depth: "quick", speedArgs: [] });
+  assert.ok(scan.includes("--environment=/e/prod.json") && scan.includes("--expect-environment-sha256=env-sha"));
+  assert.ok(previewArgs("https://a.test/graphql", { ...EMPTY_TARGET, graphql: true }).includes("--graphql"));
+  assert.equal(environmentProblem("relative.json"), "Give the environment file's full path.");
+  assert.equal(environmentProblem("/abs.json"), "");
+  assert.ok(scriptTextArgs("/c.json", t).includes("--show-scripts"));
+});
+
+const gqlOp = (index: number, name: string, opt_in?: string): ApiOperation => ({ index, name, method: "POST", url: "https://a.test/graphql", headers: [], state_changing: !!opt_in, opt_in, in_scope: true, scope_confirmed: true, included: !opt_in, excluded_reason: opt_in ? "method" : null });
+
+test("a GraphQL mutation is opted in to by name, and only a query is tried", () => {
+  const ops = [gqlOp(0, "mutation drop", "MUTATION"), gqlOp(1, "query me")];
+  assert.deepEqual(defaultSelection(ops), [1]);
+  assert.equal(tickable(ops[0], false), false);
+  assert.equal(tickable(ops[0], true), true);
+  assert.deepEqual(includeMethods(ops, [0, 1]), ["MUTATION"]);
+  assert.deepEqual(optInMethods(ops), ["MUTATION"]);
+  assert.equal(excludedText(ops[0], false), "MUTATION isn't sent unless you allow it.");
+  assert.equal(pickCheckOperation(ops, [0, 1], "graphql")?.name, "query me");
+  assert.equal(pickCheckOperation([ops[0]], [0], "graphql"), null);
+  assert.equal(pickCheckOperation([{ ...ops[1], name: "query x" }], [0], "openapi3"), null, "a POST elsewhere is never tried");
+  assert.equal(sendsPost(ops, [1]), false);
+  assert.equal(sendsPost(ops, [0]), true);
+});
+
+test("OAuth settings build `auth add` with secrets named, never given", () => {
+  const f = { ...EMPTY_OAUTH, flow: "password" as const, tokenUrl: "https://id.test/token", clientId: "c", username: "u", scope: "a b", audience: "x" };
+  const args = oauthAddArgs(" p ", f, { secret: true, refresh: false });
+  assert.deepEqual(args.slice(-2), ["--", "p"]);
+  for (const flag of ["--oauth-flow=password", "--oauth-store-secrets", "--oauth-client-secret-env=BRAINPROXY_SECRET_OAUTH_CLIENT", "--oauth-scope=a b", "--oauth-audience=x", "--username=u"]) assert.ok(args.includes(flag), flag);
+  assert.deepEqual(oauthEnv({ secret: " S ", refresh: "", password: "P" }), { BRAINPROXY_SECRET_OAUTH_CLIENT: "S", BRAINPROXY_SECRET_PASSWORD: "P" });
+  const has = { secret: true, refresh: false, password: true };
+  assert.deepEqual(oauthProblems(f, "p", [], has), []);
+  assert.ok(oauthProblems(f, "p", ["p"], has)[0].includes("already exists"));
+  assert.ok(oauthProblems({ ...f, tokenUrl: "ftp://x" }, "p", [], has).some((m) => m.includes("token URL")));
+  assert.ok(oauthProblems({ ...f, flow: "client_credentials" }, "p", [], { ...has, secret: false }).some((m) => m.includes("client secret")));
+  assert.ok(oauthProblems({ ...f, flow: "refresh_token" }, "p", [], has).some((m) => m.includes("refresh token")));
+  assert.ok(oauthProblems({ ...f, flow: "authorization_code" }, "p", [], has).some((m) => m.includes("sign-in page")));
+  const hint = { source: "s", flow: "authorization_code" as const, token_url: "https://t", authorize_url: "https://a", scopes: ["r", "w"], openid_url: null };
+  assert.deepEqual(oauthDefaults([hint]), { ...EMPTY_OAUTH, flow: "authorization_code", tokenUrl: "https://t", authorizeUrl: "https://a", scope: "r w" });
+  assert.deepEqual(oauthDefaults([]), EMPTY_OAUTH);
+  const a = { ...EMPTY_AUTH, mode: "oauth" as const };
+  assert.ok(authProblems(a)[0].includes("OAuth"));
+  assert.equal(authProfile({ ...a, savedProfile: "p" }), "p");
+  assert.ok(authSummary({ ...a, savedProfile: "p" }).includes("OAuth 2 (client credentials)"));
+});
+
+test("new signer kinds round-trip through their form", () => {
+  const sig = { name: "v4", key: { env: "SK" }, origins: ["https://a.test"], to: { header: "Authorization" }, kind: "sigv4", access_key: { file: "/k/id" }, session_token: { env: "T" }, region: "eu-west-1", service: "s3" } as Signer;
+  const args = signerAddArgs("p", signerForm(sig));
+  for (const flag of ["--secret-env=SK", "--sigv4-region=eu-west-1", "--sigv4-service=s3", "--access-key-file=/k/id", "--session-token-env=T", "--origin=https://a.test"]) assert.ok(args.includes(flag), flag);
+  assert.ok(!args.some((a) => a.startsWith("--to=")), "SigV4 has a fixed place");
+  assert.ok(signerLabel(sig).includes("AWS SigV4 for s3 in eu-west-1"));
+  const key = { name: "k", key: { file: "/k.pem" }, origins: ["https://a.test"], to: { header: "X-Sig" }, kind: "key", alg: "EdDSA", canonical: "{{path}}", output: "base64" } as Signer;
+  const kargs = signerAddArgs("p", signerForm(key));
+  for (const flag of ["--key-alg=EdDSA", "--canonical={{path}}", "--output=base64", "--to=header:X-Sig"]) assert.ok(kargs.includes(flag), flag);
+  const script = { name: "s", key: "none", origins: ["https://a.test"], to: { header: "X-Brainproxy-Script" }, kind: "script", file: "/c.json", sha256: "ab", vars: [["a", "1"]] } as Signer;
+  const sargs = signerAddArgs("p", signerForm(script));
+  for (const flag of ["--script=/c.json", "--script-sha256=ab", "--script-var=a=1"]) assert.ok(sargs.includes(flag), flag);
+  assert.ok(!sargs.some((a) => a.startsWith("--secret") || a.startsWith("--to=")), sargs.join(" "));
+  assert.ok(signerLabel(script).includes("Postman script from /c.json"));
+  const form = scriptSignerForm("/c.json", "abcdef0123", "/e.json", ["https://a.test", "https://b.test"]);
+  assert.equal(form.name, "postman-script-abcdef01");
+  assert.ok(signerAddArgs("p", form).includes("--secret-file=/e.json"));
+  assert.ok(signerProblems({ ...EMPTY_SIGNER, name: "a", kind: "sigv4", keyFrom: "env", key: "SK", origins: "https://a.test" }, []).some((m) => m.includes("region")));
 });

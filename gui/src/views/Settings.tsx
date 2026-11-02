@@ -268,6 +268,7 @@ function addArgs(f: Form): string[] {
   args.push(...platformArgs(f.platform));
   // This form doesn't show query keys, so saving it mustn't drop them.
   args.push("--keep-query-keys");
+  args.push("--keep-oauth");
   args.push("--", f.name.trim());
   return args;
 }

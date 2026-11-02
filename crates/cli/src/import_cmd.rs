@@ -21,9 +21,11 @@ use crate::output::{body_value, Out};
 
 #[derive(Subcommand)]
 pub enum ImportCmd {
-    /// An API description, its format detected: OpenAPI 3.x, Swagger 2.0, or Postman v2.0/v2.1.
+    /// An API description, its format detected: OpenAPI 3.x, Swagger 2.0, Postman v2.0/v2.1, or a GraphQL
+    /// schema file or introspection result (--graphql introspects a URL).
     /// `--dry-run` is the preview: every request built, and which would go out.
-    #[command(after_help = "Sends GET, HEAD, OPTIONS, and POST; --include-methods opts in to others. Credentials \
+    #[command(after_help = "Sends GET, HEAD, OPTIONS, and POST; --include-methods opts in to others, and to GraphQL \
+        mutations as MUTATION. A GraphQL schema file needs --base-url, the endpoint. Credentials \
         in the document are never sent or stored, only listed under `credentials`: use `auth add` and --auth \
         for them. Indexes for --only count the built requests in document order, so they hold for one document \
         and one set of options; --expect-sha256 proves the document is the one previewed.")]
@@ -77,6 +79,19 @@ pub struct ApiArgs {
     /// Refuse a document whose sha256 isn't this: it proves the file is the one previewed.
     #[arg(long, value_name = "HEX")]
     expect_sha256: Option<String>,
+    /// A Postman environment file, for the collection's variables. Those marked secret or
+    /// that look like credentials are withheld; --var goes on top.
+    #[arg(long, value_name = "FILE")]
+    environment: Option<String>,
+    /// Refuse an environment file whose sha256 isn't this.
+    #[arg(long, value_name = "HEX", requires = "environment")]
+    expect_environment_sha256: Option<String>,
+    /// SOURCE is a GraphQL endpoint: introspect it instead of fetching a document.
+    #[arg(long)]
+    graphql: bool,
+    /// List the text of each Postman pre-request script in the preview.
+    #[arg(long)]
+    show_scripts: bool,
 }
 
 #[derive(clap::Args)]
@@ -160,6 +175,9 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
             }
             // A local file can be checked now, so the caller gets the error and not a failed job.
             if remote.is_none() {
+                if a.graphql {
+                    return Err(Error::InvalidInput("--graphql needs the endpoint's http(s) URL".into()));
+                }
                 let loaded = api::load(&read_local(&a.doc.source)?, &a.options()?)?;
                 check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&a.selection(), &guard)?)?;
@@ -290,6 +308,8 @@ impl ApiArgs {
             server: self.server,
             vars: parse_vars(&self.doc.vars)?,
             expect_sha256: self.expect_sha256.clone(),
+            environment: self.environment.as_deref().map(read_environment).transpose()?,
+            expect_environment_sha256: self.expect_environment_sha256.clone(),
             spec_url: None,
         })
     }
@@ -314,7 +334,14 @@ fn import_api(
 ) -> Result<(), Error> {
     let c = &a.doc.common;
     let guard = fetch.send.guard.clone().ok_or_else(|| Error::OutOfScope("no scope set".into()))?;
-    let loaded = load_api(fetch, &a.doc.source, a.options()?)?;
+    let mut loaded = if a.graphql {
+        load_graphql_endpoint(fetch, &a.doc.source, a.options()?)?
+    } else {
+        load_api(fetch, &a.doc.source, a.options()?)?
+    };
+    if a.show_scripts && !a.graphql {
+        api::add_script_text(&mut loaded, &fetch.document(&a.doc.source)?.0);
+    }
     let plan = loaded.plan(&a.selection(), &guard)?;
     let preview = loaded.preview(&plan, c.limit);
     let bodies: Vec<Value> = preview.requests.iter().map(|r| body_value(&r.body, c.max_body)).collect();
@@ -368,6 +395,35 @@ pub(crate) fn load_api(fetch: &Fetcher<'_>, source: &str, mut opts: api::Options
     let (text, spec_url) = fetch.document(source)?;
     opts.spec_url = spec_url;
     api::load(&text, &opts)
+}
+
+/// Builds requests from what a GraphQL endpoint says of itself, when it will.
+pub(crate) fn load_graphql_endpoint(
+    fetch: &Fetcher<'_>,
+    url: &str,
+    mut opts: api::Options,
+) -> Result<api::Loaded, Error> {
+    if !is_url(url) {
+        return Err(Error::InvalidInput(
+            "--graphql needs the endpoint's http(s) URL; a schema file goes without it".into(),
+        ));
+    }
+    let text = fetch.introspect(url).map_err(|e| {
+        Error::InvalidInput(format!(
+            "the endpoint wouldn't describe itself ({e}). If introspection is off or needs a login, use a schema file \
+             with --base-url, or --auth"
+        ))
+    })?;
+    opts.spec_url = Some(url.to_string());
+    api::load(&text, &opts)
+}
+
+/// Reads an environment file. A path, never a URL: it holds secrets.
+pub(crate) fn read_environment(path: &str) -> Result<String, Error> {
+    if is_url(path) || path == "-" {
+        return Err(Error::InvalidInput("--environment must be a local file".into()));
+    }
+    std::fs::read_to_string(path).map_err(|_| Error::InvalidInput(format!("can't read the environment file {path:?}")))
 }
 
 pub(crate) fn selection(include_methods: &[String], only: Option<Vec<usize>>) -> api::Selection {

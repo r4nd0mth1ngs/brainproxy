@@ -77,6 +77,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth list", READ),
     ("auth show", READ),
     ("auth remove", REPLACE),
+    ("auth oauth authorize", NET),
+    ("auth oauth discover", NET),
     ("authz run", NET),
     ("authz results", READ),
     ("authz matrix", READ),

@@ -610,6 +610,7 @@ impl AuthSession {
         keep_cookies: &[&str],
         keep_params: &[&str],
     ) -> Prepared {
+        self.oauth_renew_if_due().await;
         let generation = self.generation();
         let macro_generation = self.handling.generation.load(Ordering::SeqCst);
         let mut request = raw.to_vec();

@@ -119,6 +119,9 @@ pub struct AuthProfile {
     /// some hosts, answered on every command (see [`crate::connection::platform`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<crate::connection::PlatformAuth>,
+    /// OAuth 2.0 token requests in place of a login (see [`crate::oauth`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::oauth::OAuth>,
 }
 
 fn post() -> String {
@@ -133,7 +136,7 @@ fn twenty() -> u32 {
 
 impl AuthProfile {
     pub fn has_login(&self) -> bool {
-        self.login_url.is_some()
+        self.login_url.is_some() || self.oauth.is_some()
     }
 
     /// A profile with no login or headers, whose session its macros and rules make.
@@ -173,6 +176,15 @@ impl AuthProfile {
     }
 
     fn validate_fields(&self) -> Result<()> {
+        if let Some(o) = &self.oauth {
+            if self.login_url.is_some() {
+                return Err(Error::InvalidInput("a profile logs in with --login-url or OAuth, not both".into()));
+            }
+            if self.token_regex.is_some() {
+                return Err(Error::InvalidInput("OAuth reads the token itself: leave out --token-regex".into()));
+            }
+            o.validate(self.username.as_deref(), self.password.as_ref())?;
+        }
         for q in &self.query_keys {
             // Sent as written, so nothing that means something in a query.
             let name_ok = !q.name.is_empty()
@@ -203,7 +215,7 @@ impl AuthProfile {
         if self.csrf_url.is_some() != self.csrf_regex.is_some() {
             return Err(Error::InvalidInput("--csrf-url and --csrf-regex go together".into()));
         }
-        if self.token_regex.is_some() != self.token_header.is_some() {
+        if self.oauth.is_none() && self.token_regex.is_some() != self.token_header.is_some() {
             return Err(Error::InvalidInput("--token-regex and --token-header go together".into()));
         }
         Ok(())
@@ -221,6 +233,7 @@ impl AuthProfile {
         for q in &mut p.query_keys {
             q.value = "********".into();
         }
+        p.oauth = p.oauth.as_ref().map(crate::oauth::OAuth::redacted);
         p
     }
 }
@@ -244,6 +257,11 @@ pub struct SessionState {
     /// Macro runs so far, so placeholders of different runs differ across commands.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub macro_runs: u64,
+    /// OAuth: the refresh token and when the access token runs out (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires: Option<u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -637,7 +655,7 @@ pub struct AuthSession {
     generation: AtomicU64,
     relogins: AtomicU32,
     last_login: Mutex<Option<Instant>>,
-    login_lock: tokio::sync::Mutex<()>,
+    pub(crate) login_lock: tokio::sync::Mutex<()>,
     /// Macros and session rules (see [`crate::session`]).
     pub(crate) handling: crate::session::Runtime,
 }
@@ -687,6 +705,14 @@ impl AuthSession {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn mark_login_time(&self) {
+        *self.last_login.lock().unwrap() = Some(Instant::now());
     }
 
     /// Persists the current cookies/token so the next command can reuse them.
@@ -907,6 +933,9 @@ impl AuthSession {
 
     async fn login_inner(&self) -> Result<LoginResult> {
         let p = &self.profile;
+        if p.oauth.is_some() {
+            return self.oauth_login().await;
+        }
         let Some(login_url) = &p.login_url else {
             return Ok(LoginResult {
                 success: true,
@@ -1174,7 +1203,7 @@ pub(crate) fn response_text(response: &[u8]) -> String {
     s
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{secs}")
 }

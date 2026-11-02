@@ -15,10 +15,13 @@ Only use it against systems you are authorized to test.
 - **Guided scan.** Pick the sites and a depth (Quick, Standard, Thorough) and the Overview
   crawls, attacks, and shows the results. Open it again any time from the Overview or
   Scans › New scan.
-- **Guided API scan.** Give it an OpenAPI 3 or Swagger 2.0 file (JSON or YAML) or a Postman
-  collection, choose the server, add an API key, bearer token or request signer if the API
-  needs one, and tick the operations to test. PUT, PATCH and DELETE stay off until you opt
-  in, and nothing is sent outside the engagement's scope.
+- **Guided API scan.** Give it an OpenAPI 3 or Swagger 2.0 file (JSON or YAML), a Postman
+  collection with its environment, or a GraphQL schema or endpoint, choose the server, add an
+  API key, bearer token, OAuth 2 (client credentials, password, refresh token or a browser
+  sign-in, renewed as it runs out) or a request signer (HMAC, RSA, ECDSA or Ed25519 keys, JWTs,
+  AWS SigV4, or the collection's own pre-request script) if the API needs one, and tick the
+  operations to test. PUT, PATCH, DELETE and GraphQL mutations stay off until you opt in, and
+  nothing is sent outside the engagement's scope.
 - **Targeted scans.** Search the ZAP scan rules and the Nuclei and brainproxy checks by
   name, CVE, or tag (Scans › New scan › Targeted), pick a few, and run only those.
 - **Checks for new CVEs between releases.** brainproxy's own checks come from a signed

@@ -420,6 +420,8 @@ fn command_name(cmd: &Cmd) -> String {
             auth_cmd::AuthCmd::List => "auth list",
             auth_cmd::AuthCmd::Show { .. } => "auth show",
             auth_cmd::AuthCmd::Remove { .. } => "auth remove",
+            auth_cmd::AuthCmd::Oauth(auth_cmd::OauthCmd::Authorize { .. }) => "auth oauth authorize",
+            auth_cmd::AuthCmd::Oauth(auth_cmd::OauthCmd::Discover { .. }) => "auth oauth discover",
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Start { .. }) => "auth record start",
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Finish { .. }) => "auth record finish",
             auth_cmd::AuthCmd::Macro(c) => match c {

@@ -13,8 +13,8 @@ use serde_json::Value;
 use super::postman::Variable;
 use super::values::{resolve, scalar};
 use super::{
-    build_raw, looks_secret, merge_credential, openapi, parse_base, parse_document, postman, shown_url, ApiRequest,
-    Built, Credential, Skipped,
+    build_raw, graphql, looks_secret, merge_credential, openapi, parse_base, parse_document, postman, shown_url,
+    ApiRequest, Built, Credential, Skipped,
 };
 use crate::auth::MARK;
 use crate::error::{Error, Result};
@@ -29,7 +29,11 @@ pub const DEFAULT_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST"];
 
 const MASK: &str = "********";
 
-const ACCEPTED: &str = "accepted formats: OpenAPI 3.x, Swagger 2.0, and Postman collection v2.0/v2.1, as JSON or YAML";
+const ACCEPTED: &str = "accepted formats: OpenAPI 3.x, Swagger 2.0, and Postman collection v2.0/v2.1, as JSON or \
+     YAML; a GraphQL schema or introspection result";
+
+/// What `--include-methods` calls GraphQL mutations, which all travel as POST.
+pub const MUTATION: &str = "MUTATION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +41,7 @@ pub enum Format {
     Openapi3,
     Swagger2,
     Postman,
+    Graphql,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -45,6 +50,9 @@ pub struct Options {
     pub server: Option<usize>,
     pub vars: Vec<(String, String)>,
     pub expect_sha256: Option<String>,
+    /// The text of a Postman environment file, and the hash it must have.
+    pub environment: Option<String>,
+    pub expect_environment_sha256: Option<String>,
     /// Where the document was fetched from.
     pub spec_url: Option<String>,
 }
@@ -72,6 +80,163 @@ pub struct Loaded {
     pub skipped: Vec<Skipped>,
     pub warnings: Vec<String>,
     pub requests: Vec<ApiRequest>,
+    pub environment: Option<EnvironmentInfo>,
+    pub scripts: Vec<ScriptInfo>,
+    pub oauth: Vec<OAuthHint>,
+    pub aws: Vec<AwsHint>,
+}
+
+/// An OAuth setup a document declares: never a client secret, only where to get tokens.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OAuthHint {
+    pub source: String,
+    /// As `auth add --oauth-flow` names it; none for OpenID Connect.
+    pub flow: Option<String>,
+    pub token_url: Option<String>,
+    pub authorize_url: Option<String>,
+    pub scopes: Vec<String>,
+    pub openid_url: Option<String>,
+}
+
+/// A Postman collection's AWS Signature settings.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AwsHint {
+    pub source: String,
+    pub region: Option<String>,
+    pub service: Option<String>,
+}
+
+/// The OAuth setups in an OpenAPI or Swagger document's security schemes.
+fn declared_oauth(doc: &Value) -> Vec<OAuthHint> {
+    let mut out = Vec::new();
+    let roots = [doc.pointer("/components/securitySchemes"), doc.get("securityDefinitions")];
+    for (name, scheme) in roots.into_iter().flatten().filter_map(Value::as_object).flatten() {
+        let s = resolve(doc, scheme);
+        let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        let scopes = |v: &Value| -> Vec<String> {
+            v.get("scopes").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        };
+        let source = format!("scheme:{name}");
+        match text(s, "type").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "openidconnect" => out.push(OAuthHint {
+                source,
+                flow: None,
+                token_url: None,
+                authorize_url: None,
+                scopes: vec![],
+                openid_url: text(s, "openIdConnectUrl"),
+            }),
+            "oauth2" => {
+                // OpenAPI 3 lists flows by name; Swagger 2 has one, in its own words.
+                let flows = s.get("flows").and_then(Value::as_object).cloned().unwrap_or_default();
+                let mut add = |flow: &str, v: &Value| {
+                    out.push(OAuthHint {
+                        source: source.clone(),
+                        flow: Some(flow.to_string()),
+                        token_url: text(v, "tokenUrl"),
+                        authorize_url: text(v, "authorizationUrl"),
+                        scopes: scopes(v),
+                        openid_url: None,
+                    })
+                };
+                for (k, flow) in [
+                    ("clientCredentials", "client_credentials"),
+                    ("authorizationCode", "authorization_code"),
+                    ("password", "password"),
+                ] {
+                    if let Some(v) = flows.get(k) {
+                        add(flow, v);
+                    }
+                }
+                match text(s, "flow").as_deref() {
+                    Some("application") => add("client_credentials", s),
+                    Some("accessCode") => add("authorization_code", s),
+                    Some("password") => add("password", s),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A Postman auth block's setting. `known` fills variables whose values may be shown; a
+/// setting that still needs one is left out, as it can't be used as written.
+fn postman_auth_setting(auth: &Value, kind: &str, key: &str, known: &[Variable]) -> Option<String> {
+    let raw = match auth.get(kind)? {
+        Value::Array(items) => {
+            items.iter().find(|i| i.get("key").and_then(Value::as_str) == Some(key))?.get("value")?.as_str()?
+        }
+        section => section.get(key)?.as_str()?,
+    };
+    let mut text = raw.to_string();
+    for v in known {
+        if let Some(value) = v.value.as_deref().filter(|_| !v.secret) {
+            text = text.replace(&format!("{{{{{}}}}}", v.name), value);
+        }
+    }
+    (!text.is_empty() && !text.contains("{{")).then_some(text)
+}
+
+/// The OAuth and AWS settings in a collection's auth blocks. Client ids and secrets stay out.
+fn postman_auth_hints(doc: &Value, known: &[Variable]) -> (Vec<OAuthHint>, Vec<AwsHint>) {
+    fn walk(node: &Value, label: &str, known: &[Variable], out: &mut (Vec<OAuthHint>, Vec<AwsHint>)) {
+        let source = format!("auth:{label}");
+        let auth = node.get("auth").or(node.pointer("/request/auth"));
+        match auth.and_then(|a| a.get("type")).and_then(Value::as_str) {
+            Some("oauth2") => {
+                let a = auth.unwrap_or(&Value::Null);
+                let flow = match postman_auth_setting(a, "oauth2", "grant_type", known).as_deref() {
+                    Some("client_credentials") => Some("client_credentials"),
+                    Some("password_credentials") => Some("password"),
+                    Some("authorization_code" | "authorization_code_with_pkce") => Some("authorization_code"),
+                    _ => None,
+                };
+                let hint = OAuthHint {
+                    source,
+                    flow: flow.map(str::to_string),
+                    token_url: postman_auth_setting(a, "oauth2", "accessTokenUrl", known),
+                    authorize_url: postman_auth_setting(a, "oauth2", "authUrl", known),
+                    scopes: postman_auth_setting(a, "oauth2", "scope", known)
+                        .map(|s| s.split_whitespace().map(str::to_string).collect())
+                        .unwrap_or_default(),
+                    openid_url: None,
+                };
+                if !out.0.contains(&hint) {
+                    out.0.push(hint);
+                }
+            }
+            Some("awsv4") => {
+                let a = auth.unwrap_or(&Value::Null);
+                let hint = AwsHint {
+                    source,
+                    region: postman_auth_setting(a, "awsv4", "region", known),
+                    service: postman_auth_setting(a, "awsv4", "service", known),
+                };
+                if !out.1.iter().any(|h| h.region == hint.region && h.service == hint.service) {
+                    out.1.push(hint);
+                }
+            }
+            _ => {}
+        }
+        for item in node.get("item").and_then(Value::as_array).into_iter().flatten() {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("(unnamed)");
+            let child = if label == "collection" { name.to_string() } else { format!("{label}/{name}") };
+            walk(item, &child, known, out);
+        }
+    }
+    let mut out = Default::default();
+    walk(doc, "collection", known, &mut out);
+    out
+}
+
+/// The environment file a preview used.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentInfo {
+    pub name: Option<String>,
+    pub sha256: String,
+    pub variables: usize,
 }
 
 /// A document's URL ends up in history, messages, and the job table: no credentials in it.
@@ -130,14 +295,55 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
         skipped: vec![],
         warnings: vec![],
         requests: vec![],
+        environment: None,
+        scripts: vec![],
+        oauth: vec![],
+        aws: vec![],
+    };
+    let environment = match &opts.environment {
+        Some(text) => {
+            if format != Format::Postman {
+                return Err(Error::InvalidInput("--environment is for Postman collections".into()));
+            }
+            let sha256 = crate::fetch::sha256_hex(text.as_bytes());
+            let want = opts.expect_environment_sha256.as_deref();
+            if let Some(want) = want.filter(|w| !w.trim().eq_ignore_ascii_case(&sha256)) {
+                return Err(Error::InvalidInput(format!(
+                    "the environment file changed: its sha256 is {sha256}, expected {}",
+                    want.trim()
+                )));
+            }
+            let env = postman::parse_environment(text)?;
+            loaded.environment = Some(EnvironmentInfo { name: env.name.clone(), sha256, variables: env.values.len() });
+            env
+        }
+        None => postman::Environment::default(),
     };
     let mut built = match format {
+        Format::Graphql => {
+            if opts.server.is_some() {
+                return Err(Error::InvalidInput("--server: a GraphQL schema has no servers".into()));
+            }
+            if !opts.vars.is_empty() {
+                loaded.warnings.push("--var only applies to Postman collections; it was ignored".into());
+            }
+            match opts.base_url.as_deref().or(opts.spec_url.as_deref()) {
+                Some(endpoint) => graphql::build(&doc, endpoint, true)?,
+                None => {
+                    let mut b = Built { base_url_required: true, ..Default::default() };
+                    b.skip("every operation".into(), "a schema file names no endpoint: give the GraphQL URL".into());
+                    b
+                }
+            }
+        }
         Format::Postman => {
             if opts.server.is_some() {
                 return Err(Error::InvalidInput("--server: a Postman collection has no servers".into()));
             }
-            let a = postman::analyze(&doc, &opts.vars);
+            loaded.scripts = postman_scripts(&doc);
+            let a = postman::analyze(&doc, &environment, &opts.vars);
             loaded.variables = a.variables;
+            (loaded.oauth, loaded.aws) = postman_auth_hints(&doc, &loaded.variables);
             loaded.unresolved_variables = a.unresolved;
             loaded.credentials = a.credentials;
             loaded.warnings = a.warnings;
@@ -145,7 +351,12 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
                 &doc,
                 &postman::Options {
                     base_url: opts.base_url.clone(),
-                    vars: opts.vars.clone(),
+                    vars: environment
+                        .values
+                        .iter()
+                        .map(|v| (v.name.clone(), v.value.clone()))
+                        .chain(opts.vars.iter().cloned())
+                        .collect(),
                     guarded: true,
                     withheld: a.withheld,
                 },
@@ -177,6 +388,7 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
                 .map(|(index, (url, description))| Server { index, url: shown_url(&url), description })
                 .collect();
             loaded.credentials = security_schemes(&doc);
+            loaded.oauth = declared_oauth(&doc);
             openapi::build(&doc, &o)?
         }
     };
@@ -195,12 +407,8 @@ fn detect(text: &str) -> Result<(Format, Value)> {
     if t.is_empty() {
         return Err(unknown("the document is empty"));
     }
-    let first = t.split_whitespace().next().unwrap_or_default();
-    if ["type", "schema", "scalar", "input", "enum", "interface", "union", "directive", "extend", "\"\"\""]
-        .contains(&first)
-        && t.contains('{')
-    {
-        return Err(unknown("this looks like GraphQL SDL (use `import graphql`, with an introspection result)"));
+    if graphql::looks_like_sdl(t) {
+        return Ok((Format::Graphql, graphql::parse_sdl(t)?));
     }
     if t.starts_with('<') {
         return Err(unknown("this looks like HTML or XML, not an API description"));
@@ -238,10 +446,13 @@ fn detect(text: &str) -> Result<(Format, Value)> {
         return Ok((Format::Postman, doc));
     }
     if doc.get("_postman_variable_scope").is_some() {
-        return Err(unknown("this is a Postman environment, not a collection"));
+        return Err(unknown("this is a Postman environment, not a collection: pass it with --environment"));
     }
     if doc.pointer("/data/__schema").is_some() || doc.get("__schema").is_some() {
-        return Err(unknown("this is a GraphQL introspection result (use `import graphql URL --schema FILE`)"));
+        return Ok((Format::Graphql, doc));
+    }
+    if doc.get("errors").is_some() {
+        return Err(unknown("this is a GraphQL error, not a schema: introspection may be turned off"));
     }
     if doc.pointer("/log/entries").is_some() {
         return Err(unknown("this looks like a HAR file"));
@@ -479,6 +690,63 @@ fn warn_unresolved(built: &mut Built, label: &str, r: &ApiRequest) {
     }
 }
 
+/// The name to opt in to a request by, if its method doesn't say: a GraphQL mutation.
+fn opt_in_name(format: Format, r: &ApiRequest) -> Option<String> {
+    (format == Format::Graphql && r.name.starts_with("mutation ")).then(|| MUTATION.to_string())
+}
+
+/// A Postman pre-request script's facts: enough to choose one and to fetch its text.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ScriptInfo {
+    /// Pins a signer to this text.
+    pub sha256: String,
+    /// Where it runs: `collection`, or the folders and requests that hold it.
+    pub scopes: Vec<String>,
+    /// Requests under the widest of those scopes.
+    pub requests: usize,
+    pub lines: usize,
+    /// Whether it seems to be signing something.
+    pub signs: bool,
+    /// Calls it makes that the runner refuses.
+    pub unsupported: Vec<String>,
+    /// With --show-scripts only: a script can hold a hard-coded secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+fn postman_scripts(doc: &Value) -> Vec<ScriptInfo> {
+    let mut out: Vec<ScriptInfo> = Vec::new();
+    for s in crate::sign_script::prerequest_scripts(doc) {
+        let sha256 = crate::fetch::sha256_hex(s.text.as_bytes());
+        match out.iter_mut().find(|i| i.sha256 == sha256) {
+            Some(i) => {
+                i.scopes.push(s.scope);
+                i.requests = i.requests.max(s.requests);
+            }
+            None => out.push(ScriptInfo {
+                sha256,
+                scopes: vec![s.scope],
+                requests: s.requests,
+                lines: s.text.lines().count(),
+                signs: crate::sign_script::seems_to_sign(&s.text),
+                unsupported: crate::sign_script::unsupported_calls(&s.text),
+                text: None,
+            }),
+        }
+    }
+    out
+}
+
+/// Fills in each listed script's text from the document it came from.
+pub fn add_script_text(loaded: &mut Loaded, document: &str) {
+    let Ok(doc) = super::parse_document(document) else { return };
+    let scripts = crate::sign_script::prerequest_scripts(&doc);
+    for info in &mut loaded.scripts {
+        info.text =
+            scripts.iter().find(|s| crate::fetch::sha256_hex(s.text.as_bytes()) == info.sha256).map(|s| s.text.clone());
+    }
+}
+
 /// Which built requests to use.
 #[derive(Debug, Default, Clone)]
 pub struct Selection {
@@ -522,6 +790,7 @@ impl Loaded {
             let method = request.method.to_ascii_uppercase();
             let in_scope = guard.may_allow(&target.host, target.port);
             let scope_confirmed = in_scope && guard.confirms(&target.host, target.port);
+            let method = opt_in_name(self.format, request).unwrap_or(method);
             let method_ok = all || DEFAULT_METHODS.contains(&method.as_str()) || sel.include_methods.contains(&method);
             let excluded_reason = if sel.only.as_ref().is_some_and(|o| !o.contains(&index)) {
                 Some("not_selected")
@@ -562,6 +831,10 @@ impl Loaded {
             variables: self.variables.clone(),
             unresolved_variables: self.unresolved_variables.clone(),
             credentials: self.credentials.clone(),
+            environment: self.environment.clone(),
+            scripts: self.scripts.clone(),
+            oauth: self.oauth.clone(),
+            aws: self.aws.clone(),
             built: self.requests.len(),
             selected: plan.selected(),
             skipped: self.skipped.clone(),
@@ -571,7 +844,7 @@ impl Loaded {
                 .map(|((host, port), (in_scope, scope_confirmed))| Host { host, port, in_scope, scope_confirmed })
                 .collect(),
             requests_truncated: plan.items.len() > limit,
-            requests: plan.items.iter().take(limit).map(PreviewRequest::new).collect(),
+            requests: plan.items.iter().take(limit).map(|i| PreviewRequest::new(i, self.format)).collect(),
         }
     }
 
@@ -603,7 +876,8 @@ impl Loaded {
             )));
         }
         Err(Error::InvalidInput(
-            "no requests selected: check --only, or --include-methods for PUT, PATCH, and DELETE".into(),
+            "no requests selected: check --only, or --include-methods for PUT, PATCH, DELETE, and GraphQL's MUTATION"
+                .into(),
         ))
     }
 }
@@ -645,6 +919,9 @@ pub struct PreviewRequest {
     #[serde(skip)]
     pub body: Vec<u8>,
     pub state_changing: bool,
+    /// What `--include-methods` calls it, when that isn't its method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opt_in: Option<String>,
     pub in_scope: bool,
     pub scope_confirmed: bool,
     pub included: bool,
@@ -652,8 +929,9 @@ pub struct PreviewRequest {
 }
 
 impl PreviewRequest {
-    fn new(i: &Planned) -> Self {
+    fn new(i: &Planned, format: Format) -> Self {
         let r = &i.request;
+        let opt_in = opt_in_name(format, r);
         PreviewRequest {
             index: i.index,
             name: r.name.clone(),
@@ -661,7 +939,9 @@ impl PreviewRequest {
             url: r.url.clone(),
             headers: r.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect(),
             body: masked_body(&r.headers, &r.body),
-            state_changing: matches!(r.method.to_ascii_uppercase().as_str(), "PUT" | "PATCH" | "DELETE"),
+            state_changing: opt_in.is_some()
+                || matches!(r.method.to_ascii_uppercase().as_str(), "PUT" | "PATCH" | "DELETE"),
+            opt_in,
             in_scope: i.in_scope,
             scope_confirmed: i.scope_confirmed,
             included: i.excluded_reason.is_none(),
@@ -683,6 +963,10 @@ pub struct Preview {
     pub variables: Vec<Variable>,
     pub unresolved_variables: Vec<String>,
     pub credentials: Vec<Credential>,
+    pub environment: Option<EnvironmentInfo>,
+    pub scripts: Vec<ScriptInfo>,
+    pub oauth: Vec<OAuthHint>,
+    pub aws: Vec<AwsHint>,
     pub built: usize,
     pub selected: usize,
     pub skipped: Vec<Skipped>,
@@ -854,12 +1138,15 @@ mod tests {
         assert_eq!(f("openapi: 3.1\npaths: {}"), Format::Openapi3);
         assert_eq!(f("swagger: 2.0\nhost: a.test\npaths: {}"), Format::Swagger2);
         assert_eq!(f(r#"{"info": {"name": "x"}, "item": []}"#), Format::Postman);
+        assert_eq!(f("type Query {\n  a: Int\n}\n"), Format::Graphql);
+        assert!(err("type Other {\n  a: Int\n}\n").contains("no Query type"));
+        assert_eq!(f(r#"{"data": {"__schema": {"queryType": {"name": "Query"}, "types": []}}}"#), Format::Graphql);
         for (text, says) in [
             ("openapi: 4.0.0\npaths: {}", "OpenAPI version \"4.0.0\" isn't supported"),
             ("swagger: 1.2\npaths: {}", "Swagger version \"1.2\" isn't supported"),
             ("swaggerVersion: 1.2\napis: []", "Swagger version"),
-            ("type Query {\n  a: Int\n}\n", "GraphQL SDL"),
-            (r#"{"data": {"__schema": {}}}"#, "introspection"),
+            (r#"{"errors": [{"message": "off"}]}"#, "introspection"),
+            (r#"{"values": [], "_postman_variable_scope": "environment"}"#, "--environment"),
             (r#"{"requests": [], "order": []}"#, "Postman collection v1"),
             (r#"{"log": {"entries": []}}"#, "HAR"),
             ("<html></html>", "HTML"),

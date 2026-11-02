@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { bodyText, inTauri, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
 import { loadSuggestions } from "./Scanner";
+import { OAuthFields, ScriptChoice } from "./ApiAuthExtras";
 import { SignerBuilder } from "./SessionHandling";
 import { PostWarning, SPEEDS, WizardProgress, type Speed } from "./Wizard";
 import {
@@ -26,6 +27,7 @@ import {
   likelyInScope,
   defaultTarget,
   dropOptIn,
+  environmentProblem,
   excludedText,
   filterOperations,
   formatLabel,
@@ -41,6 +43,7 @@ import {
   methodSummary,
   newSignerForm,
   newSignerProblems,
+  oauthDefaults,
   operationCount,
   operationOrigins,
   optInMethods,
@@ -75,16 +78,17 @@ import {
 import { signerAddArgs, signerLabel, signerProblems, type SessionRule, type Signer, type SignerForm } from "./sessionRules";
 import { DEPTHS, attacksPaths, type Depth } from "./wizardDepths";
 
-const FILTERS = [{ name: "API definition", extensions: ["json", "yaml", "yml"] }];
+const FILTERS = [{ name: "API definition", extensions: ["json", "yaml", "yml", "graphql", "graphqls", "gql"] }];
+const ENVIRONMENT_FILTERS = [{ name: "Postman environment", extensions: ["json"] }];
 
-/** A definition file's path; null if cancelled. */
-async function chooseFile(): Promise<string | null> {
+/** A file's path; null if cancelled. */
+async function chooseFile(filters = FILTERS, what = "API definition"): Promise<string | null> {
   if (inTauri) {
     const dialog = await import("@tauri-apps/plugin-dialog");
-    const p = await dialog.open({ filters: FILTERS, multiple: false });
+    const p = await dialog.open({ filters, multiple: false });
     return typeof p === "string" ? p : null;
   }
-  return window.prompt("Path of the API definition (full path):")?.trim() || null;
+  return window.prompt(`Path of the ${what} (full path):`)?.trim() || null;
 }
 
 interface Props {
@@ -107,6 +111,7 @@ export function ApiWizard(p: Props) {
   const [problem, setProblem] = useState("");
   const [docChanged, setDocChanged] = useState(false);
   const [target, setTarget] = useState<ApiTarget>(EMPTY_TARGET);
+  const [graphqlEndpoint, setGraphqlEndpoint] = useState(false);
   const [customBase, setCustomBase] = useState(false);
   const [previewedKey, setPreviewedKey] = useState("");
   const [scope, setScope] = useState<string[]>([]);
@@ -134,7 +139,8 @@ export function ApiWizard(p: Props) {
     setPreviewing(true);
     setProblem("");
     try {
-      const d = await run<ApiPreview>(previewArgs(src, t ?? EMPTY_TARGET));
+      const fresh = { ...EMPTY_TARGET, graphql: graphqlEndpoint && sourceKind(src) === "url" };
+      const d = await run<ApiPreview>(previewArgs(src, t ?? fresh));
       if (n !== seq.current) return;
       setSelected(defaultSelection(d.requests));
       setOptIn(false);
@@ -147,13 +153,13 @@ export function ApiWizard(p: Props) {
         if (preview?.base_url_required && !d.base_url_required && !t.baseUrl.trim()) setCustomBase(false);
         setPreviewedKey(keyOf(src, t));
       } else {
-        const first = defaultTarget(d);
+        const first = defaultTarget(d, { graphql: fresh.graphql });
         setSource(src);
         setTarget(first);
         setCustomBase(d.base_url_required);
         setPreviewedKey(keyOf(src, first));
         setDocChanged(false);
-        setAuth({ ...EMPTY_AUTH, ...keyDefaults(d.credentials) });
+        setAuth({ ...EMPTY_AUTH, ...keyDefaults(d.credentials), oauth: oauthDefaults(d.oauth ?? []) });
         setSignerDraft(null);
       }
       setPreview(d);
@@ -191,6 +197,26 @@ export function ApiWizard(p: Props) {
     }
   };
 
+  const chooseEnvironment = async () => {
+    try {
+      const f = await chooseFile(ENVIRONMENT_FILTERS, "Postman environment file");
+      if (!f) return;
+      const bad = environmentProblem(f);
+      if (bad) return setProblem(bad);
+      const next = { ...target, environment: f };
+      setTarget(next);
+      await load(source, next);
+    } catch (e: any) {
+      setProblem(String(e.message ?? e));
+    }
+  };
+
+  const dropEnvironment = async () => {
+    const next = { ...target, environment: "" };
+    setTarget(next);
+    await load(source, next);
+  };
+
   const start = async () => {
     if (!preview) return;
     setBusy(true);
@@ -200,6 +226,7 @@ export function ApiWizard(p: Props) {
         scanArgs({
           source,
           sha256: preview.document_sha256,
+          environmentSha: preview.environment?.sha256,
           target,
           operations: preview.requests,
           selected,
@@ -259,7 +286,7 @@ export function ApiWizard(p: Props) {
       </ol>
 
       {step === 0 && (
-        <DefinitionStep typed={typed} setTyped={setTyped} previewing={previewing} problem={problem} clearProblem={() => setProblem("")} preview={previewed ? preview : null} browse={browse} fetch={() => load(typed.trim(), null)} scope={scope} />
+        <DefinitionStep typed={typed} setTyped={setTyped} previewing={previewing} problem={problem} clearProblem={() => setProblem("")} preview={previewed ? preview : null} browse={browse} fetch={() => load(typed.trim(), null)} scope={scope} graphql={graphqlEndpoint} setGraphql={setGraphqlEndpoint} environment={target.environment} chooseEnvironment={chooseEnvironment} dropEnvironment={dropEnvironment} />
       )}
       {step === 1 && preview && (
         <ServerStep
@@ -324,6 +351,11 @@ function DefinitionStep(p: {
   browse: () => void;
   fetch: () => void;
   scope: string[];
+  graphql: boolean;
+  setGraphql: (on: boolean) => void;
+  environment: string;
+  chooseEnvironment: () => void;
+  dropEnvironment: () => void;
 }) {
   const text = p.typed.trim();
   const isUrl = !!text && sourceKind(text) === "url";
@@ -351,10 +383,16 @@ function DefinitionStep(p: {
           {p.previewing ? "Reading…" : isUrl ? "Fetch and preview" : "Preview"}
         </button>
       </div>
+      {isUrl && (
+        <label className="check wiz-wrap">
+          <input type="checkbox" checked={p.graphql} onChange={(e) => p.setGraphql(e.target.checked)} />
+          This is a GraphQL endpoint: ask it for its schema
+        </label>
+      )}
       {bad && <div className="wiz-problem">{bad}</div>}
       {p.problem && <div className="wiz-problem">{p.problem}</div>}
       <p className="muted">
-        OpenAPI, Swagger and Postman files. Previewing a file sends nothing.{" "}
+        OpenAPI, Swagger and Postman files, and GraphQL schemas. Previewing a file sends nothing.{" "}
         {isUrl
           ? `Previewing this URL fetches it from here right away, and only if it's inside this project's approved scope${p.scope.length ? ` (${p.scope.join(", ")})` : ""}.`
           : "A URL is fetched as soon as you preview it, and only if it's inside this project's approved scope."}
@@ -364,7 +402,8 @@ function DefinitionStep(p: {
           <dl className="facts">
             <dt>Definition</dt>
             <dd>
-              {previewTitle(d)} ({formatLabel(d.format)})
+              {previewTitle(d)}
+              {d.title ? ` (${formatLabel(d.format)})` : ""}
             </dd>
             <dt>Operations</dt>
             <dd>{d.built}</dd>
@@ -375,6 +414,29 @@ function DefinitionStep(p: {
               </>
             )}
           </dl>
+          {d.format === "postman" && (
+            <div className="wiz-sign">
+              <label className="label">Postman environment (optional)</label>
+              <div className="wiz-row">
+                <button className="btn" disabled={p.previewing} onClick={p.chooseEnvironment}>
+                  Choose an environment file…
+                </button>
+                {p.environment && (
+                  <>
+                    <span className="mono small">{p.environment}</span>
+                    <button className="link" disabled={p.previewing} onClick={p.dropEnvironment}>
+                      Remove
+                    </button>
+                  </>
+                )}
+              </div>
+              <p className="muted small">
+                {d.environment
+                  ? `"${d.environment.name ?? "Environment"}" gives ${d.environment.variables} variable${d.environment.variables === 1 ? "" : "s"}. Those that hold secrets aren't put in requests.`
+                  : "Gives the collection its variables, so you don't have to type them. It stays in its file: only its path goes in the job's record."}
+              </p>
+            </div>
+          )}
           <SkippedList preview={d} />
         </>
       )}
@@ -454,8 +516,8 @@ function ServerStep(p: {
             p.setTarget({ ...t, server: null });
           }}
         >
-          <b>Another base URL</b>
-          <span>{d.base_url_required ? "This definition doesn't say where the API is, so it needs one." : "For example a test environment. It replaces the definition's servers."}</span>
+          <b>{d.format === "graphql" ? "The GraphQL endpoint" : "Another base URL"}</b>
+          <span>{d.format === "graphql" ? "The URL that takes the queries." : d.base_url_required ? "This definition doesn't say where the API is, so it needs one." : "For example a test environment. It replaces the definition's servers."}</span>
         </button>
       </div>
       {p.customBase && (
@@ -515,7 +577,7 @@ function ServerStep(p: {
 
 interface AuthData {
   /** Names can only be checked for collisions once this loaded. */
-  profiles: { name: string; login_url?: string | null; session?: { logged_in?: boolean } }[];
+  profiles: { name: string; login_url?: string | null; oauth?: unknown; session?: { logged_in?: boolean } }[];
   signers: { profile: string; signer: Signer }[];
   rules: Record<string, SessionRule[]>;
 }
@@ -579,6 +641,14 @@ function AuthStep(p: {
     });
   }, []);
 
+  const scriptOrigins = operationOrigins(likelyInScope(ops));
+  const scriptSaved = async (name: string, sha: string) => {
+    const home = signerHome(a);
+    p.setAuth({ ...a, signing: true, signer: { profile: home, name }, script: sha });
+    p.setDraft(null);
+    await reload();
+  };
+
   const signerRow = a.signer && data?.signers.find((s) => s.profile === a.signer!.profile && s.signer.name === a.signer!.name);
   const ticked = new Set(p.selected);
   const coverage = signerRow ? signerCoverage(data!.rules[signerRow.profile] ?? [], signerRow.signer, inScope.filter((o) => ticked.has(o.index)).map((o) => o.url)) : null;
@@ -627,14 +697,18 @@ function AuthStep(p: {
     <div className="wiz-body">
       <label className="label">Does the API need authentication?</label>
       {loadProblem && <div className="wiz-problem">Couldn't read the auth profiles: {loadProblem}</div>}
-      <div className="wiz-choices three">
+      <div className="wiz-choices four">
         <button className={`wiz-choice ${a.mode === "none" ? "on" : ""}`} onClick={() => set({ mode: "none" })}>
           <b>No authentication</b>
           <span>Test what anyone can reach. A good start.</span>
         </button>
-        <button className={`wiz-choice ${a.mode === "key" ? "on" : ""}`} onClick={() => set({ mode: "key" })}>
+        <button className={`wiz-choice ${a.mode === "key" ? "on" : ""}`} onClick={() => set({ mode: "key", savedProfile: a.mode === "key" ? a.savedProfile : "" })}>
           <b>API key or bearer token</b>
           <span>The usual way. Stored in a new auth profile.</span>
+        </button>
+        <button className={`wiz-choice ${a.mode === "oauth" ? "on" : ""}`} onClick={() => set({ mode: "oauth", savedProfile: a.mode === "oauth" ? a.savedProfile : "" })}>
+          <b>OAuth 2</b>
+          <span>Gets a token, and a new one as it runs out.</span>
         </button>
         <button className={`wiz-choice ${a.mode === "profile" ? "on" : ""}`} onClick={() => set({ mode: "profile" })}>
           <b>Existing auth profile</b>
@@ -644,6 +718,8 @@ function AuthStep(p: {
 
       {a.mode === "key" && <KeyFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} origins={origins} reload={reload} />}
 
+      {a.mode === "oauth" && <OAuthFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} reload={reload} />}
+
       {a.mode === "profile" && (
         <label>
           <span className="label">Profile</span>
@@ -651,7 +727,7 @@ function AuthStep(p: {
             <option value="">Choose a profile…</option>
             {data?.profiles.map((x) => (
               <option key={x.name} value={x.name}>
-                {x.name} {x.login_url ? (x.session?.logged_in ? "(session active)" : "(logs in during the scan)") : ""}
+                {x.name} {x.login_url || x.oauth ? (x.session?.logged_in ? "(session active)" : "(logs in during the scan)") : ""}
               </option>
             ))}
           </select>
@@ -676,7 +752,17 @@ function AuthStep(p: {
         </label>
         {a.signing && (
           <>
-            <p className="muted">For APIs that reject requests without an HMAC signature or a JWT. Most APIs don't need this.</p>
+            <p className="muted">For APIs that reject requests without a signature: HMAC, a private key, AWS SigV4, a JWT or the collection's own script. Most APIs don't need this.</p>
+            <ScriptChoice
+              preview={p.preview}
+              source={p.source}
+              target={p.target}
+              home={signerHome(a)}
+              blockers={[...(data ? [] : ["Profiles are still loading."]), ...newSignerProblems(a, taken)]}
+              origins={scriptOrigins}
+              chosen={a.script}
+              onSaved={scriptSaved}
+            />
             {note && <p className="muted">{note}</p>}
             {data && data.signers.length > 0 && (
               <div className="wiz-choices">
@@ -706,7 +792,7 @@ function AuthStep(p: {
             )}
             {!p.draft ? (
               <div>
-                <button className="btn" onClick={() => p.setDraft(newSignerForm(origins))}>
+                <button className="btn" onClick={() => p.setDraft(newSignerForm(origins, p.preview.aws?.[0]))}>
                   Set up a new signer
                 </button>
               </div>
@@ -835,7 +921,7 @@ function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; sel
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<TryResult | null>(null);
   const [problem, setProblem] = useState("");
-  const op = pickCheckOperation(p.preview.requests, p.selected);
+  const op = pickCheckOperation(p.preview.requests, p.selected, p.preview.format);
   const profile = authProfile(p.auth);
   const signer = p.auth.signing && p.auth.signer ? p.auth.signer.name : "";
   const blocked = authProblems(p.auth).length > 0;
@@ -846,7 +932,7 @@ function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; sel
     setProblem("");
     setResult(null);
     try {
-      const d = await run<{ requests?: { status: number | null; history_id: number | null; error?: string }[] }>(checkArgs(p.source, p.preview.document_sha256, p.target, op.index, profile));
+      const d = await run<{ requests?: { status: number | null; history_id: number | null; error?: string }[] }>(checkArgs(p.source, p.preview.document_sha256, p.target, op.index, profile, p.preview.environment?.sha256));
       const sent = d.requests?.[0];
       if (!sent) {
         setProblem("Nothing was sent. The operation may be outside the scope.");
@@ -888,7 +974,7 @@ function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; sel
           {profile ? `, with the profile "${profile}".` : ", with no authentication."}
         </p>
       ) : (
-        <p className="muted">No GET, HEAD or OPTIONS operation is in scope, so there's nothing safe to try. POST and state-changing operations are never used for this.</p>
+        <p className="muted">No GET, HEAD or OPTIONS operation or GraphQL query is in scope, so there's nothing safe to try. POST and state-changing operations are never used for this.</p>
       )}
       <div>
         <button className="btn" disabled={busy || !op || blocked} onClick={go}>
@@ -940,7 +1026,7 @@ function OperationsStep(p: {
             }}
           />
           <span>
-            Let me tick {listWords(riskyMethods)} operations. These overwrite or delete data on the server. Each one you tick is sent as written, then again with attack data.
+            Let me tick {listWords(riskyMethods)} operations. These change, overwrite or delete data on the server. Each one you tick is sent as written, then again with attack data.
           </span>
         </label>
       )}

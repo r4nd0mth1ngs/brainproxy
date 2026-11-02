@@ -131,11 +131,19 @@ set it up myself" hides it for that project.
 
 The first step also links to the API flow (`views/ApiWizard.tsx`, with its logic in
 `views/apiScan.ts`), which shares the slot and `WizardProgress`. It previews with `import api
-SOURCE --dry-run`, then asks for the server and Postman variables, optional authentication
-(API key or bearer token via `auth add --header-env|--query-key`, with the value passed as
-`BRAINPROXY_SECRET_API_KEY`; an existing profile; optional signing via `SignerBuilder` and a
-session rule), and the operations to send, and offers a one-request check (`import api --only N
---auth P`). It runs `scan active --api SOURCE --expect-sha256 ... --only ... --background`.
+SOURCE --dry-run` (with `--graphql` for a GraphQL endpoint, and `--environment FILE` once a
+Postman environment is chosen), then asks for the server (the endpoint, for a GraphQL schema file)
+and Postman variables, optional authentication (API key or bearer token via `auth add
+--header-env|--query-key`, with the value passed as `BRAINPROXY_SECRET_API_KEY`; OAuth 2 via
+`views/ApiAuthExtras.tsx`, `auth add --oauth-* --oauth-store-secrets` with the secrets in
+`BRAINPROXY_SECRET_OAUTH_*` and `BRAINPROXY_SECRET_PASSWORD`, prefilled from the definition's `oauth`,
+then `auth login` or `auth oauth authorize`, and the profile removed again if no token comes; an
+existing profile; optional signing via `SignerBuilder` (HMAC, private key, JWT or AWS SigV4,
+prefilled from a collection's `aws`) or a collection's pre-request script, shown with
+`--show-scripts` before it can be chosen, and a session rule), and the operations to send
+(GraphQL mutations are opt-in, as MUTATION), and offers a one-request check (`import api --only N
+--auth P`, which may use a GraphQL query). It runs `scan active --api SOURCE --expect-sha256 ...
+[--expect-environment-sha256 ...] --only ... --background`.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).

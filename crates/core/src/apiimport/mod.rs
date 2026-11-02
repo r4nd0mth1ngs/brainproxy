@@ -9,6 +9,8 @@ pub mod openapi;
 pub mod postman;
 mod values;
 
+pub(crate) use values::scalar as scalar_text;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;

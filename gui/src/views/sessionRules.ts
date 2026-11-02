@@ -164,13 +164,15 @@ export function ruleProblems(r: RuleForm, macros: string[], signers: string[], h
 
 export const HMAC_HASHES = ["sha1", "sha256", "sha384", "sha512"] as const;
 export const HMAC_OUTPUTS = ["hex", "base64", "base64url"] as const;
-export const JWT_ALGS = ["HS256", "HS384", "HS512", "RS256"] as const;
+export const JWT_ALGS = ["HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"] as const;
+export const KEY_ALGS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"] as const;
 export const KEY_ENCODINGS = ["raw", "hex", "base64"] as const;
 
 /** A signer as `auth show` lists it: where its key is, never the key. */
 export type Signer = {
   name: string;
-  key: { env: string } | { file: string };
+  /** "none": a script that reads no environment. */
+  key: { env: string } | { file: string } | "none";
   key_encoding?: (typeof KEY_ENCODINGS)[number];
   origins: string[];
   to: { header: string } | { query: string };
@@ -179,11 +181,14 @@ export type Signer = {
 } & (
   | { kind: "hmac"; alg: (typeof HMAC_HASHES)[number]; canonical: string; output?: (typeof HMAC_OUTPUTS)[number] }
   | { kind: "jwt"; alg: (typeof JWT_ALGS)[number]; claims: string; ttl?: number; kid?: string; resign?: boolean }
+  | { kind: "key"; alg: (typeof KEY_ALGS)[number]; canonical: string; output?: (typeof HMAC_OUTPUTS)[number] }
+  | { kind: "sigv4"; access_key: { env: string } | { file: string }; session_token?: { env: string } | { file: string }; region: string; service: string }
+  | { kind: "script"; file: string; sha256: string; vars?: [string, string][] }
 );
 
 export interface SignerForm {
   name: string;
-  keyFrom: "env" | "file";
+  keyFrom: "env" | "file" | "none";
   /** The variable's name or the file's path, never the key. */
   key: string;
   keyEncoding: (typeof KEY_ENCODINGS)[number];
@@ -193,7 +198,7 @@ export interface SignerForm {
   wrap: string;
   /** "NAME: TEMPLATE", one per line. */
   headers: string;
-  kind: "hmac" | "jwt";
+  kind: "hmac" | "jwt" | "key" | "sigv4" | "script";
   canonical: string;
   hash: (typeof HMAC_HASHES)[number];
   output: (typeof HMAC_OUTPUTS)[number];
@@ -202,6 +207,17 @@ export interface SignerForm {
   ttl: string;
   kid: string;
   resign: boolean;
+  keyAlg: (typeof KEY_ALGS)[number];
+  region: string;
+  service: string;
+  accessFrom: "env" | "file";
+  access: string;
+  tokenFrom: "env" | "file";
+  /** Optional. */
+  token: string;
+  scriptFile: string;
+  scriptSha: string;
+  scriptVars: string[];
 }
 
 export const EMPTY_SIGNER: SignerForm = {
@@ -223,6 +239,16 @@ export const EMPTY_SIGNER: SignerForm = {
   ttl: "",
   kid: "",
   resign: false,
+  keyAlg: "ES256",
+  region: "",
+  service: "",
+  accessFrom: "env",
+  access: "",
+  tokenFrom: "env",
+  token: "",
+  scriptFile: "",
+  scriptSha: "",
+  scriptVars: [],
 };
 
 /** The form to edit a signer. */
@@ -230,8 +256,8 @@ export function signerForm(s: Signer): SignerForm {
   const f: SignerForm = {
     ...EMPTY_SIGNER,
     name: s.name,
-    keyFrom: "env" in s.key ? "env" : "file",
-    key: "env" in s.key ? s.key.env : s.key.file,
+    keyFrom: s.key === "none" ? "none" : "env" in s.key ? "env" : "file",
+    key: s.key === "none" ? "" : "env" in s.key ? s.key.env : s.key.file,
     keyEncoding: s.key_encoding ?? "raw",
     origins: s.origins.join("\n"),
     toKind: "header" in s.to ? "header" : "query",
@@ -241,6 +267,18 @@ export function signerForm(s: Signer): SignerForm {
     kind: s.kind,
   };
   if (s.kind === "hmac") return { ...f, canonical: s.canonical, hash: s.alg, output: s.output ?? "hex" };
+  if (s.kind === "key") return { ...f, canonical: s.canonical, keyAlg: s.alg, output: s.output ?? "hex" };
+  if (s.kind === "sigv4")
+    return {
+      ...f,
+      region: s.region,
+      service: s.service,
+      accessFrom: "env" in s.access_key ? "env" : "file",
+      access: "env" in s.access_key ? s.access_key.env : s.access_key.file,
+      tokenFrom: s.session_token && "file" in s.session_token ? "file" : "env",
+      token: !s.session_token ? "" : "env" in s.session_token ? s.session_token.env : s.session_token.file,
+    };
+  if (s.kind === "script") return { ...f, scriptFile: s.file, scriptSha: s.sha256, scriptVars: (s.vars ?? []).map(([k, v]) => `${k}=${v}`) };
   return { ...f, jwtAlg: s.alg, claims: s.claims, ttl: s.ttl == null ? "" : String(s.ttl), kid: s.kid ?? "", resign: !!s.resign };
 }
 
@@ -256,15 +294,27 @@ const lines = (text: string) =>
  * canonical string's spaces are signed.
  */
 export function signerAddArgs(profile: string, f: SignerForm, keepPlace = false): string[] {
-  const args = ["auth", "sign", "add", f.keyFrom === "env" ? `--secret-env=${f.key.trim()}` : `--secret-file=${f.key.trim()}`];
+  const args = ["auth", "sign", "add"];
+  if (f.keyFrom !== "none") args.push(f.keyFrom === "env" ? `--secret-env=${f.key.trim()}` : `--secret-file=${f.key.trim()}`);
   if (keepPlace) args.push("--keep-place");
-  if (f.keyEncoding !== "raw") args.push(`--secret-encoding=${f.keyEncoding}`);
+  if (f.keyEncoding !== "raw" && f.kind !== "script") args.push(`--secret-encoding=${f.keyEncoding}`);
   for (const o of lines(f.origins)) args.push(`--origin=${o}`);
-  args.push(`--to=${f.toKind}:${f.toName.trim()}`);
-  if (f.toKind === "header" && f.wrap) args.push(`--wrap=${f.wrap}`);
-  for (const h of lines(f.headers)) args.push(`--set-header=${h}`);
+  if (f.kind !== "sigv4" && f.kind !== "script") {
+    args.push(`--to=${f.toKind}:${f.toName.trim()}`);
+    if (f.toKind === "header" && f.wrap) args.push(`--wrap=${f.wrap}`);
+    for (const h of lines(f.headers)) args.push(`--set-header=${h}`);
+  }
   if (f.kind === "hmac") {
     args.push(`--canonical=${f.canonical}`, `--hash=${f.hash}`, `--output=${f.output}`);
+  } else if (f.kind === "key") {
+    args.push(`--key-alg=${f.keyAlg}`, `--canonical=${f.canonical}`, `--output=${f.output}`);
+  } else if (f.kind === "sigv4") {
+    args.push(`--sigv4-region=${f.region.trim()}`, `--sigv4-service=${f.service.trim()}`);
+    args.push(f.accessFrom === "env" ? `--access-key-env=${f.access.trim()}` : `--access-key-file=${f.access.trim()}`);
+    if (f.token.trim()) args.push(f.tokenFrom === "env" ? `--session-token-env=${f.token.trim()}` : `--session-token-file=${f.token.trim()}`);
+  } else if (f.kind === "script") {
+    args.push(`--script=${f.scriptFile}`, `--script-sha256=${f.scriptSha}`);
+    for (const v of f.scriptVars) args.push(`--script-var=${v}`);
   } else {
     args.push(`--jwt=${f.jwtAlg}`);
     if (f.claims.trim()) args.push(`--claims=${f.claims}`);
@@ -287,22 +337,36 @@ export function signerProblems(f: SignerForm, taken: string[]): string[] {
   const key = f.key.trim();
   if (!/^[A-Za-z0-9_.-]+$/.test(name)) out.push("Name the signer with letters, digits, '_', '-' and '.'.");
   if (taken.includes(name)) out.push(`A signer named "${name}" already exists.`);
+  const envName = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  const fullPath = /^(\/|[A-Za-z]:[\\/]|\\\\)/;
+  if (f.kind === "sigv4") {
+    if (!f.region.trim() || !f.service.trim()) out.push("Give the AWS region and service, like us-east-1 and execute-api.");
+    const access = f.access.trim();
+    if (f.accessFrom === "env" ? !envName.test(access) : !fullPath.test(access)) out.push("Say where the access key id is: an environment variable's name or a file's full path.");
+    const token = f.token.trim();
+    if (token && (f.tokenFrom === "env" ? !envName.test(token) : !fullPath.test(token))) out.push("Say where the session token is: an environment variable's name or a file's full path.");
+  }
   if (f.keyFrom === "env" && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) out.push("Give the name of the environment variable that holds the key, not the key.");
   // Read by whichever process signs, each with its own working directory.
   if (f.keyFrom === "file" && !/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(key)) out.push("Give the full path of the file that holds the key.");
   if (!lines(f.origins).length) out.push("Name at least one origin it may sign for.");
-  if (!f.toName.trim()) out.push(`Name the ${f.toKind} the value goes in.`);
-  if (f.toKind === "header" && f.wrap && f.wrap.split("{{signature}}").length !== 2) out.push("The header format needs {{signature}} once.");
-  if (lines(f.headers).some((h) => !h.includes(":"))) out.push("Write each header to set as NAME: TEMPLATE.");
-  if (f.kind === "hmac" && !f.canonical) out.push("Say what to sign.");
+  if (f.kind !== "sigv4" && f.kind !== "script") {
+    if (!f.toName.trim()) out.push(`Name the ${f.toKind} the value goes in.`);
+    if (f.toKind === "header" && f.wrap && f.wrap.split("{{signature}}").length !== 2) out.push("The header format needs {{signature}} once.");
+    if (lines(f.headers).some((h) => !h.includes(":"))) out.push("Write each header to set as NAME: TEMPLATE.");
+  }
+  if ((f.kind === "hmac" || f.kind === "key") && !f.canonical) out.push("Say what to sign.");
   if (f.kind === "jwt" && f.ttl.trim() && !/^\d+$/.test(f.ttl.trim())) out.push("Give the JWT's lifetime in whole seconds.");
   return out;
 }
 
 /** What a signer makes and where its key is, in plain words. */
 export function signerLabel(s: Signer): string {
-  const made = s.kind === "hmac" ? `HMAC-${s.alg.toUpperCase()} (${s.output ?? "hex"})` : `JWT ${s.alg}${s.resign ? ", re-signed" : ""}`;
+  const key = s.key === "none" ? "" : "env" in s.key ? `$${s.key.env}` : s.key.file;
+  if (s.kind === "script") return `Postman script from ${s.file}${key ? ` · environment in ${key}` : ""}`;
+  if (s.kind === "sigv4") return `AWS SigV4 for ${s.service} in ${s.region} · secret key in ${key}`;
+  const made =
+    s.kind === "hmac" ? `HMAC-${s.alg.toUpperCase()} (${s.output ?? "hex"})` : s.kind === "key" ? `${s.alg} signature (${s.output ?? "hex"})` : `JWT ${s.alg}${s.resign ? ", re-signed" : ""}`;
   const to = "header" in s.to ? `header ${s.to.header}` : `query ${s.to.query}`;
-  const key = "env" in s.key ? `$${s.key.env}` : s.key.file;
   return `${made} → ${to} · key in ${key}`;
 }
