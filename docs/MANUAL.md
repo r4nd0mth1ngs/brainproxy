@@ -521,8 +521,9 @@ byte, side by side or unified.
   project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
   is used as is: if it's taken, the proxy stays off and says why. A running proxy on another
   port keeps it until you press *Restart on port N*, which keeps its bind address and
-  options (a custom log file goes back to the default). Browsers opened earlier keep the old port until you close them and open them
-  again; reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
+  options (a custom log file goes back to the default). Browsers opened earlier still point
+  at the old port: close them and open them again, or their traffic goes to whatever proxy
+  starts on that port later, maybe another project's. Reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
   still defaults to 8080 unless given `--listen`.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,
   the fuzzer, logins, and the proxy's upstream side). A running proxy picks up a change

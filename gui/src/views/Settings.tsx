@@ -1353,7 +1353,10 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
         !now.other_pid_namespace &&
         (held === 0 || (await confirm("Restart the proxy?", `${held} held request${held === 1 ? "" : "s"} will be dropped.`, "Restart", "Keep running")))
       ) {
-        app.toast(`The proxy is now listening on ${await moveProxy(run, app.proxy, now.proxy, saved)}.`);
+        const was = now.proxy.listen;
+        app.toast(
+          `The proxy is now listening on ${await moveProxy(run, app.proxy, now.proxy, saved)}. Browsers opened earlier still send traffic to ${was}: close them, and use Open browser again. Otherwise they go through whatever proxy starts on ${was} later, maybe another project's.`,
+        );
       }
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -1411,7 +1414,8 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
         <>
           <p>
             The proxy is still listening on <span className="mono">{running.listen}</span>. It has to restart to use port {saved}.
-            Browsers opened earlier keep the old port until you close them and open them again; reconfigure tools you set up by hand.
+            Browsers opened earlier stay on {running.listen} after the restart: close them and open them again, or their traffic goes
+            to whatever proxy starts on that port later, maybe another project's. Reconfigure tools you set up by hand.
           </p>
           {blocked && <p className="muted">{blocked}</p>}
           <button className="btn small primary" disabled={p.busy || !!blocked} onClick={restart}>
