@@ -1,7 +1,8 @@
 // cURL commands in and out of Replay. `parseCurl` turns a pasted command (a POSIX shell line,
 // or Windows cmd as Chrome's "Copy as cURL (cmd)" writes it) into a raw request and its target;
-// `toCurl` writes a raw request as a POSIX shell command with every value single-quoted, so
-// header values and bodies that came from a target can't run anything in the shell.
+// `toCurl` writes a raw request as a POSIX shell command with every value single-quoted (and
+// control or non-UTF-8 bytes written with printf), so header values and bodies that came from a
+// target can't run anything in the shell.
 // Both work on byte strings (one char per byte) inside, so binary bodies survive.
 
 // With its extension, so node --test can load this module (as the tests import theirs).
@@ -115,11 +116,22 @@ function posixWords(src: string): string[] {
         if (d === "\\" && i + 1 < cs.length && '$`"\\\n'.includes(cs[i + 1])) {
           if (cs[i + 1] !== "\n") s += cs[i + 1];
           i++;
+        } else if (d === "$" && cs[i + 1] === "(") {
+          lit(s);
+          s = "";
+          const [bytes, next] = printfSubst(cs, i);
+          cur += bytes;
+          i = next - 1;
         } else if ((d === "$" && NAME_START.test(cs[i + 1] ?? "")) || d === "`") expansion();
         else s += d;
       }
       lit(s);
       i++;
+    } else if (c === "$" && cs[i + 1] === "(") {
+      const [bytes, next] = printfSubst(cs, i);
+      cur += bytes;
+      inWord = true;
+      i = next;
     } else if ((c === "$" && NAME_START.test(cs[i + 1] ?? "")) || c === "`") {
       expansion();
     } else if ("|&;<>()".includes(c)) {
@@ -176,6 +188,43 @@ function ansiC(cs: string[], i: number): [string, number] {
     } else out += "\\" + utf8(n);
   }
   throw new CurlError("Unterminated $' quote.");
+}
+
+/** `$(printf '…')`, the one command substitution toCurl writes: its bytes and where it ends. */
+function printfSubst(cs: string[], i: number): [string, number] {
+  const open = "$(printf '";
+  if (cs.slice(i, i + open.length).join("") !== open) expansion();
+  const close = cs.indexOf("'", i + open.length);
+  if (close < 0 || cs[close + 1] !== ")") expansion();
+  const bytes = printfBytes(utf8(cs.slice(i + open.length, close).join("")));
+  if (bytes.includes("\0")) throw new CurlError("A $(printf …) holds a NUL byte, which a shell can't pass to curl.");
+  // A command substitution drops trailing newlines.
+  return [bytes.replace(/\n+$/, ""), close + 2];
+}
+
+/** The bytes a printf format prints: its escapes and %%, nothing else (no conversions). */
+function printfBytes(fmt: string): string {
+  const SIMPLE: Record<string, string> = { "\\": "\\", a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
+  let out = "";
+  for (let i = 0; i < fmt.length; ) {
+    const c = fmt[i++];
+    if (c === "%") {
+      if (fmt[i] !== "%") throw new CurlError("Only %% is read in a printf format; paste the value itself.");
+      out += "%";
+      i++;
+    } else if (c === "\\") {
+      const oct = /^[0-7]{1,3}/.exec(fmt.slice(i, i + 3));
+      const n = fmt[i] ?? "";
+      if (oct) {
+        out += String.fromCharCode(parseInt(oct[0], 8) & 0xff);
+        i += oct[0].length;
+      } else if (Object.hasOwn(SIMPLE, n)) {
+        out += SIMPLE[n];
+        i++;
+      } else throw new CurlError(`The printf escape \\${decodeOr(n)} isn't read; paste the value itself.`);
+    } else out += c;
+  }
+  return out;
 }
 
 /**
@@ -262,6 +311,7 @@ const USED: Record<string, boolean> = {
   "http2-prior-knowledge": false,
   http3: false,
   "http3-only": false,
+  "proto-default": true,
   "path-as-is": false,
   basic: false,
   globoff: false,
@@ -304,7 +354,6 @@ const IGNORED: Record<string, boolean> = {
   "speed-time": true,
   "alt-svc": true,
   hsts: true,
-  "proto-default": true,
   proto: true,
   "proto-redir": true,
   "cert-type": true,
@@ -457,12 +506,15 @@ interface Options {
   range?: string;
   bearer?: string;
   requestTarget?: string;
+  protoDefault?: string;
   version: string;
+  /** --http2 (not --http2-prior-knowledge): HTTP/2 only over TLS; curl asks to upgrade over http. */
+  h2Upgrade?: boolean;
   flags: Set<string>;
   warnings: string[];
 }
 
-function readOptions(words: string[]): Options {
+function readOptions(words: string[], stdin?: string): Options {
   const o: Options = { urls: [], headers: [], data: [], form: [], cookies: [], urlQuery: [], version: "HTTP/1.1", flags: new Set(), warnings: [] };
   let i = 0;
   const value = (name: string, attached?: string): string => {
@@ -494,8 +546,10 @@ function readOptions(words: string[]): Options {
     }
     if (!used) {
       if (name === "http1.0" || name === "http1.1") o.version = name === "http1.0" ? "HTTP/1.0" : "HTTP/1.1";
-      else if (name === "http2" || name === "http2-prior-knowledge") o.version = "HTTP/2";
-      else if (name === "http3" || name === "http3-only") o.warnings.push("brainproxy doesn't speak HTTP/3: the request is sent over HTTP/1.1.");
+      else if (name === "http2" || name === "http2-prior-knowledge") {
+        o.version = "HTTP/2";
+        o.h2Upgrade = name === "http2";
+      } else if (name === "http3" || name === "http3-only") o.warnings.push("brainproxy doesn't speak HTTP/3: the request is sent over HTTP/1.1.");
       else o.flags.add(name);
       return;
     }
@@ -511,6 +565,11 @@ function readOptions(words: string[]): Options {
       case "data-ascii":
       case "data-binary":
       case "json":
+        if (name === "data-binary" && v === "@-" && stdin !== undefined) {
+          o.data.push({ bytes: stdin, json: false });
+          o.flags.add("stdin");
+          break;
+        }
         if (v.startsWith("@")) throw new CurlError(`--${name} ${decodeOr(v)} reads a file; paste its contents with --data-raw instead.`);
         o.data.push({ bytes: v, json: name === "json" });
         if (name === "json") o.flags.add("json");
@@ -558,6 +617,10 @@ function readOptions(words: string[]): Options {
         break;
       case "request-target":
         o.requestTarget = v;
+        break;
+      case "proto-default":
+        if (v !== "http" && v !== "https") throw new CurlError(`Only http and https can be sent, not --proto-default ${decodeOr(v)}.`);
+        o.protoDefault = v;
         break;
     }
   };
@@ -663,10 +726,10 @@ const percentDecode = (s: string) => s.replace(/%([0-9a-fA-F]{2})/g, (_, h) => S
 
 const basic = (credentials: string) => "Basic " + btoa(credentials);
 
-/** Splits a URL like curl reads it (no scheme means http). Byte strings in, byte strings out. */
-function splitUrl(url: string) {
+/** Splits a URL like curl reads it (no scheme means http, or --proto-default). Byte strings in, byte strings out. */
+function splitUrl(url: string, defaultScheme = "http") {
   const m = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.*)$/s.exec(url);
-  const scheme = (m ? m[1] : "http").toLowerCase();
+  const scheme = (m ? m[1] : defaultScheme).toLowerCase();
   if (scheme !== "http" && scheme !== "https") throw new CurlError(`Only http and https URLs can be sent, not ${scheme}.`);
   const rest = m ? m[2] : url;
   const end = rest.search(/[/?#]/);
@@ -691,14 +754,28 @@ function splitUrl(url: string) {
 
 const CRLF = /[\r\n\0]/;
 
+/** Without HTTP whitespace at either end. (trim() would also strip 0xA0, a byte of UTF-8 text.) */
+const trimHws = (s: string) => s.replace(/^[ \t]+|[ \t]+$/g, "");
+
 /** Parses a cURL command line into a raw request for Replay. Throws CurlError with what's wrong. */
 export function parseCurl(command: string): ParsedCurl {
-  const src = command.replace(/\r\n?/g, "\n").trim();
+  let src = command.replace(/\r\n?/g, "\n").trim();
   if (!src) throw new CurlError("Paste a curl command.");
-  const cmd = /\^\s*\n/.test(src) || src.includes('^"');
+  // Windows cmd as Chrome writes it (curl ^"…), or by hand: every line ends in ^ and nothing is
+  // single-quoted. A POSIX command may hold ^" or a ^ at a line end inside its quotes.
+  const lines = src.split("\n");
+  const cmd = /^\S*curl(\.exe)?\s+\^"/i.test(src) || (lines.length > 1 && lines.slice(0, -1).every((l) => /\s\^$/.test(l)) && !src.includes("'"));
+  // A body piped in with printf, as toCurl writes one that isn't plain text.
+  let stdin: string | undefined;
+  const pipe = cmd ? null : /^printf '([^']*)'[ \t]*\|[ \t]*/.exec(src);
+  if (pipe) {
+    stdin = printfBytes(utf8(pipe[1]));
+    src = src.slice(pipe[0].length);
+  }
   const words = cmd ? cmdWords(src) : posixWords(src);
   if (!words.length || !/(^|[/\\])curl(\.exe)?$/i.test(decodeOr(words[0]))) throw new CurlError("That isn't a curl command: it should start with curl.");
-  const o = readOptions(words.slice(1));
+  const o = readOptions(words.slice(1), stdin);
+  if (pipe && !o.flags.has("stdin")) throw new CurlError("curl doesn't read what printf pipes in; only --data-binary @- is read.");
 
   if (o.urls.length === 0) throw new CurlError("The command has no URL.");
   if (o.urls.length > 1) throw new CurlError("The command has more than one URL; paste one request at a time.");
@@ -708,7 +785,13 @@ export function parseCurl(command: string): ParsedCurl {
   const hasBody = !get && (o.data.length > 0 || o.form.length > 0);
   if (o.flags.has("head") && hasBody) throw new CurlError("curl can't send data with -I (HEAD); use -X HEAD.");
 
-  const url = splitUrl(o.urls[0]);
+  const url = splitUrl(o.urls[0], o.protoDefault);
+  // curl refuses such a URL ("Malformed input"); --request-target sends one as is.
+  if (/[\x00-\x20\x7f]/.test(o.urls[0])) throw new CurlError("The URL holds a space or control character, which curl refuses; encode it (%20).");
+  if (o.version === "HTTP/2" && o.h2Upgrade && url.scheme === "http") {
+    o.version = "HTTP/1.1";
+    o.warnings.push("curl --http2 only asks an http:// server to upgrade, so the request is sent over HTTP/1.1 (use --http2-prior-knowledge for HTTP/2).");
+  }
   let path = o.flags.has("path-as-is") ? url.path : removeDots(url.path);
   const joined = o.data.map((d, n) => (n > 0 && !d.json ? "&" : "") + d.bytes).join("");
   const query = [...(get && o.data.length ? [joined] : []), ...o.urlQuery];
@@ -761,6 +844,10 @@ export function parseCurl(command: string): ParsedCurl {
     }
   };
   for (const h of o.headers) {
+    if (h.startsWith(":")) {
+      o.warnings.push(`Left out the HTTP/2 pseudo-header ${decodeOr(/^:[^:]*/.exec(h)![0])}.`);
+      continue;
+    }
     if (h.startsWith("@")) throw new CurlError(`-H ${decodeOr(h)} reads headers from a file; paste them instead.`);
     if (CRLF.test(h)) throw new CurlError(`The header ${JSON.stringify(decodeOr(h))} holds a line break or NUL byte.`);
     const colon = h.indexOf(":");
@@ -769,19 +856,15 @@ export function parseCurl(command: string): ParsedCurl {
     if (colon < 0) {
       // "Name;" sends an empty header.
       if (!h.endsWith(";")) throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
-      name = h.slice(0, -1).trim();
+      name = trimHws(h.slice(0, -1));
       val = "";
     } else {
-      name = h.slice(0, colon).trim();
+      name = trimHws(h.slice(0, colon));
       const v = h.slice(colon + 1).replace(/^[ \t]+/, "");
       // "Name:" with nothing after it removes one of curl's headers.
-      val = v.trim() ? v : null;
+      val = v ? v : null;
     }
     if (!name || /[\s:]/.test(name)) {
-      if (name.startsWith(":")) {
-        o.warnings.push(`Left out the HTTP/2 pseudo-header ${decodeOr(name)}.`);
-        continue;
-      }
       throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
     }
     if (name.toLowerCase() === "host" && val != null) {
@@ -819,36 +902,63 @@ export function parseCurl(command: string): ParsedCurl {
  */
 const PLAIN = new RegExp("^[^\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u061c\\u200b-\\u200f\\u2028-\\u202e\\u2066-\\u2069\\ufeff]*$");
 
+/** Plain UTF-8 text, which goes in '…' as it is. */
+const isPlainText = (bytes: string) => {
+  const text = decodeUtf8(bytes);
+  return text != null && PLAIN.test(text);
+};
+
 /**
- * One shell word holding exactly these bytes: '…' for plain text, $'…' with \xNN escapes
- * otherwise. Nothing inside either form is expanded by the shell. NUL can't be passed at all.
+ * One shell word holding exactly these bytes. Plain text goes in '…', with each ' and \ written
+ * outside the quotes as \' and \\ (fish reads a \ inside '…' as an escape, POSIX shells don't);
+ * control, bidi and non-UTF-8 bytes go in "$(printf '\NNN')". Nothing is expanded by sh, bash,
+ * zsh or fish. NUL can't be passed at all.
  */
 export function shellQuote(bytes: string): string {
   if (bytes.includes("\0")) throw new CurlError("A value holds a NUL byte, which a shell can't pass as an argument.");
   const text = decodeUtf8(bytes);
-  if (text != null && PLAIN.test(text)) return `'${text.replace(/'/g, `'\\''`)}'`;
-  let out = "$'";
-  for (const ch of bytes) {
-    const c = ch.charCodeAt(0);
-    if (ch === "\\" || ch === "'") out += "\\" + ch;
-    else if (ch === "\n") out += "\\n";
-    else if (ch === "\r") out += "\\r";
-    else if (ch === "\t") out += "\\t";
-    else if (c >= 0x20 && c < 0x7f) out += ch;
-    else out += "\\x" + c.toString(16).padStart(2, "0");
+  let out = "";
+  let run = "";
+  let raw = "";
+  const quoted = () => {
+    if (run) out += `'${run}'`;
+    run = "";
+  };
+  const printed = () => {
+    if (raw) out += `"$(printf ${printfQuote(raw)})"`;
+    raw = "";
+  };
+  // Not valid UTF-8: one char per byte, and only ASCII is shown as it is.
+  for (const ch of text ?? bytes) {
+    if ((text == null && ch.charCodeAt(0) > 0x7e) || !PLAIN.test(ch)) {
+      quoted();
+      raw += text == null ? ch : utf8(ch);
+      continue;
+    }
+    printed();
+    if (ch === "'" || ch === "\\") {
+      quoted();
+      out += "\\" + ch;
+    } else run += ch;
   }
-  return out + "'";
+  quoted();
+  printed();
+  return out || "''";
 }
 
-/** A printf format string (single-quoted, octal escapes) that prints exactly these bytes, NUL included. */
+/**
+ * A printf format (single-quoted) that prints exactly these bytes, NUL included. Only printable
+ * ASCII stands as it is; everything else, ' and \ too, is an octal escape, so no shell reads an
+ * escape inside the quotes. A leading - is escaped too, or printf would read it as an option.
+ */
 function printfQuote(bytes: string): string {
   let out = "'";
-  for (const ch of bytes) {
+  for (let k = 0; k < bytes.length; k++) {
+    const ch = bytes[k];
     const c = ch.charCodeAt(0);
     if (ch === "%") out += "%%";
-    else if (ch === "\\") out += "\\\\";
     else if (ch === "\n") out += "\\n";
-    else if (c >= 0x20 && c < 0x7f && ch !== "'") out += ch;
+    else if (c >= 0x20 && c < 0x7f && ch !== "'" && ch !== "\\" && !(k === 0 && ch === "-")) out += ch;
     else out += "\\" + c.toString(8).padStart(3, "0");
   }
   return out + "'";
@@ -872,22 +982,23 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   const rl = /^(\S+)[ \t]+(.+?)(?:[ \t]+(HTTP\/\S+))?[ \t]*$/i.exec(lines[0] ?? "");
   if (!rl) throw new CurlError("The request line isn't METHOD target HTTP/version.");
   const [, method, reqTarget, version = "HTTP/1.1"] = rl;
+  const h2 = /^HTTP\/2/i.test(version);
 
   const args: string[] = [];
   let url: string;
   // curl would drop a #fragment or encode odd characters in a URL, so such a target goes as is.
+  // So does an absolute URL: Send sends it to the target, and curl must connect there too.
   const asIs = /[#]|[^\x21-\x7e]/.test(reqTarget);
   if (reqTarget.startsWith("/") && !asIs) url = origin + reqTarget;
-  else if (/^https?:\/\//i.test(reqTarget) && !asIs) url = reqTarget;
   else {
     url = origin + "/";
     args.push(`--request-target ${shellQuote(reqTarget)}`);
   }
-  const authority = (/^https?:\/\/([^/?#]*)/i.exec(url)?.[1] ?? "").toLowerCase();
+  const authority = om[2].toLowerCase();
   const path = url.replace(/^https?:\/\/[^/?#]*/i, "").replace(/[?#].*$/s, "");
   if (/[[\]{}]/.test(url)) args.push("--globoff");
   if (/(^|\/)\.\.?(\/|$)/.test(path)) args.push("--path-as-is");
-  if (/^HTTP\/2/i.test(version)) args.push(scheme === "http" ? "--http2-prior-knowledge" : "--http2");
+  if (h2) args.push(scheme === "http" ? "--http2-prior-knowledge" : "--http2");
   else if (/^HTTP\/1\.0$/i.test(version)) args.push("--http1.0");
 
   const hasLength = lines.some((l) => /^content-length\s*:/i.test(l));
@@ -903,8 +1014,13 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
       warnings.push(`Left out a line that isn't a header: ${decodeOr(line).slice(0, 60)}`);
       continue;
     }
-    const name = line.slice(0, colon).trim();
-    const value = line.slice(colon + 1).trim();
+    const name = trimHws(line.slice(0, colon));
+    const value = trimHws(line.slice(colon + 1));
+    // curl reads -H @NAME as a file of headers.
+    if (name.startsWith("@")) {
+      warnings.push(`Left out a header whose name starts with @ (curl would read a file): ${decodeOr(name).slice(0, 60)}`);
+      continue;
+    }
     const lower = name.toLowerCase();
     seen.add(lower);
     // curl writes these itself: the length from the body, Host from the URL unless it differs.
@@ -913,7 +1029,9 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
     if (lower === "transfer-encoding" && /chunked/i.test(value)) warnings.push("curl chunks the body itself with Transfer-Encoding: chunked, so a body already chunked is chunked twice.");
     args.push(`-H ${shellQuote(value ? `${name}: ${value}` : `${name};`)}`);
   }
-  // Headers curl would add that the request doesn't have.
+  // Headers curl would add that the request doesn't have. (Over HTTP/2 both use the target's
+  // authority when there's no Host.)
+  if (!seen.has("host") && !h2) args.push("-H 'Host:'");
   if (!seen.has("user-agent")) args.push("-H 'User-Agent:'");
   if (!seen.has("accept")) args.push("-H 'Accept:'");
   if (hasData && !seen.has("content-type")) args.push("-H 'Content-Type:'");
@@ -921,13 +1039,16 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
 
   let pipe = "";
   if (hasData) {
-    // --data-raw never reads a file, even for a body starting with @.
-    if (body.includes("\0")) {
+    // --data-raw never reads a file, even for a body starting with @. A body that isn't plain
+    // text (NUL, control bytes, not UTF-8) goes in through printf instead.
+    if (isPlainText(body)) args.push(`--data-raw ${shellQuote(body)}`);
+    else {
       pipe = `printf ${printfQuote(body)} | `;
       args.push("--data-binary @-");
-    } else args.push(`--data-raw ${shellQuote(body)}`);
+    }
   }
   const command = pipe + [`curl ${shellQuote(url)}`, ...args].join(" \\\n  ");
-  if (body.length > CURL_ARG_WARN) warnings.push(`The body is ${body.length} bytes: a shell may refuse an argument over 128 KB. Save the body to a file and use --data-binary @FILE instead.`);
+  // printf is built into the shell, so only --data-raw meets the limit on one argument.
+  if (!pipe && body.length > CURL_ARG_WARN) warnings.push(`The body is ${body.length} bytes: a shell may refuse an argument over 128 KB. Save the body to a file and use --data-binary @FILE instead.`);
   return { command, warnings };
 }

@@ -127,13 +127,13 @@ test("-F builds a multipart body; files are refused", () => {
 test("POSIX quoting: single, double, $'…', continuations", () => {
   const p = parseCurl(
     lines(
-      `curl "https://h.test/a b" \\`,
+      `curl "https://h.test/a%20b" \\`,
       `  -H "X-D: a \\"b\\" \\$x \\\\ \\z" \\`,
       `  -H 'X-S: it'\\''s $HOME' \\`,
       `  -H $'X-C: tab\\there \\x41\\101\\u00e9\\'q\\''`,
     ),
   );
-  assert.equal(p.raw, lines("GET /a b HTTP/1.1", "Host: h.test", "Accept: */*", 'X-D: a "b" $x \\ \\z', "X-S: it's $HOME", "X-C: tab\there AAé'q'", "", ""));
+  assert.equal(p.raw, lines("GET /a%20b HTTP/1.1", "Host: h.test", "Accept: */*", 'X-D: a "b" $x \\ \\z', "X-S: it's $HOME", "X-C: tab\there AAé'q'", "", ""));
   // Clusters and attached values.
   assert.match(parseCurl("curl -sSLkXPOST -HX-A:1 -d1 https://h.test").raw, /^POST \/ HTTP\/1\.1\n[^]*X-A: 1\n/);
   assert.match(parseCurl("curl -- https://h.test/-x").raw, /^GET \/-x /);
@@ -221,14 +221,14 @@ function chromeWin(s: string): string {
 }
 
 test("Chrome's Copy as cURL (cmd)", () => {
-  const url = 'https://app.test/s?q=%22a b%22&x=<1>|^!';
+  const url = "https://app.test/s?q=%22a%20b%22&x=<1>|^!";
   const body = '{"path":"C:\\\\dir\\\\f","q":"say \\"hi\\"","pct":"100%x"}\nline 2 é';
   const cmd = [`curl ${chromeWin(url)}`, `-H ${chromeWin("accept: */*")}`, `-H ${chromeWin('x-q: "quoted" ^caret^ %PATH%')}`, `--data-raw ${chromeWin(body)}`].join(" ^\n  ");
   const p = parseCurl(cmd);
   const len = new TextEncoder().encode(body).length;
   assert.equal(
     p.raw,
-    lines("POST /s?q=%22a b%22&x=<1>|^! HTTP/1.1", "Host: app.test", "accept: */*", 'x-q: "quoted" ^caret^ %PATH%', `Content-Length: ${len}`, "Content-Type: application/x-www-form-urlencoded", "", body),
+    lines("POST /s?q=%22a%20b%22&x=<1>|^! HTTP/1.1", "Host: app.test", "accept: */*", 'x-q: "quoted" ^caret^ %PATH%', `Content-Length: ${len}`, "Content-Type: application/x-www-form-urlencoded", "", body),
   );
   // A one-line command by hand, with ^ escapes but no quotes.
   assert.match(parseCurl('curl.exe ^"https://h.test/a^&b^" -H "X: 1"').raw, /^GET \/a&b HTTP\/1\.1\n[^]*X: 1\n/);
@@ -264,10 +264,14 @@ test("toCurl flags: HTTP/2, globbing, dot segments, request targets", () => {
   assert.match(toCurl("GET /a/../../etc/passwd HTTP/1.1\n\n", "https://h.test").command, /--path-as-is/);
   assert.doesNotMatch(toCurl("GET /a/..b/c HTTP/1.1\n\n", "https://h.test").command, /--path-as-is/);
   assert.match(toCurl("OPTIONS * HTTP/1.1\n\n", "https://h.test").command, /^curl 'https:\/\/h\.test\/' \\\n {2}--request-target '\*' \\\n {2}-X 'OPTIONS'/);
-  assert.match(toCurl("GET http://h.test/abs HTTP/1.1\n\n", "https://other.test").command, /^curl 'http:\/\/h\.test\/abs'/);
+  // An absolute URL goes to the target, as Send sends it, not to the host it names.
+  assert.match(toCurl("GET http://h.test/abs HTTP/1.1\n\n", "https://other.test").command, /^curl 'https:\/\/other\.test\/' \\\n {2}--request-target 'http:\/\/h\.test\/abs'/);
   // A fragment or a space would be dropped or encoded in a URL, so the target goes as is.
   assert.match(toCurl("GET /a b#c HTTP/1.1\n\n", "https://h.test").command, /^curl 'https:\/\/h\.test\/' \\\n {2}--request-target '\/a b#c'/);
-  assert.equal(parseCurl(toCurl("GET /a b#c HTTP/1.1\n\n", "https://h.test").command).raw, "GET /a b#c HTTP/1.1\nHost: h.test\n\n");
+  // A request without Host is copied without one (curl adds it otherwise).
+  assert.equal(parseCurl(toCurl("GET /a b#c HTTP/1.1\n\n", "https://h.test").command).raw, "GET /a b#c HTTP/1.1\n\n");
+  assert.match(toCurl("GET / HTTP/1.1\n\n", "https://h.test").command, /-H 'Host:'/);
+  assert.doesNotMatch(toCurl("GET / HTTP/2\n\n", "https://h.test").command, /-H 'Host:'/);
 });
 
 test("toCurl quotes everything a target controls", () => {
@@ -278,18 +282,20 @@ test("toCurl quotes everything a target controls", () => {
   assert.match(command, /--data-raw '@\/etc\/passwd /);
   assert.doesNotMatch(command, /--data-binary/);
   assert.match(command, /-H 'Cookie: s='\\''; touch \/tmp\/pwned; echo '\\''\$\(id\)`id`"'/);
-  assert.match(command, /-H \$'X-Bidi: a\\xe2\\x80\\xaeb'/);
+  assert.match(command, /-H 'X-Bidi: a'"\$\(printf '\\342\\200\\256'\)"'b'/);
   assert.equal(shellQuote("it's"), `'it'\\''s'`);
-  assert.equal(shellQuote("a\r\nb\t\x1b[31m\\'"), `$'a\\r\\nb\\t\\x1b[31m\\\\\\''`);
-  assert.equal(shellQuote("\xff"), `$'\\xff'`);
+  // \ and ' stand outside the quotes; control bytes and bytes that aren't UTF-8 go through printf.
+  assert.equal(shellQuote("a\r\nb\t\x1b[31m\\'"), `'a'"$(printf '\\015')"'\nb'"$(printf '\\011\\033')"'[31m'\\\\\\'`);
+  assert.equal(shellQuote("\xff"), `"$(printf '\\377')"`);
+  assert.equal(shellQuote(""), "''");
   assert.throws(() => shellQuote("a\0b"), /NUL/);
 });
 
 test("toCurl handles binary bodies and size limits", () => {
   const bin = "POST /b HTTP/1.1\r\nHost: h.test\r\nContent-Type: application/octet-stream\r\n\r\n\x89PNG\r\n\x1a\n\xff";
-  assert.match(toCurl(bin, "https://h.test", true).command, /--data-raw \$'\\x89PNG\\r\\n\\x1a\\n\\xff'$/);
+  assert.match(toCurl(bin, "https://h.test", true).command, /^printf '\\211PNG\\015\\n\\032\\n\\377' \| curl [^]*--data-binary @-$/);
   const nul = toCurl("POST /n HTTP/1.1\nContent-Type: x\n\na\0%\\'b", "https://h.test", true).command;
-  assert.match(nul, /^printf 'a\\000%%\\\\\\047b' \| curl 'https:\/\/h\.test\/n'/);
+  assert.match(nul, /^printf 'a\\000%%\\134\\047b' \| curl 'https:\/\/h\.test\/n'/);
   assert.match(nul, /--data-binary @-$/);
   const big = toCurl(`POST / HTTP/1.1\nContent-Type: x\nExpect: 100-continue\n\n${"a".repeat(CURL_ARG_WARN + 1)}`, "https://h.test");
   assert.match(big.warnings[0], /128 KB/);
@@ -323,14 +329,16 @@ test("toCurl then parseCurl gives the request back", () => {
   }
 });
 
-// Runs the command in bash with curl replaced by a function that prints its arguments and stdin,
-// so the test sees exactly what curl would get.
-const hasBash = !spawnSync("bash", ["-c", "true"]).error;
+// Runs the command in a shell with curl replaced by a function that prints its arguments and
+// stdin, so the test sees exactly what curl would get. dash is /bin/sh on Debian and Ubuntu.
+const shells = ["sh", "dash", "bash", "zsh"].filter((sh) => !spawnSync(sh, ["-c", "true"]).error);
+const hasBash = shells.includes("bash");
 
-function underBash(command: string): { args: Buffer[]; stdin: Buffer } {
+function underShell(shell: string, command: string): { args: Buffer[]; stdin: Buffer } {
   const script = `curl() { printf '%s\\0' "$#" "$@"; cat; }\n${command}\n`;
-  const r = spawnSync("bash", ["-c", script], { input: "", env: { PATH: process.env.PATH ?? "", LC_ALL: "C" } });
-  assert.equal(r.status, 0, r.stderr.toString());
+  const r = spawnSync(shell, ["-c", script], { input: "", env: { PATH: process.env.PATH ?? "", LC_ALL: "C" } });
+  assert.equal(r.status, 0, `${shell}: ${r.stderr.toString()}`);
+  assert.equal(r.stderr.toString(), "", shell);
   const out = r.stdout as Buffer;
   const fields: Buffer[] = [];
   let at = 0;
@@ -345,13 +353,104 @@ function underBash(command: string): { args: Buffer[]; stdin: Buffer } {
   return { args: fields, stdin: out.subarray(at) };
 }
 
+const underBash = (command: string) => underShell("bash", command);
+
+/** What printf prints for a format with only the escapes toCurl writes. */
+function printfOut(fmt: string): Buffer {
+  const out: number[] = [];
+  for (let i = 0; i < fmt.length; ) {
+    const c = fmt[i++];
+    const oct = c === "\\" ? /^[0-7]{1,3}/.exec(fmt.slice(i, i + 3)) : null;
+    if (oct) out.push(parseInt(oct[0], 8)), (i += oct[0].length);
+    else if (c === "\\" && fmt[i] === "n") out.push(10), i++;
+    else if (c === "%" && fmt[i] === "%") out.push(37), i++;
+    else if (c === "\\" || c === "%") throw new Error(`printf would read ${c}${fmt[i]} differently`);
+    else out.push(...Buffer.from(c));
+  }
+  return Buffer.from(out);
+}
+
+/**
+ * Words as fish reads them: inside '…' a \\ or \' is an escape, which POSIX shells don't have,
+ * and "…" may only hold toCurl's $(printf '…').
+ */
+function fishWords(command: string): Buffer[] {
+  const words: Buffer[] = [];
+  let cur: number[] = [];
+  let inWord = false;
+  let i = 0;
+  const single = () => {
+    let out = "";
+    for (;;) {
+      const c = command[i++];
+      if (c === undefined) throw new Error("unterminated '");
+      if (c === "'") return out;
+      if (c === "\\" && (command[i] === "\\" || command[i] === "'")) out += command[i++];
+      else out += c;
+    }
+  };
+  const add = (b: Buffer) => {
+    cur.push(...b);
+    inWord = true;
+  };
+  while (i < command.length) {
+    const c = command[i];
+    if (c === " " || c === "\n") {
+      if (inWord) words.push(Buffer.from(cur));
+      cur = [];
+      inWord = false;
+      i++;
+    } else if (c === "\\") {
+      if (command[i + 1] !== "\n") add(Buffer.from(command[i + 1]));
+      i += 2;
+    } else if (c === "'") {
+      i++;
+      add(Buffer.from(single()));
+    } else if (c === '"') {
+      assert.ok(command.startsWith(`"$(printf '`, i), `fish would read "…" differently at ${i}`);
+      i += 11;
+      add(printfOut(single()));
+      assert.ok(command.startsWith(`)"`, i));
+      i += 2;
+    } else if (/[\w@:.\-|]/.test(c)) {
+      add(Buffer.from(c));
+      i++;
+    } else throw new Error(`unquoted ${JSON.stringify(c)} at ${i}`);
+  }
+  if (inWord) words.push(Buffer.from(cur));
+  return words;
+}
+
+/** What curl gets when fish runs the command: its arguments and stdin. */
+function underFish(command: string): { args: Buffer[]; stdin: Buffer } {
+  const w = fishWords(command);
+  if (w[0].toString() !== "printf") return { args: w.slice(1), stdin: Buffer.alloc(0) };
+  assert.equal(w[2].toString(), "|");
+  return { args: w.slice(4), stdin: printfOut(w[1].toString("latin1")) };
+}
+
+/** Requests whose values try to end the quoting in one shell or another. */
+const hostile: [string, string, boolean][] = [
+  // dash has no $'…': a control byte and a quote once broke out there.
+  ["GET / HTTP/1.1\nHost: x.test\nX-A: \x01'; echo INJECTED #\n\n", "http://x.test", false],
+  // fish reads \' and \\ inside '…' as escapes.
+  ["POST / HTTP/1.1\nHost: x.test\nContent-Type: x\n\nv=\\'|echo INJECTED #", "https://x.test", false],
+  ["GET / HTTP/1.1\nHost: x.test\nX-B: ends in \\\nX-C: \\\\'\\'; echo INJECTED #\n\n", "https://x.test", false],
+  ["POST /p?a='b' HTTP/1.1\r\nHost: h.test\r\nX-N: v'; echo $HOME `id` \"\\\r\nContent-Type: x\r\n\r\nx'$(touch /tmp/pwned)`id`\"\\ \r\n\t\x1b\xe9\xff\x80 end", "https://h.test", true],
+  ["PUT /\x1b[2J\\' HTTP/1.1\nX-Bidi: a‮b\\'\nX\x01: \\\n\n", "https://h.test", false],
+  // A body that starts with - must not be read as printf's option.
+  ["POST / HTTP/1.1\nContent-Type: x\n\n-v\0x", "https://h.test", true],
+  ["POST / HTTP/1.1\nContent-Type: x\n\n--\x01\\'%s%%\n", "https://h.test", false],
+];
+
 test("a real shell passes the exact bytes to curl", { skip: !hasBash && "bash not found" }, () => {
   const body = "x'$(touch /tmp/pwned)`id`\"\\ \r\n\t\x1b\xe9\xff\x80 end";
   const header = "v'; echo $HOME `id` \"\\";
   const raw = `POST /p?a='b' HTTP/1.1\r\nHost: h.test\r\nX-N: ${header}\r\nContent-Type: x\r\n\r\n${body}`;
-  const { args } = underBash(toCurl(raw, "https://h.test", true).command);
-  const at = args.findIndex((a) => a.toString() === "--data-raw");
-  assert.deepEqual([...args[at + 1]], [...textBytes(body, true)]);
+  const { args, stdin } = underBash(toCurl(raw, "https://h.test", true).command);
+  // Control and non-UTF-8 bytes in a body go through printf on stdin.
+  assert.deepEqual([...stdin], [...textBytes(body, true)]);
+  assert.equal(args[args.length - 1].toString(), "@-");
   assert.ok(args.some((a) => a.equals(Buffer.from(`X-N: ${header}`, "latin1"))));
   assert.equal(args[0].toString(), "https://h.test/p?a='b'");
 
@@ -360,6 +459,37 @@ test("a real shell passes the exact bytes to curl", { skip: !hasBash && "bash no
   const piped = underBash(toCurl(`POST / HTTP/1.1\nContent-Type: x\n\n${withNul}`, "https://h.test", true).command);
   assert.deepEqual([...piped.stdin], [...textBytes(withNul, true)]);
   assert.equal(piped.args[piped.args.length - 1].toString(), "@-");
+});
+
+test("sh, dash, bash, zsh and fish read the same command the same way", { skip: !hasBash && "bash not found" }, () => {
+  for (const [raw, target, binary] of hostile) {
+    const { command } = toCurl(raw, target, binary);
+    const want = underBash(command);
+    // Every header arrives whole as one argument, and the body as it was.
+    const [head, ...rest] = raw.split(/\r?\n\r?\n/);
+    for (const line of head.split(/\r?\n/).slice(1)) {
+      if (/^(host|content-length):/i.test(line)) continue;
+      const header = textBytes(line.replace(/^([^:]*):\s*/, "$1: "), binary);
+      assert.ok(want.args.some((a) => a.equals(header)), `${JSON.stringify(line)}: ${command}`);
+    }
+    const body = textBytes(rest.join("\n\n"), binary);
+    assert.ok(want.stdin.equals(body) || want.args.some((a) => a.equals(body)), command);
+    for (const shell of shells) {
+      const got = underShell(shell, command);
+      assert.deepEqual(got.args, want.args, `${shell}: ${command}`);
+      assert.deepEqual(got.stdin, want.stdin, `${shell}: ${command}`);
+    }
+    const fish = underFish(command);
+    assert.deepEqual(fish.args, want.args, `fish: ${command}`);
+    assert.deepEqual(fish.stdin, want.stdin, `fish: ${command}`);
+    // And brainproxy reads its own command back to the same bytes.
+    const back = parseCurl(command);
+    assert.equal(back.target, target, command);
+  }
+  // The injection attempt arrives whole, as the header's value.
+  const dashed = underShell(shells[0], toCurl(hostile[0][0], hostile[0][1]).command);
+  assert.ok(dashed.args.some((a) => a.equals(Buffer.from("X-A: \x01'; echo INJECTED #"))));
+  assert.deepEqual([...underShell(shells[0], toCurl(hostile[5][0], hostile[5][1], true).command).stdin], [0x2d, 0x76, 0, 0x78]);
 });
 
 // ---------- edge cases and refusals ----------
@@ -487,9 +617,9 @@ test("toCurl: a target, method or header can't add shell syntax", () => {
   const m = toCurl("$(id) / HTTP/1.1\nHost: h.test\n\n", "https://h.test").command;
   assert.match(m, /-X '\$\(id\)'/);
   assert.match(toCurl("GET / HTTP/1.1\n\n", "https://h'$(id).test").command, /^curl 'https:\/\/h'\\''\$\(id\)\.test\/'/);
-  // Control characters in a header name or the request target go in $'…' with hex escapes.
-  assert.match(toCurl("GET / HTTP/1.1\nX\x1b[2J: v\n\n", "https://h.test").command, /-H \$'X\\x1b\[2J: v'/);
-  assert.match(toCurl("GET /a\x01b HTTP/1.1\n\n", "https://h.test").command, /--request-target \$'\/a\\x01b'/);
+  // Control characters in a header name or the request target go through printf.
+  assert.match(toCurl("GET / HTTP/1.1\nX\x1b[2J: v\n\n", "https://h.test").command, /-H 'X'"\$\(printf '\\033'\)"'\[2J: v'/);
+  assert.match(toCurl("GET /a\x01b HTTP/1.1\n\n", "https://h.test").command, /--request-target '\/a'"\$\(printf '\\001'\)"'b'/);
   // Placeholders (an auth macro's values) are copied as they are, never resolved.
   assert.match(toCurl("GET / HTTP/1.1\nCookie: «auth:main:var:csrf#7»\n\n", "https://h.test").command, /-H 'Cookie: «auth:main:var:csrf#7»'/);
   // Targets other than http(s)://host[:port] are refused.
@@ -558,8 +688,15 @@ test("a real shell passes a hostile method, target and headers exactly", { skip:
   const ctrl = "X-C: a\x1b]0;title\x07\u202Eb\x7f";
   const placeholder = "Cookie: «auth:main:var:csrf#7»; s=$HOME";
   const raw = `${method} /p?q=$(id)&r=\`id\` HTTP/1.1\nHost: h.test\n${ctrl}\n${placeholder}\n\n`;
+  for (const shell of shells) {
+    const { args } = underShell(shell, toCurl(raw, target).command);
+    assert.equal(args[0].toString(), `${target}/p?q=$(id)&r=\`id\``, shell);
+    const x = args.findIndex((a) => a.toString() === "-X");
+    assert.equal(args[x + 1].toString(), method, shell);
+    assert.ok(args.some((a) => a.equals(Buffer.from(ctrl))), shell);
+    assert.ok(args.some((a) => a.equals(Buffer.from(placeholder))), shell);
+  }
   const { args } = underBash(toCurl(raw, target).command);
-  assert.equal(args[0].toString(), `${target}/p?q=$(id)&r=\`id\``);
   const x = args.findIndex((a) => a.toString() === "-X");
   assert.equal(args[x + 1].toString(), method);
   assert.ok(args.some((a) => a.equals(Buffer.from(ctrl))));
@@ -567,4 +704,82 @@ test("a real shell passes a hostile method, target and headers exactly", { skip:
   // A request target the URL can't hold arrives as is.
   const rt = underBash(toCurl("GET /a b#c\x01 HTTP/1.1\n\n", "https://h.test").command).args;
   assert.equal(rt[rt.findIndex((a) => a.toString() === "--request-target") + 1].toString(), "/a b#c\x01");
+});
+
+test("header values keep a trailing 0xA0 byte (à, Р)", () => {
+  const c = toCurl("GET / HTTP/1.1\nHost: h.test\nX-Name: voilà\nX-Cyr: Р\n\n", "https://h.test");
+  assert.match(c.command, /-H 'X-Name: voilà'/);
+  assert.match(c.command, /-H 'X-Cyr: Р'/);
+  assert.match(parseCurl("curl -H 'X-Name: voilà' https://h.test").raw, /\nX-Name: voilà\n/);
+  // A value of only that byte isn't read as "remove this header".
+  assert.match(parseCurl("curl -H $'X-Nb: \\xa0' https://h.test").raw, /\nX-Nb: \xa0\n/);
+  assert.match(parseCurl("curl -H 'X-E:   ' https://h.test").raw, /^GET \/ HTTP\/1\.1\nHost: h\.test\nAccept: \*\/\*\n\n$/);
+});
+
+test("HTTP/2 pseudo-headers are left out with a note", () => {
+  const p = parseCurl("curl -H ':authority: h.test' -H ':path;' https://h.test");
+  assert.equal(p.raw, "GET / HTTP/1.1\nHost: h.test\nAccept: */*\n\n");
+  assert.deepEqual(p.warnings, ["Left out the HTTP/2 pseudo-header :authority.", "Left out the HTTP/2 pseudo-header :path;."]);
+});
+
+test("a header named @… isn't copied, as curl would read it as a file", () => {
+  const c = toCurl("GET / HTTP/1.1\nHost: h.test\n@hdr: x\n@x;\nX-A: 1\n\n", "https://h.test");
+  assert.doesNotMatch(c.command, /@/);
+  assert.match(c.command, /-H 'X-A: 1'/);
+  assert.equal(c.warnings.length, 2);
+  assert.match(c.warnings[0], /starts with @/);
+});
+
+test("Windows cmd is told apart from a POSIX command holding ^", () => {
+  const json = parseCurl(`curl 'https://x.test/api' -H 'content-type: application/json' --data-raw '{"a":"^"}'`);
+  assert.match(json.raw, /\n\n\{"a":"\^"\}$/);
+  assert.equal(json.target, "https://x.test");
+  assert.match(parseCurl(`curl -H 'X: ^"a"' https://h.test`).raw, /\nX: \^"a"\n/);
+  // A line ending in ^ inside a quoted multi-line body.
+  assert.match(parseCurl("curl https://h.test \\\n  --data-raw 'a ^\nb'").raw, /\n\na \^\nb$/);
+  // cmd by hand: every line ends in ^, no single quotes.
+  assert.match(parseCurl('curl "https://h.test/a" ^\n  -H "X: 1"').raw, /^GET \/a HTTP\/1\.1\n[^]*X: 1\n/);
+});
+
+test("--proto-default, --http2 over http, and URLs curl refuses", () => {
+  assert.equal(parseCurl("curl --proto-default https h.test/a").target, "https://h.test");
+  assert.equal(parseCurl("curl --proto-default https http://h.test/a").target, "http://h.test");
+  assert.match(refusal("curl --proto-default ftp h.test"), /Only http and https/);
+  const h2c = parseCurl("curl --http2 http://h.test/");
+  assert.match(h2c.raw, /^GET \/ HTTP\/1\.1\n/);
+  assert.match(h2c.warnings[0], /upgrade/);
+  assert.match(parseCurl("curl --http2-prior-knowledge http://h.test/").raw, /^GET \/ HTTP\/2\n/);
+  assert.match(parseCurl("curl --http2 https://h.test/").raw, /^GET \/ HTTP\/2\n/);
+  assert.match(refusal("curl 'https://h.test/a b'"), /space or control/);
+  assert.match(refusal("curl $'https://h.test/a\\x01'"), /space or control/);
+  assert.match(refusal("curl $'https://h.test/a\\x7f'"), /space or control/);
+  // --request-target is sent as is, as curl does.
+  assert.match(parseCurl("curl --request-target '/a b' https://h.test").raw, /^GET \/a b HTTP\/1\.1\n/);
+});
+
+test("the printf forms toCurl writes are read back", () => {
+  const p = parseCurl("printf '\\055v\\000x\\134\\047%%\\n' | curl 'https://h.test/' \\\n  --data-binary @-");
+  assert.match(p.raw, /\n\n-v\0x\\'%\n$/);
+  assert.match(parseCurl(`curl -H 'X: a'"$(printf '\\033\\342\\200\\256')"'b' https://h.test`).raw, /\nX: a\x1b\u202eb\n/);
+  assert.equal(parseCurl(`curl -H "X: $(printf '\\377')" https://h.test`).binary, true);
+  // Nothing else that looks like it is.
+  assert.match(refusal("curl -H \"X: $(printf '%s')\" https://h.test"), /Only %%/);
+  assert.match(refusal("curl -H \"X: $(printf '\\x41')\" https://h.test"), /printf escape/);
+  assert.match(refusal("curl -H \"X: $(printf 'a' b)\" https://h.test"), /shell variables/);
+  assert.match(refusal("curl -H \"X: $(id)\" https://h.test"), /shell variables/);
+  assert.match(refusal("curl -H \"X: $(printf '\\000')\" https://h.test"), /NUL/);
+  assert.match(refusal("printf 'a' | curl -d @- https://h.test"), /reads a file/);
+  assert.match(refusal("printf 'a' | curl https://h.test"), /--data-binary @-/);
+  assert.match(refusal("echo a | curl https://h.test"), /Unquoted "\|"/);
+});
+
+test("toCurl keeps an absolute-form request on the target, as Send does", () => {
+  const c = toCurl("GET http://other.test/p HTTP/1.1\nHost: other.test\n\n", "https://x.test").command;
+  assert.match(c, /^curl 'https:\/\/x\.test\/' \\\n {2}--request-target 'http:\/\/other\.test\/p'/);
+  assert.match(c, /-H 'Host: other\.test'/);
+  assert.doesNotMatch(c, /^curl 'http:\/\/other/);
+  const back = parseCurl(c);
+  assert.equal(back.target, "https://x.test");
+  assert.match(back.raw, /^GET http:\/\/other\.test\/p HTTP\/1\.1\nHost: other\.test\n/);
+  assert.match(toCurl("GET http://other.test/p HTTP/2\n\n", "https://x.test").command, /--http2 /);
 });

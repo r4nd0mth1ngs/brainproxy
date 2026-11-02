@@ -280,10 +280,11 @@ Edit a raw request and send it as often as you like, in separate tabs.
   Connections). A command that reads a file (`-d @file`, `-F field=@file`), uses shell
   variables, or has an option brainproxy doesn't know is refused with the reason.
 - **Copy as cURL:** copies the request, as Send would send it, as a curl command for a POSIX
-  shell. Every value is quoted, so headers or a body that came from the target can't run
-  anything when you paste it. The command runs outside brainproxy, so the engagement scope
-  doesn't apply to it. Bodies over 128 KB may be too long for one shell argument; save those
-  to a file and use `--data-binary @FILE`.
+  shell (it works in fish too). It goes to the tab's target, as Send does. Every value is
+  quoted, so headers or a body that came from the target can't run anything when you paste it.
+  The command runs outside brainproxy, so the engagement scope doesn't apply to it. Bodies
+  over 128 KB may be too long for one shell argument; save those to a file and use
+  `--data-binary @FILE`.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the

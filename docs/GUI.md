@@ -169,27 +169,33 @@ Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 paste only opens a tab, and sending it is Replay's `send` as usual, so the scope applies. An
 agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
 
-- **Paste** (**+ cURL** in Replay): reads POSIX shell quoting (`'…'`, `"…"`, `$'…'`, `\`
-  line breaks) and Windows cmd as Chrome's *Copy as cURL (cmd)* writes it (`^` escapes and
-  line breaks). It follows curl's rules for the method (POST with data, GET with `-G`, HEAD
-  with `-I`), joins several `-d` with `&`, builds `-F` fields as multipart, turns `-u` into
-  Basic auth, and keeps curl's own `Host` and `Accept` headers unless the command replaces or
-  removes them (it adds no `User-Agent`). Options that don't change the request (`-k`, `-s`,
-  `-L`, `-o`, timeouts) are ignored; a proxy, `--resolve`, `--connect-to` and client
-  certificates are left out with a note. Anything that reads a file (`-d @file`, `-F f=@file`,
-  `-b file`, `-T`, `-K`), shell variables or command substitution, a NUL byte, challenge
-  auth (`--digest`, `--ntlm`) and unknown options are refused with the reason, so nothing that
-  changes the request is dropped silently.
+- **Paste** (**+ cURL** in Replay): reads POSIX shell quoting (`'…'`, `"…"`, `$'…'`, `\` line
+  breaks), Windows cmd as Chrome's *Copy as cURL (cmd)* writes it (`^` escapes and line
+  breaks), and the `printf` forms *Copy as cURL* writes. It follows curl's rules for the
+  method (POST with data, GET with `-G`, HEAD with `-I`), joins several `-d` with `&`, builds
+  `-F` fields as multipart, turns `-u` into Basic auth, and keeps curl's own `Host` and
+  `Accept` headers unless the command replaces or removes them (it adds no `User-Agent`).
+  `--http2` on an `http://` URL stays HTTP/1.1, as curl only asks such a server to upgrade. A
+  URL with a space or control character is refused, as curl refuses it. Options that don't
+  change the request (`-k`, `-s`, `-L`, `-o`, timeouts) are ignored; a proxy, `--resolve`,
+  `--connect-to` and client certificates are left out with a note. Anything that reads a file
+  (`-d @file`, `-F f=@file`, `-b file`, `-T`, `-K`), shell variables or command substitution,
+  a NUL byte in an argument, challenge auth (`--digest`, `--ntlm`) and unknown options are
+  refused with the reason, so nothing that changes the request is dropped silently.
 - **Copy as cURL** (Replay, and right-click a request in Traffic or the Site map): a POSIX
-  shell command with every value in single quotes, or `$'…'` with `\xNN` escapes for control,
-  bidi and non-UTF-8 bytes, so a header or body from the target can't run anything in the
-  shell. The body goes in `--data-raw` (which never reads a file, even for a body starting
-  with `@`); one with a NUL byte goes through `printf '…' | curl … --data-binary @-`. It adds
-  `--http2` for an HTTP/2 request, `--globoff` for `[]{}` in the URL, `--path-as-is` for `..`
-  segments, `--request-target` for a target a URL can't hold, and empty `-H 'Name:'` to
-  remove the headers curl would add. Replay copies what Send would send (auto URL-encoding
-  included). A body over 128 KB gets a warning (Linux limits one argument to that size); one
-  over 2 MB is refused.
+  shell command with every value in single quotes. A `'` or `\` is written outside the quotes
+  (`\'`, `\\`), and control, bidi and non-UTF-8 bytes as `"$(printf '\NNN')"`, so a header or
+  body from the target can't run anything in sh, dash, bash, zsh or fish. A plain-text body
+  goes in `--data-raw` (which never reads a file, even for a body starting with `@`); any
+  other body (NUL, control or non-UTF-8 bytes) goes through
+  `printf '…' | curl … --data-binary @-`. The command goes to the tab's target, like Send: an
+  absolute URL in the request line goes in `--request-target`. It adds `--http2` for an
+  HTTP/2 request, `--globoff` for `[]{}` in the URL, `--path-as-is` for `..` segments,
+  `--request-target` for a target a URL can't hold, and empty `-H 'Name:'` to remove the
+  headers curl would add (`Host` too, when the request has none). A header whose name starts
+  with `@` is left out with a note, since curl would read it as a file. Replay copies what Send
+  would send (auto URL-encoding included). A `--data-raw` body over 128 KB gets a warning
+  (Linux limits one argument to that size); a body over 2 MB is refused.
 
 ## Look
 
