@@ -845,8 +845,14 @@ and targets that want a JWT you choose the claims of:
   strips as credentials). Changing the method, URL, host, body, `Content-Length` or cookies fails the
   send, as do `pm.sendRequest`, `pm.cookies`, `pm.vault` and other modules.
 - A script runs in a memory-safe interpreter with no file, network or process access, in a fresh
-  context per request, with a loop, recursion and five-second time limit; nothing bounds its memory,
-  which is why one never runs unless chosen. The collection and environment stay in their files:
+  context per request, with a loop and recursion limit and without `SharedArrayBuffer`, `Atomics` or
+  `Temporal`. Each run is a child process of brainproxy with an empty environment, killed after five
+  seconds, so a script that never ends (a regex that backtracks, a loop of `await`s) leaves nothing
+  running. On Linux the child's address space is limited to 1 GiB; macOS doesn't enforce that limit
+  and Windows has none, so there only the time limit bounds a run. A script stopped at a limit
+  stops its signer for the rest of the command: later requests fail at once, without another run;
+  a script that throws fails only that request. One never runs unless chosen. The collection and
+  environment stay in their files:
   the signer stores their paths and the script's sha256, and refuses a script that changed. Error
   messages mask the variables' values. Only the chosen script runs; scripts of folders and requests,
   and test scripts, don't.

@@ -341,6 +341,14 @@ struct CodecArgs {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    // A Postman script signer's run, in a process of its own (see sign_script). Not a
+    // command: nothing lists it, and it speaks JSON on stdin and stdout only.
+    if argv.get(1).map(String::as_str) == Some("__sign-script") {
+        std::process::exit(brainproxy_core::sign_script::child_main());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        brainproxy_core::sign_script::set_runner(exe, &["__sign-script"]);
+    }
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(e) => {

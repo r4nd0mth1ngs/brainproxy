@@ -451,7 +451,7 @@ impl Signer {
     }
 
     /// Computes this signer's value, in a request whose other placeholders are filled.
-    fn sign(&self, raw: Vec<u8>, profile: &str, key: &[u8], target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
+    fn sign(&self, raw: Vec<u8>, profile: &str, held: &Held, target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
         let mark = self.mark(profile);
         let out = raw;
         let head_len = split_head_body(&out).0.len();
@@ -467,7 +467,7 @@ impl Signer {
             match &self.kind {
                 SignKind::Hmac { alg, canonical, output } => {
                     let text = self.filled(render(canonical, &|v| parts.get(v), Mode::Canonical))?;
-                    encode_output(*output, &hmac_digest(*alg, key, &text))
+                    encode_output(*output, &hmac_digest(*alg, held.key(self)?, &text))
                 }
                 SignKind::Jwt { alg, claims, ttl, kid, resign } => {
                     let text = self.filled(render(claims, &|v| parts.get(v), Mode::Json))?;
@@ -499,17 +499,17 @@ impl Signer {
                     header.entry("typ").or_insert_with(|| "JWT".into());
                     let bytes =
                         |m: Map<String, Value>| serde_json::to_vec(&m).map_err(|e| Error::InvalidInput(e.to_string()));
-                    jwt_token(*alg, key, &bytes(header)?, &bytes(payload)?)
+                    jwt_token(*alg, held.key(self)?, &bytes(header)?, &bytes(payload)?)
                         .map_err(|e| Error::InvalidInput(format!("signer {:?}: {e}", self.name)))?
                 }
                 SignKind::Key { alg, canonical, output } => {
                     let text = self.filled(render(canonical, &|v| parts.get(v), Mode::Canonical))?;
-                    let sig = private_key_signature(*alg, key, &text)
+                    let sig = private_key_signature(*alg, held.key(self)?, &text)
                         .map_err(|e| Error::InvalidInput(format!("signer {:?}: {e}", self.name)))?;
                     encode_output(*output, &sig)
                 }
-                SignKind::Sigv4 { .. } => return self.sign_v4(out.clone(), &mark, key, target, stamp),
-                SignKind::Script { .. } => return self.sign_script(&out, &mark, key, target, stamp),
+                SignKind::Sigv4 { .. } => return self.sign_v4(out.clone(), &mark, held, target, stamp),
+                SignKind::Script { .. } => return self.sign_script(&out, &mark, held, target, stamp),
             }
         };
         let value = match self.to {
@@ -523,13 +523,18 @@ impl Signer {
 
 impl Signer {
     /// Fills in SigV4: the headers it covers, then `Authorization` over them.
-    fn sign_v4(&self, raw: Vec<u8>, mark: &str, key: &[u8], target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
+    fn sign_v4(&self, raw: Vec<u8>, mark: &str, held: &Held, target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
         let SignKind::Sigv4 { access_key, session_token, region, service } = &self.kind else {
             return Ok(raw);
         };
         let what = |e: Error| Error::InvalidInput(format!("signer {:?}: {e}", self.name));
-        let access = read_text(access_key).map_err(what)?;
-        let token = session_token.as_ref().map(read_text).transpose().map_err(what)?;
+        let key = held.key(self)?;
+        let ids = held.ids.get_or_init(|| {
+            let access = read_text(access_key).map_err(|e| e.to_string())?;
+            let token = session_token.as_ref().map(read_text).transpose().map_err(|e| e.to_string())?;
+            Ok((access, token))
+        });
+        let (access, token) = ids.clone().map_err(|e| what(Error::InvalidInput(e)))?;
         let secret = std::str::from_utf8(key)
             .map_err(|_| Error::InvalidInput(format!("signer {:?}: the secret access key is not text", self.name)))?
             .trim()
@@ -587,8 +592,9 @@ impl Signer {
     /// Runs the script, then puts what it left on the request: its headers and query, and
     /// the variables it set wherever the collection writes `{{name}}`. Only names it set:
     /// a `{{name}}` in a payload must not pull a secret out of the environment.
-    fn sign_script(&self, raw: &[u8], mark: &str, bundle: &[u8], target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
+    fn sign_script(&self, raw: &[u8], mark: &str, held: &Held, target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
         let what = |e: String| Error::InvalidInput(format!("signer {:?}: {e}", self.name));
+        let bundle = held.key(self)?;
         let b: crate::sign_script::Bundle =
             serde_json::from_slice(bundle).map_err(|_| what("its script couldn't be read".into()))?;
         let without_mark = |list: &[(String, String)]| -> Vec<(String, String)> {
@@ -608,8 +614,14 @@ impl Signer {
         };
         let old_query = parts.query.clone();
         let vars = b.vars.clone();
-        let done =
-            crate::sign_script::run(&b.script, b.vars, request).map_err(|e| what(format!("its script failed: {e}")))?;
+        let done = match crate::sign_script::run(&b.script, b.vars, request) {
+            Ok(done) => done,
+            Err(crate::sign_script::Failure::Script(e)) => return Err(what(format!("its script failed: {e}"))),
+            Err(crate::sign_script::Failure::Stopped(e)) => {
+                let _ = held.stopped.set(e.clone());
+                return Err(what(format!("its script was stopped ({e}); it signs nothing more in this run")));
+            }
+        };
         let is_reserved = |k: &str| RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k));
         let value_of = |list: &[(String, String)], k: &str| {
             list.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone())
@@ -918,19 +930,43 @@ pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
     }
 }
 
+/// What a signer keeps from its first request to its last, shared by the copies a send
+/// makes: what it read, so each is read once a run, and why its script stopped.
+#[derive(Default)]
+pub(crate) struct Held {
+    key: std::sync::OnceLock<std::result::Result<Vec<u8>, String>>,
+    /// SigV4's access key id and session token.
+    ids: std::sync::OnceLock<std::result::Result<(String, Option<String>), String>>,
+    /// A script stopped at the time or memory limit would cost as much on every request.
+    stopped: std::sync::OnceLock<String>,
+}
+
+impl Held {
+    fn key(&self, signer: &Signer) -> Result<&[u8]> {
+        let key = self.key.get_or_init(|| load_key(signer));
+        key.as_deref().map_err(|e| Error::InvalidInput(format!("signer {:?}: {e}", signer.name)))
+    }
+}
+
 /// A signer as the vault keeps it, with its key once it has signed: a key no request
 /// needs stays where it is.
 #[derive(Clone)]
 pub(crate) struct Loaded {
     pub profile: String,
     pub signer: Signer,
-    /// Shared by the copies a send makes, so a key is read once.
-    key: std::sync::Arc<std::sync::OnceLock<std::result::Result<Vec<u8>, String>>>,
+    held: std::sync::Arc<Held>,
 }
 
 impl Loaded {
     pub(crate) fn new(profile: &str, signer: Signer) -> Self {
-        Loaded { profile: profile.to_string(), signer, key: Default::default() }
+        Loaded { profile: profile.to_string(), signer, held: Default::default() }
+    }
+
+    /// A signer with its key already read, or failed to read.
+    #[cfg(test)]
+    fn with_key(profile: &str, signer: Signer, key: std::result::Result<Vec<u8>, String>) -> Self {
+        let held = Held { key: key.into(), ..Default::default() };
+        Loaded { profile: profile.to_string(), signer, held: std::sync::Arc::new(held) }
     }
 
     fn check_origin(&self, target: &Target) -> Result<()> {
@@ -961,9 +997,13 @@ impl Loaded {
         }
         self.check_origin(target)?;
         let name = &self.signer.name;
-        let key = self.key.get_or_init(|| load_key(&self.signer));
-        let key = key.as_ref().map_err(|e| Error::InvalidInput(format!("signer {name:?}: {e}")))?;
-        let out = self.signer.sign(raw, &self.profile, key, target, stamp)?;
+        if let Some(why) = self.held.stopped.get() {
+            return Err(Error::InvalidInput(format!(
+                "signer {name:?}: its script was stopped earlier in this run ({why}); it signs nothing more until \
+                 the command starts again"
+            )));
+        }
+        let out = self.signer.sign(raw, &self.profile, &self.held, target, stamp)?;
         if self.used(&out) {
             return Err(Error::InvalidInput(format!("signer {name:?} has a placeholder out of place in this request")));
         }
@@ -1331,8 +1371,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     }
 
     fn signed(s: &Signer, raw: &[u8], key: &[u8]) -> Result<String> {
-        let loaded =
-            Loaded { profile: "p".into(), signer: s.clone(), key: std::sync::Arc::new(Ok(key.to_vec()).into()) };
+        let loaded = Loaded::with_key("p", s.clone(), Ok(key.to_vec()));
         let target = Target::from_url("https://a.test").unwrap();
         Ok(String::from_utf8(applied(&loaded, s.place(raw, "p", &[]), &target)?).unwrap())
     }
@@ -1660,11 +1699,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     #[test]
     fn a_signer_can_cover_the_headers_of_a_signer_after_it_but_not_an_unmade_signature() {
         let target = Target::from_url("https://a.test").unwrap();
-        let load = |signer: &Signer| Loaded {
-            profile: "p".into(),
-            signer: signer.clone(),
-            key: std::sync::Arc::new(Ok(b"k".to_vec()).into()),
-        };
+        let load = |signer: &Signer| Loaded::with_key("p", signer.clone(), Ok(b"k".to_vec()));
         let mut covers = hmac_signer("{{header:X-Time}}", Place::Header("X-Sig".into()));
         covers.name = "covers".into();
         let mut sets = hmac_signer("{{path}}", Place::Header("X-Other".into()));
@@ -1704,15 +1739,10 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
         let other = Target::from_url("https://b.test").unwrap();
-        let loaded =
-            Loaded { profile: "p".into(), signer: s.clone(), key: std::sync::Arc::new(Ok(b"k".to_vec()).into()) };
+        let loaded = Loaded::with_key("p", s.clone(), Ok(b"k".to_vec()));
         assert!(applied(&loaded, raw.clone(), &other).is_err());
         let here = Target::from_url("https://a.test").unwrap();
-        let loaded = Loaded {
-            profile: "p".into(),
-            signer: s,
-            key: std::sync::Arc::new(Err("environment variable K is not set".to_string()).into()),
-        };
+        let loaded = Loaded::with_key("p", s, Err("environment variable K is not set".to_string()));
         assert!(applied(&loaded, raw, &here).unwrap_err().to_string().contains("K is not set"));
     }
 
@@ -1720,7 +1750,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     fn signing_alone_checks_the_origin() {
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
-        let loaded = Loaded { profile: "p".into(), signer: s, key: std::sync::Arc::new(Ok(b"k".to_vec()).into()) };
+        let loaded = Loaded::with_key("p", s, Ok(b"k".to_vec()));
         let (other, stamp) = (Target::from_url("https://b.test").unwrap(), Stamp::new().unwrap());
         assert!(loaded.sign(raw, &other, &stamp).unwrap_err().to_string().contains("doesn't sign for"));
     }
@@ -1732,7 +1762,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let loaded = Loaded::new("p", s.clone());
         let target = Target::from_url("https://a.test").unwrap();
         applied(&loaded, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(), &target).unwrap();
-        assert!(loaded.key.get().is_none(), "no placeholder, no read");
+        assert!(loaded.held.key.get().is_none(), "no placeholder, no read");
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
         let e = applied(&loaded, raw, &target).unwrap_err().to_string();
         assert!(e.contains("can't be read") && !e.contains("NotFound") && !e.contains("not found"), "{e}");
@@ -1745,7 +1775,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let mut second = hmac_signer("{{path}}", Place::Query("b".into()));
         second.name = "second".into();
         let raw = second.place(&first.place(b"GET /?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]), "p", &[]);
-        let loaded = Loaded { profile: "p".into(), signer: first, key: std::sync::Arc::new(Ok(b"k".to_vec()).into()) };
+        let loaded = Loaded::with_key("p", first, Ok(b"k".to_vec()));
         let e = applied(&loaded, raw, &Target::from_url("https://a.test").unwrap()).unwrap_err().to_string();
         assert!(e.contains("not computed yet"), "{e}");
     }
@@ -1798,5 +1828,50 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
             assert!(bad(&|s| s.to = Place::Query(name.into())), "{name}");
         }
         assert!(!bad(&|s| s.to = Place::Query("sig_1.v-2~".into())));
+    }
+
+    /// A script signer over `script`, in a file of its own.
+    fn script_signer(script: &str) -> (Signer, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bp-sign-script-{}-{}", std::process::id(), nonce().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pre.js");
+        std::fs::write(&file, script).unwrap();
+        let signer = Signer {
+            name: "script".into(),
+            key: KeySource::None,
+            key_encoding: KeyEncoding::Raw,
+            origins: vec!["https://a.test".into()],
+            to: Place::Header(SCRIPT_MARK_HEADER.into()),
+            format: None,
+            headers: vec![],
+            kind: SignKind::Script { file, sha256: crate::fetch::sha256_hex(script.as_bytes()), vars: vec![] },
+        };
+        assert!(signer.validate().is_ok());
+        (signer, dir)
+    }
+
+    fn script_signed(l: &Loaded) -> Result<Vec<u8>> {
+        let raw = l.signer.place(b"GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        applied(l, raw, &Target::from_url("https://a.test").unwrap())
+    }
+
+    #[test]
+    fn a_script_stopped_at_the_time_limit_runs_no_more_for_its_signer() {
+        crate::sign_script::tests::use_test_runner();
+        let (signer, dir) = script_signer("/^(a+)+$/.test('a'.repeat(40) + 'b');");
+        let loaded = Loaded::new("p", signer);
+        let started = std::time::Instant::now();
+        let e = script_signed(&loaded).unwrap_err().to_string();
+        assert!(e.contains("time limit") && started.elapsed() < std::time::Duration::from_secs(8), "{e}");
+        let first = crate::sign_script::LAST_CHILD.get();
+        // A copy, as each send makes, knows too, and fails at once without a run.
+        let copy = loaded.clone();
+        for l in [&loaded, &copy] {
+            let started = std::time::Instant::now();
+            let e = script_signed(l).unwrap_err().to_string();
+            assert!(e.contains("stopped earlier") && started.elapsed() < std::time::Duration::from_millis(500), "{e}");
+        }
+        assert_eq!(crate::sign_script::LAST_CHILD.get(), first, "no other run started");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

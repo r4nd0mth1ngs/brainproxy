@@ -2,13 +2,20 @@
 //!
 //! These are the only documents' code brainproxy runs, and only by that explicit choice. The
 //! interpreter is memory safe and has no way out but the few helpers here: no files, no
-//! network, no process. A run gets its own context, a loop and recursion limit, and a time
-//! limit, and can change only the request's headers and query, on the signer's origins.
+//! network, no process. A run gets its own context, a loop and recursion limit, and can
+//! change only the request's headers and query, on the signer's origins.
 //!
-//! Nothing can bound an allocation inside the interpreter, so a hostile script can still
-//! use up memory, which is why a run is never automatic.
+//! The interpreter can't be interrupted (a regex that backtracks, a loop of `await`s), so
+//! each run is a child process, `brainproxy __sign-script`, killed at the time limit. On
+//! Unix the child also limits its own address space (enforced by Linux; macOS accepts the
+//! limit but doesn't enforce it) and CPU time; on Windows only the time limit bounds it. It
+//! starts with an empty environment, and gets the script, its variables and the request on
+//! stdin.
 
-use std::sync::mpsc;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -25,6 +32,13 @@ const RECURSION_LIMIT: usize = 200;
 /// The interpreter recurses on the native stack.
 const STACK_BYTES: usize = 16 * 1024 * 1024;
 const TIME_LIMIT: Duration = Duration::from_secs(5);
+/// The child's address space: the interpreter, its stack and the script's data.
+#[cfg(unix)]
+const MEMORY_LIMIT: u64 = 1 << 30;
+/// A result longer than this is no request's headers.
+const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
+/// Globals a script has no use for: shared memory and blocking waits.
+const REMOVED_GLOBALS: &[&str] = &["SharedArrayBuffer", "Atomics", "Temporal"];
 
 /// Calls that a run refuses, so a preview can say so before anything is chosen.
 const UNSUPPORTED: &[&str] =
@@ -264,7 +278,7 @@ pub(crate) fn header_templates(doc: &Value) -> Vec<Templates> {
 }
 
 /// A request as a script sees it.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ScriptRequest {
     pub method: String,
     pub scheme: String,
@@ -277,7 +291,7 @@ pub(crate) struct ScriptRequest {
 }
 
 /// What a run leaves behind.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Outcome {
     pub headers: Vec<(String, String)>,
     pub query: String,
@@ -391,6 +405,11 @@ type Native = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
 fn run_here(script: &str, vars: &[(String, String)], request: &ScriptRequest) -> std::result::Result<Outcome, String> {
     let mut ctx = Context::default();
+    for name in REMOVED_GLOBALS {
+        ctx.global_object()
+            .delete_property_or_throw(JsString::from(*name), &mut ctx)
+            .map_err(|_| "the script runner failed to start".to_string())?;
+    }
     let limits = ctx.runtime_limits_mut();
     limits.set_loop_iteration_limit(LOOP_LIMIT);
     limits.set_recursion_limit(RECURSION_LIMIT);
@@ -433,35 +452,177 @@ fn run_here(script: &str, vars: &[(String, String)], request: &ScriptRequest) ->
     serde_json::from_str(&text).map_err(|_| "its result couldn't be read".to_string())
 }
 
-/// Runs `script` over `request`, on its own thread: deep recursion needs a large stack, and
-/// a run past the time limit is left behind rather than holding up the scan. Messages
-/// have the values of `vars` masked, as a script's own errors can quote them.
+/// Why a run gave no result.
+#[derive(Debug)]
+pub(crate) enum Failure {
+    /// The script failed: it threw, or used what isn't here. Another request may fare better.
+    Script(String),
+    /// The run was stopped at the time or memory limit, or couldn't start: running the
+    /// script again would only cost as much again.
+    Stopped(String),
+}
+
+/// How a run's child process starts.
+struct Runner {
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+static RUNNER: OnceLock<Runner> = OnceLock::new();
+
+/// Names the program that runs scripts, with its arguments: the brainproxy command sets
+/// itself and `__sign-script`, before anything signs. Without it no script runs.
+pub fn set_runner(program: PathBuf, args: &[&str]) {
+    set_runner_with_env(program, args, &[]);
+}
+
+fn set_runner_with_env(program: PathBuf, args: &[&str], env: &[(&str, &str)]) {
+    let _ = RUNNER.set(Runner {
+        program,
+        args: args.iter().map(|a| a.to_string()).collect(),
+        env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    });
+}
+
+/// One run, as the child reads it on stdin.
+#[derive(Serialize, Deserialize)]
+struct Job {
+    script: String,
+    vars: Vec<(String, String)>,
+    request: ScriptRequest,
+}
+
+/// The child's answer: one line of JSON, the last it writes.
+#[derive(Default, Serialize, Deserialize)]
+struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ok: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// The child side of a run (`brainproxy __sign-script`): limits itself, reads a [`Job`] on
+/// stdin, runs it on a thread with a large stack (the interpreter recurses on the native
+/// stack) and writes a [`Reply`]. Returns the exit code.
+pub fn child_main() -> i32 {
+    limit_resources();
+    let mut input = Vec::new();
+    if std::io::stdin().read_to_end(&mut input).is_err() {
+        return 2;
+    }
+    let Ok(job) = serde_json::from_slice::<Job>(&input) else { return 2 };
+    let ran = std::thread::Builder::new()
+        .name("postman-script".into())
+        .stack_size(STACK_BYTES)
+        .spawn(move || run_here(&job.script, &job.vars, &job.request))
+        .map(|t| t.join());
+    let reply = match ran {
+        Ok(Ok(Ok(outcome))) => Reply { ok: Some(outcome), error: None },
+        Ok(Ok(Err(e))) => Reply { ok: None, error: Some(e) },
+        _ => return 3,
+    };
+    let Ok(line) = serde_json::to_string(&reply) else { return 3 };
+    let mut out = std::io::stdout().lock();
+    // On a line of its own, whatever came before it (the test harness, in tests).
+    if writeln!(out, "\n{line}").and_then(|_| out.flush()).is_err() {
+        return 3;
+    }
+    0
+}
+
+/// Bounds the child's address space and CPU time and turns off core dumps. A limit the
+/// system refuses is left as it was: the parent's time limit still holds.
+#[cfg(unix)]
+fn limit_resources() {
+    let cpu = TIME_LIMIT.as_secs() * 2;
+    for (resource, soft, hard) in
+        [(libc::RLIMIT_AS, MEMORY_LIMIT, MEMORY_LIMIT), (libc::RLIMIT_CPU, cpu, cpu + 1), (libc::RLIMIT_CORE, 0, 0)]
+    {
+        let limit = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
+        // SAFETY: setrlimit reads the struct it is given and nothing else.
+        unsafe {
+            libc::setrlimit(resource, &limit);
+        }
+    }
+}
+
+/// Windows has no setrlimit; a job object could bound memory, which isn't done.
+#[cfg(not(unix))]
+fn limit_resources() {}
+
+#[cfg(test)]
+thread_local! {
+    /// The process of this thread's last run.
+    pub(crate) static LAST_CHILD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `script` over `request` in a child process, killed if it passes the time limit,
+/// so nothing of it outlives the call. Messages have the values of `vars` masked, as a
+/// script's own errors can quote them.
 pub(crate) fn run(
     script: &str,
     vars: Vec<(String, String)>,
     request: ScriptRequest,
-) -> std::result::Result<Outcome, String> {
-    let (send, recv) = mpsc::channel();
-    let script = script.to_string();
+) -> std::result::Result<Outcome, Failure> {
     let secrets: Vec<String> = vars.iter().map(|(_, v)| v.clone()).filter(|v| v.len() >= 4).collect();
-    std::thread::Builder::new()
-        .name("postman-script".into())
-        .stack_size(STACK_BYTES)
-        .spawn(move || {
-            let _ = send.send(run_here(&script, &vars, &request));
-        })
-        .map_err(|_| "the script couldn't start".to_string())?;
-    let result = recv.recv_timeout(TIME_LIMIT).map_err(|_| "it ran past the time limit".to_string())?;
-    result.map_err(|mut e| {
+    let mask = |mut e: String| {
         for s in &secrets {
             e = e.replace(s.as_str(), "********");
         }
         e
-    })
+    };
+    let stopped = |e: &str| Failure::Stopped(e.to_string());
+    let runner = RUNNER.get().ok_or_else(|| stopped("scripts run only from the brainproxy command"))?;
+    let input = serde_json::to_vec(&Job { script: script.to_string(), vars, request })
+        .map_err(|_| stopped("the script couldn't be handed over"))?;
+    let mut cmd = Command::new(&runner.program);
+    cmd.args(&runner.args)
+        .env_clear()
+        .envs(runner.env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    let mut child = cmd.spawn().map_err(|_| stopped("the script couldn't start"))?;
+    #[cfg(test)]
+    LAST_CHILD.set(child.id());
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(stopped("the script couldn't start"));
+    };
+    let (send, recv) = mpsc::channel();
+    // Ends when the child does: killing it closes both pipes.
+    let io = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        drop(stdin);
+        let mut out = Vec::new();
+        let _ = stdout.take(OUTPUT_LIMIT).read_to_end(&mut out);
+        let _ = send.send(out);
+    });
+    let out = recv.recv_timeout(TIME_LIMIT);
+    // Also when it answered: a child that wrote too much may still be waiting to write.
+    let _ = child.kill();
+    let status = child.wait();
+    let _ = io.join();
+    let Ok(out) = out else {
+        return Err(stopped(&format!("it ran past the time limit of {} s", TIME_LIMIT.as_secs())));
+    };
+    let text = String::from_utf8_lossy(&out);
+    let reply = text.lines().rev().find(|l| !l.trim().is_empty()).and_then(|l| serde_json::from_str::<Reply>(l).ok());
+    match (reply, status) {
+        (Some(Reply { ok: Some(outcome), .. }), Ok(s)) if s.success() => Ok(outcome),
+        (Some(Reply { error: Some(e), .. }), Ok(s)) if s.success() => Err(Failure::Script(mask(e))),
+        _ => Err(stopped("it ended without a result: out of memory, or the interpreter failed")),
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -478,8 +639,34 @@ mod tests {
         }
     }
 
+    /// Runs in this test binary started again on [`script_child`], which then acts as
+    /// `brainproxy __sign-script`.
+    pub(crate) fn use_test_runner() {
+        let exe = std::env::current_exe().unwrap();
+        let args = ["--exact", "sign_script::tests::script_child", "--nocapture", "--test-threads=1"];
+        set_runner_with_env(exe, &args, &[("BRAINPROXY_TEST_SCRIPT_CHILD", "1")]);
+    }
+
+    #[test]
+    fn script_child() {
+        if std::env::var_os("BRAINPROXY_TEST_SCRIPT_CHILD").is_some() {
+            std::process::exit(child_main());
+        }
+    }
+
+    fn run_text(script: &str, vars: Vec<(String, String)>, r: ScriptRequest) -> std::result::Result<Outcome, String> {
+        use_test_runner();
+        run(script, vars, r).map_err(|e| match e {
+            Failure::Script(e) | Failure::Stopped(e) => e,
+        })
+    }
+
     fn go(script: &str) -> std::result::Result<Outcome, String> {
-        run(script, vec![("secret".into(), "k3y-value".into()), ("base".into(), "https://api.test".into())], request())
+        run_text(
+            script,
+            vec![("secret".into(), "k3y-value".into()), ("base".into(), "https://api.test".into())],
+            request(),
+        )
     }
 
     fn header<'a>(o: &'a Outcome, name: &str) -> &'a str {
@@ -514,7 +701,7 @@ mod tests {
     fn a_request_with_no_body_still_has_one_to_read() {
         let mut r = request();
         r.body = String::new();
-        let o = run(
+        let o = run_text(
             "pm.environment.set('b', '[' + pm.request.body.toString() + ']' + pm.request.body.isEmpty());",
             vec![],
             r,
@@ -569,6 +756,40 @@ mod tests {
         assert!(go("function f() { return f(); } f();").is_err());
         let e = go("throw new Error('leak ' + pm.environment.get('secret'))").err().unwrap();
         assert!(e.contains("********") && !e.contains("k3y-value"), "{e}");
+    }
+
+    /// Runs `script`, which never ends by itself, and checks that the run is stopped at the
+    /// time limit and its process is gone.
+    fn stopped_in_time(script: &str) {
+        use_test_runner();
+        let started = std::time::Instant::now();
+        let r = run(script, vec![], request());
+        let took = started.elapsed();
+        assert!(matches!(&r, Err(Failure::Stopped(e)) if e.contains("time limit")), "{script}: {r:?}");
+        assert!(took >= TIME_LIMIT && took < TIME_LIMIT + Duration::from_secs(3), "{script}: {took:?}");
+        #[cfg(unix)]
+        {
+            let pid = LAST_CHILD.get() as libc::pid_t;
+            // SAFETY: signal 0 only asks whether the process exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "{script}: its process {pid} is still there");
+        }
+    }
+
+    #[test]
+    fn a_backtracking_regex_is_stopped_with_its_process() {
+        stopped_in_time("/^(a+)+$/.test('a'.repeat(40) + 'b');");
+    }
+
+    #[test]
+    fn an_endless_await_loop_is_stopped_with_its_process() {
+        stopped_in_time("async function f() { while (true) { await null; } } f();");
+    }
+
+    #[test]
+    fn shared_memory_and_blocking_waits_are_gone() {
+        let o = go("pm.environment.set('t', [typeof SharedArrayBuffer, typeof Atomics, typeof Temporal].join());");
+        assert_eq!(o.unwrap().set, [("t".to_string(), "undefined,undefined,undefined".to_string())]);
     }
 
     #[test]
