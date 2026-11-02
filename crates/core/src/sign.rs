@@ -1,4 +1,5 @@
-//! Request signing: HMAC signatures and JWTs for APIs that reject unsigned requests.
+//! Request signing: HMAC and private-key signatures, JWTs and AWS SigV4 for APIs that
+//! reject unsigned requests.
 //!
 //! A signer is data on a profile, next to its macros and session rules, and a rule's
 //! `sign:NAME` action uses it. The action only writes placeholders
@@ -8,7 +9,8 @@
 //!
 //! Signers hold where the key is (an environment variable or a file), never the key, so
 //! nothing that shows a profile or reads the project can reveal it. Templates only name
-//! parts of the request: nothing here runs code.
+//! parts of the request. The one thing that runs code is a [`SignKind::Script`], which the
+//! user has to ask for by name (see [`crate::sign_script`]).
 
 use std::path::PathBuf;
 
@@ -29,6 +31,8 @@ use crate::http::{RawRequest, Target};
 pub enum KeySource {
     Env(String),
     File(PathBuf),
+    /// A signer with no key of its own: a script that needs no environment.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -71,7 +75,17 @@ pub enum JwtAlg {
     HS384,
     HS512,
     RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
+    ES256,
+    ES384,
+    EdDSA,
 }
+
+const JWT_ALGS: &str = "HS256, HS384, HS512, RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, EdDSA";
 
 impl JwtAlg {
     pub fn parse(s: &str) -> Result<JwtAlg> {
@@ -80,11 +94,15 @@ impl JwtAlg {
             "HS384" => JwtAlg::HS384,
             "HS512" => JwtAlg::HS512,
             "RS256" => JwtAlg::RS256,
-            _ => {
-                return Err(Error::InvalidInput(format!(
-                    "unknown JWT algorithm {s:?}; one of HS256, HS384, HS512, RS256"
-                )))
-            }
+            "RS384" => JwtAlg::RS384,
+            "RS512" => JwtAlg::RS512,
+            "PS256" => JwtAlg::PS256,
+            "PS384" => JwtAlg::PS384,
+            "PS512" => JwtAlg::PS512,
+            "ES256" => JwtAlg::ES256,
+            "ES384" => JwtAlg::ES384,
+            "EDDSA" => JwtAlg::EdDSA,
+            _ => return Err(Error::InvalidInput(format!("unknown JWT algorithm {s:?}; one of {JWT_ALGS}"))),
         })
     }
 
@@ -94,7 +112,19 @@ impl JwtAlg {
             JwtAlg::HS384 => "HS384",
             JwtAlg::HS512 => "HS512",
             JwtAlg::RS256 => "RS256",
+            JwtAlg::RS384 => "RS384",
+            JwtAlg::RS512 => "RS512",
+            JwtAlg::PS256 => "PS256",
+            JwtAlg::PS384 => "PS384",
+            JwtAlg::PS512 => "PS512",
+            JwtAlg::ES256 => "ES256",
+            JwtAlg::ES384 => "ES384",
+            JwtAlg::EdDSA => "EdDSA",
         }
+    }
+
+    fn symmetric(self) -> bool {
+        matches!(self, JwtAlg::HS256 | JwtAlg::HS384 | JwtAlg::HS512)
     }
 }
 
@@ -132,7 +162,35 @@ pub enum SignKind {
         #[serde(default)]
         resign: bool,
     },
+    /// A private-key signature over `canonical`: RS*, PS*, ES* (fixed r||s) or EdDSA.
+    Key {
+        alg: JwtAlg,
+        canonical: String,
+        #[serde(default)]
+        output: Output,
+    },
+    /// AWS Signature Version 4. `key` is the secret access key; the value goes in
+    /// `Authorization`, with the `X-Amz-*` headers it covers.
+    Sigv4 {
+        access_key: KeySource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<KeySource>,
+        region: String,
+        service: String,
+    },
+    /// A Postman pre-request script, from a collection or a `.js` file read at signing time
+    /// and pinned by the hash of its text. `key`, if any, is a Postman environment file.
+    Script {
+        file: PathBuf,
+        sha256: String,
+        /// Variables typed in, on top of the collection's and the environment's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        vars: Vec<(String, String)>,
+    },
 }
+
+/// Where a script signer marks a request, so it isn't left out. Never sent.
+pub const SCRIPT_MARK_HEADER: &str = "X-Brainproxy-Script";
 
 /// Where the value goes. A body parameter isn't offered: it would change what a body
 /// hash covers.
@@ -216,6 +274,9 @@ impl Signer {
         if self.origins.is_empty() {
             return Err(what("name the origins it may sign for".into()));
         }
+        if self.key == KeySource::None && !matches!(self.kind, SignKind::Script { .. }) {
+            return Err(what("it needs --secret-env or --secret-file".into()));
+        }
         for o in &self.origins {
             Target::from_url(o).map_err(|e| what(format!("origin {o:?}: {e}")))?;
         }
@@ -254,6 +315,34 @@ impl Signer {
         }
         match &self.kind {
             SignKind::Hmac { canonical, .. } => check_vars(canonical, &[]).map_err(what)?,
+            SignKind::Script { sha256, .. } => {
+                if !matches!(&self.to, Place::Header(n) if n == SCRIPT_MARK_HEADER) || self.format.is_some() {
+                    return Err(what("a script sets its own headers and query".into()));
+                }
+                if !self.headers.is_empty() {
+                    return Err(what("a script sets its own headers and query".into()));
+                }
+                if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(what("a script is pinned by its sha256".into()));
+                }
+            }
+            SignKind::Key { alg, canonical, .. } => {
+                if alg.symmetric() {
+                    return Err(what(format!("{} isn't a private-key algorithm; use an HMAC", alg.name())));
+                }
+                check_vars(canonical, &[]).map_err(what)?
+            }
+            SignKind::Sigv4 { region, service, .. } => {
+                if !matches!(&self.to, Place::Header(n) if n.eq_ignore_ascii_case("authorization"))
+                    || self.format.is_some()
+                {
+                    return Err(what("SigV4 goes in the Authorization header, unwrapped".into()));
+                }
+                let word = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+                if !word(region) || !word(service) {
+                    return Err(what("SigV4 needs a region and a service, like us-east-1 and execute-api".into()));
+                }
+            }
             SignKind::Jwt { claims, .. } => {
                 check_vars(claims, &[]).map_err(what)?;
                 // Only the times are numbers: anything else needs its quotes in the JSON.
@@ -362,7 +451,7 @@ impl Signer {
     }
 
     /// Computes this signer's value, in a request whose other placeholders are filled.
-    fn sign(&self, raw: Vec<u8>, profile: &str, key: &[u8], target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
+    fn sign(&self, raw: Vec<u8>, profile: &str, held: &Held, target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
         let mark = self.mark(profile);
         let out = raw;
         let head_len = split_head_body(&out).0.len();
@@ -378,7 +467,7 @@ impl Signer {
             match &self.kind {
                 SignKind::Hmac { alg, canonical, output } => {
                     let text = self.filled(render(canonical, &|v| parts.get(v), Mode::Canonical))?;
-                    encode_output(*output, &hmac_digest(*alg, key, &text))
+                    encode_output(*output, &hmac_digest(*alg, held.key(self)?, &text))
                 }
                 SignKind::Jwt { alg, claims, ttl, kid, resign } => {
                     let text = self.filled(render(claims, &|v| parts.get(v), Mode::Json))?;
@@ -410,9 +499,17 @@ impl Signer {
                     header.entry("typ").or_insert_with(|| "JWT".into());
                     let bytes =
                         |m: Map<String, Value>| serde_json::to_vec(&m).map_err(|e| Error::InvalidInput(e.to_string()));
-                    jwt_token(*alg, key, &bytes(header)?, &bytes(payload)?)
+                    jwt_token(*alg, held.key(self)?, &bytes(header)?, &bytes(payload)?)
                         .map_err(|e| Error::InvalidInput(format!("signer {:?}: {e}", self.name)))?
                 }
+                SignKind::Key { alg, canonical, output } => {
+                    let text = self.filled(render(canonical, &|v| parts.get(v), Mode::Canonical))?;
+                    let sig = private_key_signature(*alg, held.key(self)?, &text)
+                        .map_err(|e| Error::InvalidInput(format!("signer {:?}: {e}", self.name)))?;
+                    encode_output(*output, &sig)
+                }
+                SignKind::Sigv4 { .. } => return self.sign_v4(out.clone(), &mark, held, target, stamp),
+                SignKind::Script { .. } => return self.sign_script(&out, &mark, held, target, stamp),
             }
         };
         let value = match self.to {
@@ -424,10 +521,325 @@ impl Signer {
     }
 }
 
-/// Reads a signer's key. The message of a key that can't be loaded names where
-/// it should have come from, never what was there.
-pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
-    let (raw, from) = match &s.key {
+impl Signer {
+    /// Fills in SigV4: the headers it covers, then `Authorization` over them.
+    fn sign_v4(&self, raw: Vec<u8>, mark: &str, held: &Held, target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
+        let SignKind::Sigv4 { access_key, session_token, region, service } = &self.kind else {
+            return Ok(raw);
+        };
+        let what = |e: Error| Error::InvalidInput(format!("signer {:?}: {e}", self.name));
+        let key = held.key(self)?;
+        let ids = held.ids.get_or_init(|| {
+            let access = read_text(access_key).map_err(|e| e.to_string())?;
+            let token = session_token.as_ref().map(read_text).transpose().map_err(|e| e.to_string())?;
+            Ok((access, token))
+        });
+        let (access, token) = ids.clone().map_err(|e| what(Error::InvalidInput(e)))?;
+        let secret = std::str::from_utf8(key)
+            .map_err(|_| Error::InvalidInput(format!("signer {:?}: the secret access key is not text", self.name)))?
+            .trim()
+            .to_string();
+        let body_hash = hex::encode(Sha256::digest(&*Parts::new(&raw, target, mark, stamp).body));
+        let date = amz_date(stamp.now);
+        let mut req = RawRequest::from_bytes(raw).set_header("X-Amz-Date", &date);
+        req = req.set_header("X-Amz-Content-Sha256", &body_hash);
+        if let Some(t) = &token {
+            req = req.set_header("X-Amz-Security-Token", t);
+        }
+        let out = req.into_bytes();
+        let value = {
+            let parts = Parts::new(&out, target, mark, stamp);
+            let mut headers: Vec<(String, String)> = vec![("host".into(), parts.host.clone())];
+            for (k, v) in &parts.headers {
+                let k = k.to_ascii_lowercase();
+                if k == "content-type" || k.starts_with("x-amz-") {
+                    let v = v.split_whitespace().collect::<Vec<_>>().join(" ");
+                    match headers.iter_mut().find(|(n, _)| n == &k) {
+                        Some((_, old)) => {
+                            old.push(',');
+                            old.push_str(&v);
+                        }
+                        None => headers.push((k, v)),
+                    }
+                }
+            }
+            headers.sort();
+            let listed: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+            if find(listed.as_bytes(), crate::auth::MARK.as_bytes()).is_some()
+                || find(parts.path.as_bytes(), crate::auth::MARK.as_bytes()).is_some()
+                || find(parts.query.as_bytes(), crate::auth::MARK.as_bytes()).is_some()
+            {
+                return Err(what(Error::InvalidInput("it covers a value not computed yet".into())));
+            }
+            sigv4_authorization(&Sigv4Input {
+                method: parts.method,
+                uri: &sigv4_uri(parts.path, service),
+                query: &sigv4_query(&parts.query),
+                headers: &headers,
+                payload_hash: &body_hash,
+                access_key: &access,
+                secret: &secret,
+                date: &date,
+                region,
+                service,
+            })
+        };
+        Ok(replace(&out, mark.as_bytes(), 0, value.as_bytes()))
+    }
+}
+
+impl Signer {
+    /// Runs the script, then puts what it left on the request: its headers and query, and
+    /// the variables it set wherever the collection writes `{{name}}`. Only names it set:
+    /// a `{{name}}` in a payload must not pull a secret out of the environment.
+    fn sign_script(&self, raw: &[u8], mark: &str, held: &Held, target: &Target, stamp: &Stamp) -> Result<Vec<u8>> {
+        let what = |e: String| Error::InvalidInput(format!("signer {:?}: {e}", self.name));
+        let bundle = held.key(self)?;
+        let b: crate::sign_script::Bundle =
+            serde_json::from_slice(bundle).map_err(|_| what("its script couldn't be read".into()))?;
+        let without_mark = |list: &[(String, String)]| -> Vec<(String, String)> {
+            list.iter().filter(|(k, _)| !k.eq_ignore_ascii_case(SCRIPT_MARK_HEADER)).cloned().collect()
+        };
+        let parts = Parts::new(raw, target, mark, stamp);
+        let before = without_mark(&parts.headers);
+        let request = crate::sign_script::ScriptRequest {
+            method: parts.method.to_string(),
+            scheme: target.scheme.clone(),
+            host: target.host.clone(),
+            port: target.port,
+            path: parts.path.to_string(),
+            query: parts.query.clone(),
+            headers: before.clone(),
+            body: String::from_utf8_lossy(&parts.body).into_owned(),
+        };
+        let old_query = parts.query.clone();
+        let vars = b.vars.clone();
+        let done = match crate::sign_script::run(&b.script, b.vars, request) {
+            Ok(done) => done,
+            Err(crate::sign_script::Failure::Script(e)) => return Err(what(format!("its script failed: {e}"))),
+            Err(crate::sign_script::Failure::Stopped(e)) => {
+                let _ = held.stopped.set(e.clone());
+                return Err(what(format!("its script was stopped ({e}); it signs nothing more in this run")));
+            }
+        };
+        let is_reserved = |k: &str| RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k));
+        let value_of = |list: &[(String, String)], k: &str| {
+            list.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone())
+        };
+        // Filled from what the script set; the rest of the template from any variable.
+        let fill = |tpl: &str, all: bool| -> String {
+            let mut out = tpl.to_string();
+            for (k, v) in &done.set {
+                out = out.replace(&format!("{{{{{k}}}}}"), v);
+            }
+            if all {
+                for (k, v) in &vars {
+                    out = out.replace(&format!("{{{{{k}}}}}"), v);
+                }
+            }
+            out
+        };
+        let mut out = RawRequest::from_bytes(raw.to_vec()).remove_header(SCRIPT_MARK_HEADER).into_bytes();
+        // Name by name, with every value: a header sent twice stays twice.
+        let values = |list: &[(String, String)], k: &str| -> Vec<String> {
+            list.iter().filter(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone()).collect()
+        };
+        let mut names: Vec<&String> = Vec::new();
+        for (k, _) in before.iter().chain(&done.headers) {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(k)) {
+                names.push(k);
+            }
+        }
+        for k in names {
+            let after: Vec<String> = values(&done.headers, k).iter().map(|v| fill(v, false)).collect();
+            if after == values(&before, k) {
+                continue;
+            }
+            if !valid_token(k) || after.iter().any(|v| bad_header_value(v)) {
+                return Err(what(format!("its script set a bad header {:?}", k.chars().take(60).collect::<String>())));
+            }
+            if is_reserved(k) {
+                return Err(what(format!("its script can't change {k}")));
+            }
+            out = with_header_values(out, k, &after);
+        }
+        let mut out = RawRequest::from_bytes(out);
+        let templates = crate::sign_script::templates_for(&b.templates, parts.method, parts.path)
+            .map_or(&[][..], |t| t.headers.as_slice());
+        for (k, tpl) in templates {
+            let used = done.set.iter().any(|(n, _)| tpl.contains(&format!("{{{{{n}}}}}")));
+            if used && value_of(&done.headers, k).is_none() {
+                let v = fill(tpl, true);
+                if !valid_token(k) || is_reserved(k) || bad_header_value(&v) || v.contains("{{") {
+                    return Err(what(format!("the collection's header {k} couldn't be filled")));
+                }
+                out = out.set_header(k, &v);
+            }
+        }
+        let mut bytes = out.into_bytes();
+        if done.query != old_query {
+            if done.query.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'#') {
+                return Err(what("its script made a bad query".into()));
+            }
+            // The script never saw parameters holding placeholders (other signers' marks):
+            // they go back, so those signers still find them.
+            let held = request_query(&bytes);
+            let mut query = done.query.clone();
+            for p in held.split('&').filter(|p| p.contains(crate::auth::MARK)) {
+                if !query.split('&').any(|q| q == p) {
+                    query = if query.is_empty() { p.to_string() } else { format!("{query}&{p}") };
+                }
+            }
+            bytes = set_whole_query(&bytes, &query);
+        }
+        Ok(fill_request_line(bytes, &done.set))
+    }
+}
+
+/// Whether a header value from a script holds a control character other than tab, which
+/// could end the header or confuse whatever reads it next.
+fn bad_header_value(v: &str) -> bool {
+    v.chars().any(|c| c.is_control() && c != '\t')
+}
+
+/// The query of a request's target, as written.
+fn request_query(raw: &[u8]) -> String {
+    let head = split_head_body(raw).0;
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = String::from_utf8_lossy(&head[..line_end]);
+    let uri = line.trim_end().split(' ').nth(1).unwrap_or_default();
+    uri.split_once('?').map_or("", |(_, q)| q).to_string()
+}
+
+/// The request with header `name` given exactly `values`, the last of its headers.
+fn with_header_values(raw: Vec<u8>, name: &str, values: &[String]) -> Vec<u8> {
+    let stripped = RawRequest::from_bytes(raw).remove_header(name).into_bytes();
+    let (head, body) = split_head_body(&stripped);
+    // Before the blank line that ends the head (the request is normalized to CRLF by now).
+    let Some(head) = head.strip_suffix(b"\r\n") else { return stripped };
+    let mut out = head.to_vec();
+    for v in values {
+        out.extend_from_slice(format!("{name}: {v}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    out
+}
+
+/// The request with its query replaced.
+fn set_whole_query(raw: &[u8], query: &str) -> Vec<u8> {
+    let (head, body) = split_head_body(raw);
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = String::from_utf8_lossy(&head[..line_end]).into_owned();
+    let mut words: Vec<&str> = line.trim_end().split(' ').collect();
+    let Some(uri) = words.get(1).copied() else { return raw.to_vec() };
+    let path = uri.split_once('?').map_or(uri, |(p, _)| p);
+    let uri = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+    words[1] = &uri;
+    let mut out = words.join(" ").into_bytes();
+    out.extend_from_slice(if head[..line_end].ends_with(b"\r") { b"\r" } else { b"" });
+    out.extend_from_slice(&head[line_end..]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// `{{name}}` in the request line, however it was encoded, for the variables a script set.
+fn fill_request_line(raw: Vec<u8>, set: &[(String, String)]) -> Vec<u8> {
+    let (head, body) = split_head_body(&raw);
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let mut line = String::from_utf8_lossy(&head[..line_end]).into_owned();
+    for (k, v) in set {
+        // Percent-encoded: a `+` for a space would be a plus in a path.
+        let enc = percent_encoding::utf8_percent_encode(v, AWS_ENCODE).to_string();
+        line = line.replace(&format!("%7B%7B{k}%7D%7D"), &enc).replace(&format!("{{{{{k}}}}}"), &enc);
+    }
+    let mut out = line.into_bytes();
+    out.extend_from_slice(&head[line_end..]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// `YYYYMMDDTHHMMSSZ`.
+fn amz_date(now: std::time::Duration) -> String {
+    let t = time::OffsetDateTime::from_unix_timestamp(now.as_secs() as i64).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+const AWS_ENCODE: &percent_encoding::AsciiSet =
+    &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+const AWS_ENCODE_PATH: &percent_encoding::AsciiSet = &AWS_ENCODE.remove(b'/');
+
+/// The canonical URI: S3 signs the path as sent, every other service encodes it once more.
+fn sigv4_uri(path: &str, service: &str) -> String {
+    let path = if path.is_empty() { "/" } else { path };
+    if service.eq_ignore_ascii_case("s3") {
+        return path.to_string();
+    }
+    percent_encoding::utf8_percent_encode(path, AWS_ENCODE_PATH).to_string()
+}
+
+/// The canonical query: each name and value encoded, sorted.
+fn sigv4_query(query: &str) -> String {
+    let encode = |s: &[u8]| percent_encoding::percent_encode(s, AWS_ENCODE).to_string();
+    let decoded = |s: &str| -> Vec<u8> { percent_encoding::percent_decode(s.replace('+', " ").as_bytes()).collect() };
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (encode(&decoded(k)), encode(&decoded(v)))
+        })
+        .collect();
+    pairs.sort();
+    pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+}
+
+struct Sigv4Input<'a> {
+    method: &'a str,
+    uri: &'a str,
+    query: &'a str,
+    /// Lower-case, trimmed, sorted.
+    headers: &'a [(String, String)],
+    payload_hash: &'a str,
+    access_key: &'a str,
+    secret: &'a str,
+    date: &'a str,
+    region: &'a str,
+    service: &'a str,
+}
+
+fn sigv4_authorization(i: &Sigv4Input<'_>) -> String {
+    let signed = i.headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let listed: String = i.headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let canonical = format!("{}\n{}\n{}\n{listed}\n{signed}\n{}", i.method, i.uri, i.query, i.payload_hash);
+    let day = &i.date[..8];
+    let scope = format!("{day}/{}/{}/aws4_request", i.region, i.service);
+    let to_sign =
+        format!("AWS4-HMAC-SHA256\n{}\n{scope}\n{}", i.date, hex::encode(Sha256::digest(canonical.as_bytes())));
+    let mac = |key: &[u8], data: &str| hmac_digest(HmacAlg::Sha256, key, data.as_bytes());
+    let key = mac(format!("AWS4{}", i.secret).as_bytes(), day);
+    let key = mac(&key, i.region);
+    let key = mac(&key, i.service);
+    let key = mac(&key, "aws4_request");
+    format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={}",
+        i.access_key,
+        hex::encode(mac(&key, &to_sign))
+    )
+}
+
+/// Reads a key source. The message of one that can't be read names where it should
+/// have come from, never what was there.
+fn read_source(source: &KeySource) -> std::result::Result<(Vec<u8>, String), String> {
+    Ok(match source {
         KeySource::Env(var) => {
             let v = std::env::var_os(var).ok_or_else(|| format!("environment variable {var} is not set"))?;
             (v.into_encoded_bytes(), format!("environment variable {var}"))
@@ -436,7 +848,83 @@ pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
             let from = format!("file {}", path.display());
             (std::fs::read(path).map_err(|_| format!("{from} can't be read"))?, from)
         }
+        KeySource::None => (Vec::new(), "no key".to_string()),
+    })
+}
+
+/// A script signer's script and variables, as they are now.
+fn load_script(s: &Signer) -> std::result::Result<Vec<u8>, String> {
+    let SignKind::Script { file, sha256, vars } = &s.kind else { return Ok(Vec::new()) };
+    let (text, doc) = read_script(file, Some(sha256))?;
+    let mut merged: Vec<(String, String)> = Vec::new();
+    let mut put = |k: String, v: String| {
+        merged.retain(|(n, _)| n != &k);
+        merged.push((k, v));
     };
+    let mut templates = Vec::new();
+    if let Some(doc) = &doc {
+        for v in doc.get("variable").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(k) = v.get("key").or(v.get("id")).and_then(Value::as_str) {
+                put(k.to_string(), v.get("value").map(crate::apiimport::scalar_text).unwrap_or_default());
+            }
+        }
+        templates = crate::sign_script::header_templates(doc);
+    }
+    if s.key != KeySource::None {
+        let (raw, from) = read_source(&s.key)?;
+        let text = String::from_utf8(raw).map_err(|_| format!("{from} is not text"))?;
+        let env = crate::apiimport::postman::parse_environment(&text).map_err(|e| e.to_string())?;
+        env.values.into_iter().for_each(|v| put(v.name, v.value));
+    }
+    vars.iter().for_each(|(k, v)| put(k.clone(), v.clone()));
+    serde_json::to_vec(&crate::sign_script::Bundle { script: text, vars: merged, templates })
+        .map_err(|_| "the script couldn't be loaded".to_string())
+}
+
+/// A script's text, from a `.js` file or a collection: the one with hash `want`, or the only
+/// one there is. Also the collection, if it was one.
+pub fn read_script(file: &std::path::Path, want: Option<&str>) -> std::result::Result<(String, Option<Value>), String> {
+    let from = format!("file {}", file.display());
+    let text = std::fs::read_to_string(file).map_err(|_| format!("{from} can't be read"))?;
+    let doc =
+        serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok().filter(|d| d.get("item").is_some());
+    let Some(doc) = doc else {
+        let got = crate::fetch::sha256_hex(text.as_bytes());
+        if want.is_some_and(|w| !w.eq_ignore_ascii_case(&got)) {
+            return Err(format!("{from} changed since the signer was added; add it again after reading it"));
+        }
+        return Ok((text, None));
+    };
+    let found = crate::sign_script::prerequest_scripts(&doc);
+    let script = match want {
+        Some(w) => found.iter().find(|s| crate::fetch::sha256_hex(s.text.as_bytes()).eq_ignore_ascii_case(w)),
+        None if found.len() == 1 => found.first(),
+        None if found.is_empty() => return Err(format!("{from} has no pre-request script")),
+        None => return Err(format!("{from} has {} pre-request scripts: choose one with --script-sha256", found.len())),
+    };
+    match script {
+        Some(s) => Ok((s.text.clone(), Some(doc))),
+        None => Err(format!("{from} no longer holds that script; add the signer again after reading it")),
+    }
+}
+
+/// A one-line credential from a key source, such as an AWS access key id.
+fn read_text(source: &KeySource) -> Result<String> {
+    let (raw, from) = read_source(source).map_err(Error::InvalidInput)?;
+    let text = String::from_utf8(raw).map_err(|_| Error::InvalidInput(format!("{from} is not text")))?;
+    let text = text.trim();
+    if text.is_empty() || text.contains(['\r', '\n']) {
+        return Err(Error::InvalidInput(format!("{from} must hold one line")));
+    }
+    Ok(text.to_string())
+}
+
+/// Reads a signer's key.
+pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
+    if matches!(s.kind, SignKind::Script { .. }) {
+        return load_script(s);
+    }
+    let (raw, from) = read_source(&s.key)?;
     let trimmed = String::from_utf8_lossy(&raw);
     match s.key_encoding {
         KeyEncoding::Raw => Ok(raw),
@@ -448,18 +936,43 @@ pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
     }
 }
 
+/// What a signer keeps from its first request to its last, shared by the copies a send
+/// makes: what it read, so each is read once a run, and why its script stopped.
+#[derive(Default)]
+pub(crate) struct Held {
+    key: std::sync::OnceLock<std::result::Result<Vec<u8>, String>>,
+    /// SigV4's access key id and session token.
+    ids: std::sync::OnceLock<std::result::Result<(String, Option<String>), String>>,
+    /// A script stopped at the time or memory limit would cost as much on every request.
+    stopped: std::sync::OnceLock<String>,
+}
+
+impl Held {
+    fn key(&self, signer: &Signer) -> Result<&[u8]> {
+        let key = self.key.get_or_init(|| load_key(signer));
+        key.as_deref().map_err(|e| Error::InvalidInput(format!("signer {:?}: {e}", signer.name)))
+    }
+}
+
 /// A signer as the vault keeps it, with its key once it has signed: a key no request
 /// needs stays where it is.
 #[derive(Clone)]
 pub(crate) struct Loaded {
     pub profile: String,
     pub signer: Signer,
-    key: std::sync::OnceLock<std::result::Result<Vec<u8>, String>>,
+    held: std::sync::Arc<Held>,
 }
 
 impl Loaded {
     pub(crate) fn new(profile: &str, signer: Signer) -> Self {
-        Loaded { profile: profile.to_string(), signer, key: Default::default() }
+        Loaded { profile: profile.to_string(), signer, held: Default::default() }
+    }
+
+    /// A signer with its key already read, or failed to read.
+    #[cfg(test)]
+    fn with_key(profile: &str, signer: Signer, key: std::result::Result<Vec<u8>, String>) -> Self {
+        let held = Held { key: key.into(), ..Default::default() };
+        Loaded { profile: profile.to_string(), signer, held: std::sync::Arc::new(held) }
     }
 
     fn check_origin(&self, target: &Target) -> Result<()> {
@@ -490,9 +1003,13 @@ impl Loaded {
         }
         self.check_origin(target)?;
         let name = &self.signer.name;
-        let key = self.key.get_or_init(|| load_key(&self.signer));
-        let key = key.as_ref().map_err(|e| Error::InvalidInput(format!("signer {name:?}: {e}")))?;
-        let out = self.signer.sign(raw, &self.profile, key, target, stamp)?;
+        if let Some(why) = self.held.stopped.get() {
+            return Err(Error::InvalidInput(format!(
+                "signer {name:?}: its script was stopped earlier in this run ({why}); it signs nothing more until \
+                 the command starts again"
+            )));
+        }
+        let out = self.signer.sign(raw, &self.profile, &self.held, target, stamp)?;
         if self.used(&out) {
             return Err(Error::InvalidInput(format!("signer {name:?} has a placeholder out of place in this request")));
         }
@@ -676,7 +1193,7 @@ fn replace(raw: &[u8], mark: &[u8], trailing: usize, value: &[u8]) -> Vec<u8> {
 
 /// The request with the query parameter `name` set to what `value` makes of its old
 /// value, and no other parameter of that name.
-fn set_query(raw: &[u8], name: &str, value: impl Fn(Option<&str>) -> String) -> Vec<u8> {
+pub(crate) fn set_query(raw: &[u8], name: &str, value: impl Fn(Option<&str>) -> String) -> Vec<u8> {
     let (head, body) = split_head_body(raw);
     let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
     let line = String::from_utf8_lossy(&head[..line_end]);
@@ -726,34 +1243,69 @@ pub fn hmac_digest(alg: HmacAlg, key: &[u8], data: &[u8]) -> Vec<u8> {
     hmac::sign(&hmac::Key::new(alg, key), data).as_ref().to_vec()
 }
 
-/// A signed compact JWT of the given header and payload JSON. For RS256 `key` is a PEM
-/// RSA private key (PKCS#8 or PKCS#1). Errors never quote the key.
+/// A signed compact JWT of the given header and payload JSON. For RS*, PS*, ES* and EdDSA
+/// `key` is a PEM private key. Errors never quote the key.
 pub fn jwt_token(alg: JwtAlg, key: &[u8], header: &[u8], payload: &[u8]) -> Result<String> {
     let input = format!("{}.{}", URL_SAFE_NO_PAD.encode(header), URL_SAFE_NO_PAD.encode(payload));
     let sig = match alg {
         JwtAlg::HS256 => hmac_digest(HmacAlg::Sha256, key, input.as_bytes()),
         JwtAlg::HS384 => hmac_digest(HmacAlg::Sha384, key, input.as_bytes()),
         JwtAlg::HS512 => hmac_digest(HmacAlg::Sha512, key, input.as_bytes()),
-        JwtAlg::RS256 => {
-            let bad = || {
-                Error::InvalidInput(
-                    "the RS256 key must be an unencrypted PEM RSA private key of 2048 bits or more".into(),
-                )
-            };
-            let pem = pem::parse(key).map_err(|_| bad())?;
-            let pair = match pem.tag() {
-                "PRIVATE KEY" => signature::RsaKeyPair::from_pkcs8(pem.contents()),
-                "RSA PRIVATE KEY" => signature::RsaKeyPair::from_der(pem.contents()),
-                _ => return Err(bad()),
-            }
-            .map_err(|_| bad())?;
-            let mut sig = vec![0; pair.public().modulus_len()];
-            pair.sign(&signature::RSA_PKCS1_SHA256, &rand::SystemRandom::new(), input.as_bytes(), &mut sig)
-                .map_err(|_| bad())?;
-            sig
-        }
+        _ => private_key_signature(alg, key, input.as_bytes())?,
     };
     Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)))
+}
+
+/// The signature of `data` under a PEM private key: RSA as PKCS#8 or PKCS#1, ECDSA and
+/// Ed25519 as PKCS#8. Errors never quote the key.
+pub fn private_key_signature(alg: JwtAlg, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let rng = rand::SystemRandom::new();
+    let name = alg.name();
+    let bad = |want: &str| Error::InvalidInput(format!("the {name} key must be an unencrypted PEM {want}"));
+    let rsa = |padding: &'static dyn signature::RsaEncoding| {
+        let bad = || bad("RSA private key of 2048 bits or more");
+        let pem = pem::parse(key).map_err(|_| bad())?;
+        let pair = match pem.tag() {
+            "PRIVATE KEY" => signature::RsaKeyPair::from_pkcs8(pem.contents()),
+            "RSA PRIVATE KEY" => signature::RsaKeyPair::from_der(pem.contents()),
+            _ => return Err(bad()),
+        }
+        .map_err(|_| bad())?;
+        let mut sig = vec![0; pair.public().modulus_len()];
+        pair.sign(padding, &rng, data, &mut sig).map_err(|_| bad())?;
+        Ok(sig)
+    };
+    let ec = |curve: &'static signature::EcdsaSigningAlgorithm| {
+        let bad = || bad("PKCS#8 EC private key on the right curve (`openssl pkcs8 -topk8 -nocrypt` converts one)");
+        let pem = pem::parse(key).map_err(|_| bad())?;
+        if pem.tag() != "PRIVATE KEY" {
+            return Err(bad());
+        }
+        let pair = signature::EcdsaKeyPair::from_pkcs8(curve, pem.contents(), &rng).map_err(|_| bad())?;
+        Ok(pair.sign(&rng, data).map_err(|_| bad())?.as_ref().to_vec())
+    };
+    match alg {
+        JwtAlg::RS256 => rsa(&signature::RSA_PKCS1_SHA256),
+        JwtAlg::RS384 => rsa(&signature::RSA_PKCS1_SHA384),
+        JwtAlg::RS512 => rsa(&signature::RSA_PKCS1_SHA512),
+        JwtAlg::PS256 => rsa(&signature::RSA_PSS_SHA256),
+        JwtAlg::PS384 => rsa(&signature::RSA_PSS_SHA384),
+        JwtAlg::PS512 => rsa(&signature::RSA_PSS_SHA512),
+        JwtAlg::ES256 => ec(&signature::ECDSA_P256_SHA256_FIXED_SIGNING),
+        JwtAlg::ES384 => ec(&signature::ECDSA_P384_SHA384_FIXED_SIGNING),
+        JwtAlg::EdDSA => {
+            let bad = || bad("PKCS#8 Ed25519 private key");
+            let pem = pem::parse(key).map_err(|_| bad())?;
+            if pem.tag() != "PRIVATE KEY" {
+                return Err(bad());
+            }
+            let pair = signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(pem.contents()).map_err(|_| bad())?;
+            Ok(pair.sign(data).as_ref().to_vec())
+        }
+        JwtAlg::HS256 | JwtAlg::HS384 | JwtAlg::HS512 => {
+            Err(Error::InvalidInput(format!("{name} isn't a private-key algorithm")))
+        }
+    }
 }
 
 /// `{"alg":ALG,"typ":"JWT"}` over the claims JSON: the check DSL's `generate_jwt`. Like
@@ -825,7 +1377,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     }
 
     fn signed(s: &Signer, raw: &[u8], key: &[u8]) -> Result<String> {
-        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(key.to_vec()).into() };
+        let loaded = Loaded::with_key("p", s.clone(), Ok(key.to_vec()));
         let target = Target::from_url("https://a.test").unwrap();
         Ok(String::from_utf8(applied(&loaded, s.place(raw, "p", &[]), &target)?).unwrap())
     }
@@ -888,6 +1440,124 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
             .unwrap();
         let e = jwt_token(JwtAlg::RS256, b"hunter2-not-a-pem", b"{}", b"{}").unwrap_err().to_string();
         assert!(!e.contains("hunter2"), "{e}");
+    }
+
+    /// PKCS#8 for the algorithm, made fresh so no key is checked in.
+    fn pem_of(tag_bytes: &[u8]) -> Vec<u8> {
+        pem::encode(&pem::Pem::new("PRIVATE KEY", tag_bytes.to_vec())).into_bytes()
+    }
+
+    #[test]
+    fn private_key_jwts_verify_under_their_public_keys() {
+        let rng = rand::SystemRandom::new();
+        let parts = |token: &str| {
+            let (input, sig) = token.rsplit_once('.').unwrap();
+            (input.to_string(), URL_SAFE_NO_PAD.decode(sig).unwrap())
+        };
+        let doc = signature::EcdsaKeyPair::generate_pkcs8(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let (input, sig) = parts(&jwt_token(JwtAlg::ES256, &pem_of(doc.as_ref()), b"{}", b"{}").unwrap());
+        assert_eq!(sig.len(), 64, "fixed r||s, as JWS wants");
+        let pair = signature::EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng)
+            .unwrap();
+        signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, signature::KeyPair::public_key(&pair))
+            .verify(input.as_bytes(), &sig)
+            .unwrap();
+        let doc = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let (input, sig) = parts(&jwt_token(JwtAlg::EdDSA, &pem_of(doc.as_ref()), b"{}", b"{}").unwrap());
+        let pair = signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+        signature::UnparsedPublicKey::new(&signature::ED25519, signature::KeyPair::public_key(&pair))
+            .verify(input.as_bytes(), &sig)
+            .unwrap();
+        let (input, sig) = parts(&jwt_token(JwtAlg::PS256, TEST_RSA_KEY.as_bytes(), b"{}", b"{}").unwrap());
+        let pem = pem::parse(TEST_RSA_KEY).unwrap();
+        let pair = signature::RsaKeyPair::from_pkcs8(pem.contents()).unwrap();
+        signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA256, pair.public().as_ref())
+            .verify(input.as_bytes(), &sig)
+            .unwrap();
+        // The wrong kind of key says so, and nothing of itself.
+        let e = jwt_token(JwtAlg::ES256, TEST_RSA_KEY.as_bytes(), b"{}", b"{}").unwrap_err().to_string();
+        assert!(e.contains("EC private key") && !e.contains("MII"), "{e}");
+    }
+
+    #[test]
+    fn a_key_signer_signs_the_canonical_string() {
+        let rng = rand::SystemRandom::new();
+        let doc = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let mut s = hmac_signer("", Place::Header("X-Sig".into()));
+        s.kind = SignKind::Key { alg: JwtAlg::EdDSA, canonical: "{{method}} {{path}}".into(), output: Output::Base64 };
+        assert!(s.validate().is_ok());
+        let out = signed(&s, b"GET /a HTTP/1.1\r\nHost: a.test\r\n\r\n", &pem_of(doc.as_ref())).unwrap();
+        let sig = out.lines().find_map(|l| l.strip_prefix("X-Sig: ")).unwrap();
+        let pair = signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+        signature::UnparsedPublicKey::new(&signature::ED25519, signature::KeyPair::public_key(&pair))
+            .verify(b"GET /a", &STANDARD.decode(sig).unwrap())
+            .unwrap();
+        s.kind = SignKind::Key { alg: JwtAlg::HS256, canonical: "x".into(), output: Output::Hex };
+        assert!(s.validate().is_err(), "HS256 has no private key");
+    }
+
+    fn vanilla(method: &'static str, query: &'static str, headers: &[(String, String)], hash: &'static str) -> String {
+        sigv4_authorization(&Sigv4Input {
+            method,
+            uri: "/",
+            query,
+            headers,
+            payload_hash: hash,
+            access_key: "AKIDEXAMPLE",
+            secret: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            date: "20150830T123600Z",
+            region: "us-east-1",
+            service: "service",
+        })
+    }
+
+    #[test]
+    fn sigv4_matches_the_aws_test_suite() {
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let headers = [
+            ("host".to_string(), "example.amazonaws.com".to_string()),
+            ("x-amz-date".into(), "20150830T123600Z".into()),
+        ];
+        assert!(vanilla("GET", "", &headers, EMPTY).ends_with(
+            "Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, \
+             Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        ));
+        assert!(vanilla("POST", "", &headers, EMPTY)
+            .ends_with("Signature=5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b"));
+        assert_eq!(sigv4_query("b=2&a=x%20y&a=1&c"), "a=1&a=x%20y&b=2&c=");
+        assert_eq!(sigv4_uri("/a b/%2F", "execute-api"), "/a%20b/%252F");
+        assert_eq!(sigv4_uri("/a%20b", "s3"), "/a%20b");
+        assert_eq!(amz_date(std::time::Duration::from_secs(1440938160)), "20150830T123600Z");
+    }
+
+    #[test]
+    fn a_sigv4_signer_fills_every_header_it_covers() {
+        // SAFETY of the test's env: names used by this test alone.
+        std::env::set_var("BP_TEST_SIGV4_AK", "AKIDEXAMPLE");
+        std::env::set_var("BP_TEST_SIGV4_TOKEN", "SESSIONTOK");
+        let mut s = hmac_signer("", Place::Header("Authorization".into()));
+        s.kind = SignKind::Sigv4 {
+            access_key: KeySource::Env("BP_TEST_SIGV4_AK".into()),
+            session_token: Some(KeySource::Env("BP_TEST_SIGV4_TOKEN".into())),
+            region: "eu-west-1".into(),
+            service: "execute-api".into(),
+        };
+        assert!(s.validate().is_ok());
+        let raw = b"POST /a?b=1 HTTP/1.1\r\nHost: a.test\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nabc";
+        let out = signed(&s, raw, b"secret").unwrap();
+        let auth = out.lines().find_map(|l| l.strip_prefix("Authorization: ")).expect(&out);
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), "{auth}");
+        assert!(auth.contains("/eu-west-1/execute-api/aws4_request"), "{auth}");
+        assert!(
+            auth.contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token,"),
+            "{auth}"
+        );
+        assert!(out.contains("X-Amz-Security-Token: SESSIONTOK\r\n"), "{out}");
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(out.contains(&format!("X-Amz-Content-Sha256: {hash}\r\n")), "{out}");
+        assert!(out.ends_with("\r\n\r\nabc"), "{out}");
+        s.to = Place::Header("X-Sig".into());
+        assert!(s.validate().is_err(), "SigV4 only goes in Authorization");
     }
 
     #[test]
@@ -1035,8 +1705,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     #[test]
     fn a_signer_can_cover_the_headers_of_a_signer_after_it_but_not_an_unmade_signature() {
         let target = Target::from_url("https://a.test").unwrap();
-        let load =
-            |signer: &Signer| Loaded { profile: "p".into(), signer: signer.clone(), key: Ok(b"k".to_vec()).into() };
+        let load = |signer: &Signer| Loaded::with_key("p", signer.clone(), Ok(b"k".to_vec()));
         let mut covers = hmac_signer("{{header:X-Time}}", Place::Header("X-Sig".into()));
         covers.name = "covers".into();
         let mut sets = hmac_signer("{{path}}", Place::Header("X-Other".into()));
@@ -1076,11 +1745,10 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
         let other = Target::from_url("https://b.test").unwrap();
-        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(b"k".to_vec()).into() };
+        let loaded = Loaded::with_key("p", s.clone(), Ok(b"k".to_vec()));
         assert!(applied(&loaded, raw.clone(), &other).is_err());
         let here = Target::from_url("https://a.test").unwrap();
-        let loaded =
-            Loaded { profile: "p".into(), signer: s, key: Err("environment variable K is not set".to_string()).into() };
+        let loaded = Loaded::with_key("p", s, Err("environment variable K is not set".to_string()));
         assert!(applied(&loaded, raw, &here).unwrap_err().to_string().contains("K is not set"));
     }
 
@@ -1088,7 +1756,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     fn signing_alone_checks_the_origin() {
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
-        let loaded = Loaded { profile: "p".into(), signer: s, key: Ok(b"k".to_vec()).into() };
+        let loaded = Loaded::with_key("p", s, Ok(b"k".to_vec()));
         let (other, stamp) = (Target::from_url("https://b.test").unwrap(), Stamp::new().unwrap());
         assert!(loaded.sign(raw, &other, &stamp).unwrap_err().to_string().contains("doesn't sign for"));
     }
@@ -1100,7 +1768,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let loaded = Loaded::new("p", s.clone());
         let target = Target::from_url("https://a.test").unwrap();
         applied(&loaded, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(), &target).unwrap();
-        assert!(loaded.key.get().is_none(), "no placeholder, no read");
+        assert!(loaded.held.key.get().is_none(), "no placeholder, no read");
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
         let e = applied(&loaded, raw, &target).unwrap_err().to_string();
         assert!(e.contains("can't be read") && !e.contains("NotFound") && !e.contains("not found"), "{e}");
@@ -1113,7 +1781,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let mut second = hmac_signer("{{path}}", Place::Query("b".into()));
         second.name = "second".into();
         let raw = second.place(&first.place(b"GET /?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]), "p", &[]);
-        let loaded = Loaded { profile: "p".into(), signer: first, key: Ok(b"k".to_vec()).into() };
+        let loaded = Loaded::with_key("p", first, Ok(b"k".to_vec()));
         let e = applied(&loaded, raw, &Target::from_url("https://a.test").unwrap()).unwrap_err().to_string();
         assert!(e.contains("not computed yet"), "{e}");
     }
@@ -1166,5 +1834,72 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
             assert!(bad(&|s| s.to = Place::Query(name.into())), "{name}");
         }
         assert!(!bad(&|s| s.to = Place::Query("sig_1.v-2~".into())));
+    }
+
+    /// A script signer over `script`, in a file of its own.
+    fn script_signer(script: &str) -> (Signer, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bp-sign-script-{}-{}", std::process::id(), nonce().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pre.js");
+        std::fs::write(&file, script).unwrap();
+        let signer = Signer {
+            name: "script".into(),
+            key: KeySource::None,
+            key_encoding: KeyEncoding::Raw,
+            origins: vec!["https://a.test".into()],
+            to: Place::Header(SCRIPT_MARK_HEADER.into()),
+            format: None,
+            headers: vec![],
+            kind: SignKind::Script { file, sha256: crate::fetch::sha256_hex(script.as_bytes()), vars: vec![] },
+        };
+        assert!(signer.validate().is_ok());
+        (signer, dir)
+    }
+
+    fn script_signed(l: &Loaded) -> Result<Vec<u8>> {
+        let raw = l.signer.place(b"GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        applied(l, raw, &Target::from_url("https://a.test").unwrap())
+    }
+
+    #[test]
+    fn a_script_stopped_at_the_time_limit_runs_no_more_for_its_signer() {
+        crate::sign_script::tests::use_test_runner();
+        let (signer, dir) = script_signer("/^(a+)+$/.test('a'.repeat(40) + 'b');");
+        let loaded = Loaded::new("p", signer);
+        let started = std::time::Instant::now();
+        let e = script_signed(&loaded).unwrap_err().to_string();
+        assert!(e.contains("time limit") && started.elapsed() < std::time::Duration::from_secs(8), "{e}");
+        let first = crate::sign_script::LAST_CHILD.get();
+        // A copy, as each send makes, knows too, and fails at once without a run.
+        let copy = loaded.clone();
+        for l in [&loaded, &copy] {
+            let started = std::time::Instant::now();
+            let e = script_signed(l).unwrap_err().to_string();
+            assert!(e.contains("stopped earlier") && started.elapsed() < std::time::Duration::from_millis(500), "{e}");
+        }
+        assert_eq!(crate::sign_script::LAST_CHILD.get(), first, "no other run started");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_header_with_a_control_character_is_refused() {
+        crate::sign_script::tests::use_test_runner();
+        for (value, ok) in
+            [("a\\u0001b", false), ("a\\u001bb", false), ("a\\u007fb", false), ("a\\u0085b", false), ("a\\tb", true)]
+        {
+            let (signer, dir) = script_signer(&format!("pm.request.headers.upsert({{key: 'X-A', value: '{value}'}});"));
+            let r = script_signed(&Loaded::new("p", signer));
+            match ok {
+                true => assert!(String::from_utf8(r.unwrap()).unwrap().contains("X-A: a\tb\r\n"), "{value}"),
+                false => assert!(r.unwrap_err().to_string().contains("bad header"), "{value}"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        // Nor does a cheap failure of the script itself stop the signer.
+        let (signer, dir) = script_signer("if (pm.request.url.getPath() === '/x') throw new Error('no');");
+        let loaded = Loaded::new("p", signer);
+        assert!(script_signed(&loaded).unwrap_err().to_string().contains("its script failed"));
+        assert!(script_signed(&loaded).unwrap_err().to_string().contains("its script failed"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

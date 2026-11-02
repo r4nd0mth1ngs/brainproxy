@@ -1,0 +1,63 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Pets", "version": "1.0"},
+  "servers": [
+    {"url": "http://127.0.0.1:18080/v1", "description": "local"},
+    {"url": "https://api.example.test/v2", "description": "prod"}
+  ],
+  "components": {
+    "securitySchemes": {
+      "KeyAuth": {"type": "apiKey", "in": "header", "name": "X-Api-Key"}
+    },
+    "parameters": {
+      "PetId": {"name": "id", "in": "path", "required": true, "schema": {"type": "integer", "example": 7}}
+    },
+    "requestBodies": {
+      "NewPet": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}
+      }
+    },
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "example": "rex"},
+          "age": {"type": "integer"}
+        }
+      }
+    }
+  },
+  "paths": {
+    "/pets": {
+      "get": {
+        "operationId": "listPets",
+        "parameters": [
+          {"name": "limit", "in": "query", "required": true, "schema": {"type": "integer"}},
+          {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["dog", "cat"]}}
+        ]
+      },
+      "post": {
+        "operationId": "createPet",
+        "requestBody": {"$ref": "#/components/requestBodies/NewPet"}
+      }
+    },
+    "/pets/{id}": {
+      "parameters": [{"$ref": "#/components/parameters/PetId"}],
+      "get": {"operationId": "getPet"},
+      "put": {
+        "operationId": "updatePet",
+        "requestBody": {"$ref": "#/components/requestBodies/NewPet"}
+      },
+      "patch": {"operationId": "patchPet"},
+      "delete": {"operationId": "deletePet"}
+    },
+    "/elsewhere": {
+      "get": {
+        "operationId": "elsewhere",
+        "servers": [{"url": "https://elsewhere.example.test"}]
+      }
+    }
+  }
+}

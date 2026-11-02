@@ -1,0 +1,9 @@
+swagger: 2.0
+info: {title: Store YAML, version: 1.1}
+basePath: /api
+paths:
+  /orders/{id}:
+    get:
+      operationId: getOrder
+      parameters:
+        - {name: id, in: path, required: true, type: string, x-example: ord-1}

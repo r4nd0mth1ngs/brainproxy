@@ -610,6 +610,7 @@ impl AuthSession {
         keep_cookies: &[&str],
         keep_params: &[&str],
     ) -> Prepared {
+        self.oauth_renew_if_due().await;
         let generation = self.generation();
         let macro_generation = self.handling.generation.load(Ordering::SeqCst);
         let mut request = raw.to_vec();
@@ -641,7 +642,7 @@ impl AuthSession {
             .collect();
         let mut keep: Vec<&str> = keep_cookies.to_vec();
         keep.extend(set.iter().map(String::as_str));
-        let mut request = self.apply(&request, &keep);
+        let mut request = self.apply_to(&request, &keep, target);
         for (k, v) in &headers {
             request = RawRequest::from_bytes(request).set_header(k, v).into_bytes();
         }
@@ -847,7 +848,7 @@ impl AuthSession {
                 extracted: Vec::new(),
                 error: None,
             };
-            let sent = self.client.send(&RawRequest::from_bytes(self.apply(&raw, &[])), &target).await;
+            let sent = self.client.send(&RawRequest::from_bytes(self.apply_to(&raw, &[], &target)), &target).await;
             let ex = match sent {
                 Ok(ex) => ex,
                 Err(e) => {

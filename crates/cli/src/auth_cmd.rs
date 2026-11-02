@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brainproxy_core::auth::{AuthProfile, AuthSession, Secret, SessionState};
+use brainproxy_core::auth::{AuthProfile, AuthSession, QueryKey, Secret, SessionState};
 use brainproxy_core::auth_record::{Mode, Recorded};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
+use brainproxy_core::oauth::{Flow, OAuth};
 use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool};
 use brainproxy_core::sign::{HmacAlg, JwtAlg, KeySource, Place, SignKind, Signer};
 use brainproxy_core::store::Store;
@@ -25,7 +26,10 @@ pub enum AuthCmd {
         --username alice --password-env APP_PW. JSON bodies (starting with '{') are sent as application/json.\n\
         CSRF: --csrf-url PAGE --csrf-regex 'name=\"csrf\" value=\"([^\"]+)\"' fills {{csrf}}.\n\
         Bearer token: --token-regex '\"token\":\"([^\"]+)\"' --token-header 'Authorization: Bearer {{token}}'.\n\
-        Static API key only: --header 'X-Api-Key: ...' (no --login-url).\n\
+        Static API key only: --header 'X-Api-Key: ...', or --header-env 'X-Api-Key=ENV_VAR' to keep it off the \
+        command line (no --login-url). A bearer token is --header-env 'Authorization=ENV_VAR' with the value \
+        'Bearer abc' in the variable. In the query string: --query-key 'api_key=ENV_VAR' --key-origin https://api.test; \
+        history keeps a placeholder, and the key goes only to the origins given.\n\
         Platform auth (HTTP Basic, Digest, NTLM): --platform ntlm --platform-host '*.corp.test' --username 'CORP\\bob' \
         --password-env BOB_PW. It answers those hosts' 401 challenges on every command, no --auth needed, and is added \
         on the wire only (history keeps the request without it).\n\
@@ -76,10 +80,36 @@ pub enum AuthCmd {
     /// go out with `--auth NAME` (check the session, run a macro, update the request, log in).
     #[command(subcommand)]
     Rule(RuleCmd),
-    /// A profile's request signers: HMAC signatures and JWTs computed as requests go out,
-    /// for a session rule's `sign:NAME` action. Keys stay in the environment or a file.
+    /// A profile's request signers: HMAC and private-key signatures, JWTs and AWS SigV4 computed
+    /// as requests go out, for a session rule's `sign:NAME` action. Keys stay in the environment or a file.
     #[command(subcommand)]
     Sign(SignCmd),
+    /// OAuth 2.0 sign-ins for a profile added with --oauth-flow.
+    #[command(subcommand)]
+    Oauth(OauthCmd),
+}
+
+#[derive(Subcommand)]
+pub enum OauthCmd {
+    /// Sign in with a browser (authorization code with PKCE) and store the tokens. Register
+    /// http://127.0.0.1:PORT/callback with the provider (see --oauth-redirect-port).
+    Authorize {
+        name: String,
+        /// Only print the sign-in URL; don't open a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Seconds to wait for the sign-in.
+        #[arg(long, default_value_t = 300)]
+        wait: u64,
+        #[command(flatten)]
+        net: NetArgs,
+    },
+    /// Read an OpenID Connect discovery document (fetched in scope): where tokens and sign-ins go.
+    Discover {
+        url: String,
+        #[command(flatten)]
+        net: NetArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -181,7 +211,17 @@ pub enum SignCmd {
         brainproxy auth rule add api --action sign:hm\n\
         A JWT with chosen claims, good for five minutes:\n  \
         brainproxy auth sign add api tok --jwt HS256 --secret-env JWT_KEY --origin https://api.test \\\n    \
-        --to header:Authorization --wrap 'Bearer {{signature}}' --claims '{\"sub\":\"admin\"}' --ttl 300")]
+        --to header:Authorization --wrap 'Bearer {{signature}}' --claims '{\"sub\":\"admin\"}' --ttl 300\n\
+        A signature with a private key:\n  \
+        brainproxy auth sign add api ed --key-alg EdDSA --secret-file ed25519.pem --origin https://api.test \\\n    \
+        --to header:X-Signature --output base64 --canonical '{{method}} {{path}}\\n{{body_sha256}}'\n\
+        AWS Signature Version 4:\n  \
+        brainproxy auth sign add aws v4 --sigv4-region eu-west-1 --sigv4-service execute-api \\\n    \
+        --access-key-env AWS_ACCESS_KEY_ID --secret-env AWS_SECRET_ACCESS_KEY \\\n    \
+        --session-token-env AWS_SESSION_TOKEN --origin https://abc.execute-api.eu-west-1.amazonaws.com\n\
+        A Postman collection's pre-request script (this runs its code, cut off from files and the network):\n  \
+        brainproxy auth sign add api postman --script collection.json --environment prod.postman_environment.json \\\n    \
+        --origin https://api.test")]
     Add(Box<SignAddArgs>),
     /// The profile's signers (they hold where a key is, not the key).
     List { profile: String },
@@ -195,7 +235,7 @@ pub struct SignAddArgs {
     /// Signer name.
     pub name: String,
     /// Environment variable holding the key (never stored).
-    #[arg(long, conflicts_with = "secret_file", required_unless_present = "secret_file")]
+    #[arg(long, conflicts_with = "secret_file", required_unless_present_any = ["secret_file", "script"])]
     pub secret_env: Option<String>,
     /// File holding the key (never stored), e.g. a PEM private key for RS256.
     #[arg(long)]
@@ -206,9 +246,9 @@ pub struct SignAddArgs {
     /// Origin it may sign for (scheme://host[:port]). Repeatable.
     #[arg(long = "origin", required = true)]
     pub origins: Vec<String>,
-    /// Where the value goes: header:NAME or query:NAME.
-    #[arg(long)]
-    pub to: String,
+    /// Where the value goes: header:NAME or query:NAME. SigV4 always uses Authorization.
+    #[arg(long, required_unless_present_any = ["sigv4_region", "script"])]
+    pub to: Option<String>,
     /// A header's value around the signature, e.g. 'Bearer {{signature}}'.
     #[arg(long)]
     pub wrap: Option<String>,
@@ -216,7 +256,7 @@ pub struct SignAddArgs {
     #[arg(long = "set-header")]
     pub set_headers: Vec<String>,
     /// The string to HMAC.
-    #[arg(long, conflicts_with = "jwt", required_unless_present = "jwt")]
+    #[arg(long, conflicts_with = "jwt", required_unless_present_any = ["jwt", "sigv4_region", "script"])]
     pub canonical: Option<String>,
     /// HMAC hash: sha1, sha256, sha384, or sha512.
     #[arg(long, default_value = "sha256", conflicts_with = "jwt")]
@@ -224,7 +264,11 @@ pub struct SignAddArgs {
     /// HMAC output: hex, base64, or base64url.
     #[arg(long, default_value = "hex", conflicts_with = "jwt")]
     pub output: String,
-    /// Make a JWT with this algorithm: HS256, HS384, HS512, or RS256.
+    /// Sign --canonical with a PEM private key: RS256/384/512, PS256/384/512, ES256/384, or EdDSA.
+    /// ES and Ed25519 keys are PKCS#8. --output says how the signature is written.
+    #[arg(long, requires = "canonical", conflicts_with = "jwt")]
+    pub key_alg: Option<String>,
+    /// Make a JWT with this algorithm: HS256/384/512, RS256/384/512, PS256/384/512, ES256/384, or EdDSA.
     #[arg(long)]
     pub jwt: Option<String>,
     /// JWT claims, a JSON object template.
@@ -239,6 +283,38 @@ pub struct SignAddArgs {
     /// Start from the JWT already in the request (its header and claims, --claims on top).
     #[arg(long, requires = "jwt")]
     pub resign: bool,
+    /// AWS SigV4 for this region; --secret-env or --secret-file is the secret access key.
+    #[arg(long, requires = "sigv4_service", conflicts_with_all = ["jwt", "canonical", "key_alg", "to", "wrap"])]
+    pub sigv4_region: Option<String>,
+    /// The AWS service to sign for, e.g. execute-api or s3.
+    #[arg(long, requires = "sigv4_region")]
+    pub sigv4_service: Option<String>,
+    /// Environment variable holding the AWS access key id (never stored).
+    #[arg(long, conflicts_with = "access_key_file")]
+    pub access_key_env: Option<String>,
+    /// File holding the AWS access key id (never stored).
+    #[arg(long)]
+    pub access_key_file: Option<PathBuf>,
+    /// Environment variable holding an AWS session token (never stored).
+    #[arg(long, conflicts_with = "session_token_file")]
+    pub session_token_env: Option<String>,
+    /// File holding an AWS session token (never stored).
+    #[arg(long)]
+    pub session_token_file: Option<PathBuf>,
+    /// Run a Postman pre-request script for every request: a collection or a .js file. This runs
+    /// code from that file, with no file or network access; read it first (`import api --show-scripts`).
+    /// A collection's variables, then --environment, then --script-var are what it sees.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["jwt", "canonical", "key_alg", "sigv4_region", "to", "wrap", "set_headers"])]
+    pub script: Option<PathBuf>,
+    /// Which script of the collection, by the sha256 the preview lists. Also pins a .js file.
+    #[arg(long, value_name = "HEX", requires = "script")]
+    pub script_sha256: Option<String>,
+    /// A Postman environment file holding what the script reads (never stored).
+    #[arg(long, value_name = "FILE", requires = "script", conflicts_with_all = ["secret_env", "secret_file"])]
+    pub environment: Option<PathBuf>,
+    /// Another variable for the script, NAME=VALUE. Stored, so not for secrets. Repeatable.
+    #[arg(long = "script-var", value_name = "NAME=VALUE", requires = "script")]
+    pub script_vars: Vec<String>,
     /// Replacing a signer, keep its place in the order instead of running it last.
     #[arg(long)]
     pub keep_place: bool,
@@ -326,6 +402,58 @@ pub struct AddArgs {
     /// Header added to every request (API key, static bearer token). Repeatable.
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
+    /// NAME=ENV_VAR: a header like --header, its value read once from the environment
+    /// variable and stored in the project. Repeatable.
+    #[arg(long = "header-env", value_name = "NAME=ENV_VAR")]
+    header_env: Vec<String>,
+    /// NAME=ENV_VAR: an API key sent as this query parameter, read once from the environment
+    /// variable and stored in the project. Needs --key-origin. Repeatable.
+    #[arg(long = "query-key", value_name = "NAME=ENV_VAR", requires = "key_origins")]
+    query_keys: Vec<String>,
+    /// An origin (scheme://host[:port]) the --query-key values may go to. Repeatable.
+    #[arg(long = "key-origin", value_name = "ORIGIN", requires = "query_keys")]
+    key_origins: Vec<String>,
+    /// When replacing a profile, keep its --query-key values. For an edit that can't see them.
+    #[arg(long, conflicts_with = "query_keys")]
+    keep_query_keys: bool,
+    /// OAuth 2.0 in place of a login: client_credentials, password, refresh_token, or
+    /// authorization_code (then sign in with `auth oauth authorize NAME`).
+    #[arg(long, value_name = "FLOW", requires_all = ["oauth_token_url", "oauth_client_id"], conflicts_with_all = ["login_url", "token_regex"])]
+    oauth_flow: Option<String>,
+    /// Where tokens are requested; its host must be in scope.
+    #[arg(long, value_name = "URL", requires = "oauth_flow")]
+    oauth_token_url: Option<String>,
+    #[arg(long, value_name = "ID", requires = "oauth_flow")]
+    oauth_client_id: Option<String>,
+    /// Environment variable holding the client secret, read at each token request; never stored.
+    #[arg(long, value_name = "VAR", requires = "oauth_flow")]
+    oauth_client_secret_env: Option<String>,
+    /// Environment variable holding the refresh token the refresh_token flow starts from.
+    #[arg(long, value_name = "VAR", requires = "oauth_flow")]
+    oauth_refresh_token_env: Option<String>,
+    /// Read those variables once now and store the values in the project, for background
+    /// scans that won't have them. The desktop app uses this.
+    #[arg(long, requires = "oauth_flow")]
+    oauth_store_secrets: bool,
+    /// How the client authenticates: body (form fields) or basic.
+    #[arg(long, value_name = "HOW", default_value = "body", requires = "oauth_flow")]
+    oauth_client_auth: String,
+    #[arg(long, value_name = "SCOPES", requires = "oauth_flow")]
+    oauth_scope: Option<String>,
+    #[arg(long, value_name = "AUDIENCE", requires = "oauth_flow")]
+    oauth_audience: Option<String>,
+    /// Extra token request field, NAME=VALUE. Repeatable.
+    #[arg(long = "oauth-param", value_name = "NAME=VALUE", requires = "oauth_flow")]
+    oauth_params: Vec<String>,
+    /// The sign-in page, for authorization_code.
+    #[arg(long, value_name = "URL", requires = "oauth_flow")]
+    oauth_authorize_url: Option<String>,
+    /// Loopback port the sign-in redirects to, when the client registered a fixed one.
+    #[arg(long, value_name = "PORT", requires = "oauth_flow")]
+    oauth_redirect_port: Option<u16>,
+    /// When replacing a profile, keep its OAuth setup. For an edit that can't see it.
+    #[arg(long, conflicts_with = "oauth_flow")]
+    keep_oauth: bool,
     /// Minimum seconds between automatic re-logins.
     #[arg(long, default_value_t = 5)]
     relogin_interval: u64,
@@ -387,6 +515,32 @@ pub fn maybe_session(
     name.map(|n| load_session(project, n, send.clone())).transpose()
 }
 
+/// `NAME=ENV_VAR` with the variable read. Errors name the variable, never a value.
+fn env_pair(flag: &str, spec: &str) -> Result<(String, String), Error> {
+    let bad = || Error::InvalidInput(format!("{flag}: expected NAME=ENV_VAR"));
+    let (name, var) = spec.split_once('=').ok_or_else(bad)?;
+    let (name, var) = (name.trim(), var.trim());
+    if name.is_empty() || var.is_empty() {
+        return Err(bad());
+    }
+    crate::mcp::check_secret_env(flag, var)?;
+    // Only a name that looks like one is repeated: a key given here by mistake must not be.
+    let shown = if var.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+        var
+    } else {
+        "the variable after NAME="
+    };
+    let value = std::env::var(var).map_err(|_| Error::InvalidInput(format!("{flag}: {shown} is not set")))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidInput(format!("{flag}: {shown} is empty")));
+    }
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(Error::InvalidInput(format!("{flag}: {shown} holds a line break")));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
 fn state_json(state: &SessionState) -> serde_json::Value {
     json!({
         "logged_in": state.logged_in,
@@ -394,8 +548,127 @@ fn state_json(state: &SessionState) -> serde_json::Value {
         "token": state.token.is_some(),
         "last_login": state.last_login,
         "last_error": state.last_error,
+        "refresh_token": state.refresh_token.is_some(),
+        "token_expires": state.token_expires,
         "vars": state.vars.iter().map(|v| &v.name).collect::<Vec<_>>(),
     })
+}
+
+/// The profile's OAuth setup from `auth add` flags. With --oauth-store-secrets the values
+/// are read now and go in the project; else only the variable names do.
+fn oauth_from_args(a: &AddArgs) -> Result<Option<OAuth>, Error> {
+    let Some(flow) = &a.oauth_flow else { return Ok(None) };
+    let secret = |flag: &str, var: &Option<String>| -> Result<Option<Secret>, Error> {
+        let Some(var) = var else { return Ok(None) };
+        crate::mcp::check_secret_env(flag, var)?;
+        if !a.oauth_store_secrets {
+            return Ok(Some(Secret::Env(var.clone())));
+        }
+        let (_, value) = env_pair(flag, &format!("x={var}"))?;
+        Ok(Some(Secret::Literal(value)))
+    };
+    let params = a
+        .oauth_params
+        .iter()
+        .map(|p| {
+            let (k, v) = p
+                .split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+                .ok_or_else(|| Error::InvalidInput("--oauth-param: expected NAME=VALUE".into()))?;
+            if secret_param(&k) {
+                return Err(Error::InvalidInput(format!(
+                    "--oauth-param {k} looks like a credential and would be stored as given; use \
+                     --oauth-client-secret-env or --oauth-refresh-token-env"
+                )));
+            }
+            Ok((k, v))
+        })
+        .collect::<Result<_, Error>>()?;
+    Ok(Some(OAuth {
+        flow: Flow::parse(flow)?,
+        token_url: a.oauth_token_url.clone().unwrap_or_default(),
+        client_id: a.oauth_client_id.clone().unwrap_or_default(),
+        client_secret: secret("--oauth-client-secret-env", &a.oauth_client_secret_env)?,
+        client_auth: parse_choice("client authentication", &a.oauth_client_auth, "body, basic")?,
+        scope: a.oauth_scope.clone(),
+        audience: a.oauth_audience.clone(),
+        params,
+        refresh_token: secret("--oauth-refresh-token-env", &a.oauth_refresh_token_env)?,
+        authorize_url: a.oauth_authorize_url.clone(),
+        redirect_port: a.oauth_redirect_port,
+        store_secrets: a.oauth_store_secrets,
+    }))
+}
+
+/// A token request field that holds a credential: refused by --oauth-param, masked by `auth show`.
+fn secret_param(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    brainproxy_core::apiimport::looks_secret(&n) || n.contains("assertion") || n.contains("credential")
+}
+
+/// Opens `url` in the system browser, passed as one argument with no shell between.
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut c = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut c = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut c = std::process::Command::new("xdg-open");
+    c.arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    c.spawn().map(|_| ())
+}
+
+fn oauth_cmd(project: &Path, cmd: OauthCmd, out: &Out) -> Result<(), Error> {
+    match cmd {
+        OauthCmd::Authorize { name, no_open, wait, net } => {
+            let session = AuthSession::load(project, &name, Client::new(net.send_options(project)?))?;
+            let result = runtime()?.block_on(session.oauth_authorize(Duration::from_secs(wait), |url| {
+                // On stderr: the JSON on stdout comes when the sign-in is done.
+                eprintln!("Sign in at: {url}");
+                // An agent mustn't open the user's browser at a page it chose.
+                if !no_open && !crate::mcp::in_tool_call() && open_browser(url).is_err() {
+                    eprintln!("Could not open a browser; open the URL above yourself.");
+                }
+            }))?;
+            if !result.success {
+                return Err(Error::InvalidInput(format!("OAuth sign-in failed: {}", result.reason)));
+            }
+            out.ok(json!({"name": name, "signed_in": true, "session": state_json(&session.state())}), || {
+                format!("{name} is signed in")
+            });
+        }
+        OauthCmd::Discover { url, net } => {
+            let (req, target) = RawRequest::build("GET", &url, &[("Accept".into(), "application/json".into())], b"")?;
+            let client = Client::new(net.send_options(project)?);
+            let ex = runtime()?.block_on(client.send(&req, &target))?;
+            let head = brainproxy_core::http::parse_response_head(&ex.response)?;
+            let body = brainproxy_core::http::request::split_head_body(&ex.response).1;
+            let doc: serde_json::Value =
+                serde_json::from_slice(&brainproxy_core::capture::decode_body(&head.headers, body))
+                    .ok()
+                    .filter(|_| (200..300).contains(&head.status))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!("{url} isn't a discovery document ({})", head.status))
+                    })?;
+            let text = |k: &str| doc.get(k).and_then(serde_json::Value::as_str).map(str::to_string);
+            let (token_url, authorize_url) = (text("token_endpoint"), text("authorization_endpoint"));
+            out.ok(json!({"token_url": token_url, "authorize_url": authorize_url}), || {
+                format!(
+                    "token: {}\nsign-in: {}",
+                    token_url.as_deref().unwrap_or("-"),
+                    authorize_url.as_deref().unwrap_or("-")
+                )
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
@@ -404,6 +677,7 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
         AuthCmd::Macro(cmd) => macro_cmd(project, cmd, out)?,
         AuthCmd::Rule(cmd) => rule_cmd(project, cmd, out)?,
         AuthCmd::Sign(cmd) => sign_cmd(project, cmd, out)?,
+        AuthCmd::Oauth(cmd) => oauth_cmd(project, cmd, out)?,
         AuthCmd::Add(a) => {
             let parse = |list: &[String]| {
                 list.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()
@@ -419,7 +693,30 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             if login_request.is_some() && a.login_url.is_none() {
                 return Err(Error::InvalidInput("--login-request needs --login-url (where to send it)".into()));
             }
+            if let Some(var) = &a.password_env {
+                crate::mcp::check_secret_env("--password-env", var)?;
+            }
+            let mut headers = parse(&a.headers)?;
+            for spec in &a.header_env {
+                let (name, value) = env_pair("--header-env", spec)?;
+                if name.is_empty() || name.contains([':', ' ', '\r', '\n']) {
+                    return Err(Error::InvalidInput(format!("--header-env: bad header name {name:?}")));
+                }
+                headers.push((name, value));
+            }
+            let origins =
+                a.key_origins.iter().map(|o| Target::from_url(o).map(|t| t.origin())).collect::<Result<Vec<_>, _>>()?;
+            let query_keys = a
+                .query_keys
+                .iter()
+                .map(|spec| {
+                    let (name, value) = env_pair("--query-key", spec)?;
+                    Ok(QueryKey { name, value, origins: origins.clone() })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            let oauth = oauth_from_args(&a)?;
             let mut profile = AuthProfile {
+                oauth,
                 name: a.name,
                 login_url: a.login_url,
                 login_method: a.login_method.to_ascii_uppercase(),
@@ -431,11 +728,14 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 csrf_url: a.csrf_url,
                 csrf_regex: a.csrf_regex,
                 token_regex: a.token_regex,
-                token_header: a.token_header,
+                token_header: a
+                    .token_header
+                    .or_else(|| a.oauth_flow.as_ref().map(|_| "Authorization: Bearer {{token}}".to_string())),
                 logged_in: a.logged_in,
                 logged_out: a.logged_out,
                 check_url: a.check_url,
-                headers: parse(&a.headers)?,
+                headers,
+                query_keys,
                 relogin_interval_secs: a.relogin_interval,
                 max_relogins: a.max_relogins,
                 platform: a
@@ -453,7 +753,10 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             let store = Store::open(project)?;
             // `auth show` redacts header values; re-saving one unchanged (the GUI's edit form does)
             // keeps the stored value instead of storing the mask.
-            if let Ok((old, _)) = store.auth_profile(&profile.name) {
+            // The tokens of an OAuth setup kept as it was: saving the profile clears its session,
+            // and a browser sign-in can't be got back without the user.
+            let mut kept_tokens = None;
+            if let Ok((old, old_state)) = store.auth_profile(&profile.name) {
                 for (k, v) in &mut profile.headers {
                     if let Some((_, stored)) =
                         old.headers.iter().find(|(o, _)| v == "********" && o.eq_ignore_ascii_case(k))
@@ -461,8 +764,26 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                         *v = stored.clone();
                     }
                 }
+                if a.keep_query_keys {
+                    profile.query_keys = old.query_keys;
+                }
+                if a.keep_oauth && old.oauth.is_some() {
+                    profile.oauth = old.oauth;
+                    profile.token_header = old.token_header;
+                    kept_tokens = Some(SessionState {
+                        token: old_state.token,
+                        refresh_token: old_state.refresh_token,
+                        token_expires: old_state.token_expires,
+                        logged_in: old_state.logged_in,
+                        last_login: old_state.last_login,
+                        ..Default::default()
+                    });
+                }
             }
             store.auth_save_profile(&profile)?;
+            if let Some(state) = kept_tokens {
+                store.auth_save_state(&profile.name, &state)?;
+            }
             let shown = profile.redacted();
             out.ok(json!({"profile": shown, "next": format!("brainproxy auth login {}", shown.name)}), || {
                 format!("profile {:?} saved; run: brainproxy auth login {}", shown.name, shown.name)
@@ -549,8 +870,14 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             let store = Store::open(project)?;
             let (profile, state) = store.auth_profile(&name)?;
             let handling = store.auth_handling(&name)?;
+            let mut profile = profile.redacted();
+            for (k, v) in profile.oauth.iter_mut().flat_map(|o| o.params.iter_mut()) {
+                if secret_param(k) {
+                    *v = "********".into();
+                }
+            }
             let data = json!({
-                "profile": profile.redacted(),
+                "profile": profile,
                 "session": state_json(&state),
                 "macros": handling.macros.iter().map(macro_summary).collect::<Vec<_>>(),
                 "rules": handling.rules,
@@ -612,6 +939,7 @@ fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), 
                 .collect();
             let mut p = brainproxy_core::auth_record::analyze(&recorded, &name, started["url"].as_str());
             if let Some(var) = &password_env {
+                crate::mcp::check_secret_env("--password-env", var)?;
                 if p.profile.password.is_some() {
                     p.profile.password = Some(Secret::Env(var.clone()));
                 }
@@ -930,16 +1258,87 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 ttl,
                 kid,
                 resign,
+                key_alg,
+                sigv4_region,
+                sigv4_service,
+                access_key_env,
+                access_key_file,
+                session_token_env,
+                session_token_file,
+                script,
+                script_sha256,
+                environment,
+                script_vars,
                 keep_place,
             } = *args;
-            let key = match (secret_env, secret_file) {
+            if script.is_some() && crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "--script runs code from a collection, so it isn't offered through MCP: a person must read the \
+                     script (`import api --show-scripts`) and add the signer in the app or a terminal"
+                        .into(),
+                ));
+            }
+            // These two go on the wire as they are, so an agent could send any readable file to
+            // the target; key files only ever produce a signature.
+            if crate::mcp::in_tool_call() && (access_key_file.is_some() || session_token_file.is_some()) {
+                return Err(Error::InvalidInput(
+                    "--access-key-file and --session-token-file aren't offered through MCP (their contents are sent \
+                     as they are): use --access-key-env and --session-token-env with BRAINPROXY_SECRET_* variables, \
+                     or add the signer in the app or a terminal"
+                        .into(),
+                ));
+            }
+            for (flag, var) in [
+                ("--secret-env", &secret_env),
+                ("--access-key-env", &access_key_env),
+                ("--session-token-env", &session_token_env),
+            ] {
+                if let Some(var) = var {
+                    crate::mcp::check_secret_env(flag, var)?;
+                }
+            }
+            let key = match (secret_env, secret_file.or(environment)) {
                 (Some(var), _) => KeySource::Env(var),
                 (_, Some(path)) => KeySource::File(path),
+                _ if script.is_some() => KeySource::None,
                 _ => return Err(Error::InvalidInput("give --secret-env or --secret-file".into())),
             };
-            let kind = match jwt {
-                Some(alg) => SignKind::Jwt { alg: JwtAlg::parse(&alg)?, claims, ttl, kid, resign },
-                None => SignKind::Hmac {
+            let script_kind = script
+                .map(|file| {
+                    let file = std::fs::canonicalize(&file).unwrap_or(file);
+                    let (text, _) = brainproxy_core::sign::read_script(&file, script_sha256.as_deref())
+                        .map_err(Error::InvalidInput)?;
+                    brainproxy_core::sign_script::check_syntax(&text).map_err(Error::InvalidInput)?;
+                    let vars = crate::import_cmd::parse_vars(&script_vars)?;
+                    if let Some((k, _)) = vars.iter().find(|(k, _)| brainproxy_core::apiimport::looks_secret(k)) {
+                        return Err(Error::InvalidInput(format!(
+                            "--script-var {k} looks like a credential and would be stored; put it in --environment"
+                        )));
+                    }
+                    let sha256 = brainproxy_core::fetch::sha256_hex(text.as_bytes());
+                    Ok::<_, Error>(SignKind::Script { file, sha256, vars })
+                })
+                .transpose()?;
+            let is_script = script_kind.is_some();
+            let source =
+                |env: Option<String>, file: Option<PathBuf>| env.map(KeySource::Env).or(file.map(KeySource::File));
+            let kind = match (jwt, key_alg, sigv4_region) {
+                _ if script_kind.is_some() => script_kind.unwrap_or_else(|| unreachable!("checked")),
+                (Some(alg), ..) => SignKind::Jwt { alg: JwtAlg::parse(&alg)?, claims, ttl, kid, resign },
+                (_, Some(alg), _) => SignKind::Key {
+                    alg: JwtAlg::parse(&alg)?,
+                    canonical: canonical.unwrap_or_default(),
+                    output: parse_choice("output", &output, "hex, base64, base64url")?,
+                },
+                (_, _, Some(region)) => SignKind::Sigv4 {
+                    access_key: source(access_key_env, access_key_file).ok_or_else(|| {
+                        Error::InvalidInput("--sigv4-region needs --access-key-env or --access-key-file".into())
+                    })?,
+                    session_token: source(session_token_env, session_token_file),
+                    region,
+                    service: sigv4_service.unwrap_or_default(),
+                },
+                _ => SignKind::Hmac {
                     alg: HmacAlg::parse(&hash)?,
                     canonical: canonical.unwrap_or_default(),
                     output: parse_choice("output", &output, "hex, base64, base64url")?,
@@ -960,7 +1359,11 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 key,
                 key_encoding: parse_choice("key encoding", &secret_encoding, "raw, hex, base64")?,
                 origins,
-                to: Place::parse(&to)?,
+                to: match to {
+                    Some(to) => Place::parse(&to)?,
+                    None if is_script => Place::Header(brainproxy_core::sign::SCRIPT_MARK_HEADER.into()),
+                    None => Place::Header("Authorization".into()),
+                },
                 format: wrap,
                 headers,
                 kind,

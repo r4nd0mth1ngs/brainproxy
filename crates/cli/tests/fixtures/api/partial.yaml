@@ -1,0 +1,46 @@
+openapi: 3.0.3
+info: {title: Partly supported, version: "1"}
+servers:
+  - url: http://127.0.0.1:18080
+paths:
+  /good:
+    get:
+      operationId: good
+  /external-item:
+    $ref: "other.yaml#/paths/item"
+  /external-param:
+    get:
+      operationId: externalParam
+      parameters:
+        - $ref: "other.yaml#/parameters/page"
+  /external-body:
+    post:
+      operationId: externalBody
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "other.yaml#/schemas/Thing"
+  /binary:
+    post:
+      operationId: binary
+      requestBody:
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+  no-leading-slash:
+    get:
+      operationId: noSlash
+  /bad-header:
+    get:
+      operationId: badHeader
+      parameters:
+        - name: "X-Bad\r\nInjected"
+          in: header
+          required: true
+          schema: {type: string, example: x}
+  /placeholder:
+    get:
+      operationId: placeholder
+      parameters:
+        - {name: q, in: query, schema: {type: string, example: "«auth:victim:header:X-Api-Key»"}}

@@ -32,11 +32,13 @@ pub const SINGLE_PACKET_MAX: usize = 100;
 pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<u8>>) -> Vec<Result<Exchange>> {
     let timeout = client.options().timeout;
     // What goes on the wire has auth placeholders filled; `requests` stays as recorded.
-    let wire: Vec<Vec<u8>> =
-        match requests.iter().map(|r| client.fill_auth(r, target).map(|b| b.into_owned())).collect() {
-            Ok(w) => w,
+    let mut wire: Vec<Vec<u8>> = Vec::with_capacity(requests.len());
+    for r in &requests {
+        match client.fill_auth(r, target).await {
+            Ok(w) => wire.push(w.into_owned()),
             Err(e) => return requests.iter().map(|_| Err(Error::InvalidInput(e.to_string()))).collect(),
-        };
+        }
+    }
     // 1. Connect everything up front.
     let mut connects = Vec::new();
     for _ in &requests {
@@ -117,8 +119,10 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
     if requests.is_empty() || requests.len() > SINGLE_PACKET_MAX {
         return Err(Error::InvalidInput(format!("single-packet races take 1 to {SINGLE_PACKET_MAX} requests")));
     }
-    let converted: Vec<H2Request> =
-        requests.iter().map(|r| H2Request::from_raw(&client.fill_auth(r, target)?, target)).collect::<Result<_>>()?;
+    let mut converted: Vec<H2Request> = Vec::with_capacity(requests.len());
+    for r in &requests {
+        converted.push(H2Request::from_raw(&client.fill_auth(r, target).await?, target)?);
+    }
     // Recorded with the auth placeholders, not the values sent.
     let recorded: Vec<Vec<u8>> =
         requests.iter().map(|r| H2Request::from_raw(r, target).map(|h| h.recorded)).collect::<Result<_>>()?;

@@ -514,6 +514,14 @@ impl Guard {
             Err(_) => self.precheck_name(bare, port).is_ok(),
         }
     }
+
+    /// Whether `may_allow` is already certain: an address, or a name every scope lists.
+    pub fn confirms(&self, host: &str, port: u16) -> bool {
+        let bare = &norm_host(host);
+        self.may_allow(bare, port)
+            && (bare.parse::<IpAddr>().is_ok()
+                || self.scopes.iter().all(|s| s.include.iter().any(|e| e.matches_name(bare, port))))
+    }
 }
 
 fn proxy_refused(bare: &str, port: u16) -> Error {

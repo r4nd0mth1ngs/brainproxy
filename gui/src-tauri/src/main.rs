@@ -15,8 +15,10 @@ use std::process::Stdio;
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
+use tauri::Manager;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 /// The CLI to run: $BRAINPROXY_BIN, else the bundled sidecar next to this executable,
 /// else `brainproxy` on PATH.
@@ -40,20 +42,51 @@ fn failure(message: String) -> Value {
 /// reads through options like `--password-env`, so they never appear in argv.
 const SECRET_ENV_PREFIX: &str = "BRAINPROXY_SECRET_";
 
+/// Calls started with a `call` id, which `cli_cancel` can stop.
+#[derive(Default)]
+struct Cancellable(Mutex<HashMap<String, oneshot::Sender<()>>>);
+
+impl Cancellable {
+    fn held(&self) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<()>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Runs `brainproxy --format json --project PROJECT ARGS...` and returns its JSON envelope.
 /// `stdin` is written byte for byte; `env` adds BRAINPROXY_SECRET_* variables to the child.
+/// With a `call` id, `cli_cancel` with that id kills the child (a browser sign-in waiting
+/// for the user, say), and the envelope says it was cancelled.
 #[tauri::command]
 async fn cli(
+    app: tauri::AppHandle,
     project: String,
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
     env: Option<HashMap<String, String>>,
+    call: Option<String>,
 ) -> Value {
     let env = env.unwrap_or_default();
     if let Some(bad) = env.keys().find(|k| !k.starts_with(SECRET_ENV_PREFIX)) {
         return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
     }
-    run(&project, &args, stdin, &env).await
+    let Some(call) = call else { return run(&project, &args, stdin, &env).await };
+    let (tx, rx) = oneshot::channel();
+    app.state::<Cancellable>().held().insert(call.clone(), tx);
+    // Dropping the run drops the child, which kills it (kill_on_drop).
+    let out = tokio::select! {
+        out = run(&project, &args, stdin, &env) => out,
+        _ = rx => json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}}),
+    };
+    app.state::<Cancellable>().held().remove(&call);
+    out
+}
+
+/// Stops the `cli` call started with this id, if it is still running.
+#[tauri::command]
+fn cli_cancel(call: String, running: tauri::State<'_, Cancellable>) {
+    if let Some(tx) = running.held().remove(&call) {
+        let _ = tx.send(());
+    }
 }
 
 async fn run(project: &str, args: &[String], stdin: Option<Vec<u8>>, env: &HashMap<String, String>) -> Value {
@@ -165,8 +198,10 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(TempLocks::default())
+        .manage(Cancellable::default())
         .invoke_handler(tauri::generate_handler![
             cli,
+            cli_cancel,
             temp_location,
             temp_create,
             temp_leftovers,

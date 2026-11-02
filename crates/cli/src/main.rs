@@ -341,6 +341,14 @@ struct CodecArgs {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    // A Postman script signer's run, in a process of its own (see sign_script). Not a
+    // command: nothing lists it, and it speaks JSON on stdin and stdout only.
+    if argv.get(1).map(String::as_str) == Some("__sign-script") {
+        std::process::exit(brainproxy_core::sign_script::child_main());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        brainproxy_core::sign_script::set_runner(exe, &["__sign-script"]);
+    }
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(e) => {
@@ -406,6 +414,7 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
         Cmd::Import(c) => match c {
+            import_cmd::ImportCmd::Api(_) => "import api",
             import_cmd::ImportCmd::Openapi(_) => "import openapi",
             import_cmd::ImportCmd::Postman(_) => "import postman",
             import_cmd::ImportCmd::Graphql(_) => "import graphql",
@@ -419,6 +428,8 @@ fn command_name(cmd: &Cmd) -> String {
             auth_cmd::AuthCmd::List => "auth list",
             auth_cmd::AuthCmd::Show { .. } => "auth show",
             auth_cmd::AuthCmd::Remove { .. } => "auth remove",
+            auth_cmd::AuthCmd::Oauth(auth_cmd::OauthCmd::Authorize { .. }) => "auth oauth authorize",
+            auth_cmd::AuthCmd::Oauth(auth_cmd::OauthCmd::Discover { .. }) => "auth oauth discover",
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Start { .. }) => "auth record start",
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Finish { .. }) => "auth record finish",
             auth_cmd::AuthCmd::Macro(c) => match c {

@@ -188,6 +188,8 @@ permissions of the folder it is saved in: keep it in your own folders on a share
    - **Guided:** the Overview's *Guided scan* asks for the website, whether to log in, and
      how thorough to be (Quick, Standard, Thorough) and how hard it may push the site
      (Gentle, Normal, Fast), then runs and explains the results.
+   - **Guided, for an API:** from the guided scan's first step, *Testing an API?* takes an
+     API definition instead of a website. See *Guided API scan* under **Scans**.
    - **Yourself:** in **Scans › New scan**, *Crawl and audit* is the default. It crawls the
      site, then attacks every request it found, with the Nuclei templates included at high
      severity and above.
@@ -301,6 +303,46 @@ attack type, and pick payloads:
   files and folders such as `.git`, `.env`, backups, admin panels, and debug consoles.
 
 ### Scans
+- **Guided API scan:** in the guided scan, *Testing an API?* tests an API from its definition: an
+  OpenAPI 3 or Swagger 2.0 file (JSON or YAML), a Postman collection, or a GraphQL schema (SDL file
+  or introspection result), by file or URL; or a GraphQL endpoint, which is asked for its schema
+  when you tick *GraphQL endpoint*. A URL is fetched when you preview it, in scope only; nothing
+  else is sent until you ask.
+  - **Definition:** shows what was read, which operations were skipped and why, and warnings
+    such as an external `$ref` that isn't followed. A Postman collection can take its
+    **environment file**, which fills its variables; values the environment marks secret, or whose
+    names look like credentials, are withheld. The collection's pre-request scripts are listed and
+    never run unless you make one a signer (below).
+  - **Server:** pick one of the listed servers or give a base URL, which is needed when the file
+    has none or only relative ones (for a GraphQL schema file, the endpoint), and fill in Postman
+    variables. Hosts outside the engagement are listed and those operations skipped; this flow
+    can't widen the scope.
+  - **Authentication** is optional and defaults to none:
+    - An API key or bearer token, in a header or the query string. The value is kept in the auth
+      profile, as static headers are, and history holds a placeholder.
+    - **OAuth 2:** client credentials, password, refresh token, or a browser sign-in (authorization
+      code with PKCE), prefilled from what the definition declares; an OpenID Connect discovery URL
+      can fill in the endpoints. Saving gets a token straight away, or runs the browser sign-in
+      (which *Cancel* stops), and keeps the profile only if that works. The token endpoint must be
+      in scope.
+    - An existing auth profile.
+    - **Signing** is a separate tick: HMAC, a private key, a JWT or AWS SigV4 (prefilled from a
+      collection's AWS auth), or the collection's own pre-request script. A script is shown, with
+      any invisible or text-direction characters flagged, before it can be chosen. The signer gets a
+      session rule, and a key and a signer can share a profile.
+    - Credentials found in the file are listed by name and not used. When you switch to entering
+      different credentials, the wizard offers to remove the profile it saved before, with its
+      stored secrets.
+    - *Try one request* sends one read-only operation (a GraphQL query counts) and says whether the
+      API accepted it and whether the credentials and signature were on it.
+  - **Operations:** lists every operation with its example request. GET, HEAD, OPTIONS and POST in
+    scope are ticked. PUT, PATCH, DELETE and GraphQL mutations stay off until you opt in and tick
+    them, and a later scan of history doesn't replay a mutation either unless asked (see
+    `--include-methods MUTATION`). POST requests are replayed with attack data, so the same warning
+    as the website scan applies.
+  - **Depth and speed:** as in the guided scan. Each chosen operation is sent once, then attacked.
+    Parameters without an example get a typed test value. An operation that answers 401 or 403 is
+    still scanned, and the results point out that those baselines were rejected.
 - **New scan › Active scan:**
   - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
@@ -671,7 +713,41 @@ Crawl and active-scan scope and safety flags:
   DELETE. It tries at most 40 elements per page state and chains of up to 6 clicks, and
   waits at most 10 s for a page to settle.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
-  these methods. Requests picked with `--history-id` are attacked whatever their method.
+  these methods. A GraphQL mutation (a request whose `query`, in a JSON body, an
+  `application/graphql` body or the URL, defines one) is `MUTATION` whatever its method and however
+  it was recorded, so one sent once by `import api --include-methods MUTATION`, a one-request check
+  or the proxy isn't replayed by a later scan unless `--include-methods MUTATION` (or `all`) says
+  so. Requests picked with `--history-id` are attacked whatever their method.
+- `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
+  GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
+  declared credentials, variables, every operation with its index and whether it would be sent,
+  and which operations were skipped and why. `--server N` picks a listed server, `--base-url`
+  overrides them, `--var NAME=VALUE` sets a Postman variable, `--only 0,3,7` picks operations by
+  index, and `--expect-sha256 HEX` refuses a document that changed since the preview. It sends
+  GET, HEAD, OPTIONS and POST unless `--include-methods` adds others. Credentials in the
+  document (Postman auth, secret-named headers, query parameters and body fields, and variables
+  they use) are reported by name in `credentials` and never sent or stored; use an auth profile.
+  A document fetched from a URL isn't kept in history either.
+- Postman environments: `--environment FILE` reads an environment export for the collection's
+  variables (a local file only; `--var` goes on top). Values the environment marks secret, or whose
+  names look like credentials, are withheld like the collection's own, and the preview lists them as
+  secret with no value. Only the path goes in a background job's record. `--expect-environment-sha256`
+  refuses a file that changed since the preview, which lists its sha256 under `environment`.
+- Postman pre-request scripts are listed under `scripts` (where each runs, how many requests it
+  reaches, whether it seems to sign, calls it makes that can't run) and never run by `import api`.
+  `--show-scripts` adds their text. To run one for every request, make it a signer (below).
+- GraphQL: a schema file has no endpoint, so it needs `--base-url URL` (the endpoint itself);
+  `--graphql` with an endpoint's URL introspects it instead. Each query field becomes an
+  operation with typed example variables, and mutations are opt-in as `--include-methods MUTATION`,
+  like PUT and DELETE. Introspection that's turned off or needs a login says so; use a schema file,
+  or `--auth`.
+- The preview also lists what the document declares about OAuth (`oauth`: flow, token and sign-in
+  URLs, scopes, an OpenID Connect discovery URL) and a Postman collection's AWS Signature settings
+  (`aws`: region and service), to fill in a profile or signer. Client ids and secrets are never shown.
+- `scan active --api SOURCE`: the same document flags in one job: send each chosen in-scope
+  operation once as a baseline (history source `import`), then attack exactly those. Baselines
+  count as the `scan` tool for session rules. A scan with nothing in scope exits 6 and sends
+  nothing. The result has an `import` object with what was sent and skipped.
 - `scan active --preset quick|standard|thorough`: the guided scan's depths, for scripts and CI.
   Flags given as well win, so `--preset thorough --strength high` scans with high strength.
   `--preset` doesn't crawl by itself; pair it with `--crawl`, as the guided scan does.
@@ -705,6 +781,51 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   time: use it when tokens are single-use, and lower `-c` if the site keeps only the
   latest token per session.
 
+API keys in an auth profile: `auth add NAME --header-env 'X-Api-Key=VAR'` reads the variable once
+and stores the value as `--header` does, so it stays off the command line (for a bearer token,
+`'Authorization=VAR'` with `Bearer ...` in the variable). `auth add NAME --query-key 'api_key=VAR'
+--key-origin ORIGIN` is for a key in the query string: history and findings hold
+`«auth:NAME:query:api_key»`, the value goes only into the request line of requests to those
+origins, and scans don't attack it. `auth show` and `auth list` mask both. `auth add` on an
+existing name replaces the profile's fields, query keys (unless `--keep-query-keys`), OAuth setup
+(unless `--keep-oauth`) and session, and keeps its signers, rules and macros.
+
+OAuth 2.0 in an auth profile, in place of a login:
+
+- `auth add NAME --oauth-flow FLOW --oauth-token-url URL --oauth-client-id ID
+  [--oauth-client-secret-env VAR] [--oauth-scope S] [--oauth-audience A] [--oauth-param K=V ...]
+  [--oauth-client-auth body|basic]`. FLOW is `client_credentials`, `password` (with `--username` and
+  a password), `refresh_token` (with `--oauth-refresh-token-env VAR`) or `authorization_code` (with
+  `--oauth-authorize-url URL`, then `auth oauth authorize NAME`). Variables are read at each token
+  request and never stored, unless `--oauth-store-secrets` reads them once and stores the values in
+  the project, for background jobs that won't have them (the desktop app does this). The access
+  token is kept in the project like a login's token. A refresh token the server sends is kept only
+  for the command that got it, unless `--oauth-store-secrets` is set: without it, the next command
+  starts from the flow's own grant (the refresh token variable for `refresh_token`, a new
+  `auth oauth authorize` for `authorization_code` once the access token has expired). A server that
+  rotates refresh tokens needs `--oauth-store-secrets` for the `refresh_token` flow to carry on past
+  one command. `--oauth-param`
+  is stored as given, so a name that looks like a credential (`client_assertion`, `*_token`,
+  `*secret*`, ...) is refused; `auth show` masks such a value if one is there.
+- `auth oauth authorize NAME [--no-open] [--wait SECONDS]` prints the sign-in URL on stderr, opens
+  the browser, and waits on `http://127.0.0.1:PORT/callback` (`--oauth-redirect-port` for a client
+  registered with a fixed port; any free port otherwise) with PKCE (S256) and a `state` check. A
+  redirect without the right `state`, or on another path, is refused and the wait goes on.
+- `auth oauth discover URL` reads an OpenID Connect discovery document (in scope) and prints the
+  token and sign-in URLs.
+- The token goes on requests as `Authorization: Bearer «auth:NAME:token»`, filled on the wire like a
+  login's token. A token due to expire within 30 seconds is renewed before the next request, once
+  however many requests notice, with the refresh token when there is one (a rotated one replaces
+  it) and the flow's own grant when it fails; a 401 renews it too, within `--max-relogins`. A
+  browser sign-in that can't be renewed asks for `auth oauth authorize` again.
+- The token endpoint must be in the engagement's scope; nothing widens it. Token requests get none
+  of the profile's other credentials, follow no redirects, and aren't recorded in history, since they
+  carry the client secret and the answers hold tokens. Errors give the endpoint's `error` code, never
+  its description. `auth status` says whether there is a token and a refresh token, and when the
+  token expires, never what they are.
+- Only bearer tokens are taken. Not built: the device code and implicit flows, private-key JWT
+  client authentication, and token introspection.
+
 Request signing (`auth sign`), for APIs that reject a request whose signature doesn't match
 and targets that want a JWT you choose the claims of:
 
@@ -712,11 +833,46 @@ and targets that want a JWT you choose the claims of:
   --to header:NAME|query:NAME [--wrap 'Bearer {{signature}}'] [--set-header 'NAME: TEMPLATE' ...]`,
   then `--canonical TEMPLATE [--hash sha1|sha256|sha384|sha512] [--output hex|base64|base64url]` for
   an HMAC, or `--jwt HS256|HS384|HS512|RS256 [--claims JSON] [--ttl SECONDS] [--kid ID] [--resign]`
-  for a JWT. `--secret-encoding hex|base64` decodes the key; RS256 takes a PEM private key.
+  for a JWT, or `--key-alg ALG --canonical TEMPLATE [--output ...]` for a signature made with a
+  private key. JWT algorithms are HS256/384/512, RS256/384/512, PS256/384/512, ES256/384 and EdDSA;
+  `--key-alg` takes all but the HS ones. `--secret-encoding hex|base64` decodes an HMAC key; the
+  others take a PEM private key (RSA as PKCS#8 or PKCS#1, EC and Ed25519 as PKCS#8:
+  `openssl pkcs8 -topk8 -nocrypt` converts one). ECDSA signatures are the fixed r||s form JWS uses.
   `auth sign list/remove`. Then `auth rule add PROFILE --action sign:NAME [--tool ...] [--url ...]`
   turns it on; a rule's `check` doesn't skip its `sign`. Adding a name that exists replaces the
   signer and runs it last, or keeps its place with `--keep-place`. Settings › Auth profiles has
   all of this too.
+- AWS Signature Version 4: `auth sign add PROFILE NAME --sigv4-region R --sigv4-service S
+  (--secret-env VAR | --secret-file PATH) (--access-key-env VAR | --access-key-file PATH)
+  [--session-token-env VAR | --session-token-file PATH] --origin ORIGIN`. It sets `X-Amz-Date`,
+  `X-Amz-Content-Sha256` and, with a session token, `X-Amz-Security-Token`, and signs `host`,
+  `content-type` and every `x-amz-*` header into `Authorization`. The path is encoded again for every
+  service but S3, as AWS expects. None of the three values is stored; all three are read when the
+  signer first signs in a command and kept until it ends, so credentials renewed in their files are
+  picked up by the next command (a running proxy keeps them until it restarts).
+- A Postman pre-request script: `auth sign add PROFILE NAME --script FILE [--script-sha256 HEX]
+  [--environment ENV_FILE] [--script-var NAME=VALUE ...] --origin ORIGIN`. FILE is a collection
+  (`--script-sha256` picks one of its scripts, as `import api` lists them, unless it has only one)
+  or a `.js` file. This runs code from that file, so read it first: `import api --show-scripts`.
+  The script sees the request as it is sent (method, URL, headers, body) through `pm.request`,
+  the collection's variables, then the environment's, then `--script-var`, through `pm.environment`,
+  `pm.variables` and the rest, and CryptoJS, `require('crypto-js')`, `require('crypto')`'s hashes and
+  HMACs, `uuid`, `btoa` and `atob`. It may change headers and the query; a variable it sets fills
+  `{{name}}` in the request line and in the collection headers that use it (which `import api`
+  strips as credentials). Changing the method, URL, host, body, `Content-Length` or cookies fails the
+  send, as do `pm.sendRequest`, `pm.cookies`, `pm.vault` and other modules.
+- A script runs in a memory-safe interpreter with no file, network or process access, in a fresh
+  context per request, with a loop and recursion limit and without `SharedArrayBuffer`, `Atomics` or
+  `Temporal`. Each run is a child process of brainproxy with an empty environment, killed after five
+  seconds, so a script that never ends (a regex that backtracks, a loop of `await`s) leaves nothing
+  running. On Linux the child's address space is limited to 1 GiB; macOS doesn't enforce that limit
+  and Windows has none, so there only the time limit bounds a run. A script stopped at a limit
+  stops its signer for the rest of the command: later requests fail at once, without another run;
+  a script that throws fails only that request. One never runs unless chosen. The collection and
+  environment stay in their files:
+  the signer stores their paths and the script's sha256, and refuses a script that changed. Error
+  messages mask the variables' values. Only the chosen script runs; scripts of folders and requests,
+  and test scripts, don't.
 - Templates use `{{method}}`, `{{host}}`, `{{path}}`, `{{query}}`, `{{body}}`, `{{body_sha256}}`,
   `{{body_sha256_base64}}`, `{{timestamp}}`, `{{timestamp_ms}}`, `{{nonce}}` and `{{header:NAME}}`;
   anything else is refused when the signer is saved. `--canonical` reads `\n`, `\r`, `\t` and `\\`
@@ -741,8 +897,18 @@ and targets that want a JWT you choose the claims of:
   show it; history and findings hold `«auth:PROFILE:sign:NAME»`. A value only goes to the signer's
   origins. A key is read when its signer first signs, so one no request needs is never touched. A
   missing or unreadable key fails the send, naming the variable or file and nothing more.
-- Signers are data: templates name request parts and nothing is executed. A signer can read any
-  file the process can as its key, but only the HMAC or signature made with it leaves the machine.
+- Signers are data: templates name request parts and nothing is executed, except a script signer's
+  script (above). A signer can read any file the process can as its key. An HMAC, private-key or
+  JWT signer sends only the signature made with it. A SigV4 signer also sends the access key id (in
+  `Authorization`) and the session token (`X-Amz-Security-Token`) as they are. A script signer can
+  put anything it sees, its environment file and variables included, into a header or the query.
+  So point `--access-key-*`, `--session-token-*` and `--environment` only at what that API may
+  receive.
+- Through MCP (`mcp serve`), `auth sign add --script` is refused: a person reads the script and
+  adds that signer in the app or a terminal. Variables named by `--secret-env`, `--access-key-env`,
+  `--session-token-env` (and by `auth add`'s `--header-env`, `--query-key`, `--password-env` and
+  `--oauth-*-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
+  browser.
 
 ### Comparing findings and failing a build (`findings compare`)
 

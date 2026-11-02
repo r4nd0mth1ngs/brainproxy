@@ -22,11 +22,110 @@ ofType { kind name ofType { kind name ofType { kind name } } } } } } } }";
 /// Selection depth below the root field.
 const MAX_SELECTION_DEPTH: usize = 3;
 const MAX_INPUT_DEPTH: usize = 4;
+/// `[[[...]]]` levels a schema file may nest.
+const MAX_LIST_NESTING: usize = 32;
 
 /// Body for the introspection request.
 pub fn introspection_body() -> Vec<u8> {
     serde_json::to_vec(&json!({"query": INTROSPECTION_QUERY, "operationName": "IntrospectionQuery"}))
         .unwrap_or_default()
+}
+
+/// Whether a recorded request carries a GraphQL mutation: a JSON body (or batch) whose
+/// `query` defines one, an `application/graphql` body, or a `query` URL parameter. A scan
+/// treats it like PUT or DELETE, whatever its method and wherever it was recorded.
+pub fn is_mutation_request(request: &[u8]) -> bool {
+    documents(request).iter().any(|d| defines_mutation(d))
+}
+
+/// The GraphQL documents a request carries, so two operations at one endpoint with the same
+/// variables can be told apart; empty for anything else.
+pub fn documents(request: &[u8]) -> Vec<String> {
+    let Ok(head) = crate::http::RawRequest::from_bytes(request.to_vec()).head() else { return vec![] };
+    let (_, body) = crate::http::request::split_head_body(request);
+    let mut out: Vec<String> = head
+        .target
+        .split_once('?')
+        .map(|(_, q)| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .filter(|(k, _)| k == "query")
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let graphql_body = head
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().contains("application/graphql"));
+    if graphql_body {
+        out.push(String::from_utf8_lossy(body).into_owned());
+        return out;
+    }
+    let query = |v: &Value| v.get("query").and_then(Value::as_str).map(str::to_string);
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Array(batch)) => out.extend(batch.iter().filter_map(query)),
+        Ok(v) => out.extend(query(&v)),
+        Err(_) => {}
+    }
+    out
+}
+
+/// Whether a GraphQL document defines a mutation operation. Strings and comments are
+/// skipped; a definition is a mutation when its first word at the top level says so.
+pub fn defines_mutation(doc: &str) -> bool {
+    let b = doc.as_bytes();
+    let (mut i, mut depth, mut word, mut first) = (0, 0usize, String::new(), true);
+    // Ends the word being read; true when it opens a mutation.
+    fn end_word(word: &mut String, first: &mut bool, depth: usize) -> bool {
+        let mutation = depth == 0 && *first && word == "mutation";
+        if depth == 0 && !word.is_empty() {
+            *first = false;
+        }
+        word.clear();
+        mutation
+    }
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            word.push(c as char);
+            i += 1;
+            continue;
+        }
+        if end_word(&mut word, &mut first, depth) {
+            return true;
+        }
+        match c {
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' if b[i..].starts_with(b"\"\"\"") => {
+                i += 3;
+                while i < b.len() && !b[i..].starts_with(b"\"\"\"") {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 2;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' && b[i] != b'\n' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && c == b'}' {
+                    // The next definition starts.
+                    first = true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    end_word(&mut word, &mut first, depth)
 }
 
 struct Schema<'a> {
@@ -200,6 +299,375 @@ impl Schema<'_> {
     }
 }
 
+/// Whether `text` reads as GraphQL SDL rather than JSON or YAML.
+pub fn looks_like_sdl(text: &str) -> bool {
+    let mut t = text.trim_start_matches('\u{feff}').trim_start();
+    // Comments and descriptions come before the first definition.
+    loop {
+        let rest = if let Some(r) = t.strip_prefix('#') {
+            r.split_once('\n').map_or("", |(_, r)| r)
+        } else if let Some(r) = t.strip_prefix("\"\"\"") {
+            r.split_once("\"\"\"").map_or("", |(_, r)| r)
+        } else if let Some(r) = t.strip_prefix('"') {
+            match r.split_once('"') {
+                Some((line, r)) if !line.contains('\n') => r,
+                _ => break,
+            }
+        } else {
+            break;
+        };
+        t = rest.trim_start();
+    }
+    let first = t.split_whitespace().next().unwrap_or_default();
+    ["type", "schema", "scalar", "input", "enum", "interface", "union", "directive", "extend"].contains(&first)
+        && t.contains('{')
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Name(String),
+    Punct(char),
+    /// A string or number: only ever a value to step over.
+    Value,
+}
+
+fn tokens(text: &str) -> Result<Vec<Tok>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\u{feff}' | ',' | '.' => i += 1,
+            _ if c.is_whitespace() => i += 1,
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '"' if chars[i..].starts_with(&['"', '"', '"']) => {
+                i += 3;
+                while i < chars.len() && !chars[i..].starts_with(&['"', '"', '"']) {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                if i >= chars.len() {
+                    return Err(Error::InvalidInput("the GraphQL schema has an unclosed description".into()));
+                }
+                i += 3;
+                out.push(Tok::Value);
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' && chars[i] != '\n' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+                out.push(Tok::Value);
+            }
+            _ if c == '_' || c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < chars.len() && (chars[i] == '_' || chars[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                out.push(Tok::Name(chars[start..i].iter().collect()));
+            }
+            _ if c == '-' || c.is_ascii_digit() => {
+                i += 1;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '.' | '+' | '-')) {
+                    i += 1;
+                }
+                out.push(Tok::Value);
+            }
+            '!' | '$' | '(' | ')' | ':' | '=' | '@' | '[' | ']' | '{' | '}' | '|' | '&' => {
+                out.push(Tok::Punct(c));
+                i += 1;
+            }
+            _ => return Err(Error::InvalidInput(format!("the GraphQL schema has an unexpected {c:?}"))),
+        }
+    }
+    Ok(out)
+}
+
+struct Sdl {
+    toks: Vec<Tok>,
+    at: usize,
+}
+
+impl Sdl {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.at)
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        let hit = self.peek() == Some(&Tok::Punct(c));
+        self.at += usize::from(hit);
+        hit
+    }
+
+    fn name(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(Tok::Name(n)) => {
+                let n = n.clone();
+                self.at += 1;
+                Ok(n)
+            }
+            _ => Err(Error::InvalidInput("the GraphQL schema has something else where a name belongs".into())),
+        }
+    }
+
+    fn descriptions(&mut self) {
+        while self.peek() == Some(&Tok::Value) {
+            self.at += 1;
+        }
+    }
+
+    /// Steps over a value or a bracketed group of anything.
+    fn skip_value(&mut self) {
+        let mut depth = 0usize;
+        while let Some(t) = self.peek().cloned() {
+            self.at += 1;
+            match t {
+                Tok::Punct('[' | '{' | '(') => depth += 1,
+                Tok::Punct(']' | '}' | ')') => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+
+    fn directives(&mut self) {
+        while self.eat('@') {
+            self.at += 1;
+            if self.peek() == Some(&Tok::Punct('(')) {
+                self.skip_value();
+            }
+        }
+    }
+
+    /// Steps over `A & B` or `A | B`, stopping at the next definition.
+    fn skip_names(&mut self) {
+        loop {
+            if self.eat('&') || self.eat('|') {
+                continue;
+            }
+            match self.peek() {
+                Some(Tok::Name(n)) if !is_definition(n) => self.at += 1,
+                _ => break,
+            }
+        }
+    }
+
+    fn type_ref(&mut self) -> Result<Value> {
+        self.type_ref_at(0)
+    }
+
+    /// Lists nest by recursion, so an untrusted schema gets a limit, not the stack's.
+    fn type_ref_at(&mut self, depth: usize) -> Result<Value> {
+        if depth > MAX_LIST_NESTING {
+            return Err(Error::InvalidInput("the GraphQL schema nests list types too deeply".into()));
+        }
+        let inner = if self.eat('[') {
+            let of = self.type_ref_at(depth + 1)?;
+            if !self.eat(']') {
+                return Err(Error::InvalidInput("the GraphQL schema has an unclosed list type".into()));
+            }
+            json!({"kind": "LIST", "name": null, "ofType": of})
+        } else {
+            json!({"kind": "NAMED", "name": self.name()?, "ofType": null})
+        };
+        Ok(if self.eat('!') { json!({"kind": "NON_NULL", "name": null, "ofType": inner}) } else { inner })
+    }
+
+    /// `name: Type = default @directive`, the shape of arguments and input fields.
+    fn input_value(&mut self) -> Result<Value> {
+        self.descriptions();
+        let name = self.name()?;
+        if !self.eat(':') {
+            return Err(Error::InvalidInput(format!("the GraphQL schema has no type for {name}")));
+        }
+        let ty = self.type_ref()?;
+        if self.eat('=') {
+            self.skip_value();
+        }
+        self.directives();
+        Ok(json!({"name": name, "type": ty}))
+    }
+
+    /// The items of a `{ ... }` block, if there is one.
+    fn block(&mut self, what: &str, mut item: impl FnMut(&mut Self) -> Result<Value>) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        if !self.eat('{') {
+            return Ok(out);
+        }
+        while !self.eat('}') {
+            if self.peek().is_none() {
+                return Err(Error::InvalidInput(format!("the GraphQL schema has an unclosed {what}")));
+            }
+            out.push(item(self)?);
+        }
+        Ok(out)
+    }
+
+    fn field(&mut self) -> Result<Value> {
+        self.descriptions();
+        let name = self.name()?;
+        let mut args = Vec::new();
+        if self.eat('(') {
+            while !self.eat(')') {
+                if self.peek().is_none() {
+                    return Err(Error::InvalidInput("the GraphQL schema has unclosed arguments".into()));
+                }
+                args.push(self.input_value()?);
+            }
+        }
+        if !self.eat(':') {
+            return Err(Error::InvalidInput(format!("the GraphQL schema has no type for {name}")));
+        }
+        let ty = self.type_ref()?;
+        self.directives();
+        Ok(json!({"name": name, "args": args, "type": ty}))
+    }
+
+    fn enum_value(&mut self) -> Result<Value> {
+        self.descriptions();
+        let name = self.name()?;
+        self.directives();
+        Ok(json!({"name": name}))
+    }
+}
+
+/// Gives every named reference in `v` the kind of the type it names.
+fn set_kinds(v: &mut Value, kinds: &HashMap<String, &'static str>) {
+    match v {
+        Value::Object(m) => {
+            if m.get("kind").and_then(Value::as_str) == Some("NAMED") {
+                let kind = m.get("name").and_then(Value::as_str).and_then(|n| kinds.get(n)).copied();
+                m.insert("kind".into(), kind.unwrap_or("SCALAR").into());
+            }
+            m.values_mut().for_each(|x| set_kinds(x, kinds));
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| set_kinds(x, kinds)),
+        _ => {}
+    }
+}
+
+fn is_definition(word: &str) -> bool {
+    matches!(word, "type" | "interface" | "input" | "enum" | "union" | "scalar" | "directive" | "schema" | "extend")
+}
+
+/// Adds a type, or its members to the type of that name (`extend type`).
+fn merge(types: &mut Vec<Value>, new: Value, key: &str) {
+    let same = types.iter_mut().find(|t| t["name"] == new["name"]);
+    match same.and_then(|t| t.get_mut(key)).and_then(Value::as_array_mut) {
+        Some(old) => old.extend(new[key].as_array().cloned().unwrap_or_default()),
+        None => types.push(new),
+    }
+}
+
+/// A schema in GraphQL's schema language, as an introspection result for [`build`].
+pub fn parse_sdl(text: &str) -> Result<Value> {
+    let mut p = Sdl { toks: tokens(text)?, at: 0 };
+    let mut types: Vec<Value> = Vec::new();
+    let mut kinds: HashMap<String, &'static str> = HashMap::new();
+    let (mut query, mut mutation) = ("Query".to_string(), "Mutation".to_string());
+    loop {
+        p.descriptions();
+        if p.peek().is_none() {
+            break;
+        }
+        let mut word = p.name()?;
+        if word == "extend" {
+            word = p.name()?;
+        }
+        match word.as_str() {
+            "schema" => {
+                p.directives();
+                if !p.eat('{') {
+                    continue;
+                }
+                while !p.eat('}') {
+                    if p.peek().is_none() {
+                        return Err(Error::InvalidInput("the GraphQL schema block is unclosed".into()));
+                    }
+                    let op = p.name()?;
+                    p.eat(':');
+                    let ty = p.name()?;
+                    match op.as_str() {
+                        "query" => query = ty,
+                        "mutation" => mutation = ty,
+                        _ => {}
+                    }
+                }
+            }
+            "type" | "interface" => {
+                let name = p.name()?;
+                if p.peek() == Some(&Tok::Name("implements".into())) {
+                    p.at += 1;
+                    p.skip_names();
+                }
+                p.directives();
+                let kind = if word == "type" { "OBJECT" } else { "INTERFACE" };
+                kinds.insert(name.clone(), kind);
+                let fields = p.block("type", Sdl::field)?;
+                merge(&mut types, json!({"kind": kind, "name": name, "fields": fields}), "fields");
+            }
+            "input" => {
+                let name = p.name()?;
+                p.directives();
+                kinds.insert(name.clone(), "INPUT_OBJECT");
+                let fields = p.block("input type", Sdl::input_value)?;
+                merge(&mut types, json!({"kind": "INPUT_OBJECT", "name": name, "inputFields": fields}), "inputFields");
+            }
+            "enum" => {
+                let name = p.name()?;
+                p.directives();
+                kinds.insert(name.clone(), "ENUM");
+                let values = p.block("enum", Sdl::enum_value)?;
+                merge(&mut types, json!({"kind": "ENUM", "name": name, "enumValues": values}), "enumValues");
+            }
+            "union" => {
+                let name = p.name()?;
+                p.directives();
+                kinds.insert(name.clone(), "UNION");
+                if p.eat('=') {
+                    p.skip_names();
+                }
+                types.push(json!({"kind": "UNION", "name": name}));
+            }
+            "scalar" => {
+                let name = p.name()?;
+                p.directives();
+                kinds.insert(name.clone(), "SCALAR");
+                types.push(json!({"kind": "SCALAR", "name": name}));
+            }
+            "directive" => {
+                // `directive @name(args) on A | B`: nothing a request needs.
+                p.eat('@');
+                p.at += 1;
+                if p.peek() == Some(&Tok::Punct('(')) {
+                    p.skip_value();
+                }
+                p.skip_names();
+            }
+            other => {
+                return Err(Error::InvalidInput(format!("the GraphQL schema has an unknown definition {other:?}")));
+            }
+        }
+    }
+    if !kinds.contains_key(&query) {
+        return Err(Error::InvalidInput(format!("the GraphQL schema has no {query} type")));
+    }
+    let mut schema = json!({
+        "queryType": {"name": query},
+        "mutationType": if kinds.contains_key(&mutation) { json!({"name": mutation}) } else { Value::Null },
+        "types": types,
+    });
+    set_kinds(&mut schema, &kinds);
+    Ok(json!({"__schema": schema}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +732,84 @@ mod tests {
 
         let err = build(&json!({"errors": [{"message": "introspection disabled"}]}), "http://g.test/", false);
         assert!(err.unwrap_err().to_string().contains("introspection disabled"));
+    }
+
+    #[test]
+    fn mutations_are_recognised_in_recorded_requests() {
+        for doc in [
+            "mutation deleteUser($id: ID!) { deleteUser(id: $id) }",
+            "  # a comment\n mutation { a }",
+            "query q { a } mutation m { b }",
+            "fragment F on T { x } mutation { a { ...F } }",
+            "\"\"\"described\"\"\" mutation { a }",
+        ] {
+            assert!(defines_mutation(doc), "{doc}");
+        }
+        for doc in [
+            "query user { user { id } }",
+            "{ mutation }",
+            "query q($mutation: Int) { a(mutation: $mutation) }",
+            "# mutation { a }\nquery { a }",
+            "query { a(s: \"mutation { x }\") }",
+            "",
+        ] {
+            assert!(!defines_mutation(doc), "{doc}");
+        }
+        let req = |head: &str, body: &str| format!("{head}\r\nHost: g.test\r\n\r\n{body}").into_bytes();
+        let m = r#"{"query": "mutation deleteUser { deleteUser(id: 1) }"}"#;
+        assert!(is_mutation_request(&req("POST /graphql HTTP/1.1\r\nContent-Type: application/json", m)));
+        assert!(is_mutation_request(&req("POST /graphql HTTP/1.1", &format!("[{m}]"))));
+        assert!(is_mutation_request(&req(
+            "POST /graphql HTTP/1.1\r\nContent-Type: application/graphql",
+            "mutation { a }"
+        )));
+        assert!(is_mutation_request(&req("GET /graphql?query=mutation%20%7B%20a%20%7D HTTP/1.1", "")));
+        assert!(!is_mutation_request(&req("POST /graphql HTTP/1.1", r#"{"query": "query { a }"}"#)));
+        assert!(!is_mutation_request(&req("POST /form HTTP/1.1", "mutation=1")));
+    }
+
+    #[test]
+    fn a_schema_file_builds_the_same_operations() {
+        let sdl = r#"
+            # A comment
+            """A described schema"""
+            schema { query: Root mutation: Change }
+            directive @auth(role: String = "x") on FIELD_DEFINITION | OBJECT
+            scalar Date
+            enum Role { "first" ADMIN USER @deprecated(reason: "old") }
+            interface Node { id: ID! }
+            union Result = User | Post
+            input Filter { q: String!, role: Role = ADMIN, tags: [String!] }
+            type Post implements Node { id: ID! }
+            type User implements Node & Other @auth(role: "a") {
+                id: ID!
+                role: Role
+                posts(first: Int!): [Post]
+            }
+            type Root {
+                "find one"
+                user(id: ID!): User
+                search(filter: Filter, at: Date): [Result!]!
+            }
+            extend type Root { version: String }
+            type Change { deleteUser(id: ID!): Boolean @auth(role: "root") }
+        "#;
+        assert!(looks_like_sdl(sdl));
+        assert!(!looks_like_sdl("{\"openapi\": \"3.0.0\"}"));
+        assert!(looks_like_sdl("\"The API's root\"\ntype Query { version: String }"));
+        assert!(!looks_like_sdl("\"just a string\""));
+        let deep = format!("type Query {{ a(x: {}Int{}): Int }}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(parse_sdl(&deep).unwrap_err().to_string().contains("too deeply"));
+        let b = build(&parse_sdl(sdl).unwrap(), "http://g.test/graphql", true).unwrap();
+        let names: Vec<&str> = b.requests.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["query user", "query search", "query version", "mutation deleteUser"]);
+        let body: Value = serde_json::from_slice(&b.requests[0].body).unwrap();
+        assert_eq!(body["query"], "query user($id: ID!) { user(id: $id) { id role } }");
+        let body: Value = serde_json::from_slice(&b.requests[1].body).unwrap();
+        assert_eq!(body["variables"]["filter"], json!({"q": "test", "role": "ADMIN", "tags": ["test"]}));
+        assert_eq!(body["variables"]["at"], "test");
+        for bad in ["type Query {", "type Other { a: String }", "type Query { a }", "widget Query { a: String }"] {
+            assert!(parse_sdl(bad).is_err(), "{bad}");
+        }
     }
 }

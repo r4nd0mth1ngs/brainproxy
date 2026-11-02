@@ -13,6 +13,7 @@ import {
   HMAC_HASHES,
   HMAC_OUTPUTS,
   JWT_ALGS,
+  KEY_ALGS,
   KEY_ENCODINGS,
   TOOLS,
   actionLabel,
@@ -237,7 +238,7 @@ export function SessionHandling(p: Props) {
 
       <h3>Request signers</h3>
       <p className="muted small">
-        An HMAC signature or a JWT, computed as a request goes on the wire. A session rule's <em>Sign request</em> action turns
+        An HMAC or private-key signature, a JWT, AWS SigV4 or a Postman script, computed as a request goes on the wire. A session rule's <em>Sign request</em> action turns
         one on. A signer holds where its key is, never the key, and history keeps a placeholder.
       </p>
       {p.signers.length === 0 && !signer && <div className="muted small">No signers.</div>}
@@ -258,9 +259,11 @@ export function SessionHandling(p: Props) {
                 Run last
               </button>
             )}
-            <button className="btn small" onClick={() => setSigner({ form: signerForm(s), editing: true })}>
-              Edit
-            </button>
+            {s.kind !== "script" && (
+              <button className="btn small" onClick={() => setSigner({ form: signerForm(s), editing: true })}>
+                Edit
+              </button>
+            )}
             <button className="btn small" onClick={() => removeSigner(s.name)}>
               Remove
             </button>
@@ -576,7 +579,7 @@ function RuleBuilder(p: {
   );
 }
 
-function SignerBuilder(p: {
+export function SignerBuilder(p: {
   form: SignerForm;
   editing: boolean;
   setForm: (f: SignerForm) => void;
@@ -599,13 +602,19 @@ function SignerBuilder(p: {
             <button className={f.kind === "hmac" ? "on" : ""} onClick={() => set({ kind: "hmac" })}>
               HMAC
             </button>
+            <button className={f.kind === "key" ? "on" : ""} onClick={() => set({ kind: "key" })}>
+              Private key
+            </button>
             <button className={f.kind === "jwt" ? "on" : ""} onClick={() => set({ kind: "jwt" })}>
               JWT
+            </button>
+            <button className={f.kind === "sigv4" ? "on" : ""} onClick={() => set({ kind: "sigv4" })}>
+              AWS SigV4
             </button>
           </div>
         </div>
         <div>
-          <span className="label">Key is in</span>
+          <span className="label">{f.kind === "sigv4" ? "Secret access key is in" : "Key is in"}</span>
           <div className="seg">
             <button className={f.keyFrom === "env" ? "on" : ""} onClick={() => set({ keyFrom: "env" })}>
               Env variable
@@ -626,6 +635,7 @@ function SignerBuilder(p: {
             onChange={(e) => set({ key: e.target.value })}
           />
         </label>
+        {f.kind !== "sigv4" && f.kind !== "key" && (
         <label>
           <span className="label">Key is written as</span>
           <select className="input" value={f.keyEncoding} onChange={(e) => set({ keyEncoding: e.target.value as SignerForm["keyEncoding"] })}>
@@ -634,10 +644,13 @@ function SignerBuilder(p: {
             ))}
           </select>
         </label>
+        )}
         <label className="wide">
           <span className="label">Origins it may sign for, one per line</span>
           <textarea className="input area mono" value={f.origins} placeholder="https://api.test" onChange={(e) => set({ origins: e.target.value })} />
         </label>
+        {f.kind !== "sigv4" && (
+        <>
         <div>
           <span className="label">Value goes in</span>
           <div className="seg">
@@ -663,7 +676,73 @@ function SignerBuilder(p: {
           <span className="label">Headers to set before signing, NAME: TEMPLATE, one per line</span>
           <textarea className="input area mono" value={f.headers} placeholder="X-Timestamp: {{timestamp}}" onChange={(e) => set({ headers: e.target.value })} />
         </label>
-        {f.kind === "hmac" ? (
+        </>
+        )}
+        {f.kind === "sigv4" ? (
+          <>
+            <label>
+              <span className="label">Region</span>
+              <input className="input mono" value={f.region} placeholder="eu-west-1" onChange={(e) => set({ region: e.target.value })} />
+            </label>
+            <label>
+              <span className="label">Service</span>
+              <input className="input mono" value={f.service} placeholder="execute-api" onChange={(e) => set({ service: e.target.value })} />
+            </label>
+            <div>
+              <span className="label">Access key id is in</span>
+              <div className="seg">
+                <button className={f.accessFrom === "env" ? "on" : ""} onClick={() => set({ accessFrom: "env" })}>
+                  Env variable
+                </button>
+                <button className={f.accessFrom === "file" ? "on" : ""} onClick={() => set({ accessFrom: "file" })}>
+                  File
+                </button>
+              </div>
+            </div>
+            <label>
+              <span className="label">{f.accessFrom === "env" ? "Environment variable" : "Full path of the file"}</span>
+              <input className="input mono" value={f.access} placeholder={f.accessFrom === "env" ? "AWS_ACCESS_KEY_ID" : "/home/me/keys/aws-id"} autoComplete="off" spellCheck={false} onChange={(e) => set({ access: e.target.value })} />
+            </label>
+            <div>
+              <span className="label">Session token, if any, is in</span>
+              <div className="seg">
+                <button className={f.tokenFrom === "env" ? "on" : ""} onClick={() => set({ tokenFrom: "env" })}>
+                  Env variable
+                </button>
+                <button className={f.tokenFrom === "file" ? "on" : ""} onClick={() => set({ tokenFrom: "file" })}>
+                  File
+                </button>
+              </div>
+            </div>
+            <label>
+              <span className="label">{f.tokenFrom === "env" ? "Environment variable (optional)" : "Full path of the file (optional)"}</span>
+              <input className="input mono" value={f.token} placeholder={f.tokenFrom === "env" ? "AWS_SESSION_TOKEN" : ""} autoComplete="off" spellCheck={false} onChange={(e) => set({ token: e.target.value })} />
+            </label>
+          </>
+        ) : f.kind === "key" ? (
+          <>
+            <label className="wide">
+              <span className="label">String to sign (\n, \r, \t and \\ are escapes)</span>
+              <textarea className="input area mono" value={f.canonical} placeholder={"{{method}}\\n{{path}}\\n{{body_sha256}}"} onChange={(e) => set({ canonical: e.target.value })} />
+            </label>
+            <label>
+              <span className="label">Algorithm (a PEM private key; ES and EdDSA keys as PKCS#8)</span>
+              <select className="input" value={f.keyAlg} onChange={(e) => set({ keyAlg: e.target.value as SignerForm["keyAlg"] })}>
+                {KEY_ALGS.map((a) => (
+                  <option key={a}>{a}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span className="label">Output</span>
+              <select className="input" value={f.output} onChange={(e) => set({ output: e.target.value as SignerForm["output"] })}>
+                {HMAC_OUTPUTS.map((o) => (
+                  <option key={o}>{o}</option>
+                ))}
+              </select>
+            </label>
+          </>
+        ) : f.kind === "hmac" ? (
           <>
             <label className="wide">
               <span className="label">String to sign (\n, \r, \t and \\ are escapes)</span>
@@ -694,7 +773,7 @@ function SignerBuilder(p: {
         ) : (
           <>
             <label>
-              <span className="label">Algorithm (RS256 takes a PEM private key)</span>
+              <span className="label">Algorithm (all but HS* take a PEM private key)</span>
               <select className="input" value={f.jwtAlg} onChange={(e) => set({ jwtAlg: e.target.value as SignerForm["jwtAlg"] })}>
                 {JWT_ALGS.map((a) => (
                   <option key={a}>{a}</option>

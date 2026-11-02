@@ -291,7 +291,7 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         }
         request = req.into_bytes();
         if let Some(a) = auth {
-            request = a.apply(&request, &[]);
+            request = a.apply_to(&request, &[], target);
         }
     }
     // In flight while it waits for its turn too, so the page isn't taken as settled.
@@ -306,7 +306,7 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         a.observe(response);
         // Session lost: log in again and replay with the new session.
         if a.is_logged_out(response) && a.relogin(generation).await {
-            request = a.apply(&request, &[]);
+            request = a.apply_to(&request, &[], target);
             sent = forward(s, target, &request, &method).await;
             if let Ok((_, response)) = &sent {
                 a.observe(response);

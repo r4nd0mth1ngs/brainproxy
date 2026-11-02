@@ -1,0 +1,19 @@
+openapi: 3.1.0
+info:
+  title: Pets YAML
+  version: 2.0
+servers:
+  - url: http://127.0.0.1:18080/v1
+paths:
+  /pets/{id}:
+    get:
+      operationId: getPet
+      parameters:
+        - {name: id, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    delete:
+      operationId: deletePet
+      parameters:
+        - {name: id, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+components:
+  schemas:
+    Id: {type: integer, example: 42}

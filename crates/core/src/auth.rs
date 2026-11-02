@@ -48,10 +48,20 @@ impl Secret {
     pub(crate) fn resolve(&self) -> Result<String> {
         match self {
             Secret::Literal(s) => Ok(s.clone()),
-            Secret::Env(var) => std::env::var(var)
-                .map_err(|_| Error::InvalidInput(format!("password environment variable {var} is not set"))),
+            Secret::Env(var) => {
+                std::env::var(var).map_err(|_| Error::InvalidInput(format!("environment variable {var} is not set")))
+            }
         }
     }
+}
+
+/// An API key sent in the query string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueryKey {
+    pub name: String,
+    pub value: String,
+    /// The only origins it is sent to.
+    pub origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -97,6 +107,9 @@ pub struct AuthProfile {
     /// Headers added to every request (API keys, bearer tokens, basic auth).
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    /// API keys added to the query string of requests to their origins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_keys: Vec<QueryKey>,
     /// Minimum seconds between automatic re-logins.
     #[serde(default = "five")]
     pub relogin_interval_secs: u64,
@@ -107,6 +120,9 @@ pub struct AuthProfile {
     /// some hosts, answered on every command (see [`crate::connection::platform`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<crate::connection::PlatformAuth>,
+    /// OAuth 2.0 token requests in place of a login (see [`crate::oauth`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::oauth::OAuth>,
 }
 
 fn post() -> String {
@@ -121,7 +137,7 @@ fn twenty() -> u32 {
 
 impl AuthProfile {
     pub fn has_login(&self) -> bool {
-        self.login_url.is_some()
+        self.login_url.is_some() || self.oauth.is_some()
     }
 
     /// A profile with no login or headers, whose session its macros and rules make.
@@ -145,13 +161,14 @@ impl AuthProfile {
     pub fn validate_with(&self, handling: &crate::session::Handling) -> Result<()> {
         if !self.has_login()
             && self.headers.is_empty()
+            && self.query_keys.is_empty()
             && self.platform.is_none()
             && handling.macros.is_empty()
             && handling.rules.is_empty()
             && handling.signers.is_empty()
         {
             return Err(Error::InvalidInput(format!(
-                "profile needs --login-url, --platform, at least one --header, or a macro \
+                "profile needs --login-url, --platform, at least one --header or --query-key, or a macro \
                  (`auth macro add {} MACRO --step ...` makes a profile with no login)",
                 self.name
             )));
@@ -160,6 +177,29 @@ impl AuthProfile {
     }
 
     fn validate_fields(&self) -> Result<()> {
+        if let Some(o) = &self.oauth {
+            if self.login_url.is_some() {
+                return Err(Error::InvalidInput("a profile logs in with --login-url or OAuth, not both".into()));
+            }
+            if self.token_regex.is_some() {
+                return Err(Error::InvalidInput("OAuth reads the token itself: leave out --token-regex".into()));
+            }
+            o.validate(self.username.as_deref(), self.password.as_ref())?;
+        }
+        for q in &self.query_keys {
+            // Sent as written, so nothing that means something in a query.
+            let name_ok = !q.name.is_empty()
+                && q.name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
+            if !name_ok {
+                return Err(Error::InvalidInput(format!("bad query key name {:?}", q.name)));
+            }
+            if q.origins.is_empty() {
+                return Err(Error::InvalidInput(format!("query key {:?} needs --key-origin", q.name)));
+            }
+            for o in &q.origins {
+                Target::from_url(o)?;
+            }
+        }
         if let Some(p) = &self.platform {
             p.validate(self.username.as_deref(), self.password.as_ref())?;
         }
@@ -176,13 +216,13 @@ impl AuthProfile {
         if self.csrf_url.is_some() != self.csrf_regex.is_some() {
             return Err(Error::InvalidInput("--csrf-url and --csrf-regex go together".into()));
         }
-        if self.token_regex.is_some() != self.token_header.is_some() {
+        if self.oauth.is_none() && self.token_regex.is_some() != self.token_header.is_some() {
             return Err(Error::InvalidInput("--token-regex and --token-header go together".into()));
         }
         Ok(())
     }
 
-    /// The profile with the password and static header values hidden, for display.
+    /// The profile with the password, static header values, and query keys hidden, for display.
     pub fn redacted(&self) -> AuthProfile {
         let mut p = self.clone();
         if let Some(Secret::Literal(_)) = p.password {
@@ -191,6 +231,10 @@ impl AuthProfile {
         for (_, v) in &mut p.headers {
             *v = "********".into();
         }
+        for q in &mut p.query_keys {
+            q.value = "********".into();
+        }
+        p.oauth = p.oauth.as_ref().map(crate::oauth::OAuth::redacted);
         p
     }
 }
@@ -214,6 +258,11 @@ pub struct SessionState {
     /// Macro runs so far, so placeholders of different runs differ across commands.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub macro_runs: u64,
+    /// OAuth: the refresh token and when the access token runs out (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires: Option<u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -280,12 +329,17 @@ impl Store {
 }
 
 /// The text that stands in for a secret value: `«auth:PROFILE:KIND»`, where KIND is
-/// `header:NAME`, `cookie:NAME`, `token`, `password`, `password:form` or `password:json`.
+/// `header:NAME`, `query:NAME`, `cookie:NAME`, `token`, `password`, `password:form` or `password:json`.
 pub fn placeholder(profile: &str, kind: &str) -> String {
     format!("«auth:{profile}:{kind}»")
 }
 
 pub(crate) const MARK: &str = "«auth:";
+
+/// Whether a parameter's value is a query key's placeholder, which is not for attacking.
+pub(crate) fn is_query_key_placeholder(value: &str) -> bool {
+    value.starts_with(MARK) && value.contains(":query:")
+}
 
 #[derive(Clone)]
 struct VaultEntry {
@@ -295,6 +349,8 @@ struct VaultEntry {
     header: Option<String>,
     /// Origins an anywhere value may be sent to.
     origins: Vec<String>,
+    /// A query key: filled only into the request line, for `origins`.
+    request_line: bool,
 }
 
 /// Values of per-run macro placeholders kept at most; older ones fall back to the
@@ -333,8 +389,12 @@ impl std::fmt::Debug for Vault {
 
 impl Vault {
     fn put(&self, ph: String, value: &str, header: Option<&str>, origins: Vec<String>) {
-        let entry =
-            VaultEntry { value: value.to_string(), header: header.map(|h| h.trim().to_ascii_lowercase()), origins };
+        let entry = VaultEntry {
+            value: value.to_string(),
+            header: header.map(|h| h.trim().to_ascii_lowercase()),
+            origins,
+            request_line: false,
+        };
         self.0.lock().unwrap().entries.insert(ph, entry);
     }
 
@@ -354,7 +414,7 @@ impl Vault {
         let mut inner = self.0.lock().unwrap();
         for enc in [Enc::Raw, Enc::Form, Enc::Json] {
             let value = encode(&var.value, enc);
-            let entry = VaultEntry { value, header: None, origins: var.origins.clone() };
+            let entry = VaultEntry { value, header: None, origins: var.origins.clone(), request_line: false };
             let run = placeholder(profile, &crate::session::var_kind(&var.name, Some(var.run), enc));
             if inner.entries.insert(run.clone(), entry.clone()).is_none() {
                 inner.runs.push_back(run);
@@ -385,6 +445,15 @@ impl Vault {
         for (k, v) in p.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
             self.put(placeholder(&p.name, &format!("header:{k}")), v, Some(k), vec![]);
         }
+        for q in &p.query_keys {
+            let entry = VaultEntry {
+                value: encode(&q.value, Enc::Form),
+                header: None,
+                origins: q.origins.iter().filter_map(|o| Target::from_url(o).ok()).map(|t| t.origin()).collect(),
+                request_line: true,
+            };
+            self.0.lock().unwrap().entries.insert(placeholder(&p.name, &format!("query:{}", q.name)), entry);
+        }
         for var in &st.vars {
             self.put_var(&p.name, var);
         }
@@ -398,6 +467,15 @@ impl Vault {
             inner.sign_marks.extend(signer.marks(profile));
             inner.signers.push(crate::sign::Loaded::new(profile, signer.clone()));
         }
+    }
+
+    /// Whether a signer fills a placeholder in the head of `raw`, so resolving it may block.
+    pub(crate) fn signs(&self, raw: &[u8]) -> bool {
+        if find(raw, MARK.as_bytes()).is_none() {
+            return false;
+        }
+        let head = split_head_body(raw).0;
+        self.0.lock().unwrap().sign_marks.iter().any(|m| find(head, m.as_bytes()).is_some())
     }
 
     /// Registers a password, encoded for each login body type, for the login origin (and
@@ -417,8 +495,9 @@ impl Vault {
     /// The request with placeholders replaced by their values. A header value is only
     /// filled into its own header, and a password or macro value only into requests to
     /// the origins it belongs to, so a placeholder can't be moved somewhere that
-    /// reflects it back. Fails on a placeholder left over (profile removed, never logged
-    /// in, password variable unset, or the placeholder moved out of its header). Signers
+    /// reflects it back; a query key goes only into the request line to its origins. Fails
+    /// on a placeholder left over (profile removed, never logged in, password variable
+    /// unset, or the placeholder moved out of its header). Signers
     /// run last, over the request as it will be sent; their placeholders only count in the head.
     pub fn resolve<'a>(&self, raw: &'a [u8], target: &Target) -> Result<Cow<'a, [u8]>> {
         if find(raw, MARK.as_bytes()).is_none() {
@@ -426,15 +505,18 @@ impl Vault {
         }
         let inner = self.0.lock().unwrap();
         let origin = target.origin();
-        let anywhere = |e: &VaultEntry| e.header.is_none() && e.origins.iter().any(|o| o == &origin);
+        let to_origin = |e: &VaultEntry| e.header.is_none() && e.origins.iter().any(|o| o == &origin);
+        let anywhere = |e: &VaultEntry| !e.request_line && to_origin(e);
         let (head, body) = split_head_body(raw);
         let mut out = Vec::with_capacity(raw.len());
-        for line in head.split_inclusive(|&b| b == b'\n') {
+        for (i, line) in head.split_inclusive(|&b| b == b'\n').enumerate() {
             let name = line
                 .iter()
                 .position(|&b| b == b':')
                 .map(|i| String::from_utf8_lossy(&line[..i]).trim().to_ascii_lowercase());
-            let allowed = |e: &VaultEntry| anywhere(e) || (e.header.is_some() && e.header == name);
+            let allowed = |e: &VaultEntry| {
+                anywhere(e) || (e.header.is_some() && e.header == name) || (i == 0 && e.request_line && to_origin(e))
+            };
             out.extend(fill(&inner.entries, &inner.sign_marks, line, allowed)?);
         }
         let new_body = fill(&inner.entries, &Default::default(), body, anywhere)?;
@@ -445,16 +527,19 @@ impl Vault {
         }
         if find(&out, MARK.as_bytes()).is_some() {
             // Every generated header first: a signer may cover another's.
+            // Signing can take a while (a script, an RSA key), so not with every other send waiting.
+            let (signers, marks) = (inner.signers.clone(), inner.sign_marks.clone());
+            drop(inner);
             let stamp = crate::sign::Stamp::new()?;
-            for signer in &inner.signers {
+            for signer in &signers {
                 out = signer.set_headers(out, target, &stamp)?;
             }
-            for signer in &inner.signers {
+            for signer in &signers {
                 out = signer.sign(out, target, &stamp)?;
             }
             // A signer replaced since the placeholder was written leaves it unfilled.
             let head = split_head_body(&out).0;
-            if let Some(mark) = inner.sign_marks.iter().find(|m| find(head, m.as_bytes()).is_some()) {
+            if let Some(mark) = marks.iter().find(|m| find(head, m.as_bytes()).is_some()) {
                 return Err(Error::InvalidInput(format!("no signer fills {mark} in this request")));
             }
         }
@@ -583,7 +668,7 @@ pub struct AuthSession {
     generation: AtomicU64,
     relogins: AtomicU32,
     last_login: Mutex<Option<Instant>>,
-    login_lock: tokio::sync::Mutex<()>,
+    pub(crate) login_lock: tokio::sync::Mutex<()>,
     /// Macros and session rules (see [`crate::session`]).
     pub(crate) handling: crate::session::Runtime,
 }
@@ -635,9 +720,33 @@ impl AuthSession {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Persists the current cookies/token so the next command can reuse them.
+    pub(crate) fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether the last login or token request was within the profile's re-login interval.
+    pub(crate) fn logged_in_within_interval(&self) -> bool {
+        let interval = Duration::from_secs(self.profile.relogin_interval_secs);
+        self.last_login.lock().unwrap().is_some_and(|t| t.elapsed() < interval)
+    }
+
+    pub(crate) fn mark_login_time(&self) {
+        *self.last_login.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Persists the current cookies/token so the next command can reuse them. An OAuth
+    /// refresh token stays in memory unless the profile stores its secrets.
     pub fn save(&self) -> Result<()> {
-        Store::open(&self.project)?.auth_save_state(&self.profile.name, &self.state())
+        Store::open(&self.project)?.auth_save_state(&self.profile.name, &self.persisted_state())
+    }
+
+    /// The state as it goes in the project.
+    fn persisted_state(&self) -> SessionState {
+        let mut st = self.state();
+        if !self.profile.oauth.as_ref().is_some_and(|o| o.store_secrets) {
+            st.refresh_token = None;
+        }
+        st
     }
 
     /// Logs in if the profile has a login and no session yet.
@@ -720,12 +829,25 @@ impl AuthSession {
         req.into_bytes()
     }
 
+    /// [`AuthSession::apply`] plus the query keys for `target`'s origin, as placeholders.
+    pub fn apply_to(&self, raw: &[u8], keep: &[&str], target: &Target) -> Vec<u8> {
+        let mut out = self.apply(raw, keep);
+        for q in &self.profile.query_keys {
+            if q.origins.iter().any(|o| crate::sign::same_origin(o, target)) {
+                let ph = placeholder(&self.profile.name, &format!("query:{}", q.name));
+                out = crate::sign::set_query(&out, &q.name, |_| ph.clone());
+            }
+        }
+        out
+    }
+
     /// Fetches the profile's check URL with the session applied and reports
     /// whether it still looks logged in. None when the profile has no check URL.
     pub async fn check(&self) -> Result<Option<CheckResult>> {
         let Some(url) = &self.profile.check_url else { return Ok(None) };
         let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-        let ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+        let ex =
+            self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
         self.observe(&ex.response);
         let history_id = self.record(&ex);
         let logged_in = !self.is_logged_out(&ex.response)
@@ -840,6 +962,9 @@ impl AuthSession {
 
     async fn login_inner(&self) -> Result<LoginResult> {
         let p = &self.profile;
+        if p.oauth.is_some() {
+            return self.oauth_login().await;
+        }
         let Some(login_url) = &p.login_url else {
             return Ok(LoginResult {
                 success: true,
@@ -868,7 +993,8 @@ impl AuthSession {
         let mut csrf = String::new();
         if let (Some(url), Some(re)) = (&p.csrf_url, &self.re.csrf) {
             let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-            let ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+            let ex =
+                self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
             self.observe(&ex.response);
             history.push(self.record(&ex));
             csrf = re
@@ -910,7 +1036,8 @@ impl AuthSession {
             }
         };
         // Send, following redirects (with cookies) like a browser would.
-        let mut ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
+        let mut ex =
+            self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
         self.observe(&ex.response);
         find_token(&ex.response);
         history.push(self.record(&ex));
@@ -932,7 +1059,7 @@ impl AuthSession {
                 }
                 _ => RawRequest::build("GET", current.as_str(), &[], b"")?,
             };
-            ex = self.client.send(&RawRequest::from_bytes(self.apply(r.as_bytes(), &[])), &t).await?;
+            ex = self.client.send(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await?;
             self.observe(&ex.response);
             find_token(&ex.response);
             history.push(self.record(&ex));
@@ -947,7 +1074,7 @@ impl AuthSession {
         let (verify_text, status) = match &p.check_url {
             Some(u) => {
                 let (r, t) = RawRequest::build("GET", u, &[], b"")?;
-                let cex = self.client.send(&RawRequest::from_bytes(self.apply(r.as_bytes(), &[])), &t).await?;
+                let cex = self.client.send(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await?;
                 self.observe(&cex.response);
                 history.push(self.record(&cex));
                 let logged_out = self.is_logged_out(&cex.response);
@@ -1105,7 +1232,7 @@ pub(crate) fn response_text(response: &[u8]) -> String {
     s
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{secs}")
 }
@@ -1149,9 +1276,90 @@ mod tests {
         AuthSession::new(&dir.join("p.bpdb"), profile, SessionState::default(), Client::new(opts)).unwrap()
     }
 
+    #[test]
+    fn a_refresh_token_is_stored_only_with_the_secrets() {
+        for store_secrets in [false, true] {
+            let name = format!("oauth-store-{store_secrets}");
+            let oauth = crate::oauth::OAuth {
+                flow: crate::oauth::Flow::ClientCredentials,
+                token_url: "https://a.test/token".into(),
+                client_id: "c".into(),
+                client_secret: Some(Secret::Env("UNUSED".into())),
+                client_auth: Default::default(),
+                scope: None,
+                audience: None,
+                params: vec![],
+                refresh_token: None,
+                authorize_url: None,
+                redirect_port: None,
+                store_secrets,
+            };
+            let s = session(AuthProfile { name: name.clone(), oauth: Some(oauth), ..Default::default() });
+            let store = Store::open(&s.project).unwrap();
+            store.auth_save_profile(&s.profile).unwrap();
+            {
+                let mut st = s.state.lock().unwrap();
+                st.token = Some("ACCESS".into());
+                st.refresh_token = Some("REFRESH".into());
+            }
+            s.save().unwrap();
+            let (_, stored) = store.auth_profile(&name).unwrap();
+            assert_eq!(stored.token.as_deref(), Some("ACCESS"));
+            assert_eq!(stored.refresh_token.is_some(), store_secrets);
+            // The command itself keeps using it either way.
+            assert_eq!(s.state().refresh_token.as_deref(), Some("REFRESH"));
+        }
+    }
+
+    fn vault_of(s: &AuthSession) -> &Vault {
+        &s.client.options().guard.as_ref().unwrap().vault
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_script_signing_holds_up_no_other_task() {
+        crate::sign_script::tests::use_test_runner();
+        let script = "/^(a+)+$/.test('a'.repeat(40) + 'b');";
+        let dir = std::env::temp_dir().join(format!("bp-auth-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pre.js");
+        std::fs::write(&file, script).unwrap();
+        let signer = crate::sign::Signer {
+            name: "script".into(),
+            key: crate::sign::KeySource::None,
+            key_encoding: Default::default(),
+            origins: vec!["https://a.test".into()],
+            to: crate::sign::Place::Header(crate::sign::SCRIPT_MARK_HEADER.into()),
+            format: None,
+            headers: vec![],
+            kind: crate::sign::SignKind::Script {
+                file,
+                sha256: crate::fetch::sha256_hex(script.as_bytes()),
+                vars: vec![],
+            },
+        };
+        let s = session(AuthProfile { name: "p".into(), ..Default::default() });
+        vault_of(&s).put_signers("p", std::slice::from_ref(&signer));
+        let raw = signer.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let target = Target::from_url("https://a.test").unwrap();
+        let e = s.client.fill_auth(&raw, &target).await.unwrap_err().to_string();
+        ticker.abort();
+        assert!(e.contains("time limit"), "{e}");
+        // The only worker thread kept ticking while the script ran out its five seconds.
+        assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > 100, "{ticks:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn wire(s: &AuthSession, req: &[u8]) -> Result<String> {
         let target = Target::from_url("https://a.test").unwrap();
-        Ok(String::from_utf8(s.client.fill_auth(req, &target)?.into_owned()).unwrap())
+        Ok(String::from_utf8(vault_of(s).resolve(req, &target)?.into_owned()).unwrap())
     }
 
     #[test]
@@ -1181,6 +1389,65 @@ mod tests {
         // Deletion cookies are forgotten.
         s.observe(b"HTTP/1.1 200 OK\r\nSet-Cookie: theme=; Max-Age=0\r\n\r\n");
         assert_eq!(s.state().cookies, vec![("sid".to_string(), "new".to_string())]);
+    }
+
+    #[test]
+    fn query_keys_stay_on_the_request_line_of_their_origin() {
+        let p = AuthProfile {
+            name: "t".into(),
+            query_keys: vec![QueryKey {
+                name: "api_key".into(),
+                value: "a b&c".into(),
+                origins: vec!["https://a.test".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok(), "a query key alone is enough");
+        let s = session(p.clone());
+        let a = Target::from_url("https://a.test").unwrap();
+        let applied = s.apply_to(b"GET /x?api_key=old&b=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", &[], &a);
+        let out = String::from_utf8(applied.clone()).unwrap();
+        assert!(out.starts_with("GET /x?b=1&api_key=«auth:t:query:api_key» HTTP/1.1\r\n"), "{out}");
+        let sent = wire(&s, &applied).unwrap();
+        assert!(sent.starts_with("GET /x?b=1&api_key=a+b%26c HTTP/1.1\r\n"), "{sent}");
+        // Another origin gets no key, and can't be made to take one.
+        let b = Target::from_url("https://b.test").unwrap();
+        let out = String::from_utf8(s.apply_to(b"GET /x HTTP/1.1\r\nHost: b.test\r\n\r\n", &[], &b)).unwrap();
+        assert!(!out.contains("api_key"), "{out}");
+        assert!(vault_of(&s).resolve(&applied, &b).is_err());
+        // Nor is it filled outside the request line.
+        let ph = "«auth:t:query:api_key»";
+        assert!(wire(&s, format!("GET / HTTP/1.1\r\nX-Reflect: {ph}\r\n\r\n").as_bytes()).is_err());
+        assert!(wire(&s, format!("POST / HTTP/1.1\r\nContent-Length: 22\r\n\r\n{ph}").as_bytes()).is_err());
+        // Shown masked.
+        assert_eq!(p.redacted().query_keys[0].value, "********");
+        assert!(!format!("{:?}", p.redacted()).contains("a b&c"));
+        // Bad names and missing origins are refused.
+        let bad = |name: &str, origins: Vec<String>| AuthProfile {
+            name: "t".into(),
+            query_keys: vec![QueryKey { name: name.into(), value: "v".into(), origins }],
+            ..Default::default()
+        };
+        assert!(bad("a b", vec!["https://a.test".into()]).validate().is_err());
+        assert!(bad("a", vec![]).validate().is_err());
+    }
+
+    #[test]
+    fn query_keys_load_for_requests_from_history() {
+        let p = AuthProfile {
+            name: "t".into(),
+            query_keys: vec![QueryKey {
+                name: "k".into(),
+                value: "v1".into(),
+                origins: vec!["https://a.test:443".into()],
+            }],
+            ..Default::default()
+        };
+        let vault = Vault::default();
+        vault.put_session(&p, &SessionState::default());
+        let raw = "GET /?k=«auth:t:query:k» HTTP/1.1\r\n\r\n";
+        let filled = vault.resolve(raw.as_bytes(), &Target::from_url("https://a.test").unwrap()).unwrap();
+        assert!(String::from_utf8_lossy(&filled).starts_with("GET /?k=v1 "));
     }
 
     #[test]
@@ -1265,7 +1532,7 @@ mod tests {
         let sent = wire(&s, req.as_bytes()).unwrap();
         assert!(sent.ends_with("Content-Length: 7\r\n\r\np=p%26w"), "{sent}");
         let other = Target::from_url("https://b.test").unwrap();
-        assert!(s.client.fill_auth(req.as_bytes(), &other).is_err());
+        assert!(vault_of(&s).resolve(req.as_bytes(), &other).is_err());
     }
 
     #[test]

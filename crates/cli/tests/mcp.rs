@@ -15,7 +15,13 @@ struct Mcp {
 
 impl Mcp {
     fn start(project: &std::path::Path, extra: &[&str]) -> Mcp {
+        Self::start_env(project, extra, &[])
+    }
+
+    /// A server started with these environment variables.
+    fn start_env(project: &std::path::Path, extra: &[&str], env: &[(&str, &str)]) -> Mcp {
         let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .envs(env.iter().copied())
             .arg("--project")
             .arg(project)
             .args(["mcp", "serve"])
@@ -112,7 +118,9 @@ fn protocol_and_tool_list() {
 
     let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
     let tool = |name: &str| tools.iter().find(|t| t["name"] == name).cloned();
-    for name in ["send", "history_list", "engagement_start", "scan_active", "job_wait", "query", "capabilities"] {
+    for name in
+        ["send", "history_list", "engagement_start", "scan_active", "import_api", "job_wait", "query", "capabilities"]
+    {
         assert!(tool(name).is_some(), "missing {name}");
     }
     for name in ["mcp_serve", "proxy_run", "oob_run"] {
@@ -125,6 +133,9 @@ fn protocol_and_tool_list() {
     assert_eq!(props["max_body"]["type"], "integer");
     assert_eq!(props["no_store"]["type"], "boolean");
     assert!(props.get("project").is_none() && props.get("format").is_none());
+    let import_api = tool("import_api").unwrap();
+    assert_eq!(import_api["annotations"]["openWorldHint"], true, "{import_api}");
+    assert!(tool("scan_active").unwrap()["inputSchema"]["properties"].get("api").is_some());
     let start = tool("engagement_start").unwrap();
     assert_eq!(start["inputSchema"]["required"], json!(["targets"]));
     assert!(tool("crawl").unwrap()["inputSchema"]["properties"].get("job_id").is_none());
@@ -300,4 +311,105 @@ fn annotations_resources_and_progress() {
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     assert!(progress.len() >= 2, "{progress:?}");
     assert!(progress.windows(2).all(|w| w[0] < w[1]), "{progress:?}");
+}
+
+/// What an agent may not do without a person: attach a collection's script, open the
+/// user's browser, or read a secret from any of the server's environment variables.
+#[cfg(unix)]
+#[test]
+fn an_agent_cannot_add_a_script_open_a_browser_or_read_any_variable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let p = tmp_project("guards");
+    let dir = p.parent().unwrap().to_path_buf();
+    // Stand-ins for the commands that open a browser, leaving a mark when run.
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let opened = dir.join("opened");
+    let _ = std::fs::remove_file(&opened);
+    for name in ["open", "xdg-open"] {
+        let f = bin.join(name);
+        std::fs::write(&f, format!("#!/bin/sh\necho \"$1\" >> '{}'\n", opened.display())).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let env = [
+        ("PATH", path.as_str()),
+        ("OTHER_TOKEN", "FAKE-OTHER-TOKEN"),
+        ("BRAINPROXY_SECRET_KEY", "FAKE-KEY"),
+        ("SIGN_KEY", "FAKE-SIGN-KEY"),
+    ];
+    let script = dir.join("sign.js");
+    std::fs::write(&script, "pm.request.headers.add({key: 'X-Sig', value: 'x'});\n").unwrap();
+    let script = script.to_str().unwrap();
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .envs(env.iter().copied())
+            .args(["--format", "json", "--project"])
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let mut m = Mcp::start_env(&p, &[], &env);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, env_) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{env_}");
+    let origin = "http://127.0.0.1:9";
+
+    // A script signer.
+    let (err, e) = m.call("auth_sign_add", json!({"profile": "a", "name": "s", "script": script, "origins": [origin]}));
+    assert!(err, "{e}");
+    let message = e["error"]["message"].as_str().unwrap();
+    assert!(message.contains("isn't offered through MCP") && message.contains("a person"), "{message}");
+    assert!(cli(&["auth", "sign", "add", "a", "s", "--script", script, "--origin", origin]).status.success());
+
+    // Environment variables: only the prefix the app uses.
+    let (err, e) = m.call("auth_add", json!({"name": "k", "header_env": ["X-Key=OTHER_TOKEN"]}));
+    assert!(err, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("BRAINPROXY_SECRET_"), "{e}");
+    assert!(!e.to_string().contains("FAKE-OTHER-TOKEN"), "{e}");
+    let (err, e) = m.call("auth_add", json!({"name": "k", "header_env": ["X-Key=BRAINPROXY_SECRET_KEY"]}));
+    assert!(!err, "{e}");
+    let hmac = json!({"profile": "k", "name": "h", "secret_env": "SIGN_KEY", "origins": [origin],
+        "to": "header:X-Sig", "canonical": "{{method}}"});
+    let (err, e) = m.call("auth_sign_add", hmac);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--secret-env"), "{e}");
+    // Files whose contents go on the wire as they are.
+    let secret = dir.join("aws-secret");
+    std::fs::write(&secret, "FAKE-AWS-SECRET").unwrap();
+    let (err, e) = m.call(
+        "auth_sign_add",
+        json!({"profile": "k", "name": "aws", "secret_env": "BRAINPROXY_SECRET_KEY",
+        "origins": [origin], "sigv4_region": "eu-west-1", "sigv4_service": "execute-api",
+        "access_key_file": secret.to_str().unwrap()}),
+    );
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--access-key-file"), "{e}");
+    for (flag, args) in [
+        ("--oauth-client-secret-env", json!({"oauth_client_secret_env": "OTHER_TOKEN"})),
+        ("--password-env", json!({"password_env": "OTHER_TOKEN"})),
+    ] {
+        let mut a = json!({"name": "o", "oauth_flow": "client_credentials",
+            "oauth_token_url": format!("{origin}/token"), "oauth_client_id": "c"});
+        a.as_object_mut().unwrap().extend(args.as_object().unwrap().clone());
+        let (err, e) = m.call("auth_add", a);
+        assert!(err && e["error"]["message"].as_str().unwrap().contains(flag), "{e}");
+    }
+
+    // A browser sign-in prints its URL but opens nothing.
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+    let code = ["auth", "add", "c", "--oauth-flow", "authorization_code", "--oauth-client-id", "pub"];
+    let token_url = format!("{origin}/token");
+    let more = ["--oauth-token-url", &token_url, "--oauth-authorize-url", "https://id.test/authorize"];
+    let o = cli(&[&code[..], &more[..], &["--oauth-redirect-port", &port]].concat());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    let (err, _) = m.call("auth_oauth_authorize", json!({"name": "c", "wait": 1}));
+    assert!(err, "nobody signed in");
+    assert!(!opened.exists(), "a browser was opened");
+    // From a terminal it opens one.
+    let o = cli(&["auth", "oauth", "authorize", "c", "--wait", "1"]);
+    assert!(!o.status.success());
+    let url = std::fs::read_to_string(&opened).unwrap_or_default();
+    assert!(url.starts_with("https://id.test/authorize?"), "{url}");
 }

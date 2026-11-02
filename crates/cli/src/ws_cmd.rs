@@ -385,7 +385,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
 
     let (sent, opened) = rt.block_on(async {
         let mut sent = match &session {
-            Some(s) => RawRequest::from_bytes(s.apply(handshake.as_bytes(), &[])),
+            Some(s) => RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)),
             None => handshake.clone(),
         };
         let generation = session.as_ref().map(|s| s.generation()).unwrap_or(0);
@@ -394,7 +394,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             s.observe(response);
             // Session lost: log in again and retry with the new session.
             if s.is_logged_out(response) && s.relogin(generation).await {
-                sent = client::handshake(RawRequest::from_bytes(s.apply(handshake.as_bytes(), &[])));
+                sent = client::handshake(RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)));
                 opened = client::open(&client, &target, &sent).await;
             }
         }

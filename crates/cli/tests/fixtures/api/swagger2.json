@@ -1,0 +1,26 @@
+{
+  "swagger": "2.0",
+  "info": {"title": "Store", "version": "1.1"},
+  "host": "127.0.0.1:18080",
+  "basePath": "/api",
+  "schemes": ["http", "https"],
+  "securityDefinitions": {
+    "QueryKey": {"type": "apiKey", "in": "query", "name": "api_key"}
+  },
+  "definitions": {
+    "Order": {"type": "object", "properties": {"sku": {"type": "string", "example": "abc"}, "qty": {"type": "integer"}}}
+  },
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "listOrders",
+        "parameters": [{"name": "page", "in": "query", "required": true, "type": "integer"}]
+      },
+      "post": {
+        "operationId": "createOrder",
+        "consumes": ["application/json"],
+        "parameters": [{"name": "body", "in": "body", "schema": {"$ref": "#/definitions/Order"}}]
+      }
+    }
+  }
+}

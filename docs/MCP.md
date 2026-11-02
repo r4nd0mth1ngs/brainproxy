@@ -85,6 +85,19 @@ and `project save`, since copying the project elsewhere is for the person runnin
   `query`, `encode`, `import openapi`, `intercept forward`, ...). Without it, the command's
   stdin is empty, never the server's own stdin.
 
+Some arguments need a person, so a command run for a tool call (the server sets
+`BRAINPROXY_MCP_CALL` on it) refuses them, with an error saying so:
+
+- `auth_sign_add` with `script`: a collection's pre-request script is code; a person reads it
+  (`import api --show-scripts`) and adds the signer in the app or a terminal.
+- Environment variables named by `auth_add` (`header_env`, `query_keys`, `password_env`,
+  `oauth_client_secret_env`, `oauth_refresh_token_env`) and `auth_sign_add` (`secret_env`,
+  `access_key_env`, `session_token_env`) must start with `BRAINPROXY_SECRET_`, so an agent can't
+  send the server's other secrets to a target.
+- `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
+  as they are, so they could send any readable file to a target; use the `_env` forms.
+- `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
+
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep
 values that start with `-` as values). It runs exactly the code a shell invocation runs: the

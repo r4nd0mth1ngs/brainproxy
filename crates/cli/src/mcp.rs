@@ -33,6 +33,31 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const EXCLUDED: &[&str] =
     &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save"];
 
+/// Set on every command a tool call runs, so a command can refuse what an agent must not
+/// do alone (run a collection's script, open the user's browser, read any environment variable).
+const CHILD_ENV: &str = "BRAINPROXY_MCP_CALL";
+
+/// Environment variables a command run by an agent may read secrets from: the prefix the
+/// app uses, so a person decides what the server's environment offers.
+pub(crate) const SECRET_ENV_PREFIX: &str = "BRAINPROXY_SECRET_";
+
+/// Whether this command runs for an MCP tool call.
+pub(crate) fn in_tool_call() -> bool {
+    std::env::var_os(CHILD_ENV).is_some()
+}
+
+/// Under a tool call, refuses an environment variable without [`SECRET_ENV_PREFIX`]:
+/// an agent could otherwise send any of the server's secrets to the target.
+pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() && !var.trim().starts_with(SECRET_ENV_PREFIX) {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{flag}: through MCP only variables named {SECRET_ENV_PREFIX}* can be read; have a person set one where \
+             the server starts, or add the profile in the app or a terminal"
+        )));
+    }
+    Ok(())
+}
+
 /// Tool calls that may run at once; more are refused until one finishes.
 const MAX_CALLS: usize = 16;
 
@@ -77,6 +102,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth list", READ),
     ("auth show", READ),
     ("auth remove", REPLACE),
+    ("auth oauth authorize", NET),
+    ("auth oauth discover", NET),
     ("authz run", NET),
     ("authz results", READ),
     ("authz matrix", READ),
@@ -152,6 +179,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("fuzz list", READ),
     ("fuzz stop", REPLACE),
     ("crawl", NET),
+    ("import api", NET),
     ("import openapi", NET),
     ("import postman", NET),
     ("import graphql", NET),
@@ -446,6 +474,7 @@ impl Server {
             Err(e) => return failure(command, "io", &format!("can't find own executable: {e}")),
         };
         let mut p = Process::new(exe);
+        p.env(CHILD_ENV, "1");
         p.args(["--format", "json", "--project"]).arg(&self.project);
         if let Some(home) = &self.home {
             p.arg("--home").arg(home);
