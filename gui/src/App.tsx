@@ -13,7 +13,7 @@ import { DashboardView } from "./views/Dashboard";
 import { ENGAGEMENT_CHANGED, TargetView } from "./views/Target";
 import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
-import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, withPortHint } from "./views/proxyPort";
+import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, stopOwned, stopProxy } from "./views/proxyPort";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -172,7 +172,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   const openBrowser = async (id: string) => {
     try {
       if (!status?.running) {
-        await startProxy(run);
+        await startProxy(run, app.proxy);
         refreshStatus();
       }
       const d = await run<{ browser: { name: string }; note: string | null }>(["browser", "open", `--browser=${id}`]);
@@ -182,39 +182,42 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     }
   };
 
-  // The proxy starts with the project (unless turned off in Settings); one the app started
-  // stops again when the project closes or the window does, so none are left behind.
-  const startedHere = useRef(false);
+  // The proxy starts with the project (unless turned off in Settings). While that setting is on,
+  // a proxy the app started (here, from the pill, Open browser, Settings or Record a login) stops
+  // again when the project closes or the window does, so none are left behind holding the port;
+  // one a shell or an agent started is left alone.
+  const proxyCtl = app.proxy;
+  // Pinned to this project: another may be open by the time it runs.
+  const project = app.project;
+  const inProject = (args: string[]) => run(args, { project });
+  const stopOnClose = () => (autoProxy() ? stopOwned(inProject, proxyCtl).catch(() => {}) : Promise.resolve());
   // `app` changes with every toast or tab switch; only a project change may restart the proxy.
   const toastRef = useRef(app.toast);
   toastRef.current = app.toast;
   useEffect(() => {
-    if (!autoProxy()) return;
     let cancelled = false;
     (async () => {
+      if (!autoProxy()) return;
       const s = await run<ProxyStatus>(["proxy", "status"]).catch(() => null);
       if (cancelled || !s || s.running) return;
-      // Also if it fails: one started by hand after that takes its place, and stops with the project too.
-      startedHere.current = true;
       const chosen = savedProxyPort();
       for (const port of startPorts(chosen)) {
         if (cancelled) return;
         try {
-          await run(["proxy", "start", `--listen=${proxyListen(port)}`]);
+          await startProxy(run, proxyCtl, port);
+          // The project closed while it started.
+          if (cancelled) return stopOwned(inProject, proxyCtl).catch(() => {});
           refreshStatus();
           return;
         } catch (e: any) {
-          if (chosen || !/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${withPortHint(e.message)}`, "error");
+          if (chosen || !/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${e.message}`, "error");
         }
       }
       toastRef.current(`The proxy didn't start: none of ports ${PROXY_PORTS[0]}-${PROXY_PORTS.at(-1)} could be opened. Choose a port in Settings › Proxy.`, "error");
     })();
     return () => {
       cancelled = true;
-      if (startedHere.current) {
-        startedHere.current = false;
-        run(["proxy", "stop"]).catch(() => {});
-      }
+      stopOnClose();
     };
   }, [app.project, refreshStatus]);
 
@@ -237,8 +240,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
             // Stops its proxy too. If it fails, it is kept and offered on the next launch.
             await tempProjects.discard(tempProject).catch(() => {});
             await getCurrentWindow().destroy();
-          } else if (startedHere.current) {
-            await run(["proxy", "stop"]).catch(() => {});
+          } else {
+            await stopOnClose();
           }
         }),
       )
@@ -258,8 +261,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
 
   const proxyToggle = async () => {
     try {
-      if (status?.running) await run(["proxy", "stop"]);
-      else await startProxy(run);
+      if (status?.running) await stopProxy(run, app.proxy);
+      else await startProxy(run, app.proxy);
       refreshStatus();
     } catch (e: any) {
       app.toast(e.message, "error");

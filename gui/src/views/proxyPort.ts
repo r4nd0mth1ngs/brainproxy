@@ -73,28 +73,71 @@ export function withPortHint(message: string): string {
   return /cannot listen/i.test(message) ? `${message.replace(/^conflict: /, "")}. Choose another port in Settings › Proxy.` : message;
 }
 
-/** Starts the proxy on the saved port. */
-export async function startProxy(cli: Cli): Promise<void> {
+/** The app's hold on its project's proxy, shared by every view that starts it (store.tsx keeps one per project). */
+export interface ProxyControl {
+  /** The pid of the proxy the app started; only that one is stopped when the project closes. */
+  owned: number | null;
+}
+
+export function proxyControl(): ProxyControl {
+  return { owned: null };
+}
+
+interface Status {
+  running: boolean;
+  proxy: { listen: string; pid?: number } | null;
+  other_pid_namespace?: boolean;
+}
+
+const pidOf = (started: unknown) => (started as { pid?: number } | null)?.pid ?? null;
+
+/** Starts the proxy on `port` (the saved one by default) and records it as the app's. */
+export async function startProxy(cli: Cli, ctl: ProxyControl, port = savedProxyPort()): Promise<void> {
   try {
-    await cli(["proxy", "start", `--listen=${proxyListen()}`]);
+    ctl.owned = pidOf(await cli(["proxy", "start", `--listen=${proxyListen(port)}`]));
   } catch (e: any) {
     e.message = withPortHint(e.message);
     throw e;
   }
 }
 
+/** Stops the proxy, whoever started it; it is no longer the app's. */
+export async function stopProxy(cli: Cli, ctl: ProxyControl): Promise<void> {
+  await cli(["proxy", "stop"]);
+  ctl.owned = null;
+}
+
+/**
+ * Stops the proxy the app started, if it is still the one running: not one a shell or an agent
+ * started since, one in another container, or a record that can't be verified.
+ */
+export async function stopOwned(cli: Cli, ctl: ProxyControl): Promise<void> {
+  const pid = ctl.owned;
+  ctl.owned = null;
+  if (pid == null) return;
+  const s = (await cli(["proxy", "status"])) as Status;
+  if (s.running && s.proxy?.pid === pid && !s.other_pid_namespace) await cli(["proxy", "stop"]);
+}
+
 /**
  * Restarts a running proxy on `port`, with the same host and options; returns the new address. If
  * it doesn't come up there, the proxy is started again where it was and the error says how that went.
+ * The proxy stays the app's if it was.
  */
-export async function moveProxy(cli: Cli, running: { listen: string; args?: string[] }, port: number): Promise<string> {
+export async function moveProxy(cli: Cli, ctl: ProxyControl, running: { listen: string; pid?: number; args?: string[] }, port: number): Promise<string> {
+  const ours = ctl.owned != null && ctl.owned === running.pid;
   const target = withPort(running.listen, port);
   const options = proxyOptions(running.args ?? []);
+  const start = async (listen: string) => {
+    const pid = pidOf(await cli(["proxy", "start", `--listen=${listen}`, ...options]));
+    if (ours) ctl.owned = pid;
+  };
   await cli(["proxy", "stop"]);
+  if (ours) ctl.owned = null;
   try {
-    await cli(["proxy", "start", `--listen=${target}`, ...options]);
+    await start(target);
   } catch (e: any) {
-    const back = await cli(["proxy", "start", `--listen=${running.listen}`, ...options]).then(
+    const back = await start(running.listen).then(
       () => `The proxy is back on ${running.listen}.`,
       () => "The proxy is off.",
     );

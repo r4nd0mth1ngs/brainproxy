@@ -1291,6 +1291,7 @@ interface ProxyStatus {
   running: boolean;
   proxy: {
     listen: string;
+    pid?: number;
     args?: string[];
     authz_run?: number;
     ca_cert?: string;
@@ -1343,7 +1344,7 @@ function ProxyPort(p: { proxy: ProxyStatus | null; refresh: () => void; busy: bo
         !now.other_pid_namespace &&
         (held === 0 || (await confirm("Restart the proxy?", `${held} held request${held === 1 ? "" : "s"} will be dropped.`, "Restart", "Keep running")))
       ) {
-        app.toast(`The proxy is now listening on ${await moveProxy(run, now.proxy, saved)}.`);
+        app.toast(`The proxy is now listening on ${await moveProxy(run, app.proxy, now.proxy, saved)}.`);
       }
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -1408,7 +1409,7 @@ function ProxySetup() {
   const start = async () => {
     setBusy(true);
     try {
-      await startProxy(run);
+      await startProxy(run, app.proxy);
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -1497,7 +1498,8 @@ function Project() {
               }
             }}
           />{" "}
-          Start the proxy when a project opens (on the port set in Settings › Proxy), and stop it when the project closes
+          Start the proxy when a project opens (on the port set in Settings › Proxy), and stop a proxy the app started when the
+          project closes
         </label>
       </div>
       <dl className="facts">

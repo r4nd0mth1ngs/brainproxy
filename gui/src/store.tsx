@@ -2,6 +2,7 @@
 // and toasts. Each view keeps its own data and fetches it through api.ts.
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
+import { proxyControl, type ProxyControl } from "./views/proxyPort";
 
 export type Tab =
   | "dashboard"
@@ -69,6 +70,8 @@ interface State {
   /** The guided scan on the Overview, opened on request (it also shows by itself until a project has a scan). */
   wizardOpen: boolean;
   openWizard: (open: boolean) => void;
+  /** The proxy the app started in this project (stopped when it closes); pass it to proxyPort.ts's helpers. */
+  proxy: ProxyControl;
 }
 
 const Ctx = createContext<State | null>(null);
@@ -98,6 +101,8 @@ export function AppProvider({
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
   const nextKey = useRef(1);
+  // Mutated in place: the views read it when they act, nothing renders from it.
+  const proxy = useRef(proxyControl()).current;
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info", onClick?: () => void) => {
     const id = nextKey.current++;
@@ -155,8 +160,9 @@ export function AppProvider({
       toast,
       wizardOpen,
       openWizard,
+      proxy,
     }),
-    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard],
+    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

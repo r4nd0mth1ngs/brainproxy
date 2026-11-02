@@ -559,7 +559,9 @@ byte, side by side or unified.
 - **Rules & data:** update the ZAP rule data and Nuclei templates; check for a new
   brainproxy daily, download it automatically, or check now.
 - **Project:** project information, the engagement, and *Start the proxy when a project
-  opens* (on the port set under *Proxy*).
+  opens* (on the port set under *Proxy*). While it is on, a proxy the app started (when the
+  project opened, or from the proxy pill, *Open browser*, *Start proxy* or *Record a login*)
+  stops when the project or the window closes; one started from a shell or MCP keeps running.
 - **Open source licenses:** credits for the projects the rules, checks and wordlists come
   from (OWASP ZAP, Nuclei, SecLists, ...) and the full NOTICE.
 

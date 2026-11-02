@@ -280,7 +280,7 @@ function Compare({ runId, picked, onClose }: { runId: number; picked: Picked; on
 
 interface ProxyStatus {
   running: boolean;
-  proxy: { listen?: string; authz_run?: number; args?: string[] } | null;
+  proxy: { listen?: string; pid?: number; authz_run?: number; args?: string[] } | null;
 }
 
 function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
@@ -324,14 +324,21 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       const s = await run<ProxyStatus>(["proxy", "status"]);
       const listen = `--listen=${s.proxy?.listen ?? proxyListen()}`;
       const before = proxyOptions(s.proxy?.args ?? []);
+      // The app's proxy (one it starts here, or restarts) stops when the project closes; not one a shell or an agent started.
+      const ours = !s.running || (app.proxy.owned != null && app.proxy.owned === s.proxy?.pid);
       if (s.running) await run(["proxy", "stop"]);
-      let d: { authz_run?: number };
+      if (ours) app.proxy.owned = null;
+      let d: { pid?: number; authz_run?: number };
       try {
-        d = await run<{ authz_run?: number }>(["proxy", "start", listen, ...withLive(before, live)]);
+        d = await run<{ pid?: number; authz_run?: number }>(["proxy", "start", listen, ...withLive(before, live)]);
       } catch (e) {
-        if (s.running) await run(["proxy", "start", listen, ...before]).catch(() => {});
+        if (s.running) {
+          const back = await run<{ pid?: number }>(["proxy", "start", listen, ...before]).catch(() => null);
+          if (ours && back) app.proxy.owned = back.pid ?? null;
+        }
         throw e;
       }
+      if (ours) app.proxy.owned = d.pid ?? null;
       const who = [...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(", ");
       app.toast(`Proxy restarted on ${listen.slice(9)}: requests you browse are now also tried as ${who}`);
       if (d.authz_run != null) onStarted(d.authz_run);

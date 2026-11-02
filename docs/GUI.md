@@ -39,6 +39,12 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue
   every second while its tab is open. The project is SQLite in WAL mode, so the GUI, the
   proxy, background jobs, and an agent share it safely.
+- The app's proxy: every place that starts the proxy (opening a project, the pill, Open
+  browser, Settings, Record a login, Access's live restart) goes through `views/proxyPort.ts`,
+  which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
+  proxy when a project opens* on, closing the project or the window stops the proxy only if
+  `proxy status` still shows that pid running here, so one a shell, an agent or another
+  container started is left alone.
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 
