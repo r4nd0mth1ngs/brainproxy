@@ -1290,4 +1290,61 @@ mod tests {
         // A title is the tester's text: no raw HTML in Markdown either.
         assert!(md.contains("&lt;img src=x&gt; \\| note") && !md.contains("<img"), "{md}");
     }
+
+    fn by_hand(title: &str, history: Vec<i64>) -> crate::scan::findings_db::ManualFinding {
+        crate::scan::findings_db::ManualFinding {
+            title: title.into(),
+            risk: Risk::Medium,
+            confidence: crate::scan::Confidence::Medium,
+            url: Some("http://app.test/x".into()),
+            method: None,
+            param: String::new(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history,
+        }
+    }
+
+    #[test]
+    fn scanner_only_reports_are_unchanged() {
+        let r = build(&store_with_findings(), &ReportOptions::default()).unwrap();
+        // No manual note in About, and no history_ids key on scanner instances.
+        assert!(!render(&r, ReportKind::Html).contains("found by hand"));
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        let insts = json["alerts"].as_array().unwrap().iter().flat_map(|g| g["instances"].as_array().unwrap().clone());
+        assert!(insts.into_iter().all(|i| i.get("history_ids").is_none()));
+        assert!(!render(&r, ReportKind::Markdown).contains("- History:"));
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        assert!(sarif["runs"][0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["properties"].get("historyIds").is_none()));
+    }
+
+    #[test]
+    fn a_tester_title_cannot_break_out_of_its_place() {
+        let mut s = store_with_findings();
+        s.finding_add(&by_hand("Broken\n## Fake heading <b>x</b>", vec![1])).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let md = render(&r, ReportKind::Markdown);
+        assert!(!md.lines().any(|l| l.starts_with("## Fake")), "{md}");
+        assert!(md.contains("Broken ## Fake heading &lt;b&gt;x&lt;/b&gt;"), "{md}");
+        // One linked entry is the evidence; no History line or row for it.
+        assert!(!md.contains("- History:"), "{md}");
+        let html = render(&r, ReportKind::Html);
+        assert!(!html.contains("<b>x</b>") && html.contains("&lt;b&gt;x&lt;/b&gt;"));
+        assert!(html.contains("found by hand") && !html.contains("<dt>History</dt>"));
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        let g = json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["alert_ref"] == "manual:broken-fake-heading-b-x-b")
+            .unwrap();
+        assert_eq!(g["instances"][0]["history_ids"], json!([1]));
+        assert_eq!(g["instances"][0]["source"], "manual");
+    }
 }

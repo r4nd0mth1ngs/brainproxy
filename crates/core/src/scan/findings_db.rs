@@ -760,4 +760,125 @@ mod tests {
         s.findings_remove(&[two]).unwrap();
         assert_eq!(types(&s), 0);
     }
+
+    #[test]
+    fn size_limits_hold_at_the_edge() {
+        let (mut s, h) = store();
+        let ok = |s: &mut Store, f: &ManualFinding| s.finding_add(f).map(|_| ());
+        let at = |title: &str| manual(title, Some("http://a.test/"), vec![]);
+        // The title is measured after trimming, in bytes.
+        ok(&mut s, &at(&format!("  {}  ", "a".repeat(MANUAL_TITLE_MAX)))).unwrap();
+        assert!(matches!(ok(&mut s, &at(&"é".repeat(MANUAL_TITLE_MAX / 2 + 1))), Err(Error::InvalidInput(_))));
+        let mut f = at("Texts");
+        f.description = "d".repeat(MANUAL_TEXT_MAX);
+        f.solution = "s".repeat(MANUAL_TEXT_MAX);
+        f.evidence = "e".repeat(MANUAL_EVIDENCE_MAX);
+        f.param = "p".repeat(MANUAL_EVIDENCE_MAX);
+        ok(&mut s, &f).unwrap();
+        for which in 0..4 {
+            let mut f = at(&format!("Over {which}"));
+            match which {
+                0 => f.description = "d".repeat(MANUAL_TEXT_MAX + 1),
+                1 => f.solution = "s".repeat(MANUAL_TEXT_MAX + 1),
+                2 => f.evidence = "e".repeat(MANUAL_EVIDENCE_MAX + 1),
+                _ => f.param = "p".repeat(MANUAL_EVIDENCE_MAX + 1),
+            }
+            assert!(matches!(ok(&mut s, &f), Err(Error::InvalidInput(_))), "{which}");
+        }
+        // At most so many links, counted as given.
+        let many = vec![h; MANUAL_HISTORY_MAX + 1];
+        assert!(matches!(s.finding_add(&manual("Links", None, many)), Err(Error::InvalidInput(_))));
+        let id = s.finding_add(&manual("Links", None, vec![h; MANUAL_HISTORY_MAX])).unwrap();
+        assert_eq!(s.finding_history_ids(id).unwrap(), [h]);
+        // Nothing over a limit was stored, not even its type.
+        let n = |s: &Store, sql: &str| s.query(sql, &[], 100, 100).unwrap().rows.len();
+        assert_eq!(n(&s, "SELECT id FROM findings"), 3);
+        assert_eq!(n(&s, "SELECT alert_ref FROM finding_types WHERE alert_ref LIKE 'manual:over-%'"), 0);
+    }
+
+    #[test]
+    fn fields_are_normalised() {
+        let (mut s, h) = store();
+        let mut add = |f: &ManualFinding| {
+            let id = s.finding_add(f).unwrap();
+            s.finding_get(id).unwrap()
+        };
+        let mut f = manual("Case", Some(" HTTPS://App.Test:443/a b "), vec![h]);
+        f.method = Some(" patch ".into());
+        f.cwe = Some(0);
+        let v = add(&f);
+        // The given URL and method win over the linked entry's; CWE 0 is no CWE.
+        assert_eq!((v["url"].as_str(), v["method"].as_str()), (Some("https://app.test/a%20b"), Some("PATCH")));
+        assert_eq!(
+            (v["host"].as_str(), v["history_id"].as_i64(), v["cwe"].clone()),
+            (Some("app.test"), Some(h), Value::Null)
+        );
+        // A URL but no method: the linked entry's method still applies.
+        let v = add(&manual("Method", Some("https://app.test/z"), vec![h]));
+        assert_eq!(v["method"], "POST");
+        let mut f = manual("Six", Some("http://[::1]:8080/x"), vec![]);
+        f.cwe = Some(639);
+        let v = add(&f);
+        assert_eq!(
+            (v["host"].as_str(), v["cwe"].as_i64(), v["method"].as_str()),
+            (Some("::1"), Some(639), Some("GET"))
+        );
+        let v = add(&manual("Socket", Some("wss://app.test/live"), vec![]));
+        assert_eq!(v["url"], "wss://app.test/live");
+        // Two links: no meta row, the table's first and last are enough.
+        let target = Target { scheme: "https".into(), host: "app.test".into(), port: 443 };
+        let other = s
+            .record(&Capture::new("send", &target, b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", None, None, None))
+            .unwrap();
+        let two = s.finding_add(&manual("Pair", Some("http://a.test/"), vec![other, h])).unwrap();
+        assert_eq!(s.finding_history_ids(two).unwrap(), [other, h]);
+        assert_eq!(s.meta_get(&history_key(two)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_refused_duplicate_changes_nothing() {
+        let (mut s, _) = store();
+        let mut f = manual("Order IDOR", Some("https://app.test/orders/7"), vec![]);
+        f.description = "First.".into();
+        let id = s.finding_add(&f).unwrap();
+        f.description = "Second.".into();
+        f.url = Some("https://app.test/orders/7?other=1".into());
+        assert!(matches!(s.finding_add(&f), Err(Error::Conflict(_))));
+        assert_eq!(s.finding_get(id).unwrap()["description"], "First.");
+        // Another parameter or method is another issue.
+        f.param = "id".into();
+        s.finding_add(&f).unwrap();
+        f.method = Some("DELETE".into());
+        s.finding_add(&f).unwrap();
+        assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn scanners_leave_findings_added_by_hand_alone() {
+        let (mut s, h) = store();
+        let id = s.finding_add(&manual("Order IDOR", None, vec![h])).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
+                 VALUES ('10037', 10037, 'X', '', '', '[]', '[]')",
+                [],
+            )
+            .unwrap();
+        // A passive rescan starts its own findings over, not the tester's.
+        s.findings_reset("passive").unwrap();
+        crate::scan::passive::scan_pending(&mut s).unwrap();
+        let items = s.findings_list(&FindingFilter::default(), 100).unwrap();
+        assert!(items.iter().any(|i| i["id"] == id && i["source"] == "manual"));
+        assert!(items.iter().all(|i| i["source"].is_string()));
+        let only =
+            s.findings_list(&FindingFilter { source: Some("manual".into()), ..Default::default() }, 100).unwrap();
+        assert_eq!(only.len(), 1);
+        // Removing it keeps every scanner type, used or not; the same id twice is one removal.
+        assert_eq!(s.findings_remove(&[id, id]).unwrap(), 1);
+        assert_eq!(s.findings_remove(&[]).unwrap(), 0);
+        let types = s.query("SELECT alert_ref FROM finding_types WHERE alert_ref = '10037'", &[], 10, 10).unwrap();
+        assert_eq!(types.rows.len(), 1);
+        assert!(matches!(s.finding_get(id), Err(Error::NotFound(_))));
+        assert!(matches!(s.findings_remove(&[id]), Err(Error::NotFound(_))));
+    }
 }

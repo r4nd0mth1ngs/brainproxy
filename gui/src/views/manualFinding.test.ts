@@ -72,3 +72,48 @@ test("Replay hands over its last send, or the request it holds", () => {
   assert.deepEqual(draftFromRequest(raw, ""), { method: "POST", url: undefined, history: [] });
   assert.deepEqual(draftFromRequest("", ""), { method: undefined, url: undefined, history: [] });
 });
+
+test("only web URLs with a host pass, whatever the method", () => {
+  for (const url of ["javascript:alert(1)", "file:///etc/passwd", "data:text/html,x", "http://", "mailto:a@b.test"]) {
+    assert.notEqual(formProblem(filled({ url })), null, url);
+  }
+  // The method only goes with a URL; without one the history entry's is used, so it isn't checked.
+  assert.equal(formProblem(filled({ url: "", history: "12", method: "GET /" })), null);
+  assert.match(formProblem(filled({ cwe: "0" }))!, /CWE/);
+  assert.equal(formProblem(filled({ title: "Überprüfung fehlt" })), null);
+  assert.equal(formProblem(filled({ title: "注入" })), null);
+});
+
+test("odd history ids are refused, repeats dropped", () => {
+  for (const text of ["1.5", "1e3", "0x10", "12a", "+3"]) assert.equal(historyIds(text), null, text);
+  assert.deepEqual(historyIds(" #7  #7\n8 "), [7, 8]);
+  assert.deepEqual(historyIds(" , "), []);
+});
+
+test("flags can't be confused with values", () => {
+  // Every value is joined to its flag, so text that starts with a dash stays text.
+  const { args, stdin } = findingAddArgs(
+    filled({ title: "--risk=info", param: "--url", solution: "-x", evidence: "  kept as typed ", description: "   " }),
+  );
+  assert.ok(args.every((a, i) => i < 2 || a.startsWith("--")));
+  assert.ok(args.includes("--title=--risk=info") && args.includes("--param=--url") && args.includes("--solution=-x"));
+  assert.ok(args.includes("--evidence=  kept as typed "));
+  assert.equal(args.filter((a) => a.startsWith("--risk=")).length, 1);
+  // A blank description is no description, and nothing reads stdin.
+  assert.equal(stdin, undefined);
+  assert.ok(!args.includes("--description-file=-"));
+  // History ids the form can't read are left out (formProblem stops the save first).
+  assert.ok(!findingAddArgs(filled({ history: "x" })).args.some((a) => a.startsWith("--history-id")));
+});
+
+test("Replay drafts read CRLF requests and absolute request lines", () => {
+  assert.deepEqual(draftFromRequest("GET /a?b=1 HTTP/1.1\r\nHost: app.test\r\n\r\n", "http://app.test:8080"), {
+    method: "GET",
+    url: "http://app.test:8080/a?b=1",
+    history: [],
+  });
+  assert.equal(draftFromRequest("GET http://other.test/x HTTP/1.1\n\n", "https://app.test").url, "http://other.test/x");
+  // The last send's URL wins over the request text.
+  assert.equal(draftFromRequest("GET /old HTTP/1.1\n\n", "https://app.test", 5, "https://app.test/new").url, "https://app.test/new");
+  assert.deepEqual(draftFromRequest("GET", "https://app.test"), { method: "GET", url: undefined, history: [] });
+});

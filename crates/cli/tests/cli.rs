@@ -901,3 +901,119 @@ fn auth_add_reads_a_literal_password_from_the_environment() {
     assert!(v["data"]["profile"]["password"]["literal"].is_string(), "{v}");
     assert!(!v.to_string().contains("-Pa55"), "{v}");
 }
+
+/// `findings add` records and never sends: a URL outside the engagement scope is kept with a
+/// warning, and nothing reaches history.
+#[test]
+fn findings_added_by_hand_warn_outside_scope_and_send_nothing() {
+    let project = tmp_project("manual-scope");
+    let add = |project: &std::path::Path, title: &str, url: &str| {
+        let (code, v) = run(&["findings", "add", "--title", title, "--risk", "low", "--url", url], project, None);
+        assert_eq!(code, 0, "{v}");
+        v["data"]["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    // The scope lists 127.0.0.1 and localhost.
+    assert!(add(&project, "In scope", "http://127.0.0.1:9/x").is_empty());
+    assert!(add(&project, "Socket in scope", "ws://localhost/live").is_empty());
+    let w = add(&project, "Elsewhere", "http://10.9.9.9/a");
+    assert!(w.len() == 1 && w[0].contains("10.9.9.9:80") && w[0].contains("outside"), "{w:?}");
+    let (_, v) = run(&["history", "list"], &project, None);
+    assert_eq!(v["data"]["count"], 0, "{v}");
+    let (_, v) = run(&["findings", "list", "--source", "manual", "--all"], &project, None);
+    let items = v["data"]["items"].as_array().unwrap();
+    assert!(items.len() == 3 && items.iter().all(|i| i["source"] == "manual"), "{v}");
+
+    // A scope of names: another name can't be in it, ws(s) URLs count as http(s).
+    let named = project.with_file_name("named.bpdb");
+    let _ = std::fs::remove_file(&named);
+    let (code, v) = run(&["engagement", "start", "--target", "app.test"], &named, None);
+    assert_eq!(code, 0, "{v}");
+    assert!(add(&named, "On the site", "https://app.test/a").is_empty());
+    assert!(add(&named, "Socket on the site", "wss://app.test/live").is_empty());
+    let w = add(&named, "Socket elsewhere", "wss://elsewhere.test/live");
+    assert!(w.len() == 1 && w[0].contains("elsewhere.test:443"), "{w:?}");
+    // In text, the warning comes before the result.
+    let out = bin()
+        .args(["--format", "text", "--project"])
+        .arg(&named)
+        .args(["findings", "add", "--title", "Elsewhere", "--risk", "low", "--url", "http://other.test/"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("warning: other.test:80 is outside") && text.contains("added finding"), "{text}");
+}
+
+/// Long texts come from a flag, a file, or stdin (only one of them), with clear errors.
+#[test]
+fn findings_add_reads_texts_from_files_and_stdin() {
+    let project = tmp_project("manual-texts");
+    let dir = project.parent().unwrap();
+    let file = dir.join("solution.md");
+    std::fs::write(&file, "Check the owner.\n").unwrap();
+    let base = ["findings", "add", "--title", "Order IDOR", "--risk", "high", "--url", "http://127.0.0.1/orders/7"];
+    fn args(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    let sol = file.to_str().unwrap();
+    let with = |more: &[&str]| base.iter().chain(more).map(|a| a.to_string()).collect::<Vec<String>>();
+
+    let (code, v) = run(
+        &args(&with(&["--description-file", "-", "--solution-file", sol, "--cwe", "639", "--history-id", ""])),
+        &project,
+        Some("Any user\nreads any order.".as_bytes()),
+    );
+    // An empty --history-id is not an id.
+    assert_eq!(code, 2, "{v}");
+    let (code, v) = run(
+        &args(&with(&["--description-file", "-", "--solution-file", sol, "--cwe", "639"])),
+        &project,
+        Some("Any user\nreads any order.".as_bytes()),
+    );
+    assert_eq!(code, 0, "{v}");
+    let f = &v["data"]["finding"];
+    assert_eq!(f["description"], "Any user\nreads any order.");
+    assert_eq!(f["solution"], "Check the owner.");
+    assert_eq!(
+        (f["cwe"].as_i64(), f["confidence"].as_str(), f["state"].as_str()),
+        (Some(639), Some("medium"), Some("open"))
+    );
+    let id = v["data"]["id"].as_i64().unwrap().to_string();
+    let (_, v) = run(&["findings", "show", &id], &project, None);
+    assert_eq!(v["data"]["history_ids"], serde_json::json!([]), "{v}");
+
+    let fail = |more: &[&str], stdin: Option<&[u8]>| {
+        let (code, v) = run(&args(&with(more)), &project, stdin);
+        (code, v["error"]["kind"].as_str().unwrap_or_default().to_string(), v["error"]["message"].to_string())
+    };
+    // Two flags can't both read stdin.
+    let (code, _, msg) = fail(&["--param", "a", "--description-file", "-", "--evidence-file", "-"], Some(b"x"));
+    assert!(code == 2 && msg.contains("stdin"), "{msg}");
+    // A text and its file flag together are a usage error.
+    let (code, kind, _) = fail(&["--param", "b", "--solution", "x", "--solution-file", sol], None);
+    assert_eq!((code, kind.as_str()), (2, "usage"));
+    let missing = dir.join("missing.txt");
+    let (code, kind, _) = fail(&["--param", "c", "--evidence-file", missing.to_str().unwrap()], None);
+    assert_eq!((code, kind.as_str()), (4, "not_found"));
+    let binary = dir.join("binary.bin");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+    let (code, _, msg) = fail(&["--param", "d", "--description-file", binary.to_str().unwrap()], None);
+    assert!(code == 2 && msg.contains("UTF-8"), "{msg}");
+    let (code, _, msg) = fail(&["--param", "e", "--description-file", "-"], Some(&[0xff, 0xfe]));
+    assert!(code == 2 && msg.contains("UTF-8"), "{msg}");
+    // A history entry that doesn't exist, a bad risk, and a URL that isn't one.
+    assert_eq!(fail(&["--param", "f", "--history-id", "99"], None).0, 4);
+    let (code, v) =
+        run(&["findings", "add", "--title", "X", "--risk", "severe", "--url", "http://a.test/"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("usage")));
+    let (code, v) =
+        run(&["findings", "add", "--title", "X", "--risk", "low", "--url", "javascript:alert(1)"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    // None of these was stored.
+    let (_, v) = run(&["findings", "list", "--source", "manual", "--all"], &project, None);
+    assert_eq!(v["data"]["items"].as_array().unwrap().len(), 1, "{v}");
+    // Removing one that isn't there removes nothing.
+    let (code, v) = run(&["findings", "remove", &id, "99"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
+    let (code, v) = run(&["findings", "remove", &id], &project, None);
+    assert_eq!((code, v["data"]["removed"].as_i64()), (0, Some(1)));
+}

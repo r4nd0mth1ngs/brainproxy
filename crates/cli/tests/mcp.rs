@@ -445,3 +445,36 @@ fn an_agent_adds_findings_from_stdin_but_reads_no_files() {
     let (err, e) = m.call("findings_remove", json!({"ids": [id]}));
     assert!(!err && e["data"]["removed"] == 1, "{e}");
 }
+
+#[test]
+fn an_agent_reads_no_file_through_any_finding_text_flag() {
+    let p = tmp_project("manual-files");
+    let dir = p.parent().unwrap();
+    std::fs::write(dir.join("notes.txt"), "FAKE-PRIVATE-NOTES").unwrap();
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let list = m.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    for name in ["findings_add", "findings_remove"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(t["annotations"]["readOnlyHint"], false, "{t}");
+    }
+    let abs = dir.join("notes.txt");
+    for flag in ["description_file", "solution_file", "evidence_file"] {
+        for path in [abs.to_str().unwrap(), "notes.txt", "/etc/hostname"] {
+            let mut args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7"});
+            args[flag] = json!(path);
+            let (err, e) = m.call("findings_add", args);
+            assert!(err && e["error"]["message"].as_str().unwrap().contains("through MCP"), "{flag} {path}: {e}");
+            assert!(!e.to_string().contains("FAKE-PRIVATE-NOTES"), "{e}");
+        }
+    }
+    // Only one flag reads the call's stdin.
+    let args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7",
+        "description_file": "-", "solution_file": "-", "stdin": "x"});
+    let (err, e) = m.call("findings_add", args);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("stdin"), "{e}");
+    // Nothing was added on the way.
+    let (err, e) = m.call("findings_list", json!({"source": "manual", "all": true}));
+    assert!(!err && e["data"]["count"] == 0, "{e}");
+}
