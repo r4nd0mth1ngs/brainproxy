@@ -31,6 +31,103 @@ pub fn introspection_body() -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Whether a recorded request carries a GraphQL mutation: a JSON body (or batch) whose
+/// `query` defines one, an `application/graphql` body, or a `query` URL parameter. A scan
+/// treats it like PUT or DELETE, whatever its method and wherever it was recorded.
+pub fn is_mutation_request(request: &[u8]) -> bool {
+    documents(request).iter().any(|d| defines_mutation(d))
+}
+
+/// The GraphQL documents a request carries, so two operations at one endpoint with the same
+/// variables can be told apart; empty for anything else.
+pub fn documents(request: &[u8]) -> Vec<String> {
+    let Ok(head) = crate::http::RawRequest::from_bytes(request.to_vec()).head() else { return vec![] };
+    let (_, body) = crate::http::request::split_head_body(request);
+    let mut out: Vec<String> = head
+        .target
+        .split_once('?')
+        .map(|(_, q)| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .filter(|(k, _)| k == "query")
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let graphql_body = head
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().contains("application/graphql"));
+    if graphql_body {
+        out.push(String::from_utf8_lossy(body).into_owned());
+        return out;
+    }
+    let query = |v: &Value| v.get("query").and_then(Value::as_str).map(str::to_string);
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Array(batch)) => out.extend(batch.iter().filter_map(query)),
+        Ok(v) => out.extend(query(&v)),
+        Err(_) => {}
+    }
+    out
+}
+
+/// Whether a GraphQL document defines a mutation operation. Strings and comments are
+/// skipped; a definition is a mutation when its first word at the top level says so.
+pub fn defines_mutation(doc: &str) -> bool {
+    let b = doc.as_bytes();
+    let (mut i, mut depth, mut word, mut first) = (0, 0usize, String::new(), true);
+    // Ends the word being read; true when it opens a mutation.
+    fn end_word(word: &mut String, first: &mut bool, depth: usize) -> bool {
+        let mutation = depth == 0 && *first && word == "mutation";
+        if depth == 0 && !word.is_empty() {
+            *first = false;
+        }
+        word.clear();
+        mutation
+    }
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            word.push(c as char);
+            i += 1;
+            continue;
+        }
+        if end_word(&mut word, &mut first, depth) {
+            return true;
+        }
+        match c {
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' if b[i..].starts_with(b"\"\"\"") => {
+                i += 3;
+                while i < b.len() && !b[i..].starts_with(b"\"\"\"") {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 2;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' && b[i] != b'\n' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && c == b'}' {
+                    // The next definition starts.
+                    first = true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    end_word(&mut word, &mut first, depth)
+}
+
 struct Schema<'a> {
     types: HashMap<&'a str, &'a Value>,
 }
@@ -635,6 +732,40 @@ mod tests {
 
         let err = build(&json!({"errors": [{"message": "introspection disabled"}]}), "http://g.test/", false);
         assert!(err.unwrap_err().to_string().contains("introspection disabled"));
+    }
+
+    #[test]
+    fn mutations_are_recognised_in_recorded_requests() {
+        for doc in [
+            "mutation deleteUser($id: ID!) { deleteUser(id: $id) }",
+            "  # a comment\n mutation { a }",
+            "query q { a } mutation m { b }",
+            "fragment F on T { x } mutation { a { ...F } }",
+            "\"\"\"described\"\"\" mutation { a }",
+        ] {
+            assert!(defines_mutation(doc), "{doc}");
+        }
+        for doc in [
+            "query user { user { id } }",
+            "{ mutation }",
+            "query q($mutation: Int) { a(mutation: $mutation) }",
+            "# mutation { a }\nquery { a }",
+            "query { a(s: \"mutation { x }\") }",
+            "",
+        ] {
+            assert!(!defines_mutation(doc), "{doc}");
+        }
+        let req = |head: &str, body: &str| format!("{head}\r\nHost: g.test\r\n\r\n{body}").into_bytes();
+        let m = r#"{"query": "mutation deleteUser { deleteUser(id: 1) }"}"#;
+        assert!(is_mutation_request(&req("POST /graphql HTTP/1.1\r\nContent-Type: application/json", m)));
+        assert!(is_mutation_request(&req("POST /graphql HTTP/1.1", &format!("[{m}]"))));
+        assert!(is_mutation_request(&req(
+            "POST /graphql HTTP/1.1\r\nContent-Type: application/graphql",
+            "mutation { a }"
+        )));
+        assert!(is_mutation_request(&req("GET /graphql?query=mutation%20%7B%20a%20%7D HTTP/1.1", "")));
+        assert!(!is_mutation_request(&req("POST /graphql HTTP/1.1", r#"{"query": "query { a }"}"#)));
+        assert!(!is_mutation_request(&req("POST /form HTTP/1.1", "mutation=1")));
     }
 
     #[test]

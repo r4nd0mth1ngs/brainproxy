@@ -318,7 +318,7 @@ impl ApiArgs {
     fn selection(&self) -> api::Selection {
         let mut include_methods = self.include_methods.clone();
         if self.doc.common.include_destructive {
-            include_methods.push("DELETE".into());
+            include_methods.extend(["DELETE".into(), api::MUTATION.into()]);
         }
         selection(&include_methods, self.only.clone())
     }

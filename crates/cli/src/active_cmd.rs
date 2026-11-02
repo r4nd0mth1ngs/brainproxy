@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use brainproxy_core::apiimport::api::{self, DEFAULT_METHODS};
-use brainproxy_core::apiimport::{self, RunConfig};
+use brainproxy_core::apiimport::{self, graphql, RunConfig};
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
@@ -85,7 +85,8 @@ pub struct ActiveArgs {
     browser_id: Option<String>,
     /// Also attack requests from history with these methods (comma-separated, or `all`).
     /// By default only GET, HEAD, OPTIONS and POST are replayed, and POST can change data or
-    /// trigger side effects such as email; --history-id is always attacked.
+    /// trigger side effects such as email. GraphQL mutations are MUTATION, whatever their
+    /// method. --history-id is always attacked.
     #[arg(long, value_delimiter = ',', value_name = "METHODS")]
     include_methods: Vec<String>,
     /// History entry to attack. Repeatable.
@@ -843,10 +844,18 @@ fn select_targets(
         let head = RawRequest::from_bytes(t.request.clone()).head().ok();
         let method = head.as_ref().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default();
         let explicit = t.history_id.is_some_and(|id| args.history_ids.contains(&id));
+        // A GraphQL mutation travels as POST but is opted in to as MUTATION, like PUT or
+        // DELETE, wherever it was recorded (an `import api` someone opted in to once, the proxy).
+        let documents = graphql::documents(&t.request);
+        let opt_in = if documents.iter().any(|d| graphql::defines_mutation(d)) {
+            api::MUTATION.to_string()
+        } else {
+            method.clone()
+        };
         if !(all_methods
             || explicit
-            || DEFAULT_METHODS.contains(&method.as_str())
-            || args.include_methods.contains(&method))
+            || DEFAULT_METHODS.contains(&opt_in.as_str())
+            || args.include_methods.contains(&opt_in))
         {
             skipped_methods += 1;
             continue;
@@ -857,7 +866,8 @@ fn select_targets(
             .unwrap_or_default();
         let mut names: Vec<String> = points::points(&t.request, opts).into_iter().map(|p| p.name).collect();
         names.sort();
-        match seen.entry((method, t.target.origin(), path, names)) {
+        // GraphQL operations share one path, so the operation tells them apart.
+        match seen.entry((method, t.target.origin(), path, names, documents)) {
             Entry::Vacant(e) => {
                 e.insert(kept.len());
                 kept.push(t);
