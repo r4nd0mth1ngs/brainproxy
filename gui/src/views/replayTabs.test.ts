@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fromSaved, saver, toSaved } from "./replayTabs.ts";
+import { closingSaves, fromSaved, saver, toSaved } from "./replayTabs.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -224,13 +224,13 @@ test("the same error is reported again after a save in between works", async () 
     onSaved: () => ok++,
   });
   s.schedule("A");
-  await s.flush();
+  await assert.rejects(s.flush(), /locked/);
   fail = false;
   s.schedule("B");
   await s.flush();
   fail = true;
   s.schedule("C");
-  await s.flush();
+  await assert.rejects(s.flush(), /locked/);
   assert.deepEqual(errors, ["locked", "locked"]);
   assert.equal(ok, 1);
 });
@@ -248,7 +248,7 @@ test("flush with nothing waiting saves nothing; cancel drops a failed set too", 
   });
   await s.flush();
   s.schedule("A");
-  await s.flush();
+  await assert.rejects(s.flush(), /x/);
   fail = false;
   // A temporary project being discarded: what failed isn't tried again.
   s.cancel();
@@ -336,4 +336,93 @@ test("the body is made only when a save is due", async () => {
   await sleep(30);
   assert.equal(made, 1);
   assert.deepEqual(saves, ["C"]);
+});
+
+test("a flush that can't save rejects, so Save as stops; a later one that works resolves", async () => {
+  let fail = true;
+  const saves: string[] = [];
+  const errors: string[] = [];
+  const s = saver({
+    save: async (b) => {
+      if (fail) throw new Error("over 16 MB");
+      saves.push(b);
+    },
+    delay: 1,
+    onError: (e) => errors.push(e.message),
+  });
+  // The pause's save fails first: reported once, and the flush after it still rejects.
+  s.schedule("A");
+  await sleep(10);
+  assert.deepEqual(errors, ["over 16 MB"]);
+  await assert.rejects(s.flush(), (e: Error) => e.message === "over 16 MB");
+  // Another flush waiting on the one that fails rejects too, after trying again itself.
+  s.schedule("B");
+  const first = s.flush();
+  const second = s.flush();
+  await assert.rejects(first, /over 16 MB/);
+  await assert.rejects(second, /over 16 MB/);
+  assert.deepEqual(errors, ["over 16 MB"]);
+  fail = false;
+  await s.flush();
+  assert.deepEqual(saves, ["B"]);
+});
+
+test("a failed save after the pause doesn't reject unheard", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: unknown) => unhandled.push(e);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const errors: string[] = [];
+    const s = saver({ save: async () => Promise.reject(new Error("locked")), delay: 1, onError: (e) => errors.push(e.message) });
+    s.schedule("A");
+    await sleep(20);
+    assert.deepEqual(errors, ["locked"]);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("a project opened again reads its tabs after the save from closing it", async () => {
+  // The project file: what `replay tabs list` returns.
+  let stored = "old";
+  let release!: () => void;
+  const s = saver({
+    save: (b) => new Promise<void>((r) => (release = () => ((stored = b), r()))),
+    delay: 1000,
+    onError: () => assert.fail("no error"),
+  });
+  const closing = closingSaves();
+  s.loaded("old");
+  s.schedule("new");
+  // Closed while the save is slow, then opened again at once.
+  closing.add("/p.bpx", s.flush());
+  let read: string | null = null;
+  const reopened = closing.wait("/p.bpx").then(() => (read = stored));
+  // Another project doesn't wait.
+  await closing.wait("/other.bpx");
+  await sleep(10);
+  assert.equal(read, null);
+  release();
+  await reopened;
+  assert.equal(read, "new");
+  // Done: nothing left to wait for.
+  await closing.wait("/p.bpx");
+});
+
+test("waiting on closing saves covers each one and outlasts a failure", async () => {
+  const closing = closingSaves();
+  let releaseA!: () => void;
+  let rejectB!: (e: Error) => void;
+  closing.add("/p.bpx", new Promise<void>((r) => (releaseA = r)));
+  closing.add("/p.bpx", new Promise<void>((_, r) => (rejectB = r)));
+  let done = false;
+  const waiting = closing.wait("/p.bpx").then(() => (done = true));
+  rejectB(new Error("locked"));
+  await sleep(10);
+  // The first close's save is still running.
+  assert.equal(done, false);
+  releaseA();
+  await waiting;
+  assert.equal(done, true);
 });

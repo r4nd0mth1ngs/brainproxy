@@ -4,7 +4,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { run } from "./api";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
-import { LIST_ARGS, SAVE_ARGS, fromSaved, saver, toSaved } from "./views/replayTabs";
+import { LIST_ARGS, SAVE_ARGS, closingSaves, fromSaved, saver, toSaved } from "./views/replayTabs";
 
 export type Tab =
   | "dashboard"
@@ -58,7 +58,10 @@ interface State {
   temp: TempInfo | null;
   /** Saves a temporary project to a file the user picks, then switches to it. */
   saveAs: () => Promise<void>;
-  /** Saves Replay's tabs to the project now instead of after the usual pause (the window is closing). */
+  /**
+   * Saves Replay's tabs to the project now instead of after the usual pause (the project or the
+   * window is closing). Rejects if they couldn't be saved.
+   */
   flushReplayTabs: () => Promise<void>;
   tab: Tab;
   setTab: (t: Tab) => void;
@@ -94,6 +97,9 @@ const newKey = () => nextKey++;
 
 /** How long Replay's tabs stay unchanged before they are saved to the project. */
 const SAVE_TABS_AFTER_MS = 1000;
+
+// Replay tabs being saved by projects that just closed; one opened again reads its tabs after.
+const closing = closingSaves();
 
 export function useApp(): State {
   const s = useContext(Ctx);
@@ -174,7 +180,9 @@ export function AppProvider({
   }, [tabSaver, tabsBody]);
   useEffect(() => {
     let cancelled = false;
-    run(LIST_ARGS, { project })
+    closing
+      .wait(project)
+      .then(() => (cancelled ? null : run(LIST_ARGS, { project })))
       .then((data) => {
         if (cancelled) return;
         const saved = fromSaved(data, newKey);
@@ -191,15 +199,21 @@ export function AppProvider({
     return () => {
       cancelled = true;
       // A temporary project is being discarded, or was just saved elsewhere (which saves first).
+      // Otherwise saved, and reopening it waits for that (switching project already asked
+      // if the tabs couldn't be saved).
       if (tempRef.current) tabSaver.cancel();
-      else void flushReplayTabs();
+      else closing.add(project, flushReplayTabs());
     };
   }, [project, tabSaver, setRepeater, setRepeaterActive, flushReplayTabs]);
   useEffect(() => {
     if (tabsLoaded) tabSaver.schedule(tabsBody);
   }, [tabsLoaded, repeater, repeaterActive, tabSaver, tabsBody]);
+  // The copy holds what the project holds, and the temporary one is deleted after: with tabs
+  // that couldn't be saved it stays open, so they aren't lost.
   const saveAsWithTabs = useCallback(async () => {
-    await flushReplayTabs();
+    await flushReplayTabs().catch((e) => {
+      throw new Error(`Replay tabs couldn't be saved first (${e.message}), so the temporary engagement stays open`);
+    });
     await saveAs();
   }, [flushReplayTabs, saveAs]);
 

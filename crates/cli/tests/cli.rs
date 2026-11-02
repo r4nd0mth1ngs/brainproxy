@@ -655,6 +655,20 @@ fn replay_tabs_keep_bytes_and_placeholders_and_send_nothing() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "saved 1 Replay tab\n");
     assert_eq!(text(&["replay", "tabs", "list"]), "  1  ws      \n");
+    // Control characters in a title or target can't clear the screen or add a row in text
+    // mode; JSON and the project keep them as saved.
+    let sly = serde_json::json!({"tabs": [
+        {"title": "\u{1b}[2J\u{1b}]0;x\u{7}", "target": "http://a.test\r\n  2  http  forged  http://b.test", "request": ""},
+    ]});
+    let (code, v) = run(&["replay", "tabs", "save"], &project, Some(sly.to_string().as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        text(&["replay", "tabs", "list"]),
+        "  1  http  \\u{1b}[2J\\u{1b}]0;x\\u{7}  http://a.test\\r\\n  2  http  forged  http://b.test\n"
+    );
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(v["data"]["tabs"][0]["title"], sly["tabs"][0]["title"]);
+    assert_eq!(v["data"]["tabs"][0]["target"], sly["tabs"][0]["target"]);
     run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
     assert_eq!(text(&["replay", "tabs", "list"]), "no saved Replay tabs\n");
 }

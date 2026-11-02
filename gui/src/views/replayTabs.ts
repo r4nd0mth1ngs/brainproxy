@@ -76,7 +76,8 @@ export function fromSaved(data: unknown, nextKey: () => number): { tabs: Repeate
  * Saves the latest body `delay` ms after the last change. One save runs at a time and later
  * changes wait for it; the body is made only when a save is due (it can be large), and one
  * equal to the last saved isn't sent again. `onError` hears each new failure once (not every
- * retry of the same one), `onSaved` each success.
+ * retry of the same one), `onSaved` each success. `flush` also rejects when its save fails, so
+ * whoever needs the tabs saved (Save as) can stop.
  */
 export function saver(o: {
   save: (body: string) => Promise<unknown>;
@@ -88,20 +89,22 @@ export function saver(o: {
   let saved: string | null = null;
   let lastError = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let running: Promise<void> | null = null;
+  let running: Promise<Error | null> | null = null;
 
-  const write = async (body: string) => {
+  const write = async (body: string): Promise<Error | null> => {
     try {
       await o.save(body);
       saved = body;
       lastError = "";
       o.onSaved?.();
+      return null;
     } catch (e: any) {
       // Kept for the next try (another change, or the flush on close).
       if (pending == null) pending = () => body;
       const err = e instanceof Error ? e : new Error(String(e));
       if (err.message !== lastError) o.onError(err);
       lastError = err.message;
+      return err;
     }
   };
 
@@ -118,7 +121,8 @@ export function saver(o: {
     const body = next();
     if (body === saved) return;
     running = write(body).finally(() => (running = null));
-    await running;
+    const err = await running;
+    if (err) throw err;
   };
 
   return {
@@ -126,9 +130,10 @@ export function saver(o: {
     schedule(body: string | (() => string)) {
       pending = typeof body === "string" ? () => body : body;
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => void flush(), o.delay);
+      // A failure here is reported through onError.
+      timer = setTimeout(() => void flush().catch(() => {}), o.delay);
     },
-    /** Saves what is waiting now (the project or the window is closing). */
+    /** Saves what is waiting now (the project or the window is closing); rejects if that fails. */
     flush,
     /** Marks `body` as what the project holds, e.g. the set just loaded, so it isn't saved back. */
     loaded(body: string) {
@@ -139,6 +144,29 @@ export function saver(o: {
       if (timer) clearTimeout(timer);
       timer = null;
       pending = null;
+    },
+  };
+}
+
+/**
+ * Saves still running for projects that were closed. A project opened again waits for its own
+ * before reading its tabs: otherwise it would load the set from before them, and its next save
+ * would replace the newer one.
+ */
+export function closingSaves() {
+  const running = new Map<string, Promise<unknown>>();
+  return {
+    /** `project` is closing and saving its tabs with `save`. */
+    add(project: string, save: Promise<unknown>) {
+      // After any earlier one still running for it (a quick close, reopen and close again).
+      const done: Promise<unknown> = Promise.all([running.get(project), save.catch(() => {})]).finally(() => {
+        if (running.get(project) === done) running.delete(project);
+      });
+      running.set(project, done);
+    },
+    /** Resolves once `project`'s saves on close are done, failed or not. */
+    async wait(project: string) {
+      await running.get(project);
     },
   };
 }

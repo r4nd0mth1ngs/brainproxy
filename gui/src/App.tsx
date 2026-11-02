@@ -259,6 +259,21 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   useEngage(app.toast);
 
   const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
+  // Switching project: Replay's tabs are saved before it closes (so reopening it shows them),
+  // and if they can't be, it stays open unless the user chooses to close it anyway.
+  const leave = async () => {
+    if (!app.temp) {
+      const failed = await app.flushReplayTabs().then(
+        () => null,
+        (e: Error) => e,
+      );
+      if (failed) {
+        const msg = `They couldn't be saved to the project: ${failed.message}. Changes since the last save are lost if it closes.`;
+        if (!(await confirm("Close without saving Replay's tabs?", msg, "Close anyway", "Keep open"))) return;
+      }
+    }
+    onClose();
+  };
   const tempTitle = app.temp
     ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and deleted when you discard it. Click to save it as a project file.`
     : "";
@@ -304,7 +319,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     <div className={`app ${collapsed ? "nav-collapsed" : ""}`}>
       <header className="top">
         <div className="top-left">
-          <div className="brand" onClick={onClose} title="Switch project">
+          <div className="brand" onClick={leave} title="Switch project">
             <Logo size={22} />
             <span className="brand-name">brainproxy</span>
           </div>
@@ -376,7 +391,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
                 <span className="nav-label">Save as…</span>
               </button>
             )}
-            <button className="nav-item" onClick={onClose} title={collapsed ? "Switch project" : undefined}>
+            <button className="nav-item" onClick={leave} title={collapsed ? "Switch project" : undefined}>
               <Icon name="switch" />
               <span className="nav-label">Switch project</span>
             </button>

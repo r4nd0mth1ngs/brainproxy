@@ -12,7 +12,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::output::Out;
+use crate::output::{escape_controls, Out};
 
 /// The meta key holding the saved set (JSON); absent when there are no tabs.
 const KEY: &str = "replay.tabs";
@@ -98,9 +98,10 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
                 tabs.iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        let kind = t["kind"].as_str().unwrap_or("http");
-                        let title = t["title"].as_str().unwrap_or_default();
-                        let target = t["target"].as_str().unwrap_or_default();
+                        // Typed or prepared by someone else: shown escaped, stored and in JSON as is.
+                        let kind = escape_controls(t["kind"].as_str().unwrap_or("http"));
+                        let title = escape_controls(t["title"].as_str().unwrap_or_default());
+                        let target = escape_controls(t["target"].as_str().unwrap_or_default());
                         format!("{:>3}  {kind:<4}  {title}  {target}", i + 1)
                     })
                     .collect::<Vec<_>>()

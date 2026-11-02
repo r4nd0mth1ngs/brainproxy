@@ -173,6 +173,8 @@ table), with the logic in `views/replayTabs.ts`:
 - **Opening:** the saved tabs are read when the project opens, with new keys, and the saved
   active tab is shown. Tabs sent to Replay while they load stay, after them. Nothing is saved
   until the read succeeds, so a failed read (a toast says so) never replaces the saved set.
+  A project opened again waits for the save from closing it before reading, so it never
+  loads the set from before and later saves over the newer one.
 - **Saving:** one second after the tabs stop changing (the editors pass their text up after
   300 ms), on the CLI in the background, so typing never waits. One save runs at a time and
   an unchanged set isn't sent again. Closing the project or the window takes the editor's
@@ -182,7 +184,9 @@ table), with the logic in `views/replayTabs.ts`:
   binary flag, and a WebSocket tab's Listen and Until (now kept when switching tabs too).
   Never responses or the send history. Text goes as typed, auth placeholders included.
 - **Failures:** a refused save (over 500 tabs or 16 MB) is a toast, shown once per distinct
-  error; the tabs stay open, and the next change or closing tries again.
+  error; the tabs stay open, and the next change or closing tries again. *Save as…* stops
+  there and leaves the temporary project open (copying it would leave those tabs behind);
+  switching project asks before closing without them.
 - **Agents:** `replay_tabs_save` is an MCP tool (not read-only, destructive: it replaces the
   set; it sends nothing), so an agent can prepare tabs for a person to review and send.
   `replay_tabs_list` is read-only and its output is marked untrusted, since requests often
