@@ -2,7 +2,7 @@
 // and starting or moving the proxy with it and proxyMode.ts's setup. `cli` is api.ts's `run`.
 
 import { proxyOptions } from "./accessMatrix.ts";
-import { savedProxySetup, setupHost, setupOptions, targetHost, withSetup, type ProxySetup } from "./proxyMode.ts";
+import { DEFAULT_SETUP, savedProxySetup, setupHost, setupOptions, targetHost, withSetup, type ProxySetup } from "./proxyMode.ts";
 
 type Cli = (args: string[]) => Promise<unknown>;
 
@@ -55,8 +55,8 @@ export function saveProxyPort(port: number | null): boolean {
   }
 }
 
-/** The address the app starts the proxy on. */
-export function proxyListen(port = savedProxyPort(), setup: ProxySetup = savedProxySetup()): string {
+/** The address the app starts the proxy on, with a project's setup (proxyMode.ts; this computer only by default). */
+export function proxyListen(port = savedProxyPort(), setup: ProxySetup = DEFAULT_SETUP): string {
   return `${setupHost(setup)}:${port ?? DEFAULT_PROXY_PORT}`;
 }
 

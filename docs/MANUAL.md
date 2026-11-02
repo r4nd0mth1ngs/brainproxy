@@ -571,11 +571,12 @@ byte, side by side or unified.
   refuses, the proxy stays off and says why.
   - *Who can connect:* this computer only (127.0.0.1, the default) or every network
     interface (0.0.0.0), for another device. The second asks first: anyone who can reach
-    your computer can then use the proxy without a password, and their requests are
-    recorded in the project. The choice holds for every project, so while the proxy runs
-    that way the top-bar pill says *open to the network* and this page shows a warning.
-    The setup lines show 127.0.0.1 for this computer; other devices use its LAN address
-    on the same port.
+    your computer can then use the proxy without a password, their requests get the
+    project's auth profiles, session rules and platform auth (Basic, Digest, NTLM), and
+    they are recorded in the project. The choice holds for this project only, and its proxy
+    starts that way whenever it opens: a message says so, the top-bar pill says *open to the
+    network* while it runs, and this page shows a warning. The setup lines show 127.0.0.1
+    for this computer; other devices use its LAN address on the same port.
   - *Invisible mode* (`--invisible`): for a device or program with no proxy setting. Point
     the target's name at this computer with DNS or the hosts file, set *Port* to the site's
     own (usually 80 or 443), and the client connects here as if to the site; it has to trust
@@ -583,8 +584,10 @@ byte, side by side or unified.
   - *Send everything to* (`--redirect`): every request from the listener goes to this origin
     (`https://host[:port]`), whatever host it names; it turns invisible mode on, and browsers
     opened with *Open browser* go there too. It must be in the engagement scope (checked
-    with `engagement check` when you save) and is kept for this project only (*Save as…*
-    takes it along).
+    with `engagement check` each time you save, so a name that didn't resolve can be tried
+    again).
+  - *Who can connect*, *Invisible mode* and *Send everything to* are kept for this project
+    only (*Save as…* takes them along; a new project starts with none).
   - These apply the next time the proxy starts. A running proxy that differs shows what would
     change and *Restart with these settings*, which works like the port restart.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,

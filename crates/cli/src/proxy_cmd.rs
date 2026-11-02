@@ -477,8 +477,13 @@ fn forget(store: &Store) -> Result<Option<u32>, Error> {
 }
 
 /// An address to connect to the proxy on: a wildcard listen address isn't one, so its loopback.
+/// Only the whole host is matched (`10.0.0.0:8080` stays as it is).
 pub(crate) fn connect_addr(listen: &str) -> String {
-    listen.replace("0.0.0.0:", "127.0.0.1:").replace("[::]:", "[::1]:")
+    match listen.rsplit_once(':') {
+        Some(("0.0.0.0", port)) => format!("127.0.0.1:{port}"),
+        Some(("[::]", port)) => format!("[::1]:{port}"),
+        _ => listen.to_string(),
+    }
 }
 
 fn usage_hints(state: &ProxyState) -> Value {
@@ -1022,6 +1027,23 @@ mod tests {
     }
 
     #[test]
+    fn connect_addr_replaces_only_a_whole_wildcard_host() {
+        for (listen, addr) in [
+            ("0.0.0.0:8080", "127.0.0.1:8080"),
+            ("[::]:8080", "[::1]:8080"),
+            ("10.0.0.0:8080", "10.0.0.0:8080"),
+            ("100.0.0.0:80", "100.0.0.0:80"),
+            ("10.0.0.0.0:8080", "10.0.0.0.0:8080"),
+            ("[::ffff:0.0.0.0]:8080", "[::ffff:0.0.0.0]:8080"),
+            ("[2001:db8::]:8080", "[2001:db8::]:8080"),
+            ("127.0.0.1:8080", "127.0.0.1:8080"),
+            ("8080", "8080"),
+        ] {
+            assert_eq!(connect_addr(listen), addr, "{listen}");
+        }
+    }
+
+    #[test]
     fn usage_hints_point_at_loopback_for_a_wildcard_listen_address() {
         let state = |listen: &str| ProxyState {
             pid: 1,
@@ -1038,13 +1060,15 @@ mod tests {
             ("[::]:8080", "http://[::1]:8080"),
             ("[::1]:8080", "http://[::1]:8080"),
             ("10.0.0.5:8080", "http://10.0.0.5:8080"),
+            ("10.0.0.0:8080", "http://10.0.0.0:8080"),
+            ("100.0.0.0:80", "http://100.0.0.0:80"),
         ] {
             let hints = usage_hints(&state(listen));
             assert_eq!(hints["proxy_url"], url, "{listen}");
             for key in ["curl", "env", "chromium"] {
                 let text = hints[key].as_str().unwrap();
                 assert!(
-                    text.contains(url) && !text.contains("0.0.0.0") && !text.contains("[::]:"),
+                    text.contains(url) && !text.contains("//0.0.0.0") && !text.contains("[::]:"),
                     "{listen} {key}: {text}"
                 );
             }

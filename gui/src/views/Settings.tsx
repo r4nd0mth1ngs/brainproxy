@@ -14,6 +14,8 @@ import {
   networkNote,
   redirectError,
   redirectOrigin,
+  redirectProblem,
+  redirectToCheck,
   runningSetup,
   saveProxySetup,
   savedProxySetup,
@@ -1320,7 +1322,7 @@ interface ProxyStatus {
 }
 
 /** The port the app starts the proxy on. */
-function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => void; running: string | null }) {
+function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => void; running: string | null; setup: ProxySetup }) {
   const app = useApp();
   const saved = p.saved;
   const [text, setText] = useState(saved == null ? "" : String(saved));
@@ -1343,7 +1345,7 @@ function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => 
     p.onSaved(port);
     app.toast(
       port != null
-        ? `Saved. The proxy will listen on ${proxyListen(port)} when it next starts.`
+        ? `Saved. The proxy will listen on ${proxyListen(port, p.setup)} when it next starts.`
         : `Saved. ${p.running ? `The proxy stays on ${p.running} until it stops. After that it` : "The proxy"} will use port ${DEFAULT_PROXY_PORT}, or the next free one, when a project opens.`,
     );
   };
@@ -1398,7 +1400,7 @@ function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => 
 }
 
 const EXPOSED =
-  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours and are recorded in this project. Use it only on a network you trust, or block the port in a firewall.";
+  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours, with this project's auth profiles, session rules and platform auth (Basic, Digest, NTLM) applied, and are recorded in this project. It applies to this project only, and the proxy starts that way whenever the project opens. Use it only on a network you trust, or block the port in a firewall.";
 
 /** Who can connect to the proxy, invisible mode and the redirect (proxyMode.ts). */
 function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => void }) {
@@ -1408,7 +1410,8 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
   const [invisible, setInvisible] = useState(p.saved.invisible);
   const [redirect, setRedirect] = useState(p.saved.redirect ?? "");
   const [checking, setChecking] = useState(false);
-  // The scope check's refusal, for the origin it was made for: a later edit doesn't inherit it.
+  // The last scope check's refusal, for the origin it was made for: a later edit doesn't inherit
+  // it, and each Save checks again (a name that didn't resolve may now, or a host override was added).
   const [refused, setRefused] = useState<Refusal | null>(null);
   // Bumped when Save is pressed with an invalid or refused redirect, so the error is announced again.
   const [attempt, setAttempt] = useState(0);
@@ -1419,7 +1422,7 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
   const changed = all !== p.saved.allInterfaces || invisible !== p.saved.invisible || origin !== p.saved.redirect;
 
   const save = async () => {
-    if (problem) {
+    if (redirectProblem(redirect)) {
       setAttempt((n) => n + 1);
       input.current?.focus();
       return;
@@ -1427,11 +1430,13 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
     if (!changed) return;
     setChecking(true);
     try {
-      if (origin && origin !== p.saved.redirect) {
-        const why = scopeProblem(await run(scopeCheckArgs(origin)));
+      const check = redirectToCheck(redirect, p.saved.redirect);
+      if (check) {
+        const why = scopeProblem(await run(scopeCheckArgs(check)));
+        setRefused(why ? { origin: check, why } : null);
         if (why) {
-          setRefused({ origin, why });
           setAttempt((n) => n + 1);
+          input.current?.focus();
           return;
         }
       }
@@ -1504,8 +1509,9 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
       <p id={`${id}-help`} className="muted small">
         Optional. Every request from the listener goes to this origin, whatever host it names, like a reverse proxy; each keeps
         its path. It turns invisible mode on, and browsers opened with Open browser go there too. It has to be in this
-        engagement's scope (checked when you save) and is kept for this project only.
+        engagement's scope (checked each time you save).
       </p>
+      <p className="muted small">Who can connect, invisible mode and the redirect are kept for this project only.</p>
       {/* Enabled with an invalid redirect too: pressing it (or Enter) points at the error. */}
       <button className="btn small primary" disabled={checking || (!problem && !changed)}>
         {checking ? "Checking…" : "Save"}
@@ -1619,8 +1625,9 @@ function ProxySetup() {
       </div>
       {elsewhere && (
         <div className="wiz-warn danger">
-          Listening on every network interface, as chosen under Who can connect for every project: anyone who can reach this
-          computer can use the proxy.
+          Listening on every network interface: anyone who can reach this computer can use the proxy, with this project's auth
+          profiles, session rules and platform auth (Basic, Digest, NTLM) applied to their requests. Choose this computer only
+          under Who can connect, or stop the proxy from the top bar.
         </div>
       )}
       {usage ? (
@@ -1663,6 +1670,7 @@ function ProxySetup() {
       )}
       <ProxyPort
         saved={port}
+        setup={setup}
         running={proxy?.running ? (proxy.proxy?.listen ?? null) : null}
         onSaved={(n) => {
           setPort(n);

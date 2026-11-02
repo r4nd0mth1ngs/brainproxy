@@ -324,9 +324,10 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       const live = liveArgs(f);
       setBusy(true);
       const s = await run<ProxyStatus>(["proxy", "status"]);
-      const listen = `--listen=${s.proxy?.listen ?? proxyListen()}`;
-      // A proxy that isn't running starts with the saved invisible mode and redirect, as elsewhere.
-      const before = s.proxy ? proxyOptions(s.proxy.args ?? []) : setupOptions(savedProxySetup(app.project));
+      // A proxy that isn't running starts with this project's saved setup, as elsewhere.
+      const setup = savedProxySetup(app.project);
+      const listen = `--listen=${s.proxy?.listen ?? proxyListen(undefined, setup)}`;
+      const before = s.proxy ? proxyOptions(s.proxy.args ?? []) : setupOptions(setup);
       // The app's proxy (one it starts here, or restarts) stops when the project closes; not one a shell or an agent started.
       const ours = !s.running || (app.proxy.owned != null && app.proxy.owned === s.proxy?.pid);
       if (s.running) await run(["proxy", "stop"]);

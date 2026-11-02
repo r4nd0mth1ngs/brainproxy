@@ -14,7 +14,7 @@ import { ENGAGEMENT_CHANGED, TargetView } from "./views/Target";
 import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
 import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, stopOwned, stopProxy } from "./views/proxyPort";
-import { forgetRedirect, hostOf, isWildcard, moveRedirect } from "./views/proxyMode";
+import { forgetProxySetup, hostOf, isWildcard, moveProxySetup, savedProxySetup } from "./views/proxyMode";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -70,7 +70,7 @@ export function App() {
     setTemp(null);
     if (temp && leaving)
       await tempProjects.discard(leaving).then(
-        () => forgetRedirect(leaving),
+        () => forgetProxySetup(leaving),
         (e) => setNotice(`The temporary engagement wasn't deleted: ${e}`),
       );
   }, [temp, project]);
@@ -84,8 +84,8 @@ export function App() {
     if (!dest) return;
     setProj(null);
     setTemp(null);
-    // The redirect (Settings › Proxy) is kept by path; the copy opens with it.
-    moveRedirect(leaving, dest);
+    // Settings › Proxy is kept by path; the copy opens with it.
+    moveProxySetup(leaving, dest);
     // The saved file has everything; if this fails it is offered again on the next launch.
     await tempProjects.discard(leaving).catch(() => {});
     // The shell is gone by now, so a failure is shown on the welcome screen.
@@ -215,6 +215,12 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
           // The project closed while it started.
           if (cancelled) return stopOwned(inProject, proxyCtl).catch(() => {});
           refreshStatus();
+          // Chosen for this project in Settings › Proxy, but easy to forget when opening it again.
+          if (savedProxySetup(project).allInterfaces)
+            toastRef.current(
+              "The proxy started on every network interface, as chosen for this project in Settings › Proxy: other machines can use it, with this project's auth profiles and platform auth.",
+              "error",
+            );
           return;
         } catch (e: any) {
           if (chosen || !/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${e.message}`, "error");
@@ -245,7 +251,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
             event.preventDefault();
             if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
             // Stops its proxy too. If it fails, it is kept and offered on the next launch.
-            await tempProjects.discard(tempProject).then(() => forgetRedirect(tempProject), () => {});
+            await tempProjects.discard(tempProject).then(() => forgetProxySetup(tempProject), () => {});
             await getCurrentWindow().destroy();
           } else {
             await stopOnClose();
@@ -278,7 +284,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   };
 
   const listen = status?.proxy?.listen ?? proxyListen();
-  // On 0.0.0.0 or [::]: set in Settings › Proxy for every project, so it is shown in each.
+  // On 0.0.0.0 or [::]: other machines can use it, so it is shown however it was started.
   const exposed = !!status?.running && isWildcard(hostOf(listen));
   const [collapsed, setCollapsed] = useState(() => {
     try {

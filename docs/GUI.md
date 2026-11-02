@@ -54,12 +54,15 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   where the proxy is from a fresh `proxy status`.
 - Every start also uses the rest of Settings › Proxy (`views/proxyMode.ts`): who can connect
   (`--listen=127.0.0.1:PORT`, or `0.0.0.0:PORT` after a warning that anyone on the network can
-  then use the proxy), `--invisible`, and a `--redirect=ORIGIN` that `engagement check` must
-  allow when it is saved. The port, the network choice and invisible mode are kept for every
-  project; the redirect for its project only, since it has to be in that engagement's scope
-  (Save as… moves it to the new path, discarding a temporary engagement forgets it). On a
-  wildcard address the proxy pill says "open to the network" in every project, and Settings
-  › Proxy warns and says other devices use this computer's LAN address on that port.
+  then use the proxy, with the project's auth profiles, session rules and platform auth),
+  `--invisible`, and a `--redirect=ORIGIN` that `engagement check` must allow each time it is
+  saved. The port is kept for every project; the rest for its project only, as one stored value
+  under the project's path, so a save is all or nothing and opening another project never starts
+  its proxy on every interface. Save as… moves it to the new path (replacing whatever that path
+  had), discarding a temporary engagement forgets it, and creating a project starts it afresh.
+  On a wildcard address the proxy pill says "open to the network", a project that starts its
+  proxy that way when it opens says so in a toast, and Settings › Proxy warns and says other
+  devices use this computer's LAN address on that port.
   A running proxy that differs is restarted with them on request, like a port move, keeping
   its other options (and an address that already fits, such as `[::1]`).
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member

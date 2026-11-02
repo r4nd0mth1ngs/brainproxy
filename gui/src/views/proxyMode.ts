@@ -1,14 +1,13 @@
 // How the app's proxy listens (Settings › Proxy), besides its port: on this machine only or on
 // every network interface, invisible mode, and a redirect that sends everything to one origin.
-// Stored like the port, for every project, except the redirect: that has to be in the engagement
-// scope, so it is kept per project.
+// Kept per project, as one value under its path, so a save is all or nothing: on every interface
+// other machines' requests pick up that project's auth profiles and platform auth, so the choice
+// is never carried to another project, and the redirect has to be in that engagement's scope.
 
 import { proxyOptions } from "./accessMatrix.ts";
 
-export const PROXY_NETWORK = "proxy-network";
-export const PROXY_INVISIBLE = "proxy-invisible";
 /** Followed by the project's path. */
-export const PROXY_REDIRECT = "proxy-redirect:";
+export const PROXY_SETUP = "proxy-setup:";
 
 export const LOCAL_HOST = "127.0.0.1";
 export const ALL_HOST = "0.0.0.0";
@@ -67,49 +66,62 @@ export function scopeProblem(check: ScopeCheck): string | null {
   return refused ? `It isn't in this engagement's scope${refused.reason ? `: ${refused.reason}` : "."}` : null;
 }
 
-function read(key: string): string | null {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-/** The saved setup; defaults for anything unset, invalid or unreadable. The redirect only with a project. */
+/** The saved setup for `project`; defaults for anything unset, invalid or unreadable, and without a project. */
 export function savedProxySetup(project?: string): ProxySetup {
-  const redirect = project ? redirectOrigin(read(PROXY_REDIRECT + project) ?? "") : null;
-  return { allInterfaces: read(PROXY_NETWORK) === "all", invisible: read(PROXY_INVISIBLE) === "on", redirect };
+  if (!project) return DEFAULT_SETUP;
+  let saved: any;
+  try {
+    saved = JSON.parse(localStorage.getItem(PROXY_SETUP + project) ?? "null");
+  } catch {
+    return DEFAULT_SETUP;
+  }
+  if (!saved || typeof saved !== "object") return DEFAULT_SETUP;
+  return {
+    allInterfaces: saved.network === "all",
+    invisible: saved.invisible === true,
+    redirect: typeof saved.redirect === "string" ? redirectOrigin(saved.redirect) : null,
+  };
 }
 
-/** Stores the setup (the redirect for `project`); false when it couldn't be stored. */
+/** Stores the setup for `project`, in one write; false when it couldn't be stored. */
 export function saveProxySetup(setup: ProxySetup, project: string): boolean {
-  const set = (key: string, value: string | null) => (value == null ? localStorage.removeItem(key) : localStorage.setItem(key, value));
+  const redirect = setup.redirect ? redirectOrigin(setup.redirect) : null;
+  const value = {
+    ...(setup.allInterfaces ? { network: "all" } : {}),
+    ...(setup.invisible ? { invisible: true } : {}),
+    ...(redirect ? { redirect } : {}),
+  };
   try {
-    set(PROXY_NETWORK, setup.allInterfaces ? "all" : null);
-    set(PROXY_INVISIBLE, setup.invisible ? "on" : null);
-    set(PROXY_REDIRECT + project, setup.redirect ? redirectOrigin(setup.redirect) : null);
+    if (Object.keys(value).length) localStorage.setItem(PROXY_SETUP + project, JSON.stringify(value));
+    else localStorage.removeItem(PROXY_SETUP + project);
     return true;
   } catch {
     return false;
   }
 }
 
-/** Carries a project's redirect over to its new path (Save as…); false when it couldn't be. */
-export function moveRedirect(from: string, to: string): boolean {
+/**
+ * Carries a project's setup over to its new path (Save as…), replacing whatever that path had;
+ * false when it couldn't be.
+ */
+export function moveProxySetup(from: string, to: string): boolean {
   try {
-    const value = localStorage.getItem(PROXY_REDIRECT + from);
-    if (value != null) localStorage.setItem(PROXY_REDIRECT + to, value);
-    localStorage.removeItem(PROXY_REDIRECT + from);
+    const value = localStorage.getItem(PROXY_SETUP + from);
+    if (value != null) localStorage.setItem(PROXY_SETUP + to, value);
+    else localStorage.removeItem(PROXY_SETUP + to);
+    localStorage.removeItem(PROXY_SETUP + from);
     return true;
   } catch {
+    // Never leave the new path with what it had before.
+    forgetProxySetup(to);
     return false;
   }
 }
 
-/** Forgets a deleted project's redirect. */
-export function forgetRedirect(project: string) {
+/** Forgets the setup kept for a path: a deleted project's, or one left over where a new project is made. */
+export function forgetProxySetup(project: string) {
   try {
-    localStorage.removeItem(PROXY_REDIRECT + project);
+    localStorage.removeItem(PROXY_SETUP + project);
   } catch {
     /* storage unavailable */
   }
@@ -125,6 +137,16 @@ export interface Refusal {
 export function redirectError(text: string, refused: Refusal | null): string | null {
   const origin = redirectOrigin(text);
   return redirectProblem(text) ?? (refused && origin === refused.origin ? refused.why : null);
+}
+
+/**
+ * The origin Save has to check against the engagement scope: a valid one other than the saved
+ * one. Also one refused before: the check fails when the name doesn't resolve, which may have
+ * changed, and a host override may have been added since.
+ */
+export function redirectToCheck(text: string, saved: string | null): string | null {
+  const origin = redirectOrigin(text);
+  return origin && origin !== saved ? origin : null;
 }
 
 /** The host the proxy listens on. */

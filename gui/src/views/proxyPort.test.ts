@@ -19,7 +19,7 @@ import {
   withPort,
   withPortHint,
 } from "./proxyPort.ts";
-import { PROXY_INVISIBLE, PROXY_NETWORK, PROXY_REDIRECT } from "./proxyMode.ts";
+import { PROXY_SETUP, savedProxySetup } from "./proxyMode.ts";
 
 // localStorage: a small stub on globalThis, put back after each test.
 const realStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -55,6 +55,9 @@ function fakeCli(answer: (args: string[], call: number) => unknown = () => {}) {
 }
 
 const isStart = (args: string[]) => args[1] === "start";
+
+/** Storage entries for a project's saved setup (proxyMode.ts). */
+const stored = (project: string, value: object) => ({ [PROXY_SETUP + project]: JSON.stringify(value) });
 
 test("portProblem accepts empty (automatic) and ports from 1 to 65535", () => {
   for (const text of ["", "  ", "1", "80", "8080", " 9090 ", "65535", "08080"]) {
@@ -376,17 +379,23 @@ test("moveProxy: a proxy the app didn't start doesn't become the app's", async (
 
 // The setup (proxyMode.ts): who can connect, invisible mode and the redirect.
 
-test("startProxy starts with the saved setup, the redirect from the control's project", async () => {
-  stubStorage({ [PROXY_PORT]: "80", [PROXY_NETWORK]: "all", [PROXY_INVISIBLE]: "on", [PROXY_REDIRECT + "/work/a.bpdb"]: "https://app.acme.test" });
-  let fake = fakeCli();
+test("startProxy starts with the setup saved for the control's project", async () => {
+  stubStorage({ [PROXY_PORT]: "80", ...stored("/work/a.bpdb", { network: "all", invisible: true, redirect: "https://app.acme.test" }) });
+  const fake = fakeCli();
   await startProxy(fake.cli, proxyControl("/work/a.bpdb"));
   assert.deepEqual(fake.calls, [["proxy", "start", "--listen=0.0.0.0:80", "--redirect=https://app.acme.test"]]);
-  assert.equal(proxyListen(), "0.0.0.0:80");
+  assert.equal(proxyListen(undefined, savedProxySetup("/work/a.bpdb")), "0.0.0.0:80");
+  assert.equal(proxyListen(), "127.0.0.1:80");
+});
 
-  // Another project's redirect isn't used.
-  fake = fakeCli();
-  await startProxy(fake.cli, proxyControl("/work/b.bpdb"));
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=0.0.0.0:80", "--invisible"]]);
+test("startProxy for another project: every network interface chosen for one is never used", async () => {
+  // As when the app opens a project and starts its proxy: another project's choice isn't asked for.
+  stubStorage({ ...stored("/work/a.bpdb", { network: "all", invisible: true }), "proxy-network": "all", "proxy-invisible": "on" });
+  for (const ctl of [proxyControl("/work/b.bpdb"), proxyControl(), proxyControl("")]) {
+    const { calls, cli } = fakeCli();
+    await startProxy(cli, ctl, 8080);
+    assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8080"]], String(ctl.project));
+  }
 });
 
 test("moveProxy with a setup: its host, invisible mode and redirect, the other options kept", async () => {
@@ -453,23 +462,23 @@ test("moveProxy without a setup keeps a shell's invisible mode and redirect, as 
 });
 
 test("startProxy: a saved redirect that isn't a plain origin never reaches the start", async () => {
-  for (const stored of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "https://app.acme.test --listen=0.0.0.0:80"]) {
-    stubStorage({ [PROXY_REDIRECT + "/work/a.bpdb"]: stored });
+  for (const redirect of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "https://app.acme.test --listen=0.0.0.0:80"]) {
+    stubStorage(stored("/work/a.bpdb", { redirect }));
     const { calls, cli } = fakeCli();
     await startProxy(cli, proxyControl("/work/a.bpdb"));
-    assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8080"]], stored);
+    assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8080"]], redirect);
   }
 });
 
-test("startProxy without a project: the saved host and invisible mode, never a redirect", async () => {
-  stubStorage({ [PROXY_INVISIBLE]: "on", [PROXY_NETWORK]: "all", [PROXY_REDIRECT]: "https://app.acme.test", [PROXY_REDIRECT + "undefined"]: "https://app.acme.test" });
+test("startProxy without a project: this computer only, no invisible mode or redirect", async () => {
+  stubStorage({ ...stored("", { network: "all", invisible: true, redirect: "https://app.acme.test" }), ...stored("undefined", { network: "all" }) });
   const { calls, cli } = fakeCli();
   await startProxy(cli, proxyControl(), 9090);
-  assert.deepEqual(calls, [["proxy", "start", "--listen=0.0.0.0:9090", "--invisible"]]);
+  assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
 });
 
 test("startProxy: corrupt or unreadable setup storage starts on this computer only", async () => {
-  stubStorage({ [PROXY_NETWORK]: "ALL", [PROXY_INVISIBLE]: "1" });
+  stubStorage({ [PROXY_SETUP + "/work/a.bpdb"]: '{"network":"ALL","invisible":"1"' });
   let fake = fakeCli();
   await startProxy(fake.cli, proxyControl("/work/a.bpdb"), 9090);
   assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
@@ -484,7 +493,7 @@ test("startProxy: corrupt or unreadable setup storage starts on this computer on
 });
 
 test("a start waiting on a setup move that left the proxy off starts it with the saved setup", async () => {
-  stubStorage({ [PROXY_NETWORK]: "all", [PROXY_REDIRECT + "/work/a.bpdb"]: "https://app.acme.test" });
+  stubStorage(stored("/work/a.bpdb", { network: "all", redirect: "https://app.acme.test" }));
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));
   const { calls, cli } = fakeCli(async (args) => {
