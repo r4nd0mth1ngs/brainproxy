@@ -296,3 +296,44 @@ test("flushes at once each save the latest set once, in order", async () => {
   await Promise.all([first, second, third]);
   assert.deepEqual(saves, ["A", "B"]);
 });
+
+test("going back to the saved set while another is being written saves it again", async () => {
+  const saves: string[] = [];
+  let release!: () => void;
+  const s = saver({
+    save: (b) => {
+      if (b === "B") return new Promise<void>((r) => (release = () => (saves.push(b), r())));
+      saves.push(b);
+      return Promise.resolve();
+    },
+    delay: 1,
+    onError: () => assert.fail("no error"),
+  });
+  s.loaded("A");
+  s.schedule("B");
+  await sleep(10);
+  // B is being written; the user undoes the change.
+  s.schedule("A");
+  await sleep(10);
+  release();
+  await sleep(10);
+  await s.flush();
+  assert.deepEqual(saves, ["B", "A"]);
+});
+
+test("the body is made only when a save is due", async () => {
+  const saves: string[] = [];
+  let made = 0;
+  let state = "A";
+  const body = () => (made++, state);
+  const s = saver({ save: async (b) => void saves.push(b), delay: 10, onError: () => assert.fail("no error") });
+  s.loaded("A");
+  state = "B";
+  s.schedule(body);
+  state = "C";
+  s.schedule(body);
+  assert.equal(made, 0);
+  await sleep(30);
+  assert.equal(made, 1);
+  assert.deepEqual(saves, ["C"]);
+});

@@ -64,6 +64,11 @@ interface State {
   setTab: (t: Tab) => void;
   repeater: RepeaterTab[];
   setRepeater: (f: (tabs: RepeaterTab[]) => RepeaterTab[]) => void;
+  /**
+   * An open Replay editor's way to pass its text up at once (it does so 300 ms after typing
+   * otherwise), called before Replay's tabs are saved on close. Returns the undo.
+   */
+  addReplayEditor: (commit: () => void) => () => void;
   repeaterActive: number;
   setRepeaterActive: (key: number) => void;
   sendToRepeater: (h: Handoff) => void;
@@ -109,7 +114,7 @@ export function AppProvider({
 }) {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [repeater, setRepeaterState] = useState<RepeaterTab[]>([]);
-  const [repeaterActive, setRepeaterActive] = useState(0);
+  const [repeaterActive, setRepeaterActiveState] = useState(0);
   const [fuzzerInput, setFuzzerInput] = useState<Handoff | null>(null);
   const [comparer, setComparer] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -125,12 +130,29 @@ export function AppProvider({
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), ms);
   }, []);
 
-  const setRepeater = useCallback((f: (tabs: RepeaterTab[]) => RepeaterTab[]) => setRepeaterState(f), []);
+  // Replay's tabs as of the last change, before React renders it: a save on close reads them
+  // right after the editors pass their text up.
+  const repeaterRef = useRef<RepeaterTab[]>([]);
+  const activeRef = useRef(0);
+  const setRepeater = useCallback((f: (tabs: RepeaterTab[]) => RepeaterTab[]) => {
+    repeaterRef.current = f(repeaterRef.current);
+    setRepeaterState(repeaterRef.current);
+  }, []);
+  const setRepeaterActive = useCallback((key: number) => {
+    activeRef.current = key;
+    setRepeaterActiveState(key);
+  }, []);
+  const editors = useRef(new Set<() => void>());
+  const addReplayEditor = useCallback((commit: () => void) => {
+    editors.current.add(commit);
+    return () => void editors.current.delete(commit);
+  }, []);
 
   // Replay's tabs live in the project file (`replay tabs list/save`): restored when it opens,
   // saved a moment after they change and when it closes. Nothing is saved until they have been
   // read, so a failed read never replaces the saved ones.
   const [tabsLoaded, setTabsLoaded] = useState(false);
+  const tabsLoadedRef = useRef(false);
   const toastRef = useRef(toast);
   toastRef.current = toast;
   const saverRef = useRef<ReturnType<typeof saver> | null>(null);
@@ -142,6 +164,14 @@ export function AppProvider({
   const tabSaver = saverRef.current;
   const tempRef = useRef(temp);
   tempRef.current = temp;
+  // Made only when a save is due, not on every change: it can be large.
+  const tabsBody = useCallback(() => JSON.stringify(toSaved(repeaterRef.current, activeRef.current)), []);
+  // Closing, switching project, or Save as: the editors' last keystrokes first, then save.
+  const flushReplayTabs = useCallback(() => {
+    editors.current.forEach((commit) => commit());
+    if (tabsLoadedRef.current) tabSaver.schedule(tabsBody);
+    return tabSaver.flush();
+  }, [tabSaver, tabsBody]);
   useEffect(() => {
     let cancelled = false;
     run(LIST_ARGS, { project })
@@ -150,8 +180,9 @@ export function AppProvider({
         const saved = fromSaved(data, newKey);
         tabSaver.loaded(JSON.stringify(toSaved(saved.tabs, saved.activeKey ?? 0)));
         // Tabs sent here while they loaded stay, after the saved ones.
-        setRepeaterState((cur) => [...saved.tabs, ...cur]);
-        if (saved.activeKey != null) setRepeaterActive((cur) => cur || saved.activeKey!);
+        setRepeater((cur) => [...saved.tabs, ...cur]);
+        if (saved.activeKey != null && !activeRef.current) setRepeaterActive(saved.activeKey);
+        tabsLoadedRef.current = true;
         setTabsLoaded(true);
       })
       .catch((e) => {
@@ -161,24 +192,23 @@ export function AppProvider({
       cancelled = true;
       // A temporary project is being discarded, or was just saved elsewhere (which saves first).
       if (tempRef.current) tabSaver.cancel();
-      else void tabSaver.flush();
+      else void flushReplayTabs();
     };
-  }, [project, tabSaver]);
+  }, [project, tabSaver, setRepeater, setRepeaterActive, flushReplayTabs]);
   useEffect(() => {
-    if (tabsLoaded) tabSaver.schedule(JSON.stringify(toSaved(repeater, repeaterActive)));
-  }, [tabsLoaded, repeater, repeaterActive, tabSaver]);
-  const flushReplayTabs = useCallback(() => tabSaver.flush(), [tabSaver]);
+    if (tabsLoaded) tabSaver.schedule(tabsBody);
+  }, [tabsLoaded, repeater, repeaterActive, tabSaver, tabsBody]);
   const saveAsWithTabs = useCallback(async () => {
-    await tabSaver.flush();
+    await flushReplayTabs();
     await saveAs();
-  }, [tabSaver, saveAs]);
+  }, [flushReplayTabs, saveAs]);
 
   const sendToRepeater = useCallback((h: Handoff) => {
     const key = newKey();
-    setRepeaterState((tabs) => [...tabs, { ...h, key, title: h.title ?? String(tabs.length + 1) }]);
+    setRepeater((tabs) => [...tabs, { ...h, key, title: h.title ?? String(tabs.length + 1) }]);
     setRepeaterActive(key);
     setTab("repeater");
-  }, []);
+  }, [setRepeater, setRepeaterActive]);
 
   const sendToFuzzer = useCallback((h: Handoff) => {
     setFuzzerInput({ ...h });
@@ -208,6 +238,7 @@ export function AppProvider({
       setTab,
       repeater,
       setRepeater,
+      addReplayEditor,
       repeaterActive,
       setRepeaterActive,
       sendToRepeater,
@@ -222,7 +253,7 @@ export function AppProvider({
       openWizard,
       proxy,
     }),
-    [project, temp, saveAsWithTabs, flushReplayTabs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
+    [project, temp, saveAsWithTabs, flushReplayTabs, tab, repeater, setRepeater, addReplayEditor, repeaterActive, setRepeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

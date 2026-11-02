@@ -1,7 +1,7 @@
 // Proxy → WebSockets: connections the proxy relayed (or Replay opened) and their messages;
 // and Replay's WebSocket mode (`ws send`).
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { bodyText, historyRequest, hostOf, isBinary, pathOf, requireWhole, run, type Body } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -209,21 +209,31 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [result, setResult] = useState<WsSendResult | string | null>(() => resultsByTab.get(tab.key) ?? null);
   const [current, setCurrent] = useState<number | null>(null);
 
-  const { setRepeater } = app;
+  // The latest edits, for passing them up at once: on unmount, or when the tabs are saved on close.
+  const { setRepeater, addReplayEditor } = app;
+  const edits = useRef({ raw, target, text, wait, until });
+  edits.current = { raw, target, text, wait, until };
+  const commit = useCallback(() => {
+    const { raw, target, text, wait, until } = edits.current;
+    setRepeater((ts) => {
+      const cur = ts.find((x) => x.key === tab.key);
+      const ws = splitMessages(text);
+      const same = cur && cur.raw === raw && cur.target === target && joinMessages(cur.ws ?? []) === joinMessages(ws);
+      if (!cur || (same && cur.wsWait === wait && (cur.wsUntil ?? "") === until)) return ts;
+      return ts.map((x) => (x.key === tab.key ? { ...x, raw, target, ws, wsWait: wait, wsUntil: until } : x));
+    });
+  }, [tab.key, setRepeater]);
   useEffect(() => {
-    const t = setTimeout(
-      () =>
-        setRepeater((ts) => {
-          const cur = ts.find((x) => x.key === tab.key);
-          const ws = splitMessages(text);
-          const same = cur && cur.raw === raw && cur.target === target && joinMessages(cur.ws ?? []) === joinMessages(ws);
-          if (!cur || (same && cur.wsWait === wait && (cur.wsUntil ?? "") === until)) return ts;
-          return ts.map((x) => (x.key === tab.key ? { ...x, raw, target, ws, wsWait: wait, wsUntil: until } : x));
-        }),
-      300,
-    );
+    const t = setTimeout(commit, 300);
     return () => clearTimeout(t);
-  }, [raw, target, text, wait, until, tab.key, setRepeater]);
+  }, [raw, target, text, wait, until, commit]);
+  useEffect(() => {
+    const remove = addReplayEditor(commit);
+    return () => {
+      remove();
+      commit();
+    };
+  }, [addReplayEditor, commit]);
 
   const send = async () => {
     const host = /^host:\s*(\S+)/im.exec(raw)?.[1];

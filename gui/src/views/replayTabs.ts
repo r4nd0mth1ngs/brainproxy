@@ -74,8 +74,9 @@ export function fromSaved(data: unknown, nextKey: () => number): { tabs: Repeate
 
 /**
  * Saves the latest body `delay` ms after the last change. One save runs at a time and later
- * changes wait for it; the last body saved isn't sent again. `onError` hears each new
- * failure once (not every retry of the same one), `onSaved` each success.
+ * changes wait for it; the body is made only when a save is due (it can be large), and one
+ * equal to the last saved isn't sent again. `onError` hears each new failure once (not every
+ * retry of the same one), `onSaved` each success.
  */
 export function saver(o: {
   save: (body: string) => Promise<unknown>;
@@ -83,7 +84,7 @@ export function saver(o: {
   onError: (e: Error) => void;
   onSaved?: () => void;
 }) {
-  let pending: string | null = null;
+  let pending: (() => string) | null = null;
   let saved: string | null = null;
   let lastError = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -97,7 +98,7 @@ export function saver(o: {
       o.onSaved?.();
     } catch (e: any) {
       // Kept for the next try (another change, or the flush on close).
-      if (pending == null) pending = body;
+      if (pending == null) pending = () => body;
       const err = e instanceof Error ? e : new Error(String(e));
       if (err.message !== lastError) o.onError(err);
       lastError = err.message;
@@ -107,20 +108,23 @@ export function saver(o: {
   const flush = async (): Promise<void> => {
     if (timer) clearTimeout(timer);
     timer = null;
-    // Another flush may be writing: wait for it, then save whatever came in meanwhile.
+    // Another flush may be writing: wait for it, then save whatever came in meanwhile. The
+    // comparison with what is saved happens only now, so going back to the saved set while a
+    // different one is being written still saves it.
     while (running) await running;
-    const body = pending;
+    const next = pending;
     pending = null;
-    if (body == null || body === saved) return;
+    if (next == null) return;
+    const body = next();
+    if (body === saved) return;
     running = write(body).finally(() => (running = null));
     await running;
   };
 
   return {
-    /** The tabs changed: save `body` once they stay unchanged for `delay` ms. */
-    schedule(body: string) {
-      if (body === saved && pending == null) return;
-      pending = body;
+    /** The tabs changed: save `body` (or what it returns then) once they stay unchanged for `delay` ms. */
+    schedule(body: string | (() => string)) {
+      pending = typeof body === "string" ? () => body : body;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => void flush(), o.delay);
     },

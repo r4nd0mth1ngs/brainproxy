@@ -175,9 +175,9 @@ table), with the logic in `views/replayTabs.ts`:
   until the read succeeds, so a failed read (a toast says so) never replaces the saved set.
 - **Saving:** one second after the tabs stop changing (the editors pass their text up after
   300 ms), on the CLI in the background, so typing never waits. One save runs at a time and
-  an unchanged set isn't sent again. Closing the project or the window saves what is
-  waiting; so does *Save as…*, before it copies the file. A temporary project being discarded
-  isn't saved.
+  an unchanged set isn't sent again. Closing the project or the window takes the editor's
+  last keystrokes and saves what is waiting; so does *Save as…*, before it copies the file.
+  A temporary project being discarded isn't saved.
 - **What:** per tab its kind, title, target, the request (or handshake and messages), the
   binary flag, and a WebSocket tab's Listen and Until (now kept when switching tabs too).
   Never responses or the send history. Text goes as typed, auth placeholders included.
