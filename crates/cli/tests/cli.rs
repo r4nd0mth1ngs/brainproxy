@@ -183,6 +183,71 @@ fn codecs_chain() {
 }
 
 #[test]
+fn decode_auto_steps_and_limits() {
+    let project = tmp_project("codec-auto");
+    let (_, v) = run(&["encode", "gzip,base64,url", "-"], &project, Some(b"{\"role\":\"admin\"}"));
+    let layered = v["data"]["output"]["content"].as_str().unwrap().to_string();
+    // The steps replay as an ordinary chain, and a second `auto` finds nothing more.
+    let (_, auto) = run(&["decode", "auto", &layered], &project, None);
+    let steps: Vec<&str> = auto["data"]["steps"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    let (code, v) = run(&["decode", &steps.join(","), &layered], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!((&v["data"]["steps"], &v["data"]["output"]), (&auto["data"]["steps"], &auto["data"]["output"]));
+    let (_, v) = run(&["decode", "auto,auto", &layered], &project, None);
+    assert_eq!((&v["data"]["steps"], v["data"]["chain"].as_str()), (&auto["data"]["steps"], Some("auto,auto")));
+    // Without `auto`, steps are the chain as given.
+    let (_, v) = run(&["decode", "base64,url", "YSUyMGI="], &project, None);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["base64", "url"]));
+    // --raw prints the bytes alone.
+    let out = bin().arg("--project").arg(&project).args(["decode", "auto", "--raw", &layered]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"{\"role\":\"admin\"}");
+    // Piped input with a trailing line break.
+    let (_, v) = run(&["decode", "auto", "-"], &project, Some(b"SGVsbG8sIHdvcmxkIQ==\n"));
+    assert_eq!(
+        (&v["data"]["steps"], v["data"]["output"]["content"].as_str()),
+        (&serde_json::json!(["base64"]), Some("Hello, world!"))
+    );
+    // Binary output comes back as base64.
+    let (_, v) = run(&["encode", "gzip,base64", "-"], &project, Some(&[0xff, 0x00, 0xfe]));
+    let (_, v) = run(&["decode", "auto", v["data"]["output"]["content"].as_str().unwrap()], &project, None);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["base64", "gzip"]));
+    assert_eq!(
+        (v["data"]["output"]["encoding"].as_str(), v["data"]["output"]["content"].as_str()),
+        (Some("base64"), Some("/wD+"))
+    );
+    // brotli and auto only decode.
+    for kind in ["brotli", "auto"] {
+        let (code, v) = run(&["encode", kind, "x"], &project, None);
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{kind}");
+    }
+    let (_, v) = run(&["capabilities"], &project, None);
+    let codecs = &v["data"]["codecs"];
+    for (op, kind, listed) in
+        [("decode", "auto", true), ("decode", "brotli", true), ("encode", "brotli", false), ("encode", "gzip", true)]
+    {
+        assert_eq!(codecs[op].as_array().unwrap().contains(&serde_json::json!(kind)), listed, "{op} {kind}");
+    }
+}
+
+#[test]
+fn decode_refuses_decompression_bombs() {
+    let project = tmp_project("codec-bomb");
+    let (code, v) = run(&["encode", "gzip,base64", "-"], &project, Some(&vec![0u8; 16 * 1024 * 1024 + 1]));
+    assert_eq!(code, 0);
+    let bomb = v["data"]["output"]["content"].as_str().unwrap().to_string();
+    assert!(bomb.len() < 64 * 1024);
+    let (code, v) = run(&["decode", "base64,gzip", &bomb], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")));
+    assert!(v["error"]["message"].as_str().unwrap().contains("16 MB limit"), "{v}");
+    // `auto` stops before the bomb and hands back the compressed bytes.
+    let (code, v) = run(&["decode", "auto", &bomb], &project, None);
+    assert_eq!((code, &v["data"]["steps"]), (0, &serde_json::json!(["base64"])));
+    assert_eq!(v["data"]["output"]["encoding"], "base64");
+    assert!(v["data"]["output"]["length"].as_u64().unwrap() < 64 * 1024);
+}
+
+#[test]
 fn capabilities_lists_all_commands() {
     let project = tmp_project("caps");
     let (code, v) = run(&["capabilities"], &project, None);

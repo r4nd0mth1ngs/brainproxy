@@ -543,4 +543,220 @@ mod tests {
         assert_eq!(s.steps.len(), SMART_DEPTH);
         assert!(s.steps.iter().all(|k| *k == "base64"));
     }
+
+    /// Runs `steps` one decode at a time, as the Codec view does with what `auto` found.
+    fn replay(input: &[u8], steps: &[&str]) -> Vec<u8> {
+        steps.iter().fold(input.to_vec(), |v, k| decode(k, &v).unwrap())
+    }
+
+    #[test]
+    fn compression_edge_cases() {
+        let all: Vec<u8> = (0..=255).collect();
+        for kind in ["gzip", "zlib", "deflate"] {
+            assert_eq!(decode(kind, &encode(kind, b"").unwrap()).unwrap(), b"", "{kind}");
+            assert_eq!(decode(kind, &encode(kind, &all).unwrap()).unwrap(), all, "{kind}");
+            let enc = encode(kind, b"hello hello hello").unwrap();
+            let err = decode(kind, &enc[..enc.len() / 2]).unwrap_err().to_string();
+            assert!(err.contains(&format!("{kind}: ")), "{kind}: {err}");
+        }
+        // Empty input is an error, not empty output.
+        for kind in ["gzip", "zlib", "deflate", "brotli"] {
+            let err = decode(kind, b"").unwrap_err().to_string();
+            assert!(err.contains(&format!("{kind}: ")), "{kind}: {err}");
+        }
+        assert!(decode("deflate", b"not compressed at all").unwrap_err().to_string().contains("deflate: "));
+        // Compressed input isn't trimmed: a zlib stream whose checksum ends in a whitespace
+        // byte still decodes.
+        let (plain, enc) = (0..10_000)
+            .map(|i| format!("x{i}"))
+            .map(|p| (encode("zlib", p.as_bytes()).unwrap(), p))
+            .find(|(e, _)| e.last().unwrap().is_ascii_whitespace())
+            .map(|(e, p)| (p, e))
+            .unwrap();
+        assert_eq!(decode("zlib", &enc).unwrap(), plain.as_bytes());
+        assert_eq!(decode("deflate", &enc).unwrap(), plain.as_bytes());
+        // gzip members back to back decode as one body.
+        let mut two = encode("gzip", b"ab").unwrap();
+        two.extend(encode("gzip", b"cd").unwrap());
+        assert_eq!(decode("gzip", &two).unwrap(), b"abcd");
+        // Made with Python's brotli module: "hello" four times.
+        let brotli = hex::decode("1b1600f88d946ede445586966c206f214f1ce038").unwrap();
+        assert_eq!(decode("brotli", &brotli).unwrap(), b"hello hello hello hello");
+        assert!(decode("brotli", b"\x0b\x02\x80hel").unwrap_err().to_string().contains("brotli: "));
+    }
+
+    #[test]
+    fn every_decompressor_is_capped() {
+        let over = vec![0u8; MAX_INFLATED as usize + 1];
+        for kind in ["zlib", "deflate"] {
+            let bomb = encode(kind, &over).unwrap();
+            assert!(bomb.len() < 64 * 1024, "{kind}");
+            let err = decode(kind, &bomb).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{kind}");
+            assert!(err.to_string().contains(&format!("{kind}: output is over the 16 MB limit")), "{kind}: {err}");
+            assert_eq!(decode(kind, &encode(kind, &over[1..]).unwrap()).unwrap().len(), 1 << 24, "{kind}");
+        }
+        // Made with Python's brotli module: 16 MiB + 1 zero bytes in 32 bytes, then exactly 16 MiB.
+        let bomb = hex::decode("cbffff3ff82700e2b14020f7fe8fffff7ff04f00c4611180eefd1f0000020003").unwrap();
+        let err = decode("brotli", &bomb).unwrap_err().to_string();
+        assert!(err.contains("brotli: output is over the 16 MB limit"), "{err}");
+        let limit = hex::decode("cbffff3ff82700e2b14020f7fe8fffff7ff04f00c4611180eefddf").unwrap();
+        assert_eq!(decode("brotli", &limit).unwrap().len(), 1 << 24);
+    }
+
+    #[test]
+    fn codec_kind_lists_match() {
+        // brotli only decodes, and `auto` is a decode kind only.
+        for kind in ["brotli", "auto"] {
+            let err = encode(kind, b"x").unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown encoding {kind:?}")) && err.contains("deflate"), "{err}");
+        }
+        let err = decode("zstd", b"x").unwrap_err().to_string();
+        assert!(err.contains("brotli, auto"), "{err}");
+        for kind in ENCODINGS.iter().filter(|k| **k != "url-all") {
+            assert!(DECODINGS.contains(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn smart_decode_steps_replay() {
+        let gzip = encode("gzip", b"{\"id\":7}").unwrap();
+        let wrapped: Vec<u8> = encode("base64", "The quick brown fox jumps over the lazy dog. ".repeat(10).as_bytes())
+            .unwrap()
+            .chunks(76)
+            .collect::<Vec<_>>()
+            .join(&b"\r\n"[..]);
+        let cases: &[(&[u8], &[&str], &[u8])] = &[
+            // A form value: '+' is a space once there is an escape to undo.
+            (b"q=hello+world&x=%2F", &["url"], b"q=hello world&x=/"),
+            (b"%253Cb%253E", &["url", "url"], b"<b>"),
+            (b"%E2%9C%93", &["url"], "\u{2713}".as_bytes()),
+            (b"&amp;lt;b&amp;gt;", &["html", "html"], b"<b>"),
+            (b"Tom &amp; Jerry", &["html"], b"Tom & Jerry"),
+            (b"&#x1F600;", &["html"], "\u{1F600}".as_bytes()),
+            // Pasted or piped with a line break at the end.
+            (b"SGVsbG8sIHdvcmxkIQ==\n", &["base64"], b"Hello, world!"),
+            (b"  dGVzdA==  ", &["base64"], b"test"),
+            // Starts like a JWT, but one part only: plain base64 JSON.
+            (b"eyJhIjoxfQ==", &["base64"], b"{\"a\":1}"),
+            (b"48 65 6c 6c 6f 2c 20 77 6f 72 6c 64", &["hex"], b"Hello, world"),
+            (&gzip, &["gzip"], b"{\"id\":7}"),
+        ];
+        for (input, steps, output) in cases {
+            let s = smart_decode(input);
+            assert_eq!(s.steps, *steps, "{}", String::from_utf8_lossy(input));
+            assert_eq!(s.output, *output, "{}", String::from_utf8_lossy(input));
+            assert_eq!(replay(input, &s.steps), s.output, "{}", String::from_utf8_lossy(input));
+            assert_eq!(decode("auto", input).unwrap(), s.output);
+        }
+        let s = smart_decode(&wrapped);
+        assert_eq!(s.steps, ["base64"]);
+        assert!(s.output.starts_with(b"The quick brown fox"));
+
+        // The magic bytes are enough: gzip is unpacked even when what it holds is binary.
+        let s = smart_decode(&encode("base64url", &encode("gzip", &[0xff, 0x00, 0xfe]).unwrap()).unwrap());
+        assert_eq!(s.steps.last(), Some(&"gzip"));
+        assert_eq!(s.output, [0xff, 0x00, 0xfe]);
+    }
+
+    #[test]
+    fn smart_decode_jwt() {
+        // Unsigned tokens (alg none), with or without the trailing dot.
+        for token in ["eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.", "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0"] {
+            let s = smart_decode(token.as_bytes());
+            assert_eq!(s.steps, ["jwt"], "{token}");
+            let v: serde_json::Value = serde_json::from_slice(&s.output).unwrap();
+            assert_eq!((v["header"]["alg"].as_str(), v["signature"].as_str()), (Some("none"), Some("")));
+        }
+        // The payload holds base64, but a JWT is the last step: its output is JSON to read.
+        let payload = encode("base64url", br#"{"data":"SGVsbG8sIHdvcmxkIQ=="}"#).unwrap();
+        let token = format!("eyJhbGciOiJIUzI1NiJ9.{}.c2ln", String::from_utf8(payload).unwrap());
+        let s = smart_decode(token.as_bytes());
+        assert_eq!(s.steps, ["jwt"]);
+        assert!(String::from_utf8(s.output).unwrap().contains("SGVsbG8sIHdvcmxkIQ=="));
+        // Shaped like a JWT, but the header isn't JSON: nothing is guessed instead.
+        assert!(smart_decode(b"eyJhbGci.e30.x").steps.is_empty());
+    }
+
+    #[test]
+    fn smart_decode_leaves_ids_and_secrets_alone() {
+        let plain = [
+            // Hashes, IDs, and addresses: valid hex or base64 that decodes to binary.
+            "5f4dcc3b5aa765d61d8327deb882cf99",
+            "a9993e364706816aba3e25717850c26c9cd0d89d",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "00:1a:2b:3c:4d:5e",
+            "fe80::1",
+            "0xCAFE1234",
+            "2024-01-01T00:00:00Z",
+            "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
+            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA",
+            // Token-shaped strings stay exactly as given.
+            "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+            "AKIAIOSFODNN7EXAMPLE",
+            concat!("sk_", "test_4eC39HqLyjWDarjtT1zdp7dc"),
+            // Identifiers and passwords with capitals and digits.
+            "HelloWorld2024",
+            "ThisIsATest123",
+            "getUserById2",
+            "MyPassword1",
+            "AbCd1234",
+            "Summer2024!",
+            "Base64Encoded",
+            "Kubernetes",
+            // Hex with no letters is a number.
+            "41 42 43 44",
+            "4142434445464748",
+            // Escapes that would give binary or control characters.
+            "%ff%fe",
+            "%00",
+            "a%00b",
+            "&#0;",
+            "&#55296;",
+            // Nothing to undo, or not one alphabet.
+            "a+b",
+            "a & b",
+            "QUJD+-_/",
+            "dGVzdA",
+            "AAAAAAAA",
+            "++++++++",
+            "________",
+            "",
+            "   ",
+            "\n",
+        ];
+        for word in plain {
+            let s = smart_decode(word.as_bytes());
+            assert!(s.steps.is_empty(), "{word:?} decoded as {:?}", s.steps);
+            assert_eq!(s.output, word.as_bytes());
+        }
+    }
+
+    #[test]
+    fn smart_decode_stops_at_bad_or_huge_compression() {
+        // gzip's magic bytes, then nothing usable.
+        assert_eq!(smart_decode(&[0x1f, 0x8b, 0x08]), Smart { steps: vec![], output: vec![0x1f, 0x8b, 0x08] });
+        // A bomb isn't unpacked: auto stops before it, with the compressed bytes as output.
+        let bomb = encode("gzip", &vec![0u8; MAX_INFLATED as usize + 1]).unwrap();
+        assert!(smart_decode(&bomb).steps.is_empty());
+        let s = smart_decode(&encode("base64", &bomb).unwrap());
+        assert_eq!((s.steps, s.output), (vec!["base64"], bomb));
+        // Raw deflate has no magic bytes, so it is never guessed.
+        let raw = encode("base64", &encode("deflate", b"hello hello hello").unwrap()).unwrap();
+        assert!(smart_decode(&raw).steps.is_empty());
+    }
+
+    #[test]
+    fn smart_decode_depth_counts_every_kind() {
+        let mut v = b"<b>".to_vec();
+        for _ in 0..SMART_DEPTH + 2 {
+            v = encode("url-all", &v).unwrap();
+        }
+        let s = smart_decode(&v);
+        assert_eq!(s.steps, ["url"; SMART_DEPTH]);
+        assert!(s.output.starts_with(b"%25"), "{}", String::from_utf8_lossy(&s.output));
+        assert_eq!(replay(&v, &s.steps), s.output);
+        // A second run picks up where the first stopped.
+        assert_eq!(smart_decode(&s.output).output, b"<b>");
+    }
 }
