@@ -162,6 +162,8 @@ export interface FindingItem {
   hits: number;
   history_id: number | null;
   state: string;
+  /** passive, active, authz, or manual (added by hand with `findings add`). */
+  source: string;
 }
 
 export interface Finding extends FindingItem {
@@ -175,7 +177,8 @@ export interface Finding extends FindingItem {
   refs?: string[];
   tags: string[];
   note: string | null;
-  source: string;
+  /** A finding added by hand: every history entry it links to. */
+  history_ids?: number[];
 }
 
 /** True when a body came as base64, i.e. `bodyText` gives one char per byte (Latin-1). */

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, type Finding, type FindingItem, type HistoryEntry, type Risk } from "../api";
 import { originOf, useApp } from "../store";
+import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
+import { NewFinding } from "./NewFinding";
 
 const RISKS: Risk[] = ["high", "medium", "low", "info"];
 const RANK: Record<Risk, number> = { high: 0, medium: 1, low: 2, info: 3 };
@@ -90,6 +92,31 @@ export function FindingsView({ active }: { active: boolean }) {
     };
   }, [selected, app.toast]);
 
+  const added = (id: number, ref: string, warnings: string[]) => {
+    app.newFinding(null);
+    app.toast([`Finding #${id} added.`, ...warnings].join("\n"));
+    setRisks(new Set(RISKS));
+    setCompare("all");
+    setOpen((o) => new Set(o).add(ref));
+    setSelected(id);
+    refresh();
+  };
+
+  // Only findings added by hand can be removed; scanner findings are marked instead.
+  const remove = async () => {
+    if (!finding) return;
+    if (!(await confirm("Remove this finding?", `"${finding.name}" at ${finding.url} is deleted from the project.`, "Remove", "Keep"))) return;
+    try {
+      await run(["findings", "remove", String(finding.id)]);
+      setSelected(null);
+      setFinding(null);
+      setEntry(null);
+      refresh();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
   const mark = async (state: string) => {
     if (!finding) return;
     try {
@@ -159,6 +186,9 @@ export function FindingsView({ active }: { active: boolean }) {
         )}
         <span className="grow" />
         <span className="muted">{groups.length} issue types</span>
+        <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
+          New finding…
+        </button>
         <button className="btn small" disabled={reporting} onClick={saveReport} title="Save a readable HTML report of all findings except false positives">
           {reporting ? "Saving…" : "Report…"}
         </button>
@@ -180,6 +210,7 @@ export function FindingsView({ active }: { active: boolean }) {
                 <span className="caret">{open.has(g.ref) ? "▾" : "▸"}</span>
                 <span className={`dot-risk risk-${g.risk}`} />
                 <span className="grow ellipsis">{g.name}</span>
+                {g.ref.startsWith("manual:") && <span className="tag">by hand</span>}
                 <span className="muted">{g.items.length}</span>
               </button>
               {open.has(g.ref) &&
@@ -225,6 +256,11 @@ export function FindingsView({ active }: { active: boolean }) {
                     Send to Replay
                   </button>
                 )}
+                {finding.source === "manual" && (
+                  <button className="btn small" onClick={remove} title="Delete this finding from the project">
+                    Remove
+                  </button>
+                )}
               </div>
               <dl className="facts">
                 <dt>URL</dt>
@@ -251,14 +287,30 @@ export function FindingsView({ active }: { active: boolean }) {
                 )}
                 <dt>Confidence</dt>
                 <dd>{finding.confidence}</dd>
-                <dt>Rule</dt>
-                <dd>
-                  {finding.alert_ref} ({finding.source}){finding.cwe ? ` · CWE-${finding.cwe}` : ""}
-                  {finding.wasc ? ` · WASC-${finding.wasc}` : ""} · {finding.hits} hit{finding.hits === 1 ? "" : "s"}
-                </dd>
+                {finding.source === "manual" ? (
+                  <>
+                    <dt>Source</dt>
+                    <dd>
+                      Added by hand{finding.cwe ? ` · CWE-${finding.cwe}` : ""}
+                      {finding.history_ids?.length ? ` · history ${finding.history_ids.map((h) => `#${h}`).join(", ")}` : ""}
+                    </dd>
+                  </>
+                ) : (
+                  <>
+                    <dt>Rule</dt>
+                    <dd>
+                      {finding.alert_ref} ({finding.source}){finding.cwe ? ` · CWE-${finding.cwe}` : ""}
+                      {finding.wasc ? ` · WASC-${finding.wasc}` : ""} · {finding.hits} hit{finding.hits === 1 ? "" : "s"}
+                    </dd>
+                  </>
+                )}
               </dl>
-              <h3>Description</h3>
-              <p className="prose">{finding.description}</p>
+              {finding.description && (
+                <>
+                  <h3>Description</h3>
+                  <p className="prose">{finding.description}</p>
+                </>
+              )}
               {finding.other_info && (
                 <>
                   <h3>Details</h3>
@@ -293,6 +345,7 @@ export function FindingsView({ active }: { active: boolean }) {
           <div className="blank">Select a finding to see its details and evidence.</div>
         )}
       </Split>
+      {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
     </div>
   );
 }

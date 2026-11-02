@@ -139,6 +139,7 @@ function History() {
       { label: "Send to Fuzzer", action: () => handoff(r.id, app.sendToFuzzer) },
       { label: "Send request to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(h.raw)) },
       { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
+      { label: "Create finding…", action: () => app.newFinding({ url: r.url, method: r.method, history: [r.id] }) },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       {

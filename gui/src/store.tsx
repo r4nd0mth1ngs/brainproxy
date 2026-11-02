@@ -2,6 +2,7 @@
 // and toasts. Each view keeps its own data and fetches it through api.ts.
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
+import type { FindingDraft } from "./views/manualFinding";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
 
 export type Tab =
@@ -65,6 +66,10 @@ interface State {
   comparer: string[];
   sendToComparer: (text: string) => void;
   setComparer: (items: string[]) => void;
+  /** A finding being written up by hand; Findings shows its form while one is set. */
+  findingDraft: FindingDraft | null;
+  /** Opens Findings with the "New finding" form, prefilled from `d` (null closes it). */
+  newFinding: (d: FindingDraft | null) => void;
   toasts: Toast[];
   toast: (text: string, kind?: Toast["kind"], onClick?: () => void) => void;
   /** The guided scan on the Overview, opened on request (it also shows by itself until a project has a scan). */
@@ -98,6 +103,7 @@ export function AppProvider({
   const [repeaterActive, setRepeaterActive] = useState(0);
   const [fuzzerInput, setFuzzerInput] = useState<Handoff | null>(null);
   const [comparer, setComparer] = useState<string[]>([]);
+  const [findingDraft, setFindingDraft] = useState<FindingDraft | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
   const nextKey = useRef(1);
@@ -124,6 +130,11 @@ export function AppProvider({
   const sendToFuzzer = useCallback((h: Handoff) => {
     setFuzzerInput({ ...h });
     setTab("fuzzer");
+  }, []);
+
+  const newFinding = useCallback((d: FindingDraft | null) => {
+    setFindingDraft(d);
+    if (d) setTab("findings");
   }, []);
 
   const openWizard = useCallback((open: boolean) => {
@@ -156,13 +167,15 @@ export function AppProvider({
       comparer,
       sendToComparer,
       setComparer,
+      findingDraft,
+      newFinding,
       toasts,
       toast,
       wizardOpen,
       openWizard,
       proxy,
     }),
-    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, proxy],
+    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, findingDraft, newFinding, toasts, toast, wizardOpen, openWizard, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

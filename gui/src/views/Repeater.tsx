@@ -4,6 +4,7 @@ import { useApp, type RepeaterTab } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { autoEncodeRequest } from "../ui/urlencode";
+import { draftFromRequest } from "./manualFinding";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
@@ -204,6 +205,13 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           Auto URL-encode
         </label>
         <span className="grow" />
+        <button
+          className="btn small"
+          onClick={() => app.newFinding(draftFromRequest(current?.sent ?? raw, withScheme(guessTarget(raw, target)), r?.id, r?.url))}
+          title="Write up a finding for this request, linked to its last send"
+        >
+          Create finding…
+        </button>
         {!!current?.encoded && (
           <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>
             {current.encoded} char{current.encoded === 1 ? "" : "s"} URL-encoded

@@ -241,7 +241,8 @@ The sidebar groups the tools by what you are doing.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
-  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
+  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, highlight, or
+    *Create finding…* for an issue you found by hand in that request.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
   ones Replay opened. Select a connection to see its messages in both directions (→ to the
   server, ← to the client), with pings, pongs and the close; select a message to read its
@@ -269,6 +270,8 @@ Edit a raw request and send it as often as you like, in separate tabs.
   (spaces, quotes, `<>`, `#`, non-ASCII) are encoded in the request line and in form bodies.
   `&`, `=`, `'` and existing `%XX` stay as typed, so `?q=x' OR 1=1--` arrives as
   `?q=x'%20OR%201=1--`.
+- **Create finding…:** write up an issue this request shows, linked to its last send (see
+  *New finding…* under **Findings**).
 - **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
   works in every request editor.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
@@ -446,11 +449,19 @@ Access control across users: does the app let bob read alice's data? See
 - **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
   references, the evidence highlighted in the response, and the request.
 - **Actions:** mark *open*, *confirmed*, or *false positive*; send the request to Replay.
+- **New finding…:** write up an issue you found by hand: title, risk, confidence, URL,
+  parameter, CWE, the history entries that show it, description, solution and evidence.
+  Nothing is sent; it is only recorded in the project. *Create finding…* in Traffic's
+  right-click menu and in Replay opens the same form with the URL and the request filled in.
+  Findings with the same title are grouped together and tagged *by hand*; they appear in
+  reports like any other (marked *found by hand* in the HTML report) and can be removed
+  again (*Remove*). Scanner findings can't be removed, only marked.
 - **Compare with a scan:** pick a finished active scan to show only what it found for the
   first time (*New in*), what it found again (*Still found by*), or what it covered but
   didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
   tested the finding's site (scheme, host and port) and, for active findings, its rule;
-  passive findings (headers, cookies) count only when the scan crawled. The command line
+  passive findings (headers, cookies) count only when the scan crawled. Findings added by
+  hand are left out: no scan looks for them. The command line
   has the same comparison: [`findings compare`](#comparing-findings-and-failing-a-build-findings-compare).
 - **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
   and shows it in Finder or Explorer.
@@ -614,7 +625,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 133 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 139 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -650,6 +661,8 @@ echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   #
 
 brainproxy findings list
 brainproxy findings show 12
+brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param id \
+    --description-file idor.md                # an issue found by hand; nothing is sent
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy report html -o acme-report.html
 
@@ -910,6 +923,40 @@ and targets that want a JWT you choose the claims of:
   `--oauth-*-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
   browser.
 
+### Findings found by hand (`findings add`)
+
+`findings add` records an issue you found yourself, with source `manual`. It sends nothing.
+
+```sh
+brainproxy findings add --title "Order IDOR" --risk high --confidence high \
+    --url https://app.acme.test/orders/7 --method GET --param id --cwe 639 \
+    --history-id 42,43 --evidence 'customer_email: bob@' --description-file idor.md \
+    --solution "Check that the order belongs to the signed-in user."
+brainproxy findings list --source manual
+brainproxy findings remove 17
+```
+
+- `--title` and `--risk` are required; `--confidence` defaults to medium.
+- `--url` must be an absolute http(s) or ws(s) URL. Without it, the URL and method are those of
+  the first `--history-id` entry. A URL outside the engagement scope is recorded with a warning.
+- `--history-id` (repeatable or comma-separated) links the history entries that show the issue;
+  the first is the request and response in reports.
+- `--description`, `--solution` and `--evidence` take the text; `--description-file`,
+  `--solution-file` and `--evidence-file` read it from a file, or stdin with `-` (one of them).
+  Through MCP the file flags only take `-`, the call's stdin.
+- Findings with the same title share an alert type, `manual:<title>` (`manual:order-idor`), so
+  reports group them. The type holds the description and solution: a new one replaces it, and
+  leaving it out keeps it.
+- The same title, method, URL without its query, and parameter as an existing finding is refused
+  with `conflict`.
+- `findings mark` triages them like any other. `findings remove ID...` deletes findings added by
+  hand; scanner findings are refused (mark them false positive instead), and then nothing is
+  removed.
+- `findings list`, `report` and `findings compare` show them with `source: manual`; `--source
+  manual` picks only them. `findings compare --scan` leaves them out (no scan looks for them, so
+  a scan never "fixes" them and its gate doesn't count them), while a file baseline and the plain
+  `--fail-on` gate compare them like any other.
+
 ### Comparing findings and failing a build (`findings compare`)
 
 `findings compare` reports which findings are new, unchanged, or fixed against a baseline, and
@@ -943,7 +990,8 @@ brainproxy --project app.bpdb findings compare --baseline baseline.json --fail-o
 
 `--fail-on RISK` fails on findings at or above `info`, `low`, `medium`, or `high` that are still
 there: new and unchanged ones, or with `--new-only` just the new ones. False positives never count,
-whatever `--state` lists. With `--scan`, only what that scan found counts.
+whatever `--state` lists. With `--scan`, only what that scan found counts, so findings added by
+hand don't; with a file baseline or none, they count like any other.
 
 `--scan JOB --since-scan EARLIER` is for a pipeline that scans the same project again and again.
 "New" against one scan means first found by that scan, so a finding first seen by a run that failed

@@ -113,12 +113,12 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response, right-click *Create finding…*), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages`, `findings add` |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer; *Create finding…* for the request and its last send | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin), `findings add` |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
-| Results | Findings | Issues grouped by type and risk, detail, evidence, triage | `findings list/show/mark` |
+| Results | Findings | Issues grouped by type and risk, detail, evidence, triage; *New finding…* for an issue found by hand (also *Create finding…* from Traffic and Replay), which can be removed again | `findings list/show/mark/add/remove` |
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
@@ -161,7 +161,19 @@ and written out, and a session rule), and the operations to send
 [--expect-environment-sha256 ...] --only ... --background`.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
-`sendToComparer` (right-click a history row, or buttons in Intercept and Findings).
+`sendToComparer` (right-click a history row, or buttons in Intercept and Findings), and
+`newFinding`, which opens Findings with the *New finding* form prefilled with a URL, method
+and history entry.
+
+### New finding
+
+The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findings add`: title,
+risk, confidence, method and URL (or only history entries, whose first gives both), parameter,
+CWE, history entries, description, solution and evidence. The description goes on stdin
+(`--description-file=-`); the rest are arguments. Nothing is sent. Findings added by hand are
+grouped by title, tagged *by hand*, show *Added by hand* and their history entries instead of a
+rule, and have *Remove* (`findings remove`, after asking). The scan comparison leaves them out,
+since no scan looks for them.
 
 ## Look
 
@@ -243,4 +255,7 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   `auth macro add` on the command line. A macro or rule is replaced or removed, not edited
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
+- A finding added by hand can't be edited: mark it like any other, or remove it and add it
+  again. Its solution and evidence go on the command line, so on Windows (about 32,000
+  characters for the whole command) a very long one fails; the description has no such limit.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).
