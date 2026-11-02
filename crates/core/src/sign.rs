@@ -655,7 +655,7 @@ impl Signer {
             if after == values(&before, k) {
                 continue;
             }
-            if !valid_token(k) || after.iter().any(|v| v.contains(['\r', '\n'])) {
+            if !valid_token(k) || after.iter().any(|v| bad_header_value(v)) {
                 return Err(what(format!("its script set a bad header {:?}", k.chars().take(60).collect::<String>())));
             }
             if is_reserved(k) {
@@ -670,7 +670,7 @@ impl Signer {
             let used = done.set.iter().any(|(n, _)| tpl.contains(&format!("{{{{{n}}}}}")));
             if used && value_of(&done.headers, k).is_none() {
                 let v = fill(tpl, true);
-                if !valid_token(k) || is_reserved(k) || v.contains(['\r', '\n']) || v.contains("{{") {
+                if !valid_token(k) || is_reserved(k) || bad_header_value(&v) || v.contains("{{") {
                     return Err(what(format!("the collection's header {k} couldn't be filled")));
                 }
                 out = out.set_header(k, &v);
@@ -694,6 +694,12 @@ impl Signer {
         }
         Ok(fill_request_line(bytes, &done.set))
     }
+}
+
+/// Whether a header value from a script holds a control character other than tab, which
+/// could end the header or confuse whatever reads it next.
+fn bad_header_value(v: &str) -> bool {
+    v.chars().any(|c| c.is_control() && c != '\t')
 }
 
 /// The query of a request's target, as written.
@@ -1872,6 +1878,28 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
             assert!(e.contains("stopped earlier") && started.elapsed() < std::time::Duration::from_millis(500), "{e}");
         }
         assert_eq!(crate::sign_script::LAST_CHILD.get(), first, "no other run started");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_header_with_a_control_character_is_refused() {
+        crate::sign_script::tests::use_test_runner();
+        for (value, ok) in
+            [("a\\u0001b", false), ("a\\u001bb", false), ("a\\u007fb", false), ("a\\u0085b", false), ("a\\tb", true)]
+        {
+            let (signer, dir) = script_signer(&format!("pm.request.headers.upsert({{key: 'X-A', value: '{value}'}});"));
+            let r = script_signed(&Loaded::new("p", signer));
+            match ok {
+                true => assert!(String::from_utf8(r.unwrap()).unwrap().contains("X-A: a\tb\r\n"), "{value}"),
+                false => assert!(r.unwrap_err().to_string().contains("bad header"), "{value}"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        // Nor does a cheap failure of the script itself stop the signer.
+        let (signer, dir) = script_signer("if (pm.request.url.getPath() === '/x') throw new Error('no');");
+        let loaded = Loaded::new("p", signer);
+        assert!(script_signed(&loaded).unwrap_err().to_string().contains("its script failed"));
+        assert!(script_signed(&loaded).unwrap_err().to_string().contains("its script failed"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
