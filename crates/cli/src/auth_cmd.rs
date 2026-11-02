@@ -1278,6 +1278,16 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                         .into(),
                 ));
             }
+            // These two go on the wire as they are, so an agent could send any readable file to
+            // the target; key files only ever produce a signature.
+            if crate::mcp::in_tool_call() && (access_key_file.is_some() || session_token_file.is_some()) {
+                return Err(Error::InvalidInput(
+                    "--access-key-file and --session-token-file aren't offered through MCP (their contents are sent \
+                     as they are): use --access-key-env and --session-token-env with BRAINPROXY_SECRET_* variables, \
+                     or add the signer in the app or a terminal"
+                        .into(),
+                ));
+            }
             for (flag, var) in [
                 ("--secret-env", &secret_env),
                 ("--access-key-env", &access_key_env),

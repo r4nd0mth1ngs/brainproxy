@@ -94,6 +94,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
   `oauth_client_secret_env`, `oauth_refresh_token_env`) and `auth_sign_add` (`secret_env`,
   `access_key_env`, `session_token_env`) must start with `BRAINPROXY_SECRET_`, so an agent can't
   send the server's other secrets to a target.
+- `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
+  as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
 
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --

@@ -376,6 +376,16 @@ fn an_agent_cannot_add_a_script_open_a_browser_or_read_any_variable() {
         "to": "header:X-Sig", "canonical": "{{method}}"});
     let (err, e) = m.call("auth_sign_add", hmac);
     assert!(err && e["error"]["message"].as_str().unwrap().contains("--secret-env"), "{e}");
+    // Files whose contents go on the wire as they are.
+    let secret = dir.join("aws-secret");
+    std::fs::write(&secret, "FAKE-AWS-SECRET").unwrap();
+    let (err, e) = m.call(
+        "auth_sign_add",
+        json!({"profile": "k", "name": "aws", "secret_env": "BRAINPROXY_SECRET_KEY",
+        "origins": [origin], "sigv4_region": "eu-west-1", "sigv4_service": "execute-api",
+        "access_key_file": secret.to_str().unwrap()}),
+    );
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--access-key-file"), "{e}");
     for (flag, args) in [
         ("--oauth-client-secret-env", json!({"oauth_client_secret_env": "OTHER_TOKEN"})),
         ("--password-env", json!({"password_env": "OTHER_TOKEN"})),
