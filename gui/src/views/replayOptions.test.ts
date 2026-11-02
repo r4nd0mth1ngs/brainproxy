@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_OPTIONS, activeLabels, crlfLines, optionArgs, optionsProblem, requestToSend, sendArgs, withDefaults } from "./replayOptions.ts";
+import { DEFAULT_OPTIONS, activeLabels, crlfBody, crlfHead, optionArgs, optionsProblem, requestToSend, sendArgs, sentWithNote, withDefaults } from "./replayOptions.ts";
 import { autoEncodeRequest } from "../ui/urlencode.ts";
 import { wsSendArgs } from "./ws.ts";
 
@@ -65,11 +65,13 @@ test("WebSocket tabs get only what ws send has", () => {
   ]);
 });
 
-test("sent as typed: CRLF line breaks, no auto URL-encode", () => {
+test("sent as typed: CRLF head, body as held, no auto URL-encode", () => {
   const raw = "POST /a b HTTP/1.1\nHost: a.test\nContent-Length: 4\nTransfer-Encoding: chunked\n\n0\n\nGET /admin HTTP/1.1\nX: x";
   const { text, encoded } = requestToSend(raw, { autoEncode: true, options: { verbatim: true } });
   assert.equal(encoded, 0);
-  assert.equal(text, raw.replace(/\n/g, "\r\n"));
+  assert.equal(text, "POST /a b HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\n\nGET /admin HTTP/1.1\nX: x");
+  // With CRLF body, the hand-typed chunks go out with CRLF too.
+  assert.equal(requestToSend(raw, { autoEncode: true, options: { verbatim: true, crlfBody: true } }).text, raw.replace(/\n/g, "\r\n"));
   // Not as typed: auto URL-encode applies, line endings are left to the CLI.
   const normal = requestToSend(raw, { autoEncode: true, options: {} });
   assert.equal(normal.encoded, 1);
@@ -77,13 +79,55 @@ test("sent as typed: CRLF line breaks, no auto URL-encode", () => {
   assert.equal(requestToSend(raw, { autoEncode: false }).text, raw);
 });
 
-test("CRLF lines keep existing CRLF and a binary body's bytes", () => {
-  assert.equal(crlfLines("GET / HTTP/1.1\nA: b\r\n\r\nx\r\ny\nz", false), "GET / HTTP/1.1\r\nA: b\r\n\r\nx\r\ny\r\nz");
+test("CRLF head keeps existing CRLF and the body's bytes", () => {
+  assert.equal(crlfHead("GET / HTTP/1.1\nA: b\r\n\r\nx\r\ny\nz"), "GET / HTTP/1.1\r\nA: b\r\n\r\nx\r\ny\nz");
   // No blank line is added after the headers.
-  assert.equal(crlfLines("GET / HTTP/1.1\nHost: a", false), "GET / HTTP/1.1\r\nHost: a");
+  assert.equal(crlfHead("GET / HTTP/1.1\nHost: a"), "GET / HTTP/1.1\r\nHost: a");
   const bin = "POST / HTTP/1.1\nHost: a\n\n\x89PNG\r\n\x1a\n\x00";
-  assert.equal(crlfLines(bin, true), "POST / HTTP/1.1\r\nHost: a\r\n\r\n\x89PNG\r\n\x1a\n\x00");
-  assert.equal(requestToSend(bin, { binary: true, autoEncode: true, options: { verbatim: true } }).text, crlfLines(bin, true));
+  assert.equal(crlfHead(bin), "POST / HTTP/1.1\r\nHost: a\r\n\r\n\x89PNG\r\n\x1a\n\x00");
+  assert.equal(requestToSend(bin, { binary: true, autoEncode: true, options: { verbatim: true } }).text, crlfHead(bin));
+  // CRLF body never touches a binary body.
+  assert.equal(requestToSend(bin, { binary: true, autoEncode: true, options: { verbatim: true, crlfBody: true } }).text, crlfHead(bin));
+});
+
+test("sent as typed, an unedited body from Traffic keeps its bytes and its length", () => {
+  // Pretty-printed JSON with bare LF: Content-Length still matches what goes out.
+  const body = '{\n  "a": 1,\n  "b": 2\n}';
+  const raw = `POST /api HTTP/1.1\r\nHost: a.test\r\nContent-Length: ${body.length}\r\n\r\n${body}`;
+  const { text } = requestToSend(raw, { autoEncode: true, options: { verbatim: true } });
+  assert.equal(text, raw);
+  assert.equal(text.slice(text.indexOf("\r\n\r\n") + 4).length, body.length);
+  // A bare LF typed in the body (a chunk line probe) goes out as a bare LF.
+  const probe = "POST / HTTP/1.1\nHost: a\nTransfer-Encoding: chunked\n\n1\nx\r\n0\r\n\r\n";
+  assert.equal(requestToSend(probe, { autoEncode: false, options: { verbatim: true } }).text, "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\nx\r\n0\r\n\r\n");
+});
+
+test("CRLF body changes only the body, whether or not it's sent as typed", () => {
+  assert.equal(crlfBody("POST / HTTP/1.1\nHost: a\n\na\nb\r\nc"), "POST / HTTP/1.1\nHost: a\n\na\r\nb\r\nc");
+  // No header end: no body to change.
+  assert.equal(crlfBody("GET / HTTP/1.1\nHost: a"), "GET / HTTP/1.1\nHost: a");
+  // Not sent as typed: the head is left to the CLI, after auto URL-encode.
+  const raw = "POST /a b HTTP/1.1\nHost: a\n\n0\n\n";
+  const r = requestToSend(raw, { autoEncode: true, options: { crlfBody: true } });
+  assert.deepEqual(r, { text: "POST /a%20b HTTP/1.1\nHost: a\n\n0\r\n\r\n", encoded: 1 });
+  assert.deepEqual(activeLabels({ crlfBody: true }, "http"), ["CRLF body"]);
+  assert.deepEqual(optionArgs({ crlfBody: true }, "http"), []);
+  assert.deepEqual(activeLabels({ crlfBody: true }, "ws"), []);
+});
+
+test("an invalid timeout shows as invalid and is never passed", () => {
+  for (const t of ["abc", "-1", "5s", "0", "100000", "NaN"]) {
+    assert.deepEqual(activeLabels({ timeout: t }, "http"), ["timeout invalid"], t);
+    assert.deepEqual(optionArgs({ timeout: t }, "http"), [], t);
+    assert.deepEqual(optionArgs({ timeout: t }, "ws"), [], t);
+  }
+});
+
+test("a step sent with other options than the tab has now says so", () => {
+  assert.equal(sentWithNote(["HTTP/2", "SNI x"], ["HTTP/2", "SNI x"]), null);
+  assert.equal(sentWithNote(undefined, ["HTTP/2"]), null);
+  assert.equal(sentWithNote(["HTTP/2", "SNI x"], []), "sent with: HTTP/2, SNI x");
+  assert.equal(sentWithNote([], ["not recorded"]), "sent with the default options");
 });
 
 test("a timeout that's accepted goes out as a plain positive number", () => {
@@ -138,7 +182,7 @@ test("withDefaults gives a new object and leaves the defaults alone", () => {
   const o = withDefaults(undefined);
   o.http2 = true;
   o.sni = "x";
-  assert.deepEqual(DEFAULT_OPTIONS, { http2: false, verbatim: false, sni: "", timeout: "", verifyTls: false, noStore: false });
+  assert.deepEqual(DEFAULT_OPTIONS, { http2: false, verbatim: false, crlfBody: false, sni: "", timeout: "", verifyTls: false, noStore: false });
   // Reset merges the defaults over a tab's options, as the Options row does.
   assert.deepEqual({ ...withDefaults({ verbatim: true, timeout: "3" }), ...DEFAULT_OPTIONS }, DEFAULT_OPTIONS);
 });
@@ -165,14 +209,16 @@ test("sent as typed: the auto URL-encode setting doesn't matter and nothing else
   assert.equal(requestToSend("", { autoEncode: true, options: { verbatim: true } }).text, "");
 });
 
-test("sent as typed with a binary body: only the head's line breaks change", () => {
+test("sent as typed: only the head's line breaks change", () => {
   // No header end: the whole text is the head.
-  assert.equal(crlfLines("GET / HTTP/1.1\nHost: a", true), "GET / HTTP/1.1\r\nHost: a");
+  assert.equal(crlfHead("GET / HTTP/1.1\nHost: a"), "GET / HTTP/1.1\r\nHost: a");
   // A CRLF header end and a body with bare \n: the body keeps its bytes.
   const bin = "POST / HTTP/1.1\r\nHost: a\r\n\r\n\n\x01\n\n\x02";
-  assert.equal(crlfLines(bin, true), bin);
-  // Text tab: the body's \n become CRLF too.
-  assert.equal(crlfLines("POST / HTTP/1.1\nHost: a\n\na\nb", false), "POST / HTTP/1.1\r\nHost: a\r\n\r\na\r\nb");
+  assert.equal(crlfHead(bin), bin);
+  // Text tab: the body's \n stay \n unless CRLF body is on.
+  const text = "POST / HTTP/1.1\nHost: a\n\na\nb";
+  assert.equal(requestToSend(text, { autoEncode: true, options: { verbatim: true } }).text, "POST / HTTP/1.1\r\nHost: a\r\n\r\na\nb");
+  assert.equal(requestToSend(text, { autoEncode: true, options: { verbatim: true, crlfBody: true } }).text, "POST / HTTP/1.1\r\nHost: a\r\n\r\na\r\nb");
 });
 
 test("WebSocket options go after --until and before the stdin flags", () => {

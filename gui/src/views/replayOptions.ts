@@ -11,6 +11,8 @@ export interface ReplayOptions {
   http2: boolean;
   /** `--verbatim`: no Content-Length update and no header end added; the GUI skips auto URL-encode too. */
   verbatim: boolean;
+  /** Not a CLI flag: the GUI writes a text body's line breaks as CRLF (the editor can't hold a CR). */
+  crlfBody: boolean;
   /** `--sni`: the TLS server name to send instead of the target's host. Empty: the target's. */
   sni: string;
   /** `--timeout` in seconds, as typed. Empty: the CLI's 30. */
@@ -24,7 +26,7 @@ export interface ReplayOptions {
 /** HTTP tabs offer every option; WebSocket tabs only what `ws send` has. */
 export type TabKind = "http" | "ws";
 
-export const DEFAULT_OPTIONS: ReplayOptions = { http2: false, verbatim: false, sni: "", timeout: "", verifyTls: false, noStore: false };
+export const DEFAULT_OPTIONS: ReplayOptions = { http2: false, verbatim: false, crlfBody: false, sni: "", timeout: "", verifyTls: false, noStore: false };
 
 /** The CLI's default `--timeout` for both `send` and `ws send`. */
 export const DEFAULT_TIMEOUT = 30;
@@ -36,18 +38,22 @@ export function withDefaults(o: Partial<ReplayOptions> | undefined): ReplayOptio
   return { ...DEFAULT_OPTIONS, ...o };
 }
 
-/** The timeout in seconds, or null for the CLI's default (empty, or exactly the default). */
-function timeoutSeconds(o: ReplayOptions): number | null {
+/**
+ * The timeout in seconds; null for the CLI's default (empty, or exactly the default);
+ * "invalid" when it isn't a number of seconds in range (optionsProblem says why).
+ */
+function timeoutSeconds(o: ReplayOptions): number | null | "invalid" {
   const t = o.timeout.trim();
   if (!t) return null;
   const n = Number(t);
+  if (!(n > 0 && n <= MAX_TIMEOUT)) return "invalid";
   return n === DEFAULT_TIMEOUT ? null : n;
 }
 
 /** Why the options can't be sent, or null. */
 export function optionsProblem(o: Partial<ReplayOptions> | undefined): string | null {
   const t = withDefaults(o).timeout.trim();
-  if (t && !(Number(t) > 0 && Number(t) <= MAX_TIMEOUT)) return `Timeout must be a number of seconds above 0 and at most ${MAX_TIMEOUT}, not "${t}"`;
+  if (timeoutSeconds(withDefaults(o)) === "invalid") return `Timeout must be a number of seconds above 0 and at most ${MAX_TIMEOUT}, not "${t}"`;
   const sni = withDefaults(o).sni.trim();
   if (/\s/.test(sni)) return "The SNI host name can't contain spaces";
   return null;
@@ -61,7 +67,7 @@ export function optionArgs(o: Partial<ReplayOptions> | undefined, kind: TabKind)
   if (kind === "http" && f.verbatim) args.push("--verbatim");
   if (f.sni.trim()) args.push(`--sni=${f.sni.trim()}`);
   const t = timeoutSeconds(f);
-  if (t != null) args.push(`--timeout=${t}`);
+  if (typeof t === "number") args.push(`--timeout=${t}`);
   if (f.verifyTls) args.push("--verify-tls");
   if (f.noStore) args.push("--no-store");
   return args;
@@ -78,29 +84,46 @@ export function activeLabels(o: Partial<ReplayOptions> | undefined, kind: TabKin
   const out: string[] = [];
   if (kind === "http" && f.http2) out.push("HTTP/2");
   if (kind === "http" && f.verbatim) out.push("as typed");
+  if (kind === "http" && f.crlfBody) out.push("CRLF body");
   if (f.sni.trim()) out.push(`SNI ${f.sni.trim()}`);
   const t = timeoutSeconds(f);
-  if (t != null) out.push(`timeout ${t} s`);
+  if (t === "invalid") out.push("timeout invalid");
+  else if (t != null) out.push(`timeout ${t} s`);
   if (f.verifyTls) out.push("verify TLS");
   if (f.noStore) out.push("not recorded");
   return out;
 }
 
-/** Every line break as CRLF; a binary body keeps its bytes (only its head changes). */
-export function crlfLines(raw: string, binary: boolean): string {
-  const fix = (s: string) => s.replace(/\r?\n/g, "\r\n");
-  if (!binary) return fix(raw);
+const crlf = (s: string) => s.replace(/\r?\n/g, "\r\n");
+
+/** The head's line breaks and the header end as CRLF; the body keeps its bytes. */
+export function crlfHead(raw: string): string {
   const { head, sep, body } = splitRaw(raw);
-  return fix(head) + (sep ? "\r\n\r\n" : "") + body;
+  return crlf(head) + (sep ? "\r\n\r\n" : "") + body;
+}
+
+/** A text body's line breaks as CRLF; the head is left alone. */
+export function crlfBody(raw: string): string {
+  const { head, sep, body } = splitRaw(raw);
+  return sep ? head + sep + crlf(body) : raw;
 }
 
 /**
  * The request text a send writes on stdin and how many characters auto URL-encode changed.
- * Sent as typed (`--verbatim`), the CLI changes nothing, so line breaks are written as CRLF
- * here (the editor holds only \n) and auto URL-encode is skipped. Otherwise the CLI turns
- * the head's line breaks into CRLF and fixes Content-Length.
+ * Sent as typed (`--verbatim`), the CLI changes nothing, so the head's line breaks are written
+ * as CRLF here (the editor holds only \n there) and auto URL-encode is skipped. Otherwise the
+ * CLI turns the head's line breaks into CRLF and fixes Content-Length. Either way the body is
+ * as the editor holds it (an unedited one keeps its bytes), unless "CRLF body" is on.
  */
 export function requestToSend(raw: string, o: { binary?: boolean; autoEncode: boolean; options?: Partial<ReplayOptions> }): { text: string; encoded: number } {
-  if (withDefaults(o.options).verbatim) return { text: crlfLines(raw, !!o.binary), encoded: 0 };
-  return o.autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+  const f = withDefaults(o.options);
+  const out = f.verbatim ? { text: crlfHead(raw), encoded: 0 } : o.autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+  if (f.crlfBody && !o.binary) out.text = crlfBody(out.text);
+  return out;
+}
+
+/** What the send of a step in a tab's history used, when that isn't what the tab now has. */
+export function sentWithNote(sentLabels: string[] | undefined, current: string[]): string | null {
+  if (!sentLabels || sentLabels.join("\n") === current.join("\n")) return null;
+  return sentLabels.length ? `sent with: ${sentLabels.join(", ")}` : "sent with the default options";
 }

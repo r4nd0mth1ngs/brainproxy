@@ -2,7 +2,7 @@
 // and Replay's WebSocket mode (`ws send`).
 
 import { useEffect, useRef, useState } from "react";
-import { bodyText, historyRequest, hostOf, isBinary, pathOf, requireWhole, run, type Body } from "../api";
+import { bodyText, cancelCli, historyRequest, hostOf, isBinary, pathOf, requireWhole, run, type Body } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
@@ -212,6 +212,8 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [current, setCurrent] = useState<number | null>(null);
   const [options, setOptions] = useSendOptions(tab);
   const [showOptions, setShowOptions] = useState(false);
+  // The id of the send in flight, so Stop can cancel it.
+  const call = useRef<string | null>(null);
 
   const { setRepeater } = app;
   useEffect(() => {
@@ -237,11 +239,13 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
     setTarget(to);
     setBusy(true);
     let r: WsSendResult | string;
+    call.current = `replay-ws-send-${tab.key}-${Date.now()}`;
     try {
-      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), wsSendInput(raw, splitMessages(text)));
+      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), { stdin: wsSendInput(raw, splitMessages(text)), call: call.current });
     } catch (e: any) {
-      r = e.message as string;
+      r = e.kind === "cancelled" ? "Stopped" : (e.message as string);
     }
+    call.current = null;
     resultsByTab.set(tab.key, r);
     setResult(r);
     setCurrent(null);
@@ -266,6 +270,11 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
         <button className="btn primary" disabled={busy} onClick={send}>
           {busy ? "Connected…" : "Connect and send"}
         </button>
+        {busy && (
+          <button className="btn" onClick={() => call.current && cancelCli(call.current).catch(() => {})} title="Stop the connection">
+            Stop
+          </button>
+        )}
         <span className="label">Target</span>
         <input className="input mono" style={{ width: 240 }} placeholder="wss://example.com" value={target} onChange={(e) => setTarget(e.target.value)} />
         <span className="label" title="Seconds to keep listening after the last message">

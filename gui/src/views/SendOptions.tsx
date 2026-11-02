@@ -30,7 +30,7 @@ export function OptionsToggle({ options, kind, open, onToggle }: { options: Repl
 
 const same = (a: ReplayOptions, b: ReplayOptions) => (Object.keys(a) as (keyof ReplayOptions)[]).every((k) => a[k] === b[k]);
 
-export function OptionsRow({ options, set, kind }: { options: ReplayOptions; set: (patch: Partial<ReplayOptions>) => void; kind: TabKind }) {
+export function OptionsRow({ options, set, kind, binary }: { options: ReplayOptions; set: (patch: Partial<ReplayOptions>) => void; kind: TabKind; binary?: boolean }) {
   return (
     <div className="toolbar">
       {kind === "http" && (
@@ -44,10 +44,21 @@ export function OptionsRow({ options, set, kind }: { options: ReplayOptions; set
           title={
             "Send the request exactly as it is in the editor, for request smuggling and other malformed requests: " +
             "Content-Length isn't updated, auto URL-encode is skipped, and no blank line is added after the headers. " +
-            "Each line break goes out as CRLF, in the body too (a binary body keeps its bytes)."
+            "The head's line breaks go out as CRLF; the body goes out as the editor holds it (see CRLF body)."
           }
         >
           <input type="checkbox" checked={options.verbatim} onChange={(e) => set({ verbatim: e.target.checked })} /> Send as typed
+        </label>
+      )}
+      {kind === "http" && !binary && (
+        <label
+          className="check"
+          title={
+            "Send every line break in the body as CRLF, for chunked bodies typed by hand. " +
+            "The editor can't hold a CR, so without this a body you typed has bare LF line breaks (one sent from Traffic keeps its own)."
+          }
+        >
+          <input type="checkbox" checked={options.crlfBody} onChange={(e) => set({ crlfBody: e.target.checked })} /> CRLF body
         </label>
       )}
       <span className="label" title="The TLS server name (SNI) to send instead of the target's host">
