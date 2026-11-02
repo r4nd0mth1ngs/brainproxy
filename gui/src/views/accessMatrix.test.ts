@@ -128,6 +128,27 @@ test("a run's arguments come from the form", () => {
   assert.throws(() => runArgs({ ...form, select: "history" }), /No request picked/);
 });
 
+test("requests from Traffic: by id only, and only while that selection is on", () => {
+  const history = [{ id: 31, method: "DELETE", url: "https://shop.test/x' --where=1=1" }];
+  // The form keeps the handed-over requests when another selection is picked; they must not leak in.
+  assert.deepEqual(runArgs({ ...form, history }), ["authz", "run", "--as=bob,carol"]);
+  assert.deepEqual(runArgs({ ...form, select: "tag", tag: "api", history }), ["authz", "run", "--as=bob,carol", "--tag=api"]);
+  assert.deepEqual(runArgs({ ...form, select: "host", host: "shop.test", history }), ["authz", "run", "--as=bob,carol", "--where=host = 'shop.test'"]);
+  // The URL never reaches the argv, and the other options still apply.
+  assert.deepEqual(runArgs({ ...form, select: "history", history, identities: [], owner: "alice", keepCookies: " theme , lang ", rate: "2" }), [
+    "authz",
+    "run",
+    "--owner=alice",
+    "--history-id=31",
+    "--keep-cookie=theme,lang",
+    "--rate=2",
+  ]);
+  assert.deepEqual(runArgs({ ...form, select: "history", history, anonymous: false }), ["authz", "run", "--as=bob,carol", "--no-anonymous", "--history-id=31"]);
+  // The form's own checks come first.
+  assert.throws(() => runArgs({ ...form, select: "history", history, identities: [], anonymous: false }), /at least one identity/);
+  assert.throws(() => runArgs({ ...form, select: "history", history, rate: "-1" }), /Rate/);
+});
+
 test("live testing options, and the running proxy's options kept on a restart", () => {
   assert.deepEqual(liveArgs(form), ["--authz=anonymous,bob,carol"]);
   assert.deepEqual(liveArgs({ ...form, anonymous: false, identities: ["bob"], keepCookies: "lang, theme", rate: "2.5" }), ["--authz=bob", "--authz-keep-cookie=lang,theme", "--authz-rate=2.5"]);
