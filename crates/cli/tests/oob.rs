@@ -277,6 +277,37 @@ fn oob_confirms_log4shell_and_xxe_and_manual_payloads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn oob_confirms_ssrf() {
+    let (dir, project) = setup("ssrf");
+    let app = spawn_app();
+    let url = format!("http://127.0.0.1:{app}/fetch?url=home");
+
+    // Nothing to correlate with, so nothing is sent.
+    let (code, v) = run(&["scan", "active", &url, "--rules", "40046"], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["requests"], 0, "{v}");
+
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["scan", "active", &url, "--rules", "40046", "--oob-wait", "5"], &project);
+    assert_eq!(code, 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["raised"]["40046"], 1, "{d}");
+    // Host mode can't tell an https fetch: only the http payload goes out.
+    assert_eq!(d["oob"]["payloads"], 1, "{d}");
+
+    let (code, v) = run(&["findings", "list", "--source", "active", "--all"], &project);
+    assert_eq!(code, 0, "{v}");
+    let found = v["data"]["items"].as_array().unwrap();
+    let ssrf = found.iter().find(|f| f["alert_ref"] == "40046").expect("ssrf finding");
+    assert_eq!(ssrf["param"], "url");
+
+    let (code, v) = run(&["oob", "stop"], &project);
+    assert_eq!(code, 0, "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn listener_in_another_namespace_is_not_taken_for_dead() {

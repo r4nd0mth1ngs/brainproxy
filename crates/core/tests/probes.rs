@@ -16,6 +16,14 @@ fn spawn<F>(respond: F) -> u16
 where
     F: Fn(&str) -> String + Send + Sync + 'static,
 {
+    spawn_raw(move |req| respond(req.split(' ').nth(1).unwrap_or("/")))
+}
+
+/// Like `spawn`, but `respond` gets the whole request.
+fn spawn_raw<F>(respond: F) -> u16
+where
+    F: Fn(&str) -> String + Send + Sync + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let respond = std::sync::Arc::new(respond);
@@ -27,8 +35,7 @@ where
                 let mut buf = vec![0u8; 16384];
                 let n = s.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req.split(' ').nth(1).unwrap_or("/");
-                let _ = s.write_all(respond(path).as_bytes());
+                let _ = s.write_all(respond(&req).as_bytes());
             });
         }
     });
@@ -123,6 +130,94 @@ fn finds_hidden_file_and_directory_listing() {
     // Directory Browsing (page rule) flags the listing at /files/.
     let s = run_scan(port, "/files", &[0], None);
     assert_eq!(s.raised.get("0").copied(), Some(1), "directory listing should be found: {s:?}");
+}
+
+fn origin_of(req: &str) -> Option<&str> {
+    req.lines().find_map(|l| l.strip_prefix("Origin: ")).map(str::trim)
+}
+
+fn with_headers(headers: &str) -> String {
+    format!("HTTP/1.1 200 OK\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+#[test]
+fn cors_risk_follows_what_the_server_allows() {
+    // Reflects any origin and allows credentials.
+    let reflect = spawn_raw(|req| {
+        let origin = origin_of(req).unwrap_or("");
+        with_headers(&format!("Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\n"))
+    });
+    let s = run_scan(reflect, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-3"), Some(&1), "{s:?}");
+    assert_eq!(s.requests, 1, "stops at the first answer: {s:?}");
+
+    // A wildcard.
+    let any = spawn(|_| with_headers("Access-Control-Allow-Origin: *\r\n"));
+    let s = run_scan(any, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-2"), Some(&1), "{s:?}");
+
+    // Trusts the null origin, not the random one.
+    let null = spawn_raw(|req| match origin_of(req) {
+        Some("null") => with_headers("Access-Control-Allow-Origin: null\r\n"),
+        _ => with_headers(""),
+    });
+    let s = run_scan(null, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-2"), Some(&1), "{s:?}");
+    assert_eq!(s.requests, 2, "{s:?}");
+
+    // A fixed trusted origin for most, which doesn't hide that `null` is accepted too.
+    let fixed = spawn_raw(|req| match origin_of(req) {
+        Some("null") => with_headers("Access-Control-Allow-Origin: null\r\n"),
+        _ => with_headers("Access-Control-Allow-Origin: https://trusted.example\r\n"),
+    });
+    let s = run_scan(fixed, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-2"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.get("40040-1"), None, "{s:?}");
+    assert_eq!(s.requests, 2, "{s:?}");
+
+    // Allows anything starting with its host, on a port: the origin must still parse.
+    let prefix = spawn_raw(|req| match origin_of(req) {
+        Some(o)
+            if o.starts_with("http://127.0.0.1.")
+                && o.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) =>
+        {
+            with_headers(&format!("Access-Control-Allow-Origin: {o}\r\nAccess-Control-Allow-Credentials: true\r\n"))
+        }
+        _ => with_headers(""),
+    });
+    let s = run_scan(prefix, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-3"), Some(&1), "{s:?}");
+    assert_eq!(s.requests, 3, "no prefix on an IP address: {s:?}");
+
+    // Two origins in one answer: browsers refuse it, so it proves nothing.
+    let list = spawn_raw(|req| {
+        match origin_of(req) {
+        Some(o) => with_headers(&format!(
+            "Access-Control-Allow-Origin: {o}\r\nAccess-Control-Allow-Origin: https://trusted.example\r\nAccess-Control-Allow-Credentials: true\r\n"
+        )),
+        None => with_headers(""),
+    }
+    });
+    let s = run_scan(list, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-1"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.len(), 1, "{s:?}");
+
+    // Only its own origin: CORS is in use, nothing is wrong.
+    let own = spawn_raw(move |req| match origin_of(req) {
+        Some(o) if !o.contains("bp") && o != "null" && !o.contains("%60") => {
+            with_headers(&format!("Access-Control-Allow-Origin: {o}\r\n"))
+        }
+        _ => with_headers(""),
+    });
+    let s = run_scan(own, "/", &[40040], None);
+    assert_eq!(s.raised.get("40040-1"), Some(&1), "{s:?}");
+    assert_eq!(s.requests, 6, "{s:?}");
+
+    // No CORS headers at all.
+    let none = spawn(|_| with_headers(""));
+    let s = run_scan(none, "/", &[40040], None);
+    assert!(s.raised.is_empty(), "{s:?}");
+    assert_eq!(s.requests, 6, "{s:?}");
 }
 
 #[test]

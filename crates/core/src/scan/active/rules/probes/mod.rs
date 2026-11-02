@@ -1,9 +1,10 @@
-//! Page- and host-level probe rules, ported from ZAP's ascanrules add-on
-//! (Apache License 2.0). These send extra requests to fixed paths or forge
+//! Page- and host-level probe rules, ported from ZAP's ascanrules and ascanrulesBeta
+//! add-ons (Apache License 2.0). These send extra requests to fixed paths or forge
 //! headers rather than fuzzing the base request's parameters.
 
 mod cloud_metadata;
 mod common;
+mod cors;
 mod directory_browsing;
 mod elmah;
 mod entity_expansion;
@@ -29,6 +30,7 @@ use crate::scan::active::ActiveRule;
 pub fn all() -> Vec<Box<dyn ActiveRule>> {
     vec![
         Box::new(cloud_metadata::CloudMetadata),
+        Box::new(cors::Cors),
         Box::new(directory_browsing::DirectoryBrowsing),
         Box::new(elmah::Elmah),
         Box::new(entity_expansion::EntityExpansion),
