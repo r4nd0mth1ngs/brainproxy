@@ -910,10 +910,11 @@ export const importLive = (jobId: number | null, state: string | null | undefine
 
 /**
  * What the Site map does when Import API is asked for from elsewhere (the guided API scan): a
- * running import is never replaced, only shown; an Import API already open is replaced if the user agrees.
+ * running import, or one whose start hasn't been answered yet, is never replaced, only shown; an
+ * Import API already open is replaced if the user agrees.
  */
-export function importRequest(s: { live: boolean; wizardOpen: boolean }): "show_job" | "ask" | "open" {
-  if (s.live) return "show_job";
+export function importRequest(s: { live: boolean; starting: boolean; wizardOpen: boolean }): "show_job" | "ask" | "open" {
+  if (s.live || s.starting) return "show_job";
   return s.wizardOpen ? "ask" : "open";
 }
 

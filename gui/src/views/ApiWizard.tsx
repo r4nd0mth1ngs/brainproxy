@@ -108,6 +108,8 @@ interface Props {
   jobId?: number | null;
   /** The job started: the host keeps its id, so it outlives this card and a reload. */
   onStarted?: (id: number) => void;
+  /** The start command was sent (true) or answered (false). Until then the card can't be closed: the job may still start. */
+  onStarting?: (starting: boolean) => void;
   onDismiss: () => void;
   /** Back to the website guided scan. */
   onBack?: () => void;
@@ -245,6 +247,7 @@ export function ApiWizard(p: Props) {
   const start = async () => {
     if (!preview) return;
     setBusy(true);
+    p.onStarting?.(true);
     setStartProblem("");
     try {
       const plan = {
@@ -262,6 +265,7 @@ export function ApiWizard(p: Props) {
       setStartProblem(e.message);
     }
     setBusy(false);
+    p.onStarting?.(false);
   };
 
   // After every hook above: the hook count must not change between renders.
@@ -292,11 +296,11 @@ export function ApiWizard(p: Props) {
         </div>
         <div className="wiz-row">
           {p.onBack && (
-            <button className="link" onClick={p.onBack}>
+            <button className="link" disabled={busy} onClick={p.onBack}>
               Test a website instead
             </button>
           )}
-          <button className="link" onClick={p.onDismiss}>
+          <button className="link" disabled={busy} onClick={p.onDismiss} title={busy ? "Wait for the start to be answered" : undefined}>
             {mode === "import" ? "Cancel" : "I'll set it up myself"}
           </button>
         </div>

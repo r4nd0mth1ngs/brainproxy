@@ -183,6 +183,8 @@ function SiteMap({ active }: { active: boolean }) {
     }
   });
   const [jobShown, setJobShown] = useState(true);
+  // The wizard's start command is out: the card stays until it is answered, or its job would be lost.
+  const [importStarting, setImportStarting] = useState(false);
   const setImportJob = (id: number | null) => {
     setImportJobState(id);
     setJobShown(true);
@@ -210,10 +212,10 @@ function SiteMap({ active }: { active: boolean }) {
     let state: string | undefined = job?.state;
     if (importJob != null && state == null) state = await run<Job>(["job", "status", String(importJob)]).then((j) => j.state, (e) => (e.kind === "not_found" ? "gone" : undefined));
     if (state === "gone") setImportJob(null);
-    const what = importRequest({ live: state !== "gone" && importLive(importJob, state), wizardOpen: !!importing });
+    const what = importRequest({ live: state !== "gone" && importLive(importJob, state), starting: importStarting, wizardOpen: !!importing });
     if (what === "show_job") {
       setJobShown(true);
-      app.toast("An API import is still running here. Start another when it has finished.");
+      app.toast(importStarting ? "An API import is starting here. Start another when it has finished." : "An API import is still running here. Start another when it has finished.");
     } else if (what === "open") {
       openImport(req, false);
     } else {
@@ -383,6 +385,7 @@ function SiteMap({ active }: { active: boolean }) {
               setImportJob(id);
               setImporting(null);
             }}
+            onStarting={setImportStarting}
             onDismiss={() => setImporting(null)}
           />
         </div>

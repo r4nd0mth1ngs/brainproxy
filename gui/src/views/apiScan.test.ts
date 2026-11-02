@@ -391,11 +391,13 @@ test("a running import in the Site map is never replaced", () => {
   for (const st of ["completed", "stopped", "failed"]) assert.ok(!importLive(4, st), st);
   assert.ok(!importLive(null, "running"));
   // Asked for from the guided API scan while a job runs: only its card is shown, whatever is open.
-  assert.equal(importRequest({ live: true, wizardOpen: false }), "show_job");
-  assert.equal(importRequest({ live: true, wizardOpen: true }), "show_job");
+  assert.equal(importRequest({ live: true, starting: false, wizardOpen: false }), "show_job");
+  assert.equal(importRequest({ live: true, starting: false, wizardOpen: true }), "show_job");
+  // Nor while the start is being answered: replacing the card then would lose the job it starts.
+  assert.equal(importRequest({ live: false, starting: true, wizardOpen: true }), "show_job");
   // One being set up is replaced only if the user agrees; otherwise it opens.
-  assert.equal(importRequest({ live: false, wizardOpen: true }), "ask");
-  assert.equal(importRequest({ live: false, wizardOpen: false }), "open");
+  assert.equal(importRequest({ live: false, starting: false, wizardOpen: true }), "ask");
+  assert.equal(importRequest({ live: false, starting: false, wizardOpen: false }), "open");
 });
 
 test("what the key form starts on", () => {

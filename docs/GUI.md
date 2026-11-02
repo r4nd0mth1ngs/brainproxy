@@ -41,8 +41,9 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
   1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue
-  every second while its tab is open. The project is SQLite in WAL mode, so the GUI, the
-  proxy, background jobs, and an agent share it safely.
+  every second while its tab is open. Polls can overlap; an older one that answers after a
+  newer one is dropped, so a slow poll never puts back a stale state. The project is SQLite in
+  WAL mode, so the GUI, the proxy, background jobs, and an agent share it safely.
 - The app's proxy: every place that starts the proxy (opening a project, the pill, Open
   browser, Settings, Record a login, Access's live restart) goes through `views/proxyPort.ts`,
   which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
@@ -172,9 +173,10 @@ filtered to source `import`, `openTraffic` in `store.tsx`). *Hide* shows the map
 runs, with a *Show* link in the toolbar. The Site map keeps the job id per project, so the card
 comes back after a reload. One import runs at a time. The guided API scan's first step links to it
 too (`openApiImport`), with the definition typed so far and the *GraphQL endpoint* tick; that never
-replaces a running import, and replaces one being set up only after asking. Since an import sends
-as the crawl tool, its signer check looks for a session rule that applies to crawls rather than
-scans, and says so when the check goes out unsigned.
+replaces a running import, and replaces one being set up only after asking. While `import api` is
+starting, the wizard can't be cancelled or replaced, so the job it starts is always the one shown.
+Since an import sends as the crawl tool, its signer check looks for a session rule that applies to
+crawls rather than scans, and says so when the check goes out unsigned.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings),
