@@ -102,10 +102,37 @@ export function withSaved(list: SavedFilter[], name: string, filter: TrafficFilt
 
 export const withoutSaved = (list: SavedFilter[], name: string) => list.filter((s) => s.name !== name);
 
+/** `f` in a fixed form (sources sorted, fields in order), to compare filters. */
+function normal(f: TrafficFilter): TrafficFilter {
+  const n = parseFilter(f);
+  return { ...n, sources: n.sources.sort() };
+}
+
+const same = (a: TrafficFilter, b: TrafficFilter) => JSON.stringify(normal(a)) === JSON.stringify(normal(b));
+
 /** The saved filter equal to `f`, if any (to show which one is applied). */
 export function savedMatching(list: SavedFilter[], f: TrafficFilter): string | null {
-  const key = (x: TrafficFilter) => JSON.stringify({ ...parseFilter(x), sources: [...x.sources].sort() });
-  return list.find((s) => key(s.filter) === key(f))?.name ?? null;
+  return list.find((s) => same(s.filter, f))?.name ?? null;
+}
+
+/**
+ * The saved filter to show as applied: `picked` (the one last chosen or saved) while the filter
+ * still equals it, so of two saved filters with the same state the chosen one is shown and
+ * deleted; otherwise the first equal one.
+ */
+export function appliedSaved(list: SavedFilter[], f: TrafficFilter, picked: string | null): string | null {
+  const p = picked == null ? undefined : list.find((s) => s.name === picked);
+  return p && same(p.filter, f) ? p.name : savedMatching(list, f);
+}
+
+/**
+ * Adds the saved filters of `from` to those of `to` (same name: `from` wins), for a temporary
+ * engagement saved to a file. False when storage is unavailable.
+ */
+export function copySaved(from: string, to: string): boolean {
+  const list = loadSaved(from);
+  if (!list.length) return true;
+  return storeSaved(to, list.reduce((acc, s) => withSaved(acc, s.name, s.filter), loadSaved(to)));
 }
 
 // ---------------- Contents search ----------------
@@ -116,26 +143,32 @@ export const SEARCH_PAGE = 2000;
 export const MAX_MATCHES = 10000;
 
 export interface ContentSearch {
-  query: string;
-  /** Passed as --source (when the filter picks exactly one source). */
-  source: string | null;
+  /**
+   * The filter the search runs for (from searchFor): its text goes to --contains, a single
+   * source to --source, and only rows passing its other filters count as matches.
+   */
+  filter: TrafficFilter;
   matches: Set<number>;
   /** Every match with an id up to here is in `matches`. */
   cursor: number;
   /** Stopped at MAX_MATCHES: rows after `cursor` aren't searched. */
   capped: boolean;
+  /** The last page failed; the next poll tries again. */
   error: string | null;
 }
 
-/** The search a filter asks for, or null when the contents search is off or has no text. */
-export function searchFor(f: TrafficFilter): { query: string; source: string | null } | null {
+/**
+ * The search a filter asks for, or null when the contents search is off or has no text. Any
+ * change to it (text, sources, checkboxes) is a new search, since the cap counts only rows
+ * the filter shows.
+ */
+export function searchFor(f: TrafficFilter): TrafficFilter | null {
   if (!f.contents || !f.text) return null;
-  return { query: f.text, source: f.sources.length === 1 ? f.sources[0] : null };
+  return normal(f);
 }
 
-export const newSearch = (query: string, source: string | null): ContentSearch => ({
-  query,
-  source,
+export const newSearch = (f: TrafficFilter): ContentSearch => ({
+  filter: normal({ ...f, contents: true }),
   matches: new Set(),
   cursor: 0,
   capped: false,
@@ -145,29 +178,33 @@ export const newSearch = (query: string, source: string | null): ContentSearch =
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
   const want = searchFor(f);
-  return !!s && !!want && s.query === want.query && s.source === want.source;
+  return !!s && !!want && JSON.stringify(s.filter) === JSON.stringify(want);
 };
 
 /** `history list` arguments for the next page of a search. */
 export function searchArgs(s: ContentSearch): string[] {
+  const { text, sources } = s.filter;
   return [
     "history",
     "list",
-    `--contains=${s.query}`,
-    ...(s.source ? [`--source=${s.source}`] : []),
+    `--contains=${text}`,
+    ...(sources.length === 1 ? [`--source=${sources[0]}`] : []),
     `--after=${s.cursor}`,
     `--limit=${SEARCH_PAGE}`,
   ];
 }
 
-/** Whether rows up to `upTo` (the newest id the poll has) still need searching. */
-export const needsSearch = (s: ContentSearch, upTo: number) => !s.capped && !s.error && s.cursor < upTo;
+/**
+ * Whether rows up to `upTo` (the newest id the poll has) still need searching. A failed search
+ * does too: the caller stops after a failure and tries again on the next poll.
+ */
+export const needsSearch = (s: ContentSearch, upTo: number) => !s.capped && s.cursor < upTo;
 
 /**
  * The search after one page of results. `upTo` is the newest polled id, read before the call:
  * a short page means every match up to it (and up to the last match) is known; a full page
- * covers ids up to its last row only, so the next page starts there. A match past MAX_MATCHES
- * stops the search.
+ * covers ids up to its last row only, so the next page starts there. Rows the search's filter
+ * hides are searched but not counted; a shown match past MAX_MATCHES stops the search.
  */
 export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number): ContentSearch {
   const matches = new Set(s.matches);
@@ -175,15 +212,17 @@ export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number):
   let capped = false;
   for (const i of items) {
     if (i.id <= s.cursor) continue;
-    if (matches.size >= MAX_MATCHES) {
-      capped = true;
-      break;
+    if (matchesFilter(i, s.filter)) {
+      if (matches.size >= MAX_MATCHES) {
+        capped = true;
+        break;
+      }
+      matches.add(i.id);
     }
-    matches.add(i.id);
     cursor = Math.max(cursor, i.id);
   }
   if (!capped && items.length < SEARCH_PAGE) cursor = Math.max(cursor, upTo);
-  return { ...s, matches, cursor, capped };
+  return { ...s, matches, cursor, capped, error: null };
 }
 
 /**
@@ -202,8 +241,8 @@ export function visibleRows(rows: HistoryItem[], f: TrafficFilter, s: ContentSea
 /** A short status for the toolbar while contents search is on. */
 export function searchNote(s: ContentSearch | null, upTo: number): string {
   if (!s) return "Searching…";
-  if (s.error) return `Search failed: ${s.error}`;
-  if (s.capped) return `Stopped at the first ${MAX_MATCHES.toLocaleString("en-US")} matches (up to #${s.cursor}); narrow the search to see later ones`;
+  if (s.error) return `Search failed (trying again): ${s.error}`;
+  if (s.capped) return `Stopped at the first ${MAX_MATCHES.toLocaleString("en-US")} matches (up to #${s.cursor}); narrow the search or filters to see later ones`;
   if (needsSearch(s, upTo)) return "Searching…";
   return "";
 }

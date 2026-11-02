@@ -243,10 +243,12 @@ The sidebar groups the tools by what you are doing.
   - **Contents:** tick it to search the text inside requests and responses instead: headers
     and bodies, compressed and chunked bodies included. The search is case-sensitive and the
     other filters still apply. New traffic that matches shows up as it arrives. A search stops
-    at the first 10,000 matches and says so; narrow it to see later ones.
+    at the first 10,000 matches the other filters show and says so; narrow it to see later
+    ones.
   - **Saved filters:** *Save…* names the current filters (text, Contents, sources and the
     checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept per
-    project on this computer, not in the project file.
+    project on this computer, not in the project file. *Save as…* on a temporary engagement
+    takes them along.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the

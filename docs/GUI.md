@@ -246,7 +246,10 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
 - Traffic's contents search is case-sensitive, like `history list --contains`, and stops at the
-  first 10,000 matches (oldest first; the toolbar says so).
+  first 10,000 matches the other filters show (oldest first; the toolbar says so). Changing a
+  filter starts the search again. A failed search is tried again on the next poll.
 - Saved Traffic filters are kept by the app (localStorage, per project path), not in the
   project file, so the CLI and agents don't see them and they don't follow a copied project.
+  *Save as…* on a temporary engagement copies them to the saved file; discarding one leaves its
+  (unused) entry behind.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

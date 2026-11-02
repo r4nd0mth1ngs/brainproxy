@@ -8,6 +8,7 @@ import type { TempInfo } from "../store";
 import { confirm } from "../ui/Confirm";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
+import { copySaved } from "./trafficFilter";
 
 const RECENT = "recent-projects";
 
@@ -180,6 +181,8 @@ export async function saveTempAs(project: string, name: string): Promise<string 
   if (!dest) return null;
   if (await tempProjects.isInside(dest)) throw new Error(`${dest} is inside a temporary engagement's folder, which is deleted with it`);
   await run(["project", "save", `--output=${dest}`], { project });
+  // Saved Traffic filters are kept by the app per project path, so they move with it.
+  copySaved(project, dest);
   return dest;
 }
 

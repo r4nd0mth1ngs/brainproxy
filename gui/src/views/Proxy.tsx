@@ -8,6 +8,7 @@ import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import {
+  appliedSaved,
   DEFAULT_FILTER,
   isCurrent,
   isRefused,
@@ -15,7 +16,6 @@ import {
   mergePage,
   needsSearch,
   newSearch,
-  savedMatching,
   searchArgs,
   searchFor,
   searchNote,
@@ -106,11 +106,14 @@ function History() {
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const [filter, setFilter] = useState<TrafficFilter>(DEFAULT_FILTER);
   const [saved, setSaved] = useState<SavedFilter[]>(() => loadSaved(app.project));
+  // The saved filter last chosen or saved, so two with the same state stay apart.
+  const [picked, setPicked] = useState<string | null>(null);
   const lastId = useRef(0);
   const { menu, open, close } = useMenu();
 
   // Contents search: the CLI matches the text inside requests and responses. It runs page by
-  // page up to the newest polled row, then searches only the rows each poll adds.
+  // page up to the newest polled row, then searches only the rows each poll adds. A failed
+  // page is tried again on the next poll.
   const search = useRef<ContentSearch | null>(null);
   const [found, setFound] = useState<ContentSearch | null>(null);
   const searching = useRef(false);
@@ -132,6 +135,7 @@ function History() {
         if (search.current !== s) continue;
         search.current = next;
         setFound(next);
+        if (next.error) return;
       }
     } finally {
       searching.current = false;
@@ -154,17 +158,17 @@ function History() {
     await searchMore();
   }, 1500);
 
-  // A new search shortly after the text (or the single source) stops changing.
+  // A new search shortly after the text or another filter stops changing.
   const wanted = JSON.stringify(searchFor(filter));
   useEffect(() => {
-    const want = JSON.parse(wanted) as ReturnType<typeof searchFor>;
+    const want = JSON.parse(wanted) as TrafficFilter | null;
     if (!want) {
       search.current = null;
       setFound(null);
       return;
     }
     const t = setTimeout(() => {
-      search.current = newSearch(want.query, want.source);
+      search.current = newSearch(want);
       setFound(search.current);
       searchMore();
     }, 300);
@@ -224,7 +228,7 @@ function History() {
     setFilter((f) => ({ ...f, sources: f.sources.includes(s) ? f.sources.filter((x) => x !== s) : [...f.sources, s] }));
 
   // Saved filters are kept per project in this app (localStorage).
-  const applied = savedMatching(saved, filter);
+  const applied = appliedSaved(saved, filter, picked);
   const keepSaved = (list: SavedFilter[]) => {
     setSaved(list);
     if (!storeSaved(app.project, list)) app.toast("Saved filters can't be stored here; they last until the app closes.", "error");
@@ -234,6 +238,7 @@ function History() {
     if (!name) return;
     if (name !== applied && saved.some((s) => s.name === name) && !(await confirm(`Replace the filter ${name}?`, "A saved filter already has that name.", "Replace", "Cancel"))) return;
     keepSaved(withSaved(saved, name, filter));
+    setPicked(name);
   };
   const deleteFilter = async () => {
     if (!applied || !(await confirm(`Delete the filter ${applied}?`, "Only the saved filter is deleted, not any traffic.", "Delete", "Cancel"))) return;
@@ -278,7 +283,10 @@ function History() {
           title="Saved filters for this project"
           onChange={(e) => {
             const s = saved.find((x) => x.name === e.target.value);
-            if (s) setFilter(s.filter);
+            if (s) {
+              setPicked(s.name);
+              setFilter(s.filter);
+            }
           }}
         >
           <option value="">{saved.length ? "Saved filters" : "No saved filters"}</option>
