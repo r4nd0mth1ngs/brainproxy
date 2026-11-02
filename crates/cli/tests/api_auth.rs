@@ -30,6 +30,11 @@ impl Hit {
     }
 }
 
+/// What the local API's /graphql says of itself when introspected.
+const GRAPHQL_SDL: &str = "type Query { me: User user(id: ID!): User }\n\
+                           type Mutation { deleteUser(id: ID!): Boolean }\n\
+                           type User { id: ID! name: String }\n";
+
 /// A local API with a token endpoint at /token. Tokens are `tok-N`; `ttl` is their expires_in.
 #[derive(Clone)]
 struct Api {
@@ -88,7 +93,23 @@ impl Api {
                 body: String::from_utf8_lossy(body).into_owned(),
             };
             self.hits.lock().unwrap().push(hit.clone());
-            let reply = if target == "/token" && self.down.load(Ordering::SeqCst) {
+            let json_reply = |text: String| {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}",
+                    text.len()
+                )
+            };
+            let reply = if target == "/graphql" && hit.body.contains("__schema") {
+                let schema = brainproxy_core::apiimport::graphql::parse_sdl(GRAPHQL_SDL).unwrap();
+                json_reply(json!({"data": schema}).to_string())
+            } else if target == "/.well-known/openid-configuration" {
+                let origin = self.origin();
+                json_reply(
+                    json!({"issuer": origin, "token_endpoint": format!("{origin}/token"),
+                        "authorization_endpoint": format!("{origin}/authorize")})
+                    .to_string(),
+                )
+            } else if target == "/token" && self.down.load(Ordering::SeqCst) {
                 "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
             } else if target == "/token" {
                 let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
@@ -815,4 +836,132 @@ fn a_query_signer_after_a_script_still_signs() {
     ok(&p, &["import", "api", "--auth", "o", "--environment", &env, "--", &doc], &[("HM", "FAKE-HM")]);
     let hit = &api.at("/v1/a")[0];
     assert!(hit.target.contains("ts=1") && hit.target.contains("mac="), "{hit:?}");
+}
+
+/// The bodies sent to /graphql, from the `from`th on, that name `field`.
+fn graphql_bodies(api: &Api, from: usize, field: &str) -> Vec<String> {
+    api.at("/graphql").into_iter().skip(from).map(|h| h.body).filter(|b| b.contains(field)).collect()
+}
+
+#[test]
+fn import_api_introspects_a_graphql_endpoint() {
+    let api = Api::start(3600);
+    let (_dir, p) = setup("gql-introspect");
+    let endpoint = format!("{}/graphql", api.origin());
+    let d = ok(&p, &["import", "api", "--graphql", "--dry-run", "--", &endpoint], &[]);
+    assert_eq!(
+        (d["format"].as_str(), d["built"].as_u64(), d["selected"].as_u64()),
+        (Some("graphql"), Some(3), Some(2))
+    );
+    let row = |d: &Value, n: &str| d["requests"].as_array().unwrap().iter().find(|r| r["name"] == n).unwrap().clone();
+    assert_eq!(row(&d, "mutation deleteUser")["excluded_reason"], "method", "{d}");
+    // --include-destructive says it takes GraphQL mutations too.
+    let d = ok(&p, &["import", "api", "--graphql", "--dry-run", "--include-destructive", "--", &endpoint], &[]);
+    assert_eq!(row(&d, "mutation deleteUser")["included"], true, "{d}");
+    // Only the introspection went out, and nothing was recorded.
+    assert!(api.hits().iter().all(|h| h.body.contains("__schema")), "{:?}", api.hits());
+    let n = ok(&p, &["query", "SELECT count(*) FROM history"], &[]);
+    assert_eq!(n["rows"][0][0], 0);
+
+    ok(&p, &["import", "api", "--graphql", "--", &endpoint], &[]);
+    assert_eq!(graphql_bodies(&api, 0, "query me").len(), 1);
+    assert!(graphql_bodies(&api, 0, "deleteUser").is_empty());
+}
+
+#[test]
+fn a_mutation_sent_once_is_not_attacked_by_a_later_scan() {
+    let api = Api::start(3600);
+    let (dir, p) = setup("gql-later");
+    let schema = write(&dir, "schema.graphql", GRAPHQL_SDL);
+    let endpoint = format!("{}/graphql", api.origin());
+    ok(&p, &["import", "api", "--base-url", &endpoint, "--include-methods", "MUTATION", "--", &schema], &[]);
+    assert_eq!(graphql_bodies(&api, 0, "deleteUser").len(), 1);
+
+    // A plain scan takes every imported request, but a mutation is opted in to as MUTATION.
+    let start = api.at("/graphql").len();
+    let mut args = vec!["scan", "active", "--rules", "30001,30002", "--strength", "low"];
+    let r = ok(&p, &args, &[]);
+    assert_eq!(r["targets"], 2, "{r}");
+    assert!(graphql_bodies(&api, start, "query user").len() > 1, "the queries were attacked");
+    assert!(graphql_bodies(&api, start, "deleteUser").is_empty(), "the mutation was replayed");
+
+    // Opting in, or naming the request, attacks it.
+    let start = api.at("/graphql").len();
+    args.push("--include-methods=MUTATION");
+    let r = ok(&p, &args, &[]);
+    assert_eq!(r["targets"], 3, "{r}");
+    assert!(graphql_bodies(&api, start, "deleteUser").len() > 1);
+    let id = ok(
+        &p,
+        &["query", "SELECT id FROM history WHERE source = 'import' AND req_body_text LIKE '%deleteUser%' LIMIT 1"],
+        &[],
+    );
+    let id = id["rows"][0][0].to_string();
+    let start = api.at("/graphql").len();
+    ok(&p, &["scan", "active", "--history-id", &id, "--rules", "30001", "--strength", "low"], &[]);
+    assert!(!graphql_bodies(&api, start, "deleteUser").is_empty());
+}
+
+#[test]
+fn scan_active_api_on_a_graphql_schema_leaves_mutations_alone_unless_asked() {
+    let api = Api::start(3600);
+    let (dir, p) = setup("gql-scan");
+    let schema = write(&dir, "schema.graphql", GRAPHQL_SDL);
+    let source = format!("--api={schema}");
+    let base = format!("--base-url={}/graphql", api.origin());
+    let mut args = vec!["scan", "active", &source, &base, "--rules", "30001,30002", "--strength", "low"];
+    let r = ok(&p, &args, &[]);
+    assert_eq!((r["import"]["format"].as_str(), r["import"]["selected"].as_u64()), (Some("graphql"), Some(2)), "{r}");
+    assert_eq!(r["targets"], 2, "{r}");
+    assert!(graphql_bodies(&api, 0, "query user").len() > 1, "the queries were attacked");
+    assert!(graphql_bodies(&api, 0, "deleteUser").is_empty(), "a mutation went out");
+
+    let start = api.at("/graphql").len();
+    args.push("--include-methods=MUTATION");
+    let r = ok(&p, &args, &[]);
+    assert_eq!(r["targets"], 3, "{r}");
+    assert!(graphql_bodies(&api, start, "deleteUser").len() > 1, "the opted-in mutation was attacked");
+}
+
+#[test]
+fn oauth_discover_reads_where_tokens_and_sign_ins_go() {
+    let api = Api::start(3600);
+    let (_dir, p) = setup("discover");
+    let url = format!("{}/.well-known/openid-configuration", api.origin());
+    let d = ok(&p, &["auth", "oauth", "discover", &url], &[]);
+    assert_eq!(d["token_url"], format!("{}/token", api.origin()), "{d}");
+    assert_eq!(d["authorize_url"], format!("{}/authorize", api.origin()), "{d}");
+    let o = run(&p, &["auth", "oauth", "discover", "https://id.elsewhere.test/.well-known/openid-configuration"], &[]);
+    assert_eq!((o.code, o.json["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{}", o.all);
+    // The API's own JSON is no discovery document.
+    let o = run(&p, &["auth", "oauth", "discover", &format!("{}/v1/a", api.origin())], &[]);
+    let d = &o.json["data"];
+    assert!(o.code != 0 || (d["token_url"].is_null() && d["authorize_url"].is_null()), "{}", o.all);
+}
+
+#[test]
+fn oauth_params_reach_the_token_request_and_credentials_are_refused() {
+    let api = Api::start(3600);
+    let (dir, p) = setup("oauth-param");
+    let doc = write(&dir, "api.json", &api_doc(&api));
+    let token_url = format!("{}/token", api.origin());
+    let add = |extra: &[&str]| {
+        let mut args = vec!["auth", "add", "op", "--oauth-flow", "client_credentials", "--oauth-token-url", &token_url];
+        args.extend_from_slice(&["--oauth-client-id", "c", "--oauth-client-secret-env", "CLIENT_SECRET"]);
+        args.push("--oauth-store-secrets");
+        args.extend_from_slice(extra);
+        run(&p, &args, &[("CLIENT_SECRET", "FAKE-CLIENT-SECRET")])
+    };
+    for bad in ["client_assertion=FAKE-JWT", "client_secret=FAKE-SECRET", "subject_token=FAKE-TOKEN"] {
+        let o = add(&["--oauth-param", bad]);
+        assert_eq!(o.code, 2, "{bad}: {}", o.all);
+        assert!(o.all.contains("looks like a credential") && !o.all.contains("FAKE"), "{}", o.all);
+    }
+    let o = add(&["--oauth-param", "resource=https://api.test/", "--oauth-param", "tenant=t1"]);
+    assert_eq!(o.code, 0, "{}", o.all);
+    let shown = ok(&p, &["auth", "show", "op"], &[]);
+    assert_eq!(shown["profile"]["oauth"]["params"][0], json!(["resource", "https://api.test/"]), "{shown}");
+    ok(&p, &["import", "api", "--auth", "op", "--", &doc], &[]);
+    let body = &api.at("/token")[0].body;
+    assert!(body.contains("resource=https%3A%2F%2Fapi.test%2F") && body.contains("tenant=t1"), "{body}");
 }
