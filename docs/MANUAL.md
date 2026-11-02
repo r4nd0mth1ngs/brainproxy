@@ -832,7 +832,9 @@ and targets that want a JWT you choose the claims of:
   [--session-token-env VAR | --session-token-file PATH] --origin ORIGIN`. It sets `X-Amz-Date`,
   `X-Amz-Content-Sha256` and, with a session token, `X-Amz-Security-Token`, and signs `host`,
   `content-type` and every `x-amz-*` header into `Authorization`. The path is encoded again for every
-  service but S3, as AWS expects. None of the three values is stored.
+  service but S3, as AWS expects. None of the three values is stored; all three are read when the
+  signer first signs in a command and kept until it ends, so credentials renewed in their files are
+  picked up by the next command (a running proxy keeps them until it restarts).
 - A Postman pre-request script: `auth sign add PROFILE NAME --script FILE [--script-sha256 HEX]
   [--environment ENV_FILE] [--script-var NAME=VALUE ...] --origin ORIGIN`. FILE is a collection
   (`--script-sha256` picks one of its scripts, as `import api` lists them, unless it has only one)

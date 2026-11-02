@@ -469,6 +469,15 @@ impl Vault {
         }
     }
 
+    /// Whether a signer fills a placeholder in the head of `raw`, so resolving it may block.
+    pub(crate) fn signs(&self, raw: &[u8]) -> bool {
+        if find(raw, MARK.as_bytes()).is_none() {
+            return false;
+        }
+        let head = split_head_body(raw).0;
+        self.0.lock().unwrap().sign_marks.iter().any(|m| find(head, m.as_bytes()).is_some())
+    }
+
     /// Registers a password, encoded for each login body type, for the login origin (and
     /// the origins of macro steps that use it, which stay allowed).
     pub(crate) fn put_password(&self, p: &AuthProfile, password: &str) {
@@ -1257,9 +1266,55 @@ mod tests {
         AuthSession::new(&dir.join("p.bpdb"), profile, SessionState::default(), Client::new(opts)).unwrap()
     }
 
+    fn vault_of(s: &AuthSession) -> &Vault {
+        &s.client.options().guard.as_ref().unwrap().vault
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_script_signing_holds_up_no_other_task() {
+        crate::sign_script::tests::use_test_runner();
+        let script = "/^(a+)+$/.test('a'.repeat(40) + 'b');";
+        let dir = std::env::temp_dir().join(format!("bp-auth-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pre.js");
+        std::fs::write(&file, script).unwrap();
+        let signer = crate::sign::Signer {
+            name: "script".into(),
+            key: crate::sign::KeySource::None,
+            key_encoding: Default::default(),
+            origins: vec!["https://a.test".into()],
+            to: crate::sign::Place::Header(crate::sign::SCRIPT_MARK_HEADER.into()),
+            format: None,
+            headers: vec![],
+            kind: crate::sign::SignKind::Script {
+                file,
+                sha256: crate::fetch::sha256_hex(script.as_bytes()),
+                vars: vec![],
+            },
+        };
+        let s = session(AuthProfile { name: "p".into(), ..Default::default() });
+        vault_of(&s).put_signers("p", std::slice::from_ref(&signer));
+        let raw = signer.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let target = Target::from_url("https://a.test").unwrap();
+        let e = s.client.fill_auth(&raw, &target).await.unwrap_err().to_string();
+        ticker.abort();
+        assert!(e.contains("time limit"), "{e}");
+        // The only worker thread kept ticking while the script ran out its five seconds.
+        assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > 100, "{ticks:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn wire(s: &AuthSession, req: &[u8]) -> Result<String> {
         let target = Target::from_url("https://a.test").unwrap();
-        Ok(String::from_utf8(s.client.fill_auth(req, &target)?.into_owned()).unwrap())
+        Ok(String::from_utf8(vault_of(s).resolve(req, &target)?.into_owned()).unwrap())
     }
 
     #[test]
@@ -1314,7 +1369,7 @@ mod tests {
         let b = Target::from_url("https://b.test").unwrap();
         let out = String::from_utf8(s.apply_to(b"GET /x HTTP/1.1\r\nHost: b.test\r\n\r\n", &[], &b)).unwrap();
         assert!(!out.contains("api_key"), "{out}");
-        assert!(s.client.fill_auth(&applied, &b).is_err());
+        assert!(vault_of(&s).resolve(&applied, &b).is_err());
         // Nor is it filled outside the request line.
         let ph = "«auth:t:query:api_key»";
         assert!(wire(&s, format!("GET / HTTP/1.1\r\nX-Reflect: {ph}\r\n\r\n").as_bytes()).is_err());
@@ -1432,7 +1487,7 @@ mod tests {
         let sent = wire(&s, req.as_bytes()).unwrap();
         assert!(sent.ends_with("Content-Length: 7\r\n\r\np=p%26w"), "{sent}");
         let other = Target::from_url("https://b.test").unwrap();
-        assert!(s.client.fill_auth(req.as_bytes(), &other).is_err());
+        assert!(vault_of(&s).resolve(req.as_bytes(), &other).is_err());
     }
 
     #[test]

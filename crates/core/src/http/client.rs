@@ -218,19 +218,26 @@ impl Client {
     }
 
     /// The bytes to put on the wire: auth placeholders replaced with their values
-    /// from the guard's vault. Callers record the original bytes.
-    pub fn fill_auth<'a>(&self, bytes: &'a [u8], target: &Target) -> Result<std::borrow::Cow<'a, [u8]>> {
-        match &self.opts.guard {
-            Some(g) => g.vault.resolve(bytes, target),
-            None => Ok(std::borrow::Cow::Borrowed(bytes)),
+    /// from the guard's vault. Callers record the original bytes. Signing can block (a
+    /// script runs for up to its time limit, a key is read from a file, an RSA signature
+    /// takes a while), so a request a signer fills is filled on the blocking pool.
+    pub async fn fill_auth<'a>(&self, bytes: &'a [u8], target: &Target) -> Result<std::borrow::Cow<'a, [u8]>> {
+        let Some(g) = &self.opts.guard else { return Ok(std::borrow::Cow::Borrowed(bytes)) };
+        if !g.vault.signs(bytes) {
+            return g.vault.resolve(bytes, target);
         }
+        let (guard, owned, target) = (g.clone(), bytes.to_vec(), target.clone());
+        tokio::task::spawn_blocking(move || guard.vault.resolve(&owned, &target).map(|b| b.into_owned()))
+            .await
+            .map_err(|e| Error::Protocol(format!("signing stopped: {e}")))?
+            .map(std::borrow::Cow::Owned)
     }
 
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
         if self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")) {
-            let filled = self.fill_auth(req.as_bytes(), target)?;
+            let filled = self.fill_auth(req.as_bytes(), target).await?;
             let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
                 .await
                 .map_err(|_| Error::Timeout(self.opts.timeout))??;
@@ -273,7 +280,7 @@ impl Client {
     /// the request), a 401 challenge of their scheme is answered here, NTLM's on the
     /// same connection; the response returned is the last one.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
-        let bytes = &*self.fill_auth(bytes, target)?;
+        let bytes = &*self.fill_auth(bytes, target).await?;
         match self.platform_cred(target, bytes) {
             Some(cred) => self.exchange_platform(&cred, bytes, target, method).await,
             None => self.exchange_once(bytes, target, method).await,
