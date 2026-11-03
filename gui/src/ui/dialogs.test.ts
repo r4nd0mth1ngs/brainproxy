@@ -26,3 +26,15 @@ test("native prompt, alert and confirm dialogs aren't used beyond the known ones
   }
   assert.deepEqual(found, ALLOWED);
 });
+
+// No DOM here, so the markup is checked in the source: the in-app question's text is read with
+// its field, and Traffic's saved-filter list and search status are announced.
+test("the ask dialog and Traffic's search controls carry their accessible names", () => {
+  const read = (f: string) => readFileSync(join(SRC, f), "utf8");
+  const dialog = read("ui/Confirm.tsx");
+  assert.match(dialog, /<p id="confirm-message">/);
+  assert.match(dialog, /<input[^>]*aria-describedby="confirm-message"/s);
+  const traffic = read("views/Proxy.tsx");
+  assert.match(traffic, /<select[^>]*aria-label="Saved filters"/s);
+  assert.match(traffic, /aria-live="polite">\s*\{note\}/);
+});

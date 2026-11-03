@@ -63,18 +63,20 @@ export function ConfirmHost() {
         role={typed ? "dialog" : "alertdialog"}
         aria-modal="true"
         aria-labelledby="confirm-title"
+        aria-describedby={typed ? undefined : "confirm-message"}
         onSubmit={(e) => {
           e.preventDefault();
           if (!typed || text.trim()) answer(typed ? text : "");
         }}
       >
         <h2 id="confirm-title">{req.title}</h2>
-        <p>{req.message}</p>
+        <p id="confirm-message">{req.message}</p>
         {typed && (
           <input
             className="input"
             style={{ width: "100%", marginBottom: 18 }}
             aria-labelledby="confirm-title"
+            aria-describedby="confirm-message"
             autoFocus
             value={text}
             onFocus={(e) => e.target.select()}

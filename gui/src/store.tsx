@@ -1,7 +1,7 @@
 // App-wide state: the open project, the active tool tab, cross-tool "send to" actions,
 // and toasts. Each view keeps its own data and fetches it through api.ts.
 
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
 
 export type Tab =
@@ -86,11 +86,14 @@ export function AppProvider({
   project,
   temp,
   saveAs,
+  notice,
   children,
 }: {
   project: string;
   temp: TempInfo | null;
   saveAs: () => Promise<void>;
+  /** Toasted once when the project opens, e.g. what Save as… couldn't take along. */
+  notice?: string;
   children: ReactNode;
 }) {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -111,6 +114,14 @@ export function AppProvider({
     const ms = Math.max(kind === "error" ? 7000 : 3500, text.length * 60);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), ms);
   }, []);
+
+  const noticed = useRef("");
+  useEffect(() => {
+    if (notice && noticed.current !== notice) {
+      noticed.current = notice;
+      toast(notice, "error");
+    }
+  }, [notice, toast]);
 
   const setRepeater = useCallback((f: (tabs: RepeaterTab[]) => RepeaterTab[]) => setRepeaterState(f), []);
 

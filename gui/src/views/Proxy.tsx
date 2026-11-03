@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bodyText, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
+import { bodyText, cancelCli, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
 import { ask, confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -10,12 +10,14 @@ import { usePoll } from "../ui/usePoll";
 import {
   appliedSaved,
   DEFAULT_FILTER,
+  failPage,
   isCurrent,
   isRefused,
   loadSaved,
   mergePage,
   needsSearch,
   newSearch,
+  refilter,
   searchArgs,
   searchFor,
   searchNote,
@@ -25,6 +27,7 @@ import {
   withoutSaved,
   type ContentSearch,
   type SavedFilter,
+  type SearchQuery,
   type TrafficFilter,
 } from "./trafficFilter";
 import { WebSockets } from "./WebSockets";
@@ -113,10 +116,15 @@ function History() {
 
   // Contents search: the CLI matches the text inside requests and responses. It runs page by
   // page up to the newest polled row, then searches only the rows each poll adds. A failed
-  // page is tried again on the next poll.
+  // page is tried again on a later poll, waiting longer after each failure.
   const search = useRef<ContentSearch | null>(null);
   const [found, setFound] = useState<ContentSearch | null>(null);
   const searching = useRef(false);
+  // The CLI call running for the search, stopped when the query changes.
+  const searchCall = useRef<string | null>(null);
+  // The filter in force, which decides which matches count toward the cap.
+  const current = useRef(filter);
+  current.current = filter;
   const searchMore = async () => {
     if (searching.current) return;
     searching.current = true;
@@ -125,13 +133,18 @@ function History() {
         const s = search.current;
         const upTo = lastId.current;
         if (!s || !needsSearch(s, upTo)) return;
+        const call = `traffic-search-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        searchCall.current = call;
         let next: ContentSearch;
         try {
-          next = mergePage(s, (await run<{ items: HistoryItem[] }>(searchArgs(s))).items, upTo);
+          next = mergePage(s, (await run<{ items: HistoryItem[] }>(searchArgs(s), { call })).items, upTo, current.current);
         } catch (e: any) {
-          next = { ...s, error: e.message };
+          next = failPage(s, e.message);
+        } finally {
+          searchCall.current = null;
         }
-        // The text changed meanwhile: drop this page and run the new search.
+        // The query changed (this call was stopped) or the cap was worked out again
+        // meanwhile: drop this page and carry on with the search as it is now.
         if (search.current !== s) continue;
         search.current = next;
         setFound(next);
@@ -158,12 +171,12 @@ function History() {
     await searchMore();
   }, 1500);
 
-  // A new search shortly after the text or another filter stops changing.
+  // A new search shortly after the text or the single source stops changing. The old one's
+  // CLI call is stopped at once: it may be reading every body in the project.
   const wanted = JSON.stringify(searchFor(filter));
   useEffect(() => {
-    const want = JSON.parse(wanted) as TrafficFilter | null;
+    const want = JSON.parse(wanted) as SearchQuery | null;
     if (!want) {
-      search.current = null;
       setFound(null);
       return;
     }
@@ -172,8 +185,24 @@ function History() {
       setFound(search.current);
       searchMore();
     }, 300);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(t);
+      search.current = null;
+      if (searchCall.current) cancelCli(searchCall.current).catch(() => {});
+    };
   }, [wanted]);
+
+  // The other filters only decide which matches show and count toward the cap: work that out
+  // again here, searching on only if the cap no longer applies.
+  useEffect(() => {
+    const s = search.current;
+    if (!isCurrent(s, filter)) return;
+    const next = refilter(s, filter);
+    if (next === s) return;
+    search.current = next;
+    setFound(next);
+    searchMore();
+  }, [filter]);
 
   useEffect(() => {
     if (selected == null) return setEntry(null);
@@ -255,7 +284,7 @@ function History() {
           value={filter.text}
           onChange={(e) => setFilter({ ...filter, text: e.target.value })}
         />
-        <label className="check" title="Search inside requests and responses: headers and bodies, compressed bodies included. Case-sensitive. Runs history list --contains.">
+        <label className="check" title="Search inside requests and responses: headers and bodies, compressed bodies included. Case-sensitive and literal: the text must appear as stored (URL-encoded or JSON-escaped text included). Runs history list --contains.">
           <input type="checkbox" checked={filter.contents} onChange={(e) => setFilter({ ...filter, contents: e.target.checked })} /> Contents
         </label>
         <div className="seg">
@@ -278,6 +307,7 @@ function History() {
         <span className="sep" />
         <select
           className="input"
+          aria-label="Saved filters"
           value={applied ?? ""}
           disabled={!saved.length}
           title="Saved filters for this project"
@@ -303,7 +333,9 @@ function History() {
           Delete
         </button>
         <span className="grow" />
-        {note && <span className={found?.error && isCurrent(found, filter) ? "s5" : "muted"}>{note}</span>}
+        <span className={found?.error && isCurrent(found, filter) ? "s5" : "muted"} aria-live="polite">
+          {note}
+        </span>
         <span className="muted">
           {contents
             ? `${shown.length} match${shown.length === 1 ? "" : "es"} of ${rows.length} items`

@@ -141,88 +141,131 @@ export function copySaved(from: string, to: string): boolean {
 export const SEARCH_PAGE = 2000;
 /** A search stops after this many matches (oldest first); the rest needs a narrower search. */
 export const MAX_MATCHES = 10000;
+/** After a failed page the next try waits this long, doubling per failure up to RETRY_MAX (ms). */
+export const RETRY_BASE = 2000;
+export const RETRY_MAX = 60000;
+
+/** What the CLI is asked: the text for --contains and the one source for --source (null: all). */
+export interface SearchQuery {
+  text: string;
+  source: string | null;
+}
 
 export interface ContentSearch {
+  query: SearchQuery;
   /**
-   * The filter the search runs for (from searchFor): its text goes to --contains, a single
-   * source to --source, and only rows passing its other filters count as matches.
+   * Every row the CLI matched up to `cursor`, whether the other filters show it or not, so
+   * changing a checkbox needs no new search. The fields those filters use never change.
    */
-  filter: TrafficFilter;
-  matches: Set<number>;
+  matches: Map<number, HistoryItem>;
   /** Every match with an id up to here is in `matches`. */
   cursor: number;
-  /** Stopped at MAX_MATCHES: rows after `cursor` aren't searched. */
+  /** Stopped at MAX_MATCHES shown matches: rows after `cursor` aren't searched. */
   capped: boolean;
-  /** The last page failed; the next poll tries again. */
+  /** The last page failed; it is tried again from `retryAt` (ms, Date.now). */
   error: string | null;
+  /** Pages failed in a row, for the backoff. */
+  failures: number;
+  retryAt: number;
 }
 
 /**
- * The search a filter asks for, or null when the contents search is off or has no text. Any
- * change to it (text, sources, checkboxes) is a new search, since the cap counts only rows
- * the filter shows.
+ * The search a filter asks for, or null when the contents search is off or its text is only
+ * whitespace (it would match almost every row). Only the text and a single source are sent to
+ * the CLI, so only they make a new search; the checkboxes are applied here (see refilter).
  */
-export function searchFor(f: TrafficFilter): TrafficFilter | null {
-  if (!f.contents || !f.text) return null;
-  return normal(f);
+export function searchFor(f: TrafficFilter): SearchQuery | null {
+  if (!f.contents || !f.text.trim()) return null;
+  return { text: f.text, source: f.sources.length === 1 ? f.sources[0] : null };
 }
 
-export const newSearch = (f: TrafficFilter): ContentSearch => ({
-  filter: normal({ ...f, contents: true }),
-  matches: new Set(),
+export const newSearch = (query: SearchQuery): ContentSearch => ({
+  query: { ...query },
+  matches: new Map(),
   cursor: 0,
   capped: false,
   error: null,
+  failures: 0,
+  retryAt: 0,
 });
 
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
   const want = searchFor(f);
-  return !!s && !!want && JSON.stringify(s.filter) === JSON.stringify(want);
+  return !!s && !!want && s.query.text === want.text && s.query.source === want.source;
 };
 
 /** `history list` arguments for the next page of a search. */
 export function searchArgs(s: ContentSearch): string[] {
-  const { text, sources } = s.filter;
-  return [
-    "history",
-    "list",
-    `--contains=${text}`,
-    ...(sources.length === 1 ? [`--source=${sources[0]}`] : []),
-    `--after=${s.cursor}`,
-    `--limit=${SEARCH_PAGE}`,
-  ];
+  const { text, source } = s.query;
+  return ["history", "list", `--contains=${text}`, ...(source ? [`--source=${source}`] : []), `--after=${s.cursor}`, `--limit=${SEARCH_PAGE}`];
 }
 
 /**
- * Whether rows up to `upTo` (the newest id the poll has) still need searching. A failed search
- * does too: the caller stops after a failure and tries again on the next poll.
+ * Whether rows up to `upTo` (the newest id the poll has) still need searching. After a failure,
+ * not before `retryAt`: the caller stops and a later poll tries again.
  */
-export const needsSearch = (s: ContentSearch, upTo: number) => !s.capped && s.cursor < upTo;
+export const needsSearch = (s: ContentSearch, upTo: number, now = Date.now()) => !s.capped && s.cursor < upTo && now >= s.retryAt;
+
+/** How many of the search's matches `f` shows. */
+export function shownMatches(s: ContentSearch, f: TrafficFilter): number {
+  let n = 0;
+  for (const i of s.matches.values()) if (matchesFilter(i, f)) n++;
+  return n;
+}
 
 /**
  * The search after one page of results. `upTo` is the newest polled id, read before the call:
  * a short page means every match up to it (and up to the last match) is known; a full page
- * covers ids up to its last row only, so the next page starts there. Rows the search's filter
- * hides are searched but not counted; a shown match past MAX_MATCHES stops the search.
+ * covers ids up to its last row only, so the next page starts there. Every match is kept, but
+ * only those `f` shows count: a shown match past MAX_MATCHES stops the search.
  */
-export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number): ContentSearch {
-  const matches = new Set(s.matches);
+export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number, f: TrafficFilter): ContentSearch {
+  const matches = new Map(s.matches);
+  let shown = shownMatches(s, f);
   let cursor = s.cursor;
   let capped = false;
   for (const i of items) {
     if (i.id <= s.cursor) continue;
-    if (matchesFilter(i, s.filter)) {
-      if (matches.size >= MAX_MATCHES) {
+    if (matchesFilter(i, f)) {
+      if (shown >= MAX_MATCHES) {
         capped = true;
         break;
       }
-      matches.add(i.id);
+      shown++;
     }
+    matches.set(i.id, i);
     cursor = Math.max(cursor, i.id);
   }
   if (!capped && items.length < SEARCH_PAGE) cursor = Math.max(cursor, upTo);
-  return { ...s, matches, cursor, capped, error: null };
+  return { ...s, matches, cursor, capped, error: null, failures: 0, retryAt: 0 };
+}
+
+/** The search after a failed page: it keeps its matches and waits longer after each failure. */
+export function failPage(s: ContentSearch, error: string, now = Date.now()): ContentSearch {
+  const failures = s.failures + 1;
+  return { ...s, error, failures, retryAt: now + Math.min(RETRY_MAX, RETRY_BASE * 2 ** (failures - 1)) };
+}
+
+/**
+ * The search with the cap worked out again for `f`, after a checkbox (or a second source)
+ * changed: the matches stay, nothing is searched again. Capped, it carries on from its cursor
+ * when `f` shows no more than MAX_MATCHES of them (the next shown match stops it again); when
+ * `f` shows more, it stops before the first match past the cap. The same object when nothing
+ * changes.
+ */
+export function refilter(s: ContentSearch, f: TrafficFilter): ContentSearch {
+  const ids = [...s.matches.keys()].sort((a, b) => a - b);
+  let shown = 0;
+  for (const id of ids) {
+    if (!matchesFilter(s.matches.get(id)!, f)) continue;
+    if (shown === MAX_MATCHES) {
+      const matches = new Map(ids.filter((x) => x < id).map((x) => [x, s.matches.get(x)!]));
+      return { ...s, matches, cursor: id - 1, capped: true };
+    }
+    shown++;
+  }
+  return s.capped ? { ...s, capped: false } : s;
 }
 
 /**
