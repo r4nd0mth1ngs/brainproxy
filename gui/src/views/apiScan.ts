@@ -684,10 +684,19 @@ export function afterServerChange(a: AuthState, origins: string[]): Partial<Auth
   return {};
 }
 
-/** While a query key is set aside: why, and what to do. "" otherwise. */
+/**
+ * The auth state once `mode` is chosen on a server whose in-scope operations are on `origins`. Choosing API key again
+ * on a server a key set aside covers brings it back, as going back to that server in key mode does.
+ */
+export function chooseMode(a: AuthState, mode: AuthState["mode"], origins: string[]): Partial<AuthState> {
+  const next = { mode, savedProfile: "" };
+  return mode === "key" ? { ...next, ...afterServerChange({ ...a, ...next }, origins) } : next;
+}
+
+/** While a query key is set aside and doesn't go to this server: why, and what to do. "" otherwise. */
 export function droppedKeyText(a: AuthState, origins: string[]): string {
   const d = a.dropped;
-  if (!d || a.mode !== "key" || a.savedProfile) return "";
+  if (!d || a.mode !== "key" || a.savedProfile || keyCovers(d.origins, origins)) return "";
   const elsewhere = origins.filter((o) => !d.origins.includes(o));
   return `The server changed. The key saved in the profile "${d.profile}" only goes to ${listWords(d.origins)}, which it was saved for, not to ${listWords(elsewhere) || "the new server"}. Save the key again for this server, or go back to the server it was saved for and it's used as before.`;
 }
@@ -713,6 +722,44 @@ export function keySaved(saved: AuthState, origins: string[]): AuthPatch {
     dropped: null,
     queryKeys: isQueryKey(saved) ? [...prev.queryKeys.filter((k) => k.profile !== profile), { profile, origins }] : prev.queryKeys,
   });
+}
+
+/** A profile saved in this wizard with stored secrets, and the question offering to remove it. */
+export interface LeaveOffer {
+  profile: string;
+  message: string;
+}
+
+function leaveOfferFor(a: AuthState, profile: string, dropped: DroppedKey | null): LeaveOffer {
+  const withSigner = a.signer?.profile === profile;
+  const what = dropped ? `the key you saved for ${listWords(dropped.origins)}` : a.mode === "oauth" ? "the OAuth client secret and tokens you saved" : "the key you saved";
+  return {
+    profile,
+    message: `It holds ${what}${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. ${dropped ? `Keep it to use it again with ${listWords(dropped.origins)}.` : "Keep it to choose it later as an existing profile."}`,
+  };
+}
+
+/**
+ * Before other credentials replace the saved ones, or a key set aside for another server: the profile to offer to
+ * remove. A key set aside is offered once: kept, it's for the server it was saved for.
+ */
+export function leaveOffer(a: AuthState): LeaveOffer | null {
+  const dropped = a.savedProfile || a.dropped?.kept ? null : a.dropped;
+  const saved = a.savedProfile || dropped?.profile;
+  if (!saved || (a.mode !== "key" && a.mode !== "oauth")) return null;
+  return leaveOfferFor(a, saved, dropped);
+}
+
+/**
+ * Before the wizard forgets `a`, for a new definition or on leaving it: the profiles saved in it that nothing would
+ * refer to any more. A key set aside that was kept, or whose profile is chosen, isn't offered again.
+ */
+export function leftBehind(a: AuthState): LeaveOffer[] {
+  const out: LeaveOffer[] = [];
+  if (a.savedProfile && (a.mode === "key" || a.mode === "oauth")) out.push(leaveOfferFor(a, a.savedProfile, null));
+  const d = a.dropped;
+  if (d && !d.kept && d.profile !== a.savedProfile && d.profile !== authProfile(a)) out.push(leaveOfferFor(a, d.profile, d));
+  return out;
 }
 
 /** Once `auth remove` removed the profile `name`: nothing refers to it any more. */

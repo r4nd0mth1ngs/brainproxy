@@ -21,6 +21,7 @@ import {
   authSummary,
   baseUrlProblem,
   checkArgs,
+  chooseMode,
   checkMeaning,
   credentialOnRequest,
   credentialText,
@@ -43,6 +44,8 @@ import {
   keyKindDefaults,
   keyProblems,
   keySaved,
+  leaveOffer,
+  leftBehind,
   listWords,
   methodSummary,
   newSignerForm,
@@ -109,6 +112,7 @@ interface Props {
 const STEPS = ["Definition", "Server", "Authentication", "Operations", "Depth and start"];
 
 export function ApiWizard(p: Props) {
+  const app = useApp();
   const [step, setStep] = useState(0);
   const [typed, setTyped] = useState("");
   // What the preview below is of. `typed` can move on from it.
@@ -123,6 +127,9 @@ export function ApiWizard(p: Props) {
   const [previewedKey, setPreviewedKey] = useState("");
   const [scope, setScope] = useState<string[]>([]);
   const [auth, setAuth] = useState<AuthState>(EMPTY_AUTH);
+  // For what happens after a preview or a question: the state as it is then.
+  const authRef = useRef(auth);
+  authRef.current = auth;
   const [signerDraft, setSignerDraft] = useState<SignerForm | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
   const [optIn, setOptIn] = useState(false);
@@ -140,6 +147,23 @@ export function ApiWizard(p: Props) {
 
   const keyOf = (src: string, t: ApiTarget) => JSON.stringify(previewArgs(src, t));
 
+  /** Before the wizard forgets the profiles saved in it: they hold stored secrets, so offer to remove each. */
+  const offerLeftBehind = async () => {
+    for (const x of leftBehind(authRef.current)) {
+      if (!(await confirm(`Remove the profile "${x.profile}"?`, x.message, "Remove it", "Keep it"))) continue;
+      try {
+        await run(["auth", "remove", "--", x.profile]);
+        setAuth((prev) => ({ ...prev, ...profileRemoved(prev, x.profile) }));
+      } catch (e: any) {
+        app.toast(e.message, "error");
+      }
+    }
+  };
+  const leave = (then: () => void) => async () => {
+    await offerLeftBehind();
+    then();
+  };
+
   /** Runs the preview. A new source starts the flow over; a new server keeps the choices made before it. */
   const load = async (src: string, t: ApiTarget | null) => {
     const n = ++seq.current;
@@ -149,6 +173,11 @@ export function ApiWizard(p: Props) {
       const fresh = { ...EMPTY_TARGET, graphql: graphqlEndpoint && sourceKind(src) === "url" };
       const d = await run<ApiPreview>(previewArgs(src, t ?? fresh));
       if (n !== seq.current) return;
+      // A new source starts over: what was saved for the last one would be left behind.
+      if (!t) {
+        await offerLeftBehind();
+        if (n !== seq.current) return;
+      }
       setSelected(defaultSelection(d.requests));
       setOptIn(false);
       if (t) {
@@ -277,10 +306,10 @@ export function ApiWizard(p: Props) {
           <h2>Check an API for security problems</h2>
         </div>
         <div className="wiz-row">
-          <button className="link" onClick={p.onBack}>
+          <button className="link" onClick={leave(p.onBack)}>
             Test a website instead
           </button>
-          <button className="link" onClick={p.onDismiss}>
+          <button className="link" onClick={leave(p.onDismiss)}>
             I'll set it up myself
           </button>
         </div>
@@ -713,18 +742,12 @@ function AuthStep(p: {
 
   /** Before other credentials replace the saved ones, or a key set aside for another server: their profile holds stored secrets, so offer to remove it. */
   const leaveSaved = async () => {
-    // A key set aside is offered once: kept, it's for the server it was saved for.
-    const dropped = a.savedProfile || a.dropped?.kept ? null : a.dropped;
-    const saved = a.savedProfile || dropped?.profile;
-    if (!saved || (a.mode !== "key" && a.mode !== "oauth")) return;
-    const withSigner = a.signer?.profile === saved;
-    const what = a.mode === "oauth" ? "the OAuth client secret and tokens you saved" : dropped ? `the key you saved for ${listWords(dropped.origins)}` : "the key you saved";
-    const remove = await confirm(
-      `Remove the profile "${saved}"?`,
-      `It holds ${what}${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. ${dropped ? `Keep it to use it again with ${listWords(dropped.origins)}.` : "Keep it to choose it later as an existing profile."}`,
-      "Remove it",
-      "Keep it",
-    );
+    const offer = leaveOffer(a);
+    if (!offer) return;
+    const saved = offer.profile;
+    // Not the saved profile: the key set aside, whose "Keep it" is remembered.
+    const dropped = a.savedProfile ? null : a.dropped;
+    const remove = await confirm(`Remove the profile "${saved}"?`, offer.message, "Remove it", "Keep it");
     if (!remove) {
       if (dropped) set((prev) => (prev.dropped?.profile === dropped.profile ? { dropped: { ...prev.dropped, kept: true } } : {}));
       return;
@@ -741,7 +764,8 @@ function AuthStep(p: {
   const choose = async (mode: AuthState["mode"]) => {
     if (mode === a.mode) return;
     await leaveSaved();
-    set({ mode, savedProfile: "" });
+    // From the latest state: the profile may have been removed. A key set aside for this server comes back.
+    set((prev) => chooseMode(prev, mode, origins));
   };
 
   const signerNames = data?.signers.filter((s) => s.profile === signerHome(a)).map((s) => s.signer.name) ?? [];

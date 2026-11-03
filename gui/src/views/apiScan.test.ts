@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import {
   EMPTY_AUTH,
   afterServerChange,
+  chooseMode,
   droppedKeyText,
   keySaved,
+  leaveOffer,
+  leftBehind,
   profileKeyText,
   profileRemoved,
   environmentProblem,
@@ -563,6 +566,91 @@ test("a query key saved over one set aside: the old one isn't brought back", () 
     assert.equal(other.dropped, null, JSON.stringify(kind));
     assert.equal(move(enterAnother(other), [A]).savedProfile, "", JSON.stringify(kind));
   }
+});
+
+test("a query key set aside comes back when API key is chosen again on its server", () => {
+  const A = "https://a.test";
+  const B = "https://b.test";
+  const save = (a: AuthState, origins: string[]): AuthState => {
+    const patch = keySaved(a, origins);
+    return { ...a, ...(typeof patch === "function" ? patch(a) : patch) };
+  };
+  const move = (a: AuthState, origins: string[]): AuthState => ({ ...a, ...afterServerChange(a, origins) });
+  // As `choose` does once `leaveSaved` is answered.
+  const pick = (a: AuthState, mode: AuthState["mode"], origins: string[]): AuthState => ({ ...a, ...chooseMode(a, mode, origins) });
+  const keep = (a: AuthState): AuthState => (a.dropped ? { ...a, dropped: { ...a.dropped, kept: true } } : a);
+
+  const saved = save({ ...EMPTY_AUTH, mode: "key", place: "query", keyName: "api_key", profileName: "pets-api" }, [A]);
+  const away = move(saved, [B]);
+  // No authentication on B, the profile kept, then back to A: the key stays aside until API key is chosen again.
+  const none = pick(keep(away), "none", [B]);
+  assert.equal(none.mode, "none");
+  assert.deepEqual(move(none, [A]), none, "not in key mode, nothing comes back yet");
+  const again = pick(move(none, [A]), "key", [A]);
+  assert.equal(again.savedProfile, "pets-api");
+  assert.equal(again.place, "query");
+  assert.equal(again.keyName, "api_key");
+  assert.equal(again.dropped, null);
+  assert.equal(authProfile(again), "pets-api");
+  assert.deepEqual(authProblems(again), []);
+  assert.equal(droppedKeyText(again, [A]), "");
+
+  // Chosen again on B: still aside, and said so.
+  const onB = pick(none, "key", [B]);
+  assert.equal(onB.savedProfile, "");
+  assert.ok(onB.dropped);
+  assert.match(droppedKeyText(onB, [B]), /only goes to https:\/\/a\.test/);
+  // Through an existing profile or OAuth instead of No authentication: the same.
+  for (const mode of ["profile", "oauth"] as const) assert.equal(pick(move(pick(keep(away), mode, [B]), [A]), "key", [A]).savedProfile, "pets-api", mode);
+  // Other choices never bring it back, and a key that covers the server isn't said to be aside.
+  assert.deepEqual(chooseMode(keep(away), "none", [A]), { mode: "none", savedProfile: "" });
+  assert.deepEqual(chooseMode(keep(away), "profile", [A]), { mode: "profile", savedProfile: "" });
+  assert.equal(droppedKeyText(away, [A]), "", "the server it was saved for");
+  assert.match(droppedKeyText(away, []), /not to the new server\./, "nothing in scope isn't covered");
+  // No key set aside: API key starts with nothing saved.
+  assert.deepEqual(chooseMode({ ...EMPTY_AUTH, mode: "none" }, "key", [A]), { mode: "key", savedProfile: "" });
+});
+
+test("profiles saved in the wizard are offered for removal before it forgets them", () => {
+  const A = "https://a.test";
+  const B = "https://b.test";
+  const saved: AuthState = { ...EMPTY_AUTH, mode: "key", place: "query", keyName: "api_key", savedProfile: "pets-api", keyOrigins: [A], queryKeys: [{ profile: "pets-api", origins: [A] }] };
+  const away = { ...saved, ...afterServerChange(saved, [B]) };
+
+  // Nothing saved: nothing to offer, on the first definition or on leaving.
+  assert.deepEqual(leftBehind(EMPTY_AUTH), []);
+  assert.equal(leaveOffer(EMPTY_AUTH), null);
+
+  // A key saved and in use.
+  assert.deepEqual(leftBehind(saved), [{ profile: "pets-api", message: "It holds the key you saved, stored in the project file. Keep it to choose it later as an existing profile." }]);
+  assert.deepEqual(leaveOffer(saved), leftBehind(saved)[0]);
+  // OAuth, with a signer set up in it.
+  const oauth: AuthState = { ...EMPTY_AUTH, mode: "oauth", savedProfile: "pets-oauth", signing: true, signer: { profile: "pets-oauth", name: "hm" } };
+  assert.deepEqual(leftBehind(oauth), [
+    { profile: "pets-oauth", message: "It holds the OAuth client secret and tokens you saved, and the signer set up in it, stored in the project file. Keep it to choose it later as an existing profile." },
+  ]);
+
+  // A key set aside, whatever was chosen since: offered with where it goes, until kept.
+  const asideText = "It holds the key you saved for https://a.test, stored in the project file. Keep it to use it again with https://a.test.";
+  assert.deepEqual(leftBehind(away), [{ profile: "pets-api", message: asideText }]);
+  assert.deepEqual(leaveOffer(away), { profile: "pets-api", message: asideText });
+  assert.deepEqual(leftBehind({ ...away, mode: "none" }), [{ profile: "pets-api", message: asideText }], "No authentication chosen, the offer not answered");
+  assert.equal(leaveOffer({ ...away, mode: "none" }), null, "choosing another kind from none offers nothing");
+  const kept = { ...away, dropped: { ...away.dropped!, kept: true } };
+  assert.deepEqual(leftBehind(kept), [], "kept: not asked again");
+  assert.equal(leaveOffer(kept), null);
+  // Its profile chosen, for its signer or as an existing one: in use, so not offered.
+  assert.deepEqual(leftBehind({ ...away, mode: "profile", existing: "pets-api", signing: true, signer: { profile: "pets-api", name: "hm" } }), []);
+  assert.deepEqual(leftBehind({ ...away, mode: "none", signing: true, signer: { profile: "pets-api", name: "hm" } }), []);
+
+  // OAuth saved on B while the key set aside was never offered: both are.
+  const both: AuthState = { ...away, mode: "oauth", savedProfile: "pets-api-2" };
+  assert.deepEqual(leftBehind(both).map((x) => x.profile), ["pets-api-2", "pets-api"]);
+  assert.equal(leaveOffer(both)?.profile, "pets-api-2", "another kind chosen: the profile in use first, as before");
+  assert.match(leftBehind(both)[1].message, /the key you saved for https:\/\/a\.test/, "each says what it holds");
+
+  // Removed after the offer: nothing left behind.
+  assert.deepEqual(leftBehind({ ...away, ...profileRemoved(away, "pets-api") }), []);
 });
 
 test("signer coverage", () => {
