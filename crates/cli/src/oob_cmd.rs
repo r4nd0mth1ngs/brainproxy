@@ -357,6 +357,7 @@ fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
         }
     }
     cmd.arg("--log").arg(&log);
+    brainproxy_core::provenance::pass_on(&mut cmd);
     process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;

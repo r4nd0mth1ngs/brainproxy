@@ -109,7 +109,8 @@ pub struct RunArgs {
     /// non-ASCII); & = ' ; and existing %XX are kept.
     #[arg(long)]
     no_encode: bool,
-    /// Which exchanges go into history (results always go into fuzz_results).
+    /// Which exchanges go into history (results always go into fuzz_results). Through MCP,
+    /// only `all`: an agent's requests are always recorded.
     #[arg(long, value_enum, default_value = "all")]
     store: StoreArg,
 
@@ -309,6 +310,11 @@ fn text_summary(s: &Value) -> String {
 }
 
 fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), Error> {
+    match args.store {
+        StoreArg::All => {}
+        StoreArg::Matches => crate::mcp::check_records_all("--store matches")?,
+        StoreArg::None => crate::mcp::check_records_all("--store none")?,
+    }
     let mode = Mode::parse(&args.mode)?;
     let stdin_payloads = args.payloads.iter().filter(|p| *p == "file:-").count();
     if stdin_payloads > 1 || (stdin_payloads == 1 && args.req.reads_stdin()) {
@@ -476,6 +482,7 @@ fn spawn_background(
     let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
+    brainproxy_core::provenance::pass_on(&mut cmd);
     process::detach(&mut cmd);
     let stdin = process::work_lock_stdin(store, &lock_name(run_id));
     let mut child =

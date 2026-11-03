@@ -112,6 +112,16 @@ impl Out {
         let _ = stdout.flush();
     }
 
+    /// [`Out::error`] with what the command did before failing as `data` (JSON mode only).
+    pub fn error_with(&self, kind: &str, message: &str, data: Value) {
+        if self.json() {
+            let error = json!({"kind": kind, "message": message});
+            println!("{}", self.mark(json!({"ok": false, "command": self.command, "error": error, "data": data})));
+        } else {
+            eprintln!("error ({kind}): {message}");
+        }
+    }
+
     pub fn error(&self, kind: &str, message: &str) {
         if self.json() {
             let env =

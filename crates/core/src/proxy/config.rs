@@ -148,6 +148,10 @@ pub struct Rule {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Who added it or last enabled it: gui, cli or mcp (None: before brainproxy kept it). A
+    /// request it changes records this in its history row's `edited_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 fn yes() -> bool {
@@ -156,6 +160,8 @@ fn yes() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
+    pub id: u32,
+    pub origin: Option<String>,
     location: RuleLocation,
     text: Option<Regex>,
     bytes: Option<BytesRegex>,
@@ -176,6 +182,8 @@ pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
             let body = matches!(r.location, RuleLocation::RequestBody | RuleLocation::ResponseBody);
             let bad = |e: regex::Error| Error::InvalidInput(format!("rule {} pattern: {e}", r.id));
             Ok(CompiledRule {
+                id: r.id,
+                origin: r.origin.clone(),
                 location: r.location,
                 text: if body || r.pattern.is_empty() { None } else { Some(Regex::new(&r.pattern).map_err(bad)?) },
                 bytes: if body && !r.pattern.is_empty() {
@@ -191,9 +199,15 @@ pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
 
 /// Applies request rules. Returns the request unchanged when nothing matched.
 pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
+    apply_request_rules_traced(rules, req).0
+}
+
+/// Applies request rules, and says which of them changed the request, so its record can say
+/// who edited it.
+pub fn apply_request_rules_traced(rules: &[CompiledRule], req: Vec<u8>) -> (Vec<u8>, Vec<&CompiledRule>) {
     let active: Vec<&CompiledRule> = rules.iter().filter(|r| r.location.is_request()).collect();
     if active.is_empty() {
-        return req;
+        return (req, Vec::new());
     }
     let (head, raw_body) = split_head_body(&req);
     let (mut first, mut headers) = split_lines(head);
@@ -206,33 +220,38 @@ pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
     let has_body_rule = active.iter().any(|r| r.location == RuleLocation::RequestBody && r.bytes.is_some());
     let mut body = if chunked && has_body_rule { dechunk(raw_body) } else { raw_body.to_vec() };
     let mut body_changed = false;
+    let mut changed_by = Vec::new();
     for rule in active {
-        match rule.location {
-            RuleLocation::RequestLine => {
-                if let Some(re) = &rule.text {
-                    first = re.replace_all(&first, rule.replace.as_str()).into_owned();
-                }
+        let changed = match rule.location {
+            RuleLocation::RequestLine => rule.text.as_ref().is_some_and(|re| {
+                let new = re.replace_all(&first, rule.replace.as_str()).into_owned();
+                std::mem::replace(&mut first, new) != first
+            }),
+            RuleLocation::RequestHeader => {
+                let before = headers.clone();
+                apply_header_rule(rule, &mut headers);
+                before != headers
             }
-            RuleLocation::RequestHeader => apply_header_rule(rule, &mut headers),
-            RuleLocation::RequestBody => {
-                if let Some(re) = &rule.bytes {
-                    let new = re.replace_all(&body, rule.replace.as_bytes()).into_owned();
-                    body_changed |= new != body;
-                    body = new;
-                }
-            }
-            _ => {}
+            RuleLocation::RequestBody => rule.bytes.as_ref().is_some_and(|re| {
+                let new = re.replace_all(&body, rule.replace.as_bytes()).into_owned();
+                std::mem::replace(&mut body, new) != body
+            }),
+            _ => false,
+        };
+        if changed {
+            body_changed |= rule.location == RuleLocation::RequestBody;
+            changed_by.push(rule);
         }
     }
     if !body_changed {
-        return join(&first, &headers, if chunked && has_body_rule { raw_body } else { &body });
+        return (join(&first, &headers, if chunked && has_body_rule { raw_body } else { &body }), changed_by);
     }
     if chunked {
         // Only the chunks were taken off: a Content-Encoding still applies to the body.
         reframe(&mut headers, body.len(), false);
-        return join(&first, &headers, &body);
+        return (join(&first, &headers, &body), changed_by);
     }
-    RawRequest::from_bytes(join(&first, &headers, &body)).update_content_length().into_bytes()
+    (RawRequest::from_bytes(join(&first, &headers, &body)).update_content_length().into_bytes(), changed_by)
 }
 
 /// Drops the framing headers of a de-chunked body (and with `decoded`, its coding header)
@@ -454,7 +473,15 @@ mod tests {
     use super::*;
 
     fn rule(id: u32, loc: RuleLocation, pattern: &str, replace: &str) -> Rule {
-        Rule { id, location: loc, pattern: pattern.into(), replace: replace.into(), enabled: true, comment: None }
+        Rule {
+            id,
+            location: loc,
+            pattern: pattern.into(),
+            replace: replace.into(),
+            enabled: true,
+            comment: None,
+            origin: None,
+        }
     }
 
     #[test]
@@ -488,6 +515,23 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\nX-Added: 1\r\n\r\nrole=admin"
         );
+    }
+
+    #[test]
+    fn request_rules_say_which_of_them_changed_the_request() {
+        let mut agents = rule(2, RuleLocation::RequestHeader, "^X-Role: user$", "X-Role: admin");
+        agents.origin = Some("mcp".into());
+        let rules = compile_rules(&[
+            rule(1, RuleLocation::RequestBody, "never-there", "x"),
+            agents,
+            rule(3, RuleLocation::RequestLine, "^GET ", "GET "),
+        ])
+        .unwrap();
+        let (out, changed) = apply_request_rules_traced(&rules, b"GET /p HTTP/1.1\r\nX-Role: user\r\n\r\n".to_vec());
+        assert_eq!(String::from_utf8(out).unwrap(), "GET /p HTTP/1.1\r\nX-Role: admin\r\n\r\n");
+        // A rule that matched but left the bytes as they were didn't change it.
+        let changed: Vec<_> = changed.iter().map(|r| (r.id, r.origin.as_deref())).collect();
+        assert_eq!(changed, [(2, Some("mcp"))]);
     }
 
     #[test]
