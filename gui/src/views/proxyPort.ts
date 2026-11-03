@@ -1,7 +1,7 @@
 // The port the app's proxy listens on (Settings › Proxy): the saved choice, the address it makes,
 // and starting or moving the proxy with it. `cli` is api.ts's `run`.
 
-import { proxyOptions } from "./accessMatrix.ts";
+import { proxyOptions, withLive } from "./accessMatrix.ts";
 
 type Cli = (args: string[]) => Promise<unknown>;
 
@@ -77,7 +77,7 @@ export function withPortHint(message: string): string {
 export interface ProxyControl {
   /** The pid of the proxy the app started; only that one is stopped when the project closes. */
   owned: number | null;
-  /** Set while a move restarts the proxy on another port; other starts in the app wait for it. Never rejects. */
+  /** Set while the app restarts the proxy (a move to another port, or Access's live testing); other starts in the app wait for it. Never rejects. */
   moving: Promise<void> | null;
 }
 
@@ -87,8 +87,15 @@ export function proxyControl(): ProxyControl {
 
 interface Status {
   running: boolean;
-  proxy: { listen: string; pid?: number } | null;
+  proxy: { listen: string; pid?: number; args?: string[] } | null;
   other_pid_namespace?: boolean;
+}
+
+/** What `proxy start` and `proxy restart` print. */
+export interface Started {
+  pid?: number;
+  listen?: string;
+  authz_run?: number;
 }
 
 const pidOf = (started: unknown) => (started as { pid?: number } | null)?.pid ?? null;
@@ -158,7 +165,33 @@ type Running = { listen: string; pid?: number; args?: string[] };
  * Starts from elsewhere in the app wait until it is done. The proxy stays the app's if it was.
  */
 export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
-  const work = move(cli, ctl, running, port);
+  const target = withPort(running.listen, port);
+  await holding(ctl, restart(cli, ctl, running, target, proxyOptions(running.args ?? [])));
+  return target;
+}
+
+/**
+ * Runs the proxy with live testing (`live`, from accessMatrix's `liveArgs`) on its address and with
+ * its other options: one `proxy restart` if it runs, as a move does, or `proxy start` on the app's
+ * port if it doesn't. The proxy is the app's afterwards if it was before, or if the app started it.
+ */
+export async function startLive(cli: Cli, ctl: ProxyControl, live: string[]): Promise<Started & { listen: string }> {
+  const s = (await cli(["proxy", "status"])) as Status;
+  const running = s.running ? s.proxy : null;
+  const listen = running?.listen ?? proxyListen();
+  const options = withLive(proxyOptions(running?.args ?? []), live);
+  let started: Started;
+  if (running) {
+    started = await holding(ctl, restart(cli, ctl, running, listen, options));
+  } else {
+    started = (await cli(["proxy", "start", `--listen=${listen}`, ...options])) as Started;
+    ctl.owned = pidOf(started);
+  }
+  return { ...started, listen: started.listen ?? listen };
+}
+
+/** Marks `work` as a restart in `ctl` until it settles, so that other starts in the app wait for it. */
+async function holding<T>(ctl: ProxyControl, work: Promise<T>): Promise<T> {
   const moving = work.then(
     () => {},
     () => {},
@@ -171,12 +204,13 @@ export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, p
   }
 }
 
-async function move(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
+/** `proxy restart` of `running` on `listen` with `options`, keeping the app's hold on it; a failure says where the proxy is now. */
+async function restart(cli: Cli, ctl: ProxyControl, running: Running, listen: string, options: string[]): Promise<Started> {
   const ours = ctl.owned != null && ctl.owned === running.pid;
-  const target = withPort(running.listen, port);
   try {
-    const pid = pidOf(await cli(["proxy", "restart", `--listen=${target}`, ...proxyOptions(running.args ?? [])]));
-    if (ours) ctl.owned = pid;
+    const started = (await cli(["proxy", "restart", `--listen=${listen}`, ...options])) as Started;
+    if (ours) ctl.owned = pidOf(started);
+    return started;
   } catch (e: any) {
     const failed = restartFailure(e.message);
     // Refused before anything stopped: the proxy runs as it did.
@@ -184,5 +218,4 @@ async function move(cli: Cli, ctl: ProxyControl, running: Running, port: number)
     if (ours) ctl.owned = failed.pid;
     throw new Error(`${withPortHint(failed.message)} ${await whereNow(cli, running.listen)}`);
   }
-  return target;
 }

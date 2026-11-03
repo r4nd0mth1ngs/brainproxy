@@ -48,13 +48,14 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
   proxy when a project opens* on, closing the project or the window stops the proxy only if
   `proxy status` still shows that pid running here, so one a shell, an agent or another
-  container started is left alone. Settings moves the proxy to another port with one
-  `proxy restart`, which holds the project's proxy record from the stop to the start, so a
-  `proxy start` from a shell or an agent fails instead of getting in between; if the new port
-  can't be opened, the CLI starts the proxy again where it was. The control keeps the proxy
-  the app's at its new pid (or the pid it went back to) and marks the move: Open browser,
-  Record a login and Start proxy wait for it, and the pill and Access's live restart ask to
-  try again. A failed move reports where the proxy is from a fresh `proxy status`.
+  container started is left alone. Settings moves the proxy to another port, and Access's
+  live restart adds live testing to it, with one `proxy restart`, which holds the project's
+  proxy record from the stop to the start, so a `proxy start` from a shell or an agent fails
+  instead of getting in between; if the new proxy doesn't come up, the CLI starts the old one
+  again where it was. The control keeps the proxy the app's at its new pid (or the pid it went
+  back to) and marks the restart: Open browser, Record a login and Start proxy wait for it,
+  and the pill and Access's live restart ask to try again. A failed restart reports where the
+  proxy is from a fresh `proxy status`.
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 
@@ -120,7 +121,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
-| Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
+| Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/start/restart --authz` |
 | Results | Findings | Issues grouped by type and risk, detail, evidence, triage | `findings list/show/mark` |
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |

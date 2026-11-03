@@ -14,6 +14,7 @@ import {
   saveProxyPort,
   savedProxyPort,
   startPorts,
+  startLive,
   startProxy,
   stopOwned,
   stopProxy,
@@ -466,4 +467,103 @@ test("during a move that went back, a start waits and starts nothing", async () 
   assert.equal(await startProxy(cli, ctl), false);
   await assert.rejects(moved);
   assert.ok(!calls.some(isStart), JSON.stringify(calls));
+});
+
+// Access's live testing: the same restart, on the same address, with live testing added.
+
+const LIVE = ["--authz=anonymous,bob", "--authz-rate=5"];
+const liveRunning = { listen: "127.0.0.1:8081", pid: 7, args: ["proxy", "run", "--listen", "127.0.0.1:8081", "--timeout", "12", "--authz=alice"] };
+
+test("startLive restarts a running proxy where it is in one call, with its options and live testing", async () => {
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { calls, cli } = proxyCli(() => ({ running: true, proxy: liveRunning }), [8]);
+  const d = await startLive(cli, ctl, LIVE);
+  assert.deepEqual(calls, [
+    ["proxy", "status"],
+    ["proxy", "restart", "--listen=127.0.0.1:8081", "--timeout=12", ...LIVE],
+  ]);
+  assert.equal(d.listen, "127.0.0.1:8081");
+  assert.equal(ctl.owned, 8);
+  assert.equal(ctl.moving, null);
+});
+
+test("startLive starts a proxy that isn't running on the app's port, and it is the app's", async () => {
+  stubStorage({ [PROXY_PORT]: "9090" });
+  const ctl = proxyControl();
+  const { calls, cli } = proxyCli(() => ({ running: false, proxy: null }), [8]);
+  const d = await startLive(cli, ctl, LIVE);
+  assert.deepEqual(calls, [
+    ["proxy", "status"],
+    ["proxy", "start", "--listen=127.0.0.1:9090", ...LIVE],
+  ]);
+  assert.equal(d.listen, "127.0.0.1:9090");
+  assert.equal(ctl.owned, 8);
+});
+
+test("startLive: a proxy the app didn't start doesn't become the app's", async () => {
+  const ctl = proxyControl();
+  const { cli } = proxyCli(() => ({ running: true, proxy: liveRunning }), [8]);
+  await startLive(cli, ctl, LIVE);
+  assert.equal(ctl.owned, null);
+});
+
+test("startLive: when the live proxy doesn't come up, the CLI puts the old one back and a fresh status says where", async () => {
+  const failure = "invalid input: login failed: no session";
+  for (const [pid, owned, status, where] of [
+    [9, 9, { running: true, proxy: { listen: "127.0.0.1:8081", pid: 9 } }, "The proxy is back on 127.0.0.1:8081."],
+    [null, null, { running: false, proxy: null }, "The proxy is off."],
+  ] as const) {
+    const ctl = proxyControl();
+    ctl.owned = 7;
+    let statuses = 0;
+    const { calls, cli } = fakeCli((args) => {
+      if (args[1] === "restart") {
+        throw new Error(
+          pid == null
+            ? `${failure}; the proxy couldn't be started again on 127.0.0.1:8081: conflict: cannot listen. It is off now`
+            : `${failure}; the proxy was started again on 127.0.0.1:8081 (pid ${pid})`,
+        );
+      }
+      return statuses++ ? status : { running: true, proxy: liveRunning };
+    });
+    await assert.rejects(startLive(cli, ctl, LIVE), { message: `${failure} ${where}` });
+    assert.deepEqual(calls.map((c) => c[1]), ["status", "restart", "status"]);
+    assert.equal(ctl.owned, owned);
+    assert.equal(ctl.moving, null);
+  }
+});
+
+test("startLive: a restart refused before stopping anything rejects as it is, and the proxy stays the app's", async () => {
+  const message = "conflict: the proxy is being restarted (`brainproxy proxy restart`, pid 5); try again once that has finished";
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { calls, cli } = fakeCli((args) => {
+    if (args[1] === "restart") throw new Error(message);
+    return { running: true, proxy: liveRunning };
+  });
+  await assert.rejects(startLive(cli, ctl, LIVE), { message });
+  assert.equal(calls.length, 2);
+  assert.equal(ctl.owned, 7);
+});
+
+test("during a live restart, other starts in the app wait for it", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const { calls, cli } = fakeCli(async (args) => {
+    if (args[1] === "restart") await held;
+    if (args[1] === "status") return { running: true, proxy: liveRunning };
+    return { pid: 8 };
+  });
+  const ctl = proxyControl();
+  const live = startLive(cli, ctl, LIVE);
+  while (!ctl.moving) await Promise.resolve();
+  const started = startProxy(cli, ctl);
+  await Promise.resolve();
+  assert.equal(calls.filter(isStart).length, 0);
+  release();
+  await live;
+  assert.equal(await started, false);
+  assert.equal(calls.filter(isStart).length, 0);
+  assert.equal(ctl.moving, null);
 });
