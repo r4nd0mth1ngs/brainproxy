@@ -22,7 +22,7 @@ export interface ReplayOptions {
   timeout: string;
   /** `--verify-tls`: check the server certificate (off by default). */
   verifyTls: boolean;
-  /** `--no-store`: don't record the exchange in history. */
+  /** `--no-store`: keep the exchange's content out of history (it still gets a row). */
   noStore: boolean;
 }
 

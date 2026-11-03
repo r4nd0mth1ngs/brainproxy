@@ -274,7 +274,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
           {busy ? "Connected…" : "Connect and send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop the connection. What was sent may already have reached the server, and may not be in history.">
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop the connection. What was sent may already have reached the server; history has what was recorded up to then.">
             Stop
           </button>
         )}

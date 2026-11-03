@@ -75,7 +75,7 @@ export function OptionsRow({ id, options, set, kind, binary }: { id: string; opt
       <label className="check" title="Check the server's certificate and refuse an invalid one (off by default, as with most intercepting tools)">
         <input type="checkbox" checked={options.verifyTls} onChange={(e) => set({ verifyTls: e.target.checked })} /> Verify TLS
       </label>
-      <label className="check" title={kind === "http" ? "Don't record the request and response in history" : "Don't record the connection and its messages"}>
+      <label className="check" title={kind === "http" ? "Keep the request and response out of history: its row has only the time, target, method and path" : "Keep the connection and its messages out of history: only the handshake gets a row, with the time, target and path"}>
         <input type="checkbox" checked={options.noStore} onChange={(e) => set({ noStore: e.target.checked })} /> Don't record
       </label>
       <span className="grow" />

@@ -90,7 +90,7 @@ test("closing asks only while a send is running, and says what stopping it means
   assert.equal(sendsInFlight(1), 1);
   assert.equal(sendsInFlight(3), 0);
   const tab = closeQuestion(1);
-  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and it may not be in history/);
+  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and history keeps it without a response/);
   assert.equal(closeQuestion(3), null);
   assert.match(closeQuestion()?.message ?? "", /^2 Replay sends are still waiting\. Closing the project stops them/);
   // A finished send isn't running any more, though its tab still has a (null) call.
@@ -107,10 +107,13 @@ test("a stopped send doesn't read as not sent", () => {
   assert.equal(failureText({ kind: "cancelled" }, "ws"), stoppedText("ws"));
   for (const kind of ["http", "ws"] as const) {
     assert.match(stoppedText(kind), /may already have reached the server/);
-    // Stopped just after the CLI recorded it, it is in history after all.
-    assert.match(stoppedText(kind), /may not be in history/);
-    assert.doesNotMatch(stoppedText(kind), /before a response/);
+    // The CLI records a request before it goes out, so a stopped send isn't promised to be missing.
+    assert.match(stoppedText(kind), /history has/);
+    assert.doesNotMatch(stoppedText(kind), /not be in history/);
   }
+  // A CLI that answered in time names its rows; that is kept.
+  const said = "cancelled by user before a response was recorded (history #7)";
+  assert.equal(failureText({ kind: "cancelled", message: said }, "http"), `${stoppedText("http")} (${said})`);
   assert.equal(failureText({ kind: "cli", message: "connection refused" }, "http"), "connection refused");
   assert.equal(failureText(new Error("timed out"), "ws"), "timed out");
 });

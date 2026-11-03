@@ -274,7 +274,8 @@ The sidebar groups the tools by what you are doing.
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
 - **Sending:** ⌘/Ctrl+Enter sends; **Stop** gives up on a request that is still waiting.
-  A stopped request may already have reached the server, but usually isn't in history.
+  A stopped request may already have reached the server; if it went out, history has it,
+  without a response.
   A send carries on while you look at another tab, and its response lands in its own tab;
   closing the tab (or the project, or quitting) stops it, so the app asks first while one
   is running. ‹ › step back and forward through what you sent. A step sent with other
@@ -301,7 +302,9 @@ Edit a raw request and send it as often as you like, in separate tabs.
   - **Timeout**: seconds the request may take, as a plain number such as `60` or `2.5`
     (30 by default, at most a day).
   - **Verify TLS**: refuse a server certificate that isn't valid (off by default).
-  - **Don't record**: the exchange isn't saved in history (`--no-store`).
+  - **Don't record** (`--no-store`): history keeps only a row with the time, target, method
+    and path, without the query string, headers, bodies or response. Agents can't use it
+    through MCP.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
