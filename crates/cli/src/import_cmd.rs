@@ -613,40 +613,47 @@ impl Fetcher<'_> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let client = Client::new(self.send.clone());
         let mut log = crate::sent::SentLog::open(self.project, apiimport::SOURCE, false)?;
-        // Each request (a lost session's retry too) is on record before it goes out.
-        let mut pending: Vec<(i64, Vec<u8>)> = Vec::new();
+        // Each request (a lost session's retry too) is on record before it goes out. `open` is
+        // the one out and unanswered; a row answered already is never rewritten.
+        let mut open: Option<(i64, Vec<u8>)> = None;
         let sent = {
-            let (log, pending) = (&mut log, &mut pending);
+            let (log, open) = (&mut log, &mut open);
+            let sending = |log: &mut crate::sent::SentLog, open: &mut Option<_>, r: &RawRequest| {
+                let recorded = client.recorded_request(r, &target)?;
+                *open = Some((log.pending(&target, &recorded)?, recorded));
+                Ok::<_, Error>(())
+            };
             match self.auth {
                 Some(a) => {
                     let watch = |at: Attempt<'_>| match at {
-                        Attempt::Sending(r) => {
-                            let recorded = client.recorded_request(r, &target)?;
-                            pending.push((log.pending(&target, &recorded)?, recorded));
-                            Ok(())
-                        }
-                        Attempt::Replaced(ex) => log.answered(pending.last().map_or(0, |p| p.0), ex),
+                        Attempt::Sending(r) => sending(log, open, r),
+                        Attempt::Answered(ex) => match open.take() {
+                            Some((id, _)) => log.answered(id, ex),
+                            None => Ok(()),
+                        },
                     };
                     rt.block_on(a.send_as_watched(self.tool, &req, &target, watch))
                 }
                 None => {
-                    let recorded = client.recorded_request(&req, &target)?;
-                    pending.push((log.pending(&target, &recorded)?, recorded));
-                    rt.block_on(client.send(&req, &target))
+                    sending(log, open, &req)?;
+                    let r = rt.block_on(client.send(&req, &target));
+                    if let Ok(ex) = &r {
+                        if let Some((id, _)) = open.take() {
+                            log.answered(id, ex)?;
+                        }
+                    }
+                    r
                 }
             }
         };
-        let ex = match (sent, pending.last()) {
-            (Ok(ex), Some((id, _))) => {
-                log.answered(*id, &ex)?;
-                ex
-            }
+        let ex = match (sent, open) {
+            (Ok(ex), None) => ex,
+            (Ok(_), Some(_)) => unreachable!("an answer completes its row"),
             (Err(e), Some((id, recorded))) => {
-                log.failed(*id, &target, recorded, &e.to_string())?;
+                log.failed(id, &target, &recorded, &e.to_string())?;
                 return Err(e);
             }
             (Err(e), None) => return Err(e),
-            (Ok(_), None) => unreachable!("every request is recorded before it is sent"),
         };
         let head = parse_response_head(&ex.response)?;
         let body = decode_body(&head.headers, split_head_body(&ex.response).1);
