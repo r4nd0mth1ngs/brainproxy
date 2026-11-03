@@ -683,7 +683,13 @@ fn proxy_serves_http2() {
     assert!(body.starts_with("POST /fallback HTTP/1.1\r\n"), "{body}");
     assert!(body.contains("\r\ncontent-length: 3\r\n") && body.ends_with("\r\n\r\nabc"), "{body}");
 
-    std::thread::sleep(Duration::from_millis(300));
+    // The rows are written after the client has its response: wait for them under load.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count("SELECT count(*) FROM history WHERE source = 'proxy' AND status IS NOT NULL") < 3
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         env.count(
             "SELECT count(*) FROM history WHERE source = 'proxy' AND path = '/h2' AND status = 200 \
