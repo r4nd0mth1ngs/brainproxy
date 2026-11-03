@@ -584,6 +584,7 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
 }
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
+    mcp::check_no_store(args.no_store)?;
     let (req, target) = args.req.prepare(None)?;
     let guard = project_guard(project)?;
     // Refuse out-of-scope targets up front, before any connection is attempted.

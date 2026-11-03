@@ -97,6 +97,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
+- `send` and `ws_send` with `no_store` (races too): what an agent sends is always recorded in
+  history, so a person can see what was sent on their behalf.
+- `proxy_start` with a `listen` address other than loopback: an agent can't open the person's
+  proxy, with their auth profiles, to the network.
 
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep

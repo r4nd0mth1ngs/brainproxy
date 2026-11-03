@@ -885,7 +885,7 @@ fn a_mutation_sent_once_is_not_attacked_by_a_later_scan() {
     assert!(graphql_bodies(&api, start, "query user").len() > 1, "the queries were attacked");
     assert!(graphql_bodies(&api, start, "deleteUser").is_empty(), "the mutation was replayed");
 
-    // Opting in, or naming the request, attacks it.
+    // Opting in attacks it.
     let start = api.at("/graphql").len();
     args.push("--include-methods=MUTATION");
     let r = ok(&p, &args, &[]);
@@ -897,8 +897,14 @@ fn a_mutation_sent_once_is_not_attacked_by_a_later_scan() {
         &[],
     );
     let id = id["rows"][0][0].to_string();
+    // Naming it isn't opting in: refused before anything is sent.
     let start = api.at("/graphql").len();
-    ok(&p, &["scan", "active", "--history-id", &id, "--rules", "30001", "--strength", "low"], &[]);
+    let named = ["scan", "active", "--history-id", &id, "--rules", "30001", "--strength", "low"];
+    let o = run(&p, &named, &[]);
+    assert_eq!(o.code, 2, "{}", o.all);
+    assert!(o.all.contains("--include-methods MUTATION"), "{}", o.all);
+    assert_eq!(api.at("/graphql").len(), start);
+    ok(&p, &[&named[..], &["--include-methods", "MUTATION"]].concat(), &[]);
     assert!(!graphql_bodies(&api, start, "deleteUser").is_empty());
 }
 

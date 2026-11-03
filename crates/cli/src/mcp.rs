@@ -58,6 +58,19 @@ pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_c
     Ok(())
 }
 
+/// Under a tool call, refuses `--no-store`: whatever an agent sends goes into the project's
+/// history, so a person can see what was sent on their behalf.
+pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Error> {
+    if no_store && in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(
+            "--no-store: through MCP everything sent is recorded; a person can leave a send out of history in the \
+             app or a terminal"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Tool calls that may run at once; more are refused until one finishes.
 const MAX_CALLS: usize = 16;
 

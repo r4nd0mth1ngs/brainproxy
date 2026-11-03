@@ -717,7 +717,8 @@ Crawl and active-scan scope and safety flags:
   `application/graphql` body or the URL, defines one) is `MUTATION` whatever its method and however
   it was recorded, so one sent once by `import api --include-methods MUTATION`, a one-request check
   or the proxy isn't replayed by a later scan unless `--include-methods MUTATION` (or `all`) says
-  so. Requests picked with `--history-id` are attacked whatever their method.
+  so. A request picked with `--history-id` needs the same opt-in: naming a DELETE or a mutation
+  without `--include-methods DELETE` (or `MUTATION`) is refused with exit code 2 before anything is sent.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
   GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
@@ -1028,7 +1029,9 @@ control. Low ones are only in the results, to review.
 Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
 replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
 another user. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
-so the owner stays logged in. `--history-id` picks a request whatever its method. URLs on
+so the owner stays logged in. A request picked with `--history-id` may lack credentials, but its
+method needs `--include-methods` like any other, and one matching `--exclude` is refused
+(exit code 2, nothing sent) unless `--exclude` is given a pattern it doesn't match. URLs on
 the command line are fetched with GET and need `--owner`. Every request stays inside the
 engagement scope and is recorded in history with source `authz`.
 

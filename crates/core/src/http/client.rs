@@ -580,6 +580,16 @@ impl Client {
         target: &Target,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let name = self.opts.sni.as_deref().unwrap_or(&target.host);
+        // The server name picks the site on a shared front end as much as the address does, so a
+        // different one must be in scope by name too: else an in-scope host on a CDN reaches any tenant.
+        if let Some(sni) = &self.opts.sni {
+            let guard = self.opts.guard.as_ref().ok_or_else(|| Error::OutOfScope("no engagement scope".into()))?;
+            if !sni.eq_ignore_ascii_case(&target.host) && !guard.confirms(sni, target.port) {
+                return Err(Error::OutOfScope(format!(
+                    "--sni {sni}: a server name other than the target's must be listed by name in the scope"
+                )));
+            }
+        }
         let server_name = ServerName::try_from(name.to_string())
             .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
         connector.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))

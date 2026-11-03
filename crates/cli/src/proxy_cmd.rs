@@ -573,6 +573,9 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if let Some((s, known)) = recorded(&store)? {
         return Err(already_running(&s, known));
     }
+    if let Ok(addr) = args.listen.parse() {
+        check_listen(addr)?;
+    }
     load_ca(home)?; // Surface CA and scope problems here rather than in the log.
     store.guard()?;
     let project = std::fs::canonicalize(project)?;
@@ -726,6 +729,18 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
 }
 
 /// Why the address can't be bound, by error kind: the system's own text is localised on Windows.
+/// Under an MCP tool call, refuses a listener other machines could reach: an agent could
+/// otherwise open the person's proxy, with their auth profiles, to the network.
+fn check_listen(addr: std::net::SocketAddr) -> Result<(), Error> {
+    if crate::mcp::in_tool_call() && !addr.ip().is_loopback() {
+        return Err(Error::InvalidInput(format!(
+            "--listen {addr}: through MCP the proxy listens on loopback only; a person can choose another address \
+             in the app or a terminal"
+        )));
+    }
+    Ok(())
+}
+
 fn listen_error(addr: &str, e: &std::io::Error) -> Error {
     Error::Conflict(match e.kind() {
         std::io::ErrorKind::AddrInUse => {
@@ -756,6 +771,7 @@ fn serve(
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&args.listen).await.map_err(|e| listen_error(&args.listen, &e))?;
         let addr = listener.local_addr()?;
+        check_listen(addr)?;
         let (authz, worker) = match live {
             Some(l) => {
                 let (live, worker) = Live::start(project, l.run_id, l.cfg, l.opts, l.ctl)?;

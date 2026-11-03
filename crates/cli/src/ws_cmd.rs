@@ -348,6 +348,7 @@ fn outgoing(store: &Store, args: &SendArgs, input: &Input) -> Result<Vec<(u8, Ve
 }
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
+    crate::mcp::check_no_store(args.no_store)?;
     let store = Store::open(project)?;
     let input = if args.input_json {
         serde_json::from_slice(&crate::read_input(None)?)

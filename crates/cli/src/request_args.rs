@@ -50,7 +50,8 @@ pub struct RequestArgs {
     /// Verify the server certificate (off by default, as with most intercepting tools).
     #[arg(long)]
     pub verify_tls: bool,
-    /// Override the TLS SNI host name.
+    /// Override the TLS SNI host name. A name other than the target's must be listed by
+    /// name in the scope: on a shared front end it picks the site as much as the address does.
     #[arg(long)]
     pub sni: Option<String>,
     /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http). A raw
