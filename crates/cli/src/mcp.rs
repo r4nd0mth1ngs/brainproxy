@@ -28,10 +28,11 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Commands not offered as tools: the server itself, foreground servers that never
 /// return (their `start` variants run them in the background), the feed signing
-/// key's commands (publishing checks is for a maintainer, not an agent), and `project save`
-/// (copying the project elsewhere is for the person running the server).
+/// key's commands (publishing checks is for a maintainer, not an agent), `project save`
+/// (copying the project elsewhere is for the person running the server), and `browser open`
+/// (the browser profile holds the person's sign-ins; the command refuses a tool call too).
 const EXCLUDED: &[&str] =
-    &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save"];
+    &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save", "browser open"];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
 /// do alone (run a collection's script, open the user's browser, read any environment variable),
@@ -68,6 +69,18 @@ pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Erro
              of history (it still gets a row) in the app or a terminal"
                 .into(),
         ));
+    }
+    Ok(())
+}
+
+/// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as
+/// `fuzz run --store none`), for the same reason as [`check_no_store`].
+pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{flag}: through MCP everything sent is recorded; a person can keep requests out of history in the app \
+             or a terminal"
+        )));
     }
     Ok(())
 }

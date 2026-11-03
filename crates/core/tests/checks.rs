@@ -70,6 +70,21 @@ fn tmp(name: &str) -> PathBuf {
     dir
 }
 
+/// The project `run_with` records into for a server on `port`.
+fn project_of(port: u16) -> PathBuf {
+    std::env::temp_dir().join(format!("bp-checks-e2e-{}-t{port}", std::process::id())).join("p.bpdb")
+}
+
+/// Rows of `sql` against that project, every cell as text.
+fn rows(port: u16, sql: &str) -> Vec<Vec<String>> {
+    let store = brainproxy_core::store::Store::open_read_only(&project_of(port)).unwrap();
+    let r = store.query(sql, &[], 1000, 10_000).unwrap();
+    r.rows
+        .iter()
+        .map(|row| row.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)).collect())
+        .collect()
+}
+
 fn run(port: u16, path: &str, templates: &[(&str, &str)]) -> ActiveSummary {
     run_opts(port, path, templates, &Default::default())
 }
@@ -86,6 +101,7 @@ fn run_with(
     tweak: impl FnOnce(&mut ActiveConfig),
 ) -> ActiveSummary {
     let dir = tmp(&format!("t{port}"));
+    let project = project_of(port);
     for (name, text) in templates {
         std::fs::write(dir.join(name), text).unwrap();
     }
@@ -115,6 +131,7 @@ fn run_with(
         auth: None,
         oob: None,
         oob_wait: Duration::ZERO,
+        check_methods: vec![],
     };
     tweak(&mut cfg);
     let targets = vec![ScanTarget {
@@ -124,7 +141,6 @@ fn run_with(
         response: resp("200 OK", "Content-Type: text/html\r\n", "<html>welcome</html>").into_bytes(),
         duration_ms: None,
     }];
-    let project = dir.join("p.bpdb");
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     rt.block_on(active::run(&project, targets, cfg, JobControl::default())).unwrap()
 }
@@ -519,4 +535,63 @@ fn too_many_requests_pauses_and_retries() {
     assert_eq!(s.raised.get("check:git-config"), Some(&1), "{s:?}");
     assert_eq!(s.requests, 2);
     assert!(started.elapsed() >= Duration::from_secs(1));
+}
+
+const DELETE_PROBE: &str = r#"
+id: delete-probe
+info: {name: Delete probe, severity: info}
+http:
+  - raw:
+      - |
+        DELETE /items/1?x=1 HTTP/1.1
+        Host: {{Hostname}}
+        X-Probe: 1
+
+    matchers:
+      - type: word
+        words: ["never in a response"]
+"#;
+
+#[test]
+fn every_request_a_check_sends_is_recorded() {
+    let (port, seen) = spawn(|req| match req.split(' ').nth(1).unwrap_or("") {
+        "/.git/config" => resp("200 OK", "", "[core]\n"),
+        _ => resp("404 Not Found", "", "welcome"),
+    });
+    let s = run(port, "/", &[("git.yaml", GIT), ("neg.yaml", NEGATIVE)]);
+    assert_eq!(s.raised.get("check:git-config"), Some(&1), "{s:?}");
+    let sent = seen.lock().unwrap().len();
+    // One row per request, with its response, whether or not it backs a finding.
+    let history = rows(port, "SELECT source, path, status, error FROM history ORDER BY id");
+    assert_eq!(history.len(), sent, "{history:?}");
+    assert!(history.iter().all(|r| r[0] == "scan" && r[3] == "null"), "{history:?}");
+    for path in ["/.git/config", "/.env", "/other.example/x"] {
+        assert_eq!(history.iter().filter(|r| r[1] == path).count(), 1, "{path}: {history:?}");
+    }
+    // The finding points at that row; the exchange isn't recorded twice.
+    let finding = rows(port, "SELECT f.history_id FROM findings f JOIN history h ON h.id = f.history_id");
+    let git = rows(port, "SELECT id FROM history WHERE path = '/.git/config'");
+    assert_eq!(finding, git);
+}
+
+#[test]
+fn a_check_sends_other_methods_only_when_opted_in() {
+    let (port, seen) = spawn(|_| resp("200 OK", "", "ok"));
+    let s = run(port, "/", &[("delete.yaml", DELETE_PROBE)]);
+    assert_eq!(s.check_skipped_methods, 1, "{s:?}");
+    assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+    assert!(rows(port, "SELECT id FROM history").is_empty());
+
+    let (port, seen) = spawn(|_| resp("200 OK", "", "ok"));
+    let s = run_with(port, "/", &[("delete.yaml", DELETE_PROBE)], &Default::default(), |c| {
+        c.check_methods = vec!["DELETE".into()];
+    });
+    assert_eq!(s.check_skipped_methods, 0, "{s:?}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let history = rows(port, "SELECT source, method, url, status, CAST(request AS TEXT) FROM history");
+    assert_eq!(history.len(), 1, "{history:?}");
+    let [source, method, url, status, request] = &history[0][..] else { unreachable!() };
+    assert_eq!((source.as_str(), method.as_str(), status.as_str()), ("scan", "DELETE", "200"));
+    assert_eq!(url, &format!("http://127.0.0.1:{port}/items/1?x=1"));
+    assert!(request.contains("X-Probe: 1"), "{request}");
 }

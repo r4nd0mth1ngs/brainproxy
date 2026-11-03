@@ -16,6 +16,24 @@ export class CliError extends Error {
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window; // no window under node --test
 
+// The Vite dev bridge's per-run token: `npm run dev` prints the URL to open, which carries it
+// as #bridge=<token>. Kept for this tab and taken off the address bar; no page the dev server
+// serves holds it, so nothing that can only send HTTP requests to it learns it.
+const bridgeToken: string = (() => {
+  if (typeof window === "undefined" || inTauri) return "";
+  const given = /(?:^#|&)bridge=([0-9a-f]+)/.exec(window.location.hash)?.[1];
+  try {
+    if (given) {
+      sessionStorage.setItem("brainproxy-bridge", given);
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      return given;
+    }
+    return sessionStorage.getItem("brainproxy-bridge") ?? "";
+  } catch {
+    return given ?? "";
+  }
+})();
+
 let project = "";
 export const setProject = (p: string) => (project = p);
 export const getProject = () => project;
@@ -46,7 +64,7 @@ export async function cli<T = any>(args: string[], input: string | Uint8Array | 
   }
   const res = await fetch("/api/cli", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-brainproxy": "1" },
+    headers: { "content-type": "application/json", "x-brainproxy": bridgeToken },
     body: JSON.stringify({ project: proj, args, stdin: bytes, env, call }),
   });
   return res.json();
@@ -61,7 +79,7 @@ export async function cancelCli(call: string): Promise<void> {
   }
   await fetch("/api/cli-cancel", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-brainproxy": "1" },
+    headers: { "content-type": "application/json", "x-brainproxy": bridgeToken },
     body: JSON.stringify({ call }),
   });
 }

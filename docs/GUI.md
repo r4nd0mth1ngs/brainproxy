@@ -47,9 +47,15 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   that arrives truncated; the GUI then refuses to send it to Replay or the Fuzzer and shows
   an intercepted one read-only (forward or drop it as is).
 - `npm run dev` also serves the UI to a plain browser: `vite.config.ts` adds `POST /api/cli`
-  and `POST /api/cli-cancel` (dev server only; localhost Host and an `X-Brainproxy: 1` header
-  required; cancelling sends SIGTERM, then SIGKILL after 3 s). It runs
-  `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
+  and `POST /api/cli-cancel` (dev server only; cancelling sends SIGTERM, then SIGKILL after
+  3 s). It runs `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
+  - The bridge runs any command, with none of the MCP limits, so it answers only a localhost
+    Host whose `X-Brainproxy` header is a random token made when the dev server starts. It is
+    printed under the server's URLs (`brainproxy dev bridge: open http://127.0.0.1:5173/#bridge=...`);
+    open that link. `api.ts` keeps the token for the tab (sessionStorage) and takes it off the
+    address bar. The fragment never reaches a server, and no page or file the dev server serves
+    holds the token, so an agent that can reach the port through `send` can't learn it.
+  - Requests with brainproxy's own `User-Agent` (`brainproxy/...`) are refused as well.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
   1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue
   every second while its tab is open. The project is SQLite in WAL mode, so the GUI, the
@@ -193,7 +199,7 @@ anything above 5 MB only after a click.
 ```sh
 cargo build                      # the CLI the GUI runs
 cd gui && npm install
-npm run dev                      # UI in a browser at http://127.0.0.1:5173 (dev bridge)
+npm run dev                      # UI in a browser: open the #bridge= link it prints (dev bridge)
 cargo tauri dev                  # desktop window (from gui/)
 npm run check                    # TypeScript
 npm test                         # unit tests (node --test, e.g. ui/urlencode.test.ts)

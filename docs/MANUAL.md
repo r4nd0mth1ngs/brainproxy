@@ -799,6 +799,10 @@ Crawl and active-scan scope and safety flags:
   or the proxy isn't replayed by a later scan unless `--include-methods MUTATION` (or `all`) says
   so. A request picked with `--history-id` needs the same opt-in: naming a DELETE or a mutation
   without `--include-methods DELETE` (or `MUTATION`) is refused with exit code 2 before anything is sent.
+- `scan active --checks`: the same opt-in applies to the requests a template sends, from any
+  store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
+  without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
+  check does send is recorded in history (source `scan`), finding or not.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
   GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
@@ -808,7 +812,9 @@ Crawl and active-scan scope and safety flags:
   GET, HEAD, OPTIONS and POST unless `--include-methods` adds others. Credentials in the
   document (Postman auth, secret-named headers, query parameters and body fields, and variables
   they use) are reported by name in `credentials` and never sent or stored; use an auth profile.
-  A document fetched from a URL isn't kept in history either.
+  A document fetched from a URL is recorded in history (source `import`) as it was sent and
+  answered, like any other request (so are `--graphql`'s introspection and `scan active --api`'s
+  fetch); the response is the document, so whatever it holds is in the project too.
 - Postman environments: `--environment FILE` reads an environment export for the collection's
   variables (a local file only; `--var` goes on top). Values the environment marks secret, or whose
   names look like credentials, are withheld like the collection's own, and the preview lists them as
@@ -1020,6 +1026,11 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   with the error. If no copy got a response, the command fails with the error's kind (exit
   3) and the message lists the rows; with `--format json` the envelope's `data.results`
   has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
+- The requests a `scan active --checks` template sends, and the document fetches of `import`
+  and `scan active --api` (with `--graphql`, the introspection), are recorded the same way: a row
+  just before the request goes out, completed with the response or the failure. A check request
+  cut off by its timeout, or by a stopped scan, keeps `sent; no response recorded (the check
+  timed out or the scan stopped)`.
 - `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
   for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
   before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent, and
@@ -1211,6 +1222,11 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 Everything its tool calls record (history, findings, finding state changes) is marked with
 origin `mcp`, including what a proxy or job it started records; see
 [Who recorded what](#who-recorded-what).
+
+A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
+and `fuzz run --store none` or `--store matches` are refused. `browser open` isn't offered (the
+project's browser profile keeps the person's sign-ins), and other options that need a person are
+refused too; docs/MCP.md lists them.
 
 ---
 
