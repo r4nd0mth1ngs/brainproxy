@@ -864,7 +864,8 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
                 // The first exchange went out and was answered: it has its own row.
                 if record && flight.claim() {
                     let ms = Some(started.elapsed().as_millis() as i64);
-                    send_capture(ctx, Capture::new("proxy", target, sent, Some(response), ms, None), None).await;
+                    let c = Capture::new("proxy", target, sent, Some(response), ms, None);
+                    send_capture(ctx, Capture { edited_by: edited_by.clone(), ..c }, None).await;
                 }
                 flight = next;
                 request = retry;

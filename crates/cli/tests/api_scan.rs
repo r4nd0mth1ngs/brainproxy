@@ -280,7 +280,7 @@ fn a_document_from_a_url_is_fetched_in_scope_and_checked() {
     assert_eq!(d["requests"][0]["url"], format!("{}/rel/a", api.origin()), "relative to the document's URL");
     assert_eq!(api.hits().len(), 1, "only the document");
     // The fetch is recorded as sent, like any request that went out.
-    let sql = "SELECT source, method, url, status, CAST(response AS TEXT) FROM history";
+    let sql = "SELECT source, method, url, status, CAST(response AS TEXT), error FROM history";
     let kept = ok(&p, &["query", sql])["rows"].clone();
     assert_eq!(kept.as_array().map(Vec::len), Some(1), "{kept}");
     assert_eq!(
@@ -288,7 +288,13 @@ fn a_document_from_a_url_is_fetched_in_scope_and_checked() {
         (Some("import"), Some("GET"), Some(&*url))
     );
     assert_eq!(kept[0][3], 200);
-    assert!(kept[0][4].as_str().unwrap().ends_with(doc), "{kept}");
+    // Not the document, which can hold credentials the import withholds: its head, and the
+    // body's hash, the same the import checks.
+    let response = kept[0][4].as_str().unwrap();
+    assert!(response.starts_with("HTTP/1.1 200") && !response.contains("openapi"), "{kept}");
+    let sha = d["document_sha256"].as_str().unwrap();
+    let error = kept[0][5].as_str().unwrap();
+    assert!(error.starts_with("API document: body omitted") && error.contains(sha), "{kept}");
 
     // The hash of what the server gives is what's checked, in the foreground and in a job.
     let sha = d["document_sha256"].as_str().unwrap().to_string();

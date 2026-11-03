@@ -9,12 +9,17 @@
 //! source, and target. The response is left out (no status, so passive checks skip it), and
 //! the error says so, starting with [`NOT_STORED`] (or [`TOKEN_OMITTED`]), then whether a
 //! query string was left out, then how the request ended.
+//!
+//! An API document's fetch keeps its request as sent and the response's head, but not the
+//! document: it can hold the credentials `import` reports by name and withholds. The error
+//! says so ([`DOCUMENT_OMITTED`]), with the body's length and sha256.
 
 use std::path::Path;
 
 use crate::capture::Capture;
 use crate::error::Result;
 use crate::http::client::final_response;
+use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Exchange, Target};
 use crate::store::Store;
 
@@ -28,12 +33,17 @@ pub const NOT_STORED: &str = "not stored (--no-store): content omitted";
 /// How an OAuth token request's row's error starts.
 pub const TOKEN_OMITTED: &str = "token request: content omitted (it carries the client secret and tokens)";
 
+/// How the error of an API document fetch whose body was left out starts.
+pub const DOCUMENT_OMITTED: &str = "API document: body omitted (it can hold credentials the import withholds)";
+
 /// Records requests of one source as they go out. See the module docs.
 pub struct SentLog {
     pub store: Store,
     source: &'static str,
     /// Keep no content: the error's first words for such rows.
     omit: Option<&'static str>,
+    /// Keep the request and the response's head, not its body: the error's first words.
+    omit_body: Option<&'static str>,
 }
 
 impl SentLog {
@@ -43,12 +53,19 @@ impl SentLog {
     }
 
     pub fn new(store: Store, source: &'static str, no_store: bool) -> Self {
-        Self { store, source, omit: no_store.then_some(NOT_STORED) }
+        Self { store, source, omit: no_store.then_some(NOT_STORED), omit_body: None }
     }
 
     /// Rows keep no content, marked with `reason`.
     pub fn without_content(mut self, reason: &'static str) -> Self {
         self.omit = Some(reason);
+        self
+    }
+
+    /// Rows keep the request and the response's head, but not the response body: their error
+    /// starts with `reason` and gives the body's length and sha256.
+    pub fn without_response_body(mut self, reason: &'static str) -> Self {
+        self.omit_body = Some(reason);
         self
     }
 
@@ -67,6 +84,14 @@ impl SentLog {
     ) -> Capture {
         let ms = duration_ms.map(|d| d as i64);
         let Some(omit) = self.omit else {
+            if let (Some(reason), Some(r)) = (self.omit_body, response) {
+                let (head, body) = split_head_body(final_response(r));
+                let mut note = format!("{reason}; {} bytes, sha256 {}", body.len(), crate::fetch::sha256_hex(body));
+                if let Some(e) = error {
+                    note.push_str(&format!("; {e}"));
+                }
+                return Capture::new(self.source, target, request, Some(head), ms, Some(&note));
+            }
             return Capture::new(self.source, target, request, response, ms, error);
         };
         let (line, had_query) = request_line(request);

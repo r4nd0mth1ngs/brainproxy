@@ -958,8 +958,14 @@ fn oauth_discover_reads_where_tokens_and_sign_ins_go() {
     let d = ok(&p, &["auth", "oauth", "discover", &url], &[]);
     assert_eq!(d["token_url"], format!("{}/token", api.origin()), "{d}");
     assert_eq!(d["authorize_url"], format!("{}/authorize", api.origin()), "{d}");
+    // The fetch is on record, as sent.
+    let sql = "SELECT source, method, url, status FROM history";
+    let rows = ok(&p, &["query", sql], &[])["rows"].clone();
+    assert_eq!(rows, serde_json::json!([["auth", "GET", url, 200]]), "{rows}");
     let o = run(&p, &["auth", "oauth", "discover", "https://id.elsewhere.test/.well-known/openid-configuration"], &[]);
     assert_eq!((o.code, o.json["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{}", o.all);
+    // Refused before anything went out, so nothing more is recorded.
+    assert_eq!(ok(&p, &["query", "SELECT count(*) FROM history"], &[])["rows"][0][0], 1);
     // The API's own JSON is no discovery document.
     let o = run(&p, &["auth", "oauth", "discover", &format!("{}/v1/a", api.origin())], &[]);
     let d = &o.json["data"];

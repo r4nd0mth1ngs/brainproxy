@@ -612,7 +612,8 @@ impl Fetcher<'_> {
         let (req, target): (RawRequest, Target) = RawRequest::build(method, url, &headers, body)?;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let client = Client::new(self.send.clone());
-        let mut log = crate::sent::SentLog::open(self.project, apiimport::SOURCE, false)?;
+        let mut log = crate::sent::SentLog::open(self.project, apiimport::SOURCE, false)?
+            .without_response_body(brainproxy_core::sent::DOCUMENT_OMITTED);
         // Each request (a lost session's retry too) is on record before it goes out. `open` is
         // the one out and unanswered; a row answered already is never rewritten.
         let mut open: Option<(i64, Vec<u8>)> = None;

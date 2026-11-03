@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -90,6 +90,22 @@ ALTER TABLE findings ADD COLUMN note_origin TEXT;
 ALTER TABLE findings ADD COLUMN note_changed_at TEXT;
 ALTER TABLE intercepts ADD COLUMN resolved_by TEXT;
 ";
+
+/// Runs each `ALTER TABLE t ADD COLUMN c ...` line of `schema` whose column `t` lacks, and
+/// every other line as it is (they must be idempotent, like `CREATE INDEX IF NOT EXISTS`).
+fn add_missing_columns(conn: &Connection, schema: &str) -> Result<()> {
+    for line in schema.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let ["ALTER", "TABLE", table, "ADD", "COLUMN", column, ..] = words[..] {
+            let mut stmt = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?;
+            if stmt.exists([column])? {
+                continue;
+            }
+        }
+        conn.execute_batch(line)?;
+    }
+    Ok(())
+}
 
 const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS intercepts (
@@ -540,6 +556,10 @@ impl Store {
         }
         if version < 13 {
             self.conn.execute_batch(SCHEMA_V13)?;
+        }
+        if version < 14 {
+            // Builds before the release recorded v13 with fewer of its columns: add any missing.
+            add_missing_columns(&self.conn, SCHEMA_V13)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1438,6 +1458,44 @@ mod tests {
         store.intercept_resolve(held, "forwarded", Some(b"GET /x HTTP/1.1\r\n\r\n"), Some("mcp")).unwrap();
         let (entry, _, _) = store.intercept_get(held).unwrap();
         assert_eq!((entry.resolved_by.as_deref(), entry.edited), (Some("mcp"), true));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_from_an_early_v13_build_gets_the_columns_it_lacks() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v13-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        // v13 as the first provenance builds wrote it: origin, client_addr and sni only.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE history DROP COLUMN edited_by; ALTER TABLE history DROP COLUMN note_origin;
+             ALTER TABLE findings DROP COLUMN note_origin; ALTER TABLE intercepts DROP COLUMN resolved_by;
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        for (table, column) in [
+            ("history", "edited_by"),
+            ("history", "note_origin"),
+            ("findings", "note_origin"),
+            ("intercepts", "resolved_by"),
+        ] {
+            let has: bool = store
+                .conn
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n == 1)
+                .unwrap();
+            assert!(has, "{table}.{column}");
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

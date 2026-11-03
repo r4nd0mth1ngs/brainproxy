@@ -48,7 +48,10 @@ export interface CliInput {
   env?: Record<string, string>;
   /** Run against this project instead of the open one. */
   project?: string;
-  /** An id `cancelCli` can stop the call by; it then fails with kind "cancelled". */
+  /**
+   * An id `cancelCli` can stop the call by. A call it stopped fails with kind "cancelled"; one
+   * that finished within the grace period returns its own result with `cancelled: true`.
+   */
   call?: string;
 }
 

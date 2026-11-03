@@ -814,7 +814,9 @@ Crawl and active-scan scope and safety flags:
   they use) are reported by name in `credentials` and never sent or stored; use an auth profile.
   A document fetched from a URL is recorded in history (source `import`) as it was sent and
   answered, like any other request (so are `--graphql`'s introspection and `scan active --api`'s
-  fetch); the response is the document, so whatever it holds is in the project too.
+  fetch), except the document itself: the row keeps the response's head, and its error says
+  `API document: body omitted (it can hold credentials the import withholds)` with the body's
+  length and sha256 (the `document_sha256` the import reports).
 - Postman environments: `--environment FILE` reads an environment export for the collection's
   variables (a local file only; `--var` goes on top). Values the environment marks secret, or whose
   names look like credentials, are withheld like the collection's own, and the preview lists them as
@@ -899,7 +901,7 @@ OAuth 2.0 in an auth profile, in place of a login:
   registered with a fixed port; any free port otherwise) with PKCE (S256) and a `state` check. A
   redirect without the right `state`, or on another path, is refused and the wait goes on.
 - `auth oauth discover URL` reads an OpenID Connect discovery document (in scope) and prints the
-  token and sign-in URLs.
+  token and sign-in URLs. The fetch is recorded in history (source `auth`), as `send` records.
 - The token goes on requests as `Authorization: Bearer «auth:NAME:token»`, filled on the wire like a
   login's token. A token due to expire within 30 seconds is renewed before the next request, once
   however many requests notice, with the refresh token when there is one (a rotated one replaces
