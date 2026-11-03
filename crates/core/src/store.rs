@@ -197,10 +197,14 @@ pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
     ("resp_body_text", "TEXT", "Response body as text if valid UTF-8, else NULL"),
     ("resp_body_length", "INTEGER", "Length of the decoded response body"),
     ("title", "TEXT", "HTML <title>, if any"),
-    ("duration_ms", "INTEGER", "Round-trip time"),
+    ("duration_ms", "INTEGER", "Round-trip time (race rows: from the release of the final bytes)"),
     ("error", "TEXT", "Error message when no response was received"),
     ("note", "TEXT", "Free-text note (set with `history note`)"),
-    ("tags", "TEXT", "JSON array of tags (set with `history tag`)"),
+    (
+        "tags",
+        "TEXT",
+        "JSON array of tags (set with `history tag`; send --race adds race:ID, race-sync:..., race-pos:I/N)",
+    ),
     ("request", "BLOB", "Raw request bytes exactly as sent"),
     ("response", "BLOB", "Raw response bytes exactly as received"),
 ];
@@ -997,9 +1001,9 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
         "INSERT INTO history (source, scheme, host, port, method, url, path, query,
             req_headers, req_content_type, req_body, req_body_text,
             status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
-            title, duration_ms, error, request, response)
+            title, duration_ms, error, request, response, tags)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-            ?20, ?21, ?22, ?23, ?24)",
+            ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             c.source,
             c.scheme,
@@ -1025,6 +1029,7 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
             c.error,
             c.request,
             c.response,
+            serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1226,6 +1231,23 @@ mod tests {
         a.record_batch(&[capture]).unwrap();
         holder.join().unwrap();
         assert_eq!(a.list(&HistoryFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn records_a_capture_with_its_tags() {
+        let s = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let mut c = Capture::new("race", &target, b"GET / HTTP/1.1\r\n\r\n", None, None, Some("boom"));
+        c.tags = vec!["race:x".into(), "race-pos:1/2".into()];
+        let id = s.record(&c).unwrap();
+        let untagged = s.record_failure("send", &target, b"GET / HTTP/1.1\r\n\r\n", "boom").unwrap();
+        let f = HistoryFilter { tag: Some("race:x".into()), ..Default::default() };
+        let found = s.list(&f).unwrap();
+        assert_eq!(
+            (found.len(), found[0].id, &found[0].tags[..]),
+            (1, id, &["race:x".to_string(), "race-pos:1/2".into()][..])
+        );
+        assert_eq!(s.update_tags(untagged, &[], &[]).unwrap(), Vec::<String>::new());
     }
 
     #[test]

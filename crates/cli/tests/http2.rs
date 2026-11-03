@@ -99,6 +99,12 @@ fn send_race_and_fuzz_over_http2() {
     for r in d["results"].as_array().unwrap() {
         assert!(r["id"].is_i64() && r["status"] == 200 && r["length"].is_u64() && r["duration_ms"].is_u64(), "{r}");
     }
+    // Its rows say how it was run (all three final frames went out together: not partial).
+    let id = d["results"][2]["id"].to_string();
+    let tags = &run(&["history", "show", &id], &p, None)["entry"]["tags"];
+    let want =
+        [format!("race:{}", d["race_id"].as_str().unwrap()), "race-sync:single-packet".into(), "race-pos:3/3".into()];
+    assert_eq!(tags, &serde_json::json!(want), "{tags}");
 
     let d = run(&["fuzz", "run", "--http2", "--url", &format!("{base}/f?q=§x§"), "-p", "list:a,b,c,d"], &p, None);
     assert_eq!(d["run"]["done"], 4, "{d}");

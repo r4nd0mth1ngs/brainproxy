@@ -168,15 +168,18 @@ tab's request, prepared exactly as Send prepares it (auto URL-encode, binary bod
 single-packet attack; otherwise it is last-byte sync over HTTP/1.1. The toolbar names the
 technique the CLI reports (and when a single-packet race couldn't put every final frame in one
 packet), the spread between the fastest and slowest response, and how many differ. The response
-side lists each request's status, length, time since the release and history id; rows whose
-status or length (or error) differ from request #1's are highlighted. Selecting a row opens that
-response (`history show ID`); the first is opened when the race ends. A race is one step in
-‹ › like a send. Send history and the running send or race are kept per tab outside the tab's
-view (`views/replayState.ts`), so a race that ends after the user switched tabs still lands in its
-tab. That store belongs to the open project's Replay view, and the send, race and `history show`
-run against the project they started in: a race that ends after the project closed is dropped,
-and the next project's tabs start empty. It races copies of one request; racing different
-requests against each other isn't offered.
+side lists each request's status (or error), length, time since the release and history id
+(failures are recorded too); rows whose status or length differ from the most common response's
+are highlighted, as is every failure (when nothing came back, the most common error is the
+baseline). Selecting a row opens that response (`history show ID`); the first response is opened
+when the race ends. The CLI tags every row with the race (`race:ID`, `race-sync:...`,
+`race-pos:I/N`, `race-partial`) and refuses a last-byte race the open-file limit has no room
+for. A race is one step in ‹ › like a send. Send history and the running send or race are kept
+per tab outside the tab's view (`views/replayState.ts`), so a race that ends after the user
+switched tabs still lands in its tab. That store belongs to the open project's Replay view, and
+the send, race and `history show` run against the project they started in: a race that ends
+after the project closed is dropped, and the next project's tabs start empty. It races copies of
+one request; racing different requests against each other isn't offered.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings).

@@ -7,6 +7,7 @@ import { Split } from "../ui/Split";
 import { autoEncodeRequest } from "../ui/urlencode";
 import {
   firstOpenable,
+  openable,
   parseRaceCount,
   patchOpen,
   plannedTechnique,
@@ -17,6 +18,7 @@ import {
   raceRows,
   raceSummary,
   sentRequestLine,
+  shapeLabel,
   syncNote,
   techniqueLabel,
   type Raced,
@@ -125,7 +127,7 @@ const RACE_COLUMNS: Column<RaceRow>[] = [
   { key: "length", label: "Length", width: 80, value: (r) => r.length, align: "right" },
   { key: "time", label: "Time (ms)", width: 80, value: (r) => r.duration_ms, align: "right" },
   { key: "id", label: "History", width: 70, value: (r) => r.id, render: (r) => (r.id == null ? "" : `#${r.id}`) },
-  { key: "differs", label: "", width: 120, value: (r) => (r.differs ? 1 : 0), render: (r) => (r.differs ? <span className="race-differs-tag">differs from #1</span> : "") },
+  { key: "differs", label: "", width: 120, value: (r) => (r.differs ? 1 : 0), render: (r) => (r.differs ? <span className="race-differs-tag">differs</span> : "") },
 ];
 
 function storedAutoEncode(): boolean {
@@ -239,7 +241,8 @@ function RepeaterTabView({ tab, store }: { tab: RepeaterTab; store: TabStore<Tab
   const openRaced = async (idx: number, result: RaceResult) => {
     const item = raceRows(result)[idx];
     update((s) => ({ ...s, list: s.list.map((e) => (e.race?.result === result ? { ...e, race: { result, open: idx }, result: null, error: item.error } : e)) }));
-    if (item.id == null) return;
+    // A failure's row holds only its error, shown already.
+    if (!openable(item)) return;
     const patch = (p: Partial<Sent>) => update((s) => ({ ...s, list: patchOpen(s.list, result, idx, p) }));
     try {
       const entry = await run<HistoryEntry>(["history", "show", String(item.id), MAX_BODY], { project });
@@ -301,7 +304,7 @@ function RepeaterTabView({ tab, store }: { tab: RepeaterTab; store: TabStore<Tab
             {busy === "race" ? "Racing…" : "Race"}
           </button>
           <span className="label">×</span>
-          <input className="input mono" type="number" min={RACE_MIN} max={raceMax(line)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+          <input className="input mono" type="number" aria-label="Race count" min={RACE_MIN} max={raceMax(line)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
         </div>
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
@@ -335,14 +338,14 @@ function RepeaterTabView({ tab, store }: { tab: RepeaterTab; store: TabStore<Tab
           </span>
         )}
         {raced && summary && (
-          <span className="tag" title={note ?? undefined}>
+          <span className="tag" title={[note, raced.result.race_id && `History rows tagged race:${raced.result.race_id}`].filter(Boolean).join("\n") || undefined}>
             race ×{raced.result.race} · {techniqueLabel(raced.result.sync)}
             {note ? " (partial)" : ""}
           </span>
         )}
         {raced && summary && (
-          <span className="muted">
-            {summary.spread == null ? "no responses" : `spread ${summary.spread} ms`} · {summary.differing ? `${summary.differing} differ` : "all alike"}
+          <span className="muted" title={summary.baseline == null ? undefined : `Compared with the most common result: ${shapeLabel(raced.result.results[summary.baseline])} (first at #${summary.baseline + 1})`}>
+            {summary.spread == null ? "no responses" : `spread ${summary.spread} ms`} · {summary.differing ? `${summary.differing} differ from the most common` : "all alike"}
             {summary.errors ? ` · ${summary.errors} failed` : ""}
           </span>
         )}

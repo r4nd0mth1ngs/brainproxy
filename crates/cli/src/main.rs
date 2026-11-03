@@ -29,7 +29,7 @@ mod ws_cmd;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use brainproxy_core::capture::decode_body;
+use brainproxy_core::capture::{decode_body, Capture};
 use brainproxy_core::codec;
 use brainproxy_core::http::request::split_head_body;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, Target};
@@ -227,6 +227,7 @@ struct SendArgs {
     /// Race mode: send the request N times at once. HTTP/1.1: N connections, releasing
     /// the last byte of every request together (last-byte sync). With --http2: one
     /// connection, final frames released in one packet (single-packet attack, N <= 100).
+    /// Rows are tagged race:ID, race-sync:..., race-pos:I/N (and race-partial).
     #[arg(long, value_name = "N")]
     race: Option<usize>,
     /// Send with this auth profile's session (cookies/headers; re-login if logged out).
@@ -349,6 +350,8 @@ fn main() {
     if let Ok(exe) = std::env::current_exe() {
         brainproxy_core::sign_script::set_runner(exe, &["__sign-script"]);
     }
+    // A last-byte race opens a connection per request; don't stop at a low default soft limit.
+    brainproxy_core::race::raise_fd_limit();
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(e) => {
@@ -585,6 +588,12 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let (req, target) = args.req.prepare(None)?;
+    // HTTP/2 (the flag, or a request line saying so) races single-packet.
+    let h2 = args.req.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"));
+    if let Some(n) = args.race {
+        // Refused before anything is sent, a login included.
+        check_race_count(n, h2)?;
+    }
     let guard = project_guard(project)?;
     // Refuse out-of-scope targets up front, before any connection is attempted.
     require_in_scope(&guard, &target)?;
@@ -601,7 +610,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             }
             None => req,
         };
-        return race(project, &args, req, target, client, n, out);
+        return race(project, &args, req, target, client, n, h2, out);
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     let result = match &session {
@@ -647,6 +656,33 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     Ok(())
 }
 
+/// Files kept free beyond a last-byte race's connections: the project database, the runtime,
+/// name lookups and TLS roots.
+const RACE_FD_RESERVE: usize = 64;
+
+/// Refuses race counts the CLI can't run: 1 to 1000, at most 100 single-packet, and for
+/// last-byte sync (a connection each) no more than the open-file limit leaves room for.
+fn check_race_count(n: usize, h2: bool) -> Result<(), Error> {
+    if !(1..=1000).contains(&n) {
+        return Err(Error::InvalidInput("--race must be between 1 and 1000".into()));
+    }
+    let max = brainproxy_core::race::SINGLE_PACKET_MAX;
+    if h2 && n > max {
+        return Err(Error::InvalidInput(format!("single-packet races take 1 to {max} requests")));
+    }
+    if let Some((limit, open)) = brainproxy_core::race::fd_usage().filter(|_| !h2) {
+        let room = limit.saturating_sub(open + RACE_FD_RESERVE);
+        if n > room {
+            return Err(Error::InvalidInput(format!(
+                "--race {n} needs {n} connections, but the open-file limit ({limit}) leaves room for {room}; \
+                 lower --race or raise the limit (ulimit -n)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn race(
     project: &Path,
     args: &SendArgs,
@@ -654,13 +690,10 @@ fn race(
     target: Target,
     client: Client,
     n: usize,
+    h2: bool,
     out: &Out,
 ) -> Result<(), Error> {
-    if !(1..=1000).contains(&n) {
-        return Err(Error::InvalidInput("--race must be between 1 and 1000".into()));
-    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
-    let h2 = args.req.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"));
     let requests = vec![req.as_bytes().to_vec(); n];
     let (results, sync, synced) = if h2 {
         let run = rt.block_on(brainproxy_core::race::single_packet(&client, &target, requests))?;
@@ -668,13 +701,33 @@ fn race(
     } else {
         (rt.block_on(brainproxy_core::race::last_byte_sync(&client, &target, requests)), "last-byte", None)
     };
-    let store = if args.no_store { None } else { Some(Store::open(project)?) };
+    // Every row says which race it was in, how, and where: see race::row_tags.
+    let race_id = brainproxy_core::race::new_race_id()?;
+    let partial = synced.is_some_and(|s| s < n);
+    let captures: Vec<Capture> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut c = match r {
+                Ok(ex) => {
+                    Capture::new("race", &ex.target, &ex.request, Some(&ex.response), Some(ex.duration_ms as i64), None)
+                }
+                Err(e) => Capture::new("race", &target, req.as_bytes(), None, None, Some(&e.to_string())),
+            };
+            c.tags = brainproxy_core::race::row_tags(&race_id, sync, partial, i, n);
+            c
+        })
+        .collect();
+    let ids: Vec<Option<i64>> = if args.no_store {
+        vec![None; n]
+    } else {
+        Store::open(project)?.record_batch(&captures)?.into_iter().map(Some).collect()
+    };
     let mut items = Vec::new();
     let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
-    for r in &results {
+    for (r, id) in results.iter().zip(ids) {
         match r {
             Ok(ex) => {
-                let id = store.as_ref().map(|s| s.record_exchange("race", ex)).transpose()?;
                 let head = parse_response_head(&ex.response).ok();
                 let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(&ex.response).1));
                 let status = head.as_ref().map(|h| h.status);
@@ -683,26 +736,25 @@ fn race(
                 items.push(json!({"id": id, "status": status, "length": length, "duration_ms": ex.duration_ms}));
             }
             Err(e) => {
-                if let Some(s) = &store {
-                    s.record_failure("race", &target, req.as_bytes(), &e.to_string())?;
-                }
                 *shapes.entry(format!("error: {}", e.kind())).or_default() += 1;
-                items.push(json!({"error": e.to_string(), "kind": e.kind()}));
+                items.push(json!({"id": id, "error": e.to_string(), "kind": e.kind()}));
             }
         }
     }
     let data = json!({
         "race": n,
+        "race_id": race_id,
         "sync": sync,
         "synced": synced,
         "target": target.origin(),
         "distinct_responses": shapes,
         "results": items,
-        "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2.",
+        "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2. duration_ms counts from the release of the final bytes. Every recorded row is tagged race:RACE_ID.",
     });
     out.ok(data.clone(), || {
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
-        lines.insert(0, format!("race x{n} ({sync}) -> {}", target.origin()));
+        let note = if partial { ", partial" } else { "" };
+        lines.insert(0, format!("race x{n} ({sync}{note}) -> {}  [tag race:{race_id}]", target.origin()));
         lines.join("\n")
     });
     Ok(())

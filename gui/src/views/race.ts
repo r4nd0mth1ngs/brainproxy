@@ -3,13 +3,18 @@
 
 import { autoEncodeRequest } from "../ui/urlencode.ts";
 
-/** One request of a race, as `send --race` returns it: a response, or why it failed. */
+/**
+ * One request of a race, as `send --race` returns it: a response, or why it failed. `id` is the
+ * history row that records either (null with --no-store).
+ */
 export type RaceItem =
   | { id: number | null; status: number | null; length: number | null; duration_ms: number }
-  | { error: string; kind: string };
+  | { id?: number | null; error: string; kind: string };
 
 export interface RaceResult {
   race: number;
+  /** Every row the race recorded is tagged `race:<race_id>`. */
+  race_id?: string;
   /** The technique: "last-byte" (HTTP/1.1) or "single-packet" (HTTP/2). */
   sync: string;
   /** Single-packet only: final frames that went out in the one write. */
@@ -71,7 +76,7 @@ export function plannedTechnique(raw: string): string {
   return techniqueLabel(isHttp2Request(raw) ? "single-packet" : "last-byte");
 }
 
-export const isRaceError = (r: RaceItem): r is { error: string; kind: string } => "error" in r;
+export const isRaceError = (r: RaceItem): r is { id?: number | null; error: string; kind: string } => "error" in r;
 
 /** What two responses are compared by: status and length, or the kind of error. */
 export function shapeOf(r: RaceItem): string {
@@ -86,16 +91,43 @@ export interface RaceRow {
   length: number | null;
   duration_ms: number | null;
   error: string | null;
-  /** Status, length, or error differs from the first request's. */
+  /** Status, length, or error differs from the most common response's (see baselineOf). */
   differs: boolean;
 }
 
+/**
+ * The request the others are compared with: the first of the most common responses (status and
+ * length). A failure is no response, so it only counts when nothing came back; then it's the
+ * most common kind of error. Null for an empty race.
+ */
+export function baselineOf(results: RaceItem[]): number | null {
+  const pick = (only: (r: RaceItem) => boolean): number | null => {
+    const counts = new Map<string, { first: number; n: number }>();
+    results.forEach((r, i) => {
+      if (!only(r)) return;
+      const c = counts.get(shapeOf(r));
+      if (c) c.n++;
+      else counts.set(shapeOf(r), { first: i, n: 1 });
+    });
+    let best: { first: number; n: number } | null = null;
+    for (const c of counts.values()) if (!best || c.n > best.n) best = c; // ties: the earliest
+    return best?.first ?? null;
+  };
+  return pick((r) => !isRaceError(r)) ?? pick(() => true);
+}
+
+/** The baseline in words, for the toolbar. */
+export function shapeLabel(r: RaceItem): string {
+  return isRaceError(r) ? `error: ${r.kind}` : `${r.status ?? "no status"}, ${r.length ?? "?"} bytes`;
+}
+
 export function raceRows(r: RaceResult): RaceRow[] {
-  const first = r.results[0] ? shapeOf(r.results[0]) : "";
+  const at = baselineOf(r.results);
+  const base = at == null ? "" : shapeOf(r.results[at]);
   return r.results.map((item, idx) =>
     isRaceError(item)
-      ? { idx, id: null, status: null, length: null, duration_ms: null, error: item.error, differs: shapeOf(item) !== first }
-      : { idx, id: item.id, status: item.status, length: item.length, duration_ms: item.duration_ms, error: null, differs: shapeOf(item) !== first },
+      ? { idx, id: item.id ?? null, status: null, length: null, duration_ms: null, error: item.error, differs: shapeOf(item) !== base }
+      : { idx, id: item.id, status: item.status, length: item.length, duration_ms: item.duration_ms, error: null, differs: shapeOf(item) !== base },
   );
 }
 
@@ -106,9 +138,11 @@ export interface RaceSummary {
   spread: number | null;
   fastest: number | null;
   slowest: number | null;
-  /** Requests whose status, length or error differs from the first's. */
+  /** Requests whose status, length or error differs from the most common response's. */
   differing: number;
   distinct: number;
+  /** The request the others are compared with (see baselineOf). */
+  baseline: number | null;
 }
 
 export function raceSummary(r: RaceResult): RaceSummary {
@@ -124,6 +158,7 @@ export function raceSummary(r: RaceResult): RaceSummary {
     slowest,
     differing: rows.filter((x) => x.differs).length,
     distinct: new Set(r.results.map(shapeOf)).size,
+    baseline: baselineOf(r.results),
   };
 }
 
@@ -133,9 +168,12 @@ export function syncNote(r: RaceResult): string | null {
   return `${r.synced} of ${r.results.length} final frames went in the single packet; the rest were sent separately`;
 }
 
+/** Whether a row has a recorded response to open with `history show` (a failure has only its error). */
+export const openable = (x: RaceRow): boolean => x.id != null && x.error == null;
+
 /** The row to open first: the first request with a recorded response. */
 export function firstOpenable(rows: RaceRow[]): number | null {
-  return rows.find((x) => x.id != null)?.idx ?? null;
+  return rows.find(openable)?.idx ?? null;
 }
 
 /** What Replay keeps per race: its results and the response open in the response pane. */

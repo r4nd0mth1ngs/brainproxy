@@ -937,15 +937,33 @@ fn race_from_stdin_as_replay_runs_it() {
     let (code, v) = run(&["history", "show", &id, "--max-body=2000000"], &project, None);
     assert_eq!((code, v["data"]["response"]["status"].as_u64()), (0, Some(200)), "{v}");
 
+    // Each row says which race it was in, how it was run, and its place in it.
+    let race_id = d["race_id"].as_str().unwrap().to_string();
+    let (_, v) = run(&["query", "SELECT tags FROM history WHERE source = 'race' ORDER BY id"], &project, None);
+    let tags: Vec<Vec<String>> = v["data"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_str(r[0].as_str().unwrap()).unwrap())
+        .collect();
+    for (i, t) in tags.iter().enumerate() {
+        let want = [format!("race:{race_id}"), "race-sync:last-byte".into(), format!("race-pos:{}/3", i + 1)];
+        assert_eq!(t, &want, "{tags:?}");
+    }
+    let (_, v) = run(&["history", "list", "--tag", &format!("race:{race_id}")], &project, None);
+    assert_eq!(v["data"]["count"], 3, "{v}");
+
     // With the profile gone, no racing request goes out with the placeholder.
     run(&["auth", "remove", "k"], &project, None);
     let (code, v) = run(&["send", &target, "--race=3", "-"], &project, Some(raw.as_bytes()));
     assert_eq!(code, 0, "{v}");
     for r in v["data"]["results"].as_array().unwrap() {
         let named = r["error"].as_str().is_some_and(|e| e.contains("«auth:k:header:X-Api-Key»"));
-        assert!(named && r["kind"] == "invalid_input" && r["id"].is_null(), "{r}");
+        assert!(named && r["kind"] == "invalid_input" && r["id"].is_i64(), "{r}");
     }
     assert_eq!(seen.lock().unwrap().len(), 3);
+    // A second race of the same request has an id of its own.
+    assert_ne!(v["data"]["race_id"].as_str(), Some(race_id.as_str()), "{v}");
 
     // The counts the app allows: 1000 at most, and 100 for a request line in HTTP/2.
     // Both are refused before anything is sent.
@@ -969,11 +987,68 @@ fn race_failures_come_back_per_request() {
         run(&["send", &format!("--target=http://127.0.0.1:{port}"), "--race=2", "-"], &project, Some(raw.as_bytes()));
     assert_eq!(code, 0, "{v}");
     let d = &v["data"];
+    // Each failure comes back with the id of the row that records it.
     for r in d["results"].as_array().unwrap() {
-        assert!(r["error"].is_string() && r["kind"] == "connect" && r["id"].is_null(), "{r}");
+        assert!(r["error"].is_string() && r["kind"] == "connect" && r["id"].is_i64(), "{r}");
+        let (code, v) = run(&["history", "show", &r["id"].to_string()], &project, None);
+        assert_eq!((code, v["data"]["entry"]["error"].as_str()), (0, r["error"].as_str()), "{v}");
     }
     assert_eq!(d["distinct_responses"], serde_json::json!({"error: connect": 2}), "{d}");
-    let (_, v) =
-        run(&["query", "SELECT count(*) FROM history WHERE source = 'race' AND error IS NOT NULL"], &project, None);
+    let (_, v) = run(
+        &[
+            "query",
+            "SELECT count(*) FROM history WHERE source = 'race' AND error IS NOT NULL AND tags LIKE '%race-pos:%/2%'",
+        ],
+        &project,
+        None,
+    );
     assert_eq!(v["data"]["rows"][0][0], 2, "{v}");
+
+    // Unstored, nothing has an id.
+    let (code, v) = run(
+        &["send", &format!("--target=http://127.0.0.1:{port}"), "--race=2", "--no-store", "-"],
+        &project,
+        Some(raw.as_bytes()),
+    );
+    assert_eq!(code, 0, "{v}");
+    assert!(v["data"]["results"].as_array().unwrap().iter().all(|r| r["id"].is_null()), "{v}");
+}
+
+/// A last-byte race opens a connection per request: a count the open-file limit has no room
+/// for is refused before anything is sent, instead of failing locally request by request.
+#[cfg(unix)]
+#[test]
+fn race_beyond_the_open_file_limit_is_refused() {
+    use std::os::unix::process::CommandExt;
+    let (port, seen) = serve_recording();
+    let project = tmp_project("race-nofile");
+    let raw = format!("GET / HTTP/1.1\nHost: 127.0.0.1:{port}\n\n");
+    let race = |n: &str| {
+        let mut cmd = bin();
+        cmd.args(["--format", "json", "--project"]).arg(&project);
+        cmd.args(["send", &format!("--target=http://127.0.0.1:{port}"), n, "-"]);
+        // Soft and hard limit 128, as `ulimit -n 128` sets them: nothing to raise it to.
+        // SAFETY: setrlimit is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                let lim = libc::rlimit { rlim_cur: 128, rlim_max: 128 };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(raw.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code().unwrap(), v)
+    };
+    let (code, v) = race("--race=100");
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("open-file limit (128)"), "{v}");
+    assert!(seen.lock().unwrap().is_empty());
+    let (code, v) = race("--race=10");
+    assert_eq!(code, 0, "{v}");
+    assert!(v["data"]["results"].as_array().unwrap().iter().all(|r| r["status"] == 200), "{v}");
 }

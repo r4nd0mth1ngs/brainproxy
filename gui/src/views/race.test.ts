@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  baselineOf,
   firstOpenable,
   isHttp2Request,
+  openable,
   parseRaceCount,
   patchOpen,
   plannedTechnique,
@@ -11,6 +13,7 @@ import {
   raceRows,
   raceSummary,
   sentRequestLine,
+  shapeLabel,
   syncNote,
   techniqueLabel,
   type RaceResult,
@@ -49,7 +52,7 @@ test("the race is Replay's send plus --race", () => {
   assert.deepEqual(raceArgs("https://shop.test", 20), ["send", "--target=https://shop.test", "--race=20", "-"]);
 });
 
-test("responses that differ from the first are marked", () => {
+test("responses that differ from the most common one are marked", () => {
   const rows = raceRows(
     result([
       { id: 1, status: 200, length: 12, duration_ms: 40 },
@@ -67,19 +70,65 @@ test("responses that differ from the first are marked", () => {
   assert.equal(rows[4].duration_ms, null);
 });
 
-test("when the first failed, other failures of the same kind match it", () => {
+test("a failed first request isn't what the others are compared with", () => {
+  // Failures are no response: with any response, it's the baseline and every failure differs.
   const rows = raceRows(
     result([
-      { error: "timed out", kind: "timeout" },
-      { error: "timed out", kind: "timeout" },
+      { id: 1, error: "timed out", kind: "timeout" },
+      { id: 2, error: "timed out", kind: "timeout" },
       { id: 3, status: 200, length: 5, duration_ms: 9 },
     ]),
   );
   assert.deepEqual(
     rows.map((r) => r.differs),
-    [false, false, true],
+    [true, true, false],
   );
   assert.equal(firstOpenable(rows), 2);
+});
+
+test("the most common response is the baseline, not request #1", () => {
+  const r = result([
+    { id: 1, status: 409, length: 3, duration_ms: 1 },
+    { id: 2, status: 200, length: 12, duration_ms: 1 },
+    { id: 3, status: 200, length: 12, duration_ms: 1 },
+  ]);
+  assert.equal(baselineOf(r.results), 1);
+  assert.deepEqual(
+    raceRows(r).map((x) => x.differs),
+    [true, false, false],
+  );
+  assert.equal(raceSummary(r).differing, 1);
+  assert.equal(shapeLabel(r.results[1]), "200, 12 bytes");
+  // A tie goes to the earliest; an empty race has none.
+  assert.equal(baselineOf(r.results.slice(0, 2)), 0);
+  assert.equal(baselineOf([]), null);
+});
+
+test("local failures outnumbering responses don't make every response differ", () => {
+  // e.g. "Too many open files" for most of a large race: the few responses are the baseline.
+  const fails = Array.from({ length: 8 }, (_, i) => ({ id: 10 + i, error: "Too many open files (os error 24)", kind: "io" }));
+  const r = result([...fails, { id: 20, status: 200, length: 2, duration_ms: 5 }, { id: 21, status: 200, length: 2, duration_ms: 6 }]);
+  const s = raceSummary(r);
+  assert.equal(s.baseline, 8);
+  assert.equal(s.differing, 8);
+  assert.deepEqual(
+    raceRows(r).filter((x) => !x.differs).map((x) => x.id),
+    [20, 21],
+  );
+  assert.equal(shapeLabel(fails[0]), "error: io");
+});
+
+test("a recorded failure shows its history id but has no response to open", () => {
+  const rows = raceRows(
+    result([
+      { id: 5, error: "refused", kind: "connect" },
+      { id: 6, status: 200, length: 2, duration_ms: 3 },
+    ]),
+  );
+  assert.equal(rows[0].id, 5);
+  assert.equal(openable(rows[0]), false);
+  assert.equal(openable(rows[1]), true);
+  assert.equal(firstOpenable(rows), 1);
 });
 
 test("the summary gives the spread of response times and the counts", () => {
@@ -91,7 +140,7 @@ test("the summary gives the spread of response times and the counts", () => {
       { error: "reset", kind: "io" },
     ]),
   );
-  assert.deepEqual(s, { responses: 3, errors: 1, spread: 7, fastest: 40, slowest: 47, differing: 2, distinct: 3 });
+  assert.deepEqual(s, { responses: 3, errors: 1, spread: 7, fastest: 40, slowest: 47, differing: 2, distinct: 3, baseline: 0 });
   assert.equal(raceSummary(result([{ error: "reset", kind: "io" }])).spread, null);
 });
 
@@ -130,7 +179,7 @@ test("the target stays one argument, so it can't add flags", () => {
 test("an empty race has no rows, no spread and nothing to open", () => {
   const r = result([]);
   assert.deepEqual(raceRows(r), []);
-  assert.deepEqual(raceSummary(r), { responses: 0, errors: 0, spread: null, fastest: null, slowest: null, differing: 0, distinct: 0 });
+  assert.deepEqual(raceSummary(r), { responses: 0, errors: 0, spread: null, fastest: null, slowest: null, differing: 0, distinct: 0, baseline: null });
   assert.equal(firstOpenable(raceRows(r)), null);
   assert.equal(syncNote(result([], "single-packet", 0)), null);
 });
