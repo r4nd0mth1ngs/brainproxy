@@ -4,13 +4,16 @@
 
 export type Envelope<T = any> =
   | { ok: true; command: string; data: T }
-  | { ok: false; command?: string; error: { kind: string; message: string } };
+  | { ok: false; command?: string; error: { kind: string; message: string; data?: unknown } };
 
 export class CliError extends Error {
   kind: string;
-  constructor(kind: string, message: string) {
+  /** What the command did before it failed, where it says (e.g. `proxy restart`, `project stop`). */
+  data?: unknown;
+  constructor(kind: string, message: string, data?: unknown) {
     super(message);
     this.kind = kind;
+    this.data = data;
   }
 }
 
@@ -99,7 +102,7 @@ export const tempProjects = {
 /** Runs a command and returns its data, throwing CliError when ok is false. */
 export async function run<T = any>(args: string[], input?: string | Uint8Array | CliInput): Promise<T> {
   const env = await cli<T>(args, input);
-  if (!env.ok) throw new CliError(env.error.kind, env.error.message);
+  if (!env.ok) throw new CliError(env.error.kind, env.error.message, env.error.data);
   return env.data;
 }
 

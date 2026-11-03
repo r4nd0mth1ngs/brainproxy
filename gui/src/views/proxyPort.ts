@@ -88,7 +88,6 @@ export function proxyControl(): ProxyControl {
 interface Status {
   running: boolean;
   proxy: { listen: string; pid?: number; args?: string[] } | null;
-  other_pid_namespace?: boolean;
 }
 
 /** What `proxy start` and `proxy restart` print. */
@@ -126,15 +125,19 @@ export async function stopProxy(cli: Cli, ctl: ProxyControl): Promise<void> {
 
 /**
  * Stops the proxy the app started, if it is still the one running: not one a shell or an agent
- * started since, one in another container, or a record that can't be verified.
+ * started since, one in another container, or a record that can't be verified. The CLI checks
+ * that as it stops (`proxy stop --pid`), so nothing can start in between; otherwise it is not_found.
  */
 export async function stopOwned(cli: Cli, ctl: ProxyControl): Promise<void> {
   await ctl.moving;
   const pid = ctl.owned;
   ctl.owned = null;
   if (pid == null) return;
-  const s = (await cli(["proxy", "status"])) as Status;
-  if (s.running && s.proxy?.pid === pid && !s.other_pid_namespace) await cli(["proxy", "stop"]);
+  try {
+    await cli(["proxy", "stop", `--pid=${pid}`]);
+  } catch (e: any) {
+    if (e?.kind !== "not_found") throw e;
+  }
 }
 
 /** Where the proxy is now, from a fresh `proxy status`: the end of a failed move's message. */
@@ -145,15 +148,24 @@ async function whereNow(cli: Cli, was: string): Promise<string> {
   return s.proxy.listen === was ? `The proxy is back on ${was}.` : `The proxy is on ${s.proxy.listen}.`;
 }
 
+/** What a failed `proxy restart` says it did, in its error's `data`. */
+interface RestartData {
+  stopped?: boolean;
+  /** Why the new proxy didn't come up, without where the proxy is now. */
+  failure?: string;
+  /** The old proxy, started again where it was; null if it couldn't be. */
+  restarted?: { pid?: number; listen?: string } | null;
+}
+
 /**
- * A failed `proxy restart`, from its message. Once it has stopped the proxy, the CLI adds whether
- * it started it again where it was (and its pid): `stopped`, `pid`, and `message` without that
- * part, since the app says where the proxy is from a fresh status.
+ * A failed `proxy restart`, from its error's `data`: whether it had stopped the proxy, the pid it
+ * started again where it was (null if none), and `message` without where the proxy is, since the
+ * app says that from a fresh status.
  */
-export function restartFailure(message: string): { message: string; stopped: boolean; pid: number | null } {
-  const m = /; the proxy (?:was started again on \S+ \(pid (\d+)\)$|couldn't be started again on [\s\S]*$)/.exec(message);
-  if (!m) return { message, stopped: false, pid: null };
-  return { message: message.slice(0, m.index), stopped: true, pid: m[1] ? Number(m[1]) : null };
+export function restartFailure(e: { message: string; data?: unknown }): { message: string; stopped: boolean; pid: number | null } {
+  const d = (e.data ?? null) as RestartData | null;
+  if (!d?.stopped) return { message: e.message, stopped: false, pid: null };
+  return { message: d.failure ?? e.message, stopped: true, pid: d.restarted?.pid ?? null };
 }
 
 type Running = { listen: string; pid?: number; args?: string[] };
@@ -212,7 +224,7 @@ async function restart(cli: Cli, ctl: ProxyControl, running: Running, listen: st
     if (ours) ctl.owned = pidOf(started);
     return started;
   } catch (e: any) {
-    const failed = restartFailure(e.message);
+    const failed = restartFailure(e);
     // Refused before anything stopped: the proxy runs as it did.
     if (!failed.stopped) throw e;
     if (ours) ctl.owned = failed.pid;
