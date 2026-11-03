@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
+import { afterStart, cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
 
 const cell = (verdict: string, status: number | null, history_id: number, confidence: string | null = null) => ({ verdict, confidence, status, history_id });
 
@@ -100,7 +100,7 @@ test("rows can be filtered by kind and sorted worst first", () => {
   assert.deepEqual(grid(matrix, { worstFirst: true }).rows.map((r) => r.url.split("/").pop()), ["1", "dashboard", "me", "9"]);
 });
 
-const form: RunForm = { identities: ["bob", "carol"], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
+const form: RunForm = { identities: ["bob", "carol"], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
 
 test("a run's arguments come from the form", () => {
   assert.deepEqual(runArgs(form), ["authz", "run", "--as=bob,carol"]);
@@ -119,6 +119,34 @@ test("a run's arguments come from the form", () => {
   assert.throws(() => runArgs({ ...form, identities: [], anonymous: false }), /at least one identity/);
   assert.throws(() => runArgs({ ...form, select: "host", host: " " }), /host/);
   assert.throws(() => runArgs({ ...form, rate: "oops" }), /Rate/);
+  // Requests handed over from Traffic, tested by id.
+  const history = [
+    { id: 4, method: "GET", url: "https://shop.test/orders/4" },
+    { id: 8, method: "POST", url: "https://shop.test/orders" },
+  ];
+  assert.deepEqual(runArgs({ ...form, select: "history", history }), ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8"]);
+  assert.throws(() => runArgs({ ...form, select: "history" }), /No request picked/);
+});
+
+test("requests from Traffic: by id only, and only while that selection is on", () => {
+  const history = [{ id: 31, method: "DELETE", url: "https://shop.test/x' --where=1=1" }];
+  // The form keeps the handed-over requests when another selection is picked; they must not leak in.
+  assert.deepEqual(runArgs({ ...form, history }), ["authz", "run", "--as=bob,carol"]);
+  assert.deepEqual(runArgs({ ...form, select: "tag", tag: "api", history }), ["authz", "run", "--as=bob,carol", "--tag=api"]);
+  assert.deepEqual(runArgs({ ...form, select: "host", host: "shop.test", history }), ["authz", "run", "--as=bob,carol", "--where=host = 'shop.test'"]);
+  // The URL never reaches the argv, and the other options still apply.
+  assert.deepEqual(runArgs({ ...form, select: "history", history, identities: [], owner: "alice", keepCookies: " theme , lang ", rate: "2" }), [
+    "authz",
+    "run",
+    "--owner=alice",
+    "--history-id=31",
+    "--keep-cookie=theme,lang",
+    "--rate=2",
+  ]);
+  assert.deepEqual(runArgs({ ...form, select: "history", history, anonymous: false }), ["authz", "run", "--as=bob,carol", "--no-anonymous", "--history-id=31"]);
+  // The form's own checks come first.
+  assert.throws(() => runArgs({ ...form, select: "history", history, identities: [], anonymous: false }), /at least one identity/);
+  assert.throws(() => runArgs({ ...form, select: "history", history, rate: "-1" }), /Rate/);
 });
 
 test("live testing options, and the running proxy's options kept on a restart", () => {
@@ -141,4 +169,18 @@ test("hosts and run labels", () => {
   const run = { run_id: 12, time: "2026-10-29T10:11:12.000Z", state: "running", args: ["proxy", "run", "--authz", "bob"], verdicts: { bypass: 2, enforced: 5 } };
   assert.equal(runLabel(run), "#12 · 2026-10-29 10:11 · live (proxy) · running · 2 bypasses");
   assert.equal(runLabel({ ...run, args: ["authz", "run"], verdicts: { bypass: 1 } }), "#12 · 2026-10-29 10:11 · running · 1 bypass");
+});
+
+test("a run that started drops the requests from Traffic, so the next one starts from all history", () => {
+  const history = [{ id: 4, method: "GET", url: "https://shop.test/a" }];
+  const f = { ...form, select: "history" as const, history, owner: "alice", keepCookies: "lang" };
+  const next = afterStart(f);
+  assert.equal(next.select, "all");
+  assert.deepEqual(next.history, []);
+  assert.deepEqual(runArgs(next), ["authz", "run", "--as=bob,carol", "--owner=alice", "--keep-cookie=lang"]);
+  // The rest of the form stays, and the old form isn't changed.
+  assert.deepEqual({ ...next, select: f.select, history: f.history }, f);
+  assert.equal(f.select, "history");
+  // Another choice is kept; picks left over from Traffic are dropped too.
+  assert.deepEqual(afterStart({ ...form, select: "tag", tag: "api", history }), { ...form, select: "tag", tag: "api", history: [] });
 });

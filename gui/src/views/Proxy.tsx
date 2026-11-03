@@ -30,6 +30,7 @@ import {
   type SearchQuery,
   type TrafficFilter,
 } from "./trafficFilter";
+import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
@@ -236,12 +237,49 @@ function History() {
       (e) => app.toast(e.message, "error"),
     );
 
-  const rowMenu = (r: HistoryItem, ev: React.MouseEvent) =>
+  // Whether a pick carries a GraphQL mutation, from its recorded request, so the questions name it.
+  // Unknown when the request can't be read: the questions then go by its method.
+  const withMutation = (p: HistoryPick): Promise<HistoryPick> =>
+    run<HistoryEntry>(["history", "show", String(p.id), MAX_BODY]).then(
+      (e) => ({ ...p, mutation: isMutationRequest(bodyText(e.request), !!e.request.truncated) }),
+      () => p,
+    );
+
+  // Attack traffic: asked first, then started in the background and shown in Scans › Tasks on a click.
+  const scan = async (pick: HistoryPick) => {
+    const [checks, picks] = await Promise.all([
+      run<{ nuclei: unknown }>(["checks", "status"]).catch(() => ({ nuclei: null })),
+      withMutation(pick).then((p) => [p]),
+    ]);
+    const defaults = { nuclei: !!checks.nuclei };
+    const q = scanConfirm(picks, defaults);
+    if (!(await confirm(q.title, q.message, q.ok, q.cancel))) return;
+    try {
+      const d = await run<{ job: number }>(scanArgs(picks, defaults));
+      app.toast(`Active scan started (job ${d.job}). Click to follow it in Scans.`, "info", () => app.showJob(d.job));
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  const highlight = (r: HistoryItem, on: boolean) =>
+    run(highlightArgs(r.id, on))
+      .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, tags: withHighlight(x.tags, on) } : x))))
+      .catch((e) => app.toast(e.message, "error"));
+
+  const rowMenu = (r: HistoryItem, ev: React.MouseEvent) => {
+    const pick = { id: r.id, method: r.method, url: r.url };
+    const refused = isRefused(r);
+    const noScan = scanBlocker(r);
+    const highlighted = r.tags.includes("highlight");
     open(ev, [
       { label: "Send to Replay", action: () => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
       { label: "Send to Fuzzer", action: () => handoff(r.id, app.sendToFuzzer) },
       { label: "Send request to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(h.raw)) },
       { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
+      "-",
+      { label: "Scan this request…", action: () => scan(pick), disabled: !!noScan, hint: noScan ?? undefined },
+      { label: "Test access control…", action: () => withMutation(pick).then((p) => app.sendToAccess([p])), disabled: refused, hint: refused ? REFUSED_HINT : undefined },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       {
@@ -254,14 +292,9 @@ function History() {
             .catch((e) => app.toast(e.message, "error"));
         },
       },
-      {
-        label: "Highlight",
-        action: () =>
-          run(["history", "tag", String(r.id), "--add", "highlight"])
-            .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, tags: [...new Set([...x.tags, "highlight"])] } : x))))
-            .catch((e) => app.toast(e.message, "error")),
-      },
+      { label: highlighted ? "Remove highlight" : "Highlight", action: () => highlight(r, !highlighted) },
     ]);
+  };
 
   const toggleSource = (s: string) =>
     setFilter((f) => ({ ...f, sources: f.sources.includes(s) ? f.sources.filter((x) => x !== s) : [...f.sources, s] }));

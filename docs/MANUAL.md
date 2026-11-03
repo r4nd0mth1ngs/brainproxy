@@ -263,7 +263,20 @@ The sidebar groups the tools by what you are doing.
     that is who started the proxy, not who sent the request: hover it to see the address of
     the client that sent it.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
-  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
+  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight
+    (*Remove highlight* on a highlighted row).
+  - **Scan this request…** asks first, naming the request, then runs an active scan of that
+    request in the background (`scan active --history-id`, medium strength). Once the Nuclei
+    templates are downloaded, those of high severity and up also run against its site, and
+    some of them request paths of their own (such as `/.git/config`); the question says so. The
+    request is attacked whatever its method, so a POST or a GraphQL mutation is replayed
+    with attack data too, and the question names it; it also says when the path looks like a
+    logout, since replaying it can end the session it was recorded with. Click the toast to
+    follow it in **Scans › Tasks**. A request that got no response (a connection error, a
+    timeout, or dropped in **Intercept**) has nothing to scan, so the item is greyed out,
+    with the reason under it.
+  - **Test access control…** opens **Access** with a new run set to test that request
+    (`authz run --history-id`). Pick the identities and start it.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
   ones Replay opened. Select a connection to see its messages in both directions (→ to the
   server, ← to the client), with pings, pongs and the close; select a message to read its
@@ -454,7 +467,14 @@ Access control across users: does the app let bob read alice's data? See
   user) and keep *anonymous* on to also send with no session. *Owner* is worked out per
   request unless you pick one. Choose which requests to test: all recorded requests that
   carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
-  OPTIONS requests are replayed, and logout paths never are.
+  OPTIONS requests are replayed, and logout paths never are. A request sent from
+  **Traffic** (right-click › *Test access control…*) shows as *From Traffic*: it is tested
+  as it is, whatever its method or path and even if it carries no credentials. It is sent
+  twice as its owner, then as each identity and with no session. The form warns when it is a
+  POST, a GraphQL mutation or another request that may change data, or when its path looks
+  like a logout (which can end the owner's and each identity's session, so later results may
+  not be reliable), and *Start run* asks first. Once the run has started, the form goes back
+  to all recorded requests.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
   those identities in the background. If it doesn't start, the

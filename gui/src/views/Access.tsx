@@ -5,14 +5,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { bodyText, rawResponse, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
+import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
+import { afterStart, grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { proxyListen, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
+import { accessConfirm, changeKinds, isLogout } from "./trafficActions";
 
-const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
+const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
 
 /** The cell being compared: the run's baseline and the identity's replay. */
 interface Picked {
@@ -66,6 +68,11 @@ export function AccessView({ active }: { active: boolean }) {
   useEffect(() => {
     if (current && !live) refreshMatrix();
   }, [current?.state, live, refreshMatrix]);
+
+  // Requests handed over from Traffic open the new-run form.
+  useEffect(() => {
+    if (app.accessInput) setShowNew(true);
+  }, [app.accessInput]);
 
   const g = useMemo(() => (matrix && matrix.run_id === runId ? grid(matrix, { only, worstFirst }) : null), [matrix, runId, only, worstFirst]);
 
@@ -299,13 +306,25 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
     );
   }, []);
 
+  // Requests handed over from Traffic: test exactly those.
+  useEffect(() => {
+    if (app.accessInput) set({ select: "history", history: app.accessInput });
+  }, [app.accessInput]);
+  const unsafe = changeKinds(f.history);
+  const logouts = f.history.filter(isLogout);
+
   const toggle = (name: string) => set({ identities: f.identities.includes(name) ? f.identities.filter((n) => n !== name) : [...f.identities, name] });
 
   const start = async () => {
     try {
       const args = runArgs(f);
+      // Requests from Traffic are replayed whatever their method or path: a POST, a GraphQL
+      // mutation or a logout is asked about first.
+      const q = f.select === "history" ? accessConfirm(f.history, f.identities, f.anonymous) : null;
+      if (q && !(await confirm(q.title, q.message, q.ok, q.cancel))) return;
       setBusy(true);
       const d = await run<{ job: number }>([...args, "--background"]);
+      setF(afterStart);
       app.toast(`Access-control run #${d.job} started`);
       onStarted(d.job);
     } catch (e: any) {
@@ -355,7 +374,8 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       <p className="muted small">
         Requests from history are sent again as each identity (with the owner's credentials removed) and with no session, and
         compared with the owner's response. Only GET, HEAD and OPTIONS requests that carry credentials are picked; logout
-        paths are left alone. Every request stays inside the engagement scope.
+        paths are left alone. Requests sent from Traffic are the exception: they are tested as they are. Every request
+        stays inside the engagement scope.
       </p>
       <div className="sc-field">
         <span className="label">Send as</span>
@@ -410,6 +430,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
                 ["host", "One site"],
                 ["tag", "Tag"],
                 ["where", "SQL condition"],
+                ...(f.history.length ? ([["history", `From Traffic (${f.history.length})`]] as const) : []),
               ] as const
             ).map(([k, label]) => (
               <button key={k} className={f.select === k ? "on" : ""} onClick={() => set({ select: k })}>
@@ -430,6 +451,20 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
           {f.select === "tag" && <input className="input mono" value={f.tag} placeholder="api" onChange={(e) => set({ tag: e.target.value })} />}
           {f.select === "where" && <input className="input mono az-where" value={f.where} placeholder="host = 'app.example.com' AND path LIKE '/api/%'" onChange={(e) => set({ where: e.target.value })} />}
         </div>
+        {f.select === "history" && (
+          <div className="az-picked">
+            {f.history.map((h) => (
+              <div key={h.id} className="mono ellipsis small" title={h.url}>
+                #{h.id} <span className="method">{h.method}</span> {h.url}
+              </div>
+            ))}
+            <p className="muted small">
+              Tested whatever its method or path, even a logout, and even if it carries no credentials.
+              {unsafe.length > 0 && <b> {unsafe.join(", ")} requests are sent again as each identity: they may change data, now as another user.</b>}
+              {logouts.length > 0 && <b> {logouts.map((h) => `#${h.id}`).join(", ")} {logouts.length === 1 ? "looks" : "look"} like a logout: sending {logouts.length === 1 ? "it" : "them"} can end the owner's session and each identity's.</b>}
+            </p>
+          </div>
+        )}
       </div>
       <div className="row gap">
         <button className="btn primary" disabled={busy} onClick={start}>
