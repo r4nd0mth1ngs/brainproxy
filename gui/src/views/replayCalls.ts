@@ -87,14 +87,15 @@ export function sendsInFlight(key?: number): number {
 }
 
 /**
- * What a stopped send says. Stop kills the CLI before it records anything (`send` records after
- * the response, `ws send` at the end of the run), but the request may already be on the wire,
- * so it doesn't read as "not sent".
+ * What a stopped send says. Stop kills the CLI, which records only once it is done (`send`
+ * after the response, `ws send` at the end of the run), so a stopped send is usually missing
+ * from history; but the request may already be on the wire, so it doesn't read as "not sent".
+ * Stopped just after the CLI recorded, it is in history after all, hence "may".
  */
 export function stoppedText(kind: "http" | "ws"): string {
   return kind === "http"
-    ? "Stopped: the request may already have reached the server, and it wasn't recorded"
-    : "Stopped: the handshake and messages may already have reached the server, and nothing was recorded";
+    ? "Stopped: the request may already have reached the server, and may not be in history"
+    : "Stopped: the handshake and messages may already have reached the server, and may not be in history";
 }
 
 /** What a failed send says: the stopped text when it was stopped, otherwise the error. */
@@ -113,7 +114,7 @@ export function closeQuestion(key?: number): { title: string; message: string } 
   const sends = n === 1 ? "A Replay send is" : `${n} Replay sends are`;
   return {
     title: `Stop ${n === 1 ? "the send" : "the sends"} still running?`,
-    message: `${sends} still waiting. Closing ${what} stops ${n === 1 ? "it" : "them"}: the server may already have the request, and it won't be recorded.`,
+    message: `${sends} still waiting. Closing ${what} stops ${n === 1 ? "it" : "them"}: the server may already have the request, and it may not be in history.`,
   };
 }
 
@@ -121,6 +122,12 @@ export function closeQuestion(key?: number): { title: string; message: string } 
 export function forgetTab(key: number, cancel: (call: string) => Promise<void>): void {
   stopCall(key, cancel);
   slots.forEach((s) => s.clear(key));
+}
+
+/** Stops every send in flight and waits until each is cancelled (before the app quits, say). */
+export async function stopAllCalls(cancel: (call: string) => Promise<void>): Promise<void> {
+  const calls = replayCalls.keys().map((k) => replayCalls.get(k)).filter((c): c is string => c != null);
+  await Promise.all(calls.map((c) => cancel(c).catch(() => {})));
 }
 
 /** Forgets every tab, stopping their sends: the project closed, and the next one reuses the keys. */

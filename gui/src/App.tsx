@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { inTauri, run, setProject, tempProjects } from "./api";
+import { cancelCli, inTauri, run, setProject, tempProjects } from "./api";
 import { AppProvider, autoProxy, useApp, type Tab, type TempInfo } from "./store";
 import { ProxyView } from "./views/Proxy";
 import { RepeaterView } from "./views/Repeater";
@@ -21,7 +21,7 @@ import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
 import { Welcome, remember, saveTempAs } from "./views/Welcome";
-import { closeQuestion } from "./views/replayCalls";
+import { closeQuestion, stopAllCalls } from "./views/replayCalls";
 import { usePoll } from "./ui/usePoll";
 import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
@@ -249,6 +249,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
           // Held open while a question is in the window; closed explicitly once answered.
           event.preventDefault();
           if (!(await stopSends("Stop and quit"))) return;
+          // Destroying the window doesn't unmount the provider, so its cleanup can't stop them.
+          await stopAllCalls(cancelCli);
           if (tempProject) {
             if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
             // Stops its proxy too. If it fails, it is kept and offered on the next launch.

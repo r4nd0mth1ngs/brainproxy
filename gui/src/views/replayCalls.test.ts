@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { beginCall, clearReplayTabs, closeQuestion, endCall, failureText, forgetTab, replayCalls, sendsInFlight, stopCall, stoppedText, tabSlot } from "./replayCalls.ts";
+import { beginCall, clearReplayTabs, closeQuestion, endCall, failureText, forgetTab, replayCalls, sendsInFlight, stopAllCalls, stopCall, stoppedText, tabSlot } from "./replayCalls.ts";
 
 /** A stand-in for cancelCli that records what it was asked to stop. */
 function canceller() {
@@ -90,7 +90,7 @@ test("closing asks only while a send is running, and says what stopping it means
   assert.equal(sendsInFlight(1), 1);
   assert.equal(sendsInFlight(3), 0);
   const tab = closeQuestion(1);
-  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and it won't be recorded/);
+  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and it may not be in history/);
   assert.equal(closeQuestion(3), null);
   assert.match(closeQuestion()?.message ?? "", /^2 Replay sends are still waiting\. Closing the project stops them/);
   // A finished send isn't running any more, though its tab still has a (null) call.
@@ -107,9 +107,32 @@ test("a stopped send doesn't read as not sent", () => {
   assert.equal(failureText({ kind: "cancelled" }, "ws"), stoppedText("ws"));
   for (const kind of ["http", "ws"] as const) {
     assert.match(stoppedText(kind), /may already have reached the server/);
-    assert.match(stoppedText(kind), /recorded/);
+    // Stopped just after the CLI recorded it, it is in history after all.
+    assert.match(stoppedText(kind), /may not be in history/);
     assert.doesNotMatch(stoppedText(kind), /before a response/);
   }
   assert.equal(failureText({ kind: "cli", message: "connection refused" }, "http"), "connection refused");
   assert.equal(failureText(new Error("timed out"), "ws"), "timed out");
+});
+
+test("before quitting, every send in flight is cancelled and waited for", async () => {
+  clearReplayTabs(async () => {});
+  const a = beginCall(1, "replay-send");
+  const b = beginCall(2, "replay-ws-send");
+  const done = beginCall(3, "replay-send");
+  endCall(3, done);
+  const cancelled: string[] = [];
+  // A slow cancel, and one that fails: both are waited for, and the failure doesn't stop the rest.
+  await stopAllCalls(async (call) => {
+    await new Promise((r) => setTimeout(r, 5));
+    cancelled.push(call);
+    if (call === a) throw new Error("already gone");
+  });
+  assert.deepEqual(cancelled.sort(), [a, b].sort());
+  // Once their runs have ended, there is nothing left to cancel.
+  endCall(1, a);
+  endCall(2, b);
+  const again: string[] = [];
+  await stopAllCalls(async (call) => void again.push(call));
+  assert.deepEqual(again, []);
 });

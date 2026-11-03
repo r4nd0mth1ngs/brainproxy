@@ -201,7 +201,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           {busy ? "Sending…" : "Send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request. It may already have reached the server, and it won't be recorded.">
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request. It may already have reached the server, and may not be in history.">
             Stop
           </button>
         )}

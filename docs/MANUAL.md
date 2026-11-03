@@ -265,7 +265,7 @@ The sidebar groups the tools by what you are doing.
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
 - **Sending:** ⌘/Ctrl+Enter sends; **Stop** gives up on a request that is still waiting.
-  A stopped request may already have reached the server, but it isn't recorded in history.
+  A stopped request may already have reached the server, but usually isn't in history.
   A send carries on while you look at another tab, and its response lands in its own tab;
   closing the tab (or the project, or quitting) stops it, so the app asks first while one
   is running. ‹ › step back and forward through what you sent. A step sent with other
@@ -299,8 +299,8 @@ Edit a raw request and send it as often as you like, in separate tabs.
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
   reply matches **Until**. Each run is recorded like proxied traffic, unless **Don't
   record** is on. Their Options are SNI, Timeout, Verify TLS and Don't record. **Stop** ends
-  a run early; what it sent may already have reached the server, and nothing of a stopped
-  run is recorded.
+  a run early; what it sent may already have reached the server, but a stopped run usually
+  isn't in history.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
