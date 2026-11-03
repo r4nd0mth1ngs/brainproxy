@@ -112,6 +112,23 @@ over `BRAINPROXY_CLIENT=gui` (what the desktop app sets), and tool arguments can
 environment variables, so an agent can't make its records look like a person's. List them
 with `history_list` and `origin: "mcp"`.
 
+Origin is per process: it is who started the process that recorded a row. A proxy a person
+started from the app records `gui` even for requests an agent's actions sent through it, so
+an agent's changes to proxied traffic are recorded on their own:
+
+- `intercept_forward` and `intercept_drop` set the intercept's `resolved_by` to `mcp`, and
+  `edited` says whether the message was replaced. A request forwarded edited gets
+  `edited_by: [{"by": "mcp", "intercept": ID}]` on its history row.
+- `rules_add` (and `rules_enable` of a disabled rule) gives the rule origin `mcp`; a request
+  the rule changes gets `edited_by: [{"by": "mcp", "rule": ID}]`.
+- `findings_mark` with a note sets `note_origin`; `history_note` and `history_tag` set
+  `note_origin` and `tags_origin`.
+- `scan_passive` with `rescan` keeps every finding's state, note and origins, and keeps a
+  triaged finding it doesn't find again (with 0 hits), so it can't erase a person's triage.
+
+Reports name an agent's confirmations ("confirmed via MCP (an agent)") and list the findings
+an agent marked false positive, which the default state filter leaves out.
+
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep
 values that start with `-` as values). It runs exactly the code a shell invocation runs: the

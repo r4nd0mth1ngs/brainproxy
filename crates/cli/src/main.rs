@@ -940,7 +940,12 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                         let status = e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
                         let len = e.resp_body_length.unwrap_or(0);
                         let origin = e.origin.as_deref().unwrap_or("unknown");
-                        format!("{:>6}  {:<4} {:<7} {}  {len}B  {origin}", e.id, status, e.method, e.url)
+                        let mut by: Vec<&str> =
+                            e.edited_by.iter().map(|x| x.by.as_deref().unwrap_or("unknown")).collect();
+                        by.dedup();
+                        let edited =
+                            if by.is_empty() { String::new() } else { format!("  edited by {}", by.join(",")) };
+                        format!("{:>6}  {:<4} {:<7} {}  {len}B  {origin}{edited}", e.id, status, e.method, e.url)
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -967,20 +972,19 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
             );
             data["request"] = body_value(&item.request, max_body);
             data["entry"] = json!(item.entry);
-            data["origin_text"] =
-                json!(format!("recorded {}", brainproxy_core::provenance::describe(item.entry.origin.as_deref())));
+            data["origin_text"] = json!(recorded_text(&item.entry));
             out.ok(data, || {
                 let e = &item.entry;
-                let mut about = vec![format!(
-                    "#{id} {} recorded {}",
-                    e.source,
-                    brainproxy_core::provenance::describe(e.origin.as_deref())
-                )];
+                let mut about = vec![format!("#{id} {} {}", e.source, recorded_text(e))];
                 if let Some(a) = &e.client_addr {
-                    about.push(format!("proxy client {a}"));
+                    about.push(format!("sent by proxy client {a}"));
                 }
+                about.extend(e.edited_by.iter().map(|x| x.describe()));
                 if let Some(n) = &e.sni {
                     about.push(format!("TLS server name (SNI) {n}"));
+                }
+                if e.note.is_some() || e.note_origin.is_some() {
+                    about.push(format!("note set {}", brainproxy_core::provenance::describe(e.note_origin.as_deref())));
                 }
                 format!(
                     "{}\n\n{}\n\n{}",
@@ -1000,6 +1004,17 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Who recorded an entry, in words. The proxy's origin is whoever started the proxy: the
+/// request came from its client, so a row must not read as if that person or agent sent it.
+fn recorded_text(e: &brainproxy_core::store::HistoryEntry) -> String {
+    let by = brainproxy_core::provenance::describe(e.origin.as_deref());
+    if e.source == "proxy" && e.origin.is_some() {
+        format!("recorded by a proxy started {by}")
+    } else {
+        format!("recorded {by}")
+    }
 }
 
 fn codec_cmd(a: CodecArgs, out: &Out, f: impl Fn(&str, &[u8]) -> Result<Vec<u8>, Error>) -> Result<(), Error> {

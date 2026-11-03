@@ -41,6 +41,8 @@ pub struct Capture {
     /// The TLS server name sent when it was overridden (`--sni`); None: the SNI override in
     /// effect for this process, if any.
     pub sni: Option<String>,
+    /// Who changed the request before it went out (intercept edits, rules), for the proxy.
+    pub edited_by: Vec<crate::provenance::Edit>,
 }
 
 impl Capture {

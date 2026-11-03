@@ -258,3 +258,220 @@ fn an_overridden_server_name_is_recorded() {
     assert_eq!(env.ok(&[], &["history", "show", "1"])["entry"]["sni"], "app.test");
     assert!(env.text(&["history", "show", "1"]).lines().next().unwrap().ends_with("TLS server name (SNI) app.test"));
 }
+
+/// Sends one request through the proxy and returns the response.
+fn through(listen: &str, port: u16, path: &str, headers: &str) -> String {
+    let mut s = TcpStream::connect(listen).unwrap();
+    write!(
+        s,
+        "GET http://127.0.0.1:{port}{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).unwrap();
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+fn wait_for_settings() {
+    // The proxy reloads settings every 300 ms.
+    std::thread::sleep(Duration::from_millis(700));
+}
+
+#[test]
+fn an_agents_intercept_edit_and_rule_in_a_proxy_the_app_started_say_so() {
+    let port = serve();
+    let env = Env::new("edits");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    let started = env.ok(&gui, &["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+
+    // A person's request is held, and the agent forwards an edited one.
+    env.ok(&gui, &["intercept", "enable", "--timeout", "30"]);
+    wait_for_settings();
+    let l = listen.clone();
+    let person = std::thread::spawn(move || through(&l, port, "/human", ""));
+    let listed = env.ok(&agent, &["intercept", "list", "--wait", "10"]);
+    let id = listed["items"][0]["id"].as_i64().unwrap();
+    let held = env.ok(&agent, &["intercept", "show", &id.to_string()]);
+    let edited = env.project.with_extension("edited.http");
+    std::fs::write(&edited, held["message"]["content"].as_str().unwrap().replace("/human", "/agent-edited")).unwrap();
+    let fwd = env.ok(&agent, &["intercept", "forward", &id.to_string(), "--file", edited.to_str().unwrap()]);
+    assert_eq!(fwd["resolved_by"], "mcp");
+    assert!(person.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    // The intercept says who resolved it and that it was edited.
+    let all = env.ok(&[], &["intercept", "list", "--state", "all"]);
+    assert_eq!((&all["items"][0]["resolved_by"], &all["items"][0]["edited"]), (&"mcp".into(), &true.into()), "{all}");
+
+    // The row is the GUI proxy's, and names the agent's edit.
+    wait_for(&env, "SELECT count(*) FROM history WHERE path = '/agent-edited'", 1);
+    let rows = env.rows("SELECT id, origin, edited_by FROM history WHERE path = '/agent-edited'");
+    assert_eq!(rows[0][1], "gui");
+    let edits: Value = serde_json::from_str(rows[0][2].as_str().unwrap()).unwrap();
+    assert_eq!(edits, serde_json::json!([{"by": "mcp", "intercept": id}]));
+    let hid = rows[0][0].as_i64().unwrap().to_string();
+    let shown = env.ok(&[], &["history", "show", &hid]);
+    assert_eq!(shown["entry"]["edited_by"], edits);
+    assert_eq!(shown["origin_text"], "recorded by a proxy started from the desktop app");
+    let text = env.text(&["history", "show", &hid]);
+    let about = text.lines().next().unwrap();
+    assert!(
+        about.starts_with(&format!(
+            "#{hid} proxy recorded by a proxy started from the desktop app · sent by proxy client "
+        )),
+        "{about}"
+    );
+    assert!(about.contains(&format!("edited in intercept {id} via MCP (an agent)")), "{about}");
+    assert!(env
+        .text(&["history", "list"])
+        .lines()
+        .any(|l| l.contains("/agent-edited") && l.ends_with("gui  edited by mcp")));
+
+    // Forwarded unchanged: no edit on either record.
+    let l = listen.clone();
+    let person = std::thread::spawn(move || through(&l, port, "/as-is", ""));
+    let listed = env.ok(&gui, &["intercept", "list", "--wait", "10"]);
+    let id2 = listed["items"][0]["id"].as_i64().unwrap().to_string();
+    env.ok(&gui, &["intercept", "forward", &id2]);
+    person.join().unwrap();
+    env.ok(&gui, &["intercept", "disable"]);
+    wait_for(&env, "SELECT count(*) FROM history WHERE path = '/as-is'", 1);
+    assert_eq!(env.rows("SELECT edited_by FROM history WHERE path = '/as-is'")[0][0], Value::Null);
+    let all = env.ok(&[], &["intercept", "list", "--state", "all"]);
+    assert_eq!((&all["items"][1]["resolved_by"], &all["items"][1]["edited"]), (&"gui".into(), &false.into()));
+
+    // A rule the agent added changes the person's request: the row names the rule and the agent.
+    let rules = env.ok(
+        &agent,
+        &["rules", "add", "--location", "request-header", "--match", "^X-Role: user$", "--replace", "X-Role: admin"],
+    );
+    assert_eq!(rules["rules"][0]["origin"], "mcp");
+    // One that matches nothing changes nothing.
+    env.ok(&gui, &["rules", "add", "--location", "request-line", "--match", "^NEVER ", "--replace", "X "]);
+    wait_for_settings();
+    through(&listen, port, "/ruled", "X-Role: user\r\n");
+    through(&listen, port, "/unruled", "");
+    wait_for(&env, "SELECT count(*) FROM history WHERE path IN ('/ruled', '/unruled')", 2);
+    let rows = env.rows(
+        "SELECT path, origin, edited_by, req_headers FROM history WHERE path IN ('/ruled', '/unruled') ORDER BY path",
+    );
+    assert_eq!(rows[0][1], "gui");
+    assert_eq!(
+        serde_json::from_str::<Value>(rows[0][2].as_str().unwrap()).unwrap(),
+        serde_json::json!([{"by": "mcp", "rule": 1}])
+    );
+    assert!(rows[0][3].as_str().unwrap().contains("admin"));
+    assert_eq!(rows[1][2], Value::Null);
+}
+
+#[test]
+fn a_rescan_keeps_a_persons_triage() {
+    let port = serve();
+    let env = Env::new("rescan");
+    let url = format!("http://127.0.0.1:{port}/");
+    env.ok(&[(CLIENT, "gui")], &["send", "--url", &url]);
+    let all = env.ok(&[(CLIENT, "gui")], &["findings", "list", "--all"]);
+    let count = all["count"].as_i64().unwrap();
+    assert!(count >= 2, "{all}");
+    let (fp, open) = (all["items"][0]["id"].as_i64().unwrap(), all["items"][1]["id"].as_i64().unwrap());
+    env.ok(
+        &[(CLIENT, "gui")],
+        &["findings", "mark", &fp.to_string(), "--state", "false-positive", "--note", "checked by a person"],
+    );
+
+    // The agent rescans: the same findings, with their ids, state, note and who set them.
+    let stats = env.ok(&[(MCP, "1")], &["scan", "passive", "--rescan"]);
+    assert_eq!((stats["new_findings"].as_i64(), stats["removed"].as_i64()), (Some(0), Some(0)), "{stats}");
+    let f = env.ok(&[], &["findings", "show", &fp.to_string()]);
+    assert_eq!((f["state"].as_str(), f["note"].as_str()), (Some("false_positive"), Some("checked by a person")));
+    assert_eq!(
+        (f["origin"].as_str(), f["state_origin"].as_str(), f["note_origin"].as_str()),
+        (Some("gui"), Some("gui"), Some("gui"))
+    );
+    assert_eq!(f["hits"], 1);
+    assert_eq!(env.ok(&[], &["findings", "show", &open.to_string()])["origin"], "gui");
+    assert_eq!(env.rows("SELECT count(*) FROM findings")[0][0].as_i64(), Some(count));
+
+    // Rules turned off: the untriaged finding goes, the triaged one stays, with 0 hits.
+    let rule = |id: i64| env.ok(&[], &["findings", "show", &id.to_string()])["rule_id"].to_string();
+    env.ok(&[(MCP, "1")], &["scan", "disable", &rule(fp), &rule(open)]);
+    let stats = env.ok(&[(MCP, "1")], &["scan", "passive", "--rescan"]);
+    assert_eq!(stats["kept_not_found"], 1, "{stats}");
+    assert!(stats["removed"].as_i64().unwrap() >= 1, "{stats}");
+    let f = env.ok(&[], &["findings", "show", &fp.to_string()]);
+    assert_eq!(
+        (f["state"].as_str(), f["hits"].as_i64(), f["state_origin"].as_str()),
+        (Some("false_positive"), Some(0), Some("gui"))
+    );
+    let (code, _, _) = env.run(&[], &["findings", "show", &open.to_string()]);
+    assert_ne!(code, 0);
+}
+
+#[test]
+fn reports_say_who_triaged_each_finding() {
+    let port = serve();
+    let env = Env::new("report");
+    env.ok(&[], &["send", "--url", &format!("http://127.0.0.1:{port}/")]);
+    let all = env.ok(&[], &["findings", "list", "--all"]);
+    assert!(all["count"].as_i64().unwrap() >= 3, "{all}");
+    let id = |i: usize| all["items"][i]["id"].as_i64().unwrap();
+    let (by_agent, by_person, hidden) = (id(0), id(1), id(2));
+    env.ok(&[(MCP, "1")], &["findings", "mark", &by_agent.to_string(), "--state", "confirmed"]);
+    env.ok(
+        &[(CLIENT, "gui")],
+        &["findings", "mark", &by_person.to_string(), "--state", "confirmed", "--note", "seen it"],
+    );
+    env.ok(&[(MCP, "1")], &["findings", "mark", &hidden.to_string(), "--state", "false-positive", "--note", "noise"]);
+
+    let report = |kind: &str| {
+        let out = env.project.with_extension(format!("report.{kind}"));
+        env.ok(&[], &["report", kind, "--output", out.to_str().unwrap(), "--force"]);
+        std::fs::read_to_string(&out).unwrap()
+    };
+
+    let json: Value = serde_json::from_str(&report("json")).unwrap();
+    let insts: Vec<&Value> =
+        json["alerts"].as_array().unwrap().iter().flat_map(|g| g["instances"].as_array().unwrap()).collect();
+    let inst = |id: i64| *insts.iter().find(|i| i["id"] == id).unwrap();
+    assert_eq!(inst(by_agent)["state_origin"], "mcp");
+    assert!(inst(by_agent)["state_changed_at"].as_str().is_some_and(|t| t.ends_with('Z')));
+    assert!(inst(by_agent)["state_text"].as_str().unwrap().starts_with("confirmed via MCP (an agent) at "));
+    assert_eq!((&inst(by_person)["state_origin"], &inst(by_person)["note_origin"]), (&"gui".into(), &"gui".into()));
+    assert!(insts.iter().all(|i| i["id"] != hidden), "a false positive isn't listed as an issue");
+    assert_eq!(json["summary"]["false_positives_left_out"], serde_json::json!([{"origin": "mcp", "count": 1}]));
+    assert_eq!(json["agent_false_positives"][0]["id"], hidden);
+    assert_eq!(json["agent_false_positives"][0]["note"], "noise");
+
+    let md = report("markdown");
+    assert!(
+        md.contains(&format!("Finding #{by_agent} · ")) && md.contains("· confirmed via MCP (an agent) at "),
+        "{md}"
+    );
+    assert!(md.contains("· confirmed from the desktop app at "), "{md}");
+    assert!(md.contains("- Note (written from the desktop app at "), "{md}");
+    assert!(md.contains("1 finding marked false positive is left out of this report: 1 via MCP (an agent)."), "{md}");
+    assert!(md.contains("## Marked false positive by an agent") && md.contains(&format!("- #{hidden} ")), "{md}");
+
+    let html = report("html");
+    // The tag says who confirmed it; only a person's confirmation reads as the tester's.
+    // Once on the finding, once where "About this report" explains it.
+    assert_eq!(html.matches("<span class=\"tag\">confirmed via MCP (an agent)</span>").count(), 2, "{html}");
+    assert!(html.contains("<span class=\"tag\">confirmed</span></td>"), "{html}");
+    assert!(html.contains("checked by the tester, from the desktop app or the command line"));
+    assert!(html.contains("<h2 id=\"agent-fp\">Marked false positive by an agent</h2>"));
+
+    let sarif: Value = serde_json::from_str(&report("sarif")).unwrap();
+    let results = sarif["runs"][0]["results"].as_array().unwrap();
+    let res = results.iter().find(|r| r["properties"]["findingId"] == by_agent).unwrap();
+    assert_eq!(res["properties"]["stateOrigin"], "mcp");
+    assert!(res["properties"]["stateChangedAt"].is_string());
+    assert_eq!(sarif["runs"][0]["properties"]["agentFalsePositives"][0]["id"], hidden);
+
+    // With false positives asked for, they are in the report and not counted as left out.
+    let out = env.project.with_extension("fp.json");
+    env.ok(&[], &["report", "json", "--state", "all", "--output", out.to_str().unwrap()]);
+    let all: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(all["summary"]["false_positives_left_out"], serde_json::json!([]));
+    assert_eq!(all["agent_false_positives"], serde_json::json!([]));
+}
