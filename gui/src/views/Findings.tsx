@@ -61,7 +61,8 @@ export function FindingsView({ active }: { active: boolean }) {
   const groups = useMemo(() => {
     const by = new Map<string, Group>();
     for (const f of data?.items ?? []) {
-      if (!risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
+      // Removed findings added by hand stay in the project for comparisons, not in the list.
+      if (f.state === "removed" || !risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
       if (comparing && seen.get(f.id) !== compare) continue;
       const g = by.get(f.alert_ref) ?? { ref: f.alert_ref, name: f.name, risk: f.risk, items: [] };
       g.items.push(f);
@@ -72,7 +73,7 @@ export function FindingsView({ active }: { active: boolean }) {
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const f of data?.items ?? []) if (f.state !== "false_positive") c[f.risk] = (c[f.risk] ?? 0) + 1;
+    for (const f of data?.items ?? []) if (f.state !== "false_positive" && f.state !== "removed") c[f.risk] = (c[f.risk] ?? 0) + 1;
     return c;
   }, [data]);
 
@@ -105,7 +106,8 @@ export function FindingsView({ active }: { active: boolean }) {
   // Only findings added by hand can be removed; scanner findings are marked instead.
   const remove = async () => {
     if (!finding) return;
-    if (!(await confirm("Remove this finding?", `"${finding.name}" at ${finding.url} is deleted from the project.`, "Remove", "Keep"))) return;
+    const message = `"${finding.name}" at ${finding.url} leaves the findings and reports. The project keeps a record that it was removed, so comparing with an earlier report shows it as removed, not fixed.`;
+    if (!(await confirm("Remove this finding?", message, "Remove", "Keep"))) return;
     try {
       await run(["findings", "remove", String(finding.id)]);
       setSelected(null);
@@ -257,7 +259,7 @@ export function FindingsView({ active }: { active: boolean }) {
                   </button>
                 )}
                 {finding.source === "manual" && (
-                  <button className="btn small" onClick={remove} title="Delete this finding from the project">
+                  <button className="btn small" onClick={remove} title="Take this finding out of the findings and reports">
                     Remove
                   </button>
                 )}

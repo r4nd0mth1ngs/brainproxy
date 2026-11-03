@@ -1,7 +1,8 @@
 // In-app confirmation dialog. Native ones render differently per OS (GTK repeats the title as
 // both the window title and the heading), so questions are asked inside the window instead.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useDialogFocus } from "./dialogFocus";
 
 interface Request {
   title: string;
@@ -38,9 +39,15 @@ export function ConfirmHost() {
     setReq(null);
     req.resolve(yes);
   };
+  return <ConfirmDialog req={req} answer={answer} />;
+}
+
+function ConfirmDialog({ req, answer }: { req: Request; answer: (yes: boolean) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useDialogFocus(ref);
   return (
     <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && answer(false)}>
-      <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div ref={ref} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
         <h2 id="confirm-title">{req.title}</h2>
         <p>{req.message}</p>
         <div className="row gap">

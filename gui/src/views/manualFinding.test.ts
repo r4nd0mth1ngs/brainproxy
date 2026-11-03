@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { draftFromRequest, findingAddArgs, formFromDraft, formProblem, historyIds, type FindingForm } from "./manualFinding.ts";
+import { asksToReplace, draftFromRequest, findingAddArgs, formFromDraft, formProblem, historyIds, type FindingForm } from "./manualFinding.ts";
 
 const filled = (over: Partial<FindingForm> = {}): FindingForm => ({
   ...formFromDraft({ url: "https://app.test/orders/7?x=1", method: "post", history: [12] }),
@@ -50,17 +50,35 @@ test("the form becomes one findings add call, the texts on stdin", () => {
     "--title=Order IDOR",
     "--risk=high",
     "--confidence=high",
-    "--url=https://app.test/orders/7?x=1",
-    "--method=POST",
     "--history-id=12,15",
     "--param=id",
     "--cwe=639",
     "--input-json",
   ]);
-  assert.deepEqual(JSON.parse(stdin!), { description: "Any user can read any order.", solution: "Check the owner.", evidence: "-leading dash" });
+  assert.deepEqual(JSON.parse(stdin!), {
+    url: "https://app.test/orders/7?x=1",
+    method: "POST",
+    description: "Any user can read any order.",
+    solution: "Check the owner.",
+    evidence: "-leading dash",
+  });
   // Nothing optional: no empty flags and no stdin; without a URL the history entry gives it and its method.
   const bare = findingAddArgs(filled({ url: "", history: "12" }));
   assert.deepEqual(bare, { args: ["findings", "add", "--title=Order IDOR", "--risk=medium", "--confidence=medium", "--history-id=12"] });
+});
+
+test("a URL with a token in it stays out of the arguments", () => {
+  const { args, stdin } = findingAddArgs(filled({ url: "https://app.test/reset?token=FAKE-TOKEN-123", history: "" }));
+  assert.ok(!args.join(" ").includes("FAKE-TOKEN-123"), args.join(" "));
+  assert.ok(!args.some((a) => a.startsWith("--url") || a.startsWith("--method")), args.join(" "));
+  assert.deepEqual(JSON.parse(stdin!), { url: "https://app.test/reset?token=FAKE-TOKEN-123", method: "POST" });
+});
+
+test("replacing the shared write-up is asked for, not assumed", () => {
+  assert.ok(!findingAddArgs(filled()).args.includes("--replace-text"));
+  assert.ok(findingAddArgs(filled({ replaceText: true })).args.includes("--replace-text"));
+  assert.ok(asksToReplace("conflict: the description differs from the one every finding titled \"X\" shares; leave it out to keep that one, or give --replace-text to replace it"));
+  assert.ok(!asksToReplace("conflict: finding 3 is already this issue"));
 });
 
 test("Replay hands over its last send, or the request it holds", () => {
@@ -108,9 +126,9 @@ test("flags can't be confused with values", () => {
   assert.ok(args.includes("--title=--risk=info") && args.includes("--param=--url"));
   assert.equal(args.filter((a) => a.startsWith("--risk=")).length, 1);
   // A blank description is no description; the evidence is kept as typed.
-  assert.deepEqual(JSON.parse(stdin!), { solution: "-x", evidence: "  kept as typed " });
-  // No text, no stdin.
-  const none = findingAddArgs(filled({ description: "  ", solution: " ", evidence: "" }));
+  assert.deepEqual(JSON.parse(stdin!), { url: "https://app.test/orders/7?x=1", method: "POST", solution: "-x", evidence: "  kept as typed " });
+  // No URL and no text, no stdin.
+  const none = findingAddArgs(filled({ url: "", history: "12", description: "  ", solution: " ", evidence: "" }));
   assert.equal(none.stdin, undefined);
   assert.ok(!none.args.includes("--input-json"));
   // History ids the form can't read are left out (formProblem stops the save first).

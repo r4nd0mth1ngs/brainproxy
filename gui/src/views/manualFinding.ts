@@ -23,6 +23,8 @@ export interface FindingForm {
   description: string;
   solution: string;
   evidence: string;
+  /** Replace the description and solution that findings with this title share (`--replace-text`). */
+  replaceText: boolean;
 }
 
 export function formFromDraft(d: FindingDraft | null): FindingForm {
@@ -38,6 +40,7 @@ export function formFromDraft(d: FindingDraft | null): FindingForm {
     description: "",
     solution: "",
     evidence: "",
+    replaceText: false,
   };
 }
 
@@ -71,24 +74,34 @@ export function formProblem(f: FindingForm): string | null {
 }
 
 /**
- * The `findings add` call. The description, solution and evidence go on stdin as JSON
- * (`--input-json`): evidence is often copied from a response and may hold a token, and
- * arguments are visible in the process list. The rest are flags.
+ * The `findings add` call. The URL, method, description, solution and evidence go on stdin as
+ * JSON (`--input-json`): a URL from Traffic may carry a token in its query, evidence is often
+ * copied from a response, and arguments are visible in the process list. The rest are flags.
  */
 export function findingAddArgs(f: FindingForm): { args: string[]; stdin?: string } {
   const args = ["findings", "add", `--title=${f.title.trim()}`, `--risk=${f.risk}`, `--confidence=${f.confidence}`];
-  // Without a URL, the CLI takes the first history entry's URL and method.
-  if (f.url.trim()) args.push(`--url=${f.url.trim()}`, `--method=${f.method.trim().toUpperCase()}`);
   const ids = historyIds(f.history) ?? [];
   if (ids.length) args.push(`--history-id=${ids.join(",")}`);
   if (f.param) args.push(`--param=${f.param}`);
   if (f.cwe.trim()) args.push(`--cwe=${f.cwe.trim()}`);
-  const texts: Record<string, string> = {};
-  if (f.description.trim()) texts.description = f.description.trim();
-  if (f.solution.trim()) texts.solution = f.solution.trim();
-  if (f.evidence) texts.evidence = f.evidence;
-  if (!Object.keys(texts).length) return { args };
-  return { args: [...args, "--input-json"], stdin: JSON.stringify(texts) };
+  if (f.replaceText) args.push("--replace-text");
+  const input: Record<string, string> = {};
+  // Without a URL, the CLI takes the first history entry's URL and method.
+  if (f.url.trim()) {
+    input.url = f.url.trim();
+    input.method = f.method.trim().toUpperCase();
+  }
+  if (f.description.trim()) input.description = f.description.trim();
+  if (f.solution.trim()) input.solution = f.solution.trim();
+  if (f.evidence) input.evidence = f.evidence;
+  if (!Object.keys(input).length) return { args };
+  return { args: [...args, "--input-json"], stdin: JSON.stringify(input) };
+}
+
+/** Whether `findings add` refused because the description or solution differs from the one
+ * findings with this title share, so the form can offer to replace it. */
+export function asksToReplace(error: string): boolean {
+  return error.includes("--replace-text");
 }
 
 /**

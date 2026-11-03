@@ -169,15 +169,21 @@ and history entry.
 
 The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findings add`: title,
 risk, confidence, method and URL (or only history entries, whose first gives both), parameter,
-CWE, history entries, description, solution and evidence. The description, solution and
-evidence go on stdin as JSON (`--input-json`), so a token in the evidence stays out of the
-process list; the rest are arguments. From Replay, an unsent request's URL is its request line
+CWE, history entries, description, solution and evidence. The method, URL, description,
+solution and evidence go on stdin as JSON (`--input-json`), so a token in a URL from Traffic
+or in the evidence stays out of the process list; the rest are arguments. From Replay, an unsent request's URL is its request line
 on the target's scheme, host and port, with the path as written (`%2e%2e` is not resolved).
-Nothing is sent. A warning (outside the scope, or a
-replaced description or solution that findings of the same title share) shows with the
-confirmation. Findings added by hand are grouped by title, tagged *by hand*, show *Added by
-hand* and their history entries instead of a rule, and have *Remove* (`findings remove`, after
-asking). The scan comparison leaves them out, since no scan looks for them.
+Nothing is sent. When the description or solution differs from the one findings of the same
+title share, `findings add` refuses; the form then shows a checkbox to replace it
+(`--replace-text`, which keeps the earlier text). A warning (outside the scope, a linked history
+entry on another host or port, or a replaced description or solution) shows with the
+confirmation. Risk and confidence are radio groups, the method and URL inputs have their own
+labels, and Tab stays inside the dialog (`ui/dialogFocus.ts`, shared with the confirmation
+dialog), with focus going back to where it was when it closes. Findings added by hand are
+grouped by title, tagged *by hand*, show *Added by hand* and their history entries instead of a
+rule, and have *Remove* (`findings remove`, after asking). A removed finding is kept with state
+`removed`, which the list leaves out. The scan comparison leaves them out, since no scan looks
+for them.
 
 ## Look
 
@@ -260,5 +266,7 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
 - A finding added by hand can't be edited: mark it like any other, or remove it and add it
-  again.
+  again (a new finding, with a new id and an open state; the removed one stays as `removed`).
+- Who added or removed a finding (a person in the app or a terminal, or an agent over MCP)
+  isn't recorded yet, so reports and the app don't show it.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

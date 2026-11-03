@@ -1,14 +1,27 @@
 // "New finding": writes up an issue found by hand with `findings add`. Opened from Findings, from
 // Traffic's right-click menu, and from Replay, prefilled with the URL and history entry.
 
-import { useState, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
 import { run, type Risk } from "../api";
-import { findingAddArgs, formFromDraft, formProblem, type FindingDraft, type FindingForm } from "./manualFinding";
+import { useDialogFocus } from "../ui/dialogFocus";
+import { asksToReplace, findingAddArgs, formFromDraft, formProblem, type FindingDraft, type FindingForm } from "./manualFinding";
 
 const RISKS: Risk[] = ["high", "medium", "low", "info"];
 const CONFIDENCES: FindingForm["confidence"][] = ["high", "medium", "low"];
 
-function Field({ label, children, wide }: { label: string; children: ReactNode; wide?: boolean }) {
+/** A labelled control. One with several controls (`group`) names the group, and each control has its own aria-label. */
+function Field({ label, children, wide, group }: { label: string; children: ReactNode; wide?: boolean; group?: boolean }) {
+  const id = useId();
+  if (group) {
+    return (
+      <div className={wide ? "wide" : undefined} role="group" aria-labelledby={id}>
+        <span className="label" id={id}>
+          {label}
+        </span>
+        {children}
+      </div>
+    );
+  }
   return (
     <label className={wide ? "wide" : undefined}>
       <span className="label">{label}</span>
@@ -17,10 +30,33 @@ function Field({ label, children, wide }: { label: string; children: ReactNode; 
   );
 }
 
+/** One of a few choices: a radio group, so a screen reader names the group and says which is picked. */
+function Choice<T extends string>({ label, value, options, onPick, render }: { label: string; value: T; options: T[]; onPick: (v: T) => void; render?: (v: T) => ReactNode }) {
+  const id = useId();
+  return (
+    <div>
+      <span className="label" id={id}>
+        {label}
+      </span>
+      <div className="seg" role="radiogroup" aria-labelledby={id}>
+        {options.map((o) => (
+          <button key={o} type="button" role="radio" aria-checked={value === o} className={value === o ? "on" : ""} onClick={() => onPick(o)}>
+            {render ? render(o) : o}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function NewFinding({ draft, onClose, onAdded }: { draft: FindingDraft; onClose: () => void; onAdded: (id: number, alertRef: string, warnings: string[]) => void }) {
   const [form, setForm] = useState(() => formFromDraft(draft));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Shown once the CLI refuses a description or solution that differs from the shared one.
+  const [offerReplace, setOfferReplace] = useState(false);
+  const dialog = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialog);
   const set = (p: Partial<FindingForm>) => {
     setForm((f) => ({ ...f, ...p }));
     setError(null);
@@ -36,6 +72,7 @@ export function NewFinding({ draft, onClose, onAdded }: { draft: FindingDraft; o
       onAdded(r.id, r.finding.alert_ref, r.warnings);
     } catch (e: any) {
       setError(e.message);
+      if (asksToReplace(e.message)) setOfferReplace(true);
     }
     setBusy(false);
   };
@@ -46,35 +83,29 @@ export function NewFinding({ draft, onClose, onAdded }: { draft: FindingDraft; o
 
   return (
     <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && !busy && onClose()}>
-      <div className="confirm-dialog finding-dialog" role="dialog" aria-modal="true" aria-labelledby="new-finding-title">
+      <div ref={dialog} className="confirm-dialog finding-dialog" role="dialog" aria-modal="true" aria-labelledby="new-finding-title">
         <h2 id="new-finding-title">New finding</h2>
         <p>An issue you found by hand. It is only recorded in this project: nothing is sent.</p>
         <div className="form">
           <Field label="Title" wide>
             <input className="input" autoFocus value={form.title} placeholder="Another user's order is readable" onChange={(e) => set({ title: e.target.value })} />
           </Field>
-          <Field label="Risk">
-            <div className="seg">
-              {RISKS.map((r) => (
-                <button key={r} type="button" className={form.risk === r ? "on" : ""} onClick={() => set({ risk: r })}>
-                  <span className={`dot-risk risk-${r}`} /> {r}
-                </button>
-              ))}
-            </div>
-          </Field>
-          <Field label="Confidence">
-            <div className="seg">
-              {CONFIDENCES.map((c) => (
-                <button key={c} type="button" className={form.confidence === c ? "on" : ""} onClick={() => set({ confidence: c })}>
-                  {c}
-                </button>
-              ))}
-            </div>
-          </Field>
-          <Field label="URL" wide>
+          <Choice
+            label="Risk"
+            value={form.risk}
+            options={RISKS}
+            onPick={(risk) => set({ risk })}
+            render={(r) => (
+              <>
+                <span className={`dot-risk risk-${r}`} /> {r}
+              </>
+            )}
+          />
+          <Choice label="Confidence" value={form.confidence} options={CONFIDENCES} onPick={(confidence) => set({ confidence })} />
+          <Field label="Method and URL" wide group>
             <div className="row gap">
-              <input className="input mono" style={{ width: 90 }} value={form.method} disabled={!form.url.trim()} title="Request method" onChange={(e) => set({ method: e.target.value })} />
-              <input className="input mono grow" value={form.url} placeholder="https://app.example.com/orders/7 (or leave empty to use the history entry's)" onChange={(e) => set({ url: e.target.value })} />
+              <input className="input mono" style={{ width: 90 }} aria-label="Method" value={form.method} disabled={!form.url.trim()} title="Request method" onChange={(e) => set({ method: e.target.value })} />
+              <input className="input mono grow" aria-label="URL" value={form.url} placeholder="https://app.example.com/orders/7 (or leave empty to use the history entry's)" onChange={(e) => set({ url: e.target.value })} />
             </div>
           </Field>
           <Field label="Parameter, header or cookie">
@@ -96,7 +127,17 @@ export function NewFinding({ draft, onClose, onAdded }: { draft: FindingDraft; o
             {area("evidence", "What shows it, such as a line of the response", true)}
           </Field>
         </div>
-        {error && <div className="error">{error}</div>}
+        {offerReplace && (
+          <label className="check">
+            <input type="checkbox" checked={form.replaceText} onChange={(e) => set({ replaceText: e.target.checked })} /> Replace the description and solution that
+            findings with this title share (the earlier text is kept)
+          </label>
+        )}
+        {error && (
+          <div className="error" role="alert">
+            {error}
+          </div>
+        )}
         <div className="row gap finding-dialog-actions">
           <span className="grow" />
           <button className="btn" disabled={busy} onClick={onClose}>
