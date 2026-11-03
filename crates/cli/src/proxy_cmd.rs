@@ -1000,6 +1000,15 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
     }
     // Everything that can be checked is, before anything stops.
     let back = back_args(&old.state)?;
+    // Through MCP the old proxy couldn't be started again where it was, if it listens where other
+    // machines can reach it: a restart that failed would leave it off.
+    if crate::mcp::in_tool_call() && check_listen_arg(&back.listen).is_err() {
+        return Err(Error::InvalidInput(format!(
+            "can't restart the proxy through MCP: it listens on {}, not loopback, and through MCP it couldn't be \
+             started there again if the restart failed; a person can restart it in the app or a terminal",
+            back.listen
+        )));
+    }
     let launch = Launch::prepare(project, home, &args, &store, MAX_RESTART_WAIT)?;
 
     // Before the hold goes in, so that from the moment it is there the lock vouches for it.

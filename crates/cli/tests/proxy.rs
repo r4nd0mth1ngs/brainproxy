@@ -28,7 +28,13 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> (i32, Value) {
+        self.run_env(args, &[])
+    }
+
+    /// [`Env::run`] with these environment variables set.
+    fn run_env(&self, args: &[&str], vars: &[(&str, &str)]) -> (i32, Value) {
         let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .envs(vars.iter().copied())
             .args(["--format", "json", "--project"])
             .arg(&self.project)
             .arg("--home")
@@ -1254,6 +1260,35 @@ fn proxy_restart_refuses_a_proxy_it_could_not_start_again() {
     assert_eq!(proxy_record(&env), Some(record.to_string()));
     assert_eq!(env.ok(&["proxy", "status"])["proxy"]["pid"].as_u64(), Some(pid));
     assert_eq!(env.ok(&["proxy", "stop"])["stopped"].as_u64(), Some(pid));
+}
+
+/// Through MCP a restart, like a start, listens on loopback only, and it leaves alone a proxy
+/// that doesn't: if it failed, it couldn't start that one again where it was.
+#[test]
+fn proxy_restart_through_mcp_stays_on_loopback() {
+    let agent = [("BRAINPROXY_MCP_CALL", "1")];
+    let env = Env::new("restart-mcp");
+    let pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    let before = proxy_record(&env);
+    let (code, v) = env.run_env(&["proxy", "restart", "--listen", "0.0.0.0:0"], &agent);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("loopback only"), "{v}");
+    assert_eq!(v["error"]["data"], serde_json::json!({"stopped": false}), "{v}");
+    assert_eq!(proxy_record(&env), before);
+    env.ok(&["proxy", "stop"]);
+
+    // A person's proxy on every address.
+    let pid2 = env.ok(&["proxy", "start", "--listen", "0.0.0.0:0"])["pid"].as_u64().unwrap();
+    assert_ne!(pid, pid2);
+    let before = proxy_record(&env);
+    let (code, v) = env.run_env(&["proxy", "restart", "--listen", "127.0.0.1:0"], &agent);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("can't restart the proxy through MCP"), "{v}");
+    assert_eq!(v["error"]["data"], serde_json::json!({"stopped": false}), "{v}");
+    assert_eq!(proxy_record(&env), before);
+    // A person can.
+    let moved = env.ok(&["proxy", "restart", "--listen", "127.0.0.1:0"]);
+    assert_eq!(moved["replaced"]["pid"].as_u64(), Some(pid2), "{moved}");
 }
 
 /// Going back starts the old proxy with all of its options, not only --listen and --timeout.
