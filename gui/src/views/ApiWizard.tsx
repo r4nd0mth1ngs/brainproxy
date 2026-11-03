@@ -13,6 +13,7 @@ import { PostWarning, SPEEDS, WizardProgress, type Speed } from "./Wizard";
 import {
   EMPTY_AUTH,
   EMPTY_TARGET,
+  afterServerChange,
   apiDepthText,
   apiSpeedText,
   authProblems,
@@ -20,6 +21,7 @@ import {
   authSummary,
   baseUrlProblem,
   checkArgs,
+  chooseMode,
   checkMeaning,
   credentialOnRequest,
   credentialText,
@@ -28,6 +30,7 @@ import {
   likelyInScope,
   defaultTarget,
   dropOptIn,
+  droppedKeyText,
   environmentProblem,
   excludedText,
   filterOperations,
@@ -40,6 +43,9 @@ import {
   keyEnv,
   keyKindDefaults,
   keyProblems,
+  keySaved,
+  leaveOffer,
+  leftBehind,
   listWords,
   methodSummary,
   newSignerForm,
@@ -51,6 +57,8 @@ import {
   pickCheckOperation,
   previewArgs,
   previewTitle,
+  profileKeyText,
+  profileRemoved,
   scanArgs,
   scrubSecret,
   selectShown,
@@ -104,6 +112,7 @@ interface Props {
 const STEPS = ["Definition", "Server", "Authentication", "Operations", "Depth and start"];
 
 export function ApiWizard(p: Props) {
+  const app = useApp();
   const [step, setStep] = useState(0);
   const [typed, setTyped] = useState("");
   // What the preview below is of. `typed` can move on from it.
@@ -118,6 +127,9 @@ export function ApiWizard(p: Props) {
   const [previewedKey, setPreviewedKey] = useState("");
   const [scope, setScope] = useState<string[]>([]);
   const [auth, setAuth] = useState<AuthState>(EMPTY_AUTH);
+  // For what happens after a preview or a question: the state as it is then.
+  const authRef = useRef(auth);
+  authRef.current = auth;
   const [signerDraft, setSignerDraft] = useState<SignerForm | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
   const [optIn, setOptIn] = useState(false);
@@ -126,6 +138,8 @@ export function ApiWizard(p: Props) {
   const [busy, setBusy] = useState(false);
   const [startProblem, setStartProblem] = useState("");
   const seq = useRef(0);
+  // Set once an exit is asking about the profiles saved here: no scan starts with one of them.
+  const leaving = useRef(false);
 
   useEffect(() => {
     loadSuggestions()
@@ -134,6 +148,27 @@ export function ApiWizard(p: Props) {
   }, []);
 
   const keyOf = (src: string, t: ApiTarget) => JSON.stringify(previewArgs(src, t));
+
+  /** Before the wizard forgets the profiles saved in it: they hold stored secrets, so offer to remove each. */
+  const offerLeftBehind = async () => {
+    for (const x of leftBehind(authRef.current)) {
+      if (!(await confirm(`Remove the profile "${x.profile}"?`, x.message, "Remove it", "Keep it"))) continue;
+      try {
+        await run(["auth", "remove", "--", x.profile]);
+        setAuth((prev) => ({ ...prev, ...profileRemoved(prev, x.profile) }));
+      } catch (e: any) {
+        app.toast(e.message, "error");
+      }
+    }
+  };
+  const leave = (then: () => void) => async () => {
+    leaving.current = true;
+    // A preview still loading would start over, and ask again, once the wizard is gone.
+    seq.current++;
+    setPreviewing(false);
+    await offerLeftBehind();
+    then();
+  };
 
   /** Runs the preview. A new source starts the flow over; a new server keeps the choices made before it. */
   const load = async (src: string, t: ApiTarget | null) => {
@@ -144,13 +179,18 @@ export function ApiWizard(p: Props) {
       const fresh = { ...EMPTY_TARGET, graphql: graphqlEndpoint && sourceKind(src) === "url" };
       const d = await run<ApiPreview>(previewArgs(src, t ?? fresh));
       if (n !== seq.current) return;
+      // A new source starts over: what was saved for the last one would be left behind.
+      if (!t) {
+        await offerLeftBehind();
+        if (n !== seq.current) return;
+      }
       setSelected(defaultSelection(d.requests));
       setOptIn(false);
       if (t) {
         if (preview && d.document_sha256 !== preview.document_sha256) setDocChanged(true);
         // A saved query key may only go to the origins it was saved for: a new server needs it saved again.
-        const inScopeOrigins = (x: ApiPreview) => operationOrigins(likelyInScope(x.requests)).join(" ");
-        if (preview && inScopeOrigins(d) !== inScopeOrigins(preview)) setAuth((a) => (a.savedProfile && a.place === "query" ? { ...a, savedProfile: "", profileName: "" } : a));
+        const origins = operationOrigins(likelyInScope(d.requests));
+        setAuth((a) => ({ ...a, ...afterServerChange(a, origins) }));
         // A variable gave the definition its address, so no base URL is needed after all.
         if (preview?.base_url_required && !d.base_url_required && !t.baseUrl.trim()) setCustomBase(false);
         setPreviewedKey(keyOf(src, t));
@@ -161,7 +201,8 @@ export function ApiWizard(p: Props) {
         setCustomBase(d.base_url_required);
         setPreviewedKey(keyOf(src, first));
         setDocChanged(false);
-        setAuth({ ...EMPTY_AUTH, ...keyDefaults(d.credentials), oauth: oauthDefaults(d.oauth ?? []) });
+        // The query keys saved for the last source are still in the project, and may be chosen as existing profiles.
+        setAuth((a) => ({ ...EMPTY_AUTH, ...keyDefaults(d.credentials), oauth: oauthDefaults(d.oauth ?? []), queryKeys: a.queryKeys }));
         setSignerDraft(null);
       }
       setPreview(d);
@@ -220,7 +261,7 @@ export function ApiWizard(p: Props) {
   };
 
   const start = async () => {
-    if (!preview) return;
+    if (!preview || leaving.current) return;
     setBusy(true);
     setStartProblem("");
     try {
@@ -260,7 +301,7 @@ export function ApiWizard(p: Props) {
           ? authProblems(auth)
           : step === 3
             ? selectionProblems(selected)
-            : [];
+            : authProblems(auth);
   const canGoOn = step === 0 ? previewed && !previewing : !previewing && !previewStale && !problem && blockers.length === 0;
 
   return (
@@ -271,10 +312,11 @@ export function ApiWizard(p: Props) {
           <h2>Check an API for security problems</h2>
         </div>
         <div className="wiz-row">
-          <button className="link" onClick={p.onBack}>
+          {/* Not while the scan starts, nor Back below: it may run with a profile offered for removal. */}
+          <button className="link" disabled={busy} onClick={leave(p.onBack)}>
             Test a website instead
           </button>
-          <button className="link" onClick={p.onDismiss}>
+          <button className="link" disabled={busy} onClick={leave(p.onDismiss)}>
             I'll set it up myself
           </button>
         </div>
@@ -325,7 +367,7 @@ export function ApiWizard(p: Props) {
 
       <footer className="row gap">
         {step > 0 && (
-          <button className="btn" onClick={() => setStep(step - 1)}>
+          <button className="btn" disabled={busy} onClick={() => setStep(step - 1)}>
             Back
           </button>
         )}
@@ -335,7 +377,7 @@ export function ApiWizard(p: Props) {
             {step === 1 && (previewing || previewWaits) ? "Checking…" : "Next"}
           </button>
         ) : (
-          <button className="btn primary" disabled={busy || !selected.length} onClick={start}>
+          <button className="btn primary" disabled={busy || !selected.length || blockers.length > 0} onClick={start}>
             {busy ? "Starting…" : "Start scan"}
           </button>
         )}
@@ -628,6 +670,8 @@ function AuthStep(p: {
   const inScope = ops.filter((o) => o.in_scope);
   const origins = operationOrigins(likelyInScope(ops));
   const taken = data?.profiles.map((x) => x.name) ?? [];
+  const droppedNote = droppedKeyText(a, origins);
+  const profileNote = profileKeyText(a, origins);
 
   const reload = () =>
     loadAuthData().then(
@@ -661,12 +705,17 @@ function AuthStep(p: {
   const ticked = new Set(p.selected);
   const coverage = signerRow ? signerCoverage(data!.rules[signerRow.profile] ?? [], signerRow.signer, inScope.filter((o) => ticked.has(o.index)).map((o) => o.url)) : null;
 
-  const pickSigner = (profile: string, name: string) => {
+  const pickSigner = async (profile: string, name: string) => {
     // A scan uses one profile, and `auth add` can't add a key to one that exists: pick its profile.
     const moved = authProfile(a) !== profile;
-    set({ signing: true, signer: { profile, name }, ...(moved ? { mode: "profile" as const, existing: profile } : {}) });
+    const next = moved ? { mode: "profile" as const, existing: profile, savedProfile: "" } : {};
+    // Leaving saved credentials, as choosing another kind does; not when the signer is in the key set aside.
+    if (moved && profile !== a.dropped?.profile) await leaveSaved();
+    set({ signing: true, signer: { profile, name }, ...next });
     p.setDraft(null);
-    setNote(moved ? `Selected the profile "${profile}", which holds this signer. The scan runs with that profile's credentials.` : "");
+    // A query key that doesn't go to this server: the warning under the profile says so instead.
+    const keyless = profileKeyText({ ...a, ...next }, origins);
+    setNote(moved ? `Selected the profile "${profile}", which holds this signer.${keyless ? "" : " The scan runs with that profile's credentials."}` : "");
   };
 
   const saveSigner = async (f: SignerForm) => {
@@ -698,22 +747,21 @@ function AuthStep(p: {
     setSaving(false);
   };
 
-  /** Before other credentials replace the saved ones: their profile holds stored secrets, so offer to remove it. */
+  /** Before other credentials replace the saved ones, or a key set aside for another server: their profile holds stored secrets, so offer to remove it. */
   const leaveSaved = async () => {
-    const saved = a.savedProfile;
-    if (!saved || (a.mode !== "key" && a.mode !== "oauth")) return;
-    const withSigner = a.signer?.profile === saved;
-    const what = a.mode === "oauth" ? "the OAuth client secret and tokens" : "the key";
-    const remove = await confirm(
-      `Remove the profile "${saved}"?`,
-      `It holds ${what} you saved${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. Keep it to choose it later as an existing profile.`,
-      "Remove it",
-      "Keep it",
-    );
-    if (!remove) return;
+    const offer = leaveOffer(a);
+    if (!offer) return;
+    const saved = offer.profile;
+    // Not the saved profile: the key set aside, whose "Keep it" is remembered.
+    const dropped = a.savedProfile ? null : a.dropped;
+    const remove = await confirm(`Remove the profile "${saved}"?`, offer.message, "Remove it", "Keep it");
+    if (!remove) {
+      if (dropped) set((prev) => (prev.dropped?.profile === dropped.profile ? { dropped: { ...prev.dropped, kept: true } } : {}));
+      return;
+    }
     try {
       await run(["auth", "remove", "--", saved]);
-      if (withSigner) set((prev) => (prev.signer?.profile === saved ? { signer: null, script: null } : {}));
+      set((prev) => profileRemoved(prev, saved));
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -723,7 +771,8 @@ function AuthStep(p: {
   const choose = async (mode: AuthState["mode"]) => {
     if (mode === a.mode) return;
     await leaveSaved();
-    set({ mode, savedProfile: "" });
+    // From the latest state: the profile may have been removed. A key set aside for this server comes back.
+    set((prev) => chooseMode(prev, mode, origins));
   };
 
   const signerNames = data?.signers.filter((s) => s.profile === signerHome(a)).map((s) => s.signer.name) ?? [];
@@ -752,6 +801,8 @@ function AuthStep(p: {
         </button>
       </div>
 
+      {droppedNote && <div className="wiz-warn">{droppedNote}</div>}
+
       {a.mode === "key" && <KeyFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} origins={origins} reload={reload} leave={leaveSaved} />}
 
       {a.mode === "oauth" && <OAuthFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} reload={reload} leave={leaveSaved} />}
@@ -769,6 +820,7 @@ function AuthStep(p: {
           </select>
         </label>
       )}
+      {profileNote && <div className="wiz-warn">{profileNote}</div>}
 
       {p.preview.credentials.length > 0 && (
         <>
@@ -863,7 +915,7 @@ function KeyFields(p: {
   loaded: boolean;
   origins: string[];
   reload: () => Promise<unknown>;
-  /** Before another key replaces the saved one: offers to remove the profile holding it. */
+  /** Before another key replaces the saved one, or once it replaced one set aside: offers to remove the profile holding it. */
   leave: () => Promise<void>;
 }) {
   const a = p.auth;
@@ -899,8 +951,10 @@ function KeyFields(p: {
       await run(keyAddArgs(a, p.origins), { env: keyEnv(a.keyKind, value) });
       if (input.current) input.current.value = "";
       setHasValue(false);
-      p.set({ savedProfile: a.profileName.trim() });
+      p.set(keySaved(a, p.origins));
       await p.reload();
+      // `leave` is from before this save, so it offers the profile of the key set aside.
+      if (a.dropped) await p.leave();
     } catch (e: any) {
       setProblem(scrubSecret(e.message, value));
     }
@@ -1158,6 +1212,9 @@ function StartStep(p: {
 }) {
   const d = p.preview;
   const depth = DEPTHS.find((x) => x.id === p.depth)!;
+  const origins = operationOrigins(likelyInScope(d.requests));
+  // The key the user chose that the scan would run without.
+  const keyless = droppedKeyText(p.auth, origins) || profileKeyText(p.auth, origins);
   return (
     <div className="wiz-body">
       <label className="label">How thorough should it be?</label>
@@ -1195,7 +1252,7 @@ function StartStep(p: {
           </>
         )}
         <dt>Authentication</dt>
-        <dd>{authSummary(p.auth)}</dd>
+        <dd className={keyless || (p.auth.mode === "key" && !p.auth.savedProfile) ? "s5" : ""}>{authSummary(p.auth)}</dd>
         <dt>Signing</dt>
         <dd>{signingSummary(p.auth)}</dd>
         <dt>Operations</dt>
@@ -1207,6 +1264,7 @@ function StartStep(p: {
         <dt>Speed</dt>
         <dd className={p.speed === "fast" ? "s5" : ""}>{SPEEDS.find((s) => s.id === p.speed)!.title}</dd>
       </dl>
+      {keyless && <div className="wiz-warn danger">{keyless}</div>}
       {p.problem && <div className="wiz-problem">{p.problem}</div>}
       {p.speed === "fast" && (
         <div className="wiz-warn danger">

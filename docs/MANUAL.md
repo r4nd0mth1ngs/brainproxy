@@ -329,7 +329,13 @@ attack type, and pick payloads:
     can't widen the scope.
   - **Authentication** is optional and defaults to none:
     - An API key or bearer token, in a header or the query string. The value is kept in the auth
-      profile, as static headers are, and history holds a placeholder.
+      profile, as static headers are, and history holds a placeholder. A key in the query string
+      only goes to the addresses it was saved for: if you then choose a server elsewhere, the
+      wizard says the key has to be saved again, and the scan can't start until you save it, go
+      back to that server, or choose something else. Saving it again, or choosing something else,
+      offers to remove the profile saved before. Back on that server, choosing an API key again
+      uses the saved key. If you keep that profile and choose it as an existing profile on a
+      server its key doesn't go to, the wizard says the scan runs without the key.
     - **OAuth 2:** client credentials, password, refresh token, or a browser sign-in (authorization
       code with PKCE), prefilled from what the definition declares; an OpenID Connect discovery URL
       can fill in the endpoints. Saving gets a token straight away, or runs the browser sign-in
@@ -342,7 +348,8 @@ attack type, and pick payloads:
       session rule, and a key and a signer can share a profile.
     - Credentials found in the file are listed by name and not used. When you switch to entering
       different credentials, the wizard offers to remove the profile it saved before, with its
-      stored secrets.
+      stored secrets. Loading another definition, or leaving the wizard before the scan starts,
+      offers the same for each profile saved in it that nothing would use any more.
     - *Try one request* sends one read-only operation (a GraphQL query counts) and says whether the
       API accepted it and whether the credentials and signature were on it.
   - **Operations:** lists every operation with its example request. GET, HEAD, OPTIONS and POST in

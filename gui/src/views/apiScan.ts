@@ -387,11 +387,30 @@ export interface AuthState {
   profileName: string;
   /** Set once the key is saved: the profile that holds it. */
   savedProfile: string;
+  /** The origins a saved query key goes to: those it was saved for. */
+  keyOrigins: string[];
+  /** A saved query key set aside because the server changed, until it's saved again or the server changes back. */
+  dropped: DroppedKey | null;
+  /** Every query key saved in this wizard and not removed, kept across sources: choosing its profile later says where it goes. */
+  queryKeys: QueryKey[];
   signing: boolean;
   signer: { profile: string; name: string } | null;
   oauth: OAuthForm;
   /** The hash of the Postman script chosen as the signer. */
   script: string | null;
+}
+
+/** A query key saved in this wizard: the profile holding it, and the only origins it goes to. */
+export interface QueryKey {
+  profile: string;
+  origins: string[];
+}
+
+/** A query key that doesn't go to the new server: the profile holding it, and where it does go. */
+export interface DroppedKey extends QueryKey {
+  keyName: string;
+  /** "Keep it" was the answer to the offer to remove its profile, which isn't made again. */
+  kept: boolean;
 }
 
 /** A change to the auth state: fields, or fields worked out from the latest state. */
@@ -422,6 +441,9 @@ export const EMPTY_AUTH: AuthState = {
   keyName: "",
   profileName: "",
   savedProfile: "",
+  keyOrigins: [],
+  dropped: null,
+  queryKeys: [],
   signing: false,
   signer: null,
   oauth: EMPTY_OAUTH,
@@ -632,7 +654,7 @@ export function newSignerProblems(a: AuthState, taken: string[]): string[] {
 /** What keeps the Authentication step from moving on. No authentication is always fine. */
 export function authProblems(a: AuthState): string[] {
   const out: string[] = [];
-  if (a.mode === "key" && !a.savedProfile) out.push("Save the key, or choose No authentication.");
+  if (a.mode === "key" && !a.savedProfile) out.push(a.dropped ? "Save the key again for this server, or choose No authentication." : "Save the key, or choose No authentication.");
   if (a.mode === "oauth" && !a.savedProfile) out.push("Save the OAuth settings, or choose No authentication.");
   if (a.mode === "profile" && !a.existing) out.push("Choose a profile, or choose No authentication.");
   if (a.signing && !a.signer) out.push('Choose or set up a signer, or untick "Every request must be signed".');
@@ -640,6 +662,113 @@ export function authProblems(a: AuthState): string[] {
   if (a.signing && a.signer && profile && a.signer.profile !== profile)
     out.push(`The signer is in profile "${a.signer.profile}", but "${profile}" is selected. A scan uses one profile, so choose that one or set up a new signer.`);
   return out;
+}
+
+const isQueryKey = (a: Pick<AuthState, "mode" | "keyKind" | "place">): boolean => a.mode === "key" && a.keyKind === "api_key" && a.place === "query";
+
+/** Every origin the scan reaches is one the key goes to. */
+const keyCovers = (keyOrigins: string[], origins: string[]): boolean => origins.length > 0 && origins.every((o) => keyOrigins.includes(o));
+
+/**
+ * The auth state after a new server, whose in-scope operations are on `origins`. A saved query key only goes to the
+ * origins it was saved for, so if one of these isn't among them the key is set aside and has to be saved again. Going
+ * back to a server it covers brings it back. Header keys, OAuth tokens and signers aren't bound to origins this way.
+ */
+export function afterServerChange(a: AuthState, origins: string[]): Partial<AuthState> {
+  if (a.savedProfile && isQueryKey(a)) {
+    if (keyCovers(a.keyOrigins, origins)) return {};
+    return { savedProfile: "", profileName: "", dropped: { profile: a.savedProfile, keyName: a.keyName.trim(), origins: a.keyOrigins, kept: false } };
+  }
+  if (a.mode === "key" && !a.savedProfile && a.dropped && keyCovers(a.dropped.origins, origins))
+    return { savedProfile: a.dropped.profile, keyKind: "api_key", place: "query", keyName: a.dropped.keyName, keyOrigins: a.dropped.origins, dropped: null };
+  return {};
+}
+
+/**
+ * The auth state once `mode` is chosen on a server whose in-scope operations are on `origins`. Choosing API key again
+ * on a server a key set aside covers brings it back, as going back to that server in key mode does.
+ */
+export function chooseMode(a: AuthState, mode: AuthState["mode"], origins: string[]): Partial<AuthState> {
+  const next = { mode, savedProfile: "" };
+  return mode === "key" ? { ...next, ...afterServerChange({ ...a, ...next }, origins) } : next;
+}
+
+/** While a query key is set aside and doesn't go to this server: why, and what to do. "" otherwise. */
+export function droppedKeyText(a: AuthState, origins: string[]): string {
+  const d = a.dropped;
+  if (!d || a.mode !== "key" || a.savedProfile || keyCovers(d.origins, origins)) return "";
+  const elsewhere = origins.filter((o) => !d.origins.includes(o));
+  return `The server changed. The key saved in the profile "${d.profile}" only goes to ${listWords(d.origins)}, which it was saved for, not to ${listWords(elsewhere) || "the new server"}. Save the key again for this server, or go back to the server it was saved for and it's used as before.`;
+}
+
+/** When the existing profile chosen holds a query key saved here for other origins: that the scan runs without it. "" otherwise. */
+export function profileKeyText(a: AuthState, origins: string[]): string {
+  const k = a.mode === "profile" ? a.queryKeys.find((x) => x.profile === a.existing) : undefined;
+  if (!k || keyCovers(k.origins, origins)) return "";
+  const elsewhere = origins.filter((o) => !k.origins.includes(o));
+  return `The key saved in the profile "${k.profile}" only goes to ${listWords(k.origins)}, which it was saved for, not to ${listWords(elsewhere) || "this server"}, so the scan runs without it. To send a key, choose API key or bearer token and save it again for this server, or go back to the server it was saved for.`;
+}
+
+/**
+ * Once `auth add` saved the key in `saved` for `origins`: its profile is the one used, and a query key is remembered
+ * with its origins. A key set aside is replaced, so it isn't brought back by a later server change; its profile, if
+ * kept, is still known as an existing one.
+ */
+export function keySaved(saved: AuthState, origins: string[]): AuthPatch {
+  const profile = saved.profileName.trim();
+  return (prev) => ({
+    savedProfile: profile,
+    keyOrigins: origins,
+    dropped: null,
+    queryKeys: isQueryKey(saved) ? [...prev.queryKeys.filter((k) => k.profile !== profile), { profile, origins }] : prev.queryKeys,
+  });
+}
+
+/** A profile saved in this wizard with stored secrets, and the question offering to remove it. */
+export interface LeaveOffer {
+  profile: string;
+  message: string;
+}
+
+function leaveOfferFor(a: AuthState, profile: string, dropped: DroppedKey | null): LeaveOffer {
+  const withSigner = a.signer?.profile === profile;
+  const what = dropped ? `the key you saved for ${listWords(dropped.origins)}` : a.mode === "oauth" ? "the OAuth client secret and tokens you saved" : "the key you saved";
+  return {
+    profile,
+    message: `It holds ${what}${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. ${dropped ? `Keep it to use it again with ${listWords(dropped.origins)}.` : "Keep it to choose it later as an existing profile."}`,
+  };
+}
+
+/**
+ * Before other credentials replace the saved ones, or a key set aside for another server: the profile to offer to
+ * remove. A key set aside is offered once: kept, it's for the server it was saved for.
+ */
+export function leaveOffer(a: AuthState): LeaveOffer | null {
+  const dropped = a.savedProfile || a.dropped?.kept ? null : a.dropped;
+  const saved = a.savedProfile || dropped?.profile;
+  if (!saved || (a.mode !== "key" && a.mode !== "oauth")) return null;
+  return leaveOfferFor(a, saved, dropped);
+}
+
+/**
+ * Before the wizard forgets `a`, for a new definition or on leaving it: the profiles saved in it that nothing would
+ * refer to any more. A key set aside that was kept, or whose profile is chosen, isn't offered again.
+ */
+export function leftBehind(a: AuthState): LeaveOffer[] {
+  const out: LeaveOffer[] = [];
+  if (a.savedProfile && (a.mode === "key" || a.mode === "oauth")) out.push(leaveOfferFor(a, a.savedProfile, null));
+  const d = a.dropped;
+  if (d && !d.kept && d.profile !== a.savedProfile && d.profile !== authProfile(a)) out.push(leaveOfferFor(a, d.profile, d));
+  return out;
+}
+
+/** Once `auth remove` removed the profile `name`: nothing refers to it any more. */
+export function profileRemoved(a: AuthState, name: string): Partial<AuthState> {
+  return {
+    queryKeys: a.queryKeys.filter((k) => k.profile !== name),
+    ...(a.dropped?.profile === name ? { dropped: null } : {}),
+    ...(a.signer?.profile === name ? { signer: null, script: null } : {}),
+  };
 }
 
 /** The form for a new signer: origins default to the operations' hosts. */
@@ -770,7 +899,7 @@ export function authSummary(a: AuthState): string {
   if (a.mode === "oauth") return `OAuth 2 (${a.oauth.flow.replace(/_/g, " ")}), saved in profile "${a.savedProfile}"`;
   if (a.mode === "key") {
     const what = a.keyKind === "bearer" ? "bearer token" : a.place === "query" ? `API key in query parameter ${a.keyName.trim()}` : `API key in header ${a.keyName.trim()}`;
-    return `${what}, saved in profile "${a.savedProfile}"`;
+    return a.savedProfile ? `${what}, saved in profile "${a.savedProfile}"` : `${what}, not saved, so the scan would run without it`;
   }
   return a.signing && a.signer ? `no key (profile "${a.signer.profile}" holds the signer)` : "none";
 }
