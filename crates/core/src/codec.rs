@@ -308,9 +308,12 @@ fn printable_ascii(v: &[u8]) -> bool {
 }
 
 /// A JSON object or array, checked without building it (decoded output can be megabytes).
+/// Parsed from a `str`: `from_slice` with `IgnoredAny` skips strings unchecked, so bytes
+/// that aren't UTF-8 would pass.
 fn json_container(v: &[u8]) -> bool {
-    matches!(v.iter().find(|b| !b.is_ascii_whitespace()), Some(b'{' | b'['))
-        && serde_json::from_slice::<serde::de::IgnoredAny>(v).is_ok()
+    std::str::from_utf8(v).is_ok_and(|s| {
+        s.trim_start().starts_with(['{', '[']) && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+    })
 }
 
 fn compress(mut encoder: impl Read) -> Result<Vec<u8>> {
@@ -753,6 +756,9 @@ mod tests {
         assert_eq!(smart_decode(&hex).output, r#"["café"]"#.as_bytes());
         // Short JSON the ASCII check finds too sparse still counts.
         assert!(looks_decoded(b"[1]") && !printable_ascii(b"[1]"));
+        // JSON must be UTF-8, strings included: ["\xff"] is neither, so the base64 stays.
+        assert!(!json_container(b"[\"\xff\"]"));
+        assert_eq!(smart_decode(b"WyL/Il0="), Smart { steps: vec![], output: b"WyL/Il0=".to_vec() });
     }
 
     #[test]
