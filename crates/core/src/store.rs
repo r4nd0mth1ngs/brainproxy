@@ -685,6 +685,27 @@ impl Store {
         Ok(())
     }
 
+    /// Reads a meta value and writes what `f` makes of it (`None` deletes it) in one write
+    /// transaction, so no other process changes it in between. An error from `f` leaves it as it was.
+    pub fn meta_update<T>(
+        &mut self,
+        key: &str,
+        f: impl FnOnce(Option<String>) -> Result<(Option<String>, T)>,
+    ) -> Result<T> {
+        let tx = self.write_tx()?;
+        let old = tx.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?;
+        let (new, out) = f(old)?;
+        match new {
+            Some(v) => tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, v],
+            )?,
+            None => tx.execute("DELETE FROM meta WHERE key = ?1", [key])?,
+        };
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Reads a JSON setting, or its default when unset.
     pub fn setting<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
         match self.meta_get(&format!("setting.{key}"))? {
@@ -1226,6 +1247,20 @@ mod tests {
         a.record_batch(&[capture]).unwrap();
         holder.join().unwrap();
         assert_eq!(a.list(&HistoryFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn meta_update_writes_what_it_read_or_nothing() {
+        let mut s = Store::open_in_memory().unwrap();
+        let n = s.meta_update("k", |old| Ok((Some(format!("{}1", old.unwrap_or_default())), 7))).unwrap();
+        assert_eq!((n, s.meta_get("k").unwrap().as_deref()), (7, Some("1")));
+        s.meta_update("k", |old| Ok((old.map(|v| v + "2"), ()))).unwrap();
+        assert_eq!(s.meta_get("k").unwrap().as_deref(), Some("12"));
+        let e = s.meta_update::<()>("k", |_| Err(Error::Conflict("no".into()))).unwrap_err();
+        assert_eq!(e.kind(), "conflict");
+        assert_eq!(s.meta_get("k").unwrap().as_deref(), Some("12"));
+        s.meta_update("k", |_| Ok((None, ()))).unwrap();
+        assert_eq!(s.meta_get("k").unwrap(), None);
     }
 
     #[test]

@@ -565,6 +565,7 @@ fn replay_tabs_are_saved_in_the_project() {
     let (code, v) = run(&["replay", "tabs", "save"], &project, Some(set.to_string().as_bytes()));
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["count"], 2);
+    assert_eq!(v["data"]["rev"], 1);
     // Only counts come back, so no untrusted mark; the list carries request text, so it has one.
     assert!(v.get("_meta").is_none(), "{v}");
 
@@ -596,15 +597,58 @@ fn replay_tabs_are_saved_in_the_project() {
     assert!(v["error"]["message"].as_str().unwrap().contains("over 16 MB"), "{v}");
     assert_eq!(run(&["replay", "tabs", "list"], &project, None).1["data"]["count"], 2);
 
-    // The tabs travel with a saved copy; an empty set removes them.
+    // A summary leaves the requests out, and one tab can be read on its own, so a large set
+    // can be paged through under an output cap.
+    let (code, v) = run(&["replay", "tabs", "list", "--summary"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["rev"], 1);
+    assert_eq!(
+        v["data"]["tabs"][0],
+        serde_json::json!({"index": 0, "kind": "http", "title": "one",
+        "target": "http://127.0.0.1", "request_bytes": req.len()})
+    );
+    assert_eq!(v["data"]["tabs"][1]["messages"], 1);
+    assert_eq!(v["_meta"]["provenance"]["untrusted_content"], true);
+    let (code, v) = run(&["replay", "tabs", "list", "--index", "1"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((&v["data"]["index"], &v["data"]["tab"]["title"]), (&serde_json::json!(1), &set["tabs"][1]["title"]));
+    assert_eq!(v["data"]["tab"]["messages"], set["tabs"][1]["messages"]);
+    let (code, v) = run(&["replay", "tabs", "list", "--index", "2"], &project, None);
+    assert_eq!(v["error"]["kind"], "not_found", "{v}");
+    assert_ne!(code, 0);
+
+    // A save checked against an old revision changes nothing; appending keeps the saved tabs.
+    let one = br#"{"tabs": [{"title": "agent", "request": "GET / HTTP/1.1\n\n"}], "active": 0}"#;
+    let (code, v) = run(&["replay", "tabs", "save", "--if-revision", "0"], &project, Some(one));
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("revision 1, not 0"), "{v}");
+    assert_ne!(code, 0);
+    let (code, v) = run(&["replay", "tabs", "save", "--append", "--if-revision", "1"], &project, Some(one));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((&v["data"]["count"], &v["data"]["added"], &v["data"]["rev"]), (&3.into(), &1.into(), &2.into()));
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(v["data"]["tabs"][0]["title"], "one");
+    assert_eq!(v["data"]["tabs"][2]["title"], "agent");
+    assert_eq!(v["data"]["active"], 2);
+
+    // The tabs travel with a saved copy; an empty set leaves none but keeps the revision going.
     let copy = project.with_file_name("copy.bpdb");
     let _ = std::fs::remove_file(&copy);
     let (code, v) = run(&["project", "save", "--output", copy.to_str().unwrap()], &project, None);
     assert_eq!(code, 0, "{v}");
     assert_eq!(run(&["replay", "tabs", "list"], &copy, None).1["data"]["tabs"][0]["title"], "one");
-    let (code, _) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
-    assert_eq!(code, 0);
-    assert_eq!(run(&["replay", "tabs", "list"], &project, None).1["data"]["count"], 0);
+    let (code, v) = run(&["replay", "tabs", "save", "--if-revision", "2"], &project, Some(br#"{"tabs": []}"#));
+    assert_eq!((code, &v["data"]["rev"]), (0, &3.into()), "{v}");
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!((&v["data"]["count"], &v["data"]["rev"]), (&0.into(), &3.into()), "{v}");
+
+    // A set saved by a newer version isn't saved over (its new fields would be lost), but lists.
+    let newer = r#"{"v":2,"rev":7,"tabs":[{"kind":"grpc","request":""}]}"#;
+    brainproxy_core::store::Store::open(&project).unwrap().meta_set("replay.tabs", Some(newer)).unwrap();
+    let (code, v) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    assert_ne!(code, 0);
+    assert_eq!(run(&["replay", "tabs", "list"], &project, None).1["data"]["tabs"][0]["kind"], "grpc");
 }
 
 #[test]
@@ -641,7 +685,7 @@ fn replay_tabs_keep_bytes_and_placeholders_and_send_nothing() {
     let list = text(&["replay", "tabs", "list"]);
     assert_eq!(
         list.lines().collect::<Vec<_>>(),
-        ["  1  http  bin  http://10.255.255.1", "  2  http  auth  http://127.0.0.1"]
+        ["  0  http  bin  http://10.255.255.1", "  1  http  auth  http://127.0.0.1"]
     );
     let mut child = bin()
         .args(["--format", "text", "--project"])
@@ -654,7 +698,7 @@ fn replay_tabs_keep_bytes_and_placeholders_and_send_nothing() {
     child.stdin.take().unwrap().write_all(br#"{"tabs": [{"kind": "ws", "request": ""}]}"#).unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "saved 1 Replay tab\n");
-    assert_eq!(text(&["replay", "tabs", "list"]), "  1  ws      \n");
+    assert_eq!(text(&["replay", "tabs", "list"]), "  0  ws      \n");
     // Control characters in a title or target can't clear the screen or add a row in text
     // mode; JSON and the project keep them as saved.
     let sly = serde_json::json!({"tabs": [
@@ -664,13 +708,26 @@ fn replay_tabs_keep_bytes_and_placeholders_and_send_nothing() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(
         text(&["replay", "tabs", "list"]),
-        "  1  http  \\u{1b}[2J\\u{1b}]0;x\\u{7}  http://a.test\\r\\n  2  http  forged  http://b.test\n"
+        "  0  http  \\u{1b}[2J\\u{1b}]0;x\\u{7}  http://a.test\\r\\n  2  http  forged  http://b.test\n"
     );
     let (_, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!(v["data"]["tabs"][0]["title"], sly["tabs"][0]["title"]);
     assert_eq!(v["data"]["tabs"][0]["target"], sly["tabs"][0]["target"]);
     run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
     assert_eq!(text(&["replay", "tabs", "list"]), "no saved Replay tabs\n");
+}
+
+#[test]
+fn ws_send_refuses_a_wait_over_a_day() {
+    // A saved Replay tab carries its wait to Send: too large a value would hold the connection
+    // for years, or panic making the duration.
+    let project = tmp_project("ws-wait");
+    for wait in ["1e300", "86400.5", "inf"] {
+        let (code, v) = run(&["ws", "send", "--url", "ws://127.0.0.1:9/", "--wait", wait], &project, None);
+        assert_eq!(v["error"]["kind"], "invalid_input", "{wait}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("--wait: at most 86400"), "{v}");
+        assert_eq!(code, 2);
+    }
 }
 
 #[test]

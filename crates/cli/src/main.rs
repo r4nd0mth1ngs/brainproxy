@@ -390,8 +390,8 @@ fn command_name(cmd: &Cmd) -> String {
         },
         Cmd::Send(_) => "send",
         Cmd::Replay(replay_cmd::ReplayCmd::Tabs(c)) => match c {
-            replay_cmd::TabsCmd::List => "replay tabs list",
-            replay_cmd::TabsCmd::Save => "replay tabs save",
+            replay_cmd::TabsCmd::List { .. } => "replay tabs list",
+            replay_cmd::TabsCmd::Save { .. } => "replay tabs save",
         },
         Cmd::History(HistoryCmd::List { .. }) => "history list",
         Cmd::History(HistoryCmd::Show { .. }) => "history show",

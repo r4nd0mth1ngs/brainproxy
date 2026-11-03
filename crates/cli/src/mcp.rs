@@ -131,8 +131,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("project stop", REPLACE),
     ("send", NET),
     ("replay tabs list", READ),
-    // Replaces the saved set; sends nothing (a person sends a tab from Replay).
-    ("replay tabs save", REPLACE),
+    // Through MCP only adds to the saved set (--append); sends nothing (a person sends a tab from Replay).
+    ("replay tabs save", ADD),
     ("proxy start", ADD),
     ("proxy stop", REPLACE),
     ("proxy status", READ),
