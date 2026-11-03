@@ -693,14 +693,20 @@ fn proxy_serves_http2() {
     assert!(body.starts_with("POST /fallback HTTP/1.1\r\n"), "{body}");
     assert!(body.contains("\r\ncontent-length: 3\r\n") && body.ends_with("\r\n\r\nabc"), "{body}");
 
-    // Captures are written in the background: a busy machine may take a while.
-    let h2_rows = "SELECT count(*) FROM history WHERE source = 'proxy' AND path = '/h2' AND status = 200 \
-                   AND CAST(request AS TEXT) LIKE 'POST /h2?q=1 HTTP/2%' AND CAST(response AS TEXT) LIKE 'HTTP/2 200%'";
+    // The rows are written after the client has its response: wait for them under load.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while env.count(h2_rows) < 2 && Instant::now() < deadline {
+    while env.count("SELECT count(*) FROM history WHERE source = 'proxy' AND status IS NOT NULL") < 3
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(env.count(h2_rows), 2);
+    assert_eq!(
+        env.count(
+            "SELECT count(*) FROM history WHERE source = 'proxy' AND path = '/h2' AND status = 200 \
+             AND CAST(request AS TEXT) LIKE 'POST /h2?q=1 HTTP/2%' AND CAST(response AS TEXT) LIKE 'HTTP/2 200%'"
+        ),
+        2
+    );
     assert_eq!(
         env.count("SELECT count(*) FROM history WHERE path = '/fallback' AND CAST(request AS TEXT) LIKE '% HTTP/1.1%'"),
         1
