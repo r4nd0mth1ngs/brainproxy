@@ -289,7 +289,14 @@ fn by_risk(items: &[&Item]) -> Value {
 fn text(data: &Value) -> String {
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
     let row = |title: &str, f: &Value| {
-        format!("{title:<6} {:<6} {:<45} {} {}", s(&f["risk"]), s(&f["name"]), s(&f["url"]), s(&f["param"]))
+        let origin = brainproxy_core::provenance::describe(f["origin"].as_str());
+        format!(
+            "{title:<6} {:<6} {:<45} {} {}  (added {origin})",
+            s(&f["risk"]),
+            s(&f["name"]),
+            s(&f["url"]),
+            s(&f["param"])
+        )
     };
     let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
     let mut lines: Vec<String> = list(&data["warnings"]).iter().map(|w| format!("warning: {}", s(w))).collect();

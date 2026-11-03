@@ -646,8 +646,25 @@ fn oauth_cmd(project: &Path, cmd: OauthCmd, out: &Out) -> Result<(), Error> {
         }
         OauthCmd::Discover { url, net } => {
             let (req, target) = RawRequest::build("GET", &url, &[("Accept".into(), "application/json".into())], b"")?;
-            let client = Client::new(net.send_options(project)?);
-            let ex = runtime()?.block_on(client.send(&req, &target))?;
+            let opts = net.send_options(project)?;
+            // Refused before a row is written: nothing goes out.
+            if let Some(guard) = &opts.guard {
+                crate::require_in_scope(guard, &target)?;
+            }
+            let client = Client::new(opts);
+            // On record before it goes out, like any request brainproxy sends.
+            let mut log = crate::sent::SentLog::open(project, "auth", false)?;
+            let id = log.pending(&target, &client.recorded_request(&req, &target)?)?;
+            let ex = match runtime()?.block_on(client.send(&req, &target)) {
+                Ok(ex) => {
+                    log.answered(id, &ex)?;
+                    ex
+                }
+                Err(e) => {
+                    log.failed(id, &target, &client.recorded_request(&req, &target)?, &e.to_string())?;
+                    return Err(e);
+                }
+            };
             let head = brainproxy_core::http::parse_response_head(&ex.response)?;
             let body = brainproxy_core::http::request::split_head_body(&ex.response).1;
             let doc: serde_json::Value =

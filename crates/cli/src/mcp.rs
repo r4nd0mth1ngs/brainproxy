@@ -29,14 +29,25 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Commands not offered as tools: the server itself, foreground servers that never
 /// return (their `start` variants run them in the background), the feed signing
 /// key's commands (publishing checks is for a maintainer, not an agent), `project save`
-/// (copying the project elsewhere is for the person running the server), and `findings remove`
-/// (an agent can't tell a person's finding from its own; it marks one false_positive instead).
-const EXCLUDED: &[&str] =
-    &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save", "findings remove"];
+/// (copying the project elsewhere is for the person running the server), `browser open`
+/// (the browser profile holds the person's sign-ins; the command refuses a tool call too), and
+/// `findings remove` (an agent can't tell a person's finding from its own; it marks one
+/// false_positive instead; the command refuses a tool call too).
+const EXCLUDED: &[&str] = &[
+    "mcp serve",
+    "proxy run",
+    "oob run",
+    "checks feed keygen",
+    "checks feed sign",
+    "project save",
+    "browser open",
+    "findings remove",
+];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
-/// do alone (run a collection's script, open the user's browser, read any environment variable).
-const CHILD_ENV: &str = "BRAINPROXY_MCP_CALL";
+/// do alone (run a collection's script, open the user's browser, read any environment variable),
+/// and so everything it records is marked as an agent's (origin `mcp`).
+const CHILD_ENV: &str = brainproxy_core::provenance::MCP_ENV;
 
 /// Environment variables a command run by an agent may read secrets from: the prefix the
 /// app uses, so a person decides what the server's environment offers.
@@ -58,6 +69,35 @@ pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_c
     }
     Ok(())
 }
+
+/// Under a tool call, refuses `--no-store`: whatever an agent sends goes into the project's
+/// history, so a person can see what was sent on their behalf.
+pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Error> {
+    if no_store && in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(
+            "--no-store: through MCP everything sent is recorded in full; a person can keep a send's content out \
+             of history (it still gets a row) in the app or a terminal"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as
+/// `fuzz run --store none`), for the same reason as [`check_no_store`].
+pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{flag}: through MCP everything sent is recorded; a person can keep requests out of history in the app \
+             or a terminal"
+        )));
+    }
+    Ok(())
+}
+
+/// How long a cancelled or timed-out call may take to exit after SIGTERM (recording what it
+/// sent) before it is killed.
+const CANCEL_GRACE: Duration = Duration::from_secs(3);
 
 /// Tool calls that may run at once; more are refused until one finishes.
 const MAX_CALLS: usize = 16;
@@ -512,8 +552,7 @@ impl Server {
                     std::thread::sleep(Duration::from_millis(20))
                 }
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::process::end_child(&mut child, CANCEL_GRACE);
                     break None;
                 }
             }
@@ -522,7 +561,7 @@ impl Server {
         let (stderr, _) = err.join().unwrap_or_default();
         let Some(status) = status else {
             let secs = self.timeout.as_secs();
-            return failure(command, "timeout", &format!("killed after {secs} s; use --background and job_wait"));
+            return failure(command, "timeout", &format!("stopped after {secs} s; use --background and job_wait"));
         };
         let mut text = String::from_utf8_lossy(&stdout).into_owned();
         if truncated {

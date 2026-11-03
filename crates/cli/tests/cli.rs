@@ -628,6 +628,16 @@ fn scan_active_skips_methods_outside_the_defaults() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["targets"], 1, "{v}");
     assert!(v["data"].get("post_hint").is_none(), "{v}");
+    // Naming it by id still needs its method.
+    let id = run(&["query", "SELECT id FROM history WHERE method = 'DELETE' LIMIT 1"], &project, None).1["data"]
+        ["rows"][0][0]
+        .to_string();
+    let named = ["scan", "active", "--rules", "40018", "--no-oob", "--history-id", &id];
+    let (code, v) = run(&named, &project, None);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods DELETE"), "{v}");
+    let (code, v) = run(&[&named[..], &["--include-methods", "DELETE"]].concat(), &project, None);
+    assert_eq!(code, 0, "{v}");
 }
 
 #[test]
@@ -1093,4 +1103,26 @@ fn findings_add_takes_the_url_on_stdin_and_checks_its_links() {
     // Not both ways.
     let (code, v) = add(&["--url", "http://127.0.0.1/a", "--input-json"], Some(br#"{"url": "http://127.0.0.1/b"}"#));
     assert!(code == 2 && v["error"]["message"].as_str().unwrap().contains("--url"), "{v}");
+}
+
+#[test]
+fn a_server_name_outside_the_scope_is_refused() {
+    // Accepts connections and says nothing: the check comes before the TLS handshake.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        for s in listener.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    let project = tmp_project("sni");
+    let url = format!("https://127.0.0.1:{port}/");
+    let (code, v) = run(&["send", "--url", &url, "--sni", "other-tenant.test", "--timeout", "2"], &project, None);
+    assert_ne!(code, 0, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--sni other-tenant.test"), "{v}");
+    // A name the scope lists gets as far as the handshake.
+    let (code, v) = run(&["send", "--url", &url, "--sni", "localhost", "--timeout", "2"], &project, None);
+    assert_ne!(code, 0, "{v}");
+    assert!(!v["error"]["message"].as_str().unwrap().contains("--sni"), "{v}");
 }

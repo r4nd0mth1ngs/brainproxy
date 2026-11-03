@@ -33,6 +33,8 @@ pub struct Item {
     pub url: String,
     pub param: String,
     pub state: String,
+    /// Who or what added it (gui, cli, mcp); None when unknown.
+    pub origin: Option<String>,
 }
 
 impl Item {
@@ -209,7 +211,7 @@ impl ScanScope {
 pub fn compare_scan(store: &Store, scope: &ScanScope) -> Result<Comparison> {
     let mut stmt = store.conn.prepare(
         "SELECT f.id, f.alert_ref, f.name, f.risk, f.confidence, f.source, f.method, f.url, f.param, f.state,
-            f.time, coalesce(h.time, f.time), f.rule_id
+            f.time, coalesce(h.time, f.time), f.rule_id, f.origin
          FROM findings f LEFT JOIN history h ON h.id = f.last_history_id WHERE f.state != 'removed'",
     )?;
     let mut rows = stmt.query([])?;
@@ -247,14 +249,15 @@ fn item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         url: r.get(7)?,
         param: r.get(8)?,
         state: r.get(9)?,
+        origin: r.get("origin")?,
     })
 }
 
 /// Every finding of a project, false positives and removed ones (tombstones) included.
 pub fn project_items(store: &Store) -> Result<Vec<Item>> {
-    let mut stmt = store
-        .conn
-        .prepare("SELECT id, alert_ref, name, risk, confidence, source, method, url, param, state FROM findings")?;
+    let mut stmt = store.conn.prepare(
+        "SELECT id, alert_ref, name, risk, confidence, source, method, url, param, state, origin FROM findings",
+    )?;
     let rows = stmt.query_map([], item)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -334,6 +337,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
                 url: i.url,
                 param: i.param,
                 state: i.state,
+                origin: i.origin,
             })
         })
         .collect();
@@ -371,6 +375,9 @@ struct SavedInstance {
     url: String,
     param: String,
     state: String,
+    /// Absent from reports written before origins were kept.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[cfg(test)]
@@ -393,6 +400,7 @@ mod tests {
             url: url.into(),
             param: String::new(),
             state: state.into(),
+            origin: None,
         }
     }
 
