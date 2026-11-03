@@ -204,7 +204,9 @@ impl AuthSession {
         }
         fields.extend(o.params.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let (req, target) = RawRequest::build("POST", &o.token_url, &headers, form(&fields).as_bytes())?;
-        let ex = self.client.send(&req, &target).await?;
+        // On record before it goes out, without its content: the request carries the client
+        // secret and the answer holds tokens.
+        let ex = self.send_recorded(&req, &target, Some(crate::sent::TOKEN_OMITTED)).await.1?;
         parse_answer(&ex.response, &o.origin())
     }
 

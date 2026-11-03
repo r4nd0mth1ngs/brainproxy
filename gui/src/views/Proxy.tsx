@@ -64,6 +64,9 @@ export function ProxyView() {
 
 const statusClass = (s: number | null) => (s == null ? "s0" : s >= 500 ? "s5" : s >= 400 ? "s4" : s >= 300 ? "s3" : "s2");
 
+/** Who or what recorded an entry, as the column shows it. */
+const ORIGIN_LABEL: Record<string, string> = { gui: "app", cli: "CLI", mcp: "agent" };
+
 const COLUMNS: Column<HistoryItem>[] = [
   { key: "id", label: "#", width: 56, value: (r) => r.id, align: "right" },
   { key: "host", label: "Host", width: 170, value: (r) => hostOf(r.url) },
@@ -81,6 +84,13 @@ const COLUMNS: Column<HistoryItem>[] = [
   { key: "mime", label: "MIME", width: 110, value: (r) => (r.resp_content_type ?? "").split(";")[0] },
   { key: "title", label: "Title", width: 180, value: (r) => r.title },
   { key: "source", label: "Source", width: 70, value: (r) => r.source },
+  {
+    key: "origin",
+    label: "By",
+    width: 60,
+    value: (r) => r.origin ?? "unknown",
+    render: (r) => <span title={r.client_addr ? `proxy client ${r.client_addr}` : undefined}>{ORIGIN_LABEL[r.origin ?? ""] ?? "unknown"}</span>,
+  },
   { key: "ms", label: "Time", width: 60, value: (r) => r.duration_ms, render: (r) => (r.duration_ms == null ? "" : `${r.duration_ms} ms`), align: "right" },
   {
     key: "notes",

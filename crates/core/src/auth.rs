@@ -18,7 +18,7 @@ use regex::Regex;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{decode_body, Capture};
+use crate::capture::decode_body;
 use crate::error::{Error, Result};
 use crate::http::request::{find, split_head_body};
 use crate::http::{parse_response_head, Client, Exchange, RawRequest, Target};
@@ -657,6 +657,14 @@ struct Compiled {
     logged_out: Option<Regex>,
 }
 
+/// What [`AuthSession::send_as_watched`] reports while it sends.
+pub enum Attempt<'a> {
+    /// This request is about to go out.
+    Sending(&'a RawRequest),
+    /// The request that went out last is answered (before any re-login it leads to).
+    Answered(&'a Exchange),
+}
+
 /// A live session shared by every request of a command run.
 pub struct AuthSession {
     pub profile: AuthProfile,
@@ -671,6 +679,8 @@ pub struct AuthSession {
     pub(crate) login_lock: tokio::sync::Mutex<()>,
     /// Macros and session rules (see [`crate::session`]).
     pub(crate) handling: crate::session::Runtime,
+    /// Its own requests keep no content in history (`--no-store`).
+    no_store: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for AuthSession {
@@ -709,11 +719,18 @@ impl AuthSession {
             last_login: Mutex::new(None),
             login_lock: tokio::sync::Mutex::new(()),
             handling: Default::default(),
+            no_store: Default::default(),
         })
     }
 
     pub fn state(&self) -> SessionState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// The session's own requests (login, CSRF page, check, macro steps, token requests)
+    /// keep no content in history, as the command's do with `--no-store`.
+    pub fn keep_no_content(&self) {
+        self.no_store.store(true, Ordering::SeqCst);
     }
 
     pub fn generation(&self) -> u64 {
@@ -846,10 +863,10 @@ impl AuthSession {
     pub async fn check(&self) -> Result<Option<CheckResult>> {
         let Some(url) = &self.profile.check_url else { return Ok(None) };
         let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-        let ex =
-            self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
+        let (history_id, ex) =
+            self.send_own(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await;
+        let ex = ex?;
         self.observe(&ex.response);
-        let history_id = self.record(&ex);
         let logged_in = !self.is_logged_out(&ex.response)
             && self.re.logged_in.as_ref().is_none_or(|re| re.is_match(&response_text(&ex.response)));
         self.state.lock().unwrap().logged_in = logged_in;
@@ -921,11 +938,30 @@ impl AuthSession {
 
     /// [`AuthSession::send`] for requests of `tool`, whose session rules apply.
     pub async fn send_as(&self, tool: crate::session::Tool, req: &RawRequest, target: &Target) -> Result<Exchange> {
+        self.send_as_watched(tool, req, target, |_| Ok(())).await
+    }
+
+    /// [`AuthSession::send_as`], telling `watch` about each request just before it goes out
+    /// (with the session applied, as [`Client::recorded_request`] records it) and as soon as
+    /// it is answered, before a lost session is renewed and the request sent again. An error
+    /// from `watch` stops the send there.
+    pub async fn send_as_watched(
+        &self,
+        tool: crate::session::Tool,
+        req: &RawRequest,
+        target: &Target,
+        mut watch: impl FnMut(Attempt<'_>) -> Result<()>,
+    ) -> Result<Exchange> {
         let prepared = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
-        let ex = self.client.send(&RawRequest::from_bytes(prepared.request.clone()), target).await?;
+        let first = RawRequest::from_bytes(prepared.request.clone());
+        watch(Attempt::Sending(&first))?;
+        let ex = self.client.send(&first, target).await?;
+        watch(Attempt::Answered(&ex))?;
         if self.after_response(&prepared, &ex.response).await {
-            let again = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
-            let ex = self.client.send(&RawRequest::from_bytes(again.request), target).await?;
+            let again = RawRequest::from_bytes(self.prepare(tool, target, req.as_bytes(), &[], &[]).await.request);
+            watch(Attempt::Sending(&again))?;
+            let ex = self.client.send(&again, target).await?;
+            watch(Attempt::Answered(&ex))?;
             self.observe(&ex.response);
             return Ok(ex);
         }
@@ -993,10 +1029,11 @@ impl AuthSession {
         let mut csrf = String::new();
         if let (Some(url), Some(re)) = (&p.csrf_url, &self.re.csrf) {
             let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-            let ex =
-                self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
+            let (id, ex) =
+                self.send_own(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await;
+            history.push(id);
+            let ex = ex?;
             self.observe(&ex.response);
-            history.push(self.record(&ex));
             csrf = re
                 .captures(&response_text(&ex.response))
                 .and_then(|c| c.get(1).or_else(|| c.get(0)))
@@ -1036,11 +1073,12 @@ impl AuthSession {
             }
         };
         // Send, following redirects (with cookies) like a browser would.
-        let mut ex =
-            self.client.send(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await?;
+        let (id, ex) =
+            self.send_own(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await;
+        history.push(id);
+        let mut ex = ex?;
         self.observe(&ex.response);
         find_token(&ex.response);
-        history.push(self.record(&ex));
         let mut current = url::Url::parse(login_url).map_err(|e| Error::InvalidInput(e.to_string()))?;
         for _ in 0..5 {
             let Ok(head) = parse_response_head(&ex.response) else { break };
@@ -1059,10 +1097,11 @@ impl AuthSession {
                 }
                 _ => RawRequest::build("GET", current.as_str(), &[], b"")?,
             };
-            ex = self.client.send(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await?;
+            let (id, next) = self.send_own(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await;
+            history.push(id);
+            ex = next?;
             self.observe(&ex.response);
             find_token(&ex.response);
-            history.push(self.record(&ex));
         }
 
         let final_text = response_text(&ex.response);
@@ -1074,9 +1113,10 @@ impl AuthSession {
         let (verify_text, status) = match &p.check_url {
             Some(u) => {
                 let (r, t) = RawRequest::build("GET", u, &[], b"")?;
-                let cex = self.client.send(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await?;
+                let (id, cex) = self.send_own(&RawRequest::from_bytes(self.apply_to(r.as_bytes(), &[], &t)), &t).await;
+                history.push(id);
+                let cex = cex?;
                 self.observe(&cex.response);
-                history.push(self.record(&cex));
                 let logged_out = self.is_logged_out(&cex.response);
                 let text = response_text(&cex.response);
                 (if logged_out { None } else { Some(text) }, parse_response_head(&cex.response).ok().map(|h| h.status))
@@ -1114,18 +1154,46 @@ impl AuthSession {
         })
     }
 
-    pub(crate) fn record(&self, ex: &Exchange) -> Option<i64> {
-        let store = Store::open(&self.project).ok()?;
-        store
-            .record(&Capture::new(
-                "auth",
-                &ex.target,
-                &ex.request,
-                Some(&ex.response),
-                Some(ex.duration_ms as i64),
-                None,
-            ))
-            .ok()
+    /// Sends one of the session's own requests (login, CSRF page, check, macro step) with
+    /// its row (source auth) written before it goes out and completed after, as in
+    /// [`crate::sent`]. The row id is None only when it couldn't be written; then nothing
+    /// is sent and the result is that error.
+    pub(crate) async fn send_own(&self, req: &RawRequest, target: &Target) -> (Option<i64>, Result<Exchange>) {
+        self.send_recorded(req, target, None).await
+    }
+
+    /// [`AuthSession::send_own`], keeping no content when `omit` (its reason) is given.
+    pub(crate) async fn send_recorded(
+        &self,
+        req: &RawRequest,
+        target: &Target,
+        omit: Option<&'static str>,
+    ) -> (Option<i64>, Result<Exchange>) {
+        let opened = crate::sent::SentLog::open(&self.project, "auth", self.no_store.load(Ordering::SeqCst));
+        let mut log = match opened {
+            Ok(log) => match omit {
+                Some(reason) => log.without_content(reason),
+                None => log,
+            },
+            Err(e) => return (None, Err(e)),
+        };
+        let recorded = match self.client.recorded_request(req, target) {
+            Ok(r) => r,
+            Err(e) => return (None, Err(e)),
+        };
+        let id = match log.pending(target, &recorded) {
+            Ok(id) => id,
+            Err(e) => return (None, Err(e)),
+        };
+        let result = self.client.send(req, target).await;
+        let done = match &result {
+            Ok(ex) => log.answered(id, ex).and_then(|_| crate::scan::passive::scan_late(&mut log.store, id).map(drop)),
+            Err(e) => log.failed(id, target, &recorded, &e.to_string()),
+        };
+        if let Err(e) = done {
+            eprintln!("brainproxy: history #{id} not completed: {e}");
+        }
+        (Some(id), result)
     }
 }
 

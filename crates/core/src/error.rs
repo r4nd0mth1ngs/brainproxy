@@ -44,6 +44,22 @@ impl Error {
         }
     }
 
+    /// The same error again, for one failure that is the result of several requests.
+    pub fn duplicate(&self) -> Error {
+        match self {
+            Error::InvalidInput(s) => Error::InvalidInput(s.clone()),
+            Error::NotFound(s) => Error::NotFound(s.clone()),
+            Error::OutOfScope(s) => Error::OutOfScope(s.clone()),
+            Error::Conflict(s) => Error::Conflict(s.clone()),
+            Error::Connect(s) => Error::Connect(s.clone()),
+            Error::Tls(s) => Error::Tls(s.clone()),
+            Error::Timeout(d) => Error::Timeout(*d),
+            Error::Protocol(s) => Error::Protocol(s.clone()),
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
+            Error::Store(e) => Error::Store(rusqlite::Error::UserFunctionError(e.to_string().into())),
+        }
+    }
+
     /// Process exit code. 2 is reserved for usage errors from argument parsing.
     pub fn exit_code(&self) -> i32 {
         match self {

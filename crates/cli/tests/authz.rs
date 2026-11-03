@@ -401,3 +401,29 @@ fn authz_list_reaps_a_run_whose_proxy_died() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
+
+#[test]
+fn a_named_request_still_needs_its_opt_ins() {
+    let srv = Server::start();
+    let p = tmp_project("named");
+    let logout = ok(&p, &["send", "--url", &srv.url("/logout"), "--auth", "alice"])["id"].to_string();
+    let delete =
+        ok(&p, &["send", "-X", "DELETE", "--url", &srv.url("/api/orders/3"), "--auth", "alice"])["id"].to_string();
+    assert_eq!(srv.logouts.load(Ordering::SeqCst), 1);
+
+    // Naming a logout doesn't replay it as every identity; nothing is sent.
+    let (code, v) = run(&p, &["authz", "run", "--as", "bob", "--history-id", &logout]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--exclude"), "{v}");
+    assert_eq!(srv.logouts.load(Ordering::SeqCst), 1);
+    // A pattern it doesn't match says the person means it.
+    ok(&p, &["authz", "run", "--as", "bob", "--history-id", &logout, "--exclude", "^$"]);
+    assert!(srv.logouts.load(Ordering::SeqCst) > 1);
+
+    // Nor a DELETE without its method.
+    let (code, v) = run(&p, &["authz", "run", "--as", "bob", "--history-id", &delete]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods DELETE"), "{v}");
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &delete, "--include-methods", "DELETE"]);
+    assert_eq!(r["requests"], 1, "{r}");
+}
