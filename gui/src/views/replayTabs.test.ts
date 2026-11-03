@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { closingSaves, fromSaved, saver, toSaved } from "./replayTabs.ts";
+import { CliError } from "../api.ts";
+import type { RepeaterTab } from "../store.tsx";
+import { MAX_WAIT, NEWER, addedSince, closingSaves, fromSaved, newerFormat, revisions, saver, serial, tabTexts, toSaved, type SavedTabs } from "./replayTabs.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -150,25 +152,33 @@ test("loading takes only well-formed values", () => {
   for (const active of [2, -1, "0", null, 0.5])
     assert.equal(fromSaved({ tabs: [{ request: "" }], active }, next).activeKey, null, String(active));
   for (const data of ["x", 3, [], { tabs: "no" }, { tabs: {} }, null]) assert.deepEqual(fromSaved(data, next), { tabs: [], activeKey: null });
-  const [ws, http, other] = fromSaved(
+  const loaded = fromSaved(
     {
       tabs: [
         { kind: "ws", request: "", messages: "m", wait: -1, until: 5 },
         { kind: "http", request: "", binary: "true", messages: ["m"], wait: 2, until: "u" },
-        { kind: "grpc", request: "", title: 9, target: ["t"] },
+        { kind: "grpc", request: "" },
+        { request: "", title: 9, target: ["t"] },
+        { kind: "ws", request: "", wait: 1e300 },
       ],
     },
     next,
   ).tabs;
+  const [ws, http, other, long] = loaded;
+  assert.equal(loaded.length, 4);
   assert.deepEqual(ws.ws, []);
   assert.equal(ws.wsWait, undefined);
   assert.ok(!ws.wsUntil, "until that isn't text");
   // An http tab ignores ws-only fields and a binary that isn't true.
   assert.deepEqual(Object.keys(http).sort(), ["key", "raw", "target", "title"]);
-  // An unknown kind opens as http; a title or target that isn't text is left out (numbered by position).
+  // A kind this version doesn't know is skipped, not opened as http (saving it would change it).
+  // A title or target that isn't text is left out (numbered by position).
   assert.equal(other.ws, undefined);
   assert.equal(other.title, "3");
   assert.equal(other.target, "");
+  // A wait Send would refuse (over a day) isn't taken.
+  assert.equal(long.wsWait, undefined);
+  assert.equal(fromSaved({ tabs: [{ kind: "ws", request: "", wait: MAX_WAIT }] }, next).tabs[0].wsWait, MAX_WAIT);
 });
 
 test("a change made while a save fails is the one tried again", async () => {
@@ -425,4 +435,134 @@ test("waiting on closing saves covers each one and outlasts a failure", async ()
   releaseA();
   await waiting;
   assert.equal(done, true);
+});
+
+test("tabs saved elsewhere since are told apart from the app's, duplicates counted", () => {
+  const a = { kind: "http", title: "a", target: "", request: "A" };
+  const b = { kind: "http", title: "b", target: "", request: "B" };
+  const known = tabTexts(JSON.stringify({ tabs: [a, a, b] }));
+  let k = 1;
+  // Two a's and a b were known: only the third a and the new WebSocket tab are new, numbered
+  // after the three open.
+  const r = addedSince(known, { rev: 3, tabs: [a, { ...a }, b, a, { kind: "ws", request: "W" }] }, () => k++, 4);
+  assert.deepEqual(
+    r.added.map((t) => [t.title, t.raw, !!t.ws]),
+    [
+      ["a", "A", false],
+      ["5", "W", true],
+    ],
+  );
+  assert.equal(r.now.length, 5);
+  // The CLI writes a wait of 3 as 3.0; read back it is the same tab.
+  assert.deepEqual(tabTexts({ tabs: [JSON.parse('{"kind":"ws","wait":3.0}')] }), tabTexts('{"tabs":[{"kind":"ws","wait":3}]}'));
+  assert.deepEqual(addedSince(known, { tabs: [b] }, () => k++).added, []);
+});
+
+test("one call at a time, in order, past a failure", async () => {
+  const one = serial();
+  const log: string[] = [];
+  const step = (name: string, ms: number, fail = false) =>
+    one(async () => {
+      log.push(`${name}+`);
+      await sleep(ms);
+      log.push(`${name}-`);
+      if (fail) throw new Error(name);
+      return name;
+    });
+  const results = await Promise.allSettled([step("a", 15), step("b", 1, true), step("c", 1)]);
+  assert.deepEqual(log, ["a+", "a-", "b+", "b-", "c+", "c-"]);
+  assert.deepEqual(results.map((r) => r.status), ["fulfilled", "rejected", "fulfilled"]);
+});
+
+/** A fake CLI holding one saved set, revisions and --if-revision as `replay tabs` keeps them. */
+function fakeCli(start: SavedTabs = { tabs: [] }) {
+  const db = { set: { v: 1, rev: 0, ...start } as SavedTabs & { rev: number } };
+  const calls: string[] = [];
+  const cli = async (args: string[], stdin?: string): Promise<any> => {
+    calls.push(args.slice(2).join(" "));
+    await sleep(1);
+    if (args.includes("save")) {
+      const want = Number(args[args.indexOf("--if-revision") + 1]);
+      if (want !== db.set.rev) throw new CliError("conflict", `at revision ${db.set.rev}, not ${want}`);
+      const given = JSON.parse(stdin!) as SavedTabs;
+      db.set = { ...db.set, ...given, rev: db.set.rev + 1 };
+      return { count: given.tabs.length, rev: db.set.rev };
+    }
+    return args.includes("--summary") ? { rev: db.set.rev, tabs: [] } : JSON.parse(JSON.stringify(db.set));
+  };
+  /** Another writer: an agent's `--append`. */
+  const append = (...tabs: SavedTabs["tabs"]) => (db.set = { ...db.set, tabs: [...db.set.tabs, ...tabs], rev: db.set.rev + 1 });
+  return { db, cli, calls, append };
+}
+
+function app(f: ReturnType<typeof fakeCli>, open: string[]) {
+  let k = 1;
+  const tabs: RepeaterTab[] = open.map((raw) => ({ key: k++, title: raw, target: "", raw }));
+  const added: string[][] = [];
+  const revs = revisions({
+    cli: f.cli,
+    body: () => JSON.stringify(toSaved(tabs, 0)),
+    add: (ts) => {
+      tabs.push(...ts);
+      added.push(ts.map((t) => t.raw));
+    },
+    count: () => tabs.length,
+    nextKey: () => k++,
+  });
+  return { tabs, added, revs, body: () => JSON.stringify(toSaved(tabs, 0)) };
+}
+
+test("the app's save keeps tabs an agent saved meanwhile", async () => {
+  const f = fakeCli({ tabs: [{ kind: "http", title: "mine", target: "", request: "mine" }] });
+  const a = app(f, ["mine"]);
+  a.revs.loaded(await f.cli(["replay", "tabs", "list"]));
+  // Saved while the app is open: the app's next save (any change, even switching tabs) conflicts,
+  // takes the agent's tab in, and saves both.
+  f.append({ kind: "http", title: "agent", target: "", request: "agent" });
+  a.tabs.push({ key: 99, title: "new", target: "", raw: "new" });
+  const wrote = await a.revs.save(a.body());
+  assert.deepEqual(a.added, [["agent"]]);
+  assert.deepEqual(f.db.set.tabs.map((t) => t.request), ["mine", "new", "agent"]);
+  assert.equal(wrote, a.body());
+  assert.equal(f.db.set.rev, 2);
+  // Nothing new since: a plain save, and a closed tab stays closed.
+  a.tabs.splice(0, 1);
+  await a.revs.save(a.body());
+  assert.deepEqual(f.db.set.tabs.map((t) => t.request), ["new", "agent"]);
+  assert.deepEqual(a.added, [["agent"]]);
+});
+
+test("coming back to the window shows an agent's tabs without a save", async () => {
+  const f = fakeCli();
+  const a = app(f, []);
+  a.revs.loaded(await f.cli(["replay", "tabs", "list"]));
+  await a.revs.check();
+  assert.deepEqual(f.calls, ["list", "list --summary"], "the full set is read only when the revision moved");
+  f.append({ kind: "ws", title: "feed", target: "", request: "ws", messages: ["hi"] });
+  await a.revs.check();
+  assert.deepEqual(a.added, [["ws"]]);
+  assert.deepEqual(a.tabs[0].ws, ["hi"]);
+  // The app saves them back at the revision it read, with no conflict and nothing doubled.
+  await a.revs.save(a.body());
+  assert.deepEqual(f.db.set.tabs.length, 1);
+  assert.deepEqual(a.added, [["ws"]]);
+  // A check queued behind a running save reads the revision that save set.
+  a.tabs.push({ key: 50, title: "x", target: "", raw: "x" });
+  await Promise.all([a.revs.save(a.body()), a.revs.check()]);
+  assert.deepEqual(a.added, [["ws"]], "its own save isn't taken for someone else's");
+});
+
+test("a set saved by a newer version isn't saved over", async () => {
+  assert.equal(newerFormat({ v: 2, tabs: [] }), true);
+  assert.equal(newerFormat({ v: 1, tabs: [] }), false);
+  assert.equal(newerFormat({ tabs: [] }), false);
+  const f = fakeCli();
+  const a = app(f, ["mine"]);
+  a.revs.loaded(await f.cli(["replay", "tabs", "list"]));
+  f.db.set = { v: 2, rev: 5, tabs: [] };
+  await assert.rejects(a.revs.save(a.body()), (e: Error) => e.message === NEWER);
+  assert.equal(f.db.set.rev, 5);
+  // Other errors are passed on as they are.
+  const b = app({ ...f, cli: async () => Promise.reject(new CliError("invalid_input", "over 16 MB")) }, []);
+  await assert.rejects(b.revs.save("{}"), /over 16 MB/);
 });

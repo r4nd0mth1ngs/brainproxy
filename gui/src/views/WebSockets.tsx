@@ -10,6 +10,7 @@ import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
+import { MAX_WAIT } from "./replayTabs";
 
 const PREVIEW = 300;
 
@@ -276,7 +277,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
         <span className="label" title="Seconds to keep listening after the last message">
           Listen
         </span>
-        <input className="input" type="number" min={0} step={0.5} style={{ width: 64 }} value={wait} onChange={(e) => setWait(Math.max(0, Number(e.target.value)))} />
+        <input className="input" type="number" min={0} max={MAX_WAIT} step={0.5} style={{ width: 64 }} value={wait} onChange={(e) => setWait(Math.min(MAX_WAIT, Math.max(0, Number(e.target.value) || 0)))} />
         <span className="label" title="Stop as soon as a received message matches this regex">
           Until
         </span>

@@ -168,7 +168,8 @@ Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 
 `store.tsx` keeps Replay's tabs in the project file through `replay tabs list` and `replay
 tabs save` (JSON on stdin, replacing the saved set; stored under one key of the `meta`
-table), with the logic in `views/replayTabs.ts`:
+table with a format version `v` and a revision `rev` that every save raises), with the
+logic in `views/replayTabs.ts`:
 
 - **Opening:** the saved tabs are read when the project opens, with new keys, and the saved
   active tab is shown. Tabs sent to Replay while they load stay, after them. Nothing is saved
@@ -180,17 +181,31 @@ table), with the logic in `views/replayTabs.ts`:
   an unchanged set isn't sent again. Closing the project or the window takes the editor's
   last keystrokes and saves what is waiting; so does *Save as…*, before it copies the file.
   A temporary project being discarded isn't saved.
+- **Saved elsewhere:** each save passes `--if-revision` with the revision the app last read
+  or wrote. If the set was saved elsewhere meanwhile (an agent, the command line), the save
+  fails with a conflict; the app then reads the set, adds the tabs it didn't know (a toast
+  says how many) after its own, and saves them all. Tabs the app closed stay closed. When
+  the window comes back to the front the app reads the revision (`list --summary`) and,
+  if it moved, takes in new tabs the same way, so an agent's tabs show up without a save.
+  Checks and saves run one at a time.
+- **Newer format:** a set with a higher `v` than this build writes is shown, but the app
+  doesn't save it (a toast says so), and `replay tabs save` refuses to save over it, since
+  the newer fields would be lost. A tab of a kind this build doesn't know isn't opened.
 - **What:** per tab its kind, title, target, the request (or handshake and messages), the
-  binary flag, and a WebSocket tab's Listen and Until (now kept when switching tabs too).
-  Never responses or the send history. Text goes as typed, auth placeholders included.
+  binary flag, and a WebSocket tab's Listen (at most 86400 s, as `ws send --wait`) and
+  Until (now kept when switching tabs too). Never responses or the send history. Text goes
+  as typed, auth placeholders included, and so do live `Cookie` or `Authorization` values in
+  a request sent over from history: `replay tabs list` returns them in full. Use `«auth:…»`
+  placeholders in tabs that are kept.
 - **Failures:** a refused save (over 500 tabs or 16 MB) is a toast, shown once per distinct
   error; the tabs stay open, and the next change or closing tries again. *Save as…* stops
   there and leaves the temporary project open (copying it would leave those tabs behind);
   switching project asks before closing without them.
-- **Agents:** `replay_tabs_save` is an MCP tool (not read-only, destructive: it replaces the
-  set; it sends nothing), so an agent can prepare tabs for a person to review and send.
-  `replay_tabs_list` is read-only and its output is marked untrusted, since requests often
-  come from the target's traffic.
+- **Agents:** `replay_tabs_save` is an MCP tool that only adds tabs there (`append`; not
+  destructive, sends nothing), so an agent can prepare tabs for a person to review and send
+  but can't replace or clear theirs. `replay_tabs_list` is read-only and its output is
+  marked untrusted, since requests often come from the target's traffic; `summary` and
+  `index` page through a set larger than the server's output cap.
 
 ## Look
 
@@ -260,10 +275,11 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   off), so Settings briefly turns intercept on and off again when it is off.
 - Replay's WebSocket tabs send text messages only (binary: `ws send --binary` or `--resend ID`
   from the CLI), and show one run at a time (each run is in Proxy › WebSockets).
-- Replay tabs are read only when the project opens. Tabs saved from elsewhere (an agent,
-  another window) while it is open are replaced by the app's next save, which follows any
-  change to its own tabs; reopen the project to see them first. In the browser build (`npm
-  run dev`) closing the tab can lose the last second of edits.
+- Tabs saved from elsewhere while the project is open show up on the app's next save or
+  when its window comes back to the front, not at once. Removing or changing tabs from
+  elsewhere while the app has them open doesn't stick: the app keeps its open tabs and
+  saves them again. In the browser build (`npm run dev`) closing the tab can lose the last
+  second of edits.
 - Proxy › WebSockets reloads the newest 5,000 connections every 2 s (`ws list --newest`);
   older ones are reachable with `ws list` or `query`. Messages are fetched incrementally.
   Only text messages can be sent to Replay; Copy payload refuses messages over 2 MB.

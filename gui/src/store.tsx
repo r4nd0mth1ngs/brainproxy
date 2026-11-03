@@ -4,7 +4,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { run } from "./api";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
-import { LIST_ARGS, SAVE_ARGS, closingSaves, fromSaved, saver, toSaved } from "./views/replayTabs";
+import { LIST_ARGS, NEWER, closingSaves, fromSaved, newerFormat, revisions, saver, toSaved } from "./views/replayTabs";
 
 export type Tab =
   | "dashboard"
@@ -156,22 +156,36 @@ export function AppProvider({
 
   // Replay's tabs live in the project file (`replay tabs list/save`): restored when it opens,
   // saved a moment after they change and when it closes. Nothing is saved until they have been
-  // read, so a failed read never replaces the saved ones.
+  // read, so a failed read never replaces the saved ones. Tabs saved elsewhere meanwhile (an
+  // agent's) are added here, when a save finds them or the window comes back to the front.
   const [tabsLoaded, setTabsLoaded] = useState(false);
   const tabsLoadedRef = useRef(false);
   const toastRef = useRef(toast);
   toastRef.current = toast;
+  // Made only when a save is due, not on every change: it can be large.
+  const tabsBody = useCallback(() => JSON.stringify(toSaved(repeaterRef.current, activeRef.current)), []);
+  const revsRef = useRef<ReturnType<typeof revisions> | null>(null);
+  revsRef.current ??= revisions({
+    cli: (args, stdin) => run(args, stdin == null ? { project } : { stdin, project }),
+    body: tabsBody,
+    add: (tabs) => {
+      setRepeater((cur) => [...cur, ...tabs]);
+      const n = tabs.length;
+      toastRef.current(`${n} Replay tab${n === 1 ? " was" : "s were"} added to the project from elsewhere (an agent or the command line)`);
+    },
+    count: () => repeaterRef.current.length,
+    nextKey: newKey,
+  });
+  const tabRevs = revsRef.current;
   const saverRef = useRef<ReturnType<typeof saver> | null>(null);
   saverRef.current ??= saver({
-    save: (body) => run(SAVE_ARGS, { stdin: body, project }),
+    save: tabRevs.save,
     delay: SAVE_TABS_AFTER_MS,
     onError: (e) => toastRef.current(`Replay tabs weren't saved to the project: ${e.message}. They stay open here.`, "error"),
   });
   const tabSaver = saverRef.current;
   const tempRef = useRef(temp);
   tempRef.current = temp;
-  // Made only when a save is due, not on every change: it can be large.
-  const tabsBody = useCallback(() => JSON.stringify(toSaved(repeaterRef.current, activeRef.current)), []);
   // Closing, switching project, or Save as: the editors' last keystrokes first, then save.
   const flushReplayTabs = useCallback(() => {
     editors.current.forEach((commit) => commit());
@@ -187,9 +201,12 @@ export function AppProvider({
         if (cancelled) return;
         const saved = fromSaved(data, newKey);
         tabSaver.loaded(JSON.stringify(toSaved(saved.tabs, saved.activeKey ?? 0)));
+        tabRevs.loaded(data);
         // Tabs sent here while they loaded stay, after the saved ones.
         setRepeater((cur) => [...saved.tabs, ...cur]);
         if (saved.activeKey != null && !activeRef.current) setRepeaterActive(saved.activeKey);
+        // Shown, but saving would drop what the newer version keeps.
+        if (newerFormat(data)) return toastRef.current(`Replay tabs aren't saved to this project: ${NEWER}.`, "error");
         tabsLoadedRef.current = true;
         setTabsLoaded(true);
       })
@@ -204,10 +221,18 @@ export function AppProvider({
       if (tempRef.current) tabSaver.cancel();
       else closing.add(project, flushReplayTabs());
     };
-  }, [project, tabSaver, setRepeater, setRepeaterActive, flushReplayTabs]);
+  }, [project, tabSaver, tabRevs, setRepeater, setRepeaterActive, flushReplayTabs]);
   useEffect(() => {
     if (tabsLoaded) tabSaver.schedule(tabsBody);
   }, [tabsLoaded, repeater, repeaterActive, tabSaver, tabsBody]);
+  // Back from the terminal where an agent saved tabs: they show up without waiting for a save.
+  // A failure here is left to the next save, which reports it.
+  useEffect(() => {
+    if (!tabsLoaded) return;
+    const check = () => void tabRevs.check().catch(() => {});
+    window.addEventListener("focus", check);
+    return () => window.removeEventListener("focus", check);
+  }, [tabsLoaded, tabRevs]);
   // The copy holds what the project holds, and the temporary one is deleted after: with tabs
   // that couldn't be saved it stays open, so they aren't lost.
   const saveAsWithTabs = useCallback(async () => {
