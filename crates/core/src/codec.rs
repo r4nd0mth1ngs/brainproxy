@@ -290,19 +290,27 @@ fn is_text(v: &[u8]) -> bool {
     std::str::from_utf8(v).is_ok_and(|s| s.chars().all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r')))
 }
 
-/// Whether base64 or hex output looks like progress: compressed data to unpack, a JSON
-/// object or array (UTF-8, so non-ASCII strings count), or printable ASCII. Under 12 bytes,
-/// chance printable output is common, so short text must also be at least half letters,
-/// digits, and spaces.
+/// Whether base64 or hex output looks like progress: compressed data to unpack, printable
+/// ASCII, or a JSON object or array (UTF-8, so non-ASCII strings count).
 fn looks_decoded(v: &[u8]) -> bool {
-    if compressed(v) || serde_json::from_slice::<serde_json::Value>(v).is_ok_and(|j| j.is_object() || j.is_array()) {
-        return true;
-    }
+    // JSON last: the ASCII check reads the bytes once, while parsing walks the whole tree.
+    compressed(v) || printable_ascii(v) || json_container(v)
+}
+
+/// Printable ASCII. Under 12 bytes, chance printable output is common, so short text must
+/// also be at least half letters, digits, and spaces.
+fn printable_ascii(v: &[u8]) -> bool {
     if !v.iter().all(|&b| b.is_ascii_graphic() || matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
         return false;
     }
     let wordy = v.iter().filter(|&&b| b.is_ascii_alphanumeric() || b == b' ').count();
     wordy > 0 && (v.len() >= 12 || wordy * 2 >= v.len())
+}
+
+/// A JSON object or array, checked without building it (decoded output can be megabytes).
+fn json_container(v: &[u8]) -> bool {
+    matches!(v.iter().find(|b| !b.is_ascii_whitespace()), Some(b'{' | b'['))
+        && serde_json::from_slice::<serde::de::IgnoredAny>(v).is_ok()
 }
 
 fn compress(mut encoder: impl Read) -> Result<Vec<u8>> {
@@ -743,6 +751,22 @@ mod tests {
         assert_eq!(s.output, r#"{"name":"José"}"#.as_bytes());
         let hex = encode("hex", r#"["café"]"#.as_bytes()).unwrap();
         assert_eq!(smart_decode(&hex).output, r#"["café"]"#.as_bytes());
+        // Short JSON the ASCII check finds too sparse still counts.
+        assert!(looks_decoded(b"[1]") && !printable_ascii(b"[1]"));
+    }
+
+    #[test]
+    fn looks_decoded_tries_ascii_before_json() {
+        // ASCII JSON passes the ASCII check, so looks_decoded never parses it.
+        let big = format!("[{}0]", "0,".repeat(100_000));
+        assert!(printable_ascii(big.as_bytes()) && looks_decoded(big.as_bytes()));
+        // The JSON fallback takes objects and arrays only, whole, and with any UTF-8 inside.
+        assert!(json_container(r#" {"name":"José"}"#.as_bytes()) && !printable_ascii(r#"{"name":"José"}"#.as_bytes()));
+        assert!(json_container("[\"café\"]\n".as_bytes()));
+        assert!(!json_container(b"12"));
+        for not in [r#""José""#, r#"{"name":"José"} x"#, r#"{"name":"José""#, "José"] {
+            assert!(!json_container(not.as_bytes()) && !looks_decoded(not.as_bytes()), "{not}");
+        }
     }
 
     #[test]
