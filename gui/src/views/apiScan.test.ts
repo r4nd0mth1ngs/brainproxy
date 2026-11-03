@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   EMPTY_AUTH,
+  afterServerChange,
+  droppedKeyText,
   environmentProblem,
   EMPTY_OAUTH,
   oauthAddArgs,
@@ -336,6 +338,59 @@ test("which profile a scan runs with", () => {
   assert.equal(authSummary({ ...EMPTY_AUTH, mode: "profile", existing: "e" }), 'existing profile "e"');
   assert.equal(authSummary({ ...EMPTY_AUTH, mode: "key", keyKind: "api_key", place: "query", keyName: "k", savedProfile: "p" }), 'API key in query parameter k, saved in profile "p"');
   assert.match(authSummary({ ...EMPTY_AUTH, mode: "key", keyKind: "bearer", savedProfile: "p" }), /bearer token/);
+});
+
+test("a query key saved for one server is set aside on another, and back on its own", () => {
+  const A = "https://a.test";
+  const B = "https://b.test";
+  const saved: AuthState = { ...EMPTY_AUTH, mode: "key", place: "query", keyName: "api_key", profileName: "pets-api", savedProfile: "pets-api", keyOrigins: [A] };
+  const move = (a: AuthState, origins: string[]): AuthState => ({ ...a, ...afterServerChange(a, origins) });
+
+  assert.deepEqual(afterServerChange(saved, [A]), {}, "the same origins");
+  assert.deepEqual(afterServerChange({ ...saved, keyOrigins: [A, B] }, [B]), {}, "fewer origins: the key still reaches each one");
+
+  const away = move(saved, [A, B]);
+  assert.equal(away.savedProfile, "", "an origin the key wasn't saved for");
+  assert.equal(away.profileName, "", "so a free name is picked for the new profile");
+  assert.deepEqual(away.dropped, { profile: "pets-api", keyName: "api_key", origins: [A] });
+  assert.equal(authProfile(away), "");
+  assert.deepEqual(authProblems(away), ["Save the key again for this server, or choose No authentication."]);
+  assert.equal(
+    droppedKeyText(away, [A, B]),
+    'The server changed. The key saved in the profile "pets-api" only goes to https://a.test, which it was saved for, not to https://b.test. Save the key again for this server, or go back to the server it was saved for and it\'s used as before.',
+  );
+  assert.equal(authSummary(away), "API key in query parameter api_key, not saved, so the scan would run without it");
+  assert.equal(move(away, [B]).dropped, away.dropped, "another server it doesn't cover changes nothing");
+  assert.equal(move(saved, []).savedProfile, "", "nothing in scope isn't covered");
+
+  // Back where it was saved for, even after the form was changed: the same key, said once.
+  const back = move({ ...away, keyName: "typed", place: "header" }, [A]);
+  assert.equal(back.savedProfile, "pets-api");
+  assert.equal(back.place, "query");
+  assert.equal(back.keyName, "api_key");
+  assert.equal(back.dropped, null);
+  assert.equal(droppedKeyText(back, [A]), "");
+  assert.deepEqual(authProblems(back), []);
+  assert.deepEqual(back, { ...saved, profileName: "" });
+
+  // Saved again for the new server: the old profile isn't brought back over the new one.
+  const resaved = { ...away, savedProfile: "pets-api-2", keyOrigins: [A, B] };
+  assert.deepEqual(afterServerChange(resaved, [A, B]), {});
+  assert.equal(move(resaved, [A]).savedProfile, "pets-api-2");
+  assert.equal(droppedKeyText(resaved, [A, B]), "");
+  // Another choice made, or the key removed: nothing to bring back.
+  assert.deepEqual(afterServerChange({ ...away, mode: "none" }, [A]), {});
+  assert.equal(droppedKeyText({ ...away, mode: "none" }, [A, B]), "");
+  assert.deepEqual(afterServerChange({ ...away, dropped: null }, [A]), {});
+
+  // Only a query key is bound to origins.
+  for (const other of [
+    { ...saved, place: "header" as const },
+    { ...saved, keyKind: "bearer" as const },
+    { ...saved, mode: "oauth" as const },
+    { ...saved, mode: "profile" as const, existing: "e" },
+  ])
+    assert.deepEqual(afterServerChange(other, [B]), {}, JSON.stringify(other));
 });
 
 test("signer coverage", () => {

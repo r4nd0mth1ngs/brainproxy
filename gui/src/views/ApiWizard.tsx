@@ -13,6 +13,7 @@ import { PostWarning, SPEEDS, WizardProgress, type Speed } from "./Wizard";
 import {
   EMPTY_AUTH,
   EMPTY_TARGET,
+  afterServerChange,
   apiDepthText,
   apiSpeedText,
   authProblems,
@@ -28,6 +29,7 @@ import {
   likelyInScope,
   defaultTarget,
   dropOptIn,
+  droppedKeyText,
   environmentProblem,
   excludedText,
   filterOperations,
@@ -149,8 +151,8 @@ export function ApiWizard(p: Props) {
       if (t) {
         if (preview && d.document_sha256 !== preview.document_sha256) setDocChanged(true);
         // A saved query key may only go to the origins it was saved for: a new server needs it saved again.
-        const inScopeOrigins = (x: ApiPreview) => operationOrigins(likelyInScope(x.requests)).join(" ");
-        if (preview && inScopeOrigins(d) !== inScopeOrigins(preview)) setAuth((a) => (a.savedProfile && a.place === "query" ? { ...a, savedProfile: "", profileName: "" } : a));
+        const origins = operationOrigins(likelyInScope(d.requests));
+        setAuth((a) => ({ ...a, ...afterServerChange(a, origins) }));
         // A variable gave the definition its address, so no base URL is needed after all.
         if (preview?.base_url_required && !d.base_url_required && !t.baseUrl.trim()) setCustomBase(false);
         setPreviewedKey(keyOf(src, t));
@@ -260,7 +262,7 @@ export function ApiWizard(p: Props) {
           ? authProblems(auth)
           : step === 3
             ? selectionProblems(selected)
-            : [];
+            : authProblems(auth);
   const canGoOn = step === 0 ? previewed && !previewing : !previewing && !previewStale && !problem && blockers.length === 0;
 
   return (
@@ -335,7 +337,7 @@ export function ApiWizard(p: Props) {
             {step === 1 && (previewing || previewWaits) ? "Checking…" : "Next"}
           </button>
         ) : (
-          <button className="btn primary" disabled={busy || !selected.length} onClick={start}>
+          <button className="btn primary" disabled={busy || !selected.length || blockers.length > 0} onClick={start}>
             {busy ? "Starting…" : "Start scan"}
           </button>
         )}
@@ -628,6 +630,7 @@ function AuthStep(p: {
   const inScope = ops.filter((o) => o.in_scope);
   const origins = operationOrigins(likelyInScope(ops));
   const taken = data?.profiles.map((x) => x.name) ?? [];
+  const droppedNote = droppedKeyText(a, origins);
 
   const reload = () =>
     loadAuthData().then(
@@ -698,18 +701,21 @@ function AuthStep(p: {
     setSaving(false);
   };
 
-  /** Before other credentials replace the saved ones: their profile holds stored secrets, so offer to remove it. */
+  /** Before other credentials replace the saved ones, or a key set aside for another server: their profile holds stored secrets, so offer to remove it. */
   const leaveSaved = async () => {
-    const saved = a.savedProfile;
+    const dropped = a.savedProfile ? null : a.dropped;
+    const saved = a.savedProfile || dropped?.profile;
     if (!saved || (a.mode !== "key" && a.mode !== "oauth")) return;
     const withSigner = a.signer?.profile === saved;
-    const what = a.mode === "oauth" ? "the OAuth client secret and tokens" : "the key";
+    const what = a.mode === "oauth" ? "the OAuth client secret and tokens you saved" : dropped ? `the key you saved for ${listWords(dropped.origins)}` : "the key you saved";
     const remove = await confirm(
       `Remove the profile "${saved}"?`,
-      `It holds ${what} you saved${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. Keep it to choose it later as an existing profile.`,
+      `It holds ${what}${withSigner ? ", and the signer set up in it" : ""}, stored in the project file. Keep it to choose it later as an existing profile.`,
       "Remove it",
       "Keep it",
     );
+    // Answered: the wizard doesn't refer to that profile any more.
+    if (dropped) set((prev) => (prev.dropped?.profile === dropped.profile ? { dropped: null } : {}));
     if (!remove) return;
     try {
       await run(["auth", "remove", "--", saved]);
@@ -751,6 +757,8 @@ function AuthStep(p: {
           <span>{taken.length ? "One you already set up." : "This project has none yet."}</span>
         </button>
       </div>
+
+      {droppedNote && <div className="wiz-warn">{droppedNote}</div>}
 
       {a.mode === "key" && <KeyFields auth={a} set={set} preview={p.preview} taken={taken} loaded={!!data} origins={origins} reload={reload} leave={leaveSaved} />}
 
@@ -863,7 +871,7 @@ function KeyFields(p: {
   loaded: boolean;
   origins: string[];
   reload: () => Promise<unknown>;
-  /** Before another key replaces the saved one: offers to remove the profile holding it. */
+  /** Before another key replaces the saved one, or once it replaced one set aside: offers to remove the profile holding it. */
   leave: () => Promise<void>;
 }) {
   const a = p.auth;
@@ -899,8 +907,10 @@ function KeyFields(p: {
       await run(keyAddArgs(a, p.origins), { env: keyEnv(a.keyKind, value) });
       if (input.current) input.current.value = "";
       setHasValue(false);
-      p.set({ savedProfile: a.profileName.trim() });
+      p.set({ savedProfile: a.profileName.trim(), keyOrigins: p.origins });
       await p.reload();
+      // `leave` is from before this save, so it offers the profile of the key set aside.
+      if (a.dropped) await p.leave();
     } catch (e: any) {
       setProblem(scrubSecret(e.message, value));
     }
@@ -1158,6 +1168,7 @@ function StartStep(p: {
 }) {
   const d = p.preview;
   const depth = DEPTHS.find((x) => x.id === p.depth)!;
+  const dropped = droppedKeyText(p.auth, operationOrigins(likelyInScope(d.requests)));
   return (
     <div className="wiz-body">
       <label className="label">How thorough should it be?</label>
@@ -1195,7 +1206,7 @@ function StartStep(p: {
           </>
         )}
         <dt>Authentication</dt>
-        <dd>{authSummary(p.auth)}</dd>
+        <dd className={p.auth.mode === "key" && !p.auth.savedProfile ? "s5" : ""}>{authSummary(p.auth)}</dd>
         <dt>Signing</dt>
         <dd>{signingSummary(p.auth)}</dd>
         <dt>Operations</dt>
@@ -1207,6 +1218,7 @@ function StartStep(p: {
         <dt>Speed</dt>
         <dd className={p.speed === "fast" ? "s5" : ""}>{SPEEDS.find((s) => s.id === p.speed)!.title}</dd>
       </dl>
+      {dropped && <div className="wiz-warn danger">{dropped}</div>}
       {p.problem && <div className="wiz-problem">{p.problem}</div>}
       {p.speed === "fast" && (
         <div className="wiz-warn danger">

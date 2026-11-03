@@ -319,7 +319,11 @@ attack type, and pick payloads:
     can't widen the scope.
   - **Authentication** is optional and defaults to none:
     - An API key or bearer token, in a header or the query string. The value is kept in the auth
-      profile, as static headers are, and history holds a placeholder.
+      profile, as static headers are, and history holds a placeholder. A key in the query string
+      only goes to the addresses it was saved for: if you then choose a server elsewhere, the
+      wizard says the key has to be saved again, and the scan can't start until you save it, go
+      back to that server, or choose something else. Saving it again, or choosing something else,
+      offers to remove the profile saved before.
     - **OAuth 2:** client credentials, password, refresh token, or a browser sign-in (authorization
       code with PKCE), prefilled from what the definition declares; an OpenID Connect discovery URL
       can fill in the endpoints. Saving gets a token straight away, or runs the browser sign-in
