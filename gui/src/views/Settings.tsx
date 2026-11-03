@@ -1401,7 +1401,7 @@ function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => 
 }
 
 const EXPOSED =
-  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours, with this project's auth profiles, session rules and platform auth (Basic, Digest, NTLM) applied, and are recorded in this project. Live access-control testing started from Access uses the same listener, so their requests are also sent as each identity. It is saved in this project file, and the proxy starts that way whenever the file is opened. Use it only on a network you trust, or block the port in a firewall.";
+  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours, with this project's auth profiles, session rules and platform auth (Basic, Digest, NTLM) applied, and are recorded in this project with their client address, the device they came from. Live access-control testing started from Access uses the same listener, so their requests are also sent as each identity. It is saved in this project file, and the proxy starts that way whenever the file is opened. Use it only on a network you trust, or block the port in a firewall.";
 
 /** Who can connect to the proxy, invisible mode and the redirect (proxyMode.ts). */
 function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => void }) {

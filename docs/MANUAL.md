@@ -700,7 +700,7 @@ byte, side by side or unified.
     interface (0.0.0.0), for another device. The second asks first: anyone who can reach
     your computer can then use the proxy without a password, their requests get the
     project's auth profiles, session rules and platform auth (Basic, Digest, NTLM), and
-    they are recorded in the project. Its proxy starts that way whenever the project opens:
+    they are recorded in the project with their client address (`client_addr`). Its proxy starts that way whenever the project opens:
     a message says so, the top-bar pill says *open to the network* while it runs, and this
     page shows a warning. Live access-control testing started from **Access** when the proxy
     is off starts it the same way, so other devices' requests are then also sent as each
