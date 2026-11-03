@@ -42,7 +42,7 @@ const RISK_TEXT: Record<Risk, string> = {
   info: "Observations, not problems on their own.",
 };
 
-const RISK_SQL = `SELECT risk, count(*) FROM findings WHERE state <> 'false_positive' GROUP BY risk`;
+const RISK_SQL = `SELECT risk, count(*) FROM findings WHERE state NOT IN ('false_positive', 'removed') GROUP BY risk`;
 
 /** The warning at the Start step, in every guided scan. */
 export function PostWarning() {

@@ -49,7 +49,7 @@ const TREE_SQL = `SELECT h.scheme, h.host, h.port, h.path, group_concat(DISTINCT
   group_concat(DISTINCT h.status) AS statuses, count(*) AS n, max(h.id) AS last, f.risk, f.issues
 FROM history h
 LEFT JOIN (SELECT x.scheme s, x.host hh, x.port pp, x.path p, max(f.risk_level) risk, count(DISTINCT f.id) issues
-  FROM findings f JOIN history x ON x.id = f.history_id WHERE f.state <> 'false_positive' GROUP BY 1, 2, 3, 4) f
+  FROM findings f JOIN history x ON x.id = f.history_id WHERE f.state NOT IN ('false_positive', 'removed') GROUP BY 1, 2, 3, 4) f
   ON f.s = h.scheme AND f.hh = h.host AND f.pp = h.port AND f.p = h.path
 WHERE (?1 OR h.source NOT IN ('scan', 'fuzz'))
   AND (NOT ?2 OR h.error IS NULL OR h.error NOT LIKE 'out of scope%')

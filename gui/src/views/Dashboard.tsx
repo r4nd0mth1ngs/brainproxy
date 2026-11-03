@@ -13,9 +13,9 @@ const RISKS: Risk[] = ["high", "medium", "low", "info"];
 const STATS_SQL = `SELECT count(*) AS requests, count(DISTINCT host) AS hosts, count(DISTINCT host || ':' || port || path) AS paths,
   min(time) AS first, max(time) AS last FROM history`;
 
-const RISK_SQL = `SELECT risk, count(*) AS n FROM findings WHERE state <> 'false_positive' GROUP BY risk`;
+const RISK_SQL = `SELECT risk, count(*) AS n FROM findings WHERE state NOT IN ('false_positive', 'removed') GROUP BY risk`;
 
-const RECENT_SQL = `SELECT id, name, risk, url, param, time FROM findings WHERE state <> 'false_positive' ORDER BY id DESC LIMIT 8`;
+const RECENT_SQL = `SELECT id, name, risk, url, param, time FROM findings WHERE state NOT IN ('false_positive', 'removed') ORDER BY id DESC LIMIT 8`;
 
 export function DashboardView({ active }: { active: boolean }) {
   const app = useApp();
