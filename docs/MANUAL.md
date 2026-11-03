@@ -753,6 +753,10 @@ Crawl and active-scan scope and safety flags:
   or the proxy isn't replayed by a later scan unless `--include-methods MUTATION` (or `all`) says
   so. A request picked with `--history-id` needs the same opt-in: naming a DELETE or a mutation
   without `--include-methods DELETE` (or `MUTATION`) is refused with exit code 2 before anything is sent.
+- `scan active --checks`: the same opt-in applies to the requests a template sends, from any
+  store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
+  without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
+  check does send is recorded in history (source `scan`), finding or not.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
   GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
