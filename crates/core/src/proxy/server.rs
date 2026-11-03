@@ -64,6 +64,17 @@ pub struct ProxyOptions {
     pub authz: Option<Arc<LiveAuthz>>,
 }
 
+tokio::task_local! {
+    /// The client of the connection being served, for the captures made while serving it
+    /// (set per connection, and again on each HTTP/2 stream's task).
+    static PEER: SocketAddr;
+}
+
+/// The address of the proxy client being served, outside a connection None.
+pub(crate) fn client_addr() -> Option<String> {
+    PEER.try_with(|p| p.to_string()).ok()
+}
+
 /// A capture for the writer, with the request to offer for live access-control testing.
 struct Recorded {
     capture: Capture,
@@ -246,14 +257,14 @@ pub async fn run(
                 tcp.set_nodelay(true).ok();
                 ctx.stats.connections.fetch_add(1, Ordering::Relaxed);
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                tokio::spawn(PEER.scope(peer, async move {
                     if let Err(e) = handle_connection(&ctx, tcp, peer).await {
                         ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
                         if !matches!(e, Error::Io(_)) {
                             eprintln!("brainproxy: {peer}: {e}");
                         }
                     }
-                });
+                }));
             }
         }
     }
@@ -595,14 +606,19 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let (req, respond) = accepted.map_err(h2_error)?;
         ctx.stats.requests.fetch_add(1, Ordering::Relaxed);
         let (ctx, target) = (ctx.clone(), target.clone());
-        tokio::spawn(async move {
+        let stream = async move {
             if let Err(e) = serve_h2_stream(&ctx, req, respond, &target).await {
                 ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
                 if !matches!(e, Error::Io(_)) {
                     eprintln!("brainproxy: {}: HTTP/2 stream: {e}", target.origin());
                 }
             }
-        });
+        };
+        // A task of its own doesn't see the connection's client address: hand it on.
+        match PEER.try_with(|p| *p) {
+            Ok(peer) => tokio::spawn(PEER.scope(peer, stream)),
+            Err(_) => tokio::spawn(stream),
+        };
     }
     Ok(())
 }

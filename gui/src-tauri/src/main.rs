@@ -92,6 +92,8 @@ fn cli_cancel(call: String, running: tauri::State<'_, Cancellable>) {
 async fn run(project: &str, args: &[String], stdin: Option<Vec<u8>>, env: &HashMap<String, String>) -> Value {
     let mut cmd = Command::new(binary());
     cmd.args(["--format", "json", "--project"]).arg(project).args(args).envs(env);
+    // What the CLI records is marked as the app's (origin `gui`).
+    cmd.env("BRAINPROXY_CLIENT", "gui");
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

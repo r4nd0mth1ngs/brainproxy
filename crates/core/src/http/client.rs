@@ -139,6 +139,7 @@ fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> R
 impl Client {
     pub fn new(opts: SendOptions) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::provenance::note_sni(opts.sni.as_deref());
         let config = tls_config(opts.verify_tls, b"http/1.1", None).expect("TLS configuration without a certificate");
         let h2_config = tls_config(opts.verify_tls, b"h2", None).expect("TLS configuration without a certificate");
         Self {

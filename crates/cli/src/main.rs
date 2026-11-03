@@ -285,6 +285,10 @@ enum HistoryCmd {
         source: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Who or what recorded the entry: gui (the desktop app), cli (a terminal or script), mcp (an
+        /// agent through MCP), or unknown (recorded before brainproxy kept it).
+        #[arg(long, value_parser = ["gui", "cli", "mcp", "unknown"])]
+        origin: Option<String>,
         /// Substring to search for in raw requests and responses.
         #[arg(long)]
         contains: Option<String>,
@@ -823,13 +827,14 @@ fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
 fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        HistoryCmd::List { host, method, status, source, tag, contains, after, limit } => {
+        HistoryCmd::List { host, method, status, source, tag, origin, contains, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,
                 method,
                 status,
                 source,
                 tag,
+                origin,
                 contains,
                 after_id: after,
                 limit: Some(limit),
@@ -841,7 +846,8 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                     .map(|e| {
                         let status = e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
                         let len = e.resp_body_length.unwrap_or(0);
-                        format!("{:>6}  {:<4} {:<7} {}  {len}B", e.id, status, e.method, e.url)
+                        let origin = e.origin.as_deref().unwrap_or("unknown");
+                        format!("{:>6}  {:<4} {:<7} {}  {len}B  {origin}", e.id, status, e.method, e.url)
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -868,8 +874,27 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
             );
             data["request"] = body_value(&item.request, max_body);
             data["entry"] = json!(item.entry);
+            data["origin_text"] =
+                json!(format!("recorded {}", brainproxy_core::provenance::describe(item.entry.origin.as_deref())));
             out.ok(data, || {
-                format!("{}\n\n{}", String::from_utf8_lossy(&item.request), String::from_utf8_lossy(&item.response))
+                let e = &item.entry;
+                let mut about = vec![format!(
+                    "#{id} {} recorded {}",
+                    e.source,
+                    brainproxy_core::provenance::describe(e.origin.as_deref())
+                )];
+                if let Some(a) = &e.client_addr {
+                    about.push(format!("proxy client {a}"));
+                }
+                if let Some(n) = &e.sni {
+                    about.push(format!("TLS server name (SNI) {n}"));
+                }
+                format!(
+                    "{}\n\n{}\n\n{}",
+                    about.join(" · "),
+                    String::from_utf8_lossy(&item.request),
+                    String::from_utf8_lossy(&item.response)
+                )
             });
         }
         HistoryCmd::Note { id, text } => {

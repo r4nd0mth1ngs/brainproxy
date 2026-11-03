@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -67,6 +67,18 @@ CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
+
+/// Provenance: who or what recorded a row (rows from before stay NULL, "unknown"), the proxy
+/// client's address, the overridden TLS server name, and who last changed a finding's state.
+const SCHEMA_V13: &str = "
+ALTER TABLE history ADD COLUMN origin TEXT;
+ALTER TABLE history ADD COLUMN client_addr TEXT;
+ALTER TABLE history ADD COLUMN sni TEXT;
+CREATE INDEX IF NOT EXISTS history_origin ON history(origin);
+ALTER TABLE findings ADD COLUMN origin TEXT;
+ALTER TABLE findings ADD COLUMN state_origin TEXT;
+ALTER TABLE findings ADD COLUMN state_changed_at TEXT;
 ";
 
 const SCHEMA_V2: &str = "
@@ -203,6 +215,14 @@ pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
     ("tags", "TEXT", "JSON array of tags (set with `history tag`)"),
     ("request", "BLOB", "Raw request bytes exactly as sent"),
     ("response", "BLOB", "Raw response bytes exactly as received"),
+    (
+        "origin",
+        "TEXT",
+        "Who or what recorded it: gui (the desktop app), cli (a terminal or script), mcp (an agent through MCP); \
+         NULL for entries recorded before brainproxy kept it",
+    ),
+    ("client_addr", "TEXT", "Proxy client address (ip:port) for source proxy; NULL otherwise"),
+    ("sni", "TEXT", "TLS server name sent when overridden with --sni; NULL when it was the target host"),
 ];
 
 pub const FUNCTIONS: &[(&str, &str)] = &[
@@ -246,6 +266,12 @@ pub struct HistoryEntry {
     pub error: Option<String>,
     pub note: Option<String>,
     pub tags: Vec<String>,
+    /// gui, cli or mcp; None for entries recorded before it was kept.
+    pub origin: Option<String>,
+    /// The proxy client's address, for proxy entries.
+    pub client_addr: Option<String>,
+    /// The TLS server name sent, when overridden.
+    pub sni: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +290,8 @@ pub struct HistoryFilter {
     pub status: Option<u16>,
     pub source: Option<String>,
     pub tag: Option<String>,
+    /// gui, cli, mcp, or unknown (entries from before origins were kept).
+    pub origin: Option<String>,
     /// Substring searched in the raw request and response.
     pub contains: Option<String>,
     pub after_id: Option<i64>,
@@ -460,6 +488,9 @@ impl Store {
         }
         if version < 12 {
             self.conn.execute_batch(crate::ws::db::SCHEMA)?;
+        }
+        if version < 13 {
+            self.conn.execute_batch(SCHEMA_V13)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -838,6 +869,10 @@ impl Store {
         if let Some(t) = &f.tag {
             push("EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)", Box::new(t.clone()));
         }
+        if let Some(o) = &f.origin {
+            // Entries from before origins were kept have none: "unknown".
+            push("coalesce(origin, 'unknown') = ?", Box::new(o.clone()));
+        }
         if let Some(id) = f.after_id {
             push("id > ?", Box::new(id));
         }
@@ -870,10 +905,10 @@ impl Store {
                 |r| {
                     Ok(HistoryItem {
                         entry: row_to_entry(r)?,
-                        target: Target { scheme: r.get(13)?, host: r.get(14)?, port: r.get(15)? },
-                        request: r.get(16)?,
-                        response: r.get(17)?,
-                        resp_body: r.get(18)?,
+                        target: Target { scheme: r.get("scheme")?, host: r.get("host")?, port: r.get("port")? },
+                        request: r.get("request")?,
+                        response: r.get("response")?,
+                        resp_body: r.get("resp_body")?,
                     })
                 },
             )
@@ -997,9 +1032,9 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
         "INSERT INTO history (source, scheme, host, port, method, url, path, query,
             req_headers, req_content_type, req_body, req_body_text,
             status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
-            title, duration_ms, error, request, response)
+            title, duration_ms, error, request, response, origin, client_addr, sni)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-            ?20, ?21, ?22, ?23, ?24)",
+            ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             c.source,
             c.scheme,
@@ -1025,6 +1060,9 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
             c.error,
             c.request,
             c.response,
+            c.origin.as_deref().unwrap_or(crate::provenance::origin()),
+            c.client_addr,
+            c.sni.clone().or_else(|| crate::provenance::sni_for(&c.scheme)),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1113,7 +1151,7 @@ fn text_arg(ctx: &rusqlite::functions::Context, idx: usize) -> rusqlite::Result<
 }
 
 const ENTRY_COLS: &str = "id, time, source, method, url, status, resp_content_type, resp_body_length, \
-    title, duration_ms, error, note, tags";
+    title, duration_ms, error, note, tags, origin, client_addr, sni";
 
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<HistoryEntry> {
     let tags: String = r.get(12)?;
@@ -1131,6 +1169,9 @@ fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<HistoryEntry> {
         error: r.get(10)?,
         note: r.get(11)?,
         tags: serde_json::from_str(&tags).unwrap_or_default(),
+        origin: r.get(13)?,
+        client_addr: r.get(14)?,
+        sni: r.get(15)?,
     })
 }
 
@@ -1148,6 +1189,12 @@ mod tests {
         store.record_exchange("send", &ex).unwrap()
     }
 
+    /// Takes a project back to before schema v13.
+    const UNDO_V13: &str = "DROP INDEX history_origin;
+        ALTER TABLE history DROP COLUMN origin; ALTER TABLE history DROP COLUMN client_addr;
+        ALTER TABLE history DROP COLUMN sni; ALTER TABLE findings DROP COLUMN origin;
+        ALTER TABLE findings DROP COLUMN state_origin; ALTER TABLE findings DROP COLUMN state_changed_at;";
+
     #[test]
     fn a_project_on_v11_gets_the_websocket_tables() {
         let dir = std::env::temp_dir().join(format!("bp-store-v11-{}", std::process::id()));
@@ -1156,6 +1203,7 @@ mod tests {
         let path = dir.join("p.bpdb");
         {
             let store = Store::open(&path).unwrap();
+            store.conn.execute_batch(UNDO_V13).unwrap();
             store.conn.execute_batch("DROP TABLE ws_messages; DROP TABLE ws_connections;").unwrap();
             store.conn.pragma_update(None, "user_version", 11).unwrap();
         }
@@ -1171,6 +1219,70 @@ mod tests {
         assert_eq!(tables, 2);
         let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_on_v12_gets_provenance_columns() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        {
+            // A v12 project: no provenance columns, one entry and one finding.
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(&format!(
+                    "{UNDO_V13}
+                     INSERT INTO history (source, scheme, host, port, method, url, path, req_headers, req_body,
+                         request, response) VALUES ('send', 'http', 'a.test', 80, 'GET', 'http://a.test/', '/', '[]',
+                         x'', x'', x'');
+                     INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host,
+                         method, url, dedupe) VALUES ('passive', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET',
+                         'http://a.test/', 'k');"
+                ))
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 12).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // Old rows don't guess: their origin is unknown.
+        let old = store.get(1).unwrap().entry;
+        assert_eq!((old.origin, old.client_addr, old.sni), (None, None, None));
+        let unknown = HistoryFilter { origin: Some("unknown".into()), ..Default::default() };
+        assert_eq!(store.list(&unknown).unwrap().len(), 1);
+        let f = store.finding_get(1).unwrap();
+        assert!(f["origin"].is_null() && f["state_origin"].is_null(), "{f}");
+        assert_eq!(f["origin_text"], "added from an unknown origin (recorded before brainproxy kept it)");
+
+        // New rows carry this process's origin, and what a capture says about the wire.
+        let id = sample(&store);
+        assert_eq!(store.get(id).unwrap().entry.origin.as_deref(), Some(crate::provenance::origin()));
+        let c = Capture {
+            source: "proxy".into(),
+            scheme: "https".into(),
+            method: "GET".into(),
+            url: "https://a.test/".into(),
+            origin: Some("gui".into()),
+            client_addr: Some("127.0.0.1:5000".into()),
+            sni: Some("b.test".into()),
+            ..Default::default()
+        };
+        let e = store.get(store.record(&c).unwrap()).unwrap().entry;
+        assert_eq!(
+            (e.origin.as_deref(), e.client_addr.as_deref(), e.sni.as_deref()),
+            (Some("gui"), Some("127.0.0.1:5000"), Some("b.test"))
+        );
+        let gui = HistoryFilter { origin: Some("gui".into()), ..Default::default() };
+        assert_eq!(store.list(&gui).unwrap().len(), 1);
+
+        store.finding_mark(1, Some("false_positive"), None).unwrap();
+        let f = store.finding_get(1).unwrap();
+        assert_eq!(f["state_origin"], crate::provenance::origin());
+        assert!(f["state_changed_at"].is_string(), "{f}");
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

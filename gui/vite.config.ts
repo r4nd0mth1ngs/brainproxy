@@ -59,7 +59,8 @@ function cliBridge(): Plugin {
           const extra = Object.fromEntries(Object.entries(env ?? {}).filter(([k]) => k.startsWith("BRAINPROXY_SECRET_")));
           const child = spawn(bin, ["--format", "json", "--project", project, ...args], {
             stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"],
-            env: { ...process.env, ...extra },
+            // What the CLI records is marked as the app's (origin `gui`), as with the Tauri command.
+            env: { ...process.env, ...extra, BRAINPROXY_CLIENT: "gui" },
           });
           if (call) running.set(call, child);
           if (stdin != null) {

@@ -73,6 +73,14 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("hits", "INTEGER", "Times seen (same alert, method, URL without query, param)"),
     ("state", "TEXT", "open, confirmed, false_positive"),
     ("note", "TEXT", "Free-text note"),
+    (
+        "origin",
+        "TEXT",
+        "Who or what added it: gui (the desktop app), cli (a terminal or script), mcp (an agent through MCP); \
+         NULL for findings from before brainproxy kept it",
+    ),
+    ("state_origin", "TEXT", "gui, cli or mcp: who last changed state with `findings mark`; NULL if never changed"),
+    ("state_changed_at", "TEXT", "UTC time of the last state change; NULL if never changed"),
 ];
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
@@ -192,8 +200,8 @@ impl Store {
             )?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, wasc, host,
-                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18)
+                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id
                  RETURNING hits",
             )?;
@@ -230,6 +238,7 @@ impl Store {
                         msg.history_id,
                         dedupe,
                         truncate(&f.attack, 2000),
+                        crate::provenance::origin(),
                     ],
                     |r| r.get(0),
                 )?;
@@ -277,7 +286,7 @@ impl Store {
         let (where_sql, args) = filter.sql();
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
-                hits, history_id, state
+                hits, history_id, state, origin, state_origin, state_changed_at
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -296,6 +305,9 @@ impl Store {
                 "hits": r.get::<_, i64>(10)?,
                 "history_id": r.get::<_, Option<i64>>(11)?,
                 "state": r.get::<_, String>(12)?,
+                "origin": r.get::<_, Option<String>>(13)?,
+                "state_origin": r.get::<_, Option<String>>(14)?,
+                "state_changed_at": r.get::<_, Option<String>>(15)?,
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -313,6 +325,8 @@ impl Store {
         let row = r.rows.into_iter().next().ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
         let mut obj: serde_json::Map<String, Value> = r.columns.into_iter().zip(row).collect();
         obj.remove("dedupe");
+        let origin = obj.get("origin").and_then(Value::as_str).map(str::to_string);
+        obj.insert("origin_text".into(), json!(format!("added {}", crate::provenance::describe(origin.as_deref()))));
         for k in ["refs", "tags"] {
             if let Some(Value::String(s)) = obj.get(k) {
                 let v = serde_json::from_str(s).unwrap_or(Value::Null);
@@ -322,11 +336,16 @@ impl Store {
         Ok(Value::Object(obj))
     }
 
-    /// Sets a finding's triage state and/or note.
+    /// Sets a finding's triage state and/or note. A state change records who made it and when,
+    /// so a finding hidden as a false positive says by whom.
     pub fn finding_mark(&self, id: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note) WHERE id = ?3",
-            params![state, note, id],
+            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note),
+                state_origin = CASE WHEN ?1 IS NULL THEN state_origin ELSE ?4 END,
+                state_changed_at = CASE WHEN ?1 IS NULL THEN state_changed_at
+                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
+             WHERE id = ?3",
+            params![state, note, id, crate::provenance::origin()],
         )?;
         if n == 0 {
             return Err(Error::NotFound(format!("finding {id}")));
