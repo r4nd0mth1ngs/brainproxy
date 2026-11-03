@@ -517,9 +517,10 @@ Access control across users: does the app let bob read alice's data? See
   no path. Once the run has started, the form goes back to all recorded requests.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
-  those identities in the background. If it doesn't start, the
-  previous proxy is started again. Results fill the grid as you go; stopping the proxy ends
-  the run.
+  those identities in the background. It is one `proxy restart`, as in **Settings › Proxy**, so
+  a proxy started meanwhile from a shell or MCP can't take its place. If it doesn't start, the
+  previous proxy is started again and the message says where the proxy is. Results fill the
+  grid as you go; stopping the proxy ends the run.
 - **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
   red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
   a dashed outline inconclusive (a successful response with nothing to compare, so check it
@@ -687,8 +688,10 @@ byte, side by side or unified.
   project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
   is used as is: if it's taken, the proxy stays off and says why. A running proxy on another
   port keeps it until you press *Restart on port N*, which keeps its bind address and
-  options (a custom log file goes back to the default). Browsers opened earlier still point
-  at the old port: close them and open them again, or their traffic goes to whatever proxy
+  options (a custom log file goes back to the default). It is one `proxy restart`, so a
+  proxy started meanwhile from a shell or MCP can't take its place; if the new port can't be
+  opened, the proxy goes back to the old one and the message says where it is. Browsers
+  opened earlier still point at the old port: close them and open them again, or their traffic goes to whatever proxy
   starts on that port later, maybe another project's. Reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
   still defaults to 8080 unless given `--listen`.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,
@@ -738,7 +741,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 133 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 138 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -882,6 +885,50 @@ goes to that name on port 443; ordinary proxy requests work on the same listener
 `--redirect URL` sends every request from the listener to that origin (implies
 `--invisible`). Pass-through hosts and hosts outside the proxy scope are tunnelled as with
 CONNECT.
+
+To move a running proxy to another address or options, restart it in one step:
+
+```sh
+brainproxy proxy restart --listen 127.0.0.1:9090 --auth alice
+```
+
+`proxy restart` takes `proxy start`'s options, defaults included: what isn't given isn't
+carried over from the running proxy. It holds the project's proxy record from before it
+stops the proxy until the new one is listening, so a `proxy start` (or another restart, or
+`proxy stop --forget`) from a shell, an agent or the app meanwhile fails with "the proxy is
+being restarted" instead of getting in between, and `proxy status` shows `"restarting": true`.
+If the new proxy doesn't come up (the port is taken, say), the old one is started again on the
+address it had, with its options, and the command fails with an error that ends with where the
+proxy is now. The error's `data` says the same for a script or an agent: `{"stopped": true,
+"failure": "<why the new proxy didn't come up>", "restarted": {"pid": N, "listen": "ADDR"}}`, with
+`"restarted": null` if the old one couldn't be started again (an error before anything stopped
+has `{"stopped": false}`). With no proxy running it starts nothing and fails with `not_found`:
+use `proxy start`. `--wait` is 0 to 60 seconds for a restart (0 to 3600 for `proxy start`), for
+the new proxy and again for going back, since every other start waits meanwhile; it is checked
+with the other options, before anything stops. On success it prints what `proxy start` does,
+plus `replaced`: the old pid and address, whether it had to be killed, and `args`, what it ran
+with, so you can see what a restart without those options left out. While a restart runs it
+holds `brainproxy.bpdb-proxy-restart.lock`, which is how another container on the same volume
+knows it is still under way. If the restart is killed (Ctrl-C, say, or an MCP client's timeout
+or cancel) before the old proxy has exited, the next command gives the old proxy its record
+back, so that `proxy status` shows it and `proxy stop` stops it. Killed while its new proxy
+starts, the hold lasts until that proxy is up or has failed, and that proxy goes back to the
+old one itself if it can't come up; a `proxy stop` meanwhile stops it instead.
+
+`proxy stop` during a restart calls the restart off: the proxy it was starting is killed, the
+proxy it replaced stays off, and the restart fails saying so (`"called_off": true` in its
+error's `data`). The stop waits up to 40 seconds for the restart to let go (it is refused if the
+restart doesn't), then stops whatever proxy runs; its output names the restart in
+`restart_called_off`. `proxy stop --pid N` stops the proxy only if it is still pid N in this
+container, and fails with `not_found` otherwise, calling nothing off: what the app runs when it
+closes a project, so a proxy started since from a shell or an agent is left alone. `proxy stop`
+marks the record as being stopped until the proxy has exited, so a restart (or start) meanwhile
+fails with "the proxy is being stopped" and the proxy ends up off. If another proxy has taken
+the record by the time the old one is gone, the stop fails and names it rather than reporting
+the proxy off. `project stop` calls off a restart under way too, stops the OOB listener, jobs
+and fuzz runs, then the proxy, and also a proxy that took the record meanwhile. If something
+doesn't stop, it still stops the rest, then fails naming every failure, with what it did stop
+in the error's `data` (`proxy`, `oob`, `work`).
 
 Crawl and active-scan scope and safety flags:
 
@@ -1387,6 +1434,8 @@ refused too; docs/MCP.md lists them.
 | Container: "can't open the proxy lock file" | A lock file is there that this user can't open, so starting would go unseen from other containers. Make it readable (`chmod 644`), or remove it if no proxy (or OOB listener) runs for this project anywhere. |
 | Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: none of ports 8080-8089 could be opened" | Other programs hold or block those ports. Stop them, or choose a port in **Settings › Proxy**. From a shell: `brainproxy proxy start --listen 127.0.0.1:9090`. |
+| "the proxy is being restarted" | A `proxy restart` (from the app's *Restart on port N* or *Test live while browsing*, a shell or an agent) is between stopping the proxy and starting it again, for a few minutes at most. Try again once it has finished, or call it off with `brainproxy proxy stop`, which leaves the proxy off. If its process was killed, the next command clears its hold, and gives the record back to the old proxy if that still runs. |
+| "the proxy is being stopped" | A `proxy stop` (or `project stop`) is waiting for the proxy to exit. Start it again once it has. |
 | "cannot listen on …: the port is already in use" | Another program or another project's proxy holds that port. Stop it, or choose another port in **Settings › Proxy** (or with `--listen`). A chosen port is never swapped for another, so the proxy stays off until then. |
 | "cannot listen on …: permission denied" | Ports below 1024 usually need elevated privileges, and the system can reserve others (Windows does, in ranges that change). Choose another port in **Settings › Proxy** (or with `--listen`). |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |

@@ -134,6 +134,24 @@ pub(crate) fn still_running(pid: u32, start: Option<u64>) -> Option<bool> {
     start.map(|s| start_time(pid) == Some(s))
 }
 
+/// Whether `pid` has exited and waits to be reaped: a zombie, which a container's init may never
+/// reap. Only Linux tells; elsewhere `false`.
+pub(crate) fn exited(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // The state follows `(comm)`.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// This process's PID namespace; pids only mean something inside one. `None` where there
 /// are no such namespaces to tell apart, or `/proc` isn't there to ask.
 pub(crate) fn pid_namespace() -> Option<String> {
@@ -182,18 +200,20 @@ pub(crate) fn liveness(store: &Store, what: &str, pid: u32, start: Option<u64>, 
 }
 
 fn label(what: &str) -> &str {
-    if what == "oob" {
-        "OOB listener"
-    } else {
-        what
+    match what {
+        "oob" => "OOB listener",
+        "proxy-restart" => "proxy restart",
+        _ => what,
     }
 }
 
 /// Why a saved listener can't be verified, and the way out.
 pub(crate) fn unverified_text(what: &str, pid: u32) -> String {
+    // A restart's hold is the proxy's record.
+    let command = if what == "proxy-restart" { "proxy" } else { what };
     format!(
         "can't verify the {} recorded as pid {pid} in another container or PID namespace: its lock file isn't \
-         readable here. If it is no longer running, `brainproxy {what} stop --forget` clears the record",
+         readable here. If it is no longer running, `brainproxy {command} stop --forget` clears the record",
         label(what)
     )
 }

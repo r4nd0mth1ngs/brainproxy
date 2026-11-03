@@ -233,6 +233,7 @@ brainproxy scope set --include '(^|\.)target\.test$' # only intercept/record the
 brainproxy rules add --location request-header --replace 'X-Forwarded-For: 127.0.0.1'
 brainproxy rules add --location response-body --match 'disabled' --replace ''
 brainproxy proxy status
+brainproxy proxy restart --listen 127.0.0.1:9090  # move it: stop and start in one step, back on failure
 brainproxy proxy stop
 
 # Intercept without a human in the loop: held messages wait in a queue
@@ -437,6 +438,7 @@ brainproxy decode jwt eyJhbGciOi...
   `BRAINPROXY_FORMAT`), or file.
 - When stdout isn't a terminal, every command prints one JSON envelope:
   `{"ok":true,"command":...,"data":...}` or `{"ok":false,"command":...,"error":{"kind","message"}}`.
+  Some errors add `error.data`, what the command did before failing (`proxy restart`, `project stop`).
 - Exit codes: `0` success, `1` internal/storage, `2` invalid input or usage, `3` network,
   `4` not found, `5` a `findings compare --fail-on` gate found something, `6` out of scope.
 - `brainproxy capabilities` describes the whole CLI as JSON. `brainproxy capabilities send`

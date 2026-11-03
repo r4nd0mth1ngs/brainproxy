@@ -28,7 +28,8 @@ pub enum ProjectCmd {
     },
     /// Stop everything running for this project: its proxy, OOB listener, jobs and fuzz runs.
     #[command(after_help = "Jobs and fuzz runs are asked to stop and given 10 s to finish; it fails, naming \
-        them, if any are still running. Nothing is deleted.")]
+        them, if any are still running. A proxy restart under way is called off. Whatever fails to stop, the \
+        rest is still stopped, and the error names every failure. Nothing is deleted.")]
     Stop,
 }
 
@@ -51,21 +52,74 @@ pub fn project(path: &Path, cmd: ProjectCmd, out: &Out) -> Result<(), Error> {
             out.ok(json!({"path": saved, "from": path}), || format!("saved to {}", saved.display()));
         }
         ProjectCmd::Stop => {
-            let stopped = stop_all(path)?;
+            let (stopped, failed) = stop_all(path)?;
+            if let Some(e) = failed {
+                out.error_data(stopped);
+                return Err(e);
+            }
             out.ok(stopped.clone(), || format!("stopped: {stopped}"));
         }
     }
     Ok(())
 }
 
-/// Stops the project's proxy, OOB listener, jobs and fuzz runs. Returns what was stopped;
-/// fails if some work is still running after being asked to stop.
-fn stop_all(path: &Path) -> Result<Value, Error> {
+/// Stops the project's proxy, OOB listener, jobs and fuzz runs. Returns what was stopped, and
+/// if some of it didn't stop, why: every failure, not only the first, since the rest is stopped
+/// anyway.
+fn stop_all(path: &Path) -> Result<(Value, Option<Error>), Error> {
     let store = Store::open(path)?;
-    let proxy = crate::proxy_cmd::stop(&store)?.map(|(pid, _)| pid);
-    let oob = crate::oob_cmd::stop(&store)?.map(|(pid, _)| pid);
+    let mut failed: Vec<Error> = Vec::new();
+    // A `proxy restart` under way is called off now and the proxy stopped last, once the restart
+    // has let go of it, so that the rest doesn't wait for that.
+    let restarting = crate::proxy_cmd::ask_restart_to_give_up(&store).unwrap_or_else(|e| {
+        failed.push(e);
+        false
+    });
+    let stop_proxy = |failed: &mut Vec<Error>| match crate::proxy_cmd::stop_every(&store) {
+        Ok(stopped) => stopped.proxy.map(|(pid, _)| pid),
+        Err(e) => {
+            failed.push(e);
+            None
+        }
+    };
+    let mut proxy = if restarting { None } else { stop_proxy(&mut failed) };
+    let oob = crate::oob_cmd::stop(&store).unwrap_or_else(|e| {
+        failed.push(e);
+        None
+    });
+    let oob = oob.map(|(pid, _)| pid);
     let work = store.unfinished_work()?;
+    // What still runs isn't reported as stopped.
+    let left = match stop_work(&store) {
+        Ok(()) => Some(Vec::new()),
+        Err((e, left)) => {
+            failed.push(e);
+            left
+        }
+    };
+    let work: Vec<Value> = work
+        .iter()
+        .filter(|(what, id, _)| left.as_ref().is_some_and(|left| !left.iter().any(|(w, i)| w == what && i == id)))
+        .map(|(what, id, _)| json!({"kind": what, "id": id}))
+        .collect();
+    if restarting {
+        proxy = stop_proxy(&mut failed);
+    }
+    let stopped = json!({"proxy": proxy, "oob": oob, "work": work});
+    let failed = match failed.len() {
+        0 => None,
+        1 => failed.pop(),
+        _ => Some(Error::Conflict(failed.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; also "))),
+    };
+    Ok((stopped, failed))
+}
 
+/// Jobs and fuzz runs by kind and id.
+type Work = Vec<(String, i64)>;
+
+/// Stops the project's jobs and fuzz runs, or fails naming the ones still running (or that
+/// might be), with their kind and id: `None` if that isn't known.
+fn stop_work(store: &Store) -> Result<(), (Error, Option<Work>)> {
     // Jobs and fuzz runs poll for the stop request and exit. It is repeated while waiting: one
     // still queued has no process yet and marks itself running once its process starts. They
     // are never signalled: no start time is recorded for them, so a pid reused by another
@@ -82,41 +136,45 @@ fn stop_all(path: &Path) -> Result<Value, Error> {
         let work = store.unfinished_work()?;
         Ok(work
             .into_iter()
-            .filter(|(what, id, pid)| pid.is_none_or(|pid| !process::work_gone(&store, &lock(what, *id), pid)))
+            .filter(|(what, id, pid)| pid.is_none_or(|pid| !process::work_gone(store, &lock(what, *id), pid)))
             .collect())
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut left = busy()?;
+    let unknown = |e| (e, None);
+    let mut left = busy().map_err(unknown)?;
     while !left.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
-        left = busy()?;
+        left = busy().map_err(unknown)?;
     }
-    // Work that never got a process has nothing to stop. Work that can't be verified may well be
-    // gone, and its pid may be another process here: point to `stop --forget`, not to the pid.
+    // Work that never got a process has nothing to stop.
+    let running =
+        Some(left.iter().filter(|(_, _, pid)| pid.is_some()).map(|(what, id, _)| (what.clone(), *id)).collect());
+    // Work that can't be verified may well be gone, and its pid may be another process here:
+    // point to `stop --forget`, not to the pid.
     let stuck: Vec<String> = left
         .iter()
         .filter_map(|(what, id, pid)| {
             let pid = (*pid)?;
             let name = lock(what, *id);
-            Some(match process::work_liveness(&store, &name, pid) {
+            Some(match process::work_liveness(store, &name, pid) {
                 Liveness::Unverified => {
                     process::work_unverified_text(if what == "job" { "job" } else { "fuzz" }, *id, pid)
                 }
-                _ => format!("{what} {id} ({})", process::work_pid_text(&store, &name, pid)),
+                _ => format!("{what} {id} ({})", process::work_pid_text(store, &name, pid)),
             })
         })
         .collect();
     if left.iter().any(|(what, id, pid)| {
-        pid.is_some_and(|pid| process::work_liveness(&store, &lock(what, *id), pid) == Liveness::Unverified)
+        pid.is_some_and(|pid| process::work_liveness(store, &lock(what, *id), pid) == Liveness::Unverified)
     }) {
-        return Err(Error::Conflict(format!("still not known to have stopped: {}", stuck.join("; "))));
+        return Err((Error::Conflict(format!("still not known to have stopped: {}", stuck.join("; "))), running));
     }
     if !stuck.is_empty() {
-        return Err(Error::Conflict(format!(
+        let e = Error::Conflict(format!(
             "still running after being asked to stop: {}; wait for them to finish (or stop those processes)",
             stuck.join(", ")
-        )));
+        ));
+        return Err((e, running));
     }
-    let work: Vec<Value> = work.iter().map(|(what, id, _)| json!({"kind": what, "id": id})).collect();
-    Ok(json!({"proxy": proxy, "oob": oob, "work": work}))
+    Ok(())
 }

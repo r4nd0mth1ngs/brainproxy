@@ -9,8 +9,8 @@ import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { afterStart, grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
-import { proxyListen, withPortHint } from "./proxyPort";
+import { afterStart, grid, KIND_LABEL, KINDS, liveArgs, runArgs, runLabel, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
+import { startLive, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
 import { accessConfirm, changeKinds, isLogout } from "./trafficActions";
 
@@ -285,11 +285,6 @@ function Compare({ runId, picked, onClose }: { runId: number; picked: Picked; on
 
 // ---------------- new run ----------------
 
-interface ProxyStatus {
-  running: boolean;
-  proxy: { listen?: string; pid?: number; authz_run?: number; args?: string[] } | null;
-}
-
 function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
   const app = useApp();
   const [f, setF] = useState(FORM);
@@ -335,33 +330,16 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
     }
   };
 
-  // Restarts the proxy on the same address and with the same options, plus live testing. If it
-  // doesn't come up, the previous proxy is started again.
-  const startLive = async () => {
+  // Restarts the proxy on the same address and with the same options, plus live testing, in one
+  // `proxy restart` (proxyPort.ts). If it doesn't come up, the CLI starts the previous proxy again.
+  const onLive = async () => {
     if (app.proxy.moving) return app.toast("The proxy is restarting on another port. Try again in a moment.");
     try {
       const live = liveArgs(f);
       setBusy(true);
-      const s = await run<ProxyStatus>(["proxy", "status"]);
-      const listen = `--listen=${s.proxy?.listen ?? proxyListen()}`;
-      const before = proxyOptions(s.proxy?.args ?? []);
-      // The app's proxy (one it starts here, or restarts) stops when the project closes; not one a shell or an agent started.
-      const ours = !s.running || (app.proxy.owned != null && app.proxy.owned === s.proxy?.pid);
-      if (s.running) await run(["proxy", "stop"]);
-      if (ours) app.proxy.owned = null;
-      let d: { pid?: number; authz_run?: number };
-      try {
-        d = await run<{ pid?: number; authz_run?: number }>(["proxy", "start", listen, ...withLive(before, live)]);
-      } catch (e) {
-        if (s.running) {
-          const back = await run<{ pid?: number }>(["proxy", "start", listen, ...before]).catch(() => null);
-          if (ours && back) app.proxy.owned = back.pid ?? null;
-        }
-        throw e;
-      }
-      if (ours) app.proxy.owned = d.pid ?? null;
+      const d = await startLive(run, app.proxy, live);
       const who = [...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(", ");
-      app.toast(`Proxy restarted on ${listen.slice(9)}: requests you browse are now also tried as ${who}`);
+      app.toast(`Proxy restarted on ${d.listen}: requests you browse are now also tried as ${who}`);
       if (d.authz_run != null) onStarted(d.authz_run);
     } catch (e: any) {
       app.toast(withPortHint(e.message), "error");
@@ -471,7 +449,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
         <button className="btn primary" disabled={busy} onClick={start}>
           Start run
         </button>
-        <button className="btn" disabled={busy || f.owner !== "" || f.select !== "all"} onClick={startLive} title="Restart the proxy so each request you browse is also tried as these identities">
+        <button className="btn" disabled={busy || f.owner !== "" || f.select !== "all"} onClick={onLive} title="Restart the proxy so each request you browse is also tried as these identities">
           Test live while browsing
         </button>
         <span className="muted small">Live testing restarts the proxy (same address and options) and tests in-scope GET, HEAD and OPTIONS requests as they are recorded, leaving out static assets and responses other than 2xx.</span>

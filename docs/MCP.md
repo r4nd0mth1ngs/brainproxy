@@ -78,7 +78,9 @@ and `project save`, since copying the project elsewhere is for the person runnin
   `query`, `schema`, `capabilities`, `history_*` reads, `findings_list`/`show`, `job_wait`,
   ... Open world and destructive (requests can change state on the target): `send`,
   `fuzz_run`, `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`.
-  Destructive locally: `engagement_start` (write-once), `*_stop`, `*_remove`, `*_clear`,
+  Destructive locally: `engagement_start` (write-once), `*_stop`, `proxy_restart` (its `wait` is at
+  most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
+  goes back to the old proxy if the new one can't come up), `*_remove`, `*_clear`,
   `scope_set`, `ca_init`, `scan_data_reset`. A command missing from the table gets the
   spec's cautious defaults (not read-only, destructive, not idempotent, open world); a
   test fails until it is classified. These are hints for clients deciding what to confirm;
@@ -113,8 +115,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
   project's profile, with the person's cookies and sign-ins, and the pages it loads would be
   recorded as the proxy's traffic, not the agent's.
-- `proxy_start` with a `listen` address other than loopback: an agent can't open the person's
-  proxy, with their auth profiles, to the network.
+- `proxy_start` and `proxy_restart` with a `listen` address other than loopback: an agent can't
+  open the person's proxy, with their auth profiles, to the network. `proxy_restart` is also
+  refused, before anything stops, for a proxy that listens elsewhere than loopback: if the
+  restart failed, it couldn't be started there again.
 
 `scan_active` with `checks` takes any template file, including one the agent wrote. Its
 requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DELETE or GraphQL
@@ -127,7 +131,8 @@ prints in its terminal; `send` can't learn it (see GUI.md).
 
 Everything a tool call records is marked as an agent's: history entries and findings get
 origin `mcp`, and so does a finding state change (`findings_mark` sets `state_origin`). A
-proxy, job or fuzz run started by a tool call records `mcp` too. `BRAINPROXY_MCP_CALL` wins
+proxy, job or fuzz run started by a tool call records `mcp` too, and so does the proxy a
+`proxy_restart` starts (or starts again, when the restart fails). `BRAINPROXY_MCP_CALL` wins
 over `BRAINPROXY_CLIENT=gui` (what the desktop app sets), and tool arguments can't set
 environment variables, so an agent can't make its records look like a person's. List them
 with `history_list` and `origin: "mcp"`.
@@ -164,7 +169,8 @@ Result:
 ```
 
 `isError` is true when the exit code isn't 0 (the envelope's `error.kind` says why:
-`out_of_scope`, `usage`, `connect`, ...). `structuredContent` is the parsed envelope when
+`out_of_scope`, `usage`, `connect`, ...; some errors add `error.data`, such as what a failed
+`proxy_restart` did with the proxy). `structuredContent` is the parsed envelope when
 stdout is one JSON object (not for `--raw` output or cut-off output). On failure, stderr (up
 to 4 KB) is added as a second text item.
 

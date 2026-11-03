@@ -67,12 +67,16 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
 - The app's proxy: every place that starts the proxy (opening a project, the pill, Open
   browser, Settings, Record a login, Access's live restart) goes through `views/proxyPort.ts`,
   which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
-  proxy when a project opens* on, closing the project or the window stops the proxy only if
-  `proxy status` still shows that pid running here, so one a shell, an agent or another
-  container started is left alone. While Settings moves the proxy to another port (stop,
-  then start), the control marks a move: Open browser, Record a login and Start proxy wait
-  for it, and the pill and Access's live restart ask to try again. A failed move reports
-  where the proxy is from a fresh `proxy status`.
+  proxy when a project opens* on, closing the project or the window stops the proxy with
+  `proxy stop --pid`, which stops it only if that pid is still the one running here, so one a
+  shell, an agent or another container started is left alone, even if it started a moment ago. Settings moves the proxy to another port, and Access's
+  live restart adds live testing to it, with one `proxy restart`, which holds the project's
+  proxy record from the stop to the start, so a `proxy start` from a shell or an agent fails
+  instead of getting in between; if the new proxy doesn't come up, the CLI starts the old one
+  again where it was. The control keeps the proxy the app's at its new pid (or the pid it went
+  back to, from the error's `data`, not its wording) and marks the restart: Open browser,
+  Record a login and Start proxy wait for it, and the pill and Access's live restart ask to try
+  again. A failed restart reports where the proxy is from a fresh `proxy status`.
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 
@@ -139,12 +143,12 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor; **+ cURL** opens a pasted curl command as a tab and *Copy as cURL* copies the request (both below). WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
-| Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, a SQL condition, or the requests sent from Traffic), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background` (with `--history-id` for requests from Traffic), `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
+| Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, a SQL condition, or the requests sent from Traffic), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background` (with `--history-id` for requests from Traffic), `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/start/restart --authz` |
 | Results | Findings | Issues grouped by type and risk, detail, evidence, triage | `findings list/show/mark` |
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps, including gzip, zlib, and raw deflate (Brotli decodes only). **Smart decode** finds the layers (URL, Base64, hex, HTML, JWT, gzip, zlib) and puts them in as steps to check or change, stopping at JSON; its note says if the 8-layer limit or a decompression bomb stopped it | `encode`, `decode`, `hash`; Smart decode: `decode auto -` (its `steps` and `stopped`) |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port the app uses and restarting on it, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port the app uses and restarting on it, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop/restart`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 

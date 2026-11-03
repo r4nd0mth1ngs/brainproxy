@@ -1,7 +1,7 @@
 // The port the app's proxy listens on (Settings › Proxy): the saved choice, the address it makes,
 // and starting or moving the proxy with it. `cli` is api.ts's `run`.
 
-import { proxyOptions } from "./accessMatrix.ts";
+import { proxyOptions, withLive } from "./accessMatrix.ts";
 
 type Cli = (args: string[]) => Promise<unknown>;
 
@@ -77,7 +77,7 @@ export function withPortHint(message: string): string {
 export interface ProxyControl {
   /** The pid of the proxy the app started; only that one is stopped when the project closes. */
   owned: number | null;
-  /** Set while a move has stopped the proxy and starts it again; other starts wait for it. Never rejects. */
+  /** Set while the app restarts the proxy (a move to another port, or Access's live testing); other starts in the app wait for it. Never rejects. */
   moving: Promise<void> | null;
 }
 
@@ -87,8 +87,14 @@ export function proxyControl(): ProxyControl {
 
 interface Status {
   running: boolean;
-  proxy: { listen: string; pid?: number } | null;
-  other_pid_namespace?: boolean;
+  proxy: { listen: string; pid?: number; args?: string[] } | null;
+}
+
+/** What `proxy start` and `proxy restart` print. */
+export interface Started {
+  pid?: number;
+  listen?: string;
+  authz_run?: number;
 }
 
 const pidOf = (started: unknown) => (started as { pid?: number } | null)?.pid ?? null;
@@ -119,15 +125,19 @@ export async function stopProxy(cli: Cli, ctl: ProxyControl): Promise<void> {
 
 /**
  * Stops the proxy the app started, if it is still the one running: not one a shell or an agent
- * started since, one in another container, or a record that can't be verified.
+ * started since, one in another container, or a record that can't be verified. The CLI checks
+ * that as it stops (`proxy stop --pid`), so nothing can start in between; otherwise it is not_found.
  */
 export async function stopOwned(cli: Cli, ctl: ProxyControl): Promise<void> {
   await ctl.moving;
   const pid = ctl.owned;
   ctl.owned = null;
   if (pid == null) return;
-  const s = (await cli(["proxy", "status"])) as Status;
-  if (s.running && s.proxy?.pid === pid && !s.other_pid_namespace) await cli(["proxy", "stop"]);
+  try {
+    await cli(["proxy", "stop", `--pid=${pid}`]);
+  } catch (e: any) {
+    if (e?.kind !== "not_found") throw e;
+  }
 }
 
 /** Where the proxy is now, from a fresh `proxy status`: the end of a failed move's message. */
@@ -138,15 +148,62 @@ async function whereNow(cli: Cli, was: string): Promise<string> {
   return s.proxy.listen === was ? `The proxy is back on ${was}.` : `The proxy is on ${s.proxy.listen}.`;
 }
 
+/** What a failed `proxy restart` says it did, in its error's `data`. */
+interface RestartData {
+  stopped?: boolean;
+  /** Why the new proxy didn't come up, without where the proxy is now. */
+  failure?: string;
+  /** The old proxy, started again where it was; null if it couldn't be. */
+  restarted?: { pid?: number; listen?: string } | null;
+}
+
+/**
+ * A failed `proxy restart`, from its error's `data`: whether it had stopped the proxy, the pid it
+ * started again where it was (null if none), and `message` without where the proxy is, since the
+ * app says that from a fresh status.
+ */
+export function restartFailure(e: { message: string; data?: unknown }): { message: string; stopped: boolean; pid: number | null } {
+  const d = (e.data ?? null) as RestartData | null;
+  if (!d?.stopped) return { message: e.message, stopped: false, pid: null };
+  return { message: d.failure ?? e.message, stopped: true, pid: d.restarted?.pid ?? null };
+}
+
 type Running = { listen: string; pid?: number; args?: string[] };
 
 /**
- * Restarts a running proxy on `port`, with the same host and options; returns the new address. If
- * it doesn't come up there, the proxy is started again where it was and the error says where it is
- * now. Starts from elsewhere in the app wait until it is done. The proxy stays the app's if it was.
+ * Restarts a running proxy on `port`, with the same host and options; returns the new address. It
+ * is one `proxy restart`, so a start from a shell or an agent can't get in between. If the proxy
+ * doesn't come up there, the CLI starts it again where it was, and the error says where it is now.
+ * Starts from elsewhere in the app wait until it is done. The proxy stays the app's if it was.
  */
 export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
-  const work = move(cli, ctl, running, port);
+  const target = withPort(running.listen, port);
+  await holding(ctl, restart(cli, ctl, running, target, proxyOptions(running.args ?? [])));
+  return target;
+}
+
+/**
+ * Runs the proxy with live testing (`live`, from accessMatrix's `liveArgs`) on its address and with
+ * its other options: one `proxy restart` if it runs, as a move does, or `proxy start` on the app's
+ * port if it doesn't. The proxy is the app's afterwards if it was before, or if the app started it.
+ */
+export async function startLive(cli: Cli, ctl: ProxyControl, live: string[]): Promise<Started & { listen: string }> {
+  const s = (await cli(["proxy", "status"])) as Status;
+  const running = s.running ? s.proxy : null;
+  const listen = running?.listen ?? proxyListen();
+  const options = withLive(proxyOptions(running?.args ?? []), live);
+  let started: Started;
+  if (running) {
+    started = await holding(ctl, restart(cli, ctl, running, listen, options));
+  } else {
+    started = (await cli(["proxy", "start", `--listen=${listen}`, ...options])) as Started;
+    ctl.owned = pidOf(started);
+  }
+  return { ...started, listen: started.listen ?? listen };
+}
+
+/** Marks `work` as a restart in `ctl` until it settles, so that other starts in the app wait for it. */
+async function holding<T>(ctl: ProxyControl, work: Promise<T>): Promise<T> {
   const moving = work.then(
     () => {},
     () => {},
@@ -159,22 +216,18 @@ export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, p
   }
 }
 
-async function move(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
+/** `proxy restart` of `running` on `listen` with `options`, keeping the app's hold on it; a failure says where the proxy is now. */
+async function restart(cli: Cli, ctl: ProxyControl, running: Running, listen: string, options: string[]): Promise<Started> {
   const ours = ctl.owned != null && ctl.owned === running.pid;
-  const target = withPort(running.listen, port);
-  const options = proxyOptions(running.args ?? []);
-  const start = async (listen: string) => {
-    const pid = pidOf(await cli(["proxy", "start", `--listen=${listen}`, ...options]));
-    if (ours) ctl.owned = pid;
-  };
-  await cli(["proxy", "stop"]);
-  if (ours) ctl.owned = null;
   try {
-    await start(target);
+    const started = (await cli(["proxy", "restart", `--listen=${listen}`, ...options])) as Started;
+    if (ours) ctl.owned = pidOf(started);
+    return started;
   } catch (e: any) {
-    // A shell or an agent may have started it in the meantime, on either port.
-    await start(running.listen).catch(() => {});
-    throw new Error(`${withPortHint(e.message)} ${await whereNow(cli, running.listen)}`);
+    const failed = restartFailure(e);
+    // Refused before anything stopped: the proxy runs as it did.
+    if (!failed.stopped) throw e;
+    if (ours) ctl.owned = failed.pid;
+    throw new Error(`${withPortHint(failed.message)} ${await whereNow(cli, running.listen)}`);
   }
-  return target;
 }
