@@ -1916,6 +1916,65 @@ fn project_stop_reports_only_the_work_that_stopped() {
 }
 
 #[test]
+fn proxy_setup_is_saved_in_the_project_file() {
+    let env = Env::new("setup");
+    let defaults = |v: &Value| {
+        assert_eq!(v["network"], "local", "{v}");
+        assert_eq!(v["invisible"], false, "{v}");
+        assert!(v["redirect"].is_null(), "{v}");
+        assert_eq!(v["host"], "127.0.0.1", "{v}");
+    };
+    defaults(&env.ok(&["proxy", "setup", "show"]));
+
+    // Saved as an origin; the redirect implies invisible mode.
+    let saved = env.ok(&["proxy", "setup", "set", "--network=all", "--redirect=HTTPS://App.Example.Test:443/x?y"]);
+    assert_eq!(saved["redirect"], "https://app.example.test", "{saved}");
+    assert_eq!(saved["invisible"], true);
+    assert_eq!(saved["host"], "0.0.0.0");
+    assert_eq!(saved["start_options"], serde_json::json!(["--redirect=https://app.example.test"]));
+    assert_eq!(env.ok(&["proxy", "setup", "show"]), saved);
+
+    // It belongs to the file: a copy has it, a new project at another path doesn't.
+    let copy = env.dir.join("copy.bpdb");
+    std::fs::copy(&env.project, &copy).unwrap();
+    let show = |project: &Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .args(["--format", "json", "--project"])
+            .arg(project)
+            .args(["proxy", "setup", "show"])
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"].clone()
+    };
+    assert_eq!(show(&copy), saved);
+    defaults(&show(&env.dir.join("fresh.bpdb")));
+
+    // An agent can't open the proxy to the network, and a refused set changes nothing.
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&env.project)
+        .args(["proxy", "setup", "set", "--network=all"])
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("isn't offered through MCP"), "{v}");
+    for bad in ["--redirect=ftp://app.example.test", "--redirect=http://127.0.0.1:0"] {
+        let (code, v) = env.run(&["proxy", "setup", "set", bad]);
+        assert_eq!(code, 2, "{bad}: {v}");
+    }
+    assert_eq!(env.ok(&["proxy", "setup", "show"]), saved);
+
+    // Set replaces the whole setup.
+    let invisible = env.ok(&["proxy", "setup", "set", "--invisible"]);
+    assert_eq!((invisible["network"].as_str(), invisible["invisible"].as_bool()), (Some("local"), Some(true)));
+    assert!(invisible["redirect"].is_null());
+    defaults(&env.ok(&["proxy", "setup", "set"]));
+    defaults(&env.ok(&["proxy", "setup", "show"]));
+}
+
+#[test]
 fn stopping_the_proxy_records_requests_still_waiting() {
     use std::io::{Read, Write};
     let env = Env::new("drain");

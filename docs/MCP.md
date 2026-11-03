@@ -119,6 +119,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
   open the person's proxy, with their auth profiles, to the network. `proxy_restart` is also
   refused, before anything stops, for a proxy that listens elsewhere than loopback: if the
   restart failed, it couldn't be started there again.
+- `proxy_setup_set` with `network` `all`: the app would then start the proxy on every network
+  interface, where anyone who can reach the computer can use it; a person chooses that.
 
 `scan_active` with `checks` takes any template file, including one the agent wrote. Its
 requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DELETE or GraphQL

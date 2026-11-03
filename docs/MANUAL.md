@@ -684,16 +684,46 @@ byte, side by side or unified.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
-  Chromium, curl, or a shell at it. *Port* sets the port on 127.0.0.1 the app uses, for every
+  Chromium, curl, or a shell at it. *Port* sets the port the app's proxy listens on, for every
   project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
   is used as is: if it's taken, the proxy stays off and says why. A running proxy on another
-  port keeps it until you press *Restart on port N*, which keeps its bind address and
+  port keeps it until you press *Restart on port N*, which keeps its bind address (when it fits *Who can connect*) and
   options (a custom log file goes back to the default). It is one `proxy restart`, so a
   proxy started meanwhile from a shell or MCP can't take its place; if the new port can't be
   opened, the proxy goes back to the old one and the message says where it is. Browsers
   opened earlier still point at the old port: close them and open them again, or their traffic goes to whatever proxy
   starts on that port later, maybe another project's. Reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
-  still defaults to 8080 unless given `--listen`.
+  still defaults to 8080 unless given `--listen`. Ports below 1024 may need elevated
+  privileges (on Linux, root or the `CAP_NET_BIND_SERVICE` capability); if the system
+  refuses, the proxy stays off and says why.
+  - *Who can connect:* this computer only (127.0.0.1, the default) or every network
+    interface (0.0.0.0), for another device. The second asks first: anyone who can reach
+    your computer can then use the proxy without a password, their requests get the
+    project's auth profiles, session rules and platform auth (Basic, Digest, NTLM), and
+    they are recorded in the project. Its proxy starts that way whenever the project opens:
+    a message says so, the top-bar pill says *open to the network* while it runs, and this
+    page shows a warning. Live access-control testing started from **Access** when the proxy
+    is off starts it the same way, so other devices' requests are then also sent as each
+    identity. The setup lines show 127.0.0.1 for this computer; other devices use its LAN
+    address on the same port.
+  - *Invisible mode* (`--invisible`): for a device or program with no proxy setting. Point
+    the target's name at this computer with DNS or the hosts file, set *Port* to the site's
+    own (usually 80 or 443), and the client connects here as if to the site; it has to trust
+    the brainproxy CA. The proxy listens on one port, so it covers a site's plain HTTP (80)
+    or its HTTPS (443), not both, and a project runs one proxy at a time: choose the port
+    the client uses. TLS always goes on to port 443 of the name the client asks for. How it
+    routes requests is under *Connection options* in [Command line](#command-line).
+  - *Send everything to* (`--redirect`): every request from the listener goes to this origin
+    (`https://host[:port]`), whatever host it names; it turns invisible mode on, and browsers
+    opened with *Open browser* go there too. It must be in the engagement scope (checked
+    with `engagement check` each time you save, so a name that didn't resolve can be tried
+    again).
+  - *Who can connect*, *Invisible mode* and *Send everything to* are saved in the project
+    file (`brainproxy proxy setup show`), so they go with it: a copy, or *Save as…*, has
+    them, and a new project starts with none. `proxy setup set` saves them from a shell;
+    `proxy start` doesn't read them.
+  - These apply the next time the proxy starts. A running proxy that differs shows what would
+    change and *Restart with these settings*, which works like the port restart.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,
   the fuzzer, logins, and the proxy's upstream side). A running proxy picks up a change
   within a second. None of them widens the engagement scope.
@@ -741,7 +771,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 138 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 140 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -877,14 +907,25 @@ brainproxy connection show
 brainproxy auth add corp --platform ntlm --platform-host '*.acme.test' --username 'ACME\me' --password-env CORP_PW
 brainproxy proxy start --listen 0.0.0.0:8080 --invisible  # also serve clients that don't know they're proxied
 brainproxy proxy start --listen 127.0.0.1:8443 --redirect https://app.acme.test  # everything to one origin
+brainproxy proxy setup set --network all --invisible   # how the desktop app starts this project's proxy
+brainproxy proxy setup show
 ```
 
 With `--invisible`, plain requests in origin form (`GET /path`) go to their Host header's
 host and port, and a TLS client that connects directly gets a certificate for its SNI and
-goes to that name on port 443; ordinary proxy requests work on the same listener. A
+goes to that name on port 443 (whatever port it connected to); ordinary proxy requests work
+on the same listener. One listener has one port, so it serves a site's plain HTTP or its
+HTTPS, not both. A
 `--redirect URL` sends every request from the listener to that origin (implies
 `--invisible`). Pass-through hosts and hosts outside the proxy scope are tunnelled as with
-CONNECT.
+CONNECT. On `0.0.0.0` or `[::]`, the proxy URL and setup lines that `proxy start` and
+`proxy status` print use 127.0.0.1 or `[::1]` (their text output names the wildcard address
+too); other devices use this computer's LAN address.
+
+`proxy setup set` saves, in the project file, how the desktop app starts the project's proxy
+(Settings › Proxy): `--network local|all` (127.0.0.1 or 0.0.0.0), `--invisible` and
+`--redirect URL`, replacing the whole setup each time; `proxy setup show` prints it with the
+`proxy start` options it stands for. An MCP tool call can't save `--network all`.
 
 To move a running proxy to another address or options, restart it in one step:
 

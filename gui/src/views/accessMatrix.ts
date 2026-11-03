@@ -223,8 +223,8 @@ export function liveArgs(f: Pick<RunForm, "identities" | "anonymous" | "keepCook
   return args;
 }
 
-/** `proxy run` options that take a value; the others (--verify-tls, --no-http2) are flags. */
-const VALUE_OPTIONS = ["--listen", "--timeout", "--wait", "--log", "--auth", "--authz", "--authz-rate", "--authz-queue", "--authz-exclude", "--authz-keep-cookie"];
+/** `proxy run` options that take a value; the others (--verify-tls, --no-http2, --invisible) are flags. */
+const VALUE_OPTIONS = ["--listen", "--timeout", "--wait", "--log", "--auth", "--redirect", "--authz", "--authz-rate", "--authz-queue", "--authz-exclude", "--authz-keep-cookie"];
 
 /**
  * The options a running proxy was started with (its `proxy run` arguments, from `proxy status`), as

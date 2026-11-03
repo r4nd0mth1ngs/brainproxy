@@ -14,6 +14,7 @@ import { ENGAGEMENT_CHANGED, TargetView } from "./views/Target";
 import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
 import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, stopOwned, stopProxy } from "./views/proxyPort";
+import { hostOf, isWildcard } from "./views/proxyMode";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -203,16 +204,23 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     let cancelled = false;
     (async () => {
       if (!autoProxy()) return;
-      const s = await run<ProxyStatus>(["proxy", "status"]).catch(() => null);
+      const s = (await inProject(["proxy", "status"]).catch(() => null)) as ProxyStatus | null;
       if (cancelled || !s || s.running) return;
       const chosen = savedProxyPort();
       for (const port of startPorts(chosen)) {
         if (cancelled) return;
         try {
-          await startProxy(run, proxyCtl, port);
+          // Pinned: the setup is read and the proxy started in this project, even if another opens meanwhile.
+          const listen = await startProxy(inProject, proxyCtl, port);
           // The project closed while it started.
           if (cancelled) return stopOwned(inProject, proxyCtl).catch(() => {});
           refreshStatus();
+          // Chosen for this project in Settings › Proxy, but easy to forget when opening it again.
+          if (listen && isWildcard(hostOf(listen)))
+            toastRef.current(
+              "The proxy started on every network interface, as chosen for this project in Settings › Proxy: other machines can use it, with this project's auth profiles and platform auth.",
+              "error",
+            );
           return;
         } catch (e: any) {
           if (chosen || !/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${e.message}`, "error");
@@ -276,6 +284,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   };
 
   const listen = status?.proxy?.listen ?? proxyListen();
+  // On 0.0.0.0 or [::]: other machines can use it, so it is shown however it was started.
+  const exposed = !!status?.running && isWildcard(hostOf(listen));
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("sidebar") === "collapsed";
@@ -350,9 +360,19 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
               Open browser
             </button>
           )}
-          <button className={`pill ${status?.running ? "live" : ""}`} onClick={proxyToggle} title={status?.running ? "Stop the proxy" : "Start the proxy"}>
+          <button
+            className={`pill ${status?.running ? "live" : ""} ${exposed ? "exposed" : ""}`}
+            onClick={proxyToggle}
+            title={
+              exposed
+                ? "Listening on every network interface: anyone who can reach this computer can use the proxy (Settings › Proxy). Click to stop it."
+                : status?.running
+                  ? "Stop the proxy"
+                  : "Start the proxy"
+            }
+          >
             <span className="dot" />
-            {status?.running ? `Proxy ${listen}` : "Proxy off"}
+            {status?.running ? `Proxy ${listen}${exposed ? " · open to the network" : ""}` : "Proxy off"}
           </button>
           <button className="icon-btn" onClick={toggleTheme} title="Toggle light/dark">
             <Icon name="theme" />

@@ -1,7 +1,8 @@
 // The port the app's proxy listens on (Settings › Proxy): the saved choice, the address it makes,
-// and starting or moving the proxy with it. `cli` is api.ts's `run`.
+// and starting or moving the proxy with it and proxyMode.ts's setup. `cli` is api.ts's `run`.
 
 import { proxyOptions, withLive } from "./accessMatrix.ts";
+import { DEFAULT_SETUP, savedProxySetup, setupHost, setupOptions, targetHost, withSetup, type ProxySetup } from "./proxyMode.ts";
 
 type Cli = (args: string[]) => Promise<unknown>;
 
@@ -28,7 +29,9 @@ export function portProblem(text: string): string | null {
 
 /** A note for ports the system may not let an ordinary user open. */
 export function lowPortNote(port: number): string | null {
-  return port < 1024 ? "Ports below 1024 may need elevated privileges." : null;
+  return port < 1024
+    ? "Ports below 1024 may need elevated privileges (on Linux, root or the CAP_NET_BIND_SERVICE capability). If the system refuses, the proxy stays off and says why."
+    : null;
 }
 
 /** The chosen port; null for automatic, also when the stored value is invalid or storage is unavailable. */
@@ -52,9 +55,9 @@ export function saveProxyPort(port: number | null): boolean {
   }
 }
 
-/** The address the app starts the proxy on. */
-export function proxyListen(port = savedProxyPort()): string {
-  return `127.0.0.1:${port ?? DEFAULT_PROXY_PORT}`;
+/** The address the app starts the proxy on, with a project's setup (proxyMode.ts; this computer only by default). */
+export function proxyListen(port = savedProxyPort(), setup: ProxySetup = DEFAULT_SETUP): string {
+  return `${setupHost(setup)}:${port ?? DEFAULT_PROXY_PORT}`;
 }
 
 /** The port of `host:port` (the last colon, for `[::1]:8080`); null if it isn't a usable one. */
@@ -100,21 +103,25 @@ export interface Started {
 const pidOf = (started: unknown) => (started as { pid?: number } | null)?.pid ?? null;
 
 /**
- * Starts the proxy on `port` (the saved one by default) and records it as the app's. During a
- * move it waits for that first, and starts nothing if the proxy is up after it: false then.
+ * Starts the proxy on `port` (the saved one by default), with the project's saved setup, and records
+ * it as the app's; returns the address it listens on. During a move it waits for that first, and
+ * starts nothing if the proxy is up after it: null then.
  */
-export async function startProxy(cli: Cli, ctl: ProxyControl, port = savedProxyPort()): Promise<boolean> {
+export async function startProxy(cli: Cli, ctl: ProxyControl, port = savedProxyPort()): Promise<string | null> {
   if (ctl.moving) {
     await ctl.moving;
-    if (((await cli(["proxy", "status"])) as Status).running) return false;
+    if (((await cli(["proxy", "status"])) as Status).running) return null;
   }
+  const setup = await savedProxySetup(cli);
+  const listen = proxyListen(port, setup);
   try {
-    ctl.owned = pidOf(await cli(["proxy", "start", `--listen=${proxyListen(port)}`]));
+    const started = (await cli(["proxy", "start", `--listen=${listen}`, ...setupOptions(setup)])) as { pid?: number; listen?: string } | null;
+    ctl.owned = pidOf(started);
+    return started?.listen ?? listen;
   } catch (e: any) {
     e.message = withPortHint(e.message);
     throw e;
   }
-  return true;
 }
 
 /** Stops the proxy, whoever started it; it is no longer the app's. */
@@ -171,32 +178,38 @@ export function restartFailure(e: { message: string; data?: unknown }): { messag
 type Running = { listen: string; pid?: number; args?: string[] };
 
 /**
- * Restarts a running proxy on `port`, with the same host and options; returns the new address. It
- * is one `proxy restart`, so a start from a shell or an agent can't get in between. If the proxy
- * doesn't come up there, the CLI starts it again where it was, and the error says where it is now.
- * Starts from elsewhere in the app wait until it is done. The proxy stays the app's if it was.
+ * Restarts a running proxy on `port`, with the same host and options, or with `setup`'s host,
+ * invisible mode and redirect when given; returns the new address. It is one `proxy restart`, so a
+ * start from a shell or an agent can't get in between. If the proxy doesn't come up there, the CLI
+ * starts it again as it was, and the error says where it is now. Starts from elsewhere in the app
+ * wait until it is done. The proxy stays the app's if it was.
  */
-export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
-  const target = withPort(running.listen, port);
-  await holding(ctl, restart(cli, ctl, running, target, proxyOptions(running.args ?? [])));
+export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, port: number, setup?: ProxySetup): Promise<string> {
+  const before = proxyOptions(running.args ?? []);
+  const target = setup ? `${targetHost(setup, running.listen)}:${port}` : withPort(running.listen, port);
+  await holding(ctl, restart(cli, ctl, running, target, setup ? withSetup(before, setup) : before));
   return target;
 }
 
 /**
  * Runs the proxy with live testing (`live`, from accessMatrix's `liveArgs`) on its address and with
  * its other options: one `proxy restart` if it runs, as a move does, or `proxy start` on the app's
- * port if it doesn't. The proxy is the app's afterwards if it was before, or if the app started it.
+ * port with the project's saved setup if it doesn't (on every network interface too, if chosen, so
+ * other devices' requests are also tried as each identity). The proxy is the app's afterwards if it
+ * was before, or if the app started it.
  */
 export async function startLive(cli: Cli, ctl: ProxyControl, live: string[]): Promise<Started & { listen: string }> {
   const s = (await cli(["proxy", "status"])) as Status;
   const running = s.running ? s.proxy : null;
-  const listen = running?.listen ?? proxyListen();
-  const options = withLive(proxyOptions(running?.args ?? []), live);
   let started: Started;
+  let listen: string;
   if (running) {
-    started = await holding(ctl, restart(cli, ctl, running, listen, options));
+    listen = running.listen;
+    started = await holding(ctl, restart(cli, ctl, running, listen, withLive(proxyOptions(running.args ?? []), live)));
   } else {
-    started = (await cli(["proxy", "start", `--listen=${listen}`, ...options])) as Started;
+    const setup = await savedProxySetup(cli);
+    listen = proxyListen(undefined, setup);
+    started = (await cli(["proxy", "start", `--listen=${listen}`, ...withLive(setupOptions(setup), live)])) as Started;
     ctl.owned = pidOf(started);
   }
   return { ...started, listen: started.listen ?? listen };

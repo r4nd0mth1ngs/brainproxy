@@ -61,6 +61,12 @@ const isStart = (args: string[]) => args[1] === "start";
 const cliError = (message: string, data?: object) =>
   Object.assign(new Error(message), { kind: message.slice(0, message.indexOf(":")).replace(/ /g, "_"), data });
 
+const SHOW = ["proxy", "setup", "show"];
+
+/** A `fakeCli` answer: the project's saved setup for `proxy setup show`, `rest` for the others. */
+const withSaved = (setup: object, rest: (args: string[], call: number) => unknown = () => {}) => (args: string[], call: number) =>
+  args[1] === "setup" ? setup : rest(args, call);
+
 test("portProblem accepts empty (automatic) and ports from 1 to 65535", () => {
   for (const text of ["", "  ", "1", "80", "8080", " 9090 ", "65535", "08080"]) {
     assert.equal(portProblem(text), null, JSON.stringify(text));
@@ -150,20 +156,22 @@ test("startProxy uses the saved port, or the default", async () => {
   stubStorage({ [PROXY_PORT]: "9090" });
   let fake = fakeCli();
   await startProxy(fake.cli, proxyControl());
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
+  assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:9090"]]);
 
   stubStorage();
   fake = fakeCli();
   await startProxy(fake.cli, proxyControl());
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:8080"]]);
+  assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:8080"]]);
 });
 
 test("startProxy: a failed bind still rejects, now with the hint; other errors are unchanged", async () => {
   stubStorage();
   const failing = (message: string) =>
-    fakeCli(() => {
-      throw new Error(message);
-    }).cli;
+    fakeCli(
+      withSaved({}, () => {
+        throw new Error(message);
+      }),
+    ).cli;
   await assert.rejects(startProxy(failing(BIND_FAILURE), proxyControl()), { message: HINTED });
   await assert.rejects(startProxy(failing("conflict: proxy already running"), proxyControl()), { message: "conflict: proxy already running" });
 });
@@ -277,7 +285,7 @@ test("during a move, other starts wait for it and start nothing if the proxy is 
   assert.deepEqual(calls, [["proxy", "restart", "--listen=127.0.0.1:9090", "--timeout=30"]]);
   release();
   assert.equal(await moved, "127.0.0.1:9090");
-  assert.equal(await started, false);
+  assert.equal(await started, null);
   assert.deepEqual(calls.slice(1), [["proxy", "status"]]);
   assert.equal(ctl.moving, null);
 });
@@ -301,7 +309,7 @@ test("during a move that leaves the proxy off, a start waits and then starts it"
   });
   const ctl = proxyControl();
   const moved = moveProxy(cli, ctl, movable, 9090);
-  assert.equal(await startProxy(cli, ctl), true);
+  assert.equal(await startProxy(cli, ctl), "127.0.0.1:8080");
   await assert.rejects(moved);
   assert.deepEqual(calls.at(-1), ["proxy", "start", "--listen=127.0.0.1:8080"]);
   assert.equal(ctl.moving, null);
@@ -316,6 +324,7 @@ test("during a move that leaves the proxy off, a start waits and then starts it"
  */
 function proxyCli(status: () => object, pids: number[] = [], fail: (args: string[]) => boolean = () => false) {
   return fakeCli((args) => {
+    if (args[1] === "setup") return {};
     if (fail(args)) throw args[1] === "restart" ? restartFailed(pids.shift()!) : cliError(BIND_FAILURE);
     if (args[1] === "status") return status();
     if (isStart(args) || args[1] === "restart") return { pid: pids.shift(), listen: args[2].slice(9) };
@@ -340,7 +349,7 @@ test("startProxy takes an explicit port, and a failed start records nothing", as
   const ctl = proxyControl();
   const { calls, cli } = proxyCli(() => ({}), [], () => true);
   await assert.rejects(startProxy(cli, ctl, 8083), { message: HINTED });
-  assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8083"]]);
+  assert.deepEqual(calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:8083"]]);
   assert.equal(ctl.owned, null);
 });
 
@@ -477,7 +486,7 @@ test("during a move that went back, a start waits and starts nothing", async () 
   const { calls, cli } = proxyCli(() => runningAs(9), [9], (args) => args[1] === "restart");
   const ctl = proxyControl();
   const moved = moveProxy(cli, ctl, movable, 9090);
-  assert.equal(await startProxy(cli, ctl), false);
+  assert.equal(await startProxy(cli, ctl), null);
   await assert.rejects(moved);
   assert.ok(!calls.some(isStart), JSON.stringify(calls));
 });
@@ -508,10 +517,25 @@ test("startLive starts a proxy that isn't running on the app's port, and it is t
   const d = await startLive(cli, ctl, LIVE);
   assert.deepEqual(calls, [
     ["proxy", "status"],
+    SHOW,
     ["proxy", "start", "--listen=127.0.0.1:9090", ...LIVE],
   ]);
   assert.equal(d.listen, "127.0.0.1:9090");
   assert.equal(ctl.owned, 8);
+});
+
+test("startLive starts a proxy that isn't running with the project's saved setup, plus live testing", async () => {
+  stubStorage({ [PROXY_PORT]: "9090" });
+  const { calls, cli } = fakeCli(withSaved({ network: "all", redirect: "https://app.acme.test" }, (args) => (args[1] === "status" ? { running: false, proxy: null } : { pid: 8 })));
+  const d = await startLive(cli, proxyControl(), LIVE);
+  assert.deepEqual(calls.at(-1), ["proxy", "start", "--listen=0.0.0.0:9090", "--redirect=https://app.acme.test", ...LIVE]);
+  assert.equal(d.listen, "0.0.0.0:9090");
+});
+
+test("startLive leaves the saved setup alone for a proxy that runs: it keeps its own options", async () => {
+  const { calls, cli } = proxyCli(() => ({ running: true, proxy: liveRunning }), [8]);
+  await startLive(cli, proxyControl(), LIVE);
+  assert.ok(!calls.some((c) => c[1] === "setup"), JSON.stringify(calls));
 });
 
 test("startLive: a proxy the app didn't start doesn't become the app's", async () => {
@@ -577,7 +601,137 @@ test("during a live restart, other starts in the app wait for it", async () => {
   assert.equal(calls.filter(isStart).length, 0);
   release();
   await live;
-  assert.equal(await started, false);
+  assert.equal(await started, null);
   assert.equal(calls.filter(isStart).length, 0);
   assert.equal(ctl.moving, null);
+});
+
+// The setup (proxyMode.ts): who can connect, invisible mode and the redirect.
+
+test("startProxy starts with the setup saved in the project file", async () => {
+  stubStorage({ [PROXY_PORT]: "80" });
+  const fake = fakeCli(withSaved({ network: "all", invisible: true, redirect: "https://app.acme.test" }));
+  assert.equal(await startProxy(fake.cli, proxyControl()), "0.0.0.0:80");
+  assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=0.0.0.0:80", "--redirect=https://app.acme.test"]]);
+  assert.equal(proxyListen(), "127.0.0.1:80");
+});
+
+test("startProxy: a setup that can't be read starts nothing", async () => {
+  const fake = fakeCli((args) => {
+    if (args[1] === "setup") throw new Error("internal: database is locked");
+  });
+  await assert.rejects(startProxy(fake.cli, proxyControl(), 8080), { message: "internal: database is locked" });
+  assert.deepEqual(fake.calls, [SHOW]);
+});
+
+test("startProxy returns the address the proxy reports, or the one it asked for", async () => {
+  let fake = fakeCli(withSaved({}, (args) => (isStart(args) ? { pid: 3, listen: "127.0.0.1:41000" } : {})));
+  assert.equal(await startProxy(fake.cli, proxyControl(), 8080), "127.0.0.1:41000");
+  fake = fakeCli();
+  assert.equal(await startProxy(fake.cli, proxyControl(), 8080), "127.0.0.1:8080");
+});
+
+test("moveProxy with a setup: its host, invisible mode and redirect, the other options kept", async () => {
+  const running = { listen: "127.0.0.1:8080", args: ["proxy", "run", "--listen", "127.0.0.1:8080", "--timeout", "30", "--invisible"] };
+  const { calls, cli } = fakeCli();
+  const setup = { allInterfaces: true, invisible: false, redirect: "https://app.acme.test" };
+  assert.equal(await moveProxy(cli, proxyControl(), running, 443, setup), "0.0.0.0:443");
+  assert.deepEqual(calls, [["proxy", "restart", "--listen=0.0.0.0:443", "--timeout=30", "--redirect=https://app.acme.test"]]);
+});
+
+test("moveProxy with a setup on the same port: only the mode changes", async () => {
+  const { calls, cli } = fakeCli();
+  const setup = { allInterfaces: false, invisible: true, redirect: null };
+  assert.equal(await moveProxy(cli, proxyControl(), { listen: "[::1]:8080" }, 8080, setup), "[::1]:8080");
+  assert.deepEqual(calls, [["proxy", "restart", "--listen=[::1]:8080", "--invisible"]]);
+});
+
+test("moveProxy with a setup that fails: the CLI puts the proxy back as it was, and the app keeps it", async () => {
+  const running = { listen: "127.0.0.1:8080", pid: 7, args: ["proxy", "run", "--listen", "127.0.0.1:8080", "--redirect", "https://old.test"] };
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { calls, cli } = proxyCli(() => runningAs(9), [9], (args) => args.includes("--listen=0.0.0.0:80"));
+  await assert.rejects(moveProxy(cli, ctl, running, 80, { allInterfaces: true, invisible: true, redirect: null }), {
+    message: `${HINTED} The proxy is back on 127.0.0.1:8080.`,
+  });
+  // One restart: going back, with the old options, is the CLI's job.
+  assert.deepEqual(calls, [
+    ["proxy", "restart", "--listen=0.0.0.0:80", "--invisible"],
+    ["proxy", "status"],
+  ]);
+  assert.equal(ctl.owned, 9);
+});
+
+test("moveProxy back to this computer only: a proxy on every interface doesn't stay there", async () => {
+  for (const host of ["0.0.0.0", "[::]", "192.168.1.5"]) {
+    const running = { listen: `${host}:8080`, args: ["proxy", "run", "--listen", `${host}:8080`, "--invisible", "--redirect", "https://old.test", "--auth", "alice"] };
+    const { calls, cli } = fakeCli();
+    assert.equal(await moveProxy(cli, proxyControl(), running, 8080, { allInterfaces: false, invisible: false, redirect: null }), "127.0.0.1:8080", host);
+    assert.deepEqual(calls, [["proxy", "restart", "--listen=127.0.0.1:8080", "--auth=alice"]], host);
+  }
+});
+
+test("moveProxy with a setup: the app's proxy stays the app's, another's doesn't become it", async () => {
+  const setup = { allInterfaces: true, invisible: true, redirect: null };
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  let fake = proxyCli(() => ({}), [8]);
+  await moveProxy(fake.cli, ctl, { listen: "127.0.0.1:8080", pid: 7 }, 8080, setup);
+  assert.equal(ctl.owned, 8);
+
+  const other = proxyControl();
+  fake = proxyCli(() => ({}), [9]);
+  await moveProxy(fake.cli, other, { listen: "127.0.0.1:8080", pid: 7 }, 8080, setup);
+  assert.equal(other.owned, null);
+});
+
+test("moveProxy without a setup keeps a shell's invisible mode and redirect, as one option each", async () => {
+  const running = { listen: "0.0.0.0:80", args: ["proxy", "run", "--listen", "0.0.0.0:80", "--invisible", "--redirect", "https://app.acme.test", "--no-http2"] };
+  const { calls, cli } = fakeCli();
+  assert.equal(await moveProxy(cli, proxyControl(), running, 8080), "0.0.0.0:8080");
+  assert.deepEqual(calls, [["proxy", "restart", "--listen=0.0.0.0:8080", "--invisible", "--redirect=https://app.acme.test", "--no-http2"]]);
+});
+
+test("startProxy: a saved redirect that isn't a plain origin never reaches the start", async () => {
+  for (const redirect of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "https://app.acme.test --listen=0.0.0.0:80"]) {
+    const { calls, cli } = fakeCli(withSaved({ redirect }));
+    await startProxy(cli, proxyControl());
+    assert.deepEqual(calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:8080"]], redirect);
+  }
+});
+
+test("startProxy: an unreadable saved setup starts on this computer only", async () => {
+  for (const saved of [null, "all", { network: "ALL", invisible: "1" }]) {
+    const fake = fakeCli(withSaved(saved as object));
+    await startProxy(fake.cli, proxyControl(), 9090);
+    assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:9090"]], JSON.stringify(saved));
+  }
+});
+
+test("a start waiting on a setup move that left the proxy off starts it with the saved setup", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const { calls, cli } = fakeCli(async (args) => {
+    if (args[1] === "setup") return { network: "all", redirect: "https://app.acme.test" };
+    if (args[1] === "restart") {
+      await held;
+      throw cliError(BIND_FAILURE, { stopped: true, failure: BIND_FAILURE, restarted: null });
+    }
+    if (args[1] === "status") return { running: false, proxy: null };
+    return {};
+  });
+  const ctl = proxyControl();
+  const moved = moveProxy(cli, ctl, { listen: "127.0.0.1:8080" }, 80, { allInterfaces: true, invisible: false, redirect: "https://app.acme.test" });
+  const started = startProxy(cli, ctl, 8080).catch((e) => e);
+  release();
+  await assert.rejects(moved);
+  await started;
+  // The move's restart and status, then the waiting start's status check, setup and its own start.
+  assert.deepEqual(calls.at(-1), ["proxy", "start", "--listen=0.0.0.0:8080", "--redirect=https://app.acme.test"]);
+});
+
+test("lowPortNote says what privileges a low port needs", () => {
+  assert.match(lowPortNote(80)!, /CAP_NET_BIND_SERVICE/);
+  assert.match(lowPortNote(1)!, /stays off/);
+  assert.equal(lowPortNote(65535), null);
 });

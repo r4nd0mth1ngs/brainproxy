@@ -188,6 +188,8 @@ test("live testing options, and the running proxy's options kept on a restart", 
   assert.deepEqual(withLive(live, ["--authz=carol"]), ["--timeout=30", "--verify-tls", "--auth=alice", "--authz-rate=5", "--no-http2", "--authz-queue=50", "--authz-exclude=(?i)a=b", "--authz=carol"]);
   assert.deepEqual(withLive(live, ["--authz=carol", "--authz-rate=2"]).filter((o) => o.startsWith("--authz-rate")), ["--authz-rate=2"]);
   assert.deepEqual(proxyOptions([]), []);
+  // Invisible mode is a flag, the redirect takes a value.
+  assert.deepEqual(proxyOptions(["proxy", "run", "--invisible", "--redirect", "https://app.test", "--no-http2"]), ["--invisible", "--redirect=https://app.test", "--no-http2"]);
 });
 
 test("hosts and run labels", () => {

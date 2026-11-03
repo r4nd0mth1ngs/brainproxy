@@ -223,8 +223,7 @@ pub(crate) fn open(
     let state = crate::proxy_cmd::running_here(&store)?.ok_or_else(|| {
         Error::Conflict("the proxy isn't running for this project; start it with `brainproxy proxy start`".into())
     })?;
-    // A wildcard listen address isn't something to connect to.
-    let proxy = state.listen.replace("0.0.0.0:", "127.0.0.1:").replace("[::]:", "[::1]:");
+    let proxy = crate::proxy_cmd::connect_addr(&state.listen);
     let (port, host) = proxy.rsplit_once(':').map(|(h, p)| (p.to_string(), h.to_string())).unwrap_or_default();
     let profile = match fresh {
         // A throwaway profile, emptied first: no earlier session can skip the login.

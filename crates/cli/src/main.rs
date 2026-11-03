@@ -406,6 +406,8 @@ fn command_name(cmd: &Cmd) -> String {
             proxy_cmd::ProxyCmd::Stop { .. } => "proxy stop",
             proxy_cmd::ProxyCmd::Restart(_) => "proxy restart",
             proxy_cmd::ProxyCmd::Status => "proxy status",
+            proxy_cmd::ProxyCmd::Setup(proxy_cmd::SetupCmd::Show) => "proxy setup show",
+            proxy_cmd::ProxyCmd::Setup(proxy_cmd::SetupCmd::Set { .. }) => "proxy setup set",
         },
         Cmd::Ca(_) => "ca",
         Cmd::Browser(browser_cmd::BrowserCmd::List) => "browser list",
