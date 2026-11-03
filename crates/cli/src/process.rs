@@ -110,6 +110,24 @@ pub(crate) fn still_running(pid: u32, start: Option<u64>) -> Option<bool> {
     start.map(|s| start_time(pid) == Some(s))
 }
 
+/// Whether `pid` has exited and waits to be reaped: a zombie, which a container's init may never
+/// reap. Only Linux tells; elsewhere `false`.
+pub(crate) fn exited(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // The state follows `(comm)`.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// This process's PID namespace; pids only mean something inside one. `None` where there
 /// are no such namespaces to tell apart, or `/proc` isn't there to ask.
 pub(crate) fn pid_namespace() -> Option<String> {

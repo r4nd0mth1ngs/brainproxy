@@ -37,7 +37,9 @@ const BACK_ENV: &str = "BRAINPROXY_PROXY_RESTART_BACK";
 /// that one goes back to if the restart has gone (see [`go_back`]).
 const WAS_ENV: &str = "BRAINPROXY_PROXY_RESTART_WAS";
 /// `proxy stop` calls off a restart under way by writing its token here; the restart looks
-/// between its steps and while it waits for a proxy to come up (see [`call_off`]).
+/// between its steps and while it waits for a proxy to come up, and so does a proxy started on
+/// its behalf before it takes the record (see [`call_off`]). Tokens are never reused, so a
+/// call-off left here once it has worked is harmless until the next one replaces it.
 const CANCEL_KEY: &str = "proxy.restart.cancel";
 /// How long `proxy stop` waits for a restart it called off to let go of the record. Its longest
 /// step is stopping the old proxy: with a live authz run, `STOP_WAIT_AUTHZ` and then a kill.
@@ -499,10 +501,12 @@ fn restart_gone(store: &Store, s: &Saved) -> bool {
     process::liveness(store, RESTART_LOCK, s.state.pid, s.start_time, s.pid_ns.as_deref()) == Liveness::Gone
 }
 
-/// The pid of the proxy a restart's hold says it is starting, if that still runs here.
+/// The pid of the proxy a restart's hold says it is starting, if that still runs here. Orphaned,
+/// it may never be reaped, so a zombie counts as gone.
 fn starting_here(s: &Saved) -> Option<u32> {
     let (pid, start) = s.starting?;
-    (!process::elsewhere(s.pid_ns.as_deref()) && process::still_running(pid, start) != Some(false)).then_some(pid)
+    let here = !process::elsewhere(s.pid_ns.as_deref());
+    (here && process::still_running(pid, start) != Some(false) && !process::exited(pid)).then_some(pid)
 }
 
 /// The saved state and what is known about it, clearing stale state left by a crash. A
@@ -660,9 +664,10 @@ fn call_off(store: &Store, wait: Duration) -> Result<Option<Saved>, Error> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let still = held()?.is_some();
-    store.meta_swap(CANCEL_KEY, Some(token), None)?;
-    if still {
+    // Called off, the call-off stays: a proxy started on the restart's behalf that hasn't been
+    // seen yet (going back, say) refuses the record by it (see `serve`). A later one replaces it.
+    if held()?.is_some() {
+        store.meta_swap(CANCEL_KEY, Some(token), None)?;
         return Err(Error::Conflict(format!(
             "the proxy is being restarted (`brainproxy proxy restart`, {}), and the restart hasn't given up {} s after \
              being asked to; try again once it has finished",
@@ -1796,6 +1801,29 @@ mod tests {
         let Err(Error::NotFound(_)) = stop(&store, Some(std::process::id())) else { panic!("a hold was stopped") };
         store.meta_set(STATE_KEY, None).unwrap();
         assert!(stop(&store, Some(1)).unwrap().proxy.is_none());
+    }
+
+    /// A hold lasts while the proxy it starts runs, also once the restart has gone, but not once
+    /// that proxy has exited, even if nothing reaps it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hold_lasts_while_its_proxy_starts_but_not_for_a_zombie() {
+        let store = Store::open_in_memory().unwrap();
+        let starting = |pid: u32| {
+            let hold = Saved { starting: Some((pid, process::start_time(pid))), ..record(GONE, Some("t"), None) };
+            parse_state(&serde_json::to_string(&hold).unwrap()).unwrap()
+        };
+        assert_eq!(liveness(&store, &starting(std::process::id())), Liveness::Running);
+        assert!(restart_gone(&store, &starting(std::process::id())));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let hold = starting(child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process::exited(child.id()) {
+            assert!(Instant::now() < deadline, "never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(liveness(&store, &hold), Liveness::Gone);
+        child.wait().unwrap();
     }
 
     /// A restart's hold that can't be verified points at the proxy's own `stop --forget`.
