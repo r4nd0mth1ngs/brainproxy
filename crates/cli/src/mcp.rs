@@ -132,6 +132,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("send", NET),
     ("proxy start", ADD),
     ("proxy stop", REPLACE),
+    // Stops the running proxy and starts one in its place.
+    ("proxy restart", REPLACE),
     ("proxy status", READ),
     ("ca init", REPLACE),
     // --out writes a file (refused if it exists unless --force).

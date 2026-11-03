@@ -76,7 +76,7 @@ and `project save`, since copying the project elsewhere is for the person runnin
   `query`, `schema`, `capabilities`, `history_*` reads, `findings_list`/`show`, `job_wait`,
   ... Open world and destructive (requests can change state on the target): `send`,
   `fuzz_run`, `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`.
-  Destructive locally: `engagement_start` (write-once), `*_stop`, `*_remove`, `*_clear`,
+  Destructive locally: `engagement_start` (write-once), `*_stop`, `proxy_restart`, `*_remove`, `*_clear`,
   `scope_set`, `ca_init`, `scan_data_reset`. A command missing from the table gets the
   spec's cautious defaults (not read-only, destructive, not idempotent, open world); a
   test fails until it is classified. These are hints for clients deciding what to confirm;

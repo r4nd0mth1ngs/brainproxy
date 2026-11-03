@@ -77,7 +77,7 @@ export function withPortHint(message: string): string {
 export interface ProxyControl {
   /** The pid of the proxy the app started; only that one is stopped when the project closes. */
   owned: number | null;
-  /** Set while a move has stopped the proxy and starts it again; other starts wait for it. Never rejects. */
+  /** Set while a move restarts the proxy on another port; other starts in the app wait for it. Never rejects. */
   moving: Promise<void> | null;
 }
 
@@ -138,12 +138,24 @@ async function whereNow(cli: Cli, was: string): Promise<string> {
   return s.proxy.listen === was ? `The proxy is back on ${was}.` : `The proxy is on ${s.proxy.listen}.`;
 }
 
+/**
+ * A failed `proxy restart`, from its message. Once it has stopped the proxy, the CLI adds whether
+ * it started it again where it was (and its pid): `stopped`, `pid`, and `message` without that
+ * part, since the app says where the proxy is from a fresh status.
+ */
+export function restartFailure(message: string): { message: string; stopped: boolean; pid: number | null } {
+  const m = /; the proxy (?:was started again on \S+ \(pid (\d+)\)$|couldn't be started again on [\s\S]*$)/.exec(message);
+  if (!m) return { message, stopped: false, pid: null };
+  return { message: message.slice(0, m.index), stopped: true, pid: m[1] ? Number(m[1]) : null };
+}
+
 type Running = { listen: string; pid?: number; args?: string[] };
 
 /**
- * Restarts a running proxy on `port`, with the same host and options; returns the new address. If
- * it doesn't come up there, the proxy is started again where it was and the error says where it is
- * now. Starts from elsewhere in the app wait until it is done. The proxy stays the app's if it was.
+ * Restarts a running proxy on `port`, with the same host and options; returns the new address. It
+ * is one `proxy restart`, so a start from a shell or an agent can't get in between. If the proxy
+ * doesn't come up there, the CLI starts it again where it was, and the error says where it is now.
+ * Starts from elsewhere in the app wait until it is done. The proxy stays the app's if it was.
  */
 export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
   const work = move(cli, ctl, running, port);
@@ -162,19 +174,15 @@ export async function moveProxy(cli: Cli, ctl: ProxyControl, running: Running, p
 async function move(cli: Cli, ctl: ProxyControl, running: Running, port: number): Promise<string> {
   const ours = ctl.owned != null && ctl.owned === running.pid;
   const target = withPort(running.listen, port);
-  const options = proxyOptions(running.args ?? []);
-  const start = async (listen: string) => {
-    const pid = pidOf(await cli(["proxy", "start", `--listen=${listen}`, ...options]));
-    if (ours) ctl.owned = pid;
-  };
-  await cli(["proxy", "stop"]);
-  if (ours) ctl.owned = null;
   try {
-    await start(target);
+    const pid = pidOf(await cli(["proxy", "restart", `--listen=${target}`, ...proxyOptions(running.args ?? [])]));
+    if (ours) ctl.owned = pid;
   } catch (e: any) {
-    // A shell or an agent may have started it in the meantime, on either port.
-    await start(running.listen).catch(() => {});
-    throw new Error(`${withPortHint(e.message)} ${await whereNow(cli, running.listen)}`);
+    const failed = restartFailure(e.message);
+    // Refused before anything stopped: the proxy runs as it did.
+    if (!failed.stopped) throw e;
+    if (ours) ctl.owned = failed.pid;
+    throw new Error(`${withPortHint(failed.message)} ${await whereNow(cli, running.listen)}`);
   }
   return target;
 }

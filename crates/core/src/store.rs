@@ -685,6 +685,24 @@ impl Store {
         Ok(())
     }
 
+    /// Sets `key` to `value` (`None` removes it) only if it still holds `expected` (`None`:
+    /// unset), in one statement, so that two processes can't both act on what they read.
+    /// Returns whether it was changed.
+    pub fn meta_swap(&self, key: &str, expected: Option<&str>, value: Option<&str>) -> Result<bool> {
+        let changed = match (expected, value) {
+            (None, Some(v)) => self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+                params![key, v],
+            )?,
+            (Some(e), Some(v)) => {
+                self.conn.execute("UPDATE meta SET value = ?3 WHERE key = ?1 AND value = ?2", params![key, e, v])?
+            }
+            (Some(e), None) => self.conn.execute("DELETE FROM meta WHERE key = ?1 AND value = ?2", params![key, e])?,
+            (None, None) => return Ok(self.meta_get(key)?.is_none()),
+        };
+        Ok(changed == 1)
+    }
+
     /// Reads a JSON setting, or its default when unset.
     pub fn setting<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
         match self.meta_get(&format!("setting.{key}"))? {
@@ -1199,6 +1217,27 @@ mod tests {
         let version: i64 =
             Connection::open(&path).unwrap().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn meta_swap_changes_only_what_was_read() {
+        let dir = std::env::temp_dir().join(format!("bp-store-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        assert!(store.meta_swap("k", None, None).unwrap());
+        assert!(store.meta_swap("k", None, Some("a")).unwrap());
+        assert!(!store.meta_swap("k", None, Some("b")).unwrap(), "set meanwhile");
+        assert!(!store.meta_swap("k", Some("b"), Some("c")).unwrap(), "not what was read");
+        assert!(!store.meta_swap("k", None, None).unwrap());
+        assert_eq!(store.meta_get("k").unwrap().as_deref(), Some("a"));
+        assert!(store.meta_swap("k", Some("a"), Some("b")).unwrap());
+        assert!(!store.meta_swap("k", Some("a"), None).unwrap());
+        assert!(store.meta_swap("k", Some("b"), None).unwrap());
+        assert_eq!(store.meta_get("k").unwrap(), None);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

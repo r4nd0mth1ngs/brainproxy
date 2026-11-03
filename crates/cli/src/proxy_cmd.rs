@@ -24,6 +24,8 @@ use crate::process::{self, Liveness};
 /// `proxy stop` asks the proxy to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "proxy.stop";
 const LOCK_NAME: &str = "proxy";
+/// Hands a `proxy restart`'s hold on the record to the proxy it starts (see `Saved::restart`).
+const RESTART_ENV: &str = "BRAINPROXY_PROXY_RESTART";
 
 /// How long a proxy may take to exit when asked to. With a live authz run it also has to
 /// finish its tests and save the run.
@@ -70,6 +72,10 @@ pub enum ProxyCmd {
         #[arg(long)]
         forget: bool,
     },
+    /// Move this project's running proxy to another address or options: stop it and start it again
+    /// in one step, so no other start gets in between. Takes start's options, defaults included;
+    /// if the new proxy doesn't come up, the old one is started again where it was.
+    Restart(ProxyRunArgs),
     /// Show whether a proxy is running, with capture and intercept counts.
     Status,
 }
@@ -407,27 +413,44 @@ struct Saved {
     /// The proxy's PID namespace, recorded if it holds its lock file: see `process`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pid_ns: Option<String>,
+    /// Set while `proxy restart` holds the record, from before it stops the proxy until the
+    /// proxy it starts takes the record over: the pid is the restart's own, so every other start
+    /// finds the record taken. The proxy it starts gets this token in [`RESTART_ENV`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<String>,
+    /// The record as stored. It is only ever replaced or cleared if it still reads the same.
+    #[serde(skip)]
+    raw: String,
+}
+
+fn parse_state(raw: &str) -> Option<Saved> {
+    serde_json::from_str(raw).ok().map(|s| Saved { raw: raw.to_string(), ..s })
 }
 
 fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
-    Ok(store.meta_get(STATE_KEY)?.and_then(|s| serde_json::from_str(&s).ok()))
+    Ok(store.meta_get(STATE_KEY)?.as_deref().and_then(parse_state))
+}
+
+fn liveness(store: &Store, s: &Saved) -> Liveness {
+    process::liveness(store, LOCK_NAME, s.state.pid, s.start_time, s.pid_ns.as_deref())
 }
 
 /// The saved state and what is known about it, clearing stale state left by a crash.
 fn recorded(store: &Store) -> Result<Option<(Saved, Liveness)>, Error> {
     let Some(s) = read_state(store)? else { return Ok(None) };
-    match process::liveness(store, LOCK_NAME, s.state.pid, s.start_time, s.pid_ns.as_deref()) {
+    match liveness(store, &s) {
         Liveness::Gone => {
-            store.meta_set(STATE_KEY, None)?;
+            store.meta_swap(STATE_KEY, Some(&s.raw), None)?;
             Ok(None)
         }
         known => Ok(Some((s, known))),
     }
 }
 
-/// The running proxy's saved state, clearing stale state left by a crash.
+/// The running proxy's saved state, clearing stale state left by a crash. Not a restart's
+/// hold on the record, which has no proxy to connect to.
 fn current(store: &Store) -> Result<Option<Saved>, Error> {
-    Ok(recorded(store)?.filter(|(_, known)| *known == Liveness::Running).map(|(s, _)| s))
+    Ok(recorded(store)?.filter(|(s, known)| *known == Liveness::Running && s.restart.is_none()).map(|(s, _)| s))
 }
 
 /// The running proxy for this project, clearing stale state left by a crash.
@@ -440,16 +463,30 @@ pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
     Ok(current(store)?.filter(|s| !process::elsewhere(s.pid_ns.as_deref())).map(|s| s.state))
 }
 
-/// Stops this project's proxy if one runs: its pid, and whether it had to be killed.
+/// Stops this project's proxy if one runs: its pid, and whether it had to be killed. Refused
+/// while a restart holds the record.
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
-    let Some((Saved { state, start_time, pid_ns }, _)) = recorded(store)? else { return Ok(None) };
+    let Some((saved, known)) = recorded(store)? else { return Ok(None) };
+    if saved.restart.is_some() {
+        return Err(already_running(&saved, known));
+    }
+    let forced = halt(store, &saved)?;
+    store.meta_swap(STATE_KEY, Some(&saved.raw), None)?;
+    store.meta_set(STOP_KEY, None)?;
+    Ok(Some((saved.state.pid, forced)))
+}
+
+/// Asks the proxy recorded as `saved` to exit and waits until it has; whether it had to be
+/// killed. Its record is the caller's to clear or replace.
+fn halt(store: &Store, saved: &Saved) -> Result<bool, Error> {
+    let Saved { state, start_time, pid_ns, .. } = saved;
     process::request_stop(store, STOP_KEY, state.pid)?;
     let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
     let forced = if process::elsewhere(pid_ns.as_deref()) {
         process::await_exit_elsewhere(store, LOCK_NAME, STATE_KEY, state.pid, wait)?;
         false
     } else {
-        process::terminate(state.pid, start_time, "proxy", wait)?
+        process::terminate(state.pid, *start_time, "proxy", wait)?
     };
     // Killed, it couldn't save its run; the rows recorded so far stay.
     if let Some(id) = state.authz_run.filter(|_| forced) {
@@ -457,21 +494,22 @@ pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
             store.job_set_state(id, "failed", None, Some("the proxy was killed before the run was saved"), true)?;
         }
     }
-    store.meta_set(STATE_KEY, None)?;
-    store.meta_set(STOP_KEY, None)?;
-    Ok(Some((state.pid, forced)))
+    Ok(forced)
 }
 
 /// Clears a record that can't be verified: its pid, or `None` if there is no record.
 fn forget(store: &Store) -> Result<Option<u32>, Error> {
     let Some((saved, known)) = recorded(store)? else { return Ok(None) };
+    if known == Liveness::Running && saved.restart.is_some() {
+        return Err(already_running(&saved, known));
+    }
     if known == Liveness::Running {
         return Err(Error::Conflict(format!(
             "the proxy is running ({}), so its record stays; use `brainproxy proxy stop`",
             process::pid_text(saved.state.pid, saved.pid_ns.as_deref())
         )));
     }
-    store.meta_set(STATE_KEY, None)?;
+    store.meta_swap(STATE_KEY, Some(&saved.raw), None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some(saved.state.pid))
 }
@@ -503,6 +541,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
     match cmd {
         ProxyCmd::Start(args) => start(project, home, args, out),
         ProxyCmd::Run(args) => run_foreground(project, home, args, out),
+        ProxyCmd::Restart(args) => restart(project, home, args, out),
         ProxyCmd::Stop { forget: true } => {
             let store = Store::open(project)?;
             let pid = forget(&store)?.ok_or_else(|| Error::NotFound("no proxy recorded for this project".into()))?;
@@ -525,6 +564,10 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                     "next": "brainproxy proxy stop --forget"})
             });
             let pid_ns = saved.as_ref().and_then(|s| s.pid_ns.clone());
+            let (held, saved) = match saved {
+                Some(s) if s.restart.is_some() => (known == Some(Liveness::Running), None),
+                saved => (false, saved),
+            };
             let state = saved.filter(|_| known == Some(Liveness::Running)).map(|s| s.state);
             let captures = store.list(&HistoryFilter { source: Some("proxy".into()), ..Default::default() })?.len();
             let pending = store.intercept_list(Some("pending"), u32::MAX)?.len();
@@ -541,6 +584,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             };
             let data = json!({
                 "running": state.is_some(),
+                "restarting": held,
                 "proxy": state.as_ref().map(state_json),
                 "other_pid_namespace": process::elsewhere(pid_ns.as_deref()),
                 "unverified": unverified,
@@ -560,6 +604,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 ),
                 None => match &unverified {
                     Some(u) => u["reason"].as_str().unwrap_or_default().to_string(),
+                    None if held => "not running: being restarted".into(),
                     None => "not running".into(),
                 },
             });
@@ -573,70 +618,224 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if let Some((s, known)) = recorded(&store)? {
         return Err(already_running(&s, known));
     }
-    load_ca(home)?; // Surface CA and scope problems here rather than in the log.
-    store.guard()?;
-    let project = std::fs::canonicalize(project)?;
-    let log = args.log.clone().unwrap_or_else(|| project.with_extension("proxy.log"));
-    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-    let log_start = log_file.metadata()?.len() as usize;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--project")
-        .arg(&project)
-        .arg("--home")
-        .arg(home)
-        .args(["--format", "json", "proxy", "run", "--listen", &args.listen])
-        .args(["--timeout", &args.timeout.to_string()])
-        .arg("--log")
-        .arg(&log);
-    if args.verify_tls {
-        cmd.arg("--verify-tls");
-    }
-    if args.no_http2 {
-        cmd.arg("--no-http2");
-    }
-    if args.invisible {
-        cmd.arg("--invisible");
-    }
-    if let Some(r) = &args.redirect {
-        Target::from_url(r)?;
-        cmd.args(["--redirect", r]);
-    }
-    if let Some(name) = &args.auth {
-        store.auth_profile(name)?; // Fail fast on an unknown profile.
-        cmd.args(["--auth", name]);
-    }
-    let live = args.live_authz()?;
-    if live.enabled {
-        crate::authz_cmd::require_profiles(&project, &live.identities)?;
-        cmd.arg("--authz").arg(args.authz.join(","));
-        cmd.args(["--authz-rate", &args.authz_rate.to_string(), "--authz-queue", &args.authz_queue.to_string()]);
-        cmd.arg("--authz-exclude").arg(&args.authz_exclude);
-        if !args.authz_keep_cookie.is_empty() {
-            cmd.arg("--authz-keep-cookie").arg(args.authz_keep_cookie.join(","));
-        }
-    }
-    process::detach(&mut cmd);
-    let mut child =
-        cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
+    let state = Launch::prepare(project, home, &args, &store)?.spawn(&store, None)?;
+    out.ok(state_json(&state), || {
+        format!("proxy listening on http://{} (pid {}){}", state.listen, state.pid, live_text(state.authz_run))
+    });
+    Ok(())
+}
 
-    let deadline = Instant::now() + Duration::from_secs_f64(args.wait.max(0.1));
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let log_text = std::fs::read(&log).unwrap_or_default();
-            let new = String::from_utf8_lossy(log_text.get(log_start..).unwrap_or_default()).into_owned();
-            return Err(crate::jobs_cmd::child_failure("proxy", status, &new));
+/// A `proxy run` for the background, its options checked, ready to start.
+struct Launch {
+    cmd: std::process::Command,
+    log: PathBuf,
+    wait: f64,
+}
+
+impl Launch {
+    fn prepare(project: &Path, home: &Path, args: &ProxyRunArgs, store: &Store) -> Result<Self, Error> {
+        load_ca(home)?; // Surface CA and scope problems here rather than in the log.
+        store.guard()?;
+        let project = std::fs::canonicalize(project)?;
+        let log = args.log.clone().unwrap_or_else(|| project.with_extension("proxy.log"));
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.arg("--project")
+            .arg(&project)
+            .arg("--home")
+            .arg(home)
+            .args(["--format", "json", "proxy", "run", "--listen", &args.listen])
+            .args(["--timeout", &args.timeout.to_string()])
+            .arg("--log")
+            .arg(&log);
+        if args.verify_tls {
+            cmd.arg("--verify-tls");
         }
-        if let Some(Saved { state, .. }) = read_state(&store)?.filter(|s| s.state.pid == child.id()) {
-            out.ok(state_json(&state), || {
-                format!("proxy listening on http://{} (pid {}){}", state.listen, state.pid, live_text(state.authz_run))
-            });
-            return Ok(());
+        if args.no_http2 {
+            cmd.arg("--no-http2");
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            return Err(Error::Timeout(Duration::from_secs_f64(args.wait)));
+        if args.invisible {
+            cmd.arg("--invisible");
         }
-        std::thread::sleep(Duration::from_millis(50));
+        if let Some(r) = &args.redirect {
+            Target::from_url(r)?;
+            cmd.args(["--redirect", r]);
+        }
+        if let Some(name) = &args.auth {
+            store.auth_profile(name)?; // Fail fast on an unknown profile.
+            cmd.args(["--auth", name]);
+        }
+        let live = args.live_authz()?;
+        if live.enabled {
+            crate::authz_cmd::require_profiles(&project, &live.identities)?;
+            cmd.arg("--authz").arg(args.authz.join(","));
+            cmd.args(["--authz-rate", &args.authz_rate.to_string(), "--authz-queue", &args.authz_queue.to_string()]);
+            cmd.arg("--authz-exclude").arg(&args.authz_exclude);
+            if !args.authz_keep_cookie.is_empty() {
+                cmd.arg("--authz-keep-cookie").arg(args.authz_keep_cookie.join(","));
+            }
+        }
+        Ok(Self { cmd, log, wait: args.wait })
+    }
+
+    /// Starts it and waits until it is listening. `restart` is the token of the restart holding
+    /// the record, which the new proxy then takes over.
+    fn spawn(mut self, store: &Store, restart: Option<&str>) -> Result<ProxyState, Error> {
+        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&self.log)?;
+        let log_start = log_file.metadata()?.len() as usize;
+        match restart {
+            Some(token) => self.cmd.env(RESTART_ENV, token),
+            None => self.cmd.env_remove(RESTART_ENV),
+        };
+        process::detach(&mut self.cmd);
+        let mut child = self
+            .cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file.try_clone()?))
+            .stderr(Stdio::from(log_file))
+            .spawn()?;
+
+        let deadline = Instant::now() + Duration::from_secs_f64(self.wait.max(0.1));
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let log_text = std::fs::read(&self.log).unwrap_or_default();
+                let new = String::from_utf8_lossy(log_text.get(log_start..).unwrap_or_default()).into_owned();
+                return Err(crate::jobs_cmd::child_failure("proxy", status, &new));
+            }
+            if let Some(Saved { state, .. }) = read_state(store)?.filter(|s| s.state.pid == child.id()) {
+                return Ok(state);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                return Err(Error::Timeout(Duration::from_secs_f64(self.wait)));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Stops the running proxy and starts it with `args`, holding the record in between so that no
+/// other start can take it (see `Saved::restart`). If the new proxy doesn't come up, the old one
+/// is started again on the address it had, with its options, and the error says where it is.
+/// With no proxy running nothing is started: that is `start`'s job.
+fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    let Some((old, known)) = recorded(&store)? else {
+        return Err(Error::NotFound(
+            "no proxy running for this project; start one with `brainproxy proxy start`".into(),
+        ));
+    };
+    if known != Liveness::Running || old.restart.is_some() {
+        return Err(already_running(&old, known));
+    }
+    // Everything that can be checked is, before anything stops.
+    let back = ProxyRunArgs { listen: old.state.listen.clone(), ..previous_args(&old.state)? };
+    let launch = Launch::prepare(project, home, &args, &store)?;
+
+    let me = std::process::id();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let token = format!("{me}-{}", now.as_nanos());
+    let hold = Saved {
+        state: ProxyState { pid: me, started: now.as_secs().to_string(), authz_run: None, ..old.state.clone() },
+        start_time: process::start_time(me),
+        pid_ns: process::pid_namespace(),
+        restart: Some(token.clone()),
+        raw: String::new(),
+    };
+    let hold = serde_json::to_string(&hold).unwrap_or_default();
+    if !store.meta_swap(STATE_KEY, Some(&old.raw), Some(&hold))? {
+        return Err(Error::Conflict(
+            "the proxy was stopped or replaced while restarting it; see `brainproxy proxy status`".into(),
+        ));
+    }
+    let forced = match halt(&store, &old) {
+        Ok(forced) => forced,
+        Err(e) => {
+            // It still runs: give it its record back.
+            store.meta_swap(STATE_KEY, Some(&hold), Some(&old.raw))?;
+            return Err(e);
+        }
+    };
+    store.meta_set(STOP_KEY, None)?;
+
+    let state = match launch.spawn(&store, Some(&token)) {
+        Ok(state) => state,
+        Err(e) => {
+            let again = Launch::prepare(project, home, &back, &store).and_then(|l| l.spawn(&store, Some(&token)));
+            let note = match again {
+                Ok(s) => format!("the proxy was started again on {} (pid {})", s.listen, s.pid),
+                Err(e2) => {
+                    store.meta_swap(STATE_KEY, Some(&hold), None)?;
+                    format!("the proxy couldn't be started again on {}: {e2}. {}", back.listen, where_now(&store))
+                }
+            };
+            return Err(noted(e, &note));
+        }
+    };
+    let mut data = state_json(&state);
+    data["replaced"] = json!({"pid": old.state.pid, "listen": old.state.listen, "forced": forced});
+    out.ok(data, || {
+        format!(
+            "proxy listening on http://{} (pid {}){}, replacing the one on {} (pid {})",
+            state.listen,
+            state.pid,
+            live_text(state.authz_run),
+            old.state.listen,
+            old.state.pid
+        )
+    });
+    Ok(())
+}
+
+/// The options the proxy recorded as `state` was started with, to start it again alike.
+fn previous_args(state: &ProxyState) -> Result<ProxyRunArgs, Error> {
+    #[derive(clap::Parser)]
+    #[command(no_binary_name = true)]
+    struct Previous {
+        #[command(flatten)]
+        args: ProxyRunArgs,
+    }
+    let unreadable = || {
+        Error::Conflict(format!(
+            "can't restart the proxy: the options it runs with ({}) can't be read, so it couldn't be started again \
+             if the restart failed. Stop it and start it again instead",
+            state.args.join(" ")
+        ))
+    };
+    let rest = match state.args.as_slice() {
+        [proxy, run, rest @ ..] if proxy == "proxy" && run == "run" => rest,
+        // Recorded by a version that didn't keep them.
+        [] => &[],
+        _ => return Err(unreadable()),
+    };
+    <Previous as clap::Parser>::try_parse_from(rest).map(|p| p.args).map_err(|_| unreadable())
+}
+
+/// Where this project's proxy is now, for a failed restart's message.
+fn where_now(store: &Store) -> String {
+    match current(store) {
+        Ok(Some(s)) => {
+            format!(
+                "A proxy is running on {} ({}) now",
+                s.state.listen,
+                process::pid_text(s.state.pid, s.pid_ns.as_deref())
+            )
+        }
+        Ok(None) => "It is off now".into(),
+        Err(_) => "See `brainproxy proxy status` for whether it runs".into(),
+    }
+}
+
+/// `e` with `note` after its message, keeping its kind where it has a message to add to.
+fn noted(e: Error, note: &str) -> Error {
+    match e {
+        Error::InvalidInput(m) => Error::InvalidInput(format!("{m}; {note}")),
+        Error::NotFound(m) => Error::NotFound(format!("{m}; {note}")),
+        Error::OutOfScope(m) => Error::OutOfScope(format!("{m}; {note}")),
+        Error::Conflict(m) => Error::Conflict(format!("{m}; {note}")),
+        Error::Connect(m) => Error::Connect(format!("{m}; {note}")),
+        Error::Tls(m) => Error::Tls(format!("{m}; {note}")),
+        Error::Protocol(m) => Error::Protocol(format!("{m}; {note}")),
+        e => Error::Conflict(format!("{e}; {note}")),
     }
 }
 
@@ -645,6 +844,11 @@ fn already_running(s: &Saved, known: Liveness) -> Error {
         return Error::Conflict(process::unverified_text(LOCK_NAME, s.state.pid));
     }
     let pid = process::pid_text(s.state.pid, s.pid_ns.as_deref());
+    if s.restart.is_some() {
+        return Error::Conflict(format!(
+            "the proxy is being restarted (`brainproxy proxy restart`, {pid}); try again once that has finished"
+        ));
+    }
     Error::Conflict(format!("proxy already running on {} ({pid})", s.state.listen))
 }
 
@@ -663,11 +867,7 @@ struct LiveRun {
 fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
     let (ca, info) = load_ca(home)?;
     let store = Store::open(project)?;
-    // Its own pid is its own state, unless that is the same pid in another container.
-    let me = std::process::id();
-    if let Some((s, known)) =
-        recorded(&store)?.filter(|(s, _)| s.state.pid != me || process::elsewhere(s.pid_ns.as_deref()))
-    {
+    if let Some((s, known)) = recorded(&store)?.filter(|(s, _)| !replaceable(s)) {
         return Err(already_running(&s, known));
     }
     // Fail before listening if there is no scope; the scope can't change while we run.
@@ -725,6 +925,31 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     Ok(())
 }
 
+/// Whether this process may take over the record `s`: its own pid is its own state (unless
+/// that is the same pid in another container), and so is the hold of the restart starting it.
+fn replaceable(s: &Saved) -> bool {
+    let restarting = std::env::var(RESTART_ENV).ok();
+    (s.state.pid == std::process::id() && !process::elsewhere(s.pid_ns.as_deref()))
+        || (s.restart.is_some() && s.restart == restarting)
+}
+
+/// Records this process as the proxy, unless another one got there first: the record has to
+/// be empty, stale, or [`replaceable`], and still the same when it is written.
+fn take_record(store: &Store, saved: &str) -> Result<(), Error> {
+    let raw = store.meta_get(STATE_KEY)?;
+    let free = match raw.as_deref().map(parse_state) {
+        None | Some(None) => true,
+        Some(Some(s)) => replaceable(&s) || liveness(store, &s) == Liveness::Gone,
+    };
+    if free && store.meta_swap(STATE_KEY, raw.as_deref(), Some(saved))? {
+        return Ok(());
+    }
+    Err(match recorded(store)? {
+        Some((s, known)) => already_running(&s, known),
+        None => Error::Conflict("another proxy for this project started at the same time; try again".into()),
+    })
+}
+
 /// Why the address can't be bound, by error kind: the system's own text is localised on Windows.
 fn listen_error(addr: &str, e: &std::io::Error) -> Error {
     Error::Conflict(match e.kind() {
@@ -778,8 +1003,11 @@ fn serve(
             state,
             start_time: process::start_time(std::process::id()),
             pid_ns: lock.as_ref().and_then(|_| process::pid_namespace()),
+            restart: None,
+            raw: String::new(),
         };
-        store.meta_set(STATE_KEY, Some(&serde_json::to_string(&saved).unwrap_or_default()))?;
+        let raw = serde_json::to_string(&saved).unwrap_or_default();
+        take_record(&store, &raw)?;
         let state = saved.state;
         out.ok(state_json(&state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));
 
@@ -799,11 +1027,8 @@ fn serve(
             Some(w) => w.finish().await,
             None => Ok(Value::Null),
         };
-        if read_state(&store)?
-            .is_some_and(|s| s.state.pid == std::process::id() && !process::elsewhere(s.pid_ns.as_deref()))
-        {
-            store.meta_set(STATE_KEY, None)?;
-        }
+        // Only the record as written: a restart may hold it by now.
+        store.meta_swap(STATE_KEY, Some(&raw), None)?;
         if let Some(a) = &auth {
             a.save()?;
         }
@@ -1014,6 +1239,79 @@ mod tests {
             conflict_text(ErrorKind::PermissionDenied),
             "cannot listen on 127.0.0.1:80: permission denied (ports below 1024 usually need elevated privileges, and the system can reserve others)"
         );
+    }
+
+    fn state_with(args: &[&str]) -> ProxyState {
+        ProxyState {
+            pid: 7,
+            listen: "127.0.0.1:8080".into(),
+            started: "0".into(),
+            ca_cert: "/ca.pem".into(),
+            log: None,
+            authz_run: None,
+            args: args.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn previous_args_reads_what_the_proxy_runs_with() {
+        let args = previous_args(&state_with(&[
+            "proxy",
+            "run",
+            "--listen",
+            "0.0.0.0:0",
+            "--timeout",
+            "12",
+            "--log",
+            "/x.log",
+            "--auth=alice",
+            "--invisible",
+        ]))
+        .unwrap();
+        assert_eq!(args.listen, "0.0.0.0:0");
+        assert_eq!(args.timeout, 12.0);
+        assert_eq!(args.log, Some(PathBuf::from("/x.log")));
+        assert_eq!(args.auth.as_deref(), Some("alice"));
+        assert!(args.invisible && !args.verify_tls);
+        // None recorded (an older version): the defaults.
+        let args = previous_args(&state_with(&[])).unwrap();
+        assert_eq!((args.listen.as_str(), args.timeout, args.auth), ("127.0.0.1:8080", 30.0, None));
+    }
+
+    #[test]
+    fn previous_args_refuses_what_it_cannot_read() {
+        for args in [&["proxy", "run", "--from-the-future"][..], &["scan", "active"]] {
+            let Err(Error::Conflict(text)) = previous_args(&state_with(args)) else { panic!("{args:?} was read") };
+            assert!(text.contains("can't restart the proxy"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_restart_hold_reads_back_with_its_raw_text() {
+        let saved = Saved {
+            state: state_with(&["proxy", "run"]),
+            start_time: Some(1),
+            pid_ns: None,
+            restart: Some("7-1".into()),
+            raw: String::new(),
+        };
+        let raw = serde_json::to_string(&saved).unwrap();
+        assert!(!raw.contains("\"raw\""), "{raw}");
+        let back = parse_state(&raw).unwrap();
+        assert_eq!((back.restart.as_deref(), back.raw.as_str()), (Some("7-1"), raw.as_str()));
+        let Error::Conflict(text) = already_running(&back, Liveness::Running) else { panic!() };
+        assert!(text.starts_with("the proxy is being restarted (`brainproxy proxy restart`, pid 7)"), "{text}");
+        // A record from before restarts were held has none.
+        let old = r#"{"pid":7,"listen":"127.0.0.1:1","started":"0","ca_cert":"/x","log":null}"#;
+        assert_eq!(parse_state(old).unwrap().restart, None);
+    }
+
+    #[test]
+    fn noted_keeps_the_kind() {
+        let e = noted(Error::Conflict("cannot listen".into()), "the proxy was started again");
+        assert_eq!(e.to_string(), "conflict: cannot listen; the proxy was started again");
+        let e = noted(Error::Timeout(Duration::from_secs(1)), "it is off now");
+        assert_eq!(e.to_string(), "conflict: timed out after 1s; it is off now");
     }
 
     #[test]

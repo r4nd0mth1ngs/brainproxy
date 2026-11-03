@@ -392,6 +392,7 @@ fn command_name(cmd: &Cmd) -> String {
             proxy_cmd::ProxyCmd::Start(_) => "proxy start",
             proxy_cmd::ProxyCmd::Run(_) => "proxy run",
             proxy_cmd::ProxyCmd::Stop { .. } => "proxy stop",
+            proxy_cmd::ProxyCmd::Restart(_) => "proxy restart",
             proxy_cmd::ProxyCmd::Status => "proxy status",
         },
         Cmd::Ca(_) => "ca",

@@ -563,8 +563,10 @@ byte, side by side or unified.
   project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
   is used as is: if it's taken, the proxy stays off and says why. A running proxy on another
   port keeps it until you press *Restart on port N*, which keeps its bind address and
-  options (a custom log file goes back to the default). Browsers opened earlier still point
-  at the old port: close them and open them again, or their traffic goes to whatever proxy
+  options (a custom log file goes back to the default). It is one `proxy restart`, so a
+  proxy started meanwhile from a shell or MCP can't take its place; if the new port can't be
+  opened, the proxy goes back to the old one and the message says where it is. Browsers
+  opened earlier still point at the old port: close them and open them again, or their traffic goes to whatever proxy
   starts on that port later, maybe another project's. Reconfigure tools you set up by hand. `brainproxy proxy start` from a shell or MCP
   still defaults to 8080 unless given `--listen`.
 - **Connections:** options for every request brainproxy sends (also from scans, the crawler,
@@ -614,7 +616,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 133 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 138 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -686,6 +688,22 @@ goes to that name on port 443; ordinary proxy requests work on the same listener
 `--redirect URL` sends every request from the listener to that origin (implies
 `--invisible`). Pass-through hosts and hosts outside the proxy scope are tunnelled as with
 CONNECT.
+
+To move a running proxy to another address or options, restart it in one step:
+
+```sh
+brainproxy proxy restart --listen 127.0.0.1:9090 --auth alice
+```
+
+`proxy restart` takes `proxy start`'s options, defaults included: what isn't given isn't
+carried over from the running proxy. It holds the project's proxy record from before it
+stops the proxy until the new one is listening, so a `proxy start` (or `proxy stop`, or
+another restart) from a shell, an agent or the app meanwhile fails with "the proxy is being
+restarted" instead of getting in between, and `proxy status` shows `"restarting": true`. If the
+new proxy doesn't come up (the port is taken, say), the old one is started again on the address
+it had, with its options, and the command fails with an error that ends with where the proxy
+is now. With no proxy running it starts nothing and fails with `not_found`: use `proxy start`.
+On success it prints what `proxy start` does, plus `replaced` (the old pid and address).
 
 Crawl and active-scan scope and safety flags:
 
@@ -1121,6 +1139,7 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | Container: "can't open the proxy lock file" | A lock file is there that this user can't open, so starting would go unseen from other containers. Make it readable (`chmod 644`), or remove it if no proxy (or OOB listener) runs for this project anywhere. |
 | Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: none of ports 8080-8089 could be opened" | Other programs hold or block those ports. Stop them, or choose a port in **Settings › Proxy**. From a shell: `brainproxy proxy start --listen 127.0.0.1:9090`. |
+| "the proxy is being restarted" | A `proxy restart` (from the app's *Restart on port N*, a shell or an agent) is between stopping the proxy and starting it again. Try again once it has finished. If its process was killed, the next command clears its hold. |
 | "cannot listen on …: the port is already in use" | Another program or another project's proxy holds that port. Stop it, or choose another port in **Settings › Proxy** (or with `--listen`). A chosen port is never swapped for another, so the proxy stays off until then. |
 | "cannot listen on …: permission denied" | Ports below 1024 usually need elevated privileges, and the system can reserve others (Windows does, in ranges that change). Choose another port in **Settings › Proxy** (or with `--listen`). |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |

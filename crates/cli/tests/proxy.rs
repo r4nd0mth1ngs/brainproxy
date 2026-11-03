@@ -987,3 +987,129 @@ fn proxy_start_on_a_chosen_port() {
     assert_eq!(status["proxy"]["listen"].as_str(), Some(listen.as_str()), "{status}");
     assert_eq!(status["proxy"]["usage"]["proxy_url"].as_str(), Some(format!("http://{listen}").as_str()), "{status}");
 }
+
+/// Starts racing a restart, from a shell or an agent, never get in between its stop and its
+/// start: each one fails, and what runs afterwards is the restart's proxy.
+#[test]
+fn proxy_restart_keeps_other_starts_out() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let env = Env::new("restart-race");
+    let mut pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    let mut held_off = 0;
+    for _ in 0..3 {
+        let done = AtomicBool::new(false);
+        let ((code, v), starts) = std::thread::scope(|s| {
+            let racer = s.spawn(|| {
+                let mut starts = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    starts.push(env.run(&["proxy", "start", "--listen", "127.0.0.1:0"]));
+                }
+                starts
+            });
+            let restarted = env.run(&["proxy", "restart", "--listen", "127.0.0.1:0"]);
+            done.store(true, Ordering::SeqCst);
+            (restarted, racer.join().unwrap())
+        });
+        assert_eq!(code, 0, "{v}");
+        let restarted = &v["data"];
+        assert_eq!(restarted["replaced"]["pid"].as_u64(), Some(pid), "{v}");
+        assert!(!starts.is_empty());
+        for (code, v) in &starts {
+            assert_eq!((*code, v["error"]["kind"].as_str()), (2, Some("conflict")), "a start got in: {v}");
+            held_off += v["error"]["message"].as_str().unwrap().contains("being restarted") as usize;
+        }
+        pid = restarted["pid"].as_u64().unwrap();
+        let status = env.ok(&["proxy", "status"]);
+        assert_eq!(status["proxy"]["pid"].as_u64(), Some(pid), "{status}");
+        assert_eq!(status["proxy"]["listen"], restarted["listen"], "{status}");
+    }
+    eprintln!("{held_off} starts found the proxy being restarted");
+}
+
+#[test]
+fn proxy_restart_to_a_taken_port_goes_back() {
+    let env = Env::new("restart-back");
+    let old = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0", "--timeout", "12"]);
+    let was = old["listen"].as_str().unwrap();
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = holder.local_addr().unwrap().to_string();
+
+    let (code, v) = env.run(&["proxy", "restart", "--listen", &taken]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("cannot listen on {taken}: the port is already in use")), "{message}");
+
+    // Started again where it was, with its options, and the error says so.
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!(status["proxy"]["listen"].as_str(), Some(was), "{status}");
+    let pid = status["proxy"]["pid"].as_u64().unwrap();
+    assert_ne!(Some(pid), old["pid"].as_u64());
+    assert!(message.ends_with(&format!("; the proxy was started again on {was} (pid {pid})")), "{message}");
+    let args: Vec<&str> = status["proxy"]["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    assert!(args.windows(2).any(|w| w == ["--timeout", "12"]), "{args:?}");
+}
+
+/// When neither the new proxy nor the old one comes up, the record is let go and the error says
+/// the proxy is off.
+#[test]
+fn proxy_restart_that_cannot_go_back_says_the_proxy_is_off() {
+    let env = Env::new("restart-off");
+    env.ok(&["auth", "add", "key", "-H", "Authorization: Bearer x"]);
+    let was = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0", "--auth", "key"])["listen"].clone();
+    env.ok(&["auth", "remove", "key"]);
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = holder.local_addr().unwrap().to_string();
+
+    let (code, v) = env.run(&["proxy", "restart", "--listen", &taken]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    let back = format!("; the proxy couldn't be started again on {}: ", was.as_str().unwrap());
+    assert!(message.contains(&back), "{message}");
+    assert!(message.ends_with(". It is off now"), "{message}");
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["restarting"]), (&false.into(), &false.into()), "{status}");
+    env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+}
+
+#[test]
+fn proxy_restart_with_nothing_running_starts_nothing() {
+    let env = Env::new("restart-none");
+    let (code, v) = env.run(&["proxy", "restart", "--listen", "127.0.0.1:0"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("brainproxy proxy start"), "{v}");
+    assert_eq!(env.ok(&["proxy", "status"])["running"], false);
+}
+
+/// While a restart holds the record, no other start, stop or restart acts on it, and there is
+/// no proxy to connect to. The hold goes with the restart's process.
+#[cfg(unix)]
+#[test]
+fn a_restart_in_progress_holds_off_the_rest() {
+    use brainproxy_core::proxy::STATE_KEY;
+    let env = Env::new("restart-held");
+    let mut restarting = Command::new("sleep").arg("30").spawn().unwrap();
+    let hold = serde_json::json!({"pid": restarting.id(), "listen": "127.0.0.1:1", "started": "0", "ca_cert": "/x",
+        "log": null, "restart": "test"});
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    store.meta_set(STATE_KEY, Some(&hold.to_string())).unwrap();
+
+    for args in [
+        &["proxy", "start", "--listen", "127.0.0.1:0"][..],
+        &["proxy", "run", "--listen", "127.0.0.1:0"],
+        &["proxy", "restart", "--listen", "127.0.0.1:0"],
+        &["proxy", "stop"],
+        &["proxy", "stop", "--forget"],
+    ] {
+        let (code, v) = env.run(args);
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{args:?}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("being restarted"), "{args:?}: {v}");
+    }
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["restarting"]), (&false.into(), &true.into()), "{status}");
+    assert!(restarting.try_wait().unwrap().is_none(), "the restart was signalled");
+
+    restarting.kill().unwrap();
+    restarting.wait().unwrap();
+    assert_eq!(env.ok(&["proxy", "status"])["restarting"], false);
+    env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+}

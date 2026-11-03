@@ -233,6 +233,7 @@ brainproxy scope set --include '(^|\.)target\.test$' # only intercept/record the
 brainproxy rules add --location request-header --replace 'X-Forwarded-For: 127.0.0.1'
 brainproxy rules add --location response-body --match 'disabled' --replace ''
 brainproxy proxy status
+brainproxy proxy restart --listen 127.0.0.1:9090  # move it: stop and start in one step, back on failure
 brainproxy proxy stop
 
 # Intercept without a human in the loop: held messages wait in a queue

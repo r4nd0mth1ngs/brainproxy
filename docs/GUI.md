@@ -48,10 +48,13 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
   proxy when a project opens* on, closing the project or the window stops the proxy only if
   `proxy status` still shows that pid running here, so one a shell, an agent or another
-  container started is left alone. While Settings moves the proxy to another port (stop,
-  then start), the control marks a move: Open browser, Record a login and Start proxy wait
-  for it, and the pill and Access's live restart ask to try again. A failed move reports
-  where the proxy is from a fresh `proxy status`.
+  container started is left alone. Settings moves the proxy to another port with one
+  `proxy restart`, which holds the project's proxy record from the stop to the start, so a
+  `proxy start` from a shell or an agent fails instead of getting in between; if the new port
+  can't be opened, the CLI starts the proxy again where it was. The control keeps the proxy
+  the app's at its new pid (or the pid it went back to) and marks the move: Open browser,
+  Record a login and Start proxy wait for it, and the pill and Access's live restart ask to
+  try again. A failed move reports where the proxy is from a fresh `proxy status`.
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 
@@ -122,7 +125,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port the app uses and restarting on it, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, the port the app uses and restarting on it, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start/stop/restart`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 
