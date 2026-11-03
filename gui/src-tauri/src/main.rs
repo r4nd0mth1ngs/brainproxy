@@ -62,7 +62,9 @@ const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// for the user, say), and the envelope says it was cancelled. On unix the child gets
 /// SIGTERM first, so a request it already sent is recorded as cancelled, and is killed if
 /// it is still running after `CANCEL_GRACE`. Windows has no SIGTERM: the child is killed at
-/// once, and a sent request keeps the row it was given before it went out.
+/// once, and a sent request keeps the row it was given before it went out. A child that
+/// exits in time answers with its own envelope, marked `cancelled: true` (a failure gets
+/// kind `cancelled`, its own in `cli_kind`), so the UI can still show the rows it names.
 #[tauri::command]
 async fn cli(
     app: tauri::AppHandle,
@@ -77,40 +79,65 @@ async fn cli(
         return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
     }
     let Some(call) = call else { return run(&project, &args, stdin, &env).await };
-    let child = match spawn(&project, &args, stdin, &env) {
+    let mut child = match spawn(&project, &args, stdin, &env) {
         Ok(c) => c,
         Err(e) => return e,
     };
     let (tx, rx) = oneshot::channel();
     app.state::<Cancellable>().held().insert(call.clone(), tx);
-    let pid = child.id();
-    let output = output(child);
-    tokio::pin!(output);
-    let out = tokio::select! {
-        out = &mut output => out,
-        _ = rx => {
-            terminate(pid);
-            // Dropping the output drops the child, which kills it (kill_on_drop).
-            let _ = tokio::time::timeout(CANCEL_GRACE, &mut output).await;
-            json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}})
-        }
+    let (stdout, stderr) = (read_all(child.stdout.take()), read_all(child.stderr.take()));
+    let cancelled = tokio::select! {
+        _ = child.wait() => false,
+        _ = rx => true,
     };
+    if cancelled {
+        terminate(&child);
+        if tokio::time::timeout(CANCEL_GRACE, child.wait()).await.is_err() {
+            let _ = child.kill().await;
+        }
+    }
     app.state::<Cancellable>().held().remove(&call);
-    out
+    let (stdout, stderr) = (stdout.await.unwrap_or_default(), stderr.await.unwrap_or_default());
+    if !cancelled {
+        return envelope(&stdout, &stderr);
+    }
+    match serde_json::from_slice::<Value>(&stdout) {
+        Ok(mut v @ Value::Object(_)) => {
+            v["cancelled"] = json!(true);
+            if v["ok"] == false {
+                v["error"]["cli_kind"] = v["error"]["kind"].clone();
+                v["error"]["kind"] = json!("cancelled");
+            }
+            v
+        }
+        _ => json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}}),
+    }
+}
+
+/// Reads a pipe to the end.
+fn read_all<R: tokio::io::AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
+        }
+        buf
+    })
 }
 
 /// Asks the child to exit (SIGTERM). Elsewhere there is no such request; the child is killed
-/// when it is dropped.
-fn terminate(pid: Option<u32>) {
+/// after the grace period instead.
+fn terminate(child: &tokio::process::Child) {
+    // None once the child has been reaped, so a reused pid is never signalled.
     #[cfg(unix)]
-    if let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()).filter(|&p| p > 1) {
-        // SAFETY: kill() only sends a signal; the pid is our own child's, still unreaped.
+    if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()).filter(|&p| p > 1) {
+        // SAFETY: kill() only sends a signal; the pid is our own child's, not yet reaped.
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = child;
 }
 
 /// Stops the `cli` call started with this id, if it is still running.
@@ -158,12 +185,17 @@ fn spawn(
 /// The child's JSON envelope, once it exits.
 async fn output(child: tokio::process::Child) -> Value {
     match child.wait_with_output().await {
-        Ok(out) => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
-            let text = String::from_utf8_lossy(if out.stdout.is_empty() { &out.stderr } else { &out.stdout });
-            failure(text.trim().to_string())
-        }),
+        Ok(out) => envelope(&out.stdout, &out.stderr),
         Err(e) => failure(e.to_string()),
     }
+}
+
+/// The JSON envelope the CLI printed, or a failure with what it said instead.
+fn envelope(stdout: &[u8], stderr: &[u8]) -> Value {
+    serde_json::from_slice(stdout).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(if stdout.is_empty() { stderr } else { stdout });
+        failure(text.trim().to_string())
+    })
 }
 
 /// The locks on the temp projects this app has, with whether each is a leftover it is asking

@@ -25,10 +25,15 @@ use crate::process::{self, Liveness};
 const STOP_KEY: &str = "proxy.stop";
 const LOCK_NAME: &str = "proxy";
 
-/// How long a proxy may take to exit when asked to. With a live authz run it also has to
-/// finish its tests and save the run.
-const STOP_WAIT: Duration = Duration::from_secs(5);
+/// How long a proxy may take to exit when asked to before it is killed. It exits as soon as
+/// it is done: after waiting up to 3 s for requests already sent upstream, it writes out
+/// every queued capture, which a busy proxy may take a while to do. With a live authz run
+/// it also has to finish its tests and save the run.
+const STOP_WAIT: Duration = Duration::from_secs(30);
 const STOP_WAIT_AUTHZ: Duration = Duration::from_secs(30);
+/// A proxy whose state has no start time is from an older version, which exits without
+/// draining.
+const STOP_WAIT_OLD: Duration = Duration::from_secs(5);
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -444,7 +449,11 @@ pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     let Some((Saved { state, start_time, pid_ns }, _)) = recorded(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
-    let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
+    let wait = match (state.authz_run.is_some(), start_time.is_some()) {
+        (true, _) => STOP_WAIT_AUTHZ,
+        (false, true) => STOP_WAIT,
+        (false, false) => STOP_WAIT_OLD,
+    };
     let forced = if process::elsewhere(pid_ns.as_deref()) {
         process::await_exit_elsewhere(store, LOCK_NAME, STATE_KEY, state.pid, wait)?;
         false

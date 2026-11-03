@@ -598,6 +598,10 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     require_in_scope(&guard, &target)?;
     let send_opts = args.req.send_options(guard);
     let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
+    if let Some(s) = session.as_ref().filter(|_| args.no_store) {
+        // Its logins, checks and macros keep no content either.
+        s.keep_no_content();
+    }
     let client = Client::new(send_opts);
     if let Some(n) = args.race {
         // Every racing request carries the same session, applied once.
@@ -613,27 +617,38 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     let mut log = sent::SentLog::open(project, "send", args.no_store)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-    // Each request is on record (its row and the bytes recorded) before it goes out.
-    let mut pending: Vec<(i64, Vec<u8>)> = Vec::new();
+    // Each request is on record (its row and the bytes recorded) before it goes out. `open`
+    // is the one out and unanswered; a row answered already is never rewritten.
+    let mut rows: Vec<i64> = Vec::new();
+    let mut open: Option<(i64, Vec<u8>)> = None;
     let result = {
-        let (log, pending) = (&mut log, &mut pending);
+        let (log, rows, open) = (&mut log, &mut rows, &mut open);
         let sending = async {
+            let sending = |log: &mut sent::SentLog, rows: &mut Vec<i64>, open: &mut Option<_>, r: &RawRequest| {
+                let recorded = client.recorded_request(r, &target)?;
+                let id = log.pending(&target, &recorded)?;
+                rows.push(id);
+                *open = Some((id, recorded));
+                Ok::<_, Error>(())
+            };
             match &session {
                 Some(s) => {
                     let watch = |a: Attempt<'_>| match a {
-                        Attempt::Sending(r) => {
-                            let recorded = client.recorded_request(r, &target)?;
-                            pending.push((log.pending(&target, &recorded)?, recorded));
-                            Ok(())
-                        }
-                        Attempt::Replaced(ex) => log.answered(pending.last().map_or(0, |p| p.0), ex),
+                        Attempt::Sending(r) => sending(log, rows, open, r),
+                        Attempt::Answered(ex) => match open.take() {
+                            Some((id, _)) => log.answered(id, ex),
+                            None => Ok(()),
+                        },
                     };
                     s.send_as_watched(brainproxy_core::session::Tool::Send, &req, &target, watch).await
                 }
                 None => {
-                    let recorded = client.recorded_request(&req, &target)?;
-                    pending.push((log.pending(&target, &recorded)?, recorded));
-                    client.send(&req, &target).await
+                    sending(log, rows, open, &req)?;
+                    let ex = client.send(&req, &target).await?;
+                    if let Some((id, _)) = open.take() {
+                        log.answered(id, &ex)?;
+                    }
+                    Ok(ex)
                 }
             }
         };
@@ -644,29 +659,21 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             }
         })
     };
-    if let Some(s) = &session {
-        s.save()?;
-    }
-    let last = pending.last().cloned();
-    let (id, ex) = match (result, last) {
-        (Some(Ok(ex)), Some((id, _))) => {
-            log.answered(id, &ex)?;
-            (id, ex)
-        }
+    // Rows first: a failure saving the session mustn't leave one pending.
+    // An answered request's row is complete already.
+    let outcome = match (result, open) {
+        (Some(Ok(ex)), None) => Ok((*rows.last().expect("every request is recorded before it is sent"), ex)),
+        (Some(Ok(_)), Some(_)) => unreachable!("an answer completes its row"),
+        (Some(Err(e)), Some((id, recorded))) => log.failed(id, &target, &recorded, &e.to_string()).and(Err(e)),
+        (Some(Err(e)), None) => Err(e),
         (None, Some((id, recorded))) => {
-            log.failed(id, &target, &recorded, sent::CANCELLED)?;
-            return Err(sent::cancelled(&[id]));
+            log.failed(id, &target, &recorded, sent::CANCELLED).and(Err(sent::cancelled(&rows)))
         }
-        (Some(Err(e)), Some((id, recorded))) => {
-            log.failed(id, &target, &recorded, &e.to_string())?;
-            return Err(e);
-        }
-        // Stopped or failed before anything went out.
-        (None, None) => return Err(sent::cancelled(&[])),
-        (Some(Err(e)), None) => return Err(e),
-        (Some(Ok(_)), None) => unreachable!("every request is recorded before it is sent"),
+        (None, None) => Err(sent::cancelled(&rows)),
     };
-    let new_findings = log.scan(&pending.iter().map(|p| p.0).collect::<Vec<_>>())?;
+    let saved = session.as_ref().map(|s| s.save()).transpose();
+    let (id, ex) = outcome?;
+    let new_findings = log.scan(&rows)?;
     let id = Some(id);
 
     if args.raw {
@@ -679,6 +686,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if new_findings > 0 {
         data["new_findings"] = json!(new_findings);
+    }
+    if let Err(e) = saved {
+        data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
@@ -722,19 +732,26 @@ fn race(
             _ = process::interrupted() => None,
         }
     });
+    // Every row is completed before a store error is reported, so none stays pending.
+    let mut store_error = None;
+    let mut done = |r: Result<(), Error>| {
+        if let Err(e) = r {
+            store_error.get_or_insert(e);
+        }
+    };
     let (results, sync, synced) = match outcome {
         Some(Ok(v)) => v,
         Some(Err(e)) => {
             for id in &ids {
-                log.failed(*id, &target, &recorded, &e.to_string())?;
+                done(log.failed(*id, &target, &recorded, &e.to_string()));
             }
-            return Err(e);
+            return Err(store_error.unwrap_or(e));
         }
         None => {
             for id in &ids {
-                log.failed(*id, &target, &recorded, sent::CANCELLED)?;
+                done(log.failed(*id, &target, &recorded, sent::CANCELLED));
             }
-            return Err(sent::cancelled(&ids));
+            return Err(store_error.unwrap_or_else(|| sent::cancelled(&ids)));
         }
     };
     let mut items = Vec::new();
@@ -742,7 +759,7 @@ fn race(
     for (r, &id) in results.iter().zip(&ids) {
         match r {
             Ok(ex) => {
-                log.answered(id, ex)?;
+                done(log.answered(id, ex));
                 let head = parse_response_head(&ex.response).ok();
                 let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(&ex.response).1));
                 let status = head.as_ref().map(|h| h.status);
@@ -751,11 +768,22 @@ fn race(
                 items.push(json!({"id": id, "status": status, "length": length, "duration_ms": ex.duration_ms}));
             }
             Err(e) => {
-                log.failed(id, &target, &recorded, &e.to_string())?;
+                done(log.failed(id, &target, &recorded, &e.to_string()));
                 *shapes.entry(format!("error: {}", e.kind())).or_default() += 1;
                 items.push(json!({"id": id, "error": e.to_string(), "kind": e.kind()}));
             }
         }
+    }
+    if let Some(e) = store_error {
+        return Err(e);
+    }
+    // A single-packet race that got no response at all failed as a whole (its connection),
+    // as before; the rows of the copies are still in the output.
+    if let (true, Some(Err(e))) = (h2 && results.iter().all(|r| r.is_err()), results.first()) {
+        let rows = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        let data = json!({"race": n, "sync": sync, "target": target.origin(), "results": items});
+        out.error_with(e.kind(), &format!("{e} (every copy failed; history {rows})"), data);
+        std::process::exit(e.exit_code());
     }
     let new_findings = log.scan(&ids)?;
     let mut data = json!({

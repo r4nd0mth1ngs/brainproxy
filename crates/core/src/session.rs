@@ -848,7 +848,9 @@ impl AuthSession {
                 extracted: Vec::new(),
                 error: None,
             };
-            let sent = self.client.send(&RawRequest::from_bytes(self.apply_to(&raw, &[], &target)), &target).await;
+            let (history_id, sent) =
+                self.send_own(&RawRequest::from_bytes(self.apply_to(&raw, &[], &target)), &target).await;
+            sr.history_id = history_id;
             let ex = match sent {
                 Ok(ex) => ex,
                 Err(e) => {
@@ -859,7 +861,6 @@ impl AuthSession {
                 }
             };
             self.observe(&ex.response);
-            sr.history_id = self.record(&ex);
             sr.status = parse_response_head(&ex.response).ok().map(|h| h.status);
             for x in &step.extract {
                 match extract(x, &ex.response) {

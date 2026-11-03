@@ -97,6 +97,22 @@ pub(crate) async fn interrupted() {
     }
 }
 
+/// Ends a child we started: asks it to exit (SIGTERM, so a command that already sent
+/// something records it as cancelled), and kills it if it is still running after `grace`.
+/// Windows has no such request: the child is killed at once.
+pub(crate) fn end_child(child: &mut std::process::Child, grace: Duration) {
+    // Not reaped until it is waited for, so its pid is still ours to signal.
+    if cfg!(unix) && matches!(child.try_wait(), Ok(None)) {
+        sys::ask_to_exit(child.id());
+        let deadline = Instant::now() + grace;
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Whether `pid` is a live process we may stop.
 pub(crate) fn alive(pid: u32) -> bool {
     sys::alive(pid)

@@ -385,29 +385,46 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         write_timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
     };
 
+    if let Some(s) = session.as_ref().filter(|_| args.no_store) {
+        // Its logins and checks keep no content either.
+        s.keep_no_content();
+    }
+    // One SIGTERM / Ctrl-C listener for the whole command, so a signal between the handshake
+    // and the listening isn't lost.
+    let mut stop = Box::pin(crate::process::interrupted());
+
     // The handshake is on record before it goes out (its row and the bytes sent), and so is
-    // a retry with a renewed session.
+    // a retry with a renewed session. `last` is the latest row and whether its request is
+    // still unanswered; a row answered already is never rewritten.
     let mut log = crate::sent::SentLog::new(store, "ws", args.no_store);
-    let mut pending: Option<(i64, RawRequest)> = None;
+    let mut rows: Vec<i64> = Vec::new();
+    let mut last: Option<(i64, RawRequest, bool)> = None;
     let opened = {
-        let (log, pending) = (&mut log, &mut pending);
+        let (log, rows, last) = (&mut log, &mut rows, &mut last);
         let handshaking = async {
             let sent = match &session {
                 Some(s) => RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)),
                 None => handshake.clone(),
             };
-            *pending = Some((log.pending(&target, sent.as_bytes())?, sent.clone()));
+            let id = log.pending(&target, sent.as_bytes())?;
+            rows.push(id);
+            *last = Some((id, sent.clone(), true));
             let generation = session.as_ref().map(|s| s.generation()).unwrap_or(0);
             let opened = client::open(&client, &target, &sent).await;
             if let (Some(s), Ok(Err((response, ms)))) = (&session, &opened) {
                 s.observe(response);
                 // Session lost: log in again and retry with the new session.
-                if s.is_logged_out(response) && s.relogin(generation).await {
-                    log.complete(pending_id(pending), &target, sent.as_bytes(), Some(response), Some(*ms), None)?;
-                    let sent =
-                        client::handshake(RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)));
-                    *pending = Some((log.pending(&target, sent.as_bytes())?, sent.clone()));
-                    return client::open(&client, &target, &sent).await;
+                if s.is_logged_out(response) {
+                    log.complete(id, &target, sent.as_bytes(), Some(response), Some(*ms), None)?;
+                    *last = Some((id, sent.clone(), false));
+                    if s.relogin(generation).await {
+                        let sent =
+                            client::handshake(RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)));
+                        let id = log.pending(&target, sent.as_bytes())?;
+                        rows.push(id);
+                        *last = Some((id, sent.clone(), true));
+                        return client::open(&client, &target, &sent).await;
+                    }
                 }
             }
             opened
@@ -415,47 +432,65 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         rt.block_on(async {
             tokio::select! {
                 r = handshaking => Some(r),
-                _ = crate::process::interrupted() => None,
+                _ = &mut stop => None,
             }
         })
     };
-    if let Some(s) = &session {
-        s.save()?;
-    }
-    let Some((history_id, sent)) = pending else {
+    let Some((history_id, sent, unanswered)) = last else {
         // Stopped or failed before the handshake went out.
         return Err(opened.map_or_else(|| crate::sent::cancelled(&[]), |r| r.err().unwrap_or_else(not_recorded)));
+    };
+    // Stopped or failed: the row of a request still out says so (one stopped during a
+    // re-login keeps its response).
+    let failed = |log: &mut crate::sent::SentLog, error: &str| match unanswered {
+        true => log.failed(history_id, &target, sent.as_bytes(), error),
+        false => Ok(()),
     };
     let opened = match opened {
         Some(Ok(o)) => o,
         Some(Err(e)) => {
-            log.failed(history_id, &target, sent.as_bytes(), &e.to_string())?;
+            failed(&mut log, &e.to_string())?;
+            if let Some(s) = &session {
+                s.save()?;
+            }
             return Err(e);
         }
         None => {
-            log.failed(history_id, &target, sent.as_bytes(), crate::sent::CANCELLED)?;
-            return Err(crate::sent::cancelled(&[history_id]));
+            failed(&mut log, crate::sent::CANCELLED)?;
+            if let Some(s) = &session {
+                s.save()?;
+            }
+            return Err(crate::sent::cancelled(&rows));
         }
     };
     let opened = match opened {
         Ok(o) => o,
         Err((response, ms)) => {
-            log.complete(history_id, &target, sent.as_bytes(), Some(&response), Some(ms), None)?;
+            // Unless a failed re-login completed it already.
+            if unanswered {
+                log.complete(history_id, &target, sent.as_bytes(), Some(&response), Some(ms), None)?;
+            }
+            let saved = session.as_ref().map(|s| s.save()).transpose();
             let mut data =
                 crate::exchange_json(Some(history_id), &target, sent.as_bytes(), &response, Some(ms), args.max_body);
             data["upgraded"] = json!(false);
             data["hint"] = json!("The server did not switch protocols (no 101 with Upgrade: websocket); see response.");
+            if let Err(e) = saved {
+                data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
+            }
             out.ok(data, || format!("not upgraded\n\n{}", String::from_utf8_lossy(&response)));
             return Ok(());
         }
     };
     let (response, duration_ms, accept_ok) = (opened.response.clone(), opened.duration_ms, opened.accept_ok);
     let capture = log.complete(history_id, &target, sent.as_bytes(), Some(&response), Some(duration_ms), None)?;
+    let saved = session.as_ref().map(|s| s.save()).transpose();
     let url =
         ws::ws_url(&format!("{}{}", target.origin(), sent.head().map(|h| h.target).unwrap_or_else(|_| "/".into())));
 
     // The connection and each message are recorded as they happen (not with --no-store,
-    // which keeps only the handshake's request line).
+    // which keeps only the handshake's request line), on a thread of their own so writing
+    // never holds up reading and answering pings.
     let mut keys = HashMap::new();
     let connection_id = if log.no_store() {
         None
@@ -464,26 +499,34 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         keys.insert(0, id);
         Some(id)
     };
-    let mut record_error = None;
-    let outcome = {
-        let (store, keys, record_error) = (&mut log.store, &mut keys, &mut record_error);
-        let watch = |e: &client::Event| {
-            if connection_id.is_none() || record_error.is_some() {
-                return;
+    let (events, queued) = std::sync::mpsc::channel::<WsEvent>();
+    let writer = connection_id.map(|_| {
+        let (project, mut keys) = (project.to_path_buf(), keys.clone());
+        std::thread::spawn(move || -> Result<(), Error> {
+            let mut store = Store::open(&project)?;
+            while let Ok(first) = queued.recv() {
+                let batch: Vec<WsEvent> = std::iter::once(first).chain(queued.try_iter()).collect();
+                store.ws_record(&batch, &mut keys)?;
             }
-            let event =
-                WsEvent::Message { key: 0, direction: e.direction, message: e.message.clone(), intercept: None };
-            if let Err(err) = store.ws_record(&[event], keys) {
-                *record_error = Some(err);
+            Ok(())
+        })
+    });
+    let outcome = {
+        let watch = |e: &client::Event| {
+            if connection_id.is_some() {
+                let message = e.message.clone();
+                let _ = events.send(WsEvent::Message { key: 0, direction: e.direction, message, intercept: None });
             }
         };
         rt.block_on(async {
             tokio::select! {
                 o = client::talk_watched(opened, &messages, &opts, watch) => Some(o),
-                _ = crate::process::interrupted() => None,
+                _ = &mut stop => None,
             }
         })
     };
+    drop(events);
+    let record_error = writer.and_then(|w| w.join().unwrap_or_else(|_| Err(not_recorded())).err());
     let close = |outcome: Option<&client::Outcome>| WsEvent::Close {
         key: 0,
         time: ws::now_iso(),
@@ -516,7 +559,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         .collect();
     let head =
         brainproxy_core::http::parse_response_head(brainproxy_core::http::client::final_response(&response)).ok();
-    let data = json!({
+    let mut data = json!({
         "connection_id": connection_id,
         "history_id": history_id,
         "url": url,
@@ -531,6 +574,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         "error": outcome.error,
         "messages": items,
     });
+    if let Err(e) = saved {
+        data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
+    }
     out.ok(data, || {
         let mut lines = vec![format!(
             "{}{url} (stopped: {}, {received} received)",
@@ -544,11 +590,6 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         lines.join("\n")
     });
     Ok(())
-}
-
-/// The history row of the request about to go out.
-fn pending_id(pending: &Option<(i64, RawRequest)>) -> i64 {
-    pending.as_ref().map_or(0, |p| p.0)
 }
 
 fn not_recorded() -> Error {

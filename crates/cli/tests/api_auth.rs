@@ -252,11 +252,26 @@ fn client_credentials_get_a_token_kept_out_of_history() {
     for h in api.at("/v1/a").iter().chain(&api.at("/v1/b")) {
         assert_eq!(h.header("Authorization"), Some("Bearer tok-1"), "{h:?}");
     }
-    // No token in history, and neither token request nor secret in it at all.
+    // The token request went on the wire, so it has a row, but without its content: neither
+    // the secret nor the token is anywhere in history.
     let rows = ok(&p, &["history", "list", "--limit", "50"], &[]);
-    assert!(!rows.to_string().contains("/token"), "{rows}");
+    let token_row = &rows["items"][0];
+    assert!(token_row["url"].as_str().unwrap().ends_with("/token"), "{rows}");
+    assert!(token_row["error"].as_str().unwrap().starts_with("token request: content omitted"), "{rows}");
+    let leaks = ok(
+        &p,
+        &[
+            "query",
+            "SELECT count(*) FROM history WHERE instr(request, 'FAKE-CLIENT-SECRET') OR instr(response, 'tok-1') \
+             OR instr(request, 'client_secret') OR (id = ?1 AND length(response) > 0)",
+            "-p",
+            &token_row["id"].to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(leaks["rows"][0][0], 0, "{leaks}");
     let raw =
-        ok(&p, &["history", "show", rows["items"][0]["id"].to_string().as_str(), "--part", "request", "--raw"], &[]);
+        ok(&p, &["history", "show", rows["items"][1]["id"].to_string().as_str(), "--part", "request", "--raw"], &[]);
     assert!(!raw.to_string().contains("tok-1"), "{raw}");
     // The status says there is a refresh token, not what it is.
     let status = ok(&p, &["auth", "status", "cc", "--offline"], &[]);

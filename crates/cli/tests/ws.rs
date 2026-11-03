@@ -612,6 +612,6 @@ fn ws_send_records_as_it_goes() {
         let out = child.wait_with_output().unwrap();
         assert_ne!(out.status.code(), Some(0));
         let c = env.ok(&["query", "SELECT state, error FROM ws_connections"]);
-        assert_eq!(c["rows"], serde_json::json!([["closed", "cancelled by user after the request was sent"]]));
+        assert_eq!(c["rows"], serde_json::json!([["closed", "cancelled by user before a response was recorded"]]));
     }
 }

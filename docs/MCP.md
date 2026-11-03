@@ -45,8 +45,10 @@ Tool calls run concurrently, each on its own thread and child process, up to 16 
 (more are refused with `-32000`; a second call with the id of a running one gets `-32600`),
 so a long `job_wait` doesn't hold up other calls; replies can arrive out of order. Other
 requests are answered right away. `notifications/cancelled` with a running call's
-`requestId` kills its child process, and no response is sent for that call. When stdin
-closes, running calls are killed and the server exits.
+`requestId` stops its child process (SIGTERM, so a request it already sent is recorded as
+cancelled; killed 3 s later if still running; on Windows killed at once), and no response is
+sent for that call. When stdin closes, running calls are stopped the same way and the server
+exits.
 
 Progress: when a `tools/call` request has `params._meta.progressToken` (string or number),
 the server sends `notifications/progress` with that token every second while the command
@@ -98,7 +100,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
 - `send` and `ws_send` with `no_store` (races too): what an agent sends is always recorded in
-  history, so a person can see what was sent on their behalf.
+  full, so a person can see what was sent on their behalf. A person can keep a send's content
+  out of history from the app or a terminal; it still gets a row.
 - `proxy_start` with a `listen` address other than loopback: an agent can't open the person's
   proxy, with their auth profiles, to the network.
 
@@ -150,7 +153,7 @@ No subscriptions or templates.
 - `--max-output` (default 1,000,000 bytes): stdout beyond this is dropped and the text ends
   with `[output cut off at N bytes]`. Use the commands' own `--limit`, `--max-body`, and
   `--max-cell` to stay under it.
-- `--timeout` (default 600 s): a call running longer is killed and returns an error envelope
+- `--timeout` (default 600 s): a call running longer is stopped (as a cancelled one is) and returns an error envelope
   with kind `timeout`. Crawls, scans, fuzzing, and imports take `background: true`; then
   poll with `job_status` / `job_wait` (with its own `timeout`).
 

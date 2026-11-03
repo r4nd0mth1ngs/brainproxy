@@ -88,7 +88,19 @@ function cliBridge(): Plugin {
             const stopped = cancelled.delete(child);
             if (res.writableEnded) return;
             res.setHeader("content-type", "application/json");
-            if (stopped) return res.end(JSON.stringify({ ok: false, command: "gui", error: { kind: "cancelled", message: "cancelled" } }));
+            if (stopped) {
+              // A CLI that exited in time answers itself (as the Tauri command does): marked cancelled.
+              let v: any = null;
+              try {
+                v = JSON.parse(out);
+              } catch {}
+              if (v && typeof v === "object") {
+                v.cancelled = true;
+                if (v.ok === false && v.error) v.error = { ...v.error, cli_kind: v.error.kind, kind: "cancelled" };
+                return res.end(JSON.stringify(v));
+              }
+              return res.end(JSON.stringify({ ok: false, command: "gui", error: { kind: "cancelled", message: "cancelled" } }));
+            }
             res.end(out.trim() || JSON.stringify({ ok: false, error: { kind: "gui", message: err.trim() || "no output" } }));
           });
         });

@@ -36,7 +36,9 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     such as the browser sign-in. The process gets SIGTERM, so a request it already sent
     is recorded as cancelled, and SIGKILL if it is still running 3 s later. Windows has no
     SIGTERM: the process is killed at once, and a sent request keeps the row written before
-    it went out.
+    it went out. A process that exits in time answers with its own envelope, marked
+    `cancelled: true` (a failure gets kind `cancelled`, with its own in `error.cli_kind`), so
+    its message still names the history rows; the dev bridge does the same.
 - Value flags are passed as `--flag=value` and free-text positionals after `--`, so values
   starting with `-` aren't read as flags.
 - Messages the GUI edits or resends are loaded with `--max-body=2000000`. One larger than

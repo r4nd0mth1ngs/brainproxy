@@ -64,13 +64,17 @@ pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_c
 pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Error> {
     if no_store && in_tool_call() {
         return Err(brainproxy_core::Error::InvalidInput(
-            "--no-store: through MCP everything sent is recorded; a person can leave a send out of history in the \
-             app or a terminal"
+            "--no-store: through MCP everything sent is recorded in full; a person can keep a send's content out \
+             of history (it still gets a row) in the app or a terminal"
                 .into(),
         ));
     }
     Ok(())
 }
+
+/// How long a cancelled or timed-out call may take to exit after SIGTERM (recording what it
+/// sent) before it is killed.
+const CANCEL_GRACE: Duration = Duration::from_secs(3);
 
 /// Tool calls that may run at once; more are refused until one finishes.
 const MAX_CALLS: usize = 16;
@@ -522,8 +526,7 @@ impl Server {
                     std::thread::sleep(Duration::from_millis(20))
                 }
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::process::end_child(&mut child, CANCEL_GRACE);
                     break None;
                 }
             }
@@ -532,7 +535,7 @@ impl Server {
         let (stderr, _) = err.join().unwrap_or_default();
         let Some(status) = status else {
             let secs = self.timeout.as_secs();
-            return failure(command, "timeout", &format!("killed after {secs} s; use --background and job_wait"));
+            return failure(command, "timeout", &format!("stopped after {secs} s; use --background and job_wait"));
         };
         let mut text = String::from_utf8_lossy(&stdout).into_owned();
         if truncated {

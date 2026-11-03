@@ -854,8 +854,9 @@ OAuth 2.0 in an auth profile, in place of a login:
   it) and the flow's own grant when it fails; a 401 renews it too, within `--max-relogins`. A
   browser sign-in that can't be renewed asks for `auth oauth authorize` again.
 - The token endpoint must be in the engagement's scope; nothing widens it. Token requests get none
-  of the profile's other credentials, follow no redirects, and aren't recorded in history, since they
-  carry the client secret and the answers hold tokens. Errors give the endpoint's `error` code, never
+  of the profile's other credentials and follow no redirects. Their history rows keep only the
+  method, URL without its query, and outcome, since they carry the client secret and the answers
+  hold tokens. Errors give the endpoint's `error` code, never
   its description. `auth status` says whether there is a token and a refresh token, and when the
   token expires, never what they are.
 - Only bearer tokens are taken. Not built: the device code and implicit flows, private-key JWT
@@ -952,27 +953,43 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
 - `send`, `send --race` and `ws send` write each request's row just before it goes out, with
   the error `sent; no response recorded (cancelled or interrupted)`, and complete it with the
   response or the failure. A command that is killed or crashes keeps that row. Ctrl-C or
-  SIGTERM while it waits records `cancelled by user after the request was sent` instead,
-  and the command fails. The app cancels a command with SIGTERM, and kills it 3 seconds
-  later if it is still running; on Windows, which has no SIGTERM, it kills it at once. A request sent again after a lost session was
-  renewed gets a second row; the first keeps its response.
-- `ws send` records the connection and each message as they happen, not at the end. Killed
-  while listening, the connection stays `open` with every message up to then; stopped with
-  Ctrl-C or SIGTERM, it is closed with that error.
+  SIGTERM while it waits records `cancelled by user before a response was recorded` instead
+  (the request may not have gone out yet, if its connection was still opening), and the
+  command fails. A row already answered is never changed.
+- With `--auth`, the session's own requests (login, CSRF page, check URL, macro steps) are
+  recorded the same way, with source `auth`. A request answered with "logged out" keeps its
+  row (the 401, say); the request sent again after the re-login gets a second row. Stopped
+  during the re-login, the login's row keeps the pending error.
+- OAuth token requests carry the client secret and the answers hold tokens, so their rows
+  keep no content: method, URL without its query string, time, and how they ended, with an
+  error starting `token request: content omitted`.
+- The app, and the MCP server when a call is cancelled or times out, stop a command with
+  SIGTERM and kill it 3 seconds later if it is still running. Windows has no SIGTERM: there
+  the command is killed at once, and its row keeps the pending error.
+- `ws send` records the connection and each message as they happen, not at the end (a
+  message to the server when it is queued, so one queued just before the connection dropped
+  may not have gone out). Killed while listening, the connection stays `open` with every
+  message up to then; stopped with Ctrl-C or SIGTERM, it is closed with that error.
 - An HTTP/2 race (`send --race N --http2`) that fails after connecting records each copy
-  with the error, as the HTTP/1.1 race does. Every item in the output, failed or not, has its
-  history `id`.
+  with the error. If no copy got a response, the command fails with the error's kind (exit
+  3) and the message lists the rows; with `--format json` the envelope's `data.results`
+  has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
 - `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
   for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
-  before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent.
+  before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent, and
+  neither is a re-login retry. The proxy then writes out every capture still queued
+  (passive checks of the last ones wait for the next scan); `proxy stop` waits up to 30
+  seconds for it to exit before killing it.
 - `--no-store` (`send`, `send --race`, `ws send`) keeps no content, but still writes a row:
-  the time, source, target, and request line (method and URL, so `url`, `path` and `query`
-  are filled). The request is stored as that line alone; headers, bodies, and the response
-  are left out, `status` is empty (so passive checks skip it), and `error` starts with
-  `not stored (--no-store): content omitted`, then says how it ended (`; response status
-  200`, or the failure). Find them with `SELECT * FROM history WHERE error LIKE 'not
-  stored%'`. `ws send --no-store` records the handshake that way and nothing of the
-  connection or its messages.
+  the time, source, target, method, and path. The query string is left out too, since it
+  often holds a token: `query` is empty, and `url` and the stored request line stop at the
+  path. Headers, bodies, and the response are left out, `status` is empty (so passive checks
+  skip it), and `error` starts with `not stored (--no-store): content omitted`, then
+  `; query string omitted` if there was one, then how it ended (`; response status 200`,
+  or the failure). The session's own requests for that command (`--auth`) are recorded the
+  same way. Find these rows with `SELECT * FROM history WHERE error LIKE 'not stored%'`.
+  `ws send --no-store` records the handshake that way and nothing of the connection or its
+  messages.
 
 ### Comparing findings and failing a build (`findings compare`)
 

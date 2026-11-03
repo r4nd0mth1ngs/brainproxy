@@ -113,9 +113,11 @@ pub async fn talk(opened: Opened, messages: &[(u8, Vec<u8>)], opts: &Options) ->
     talk_watched(opened, messages, opts, |_| {}).await
 }
 
-/// [`talk`], calling `watch` with each event as it happens: a message to the server just
-/// before it is written, one from the server as it arrives. A caller can record as it goes,
-/// so what was sent is on record even if it never gets the outcome.
+/// [`talk`], calling `watch` with each event as it happens: a message to the server when it
+/// is queued to be written (the ones given are all queued at the start, so a connection that
+/// drops early may not have sent the last of them), one from the server as it arrives. A
+/// caller can record as it goes, so what was sent is on record even if it never gets the
+/// outcome. `watch` runs on the reading task: it mustn't block.
 pub async fn talk_watched(
     opened: Opened,
     messages: &[(u8, Vec<u8>)],

@@ -25,6 +25,7 @@ pub mod provenance;
 pub mod proxy;
 pub mod race;
 pub mod scan;
+pub mod sent;
 pub mod session;
 pub mod sign;
 pub mod sign_script;
