@@ -21,12 +21,19 @@ import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
 import { Welcome, remember, saveTempAs } from "./views/Welcome";
+import { closeQuestion } from "./views/replayCalls";
 import { usePoll } from "./ui/usePoll";
 import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
 
 const DISCARD_TITLE = "Discard this temporary engagement?";
 const DISCARD = "Its traffic, findings and settings are deleted for good. Use Save as… first to keep them.";
+
+/** Asks before leaving the project while Replay sends are running (leaving stops them); true to go on. */
+async function stopSends(ok: string): Promise<boolean> {
+  const q = closeQuestion();
+  return !q || confirm(q.title, q.message, ok, "Keep open");
+}
 
 export function App() {
   const [project, setProj] = useState<string | null>(null);
@@ -63,6 +70,7 @@ export function App() {
   // discard also stops the proxy, OOB listener and jobs of a temporary one before deleting it;
   // if that fails it is kept, and offered again on the next launch.
   const close = useCallback(async () => {
+    if (!(await stopSends("Stop and close"))) return;
     if (temp && !(await confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"))) return;
     const leaving = project;
     setProj(null);
@@ -75,6 +83,8 @@ export function App() {
   const saveAs = useCallback(async () => {
     const leaving = project;
     if (!leaving) return;
+    // The saved copy opens as a new project, so this one's sends stop.
+    if (!(await stopSends("Stop and save"))) return;
     const eng = await run<{ engagement: { name: string | null } | null }>(["engagement", "show"]).catch(() => null);
     const dest = await saveTempAs(leaving, eng?.engagement?.name ?? "");
     if (!dest) return;
@@ -90,7 +100,8 @@ export function App() {
   return (
     <>
       {project ? (
-        <AppProvider project={project} temp={temp} saveAs={saveAs}>
+        // Keyed by project: per-project state (Replay's sends and results among it) never carries over.
+        <AppProvider key={project} project={project} temp={temp} saveAs={saveAs}>
           <Shell onClose={close} toggleTheme={toggleTheme} />
         </AppProvider>
       ) : (
@@ -234,16 +245,18 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
       .then(({ getCurrentWindow }) =>
         getCurrentWindow().onCloseRequested(async (event) => {
           const tempProject = tempRef.current;
+          if (!tempProject && !closeQuestion()) return stopOnClose();
+          // Held open while a question is in the window; closed explicitly once answered.
+          event.preventDefault();
+          if (!(await stopSends("Stop and quit"))) return;
           if (tempProject) {
-            // Held open while the question is in the window; closed explicitly on "discard".
-            event.preventDefault();
             if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
             // Stops its proxy too. If it fails, it is kept and offered on the next launch.
             await tempProjects.discard(tempProject).catch(() => {});
-            await getCurrentWindow().destroy();
           } else {
             await stopOnClose();
           }
+          await getCurrentWindow().destroy();
         }),
       )
       .then((u) => (disposed ? u() : (unlisten = u)));

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_OPTIONS, activeLabels, crlfBody, crlfHead, optionArgs, optionsProblem, requestToSend, sendArgs, sentWithNote, withDefaults } from "./replayOptions.ts";
+import { DEFAULT_OPTIONS, activeLabels, crlfBody, crlfHead, optionArgs, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
 import { autoEncodeRequest } from "../ui/urlencode.ts";
 import { wsSendArgs } from "./ws.ts";
 
@@ -13,19 +13,27 @@ test("default options add no flags and show nothing", () => {
 });
 
 test("every option maps to its send flag, before the stdin '-'", () => {
-  const o = { http2: true, verbatim: true, sni: " other.test ", timeout: "5", verifyTls: true, noStore: true };
-  assert.deepEqual(sendArgs("https://a.test", o), [
-    "send",
-    "--target=https://a.test",
-    "--http2",
-    "--verbatim",
-    "--sni=other.test",
-    "--timeout=5",
-    "--verify-tls",
-    "--no-store",
-    "-",
-  ]);
-  assert.deepEqual(activeLabels(o, "http"), ["HTTP/2", "as typed", "SNI other.test", "timeout 5 s", "verify TLS", "not recorded"]);
+  const o = { verbatim: true, sni: " other.test ", timeout: "5", verifyTls: true, noStore: true };
+  assert.deepEqual(sendArgs("https://a.test", o), ["send", "--target=https://a.test", "--verbatim", "--sni=other.test", "--timeout=5", "--verify-tls", "--no-store", "-"]);
+  assert.deepEqual(activeLabels(o, "http"), ["as typed", "SNI other.test", "timeout 5 s", "verify TLS", "not recorded"]);
+  assert.deepEqual(sendArgs("https://a.test", { http2: true }), ["send", "--target=https://a.test", "--http2", "-"]);
+  assert.deepEqual(activeLabels({ http2: true }, "http"), ["HTTP/2"]);
+});
+
+test("send as typed is HTTP/1 only: with HTTP/2 on it isn't passed, shown or applied", () => {
+  const o = { http2: true, verbatim: true, sni: "s.test" };
+  assert.equal(sendsAsTyped(o), false);
+  assert.equal(sendsAsTyped({ verbatim: true }), true);
+  assert.equal(sendsAsTyped(undefined), false);
+  // HTTP/2 rebuilds the request into frames, so --verbatim would only mislead.
+  assert.deepEqual(sendArgs("https://a.test", o), ["send", "--target=https://a.test", "--http2", "--sni=s.test", "-"]);
+  assert.deepEqual(activeLabels(o, "http"), ["HTTP/2", "SNI s.test"]);
+  // The request goes as without "as typed": auto URL-encode applies, the head isn't rewritten.
+  const raw = "GET /a b HTTP/1.1\nHost: a.test\n\n";
+  assert.deepEqual(requestToSend(raw, { autoEncode: true, options: o }), autoEncodeRequest(raw));
+  assert.deepEqual(requestToSend(raw, { autoEncode: false, options: o }), { text: raw, encoded: 0 });
+  // The choice is kept, and applies again once HTTP/2 is off.
+  assert.deepEqual(optionArgs({ ...o, http2: false }, "http"), ["--verbatim", "--sni=s.test"]);
 });
 
 test("a value is one argument, so one starting with - isn't read as a flag", () => {
@@ -116,7 +124,7 @@ test("CRLF body changes only the body, whether or not it's sent as typed", () =>
 });
 
 test("an invalid timeout shows as invalid and is never passed", () => {
-  for (const t of ["abc", "-1", "5s", "0", "100000", "NaN"]) {
+  for (const t of ["abc", "-1", "5s", "0", "100000", "NaN", "0x10", "1e3"]) {
     assert.deepEqual(activeLabels({ timeout: t }, "http"), ["timeout invalid"], t);
     assert.deepEqual(optionArgs({ timeout: t }, "http"), [], t);
     assert.deepEqual(optionArgs({ timeout: t }, "ws"), [], t);
@@ -128,14 +136,16 @@ test("a step sent with other options than the tab has now says so", () => {
   assert.equal(sentWithNote(undefined, ["HTTP/2"]), null);
   assert.equal(sentWithNote(["HTTP/2", "SNI x"], []), "sent with: HTTP/2, SNI x");
   assert.equal(sentWithNote([], ["not recorded"]), "sent with the default options");
+  // The SNI a step went out with is named, also when only the SNI changed since.
+  assert.equal(sentWithNote(activeLabels({ sni: "a.test" }, "http"), activeLabels({ sni: "b.test" }, "http")), "sent with: SNI a.test");
 });
 
 test("a timeout that's accepted goes out as a plain positive number", () => {
   for (const [typed, arg] of [
-    ["1e-3", "--timeout=0.001"],
-    ["+5", "--timeout=5"],
-    ["0x10", "--timeout=16"],
-    ["86400", "--timeout=86400"],
+    ["0.001", "--timeout=0.001"],
+    ["05", "--timeout=5"],
+    ["2.50", "--timeout=2.5"],
+    [" 86400 ", "--timeout=86400"],
   ]) {
     assert.equal(optionsProblem({ timeout: typed }), null, typed);
     assert.deepEqual(optionArgs({ timeout: typed }, "http"), [arg], typed);
@@ -145,6 +155,11 @@ test("a timeout that's accepted goes out as a plain positive number", () => {
   assert.deepEqual(optionArgs({ timeout: "   " }, "ws"), []);
   assert.deepEqual(activeLabels({ timeout: "   " }, "ws"), []);
   for (const t of ["86400.5", "Infinity", "NaN", "1_000", "5s", "--5"]) assert.match(optionsProblem({ timeout: t }) ?? "", /Timeout/, t);
+  // Only plain digits with an optional decimal part: Number() would take all of these.
+  for (const t of ["0x10", "1e3", "1e-3", "+5", ".5", "5.", "0b1", "1 0", "1,5"]) {
+    assert.match(optionsProblem({ timeout: t }) ?? "", /plain number/, t);
+    assert.deepEqual(optionArgs({ timeout: t }, "http"), [], t);
+  }
 });
 
 test("an SNI value can't smuggle in another argument or line", () => {

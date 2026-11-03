@@ -1,7 +1,7 @@
 // Proxy → WebSockets: connections the proxy relayed (or Replay opened) and their messages;
 // and Replay's WebSocket mode (`ws send`).
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { bodyText, cancelCli, historyRequest, hostOf, isBinary, pathOf, requireWhole, run, type Body } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -9,7 +9,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { beginCall, endCall, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
+import { beginCall, endCall, failureText, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { optionsProblem } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
@@ -213,6 +213,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [current, setCurrent] = useState<number | null>(null);
   const [options, setOptions] = useSendOptions(tab);
   const [showOptions, setShowOptions] = useState(false);
+  const optionsId = useId();
   // The run in flight, so Stop can cancel it.
   const [call] = useTabSlot(replayCalls, tab.key);
   const busy = call != null;
@@ -248,7 +249,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
     try {
       r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), { stdin: wsSendInput(raw, splitMessages(text)), call: id });
     } catch (e: any) {
-      r = e.kind === "cancelled" ? "Stopped" : (e.message as string);
+      r = failureText(e, "ws");
     }
     // Into the tab even if the view was remounted meanwhile; not if the tab closed.
     if (endCall(key, id)) resultsByTab.update(key, () => r);
@@ -273,7 +274,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
           {busy ? "Connected…" : "Connect and send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop the connection">
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop the connection. What was sent may already have reached the server, and nothing will be recorded.">
             Stop
           </button>
         )}
@@ -287,11 +288,11 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
           Until
         </span>
         <input className="input mono" style={{ width: 160 }} placeholder="regex (optional)" value={until} onChange={(e) => setUntil(e.target.value)} />
-        <OptionsToggle options={options} kind="ws" open={showOptions} onToggle={() => setShowOptions(!showOptions)} />
+        <OptionsToggle options={options} kind="ws" open={showOptions} onToggle={() => setShowOptions(!showOptions)} controls={optionsId} />
         <span className="grow" />
         <span className="muted">{status}</span>
       </div>
-      {showOptions && <OptionsRow options={options} set={setOptions} kind="ws" />}
+      {showOptions && <OptionsRow id={optionsId} options={options} set={setOptions} kind="ws" />}
       <Split id="ws-replay" dir="row">
         <Split id="ws-replay-in" dir="col" initial={0.5}>
           <HttpView title="Handshake" value={raw} onChange={setRaw} />

@@ -9,7 +9,10 @@ import { autoEncodeRequest } from "../ui/urlencode.ts";
 export interface ReplayOptions {
   /** `--http2`: ALPN h2 for https, prior knowledge for http. */
   http2: boolean;
-  /** `--verbatim`: no Content-Length update and no header end added; the GUI skips auto URL-encode too. */
+  /**
+   * `--verbatim`: no Content-Length update and no header end added; the GUI skips auto URL-encode
+   * too. HTTP/1 only: with `http2` on it is kept but not used (sendsAsTyped).
+   */
   verbatim: boolean;
   /** Not a CLI flag: the GUI writes a text body's line breaks as CRLF (the editor can't hold a CR). */
   crlfBody: boolean;
@@ -39,12 +42,23 @@ export function withDefaults(o: Partial<ReplayOptions> | undefined): ReplayOptio
 }
 
 /**
+ * Whether the tab sends as typed. Only over HTTP/1: HTTP/2 rebuilds the request into frames from
+ * the parsed text, so "as typed" means nothing on the wire there and `--verbatim` isn't passed.
+ */
+export function sendsAsTyped(o: Partial<ReplayOptions> | undefined): boolean {
+  const f = withDefaults(o);
+  return f.verbatim && !f.http2;
+}
+
+/**
  * The timeout in seconds; null for the CLI's default (empty, or exactly the default);
- * "invalid" when it isn't a number of seconds in range (optionsProblem says why).
+ * "invalid" when it isn't a plain number of seconds in range (optionsProblem says why).
+ * Plain digits only: Number() would also take `0x10`, `1e3` or `+5`.
  */
 function timeoutSeconds(o: ReplayOptions): number | null | "invalid" {
   const t = o.timeout.trim();
   if (!t) return null;
+  if (!/^\d+(\.\d+)?$/.test(t)) return "invalid";
   const n = Number(t);
   if (!(n > 0 && n <= MAX_TIMEOUT)) return "invalid";
   return n === DEFAULT_TIMEOUT ? null : n;
@@ -53,7 +67,7 @@ function timeoutSeconds(o: ReplayOptions): number | null | "invalid" {
 /** Why the options can't be sent, or null. */
 export function optionsProblem(o: Partial<ReplayOptions> | undefined): string | null {
   const t = withDefaults(o).timeout.trim();
-  if (timeoutSeconds(withDefaults(o)) === "invalid") return `Timeout must be a number of seconds above 0 and at most ${MAX_TIMEOUT}, not "${t}"`;
+  if (timeoutSeconds(withDefaults(o)) === "invalid") return `Timeout must be a plain number of seconds above 0 and at most ${MAX_TIMEOUT}, such as 60 or 2.5, not "${t}"`;
   const sni = withDefaults(o).sni.trim();
   if (/\s/.test(sni)) return "The SNI host name can't contain spaces";
   return null;
@@ -64,7 +78,7 @@ export function optionArgs(o: Partial<ReplayOptions> | undefined, kind: TabKind)
   const f = withDefaults(o);
   const args: string[] = [];
   if (kind === "http" && f.http2) args.push("--http2");
-  if (kind === "http" && f.verbatim) args.push("--verbatim");
+  if (kind === "http" && sendsAsTyped(f)) args.push("--verbatim");
   if (f.sni.trim()) args.push(`--sni=${f.sni.trim()}`);
   const t = timeoutSeconds(f);
   if (typeof t === "number") args.push(`--timeout=${t}`);
@@ -83,7 +97,7 @@ export function activeLabels(o: Partial<ReplayOptions> | undefined, kind: TabKin
   const f = withDefaults(o);
   const out: string[] = [];
   if (kind === "http" && f.http2) out.push("HTTP/2");
-  if (kind === "http" && f.verbatim) out.push("as typed");
+  if (kind === "http" && sendsAsTyped(f)) out.push("as typed");
   if (kind === "http" && f.crlfBody) out.push("CRLF body");
   if (f.sni.trim()) out.push(`SNI ${f.sni.trim()}`);
   const t = timeoutSeconds(f);
@@ -110,14 +124,15 @@ export function crlfBody(raw: string): string {
 
 /**
  * The request text a send writes on stdin and how many characters auto URL-encode changed.
- * Sent as typed (`--verbatim`), the CLI changes nothing, so the head's line breaks are written
- * as CRLF here (the editor holds only \n there) and auto URL-encode is skipped. Otherwise the
- * CLI turns the head's line breaks into CRLF and fixes Content-Length. Either way the body is
- * as the editor holds it (an unedited one keeps its bytes), unless "CRLF body" is on.
+ * Sent as typed (`--verbatim`, HTTP/1 only), the CLI changes nothing, so the head's line
+ * breaks are written as CRLF here (the editor holds only \n there) and auto URL-encode is
+ * skipped. Otherwise the CLI turns the head's line breaks into CRLF and fixes Content-Length.
+ * Either way the body is as the editor holds it (an unedited one keeps its bytes), unless
+ * "CRLF body" is on.
  */
 export function requestToSend(raw: string, o: { binary?: boolean; autoEncode: boolean; options?: Partial<ReplayOptions> }): { text: string; encoded: number } {
   const f = withDefaults(o.options);
-  const out = f.verbatim ? { text: crlfHead(raw), encoded: 0 } : o.autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+  const out = sendsAsTyped(f) ? { text: crlfHead(raw), encoded: 0 } : o.autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
   if (f.crlfBody && !o.binary) out.text = crlfBody(out.text);
   return out;
 }

@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { bodyText, cancelCli, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
-import { beginCall, endCall, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
-import { activeLabels, optionsProblem, requestToSend, sendArgs, sentWithNote } from "./replayOptions";
+import { confirm } from "../ui/Confirm";
+import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
+import { activeLabels, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
@@ -44,7 +45,10 @@ export function RepeaterView() {
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
-  const closeTab = (key: number) => {
+  const closeTab = async (key: number) => {
+    // Closing stops a send still running, which may already have reached the server.
+    const q = closeQuestion(key);
+    if (q && !(await confirm(q.title, q.message, "Stop and close", "Keep open"))) return;
     forgetTab(key, cancelCli);
     app.setRepeater((ts) => ts.filter((t) => t.key !== key));
     if (key === active?.key) {
@@ -123,6 +127,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
   const [options, setOptions] = useSendOptions(tab);
   const [showOptions, setShowOptions] = useState(false);
+  const optionsId = useId();
   const [sent, setSent] = useTabSlot(sentByTab, tab.key);
   const current = sent.list[sent.at];
   // The send in flight, so Stop can cancel it (a long timeout would otherwise hold the tab).
@@ -161,7 +166,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
       const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: id });
       entry = { raw, sent, encoded, labels, result, error: null };
     } catch (e: any) {
-      entry = { raw, sent, encoded, labels, result: null, error: e.kind === "cancelled" ? "Stopped before a response arrived" : e.message };
+      entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "http") };
     }
     // Into the tab's history even if the view was remounted meanwhile; not if the tab closed.
     if (endCall(key, id)) sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
@@ -196,7 +201,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           {busy ? "Sending…" : "Send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request">
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request. It may already have reached the server, and it won't be recorded.">
             Stop
           </button>
         )}
@@ -213,15 +218,15 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         <label
           className="check"
           title={
-            options.verbatim
+            sendsAsTyped(options)
               ? "Off while this tab sends as typed (Options)"
               : "Before sending, percent-encode characters that aren't valid in a URL (spaces, quotes, <>, #, non-ASCII) in the request line and in form bodies. & = ? / and existing %XX stay as typed."
           }
         >
           <input
             type="checkbox"
-            checked={autoEncode && !options.verbatim}
-            disabled={options.verbatim}
+            checked={autoEncode && !sendsAsTyped(options)}
+            disabled={sendsAsTyped(options)}
             onChange={(e) => {
               setAutoEncode(e.target.checked);
               try {
@@ -233,7 +238,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           />{" "}
           Auto URL-encode
         </label>
-        <OptionsToggle options={options} kind="http" open={showOptions} onToggle={() => setShowOptions(!showOptions)} />
+        <OptionsToggle options={options} kind="http" open={showOptions} onToggle={() => setShowOptions(!showOptions)} controls={optionsId} />
         <span className="grow" />
         {note && (
           <span className="tag" title="This step was sent with other options than the tab has now">
@@ -252,7 +257,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           </span>
         )}
       </div>
-      {showOptions && <OptionsRow options={options} set={setOptions} kind="http" binary={tab.binary} />}
+      {showOptions && <OptionsRow id={optionsId} options={options} set={setOptions} kind="http" binary={tab.binary} />}
       <Split id="repeater" dir="row">
         <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} />
         <HttpView

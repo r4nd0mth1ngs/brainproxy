@@ -2,7 +2,7 @@
 // toolbar, and the row that edits them. The flags they map to are in replayOptions.ts.
 
 import { useApp, type RepeaterTab } from "../store";
-import { DEFAULT_OPTIONS, DEFAULT_TIMEOUT, activeLabels, withDefaults, type ReplayOptions, type TabKind } from "./replayOptions";
+import { DEFAULT_OPTIONS, DEFAULT_TIMEOUT, activeLabels, sendsAsTyped, withDefaults, type ReplayOptions, type TabKind } from "./replayOptions";
 
 /** The tab's options, and a setter that keeps them in the tab (so they survive tab switches). */
 export function useSendOptions(tab: RepeaterTab): [ReplayOptions, (patch: Partial<ReplayOptions>) => void] {
@@ -13,10 +13,10 @@ export function useSendOptions(tab: RepeaterTab): [ReplayOptions, (patch: Partia
 }
 
 /** "Options" plus a chip for each option that isn't the default, so a changed send isn't a surprise. */
-export function OptionsToggle({ options, kind, open, onToggle }: { options: ReplayOptions; kind: TabKind; open: boolean; onToggle: () => void }) {
+export function OptionsToggle({ options, kind, open, onToggle, controls }: { options: ReplayOptions; kind: TabKind; open: boolean; onToggle: () => void; controls: string }) {
   return (
     <>
-      <button className="btn small" onClick={onToggle} title={open ? "Hide the send options" : "Show the send options"}>
+      <button className="btn small" onClick={onToggle} aria-expanded={open} aria-controls={controls} title={open ? "Hide the send options" : "Show the send options"}>
         Options {open ? "▴" : "▾"}
       </button>
       {activeLabels(options, kind).map((l) => (
@@ -30,9 +30,9 @@ export function OptionsToggle({ options, kind, open, onToggle }: { options: Repl
 
 const same = (a: ReplayOptions, b: ReplayOptions) => (Object.keys(a) as (keyof ReplayOptions)[]).every((k) => a[k] === b[k]);
 
-export function OptionsRow({ options, set, kind, binary }: { options: ReplayOptions; set: (patch: Partial<ReplayOptions>) => void; kind: TabKind; binary?: boolean }) {
+export function OptionsRow({ id, options, set, kind, binary }: { id: string; options: ReplayOptions; set: (patch: Partial<ReplayOptions>) => void; kind: TabKind; binary?: boolean }) {
   return (
-    <div className="toolbar">
+    <div className="toolbar" id={id} role="group" aria-label="Send options">
       {kind === "http" && (
         <label className="check" title="Send over HTTP/2: ALPN h2 for https, prior knowledge for http. The request line can stay HTTP/1.1.">
           <input type="checkbox" checked={options.http2} onChange={(e) => set({ http2: e.target.checked })} /> HTTP/2
@@ -42,12 +42,14 @@ export function OptionsRow({ options, set, kind, binary }: { options: ReplayOpti
         <label
           className="check"
           title={
-            "Send the request exactly as it is in the editor, for request smuggling and other malformed requests: " +
-            "Content-Length isn't updated, auto URL-encode is skipped, and no blank line is added after the headers. " +
-            "The head's line breaks go out as CRLF; the body goes out as the editor holds it (see CRLF body)."
+            options.http2
+              ? "HTTP/1 only: HTTP/2 rebuilds the request into frames, so it can't be sent as typed. Turn HTTP/2 off to use it."
+              : "Send the request exactly as it is in the editor, for request smuggling and other malformed requests: " +
+                "Content-Length isn't updated, auto URL-encode is skipped, and no blank line is added after the headers. " +
+                "The head's line breaks go out as CRLF; the body goes out as the editor holds it (see CRLF body)."
           }
         >
-          <input type="checkbox" checked={options.verbatim} onChange={(e) => set({ verbatim: e.target.checked })} /> Send as typed
+          <input type="checkbox" checked={sendsAsTyped(options)} disabled={options.http2} onChange={(e) => set({ verbatim: e.target.checked })} /> Send as typed
         </label>
       )}
       {kind === "http" && !binary && (
@@ -61,14 +63,14 @@ export function OptionsRow({ options, set, kind, binary }: { options: ReplayOpti
           <input type="checkbox" checked={options.crlfBody} onChange={(e) => set({ crlfBody: e.target.checked })} /> CRLF body
         </label>
       )}
-      <span className="label" title="The TLS server name (SNI) to send instead of the target's host">
+      <label className="label" htmlFor={`${id}-sni`} title="The TLS server name (SNI) to send instead of the target's host">
         SNI
-      </span>
-      <input className="input mono" style={{ width: 180 }} placeholder="the target's host" spellCheck={false} value={options.sni} onChange={(e) => set({ sni: e.target.value })} />
-      <span className="label" title="Seconds the request may take">
+      </label>
+      <input id={`${id}-sni`} className="input mono" style={{ width: 180 }} placeholder="the target's host" spellCheck={false} value={options.sni} onChange={(e) => set({ sni: e.target.value })} />
+      <label className="label" htmlFor={`${id}-timeout`} title="Seconds the request may take">
         Timeout
-      </span>
-      <input className="input" inputMode="decimal" style={{ width: 56 }} placeholder={String(DEFAULT_TIMEOUT)} value={options.timeout} onChange={(e) => set({ timeout: e.target.value })} />
+      </label>
+      <input id={`${id}-timeout`} className="input" inputMode="decimal" style={{ width: 56 }} placeholder={String(DEFAULT_TIMEOUT)} value={options.timeout} onChange={(e) => set({ timeout: e.target.value })} />
       <span className="muted">s</span>
       <label className="check" title="Check the server's certificate and refuse an invalid one (off by default, as with most intercepting tools)">
         <input type="checkbox" checked={options.verifyTls} onChange={(e) => set({ verifyTls: e.target.checked })} /> Verify TLS

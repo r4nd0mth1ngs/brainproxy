@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { beginCall, clearReplayTabs, endCall, forgetTab, replayCalls, stopCall, tabSlot } from "./replayCalls.ts";
+import { beginCall, clearReplayTabs, closeQuestion, endCall, failureText, forgetTab, replayCalls, sendsInFlight, stopCall, stoppedText, tabSlot } from "./replayCalls.ts";
 
 /** A stand-in for cancelCli that records what it was asked to stop. */
 function canceller() {
@@ -78,4 +78,38 @@ test("a slot tells its subscribers about every change", () => {
   assert.equal(n, 2);
   // The default for a tab without a value is the same object each time (useSyncExternalStore needs that).
   assert.equal(results.get(9), results.get(9));
+});
+
+test("closing asks only while a send is running, and says what stopping it means", () => {
+  clearReplayTabs(async () => {});
+  assert.equal(closeQuestion(), null);
+  assert.equal(closeQuestion(1), null);
+  const a = beginCall(1, "replay-send");
+  beginCall(2, "replay-ws-send");
+  assert.equal(sendsInFlight(), 2);
+  assert.equal(sendsInFlight(1), 1);
+  assert.equal(sendsInFlight(3), 0);
+  const tab = closeQuestion(1);
+  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and it won't be recorded/);
+  assert.equal(closeQuestion(3), null);
+  assert.match(closeQuestion()?.message ?? "", /^2 Replay sends are still waiting\. Closing the project stops them/);
+  // A finished send isn't running any more, though its tab still has a (null) call.
+  endCall(1, a);
+  assert.equal(closeQuestion(1), null);
+  assert.equal(sendsInFlight(), 1);
+  assert.match(closeQuestion()?.message ?? "", /^A Replay send is still waiting/);
+  clearReplayTabs(async () => {});
+  assert.equal(closeQuestion(), null);
+});
+
+test("a stopped send doesn't read as not sent", () => {
+  assert.equal(failureText({ kind: "cancelled", message: "cancelled" }, "http"), stoppedText("http"));
+  assert.equal(failureText({ kind: "cancelled" }, "ws"), stoppedText("ws"));
+  for (const kind of ["http", "ws"] as const) {
+    assert.match(stoppedText(kind), /may already have reached the server/);
+    assert.match(stoppedText(kind), /recorded/);
+    assert.doesNotMatch(stoppedText(kind), /before a response/);
+  }
+  assert.equal(failureText({ kind: "cli", message: "connection refused" }, "http"), "connection refused");
+  assert.equal(failureText(new Error("timed out"), "ws"), "timed out");
 });

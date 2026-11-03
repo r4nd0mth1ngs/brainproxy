@@ -80,6 +80,43 @@ export function stopCall(key: number, cancel: (call: string) => Promise<void>): 
   if (call) cancel(call).catch(() => {});
 }
 
+/** How many tabs (or, given a key, whether that tab) have a send in flight. */
+export function sendsInFlight(key?: number): number {
+  const keys = key == null ? replayCalls.keys() : [key];
+  return keys.filter((k) => replayCalls.get(k) != null).length;
+}
+
+/**
+ * What a stopped send says. Stop kills the CLI before it records anything (`send` records after
+ * the response, `ws send` at the end of the run), but the request may already be on the wire,
+ * so it doesn't read as "not sent".
+ */
+export function stoppedText(kind: "http" | "ws"): string {
+  return kind === "http"
+    ? "Stopped: the request may already have reached the server, and it wasn't recorded"
+    : "Stopped: the handshake and messages may already have reached the server, and nothing was recorded";
+}
+
+/** What a failed send says: the stopped text when it was stopped, otherwise the error. */
+export function failureText(e: { kind?: string; message?: string }, kind: "http" | "ws"): string {
+  return e.kind === "cancelled" ? stoppedText(kind) : String(e.message ?? e);
+}
+
+/**
+ * The question to ask before closing a tab (given its key) or the project while sends are in
+ * flight, or null when nothing is running. Closing stops them the same way Stop does.
+ */
+export function closeQuestion(key?: number): { title: string; message: string } | null {
+  const n = sendsInFlight(key);
+  if (!n) return null;
+  const what = key != null ? "this tab" : "the project";
+  const sends = n === 1 ? "A Replay send is" : `${n} Replay sends are`;
+  return {
+    title: `Stop ${n === 1 ? "the send" : "the sends"} still running?`,
+    message: `${sends} still waiting. Closing ${what} stops ${n === 1 ? "it" : "them"}: the server may already have the request, and it won't be recorded.`,
+  };
+}
+
 /** Forgets a closed tab: its send is stopped, and nothing it returns lands anywhere. */
 export function forgetTab(key: number, cancel: (call: string) => Promise<void>): void {
   stopCall(key, cancel);
