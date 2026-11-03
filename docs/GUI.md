@@ -178,7 +178,7 @@ agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
   removes them (it adds no `User-Agent`). A `-H` is read only as `Name: value` (or
   `Name:value`), `Name:` (removes curl's own header) or `Name;` (an empty one), with `Name` a
   token and nothing between it and the `:` or `;`; each replaces curl's header of that name,
-  and only the first custom `Host` is sent, as curl does. Any other form (`Name : x`,
+  and a command that sets `Host` more than once is refused. Any other form (`Name : x`,
   `Name;x: y`, a space before the name) is refused, as curl reads those by rules of its own;
   write it in one of the three forms and edit the header in the tab. `-G` and `--url-query`
   add `&` only after a query that has something in it. Long options take a value after `=`

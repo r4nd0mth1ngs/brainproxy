@@ -623,8 +623,11 @@ test("options are read as curl reads them, or refused", () => {
   assert.deepEqual(forms("Content-Type:\ttext/plain"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: text/plain", "Content-Length: 1"]);
   assert.deepEqual(forms("Content-Type;"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: ", "Content-Length: 1"]);
   assert.deepEqual(forms("Content-Length:"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: application/x-www-form-urlencoded"]);
-  // Only the first custom Host is sent, in Host's place, as curl does; "Host:" after it removes nothing.
-  assert.match(parseCurl("curl -H 'X: 1' -H 'Host: a.test' -H 'Host: b.test' -H 'Host:' http://h.test/").raw, /^GET \/ HTTP\/1\.1\nHost: a\.test\nAccept: \*\/\*\nX: 1\n\n$/);
+  // A custom Host goes in Host's place.
+  assert.match(parseCurl("curl -H 'X: 1' -H 'Host: a.test' http://h.test/").raw, /^GET \/ HTTP\/1\.1\nHost: a\.test\nAccept: \*\/\*\nX: 1\n\n$/);
+  // More than one Host, in any form, is refused: which ones curl sends depends on their order.
+  for (const hs of ["-H 'Host: a.test' -H 'Host: b.test'", "-H 'Host:' -H 'Host: a.test' -H 'Host: b.test'", "-H 'Host: a.test' -H 'Host:'", "-H 'host;' -H 'Host: a.test'"])
+    assert.match(refusal(`curl ${hs} http://h.test/`), /Host more than once/);
   // --no-get turns -G back off.
   assert.match(parseCurl("curl -G --no-get -d a=1 https://h.test").raw, /^POST \/ /);
 });

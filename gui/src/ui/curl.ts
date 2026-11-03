@@ -951,7 +951,10 @@ export function parseCurl(command: string): ParsedCurl {
   if (hasBody) trailing.push(["Content-Length", String(body.length)], ["Content-Type", contentType!]);
 
   // Each custom header drops curl's own of that name; "Name:" (a null value) sends nothing.
-  // A custom Host goes first, where curl writes it, and only the first is sent, as in curl.
+  // A custom Host goes first, where curl writes it. Which of several Host headers curl sends
+  // depends on their order and forms, so more than one is refused rather than guessed.
+  if (custom.filter(([n]) => n.toLowerCase() === "host").length > 1)
+    throw new CurlError("The command sets Host more than once, which can't be imported exactly; keep one -H 'Host: …' and edit the request after pasting.");
   let customHost: [string, string] | undefined;
   const added: [string, string][] = [];
   for (const [name, val] of custom) {
