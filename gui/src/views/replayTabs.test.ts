@@ -31,6 +31,36 @@ test("tabs round-trip without keys or responses, text as typed", () => {
   assert.equal(toSaved(tabs, 0).active, undefined);
 });
 
+test("a tab's send options are kept, but never Don't record", () => {
+  const tabs: RepeaterTab[] = [
+    { key: 1, title: "a", target: "https://a.test", raw: "GET / HTTP/1.1\n\n", options: { http2: true, verbatim: true, crlfBody: true, sni: " other.test ", timeout: "2.5", verifyTls: true, noStore: true } },
+    // A WebSocket tab keeps only what `ws send` has; defaults and Don't record leave nothing.
+    { key: 2, title: "b", target: "wss://a.test", raw: "", ws: [], options: { http2: true, sni: "10.0.0.1", timeout: "30", noStore: true } },
+    { key: 3, title: "c", target: "", raw: "", options: { noStore: true, timeout: "30" } },
+    // What isn't valid yet (being typed) is left out, so the save doesn't fail.
+    { key: 4, title: "d", target: "", raw: "", options: { sni: "half-", timeout: "1e3" } },
+  ];
+  const saved = toSaved(tabs, 0);
+  assert.deepEqual(
+    saved.tabs.map((t) => t.options),
+    [{ http2: true, verbatim: true, crlfBody: true, sni: "other.test", timeout: 2.5, verifyTls: true }, { sni: "10.0.0.1" }, undefined, undefined],
+  );
+  assert.doesNotMatch(JSON.stringify(saved), /noStore/);
+  // The CLI's order, so a listed tab reads the same as the app's (tabTexts).
+  assert.deepEqual(Object.keys(saved.tabs[0]), ["kind", "title", "target", "request", "options"]);
+  assert.deepEqual(Object.keys(saved.tabs[0].options!), ["http2", "verbatim", "crlfBody", "sni", "timeout", "verifyTls"]);
+  let k = 1;
+  const back = fromSaved(JSON.parse(JSON.stringify(saved)), () => k++).tabs;
+  assert.deepEqual(back[0].options, { http2: true, verbatim: true, crlfBody: true, sni: "other.test", timeout: "2.5", verifyTls: true });
+  assert.deepEqual(back[1].options, { sni: "10.0.0.1" });
+  assert.equal(back[2].options, undefined);
+  // A set saved elsewhere (an agent's) can't turn Don't record on, nor HTTP-only options for a WebSocket tab.
+  const listed = { tabs: [{ request: "", options: { noStore: true, timeout: 99999, sni: "a b" } }, { kind: "ws", request: "", options: { http2: true, timeout: 60 } }] };
+  const agent = fromSaved(listed, () => k++).tabs;
+  assert.equal(agent[0].options, undefined);
+  assert.deepEqual(agent[1].options, { timeout: "60" });
+});
+
 test("loading skips what isn't a tab", () => {
   let k = 1;
   const r = fromSaved({ tabs: [null, "x", { title: "no request" }, { request: "GET / HTTP/1.1\n\n", future: 1 }, { kind: "ws", request: "", messages: [1, "m"] }], active: 0 }, () => k++);

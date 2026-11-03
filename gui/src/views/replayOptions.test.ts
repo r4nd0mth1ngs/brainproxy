@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_OPTIONS, activeLabels, crlfBody, crlfHead, curlOptions, optionArgs, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
+import { DEFAULT_OPTIONS, validServerName, activeLabels, crlfBody, crlfHead, curlOptions, optionArgs, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
 import { autoEncodeRequest } from "../ui/urlencode.ts";
 import { parseCurl, toCurl } from "../ui/curl.ts";
 import { wsSendArgs } from "./ws.ts";
@@ -274,4 +274,12 @@ test("Copy as cURL sends the way the tab does", () => {
   assert.deepEqual(copy({ verbatim: true, http2: true }).warnings, []);
   assert.match(copy({ sni: "other.test" }).warnings.join("\n"), /not the tab's SNI \(other\.test\)/);
   assert.deepEqual(copy({ sni: "other.test" }, "http://h.test").warnings, []);
+});
+
+test("an SNI must be a TLS server name, as the CLI's --sni takes", () => {
+  for (const ok of ["a.test", "a.test.", "x_y.test", "a-b.test", "localhost", "10.0.0.1", "::1", "2001:db8::1", "a".repeat(63) + ".test"]) assert.equal(validServerName(ok), true, ok);
+  for (const bad of ["", "-a.test", "a-.test", "a..test", "1.2.3", "300.1.1.1", "a.test/x", "a b", "a".repeat(64) + ".test", "x." + "a".repeat(250), ":::x", "[::1]"])
+    assert.equal(validServerName(bad), false, bad);
+  assert.match(optionsProblem({ sni: "-x.test" }) ?? "", /isn't a valid TLS server name/);
+  assert.equal(optionsProblem({ sni: "x.test" }), null);
 });

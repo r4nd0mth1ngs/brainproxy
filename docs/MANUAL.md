@@ -405,8 +405,9 @@ Edit a raw request and send it as often as you like, in separate tabs.
 - **Kept with the project:** open tabs are saved in the project file a moment after you
   change them and when you close it, and come back when you open it again (copies made with
   `project save` or *Save as…* have them too). A tab keeps its title, target, request (or
-  handshake and messages) and Listen and Until; responses and the ‹ › send history are not
-  kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
+  handshake and messages), Listen and Until, and its Options except **Don't record**, which
+  is chosen again each time (so a reopened tab, or one an agent prepared, never sends
+  unrecorded); responses and the ‹ › send history are not kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
   (more than 500 tabs or 16 MB), the app says so and the tabs stay open; *Save as…* keeps
   the temporary engagement open, and switching project asks first. From the command
   line or an agent: `replay tabs list` and `replay tabs save`, so an agent can prepare tabs

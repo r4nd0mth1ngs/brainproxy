@@ -25,6 +25,8 @@ const MAX_TABS: usize = 500;
 const MAX_TITLE: usize = 200;
 const MAX_TARGET: usize = 2048;
 const MAX_UNTIL: usize = 1000;
+/// Longest timeout a tab keeps, in seconds (a day), as the app allows.
+const MAX_TIMEOUT_SECS: f64 = 86400.0;
 
 #[derive(Subcommand)]
 pub enum ReplayCmd {
@@ -53,7 +55,9 @@ pub enum TabsCmd {
         {\"kind\": \"ws\", \"title\": \"feed\", \"target\": \"wss://app.example.com\", \"request\": \"GET /ws HTTP/1.1\\n...\", \
         \"messages\": [\"{\\\"op\\\":\\\"sub\\\"}\"], \"wait\": 3, \"until\": \"done\"}], \"active\": 0}. \
         kind is http (default) or ws; binary marks an http request held one character per byte; messages, \
-        wait (seconds, at most 86400) and until (regex) are for ws tabs; active is the index of the tab shown \
+        wait (seconds, at most 86400) and until (regex) are for ws tabs; options holds how a tab sends: \
+        {\"http2\", \"verbatim\", \"crlfBody\" (http tabs), \"sni\", \"timeout\" (seconds, at most 86400), \
+        \"verifyTls\"}, never noStore; active is the index of the tab shown \
         (with --append, among the tabs given). Text is stored as given, auth placeholders included: write \
         «auth:...» placeholders rather than live cookies or tokens. Responses are never stored. At most 500 tabs \
         and 16 MB. An empty list leaves no tabs. Through MCP only --append is allowed, so an agent can't remove \
@@ -96,6 +100,56 @@ struct Tab {
     wait: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     until: Option<String>,
+    /// How the tab sends (the app's Options), as `send` / `ws send` flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    options: Option<TabOptions>,
+}
+
+/// A tab's send options. Never Don't record (`--no-store`): a tab reopened, or prepared by an
+/// agent, must not make a person's send go unrecorded, so a set holding it is refused.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TabOptions {
+    /// `--http2` (HTTP tabs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    http2: bool,
+    /// `--verbatim` (HTTP tabs; the app sends as typed over HTTP/1 only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    verbatim: bool,
+    /// The app writes a text body's line breaks as CRLF (HTTP tabs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    crlf_body: bool,
+    /// `--sni`: a TLS server name, checked as the flag is (the scope is checked when it's sent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sni: Option<String>,
+    /// `--timeout`, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout: Option<f64>,
+    /// `--verify-tls`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    verify_tls: bool,
+    /// Read only to refuse it (see above); never stored.
+    #[serde(default, skip_serializing)]
+    no_store: Option<Value>,
+}
+
+impl TabOptions {
+    fn check(&self, kind: Kind) -> Result<(), String> {
+        if self.no_store.as_ref().is_some_and(|v| *v != Value::Bool(false)) {
+            return Err("noStore isn't kept with a tab: whether a send is recorded is chosen when it is sent".into());
+        }
+        if kind == Kind::Ws && (self.http2 || self.verbatim || self.crlf_body) {
+            return Err("http2, verbatim and crlfBody are for HTTP tabs".into());
+        }
+        if let Some(t) = self.timeout.filter(|t| !(*t > 0.0 && *t <= MAX_TIMEOUT_SECS)) {
+            return Err(format!("timeout must be above 0 and at most {MAX_TIMEOUT_SECS} seconds, not {t}"));
+        }
+        if let Some(sni) = &self.sni {
+            brainproxy_core::http::server_name(sni)
+                .map_err(|_| format!("sni {sni:?} isn't a valid TLS server name (a DNS name or an IP address)"))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -276,6 +330,9 @@ fn parse(input: &[u8]) -> Result<Tabs, Error> {
         if t.until.as_ref().is_some_and(|u| u.chars().count() > MAX_UNTIL) {
             return Err(bad(format!("until is longer than {MAX_UNTIL} characters")));
         }
+        if let Some(o) = &t.options {
+            o.check(t.kind).map_err(bad)?;
+        }
     }
     Ok(set)
 }
@@ -324,6 +381,39 @@ mod tests {
 
     fn err(input: &str) -> String {
         save(input.as_bytes()).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn tab_options_are_kept_checked_and_never_no_store() {
+        let (json, _) = save(
+            br#"{"tabs": [{"request": "x", "options": {"http2": true, "verbatim": false, "sni": "other.test", "timeout": 2.5, "verifyTls": true}},
+                {"kind": "ws", "request": "", "options": {"sni": "127.0.0.1", "noStore": false}}]}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["tabs"][0]["options"],
+            json!({"http2": true, "sni": "other.test", "timeout": 2.5, "verifyTls": true})
+        );
+        assert_eq!(v["tabs"][1]["options"], json!({"sni": "127.0.0.1"}));
+        let err = |s: &str| parse(s.as_bytes()).unwrap_err().to_string();
+        // A saved tab never makes a send go unrecorded.
+        assert!(err(r#"{"tabs": [{"request": "", "options": {"noStore": true}}]}"#).contains("noStore isn't kept"));
+        assert!(err(r#"{"tabs": [{"request": "", "options": {"noStore": 1}}]}"#).contains("noStore isn't kept"));
+        // The timeout is capped as the app caps it; the server name is checked as --sni is.
+        for t in ["0", "-1", "86400.5", "1e300"] {
+            let e = err(&format!(r#"{{"tabs": [{{"request": "", "options": {{"timeout": {t}}}}}]}}"#));
+            assert!(e.contains("timeout must be above 0 and at most 86400"), "{t}: {e}");
+        }
+        assert!(parse(br#"{"tabs": [{"request": "", "options": {"timeout": 86400}}]}"#).is_ok());
+        for sni in ["a b", "-x.test", "x..test", "", "1.2.3", "x.test/a"] {
+            let e = err(&format!(r#"{{"tabs": [{{"request": "", "options": {{"sni": "{sni}"}}}}]}}"#));
+            assert!(e.contains("isn't a valid TLS server name"), "{sni}: {e}");
+        }
+        assert!(
+            err(r#"{"tabs": [{"kind": "ws", "request": "", "options": {"http2": true}}]}"#).contains("for HTTP tabs")
+        );
+        assert!(err(r#"{"tabs": [{"request": "", "options": {"proxy": "x"}}]}"#).contains("unknown field"));
     }
 
     #[test]

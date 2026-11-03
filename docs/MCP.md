@@ -109,7 +109,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `replay_tabs_save` without `append`: an agent can add Replay tabs for a person to send, but
   not replace or clear the ones they keep (a prompt injected through target content could
   otherwise wipe them). The app adds tabs saved this way to the open ones; it doesn't save
-  over them. `replay_tabs_list` can return a large set; `summary` leaves the requests out and
+  over them. A tab's `options` can't hold `noStore` (refused for everyone, not only through
+  MCP), so a prepared tab never makes the person's send go unrecorded. `replay_tabs_list` can return a large set; `summary` leaves the requests out and
   `index` returns one tab, so a set over `--max-output` can be read a tab at a time. It
   returns requests as stored, live cookies or tokens typed into a tab included.
 - `send` and `ws_send` with `no_store` (races too), and `fuzz_run` with `store` `none` or

@@ -606,8 +606,7 @@ impl Client {
                 )));
             }
         }
-        let server_name = ServerName::try_from(name.to_string())
-            .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
+        let server_name = server_name(name)?;
         connector.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))
     }
 
@@ -809,6 +808,12 @@ impl ServerCertVerifier for NoVerify {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
     }
+}
+
+/// A TLS server name as `--sni` (or a target's host) must be: a DNS name or an IP address.
+pub fn server_name(name: &str) -> Result<ServerName<'static>> {
+    ServerName::try_from(name.to_string())
+        .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))
 }
 
 #[cfg(test)]

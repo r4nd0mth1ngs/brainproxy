@@ -364,8 +364,14 @@ logic in `views/replayTabs.ts`:
   doesn't save it (a toast says so), and `replay tabs save` refuses to save over it, since
   the newer fields would be lost. A tab of a kind this build doesn't know isn't opened.
 - **What:** per tab its kind, title, target, the request (or handshake and messages), the
-  binary flag, and a WebSocket tab's Listen (at most 86400 s, as `ws send --wait`) and
-  Until (now kept when switching tabs too). Never responses or the send history. Text goes
+  binary flag, a WebSocket tab's Listen (at most 86400 s, as `ws send --wait`) and
+  Until (now kept when switching tabs too), and its send options (`options`: `http2`,
+  `verbatim`, `crlfBody`, `sni`, `timeout`, `verifyTls`; `savedOptions` in
+  `views/replayOptions.ts`). Never Don't record: `replay tabs save` refuses `noStore`, so a
+  reopened or agent-prepared tab can't make a person's send unrecorded. The CLI checks the
+  rest as the flags are: a timeout above 0 and at most a day, an SNI that is a TLS server
+  name (its scope is checked when it is sent); the app leaves out an SNI or timeout that
+  isn't valid yet rather than failing the save. Never responses or the send history. Text goes
   as typed, auth placeholders included, and so do live `Cookie` or `Authorization` values in
   a request sent over from history: `replay tabs list` returns them in full. Use `«auth:…»`
   placeholders in tabs that are kept.

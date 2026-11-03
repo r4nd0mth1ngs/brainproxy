@@ -5,6 +5,7 @@
 // elsewhere meanwhile (an agent's) are added to the app's rather than replaced.
 
 import type { RepeaterTab } from "../store";
+import { optionsFromSaved, savedOptions, type SavedOptions } from "./replayOptions.ts";
 
 /** One tab as `replay tabs save` takes it. */
 export interface SavedTab {
@@ -17,6 +18,8 @@ export interface SavedTab {
   messages?: string[];
   wait?: number;
   until?: string;
+  /** How the tab sends; never Don't record (see savedOptions). */
+  options?: SavedOptions;
 }
 
 export interface SavedTabs {
@@ -52,6 +55,8 @@ export function newerFormat(data: unknown): boolean {
 export function toSaved(tabs: RepeaterTab[], activeKey: number): SavedTabs {
   const saved = tabs.map((t): SavedTab => {
     const base = { title: t.title, target: t.target, request: t.raw };
+    // Last, in the order the CLI writes a tab, so a listing's tab reads the same as the app's.
+    const opts = (o: SavedOptions | undefined) => (o ? { options: o } : {});
     if (t.ws)
       return {
         kind: "ws",
@@ -59,8 +64,9 @@ export function toSaved(tabs: RepeaterTab[], activeKey: number): SavedTabs {
         messages: t.ws,
         ...(t.wsWait != null ? { wait: t.wsWait } : {}),
         ...(t.wsUntil ? { until: t.wsUntil } : {}),
+        ...opts(savedOptions(t.options, "ws")),
       };
-    return { kind: "http", ...base, ...(t.binary ? { binary: true } : {}) };
+    return { kind: "http", ...base, ...(t.binary ? { binary: true } : {}), ...opts(savedOptions(t.options, "http")) };
   });
   const active = tabs.findIndex((t) => t.key === activeKey);
   return active >= 0 ? { tabs: saved, active } : { tabs: saved };
@@ -90,6 +96,8 @@ export function fromSaved(data: unknown, nextKey: () => number, firstNumber = 1)
       if (typeof t.wait === "number" && t.wait >= 0 && t.wait <= MAX_WAIT) tab.wsWait = t.wait;
       if (t.until) tab.wsUntil = str(t.until);
     } else if (t.binary === true) tab.binary = true;
+    const options = optionsFromSaved(t.options, t.kind === "ws" ? "ws" : "http");
+    if (options) tab.options = options;
     tabs.push(tab);
     if (i === d.active) activeKey = key;
   });

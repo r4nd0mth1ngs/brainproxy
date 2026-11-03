@@ -70,7 +70,73 @@ export function optionsProblem(o: Partial<ReplayOptions> | undefined): string | 
   if (timeoutSeconds(withDefaults(o)) === "invalid") return `Timeout must be a plain number of seconds above 0 and at most ${MAX_TIMEOUT}, such as 60 or 2.5, not "${t}"`;
   const sni = withDefaults(o).sni.trim();
   if (/\s/.test(sni)) return "The SNI host name can't contain spaces";
+  if (sni && !validServerName(sni)) return `The SNI "${sni}" isn't a valid TLS server name (a DNS name or an IP address)`;
   return null;
+}
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+
+/**
+ * Whether `name` is a TLS server name `--sni` takes: an IP address, or a DNS name as rustls
+ * reads one (at most 253 bytes; labels of 1 to 63 letters, digits, `_` and `-`, not starting or
+ * ending with `-`; a trailing dot allowed; the last label not all digits).
+ */
+export function validServerName(name: string): boolean {
+  if (IPV4.test(name)) return true;
+  if (name.includes(":")) {
+    try {
+      return new URL(`https://[${name}]/`).hostname !== "";
+    } catch {
+      return false;
+    }
+  }
+  if (!name || name.length > 253) return false;
+  const labels = (name.endsWith(".") ? name.slice(0, -1) : name).split(".");
+  if (!labels.every((l) => /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/.test(l))) return false;
+  return !/^\d+$/.test(labels[labels.length - 1]);
+}
+
+/** A tab's options as `replay tabs save` keeps them (`options`), or undefined when all are defaults. */
+export interface SavedOptions {
+  http2?: true;
+  verbatim?: true;
+  crlfBody?: true;
+  sni?: string;
+  timeout?: number;
+  verifyTls?: true;
+}
+
+/**
+ * The options kept with a saved tab, in the order the CLI writes them. Never Don't record: a
+ * reopened tab, or one an agent prepared, must not make a person's send unrecorded. An SNI or
+ * timeout that isn't valid yet (still being typed) is left out rather than failing the save.
+ */
+export function savedOptions(o: Partial<ReplayOptions> | undefined, kind: TabKind): SavedOptions | undefined {
+  const f = withDefaults(o);
+  const out: SavedOptions = {};
+  if (kind === "http" && f.http2) out.http2 = true;
+  if (kind === "http" && f.verbatim) out.verbatim = true;
+  if (kind === "http" && f.crlfBody) out.crlfBody = true;
+  const sni = f.sni.trim();
+  if (sni && validServerName(sni)) out.sni = sni;
+  const t = timeoutSeconds(f);
+  if (typeof t === "number") out.timeout = t;
+  if (f.verifyTls) out.verifyTls = true;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** A saved tab's options back as a tab's; anything unknown or out of range is ignored. */
+export function optionsFromSaved(v: unknown, kind: TabKind): Partial<ReplayOptions> | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const s = v as Record<string, unknown>;
+  const out: Partial<ReplayOptions> = {};
+  if (kind === "http" && s.http2 === true) out.http2 = true;
+  if (kind === "http" && s.verbatim === true) out.verbatim = true;
+  if (kind === "http" && s.crlfBody === true) out.crlfBody = true;
+  if (typeof s.sni === "string" && validServerName(s.sni)) out.sni = s.sni;
+  if (typeof s.timeout === "number" && s.timeout > 0 && s.timeout <= MAX_TIMEOUT) out.timeout = String(s.timeout);
+  if (s.verifyTls === true) out.verifyTls = true;
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** The flags for the options that aren't the default, as `--flag` or `--flag=value`. */
