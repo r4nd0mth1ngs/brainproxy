@@ -52,6 +52,30 @@ test("the race is Replay's send plus --race", () => {
   assert.deepEqual(raceArgs("https://shop.test", 20), ["send", "--target=https://shop.test", "--race=20", "-"]);
 });
 
+test("the race sends with the tab's options", () => {
+  const o = { http2: true, sni: "other.test", timeout: "5", verifyTls: true, noStore: true };
+  assert.deepEqual(raceArgs("https://shop.test", 20, o), [
+    "send",
+    "--target=https://shop.test",
+    "--race=20",
+    "--http2",
+    "--sni=other.test",
+    "--timeout=5",
+    "--verify-tls",
+    "--no-store",
+    "-",
+  ]);
+  // As typed is HTTP/1 only, as for Send.
+  assert.deepEqual(raceArgs("https://shop.test", 2, { verbatim: true }), ["send", "--target=https://shop.test", "--race=2", "--verbatim", "-"]);
+  assert.deepEqual(raceArgs("https://shop.test", 2, { verbatim: true, http2: true }), ["send", "--target=https://shop.test", "--race=2", "--http2", "-"]);
+  // The HTTP/2 option makes an HTTP/1.1 request line a single-packet race of at most 100.
+  assert.equal(raceMax(H1, true), 100);
+  assert.equal(parseRaceCount("101", H1, true), null);
+  assert.equal(parseRaceCount("100", H1, true), 100);
+  assert.equal(plannedTechnique(H1, true), "single-packet attack (HTTP/2)");
+  assert.equal(plannedTechnique(H1, false), "last-byte sync (HTTP/1.1)");
+});
+
 test("responses that differ from the most common one are marked", () => {
   const rows = raceRows(
     result([

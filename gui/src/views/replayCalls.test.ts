@@ -112,6 +112,9 @@ test("a stopped send doesn't read as not sent", () => {
     assert.match(stoppedText(kind), /cancelled \(on Windows, /);
     assert.doesNotMatch(stoppedText(kind), /not be in history/);
   }
+  // A stopped race says its copies are recorded as one race.
+  assert.equal(failureText({ kind: "cancelled" }, "race"), stoppedText("race"));
+  assert.match(stoppedText("race"), /every copy as cancelled \(on Windows, [^)]*\), tagged with the race/);
   // A CLI that answered in time names its rows; that is kept.
   const said = "cancelled by user before a response was recorded (history #7)";
   assert.equal(failureText({ kind: "cancelled", message: said }, "http"), `${stoppedText("http")} (${said})`);

@@ -376,9 +376,10 @@ Edit a raw request and send it as often as you like, in separate tabs.
 - **Race:** set how many copies to send (2 to 1000) and click **Race** to send the request
   that many times at once, to look for race conditions such as a coupon redeemed twice. Over
   HTTP/1.1 each copy gets its own connection and the last byte of every copy is released
-  together (last-byte sync). When the request line ends in `HTTP/2`, all copies go on one
-  connection and their final frames leave in a single packet (single-packet attack, up to 100
-  copies). The toolbar shows which was used, the spread between the fastest and slowest
+  together (last-byte sync). With **HTTP/2** on in the tab's Options, or a request line ending
+  in `HTTP/2`, all copies go on one connection and their final frames leave in a single packet
+  (single-packet attack, up to 100 copies). The race uses the tab's other options too (send as
+  typed, SNI, timeout, Verify TLS, Don't record). The toolbar shows which was used, the spread between the fastest and slowest
   response, and how many responses differ from the most common one. Each copy is listed with
   its status (or error), length, time since the release and history id; ones whose status or
   length differ from the most common response are highlighted, and so is every failure. Select
@@ -387,9 +388,12 @@ Edit a raw request and send it as often as you like, in separate tabs.
   (`race-pos:3/20`), and `race-partial` when not every final frame fitted in the one packet;
   its time is measured from the release. A last-byte race needs a connection per copy: if the
   open-file limit (`ulimit -n`) has no room for that many, the race is refused before anything
-  is sent. You can switch tabs while a race runs; its results show up in its tab when it ends
-  (not if you close the project first). The same as `brainproxy send req.http --race 20`; in
-  the app the request line decides HTTP/2, while on the command line `--http2` does it too.
+  is sent. Every copy's row is written, with its tags, before any copy goes out, so **Stop**
+  (or closing the tab) leaves them all in history as one race, marked cancelled (on Windows,
+  with `sent; no response recorded`). You can switch tabs while a race runs; its results show
+  up in its tab when it ends (not if you close the project first). The same as
+  `brainproxy send req.http --race 20` with the tab's options as flags (`--http2`, `--sni`,
+  `--timeout`, `--verify-tls`, `--no-store`).
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the

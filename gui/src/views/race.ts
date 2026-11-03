@@ -2,6 +2,7 @@
 // tested on its own (race.test.ts).
 
 import { autoEncodeRequest } from "../ui/urlencode.ts";
+import { optionArgs, type ReplayOptions } from "./replayOptions.ts";
 
 /**
  * One request of a race, as `send --race` returns it: a response, or why it failed. `id` is the
@@ -48,20 +49,31 @@ export function sentRequestLine(raw: string, autoEncode: boolean): string {
   return autoEncode ? autoEncodeRequest(line).text : line;
 }
 
-export function raceMax(raw: string): number {
-  return isHttp2Request(raw) ? RACE_MAX_HTTP2 : RACE_MAX;
+/**
+ * Whether the race goes over HTTP/2 (single-packet): the tab's HTTP/2 option (`--http2`) or a
+ * request line saying so, as `send` decides.
+ */
+export function racesHttp2(raw: string, http2 = false): boolean {
+  return http2 || isHttp2Request(raw);
+}
+
+export function raceMax(raw: string, http2 = false): number {
+  return racesHttp2(raw, http2) ? RACE_MAX_HTTP2 : RACE_MAX;
 }
 
 /** The count typed in, or null when it isn't a whole number the CLI accepts for this request. */
-export function parseRaceCount(text: string, raw: string): number | null {
+export function parseRaceCount(text: string, raw: string, http2 = false): number | null {
   if (!/^\s*\d+\s*$/.test(text)) return null;
   const n = Number(text);
-  return n >= RACE_MIN && n <= raceMax(raw) ? n : null;
+  return n >= RACE_MIN && n <= raceMax(raw, http2) ? n : null;
 }
 
-/** The CLI call: the same as Replay's Send, plus --race. */
-export function raceArgs(target: string, n: number): string[] {
-  return ["send", `--target=${target}`, `--race=${n}`, "-"];
+/**
+ * The CLI call: the same as Replay's Send, with the tab's options (HTTP/2, as typed, SNI,
+ * timeout, Verify TLS, Don't record), plus --race.
+ */
+export function raceArgs(target: string, n: number, options?: Partial<ReplayOptions>): string[] {
+  return ["send", `--target=${target}`, `--race=${n}`, ...optionArgs(options, "http"), "-"];
 }
 
 /** The technique in words. */
@@ -72,8 +84,8 @@ export function techniqueLabel(sync: string): string {
 }
 
 /** What `send` will use for this request, before racing. */
-export function plannedTechnique(raw: string): string {
-  return techniqueLabel(isHttp2Request(raw) ? "single-packet" : "last-byte");
+export function plannedTechnique(raw: string, http2 = false): string {
+  return techniqueLabel(racesHttp2(raw, http2) ? "single-packet" : "last-byte");
 }
 
 export const isRaceError = (r: RaceItem): r is { id?: number | null; error: string; kind: string } => "error" in r;

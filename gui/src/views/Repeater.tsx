@@ -234,12 +234,15 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   };
 
   const race = async () => {
-    // The limit depends on the request line as sent (HTTP/2 or not), after auto URL-encoding.
+    // The limit depends on HTTP/2 (the option, or the request line as sent, after auto
+    // URL-encoding), which makes it a single-packet race.
     const { text: sent, encoded } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
-    const n = parseRaceCount(raceCount, sent);
-    if (n == null) return app.toast(`Race takes ${RACE_MIN} to ${raceMax(sent)} requests (${plannedTechnique(sent)})`, "error");
+    const n = parseRaceCount(raceCount, sent, options.http2);
+    if (n == null) return app.toast(`Race takes ${RACE_MIN} to ${raceMax(sent, options.http2)} requests (${plannedTechnique(sent, options.http2)})`, "error");
     const to = withScheme(guessTarget(raw, target));
     if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
+    const problem = optionsProblem(options);
+    if (problem) return app.toast(problem, "error");
     setTarget(to);
     try {
       localStorage.setItem(RACE_COUNT, String(n));
@@ -251,10 +254,10 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const id = beginCall(key, "replay-race");
     let entry: Sent;
     try {
-      const result = await run<RaceResult>(raceArgs(to, n), { stdin: textBytes(sent, tab.binary), call: id, project });
+      const result = await run<RaceResult>(raceArgs(to, n, options), { stdin: textBytes(sent, tab.binary), call: id, project });
       entry = { raw, sent, encoded, labels, result: null, error: null, race: { result, open: null } };
     } catch (e: any) {
-      entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "http") };
+      entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "race") };
     }
     // The tab or the project closed while it ran: nothing to show the response in.
     if (!endCall(key, id)) return;
@@ -306,7 +309,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const r = current?.result;
   const note = current ? sentWithNote(current.labels, activeLabels(options, "http")) : null;
   const raced = current?.race;
-  const line = sentRequestLine(raw, autoEncode);
+  const line = sentRequestLine(raw, autoEncode && !sendsAsTyped(options));
   const rows = raced ? raceRows(raced.result) : [];
   const summary = raced ? raceSummary(raced.result) : null;
   const partial = raced ? syncNote(raced.result) : null;
@@ -332,16 +335,27 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
           {busy && !racing ? "Sending…" : "Send"}
         </button>
         {busy && (
-          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request. It may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded).">
+          <button
+            className="btn"
+            onClick={() => stopCall(tab.key, cancelCli)}
+            title={
+              racing
+                ? "Stop the race. Its requests may already have reached the server; if they went out, history has every copy as cancelled (on Windows, as sent with no response recorded)."
+                : "Stop waiting for this request. It may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded)."
+            }
+          >
             Stop
           </button>
         )}
-        <div className="race-ctl" title={`Send the request ${raceCount || "N"} times at once to look for race conditions: ${plannedTechnique(line)}. A request line ending in HTTP/2 uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}>
+        <div
+          className="race-ctl"
+          title={`Send the request ${raceCount || "N"} times at once, with the tab's options, to look for race conditions: ${plannedTechnique(line, options.http2)}. HTTP/2 (the option, or a request line ending in HTTP/2) uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}
+        >
           <button className="btn" disabled={busy} onClick={race}>
             {racing ? "Racing…" : "Race"}
           </button>
           <span className="label">×</span>
-          <input className="input mono" type="number" aria-label="Race count" min={RACE_MIN} max={raceMax(line)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+          <input className="input mono" type="number" aria-label="Race count" min={RACE_MIN} max={raceMax(line, options.http2)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
         </div>
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
