@@ -704,24 +704,21 @@ fn race(
     // Every row says which race it was in, how, and where: see race::row_tags.
     let race_id = brainproxy_core::race::new_race_id()?;
     let partial = synced.is_some_and(|s| s < n);
-    let captures: Vec<Capture> = results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let mut c = match r {
-                Ok(ex) => {
-                    Capture::new("race", &ex.target, &ex.request, Some(&ex.response), Some(ex.duration_ms as i64), None)
-                }
-                Err(e) => Capture::new("race", &target, req.as_bytes(), None, None, Some(&e.to_string())),
-            };
-            c.tags = brainproxy_core::race::row_tags(&race_id, sync, partial, i, n);
-            c
-        })
-        .collect();
+    // One transaction, one decoded capture held at a time.
+    let capture = |i: usize| {
+        let mut c = match &results[i] {
+            Ok(ex) => {
+                Capture::new("race", &ex.target, &ex.request, Some(&ex.response), Some(ex.duration_ms as i64), None)
+            }
+            Err(e) => Capture::new("race", &target, req.as_bytes(), None, None, Some(&e.to_string())),
+        };
+        c.tags = brainproxy_core::race::row_tags(&race_id, sync, partial, i, n);
+        c
+    };
     let ids: Vec<Option<i64>> = if args.no_store {
-        vec![None; n]
+        vec![None; results.len()]
     } else {
-        Store::open(project)?.record_batch(&captures)?.into_iter().map(Some).collect()
+        Store::open(project)?.record_each(results.len(), capture)?.into_iter().map(Some).collect()
     };
     let mut items = Vec::new();
     let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();

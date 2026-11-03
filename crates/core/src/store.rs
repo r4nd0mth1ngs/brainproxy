@@ -492,6 +492,18 @@ impl Store {
         Ok(ids)
     }
 
+    /// [`Store::record_batch`] for `n` captures built one at a time by `capture(i)`, so only
+    /// one (decoded bodies and all) is held at once.
+    pub fn record_each(&mut self, n: usize, mut capture: impl FnMut(usize) -> Capture) -> Result<Vec<i64>> {
+        let tx = self.write_tx()?;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(insert_capture(&tx, &capture(i))?);
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn fuzz_create(
         &self,
@@ -1235,18 +1247,18 @@ mod tests {
 
     #[test]
     fn records_a_capture_with_its_tags() {
-        let s = Store::open_in_memory().unwrap();
+        let mut s = Store::open_in_memory().unwrap();
         let target = Target::from_url("http://a.test").unwrap();
         let mut c = Capture::new("race", &target, b"GET / HTTP/1.1\r\n\r\n", None, None, Some("boom"));
         c.tags = vec!["race:x".into(), "race-pos:1/2".into()];
-        let id = s.record(&c).unwrap();
+        // Built one at a time, recorded together.
+        let ids = s.record_each(2, |i| Capture { title: Some(format!("#{i}")), ..c.clone() }).unwrap();
         let untagged = s.record_failure("send", &target, b"GET / HTTP/1.1\r\n\r\n", "boom").unwrap();
         let f = HistoryFilter { tag: Some("race:x".into()), ..Default::default() };
-        let found = s.list(&f).unwrap();
-        assert_eq!(
-            (found.len(), found[0].id, &found[0].tags[..]),
-            (1, id, &["race:x".to_string(), "race-pos:1/2".into()][..])
-        );
+        let mut found: Vec<(i64, Vec<String>)> = s.list(&f).unwrap().into_iter().map(|e| (e.id, e.tags)).collect();
+        found.sort();
+        let tags = vec!["race:x".to_string(), "race-pos:1/2".into()];
+        assert_eq!(found, [(ids[0], tags.clone()), (ids[1], tags)]);
         assert_eq!(s.update_tags(untagged, &[], &[]).unwrap(), Vec::<String>::new());
     }
 
