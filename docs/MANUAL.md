@@ -315,7 +315,9 @@ The sidebar groups the tools by what you are doing.
 Edit a raw request and send it as often as you like, in separate tabs.
 - **Sending:** ⌘/Ctrl+Enter sends; **Stop** gives up on a request that is still waiting.
   A stopped request may already have reached the server; if it went out, history has it,
-  without a response.
+  marked cancelled (on Windows, where the app can only kill the command, its row keeps
+  `sent; no response recorded`). A stopped WebSocket tab's connection is closed as
+  cancelled, with the messages sent up to then (left open on Windows).
   A send carries on while you look at another tab, and its response lands in its own tab;
   closing the tab (or the project, or quitting) stops it, so the app asks first while one
   is running. ‹ › step back and forward through what you sent. A step sent with other

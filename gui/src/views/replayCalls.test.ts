@@ -90,7 +90,7 @@ test("closing asks only while a send is running, and says what stopping it means
   assert.equal(sendsInFlight(1), 1);
   assert.equal(sendsInFlight(3), 0);
   const tab = closeQuestion(1);
-  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and history keeps it without a response/);
+  assert.match(tab?.message ?? "", /Closing this tab stops it: the server may already have the request, and history keeps it as cancelled \(on Windows, as sent with no response recorded\)/);
   assert.equal(closeQuestion(3), null);
   assert.match(closeQuestion()?.message ?? "", /^2 Replay sends are still waiting\. Closing the project stops them/);
   // A finished send isn't running any more, though its tab still has a (null) call.
@@ -109,6 +109,7 @@ test("a stopped send doesn't read as not sent", () => {
     assert.match(stoppedText(kind), /may already have reached the server/);
     // The CLI records a request before it goes out, so a stopped send isn't promised to be missing.
     assert.match(stoppedText(kind), /history has/);
+    assert.match(stoppedText(kind), /cancelled \(on Windows, /);
     assert.doesNotMatch(stoppedText(kind), /not be in history/);
   }
   // A CLI that answered in time names its rows; that is kept.

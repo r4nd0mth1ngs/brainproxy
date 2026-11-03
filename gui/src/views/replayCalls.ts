@@ -87,16 +87,18 @@ export function sendsInFlight(key?: number): number {
 }
 
 /**
- * What a stopped send says. Stop ends the CLI (SIGTERM, then a kill), which writes a request's
- * row just before it goes out (`ws send` records the connection and messages as they happen),
- * so what went out is in history, without a response; but it may already be on the wire, so
- * it doesn't read as "not sent". Stopped while its connection was still opening, nothing went
- * out, hence "may" and "if".
+ * What a stopped send says. The CLI writes a request's row just before it goes out (`ws send`
+ * records the connection and messages as they happen), so what went out is in history; but
+ * it may already be on the wire, so it doesn't read as "not sent". Stop sends SIGTERM, so the
+ * CLI marks the row cancelled (and closes a WebSocket connection with that error); Windows has
+ * no SIGTERM, so the CLI is killed at once and the row keeps its "sent; no response recorded"
+ * error (a WebSocket connection stays open). Stopped while its connection was still opening,
+ * nothing went out, hence "may" and "if".
  */
 export function stoppedText(kind: "http" | "ws"): string {
   return kind === "http"
-    ? "Stopped: the request may already have reached the server; if it went out, history has it without a response"
-    : "Stopped: the handshake and messages may already have reached the server; history has what was recorded up to then";
+    ? "Stopped: the request may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded)"
+    : "Stopped: the handshake and messages may already have reached the server; history has what was sent up to then, the connection closed as cancelled (on Windows, left open)";
 }
 
 /**
@@ -120,7 +122,7 @@ export function closeQuestion(key?: number): { title: string; message: string } 
   const sends = n === 1 ? "A Replay send is" : `${n} Replay sends are`;
   return {
     title: `Stop ${n === 1 ? "the send" : "the sends"} still running?`,
-    message: `${sends} still waiting. Closing ${what} stops ${n === 1 ? "it" : "them"}: the server may already have the request, and history keeps it without a response.`,
+    message: `${sends} still waiting. Closing ${what} stops ${n === 1 ? "it" : "them"}: the server may already have the request, and history keeps it as cancelled (on Windows, as sent with no response recorded).`,
   };
 }
 
