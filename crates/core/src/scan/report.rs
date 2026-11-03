@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::guard::ScopeSpec;
 use crate::provenance;
-use crate::scan::findings_db::FindingFilter;
+use crate::scan::findings_db::{FindingFilter, MANUAL_SOURCE};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +162,12 @@ pub struct Instance {
     pub state: String,
     pub note: Option<String>,
     pub history_id: Option<i64>,
+    /// For a finding added by hand: every history entry it links to (the first is the evidence).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history_ids: Vec<i64>,
+    /// For a finding added by hand: its own CWE, when it isn't its alert type's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwe: Option<i64>,
     /// Who or what added it: gui, cli, mcp; None from before brainproxy kept it.
     pub origin: Option<String>,
     /// Who last changed its state with `findings mark` (gui, cli, mcp), and when; None if
@@ -302,6 +308,8 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             state,
             note: r.get(14)?,
             history_id: r.get(15)?,
+            history_ids: Vec::new(),
+            cwe: r.get::<_, Option<i64>>(19)?.filter(|&c| c > 0),
             origin: r.get(25)?,
             state_origin,
             state_changed_at,
@@ -313,7 +321,11 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         let alert_ref: String = r.get(16)?;
         // Rows are sorted by risk, so the first instance of a type carries its highest risk.
         match groups.iter_mut().find(|g| g.alert_ref == alert_ref) {
-            Some(g) => g.instances.push(inst),
+            Some(g) => {
+                // Each finding added by hand has its own CWE; the type takes the first one given.
+                g.cwe = g.cwe.or(inst.cwe);
+                g.instances.push(inst)
+            }
             None => {
                 let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
                 groups.push(AlertGroup {
@@ -321,7 +333,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                     rule_id: r.get(17)?,
                     name: r.get(18)?,
                     risk: inst.risk.clone(),
-                    cwe: r.get::<_, Option<i64>>(19)?.filter(|&c| c > 0),
+                    cwe: inst.cwe,
                     wasc: r.get::<_, Option<i64>>(20)?.filter(|&w| w > 0),
                     description: r.get(21)?,
                     solution: r.get(22)?,
@@ -334,6 +346,19 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     }
     drop(rows);
     drop(stmt);
+
+    for g in &mut groups {
+        let group_cwe = g.cwe;
+        for inst in &mut g.instances {
+            // An instance's CWE is shown only when it isn't the type's.
+            if inst.source != MANUAL_SOURCE || inst.cwe == group_cwe {
+                inst.cwe = None;
+            }
+            if inst.source == MANUAL_SOURCE {
+                inst.history_ids = store.finding_history_ids(inst.id)?;
+            }
+        }
+    }
 
     if opts.evidence {
         for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
@@ -548,9 +573,113 @@ fn longest_run(s: &str, c: char) -> usize {
     best
 }
 
+/// Whether an alert type is one a person added by hand (`findings add`).
+fn is_manual(g: &AlertGroup) -> bool {
+    g.alert_ref.starts_with("manual:")
+}
+
+/// "#3, #7": the history entries a finding links to.
+fn history_list(ids: &[i64]) -> String {
+    ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Markdown from a tester's text that renders nothing it holds. Fenced code blocks keep their
+/// text as written (often a request to copy), each in a fence of our own that nothing inside can
+/// close; every other line is plain text through [`md_escape`], so no HTML, link, image, code
+/// span, emphasis or table survives outside a fence. A fence indented four or more spaces, as in
+/// a list item, isn't one here: its lines are text like the rest.
+fn md_no_html(s: &str) -> String {
+    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = s.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some((indent, mark, run, lang)) = md_fence_open(lines[i]) else {
+            // Leading blanks come off, so no line starts an indented code block.
+            out.push_str(&md_escape(lines[i].trim_start_matches([' ', '\t'])));
+            out.push('\n');
+            i += 1;
+            continue;
+        };
+        let mut body = String::new();
+        i += 1;
+        while i < lines.len() {
+            let l = lines[i];
+            i += 1;
+            if md_fence_close(l, mark, run) {
+                break;
+            }
+            // The fence's own indent comes off its lines, as in CommonMark.
+            let cut = l.len() - l.trim_start_matches(' ').len();
+            body.push_str(&l[cut.min(indent)..]);
+            body.push('\n');
+        }
+        // Our own fence closes the block, so a closer misread either way leaves only literal
+        // code or escaped text, and an unclosed one ends with the text, not the report.
+        out.push_str(&md_block(&body, &lang));
+    }
+    if !s.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// A line that opens a fenced code block: its indent, fence character, fence length and language.
+fn md_fence_open(line: &str) -> Option<(usize, char, usize, String)> {
+    let rest = line.trim_start_matches(' ');
+    let indent = line.len() - rest.len();
+    let mark = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let run = rest.len() - rest.trim_start_matches(mark).len();
+    let info = rest[run..].trim();
+    if indent > 3 || run < 3 || (mark == '`' && info.contains('`')) {
+        return None;
+    }
+    // Only a plain language name is kept from the info string.
+    let lang = info.split_whitespace().next().unwrap_or("");
+    let ok = lang.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-'));
+    Some((indent, mark, run, if ok { lang.to_string() } else { String::new() }))
+}
+
+/// A line that closes a fence of `run` `mark`s: up to three spaces, at least as long a run of
+/// the same character, then only spaces or tabs.
+fn md_fence_close(line: &str, mark: char, run: usize) -> bool {
+    let rest = line.trim_start_matches(' ');
+    let n = rest.len() - rest.trim_start_matches(mark).len();
+    line.len() - rest.len() <= 3 && n >= run && rest[n..].chars().all(|c| matches!(c, ' ' | '\t'))
+}
+
+/// Text that Markdown shows as written: every ASCII punctuation character backslash-escaped,
+/// except `&`, `<` and `>`, which become entities, so even a renderer that ignores backslash
+/// escapes reads no HTML in it.
+fn md_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            c if c.is_ascii_punctuation() => {
+                o.push('\\');
+                o.push(c);
+            }
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
 /// Text from our own rule definitions; only table pipes and line breaks need care.
 fn md_text(s: &str) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+/// An alert type's name for a heading or table cell; a tester's title is plain text.
+fn md_name(g: &AlertGroup) -> String {
+    if is_manual(g) {
+        md_escape(&g.name.replace(['\r', '\n'], " "))
+    } else {
+        md_text(&g.name)
+    }
 }
 
 fn markdown(r: &Report) -> String {
@@ -591,11 +720,11 @@ fn markdown(r: &Report) -> String {
     }
     s.push_str("| # | Risk | Alert | Instances |\n|---:|---|---|---:|\n");
     for (i, g) in r.alerts.iter().enumerate() {
-        let _ = writeln!(s, "| {} | {} | {} | {} |", i + 1, risk_title(&g.risk), md_text(&g.name), g.instances.len());
+        let _ = writeln!(s, "| {} | {} | {} | {} |", i + 1, risk_title(&g.risk), md_name(g), g.instances.len());
     }
     s.push('\n');
     for (i, g) in r.alerts.iter().enumerate() {
-        let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_text(&g.name), risk_title(&g.risk));
+        let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_name(g), risk_title(&g.risk));
         let mut meta = vec![format!("**Alert:** `{}`", g.alert_ref)];
         if let Some(c) = g.cwe {
             meta.push(format!("**CWE:** [{c}]({})", cwe_url(c)));
@@ -604,11 +733,13 @@ fn markdown(r: &Report) -> String {
             meta.push(format!("**WASC:** {w}"));
         }
         let _ = writeln!(s, "{}\n", meta.join(" · "));
+        // A tester's own text is plain text, fenced code apart: it may quote the target.
+        let prose = |t: &str| if is_manual(g) { md_no_html(t.trim()) } else { t.trim().to_string() };
         if !g.description.is_empty() {
-            let _ = writeln!(s, "### Description\n\n{}\n", g.description.trim());
+            let _ = writeln!(s, "### Description\n\n{}\n", prose(&g.description));
         }
         if !g.solution.is_empty() {
-            let _ = writeln!(s, "### Solution\n\n{}\n", g.solution.trim());
+            let _ = writeln!(s, "### Solution\n\n{}\n", prose(&g.solution));
         }
         if !g.references.is_empty() {
             s.push_str("### References\n\n");
@@ -641,6 +772,12 @@ fn markdown(r: &Report) -> String {
             }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 let _ = writeln!(s, "- Note ({}): {}", note_by(inst), md_code(n));
+            }
+            if let Some(c) = inst.cwe {
+                let _ = writeln!(s, "- CWE: [{c}]({})", cwe_url(c));
+            }
+            if inst.history_ids.len() > 1 {
+                let _ = writeln!(s, "- History: {}", history_list(&inst.history_ids));
             }
             s.push('\n');
             if !inst.other_info.is_empty() {
@@ -942,14 +1079,23 @@ fn html(r: &Report) -> String {
         );
         for inst in &g.instances {
             // Only a person's confirmation reads as checked by the tester.
-            let state = match inst.state.as_str() {
+            let mut state = match inst.state.as_str() {
                 "confirmed" if by_a_person(inst.state_origin.as_deref()) => " <span class=\"tag\">confirmed</span>",
                 "confirmed" if inst.state_origin.as_deref() == Some("mcp") => {
                     " <span class=\"tag\">confirmed via MCP (an agent)</span>"
                 }
                 "confirmed" => " <span class=\"tag\">confirmed (by whom is unknown)</span>",
+                // Only in a report written with --state all or removed.
+                "removed" => " <span class=\"tag\">removed</span>",
                 _ => "",
-            };
+            }
+            .to_string();
+            // A finding an agent recorded through `findings add` isn't a person's manual testing.
+            if inst.source == MANUAL_SOURCE && inst.origin.as_deref() == Some("mcp") {
+                state.push_str(" <span class=\"tag\">added via MCP (an agent)</span>");
+            } else if inst.source == MANUAL_SOURCE {
+                state.push_str(" <span class=\"tag\">found by hand</span>");
+            }
             let _ = write!(
                 s,
                 "<tr><td><code>{} {}</code>{state}</td><td>{}</td><td>{}</td></tr>",
@@ -1008,6 +1154,12 @@ fn html(r: &Report) -> String {
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 row("Note", format!("{} <span class=\"muted\">({})</span>", esc(n), esc(&note_by(inst))));
             }
+            if let Some(c) = inst.cwe {
+                row("CWE", link(&cwe_url(c), &c.to_string()));
+            }
+            if inst.history_ids.len() > 1 {
+                row("History", history_list(&inst.history_ids));
+            }
             s.push_str("</dl>");
             if !inst.other_info.is_empty() {
                 let _ = write!(s, "<pre>{}</pre>", esc(&inst.other_info));
@@ -1062,8 +1214,22 @@ fn html(r: &Report) -> String {
          MCP (an agent)</span> was confirmed by an AI agent and not by a person. Each finding also says how it was \
          added (from the desktop app, from the command line, or via MCP, by an AI agent) and, in its technical \
          details, who last changed its state and when. Automated tests can't find every problem (for example flaws in business logic), so \
-         a short or empty report doesn't prove a site is secure.</p>\n",
+         a short or empty report doesn't prove a site is secure.",
     );
+    let manual = r.alerts.iter().flat_map(|g| &g.instances).filter(|i| i.source == MANUAL_SOURCE);
+    if manual.clone().any(|i| i.origin.as_deref() != Some("mcp")) {
+        s.push_str(
+            " A finding marked <span class=\"tag\">found by hand</span> was recorded during manual testing \
+             rather than raised by an automated test.",
+        );
+    }
+    if manual.clone().any(|i| i.origin.as_deref() == Some("mcp")) {
+        s.push_str(
+            " A finding marked <span class=\"tag\">added via MCP (an agent)</span> was recorded by an AI agent, \
+             not raised by an automated test nor checked by a person.",
+        );
+    }
+    s.push_str("</p>\n");
     s.push_str("</main></body></html>\n");
     s
 }
@@ -1144,7 +1310,9 @@ fn sarif(r: &Report) -> Value {
                 },
             });
             if !g.solution.is_empty() {
-                rule["help"] = json!({"text": g.solution, "markdown": g.solution});
+                // A tester's text may quote the target: plain text, fenced code apart.
+                let markdown = if is_manual(g) { md_no_html(&g.solution) } else { g.solution.clone() };
+                rule["help"] = json!({"text": g.solution, "markdown": markdown});
             }
             if let Some(u) = g.references.iter().find(|u| u.starts_with("http")) {
                 rule["helpUri"] = json!(u);
@@ -1199,6 +1367,12 @@ fn sarif(r: &Report) -> Value {
                     "stateText": inst.state_text,
                 },
             });
+            if !inst.history_ids.is_empty() {
+                res["properties"]["historyIds"] = json!(inst.history_ids);
+            }
+            if let Some(c) = inst.cwe {
+                res["properties"]["cwe"] = json!(c);
+            }
             if let Some(n) = &inst.note {
                 res["properties"]["note"] = json!(n);
                 res["properties"]["noteOrigin"] = json!(inst.note_origin);
@@ -1408,5 +1582,344 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t.as_str().unwrap().starts_with("external/cwe/")));
+    }
+
+    #[test]
+    fn findings_added_by_hand_in_every_format() {
+        let mut s = store_with_findings();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let entry = |path: &str| {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: app.test\r\n\r\n");
+            s.record(&Capture::new("send", &target, req.as_bytes(), None, None, None)).unwrap()
+        };
+        let (second, third) = (entry("/b"), entry("/c"));
+        let id = s
+            .finding_add(&crate::scan::findings_db::ManualFinding {
+                title: "Order IDOR".into(),
+                risk: Risk::High,
+                confidence: crate::scan::Confidence::High,
+                url: Some("http://app.test/orders/7".into()),
+                method: None,
+                param: "id".into(),
+                evidence: "another user's <order>".into(),
+                description: "Any **user** can read <script>x</script> orders.".into(),
+                solution: "Check the owner.".into(),
+                cwe: Some(639),
+                history: vec![1, second, third],
+                replace_text: false,
+            })
+            .unwrap();
+        s.finding_add(&crate::scan::findings_db::ManualFinding {
+            title: "<img src=x> | note".into(),
+            risk: Risk::Low,
+            confidence: crate::scan::Confidence::Low,
+            url: Some("http://app.test/".into()),
+            method: None,
+            param: String::new(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history: vec![],
+            replace_text: false,
+        })
+        .unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
+        assert_eq!((g.cwe, g.tags.clone()), (Some(639), vec!["manual".to_string()]));
+        assert_eq!(g.solution, "Check the owner.");
+        let inst = &g.instances[0];
+        assert_eq!((inst.id, inst.source.as_str(), inst.history_ids.clone()), (id, "manual", vec![1, second, third]));
+        // The first linked entry is the evidence.
+        assert_eq!(inst.request.as_ref().unwrap().url, "http://app.test/a?q=1");
+
+        let md = render(&r, ReportKind::Markdown);
+        assert!(md.contains("Any \\*\\*user\\*\\* can read &lt;script&gt;x&lt;\\/script&gt; orders\\."), "{md}");
+        assert!(md.contains(&format!("- History: #1, #{second}, #{third}")));
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("found by hand") && !html.contains("<script>x"));
+        assert!(html.contains("<code>another user&#39;s &lt;order&gt;</code>"));
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let res = results.iter().find(|x| x["ruleId"] == "manual:order-idor").unwrap();
+        assert_eq!(res["properties"]["source"], "manual");
+        assert_eq!(res["properties"]["historyIds"], json!([1, second, third]));
+        let only = |source: &str| {
+            let filter = FindingFilter { source: Some(source.into()), ..Default::default() };
+            build(&s, &ReportOptions { filter, ..Default::default() }).unwrap().summary.total
+        };
+        assert_eq!(only("manual"), 2);
+        assert_eq!(only("passive") + 2, r.summary.total);
+        // A title is the tester's text: no raw HTML in Markdown either.
+        assert!(md.contains("&lt;img src\\=x&gt; \\| note") && !md.contains("<img"), "{md}");
+    }
+
+    #[test]
+    fn each_finding_added_by_hand_keeps_its_cwe() {
+        let mut s = store_with_findings();
+        // The first (high) has no CWE, the second (medium) has one.
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.risk = Risk::High;
+        s.finding_add(&f).unwrap();
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.url = Some("http://app.test/y".into());
+        f.cwe = Some(639);
+        s.finding_add(&f).unwrap();
+        // A third with another CWE says so itself.
+        f.url = Some("http://app.test/z".into());
+        f.cwe = Some(284);
+        s.finding_add(&f).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
+        assert_eq!(g.cwe, Some(639));
+        let cwes: Vec<Option<i64>> = g.instances.iter().map(|i| i.cwe).collect();
+        assert_eq!(cwes, [None, None, Some(284)]);
+        let md = render(&r, ReportKind::Markdown);
+        assert!(md.contains("**CWE:** [639]") && md.contains("- CWE: [284]"), "{md}");
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("<dt>CWE</dt><dd><a href=\"https://cwe.mitre.org/data/definitions/284.html\""));
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "manual:order-idor")
+            .unwrap()
+            .clone();
+        assert!(rule["properties"]["tags"].as_array().unwrap().contains(&json!("external/cwe/cwe-639")), "{rule}");
+        assert_eq!(rule["relationships"][0]["target"]["id"], "639");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let own: Vec<&Value> = results.iter().filter_map(|x| x["properties"].get("cwe")).collect();
+        assert_eq!(own, [&json!(284)]);
+        // Scanner instances never carry their own.
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        for g in json["alerts"].as_array().unwrap().iter().filter(|g| g["alert_ref"] != "manual:order-idor") {
+            assert!(g["instances"].as_array().unwrap().iter().all(|i| i.get("cwe").is_none()), "{g}");
+        }
+    }
+
+    #[test]
+    fn a_tester_solution_is_no_raw_html_in_sarif_markdown() {
+        let mut s = store_with_findings();
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.solution = "Check the owner. <img src=x onerror=alert(1)> ![p](https://attacker.test/p?d=1)".into();
+        f.description = "See [here](https://attacker.test/) and \\[x](https://attacker.test/b).".into();
+        s.finding_add(&f).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "manual:order-idor")
+            .unwrap()
+            .clone();
+        let help = rule["help"]["markdown"].as_str().unwrap();
+        assert_inert(help);
+        assert!(help.contains("&lt;img src\\=x onerror\\=alert\\(1\\)&gt;"), "{help}");
+        assert!(help.contains("\\!\\[p\\]\\(https\\:\\/\\/attacker\\.test\\/p\\?d\\=1\\)"), "{help}");
+        // The plain text stays as written.
+        assert!(rule["help"]["text"].as_str().unwrap().contains("<img src=x"));
+        // The Markdown report has no link or image either, even after a backslash.
+        let md = render(&r, ReportKind::Markdown);
+        assert!(md.contains("See \\[here\\]\\(https\\:\\/\\/attacker\\.test\\/\\)"), "{md}");
+        assert!(md.contains("and \\\\\\[x\\]\\(https\\:\\/\\/attacker\\.test\\/b\\)\\."), "{md}");
+        assert!(!md.contains("![p]("), "{md}");
+        assert_eq!(md_no_html("![x](http://e/)"), "\\!\\[x\\]\\(http\\:\\/\\/e\\/\\)");
+    }
+
+    #[test]
+    fn a_tester_fence_is_kept_as_written() {
+        let mut s = store_with_findings();
+        let mut f = by_hand("Order IDOR", vec![]);
+        f.description = "Send `GET /orders?ids[]=1&a=2` as <b>bob</b>:\n\n  ```http\n  POST /x?a[0]=<script> HTTP/1.1\n  \\[y](https://attacker.test/)\n  ```\nDone.".into();
+        f.solution = "Use ``a`b`` and `<i>` but not ` <img src=x>.\n~~~\n```\n<img src=x>\n".into();
+        s.finding_add(&f).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let md = render(&r, ReportKind::Markdown);
+        // A fence keeps its text, in a fence of ours; a code span around it is text.
+        assert!(
+            md.contains("Send \\`GET \\/orders\\?ids\\[\\]\\=1&amp;a\\=2\\` as &lt;b&gt;bob&lt;\\/b&gt;\\:"),
+            "{md}"
+        );
+        assert!(
+            md.contains("\n```http\nPOST /x?a[0]=<script> HTTP/1.1\n\\[y](https://attacker.test/)\n```\nDone\\."),
+            "{md}"
+        );
+        // An unclosed fence is closed in our own, longer than any backtick run inside it.
+        assert!(
+            md.contains("Use \\`\\`a\\`b\\`\\` and \\`&lt;i&gt;\\` but not \\` &lt;img src\\=x&gt;\\.\n````\n```\n<img src=x>\n````\n"),
+            "{md}"
+        );
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "manual:order-idor")
+            .unwrap()
+            .clone();
+        assert_eq!(rule["help"]["markdown"], md_no_html(f.solution.trim()));
+        // The HTML report escapes the same text its own way: no backslashes, no fences.
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("Use ``a`b`` and `&lt;i&gt;` but not ` &lt;img src=x&gt;.<br>~~~<br>```"), "{html}");
+        assert!(!html.contains("\\`") && !html.contains("<img"), "{html}");
+    }
+
+    #[test]
+    fn spans_tables_and_pipes_are_text() {
+        // Backtick runs that would pair across lines into a span hiding HTML.
+        let t = md_no_html("`x``y` |\n``<img src=x onerror=alert(1)>`z``");
+        assert_eq!(t, "\\`x\\`\\`y\\` \\|\n\\`\\`&lt;img src\\=x onerror\\=alert\\(1\\)&gt;\\`z\\`\\`");
+        // A line of only U+00A0 is no blank line, but there's no table to keep going.
+        let t = md_no_html("| a |\n|---|\n\u{a0}\n| `x|<img src=x onerror=alert(1)>` |");
+        assert_inert(&t);
+        assert!(t.starts_with("\\| a \\|\n\\|\\-\\-\\-\\|\n\u{a0}\n\\| \\`x\\|&lt;img"), "{t}");
+        let t = md_no_html("| a | b |\n|---|---|\n| `x|<b>` | `<i>` |");
+        assert_eq!(t, "\\| a \\| b \\|\n\\|\\-\\-\\-\\|\\-\\-\\-\\|\n\\| \\`x\\|&lt;b&gt;\\` \\| \\`&lt;i&gt;\\` \\|");
+        assert_eq!(md_no_html("Try `x|<img src=x>` here."), "Try \\`x\\|&lt;img src\\=x&gt;\\` here\\.");
+        assert_eq!(md_no_html("After `<c>` and **b**_i_"), "After \\`&lt;c&gt;\\` and \\*\\*b\\*\\*\\_i\\_");
+        // Leading blanks come off, so no indented code block; entities can't be smuggled in.
+        assert_eq!(md_no_html("a\n\n    &lt;b&gt;\n\t1. x"), "a\n\n&amp;lt\\;b&amp;gt\\;\n1\\. x");
+        for t in ["`x``y` |\n``<img src=x onerror=alert(1)>`z``", "| `x|<img src=x>` |", "<a href=x>\r<b>"] {
+            assert_inert(&md_no_html(t));
+        }
+    }
+
+    #[test]
+    fn a_fence_closes_only_as_commonmark_allows() {
+        // Four spaces of indent, a shorter run, the other character or text after: content.
+        let s = "````\n    ````\n```\n~~~~\n```` x\n   `````  \n<b>after</b>";
+        assert_eq!(md_no_html(s), "`````\n    ````\n```\n~~~~\n```` x\n`````\n&lt;b&gt;after&lt;\\/b&gt;");
+        let s = "  ~~~\n      ~~~\n  x\n\t~~~\n ~~~\nok";
+        assert_eq!(md_no_html(s), "```\n    ~~~\nx\n\t~~~\n```\nok");
+        // A closer may have up to three spaces of indent, whatever the opener's.
+        let s = "```\nx\n    ```\n<img src=x onerror=alert(1)>\n```\nok";
+        assert_eq!(md_no_html(s), "````\nx\n    ```\n<img src=x onerror=alert(1)>\n````\nok");
+        let s = "  ```\nx\n     ```\n<img src=x>\n```";
+        assert_eq!(md_no_html(s), "````\nx\n   ```\n<img src=x>\n````");
+        // Our fence is longer than any backtick run inside, and the info string is a plain name.
+        assert_eq!(md_no_html("```js\na ````` b\n```"), "``````js\na ````` b\n``````");
+        assert_eq!(md_no_html("~~~ <b>x\n<i>\n~~~"), "```\n<i>\n```");
+        // A fence in a list item, four spaces in, is text like the rest.
+        let s = "- step:\n    ```\n    <b>y</b>\n    ```";
+        assert_eq!(md_no_html(s), "\\- step\\:\n\\`\\`\\`\n&lt;b&gt;y&lt;\\/b&gt;\n\\`\\`\\`");
+    }
+
+    #[test]
+    fn an_unclosed_fence_keeps_what_follows_as_code() {
+        // Whatever follows a fence that never closes is literal code in a block of ours, closed
+        // by a fence longer than any run inside it, so none of it is read as HTML.
+        let s = "Repro:\n  ```\n  x\n      ```\n\n<img src=x onerror=alert(1)>\n````` x";
+        let t = md_no_html(s);
+        assert_eq!(t, "Repro\\:\n``````\nx\n    ```\n\n<img src=x onerror=alert(1)>\n````` x\n``````");
+        assert_inert(&t);
+    }
+
+    /// Outside our own fences (a backtick run at column 0, closed by the same run alone), no
+    /// ASCII punctuation is left but backslash escapes and the `&amp;`, `&lt;` and `&gt;` entities.
+    fn assert_inert(md: &str) {
+        let mut fence: Option<&str> = None;
+        for line in md.lines() {
+            if let Some(f) = fence {
+                if line == f {
+                    fence = None;
+                }
+                continue;
+            }
+            let run = line.len() - line.trim_start_matches('`').len();
+            if run >= 3 {
+                fence = Some(&line[..run]);
+                continue;
+            }
+            let rest = line.replace("&amp;", "").replace("&lt;", "").replace("&gt;", "");
+            let mut chars = rest.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    assert!(chars.next().is_some_and(|e| e.is_ascii_punctuation()), "{md}");
+                } else {
+                    assert!(!c.is_ascii_punctuation(), "raw {c:?} in {md}");
+                }
+            }
+        }
+    }
+
+    fn by_hand(title: &str, history: Vec<i64>) -> crate::scan::findings_db::ManualFinding {
+        crate::scan::findings_db::ManualFinding {
+            title: title.into(),
+            risk: Risk::Medium,
+            confidence: crate::scan::Confidence::Medium,
+            url: Some("http://app.test/x".into()),
+            method: None,
+            param: String::new(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history,
+            replace_text: false,
+        }
+    }
+
+    #[test]
+    fn scanner_only_reports_are_unchanged() {
+        let r = build(&store_with_findings(), &ReportOptions::default()).unwrap();
+        // No manual note in About, and no history_ids key on scanner instances.
+        assert!(!render(&r, ReportKind::Html).contains("found by hand"));
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        let insts = json["alerts"].as_array().unwrap().iter().flat_map(|g| g["instances"].as_array().unwrap().clone());
+        assert!(insts.into_iter().all(|i| i.get("history_ids").is_none()));
+        assert!(!render(&r, ReportKind::Markdown).contains("- History:"));
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        assert!(sarif["runs"][0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["properties"].get("historyIds").is_none()));
+    }
+
+    #[test]
+    fn a_tester_title_cannot_break_out_of_its_place() {
+        let mut s = store_with_findings();
+        s.finding_add(&by_hand("Broken\n## Fake heading <b>x</b>", vec![1])).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let md = render(&r, ReportKind::Markdown);
+        assert!(!md.lines().any(|l| l.starts_with("## Fake")), "{md}");
+        assert!(md.contains("Broken \\#\\# Fake heading &lt;b&gt;x&lt;\\/b&gt;"), "{md}");
+        // One linked entry is the evidence; no History line or row for it.
+        assert!(!md.contains("- History:"), "{md}");
+        let html = render(&r, ReportKind::Html);
+        assert!(!html.contains("<b>x</b>") && html.contains("&lt;b&gt;x&lt;/b&gt;"));
+        assert!(html.contains("found by hand") && !html.contains("<dt>History</dt>"));
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        let g = json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["alert_ref"] == "manual:broken-fake-heading-b-x-b")
+            .unwrap();
+        assert_eq!(g["instances"][0]["history_ids"], json!([1]));
+        assert_eq!(g["instances"][0]["source"], "manual");
+    }
+
+    #[test]
+    fn a_removed_finding_is_left_out_unless_asked_for() {
+        let mut s = store_with_findings();
+        let id = s.finding_add(&by_hand("Order IDOR", vec![1])).unwrap();
+        // The About note doesn't say who recorded it: a person or an agent.
+        let html = render(&build(&s, &ReportOptions::default()).unwrap(), ReportKind::Html);
+        assert!(html.contains("recorded during manual testing") && !html.contains("written up by the tester"));
+        s.findings_remove(&[id]).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        assert!(r.alerts.iter().all(|g| g.alert_ref != "manual:order-idor"));
+        assert!(!render(&r, ReportKind::Html).contains("found by hand"));
+        let all = ReportOptions {
+            filter: FindingFilter { state: Some("all".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let r = build(&s, &all).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
+        assert_eq!(g.instances[0].state, "removed");
+        assert!(render(&r, ReportKind::Html).contains("<span class=\"tag\">removed</span>"));
     }
 }

@@ -512,6 +512,70 @@ fn report_of_a_scan_lists_what_it_found() {
     assert_eq!(code, 4);
 }
 
+/// No scan looks for what a person found by hand, so a scan gate neither counts it as found nor
+/// as fixed; the plain gate and file baselines see it like any other finding.
+#[test]
+fn findings_added_by_hand_and_the_gates() {
+    let env = Env::new("manual");
+    env.send("/a");
+    let baseline = env.save_baseline("base.json");
+    let url = format!("http://127.0.0.1:{}/", env.port);
+    let args: Vec<String> = ["scan", "active", "--crawl", &url].iter().map(|s| s.to_string()).collect();
+    let added = std::cell::Cell::new(0);
+    let job = scan_job(&env, &args, "completed", || {
+        env.send("/a");
+        // Linked to a request sent during the scan, on a site it covered.
+        let v = ok(&env.project, &["findings", "add", "--title", "Order IDOR", "--risk", "high", "--history-id", "2"]);
+        assert_eq!(v["data"]["finding"]["source"], "manual");
+        assert_eq!(v["data"]["finding"]["url"], format!("http://127.0.0.1:{}/a", env.port));
+        added.set(v["data"]["id"].as_i64().unwrap());
+    })
+    .to_string();
+    let id = added.get();
+
+    let (code, v) = env.compare(&["--scan", &job, "--fail-on", "high"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["summary"]["other"], 1, "{v}");
+    let report = ok(&env.project, &["report", "json", "--scan", &job, "--no-evidence"]);
+    assert!(report["data"]["alerts"].as_array().unwrap().iter().all(|g| g["alert_ref"] != "manual:order-idor"));
+
+    assert_eq!(env.compare(&["--fail-on", "high"]).0, 5);
+    let (code, v) = env.compare(&["--baseline", &baseline, "--fail-on", "high", "--new-only"]);
+    assert_eq!(code, 5, "{v}");
+    assert_eq!(v["data"]["gate"]["findings"][0]["source"], "manual");
+    // Triaged as a false positive, it no longer trips a gate; removed, it is "removed", never
+    // "fixed", against a baseline that had it, and a baseline written after has its tombstone.
+    let with = env.save_baseline("with.json");
+    ok(&env.project, &["findings", "mark", &id.to_string(), "--state", "false-positive"]);
+    assert_eq!(env.compare(&["--fail-on", "high"]).0, 0);
+    ok(&env.project, &["findings", "remove", &id.to_string()]);
+    let (_, v) = env.compare(&["--baseline", &with, "--state", "all"]);
+    assert!(v["data"]["fixed"].as_array().unwrap().iter().all(|f| f["source"] != "manual"), "{v}");
+    let removed = v["data"]["removed"].as_array().unwrap();
+    assert!(removed.len() == 1 && removed[0]["id"] == id && removed[0]["state"] == "removed", "{v}");
+    assert_eq!(v["data"]["summary"]["removed"], 1, "{v}");
+    let after = env.save_baseline("after.json");
+    let (code, v) = env.compare(&["--baseline", &after, "--state", "all"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["data"]["summary"]["removed"].as_i64(), v["data"]["summary"]["new"].as_i64()), (Some(0), Some(0)));
+    // Two files: with --state all the tombstone says removed; without, the finding looks fixed,
+    // and the result says why.
+    let (_, v) = env.compare(&["--baseline", &with, "--current", &after, "--state", "all"]);
+    assert_eq!(v["data"]["summary"]["removed"], 1, "{v}");
+    assert!(v["data"]["warnings"].as_array().unwrap().is_empty(), "{v}");
+    let plain = env.path("plain.json");
+    ok(&env.project, &["report", "json", "--no-evidence", "--output", &plain, "--force"]);
+    let (_, v) = env.compare(&["--baseline", &with, "--current", &plain, "--state", "all"]);
+    assert!(v["data"]["fixed"].as_array().unwrap().iter().any(|f| f["source"] == "manual"), "{v}");
+    assert!(v["data"]["warnings"][0].as_str().unwrap().contains("--state all"), "{v}");
+
+    // Only findings added by hand can be removed.
+    let scanner = env.ids_on("/a").into_iter().find(|&f| f != id).unwrap().to_string();
+    let (code, v) = run(&env.project, &["findings", "remove", &scanner]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("false_positive"), "{v}");
+}
+
 #[test]
 fn described_in_capabilities_and_offered_over_mcp() {
     let env = Env::new("described");

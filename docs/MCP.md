@@ -65,7 +65,9 @@ One tool per leaf command of the clap definition, so the list can't drift from t
 from `capabilities`: `send`, `history_list`, `scan_active`, `job_wait`, ... (the command path
 joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy run` and
 `oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
-and `project save`, since copying the project elsewhere is for the person running the server.
+`project save`, since copying the project elsewhere is for the person running the server; and
+`findings remove`, since an agent can't tell a finding a person added from its own (it marks
+one `false_positive` with a note instead; the command refuses a tool call too).
 
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it
@@ -113,6 +115,12 @@ Some arguments need a person, so a command run for a tool call (the server sets
   MCP), so a prepared tab never makes the person's send go unrecorded. `replay_tabs_list` can return a large set; `summary` leaves the requests out and
   `index` returns one tab, so a set over `--max-output` can be read a tab at a time. It
   returns requests as stored, live cookies or tokens typed into a tab included.
+- `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
+  would copy any file the server can read into the project for the agent to read back; pass the
+  text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `findings_add` with `replace_text`: the description and solution findings of the same title
+  share may be a person's. A different one is refused (`conflict`) without it, so an agent
+  leaves them out or uses another title.
 - `send` and `ws_send` with `no_store` (races too), and `fuzz_run` with `store` `none` or
   `matches`: what an agent sends is always recorded in full, so a person can see what was sent
   on their behalf. A person can keep a send's content out of history from the app or a

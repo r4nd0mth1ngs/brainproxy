@@ -3,6 +3,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { cancelCli, run } from "./api";
+import type { FindingDraft } from "./views/manualFinding";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
 import { clearReplayTabs } from "./views/replayCalls";
 import type { ReplayOptions } from "./views/replayOptions";
@@ -91,6 +92,10 @@ interface State {
   comparer: string[];
   sendToComparer: (text: string) => void;
   setComparer: (items: string[]) => void;
+  /** A finding being written up by hand; Findings shows its form while one is set. */
+  findingDraft: FindingDraft | null;
+  /** Opens Findings with the "New finding" form, prefilled from `d` (null closes it). */
+  newFinding: (d: FindingDraft | null) => void;
   toasts: Toast[];
   toast: (text: string, kind?: Toast["kind"], onClick?: () => void) => void;
   /** The guided scan on the Overview, opened on request (it also shows by itself until a project has a scan). */
@@ -141,6 +146,7 @@ export function AppProvider({
   const [accessInput, setAccessInput] = useState<HistoryPick[] | null>(null);
   const [jobFocus, setJobFocus] = useState<{ id: number } | null>(null);
   const [comparer, setComparer] = useState<string[]>([]);
+  const [findingDraft, setFindingDraft] = useState<FindingDraft | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [apiImport, setApiImport] = useState<State["apiImport"]>(null);
@@ -299,6 +305,11 @@ export function AppProvider({
     setTab("scanner");
   }, []);
 
+  const newFinding = useCallback((d: FindingDraft | null) => {
+    setFindingDraft(d);
+    if (d) setTab("findings");
+  }, []);
+
   const openWizard = useCallback((open: boolean) => {
     setWizardOpen(open);
     if (open) setTab("dashboard");
@@ -345,6 +356,8 @@ export function AppProvider({
       comparer,
       sendToComparer,
       setComparer,
+      findingDraft,
+      newFinding,
       toasts,
       toast,
       wizardOpen,
@@ -355,7 +368,7 @@ export function AppProvider({
       openTraffic,
       proxy,
     }),
-    [project, temp, saveAsWithTabs, flushReplayTabs, tab, repeater, setRepeater, addReplayEditor, repeaterActive, setRepeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, accessInput, sendToAccess, jobFocus, showJob, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, apiImport, openApiImport, traffic, openTraffic, proxy],
+    [project, temp, saveAsWithTabs, flushReplayTabs, tab, repeater, setRepeater, addReplayEditor, repeaterActive, setRepeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, accessInput, sendToAccess, jobFocus, showJob, comparer, sendToComparer, findingDraft, newFinding, toasts, toast, wizardOpen, openWizard, apiImport, openApiImport, traffic, openTraffic, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

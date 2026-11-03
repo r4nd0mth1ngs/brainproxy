@@ -1024,6 +1024,21 @@ select {
 .curl-dialog .curl-warnings ul {
   padding-left: 20px;
 }
+/* Findings › New finding (views/NewFinding.tsx). */
+.finding-dialog {
+  width: min(720px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.finding-dialog .form {
+  max-width: none;
+}
+.finding-dialog .error {
+  padding: 8px 0 0;
+}
+.finding-dialog-actions {
+  margin-top: 16px;
+}
 
 .toasts {
   position: fixed;

@@ -481,6 +481,95 @@ fn an_agent_cannot_add_a_script_open_a_browser_or_read_any_variable() {
 }
 
 #[test]
+fn an_agent_adds_findings_from_stdin_but_reads_no_files() {
+    let p = tmp_project("manual-findings");
+    let notes = p.parent().unwrap().join("notes.txt");
+    std::fs::write(&notes, "FAKE-PRIVATE-NOTES").unwrap();
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let list = m.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}")).clone();
+    assert!(tool("findings_add")["inputSchema"]["properties"]["stdin"].is_object());
+    // An agent can't replace the write-up findings of the same title share, nor remove findings.
+    assert_eq!(tool("findings_add")["annotations"]["destructiveHint"], false);
+    assert!(tools.iter().all(|t| t["name"] != "findings_remove"));
+
+    let base = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7"});
+    let mut from_file = base.clone();
+    from_file["description_file"] = json!(notes.to_str().unwrap());
+    let (err, e) = m.call("findings_add", from_file);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--description-file"), "{e}");
+    assert!(!e.to_string().contains("FAKE-PRIVATE-NOTES"), "{e}");
+
+    let mut from_stdin = base;
+    from_stdin["description_file"] = json!("-");
+    from_stdin["stdin"] = json!("Any user can read any order.");
+    let (err, e) = m.call("findings_add", from_stdin);
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["finding"]["description"], "Any user can read any order.");
+    // It is on the record as an agent's, like everything else a tool call records.
+    assert_eq!(e["data"]["finding"]["origin"], "mcp", "{e}");
+    let id = e["data"]["id"].as_i64().unwrap();
+    // Texts as JSON on stdin; another description than the shared one is refused, and an agent
+    // can't ask to replace it.
+    let mut args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/8", "input_json": true,
+        "stdin": r#"{"description": "Newer text.", "evidence": "{\"owner\": 2}"}"#});
+    let (err, e) = m.call("findings_add", args.clone());
+    assert!(err && e["error"]["kind"] == "conflict", "{e}");
+    args["replace_text"] = json!(true);
+    let (err, e) = m.call("findings_add", args);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("through MCP"), "{e}");
+    let args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/8", "input_json": true,
+        "stdin": r#"{"evidence": "{\"owner\": 2}"}"#});
+    let (err, e) = m.call("findings_add", args);
+    assert!(!err, "{e}");
+    assert_eq!(
+        (e["data"]["finding"]["evidence"].as_str(), e["data"]["finding"]["description"].as_str()),
+        (Some(r#"{"owner": 2}"#), Some("Any user can read any order."))
+    );
+    // Nothing can be removed: the agent marks instead.
+    let r = m.request("tools/call", json!({"name": "findings_remove", "arguments": {"ids": [id]}}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let (err, e) = m.call("findings_mark", json!({"id": id, "state": "false_positive", "note": "not a bug"}));
+    assert!(!err, "{e}");
+    let (_, e) = m.call("findings_show", json!({"id": id}));
+    assert_eq!(e["data"]["state"], "false_positive", "{e}");
+    assert_eq!(e["data"]["state_origin"], "mcp", "{e}");
+}
+
+#[test]
+fn an_agent_reads_no_file_through_any_finding_text_flag() {
+    let p = tmp_project("manual-files");
+    let dir = p.parent().unwrap();
+    std::fs::write(dir.join("notes.txt"), "FAKE-PRIVATE-NOTES").unwrap();
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let list = m.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let t = tools.iter().find(|t| t["name"] == "findings_add").unwrap();
+    assert_eq!(t["annotations"]["readOnlyHint"], false, "{t}");
+    let abs = dir.join("notes.txt");
+    for flag in ["description_file", "solution_file", "evidence_file"] {
+        for path in [abs.to_str().unwrap(), "notes.txt", "/etc/hostname"] {
+            let mut args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7"});
+            args[flag] = json!(path);
+            let (err, e) = m.call("findings_add", args);
+            assert!(err && e["error"]["message"].as_str().unwrap().contains("through MCP"), "{flag} {path}: {e}");
+            assert!(!e.to_string().contains("FAKE-PRIVATE-NOTES"), "{e}");
+        }
+    }
+    // Only one flag reads the call's stdin.
+    let args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7",
+        "description_file": "-", "solution_file": "-", "stdin": "x"});
+    let (err, e) = m.call("findings_add", args);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("stdin"), "{e}");
+    // Nothing was added on the way.
+    let (err, e) = m.call("findings_list", json!({"source": "manual", "all": true}));
+    assert!(!err && e["data"]["count"] == 0, "{e}");
+}
+
+#[test]
 fn an_agent_cannot_send_unrecorded_or_open_the_proxy_to_the_network() {
     let p = tmp_project("record");
     let mut m = Mcp::start_env(&p, &[], &[]);

@@ -3,7 +3,8 @@
 // app's WKWebView has no window.prompt at all (it returns null), so questions are asked
 // inside the window instead.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useDialogFocus } from "./dialogFocus";
 
 interface Request {
   title: string;
@@ -51,14 +52,31 @@ export function ConfirmHost() {
     };
   }, []);
   if (!req) return null;
-  const typed = req.value != null;
   const answer = (a: string | null) => {
     setReq(null);
     req.resolve(a);
   };
+  return <ConfirmDialog req={req} text={text} setText={setText} answer={answer} />;
+}
+
+function ConfirmDialog({
+  req,
+  text,
+  setText,
+  answer,
+}: {
+  req: Request;
+  text: string;
+  setText: (t: string) => void;
+  answer: (a: string | null) => void;
+}) {
+  const ref = useRef<HTMLFormElement>(null);
+  useDialogFocus(ref);
+  const typed = req.value != null;
   return (
     <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && answer(null)}>
       <form
+        ref={ref}
         className="confirm-dialog"
         role={typed ? "dialog" : "alertdialog"}
         aria-modal="true"

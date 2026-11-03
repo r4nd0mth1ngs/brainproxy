@@ -154,12 +154,12 @@ Replay tabs are also kept in the project file (below).
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node, copy a request as cURL), *Import API (sends each once)…* (an API definition's operations sent live once each and recorded, below), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `import api` (`--dry-run`, then `--background`), `job status/stop`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, saved filters per project, request/response, copy as cURL; right-click to scan a request after a confirmation, test it in Access, or highlight it and remove the highlight), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `scan active --history-id --background`, `checks status`, `ws list/messages` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor; **+ cURL** opens a pasted curl command as a tab and *Copy as cURL* copies the request with the tab's options (both below); Race (below); per-tab Options (`views/replayOptions.ts`): HTTP/2, send as typed (`--verbatim`, HTTP/1 only so greyed out with HTTP/2: no Content-Length update, no auto URL-encode, the head's line breaks sent as CRLF and the body as the editor holds it), CRLF body (the GUI writes a text body's line breaks as CRLF; no CLI flag), SNI, timeout, verify TLS, don't record, with the ones that aren't the default as chips on the toolbar; a step sent with other options than the tab now has says which; Stop cancels a send still waiting (`cancelCli`) and says it may have reached the server (history has its row marked cancelled, or on Windows with the pending error, and the rows the CLI names when it answered in time); a send in flight and its result stay with its tab across tab switches (`views/replayCalls.ts`), and closing the tab or the project (or quitting) stops it, after asking. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the same options except HTTP/2, as typed and CRLF body, Stop, the conversation with a payload viewer. Tabs are kept in the project (below) | `send --target T [--http2 \| --verbatim] [--sni] [--timeout] [--verify-tls] [--no-store] -` (with `--race N` for Race), `history show` (a raced response), `ws send --target T --input-json [--sni] [--timeout] [--verify-tls] [--no-store]` (handshake and messages on stdin), `replay tabs list/save` |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, saved filters per project, request/response, copy as cURL; right-click to scan a request after a confirmation, test it in Access, highlight it and remove the highlight, or *Create finding…*), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `scan active --history-id --background`, `checks status`, `ws list/messages`, `findings add` |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor; **+ cURL** opens a pasted curl command as a tab and *Copy as cURL* copies the request with the tab's options (both below); Race (below); per-tab Options (`views/replayOptions.ts`): HTTP/2, send as typed (`--verbatim`, HTTP/1 only so greyed out with HTTP/2: no Content-Length update, no auto URL-encode, the head's line breaks sent as CRLF and the body as the editor holds it), CRLF body (the GUI writes a text body's line breaks as CRLF; no CLI flag), SNI, timeout, verify TLS, don't record, with the ones that aren't the default as chips on the toolbar; a step sent with other options than the tab now has says which; Stop cancels a send still waiting (`cancelCli`) and says it may have reached the server (history has its row marked cancelled, or on Windows with the pending error, and the rows the CLI names when it answered in time); a send in flight and its result stay with its tab across tab switches (`views/replayCalls.ts`), and closing the tab or the project (or quitting) stops it, after asking. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the same options except HTTP/2, as typed and CRLF body, Stop, the conversation with a payload viewer. *Create finding…* for the request and its last send. Tabs are kept in the project (below) | `send --target T [--http2 \| --verbatim] [--sni] [--timeout] [--verify-tls] [--no-store] -` (with `--race N` for Race), `history show` (a raced response), `ws send --target T --input-json [--sni] [--timeout] [--verify-tls] [--no-store]` (handshake and messages on stdin), `replay tabs list/save`, `findings add` |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, a SQL condition, or the requests sent from Traffic), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background` (with `--history-id` for requests from Traffic), `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/start/restart --authz`, `proxy setup show` (a proxy that is off) |
-| Results | Findings | Issues grouped by type and risk, detail, evidence, triage | `findings list/show/mark` |
+| Results | Findings | Issues grouped by type and risk, detail, evidence, triage; *New finding…* for an issue found by hand (also *Create finding…* from Traffic and Replay), which can be removed again | `findings list/show/mark/add/remove` |
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps, including gzip, zlib, and raw deflate (Brotli decodes only). **Smart decode** finds the layers (URL, Base64, hex, HTML, JWT, gzip, zlib) and puts them in as steps to check or change, stopping at JSON; its note says if the 8-layer limit or a decompression bomb stopped it | `encode`, `decode`, `hash`; Smart decode: `decode auto -` (its `steps` and `stopped`) |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
@@ -270,7 +270,9 @@ default `--exclude`), are built in `views/trafficActions.ts`. So are the opt-ins
 a named request without (`scanOptIns`: `--include-methods` with MUTATION or the method;
 `authzOptIns`: the method, and `--exclude=^$` for a logout): `scanArgs` and `runArgs` add them
 only when told the question was answered yes. The Site map's *Active scan this request* asks
-the same question and adds the same opt-in (`scanConfirm`, `scanOptIns`). Also `openApiImport` and `openTraffic`. The table selects one row at a
+the same question and adds the same opt-in (`scanConfirm`, `scanOptIns`). Also `openApiImport`, `openTraffic`, and
+`newFinding`, which opens Findings with the *New finding* form prefilled with a URL, method
+and history entry. The table selects one row at a
 time, so these act on one request. A greyed-out menu item shows why under its label
 (`MenuItem.hint`); it stays focusable, with `aria-disabled`.
 
@@ -385,6 +387,26 @@ logic in `views/replayTabs.ts`:
   marked untrusted, since requests often come from the target's traffic; `summary` and
   `index` page through a set larger than the server's output cap.
 
+### New finding
+
+The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findings add`: title,
+risk, confidence, method and URL (or only history entries, whose first gives both), parameter,
+CWE, history entries, description, solution and evidence. The method, URL, description,
+solution and evidence go on stdin as JSON (`--input-json`), so a token in a URL from Traffic
+or in the evidence stays out of the process list; the rest are arguments. From Replay, an unsent request's URL is its request line
+on the target's scheme, host and port, with the path as written (`%2e%2e` is not resolved).
+Nothing is sent. When the description or solution differs from the one findings of the same
+title share, `findings add` refuses; the form then shows a checkbox to replace it
+(`--replace-text`, which keeps the earlier text). A warning (outside the scope, a linked history
+entry on another host or port, or a replaced description or solution) shows with the
+confirmation. Risk and confidence are named groups whose picked button is pressed
+(`aria-pressed`), the method and URL inputs have their own labels, and Tab stays inside the dialog (`ui/dialogFocus.ts`, shared with the confirmation
+dialog), with focus going back to where it was when it closes. Findings added by hand are
+grouped by title, tagged *by hand*, show *Added by hand* and their history entries instead of a
+rule, and have *Remove* (`findings remove`, after asking). A removed finding is kept with state
+`removed`, which the list leaves out. The scan comparison leaves them out, since no scan looks
+for them.
+
 ## Look
 
 The Assertive Infosec design language (from their website's design tokens): a magenta-violet
@@ -482,4 +504,6 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   copied project, and a saved search for a secret stays in the webview's storage until it is
   deleted. *Save as…* on a temporary engagement copies them to the saved file (and says so if
   it can't); discarding one leaves its (unused) entry behind.
+- A finding added by hand can't be edited: mark it like any other, or remove it and add it
+  again (a new finding, with a new id and an open state; the removed one stays as `removed`).
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

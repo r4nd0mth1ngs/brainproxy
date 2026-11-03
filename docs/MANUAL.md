@@ -276,7 +276,8 @@ The sidebar groups the tools by what you are doing.
     the client that sent it.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, copy the URL or the request
-    as a curl command, add a note, or highlight (*Remove highlight* on a highlighted row).
+    as a curl command, add a note, highlight (*Remove highlight* on a highlighted row), or
+    *Create finding…* for an issue you found by hand in that request.
   - **Scan this request…** asks first, naming the request, then runs an active scan of that
     request in the background (`scan active --history-id`, medium strength). Once the Nuclei
     templates are downloaded, those of high severity and up also run against its site, and
@@ -326,6 +327,8 @@ Edit a raw request and send it as often as you like, in separate tabs.
   (spaces, quotes, `<>`, `#`, non-ASCII) are encoded in the request line and in form bodies.
   `&`, `=`, `'` and existing `%XX` stay as typed, so `?q=x' OR 1=1--` arrives as
   `?q=x'%20OR%201=1--`.
+- **Create finding…:** write up an issue this request shows, linked to its last send (see
+  *New finding…* under **Findings**).
 - **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
   works in every request editor.
 - **From cURL** (**+ cURL**): paste a curl command, for example from a browser's *Copy as
@@ -608,11 +611,22 @@ Access control across users: does the app let bob read alice's data? See
 - **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
   references, the evidence highlighted in the response, and the request.
 - **Actions:** mark *open*, *confirmed*, or *false positive*; send the request to Replay.
+- **New finding…:** write up an issue you found by hand: title, risk, confidence, URL,
+  parameter, CWE, the history entries that show it, description, solution and evidence.
+  Nothing is sent; it is only recorded in the project. *Create finding…* in Traffic's
+  right-click menu and in Replay opens the same form with the URL and the request filled in.
+  Findings with the same title are grouped together and tagged *by hand*; they appear in
+  reports like any other (marked *found by hand* in the HTML report) and can be removed
+  again (*Remove*); the project keeps a record of a removed one, so comparing with an
+  earlier report shows it as removed, not fixed. Scanner findings can't be removed, only
+  marked. If the description or solution differs from the one findings with that title
+  already share, the form says so and offers to replace it (the earlier text is kept).
 - **Compare with a scan:** pick a finished active scan to show only what it found for the
   first time (*New in*), what it found again (*Still found by*), or what it covered but
   didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
   tested the finding's site (scheme, host and port) and, for active findings, its rule;
-  passive findings (headers, cookies) count only when the scan crawled. The command line
+  passive findings (headers, cookies) count only when the scan crawled. Findings added by
+  hand are left out: no scan looks for them. The command line
   has the same comparison: [`findings compare`](#comparing-findings-and-failing-a-build-findings-compare).
 - **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
   and shows it in Finder or Explorer.
@@ -883,6 +897,8 @@ echo '{"tabs":[{"title":"search","target":"https://app.acme.test","request":"GET
 
 brainproxy findings list
 brainproxy findings show 12
+brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param id \
+    --description-file idor.md                # an issue found by hand; nothing is sent
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
 brainproxy report html -o acme-report.html
@@ -941,9 +957,9 @@ response rule, is recorded in history as the server sent it; the intercept row h
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
 enabled it.
 
-Findings have an `origin` too (who added them: the proxy's passive scan, a scan job, ...),
-and `state_origin` and `state_changed_at` say who last changed the state with `findings mark`
-and when, so a finding an agent marked as a false positive says so. `note_origin` and
+Findings have an `origin` too (who added them: the proxy's passive scan, a scan job,
+`findings add`, ...), and `state_origin` and `state_changed_at` say who last changed the state
+with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. `note_origin` and
 `note_changed_at` do the same for the note. `findings list` and `findings show` include
 them. Reports carry them in every format:
 
@@ -951,7 +967,8 @@ them. Reports carry them in every format:
   `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
 - Markdown and HTML say it in words on each finding. In HTML a finding a person confirmed
   (from the app or the command line) is tagged **confirmed**, one an agent confirmed
-  **confirmed via MCP (an agent)**.
+  **confirmed via MCP (an agent)**. A finding added with `findings add` is tagged **found by
+  hand**, or **added via MCP (an agent)** when an agent added it.
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
 
@@ -1281,6 +1298,71 @@ and targets that want a JWT you choose the claims of:
   `--oauth-*-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
   browser.
 
+### Findings found by hand (`findings add`)
+
+`findings add` records an issue you found yourself, with source `manual`. It sends nothing.
+
+```sh
+brainproxy findings add --title "Order IDOR" --risk high --confidence high \
+    --url https://app.acme.test/orders/7 --method GET --param id --cwe 639 \
+    --history-id 42,43 --evidence 'customer_email: bob@' --description-file idor.md \
+    --solution "Check that the order belongs to the signed-in user."
+brainproxy findings list --source manual
+brainproxy findings remove 17
+```
+
+- `--title` and `--risk` are required; `--confidence` defaults to medium.
+- `--url` must be an absolute http(s) or ws(s) URL, without a user name or password. Without it,
+  the URL and method are those of the first `--history-id` entry. A URL outside the engagement
+  scope is recorded with a warning. The path and query are kept as given (`/public/%2e%2e/admin`
+  is not resolved to `/admin`); only the scheme, host and port are normalised, and a space or
+  non-ASCII character is percent-encoded.
+- `--history-id` (repeatable or comma-separated) links the history entries that show the issue;
+  the first is the request and response in reports. The result lists each linked entry's method
+  and URL in `history`, and warns about one on another host or port than the finding's URL
+  (`other_site`), which may be linked by mistake.
+- `--description`, `--solution` and `--evidence` take the text; `--description-file`,
+  `--solution-file` and `--evidence-file` read it from a file, or stdin with `-` (one of them).
+  Through MCP the file flags only take `-`, the call's stdin.
+- In Markdown reports and SARIF help, the title, description and solution are plain text: HTML,
+  links, images, code spans, emphasis, lists and tables show as typed, not rendered. Only fenced
+  code blocks (a line of three or more backticks or tildes, indented at most three spaces) keep
+  their text as written, as code; leading spaces on other lines are dropped.
+- `--input-json` reads all three from stdin instead, as
+  `{"description": "...", "solution": "...", "evidence": "...", "url": "...", "method": "..."}`
+  (each optional; `url` and `method` in place of `--url` and `--method`). Text on the command
+  line is visible in the process list, so use it for evidence or a URL that holds a token.
+- Findings with the same title share an alert type, `manual:<title>` (`manual:order-idor`), so
+  reports group them. The type holds the description and solution: leaving them out keeps the
+  type's, and one that differs from it is refused with `conflict` unless `--replace-text` is
+  given. Replacing keeps the earlier text: `findings show` lists it in `replaced_texts`, with
+  when it was replaced. Through MCP `--replace-text` is refused, since the text may be a
+  person's. A long title is shortened and ends in a short hash, so only titles that are the
+  same apart from case and punctuation share a type.
+- Each finding keeps its own `--cwe`. Reports show the first one given for the type, and an
+  instance's own when it differs.
+- The same title, method, URL without its query, and parameter as an existing finding is refused
+  with `conflict`.
+- `findings mark` triages them like any other. `findings remove ID...` removes findings added by
+  hand; scanner findings are refused (mark them false positive instead), and then nothing is
+  removed. A removed finding is kept with state `removed`: `findings list`, `report` and
+  `findings compare` leave it out unless `--state all` (or `removed`), `findings show` gives
+  when it was removed and the state it had in `removed`, and it can't be marked. The same issue
+  can then be added again, as a new finding. `findings remove` is refused through MCP (and not
+  offered as a tool): an agent can't tell a person's finding from its own, so it marks one
+  `false_positive` with a note instead.
+- `findings show` lists every linked entry in `history_ids`; in the `findings` table (`query`),
+  `history_id` is the first and `last_history_id` the last.
+- `findings list`, `report` and `findings compare` show them with `source: manual` (each group
+  of the grouped `findings list` has a `source` too); `--source manual` picks only them.
+  `findings compare --scan` leaves them out (no scan looks for them, so a scan never "fixes"
+  them and its gate doesn't count them), while a file baseline and the plain `--fail-on` gate
+  compare them like any other. A finding of the baseline that was removed here is listed under
+  `removed`, never `fixed`, and no gate counts it.
+- Like any finding, each records who added it in `origin` (`gui`, `cli` or `mcp`; see
+  [Who recorded what](#who-recorded-what)); `findings remove` sets `state_origin` and `state_changed_at`, and
+  `removed` in `findings show` also says who removed it (`by`) and who set the state it had.
+
 ### What is recorded when a request doesn't finish
 
 Every request brainproxy puts on the wire leaves a history row, whatever happens next.
@@ -1340,7 +1422,10 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   Findings match by alert, method, URL without its query, and parameter, so the URL's
   scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
   doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
-  coverage.
+  coverage. A finding added by hand and removed since (`findings remove`) is listed under
+  `removed` (with a count in `summary.removed`), not as fixed. A `--current` file needs
+  `--state all` for that, since only then does it keep removed findings; without it they count
+  as fixed, with a warning.
 - **A scan** (`--scan JOB`): a `scan active --background` job in this project, using the same logic
   as the app's *Compare with a scan*: first found by it, found again by it, or covered by it and not
   found again. Foreground scans have no job to name.
@@ -1364,7 +1449,8 @@ brainproxy --project app.bpdb findings compare --baseline baseline.json --fail-o
 
 `--fail-on RISK` fails on findings at or above `info`, `low`, `medium`, or `high` that are still
 there: new and unchanged ones, or with `--new-only` just the new ones. False positives never count,
-whatever `--state` lists. With `--scan`, only what that scan found counts.
+whatever `--state` lists. With `--scan`, only what that scan found counts, so findings added by
+hand don't; with a file baseline or none, they count like any other.
 
 `--scan JOB --since-scan EARLIER` is for a pipeline that scans the same project again and again.
 "New" against one scan means first found by that scan, so a finding first seen by a run that failed

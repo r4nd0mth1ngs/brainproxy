@@ -285,6 +285,8 @@ brainproxy findings list                          # grouped by alert type, highe
 brainproxy findings list --risk medium --all      # one row per instance
 brainproxy findings show 7                        # description, solution, references, evidence
 brainproxy findings mark 7 --state false-positive --note "test cookie"
+brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --description-file idor.md   # found by hand; nothing is sent
+brainproxy findings remove 17                     # only findings added by hand; kept as removed
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off
 brainproxy scan passive --rescan                  # rescan all history
 
