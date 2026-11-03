@@ -2,14 +2,23 @@ import { useEffect, useMemo, useState } from "react";
 import { bodyText, historyRequest, isBinary, MAX_BODY, pathOf, rawResponse, run, type HistoryEntry, type HistoryItem, type Risk } from "../api";
 import { originOf, useApp } from "../store";
 import { copyAsCurl } from "../ui/CurlDialog";
+import { confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
+import type { Job } from "./Scanner";
+import { importLive, importRequest, readImportJob } from "./apiScan";
 
 export function TargetView({ active }: { active: boolean }) {
+  const app = useApp();
   const [sub, setSub] = useState<"map" | "scope">("map");
+  // Import API opened from elsewhere shows in the map.
+  useEffect(() => {
+    if (app.apiImport) setSub("map");
+  }, [app.apiImport]);
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -162,6 +171,62 @@ function SiteMap({ active }: { active: boolean }) {
   const [selected, setSelected] = useState<number | null>(null);
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const { menu, open, close } = useMenu();
+  // Import API: an API definition's operations, sent once each and recorded. The wizard, then its
+  // job's card, show in place of the map; the card can be hidden while the job runs. The job id is
+  // remembered per project, so the result is still there after a reload.
+  const [importing, setImporting] = useState<{ source: string; graphql: boolean; key: number } | null>(null);
+  const jobKey = `api-import-job:${app.project}`;
+  const [importJob, setImportJobState] = useState<number | null>(() => {
+    try {
+      return Number(localStorage.getItem(jobKey)) || null;
+    } catch {
+      return null;
+    }
+  });
+  const [jobShown, setJobShown] = useState(true);
+  // The wizard's start command is out: the card stays until it is answered, or its job would be lost.
+  const [importStarting, setImportStarting] = useState(false);
+  const setImportJob = (id: number | null) => {
+    setImportJobState(id);
+    setJobShown(true);
+    try {
+      localStorage.setItem(jobKey, id == null ? "" : String(id));
+    } catch {
+      /* storage unavailable */
+    }
+  };
+  const job = useImportJob(importJob, active, () => setImportJob(null));
+  const importRunning = importLive(importJob, job?.state);
+  const openImport = (next: { source: string; graphql: boolean; key: number }, jobLive = importRunning) => {
+    // A finished import's card makes way for the new one.
+    if (importJob != null && !jobLive) setImportJob(null);
+    setImporting(next);
+  };
+  // Asked for from the guided API scan. A running import is never replaced, and one being set up only if the user agrees.
+  useEffect(() => {
+    const req = app.apiImport;
+    if (!req) return;
+    decide(req);
+  }, [app.apiImport]);
+  const decide = async (req: { source: string; graphql: boolean; key: number }) => {
+    // A remembered job that hasn't been read yet (the map not shown since a reload) is read first.
+    let state: string | undefined = job?.state;
+    if (importJob != null && state == null)
+      state = await readImportJob(run<Job>(["job", "status", String(importJob)])).then(
+        (j) => (j === "gone" ? "gone" : j.state),
+        () => undefined,
+      );
+    if (state === "gone") setImportJob(null);
+    const what = importRequest({ live: state !== "gone" && importLive(importJob, state), starting: importStarting, wizardOpen: !!importing });
+    if (what === "show_job") {
+      setJobShown(true);
+      app.toast(importStarting ? "An API import is starting here. Start another when it has finished." : "An API import is still running here. Start another when it has finished.");
+    } else if (what === "open") {
+      openImport(req, false);
+    } else {
+      if (await confirm("Replace the import being set up?", "Import API is already open in the Site map. Starting over with this definition loses what was chosen there.", "Start over", "Keep it")) openImport(req, false);
+    }
+  };
 
   const tree = useMemo(() => buildTree(data?.rows ?? []), [data]);
 
@@ -302,34 +367,71 @@ function SiteMap({ active }: { active: boolean }) {
         <span className="muted">
           {tree.length} host{tree.length === 1 ? "" : "s"} · right-click a node to crawl or scan it
         </span>
-      </div>
-      <Split id="sitemap" dir="row" initial={0.32}>
-        <div className="tree">
-          {tree.length === 0 && <div className="empty">No traffic yet. Crawl a target from Scans, or browse through the proxy.</div>}
-          {tree.map((n) => renderNode(n, 0))}
-        </div>
-        {node ? (
-          <Split id="sitemap-detail" dir="col" initial={0.4}>
-            <DataTable
-              rows={rows}
-              columns={COLUMNS}
-              rowKey={(r) => r.id}
-              selected={selected}
-              onSelect={(r) => setSelected(r.id)}
-              onActivate={(r) => toRepeater(r.id)}
-              onContextMenu={(r, e) => open(e, [...actions(r.url, r.id, ["--history-id", String(r.id)]), { label: "Copy as cURL", action: () => copyCurl(r.id) }])}
-              initialSort={{ key: "id", desc: true }}
-              empty="No requests under this node."
-            />
-            <Split id="sitemap-msg" dir="row">
-              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
-              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder={entry?.entry.error ?? ""} />
-            </Split>
-          </Split>
-        ) : (
-          <div className="blank">Select a host or path to see its requests.</div>
+        {importJob != null && !jobShown && (
+          <span className="muted">
+            {importRunning ? "API import running" : "API import finished"} ·{" "}
+            <button className="link" onClick={() => setJobShown(true)}>
+              Show
+            </button>
+          </span>
         )}
-      </Split>
+        <button
+          className="btn small"
+          disabled={!!importing || importRunning}
+          onClick={() => openImport({ source: "", graphql: false, key: 0 })}
+          title={importRunning ? "An API import is running" : "Send an API definition's operations once each and record them, without scanning"}
+        >
+          Import API (sends each once)…
+        </button>
+      </div>
+      {importing ? (
+        <div className="st-import">
+          <ApiWizard
+            key={importing.key}
+            mode="import"
+            initialSource={importing.source}
+            initialGraphql={importing.graphql}
+            onStarted={(id) => {
+              setImportJob(id);
+              setImporting(null);
+            }}
+            onStarting={setImportStarting}
+            onDismiss={() => setImporting(null)}
+          />
+        </div>
+      ) : importJob != null && jobShown ? (
+        <div className="st-import">
+          <ImportProgress jobId={importJob} job={job} onClose={() => setImportJob(null)} onHide={() => setJobShown(false)} />
+        </div>
+      ) : (
+        <Split id="sitemap" dir="row" initial={0.32}>
+          <div className="tree">
+            {tree.length === 0 && <div className="empty">No traffic yet. Crawl a target from Scans, or browse through the proxy.</div>}
+            {tree.map((n) => renderNode(n, 0))}
+          </div>
+          {node ? (
+            <Split id="sitemap-detail" dir="col" initial={0.4}>
+              <DataTable
+                rows={rows}
+                columns={COLUMNS}
+                rowKey={(r) => r.id}
+                selected={selected}
+                onSelect={(r) => setSelected(r.id)}
+                onActivate={(r) => toRepeater(r.id)}
+                onContextMenu={(r, e) => open(e, [...actions(r.url, r.id, ["--history-id", String(r.id)]), { label: "Copy as cURL", action: () => copyCurl(r.id) }])}
+                initialSort={{ key: "id", desc: true }}
+                empty="No requests under this node."
+              />
+              <Split id="sitemap-msg" dir="row">
+                <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
+                <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder={entry?.entry.error ?? ""} />
+              </Split>
+            </Split>
+          ) : (
+            <div className="blank">Select a host or path to see its requests.</div>
+          )}
+        </Split>
+      )}
       <Menu menu={menu} close={close} />
     </div>
   );

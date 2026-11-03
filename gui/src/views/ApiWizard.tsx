@@ -1,12 +1,15 @@
 // Guided scan of an API: import its definition, choose the server, optionally set up a key or a
 // signer, tick the operations, then a `scan active --api` job. Hosted where the website wizard
-// is. The logic is in apiScan.ts; this file holds the screens and the CLI calls.
+// is. Import API (`mode="import"`, in the Site map) is the same flow ending in an `import api`
+// job, which sends each ticked operation once and records it. The logic is in apiScan.ts; this
+// file holds the screens and the CLI calls.
 
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { bodyText, inTauri, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
-import { loadSuggestions } from "./Scanner";
+import { usePoll } from "../ui/usePoll";
+import { isLive, loadSuggestions, type Job } from "./Scanner";
 import { OAuthFields, ScriptChoice } from "./ApiAuthExtras";
 import { SignerBuilder } from "./SessionHandling";
 import { PostWarning, SPEEDS, WizardProgress, type Speed } from "./Wizard";
@@ -37,6 +40,9 @@ import {
   formatLabel,
   hostLabel,
   hostScopeText,
+  importArgs,
+  importProgressText,
+  importResultText,
   includeMethods,
   keyAddArgs,
   keyDefaults,
@@ -59,6 +65,7 @@ import {
   previewTitle,
   profileKeyText,
   profileRemoved,
+  readImportJob,
   scanArgs,
   scrubSecret,
   selectShown,
@@ -101,20 +108,39 @@ async function chooseFile(filters = FILTERS, what = "API definition"): Promise<s
   return window.prompt(`Path of the ${what} (full path):`)?.trim() || null;
 }
 
+/** "scan" tests the operations; "import" only sends each once and records it in history. */
+export type ApiMode = "scan" | "import";
+
 interface Props {
-  jobId: number | null;
-  onStarted: (id: number) => void;
+  mode?: ApiMode;
+  /** The scan's job, kept by the host. An import's job is shown by the host (the Site map). */
+  jobId?: number | null;
+  /** The job started: the host keeps its id, so it outlives this card and a reload. */
+  onStarted?: (id: number) => void;
+  /** The start command was sent (true) or answered (false). Until then the card can't be closed: the job may still start. */
+  onStarting?: (starting: boolean) => void;
   onDismiss: () => void;
   /** Back to the website guided scan. */
-  onBack: () => void;
+  onBack?: () => void;
+  /** Hands the definition typed so far, and the GraphQL endpoint tick, to Import API. */
+  onImport?: (source: string, graphql: boolean) => void;
+  /** The definition to start on. */
+  initialSource?: string;
+  /** Start with "GraphQL endpoint" ticked. */
+  initialGraphql?: boolean;
 }
 
-const STEPS = ["Definition", "Server", "Authentication", "Operations", "Depth and start"];
+const STEPS: Record<ApiMode, string[]> = {
+  scan: ["Definition", "Server", "Authentication", "Operations", "Depth and start"],
+  import: ["Definition", "Server", "Authentication", "Operations", "Import"],
+};
 
 export function ApiWizard(p: Props) {
   const app = useApp();
+  const mode = p.mode ?? "scan";
+  const steps = STEPS[mode];
   const [step, setStep] = useState(0);
-  const [typed, setTyped] = useState("");
+  const [typed, setTyped] = useState(p.initialSource ?? "");
   // What the preview below is of. `typed` can move on from it.
   const [source, setSource] = useState("");
   const [preview, setPreview] = useState<ApiPreview | null>(null);
@@ -122,7 +148,7 @@ export function ApiWizard(p: Props) {
   const [problem, setProblem] = useState("");
   const [docChanged, setDocChanged] = useState(false);
   const [target, setTarget] = useState<ApiTarget>(EMPTY_TARGET);
-  const [graphqlEndpoint, setGraphqlEndpoint] = useState(false);
+  const [graphqlEndpoint, setGraphqlEndpoint] = useState(p.initialGraphql ?? false);
   const [customBase, setCustomBase] = useState(false);
   const [previewedKey, setPreviewedKey] = useState("");
   const [scope, setScope] = useState<string[]>([]);
@@ -263,30 +289,29 @@ export function ApiWizard(p: Props) {
   const start = async () => {
     if (!preview || leaving.current) return;
     setBusy(true);
+    p.onStarting?.(true);
     setStartProblem("");
     try {
-      const d = await run<{ job: number }>(
-        scanArgs({
-          source,
-          sha256: preview.document_sha256,
-          environmentSha: preview.environment?.sha256,
-          target,
-          operations: preview.requests,
-          selected,
-          profile: authProfile(auth),
-          depth,
-          speedArgs: SPEEDS.find((s) => s.id === speed)!.args,
-        }),
-      );
-      p.onStarted(d.job);
+      const plan = {
+        source,
+        sha256: preview.document_sha256,
+        environmentSha: preview.environment?.sha256,
+        target,
+        operations: preview.requests,
+        selected,
+        profile: authProfile(auth),
+      };
+      const d = await run<{ job: number }>(mode === "import" ? importArgs(plan) : scanArgs({ ...plan, depth, speedArgs: SPEEDS.find((s) => s.id === speed)!.args }));
+      p.onStarted?.(d.job);
     } catch (e: any) {
       setStartProblem(e.message);
     }
     setBusy(false);
+    p.onStarting?.(false);
   };
 
   // After every hook above: the hook count must not change between renders.
-  if (p.jobId != null) return <WizardProgress jobId={p.jobId} onClose={p.onDismiss} />;
+  if (mode === "scan" && p.jobId != null) return <WizardProgress jobId={p.jobId} onClose={p.onDismiss} />;
 
   // The GraphQL tick changes what the URL is read as, so a preview without it is of something else.
   const previewed = !!preview && source === typed.trim() && target.graphql === (graphqlEndpoint && sourceKind(source) === "url");
@@ -308,21 +333,23 @@ export function ApiWizard(p: Props) {
     <section className="dash-card wizard">
       <header>
         <div>
-          <div className="wiz-kicker">Guided scan</div>
-          <h2>Check an API for security problems</h2>
+          <div className="wiz-kicker">{mode === "import" ? "Import API" : "Guided scan"}</div>
+          <h2>{mode === "import" ? "Add an API's requests to history" : "Check an API for security problems"}</h2>
         </div>
         <div className="wiz-row">
-          {/* Not while the scan starts, nor Back below: it may run with a profile offered for removal. */}
-          <button className="link" disabled={busy} onClick={leave(p.onBack)}>
-            Test a website instead
-          </button>
-          <button className="link" disabled={busy} onClick={leave(p.onDismiss)}>
-            I'll set it up myself
+          {/* Not while the start is answered, nor Back below: it may run with a profile offered for removal. */}
+          {p.onBack && (
+            <button className="link" disabled={busy} onClick={leave(p.onBack)}>
+              Test a website instead
+            </button>
+          )}
+          <button className="link" disabled={busy} onClick={leave(p.onDismiss)} title={busy ? "Wait for the start to be answered" : undefined}>
+            {mode === "import" ? "Cancel" : "I'll set it up myself"}
           </button>
         </div>
       </header>
       <ol className="wiz-steps">
-        {STEPS.map((s, i) => (
+        {steps.map((s, i) => (
           <li key={s} className={i === step ? "on" : i < step ? "done" : ""}>
             <span>{i < step ? "✓" : i + 1}</span>
             {s}
@@ -331,7 +358,23 @@ export function ApiWizard(p: Props) {
       </ol>
 
       {step === 0 && (
-        <DefinitionStep typed={typed} setTyped={setTyped} previewing={previewing} problem={problem} clearProblem={() => setProblem("")} preview={previewed ? preview : null} browse={browse} fetch={() => load(typed.trim(), null)} scope={scope} graphql={graphqlEndpoint} setGraphql={setGraphqlEndpoint} environment={target.environment} chooseEnvironment={chooseEnvironment} dropEnvironment={dropEnvironment} />
+        <DefinitionStep
+          typed={typed}
+          setTyped={setTyped}
+          previewing={previewing}
+          problem={problem}
+          clearProblem={() => setProblem("")}
+          preview={previewed ? preview : null}
+          browse={browse}
+          fetch={() => load(typed.trim(), null)}
+          scope={scope}
+          graphql={graphqlEndpoint}
+          setGraphql={setGraphqlEndpoint}
+          environment={target.environment}
+          chooseEnvironment={chooseEnvironment}
+          dropEnvironment={dropEnvironment}
+          onImport={mode === "scan" && p.onImport ? () => p.onImport!(typed.trim(), graphqlEndpoint) : undefined}
+        />
       )}
       {step === 1 && preview && (
         <ServerStep
@@ -345,15 +388,19 @@ export function ApiWizard(p: Props) {
           problem={problem}
           docChanged={docChanged}
           blockers={blockers}
+          mode={mode}
         />
       )}
       {step === 2 && preview && (
-        <AuthStep preview={preview} source={source} target={target} selected={selected} auth={auth} setAuth={setAuth} draft={signerDraft} setDraft={setSignerDraft} />
+        <AuthStep preview={preview} source={source} target={target} selected={selected} auth={auth} setAuth={setAuth} draft={signerDraft} setDraft={setSignerDraft} mode={mode} />
       )}
-      {step === 3 && preview && <OperationsStep operations={preview.requests} format={preview.format} truncated={preview.requests_truncated} selected={selected} setSelected={setSelected} optIn={optIn} setOptIn={setOptIn} />}
-      {step === 4 && preview && (
+      {step === 3 && preview && (
+        <OperationsStep operations={preview.requests} format={preview.format} truncated={preview.requests_truncated} selected={selected} setSelected={setSelected} optIn={optIn} setOptIn={setOptIn} mode={mode} />
+      )}
+      {step === 4 && preview && mode === "scan" && (
         <StartStep preview={preview} source={source} target={target} auth={auth} selected={selected} depth={depth} setDepth={setDepth} speed={speed} setSpeed={setSpeed} problem={startProblem} />
       )}
+      {step === 4 && preview && mode === "import" && <ImportStep preview={preview} source={source} target={target} auth={auth} selected={selected} problem={startProblem} />}
 
       {step > 1 && blockers.length > 0 && (
         <div className="wiz-body">
@@ -372,13 +419,13 @@ export function ApiWizard(p: Props) {
           </button>
         )}
         <span className="grow" />
-        {step < STEPS.length - 1 ? (
+        {step < steps.length - 1 ? (
           <button className="btn primary" disabled={!canGoOn} onClick={() => setStep(step + 1)}>
             {step === 1 && (previewing || previewWaits) ? "Checking…" : "Next"}
           </button>
         ) : (
           <button className="btn primary" disabled={busy || !selected.length || blockers.length > 0} onClick={start}>
-            {busy ? "Starting…" : "Start scan"}
+            {busy ? "Starting…" : mode === "import" ? "Import" : "Start scan"}
           </button>
         )}
       </footer>
@@ -401,6 +448,8 @@ function DefinitionStep(p: {
   environment: string;
   chooseEnvironment: () => void;
   dropEnvironment: () => void;
+  /** Offered by the scan: Import API instead. */
+  onImport?: () => void;
 }) {
   const text = p.typed.trim();
   const isUrl = !!text && sourceKind(text) === "url";
@@ -443,6 +492,13 @@ function DefinitionStep(p: {
           ? `Previewing this URL fetches it from here right away, and only if it's inside this project's approved scope${p.scope.length ? ` (${p.scope.join(", ")})` : ""}.`
           : "A URL is fetched as soon as you preview it, and only if it's inside this project's approved scope."}
       </p>
+      {p.onImport && (
+        <p className="muted">
+          <button className="link" onClick={p.onImport}>
+            Only want its requests in history, to try them by hand? Send each operation once and record it, without scanning
+          </button>
+        </p>
+      )}
       {d && (
         <>
           <dl className="facts">
@@ -531,6 +587,7 @@ function ServerStep(p: {
   problem: string;
   docChanged: boolean;
   blockers: string[];
+  mode: ApiMode;
 }) {
   const d = p.preview;
   const t = p.target;
@@ -616,7 +673,7 @@ function ServerStep(p: {
       <p className="muted">
         This project's approved scope: {p.scope.length ? <span className="mono">{p.scope.join(", ")}</span> : "not known"}. The scope can't be widened here, so operations on hosts outside it are skipped and nothing is added to the engagement.
       </p>
-      {p.docChanged && <div className="wiz-warn danger">The definition changed since you first read it. The ticked operations were reset, and the scan will use the latest version.</div>}
+      {p.docChanged && <div className="wiz-warn danger">The definition changed since you first read it. The ticked operations were reset, and the {p.mode === "import" ? "import" : "scan"} will use the latest version.</div>}
       {p.problem && <div className="wiz-problem">{p.problem}</div>}
       {!p.busy && !p.problem && p.blockers.map((b) => <div key={b} className="wiz-problem">{b}</div>)}
     </div>
@@ -657,6 +714,7 @@ function AuthStep(p: {
   setAuth: Dispatch<SetStateAction<AuthState>>;
   draft: SignerForm | null;
   setDraft: (f: SignerForm | null) => void;
+  mode: ApiMode;
 }) {
   const app = useApp();
   const [data, setData] = useState<AuthData | null>(null);
@@ -703,10 +761,12 @@ function AuthStep(p: {
 
   const signerRow = a.signer && data?.signers.find((s) => s.profile === a.signer!.profile && s.signer.name === a.signer!.name);
   const ticked = new Set(p.selected);
-  const coverage = signerRow ? signerCoverage(data!.rules[signerRow.profile] ?? [], signerRow.signer, inScope.filter((o) => ticked.has(o.index)).map((o) => o.url)) : null;
+  // An import sends as the crawl tool, as "Try one request" does.
+  const tool = p.mode === "import" ? "crawl" : "scan";
+  const coverage = signerRow ? signerCoverage(data!.rules[signerRow.profile] ?? [], signerRow.signer, inScope.filter((o) => ticked.has(o.index)).map((o) => o.url), tool) : null;
 
   const pickSigner = async (profile: string, name: string) => {
-    // A scan uses one profile, and `auth add` can't add a key to one that exists: pick its profile.
+    // A run uses one profile, and `auth add` can't add a key to one that exists: pick its profile.
     const moved = authProfile(a) !== profile;
     const next = moved ? { mode: "profile" as const, existing: profile, savedProfile: "" } : {};
     // Leaving saved credentials, as choosing another kind does; not when the signer is in the key set aside.
@@ -715,7 +775,7 @@ function AuthStep(p: {
     p.setDraft(null);
     // A query key that doesn't go to this server: the warning under the profile says so instead.
     const keyless = profileKeyText({ ...a, ...next }, origins);
-    setNote(moved ? `Selected the profile "${profile}", which holds this signer.${keyless ? "" : " The scan runs with that profile's credentials."}` : "");
+    setNote(moved ? `Selected the profile "${profile}", which holds this signer.${keyless ? "" : " The ${p.mode === "import" ? "import" : "scan"} runs with that profile's credentials."}` : "");
   };
 
   const saveSigner = async (f: SignerForm) => {
@@ -901,7 +961,7 @@ function AuthStep(p: {
         )}
       </div>
 
-      <TryOne preview={p.preview} source={p.source} target={p.target} selected={p.selected} auth={a} ruleApplies={coverage?.checkCovered ?? true} />
+      <TryOne preview={p.preview} source={p.source} target={p.target} selected={p.selected} auth={a} ruleApplies={coverage?.checkCovered ?? true} mode={p.mode} />
     </div>
   );
 }
@@ -1016,7 +1076,7 @@ interface TryResult {
   text: string;
 }
 
-function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; selected: number[]; auth: AuthState; ruleApplies: boolean }) {
+function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; selected: number[]; auth: AuthState; ruleApplies: boolean; mode: ApiMode }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<TryResult | null>(null);
   const [problem, setProblem] = useState("");
@@ -1055,6 +1115,7 @@ function TryOne(p: { preview: ApiPreview; source: string; target: ApiTarget; sel
             credentialOn: raw == null ? null : credentialOnRequest(raw, profile),
             signerOn: signer ? (raw == null ? null : signerOnRequest(raw, profile, signer)) : null,
             signerRuleApplies: p.ruleApplies,
+            run: p.mode,
           }),
         });
       }
@@ -1094,7 +1155,9 @@ function OperationsStep(p: {
   setSelected: (s: number[]) => void;
   optIn: boolean;
   setOptIn: (on: boolean) => void;
+  mode: ApiMode;
 }) {
+  const importing = p.mode === "import";
   const [filter, setFilter] = useState("");
   const [open, setOpen] = useState<number | null>(null);
   const ops = p.operations;
@@ -1104,7 +1167,7 @@ function OperationsStep(p: {
   const toggle = (i: number) => p.setSelected(on.has(i) ? p.selected.filter((x) => x !== i) : [...p.selected, i].sort((a, b) => a - b));
   return (
     <div className="wiz-body">
-      <label className="label">Which operations should be sent and tested?</label>
+      <label className="label">{importing ? "Which operations should be sent and recorded?" : "Which operations should be sent and tested?"}</label>
       <div className="wiz-row">
         <input className="input wiz-input" placeholder="Filter by method, name or URL" value={filter} onChange={(e) => setFilter(e.target.value)} />
         <button className="btn small" onClick={() => p.setSelected(selectShown(p.selected, shown, p.optIn, true))}>
@@ -1126,7 +1189,8 @@ function OperationsStep(p: {
             }}
           />
           <span>
-            Let me tick {listWords(riskyMethods)} operations. These change, overwrite or delete data on the server. Each one you tick is sent as written, then again with attack data.
+            Let me tick {listWords(riskyMethods)} operations. These change, overwrite or delete data on the server. Each one you tick is sent as written
+            {importing ? "." : ", then again with attack data."}
           </span>
         </label>
       )}
@@ -1156,10 +1220,20 @@ function OperationsStep(p: {
       {p.truncated && <p className="muted small">The definition has more operations than this list. Only those listed can be sent.</p>}
       {sendsStateChanging(ops, p.selected) && (
         <div className="wiz-warn danger">
-          <b>You ticked operations that change or delete data ({listWords(includeMethods(ops, p.selected))}).</b> They are sent as written and then many times with attack data. Real records can be overwritten or deleted, and that can't be undone. Use a test environment you can restore.
+          <b>You ticked operations that change or delete data ({listWords(includeMethods(ops, p.selected))}).</b>{" "}
+          {importing ? "Each is sent once, as written." : "They are sent as written and then many times with attack data."} Real records can be overwritten or deleted, and that can't be undone. Use a test environment you can restore.
         </div>
       )}
-      {sendsPost(ops, p.selected, p.format) && <PostWarning />}
+      {sendsPost(ops, p.selected, p.format) && (importing ? <ImportPostWarning /> : <PostWarning />)}
+    </div>
+  );
+}
+
+/** POST in an import: sent once, not attacked, but it still does whatever the operation does. */
+function ImportPostWarning() {
+  return (
+    <div className="wiz-warn replay">
+      <b>POST requests are sent once, as written.</b> They aren't attacked, but each still does what the operation does: it can create a record or send a message.
     </div>
   );
 }
@@ -1239,24 +1313,7 @@ function StartStep(p: {
 
       <label className="label">Ready to start</label>
       <dl className="facts">
-        <dt>Definition</dt>
-        <dd>
-          {previewTitle(d)} <span className="mono muted">{p.source}</span>
-        </dd>
-        <dt>Server</dt>
-        <dd className="mono">{serverSummary(d, p.target)}</dd>
-        {targetArgs(p.target).some((x) => x.startsWith("--var=")) && (
-          <>
-            <dt>Variables</dt>
-            <dd className="mono">{Object.keys(p.target.vars).filter((k) => p.target.vars[k] !== "").join(", ")}</dd>
-          </>
-        )}
-        <dt>Authentication</dt>
-        <dd className={keyless || (p.auth.mode === "key" && !p.auth.savedProfile) ? "s5" : ""}>{authSummary(p.auth)}</dd>
-        <dt>Signing</dt>
-        <dd>{signingSummary(p.auth)}</dd>
-        <dt>Operations</dt>
-        <dd>{methodSummary(d.requests, p.selected)}</dd>
+        <PlanFacts {...p} />
         <dt>Depth</dt>
         <dd>
           {depth.title} ({depth.time})
@@ -1287,5 +1344,163 @@ function StartStep(p: {
         The scan sends real attack requests, as an attacker would. It can create test data or slow down a fragile API. Prefer a test environment, and only scan systems you have permission to test.
       </div>
     </div>
+  );
+}
+
+/** What the definition, server, authentication and operations steps chose: the review's first rows. */
+function PlanFacts(p: { preview: ApiPreview; source: string; target: ApiTarget; auth: AuthState; selected: number[] }) {
+  const d = p.preview;
+  return (
+    <>
+      <dt>Definition</dt>
+      <dd>
+        {previewTitle(d)} <span className="mono muted">{p.source}</span>
+      </dd>
+      <dt>Server</dt>
+      <dd className="mono">{serverSummary(d, p.target)}</dd>
+      {targetArgs(p.target).some((x) => x.startsWith("--var=")) && (
+        <>
+          <dt>Variables</dt>
+          <dd className="mono">{Object.keys(p.target.vars).filter((k) => p.target.vars[k] !== "").join(", ")}</dd>
+        </>
+      )}
+      <dt>Authentication</dt>
+      <dd>{authSummary(p.auth)}</dd>
+      <dt>Signing</dt>
+      <dd>{signingSummary(p.auth)}</dd>
+      <dt>Operations</dt>
+      <dd>{methodSummary(d.requests, p.selected)}</dd>
+    </>
+  );
+}
+
+/** Import API's last step: what goes out, once each. */
+function ImportStep(p: { preview: ApiPreview; source: string; target: ApiTarget; auth: AuthState; selected: number[]; problem: string }) {
+  const d = p.preview;
+  return (
+    <div className="wiz-body">
+      <label className="label">Ready to import</label>
+      <dl className="facts">
+        <PlanFacts {...p} />
+      </dl>
+      <p className="muted">
+        Each ticked operation is sent once, as written, and recorded in history with the source <span className="mono">import</span>. Nothing is attacked. The requests then show in the Site map and Proxy › Traffic, ready to send to Replay, the Fuzzer or a scan.
+      </p>
+      {p.problem && <div className="wiz-problem">{p.problem}</div>}
+      {sendsStateChanging(d.requests, p.selected) && (
+        <div className="wiz-warn danger">
+          <b>This sends operations that change or delete data ({listWords(includeMethods(d.requests, p.selected))}).</b> Each is sent once, as written. Real records can be overwritten or deleted, and that can't be undone.
+        </div>
+      )}
+      {sendsPost(d.requests, p.selected, d.format) && <ImportPostWarning />}
+    </div>
+  );
+}
+
+/**
+ * An import job's status, read every 1.5 s while `active` until it ends; null until read, and for
+ * no job. `onGone` runs when the job doesn't exist or isn't an import (a remembered id from another
+ * copy of the project).
+ */
+export function useImportJob(jobId: number | null, active: boolean, onGone: () => void): Job | null {
+  const [ended, setEnded] = useState<number | null>(null);
+  const gone = useRef(onGone);
+  gone.current = onGone;
+  const [job] = usePoll<Job | null>(
+    () =>
+      jobId == null
+        ? Promise.resolve(null)
+        : readImportJob(run<Job>(["job", "status", String(jobId)])).then((j) => {
+            if (j !== "gone") return j;
+            gone.current();
+            return null;
+          }),
+    1500,
+    jobId != null && active && ended !== jobId,
+  );
+  // A poll for an earlier job can land after a new one starts.
+  const current = job && job.id === jobId ? job : null;
+  const final = current != null && !isLive(current);
+  useEffect(() => {
+    if (final) setEnded(jobId);
+  }, [final, jobId]);
+  return current;
+}
+
+/** An import job: progress, then how many requests are in history and where to find them. The Site map polls it. */
+export function ImportProgress({ jobId, job, onClose, onHide }: { jobId: number; job: Job | null; onClose: () => void; onHide: () => void }) {
+  const app = useApp();
+  const done = job != null && !isLive(job);
+  const pr: { sent?: number; total?: number } = job?.progress ?? {};
+  const frac = pr.total ? (pr.sent ?? 0) / pr.total : null;
+  const result = done && job?.state !== "failed" ? importResultText(job?.result) : null;
+
+  return (
+    <section className="dash-card wizard">
+      <header>
+        <div>
+          <div className="wiz-kicker">Import API</div>
+          <h2>{!job ? "Starting…" : !done ? "Sending the API's operations…" : job.state === "completed" ? "Import finished" : `Import ${job.state}`}</h2>
+        </div>
+        {!done && (
+          <div className="wiz-row">
+            <button className="link" onClick={onHide}>
+              Hide
+            </button>
+            {job && (
+              <button className="btn" disabled={job.state === "stopping"} onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
+                {job.state === "stopping" ? "Stopping…" : "Stop"}
+              </button>
+            )}
+          </div>
+        )}
+        {done && (
+          <button className="link" onClick={onClose}>
+            Close
+          </button>
+        )}
+      </header>
+      {!done ? (
+        <div className="wiz-body">
+          <div
+            className="wiz-bar"
+            role="progressbar"
+            aria-label="Operations sent"
+            aria-valuemin={0}
+            aria-valuemax={pr.total || undefined}
+            aria-valuenow={frac == null ? undefined : (pr.sent ?? 0)}
+            aria-valuetext={importProgressText(pr)}
+          >
+            <span style={{ width: frac == null ? "100%" : `${Math.round(frac * 100)}%` }} className={frac == null ? "indeterminate" : ""} />
+          </div>
+          <p className="muted">{importProgressText(pr)}</p>
+          <p className="muted small">The import keeps running in the background. Hide this to watch the Site map fill up, or use other tools meanwhile.</p>
+        </div>
+      ) : job?.state === "failed" ? (
+        <div className="wiz-body">
+          <div className="error">{job.error}</div>
+        </div>
+      ) : (
+        <div className="wiz-body wiz-done">
+          <label className="label">{result!.headline}</label>
+          {result!.notes.map((n) => (
+            <div key={n} className="wiz-warn replay">
+              {n}
+            </div>
+          ))}
+          <div className="row gap wiz-next">
+            <button className="btn primary" onClick={onClose}>
+              Show in the Site map
+            </button>
+            <button className="btn" onClick={() => app.openTraffic("import")}>
+              Open Proxy › Traffic
+            </button>
+            <span className="muted small">
+              Their source is <span className="mono">import</span>. Right-click a request to send it to Replay.
+            </span>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }

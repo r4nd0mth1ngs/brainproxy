@@ -235,6 +235,14 @@ The sidebar groups the tools by what you are doing.
 - **Actions:** right-click a node or request to send it to Replay, crawl from there, run an
   active scan of that branch or request, or copy the URL. A request can also be copied as a
   curl command.
+- **Import API (sends each once)…:** puts an API's operations in history without scanning them, to
+  work on by hand. This isn't offline: every ticked operation is sent to the target once. It takes
+  the same steps as the *Guided API scan* (definition, server, authentication, operations; PUT,
+  PATCH, DELETE and GraphQL mutations stay off unless you opt in), then sends each ticked operation
+  once, as written, in scope only (`import api`). *Hide* shows the map while it runs; *Show* in the
+  toolbar brings the progress back. It ends with how many requests were recorded and links to the
+  Site map and **Proxy › Traffic**, which opens showing only the source `import`; right-click one to
+  send it to Replay. One import runs at a time. The guided API scan's first step links here too.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
   the proxy scope.
 
@@ -369,7 +377,9 @@ attack type, and pick payloads:
   OpenAPI 3 or Swagger 2.0 file (JSON or YAML), a Postman collection, or a GraphQL schema (SDL file
   or introspection result), by file or URL; or a GraphQL endpoint, which is asked for its schema
   when you tick *GraphQL endpoint*. A URL is fetched when you preview it, in scope only; nothing
-  else is sent until you ask.
+  else is sent until you ask. To only send each operation once and record it, without scanning,
+  use *Send each operation once and record it, without scanning* (the Site map's *Import API (sends
+  each once)…*).
   - **Definition:** shows what was read, which operations were skipped and why, and warnings
     such as an external `$ref` that isn't followed. A Postman collection can take its
     **environment file**, which fills its variables; values the environment marks secret, or whose

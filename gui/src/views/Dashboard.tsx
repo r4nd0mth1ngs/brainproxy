@@ -79,7 +79,7 @@ export function DashboardView({ active }: { active: boolean }) {
   return (
     <div className="dash">
       {showWizard &&
-        (apiWizard ? <ApiWizard {...hosted} onBack={() => setApiWizard(false)} /> : <ScanWizard {...hosted} onApi={() => setApiWizard(true)} />)}
+        (apiWizard ? <ApiWizard {...hosted} onBack={() => setApiWizard(false)} onImport={app.openApiImport} /> : <ScanWizard {...hosted} onApi={() => setApiWizard(true)} />)}
       <AppUpdateCard />
       <UpdatesCard />
       <section className="dash-card">

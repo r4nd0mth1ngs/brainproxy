@@ -1404,6 +1404,10 @@ select {
   cursor: pointer;
   font-size: 12px;
 }
+.link:disabled {
+  color: var(--muted);
+  cursor: default;
+}
 .engage-confirm {
   padding: 12px 14px;
   border-radius: 8px;
@@ -1623,6 +1627,12 @@ select {
 }
 .dot-risk.st-none {
   border: 1px solid var(--border-strong);
+}
+/* Import API, in place of the map while open. */
+.st-import {
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
 }
 .st-badge {
   font-size: 10px;
