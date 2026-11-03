@@ -1,6 +1,7 @@
 //! Output contract. In JSON mode every command prints exactly one envelope to stdout:
 //! `{"ok":true,"command":...,"data":...}` or `{"ok":false,"command":...,"error":{"kind","message"}}`.
-//! Text mode is for humans. Errors go to stderr there.
+//! A command can add `error.data`, what it did before failing, for callers to act on without
+//! reading the message (see [`Out::error_data`]). Text mode is for humans. Errors go to stderr there.
 //!
 //! An envelope that may carry target-controlled content (response bodies, headers, titles,
 //! OOB interactions, finding evidence, ...) also has `"_meta":{"provenance":{"untrusted_content":true}}`.
@@ -77,9 +78,19 @@ const LOCAL_ONLY: &[&str] = &[
 pub struct Out {
     pub format: Format,
     pub command: String,
+    error_data: std::sync::Mutex<Option<Value>>,
 }
 
 impl Out {
+    pub fn new(format: Format, command: String) -> Self {
+        Self { format, command, error_data: Default::default() }
+    }
+
+    /// Sets what the error envelope's `data` says, should the command fail: the last one set.
+    pub fn error_data(&self, data: Value) {
+        *self.error_data.lock().unwrap_or_else(|e| e.into_inner()) = Some(data);
+    }
+
     pub fn json(&self) -> bool {
         self.format == Format::Json
     }
@@ -113,8 +124,11 @@ impl Out {
 
     pub fn error(&self, kind: &str, message: &str) {
         if self.json() {
-            let env =
-                self.mark(json!({"ok": false, "command": self.command, "error": {"kind": kind, "message": message}}));
+            let mut error = json!({"kind": kind, "message": message});
+            if let Some(data) = self.error_data.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                error["data"] = data;
+            }
+            let env = self.mark(json!({"ok": false, "command": self.command, "error": error}));
             println!("{env}");
         } else {
             eprintln!("error ({kind}): {message}");

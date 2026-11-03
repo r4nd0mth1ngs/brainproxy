@@ -167,9 +167,11 @@ fn label(what: &str) -> &str {
 
 /// Why a saved listener can't be verified, and the way out.
 pub(crate) fn unverified_text(what: &str, pid: u32) -> String {
+    // A restart's hold is the proxy's record.
+    let command = if what == "proxy-restart" { "proxy" } else { what };
     format!(
         "can't verify the {} recorded as pid {pid} in another container or PID namespace: its lock file isn't \
-         readable here. If it is no longer running, `brainproxy {what} stop --forget` clears the record",
+         readable here. If it is no longer running, `brainproxy {command} stop --forget` clears the record",
         label(what)
     )
 }

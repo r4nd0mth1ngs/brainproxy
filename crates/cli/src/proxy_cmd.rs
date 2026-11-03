@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use brainproxy_core::authz::live::{Live, LiveOptions};
@@ -29,16 +30,30 @@ const RESTART_ENV: &str = "BRAINPROXY_PROXY_RESTART";
 /// Held by `proxy restart` for as long as it holds the record: what tells another container
 /// that the restart still runs, since its pid means nothing there (see `process`).
 const RESTART_LOCK: &str = "proxy-restart";
-/// How long `project stop` waits for a restart under way to finish before it stops the proxy:
-/// the old proxy's stop with a live authz run, then two starts at `--wait`'s default.
-pub(crate) const RESTART_WAIT: Duration = Duration::from_secs(60);
+/// Set on the proxy a restart starts to go back to the old one: that one never goes back itself
+/// (see [`go_back`]).
+const BACK_ENV: &str = "BRAINPROXY_PROXY_RESTART_BACK";
+/// `proxy stop` calls off a restart under way by writing its token here; the restart looks
+/// between its steps and while it waits for a proxy to come up (see [`call_off`]).
+const CANCEL_KEY: &str = "proxy.restart.cancel";
+/// How long `proxy stop` waits for a restart it called off to let go of the record. Its longest
+/// step is stopping the old proxy: with a live authz run, `STOP_WAIT_AUTHZ` and then a kill.
+const CANCEL_WAIT: Duration = Duration::from_secs(40);
 
 /// How long a proxy may take to exit when asked to. With a live authz run it also has to
 /// finish its tests and save the run.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 const STOP_WAIT_AUTHZ: Duration = Duration::from_secs(30);
-/// The longest `--wait` that `start` and `restart` take, in seconds.
+/// Set once this process, a `proxy run`, has recorded itself as the proxy: from then on a failure
+/// is its own, not a failure to come up that a restart's proxy goes back from (see [`go_back`]).
+static TOOK_RECORD: AtomicBool = AtomicBool::new(false);
+
+/// The longest `--wait` that `start` takes, in seconds.
 const MAX_WAIT: f64 = 3600.0;
+/// The longest `--wait` that `restart` takes, in seconds, for the new proxy and for going back
+/// to the old one each: while it waits, every other start is turned away. It is well below the
+/// MCP server's default timeout, which kills a call.
+const MAX_RESTART_WAIT: f64 = 60.0;
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -73,16 +88,21 @@ pub enum ProxyCmd {
     Start(ProxyRunArgs),
     /// Run the proxy in the foreground until SIGINT/SIGTERM.
     Run(ProxyRunArgs),
-    /// Stop the background proxy for this project.
+    /// Stop the background proxy for this project. A restart under way is called off: the proxy
+    /// it was replacing stays off, and it starts nothing.
     Stop {
         /// Only clear a record that can't be verified (its lock file isn't readable from this
         /// container). Nothing is signalled, and a proxy known to be running is left alone.
         #[arg(long)]
         forget: bool,
+        /// Only stop the proxy if it is this pid, in this container: not one started since, or a
+        /// restart under way. Fails with not_found otherwise.
+        #[arg(long, value_name = "PID", conflicts_with = "forget")]
+        pid: Option<u32>,
     },
     /// Move this project's running proxy to another address or options: stop it and start it again
-    /// in one step, so no other start gets in between. Takes start's options, defaults included;
-    /// if the new proxy doesn't come up, the old one is started again where it was.
+    /// in one step, so no other start gets in between. Takes start's options, defaults included
+    /// (--wait at most 60); if the new proxy doesn't come up, the old one is started again where it was.
     Restart(ProxyRunArgs),
     /// Show whether a proxy is running, with capture and intercept counts.
     Status,
@@ -99,7 +119,7 @@ pub struct ProxyRunArgs {
     /// Upstream connect/response timeout in seconds.
     #[arg(long, default_value_t = 30.0)]
     timeout: f64,
-    /// Seconds `start` waits for the proxy to come up (at most 3600).
+    /// Seconds `start` waits for the proxy to come up (at most 3600; `restart`: 60).
     #[arg(long, default_value_t = 10.0)]
     wait: f64,
     /// Log file for `start` (default: next to the project file).
@@ -449,10 +469,18 @@ fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
     Ok(store.meta_get(STATE_KEY)?.as_deref().and_then(parse_state))
 }
 
+/// The lock that vouches for the record `s` from another container. Between a restart's stop
+/// and its start nobody holds the proxy's lock, so a restart's hold goes by the restart's.
+fn lock_of(s: &Saved) -> &'static str {
+    if s.restart.is_some() {
+        RESTART_LOCK
+    } else {
+        LOCK_NAME
+    }
+}
+
 fn liveness(store: &Store, s: &Saved) -> Liveness {
-    // Between a restart's stop and its start nobody holds the proxy's lock.
-    let lock = if s.restart.is_some() { RESTART_LOCK } else { LOCK_NAME };
-    process::liveness(store, lock, s.state.pid, s.start_time, s.pid_ns.as_deref())
+    process::liveness(store, lock_of(s), s.state.pid, s.start_time, s.pid_ns.as_deref())
 }
 
 /// The saved state and what is known about it, clearing stale state left by a crash. A
@@ -494,31 +522,62 @@ pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
     Ok(current(store)?.filter(|s| !process::elsewhere(s.pid_ns.as_deref())).map(|s| s.state))
 }
 
-/// Stops this project's proxy if one runs: its pid, and whether it had to be killed. Refused
-/// while a restart holds the record.
-pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
-    match stop_or_held(store)? {
-        Stop::Done(stopped) => Ok(stopped),
-        Stop::Held(refusal) => Err(refusal),
+/// What [`stop`] did.
+pub(crate) struct Stopped {
+    /// The proxy that is off now: its pid, and whether the stop had to kill it. `None` if none ran.
+    pub(crate) proxy: Option<(u32, bool)>,
+    /// The pid of a `proxy restart` under way that the stop called off.
+    pub(crate) restart: Option<u32>,
+}
+
+/// Stops this project's proxy if one runs. A restart under way is called off first (see
+/// [`call_off`]): it doesn't start anything, and the proxy it had stopped stays off. With `only`,
+/// it stops the proxy only if that pid is the one running here, and calls off nothing. Fails if
+/// another proxy has taken the record by the time the proxy is gone.
+pub(crate) fn stop(store: &Store, only: Option<u32>) -> Result<Stopped, Error> {
+    match stop_once(store, only)? {
+        (stopped, None) => Ok(stopped),
+        (_, Some(since)) => Err(since),
     }
 }
 
-/// What [`stop_or_held`] did.
-pub(crate) enum Stop {
-    /// The proxy's pid and whether it had to be killed, or `None` if none ran.
-    Done(Option<(u32, bool)>),
-    /// A restart that still runs holds the record, so nothing was stopped: `stop`'s refusal.
-    Held(Error),
+/// [`stop`], and again for a proxy that has taken the record meanwhile: what `project stop` does.
+pub(crate) fn stop_every(store: &Store) -> Result<Stopped, Error> {
+    let (first, mut since) = stop_once(store, None)?;
+    for _ in 0..2 {
+        if since.is_none() {
+            break;
+        }
+        since = stop_once(store, None)?.1;
+    }
+    match since {
+        None => Ok(first),
+        Some(since) => Err(since),
+    }
 }
 
-/// [`stop`], telling a restart's hold from a failure as it reads the record.
-pub(crate) fn stop_or_held(store: &Store) -> Result<Stop, Error> {
+/// One [`stop`]: what it did, and the conflict it ends with if another proxy has the record now.
+fn stop_once(store: &Store, only: Option<u32>) -> Result<(Stopped, Option<Error>), Error> {
+    let hold = if only.is_none() { call_off(store, CANCEL_WAIT)? } else { None };
+    let mut stopped = Stopped { proxy: None, restart: hold.as_ref().map(|h| h.state.pid) };
     // Marked as being stopped before it is asked to exit (see `Saved::stopping`).
     let (saved, stopping) = loop {
-        let Some((saved, known)) = recorded(store)? else { return Ok(Stop::Done(None)) };
+        let Some((saved, known)) = recorded(store)? else {
+            // A restart called off had stopped its proxy already.
+            stopped.proxy =
+                hold.as_ref().and_then(|h| h.was.as_deref()).and_then(parse_state).map(|w| (w.state.pid, false));
+            return Ok((stopped, None));
+        };
+        if let Some(pid) = only {
+            if saved.state.pid != pid || saved.restart.is_some() || process::elsewhere(saved.pid_ns.as_deref()) {
+                return Err(Error::NotFound(format!(
+                    "pid {pid} isn't this project's proxy here (the record is now {}'s); nothing was stopped",
+                    process::pid_text(saved.state.pid, saved.pid_ns.as_deref())
+                )));
+            }
+        }
         if saved.restart.is_some() {
-            let refusal = already_running(&saved, known);
-            return if known == Liveness::Running { Ok(Stop::Held(refusal)) } else { Err(refusal) };
+            return Err(already_running(&saved, known));
         }
         if saved.stopping {
             let raw = saved.raw.clone();
@@ -541,31 +600,61 @@ pub(crate) fn stop_or_held(store: &Store) -> Result<Stop, Error> {
     store.meta_set(STOP_KEY, None)?;
     // The proxy clears its record as it exits. Anything there now is another proxy's.
     store.meta_swap(STATE_KEY, Some(&stopping), None)?;
-    if let Some((now, _)) = recorded(store)? {
-        return Err(Error::Conflict(format!(
+    stopped.proxy = Some((saved.state.pid, forced));
+    let since = recorded(store)?.map(|(now, _)| {
+        Error::Conflict(format!(
             "stopped the proxy ({}), but another one has started since, on {} ({}); `brainproxy proxy stop` stops \
              that one",
             process::pid_text(saved.state.pid, saved.pid_ns.as_deref()),
             now.state.listen,
             process::pid_text(now.state.pid, now.pid_ns.as_deref())
+        ))
+    });
+    Ok((stopped, since))
+}
+
+/// Calls off a `proxy restart` that holds the record, and waits up to `wait` for it to let go:
+/// its hold, or `None` if there is none. Refused if the hold can't be verified, or is still
+/// there after `wait`.
+fn call_off(store: &Store, wait: Duration) -> Result<Option<Saved>, Error> {
+    let Some((hold, known)) = recorded(store)?.filter(|(s, _)| s.restart.is_some()) else { return Ok(None) };
+    let Some(token) = hold.restart.as_deref().filter(|_| known == Liveness::Running) else {
+        return Err(already_running(&hold, known));
+    };
+    store.meta_set(CANCEL_KEY, Some(token))?;
+    let held = || -> Result<bool, Error> { Ok(recorded(store)?.is_some_and(|(s, _)| s.restart == hold.restart)) };
+    let deadline = Instant::now() + wait;
+    while held()? && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let still = held()?;
+    store.meta_swap(CANCEL_KEY, Some(token), None)?;
+    if still {
+        return Err(Error::Conflict(format!(
+            "the proxy is being restarted (`brainproxy proxy restart`, {}), and the restart hasn't given up {} s after \
+             being asked to; try again once it has finished",
+            process::pid_text(hold.state.pid, hold.pid_ns.as_deref()),
+            wait.as_secs()
         )));
     }
-    Ok(Stop::Done(Some((saved.state.pid, forced))))
+    Ok(Some(hold))
 }
 
-/// Whether a `proxy restart` that still runs holds the record.
-pub(crate) fn restarting(store: &Store) -> Result<bool, Error> {
-    Ok(recorded(store)?.is_some_and(|(s, known)| s.restart.is_some() && known == Liveness::Running))
-}
-
-/// [`stop`], after waiting up to `wait` for a restart under way to finish: then it stops the
-/// proxy that restart left running. Still refused if the restart takes longer.
-pub(crate) fn stop_after_restart(store: &Store, wait: Duration) -> Result<Option<(u32, bool)>, Error> {
-    let deadline = Instant::now() + wait;
-    while restarting(store)? && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
+/// Asks a `proxy restart` that holds the record to give up, without waiting for it: [`stop`]
+/// does that later. Whether there was one.
+pub(crate) fn ask_restart_to_give_up(store: &Store) -> Result<bool, Error> {
+    match recorded(store)? {
+        Some((s, Liveness::Running)) if s.restart.is_some() => {
+            store.meta_set(CANCEL_KEY, s.restart.as_deref())?;
+            Ok(true)
+        }
+        _ => Ok(false),
     }
-    stop(store)
+}
+
+/// Whether `proxy stop` has called off the restart whose token this is.
+fn called_off(store: &Store, token: &str) -> bool {
+    store.meta_get(CANCEL_KEY).ok().flatten().as_deref() == Some(token)
 }
 
 /// Asks the proxy recorded as `saved` to exit and waits until it has; whether it had to be
@@ -632,19 +721,28 @@ fn state_json(state: &ProxyState) -> Value {
 pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         ProxyCmd::Start(args) => start(project, home, args, out),
-        ProxyCmd::Run(args) => run_foreground(project, home, args, out),
+        ProxyCmd::Run(args) => {
+            let hold = restart_hold(project);
+            run_foreground(project, home, args, out).map_err(|e| match TOOK_RECORD.load(Ordering::SeqCst) {
+                true => e,
+                false => go_back(project, home, hold, e),
+            })
+        }
         ProxyCmd::Restart(args) => restart(project, home, args, out),
-        ProxyCmd::Stop { forget: true } => {
+        ProxyCmd::Stop { forget: true, .. } => {
             let store = Store::open(project)?;
             let pid = forget(&store)?.ok_or_else(|| Error::NotFound("no proxy recorded for this project".into()))?;
             out.ok(json!({"forgotten": pid}), || format!("cleared the record of the proxy (pid {pid})"));
             Ok(())
         }
-        ProxyCmd::Stop { forget: false } => {
+        ProxyCmd::Stop { forget: false, pid } => {
             let store = Store::open(project)?;
-            let (pid, forced) =
-                stop(&store)?.ok_or_else(|| Error::NotFound("no proxy running for this project".into()))?;
-            out.ok(json!({"stopped": pid, "forced": forced}), || format!("stopped proxy (pid {pid})"));
+            let Stopped { proxy, restart } = stop(&store, pid)?;
+            let (pid, forced) = proxy.ok_or_else(|| Error::NotFound("no proxy running for this project".into()))?;
+            out.ok(json!({"stopped": pid, "forced": forced, "restart_called_off": restart}), || match restart {
+                Some(r) => format!("stopped proxy (pid {pid}), calling off the restart under way (pid {r})"),
+                None => format!("stopped proxy (pid {pid})"),
+            });
             Ok(())
         }
         ProxyCmd::Status => {
@@ -652,7 +750,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             let (saved, known) = recorded(&store)?.unzip();
             let unverified = saved.as_ref().filter(|_| known == Some(Liveness::Unverified)).map(|s| {
                 json!({"pid": s.state.pid, "listen": s.state.listen,
-                    "reason": process::unverified_text(LOCK_NAME, s.state.pid),
+                    "reason": process::unverified_text(lock_of(s), s.state.pid),
                     "next": "brainproxy proxy stop --forget"})
             });
             let pid_ns = saved.as_ref().and_then(|s| s.pid_ns.clone());
@@ -710,7 +808,7 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if let Some((s, known)) = recorded(&store)? {
         return Err(already_running(&s, known));
     }
-    let state = Launch::prepare(project, home, &args, &store)?.spawn(&store, None)?;
+    let state = Launch::prepare(project, home, &args, &store, MAX_WAIT)?.spawn(&store, None)?;
     out.ok(state_json(&state), || {
         format!("proxy listening on http://{} (pid {}){}", state.listen, state.pid, live_text(state.authz_run))
     });
@@ -725,10 +823,11 @@ struct Launch {
 }
 
 impl Launch {
-    fn prepare(project: &Path, home: &Path, args: &ProxyRunArgs, store: &Store) -> Result<Self, Error> {
+    /// Checks `args`, with a `--wait` of at most `max_wait` seconds.
+    fn prepare(project: &Path, home: &Path, args: &ProxyRunArgs, store: &Store, max_wait: f64) -> Result<Self, Error> {
         // NaN fails this too.
-        if !(0.0..=MAX_WAIT).contains(&args.wait) {
-            return Err(Error::InvalidInput(format!("--wait must be from 0 to {MAX_WAIT} seconds")));
+        if !(0.0..=max_wait).contains(&args.wait) {
+            return Err(Error::InvalidInput(format!("--wait must be from 0 to {max_wait} seconds")));
         }
         load_ca(home)?; // Surface CA and scope problems here rather than in the log.
         store.guard()?;
@@ -742,7 +841,8 @@ impl Launch {
             .args(["--format", "json", "proxy", "run", "--listen", &args.listen])
             .args(["--timeout", &args.timeout.to_string()])
             .arg("--log")
-            .arg(&log);
+            .arg(&log)
+            .env_remove(BACK_ENV);
         if args.verify_tls {
             cmd.arg("--verify-tls");
         }
@@ -773,8 +873,15 @@ impl Launch {
         Ok(Self { cmd, log, wait: args.wait })
     }
 
+    /// A restart's way back to the proxy it replaced, which doesn't go back again (see [`go_back`]).
+    fn going_back(mut self) -> Self {
+        self.cmd.env(BACK_ENV, "1");
+        self
+    }
+
     /// Starts it and waits until it is listening. `restart` is the token of the restart holding
-    /// the record, which the new proxy then takes over.
+    /// the record, which the new proxy then takes over; if `proxy stop` calls that restart off
+    /// meanwhile, the new proxy is killed.
     fn spawn(mut self, store: &Store, restart: Option<&str>) -> Result<ProxyState, Error> {
         let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&self.log)?;
         let log_start = log_file.metadata()?.len() as usize;
@@ -800,6 +907,11 @@ impl Launch {
             if let Some(Saved { state, .. }) = read_state(store)?.filter(|s| s.state.pid == child.id()) {
                 return Ok(state);
             }
+            if restart.is_some_and(|token| called_off(store, token)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Conflict("called off by `brainproxy proxy stop`".into()));
+            }
             if Instant::now() > deadline {
                 let _ = child.kill();
                 return Err(Error::Timeout(Duration::from_secs_f64(self.wait)));
@@ -811,9 +923,11 @@ impl Launch {
 
 /// Stops the running proxy and starts it with `args`, holding the record in between so that no
 /// other start can take it (see `Saved::restart`). If the new proxy doesn't come up, the old one
-/// is started again on the address it had, with its options, and the error says where it is.
-/// With no proxy running nothing is started: that is `start`'s job.
+/// is started again on the address it had, with its options, and the error says where it is: in
+/// its message, and in its `data` (`stopped`, `failure`, `restarted`). With no proxy running
+/// nothing is started: that is `start`'s job. `proxy stop` can call it off (see [`call_off`]).
 fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
+    out.error_data(json!({"stopped": false}));
     let store = Store::open(project)?;
     let Some((old, known)) = recorded(&store)? else {
         return Err(Error::NotFound(
@@ -825,8 +939,8 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
         return Err(already_running(&old, known));
     }
     // Everything that can be checked is, before anything stops.
-    let back = ProxyRunArgs { listen: old.state.listen.clone(), ..previous_args(&old.state)? };
-    let launch = Launch::prepare(project, home, &args, &store)?;
+    let back = back_args(&old.state)?;
+    let launch = Launch::prepare(project, home, &args, &store, MAX_RESTART_WAIT)?;
 
     // Before the hold goes in, so that from the moment it is there the lock vouches for it.
     let lock = process::RunLock::acquire(&store, RESTART_LOCK)?;
@@ -860,25 +974,49 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
     // The proxy is off from here, so every way out says where it is now. A request left behind
     // names the old pid, and a new proxy clears it as it starts anyway.
     let _ = store.meta_set(STOP_KEY, None);
+    // Called off by `proxy stop`: nothing is started, and the record is let go of.
+    let given_up = || {
+        let _ = store.meta_swap(STATE_KEY, Some(&hold), None);
+        let _ = store.meta_swap(CANCEL_KEY, Some(&token), None);
+        let e = Error::Conflict(format!(
+            "the restart was called off by `brainproxy proxy stop` after it had stopped the proxy (pid {})",
+            old.state.pid
+        ));
+        out.error_data(json!({"stopped": true, "failure": e.to_string(), "restarted": null, "called_off": true}));
+        noted(e, "the proxy is off")
+    };
+    if called_off(&store, &token) {
+        return Err(given_up());
+    }
 
     let state = match launch.spawn(&store, Some(&token)) {
         Ok(state) => state,
+        Err(_) if called_off(&store, &token) => return Err(given_up()),
         Err(e) => {
-            let again = Launch::prepare(project, home, &back, &store).and_then(|l| l.spawn(&store, Some(&token)));
-            let note = match again {
-                Ok(s) => format!("the proxy was started again on {} (pid {})", s.listen, s.pid),
+            let again = Launch::prepare(project, home, &back, &store, MAX_RESTART_WAIT)
+                .and_then(|l| l.going_back().spawn(&store, Some(&token)));
+            let (note, restarted) = match again {
+                Ok(s) => (
+                    format!("the proxy was started again on {} (pid {})", s.listen, s.pid),
+                    json!({"pid": s.pid, "listen": s.listen}),
+                ),
+                Err(_) if called_off(&store, &token) => return Err(given_up()),
                 Err(e2) => {
                     // Not cleared, it goes when this process does.
                     let _ = store.meta_swap(STATE_KEY, Some(&hold), None);
-                    format!("the proxy couldn't be started again on {}: {e2}. {}", back.listen, where_now(&store))
+                    let note =
+                        format!("the proxy couldn't be started again on {}: {e2}. {}", back.listen, where_now(&store));
+                    (note, Value::Null)
                 }
             };
+            out.error_data(json!({"stopped": true, "failure": e.to_string(), "restarted": restarted}));
             return Err(noted(e, &note));
         }
     };
     drop(lock);
     let mut data = state_json(&state);
-    data["replaced"] = json!({"pid": old.state.pid, "listen": old.state.listen, "forced": forced});
+    data["replaced"] =
+        json!({"pid": old.state.pid, "listen": old.state.listen, "forced": forced, "args": old.state.args});
     out.ok(data, || {
         format!(
             "proxy listening on http://{} (pid {}){}, replacing the one on {} (pid {})",
@@ -890,6 +1028,56 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
         )
     });
     Ok(())
+}
+
+/// The options to start the proxy recorded as `state` again with, where it is: what a restart
+/// goes back to. Waiting for it no longer than a restart may.
+fn back_args(state: &ProxyState) -> Result<ProxyRunArgs, Error> {
+    let previous = previous_args(state)?;
+    Ok(ProxyRunArgs { listen: state.listen.clone(), wait: previous.wait.min(MAX_RESTART_WAIT), ..previous })
+}
+
+/// A proxy started by a restart (not its way back) that fails before it is up, once the restart
+/// has gone (killed by an MCP timeout or cancel, say): it starts the proxy the restart replaced
+/// again itself, as the restart would have. While the restart runs, going back is its job.
+/// `hold` is the restart's hold as this process found it at its start.
+fn go_back(project: &Path, home: &Path, hold: Option<Saved>, e: Error) -> Error {
+    let Some(hold) = hold else { return e };
+    let Ok(store) = Store::open(project) else { return e };
+    // Only if the record is still the restart's hold, or was let go of with nothing else in it.
+    let untouched = match read_state(&store) {
+        Ok(None) => true,
+        Ok(Some(now)) => now.raw == hold.raw,
+        Err(_) => false,
+    };
+    if !untouched
+        || liveness(&store, &hold) != Liveness::Gone
+        || called_off(&store, hold.restart.as_deref().unwrap_or_default())
+    {
+        return e;
+    }
+    let Some(back) = hold.was.as_deref().and_then(parse_state).and_then(|w| back_args(&w.state).ok()) else { return e };
+    let again = Launch::prepare(project, home, &back, &store, MAX_RESTART_WAIT)
+        .and_then(|l| l.going_back().spawn(&store, hold.restart.as_deref()));
+    let note = match again {
+        Ok(s) => format!(
+            "the restart that started it had gone, so the proxy was started again on {} (pid {})",
+            s.listen, s.pid
+        ),
+        Err(e2) => format!(
+            "the restart that started it had gone, and the proxy couldn't be started again on {}: {e2}",
+            back.listen
+        ),
+    };
+    noted(e, &note)
+}
+
+/// The restart's hold on the record if this process is the proxy it starts (not its way back),
+/// read before anything else touches the record: what [`go_back`] goes back to.
+fn restart_hold(project: &Path) -> Option<Saved> {
+    let token = std::env::var(RESTART_ENV).ok().filter(|_| std::env::var_os(BACK_ENV).is_none())?;
+    let store = Store::open(project).ok()?;
+    read_state(&store).ok().flatten().filter(|s| s.restart.as_deref() == Some(token.as_str()))
 }
 
 /// The options the proxy recorded as `state` was started with, to start it again alike.
@@ -947,7 +1135,7 @@ fn noted(e: Error, note: &str) -> Error {
 
 fn already_running(s: &Saved, known: Liveness) -> Error {
     if known == Liveness::Unverified {
-        return Error::Conflict(process::unverified_text(LOCK_NAME, s.state.pid));
+        return Error::Conflict(process::unverified_text(lock_of(s), s.state.pid));
     }
     let pid = process::pid_text(s.state.pid, s.pid_ns.as_deref());
     if s.restart.is_some() {
@@ -1133,6 +1321,7 @@ fn serve(
         };
         let raw = serde_json::to_string(&saved).unwrap_or_default();
         take_record(&store, &raw)?;
+        TOOK_RECORD.store(true, Ordering::SeqCst);
         let state = &saved.state;
         out.ok(state_json(state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));
 
@@ -1502,19 +1691,59 @@ mod tests {
         assert_eq!(store.meta_get(STATE_KEY).unwrap(), None);
     }
 
-    /// `project stop` learns of a restart's hold from the stop itself, so a restart that finishes
-    /// in between can't leave it with a stale refusal.
+    /// A stop calls off a restart that holds the record, and is refused if the restart doesn't let
+    /// go in time (here it never looks). Either way the call-off doesn't outlive the stop.
     #[test]
-    fn a_stop_tells_a_restart_hold_from_a_failure() {
+    fn a_stop_calls_off_a_restart_and_gives_up_on_one_that_holds_on() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(call_off(&store, Duration::ZERO).unwrap().is_none());
+        assert!(!ask_restart_to_give_up(&store).unwrap());
+        let hold = record(std::process::id(), Some("t"), Some(&record(GONE, None, None)));
+        put(&store, &hold);
+        assert!(ask_restart_to_give_up(&store).unwrap());
+        assert!(called_off(&store, "t") && !called_off(&store, "u"));
+        let Err(Error::Conflict(text)) = call_off(&store, Duration::from_millis(100)) else { panic!("let go") };
+        assert!(text.contains("being restarted") && text.contains("hasn't given up"), "{text}");
+        assert_eq!(store.meta_get(STATE_KEY).unwrap(), Some(hold.raw.clone()));
+        assert_eq!(store.meta_get(CANCEL_KEY).unwrap(), None);
+    }
+
+    /// `stop --pid` stops only that proxy, here: not another one, nor a restart's hold.
+    #[test]
+    fn a_stop_for_a_pid_leaves_any_other_proxy_alone() {
         let store = Store::open_in_memory().unwrap();
         let hold = record(std::process::id(), Some("t"), None);
-        put(&store, &hold);
-        assert!(matches!(stop_or_held(&store), Ok(Stop::Held(Error::Conflict(_)))));
-        let Err(Error::Conflict(text)) = stop(&store) else { panic!("stopped") };
-        assert!(text.contains("being restarted"), "{text}");
-        assert_eq!(store.meta_get(STATE_KEY).unwrap(), Some(hold.raw));
+        for now in [record(std::process::id(), None, None), hold] {
+            put(&store, &now);
+            let other = std::process::id() + 1;
+            let Err(Error::NotFound(text)) = stop(&store, Some(other)) else { panic!("stopped") };
+            assert!(text.starts_with(&format!("pid {other} isn't this project's proxy here")), "{text}");
+            assert_eq!(store.meta_get(STATE_KEY).unwrap(), Some(now.raw.clone()));
+            assert_eq!(store.meta_get(CANCEL_KEY).unwrap(), None);
+        }
+        let Err(Error::NotFound(_)) = stop(&store, Some(std::process::id())) else { panic!("a hold was stopped") };
         store.meta_set(STATE_KEY, None).unwrap();
-        assert!(matches!(stop_or_held(&store), Ok(Stop::Done(None))));
+        assert!(stop(&store, Some(1)).unwrap().proxy.is_none());
+    }
+
+    /// A restart's hold that can't be verified points at the proxy's own `stop --forget`.
+    #[test]
+    fn an_unverified_hold_is_named_as_a_restart() {
+        let Error::Conflict(text) = already_running(&record(7, Some("t"), None), Liveness::Unverified) else {
+            panic!()
+        };
+        assert!(text.starts_with("can't verify the proxy restart recorded as pid 7"), "{text}");
+        assert!(text.ends_with("`brainproxy proxy stop --forget` clears the record"), "{text}");
+        let Error::Conflict(text) = already_running(&record(7, None, None), Liveness::Unverified) else { panic!() };
+        assert!(text.starts_with("can't verify the proxy recorded as pid 7"), "{text}");
+    }
+
+    /// Going back waits no longer than a restart may, whatever the old proxy was started with.
+    #[test]
+    fn going_back_waits_no_longer_than_a_restart() {
+        let back = back_args(&state_with(&["proxy", "run", "--listen", "0.0.0.0:0", "--wait", "3600"])).unwrap();
+        assert_eq!((back.listen.as_str(), back.wait), ("127.0.0.1:8080", MAX_RESTART_WAIT));
+        assert_eq!(back_args(&state_with(&["proxy", "run", "--wait=5"])).unwrap().wait, 5.0);
     }
 
     #[test]

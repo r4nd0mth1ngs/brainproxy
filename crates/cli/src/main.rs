@@ -356,7 +356,7 @@ fn main() {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
                 e.exit();
             }
-            let out = Out { format: Format::sniff(&argv), command: argv.get(1).cloned().unwrap_or_default() };
+            let out = Out::new(Format::sniff(&argv), argv.get(1).cloned().unwrap_or_default());
             if out.json() {
                 out.error("usage", e.render().to_string().trim());
             } else {
@@ -365,7 +365,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let out = Out { format: cli.format.resolve(), command: command_name(&cli.command) };
+    let out = Out::new(cli.format.resolve(), command_name(&cli.command));
     if let Err(e) = run(cli, &out) {
         out.error(e.kind(), &e.to_string());
         std::process::exit(e.exit_code());
