@@ -1,30 +1,51 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import type { IncomingMessage } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
 // Dev-only bridge so the UI also runs in a plain browser (`npm run dev`): POST /api/cli runs
 // the brainproxy CLI the same way the Tauri `cli` command does. It answers only requests
-// to a localhost Host with the X-Brainproxy header, which blocks DNS rebinding and simple
-// cross-site posts. Never part of a build. POST /api/cli-cancel {call} stops a call started
-// with that `call` id (SIGTERM, then SIGKILL), as the Tauri `cli_cancel` command does.
+// to a localhost Host whose X-Brainproxy header is this run's random token, which blocks DNS
+// rebinding and cross-site posts, and anything else on this machine that can send HTTP: an
+// agent's `send` through MCP would otherwise run any command, with none of the MCP limits.
+// The token is printed with the URL to open (#bridge=<token>; the fragment never reaches
+// a server) and is in no page or file the dev server serves. Requests with brainproxy's
+// own User-Agent are refused too. Never part of a build. POST /api/cli-cancel {call} stops
+// a call started with that `call` id (SIGTERM, then SIGKILL), as the Tauri `cli_cancel`
+// command does.
 function cliBridge(): Plugin {
   const running = new Map<string, ChildProcess>();
   const cancelled = new Set<ChildProcess>();
+  const token = randomBytes(32).toString("hex");
   const allowed = (req: IncomingMessage) => {
     const host = String(req.headers.host ?? "").replace(/:\d+$/, "");
-    return req.method === "POST" && req.headers["x-brainproxy"] === "1" && ["localhost", "127.0.0.1"].includes(host);
+    const given = Buffer.from(String(req.headers["x-brainproxy"] ?? ""));
+    const tokenOk = given.length === token.length && timingSafeEqual(given, Buffer.from(token));
+    const fromBrainproxy = String(req.headers["user-agent"] ?? "").toLowerCase().startsWith("brainproxy/");
+    return req.method === "POST" && tokenOk && !fromBrainproxy && ["localhost", "127.0.0.1"].includes(host);
+  };
+  const refuse = (res: ServerResponse) => {
+    res.statusCode = 403;
+    res.setHeader("content-type", "application/json");
+    const message = "The dev bridge needs this run's token: open the URL `npm run dev` printed (it ends in #bridge=...).";
+    res.end(JSON.stringify({ ok: false, error: { kind: "gui", message } }));
   };
   const bin = process.env.BRAINPROXY_BIN ?? resolve(import.meta.dirname, `../target/debug/brainproxy${process.platform === "win32" ? ".exe" : ""}`);
   return {
     name: "brainproxy-cli-bridge",
     apply: "serve",
     configureServer(server) {
+      const printUrls = server.printUrls;
+      server.printUrls = () => {
+        printUrls.call(server);
+        const local = server.resolvedUrls?.local[0] ?? "http://127.0.0.1:5173/";
+        server.config.logger.info(`  brainproxy dev bridge: open ${local}#bridge=${token}`);
+      };
       server.middlewares.use("/api/cli-cancel", (req, res) => {
         if (!allowed(req)) {
-          res.statusCode = 403;
-          res.end();
+          refuse(res);
           return;
         }
         let body = "";
@@ -45,8 +66,7 @@ function cliBridge(): Plugin {
       });
       server.middlewares.use("/api/cli", (req, res) => {
         if (!allowed(req)) {
-          res.statusCode = 403;
-          res.end();
+          refuse(res);
           return;
         }
         let body = "";

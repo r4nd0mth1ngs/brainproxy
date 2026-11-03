@@ -113,6 +113,10 @@ requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DEL
 mutation in a template isn't sent unless `include_methods` names it, and every request a
 check sends is recorded with origin `mcp`. The same holds outside MCP.
 
+The GUI's development server (`npm run dev`) runs CLI commands for the UI without these
+limits, so it only answers requests carrying a token it makes up each time it starts and
+prints in its terminal; `send` can't learn it (see GUI.md).
+
 Everything a tool call records is marked as an agent's: history entries and findings get
 origin `mcp`, and so does a finding state change (`findings_mark` sets `state_origin`). A
 proxy, job or fuzz run started by a tool call records `mcp` too. `BRAINPROXY_MCP_CALL` wins
