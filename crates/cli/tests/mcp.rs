@@ -269,6 +269,14 @@ fn annotations_resources_and_progress() {
     assert_eq!(hints("send")["openWorldHint"], true);
     assert_eq!(hints("engagement_start")["destructiveHint"], true);
     assert_eq!(hints("rules_add")["destructiveHint"], false);
+    // A restart stops the running proxy, like `proxy stop`.
+    for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+        assert_eq!(hints("proxy_restart")[hint], hints("proxy_stop")[hint], "{hint}");
+    }
+    assert_eq!(
+        (&hints("proxy_restart")["readOnlyHint"], &hints("proxy_restart")["destructiveHint"]),
+        (&false.into(), &true.into())
+    );
     assert!(tools.iter().all(|t| t["annotations"]["readOnlyHint"].is_boolean()));
 
     // Resources: schema and capabilities, read through the same CLI output.

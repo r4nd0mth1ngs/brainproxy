@@ -400,3 +400,70 @@ test("moveProxy: a proxy the app didn't start doesn't become the app's", async (
   await moveProxy(cli, ctl, { listen: "127.0.0.1:8080", pid: 7 }, 9090);
   assert.equal(ctl.owned, null);
 });
+
+test("restartFailure: other hosts, other errors, and a proxy someone else started", () => {
+  const ipv6 = "conflict: cannot listen on [::1]:9090: the port is already in use";
+  assert.deepEqual(restartFailure(`${ipv6}; the proxy was started again on [::1]:8080 (pid 12)`), { message: ipv6, stopped: true, pid: 12 });
+  const timeout = "conflict: timed out after 10s";
+  assert.deepEqual(restartFailure(`${timeout}; the proxy was started again on 127.0.0.1:8080 (pid 9)`), { message: timeout, stopped: true, pid: 9 });
+  // Not going back, a pid in the reason or in where it is now isn't the app's.
+  const taken = `${BIND_FAILURE}; the proxy couldn't be started again on 127.0.0.1:8080: conflict: proxy already running on 127.0.0.1:7000 (pid 12). A proxy is running on 127.0.0.1:7000 (pid 12) now`;
+  assert.deepEqual(restartFailure(taken), { message: BIND_FAILURE, stopped: true, pid: null });
+  // Only the CLI's own ending counts.
+  for (const message of [
+    "conflict: the proxy was stopped or replaced while restarting it; see `brainproxy proxy status`",
+    "conflict: can't restart the proxy: the options it runs with (scan active) can't be read",
+    `${BIND_FAILURE}; the proxy was started again on 127.0.0.1:8080 (pid 9) or so`,
+  ]) {
+    assert.deepEqual(restartFailure(message), { message, stopped: false, pid: null });
+  }
+});
+
+test("moveProxy: a failed restart of a proxy the app didn't start leaves the app owning nothing new", async () => {
+  for (const pid of [9, null]) {
+    const ctl = proxyControl();
+    ctl.owned = 3; // An earlier proxy of the app's, not the one moved.
+    const { cli } = fakeCli((args) => {
+      if (args[1] === "restart") throw new Error(restartFailed(pid));
+      return runningAs(9);
+    });
+    await assert.rejects(moveProxy(cli, ctl, { listen: "127.0.0.1:8080", pid: 7 }, 9090));
+    assert.equal(ctl.owned, 3);
+    assert.equal(ctl.moving, null);
+  }
+});
+
+test("moveProxy: a restart the CLI refused keeps its message and asks nothing more", async () => {
+  const message = "conflict: can't restart the proxy: the options it runs with (x) can't be read";
+  const { calls, cli } = fakeCli(() => {
+    throw new Error(message);
+  });
+  const ctl = proxyControl();
+  await assert.rejects(moveProxy(cli, ctl, movable, 9090), { message });
+  assert.equal(calls.length, 1);
+  assert.equal(ctl.moving, null);
+});
+
+test("closing during a move that went back stops the app's proxy at the pid it went back to", async () => {
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { calls, cli } = proxyCli(() => runningAs(9), [9], (args) => args[1] === "restart");
+  const moved = moveProxy(cli, ctl, { ...movable, pid: 7 }, 9090);
+  await stopOwned(cli, ctl);
+  await assert.rejects(moved, { message: `${HINTED} The proxy is back on 127.0.0.1:8080.` });
+  assert.deepEqual(calls.slice(-2), [
+    ["proxy", "status"],
+    ["proxy", "stop"],
+  ]);
+  assert.equal(ctl.owned, null);
+});
+
+test("during a move that went back, a start waits and starts nothing", async () => {
+  stubStorage();
+  const { calls, cli } = proxyCli(() => runningAs(9), [9], (args) => args[1] === "restart");
+  const ctl = proxyControl();
+  const moved = moveProxy(cli, ctl, movable, 9090);
+  assert.equal(await startProxy(cli, ctl), false);
+  await assert.rejects(moved);
+  assert.ok(!calls.some(isStart), JSON.stringify(calls));
+});
