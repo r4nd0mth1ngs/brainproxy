@@ -282,7 +282,7 @@ Edit a raw request and send it as often as you like, in separate tabs.
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
-  reply matches **Until**. Each run is recorded like proxied traffic.
+  reply matches **Until**. Each run is recorded like proxied traffic, as it happens.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -944,6 +944,35 @@ and targets that want a JWT you choose the claims of:
   `--session-token-env` (and by `auth add`'s `--header-env`, `--query-key`, `--password-env` and
   `--oauth-*-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
   browser.
+
+### What is recorded when a request doesn't finish
+
+Every request brainproxy puts on the wire leaves a history row, whatever happens next.
+
+- `send`, `send --race` and `ws send` write each request's row just before it goes out, with
+  the error `sent; no response recorded (cancelled or interrupted)`, and complete it with the
+  response or the failure. A command that is killed or crashes keeps that row. Ctrl-C or
+  SIGTERM while it waits records `cancelled by user after the request was sent` instead,
+  and the command fails. The app cancels a command with SIGTERM, and kills it 3 seconds
+  later if it is still running; on Windows, which has no SIGTERM, it kills it at once. A request sent again after a lost session was
+  renewed gets a second row; the first keeps its response.
+- `ws send` records the connection and each message as they happen, not at the end. Killed
+  while listening, the connection stays `open` with every message up to then; stopped with
+  Ctrl-C or SIGTERM, it is closed with that error.
+- An HTTP/2 race (`send --race N --http2`) that fails after connecting records each copy
+  with the error, as the HTTP/1.1 race does. Every item in the output, failed or not, has its
+  history `id`.
+- `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
+  for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
+  before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent.
+- `--no-store` (`send`, `send --race`, `ws send`) keeps no content, but still writes a row:
+  the time, source, target, and request line (method and URL, so `url`, `path` and `query`
+  are filled). The request is stored as that line alone; headers, bodies, and the response
+  are left out, `status` is empty (so passive checks skip it), and `error` starts with
+  `not stored (--no-store): content omitted`, then says how it ended (`; response status
+  200`, or the failure). Find them with `SELECT * FROM history WHERE error LIKE 'not
+  stored%'`. `ws send --no-store` records the handshake that way and nothing of the
+  connection or its messages.
 
 ### Comparing findings and failing a build (`findings compare`)
 

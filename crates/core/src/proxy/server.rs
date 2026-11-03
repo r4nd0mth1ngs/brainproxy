@@ -48,6 +48,11 @@ const SETTINGS_REFRESH: Duration = Duration::from_millis(300);
 const RECORD_BUDGET: usize = 64 * 1024 * 1024;
 /// What a queued record counts for besides its bodies, so small ones are bounded too.
 const RECORD_OVERHEAD: usize = 1024;
+/// How long stopping waits for requests already sent upstream to be answered. `proxy stop`
+/// waits 5 seconds for the process to exit.
+const DRAIN: Duration = Duration::from_secs(3);
+/// The error of a request still unanswered when the proxy stopped.
+const STOPPED: &str = "proxy stopped before the response arrived";
 
 pub struct ProxyOptions {
     pub project: PathBuf,
@@ -107,6 +112,86 @@ struct Ctx {
     h2_origins: Mutex<HashMap<String, bool>>,
     invisible: bool,
     redirect: Option<Target>,
+    in_flight: InFlight,
+}
+
+/// Requests forwarded upstream whose exchange isn't recorded yet. Stopping waits for them
+/// for a while, then records the ones left as failures; meanwhile no new request goes out.
+#[derive(Default)]
+struct InFlight(Mutex<FlightState>);
+
+#[derive(Default)]
+struct FlightState {
+    next: u64,
+    stopping: bool,
+    /// The row to record if it is still unanswered at the end (none if it isn't recorded),
+    /// and whether its exchange is being recorded (claimed). The row is made on the
+    /// connection's task, as every proxy capture is, so it has what that task knows.
+    open: HashMap<u64, (Option<Capture>, bool)>,
+}
+
+/// One request in [`InFlight`], until dropped.
+struct Flight<'a> {
+    set: &'a InFlight,
+    id: u64,
+}
+
+impl InFlight {
+    /// Registers a request about to go upstream; `None` once the proxy is stopping, when
+    /// nothing more may be sent.
+    fn start(&self, target: &Target, request: &[u8], record: bool) -> Option<Flight<'_>> {
+        let unanswered = record.then(|| unanswered(target, request));
+        let mut s = self.0.lock().unwrap();
+        if s.stopping {
+            return None;
+        }
+        s.next += 1;
+        let id = s.next;
+        s.open.insert(id, (unanswered, false));
+        Some(Flight { set: self, id })
+    }
+
+    fn stop(&self) {
+        self.0.lock().unwrap().stopping = true;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().open.is_empty()
+    }
+
+    /// Removes the requests nobody is recording yet: their exchanges won't be recorded by
+    /// whoever sent them. Returns their rows, as unanswered.
+    fn take_unclaimed(&self) -> Vec<Capture> {
+        let mut s = self.0.lock().unwrap();
+        let ids: Vec<u64> = s.open.iter().filter(|(_, v)| !v.1).map(|(k, _)| *k).collect();
+        ids.into_iter().filter_map(|id| s.open.remove(&id)).filter_map(|v| v.0).collect()
+    }
+}
+
+/// The row of a request still unanswered when the proxy stopped.
+fn unanswered(target: &Target, request: &[u8]) -> Capture {
+    Capture::new("proxy", target, request, None, None, Some(STOPPED))
+}
+
+impl Flight<'_> {
+    /// The request was sent again (a renewed session).
+    fn resent(&self, target: &Target, request: &[u8]) {
+        let row = unanswered(target, request);
+        if let Some(v) = self.set.0.lock().unwrap().open.get_mut(&self.id).filter(|v| v.0.is_some()) {
+            v.0 = Some(row);
+        }
+    }
+
+    /// Claims the exchange for recording. False if stopping already recorded it as unanswered.
+    fn claim(&self) -> bool {
+        self.set.0.lock().unwrap().open.get_mut(&self.id).map(|v| v.1 = true).is_some()
+    }
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.set.0.lock().unwrap().open.remove(&self.id);
+    }
 }
 
 /// What the recorder thread writes, in order.
@@ -235,6 +320,7 @@ pub async fn run(
         h2_origins: Mutex::default(),
         invisible: opts.invisible || opts.redirect.is_some(),
         redirect: opts.redirect,
+        in_flight: InFlight::default(),
     });
     reload(&ctx).await;
 
@@ -269,6 +355,21 @@ pub async fn run(
         }
     }
     refresher.abort();
+    // Requests already sent upstream get a moment to be answered and recorded; the ones
+    // still waiting then are recorded as unanswered.
+    ctx.in_flight.stop();
+    let deadline = Instant::now() + DRAIN;
+    while !ctx.in_flight.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for capture in ctx.in_flight.take_unclaimed() {
+        send_capture(&ctx, capture, None).await;
+    }
+    // Ones being recorded right now are only waiting for room in the queue.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !ctx.in_flight.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // Dropping the last sender ends the writer thread once queued captures are written.
     drop(std::mem::replace(&mut *ctx.recorder.tx.lock().unwrap(), mpsc::channel().0));
     drop(ctx);
@@ -730,6 +831,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // A rule or an edit may have changed the method (GET to HEAD): the response is framed
     // by the one sent.
     let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or(method);
+    let Some(flight) = ctx.in_flight.start(target, &request, record) else {
+        return Ok(Reply::Error(error_response(503, "stopping", "the proxy is stopping"), true));
+    };
     let started = Instant::now();
     let mut upstream = forward(ctx, target, &request, &method, h2).await;
     if let (Some(a), Some(p), Ok(up)) = (auth, &prepared, &upstream) {
@@ -737,6 +841,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         // replay the request with the new session.
         if a.after_response(p, &up.response).await {
             request = a.prepare(Tool::Proxy, target, &request, &[], &[]).await.request;
+            flight.resent(target, &request);
             upstream = forward(ctx, target, &request, &method, h2).await;
             if let Ok(up) = &upstream {
                 a.observe(&up.response);
@@ -747,7 +852,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         Ok(v) => v,
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
-            if record {
+            if record && flight.claim() {
                 send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())), None)
                     .await;
             }
@@ -757,7 +862,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     };
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
-    let capture = record.then(|| Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
+    // Not recorded again if stopping has already recorded it as unanswered.
+    let capture =
+        (record && flight.claim()).then(|| Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
     if status == Some(101) {
         let upgrade = Upgrade { response, conn, capture, in_scope, host: target.host.clone(), path, url };
         return Ok(Reply::Upgrade(Box::new(upgrade)));
@@ -1104,6 +1211,7 @@ pub(crate) fn error_response(status: u16, kind: &str, message: &str) -> Vec<u8> 
     let reason = match status {
         400 => "Bad Request",
         403 => "Forbidden",
+        503 => "Service Unavailable",
         _ => "Bad Gateway",
     };
     let body = format!("brainproxy: {message}\n");

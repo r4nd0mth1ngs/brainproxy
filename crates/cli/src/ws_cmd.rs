@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use brainproxy_core::capture::Capture;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::store::Store;
 use brainproxy_core::ws::db::{ConnectionFilter, MessageFilter, WsEvent};
@@ -70,7 +69,8 @@ pub enum WsCmd {
         -H and --remove-header change the handshake. Messages go out in order: --resend ones first, then \
         --message ones, then --input-json ones. Replies are collected until --until matches, --max-messages arrive, the server closes, \
         or --wait seconds pass after the last message; the connection is then closed. Everything is recorded \
-        (history source ws, connection source replay) unless --no-store.")]
+        as it happens (history source ws, connection source replay); with --no-store only the handshake's \
+        request line is.")]
     Send(Box<SendArgs>),
 }
 
@@ -146,7 +146,8 @@ pub struct SendArgs {
     /// Apply this auth profile's session to the handshake (cookies/headers; re-login if logged out).
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
-    /// Don't record the connection.
+    /// Keep no content: history gets the handshake's request line only (method, URL, time),
+    /// and the connection and its messages aren't recorded.
     #[arg(long)]
     no_store: bool,
     /// Maximum payload bytes per message in the output.
@@ -384,42 +385,64 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         write_timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
     };
 
-    let (sent, opened) = rt.block_on(async {
-        let mut sent = match &session {
-            Some(s) => RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)),
-            None => handshake.clone(),
-        };
-        let generation = session.as_ref().map(|s| s.generation()).unwrap_or(0);
-        let mut opened = client::open(&client, &target, &sent).await;
-        if let (Some(s), Ok(Err((response, _)))) = (&session, &opened) {
-            s.observe(response);
-            // Session lost: log in again and retry with the new session.
-            if s.is_logged_out(response) && s.relogin(generation).await {
-                sent = client::handshake(RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)));
-                opened = client::open(&client, &target, &sent).await;
+    // The handshake is on record before it goes out (its row and the bytes sent), and so is
+    // a retry with a renewed session.
+    let mut log = crate::sent::SentLog::new(store, "ws", args.no_store);
+    let mut pending: Option<(i64, RawRequest)> = None;
+    let opened = {
+        let (log, pending) = (&mut log, &mut pending);
+        let handshaking = async {
+            let sent = match &session {
+                Some(s) => RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)),
+                None => handshake.clone(),
+            };
+            *pending = Some((log.pending(&target, sent.as_bytes())?, sent.clone()));
+            let generation = session.as_ref().map(|s| s.generation()).unwrap_or(0);
+            let opened = client::open(&client, &target, &sent).await;
+            if let (Some(s), Ok(Err((response, ms)))) = (&session, &opened) {
+                s.observe(response);
+                // Session lost: log in again and retry with the new session.
+                if s.is_logged_out(response) && s.relogin(generation).await {
+                    log.complete(pending_id(pending), &target, sent.as_bytes(), Some(response), Some(*ms), None)?;
+                    let sent =
+                        client::handshake(RawRequest::from_bytes(s.apply_to(handshake.as_bytes(), &[], &target)));
+                    *pending = Some((log.pending(&target, sent.as_bytes())?, sent.clone()));
+                    return client::open(&client, &target, &sent).await;
+                }
             }
-        }
-        (sent, opened)
-    });
+            opened
+        };
+        rt.block_on(async {
+            tokio::select! {
+                r = handshaking => Some(r),
+                _ = crate::process::interrupted() => None,
+            }
+        })
+    };
     if let Some(s) = &session {
         s.save()?;
     }
-    let mut store = if args.no_store { None } else { Some(store) };
+    let Some((history_id, sent)) = pending else {
+        // Stopped or failed before the handshake went out.
+        return Err(opened.map_or_else(|| crate::sent::cancelled(&[]), |r| r.err().unwrap_or_else(not_recorded)));
+    };
     let opened = match opened {
-        Ok(o) => o,
-        Err(e) => {
-            if let Some(s) = &store {
-                s.record_failure("ws", &target, sent.as_bytes(), &e.to_string())?;
-            }
+        Some(Ok(o)) => o,
+        Some(Err(e)) => {
+            log.failed(history_id, &target, sent.as_bytes(), &e.to_string())?;
             return Err(e);
+        }
+        None => {
+            log.failed(history_id, &target, sent.as_bytes(), crate::sent::CANCELLED)?;
+            return Err(crate::sent::cancelled(&[history_id]));
         }
     };
     let opened = match opened {
         Ok(o) => o,
         Err((response, ms)) => {
-            let capture = Capture::new("ws", &target, sent.as_bytes(), Some(&response), Some(ms as i64), None);
-            let id = store.as_ref().map(|s| s.record(&capture)).transpose()?;
-            let mut data = crate::exchange_json(id, &target, sent.as_bytes(), &response, Some(ms), args.max_body);
+            log.complete(history_id, &target, sent.as_bytes(), Some(&response), Some(ms), None)?;
+            let mut data =
+                crate::exchange_json(Some(history_id), &target, sent.as_bytes(), &response, Some(ms), args.max_body);
             data["upgraded"] = json!(false);
             data["hint"] = json!("The server did not switch protocols (no 101 with Upgrade: websocket); see response.");
             out.ok(data, || format!("not upgraded\n\n{}", String::from_utf8_lossy(&response)));
@@ -427,43 +450,62 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         }
     };
     let (response, duration_ms, accept_ok) = (opened.response.clone(), opened.duration_ms, opened.accept_ok);
-    let outcome = rt.block_on(client::talk(opened, &messages, &opts));
+    let capture = log.complete(history_id, &target, sent.as_bytes(), Some(&response), Some(duration_ms), None)?;
     let url =
         ws::ws_url(&format!("{}{}", target.origin(), sent.head().map(|h| h.target).unwrap_or_else(|_| "/".into())));
 
-    let (mut connection_id, mut history_id, mut ids) = (None, None, Vec::new());
-    if let Some(s) = store.as_mut() {
-        let capture = Capture::new("ws", &target, sent.as_bytes(), Some(&response), Some(duration_ms as i64), None);
-        let mut events = vec![WsEvent::Open {
-            key: 0,
-            capture: Box::new(capture),
-            source: "replay",
-            url: url.clone(),
-            time: ws::now_iso(),
-        }];
-        events.extend(outcome.events.iter().map(|e| WsEvent::Message {
-            key: 0,
-            direction: e.direction,
-            message: e.message.clone(),
-            intercept: None,
-        }));
-        events.push(WsEvent::Close {
-            key: 0,
-            time: ws::now_iso(),
-            code: outcome.close_code,
-            reason: outcome.close_reason.clone(),
-            error: outcome.error.clone(),
-        });
-        let mut keys = HashMap::new();
-        s.ws_record(&events[..1], &mut keys)?;
-        let conn = keys[&0];
-        s.ws_record(&events[1..], &mut keys)?;
-        let c = s.ws_connection(conn)?;
-        let filter = MessageFilter { limit: outcome.events.len() as u32, ..Default::default() };
-        ids = s.ws_messages(conn, &filter)?.into_iter().map(|m| m.id).collect();
-        connection_id = Some(conn);
-        history_id = c.history_id;
+    // The connection and each message are recorded as they happen (not with --no-store,
+    // which keeps only the handshake's request line).
+    let mut keys = HashMap::new();
+    let connection_id = if log.no_store() {
+        None
+    } else {
+        let id = log.store.ws_open_recorded(history_id, &capture, "replay", &url, &ws::now_iso())?;
+        keys.insert(0, id);
+        Some(id)
+    };
+    let mut record_error = None;
+    let outcome = {
+        let (store, keys, record_error) = (&mut log.store, &mut keys, &mut record_error);
+        let watch = |e: &client::Event| {
+            if connection_id.is_none() || record_error.is_some() {
+                return;
+            }
+            let event =
+                WsEvent::Message { key: 0, direction: e.direction, message: e.message.clone(), intercept: None };
+            if let Err(err) = store.ws_record(&[event], keys) {
+                *record_error = Some(err);
+            }
+        };
+        rt.block_on(async {
+            tokio::select! {
+                o = client::talk_watched(opened, &messages, &opts, watch) => Some(o),
+                _ = crate::process::interrupted() => None,
+            }
+        })
+    };
+    let close = |outcome: Option<&client::Outcome>| WsEvent::Close {
+        key: 0,
+        time: ws::now_iso(),
+        code: outcome.and_then(|o| o.close_code),
+        reason: outcome.and_then(|o| o.close_reason.clone()),
+        error: outcome.map_or(Some(crate::sent::CANCELLED.to_string()), |o| o.error.clone()),
+    };
+    if connection_id.is_some() {
+        log.store.ws_record(&[close(outcome.as_ref())], &mut keys)?;
     }
+    if let Some(e) = record_error {
+        return Err(e);
+    }
+    let Some(outcome) = outcome else { return Err(crate::sent::cancelled(&[history_id])) };
+    let ids: Vec<i64> = match connection_id {
+        Some(conn) => {
+            let filter = MessageFilter { limit: outcome.events.len() as u32, ..Default::default() };
+            log.store.ws_messages(conn, &filter)?.into_iter().map(|m| m.id).collect()
+        }
+        None => Vec::new(),
+    };
+    let history_id = Some(history_id);
 
     let received = outcome.events.iter().filter(|e| e.direction == Direction::ToClient && e.message.is_data()).count();
     let items: Vec<Value> = outcome
@@ -502,6 +544,15 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         lines.join("\n")
     });
     Ok(())
+}
+
+/// The history row of the request about to go out.
+fn pending_id(pending: &Option<(i64, RawRequest)>) -> i64 {
+    pending.as_ref().map_or(0, |p| p.0)
+}
+
+fn not_recorded() -> Error {
+    Error::Protocol("the handshake was sent without a record".into())
 }
 
 fn message_json(id: Option<i64>, direction: Direction, m: &Message, elapsed_ms: u64, max_body: usize) -> Value {

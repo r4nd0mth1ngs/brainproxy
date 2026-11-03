@@ -991,3 +991,47 @@ fn proxy_start_on_a_chosen_port() {
     assert_eq!(status["proxy"]["listen"].as_str(), Some(listen.as_str()), "{status}");
     assert_eq!(status["proxy"]["usage"]["proxy_url"].as_str(), Some(format!("http://{listen}").as_str()), "{status}");
 }
+
+#[test]
+fn stopping_the_proxy_records_requests_still_waiting() {
+    use std::io::{Read, Write};
+    let env = Env::new("drain");
+    // Upstream: /slow is answered after a second, /never not at all.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (got, arrived) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = stream.unwrap();
+            let got = got.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let slow = String::from_utf8_lossy(&buf[..n]).starts_with("GET /slow");
+                let _ = got.send(());
+                if slow {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate");
+                }
+                std::thread::sleep(Duration::from_secs(60));
+            });
+        }
+    });
+    let proxy = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["listen"].as_str().unwrap().to_string();
+    let mut clients = Vec::new();
+    for path in ["/slow", "/never"] {
+        let mut c = std::net::TcpStream::connect(&proxy).unwrap();
+        write!(c, "GET http://127.0.0.1:{port}{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
+        clients.push(c);
+    }
+    for _ in 0..2 {
+        arrived.recv_timeout(Duration::from_secs(20)).expect("the proxy didn't forward the request");
+    }
+    let stopped = env.ok(&["proxy", "stop"]);
+    assert_eq!(stopped["forced"], false, "{stopped}");
+    let rows = env.ok(&["query", "SELECT path, status, error FROM history ORDER BY path"])["rows"].clone();
+    assert_eq!(
+        rows,
+        serde_json::json!([["/never", null, "proxy stopped before the response arrived"], ["/slow", 200, null]])
+    );
+}

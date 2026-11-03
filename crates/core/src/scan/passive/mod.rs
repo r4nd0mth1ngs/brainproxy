@@ -137,6 +137,22 @@ pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
     Ok(stats)
 }
 
+/// Scans history row `id` if [`scan_pending`] has already moved past it: a request recorded
+/// before it went out had no response then, so it was skipped. Call it before
+/// `scan_pending` once the row is complete; returns the new findings.
+pub fn scan_late(store: &mut Store, id: i64) -> Result<usize> {
+    let last: i64 = store.meta_get(WATERMARK_KEY)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    if id > last {
+        return Ok(0);
+    }
+    let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
+    let mut new = 0;
+    for msg in store.scan_messages_after(id - 1, &settings.sources, 1)?.iter().filter(|m| m.history_id == id) {
+        new += store.record_findings("passive", msg, &scan_message(msg, &settings))?;
+    }
+    Ok(new)
+}
+
 /// Clears passive findings and rescans all history from the start.
 pub fn rescan(store: &mut Store) -> Result<ScanStats> {
     store.findings_reset("passive")?;

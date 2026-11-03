@@ -234,10 +234,25 @@ impl Client {
             .map(std::borrow::Cow::Owned)
     }
 
+    /// Whether [`Client::send`] sends `req` over HTTP/2.
+    fn sends_h2(&self, req: &RawRequest) -> bool {
+        self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"))
+    }
+
+    /// The request as [`Client::send`] records it (its `Exchange::request`): the bytes given,
+    /// or their HTTP/2 text form; auth placeholders stay. Callers that record a request before
+    /// it goes out use this, so the row matches what is sent.
+    pub fn recorded_request(&self, req: &RawRequest, target: &Target) -> Result<Vec<u8>> {
+        if self.sends_h2(req) {
+            return Ok(H2Request::from_raw(req.as_bytes(), target)?.recorded);
+        }
+        Ok(req.as_bytes().to_vec())
+    }
+
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
-        if self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")) {
+        if self.sends_h2(req) {
             let filled = self.fill_auth(req.as_bytes(), target).await?;
             let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
                 .await
@@ -245,7 +260,7 @@ impl Client {
             return Ok(Exchange {
                 target: target.clone(),
                 // Recorded with the auth placeholders, not the values sent.
-                request: H2Request::from_raw(req.as_bytes(), target)?.recorded,
+                request: self.recorded_request(req, target)?,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
             });

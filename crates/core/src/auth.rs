@@ -657,6 +657,14 @@ struct Compiled {
     logged_out: Option<Regex>,
 }
 
+/// What [`AuthSession::send_as_watched`] reports while it sends.
+pub enum Attempt<'a> {
+    /// This request is about to go out.
+    Sending(&'a RawRequest),
+    /// This exchange is answered, and the request is sent again with a renewed session.
+    Replaced(&'a Exchange),
+}
+
 /// A live session shared by every request of a command run.
 pub struct AuthSession {
     pub profile: AuthProfile,
@@ -921,11 +929,29 @@ impl AuthSession {
 
     /// [`AuthSession::send`] for requests of `tool`, whose session rules apply.
     pub async fn send_as(&self, tool: crate::session::Tool, req: &RawRequest, target: &Target) -> Result<Exchange> {
+        self.send_as_watched(tool, req, target, |_| Ok(())).await
+    }
+
+    /// [`AuthSession::send_as`], telling `watch` about each request just before it goes out
+    /// (with the session applied, as [`Client::recorded_request`] records it) and about an
+    /// exchange that a retry replaces (the session was lost). An error from `watch` stops
+    /// the send before that request goes out.
+    pub async fn send_as_watched(
+        &self,
+        tool: crate::session::Tool,
+        req: &RawRequest,
+        target: &Target,
+        mut watch: impl FnMut(Attempt<'_>) -> Result<()>,
+    ) -> Result<Exchange> {
         let prepared = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
-        let ex = self.client.send(&RawRequest::from_bytes(prepared.request.clone()), target).await?;
+        let first = RawRequest::from_bytes(prepared.request.clone());
+        watch(Attempt::Sending(&first))?;
+        let ex = self.client.send(&first, target).await?;
         if self.after_response(&prepared, &ex.response).await {
-            let again = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
-            let ex = self.client.send(&RawRequest::from_bytes(again.request), target).await?;
+            watch(Attempt::Replaced(&ex))?;
+            let again = RawRequest::from_bytes(self.prepare(tool, target, req.as_bytes(), &[], &[]).await.request);
+            watch(Attempt::Sending(&again))?;
+            let ex = self.client.send(&again, target).await?;
             self.observe(&ex.response);
             return Ok(ex);
         }
