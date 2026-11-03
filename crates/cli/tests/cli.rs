@@ -938,6 +938,15 @@ fn history_contains_takes_the_gui_arguments_and_finds_no_secrets() {
     }
     assert!(!ids(&["--contains=«auth:p:password:form»"]).is_empty());
     assert!(!ids(&["--contains=«auth:p:header:X-Api-Key»"]).is_empty());
+
+    // The flag's help (and the history_list MCP tool, built from it) says how it matches.
+    let (code, v) = run(&["capabilities", "history", "list"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let arg = v["data"]["args"].as_array().unwrap().iter().find(|a| a["flag"] == "--contains").unwrap();
+    let help = arg["help"].as_str().unwrap();
+    for words in ["decoded bodies", "Case-sensitive and literal", "URL-encoded", "JSON-escaped"] {
+        assert!(help.contains(words), "{help}");
+    }
 }
 
 #[test]

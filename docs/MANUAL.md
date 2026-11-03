@@ -241,14 +241,18 @@ The sidebar groups the tools by what you are doing.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
   - **Contents:** tick it to search the text inside requests and responses instead: headers
-    and bodies, compressed and chunked bodies included. The search is case-sensitive and the
-    other filters still apply. New traffic that matches shows up as it arrives. A search stops
-    at the first 10,000 matches the other filters show and says so; narrow it to see later
-    ones.
+    and bodies, compressed and chunked bodies included. Unlike the plain filter, the search is
+    case-sensitive and literal: it matches the bytes as stored, so `a@b.com` doesn't find
+    `a%40b.com`, a JSON-escaped value has to be typed escaped, and HTTP/2 header names are
+    lower-case. Text that is only spaces is ignored. The other filters still apply, and
+    changing one doesn't search again. New traffic that matches shows up as it arrives. A
+    search stops at the first 10,000 matches the other filters show and says so; narrow it to
+    see later ones.
   - **Saved filters:** *Save…* names the current filters (text, Contents, sources and the
     checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept per
-    project on this computer, not in the project file. *Save as…* on a temporary engagement
-    takes them along.
+    project on this computer, in the app's own storage in plain text, not in the owner-only
+    project file: a saved search for a token or password stays there until you delete it.
+    *Save as…* on a temporary engagement takes them along.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
@@ -660,7 +664,7 @@ echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   #
 brainproxy findings list
 brainproxy findings show 12
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
-brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded
+brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
 brainproxy report html -o acme-report.html
 
 # Session handling: a macro that fetches a fresh CSRF token (history #42 is the form page),

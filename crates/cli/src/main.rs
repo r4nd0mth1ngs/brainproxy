@@ -285,8 +285,10 @@ enum HistoryCmd {
         source: Option<String>,
         #[arg(long)]
         tag: Option<String>,
-        /// Text to search for (case-sensitive) in raw requests and responses, and in their
-        /// decoded bodies (gzip, deflate, br, chunked).
+        /// Text to search for in raw requests and responses, and in their decoded bodies (gzip,
+        /// deflate, br, chunked). Case-sensitive and literal: the bytes must match as stored,
+        /// so URL-encoded (a%40b.com) or JSON-escaped text and HTTP/2's lower-case header names
+        /// are searched as they appear.
         #[arg(long)]
         contains: Option<String>,
         /// Only entries with an id greater than this (for incremental polling).

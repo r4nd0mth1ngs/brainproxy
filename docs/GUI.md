@@ -246,11 +246,16 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   `auth macro add` on the command line. A macro or rule is replaced or removed, not edited
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
-- Traffic's contents search is case-sensitive, like `history list --contains`, and stops at the
-  first 10,000 matches the other filters show (oldest first; the toolbar says so). Changing a
-  filter starts the search again. A failed search is tried again on the next poll.
-- Saved Traffic filters are kept by the app (localStorage, per project path), not in the
-  project file, so the CLI and agents don't see them and they don't follow a copied project.
-  *Save as…* on a temporary engagement copies them to the saved file; discarding one leaves its
-  (unused) entry behind.
+- Traffic's contents search is case-sensitive and literal, like `history list --contains`
+  (no `--ignore-case` yet), and stops at the first 10,000 matches the other filters show
+  (oldest first; the toolbar says so). Only a new text or a different single source starts a
+  new search, and the CLI call still running for the old one is stopped (`cancelCli`); the
+  checkboxes and several sources are applied to the matches in the app, searching on only if
+  the cap no longer applies. Whitespace-only text doesn't search. A failed search is tried
+  again after 2 s, doubling up to a minute.
+- Saved Traffic filters are kept by the app (localStorage, per project path, plain text), not
+  in the owner-only project file, so the CLI and agents don't see them, they don't follow a
+  copied project, and a saved search for a secret stays in the webview's storage until it is
+  deleted. *Save as…* on a temporary engagement copies them to the saved file (and says so if
+  it can't); discarding one leaves its (unused) entry behind.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).
