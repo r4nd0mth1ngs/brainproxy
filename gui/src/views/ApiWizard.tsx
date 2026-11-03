@@ -138,6 +138,8 @@ export function ApiWizard(p: Props) {
   const [busy, setBusy] = useState(false);
   const [startProblem, setStartProblem] = useState("");
   const seq = useRef(0);
+  // Set once an exit is asking about the profiles saved here: no scan starts with one of them.
+  const leaving = useRef(false);
 
   useEffect(() => {
     loadSuggestions()
@@ -160,6 +162,10 @@ export function ApiWizard(p: Props) {
     }
   };
   const leave = (then: () => void) => async () => {
+    leaving.current = true;
+    // A preview still loading would start over, and ask again, once the wizard is gone.
+    seq.current++;
+    setPreviewing(false);
     await offerLeftBehind();
     then();
   };
@@ -255,7 +261,7 @@ export function ApiWizard(p: Props) {
   };
 
   const start = async () => {
-    if (!preview) return;
+    if (!preview || leaving.current) return;
     setBusy(true);
     setStartProblem("");
     try {
@@ -306,10 +312,11 @@ export function ApiWizard(p: Props) {
           <h2>Check an API for security problems</h2>
         </div>
         <div className="wiz-row">
-          <button className="link" onClick={leave(p.onBack)}>
+          {/* Not while the scan starts: it may run with a profile offered for removal. */}
+          <button className="link" disabled={busy} onClick={leave(p.onBack)}>
             Test a website instead
           </button>
-          <button className="link" onClick={leave(p.onDismiss)}>
+          <button className="link" disabled={busy} onClick={leave(p.onDismiss)}>
             I'll set it up myself
           </button>
         </div>
