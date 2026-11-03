@@ -702,12 +702,12 @@ export function droppedKeyText(a: AuthState, origins: string[]): string {
   return `The server changed. The key saved in the profile "${d.profile}" only goes to ${listWords(d.origins)}, which it was saved for, not to ${listWords(elsewhere) || "the new server"}. Save the key again for this server, or go back to the server it was saved for and it's used as before.`;
 }
 
-/** When the existing profile chosen holds a query key saved here for other origins: that the scan runs without it. "" otherwise. */
-export function profileKeyText(a: AuthState, origins: string[]): string {
+/** When the existing profile chosen holds a query key saved here for other origins: that the run (a scan or an import) goes without it. "" otherwise. */
+export function profileKeyText(a: AuthState, origins: string[], run: "scan" | "import" = "scan"): string {
   const k = a.mode === "profile" ? a.queryKeys.find((x) => x.profile === a.existing) : undefined;
   if (!k || keyCovers(k.origins, origins)) return "";
   const elsewhere = origins.filter((o) => !k.origins.includes(o));
-  return `The key saved in the profile "${k.profile}" only goes to ${listWords(k.origins)}, which it was saved for, not to ${listWords(elsewhere) || "this server"}, so the scan runs without it. To send a key, choose API key or bearer token and save it again for this server, or go back to the server it was saved for.`;
+  return `The key saved in the profile "${k.profile}" only goes to ${listWords(k.origins)}, which it was saved for, not to ${listWords(elsewhere) || "this server"}, so the ${run} runs without it. To send a key, choose API key or bearer token and save it again for this server, or go back to the server it was saved for.`;
 }
 
 /**

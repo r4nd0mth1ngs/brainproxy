@@ -393,7 +393,7 @@ attack type, and pick payloads:
     - An API key or bearer token, in a header or the query string. The value is kept in the auth
       profile, as static headers are, and history holds a placeholder. A key in the query string
       only goes to the addresses it was saved for: if you then choose a server elsewhere, the
-      wizard says the key has to be saved again, and the scan can't start until you save it, go
+      wizard says the key has to be saved again, and the scan (or *Import API*) can't start until you save it, go
       back to that server, or choose something else. Saving it again, or choosing something else,
       offers to remove the profile saved before. Back on that server, choosing an API key again
       uses the saved key. If you keep that profile and choose it as an existing profile on a

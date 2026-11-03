@@ -630,6 +630,7 @@ test("an existing profile whose query key doesn't go to this server", () => {
   assert.equal(profileKeyText(kept, [A]), "", "the server it was saved for");
   assert.match(profileKeyText(kept, [A, B]), /not to https:\/\/b\.test,/, "one origin it doesn't go to is enough");
   assert.match(profileKeyText(kept, []), /not to this server,/);
+  assert.match(profileKeyText(kept, [B], "import"), /so the import runs without it/, "Import API says what it runs");
   assert.equal(profileKeyText({ ...kept, existing: "other" }, [B]), "", "another profile: nothing known about it");
   assert.equal(profileKeyText({ ...kept, mode: "key" }, [B]), "", "key mode says it with droppedKeyText");
 

@@ -729,7 +729,7 @@ function AuthStep(p: {
   const origins = operationOrigins(likelyInScope(ops));
   const taken = data?.profiles.map((x) => x.name) ?? [];
   const droppedNote = droppedKeyText(a, origins);
-  const profileNote = profileKeyText(a, origins);
+  const profileNote = profileKeyText(a, origins, p.mode);
 
   const reload = () =>
     loadAuthData().then(
@@ -774,8 +774,8 @@ function AuthStep(p: {
     set({ signing: true, signer: { profile, name }, ...next });
     p.setDraft(null);
     // A query key that doesn't go to this server: the warning under the profile says so instead.
-    const keyless = profileKeyText({ ...a, ...next }, origins);
-    setNote(moved ? `Selected the profile "${profile}", which holds this signer.${keyless ? "" : " The ${p.mode === "import" ? "import" : "scan"} runs with that profile's credentials."}` : "");
+    const keyless = profileKeyText({ ...a, ...next }, origins, p.mode);
+    setNote(moved ? `Selected the profile "${profile}", which holds this signer.${keyless ? "" : ` The ${p.mode === "import" ? "import" : "scan"} runs with that profile's credentials.`}` : "");
   };
 
   const saveSigner = async (f: SignerForm) => {
@@ -1286,9 +1286,7 @@ function StartStep(p: {
 }) {
   const d = p.preview;
   const depth = DEPTHS.find((x) => x.id === p.depth)!;
-  const origins = operationOrigins(likelyInScope(d.requests));
-  // The key the user chose that the scan would run without.
-  const keyless = droppedKeyText(p.auth, origins) || profileKeyText(p.auth, origins);
+  const keyless = keylessText(d, p.auth, "scan");
   return (
     <div className="wiz-body">
       <label className="label">How thorough should it be?</label>
@@ -1313,7 +1311,7 @@ function StartStep(p: {
 
       <label className="label">Ready to start</label>
       <dl className="facts">
-        <PlanFacts {...p} />
+        <PlanFacts {...p} mode="scan" />
         <dt>Depth</dt>
         <dd>
           {depth.title} ({depth.time})
@@ -1347,9 +1345,16 @@ function StartStep(p: {
   );
 }
 
+/** The key the user chose that the scan or import would run without: one set aside by a server change, or a profile's that doesn't go to this server. "" otherwise. */
+function keylessText(d: ApiPreview, a: AuthState, run: ApiMode): string {
+  const origins = operationOrigins(likelyInScope(d.requests));
+  return droppedKeyText(a, origins) || profileKeyText(a, origins, run);
+}
+
 /** What the definition, server, authentication and operations steps chose: the review's first rows. */
-function PlanFacts(p: { preview: ApiPreview; source: string; target: ApiTarget; auth: AuthState; selected: number[] }) {
+function PlanFacts(p: { preview: ApiPreview; source: string; target: ApiTarget; auth: AuthState; selected: number[]; mode: ApiMode }) {
   const d = p.preview;
+  const keyless = keylessText(d, p.auth, p.mode);
   return (
     <>
       <dt>Definition</dt>
@@ -1365,7 +1370,7 @@ function PlanFacts(p: { preview: ApiPreview; source: string; target: ApiTarget; 
         </>
       )}
       <dt>Authentication</dt>
-      <dd>{authSummary(p.auth)}</dd>
+      <dd className={keyless || (p.auth.mode === "key" && !p.auth.savedProfile) ? "s5" : ""}>{authSummary(p.auth)}</dd>
       <dt>Signing</dt>
       <dd>{signingSummary(p.auth)}</dd>
       <dt>Operations</dt>
@@ -1377,12 +1382,14 @@ function PlanFacts(p: { preview: ApiPreview; source: string; target: ApiTarget; 
 /** Import API's last step: what goes out, once each. */
 function ImportStep(p: { preview: ApiPreview; source: string; target: ApiTarget; auth: AuthState; selected: number[]; problem: string }) {
   const d = p.preview;
+  const keyless = keylessText(d, p.auth, "import");
   return (
     <div className="wiz-body">
       <label className="label">Ready to import</label>
       <dl className="facts">
-        <PlanFacts {...p} />
+        <PlanFacts {...p} mode="import" />
       </dl>
+      {keyless && <div className="wiz-warn danger">{keyless}</div>}
       <p className="muted">
         Each ticked operation is sent once, as written, and recorded in history with the source <span className="mono">import</span>. Nothing is attacked. The requests then show in the Site map and Proxy › Traffic, ready to send to Replay, the Fuzzer or a scan.
       </p>

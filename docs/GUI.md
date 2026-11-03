@@ -175,8 +175,8 @@ and Postman variables, optional authentication (API key or bearer token via `aut
 then `auth login` or `auth oauth authorize` (which *Cancel* stops), and the profile removed again
 if no token comes; entering other credentials offers to remove the profile saved before; a
 query key goes only to the origins it was saved for (`--key-origin`), so a server on another
-origin sets it aside (`afterServerChange`): the Authentication step and the review say so, the
-scan can't start until it's saved again or another choice is made, either of which offers to
+origin sets it aside (`afterServerChange`): the Authentication step and the review (`PlanFacts`,
+in a scan and an import alike) say so, the scan or import can't start until it's saved again or another choice is made, either of which offers to
 remove the old profile once (kept, it's there to use again with its own server), and going back
 to a server it covers before then, or choosing an API key again there (`chooseMode`), brings it
 back; loading another definition, *Test a website instead* and *I'll set it up myself* offer to
