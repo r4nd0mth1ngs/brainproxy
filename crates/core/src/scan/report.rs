@@ -448,34 +448,25 @@ fn history_list(ids: &[i64]) -> String {
 
 /// Markdown whose HTML is shown as text, not rendered, and with no links or images, which
 /// would load or point to anything quoted (`![x](https://...)`). Emphasis, lists and code stay.
-/// Code spans and fenced blocks keep their text as written (often a request to copy), each in
-/// a fence of our own that nothing inside can close.
+/// Code spans on a line with no pipe, and fenced blocks, keep their text as written (often a
+/// request to copy), each in a fence of our own that nothing inside can close.
 fn md_no_html(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let mut out = String::new();
-    // In a GFM table a pipe ends the cell even inside a code span, so in a table's rows (its
-    // header, delimiter row and the rows up to a blank line) a span with one is text like the rest.
-    let mut table = false;
     let mut i = 0;
     while i < lines.len() {
         let Some((indent, mark, run, lang)) = md_fence_open(lines[i]) else {
-            if lines[i].trim().is_empty() {
-                table = false;
-            } else if !table && lines.get(i + 1).is_some_and(|l| md_table_delimiter(l)) {
-                table = true;
-            }
-            out.push_str(&md_inline(lines[i], table));
+            out.push_str(&md_inline(lines[i]));
             out.push('\n');
             i += 1;
             continue;
         };
-        table = false;
         let mut body = String::new();
         i += 1;
         while i < lines.len() {
             let l = lines[i];
             i += 1;
-            if md_fence_close(l, mark, run) {
+            if md_fence_close(l, indent, mark, run) {
                 break;
             }
             // The fence's own indent comes off its lines, as in CommonMark.
@@ -483,7 +474,8 @@ fn md_no_html(s: &str) -> String {
             body.push_str(&l[cut.min(indent)..]);
             body.push('\n');
         }
-        // An unclosed fence ends with the text instead of taking the rest of the report.
+        // Our own fence closes the block, so a closer misread either way leaves only literal
+        // code or escaped text, and an unclosed one ends with the text, not the report.
         out.push_str(&md_block(&body, &lang));
     }
     if !s.ends_with('\n') {
@@ -508,26 +500,21 @@ fn md_fence_open(line: &str) -> Option<(usize, char, usize, String)> {
     Some((indent, mark, run, if ok { lang.to_string() } else { String::new() }))
 }
 
-/// A line that closes a fence opened by `run` of `mark`: up to three spaces of indent, at least
-/// as long a run of the same character, then only spaces or tabs.
-fn md_fence_close(line: &str, mark: char, run: usize) -> bool {
+/// A line that closes a fence opened at `indent` by `run` of `mark`: up to three spaces more
+/// indent than the opener (which may sit in a list item), at least as long a run of the same
+/// character, then only spaces or tabs.
+fn md_fence_close(line: &str, indent: usize, mark: char, run: usize) -> bool {
     let rest = line.trim_start_matches(' ');
     let n = rest.len() - rest.trim_start_matches(mark).len();
-    line.len() - rest.len() <= 3 && n >= run && rest[n..].chars().all(|c| matches!(c, ' ' | '\t'))
-}
-
-/// A GFM table's delimiter row (`|---|:-:|`), also indented in a list item. Generous on
-/// purpose: a row taken for a table only shows a span with a pipe as text.
-fn md_table_delimiter(line: &str) -> bool {
-    let l = line.trim();
-    l.contains('-')
-        && (l.contains('|') || l.contains(':'))
-        && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+    line.len() - rest.len() <= indent + 3 && n >= run && rest[n..].chars().all(|c| matches!(c, ' ' | '\t'))
 }
 
 /// One line of a tester's text: code spans as written, the rest through [`md_escape`]. A
 /// backtick that opens no span is escaped, so it can't pair with one of ours on another line.
-fn md_inline(line: &str, table: bool) -> String {
+/// On a line with a pipe, which may be a GFM table row where a pipe ends the cell even inside a
+/// span, every span is text like the rest, whether or not the line is in a table.
+fn md_inline(line: &str) -> String {
+    let pipe = line.contains('|');
     let mut out = String::new();
     let mut rest = line;
     while let Some(start) = rest.find('`') {
@@ -536,12 +523,12 @@ fn md_inline(line: &str, table: bool) -> String {
         let n = after.len() - after.trim_start_matches('`').len();
         let body = &after[n..];
         match md_closing_run(body, n) {
-            Some(end) if !(table && body[..end].contains('|')) => {
+            Some(end) if !pipe => {
                 out.push_str(&md_code(&body[..end]));
                 rest = &body[end + n..];
             }
             Some(end) => {
-                // In a table: shown as text, with every backtick escaped.
+                // On a line with a pipe: shown as text, with every backtick escaped.
                 out.push_str(&"\\`".repeat(n));
                 out.push_str(&md_escape(&body[..end]));
                 out.push_str(&"\\`".repeat(n));
@@ -1553,25 +1540,23 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(rule["help"]["markdown"], md_no_html(f.solution.trim()));
-        // In a table, a pipe in a span would end the cell: that span is text.
+        // In a table, a pipe in a span would end the cell: on a line with a pipe, spans are text.
         let t = md_no_html("| a | b |\n|---|---|\n| `x|<b>` | `<i>` |");
-        assert_eq!(t, "| a | b |\n|---|---|\n| \\`x|&lt;b&gt;\\` | `<i>` |");
-        assert_eq!(md_no_html("`a|<b>`"), "`a|<b>`");
+        assert_eq!(t, "| a | b |\n|---|---|\n| \\`x|&lt;b&gt;\\` | \\`&lt;i&gt;\\` |");
+        assert_eq!(md_no_html("`a|<b>` `<i>`"), "\\`a|&lt;b&gt;\\` \\`&lt;i&gt;\\`");
     }
 
     #[test]
-    fn only_table_rows_show_a_span_with_a_pipe_as_text() {
-        let t =
-            md_no_html("Try `GET /f?p=*a*|b` first.\n\n| a | b |\n|---|---|\n| `x|y` | z |\nrow `p|q`\n\nAfter `c|d`.");
-        assert_eq!(
-            t,
-            "Try `GET /f?p=*a*|b` first.\n\n| a | b |\n|---|---|\n| \\`x|y\\` | z |\nrow \\`p|q\\`\n\nAfter `c|d`."
-        );
-        // A table in a list item is a table too; a fence ends one.
-        let t = md_no_html("  | `a|b` |\n  |:-:|\n```\nx\n```\n`c|d`");
-        assert_eq!(t, "  | \\`a|b\\` |\n  |:-:|\n```\nx\n```\n`c|d`");
-        // A delimiter row with nothing above it starts no table.
-        assert_eq!(md_no_html("|---|\n`a|b`"), "|---|\n`a|b`");
+    fn a_line_with_a_pipe_shows_its_spans_as_text() {
+        let t = md_no_html("| a |\n|---|\nrow `p<q`\n\nAfter `<c>` and `d|<e>`.\n```\n|<f>\n```");
+        assert_eq!(t, "| a |\n|---|\nrow `p<q`\n\nAfter \\`&lt;c&gt;\\` and \\`d|&lt;e&gt;\\`.\n```\n|<f>\n```");
+        // A line of only U+00A0 is no blank line: GFM keeps the table going and splits the span
+        // at its pipe, leaving the rest to be read as HTML.
+        let t = md_no_html("| a |\n|---|\n\u{a0}\n| `x|<img src=x onerror=alert(1)>` |");
+        assert!(!t.contains("<img") && t.contains("\\`x|&lt;img src=x onerror=alert(1)&gt;\\`"), "{t}");
+        // Nor does a pipe line outside any table keep raw HTML in a span.
+        let t = md_no_html("Try `x|<img src=x>` here.");
+        assert_eq!(t, "Try \\`x|&lt;img src=x&gt;\\` here.");
     }
 
     #[test]
@@ -1581,6 +1566,17 @@ mod tests {
         assert_eq!(md_no_html(s), "`````\n    ````\n```\n~~~~\n```` x\n`````\n&lt;b&gt;after&lt;/b&gt;");
         let s = "  ~~~\n      ~~~\n  x\n\t~~~\n ~~~\nok";
         assert_eq!(md_no_html(s), "```\n    ~~~\nx\n\t~~~\n```\nok");
+        // In a list item the closer may sit up to three spaces past the opener.
+        let s = "- step:\n  ```\n  GET /x\n    ```\n- then <b>y</b>";
+        assert_eq!(md_no_html(s), "- step:\n```\nGET /x\n```\n- then &lt;b&gt;y&lt;/b&gt;");
+    }
+
+    #[test]
+    fn an_unclosed_fence_keeps_what_follows_as_code() {
+        // Whatever follows a fence that never closes is literal code in a block of ours, closed
+        // by a fence longer than any run inside it, so none of it is read as HTML.
+        let s = "Repro:\n  ```\n  x\n      ```\n\n<img src=x onerror=alert(1)>\n````` x";
+        assert_eq!(md_no_html(s), "Repro:\n``````\nx\n    ```\n\n<img src=x onerror=alert(1)>\n````` x\n``````");
     }
 
     fn by_hand(title: &str, history: Vec<i64>) -> crate::scan::findings_db::ManualFinding {
