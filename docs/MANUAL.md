@@ -716,7 +716,8 @@ holds `brainproxy.bpdb-proxy-restart.lock`, which is how another container on th
 knows it is still under way. If the restart is killed (Ctrl-C, say, or an MCP client's timeout
 or cancel) before the old proxy has exited, the next command gives the old proxy its record
 back, so that `proxy status` shows it and `proxy stop` stops it. Killed while its new proxy
-starts, that proxy goes back to the old one itself if it can't come up.
+starts, the hold lasts until that proxy is up or has failed, and that proxy goes back to the
+old one itself if it can't come up; a `proxy stop` meanwhile stops it instead.
 
 `proxy stop` during a restart calls the restart off: the proxy it was starting is killed, the
 proxy it replaced stays off, and the restart fails saying so (`"called_off": true` in its

@@ -1816,3 +1816,58 @@ fn proxy_stop_for_a_pid_stops_only_that_one() {
     let (code, v) = env.run(&["proxy", "stop", "--pid", "1", "--forget"]);
     assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("usage")), "{v}");
 }
+
+/// A stop after a restart was killed while its new proxy starts calls that proxy off too: the
+/// stop stops it, and it doesn't go back to the old proxy afterwards, so the proxy stays off.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_calls_off_the_proxy_a_killed_restart_was_starting() {
+    let env = Env::new("restart-killed-stop");
+    let (login, arrived, release) = held_login_server();
+    env.ok(&["auth", "add", "slow", "--login-url", &login, "--login-body", "a=b", "--logged-in", "Welcome"]);
+    let old_pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    let mut restart = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&env.project)
+        .arg("--home")
+        .arg(&env.home)
+        .args(["proxy", "restart", "--listen", "127.0.0.1:0", "--auth", "slow"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    arrived.recv_timeout(Duration::from_secs(10)).expect("the new proxy logs in");
+    restart.kill().unwrap();
+    restart.wait().unwrap();
+    // The hold names the proxy being started, and lasts as long as it does.
+    let hold: Value = serde_json::from_str(&proxy_record(&env).unwrap()).unwrap();
+    let starting = hold["starting"][0].as_u64().expect("the hold names the proxy it starts");
+    assert_eq!(env.ok(&["proxy", "status"])["restarting"], true);
+
+    let stopped = env.ok(&["proxy", "stop"]);
+    assert_eq!(stopped["stopped"].as_u64(), Some(old_pid), "{stopped}");
+    assert_eq!(stopped["restart_called_off"].as_u64(), Some(u64::from(restart.id())), "{stopped}");
+    wait_gone(starting);
+    let _ = release.send(false);
+    std::thread::sleep(Duration::from_millis(500));
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["restarting"]), (&false.into(), &false.into()), "{status}");
+}
+
+/// `project stop` that fails on a job still running lists only what did stop as stopped.
+#[cfg(unix)]
+#[test]
+fn project_stop_reports_only_the_work_that_stopped() {
+    let env = Env::new("project-stop-work");
+    let mut busy = Command::new("sleep").arg("60").spawn().unwrap();
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    let running = store.job_create("scan", "running", &[]).unwrap();
+    store.job_set_state(running, "running", Some(busy.id()), None, false).unwrap();
+    let queued = store.job_create("scan", "queued", &[]).unwrap();
+
+    let (code, v) = env.run(&["project", "stop"]);
+    busy.kill().unwrap();
+    busy.wait().unwrap();
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains(&format!("job {running} (")), "{v}");
+    assert_eq!(v["error"]["data"]["work"], serde_json::json!([{"kind": "job", "id": queued}]), "{v}");
+}

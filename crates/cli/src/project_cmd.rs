@@ -89,10 +89,19 @@ fn stop_all(path: &Path) -> Result<(Value, Option<Error>), Error> {
     });
     let oob = oob.map(|(pid, _)| pid);
     let work = store.unfinished_work()?;
-    if let Err(e) = stop_work(&store) {
-        failed.push(e);
-    }
-    let work: Vec<Value> = work.iter().map(|(what, id, _)| json!({"kind": what, "id": id})).collect();
+    // What still runs isn't reported as stopped.
+    let left = match stop_work(&store) {
+        Ok(()) => Some(Vec::new()),
+        Err((e, left)) => {
+            failed.push(e);
+            left
+        }
+    };
+    let work: Vec<Value> = work
+        .iter()
+        .filter(|(what, id, _)| left.as_ref().is_some_and(|left| !left.iter().any(|(w, i)| w == what && i == id)))
+        .map(|(what, id, _)| json!({"kind": what, "id": id}))
+        .collect();
     if restarting {
         proxy = stop_proxy(&mut failed);
     }
@@ -105,8 +114,12 @@ fn stop_all(path: &Path) -> Result<(Value, Option<Error>), Error> {
     Ok((stopped, failed))
 }
 
-/// Stops the project's jobs and fuzz runs, or fails naming the ones still running.
-fn stop_work(store: &Store) -> Result<(), Error> {
+/// Jobs and fuzz runs by kind and id.
+type Work = Vec<(String, i64)>;
+
+/// Stops the project's jobs and fuzz runs, or fails naming the ones still running (or that
+/// might be), with their kind and id: `None` if that isn't known.
+fn stop_work(store: &Store) -> Result<(), (Error, Option<Work>)> {
     // Jobs and fuzz runs poll for the stop request and exit. It is repeated while waiting: one
     // still queued has no process yet and marks itself running once its process starts. They
     // are never signalled: no start time is recorded for them, so a pid reused by another
@@ -127,13 +140,17 @@ fn stop_work(store: &Store) -> Result<(), Error> {
             .collect())
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut left = busy()?;
+    let unknown = |e| (e, None);
+    let mut left = busy().map_err(unknown)?;
     while !left.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
-        left = busy()?;
+        left = busy().map_err(unknown)?;
     }
-    // Work that never got a process has nothing to stop. Work that can't be verified may well be
-    // gone, and its pid may be another process here: point to `stop --forget`, not to the pid.
+    // Work that never got a process has nothing to stop.
+    let running =
+        Some(left.iter().filter(|(_, _, pid)| pid.is_some()).map(|(what, id, _)| (what.clone(), *id)).collect());
+    // Work that can't be verified may well be gone, and its pid may be another process here:
+    // point to `stop --forget`, not to the pid.
     let stuck: Vec<String> = left
         .iter()
         .filter_map(|(what, id, pid)| {
@@ -150,13 +167,14 @@ fn stop_work(store: &Store) -> Result<(), Error> {
     if left.iter().any(|(what, id, pid)| {
         pid.is_some_and(|pid| process::work_liveness(store, &lock(what, *id), pid) == Liveness::Unverified)
     }) {
-        return Err(Error::Conflict(format!("still not known to have stopped: {}", stuck.join("; "))));
+        return Err((Error::Conflict(format!("still not known to have stopped: {}", stuck.join("; "))), running));
     }
     if !stuck.is_empty() {
-        return Err(Error::Conflict(format!(
+        let e = Error::Conflict(format!(
             "still running after being asked to stop: {}; wait for them to finish (or stop those processes)",
             stuck.join(", ")
-        )));
+        ));
+        return Err((e, running));
     }
     Ok(())
 }
