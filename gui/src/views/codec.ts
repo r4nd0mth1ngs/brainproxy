@@ -40,7 +40,8 @@ export function smartNote(steps: Step[], stopped: Stopped = "nothing"): string {
   const found = steps.length
     ? `Found ${steps.length === 1 ? "1 layer" : `${steps.length} layers`}: ${steps.map((s) => s.kind).join(" → ")}`
     : stopped === "json"
-      ? "Nothing to decode: the input is JSON, left as it is."
+      ? // Smart decode keeps the user's steps when it finds no layer, so say they still apply.
+        "Nothing to decode: Smart decode leaves JSON as it is. The steps below are unchanged."
       : "Nothing to decode: no URL, Base64, hex, HTML, JWT, gzip, or zlib layer found.";
   if (stopped === "depth") {
     return `${found}. Stopped at the layer limit: more may remain (use the last output as input and run it again).`;

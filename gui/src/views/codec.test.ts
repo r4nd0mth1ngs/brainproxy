@@ -83,7 +83,7 @@ test("the note says why Smart decode stopped, when it isn't that nothing applied
   const steps = smartSteps(["base64", "gzip"]);
   assert.equal(smartNote(steps, "nothing"), "Found 2 layers: base64 → gzip");
   assert.equal(smartNote(steps, "json"), "Found 2 layers: base64 → gzip");
-  assert.equal(smartNote([], "json"), "Nothing to decode: the input is JSON, left as it is.");
+  assert.equal(smartNote([], "json"), "Nothing to decode: Smart decode leaves JSON as it is. The steps below are unchanged.");
   assert.equal(
     smartNote(smartSteps(Array(8).fill("base64")), "depth"),
     `Found 8 layers: ${Array(8).fill("base64").join(" → ")}. Stopped at the layer limit: more may remain (use the last output as input and run it again).`,

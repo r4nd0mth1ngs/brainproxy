@@ -491,8 +491,9 @@ working on the previous output. Decoding `url` reads `+` as a space, as form dat
   a clear sign: for Base64, padding, a symbol, or mixed case with digits; for hex, a `0x`
   prefix or spaces or colons between bytes. So words like `password` or `deadbeef` stay
   as they are. Base64 with a raw `+` and an escaped `=` (common in cookies) gets `percent`, not
-  `url`, so the `+` survives even when the Base64 holds binary. When it misses a layer, add
-  the step by hand.
+  `url`, so the `+` survives even when the Base64 holds binary. When it finds no layer (JSON
+  as the input included), the steps stay as they were. When it misses a layer, add the step
+  by hand.
 
 On the command line, `decode auto` does the same and lists what it applied in `steps`, and
 why it stopped in `stopped`: `"nothing"`, `"json"`, `"depth"` (the 8-layer limit), or
