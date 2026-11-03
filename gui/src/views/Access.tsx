@@ -461,7 +461,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
             <p className="muted small">
               Tested whatever its method or path, even a logout, and even if it carries no credentials.
               {unsafe.length > 0 && <b> {unsafe.join(", ")} requests are sent again as each identity: they may change data, now as another user.</b>}
-              {logouts.length > 0 && <b> {logouts.map((h) => `#${h.id}`).join(", ")} {logouts.length === 1 ? "looks" : "look"} like a logout: sending {logouts.length === 1 ? "it" : "them"} ends the owner's session and each identity's.</b>}
+              {logouts.length > 0 && <b> {logouts.map((h) => `#${h.id}`).join(", ")} {logouts.length === 1 ? "looks" : "look"} like a logout: sending {logouts.length === 1 ? "it" : "them"} can end the owner's session and each identity's.</b>}
             </p>
           </div>
         )}

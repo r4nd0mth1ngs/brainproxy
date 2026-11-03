@@ -156,9 +156,16 @@ test("logout-like paths, as authz run's default --exclude", () => {
   for (const path of ["/logout", "/account/log-out", "/LogOff", "/auth/sign_out", "/signoff?x=1", "/api/logout.json", "/user/signout/"]) {
     assert.ok(isLogout({ ...get, url: `https://shop.test${path}` }), path);
   }
-  for (const path of ["/logouts", "/catalog", "/blog/outdoor", "/signal/offer", "/?next=/logout", "/#/logout", "/logoutnow"]) {
+  for (const path of ["/logouts", "/catalog", "/blog/outdoor", "/signal/offer", "/?next=/logout", "/logoutnow"]) {
     assert.ok(!isLogout({ ...get, url: `https://shop.test${path}` }), path);
   }
+  // The path as recorded, not normalised: authz run matches /logout/../account too.
+  assert.ok(isLogout({ ...get, url: "https://shop.test/logout/../account" }));
+  assert.ok(isLogout({ ...get, url: "https://shop.test:8443/a/%2e%2e/sign-off" }));
+  assert.ok(isLogout({ ...get, url: "https://shop.test/#/logout" }));
+  // The host is not the path.
+  assert.ok(!isLogout({ ...get, url: "https://logout.shop.test/" }));
+  assert.ok(!isLogout({ ...get, url: "http://sign-out:8080/home" }));
   // Not a URL: the path is what comes before the query.
   assert.ok(isLogout({ ...get, url: "/sign-out?x" }));
   assert.ok(!isLogout({ ...get, url: "/x?sign-out" }));
@@ -201,8 +208,12 @@ test("GraphQL documents of a recorded request, as the scanner reads them", () =>
   assert.deepEqual(graphqlDocuments(graphqlPost('[{"query":"query A { a }"},{"x":1},{"query":"mutation B { b }"}]')), ["query A { a }", "mutation B { b }"]);
   assert.deepEqual(graphqlDocuments(graphqlPost("mutation { a }", "application/graphql; charset=utf-8")), ["mutation { a }"]);
   assert.deepEqual(graphqlDocuments("GET /graphql?query=mutation%20%7B%20a%20%7D&x=1 HTTP/1.1\r\nHost: shop.test\r\n\r\n"), ["mutation { a }"]);
-  assert.deepEqual(graphqlDocuments("GET /graphql?query=mutation+%7B+a+%7D HTTP/1.1\nHost: shop.test\n\n"), ["mutation { a }"]);
+  assert.deepEqual(graphqlDocuments("GET /graphql?query=mutation+%7B+a+%7D HTTP/1.1\r\nHost: shop.test\r\n\r\n"), ["mutation { a }"]);
+  // Like the scanner's parser: no CRLF blank line, no request.
+  assert.deepEqual(graphqlDocuments("POST /graphql HTTP/1.1\nContent-Type: application/json\n\n{\"query\":\"mutation { a }\"}"), []);
   assert.deepEqual(graphqlDocuments(graphqlPost("name=mutation", "application/x-www-form-urlencoded")), []);
+  // Any Content-Type header saying so, as the scanner checks each one.
+  assert.deepEqual(graphqlDocuments(graphqlPost("mutation { a }", "text/plain\r\nContent-Type: application/graphql")), ["mutation { a }"]);
   assert.deepEqual(graphqlDocuments(graphqlPost('{"query":5}')), []);
   assert.deepEqual(graphqlDocuments(graphqlPost("")), []);
 });
@@ -225,6 +236,11 @@ test("a GraphQL document defines a mutation when a top-level definition starts w
 test("a GraphQL mutation is named as one in both questions, whatever its method", () => {
   assert.ok(isMutationRequest(graphqlPost('{"query":"mutation { delete(id: 1) }"}')));
   assert.ok(!isMutationRequest(graphqlPost('{"query":"{ me { id } }"}')));
+  // Cut short, the JSON no longer parses: the word is enough to ask.
+  const cut = graphqlPost('{"query":"mutation Upload($f: String) { upload(f: $f) }","variables":{"f":"AAAA');
+  assert.ok(!isMutationRequest(cut));
+  assert.ok(isMutationRequest(cut, true));
+  assert.ok(!isMutationRequest(graphqlPost('{"query":"query { mutations }","variables":{"f":"AA'), true));
   const m: HistoryPick = { ...post, method: "POST", url: "https://shop.test/graphql", mutation: true };
   assert.deepEqual(changeKinds([m]), ["GraphQL mutation"]);
   assert.deepEqual(changeKinds([{ ...m, mutation: false }]), ["POST"]);

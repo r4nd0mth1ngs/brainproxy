@@ -139,7 +139,7 @@ function History() {
   // Unknown when the request can't be read: the questions then go by its method.
   const withMutation = (p: HistoryPick): Promise<HistoryPick> =>
     run<HistoryEntry>(["history", "show", String(p.id), MAX_BODY]).then(
-      (e) => ({ ...p, mutation: isMutationRequest(bodyText(e.request)) }),
+      (e) => ({ ...p, mutation: isMutationRequest(bodyText(e.request), !!e.request.truncated) }),
       () => p,
     );
 

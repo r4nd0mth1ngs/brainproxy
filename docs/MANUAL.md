@@ -442,9 +442,9 @@ Access control across users: does the app let bob read alice's data? See
   as it is, whatever its method or path and even if it carries no credentials. It is sent
   twice as its owner, then as each identity and with no session. The form warns when it is a
   POST, a GraphQL mutation or another request that may change data, or when its path looks
-  like a logout (which would end the owner's and each identity's session, so every later
-  result would be measured against ended sessions), and *Start run* asks first. Once the run
-  has started, the form goes back to all recorded requests.
+  like a logout (which can end the owner's and each identity's session, so later results may
+  not be reliable), and *Start run* asks first. Once the run has started, the form goes back
+  to all recorded requests.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
   those identities in the background. If it doesn't start, the

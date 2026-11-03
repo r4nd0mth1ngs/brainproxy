@@ -32,31 +32,30 @@ export function changeKinds(picks: HistoryPick[]): string[] {
  */
 export const LOGOUT = /(log|sign)[-_]?(out|off)\b/i;
 
-/** The pick's path, without the query, looks like a logout. */
+/**
+ * The pick's path looks like a logout. The path is taken as recorded (the URL is the origin plus
+ * the request target), without the query and not normalised, as `authz run` matches it: a URL
+ * parser would turn `/logout/../account` into `/account`.
+ */
 export function isLogout(p: HistoryPick): boolean {
-  let path: string;
-  try {
-    path = new URL(p.url).pathname;
-  } catch {
-    path = p.url.split(/[?#]/)[0];
-  }
-  return LOGOUT.test(path);
+  const target = p.url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?]*/i, "");
+  return LOGOUT.test(target.split("?")[0]);
 }
 
 /**
  * The GraphQL documents a raw request carries, as `graphql::documents` reads them: `query` URL
- * parameters, an `application/graphql` body, or the `query` of a JSON body or batch.
+ * parameters, an `application/graphql` body, or the `query` of a JSON body or batch. Like the
+ * scanner's parser, it needs CRLF line endings and the blank line ending the head.
  */
 export function graphqlDocuments(raw: string): string[] {
-  const sep = raw.search(/\r?\n\r?\n/);
-  const head = sep < 0 ? raw : raw.slice(0, sep);
-  const body = sep < 0 ? "" : raw.slice(sep).replace(/^\r?\n\r?\n/, "");
-  const [line = "", ...headers] = head.split(/\r?\n/);
+  const sep = raw.indexOf("\r\n\r\n");
+  if (sep < 0) return [];
+  const body = raw.slice(sep + 4);
+  const [line = "", ...headers] = raw.slice(0, sep).split("\r\n");
   const target = line.split(" ")[1] ?? "";
   const q = target.indexOf("?");
   const out = q < 0 ? [] : new URLSearchParams(target.slice(q + 1)).getAll("query");
-  const type = headers.find((h) => /^content-type\s*:/i.test(h)) ?? "";
-  if (/application\/graphql/i.test(type)) return [...out, body];
+  if (headers.some((h) => /^content-type\s*:.*application\/graphql/i.test(h))) return [...out, body];
   const query = (v: unknown) => (v && typeof v === "object" && typeof (v as { query?: unknown }).query === "string" ? [(v as { query: string }).query] : []);
   try {
     const v: unknown = JSON.parse(body);
@@ -109,9 +108,13 @@ export function definesMutation(doc: string): boolean {
   return endWord();
 }
 
-/** The raw request carries a GraphQL mutation, which can change data whatever its method. */
-export function isMutationRequest(raw: string): boolean {
-  return graphqlDocuments(raw).some(definesMutation);
+/**
+ * The raw request carries a GraphQL mutation, which can change data whatever its method. A
+ * request cut short (`truncated`, over the app's --max-body) may no longer parse, so it is taken
+ * as one when the word appears anywhere in it: the questions then ask rather than stay silent.
+ */
+export function isMutationRequest(raw: string, truncated = false): boolean {
+  return graphqlDocuments(raw).some(definesMutation) || (truncated && /\bmutation\b/.test(raw));
 }
 
 /** "alice", "alice and bob", "alice, bob and carol". */
@@ -201,7 +204,7 @@ export function scanBlocker(r: HistoryRow): string | null {
  * The question asked before an access-control run of requests picked in Traffic, or null when
  * none can change data or looks like a logout. Each is sent twice as its owner, then as each
  * identity and with no session: a POST or a GraphQL mutation can change data as another user, and
- * a logout ends those sessions, so every later result would be measured against ended ones.
+ * a logout can end those sessions, so later results may not be reliable.
  */
 export function accessConfirm(
   picks: HistoryPick[],
@@ -216,7 +219,7 @@ export function accessConfirm(
   const who = `twice as ${one ? "its owner" : "their owners"}${others ? `, then ${others}` : ""}`;
   const what = one ? `This ${kinds[0] ?? "request"}` : kinds.length ? `The ${kinds.join(", ")} requests` : `These ${picks.length} requests`;
   const change = kinds.length ? " That can change data or trigger side effects, now as another user." : "";
-  const ends = "can end the owner's session and each identity's, and every result after it would be measured against ended sessions.";
+  const ends = "can end the owner's session and each identity's, so the results after it may not be reliable.";
   const logout = !logouts.length
     ? ""
     : one
