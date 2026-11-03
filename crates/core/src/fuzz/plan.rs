@@ -289,6 +289,9 @@ pub const PROCESSORS: &[&str] = &[
     "base64url",
     "hex",
     "html",
+    "gzip",
+    "zlib",
+    "deflate",
     "md5",
     "sha1",
     "sha256",
@@ -414,5 +417,14 @@ mod tests {
         assert_eq!(process("prefix:a\\,b,suffix:!,base64", b"x").unwrap(), b"YSxieCE=");
         assert_eq!(process("upper,md5", b"a").unwrap(), b"7fc56270e7a70fa81a5935b72eacbe29");
         assert!(process("bogus", b"x").is_err());
+        // Compression works as a step, as in `encode`, so payloads can be packed then wrapped.
+        assert_eq!(
+            process("gzip,base64", b"x").unwrap(),
+            codec::encode("base64", &codec::encode("gzip", b"x").unwrap()).unwrap()
+        );
+        // Every encoding the Codec offers is a listed processor.
+        for kind in codec::ENCODINGS {
+            assert!(PROCESSORS.contains(kind), "{kind}");
+        }
     }
 }

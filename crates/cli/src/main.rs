@@ -206,7 +206,8 @@ enum Cmd {
     Encode(CodecArgs),
 
     /// Decode input. Chain decodings with commas, applied left to right. `auto` finds and
-    /// undoes the layers itself (URL, base64, hex, HTML, JWT, gzip, zlib); `steps` lists them.
+    /// undoes the layers itself (URL, base64, hex, HTML, JWT, gzip, zlib); `steps` lists them
+    /// and `stopped` says why it stopped. Binary output: use --raw.
     Decode(CodecArgs),
 
     /// Hash input.
@@ -900,15 +901,18 @@ fn codec_cmd(a: CodecArgs, out: &Out, f: impl Fn(&str, &[u8]) -> Result<Vec<u8>,
 }
 
 /// `decode`: like `codec_cmd`, plus `steps`, the decodings applied with each `auto`
-/// expanded to what it found, so the chain can be replayed or edited one step at a time.
+/// expanded to what it found, so the chain can be replayed or edited one step at a time,
+/// and `stopped`, why the last `auto` stopped.
 fn decode_cmd(a: CodecArgs, out: &Out) -> Result<(), Error> {
     let mut value = read_input(a.input.as_deref())?;
     let mut steps: Vec<&str> = Vec::new();
+    let mut stopped = None;
     for kind in a.kind.split(',').map(str::trim).filter(|k| !k.is_empty()) {
         if kind == "auto" {
             let found = codec::smart_decode(&value);
             steps.extend(found.steps);
             value = found.output;
+            stopped = Some(found.stopped.to_json());
         } else {
             value = codec::decode(kind, &value)?;
             steps.push(kind);
@@ -918,7 +922,10 @@ fn decode_cmd(a: CodecArgs, out: &Out) -> Result<(), Error> {
         out.raw(&value);
         return Ok(());
     }
-    let data = json!({"chain": a.kind, "steps": steps, "output": body_value(&value, usize::MAX)});
+    let mut data = json!({"chain": a.kind, "steps": steps, "output": body_value(&value, usize::MAX)});
+    if let Some(stopped) = stopped {
+        data["stopped"] = stopped;
+    }
     out.ok(data, || String::from_utf8_lossy(&value).into_owned());
     Ok(())
 }

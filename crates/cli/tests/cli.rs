@@ -195,9 +195,17 @@ fn decode_auto_steps_and_limits() {
     assert_eq!((&v["data"]["steps"], &v["data"]["output"]), (&auto["data"]["steps"], &auto["data"]["output"]));
     let (_, v) = run(&["decode", "auto,auto", &layered], &project, None);
     assert_eq!((&v["data"]["steps"], v["data"]["chain"].as_str()), (&auto["data"]["steps"], Some("auto,auto")));
-    // Without `auto`, steps are the chain as given.
+    // `stopped` says why the last `auto` stopped: here the JSON it reached.
+    assert_eq!(auto["data"]["stopped"], "json");
+    let (_, v) = run(&["decode", "auto", "plain"], &project, None);
+    assert_eq!((&v["data"]["steps"], &v["data"]["stopped"]), (&serde_json::json!([]), &serde_json::json!("nothing")));
+    let (_, v) = run(&["encode", &["base64"; 10].join(","), "deep"], &project, None);
+    let (_, v) = run(&["decode", "auto", v["data"]["output"]["content"].as_str().unwrap()], &project, None);
+    assert_eq!((v["data"]["steps"].as_array().unwrap().len(), &v["data"]["stopped"]), (8, &serde_json::json!("depth")));
+    // Without `auto`, steps are the chain as given and there is no `stopped`.
     let (_, v) = run(&["decode", "base64,url", "YSUyMGI="], &project, None);
     assert_eq!(v["data"]["steps"], serde_json::json!(["base64", "url"]));
+    assert!(v["data"].get("stopped").is_none(), "{v}");
     // --raw prints the bytes alone.
     let out = bin().arg("--project").arg(&project).args(["decode", "auto", "--raw", &layered]).output().unwrap();
     assert!(out.status.success());
@@ -243,6 +251,9 @@ fn decode_refuses_decompression_bombs() {
     // `auto` stops before the bomb and hands back the compressed bytes.
     let (code, v) = run(&["decode", "auto", &bomb], &project, None);
     assert_eq!((code, &v["data"]["steps"]), (0, &serde_json::json!(["base64"])));
+    // It says so, rather than looking like there was nothing more to undo.
+    assert_eq!(v["data"]["stopped"]["refused"], "gzip", "{v}");
+    assert!(v["data"]["stopped"]["error"].as_str().unwrap().contains("16 MB limit"), "{v}");
     assert_eq!(v["data"]["output"]["encoding"], "base64");
     assert!(v["data"]["output"]["length"].as_u64().unwrap() < 64 * 1024);
 }

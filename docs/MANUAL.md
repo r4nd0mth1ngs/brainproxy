@@ -293,7 +293,8 @@ attack type, and pick payloads:
   - **List:** type your own payloads.
   - **Numbers:** a range.
   - **File:** a wordlist on disk.
-  - **Processing:** each set can be encoded, hashed, or prefixed.
+  - **Processing:** each set can be encoded, compressed (gzip, zlib, deflate), hashed, or
+    prefixed.
 - **Matching:** grep for text in responses, extract values, or match status codes.
 - **Encoding:** payloads placed in the URL or a form body are URL-encoded where needed
   (option on by default).
@@ -480,21 +481,30 @@ working on the previous output. Decoding `url` reads `+` as a space, as form dat
   fill memory.
 - **Smart decode** finds the layers on the input and puts them in as steps, so you can see
   what it did and change it. It tries, in turn: gzip and zlib (by their first bytes), a JWT,
-  URL escapes, HTML entities, hex, and Base64, up to 8 layers, and stops when nothing
-  applies. It is cautious: hex and Base64 count only when the whole input is one and it
-  decodes to readable text, JSON, or compressed data that unpacks. Short inputs also need
+  URL escapes, HTML entities, hex, and Base64, up to 8 layers. It stops when nothing
+  applies, and at JSON (a JWT's included): the document is left as the server holds it,
+  with its strings' `%2F`, `+`, and `&quot;` intact. The note beside the button says when
+  it stopped for another reason: the 8-layer limit (more may remain; use the last output as
+  the input and run it again), or a gzip or zlib layer over the 16 MB limit. It is cautious:
+  hex and Base64 count only when the whole input is one and it decodes to readable text,
+  JSON, or compressed data that unpacks. Short inputs also need
   a clear sign: for Base64, padding, a symbol, or mixed case with digits; for hex, a `0x`
   prefix or spaces or colons between bytes. So words like `password` or `deadbeef` stay
   as they are. Base64 with a raw `+` and an escaped `=` (common in cookies) gets `percent`, not
   `url`, so the `+` survives even when the Base64 holds binary. When it misses a layer, add
   the step by hand.
 
-On the command line, `decode auto` does the same and lists what it applied in `steps`:
+On the command line, `decode auto` does the same and lists what it applied in `steps`, and
+why it stopped in `stopped`: `"nothing"`, `"json"`, `"depth"` (the 8-layer limit), or
+`{"refused": "gzip", "error": "..."}` for a layer over the size limit. Text output (the
+default in a terminal) is the result alone, read as UTF-8, so binary bytes come out as
+replacement characters; JSON output gives them as Base64, and `--raw` prints them as they are:
 
 ```sh
 brainproxy decode auto 'H4sIAAAAAAAA%2F6tWKsrPSVWyUkpMyc3MU6oFAOdvn34QAAAA'
-# {"role":"admin"}, with "steps": ["url", "base64", "gzip"] in the JSON output
+# {"role":"admin"}, with "steps": ["url", "base64", "gzip"] and "stopped": "json" in the JSON output
 brainproxy encode gzip,base64,url '{"role":"admin"}'    # and back again
+brainproxy decode auto --raw "$cookie" > value.bin     # binary output, byte for byte
 ```
 
 ### Diff

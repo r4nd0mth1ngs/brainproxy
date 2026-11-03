@@ -142,11 +142,38 @@ pub fn decode_jwt(token: &str) -> Result<serde_json::Value> {
     }))
 }
 
-/// What `smart_decode` found: the decodings it applied, in order, and the result.
+/// What `smart_decode` found: the decodings it applied, in order, the result, and why it
+/// stopped there.
 #[derive(Debug, PartialEq)]
 pub struct Smart {
     pub steps: Vec<&'static str>,
     pub output: Vec<u8>,
+    pub stopped: Stop,
+}
+
+/// Why `smart_decode` stopped.
+#[derive(Debug, PartialEq)]
+pub enum Stop {
+    /// No decoding applies to the output.
+    Nothing,
+    /// The output is JSON (a JWT's included), kept as the server holds it.
+    Json,
+    /// `SMART_DEPTH` steps were applied and another would apply: more may remain.
+    Depth,
+    /// The next layer is gzip or zlib over `MAX_INFLATED`, so it wasn't unpacked.
+    Refused { kind: &'static str, error: String },
+}
+
+impl Stop {
+    /// `"nothing"`, `"json"`, `"depth"`, or `{"refused": KIND, "error": MESSAGE}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Stop::Nothing => "nothing".into(),
+            Stop::Json => "json".into(),
+            Stop::Depth => "depth".into(),
+            Stop::Refused { kind, error } => serde_json::json!({"refused": kind, "error": error}),
+        }
+    }
 }
 
 /// Detects and applies decodings until none applies, up to `SMART_DEPTH` steps. Each step
@@ -156,16 +183,35 @@ pub struct Smart {
 pub fn smart_decode(input: &[u8]) -> Smart {
     let mut steps = Vec::new();
     let mut value = input.to_vec();
-    while steps.len() < SMART_DEPTH {
-        let Some((kind, next)) = smart_step(&value) else { break };
+    let stopped = loop {
+        // JSON (a JWT decodes to it) is what the server holds: undoing URL escapes or HTML
+        // entities across the whole document would change its strings and can break it.
+        if steps.last() == Some(&"jwt") || json_container(&value) {
+            break Stop::Json;
+        }
+        let Some((kind, next)) = smart_step(&value) else { break refused(&value).unwrap_or(Stop::Nothing) };
+        if steps.len() == SMART_DEPTH {
+            break Stop::Depth;
+        }
         steps.push(kind);
         value = next;
-        // A JWT decodes to JSON: nothing further to undo.
-        if kind == "jwt" {
-            break;
-        }
+    };
+    Smart { steps, output: value, stopped }
+}
+
+/// `Stop::Refused` when `v` is gzip or zlib that unpacks to more than `MAX_INFLATED`.
+fn refused(v: &[u8]) -> Option<Stop> {
+    let (kind, decoder): (_, Box<dyn Read>) = if v.starts_with(&[0x1f, 0x8b]) {
+        ("gzip", Box::new(flate2::read::MultiGzDecoder::new(v)))
+    } else if zlib_header(v) {
+        ("zlib", Box::new(flate2::read::ZlibDecoder::new(v)))
+    } else {
+        return None;
+    };
+    match read_inflated(decoder) {
+        Err(Inflate::TooBig) => Some(Stop::Refused { kind, error: Inflate::TooBig.message(kind) }),
+        _ => None,
     }
-    Smart { steps, output: value }
 }
 
 /// The first decoding that applies to `v`, and its output.
@@ -335,12 +381,16 @@ enum Inflate {
 
 impl Inflate {
     fn error(self, name: &str) -> Error {
-        Error::InvalidInput(match self {
+        Error::InvalidInput(self.message(name))
+    }
+
+    fn message(&self, name: &str) -> String {
+        match self {
             Inflate::Bad(e) => format!("{name}: {e}"),
             Inflate::TooBig => {
                 format!("{name}: output is over the {} MB limit (a decompression bomb?)", MAX_INFLATED / (1024 * 1024))
             }
-        })
+        }
     }
 }
 
@@ -378,7 +428,8 @@ fn html_decode(input: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
-        let decoded = rest.find(';').filter(|&semi| semi <= 12).and_then(|semi| {
+        // Only the next 13 bytes: searching the whole rest for every '&' is quadratic.
+        let decoded = rest.as_bytes()[..rest.len().min(13)].iter().position(|&b| b == b';').and_then(|semi| {
             let entity = &rest[1..semi];
             let ch = match entity {
                 "amp" => Some('&'),
@@ -526,7 +577,10 @@ mod tests {
         }
 
         let zlib_hex = encode("hex", &encode("zlib", b"secret=1").unwrap()).unwrap();
-        assert_eq!(smart_decode(&zlib_hex), Smart { steps: vec!["hex", "zlib"], output: b"secret=1".to_vec() });
+        assert_eq!(
+            smart_decode(&zlib_hex),
+            Smart { steps: vec!["hex", "zlib"], output: b"secret=1".to_vec(), stopped: Stop::Nothing }
+        );
 
         let s = smart_decode(b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln");
         assert_eq!(s.steps, ["jwt"]);
@@ -602,6 +656,14 @@ mod tests {
         let s = smart_decode(&v);
         assert_eq!(s.steps.len(), SMART_DEPTH);
         assert!(s.steps.iter().all(|k| *k == "base64"));
+        assert_eq!(s.stopped, Stop::Depth);
+        // Exactly SMART_DEPTH layers: nothing is left, so the limit isn't what stopped it.
+        let mut v = b"deep secret value".to_vec();
+        for _ in 0..SMART_DEPTH {
+            v = encode("base64", &v).unwrap();
+        }
+        let s = smart_decode(&v);
+        assert_eq!((s.steps.len(), s.output, s.stopped), (SMART_DEPTH, b"deep secret value".to_vec(), Stop::Nothing));
     }
 
     /// Runs `steps` one decode at a time, as the Codec view does with what `auto` found.
@@ -758,7 +820,10 @@ mod tests {
         assert!(looks_decoded(b"[1]") && !printable_ascii(b"[1]"));
         // JSON must be UTF-8, strings included: ["\xff"] is neither, so the base64 stays.
         assert!(!json_container(b"[\"\xff\"]"));
-        assert_eq!(smart_decode(b"WyL/Il0="), Smart { steps: vec![], output: b"WyL/Il0=".to_vec() });
+        assert_eq!(
+            smart_decode(b"WyL/Il0="),
+            Smart { steps: vec![], output: b"WyL/Il0=".to_vec(), stopped: Stop::Nothing }
+        );
     }
 
     #[test]
@@ -780,7 +845,7 @@ mod tests {
         // Unsigned tokens (alg none), with or without the trailing dot.
         for token in ["eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.", "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0"] {
             let s = smart_decode(token.as_bytes());
-            assert_eq!(s.steps, ["jwt"], "{token}");
+            assert_eq!((&s.steps[..], &s.stopped), (&["jwt"][..], &Stop::Json), "{token}");
             let v: serde_json::Value = serde_json::from_slice(&s.output).unwrap();
             assert_eq!((v["header"]["alg"].as_str(), v["signature"].as_str()), (Some("none"), Some("")));
         }
@@ -851,12 +916,29 @@ mod tests {
     #[test]
     fn smart_decode_stops_at_bad_or_huge_compression() {
         // gzip's magic bytes, then nothing usable.
-        assert_eq!(smart_decode(&[0x1f, 0x8b, 0x08]), Smart { steps: vec![], output: vec![0x1f, 0x8b, 0x08] });
+        assert_eq!(
+            smart_decode(&[0x1f, 0x8b, 0x08]),
+            Smart { steps: vec![], output: vec![0x1f, 0x8b, 0x08], stopped: Stop::Nothing }
+        );
         // A bomb isn't unpacked: auto stops before it, with the compressed bytes as output.
         let bomb = encode("gzip", &vec![0u8; MAX_INFLATED as usize + 1]).unwrap();
-        assert!(smart_decode(&bomb).steps.is_empty());
+        let refused = Stop::Refused {
+            kind: "gzip",
+            error: "gzip: output is over the 16 MB limit (a decompression bomb?)".into(),
+        };
+        let s = smart_decode(&bomb);
+        assert!(s.steps.is_empty());
+        assert_eq!(s.stopped, refused);
         let s = smart_decode(&encode("base64", &bomb).unwrap());
-        assert_eq!((s.steps, s.output), (vec!["base64"], bomb));
+        assert_eq!((s.steps, s.output, s.stopped), (vec!["base64"], bomb, refused));
+        let zlib = encode("zlib", &vec![0u8; MAX_INFLATED as usize + 1]).unwrap();
+        let s = smart_decode(&encode("hex", &zlib).unwrap());
+        assert_eq!(s.steps, ["hex"]);
+        assert!(matches!(s.stopped, Stop::Refused { kind: "zlib", .. }), "{:?}", s.stopped);
+        assert_eq!(
+            s.stopped.to_json(),
+            serde_json::json!({"refused": "zlib", "error": "zlib: output is over the 16 MB limit (a decompression bomb?)"})
+        );
         // Raw deflate has no magic bytes, so it is never guessed.
         let raw = encode("base64", &encode("deflate", b"hello hello hello").unwrap()).unwrap();
         assert!(smart_decode(&raw).steps.is_empty());
@@ -870,9 +952,48 @@ mod tests {
         }
         let s = smart_decode(&v);
         assert_eq!(s.steps, ["url"; SMART_DEPTH]);
+        assert_eq!(s.stopped.to_json(), "depth");
         assert!(s.output.starts_with(b"%25"), "{}", String::from_utf8_lossy(&s.output));
         assert_eq!(replay(&v, &s.steps), s.output);
         // A second run picks up where the first stopped.
         assert_eq!(smart_decode(&s.output).output, b"<b>");
+    }
+
+    #[test]
+    fn smart_decode_stops_at_json() {
+        // The JSON a cookie holds keeps its escapes: no url or html step runs across it.
+        let json = br#"{"next":"https://x/a%2Fb?q=1+2","t":"&quot;x&quot;"}"#;
+        let cookie = encode("base64", &encode("gzip", json).unwrap()).unwrap();
+        let s = smart_decode(&cookie);
+        assert_eq!((s.steps, s.output, s.stopped), (vec!["base64", "gzip"], json.to_vec(), Stop::Json));
+        // URL-escaped JSON is unescaped once, then left alone.
+        let s = smart_decode(b"%7B%22q%22%3A%22a%252Fb%22%7D");
+        assert_eq!((s.steps, s.output), (vec!["url"], br#"{"q":"a%2Fb"}"#.to_vec()));
+        assert_eq!(s.stopped.to_json(), "json");
+        // JSON as the input is already what the server holds.
+        let s = smart_decode(br#"[{"a":"&lt;b&gt;"}, "x+y%21"]"#);
+        assert_eq!((s.steps.len(), s.stopped), (0, Stop::Json));
+        // Not JSON: decoding goes on as before.
+        assert_eq!(smart_decode(b"%7Bnot json%7D&amp;").steps, ["url", "html"]);
+        assert_eq!(smart_decode(b"plain").stopped.to_json(), "nothing");
+    }
+
+    #[test]
+    fn html_decode_is_linear() {
+        // Each '&' looks for its ';' only nearby: megabytes of '&' with no ';' take
+        // milliseconds, not hours.
+        let amps = "&".repeat(4 << 20);
+        assert_eq!(html_decode(&amps), amps);
+        let mixed = "&amp;&lt;x&".repeat(1 << 18);
+        assert_eq!(html_decode(&mixed), "&<x&".repeat(1 << 18));
+        // An entity whose ';' is 12 bytes on is the longest read; multi-byte text after '&' is fine.
+        assert_eq!(html_decode("&#x000000041;"), "A");
+        assert_eq!(html_decode("&#x0000000041;"), "&#x0000000041;");
+        assert_eq!(html_decode("&éééééééé;&amp;"), "&éééééééé;&");
+        // Smart decode tries html on what it inflated: a small value hiding megabytes of '&'.
+        let hidden = encode("base64", &encode("gzip", "&".repeat(2 << 20).as_bytes()).unwrap()).unwrap();
+        assert!(hidden.len() < 16 * 1024);
+        let s = smart_decode(&hidden);
+        assert_eq!((s.steps, s.output.len(), s.stopped), (vec!["base64", "gzip"], 2 << 20, Stop::Nothing));
     }
 }

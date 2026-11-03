@@ -4,13 +4,15 @@
 
 import { useEffect, useRef, useState } from "react";
 import { bodyText, isBinary, run, textBytes, type Body } from "../api";
-import { KINDS, SmartRuns, smartNote, smartSteps, type Op, type Step } from "./codec";
+import { KINDS, SmartRuns, smartNote, smartSteps, smartStopped, type Op, type Step } from "./codec";
 
 export function DecoderView() {
   const [input, setInput] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ op: "decode", kind: "url" }]);
   const [outputs, setOutputs] = useState<{ text: string; error?: string }[]>([]);
   const [note, setNote] = useState<{ text: string; error?: boolean } | null>(null);
+  // A Smart decode is running: the CLI may take a moment on a large input.
+  const [busy, setBusy] = useState(false);
   // Any input or step edit drops a pending Smart decode, so its answer can't undo the edit.
   const smartRuns = useRef(new SmartRuns()).current;
 
@@ -69,14 +71,17 @@ export function DecoderView() {
   const smartDecode = async () => {
     const id = smartRuns.start();
     setNote(null);
+    setBusy(true);
     try {
-      const d = await run<{ steps?: unknown }>(["decode", "auto", "-"], textBytes(input));
+      const d = await run<{ steps?: unknown; stopped?: unknown }>(["decode", "auto", "-"], textBytes(input));
       if (!smartRuns.current(id)) return;
       const found = smartSteps(d.steps);
       if (found.length) setSteps(found);
-      setNote({ text: smartNote(found) });
+      setNote({ text: smartNote(found, smartStopped(d.stopped)) });
     } catch (e: any) {
       if (smartRuns.current(id)) setNote({ text: e.message, error: true });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -85,15 +90,19 @@ export function DecoderView() {
       <div className="dec-panel">
         <div className="dec-head">
           <span className="label">Input</span>
-          {note && <span className={note.error ? "error" : "muted small"}>{note.text}</span>}
+          {/* Always there, so screen readers announce the note when it changes. */}
+          <span className={note?.error ? "error" : "muted small"} aria-live="polite">
+            {note?.text}
+          </span>
           <span className="grow" />
           <button
             className="btn small"
             onClick={smartDecode}
-            disabled={!input}
+            disabled={!input || busy}
+            aria-busy={busy}
             title="Find the URL, Base64, hex, HTML, JWT, gzip, and zlib layers and make them the steps below"
           >
-            Smart decode
+            {busy ? "Decoding…" : "Smart decode"}
           </button>
         </div>
         <textarea
