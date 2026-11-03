@@ -212,6 +212,7 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&child_argv);
+    brainproxy_core::provenance::pass_on(&mut cmd);
     process::detach(&mut cmd);
     let stdin = process::work_lock_stdin(&store, &lock_name(id));
     let mut child =

@@ -96,6 +96,7 @@ fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> Act
         auth: None,
         oob: None,
         oob_wait: std::time::Duration::ZERO,
+        check_methods: vec![],
     };
     let targets = vec![ScanTarget {
         history_id: None,

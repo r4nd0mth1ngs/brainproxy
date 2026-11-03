@@ -16,7 +16,8 @@ use crate::output::Out;
 pub enum BrowserCmd {
     /// Browsers found on this machine (Chromium-based and Firefox).
     List,
-    /// Start a browser through the running proxy, in a separate profile for this project.
+    /// Start a browser through the running proxy, in a separate profile for this project. Not
+    /// offered through MCP: the profile keeps the person's sign-ins.
     #[command(after_help = "Chromium-based browsers trust the brainproxy CA in that profile only \
         (--ignore-certificate-errors-spki-list with the CA key; other certificate errors still show). Firefox gets \
         the proxy settings; import the CA once in that profile (the output says how). Loopback addresses go through \
@@ -179,6 +180,15 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
             Ok(())
         }
         BrowserCmd::Open { browser, url } => {
+            // Its profile keeps the person's cookies and sign-ins, and the window is theirs: an
+            // agent mustn't load pages in it (what it loads would be recorded as the proxy's).
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "browser open isn't offered through MCP: the browser uses the person's profile for this project; \
+                     a person opens it from the app or a terminal"
+                        .into(),
+                ));
+            }
             let (data, text) = open(project, home, &found, browser, url.unwrap_or_else(|| "about:blank".into()), None)?;
             out.ok(data, || text);
             Ok(())

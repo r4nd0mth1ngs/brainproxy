@@ -25,10 +25,15 @@ use crate::process::{self, Liveness};
 const STOP_KEY: &str = "proxy.stop";
 const LOCK_NAME: &str = "proxy";
 
-/// How long a proxy may take to exit when asked to. With a live authz run it also has to
-/// finish its tests and save the run.
-const STOP_WAIT: Duration = Duration::from_secs(5);
+/// How long a proxy may take to exit when asked to before it is killed. It exits as soon as
+/// it is done: after waiting up to 3 s for requests already sent upstream, it writes out
+/// every queued capture, which a busy proxy may take a while to do. With a live authz run
+/// it also has to finish its tests and save the run.
+const STOP_WAIT: Duration = Duration::from_secs(30);
 const STOP_WAIT_AUTHZ: Duration = Duration::from_secs(30);
+/// A proxy whose state has no start time is from an older version, which exits without
+/// draining.
+const STOP_WAIT_OLD: Duration = Duration::from_secs(5);
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -556,7 +561,11 @@ pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     let Some((Saved { state, start_time, pid_ns }, _)) = recorded(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
-    let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
+    let wait = match (state.authz_run.is_some(), start_time.is_some()) {
+        (true, _) => STOP_WAIT_AUTHZ,
+        (false, true) => STOP_WAIT,
+        (false, false) => STOP_WAIT_OLD,
+    };
     let forced = if process::elsewhere(pid_ns.as_deref()) {
         process::await_exit_elsewhere(store, LOCK_NAME, STATE_KEY, state.pid, wait)?;
         false
@@ -705,6 +714,9 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if let Some((s, known)) = recorded(&store)? {
         return Err(already_running(&s, known));
     }
+    if let Ok(addr) = args.listen.parse() {
+        check_listen(addr)?;
+    }
     load_ca(home)?; // Surface CA and scope problems here rather than in the log.
     store.guard()?;
     let project = std::fs::canonicalize(project)?;
@@ -747,6 +759,7 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
             cmd.arg("--authz-keep-cookie").arg(args.authz_keep_cookie.join(","));
         }
     }
+    brainproxy_core::provenance::pass_on(&mut cmd);
     process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
@@ -863,6 +876,18 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
 }
 
 /// Why the address can't be bound, by error kind: the system's own text is localised on Windows.
+/// Under an MCP tool call, refuses a listener other machines could reach: an agent could
+/// otherwise open the person's proxy, with their auth profiles, to the network.
+fn check_listen(addr: std::net::SocketAddr) -> Result<(), Error> {
+    if crate::mcp::in_tool_call() && !addr.ip().is_loopback() {
+        return Err(Error::InvalidInput(format!(
+            "--listen {addr}: through MCP the proxy listens on loopback only; a person can choose another address \
+             in the app or a terminal"
+        )));
+    }
+    Ok(())
+}
+
 fn listen_error(addr: &str, e: &std::io::Error) -> Error {
     Error::Conflict(match e.kind() {
         std::io::ErrorKind::AddrInUse => {
@@ -893,6 +918,7 @@ fn serve(
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&args.listen).await.map_err(|e| listen_error(&args.listen, &e))?;
         let addr = listener.local_addr()?;
+        check_listen(addr)?;
         let (authz, worker) = match live {
             Some(l) => {
                 let (live, worker) = Live::start(project, l.run_id, l.cfg, l.opts, l.ctl)?;
@@ -991,8 +1017,15 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         }
         RulesCmd::Add { location, pattern, replace, comment, disabled } => {
             let id = rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-            let rule =
-                Rule { id, location: RuleLocation::parse(&location)?, pattern, replace, enabled: !disabled, comment };
+            let rule = Rule {
+                id,
+                location: RuleLocation::parse(&location)?,
+                pattern,
+                replace,
+                enabled: !disabled,
+                comment,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
+            };
             brainproxy_core::proxy::config::validate_rule(&rule)?;
             rules.push(rule);
         }
@@ -1003,6 +1036,10 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Enable { id } => {
             let i = find(&mut rules, id)?;
             brainproxy_core::proxy::config::validate_rule(&rules[i])?;
+            // Whoever turns a rule on answers for what it changes from then on.
+            if !rules[i].enabled {
+                rules[i].origin = Some(brainproxy_core::provenance::origin().to_string());
+            }
             rules[i].enabled = true;
         }
         RulesCmd::Disable { id } => {
@@ -1119,12 +1156,16 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     )
                 }
             };
-            store.intercept_resolve(id, "forwarded", edited.as_deref())?;
-            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some()}), || format!("forwarded #{id}"));
+            let by = brainproxy_core::provenance::origin();
+            store.intercept_resolve(id, "forwarded", edited.as_deref(), Some(by))?;
+            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by}), || {
+                format!("forwarded #{id}")
+            });
         }
         InterceptCmd::Drop { id } => {
-            store.intercept_resolve(id, "dropped", None)?;
-            out.ok(json!({"id": id, "state": "dropped"}), || format!("dropped #{id}"));
+            let by = brainproxy_core::provenance::origin();
+            store.intercept_resolve(id, "dropped", None, Some(by))?;
+            out.ok(json!({"id": id, "state": "dropped", "resolved_by": by}), || format!("dropped #{id}"));
         }
     }
     Ok(())
