@@ -108,10 +108,6 @@ interface State {
 
 const Ctx = createContext<State | null>(null);
 
-// Keys of tabs and toasts. Not per project: Replay keeps send history by tab key while the app runs.
-let nextKey = 1;
-const newKey = () => nextKey++;
-
 /** How long Replay's tabs stay unchanged before they are saved to the project. */
 const SAVE_TABS_AFTER_MS = 1000;
 
@@ -151,9 +147,12 @@ export function AppProvider({
   const [traffic, setTraffic] = useState<State["traffic"]>(null);
   // Mutated in place: the views read it when they act, nothing renders from it.
   const proxy = useRef(proxyControl()).current;
-  // Replay keeps sends in flight and results outside its views, keyed by tab; the next
-  // project's tabs reuse the keys, so they go (and the sends stop) with this project. The
-  // shell keys the provider by project, so a project change always unmounts it.
+  // Keys of tabs and toasts, from 1 in each project. Replay keeps sends in flight and results
+  // outside its views, keyed by tab; the next project's tabs reuse the keys, so they go (and
+  // the sends stop) with this project. The shell keys the provider by project, so a project
+  // change always unmounts it.
+  const nextKey = useRef(1);
+  const newKey = useRef(() => nextKey.current++).current;
   useEffect(() => () => clearReplayTabs(cancelCli), []);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info", onClick?: () => void) => {
