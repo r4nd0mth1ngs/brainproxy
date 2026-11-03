@@ -391,6 +391,8 @@ export interface AuthState {
   keyOrigins: string[];
   /** A saved query key set aside because the server changed, until it's saved again or the server changes back. */
   dropped: DroppedKey | null;
+  /** Every query key saved in this wizard and not removed, kept across sources: choosing its profile later says where it goes. */
+  queryKeys: QueryKey[];
   signing: boolean;
   signer: { profile: string; name: string } | null;
   oauth: OAuthForm;
@@ -398,11 +400,17 @@ export interface AuthState {
   script: string | null;
 }
 
-/** A query key that doesn't go to the new server: the profile holding it, and where it does go. */
-export interface DroppedKey {
+/** A query key saved in this wizard: the profile holding it, and the only origins it goes to. */
+export interface QueryKey {
   profile: string;
-  keyName: string;
   origins: string[];
+}
+
+/** A query key that doesn't go to the new server: the profile holding it, and where it does go. */
+export interface DroppedKey extends QueryKey {
+  keyName: string;
+  /** "Keep it" was the answer to the offer to remove its profile, which isn't made again. */
+  kept: boolean;
 }
 
 /** A change to the auth state: fields, or fields worked out from the latest state. */
@@ -435,6 +443,7 @@ export const EMPTY_AUTH: AuthState = {
   savedProfile: "",
   keyOrigins: [],
   dropped: null,
+  queryKeys: [],
   signing: false,
   signer: null,
   oauth: EMPTY_OAUTH,
@@ -668,7 +677,7 @@ const keyCovers = (keyOrigins: string[], origins: string[]): boolean => origins.
 export function afterServerChange(a: AuthState, origins: string[]): Partial<AuthState> {
   if (a.savedProfile && isQueryKey(a)) {
     if (keyCovers(a.keyOrigins, origins)) return {};
-    return { savedProfile: "", profileName: "", dropped: { profile: a.savedProfile, keyName: a.keyName.trim(), origins: a.keyOrigins } };
+    return { savedProfile: "", profileName: "", dropped: { profile: a.savedProfile, keyName: a.keyName.trim(), origins: a.keyOrigins, kept: false } };
   }
   if (a.mode === "key" && !a.savedProfile && a.dropped && keyCovers(a.dropped.origins, origins))
     return { savedProfile: a.dropped.profile, keyKind: "api_key", place: "query", keyName: a.dropped.keyName, keyOrigins: a.dropped.origins, dropped: null };
@@ -681,6 +690,33 @@ export function droppedKeyText(a: AuthState, origins: string[]): string {
   if (!d || a.mode !== "key" || a.savedProfile) return "";
   const elsewhere = origins.filter((o) => !d.origins.includes(o));
   return `The server changed. The key saved in the profile "${d.profile}" only goes to ${listWords(d.origins)}, which it was saved for, not to ${listWords(elsewhere) || "the new server"}. Save the key again for this server, or go back to the server it was saved for and it's used as before.`;
+}
+
+/** When the existing profile chosen holds a query key saved here for other origins: that the scan runs without it. "" otherwise. */
+export function profileKeyText(a: AuthState, origins: string[]): string {
+  const k = a.mode === "profile" ? a.queryKeys.find((x) => x.profile === a.existing) : undefined;
+  if (!k || keyCovers(k.origins, origins)) return "";
+  const elsewhere = origins.filter((o) => !k.origins.includes(o));
+  return `The key saved in the profile "${k.profile}" only goes to ${listWords(k.origins)}, which it was saved for, not to ${listWords(elsewhere) || "this server"}, so the scan runs without it. To send a key, choose API key or bearer token and save it again for this server, or go back to the server it was saved for.`;
+}
+
+/** Once `auth add` saved the key in `saved` for `origins`: its profile is the one used, and a query key is remembered with its origins. */
+export function keySaved(saved: AuthState, origins: string[]): AuthPatch {
+  const profile = saved.profileName.trim();
+  return (prev) => ({
+    savedProfile: profile,
+    keyOrigins: origins,
+    queryKeys: isQueryKey(saved) ? [...prev.queryKeys.filter((k) => k.profile !== profile), { profile, origins }] : prev.queryKeys,
+  });
+}
+
+/** Once `auth remove` removed the profile `name`: nothing refers to it any more. */
+export function profileRemoved(a: AuthState, name: string): Partial<AuthState> {
+  return {
+    queryKeys: a.queryKeys.filter((k) => k.profile !== name),
+    ...(a.dropped?.profile === name ? { dropped: null } : {}),
+    ...(a.signer?.profile === name ? { signer: null, script: null } : {}),
+  };
 }
 
 /** The form for a new signer: origins default to the operations' hosts. */
