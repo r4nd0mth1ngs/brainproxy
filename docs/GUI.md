@@ -84,7 +84,7 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   saved. The port is kept for every project, in the app; the rest in the project file
   (`proxy setup show/set`, one write that replaces the whole setup), so it goes with the file
   (Save as…, a copy) and a file made at the same path starts without it. MCP calls can't save
-  every interface. Access's live testing, starting a proxy that is off, uses it too.
+  every interface, invisible mode or a redirect. Access's live testing, starting a proxy that is off, uses it too.
   On a wildcard address the proxy pill says "open to the network", a project that starts its
   proxy that way when it opens says so in a toast, and Settings › Proxy warns and says other
   devices use this computer's LAN address on that port.

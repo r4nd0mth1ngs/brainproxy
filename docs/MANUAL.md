@@ -925,7 +925,8 @@ too); other devices use this computer's LAN address.
 `proxy setup set` saves, in the project file, how the desktop app starts the project's proxy
 (Settings › Proxy): `--network local|all` (127.0.0.1 or 0.0.0.0), `--invisible` and
 `--redirect URL`, replacing the whole setup each time; `proxy setup show` prints it with the
-`proxy start` options it stands for. An MCP tool call can't save `--network all`.
+`proxy start` options it stands for. An MCP tool call can't save `--network all`,
+`--invisible` or `--redirect`: the app would start the person's proxy with them.
 
 To move a running proxy to another address or options, restart it in one step:
 

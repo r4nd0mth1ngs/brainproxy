@@ -134,11 +134,12 @@ pub enum SetupCmd {
         /// profiles and platform auth). Not `all` in an MCP tool call.
         #[arg(long, value_enum, default_value = "local")]
         network: NetworkArg,
-        /// Also serve clients that don't know they're proxied (`proxy start --invisible`).
+        /// Also serve clients that don't know they're proxied (`proxy start --invisible`). Not in an
+        /// MCP tool call.
         #[arg(long)]
         invisible: bool,
         /// Send every request to this origin (`proxy start --redirect`); a path is dropped. Implies
-        /// --invisible.
+        /// --invisible. Not in an MCP tool call.
         #[arg(long, value_name = "URL")]
         redirect: Option<String>,
     },
@@ -212,6 +213,16 @@ fn setup(project: &Path, cmd: SetupCmd, out: &Out) -> Result<(), Error> {
                 return Err(Error::InvalidInput(
                     "--network=all isn't offered through MCP: it lets anyone who can reach this computer use the \
                      proxy, so a person chooses it (Settings › Proxy in the app, or a terminal)"
+                        .into(),
+                ));
+            }
+            // The app starts the person's proxy with the setup the next time the project opens: an
+            // agent's redirect would send everything they browse to an origin it chose.
+            if (invisible || redirect.is_some()) && crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "--invisible and --redirect aren't offered through MCP: the app starts the person's proxy with \
+                     them the next time the project opens, so a person chooses them (Settings › Proxy in the app, \
+                     or a terminal)"
                         .into(),
                 ));
             }

@@ -1960,6 +1960,22 @@ fn proxy_setup_is_saved_in_the_project_file() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(2), "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("isn't offered through MCP"), "{v}");
+    // Nor plant a redirect or invisible mode that the app would start the person's proxy with.
+    for args in [
+        &["--redirect=http://127.0.0.1:8081"][..],
+        &["--invisible"],
+        &["--network=local", "--redirect=http://127.0.0.1:8081"],
+    ] {
+        let (code, v) = env.run_env(&[&["proxy", "setup", "set"][..], args].concat(), &[("BRAINPROXY_MCP_CALL", "1")]);
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{args:?}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("aren't offered through MCP"), "{v}");
+    }
+    assert_eq!(env.ok(&["proxy", "setup", "show"]), saved);
+    // Going back to the defaults is fine: it only narrows what the proxy does.
+    let (code, v) = env.run_env(&["proxy", "setup", "set", "--network=local"], &[("BRAINPROXY_MCP_CALL", "1")]);
+    assert_eq!(code, 0, "{v}");
+    defaults(&v["data"]);
+    assert_eq!(env.ok(&["proxy", "setup", "set", "--network=all", "--redirect=https://app.example.test"]), saved);
     for bad in ["--redirect=ftp://app.example.test", "--redirect=http://127.0.0.1:0"] {
         let (code, v) = env.run(&["proxy", "setup", "set", bad]);
         assert_eq!(code, 2, "{bad}: {v}");
