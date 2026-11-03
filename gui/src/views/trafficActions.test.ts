@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { accessConfirm, authzOptIns, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, scanArgs, scanBlocker, scanConfirm, scanOptIns, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { accessConfirm, authzOptIns, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, scanArgs, scanBlocker, scanConfirm, scanOptIns, siteMapScanArgs, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
 import { isRefused } from "./trafficFilter.ts";
 
 const get: HistoryPick = { id: 7, method: "GET", url: "https://shop.test/search?q=x" };
@@ -318,4 +318,27 @@ test("an access-control run needs no opt-in that its question doesn't ask about"
   for (const picks of cases) {
     if (authzOptIns(picks).length) assert.ok(accessConfirm(picks, ["alice"], true), JSON.stringify(picks));
   }
+});
+
+test("the Site map's scan of one request asks before a method or mutation the scanner refuses", () => {
+  const nuclei = ["--checks", "nuclei", "--check-severity", "high"];
+  // GET and POST are scanned by default: no question, no opt-in.
+  for (const pick of [get, post]) {
+    assert.deepEqual(scanOptIns([pick]), [], `${pick.method} needs no question`);
+    assert.deepEqual(siteMapScanArgs(pick, nuclei), ["scan", "active", "--history-id", String(pick.id), ...nuclei, "--background"]);
+  }
+  const del: HistoryPick = { id: 21, method: "delete", url: "https://shop.test/api/users/4" };
+  assert.deepEqual(scanOptIns([del]), ["DELETE"]);
+  // Not yet answered: nothing opted in, so the scanner refuses it and sends nothing.
+  assert.deepEqual(siteMapScanArgs(del, []), ["scan", "active", "--history-id", "21", "--background"]);
+  assert.deepEqual(siteMapScanArgs(del, nuclei, true), ["scan", "active", "--history-id", "21", "--include-methods=DELETE", ...nuclei, "--background"]);
+  const q = scanConfirm([del], { nuclei: true });
+  assert.match(q.message, /DELETE https:\/\/shop\.test\/api\/users\/4/, "names the request");
+  assert.match(q.message, /even though it is a DELETE/, "names the method");
+  assert.match(q.message, /Their DELETE requests are sent too/, "the templates get the opt-in as well");
+
+  const m: HistoryPick = { id: 22, method: "POST", url: "https://shop.test/graphql", mutation: true };
+  assert.deepEqual(siteMapScanArgs(m, [], true), ["scan", "active", "--history-id", "22", "--include-methods=MUTATION", "--background"]);
+  assert.match(scanConfirm([m], { nuclei: false }).message, /even though it is a GraphQL mutation/);
+  for (const method of ["PUT", "PATCH"]) assert.deepEqual(siteMapScanArgs({ ...del, method }, [], true).slice(4, 5), [`--include-methods=${method}`]);
 });

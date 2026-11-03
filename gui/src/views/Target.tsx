@@ -11,6 +11,7 @@ import { usePoll } from "../ui/usePoll";
 import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
+import { isMutationRequest, scanConfirm, scanOptIns, siteMapScanArgs, type HistoryPick } from "./trafficActions";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -284,22 +285,40 @@ function SiteMap({ active }: { active: boolean }) {
       .catch(() => {});
   }, []);
 
+  // `args` ends in --background.
   const launch = (args: string[], what: string) =>
-    run<{ job: number }>([...args, "--background"])
+    run<{ job: number }>(args)
       .then((d) => app.toast(`${what} started (job ${d.job}); see Scans`))
       .catch((e) => app.toast(e.message, "error"));
 
-  const actions = (url: string, lastId: number, scan: string[], prefix?: string): MenuItem[] => [
+  // One recorded request: `scan active --history-id` refuses a DELETE, PUT, PATCH or GraphQL
+  // mutation without `--include-methods`, so those are asked about first, naming what it is.
+  // Whether it is a mutation is read from the recorded request; when that can't be read, its method decides.
+  const scanRequest = async (r: HistoryItem) => {
+    const base: HistoryPick = { id: r.id, method: r.method, url: r.url };
+    const pick = await run<HistoryEntry>(["history", "show", String(r.id), MAX_BODY]).then(
+      (e) => ({ ...base, mutation: isMutationRequest(bodyText(e.request), !!e.request.truncated) }),
+      () => base,
+    );
+    const asks = scanOptIns([pick]).length > 0;
+    if (asks) {
+      const q = scanConfirm([pick], { nuclei: nucleiArgs.length > 0 });
+      if (!(await confirm(q.title, q.message, q.ok, q.cancel))) return;
+    }
+    return launch(siteMapScanArgs(pick, nucleiArgs, asks), "Active scan");
+  };
+
+  const actions = (url: string, lastId: number, scan: () => void, prefix?: string): MenuItem[] => [
     { label: "Send to Replay", action: () => toRepeater(lastId) },
-    { label: "Crawl from here", action: () => launch(["crawl", url, ...(prefix ? [`--path-prefix=${prefix}`] : [])], "Crawl") },
-    { label: prefix != null ? "Active scan this branch" : "Active scan this request", action: () => launch(["scan", "active", ...scan, ...nucleiArgs], "Active scan") },
+    { label: "Crawl from here", action: () => launch(["crawl", url, ...(prefix ? [`--path-prefix=${prefix}`] : []), "--background"], "Crawl") },
+    { label: prefix != null ? "Active scan this branch" : "Active scan this request", action: scan },
     { label: "Copy URL", action: () => navigator.clipboard.writeText(url) },
   ];
 
   const nodeMenu = (n: Node, ev: React.MouseEvent) => {
     ev.preventDefault();
     setNode(n);
-    open(ev, actions(n.origin + (n.path || "/"), n.last, [`--where=${whereFor(n)}`], n.path || "/"));
+    open(ev, actions(n.origin + (n.path || "/"), n.last, () => launch(["scan", "active", `--where=${whereFor(n)}`, ...nucleiArgs, "--background"], "Active scan"), n.path || "/"));
   };
 
   const isOpen = (n: Node, depth: number) => (depth === 0 ? !toggled.has(n.key) : toggled.has(n.key));
@@ -418,7 +437,7 @@ function SiteMap({ active }: { active: boolean }) {
                 selected={selected}
                 onSelect={(r) => setSelected(r.id)}
                 onActivate={(r) => toRepeater(r.id)}
-                onContextMenu={(r, e) => open(e, [...actions(r.url, r.id, ["--history-id", String(r.id)]), { label: "Copy as cURL", action: () => copyCurl(r.id) }])}
+                onContextMenu={(r, e) => open(e, [...actions(r.url, r.id, () => scanRequest(r)), { label: "Copy as cURL", action: () => copyCurl(r.id) }])}
                 initialSort={{ key: "id", desc: true }}
                 empty="No requests under this node."
               />

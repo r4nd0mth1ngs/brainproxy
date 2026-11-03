@@ -158,16 +158,31 @@ export function authzOptIns(picks: HistoryPick[]): string[] {
  */
 export function scanArgs(picks: HistoryPick[], d: ScanDefaults, confirmed = false): string[] {
   if (!picks.length) throw new Error("No request picked");
-  const optIns = confirmed ? scanOptIns(picks) : [];
   return [
     "scan",
     "active",
     ...picks.map((p) => `--history-id=${p.id}`),
     "--strength=medium",
-    ...(optIns.length ? [`--include-methods=${optIns.join(",")}`] : []),
+    ...optInArgs(picks, confirmed),
     ...(d.nuclei ? ["--checks=nuclei,brainproxy", "--check-include-tags=eol", "--check-severity=high"] : []),
     "--background",
   ];
+}
+
+/** `--include-methods` with what `scanOptIns` names, once the user said yes; nothing otherwise. */
+function optInArgs(picks: HistoryPick[], confirmed: boolean): string[] {
+  const optIns = confirmed ? scanOptIns(picks) : [];
+  return optIns.length ? [`--include-methods=${optIns.join(",")}`] : [];
+}
+
+/**
+ * The Site map's *Active scan this request*: `scan active --history-id` with the Site map's Nuclei
+ * arguments, in the background. As from Traffic, a DELETE, PUT, PATCH or GraphQL mutation is
+ * opted in to only once the user said yes to `scanConfirm`; the Site map asks only then
+ * (`scanOptIns` not empty), as `scan active` attacks anything else by default.
+ */
+export function siteMapScanArgs(pick: HistoryPick, nucleiArgs: string[], confirmed = false): string[] {
+  return ["scan", "active", "--history-id", String(pick.id), ...optInArgs([pick], confirmed), ...nucleiArgs, "--background"];
 }
 
 /**

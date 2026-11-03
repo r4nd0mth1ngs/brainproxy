@@ -234,7 +234,9 @@ The sidebar groups the tools by what you are doing.
   traffic too.
 - **Actions:** right-click a node or request to send it to Replay, crawl from there, run an
   active scan of that branch or request, or copy the URL. A request can also be copied as a
-  curl command.
+  curl command. Before scanning a DELETE, PUT or PATCH request or a GraphQL mutation, the Site
+  map asks, naming it, as such a request is only attacked when you opt in; a branch scan skips
+  them.
 - **Import API (sends each once)…:** puts an API's operations in history without scanning them, to
   work on by hand. This isn't offline: every ticked operation is sent to the target once. It takes
   the same steps as the *Guided API scan* (definition, server, authentication, operations; PUT,
