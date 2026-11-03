@@ -22,6 +22,7 @@ import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
 import { Welcome, remember, saveTempAs } from "./views/Welcome";
 import { closeQuestion, stopAllCalls } from "./views/replayCalls";
+import { onCloseRequested } from "./quit";
 import { usePoll } from "./ui/usePoll";
 import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
@@ -245,20 +246,17 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
       .then(({ getCurrentWindow }) =>
         getCurrentWindow().onCloseRequested(async (event) => {
           const tempProject = tempRef.current;
-          if (!tempProject && !closeQuestion()) return stopOnClose();
-          // Held open while a question is in the window; closed explicitly once answered.
-          event.preventDefault();
-          if (!(await stopSends("Stop and quit"))) return;
-          // Destroying the window doesn't unmount the provider, so its cleanup can't stop them.
-          await stopAllCalls(cancelCli);
-          if (tempProject) {
-            if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
-            // Stops its proxy too. If it fails, it is kept and offered on the next launch.
-            await tempProjects.discard(tempProject).catch(() => {});
-          } else {
-            await stopOnClose();
-          }
-          await getCurrentWindow().destroy();
+          return onCloseRequested({
+            temp: tempProject != null,
+            sending: () => closeQuestion() != null,
+            preventDefault: () => event.preventDefault(),
+            askSends: () => stopSends("Stop and quit"),
+            askDiscard: () => confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"),
+            stopSends: () => stopAllCalls(cancelCli),
+            // Discarding stops its proxy too. If it fails, it is kept and offered on the next launch.
+            leave: () => (tempProject ? tempProjects.discard(tempProject).catch(() => {}) : stopOnClose()),
+            destroy: () => getCurrentWindow().destroy(),
+          });
         }),
       )
       .then((u) => (disposed ? u() : (unlisten = u)));
