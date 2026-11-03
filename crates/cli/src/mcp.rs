@@ -161,6 +161,9 @@ const HINTS: &[(&str, Hints)] = &[
     // Stops the proxy, OOB listener and background work; deletes nothing.
     ("project stop", REPLACE),
     ("send", NET),
+    ("replay tabs list", READ),
+    // Through MCP only adds to the saved set (--append); sends nothing (a person sends a tab from Replay).
+    ("replay tabs save", ADD),
     ("proxy start", ADD),
     ("proxy stop", REPLACE),
     // Stops the running proxy and starts one in its place.

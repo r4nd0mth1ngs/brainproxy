@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { bodyText, cancelCli, isBinary, MAX_BODY, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { copyAsCurl, CurlDialog } from "../ui/CurlDialog";
@@ -191,19 +191,29 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
   // tabs return the same array, so React skips the update; a new array every time changed
   // the app state, which re-ran this effect every 300 ms and re-ran other views' effects too.
-  const { setRepeater } = app;
+  // Passed up 300 ms after typing, and at once on unmount or when the tabs are saved on close.
+  const { setRepeater, addReplayEditor } = app;
+  const edits = useRef({ raw, target });
+  edits.current = { raw, target };
+  const commit = useCallback(() => {
+    const { raw, target } = edits.current;
+    setRepeater((ts) => {
+      const cur = ts.find((x) => x.key === tab.key);
+      if (!cur || (cur.raw === raw && cur.target === target)) return ts;
+      return ts.map((x) => (x.key === tab.key ? { ...x, raw, target } : x));
+    });
+  }, [tab.key, setRepeater]);
   useEffect(() => {
-    const t = setTimeout(
-      () =>
-        setRepeater((ts) => {
-          const cur = ts.find((x) => x.key === tab.key);
-          if (!cur || (cur.raw === raw && cur.target === target)) return ts;
-          return ts.map((x) => (x.key === tab.key ? { ...x, raw, target } : x));
-        }),
-      300,
-    );
+    const t = setTimeout(commit, 300);
     return () => clearTimeout(t);
-  }, [raw, target, tab.key, setRepeater]);
+  }, [raw, target, commit]);
+  useEffect(() => {
+    const remove = addReplayEditor(commit);
+    return () => {
+      remove();
+      commit();
+    };
+  }, [addReplayEditor, commit]);
 
   const send = async () => {
     const to = withScheme(guessTarget(raw, target));

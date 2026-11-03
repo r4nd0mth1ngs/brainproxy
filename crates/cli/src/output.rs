@@ -73,6 +73,7 @@ const LOCAL_ONLY: &[&str] = &[
     "auth add",
     "auth list",
     "auth remove",
+    "replay tabs save",
 ];
 
 pub struct Out {
@@ -146,6 +147,19 @@ impl Out {
     }
 }
 
+/// Text for a terminal line: control characters (escape sequences, newlines, carriage returns)
+/// shown as escapes like `\u{1b}` or `\n`, so stored text can't move the cursor or add lines.
+/// For text mode only; JSON keeps the value as it is.
+pub fn escape_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return s.into();
+    }
+    s.chars()
+        .map(|c| if c.is_control() { c.escape_debug().to_string() } else { c.to_string() })
+        .collect::<String>()
+        .into()
+}
+
 /// Writes an output file named by the caller (`--out`, `-o`). An existing file is
 /// refused unless `force`, so a stray path can't clobber something like ~/.bashrc.
 pub fn write_file(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<(), brainproxy_core::Error> {
@@ -181,4 +195,18 @@ pub fn body_value(bytes: &[u8], max: usize) -> Value {
         }
     };
     json!({"encoding": encoding, "content": content, "length": bytes.len(), "truncated": truncated})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_controls_keeps_printable_text() {
+        assert_eq!(escape_controls("login é «auth:a:b:c»\\"), "login é «auth:a:b:c»\\");
+        assert_eq!(
+            escape_controls("\u{1b}[2Ja\r\n  9  http  x\u{7f}\u{85}"),
+            r"\u{1b}[2Ja\r\n  9  http  x\u{7f}\u{85}"
+        );
+    }
 }

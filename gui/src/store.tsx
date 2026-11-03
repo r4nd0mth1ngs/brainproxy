@@ -2,10 +2,11 @@
 // and toasts. Each view keeps its own data and fetches it through api.ts.
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { cancelCli } from "./api";
+import { cancelCli, run } from "./api";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
 import { clearReplayTabs } from "./views/replayCalls";
 import type { ReplayOptions } from "./views/replayOptions";
+import { LIST_ARGS, NEWER, closingSaves, fromSaved, newerFormat, revisions, saver, toSaved } from "./views/replayTabs";
 import type { HistoryPick } from "./views/trafficActions";
 
 export type Tab =
@@ -38,6 +39,9 @@ export interface RepeaterTab extends Handoff {
   title: string;
   /** Send options (HTTP/2, as typed, SNI, ...); missing means the CLI's defaults. */
   options?: Partial<ReplayOptions>;
+  /** A WebSocket tab's Listen seconds and Until regex. */
+  wsWait?: number;
+  wsUntil?: string;
 }
 
 interface Toast {
@@ -59,10 +63,20 @@ interface State {
   temp: TempInfo | null;
   /** Saves a temporary project to a file the user picks, then switches to it. */
   saveAs: () => Promise<void>;
+  /**
+   * Saves Replay's tabs to the project now instead of after the usual pause (the project or the
+   * window is closing). Rejects if they couldn't be saved.
+   */
+  flushReplayTabs: () => Promise<void>;
   tab: Tab;
   setTab: (t: Tab) => void;
   repeater: RepeaterTab[];
   setRepeater: (f: (tabs: RepeaterTab[]) => RepeaterTab[]) => void;
+  /**
+   * An open Replay editor's way to pass its text up at once (it does so 300 ms after typing
+   * otherwise), called before Replay's tabs are saved on close. Returns the undo.
+   */
+  addReplayEditor: (commit: () => void) => () => void;
   repeaterActive: number;
   setRepeaterActive: (key: number) => void;
   sendToRepeater: (h: Handoff) => void;
@@ -94,6 +108,16 @@ interface State {
 
 const Ctx = createContext<State | null>(null);
 
+// Keys of tabs and toasts. Not per project: Replay keeps send history by tab key while the app runs.
+let nextKey = 1;
+const newKey = () => nextKey++;
+
+/** How long Replay's tabs stay unchanged before they are saved to the project. */
+const SAVE_TABS_AFTER_MS = 1000;
+
+// Replay tabs being saved by projects that just closed; one opened again reads its tabs after.
+const closing = closingSaves();
+
 export function useApp(): State {
   const s = useContext(Ctx);
   if (!s) throw new Error("useApp outside AppProvider");
@@ -116,7 +140,7 @@ export function AppProvider({
 }) {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [repeater, setRepeaterState] = useState<RepeaterTab[]>([]);
-  const [repeaterActive, setRepeaterActive] = useState(0);
+  const [repeaterActive, setRepeaterActiveState] = useState(0);
   const [fuzzerInput, setFuzzerInput] = useState<Handoff | null>(null);
   const [accessInput, setAccessInput] = useState<HistoryPick[] | null>(null);
   const [jobFocus, setJobFocus] = useState<{ id: number } | null>(null);
@@ -125,7 +149,6 @@ export function AppProvider({
   const [wizardOpen, setWizardOpen] = useState(false);
   const [apiImport, setApiImport] = useState<State["apiImport"]>(null);
   const [traffic, setTraffic] = useState<State["traffic"]>(null);
-  const nextKey = useRef(1);
   // Mutated in place: the views read it when they act, nothing renders from it.
   const proxy = useRef(proxyControl()).current;
   // Replay keeps sends in flight and results outside its views, keyed by tab; the next
@@ -134,7 +157,7 @@ export function AppProvider({
   useEffect(() => () => clearReplayTabs(cancelCli), []);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info", onClick?: () => void) => {
-    const id = nextKey.current++;
+    const id = newKey();
     setToasts((t) => [...t, { id, text, kind, onClick }]);
     // Long messages (instructions) stay up long enough to read.
     const ms = Math.max(kind === "error" ? 7000 : 3500, text.length * 60);
@@ -149,14 +172,118 @@ export function AppProvider({
     }
   }, [notice, toast]);
 
-  const setRepeater = useCallback((f: (tabs: RepeaterTab[]) => RepeaterTab[]) => setRepeaterState(f), []);
+  // Replay's tabs as of the last change, before React renders it: a save on close reads them
+  // right after the editors pass their text up.
+  const repeaterRef = useRef<RepeaterTab[]>([]);
+  const activeRef = useRef(0);
+  const setRepeater = useCallback((f: (tabs: RepeaterTab[]) => RepeaterTab[]) => {
+    repeaterRef.current = f(repeaterRef.current);
+    setRepeaterState(repeaterRef.current);
+  }, []);
+  const setRepeaterActive = useCallback((key: number) => {
+    activeRef.current = key;
+    setRepeaterActiveState(key);
+  }, []);
+  const editors = useRef(new Set<() => void>());
+  const addReplayEditor = useCallback((commit: () => void) => {
+    editors.current.add(commit);
+    return () => void editors.current.delete(commit);
+  }, []);
+
+  // Replay's tabs live in the project file (`replay tabs list/save`): restored when it opens,
+  // saved a moment after they change and when it closes. Nothing is saved until they have been
+  // read, so a failed read never replaces the saved ones. Tabs saved elsewhere meanwhile (an
+  // agent's) are added here, when a save finds them or the window comes back to the front.
+  const [tabsLoaded, setTabsLoaded] = useState(false);
+  const tabsLoadedRef = useRef(false);
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  // Made only when a save is due, not on every change: it can be large.
+  const tabsBody = useCallback(() => JSON.stringify(toSaved(repeaterRef.current, activeRef.current)), []);
+  const revsRef = useRef<ReturnType<typeof revisions> | null>(null);
+  revsRef.current ??= revisions({
+    cli: (args, stdin) => run(args, stdin == null ? { project } : { stdin, project }),
+    body: tabsBody,
+    add: (tabs) => {
+      setRepeater((cur) => [...cur, ...tabs]);
+      const n = tabs.length;
+      toastRef.current(`${n} Replay tab${n === 1 ? " was" : "s were"} added to the project from elsewhere (an agent or the command line)`);
+    },
+    count: () => repeaterRef.current.length,
+    nextKey: newKey,
+  });
+  const tabRevs = revsRef.current;
+  const saverRef = useRef<ReturnType<typeof saver> | null>(null);
+  saverRef.current ??= saver({
+    save: tabRevs.save,
+    delay: SAVE_TABS_AFTER_MS,
+    onError: (e) => toastRef.current(`Replay tabs weren't saved to the project: ${e.message}. They stay open here.`, "error"),
+  });
+  const tabSaver = saverRef.current;
+  const tempRef = useRef(temp);
+  tempRef.current = temp;
+  // Closing, switching project, or Save as: the editors' last keystrokes first, then save.
+  const flushReplayTabs = useCallback(() => {
+    editors.current.forEach((commit) => commit());
+    if (tabsLoadedRef.current) tabSaver.schedule(tabsBody);
+    return tabSaver.flush();
+  }, [tabSaver, tabsBody]);
+  useEffect(() => {
+    let cancelled = false;
+    closing
+      .wait(project)
+      .then(() => (cancelled ? null : run(LIST_ARGS, { project })))
+      .then((data) => {
+        if (cancelled) return;
+        const saved = fromSaved(data, newKey);
+        tabSaver.loaded(JSON.stringify(toSaved(saved.tabs, saved.activeKey ?? 0)));
+        tabRevs.loaded(data);
+        // Tabs sent here while they loaded stay, after the saved ones.
+        setRepeater((cur) => [...saved.tabs, ...cur]);
+        if (saved.activeKey != null && !activeRef.current) setRepeaterActive(saved.activeKey);
+        // Shown, but saving would drop what the newer version keeps.
+        if (newerFormat(data)) return toastRef.current(`Replay tabs aren't saved to this project: ${NEWER}.`, "error");
+        tabsLoadedRef.current = true;
+        setTabsLoaded(true);
+      })
+      .catch((e) => {
+        if (!cancelled) toastRef.current(`Replay tabs weren't restored: ${e.message}. Changes to them aren't saved until the project is opened again.`, "error");
+      });
+    return () => {
+      cancelled = true;
+      // A temporary project is being discarded, or was just saved elsewhere (which saves first).
+      // Otherwise saved, and reopening it waits for that (switching project already asked
+      // if the tabs couldn't be saved).
+      if (tempRef.current) tabSaver.cancel();
+      else closing.add(project, flushReplayTabs());
+    };
+  }, [project, tabSaver, tabRevs, setRepeater, setRepeaterActive, flushReplayTabs]);
+  useEffect(() => {
+    if (tabsLoaded) tabSaver.schedule(tabsBody);
+  }, [tabsLoaded, repeater, repeaterActive, tabSaver, tabsBody]);
+  // Back from the terminal where an agent saved tabs: they show up without waiting for a save.
+  // A failure here is left to the next save, which reports it.
+  useEffect(() => {
+    if (!tabsLoaded) return;
+    const check = () => void tabRevs.check().catch(() => {});
+    window.addEventListener("focus", check);
+    return () => window.removeEventListener("focus", check);
+  }, [tabsLoaded, tabRevs]);
+  // The copy holds what the project holds, and the temporary one is deleted after: with tabs
+  // that couldn't be saved it stays open, so they aren't lost.
+  const saveAsWithTabs = useCallback(async () => {
+    await flushReplayTabs().catch((e) => {
+      throw new Error(`Replay tabs couldn't be saved first (${e.message}), so the temporary engagement stays open`);
+    });
+    await saveAs();
+  }, [flushReplayTabs, saveAs]);
 
   const sendToRepeater = useCallback((h: Handoff) => {
-    const key = nextKey.current++;
-    setRepeaterState((tabs) => [...tabs, { ...h, key, title: h.title ?? String(tabs.length + 1) }]);
+    const key = newKey();
+    setRepeater((tabs) => [...tabs, { ...h, key, title: h.title ?? String(tabs.length + 1) }]);
     setRepeaterActive(key);
     setTab("repeater");
-  }, []);
+  }, [setRepeater, setRepeaterActive]);
 
   const sendToFuzzer = useCallback((h: Handoff) => {
     setFuzzerInput({ ...h });
@@ -179,12 +306,12 @@ export function AppProvider({
   }, []);
 
   const openApiImport = useCallback((source: string, graphql: boolean) => {
-    setApiImport({ source, graphql, key: nextKey.current++ });
+    setApiImport({ source, graphql, key: newKey() });
     setTab("target");
   }, []);
 
   const openTraffic = useCallback((source: string) => {
-    setTraffic({ source, key: nextKey.current++ });
+    setTraffic({ source, key: newKey() });
     setTab("proxy");
   }, []);
 
@@ -200,11 +327,13 @@ export function AppProvider({
     () => ({
       project,
       temp,
-      saveAs,
+      saveAs: saveAsWithTabs,
+      flushReplayTabs,
       tab,
       setTab,
       repeater,
       setRepeater,
+      addReplayEditor,
       repeaterActive,
       setRepeaterActive,
       sendToRepeater,
@@ -227,7 +356,7 @@ export function AppProvider({
       openTraffic,
       proxy,
     }),
-    [project, temp, saveAs, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, accessInput, sendToAccess, jobFocus, showJob, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, apiImport, openApiImport, traffic, openTraffic, proxy],
+    [project, temp, saveAsWithTabs, flushReplayTabs, tab, repeater, setRepeater, addReplayEditor, repeaterActive, setRepeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, accessInput, sendToAccess, jobFocus, showJob, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard, apiImport, openApiImport, traffic, openTraffic, proxy],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

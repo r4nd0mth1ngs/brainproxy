@@ -402,6 +402,22 @@ Edit a raw request and send it as often as you like, in separate tabs.
   **Don't record** on, only the handshake gets a row, without its content. Their Options are
   SNI, Timeout, Verify TLS and Don't record. **Stop** ends a run early; what it sent may
   already have reached the server, and history keeps what was recorded up to then.
+- **Kept with the project:** open tabs are saved in the project file a moment after you
+  change them and when you close it, and come back when you open it again (copies made with
+  `project save` or *Save as…* have them too). A tab keeps its title, target, request (or
+  handshake and messages) and Listen and Until; responses and the ‹ › send history are not
+  kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
+  (more than 500 tabs or 16 MB), the app says so and the tabs stay open; *Save as…* keeps
+  the temporary engagement open, and switching project asks first. From the command
+  line or an agent: `replay tabs list` and `replay tabs save`, so an agent can prepare tabs
+  for you to send (through MCP it can only add tabs, never replace or clear yours). Tabs
+  saved from elsewhere while the project is open in the app are added to the open ones when
+  the app next saves or its window comes back to the front; the app never saves over them.
+  A request sent over from history keeps its live `Cookie` or `Authorization` values, and
+  `replay tabs list` returns them in full, so anyone with a copy of the project file can
+  read them: replace them with `«auth:…»` placeholders before you keep or share the
+  project. A project whose tabs were saved by a newer brainproxy shows them but doesn't
+  save over them.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -858,6 +874,11 @@ brainproxy ws list                                        # WebSocket connection
 brainproxy ws messages 3 --contains token                 # their messages, both ways
 brainproxy ws send --from 3 -m '{"op":"whoami"}' --until whoami   # replay with a new connection
 echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   # messages off the command line
+
+brainproxy replay tabs list                               # the app's Replay tabs, saved in the project
+brainproxy replay tabs list --summary                     # without the requests; --index N for one tab (from 0)
+echo '{"tabs":[{"title":"search","target":"https://app.acme.test","request":"GET /search?q=x HTTP/1.1\nHost: app.acme.test\n\n"}]}' \
+    | brainproxy replay tabs save --append                # adds a tab (replaces them without --append); sends nothing
 
 brainproxy findings list
 brainproxy findings show 12

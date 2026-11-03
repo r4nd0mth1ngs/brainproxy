@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cancelCli, inTauri, run, setProject, tempProjects } from "./api";
 import { AppProvider, autoProxy, useApp, type Tab, type TempInfo } from "./store";
 import { ProxyView } from "./views/Proxy";
@@ -25,6 +25,7 @@ import { Welcome, remember, saveTempAs } from "./views/Welcome";
 import { closeQuestion, stopAllCalls } from "./views/replayCalls";
 import { onCloseRequested } from "./quit";
 import { usePoll } from "./ui/usePoll";
+import { leaveProject, leaver } from "./views/leave";
 import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
 
@@ -73,10 +74,10 @@ export function App() {
 
   // Leaving the project unmounts the shell, which stops a proxy it started. The shell's
   // discard also stops the proxy, OOB listener and jobs of a temporary one before deleting it;
-  // if that fails it is kept, and offered again on the next launch.
+  // if that fails it is kept, and offered again on the next launch. The shell has already asked
+  // (and checked it is still on this project), so this closes straight away.
   const close = useCallback(async () => {
-    if (!(await stopSends("Stop and close"))) return;
-    if (temp && !(await confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"))) return;
+
     const leaving = project;
     setProj(null);
     setTemp(null);
@@ -160,7 +161,7 @@ interface ProxyStatus {
   intercept_enabled: boolean;
 }
 
-function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () => void }) {
+function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleTheme: () => void }) {
   const app = useApp();
   const [scope, setScope] = useState<string[] | null>(null);
   const [engName, setEngName] = useState("");
@@ -248,6 +249,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
 
   const tempRef = useRef(app.temp ? app.project : null);
   tempRef.current = app.temp ? app.project : null;
+  // Stable for the project's lifetime, so the close handler below can keep it.
+  const { flushReplayTabs } = app;
   useEffect(() => {
     if (!inTauri) return;
     // Registering is async: a shell unmounted before it finishes (StrictMode's double mount, a
@@ -266,7 +269,9 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
             askDiscard: () => confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"),
             stopSends: () => stopAllCalls(cancelCli),
             // Discarding stops its proxy too. If it fails, it is kept and offered on the next launch.
-            leave: () => (tempProject ? tempProjects.discard(tempProject).catch(() => {}) : stopOnClose()),
+            // Otherwise Replay's last edits are saved, which would otherwise happen a moment later.
+            leave: () =>
+              tempProject ? tempProjects.discard(tempProject).catch(() => {}) : Promise.all([flushReplayTabs().catch(() => {}), stopOnClose()]).then(() => {}),
             destroy: () => getCurrentWindow().destroy(),
           });
         }),
@@ -281,6 +286,31 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   useEngage(app.toast);
 
   const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
+  // Switching project: Replay's tabs are saved before it closes (so reopening it shows them),
+  // and if they can't be, it stays open unless the user chooses to close it anyway; a temporary
+  // one is asked about instead. Clicks while that runs join it, and it closes nothing once this
+  // shell or its project is gone.
+  const leaving = useMemo(leaver, []);
+  useEffect(() => leaving.attach(), [leaving, app.project]);
+  const leave = () =>
+    leaving.run((stale) =>
+      leaveProject({
+        temp: !!app.temp,
+        // Closing stops Replay's sends still running (the provider's cleanup).
+        sends: () => stopSends("Stop and close"),
+        flush: app.flushReplayTabs,
+        ask: (e) =>
+          confirm(
+            "Close without saving Replay's tabs?",
+            `They couldn't be saved to the project: ${e.message}. Changes since the last save are lost if it closes.`,
+            "Close anyway",
+            "Keep open",
+          ),
+        discard: () => confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"),
+        close: onClose,
+        stale,
+      }),
+    );
   const tempTitle = app.temp
     ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and deleted when you discard it. Click to save it as a project file.`
     : "";
@@ -328,7 +358,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     <div className={`app ${collapsed ? "nav-collapsed" : ""}`}>
       <header className="top">
         <div className="top-left">
-          <div className="brand" onClick={onClose} title="Switch project">
+          <div className="brand" onClick={leave} title="Switch project">
             <Logo size={22} />
             <span className="brand-name">brainproxy</span>
           </div>
@@ -410,7 +440,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
                 <span className="nav-label">Save as…</span>
               </button>
             )}
-            <button className="nav-item" onClick={onClose} title={collapsed ? "Switch project" : undefined}>
+            <button className="nav-item" onClick={leave} title={collapsed ? "Switch project" : undefined}>
               <Icon name="switch" />
               <span className="nav-label">Switch project</span>
             </button>

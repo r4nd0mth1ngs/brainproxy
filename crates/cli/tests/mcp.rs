@@ -140,6 +140,15 @@ fn protocol_and_tool_list() {
     assert_eq!(start["inputSchema"]["required"], json!(["targets"]));
     assert!(tool("crawl").unwrap()["inputSchema"]["properties"].get("job_id").is_none());
     assert!(tool("history_list").unwrap()["inputSchema"]["properties"].get("stdin").is_none());
+    // Saving Replay tabs only adds through MCP and sends nothing; listing only reads.
+    let save = tool("replay_tabs_save").unwrap();
+    assert_eq!(save["inputSchema"]["properties"]["stdin"]["type"], "string");
+    assert_eq!(save["inputSchema"]["properties"]["append"]["type"], "boolean");
+    assert_eq!(save["annotations"]["readOnlyHint"], false);
+    assert_eq!(save["annotations"]["destructiveHint"], false);
+    assert_eq!(save["annotations"]["idempotentHint"], false);
+    assert_eq!(save["annotations"]["openWorldHint"], false);
+    assert_eq!(tool("replay_tabs_list").unwrap()["annotations"]["readOnlyHint"], true);
 
     // JSON-RPC errors.
     assert_eq!(m.request("nope", json!({}))["error"]["code"], -32601);
@@ -150,6 +159,47 @@ fn protocol_and_tool_list() {
     assert_eq!(r["error"]["code"], -32602);
     m.send_line("{not json");
     assert_eq!(m.read()["error"]["code"], -32700);
+}
+
+#[test]
+fn an_agent_can_prepare_replay_tabs() {
+    let mut m = Mcp::start(&tmp_project("replay-tabs"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    // No scope needed: saving sends nothing.
+    let set = json!({"tabs": [{"kind": "ws", "title": "feed", "target": "wss://a.test", "request": "GET / HTTP/1.1\n\n",
+        "messages": ["«auth:app:header:X»"], "until": "done"}], "active": 0});
+    // Only adding: an agent (or text from the target steering it) can't replace or clear a
+    // person's tabs.
+    for stdin in [set.to_string(), r#"{"tabs": []}"#.to_string()] {
+        let (err, env) = m.call("replay_tabs_save", json!({"stdin": stdin}));
+        assert!(err, "{env}");
+        assert!(env["error"]["message"].as_str().unwrap().contains("only be added"), "{env}");
+    }
+    let (err, env) = m.call("replay_tabs_save", json!({"stdin": set.to_string(), "append": true}));
+    assert!(!err, "{env}");
+    assert_eq!((&env["data"]["count"], &env["data"]["added"]), (&json!(1), &json!(1)));
+    let r = m.request("tools/call", json!({"name": "replay_tabs_list", "arguments": {}}));
+    assert_eq!(r["result"]["_meta"]["provenance"]["untrusted_content"], true, "{r}");
+    let (err, env) = m.call("replay_tabs_list", json!({}));
+    assert!(!err, "{env}");
+    assert_eq!(env["data"]["tabs"], set["tabs"]);
+    assert_eq!(env["data"]["active"], 0);
+
+    // A bad set is a tool error and leaves the saved one alone; list takes no stdin.
+    let (err, env) =
+        m.call("replay_tabs_save", json!({"stdin": r#"{"tabs": [{"request": "", "response": "x"}]}"#, "append": true}));
+    assert!(err);
+    assert_eq!(env["error"]["kind"], "invalid_input", "{env}");
+    let (err, env) = m.call("replay_tabs_save", json!({"append": true}));
+    assert!(err, "no stdin is no set: {env}");
+    let r = m.request("tools/call", json!({"name": "replay_tabs_list", "arguments": {"stdin": "{}"}}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert_eq!(m.call("replay_tabs_list", json!({})).1["data"]["count"], 1);
+    // A summary and one tab at a time, for sets larger than the output cap.
+    let (err, env) = m.call("replay_tabs_list", json!({"summary": true}));
+    assert!(!err, "{env}");
+    assert!(env["data"]["tabs"][0].get("request").is_none(), "{env}");
+    assert_eq!(m.call("replay_tabs_list", json!({"index": 0})).1["data"]["tab"], set["tabs"][0]);
 }
 
 #[test]

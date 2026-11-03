@@ -1,7 +1,7 @@
 // Proxy → WebSockets: connections the proxy relayed (or Replay opened) and their messages;
 // and Replay's WebSocket mode (`ws send`).
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { bodyText, cancelCli, historyRequest, hostOf, isBinary, pathOf, requireWhole, run, type Body } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -13,6 +13,7 @@ import { beginCall, endCall, failureText, replayCalls, stopCall, tabSlot, useTab
 import { optionsProblem } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
+import { MAX_WAIT } from "./replayTabs";
 
 const PREVIEW = 300;
 
@@ -207,8 +208,8 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
   const [text, setText] = useState(joinMessages(tab.ws ?? []));
-  const [wait, setWait] = useState(3);
-  const [until, setUntil] = useState("");
+  const [wait, setWait] = useState(tab.wsWait ?? 3);
+  const [until, setUntil] = useState(tab.wsUntil ?? "");
   const [result] = useTabSlot(resultsByTab, tab.key);
   const [current, setCurrent] = useState<number | null>(null);
   const [options, setOptions] = useSendOptions(tab);
@@ -221,20 +222,31 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
   // A new result's rows aren't the old one's.
   useEffect(() => setCurrent(null), [result]);
 
-  const { setRepeater } = app;
+  // The latest edits, for passing them up at once: on unmount, or when the tabs are saved on close.
+  const { setRepeater, addReplayEditor } = app;
+  const edits = useRef({ raw, target, text, wait, until });
+  edits.current = { raw, target, text, wait, until };
+  const commit = useCallback(() => {
+    const { raw, target, text, wait, until } = edits.current;
+    setRepeater((ts) => {
+      const cur = ts.find((x) => x.key === tab.key);
+      const ws = splitMessages(text);
+      const same = cur && cur.raw === raw && cur.target === target && joinMessages(cur.ws ?? []) === joinMessages(ws);
+      if (!cur || (same && cur.wsWait === wait && (cur.wsUntil ?? "") === until)) return ts;
+      return ts.map((x) => (x.key === tab.key ? { ...x, raw, target, ws, wsWait: wait, wsUntil: until } : x));
+    });
+  }, [tab.key, setRepeater]);
   useEffect(() => {
-    const t = setTimeout(
-      () =>
-        setRepeater((ts) => {
-          const cur = ts.find((x) => x.key === tab.key);
-          const ws = splitMessages(text);
-          if (!cur || (cur.raw === raw && cur.target === target && joinMessages(cur.ws ?? []) === joinMessages(ws))) return ts;
-          return ts.map((x) => (x.key === tab.key ? { ...x, raw, target, ws } : x));
-        }),
-      300,
-    );
+    const t = setTimeout(commit, 300);
     return () => clearTimeout(t);
-  }, [raw, target, text, tab.key, setRepeater]);
+  }, [raw, target, text, wait, until, commit]);
+  useEffect(() => {
+    const remove = addReplayEditor(commit);
+    return () => {
+      remove();
+      commit();
+    };
+  }, [addReplayEditor, commit]);
 
   const send = async () => {
     const host = /^host:\s*(\S+)/im.exec(raw)?.[1];
@@ -283,7 +295,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
         <span className="label" title="Seconds to keep listening after the last message">
           Listen
         </span>
-        <input className="input" type="number" min={0} step={0.5} style={{ width: 64 }} value={wait} onChange={(e) => setWait(Math.max(0, Number(e.target.value)))} />
+        <input className="input" type="number" min={0} max={MAX_WAIT} step={0.5} style={{ width: 64 }} value={wait} onChange={(e) => setWait(Math.min(MAX_WAIT, Math.max(0, Number(e.target.value) || 0)))} />
         <span className="label" title="Stop as soon as a received message matches this regex">
           Until
         </span>

@@ -15,6 +15,9 @@ use serde_json::{json, Value};
 
 use crate::output::{body_value, Out};
 
+/// Longest `ws send --wait`, in seconds; a saved Replay tab's wait is held to it too.
+pub(crate) const MAX_WAIT_SECS: f64 = 86_400.0;
+
 #[derive(Subcommand)]
 pub enum WsCmd {
     /// List recorded WebSocket connections (proxied and replayed), oldest first.
@@ -134,7 +137,7 @@ pub struct SendArgs {
     /// Send a recorded message again (same opcode and payload). Repeatable.
     #[arg(long, value_name = "MESSAGE_ID")]
     resend: Vec<i64>,
-    /// Seconds to keep listening after the last message is sent.
+    /// Seconds to keep listening after the last message is sent (at most 86400, a day).
     #[arg(long, default_value_t = 5.0)]
     wait: f64,
     /// Stop listening as soon as a received text or binary message matches this regex.
@@ -365,6 +368,10 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         .map(regex::bytes::Regex::new)
         .transpose()
         .map_err(|e| Error::InvalidInput(format!("--until: {e}")))?;
+    // Checked here, not clamped: a saved Replay tab can carry the value to a person's Send.
+    let wait = Duration::try_from_secs_f64(args.wait.max(0.0)).ok().filter(|_| args.wait <= MAX_WAIT_SECS).ok_or_else(
+        || Error::InvalidInput(format!("--wait: at most {MAX_WAIT_SECS} seconds (a day), not {}", args.wait)),
+    )?;
     let guard = store.guard()?;
     // Refuse out-of-scope targets up front, before any connection is attempted.
     crate::require_in_scope(&guard, &target)?;
@@ -379,7 +386,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let client = Client::new(send_opts);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     let opts = client::Options {
-        wait: Duration::from_secs_f64(args.wait.max(0.0)),
+        wait,
         until,
         max_messages: args.max_messages.max(1),
         write_timeout: Duration::from_secs_f64(args.timeout.max(0.001)),

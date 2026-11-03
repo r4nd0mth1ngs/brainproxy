@@ -20,6 +20,7 @@ mod output;
 mod process;
 mod project_cmd;
 mod proxy_cmd;
+mod replay_cmd;
 mod report_cmd;
 mod request_args;
 mod scan_cmd;
@@ -98,6 +99,10 @@ enum Cmd {
     #[command(after_help = "Request sources, in order: --url (build a request like curl), FILE, or stdin. \
         Raw requests are sent byte-for-byte after optional line-ending normalization and Content-Length update.")]
     Send(SendArgs),
+
+    /// Replay tabs saved in the project, which the app restores when the project opens.
+    #[command(subcommand)]
+    Replay(replay_cmd::ReplayCmd),
 
     /// Run the intercepting proxy (background by default) and see its status.
     #[command(subcommand)]
@@ -399,6 +404,10 @@ fn command_name(cmd: &Cmd) -> String {
             project_cmd::ProjectCmd::Stop => "project stop",
         },
         Cmd::Send(_) => "send",
+        Cmd::Replay(replay_cmd::ReplayCmd::Tabs(c)) => match c {
+            replay_cmd::TabsCmd::List { .. } => "replay tabs list",
+            replay_cmd::TabsCmd::Save { .. } => "replay tabs save",
+        },
         Cmd::History(HistoryCmd::List { .. }) => "history list",
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
         Cmd::History(HistoryCmd::Note { .. }) => "history note",
@@ -541,6 +550,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Query(args) => query(&cli.project, args, out)?,
         Cmd::Project(cmd) => project_cmd::project(&cli.project, cmd, out)?,
         Cmd::Send(args) => send(&cli.project, args, out)?,
+        Cmd::Replay(cmd) => replay_cmd::replay(&cli.project, cmd, out)?,
         Cmd::History(cmd) => history(&cli.project, cmd, out)?,
         Cmd::Proxy(cmd) => proxy_cmd::proxy(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Ca(cmd) => proxy_cmd::ca(&proxy_cmd::resolve_home(cli.home), cmd, out)?,

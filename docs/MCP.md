@@ -81,10 +81,11 @@ and `project save`, since copying the project elsewhere is for the person runnin
   Destructive locally: `engagement_start` (write-once), `*_stop`, `proxy_restart` (its `wait` is at
   most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
   goes back to the old proxy if the new one can't come up), `*_remove`, `*_clear`,
-  `scope_set`, `ca_init`, `scan_data_reset`. A command missing from the table gets the
-  spec's cautious defaults (not read-only, destructive, not idempotent, open world); a
-  test fails until it is classified. These are hints for clients deciding what to confirm;
-  the scope is enforced by the commands regardless.
+  `scope_set`, `ca_init`, `scan_data_reset`. `replay_tabs_save` is local and not
+  destructive: through MCP it only adds Replay tabs (below), and it sends nothing. A command
+  missing from the table gets the spec's cautious defaults (not read-only, destructive, not
+  idempotent, open world); a test fails until it is classified. These are hints for clients
+  deciding what to confirm; the scope is enforced by the commands regardless.
 - **stdin**: an extra string property on commands that read standard input (`send`,
   `query`, `encode`, `import openapi`, `intercept forward`, ...). Without it, the command's
   stdin is empty, never the server's own stdin.
@@ -105,6 +106,12 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
+- `replay_tabs_save` without `append`: an agent can add Replay tabs for a person to send, but
+  not replace or clear the ones they keep (a prompt injected through target content could
+  otherwise wipe them). The app adds tabs saved this way to the open ones; it doesn't save
+  over them. `replay_tabs_list` can return a large set; `summary` leaves the requests out and
+  `index` returns one tab, so a set over `--max-output` can be read a tab at a time. It
+  returns requests as stored, live cookies or tokens typed into a tab included.
 - `send` and `ws_send` with `no_store` (races too), and `fuzz_run` with `store` `none` or
   `matches`: what an agent sends is always recorded in full, so a person can see what was sent
   on their behalf. A person can keep a send's content out of history from the app or a
