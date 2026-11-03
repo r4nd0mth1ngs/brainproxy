@@ -1160,6 +1160,11 @@ Everything its tool calls record (history, findings, finding state changes) is m
 origin `mcp`, including what a proxy or job it started records; see
 [Who recorded what](#who-recorded-what).
 
+A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
+and `fuzz run --store none` or `--store matches` are refused. `browser open` isn't offered (the
+project's browser profile keeps the person's sign-ins), and other options that need a person are
+refused too; docs/MCP.md lists them.
+
 ---
 
 ## Rules, checks, and wordlists

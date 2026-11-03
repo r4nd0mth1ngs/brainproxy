@@ -97,10 +97,21 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
-- `send` and `ws_send` with `no_store` (races too): what an agent sends is always recorded in
-  history, so a person can see what was sent on their behalf.
+- `send` and `ws_send` with `no_store` (races too), and `fuzz_run` with `store` `none` or
+  `matches`: what an agent sends is always recorded in history, so a person can see what was
+  sent on their behalf. These are the only options of a sending command that keep requests
+  out of history. (Every request a `scan_active` check template sends, and the document
+  fetches of `import_api` and `scan_active` with `api`, are recorded whoever runs them.)
+- `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
+  project's profile, with the person's cookies and sign-ins, and the pages it loads would be
+  recorded as the proxy's traffic, not the agent's.
 - `proxy_start` with a `listen` address other than loopback: an agent can't open the person's
   proxy, with their auth profiles, to the network.
+
+`scan_active` with `checks` takes any template file, including one the agent wrote. Its
+requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DELETE or GraphQL
+mutation in a template isn't sent unless `include_methods` names it, and every request a
+check sends is recorded with origin `mcp`. The same holds outside MCP.
 
 Everything a tool call records is marked as an agent's: history entries and findings get
 origin `mcp`, and so does a finding state change (`findings_mark` sets `state_origin`). A
