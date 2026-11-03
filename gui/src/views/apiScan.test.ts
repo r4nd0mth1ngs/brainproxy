@@ -393,6 +393,74 @@ test("a query key saved for one server is set aside on another, and back on its 
     assert.deepEqual(afterServerChange(other, [B]), {}, JSON.stringify(other));
 });
 
+test("a set-aside query key: origins as the preview gives them, and what stays as it was", () => {
+  const A = "https://a.test";
+  const B = "https://b.test";
+  const C = "https://c.test";
+  const saved: AuthState = { ...EMPTY_AUTH, mode: "key", place: "query", keyName: " api_key ", profileName: "pets-api", savedProfile: "pets-api", keyOrigins: [A, B] };
+  const move = (a: AuthState, origins: string[]): AuthState => ({ ...a, ...afterServerChange(a, origins) });
+  // As load() works them out from a new preview.
+  const originsOf = (urls: string[], patch: Partial<ApiOperation> = {}) => operationOrigins(likelyInScope(urls.map((url, i) => op(i, "GET", { url, ...patch }))));
+
+  assert.deepEqual(afterServerChange(saved, [B, A]), {}, "the order doesn't matter");
+  assert.deepEqual(afterServerChange(saved, originsOf(["https://A.TEST:443/v2/pets", "https://b.test/v2/x"])), {}, "a new base path on the same origins");
+  const outOfScope = [op(0, "GET", { url: "https://a.test/v1/x" }), op(1, "GET", { url: "https://c.test/x", in_scope: false })];
+  assert.deepEqual(afterServerChange(saved, operationOrigins(likelyInScope(outOfScope))), {}, "an out-of-scope origin isn't one the key would go to");
+  assert.equal(move(saved, originsOf(["http://a.test/x"])).savedProfile, "", "another scheme is another origin");
+  assert.equal(move(saved, originsOf(["https://a.test:8443/x"])).savedProfile, "", "so is another port");
+
+  // The name it was saved under, trimmed as `auth add` got it; the words list every origin on both sides.
+  const away = move(saved, [A, C, "https://d.test"]);
+  assert.equal(away.dropped?.keyName, "api_key");
+  assert.match(droppedKeyText(away, [A, C, "https://d.test"]), /only goes to https:\/\/a\.test and https:\/\/b\.test, which it was saved for, not to https:\/\/c\.test and https:\/\/d\.test\./);
+  assert.match(droppedKeyText(move(saved, []), []), /not to the new server\./, "nothing in scope: no origin to name");
+  assert.deepEqual(move(away, [A, C, "https://d.test"]), away, "the same preview again, or an updater run twice, changes nothing more");
+
+  // Only what the key needs changes: a signer in the same profile is still there when the server changes back.
+  const signer = { profile: "pets-api", name: "hm" };
+  const signed: AuthState = { ...saved, signing: true, signer, script: "s".repeat(64) };
+  const signedAway = move(signed, [C]);
+  assert.deepEqual(Object.keys(afterServerChange(signed, [C])).sort(), ["dropped", "profileName", "savedProfile"]);
+  assert.deepEqual(signedAway.signer, signer);
+  assert.deepEqual(authProblems(signedAway), ["Save the key again for this server, or choose No authentication."]);
+  const signedBack = move(signedAway, [A]);
+  assert.equal(authProfile(signedBack), "pets-api");
+  assert.deepEqual(authProblems(signedBack), [], "the signer's profile is the one selected again");
+  // Saved again elsewhere: the signer stays in the old profile, which is said rather than run without it.
+  assert.match(authProblems({ ...signedAway, savedProfile: "pets-api-2", keyOrigins: [C] })[0], /The signer is in profile "pets-api", but "pets-api-2" is selected/);
+
+  // Saved again as a header key or bearer token: the old query key doesn't come back over it.
+  for (const resaved of [
+    { ...away, place: "header" as const, keyName: "X-Api-Key", savedProfile: "pets-api-2", keyOrigins: [A, C] },
+    { ...away, keyKind: "bearer" as const, savedProfile: "pets-api-2", keyOrigins: [A, C] },
+  ]) {
+    assert.deepEqual(afterServerChange(resaved, [A]), {}, JSON.stringify(resaved));
+    assert.equal(droppedKeyText(resaved, [A]), "");
+    assert.deepEqual(authProblems(resaved), []);
+  }
+
+  // Changed to a bearer token but not saved: still the old key's to bring back, as a query key.
+  const changed = move({ ...away, keyKind: "bearer" }, [B]);
+  assert.equal(changed.savedProfile, "pets-api");
+  assert.equal(changed.keyKind, "api_key");
+  assert.equal(changed.place, "query");
+});
+
+test("the review of a scan with its query key set aside", () => {
+  const saved: AuthState = { ...EMPTY_AUTH, mode: "key", place: "query", keyName: "api_key", savedProfile: "pets-api", keyOrigins: ["https://a.test"] };
+  const away = { ...saved, ...afterServerChange(saved, ["https://b.test"]) };
+  const args = scanArgs({ source: "spec.json", sha256: SHA, target: EMPTY_TARGET, operations: OPS, selected: [2], profile: authProfile(away), depth: "standard", speedArgs: [] });
+  assert.ok(!args.some((x) => x.startsWith("--auth")), "the profile set aside isn't passed");
+  assert.match(authSummary(away), /not saved, so the scan would run without it/);
+  assert.ok(authProblems(away).length > 0, "so Start scan waits");
+  assert.equal(authSummary({ ...EMPTY_AUTH, mode: "key", keyKind: "bearer" }), "bearer token, not saved, so the scan would run without it");
+  // No authentication chosen instead: nothing to warn about.
+  const none = { ...away, mode: "none" as const, dropped: null };
+  assert.deepEqual(authProblems(none), []);
+  assert.equal(authSummary(none), "none");
+  assert.equal(droppedKeyText(none, ["https://b.test"]), "");
+});
+
 test("signer coverage", () => {
   const signer = { name: "hm", origins: ["https://api.test"] };
   const urls = ["https://api.test/v1/a"];
