@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
+import { afterStart, cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
 
 const cell = (verdict: string, status: number | null, history_id: number, confidence: string | null = null) => ({ verdict, confidence, status, history_id });
 
@@ -169,4 +169,18 @@ test("hosts and run labels", () => {
   const run = { run_id: 12, time: "2026-10-29T10:11:12.000Z", state: "running", args: ["proxy", "run", "--authz", "bob"], verdicts: { bypass: 2, enforced: 5 } };
   assert.equal(runLabel(run), "#12 · 2026-10-29 10:11 · live (proxy) · running · 2 bypasses");
   assert.equal(runLabel({ ...run, args: ["authz", "run"], verdicts: { bypass: 1 } }), "#12 · 2026-10-29 10:11 · running · 1 bypass");
+});
+
+test("a run that started drops the requests from Traffic, so the next one starts from all history", () => {
+  const history = [{ id: 4, method: "GET", url: "https://shop.test/a" }];
+  const f = { ...form, select: "history" as const, history, owner: "alice", keepCookies: "lang" };
+  const next = afterStart(f);
+  assert.equal(next.select, "all");
+  assert.deepEqual(next.history, []);
+  assert.deepEqual(runArgs(next), ["authz", "run", "--as=bob,carol", "--owner=alice", "--keep-cookie=lang"]);
+  // The rest of the form stays, and the old form isn't changed.
+  assert.deepEqual({ ...next, select: f.select, history: f.history }, f);
+  assert.equal(f.select, "history");
+  // Another choice is kept; picks left over from Traffic are dropped too.
+  assert.deepEqual(afterStart({ ...form, select: "tag", tag: "api", history }), { ...form, select: "tag", tag: "api", history: [] });
 });

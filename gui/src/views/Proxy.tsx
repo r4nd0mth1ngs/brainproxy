@@ -7,7 +7,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { highlightArgs, isRefused, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
+import { highlightArgs, isMutationRequest, isRefused, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
@@ -135,13 +135,25 @@ function History() {
       (e) => app.toast(e.message, "error"),
     );
 
+  // Whether a pick carries a GraphQL mutation, from its recorded request, so the questions name it.
+  // Unknown when the request can't be read: the questions then go by its method.
+  const withMutation = (p: HistoryPick): Promise<HistoryPick> =>
+    run<HistoryEntry>(["history", "show", String(p.id), MAX_BODY]).then(
+      (e) => ({ ...p, mutation: isMutationRequest(bodyText(e.request)) }),
+      () => p,
+    );
+
   // Attack traffic: asked first, then started in the background and shown in Scans › Tasks on a click.
-  const scan = async (picks: HistoryPick[]) => {
-    const q = scanConfirm(picks);
+  const scan = async (pick: HistoryPick) => {
+    const [checks, picks] = await Promise.all([
+      run<{ nuclei: unknown }>(["checks", "status"]).catch(() => ({ nuclei: null })),
+      withMutation(pick).then((p) => [p]),
+    ]);
+    const defaults = { nuclei: !!checks.nuclei };
+    const q = scanConfirm(picks, defaults);
     if (!(await confirm(q.title, q.message, q.ok, q.cancel))) return;
     try {
-      const checks = await run<{ nuclei: unknown }>(["checks", "status"]).catch(() => ({ nuclei: null }));
-      const d = await run<{ job: number }>(scanArgs(picks, { nuclei: !!checks.nuclei }));
+      const d = await run<{ job: number }>(scanArgs(picks, defaults));
       app.toast(`Active scan started (job ${d.job}). Click to follow it in Scans.`, "info", () => app.showJob(d.job));
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -164,8 +176,8 @@ function History() {
       { label: "Send request to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(h.raw)) },
       { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
       "-",
-      { label: "Scan this request…", action: () => scan([pick]), disabled: !!noScan, hint: noScan ?? undefined },
-      { label: "Test access control…", action: () => app.sendToAccess([pick]), disabled: refused, hint: refused ? REFUSED_HINT : undefined },
+      { label: "Scan this request…", action: () => scan(pick), disabled: !!noScan, hint: noScan ?? undefined },
+      { label: "Test access control…", action: () => withMutation(pick).then((p) => app.sendToAccess([p])), disabled: refused, hint: refused ? REFUSED_HINT : undefined },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       {

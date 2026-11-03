@@ -145,11 +145,16 @@ export interface RunForm {
   host: string;
   tag: string;
   where: string;
-  /** Requests picked in Traffic (right-click › Test access control…), tested whatever their method. */
+  /** Requests picked in Traffic (right-click › Test access control…), tested whatever their method or path. */
   history: HistoryPick[];
   /** Comma-separated cookie names that aren't credentials. */
   keepCookies: string;
   rate: string;
+}
+
+/** The form once a run has started: the requests from Traffic are dropped, so the next run doesn't start on them. */
+export function afterStart(f: RunForm): RunForm {
+  return { ...f, select: f.select === "history" ? "all" : f.select, history: [] };
 }
 
 const q = (s: string) => `'${s.replace(/'/g, "''")}'`;

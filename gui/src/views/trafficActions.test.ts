@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { accessConfirm, highlightArgs, isRefused, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { accessConfirm, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, isRefused, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
 
 const get: HistoryPick = { id: 7, method: "GET", url: "https://shop.test/search?q=x" };
 const post: HistoryPick = { id: 9, method: "post", url: "https://shop.test/contact" };
+const off = { nuclei: false };
 
 test("methods that can change data", () => {
   assert.deepEqual(unsafeMethods([get, { ...get, method: "HEAD" }, { ...get, method: "options" }]), []);
@@ -27,18 +28,18 @@ test("a scan from Traffic uses the Scans view's defaults", () => {
 });
 
 test("the question before a scan names the request and warns about a POST", () => {
-  const g = scanConfirm([get]);
+  const g = scanConfirm([get], off);
   assert.equal(g.title, "Scan this request?");
   assert.match(g.message, /real attack traffic/);
   assert.match(g.message, /GET https:\/\/shop\.test\/search\?q=x is sent again/);
   assert.doesNotMatch(g.message, /side effects/);
   assert.match(g.message, /engagement scope/);
 
-  const p = scanConfirm([post]);
+  const p = scanConfirm([post], off);
   assert.match(p.message, /POST https:\/\/shop\.test\/contact is sent again/);
   assert.match(p.message, /replayed even though it is a POST, and that can change data or trigger side effects/);
 
-  const many = scanConfirm([get, post]);
+  const many = scanConfirm([get, post], off);
   assert.equal(many.title, "Scan 2 requests?");
   assert.match(many.message, /2 requests are sent again/);
   assert.match(many.message, /POST requests among them are replayed too/);
@@ -80,32 +81,32 @@ test("a scan of many picks keeps them all, in order", () => {
 });
 
 test("the question before a scan: plain wording, labels, and every method that changes data", () => {
-  const q = scanConfirm([get]);
+  const q = scanConfirm([get], off);
   assert.equal(q.ok, "Start scan");
   assert.equal(q.cancel, "Cancel");
   assert.match(q.message, /^This sends real attack traffic to the site: /);
 
   // A lower-case method is named in upper case.
-  const put = scanConfirm([{ ...post, method: "put" }]);
+  const put = scanConfirm([{ ...post, method: "put" }], off);
   assert.match(put.message, /PUT https:\/\/shop\.test\/contact is sent again/);
   assert.match(put.message, /even though it is a PUT, and that can change data/);
   assert.match(put.message, /one contact form can send a lot of emails/);
 
   // Several safe requests: no replay warning, plural wording.
-  const reads = scanConfirm([get, { ...get, id: 8, method: "HEAD" }]);
+  const reads = scanConfirm([get, { ...get, id: 8, method: "HEAD" }], off);
   assert.equal(reads.title, "Scan 2 requests?");
   assert.match(reads.message, /2 requests are sent again/);
   assert.doesNotMatch(reads.message, /side effects|replayed/);
 
   // Each method once, whatever its case.
-  const mixed = scanConfirm([get, post, { ...post, id: 10, method: "POST" }, { ...post, id: 11, method: "delete" }]);
+  const mixed = scanConfirm([get, post, { ...post, id: 10, method: "POST" }, { ...post, id: 11, method: "delete" }], off);
   assert.equal(mixed.title, "Scan 4 requests?");
   assert.match(mixed.message, / POST, DELETE requests among them are replayed too, and that can change data/);
 });
 
 test("the question shows the URL as recorded, as text", () => {
   const url = "https://shop.test/a?x=<script>alert(1)</script>&y=\"'";
-  const q = scanConfirm([{ ...get, url }]);
+  const q = scanConfirm([{ ...get, url }], off);
   assert.ok(q.message.includes(`GET ${url} is sent again`));
   assert.ok(!q.title.includes(url), "the title stays short");
 });
@@ -139,10 +140,99 @@ test("an access-control run of a POST from Traffic asks first, naming who sends 
   assert.equal(accessConfirm([get], ["alice"], true), null);
   const one = accessConfirm([post], ["alice", "bob"], true);
   assert.equal(one?.title, "Replay this POST?");
-  assert.match(one?.message ?? "", /^This POST is sent again as alice and bob and with no session\. That can change data/);
+  assert.match(one?.message ?? "", /^This POST is sent again twice as its owner, then as alice and bob and with no session\. That can change data/);
   assert.match(one?.message ?? "", /engagement scope/);
   const many = accessConfirm([get, post, { ...post, id: 11, method: "DELETE" }], ["alice", "bob", "carol"], false);
   assert.equal(many?.title, "Replay requests that can change data?");
-  assert.match(many?.message ?? "", /^The POST, DELETE requests are sent again as alice, bob and carol\. /);
-  assert.match(accessConfirm([post], [], true)?.message ?? "", /^This POST is sent again with no session\./);
+  assert.match(many?.message ?? "", /^The POST, DELETE requests are sent again twice as their owners, then as alice, bob and carol\. /);
+  assert.match(accessConfirm([post], [], true)?.message ?? "", /^This POST is sent again twice as its owner, then with no session\./);
+  // runArgs refuses a run with nobody to send as; the question still reads.
+  assert.match(accessConfirm([post], [], false)?.message ?? "", /^This POST is sent again twice as its owner\. /);
+});
+
+const logout: HistoryPick = { id: 21, method: "GET", url: "https://shop.test/account/logout?next=/" };
+
+test("logout-like paths, as authz run's default --exclude", () => {
+  for (const path of ["/logout", "/account/log-out", "/LogOff", "/auth/sign_out", "/signoff?x=1", "/api/logout.json", "/user/signout/"]) {
+    assert.ok(isLogout({ ...get, url: `https://shop.test${path}` }), path);
+  }
+  for (const path of ["/logouts", "/catalog", "/blog/outdoor", "/signal/offer", "/?next=/logout", "/#/logout", "/logoutnow"]) {
+    assert.ok(!isLogout({ ...get, url: `https://shop.test${path}` }), path);
+  }
+  // Not a URL: the path is what comes before the query.
+  assert.ok(isLogout({ ...get, url: "/sign-out?x" }));
+  assert.ok(!isLogout({ ...get, url: "/x?sign-out" }));
+});
+
+test("an access-control run of a logout from Traffic asks first, even for a GET", () => {
+  const q = accessConfirm([logout], ["alice"], true);
+  assert.equal(q?.title, "Replay this logout?");
+  assert.match(q?.message ?? "", /^This request is sent again twice as its owner, then as alice and with no session\. It looks like a logout: /);
+  assert.match(q?.message ?? "", /end the owner's session and each identity's/);
+  assert.doesNotMatch(q?.message ?? "", /change data/);
+
+  const both = accessConfirm([{ ...logout, method: "POST" }], ["alice"], false);
+  assert.equal(both?.title, "Replay this POST?");
+  assert.match(both?.message ?? "", /That can change data.* It looks like a logout/);
+
+  const many = accessConfirm([get, logout, { ...logout, id: 22, url: "https://shop.test/signoff" }], ["bob"], true);
+  assert.equal(many?.title, "Replay requests that look like logouts?");
+  assert.match(many?.message ?? "", /^These 3 requests are sent again twice as their owners, then as bob and with no session\. #21 and #22 look like a logout: sending them /);
+  assert.match(accessConfirm([get, logout], ["bob"], true)?.message ?? "", / #21 looks like a logout: sending it /);
+});
+
+test("a scan of a logout says it can end its session", () => {
+  assert.match(scanConfirm([logout], off).message, / It looks like a logout: sending it again can end the session it was recorded with\./);
+  assert.doesNotMatch(scanConfirm([get], off).message, /logout/);
+  assert.match(scanConfirm([get, logout], off).message, / One of them looks like a logout: sending it again /);
+  assert.match(scanConfirm([logout, { ...logout, id: 22 }], off).message, / 2 of them look like a logout: sending them again can end the session they were /);
+});
+
+test("a scan with the Nuclei templates says they reach other paths of the site", () => {
+  assert.doesNotMatch(scanConfirm([get], off).message, /Nuclei/);
+  assert.match(scanConfirm([get], { nuclei: true }).message, / The downloaded Nuclei templates also run against its site, on paths of their own\. Every request/);
+  assert.match(scanConfirm([get, post], { nuclei: true }).message, /against their sites/);
+});
+
+const graphqlPost = (body: string, type = "application/json") => `POST /graphql HTTP/1.1\r\nHost: shop.test\r\nContent-Type: ${type}\r\n\r\n${body}`;
+
+test("GraphQL documents of a recorded request, as the scanner reads them", () => {
+  assert.deepEqual(graphqlDocuments(graphqlPost('{"query":"mutation { a }","variables":{}}')), ["mutation { a }"]);
+  assert.deepEqual(graphqlDocuments(graphqlPost('[{"query":"query A { a }"},{"x":1},{"query":"mutation B { b }"}]')), ["query A { a }", "mutation B { b }"]);
+  assert.deepEqual(graphqlDocuments(graphqlPost("mutation { a }", "application/graphql; charset=utf-8")), ["mutation { a }"]);
+  assert.deepEqual(graphqlDocuments("GET /graphql?query=mutation%20%7B%20a%20%7D&x=1 HTTP/1.1\r\nHost: shop.test\r\n\r\n"), ["mutation { a }"]);
+  assert.deepEqual(graphqlDocuments("GET /graphql?query=mutation+%7B+a+%7D HTTP/1.1\nHost: shop.test\n\n"), ["mutation { a }"]);
+  assert.deepEqual(graphqlDocuments(graphqlPost("name=mutation", "application/x-www-form-urlencoded")), []);
+  assert.deepEqual(graphqlDocuments(graphqlPost('{"query":5}')), []);
+  assert.deepEqual(graphqlDocuments(graphqlPost("")), []);
+});
+
+test("a GraphQL document defines a mutation when a top-level definition starts with the word", () => {
+  assert.ok(definesMutation("mutation { a }"));
+  assert.ok(definesMutation("  # comment\n mutation Login($u: String) { login(u: $u) { ok } }"));
+  assert.ok(definesMutation("query A { a } mutation B { b }"));
+  assert.ok(definesMutation("fragment F on T { x } mutation { a }"));
+  assert.ok(!definesMutation("query { mutation }"));
+  assert.ok(!definesMutation("{ a(x: \"mutation\") }"));
+  assert.ok(!definesMutation('{ a(x: """\nmutation { b }\n""") }'));
+  assert.ok(!definesMutation("# mutation { a }\nquery { a }"));
+  assert.ok(!definesMutation("mutations { a }"));
+  assert.ok(!definesMutation("query mutation { a }"));
+  assert.ok(!definesMutation(""));
+  assert.ok(definesMutation("mutation"));
+});
+
+test("a GraphQL mutation is named as one in both questions, whatever its method", () => {
+  assert.ok(isMutationRequest(graphqlPost('{"query":"mutation { delete(id: 1) }"}')));
+  assert.ok(!isMutationRequest(graphqlPost('{"query":"{ me { id } }"}')));
+  const m: HistoryPick = { ...post, method: "POST", url: "https://shop.test/graphql", mutation: true };
+  assert.deepEqual(changeKinds([m]), ["GraphQL mutation"]);
+  assert.deepEqual(changeKinds([{ ...m, mutation: false }]), ["POST"]);
+  // One sent as GET still changes data.
+  assert.deepEqual(changeKinds([get, { ...m, method: "GET" }, { ...post, method: "DELETE" }]), ["GraphQL mutation", "DELETE"]);
+  assert.match(scanConfirm([m], off).message, /replayed even though it is a GraphQL mutation, and that can change data/);
+  assert.match(scanConfirm([m, { ...post, id: 30 }], off).message, / GraphQL mutation, POST requests among them are replayed too/);
+  const q = accessConfirm([{ ...m, method: "GET" }], ["alice"], true);
+  assert.equal(q?.title, "Replay this GraphQL mutation?");
+  assert.match(q?.message ?? "", /^This GraphQL mutation is sent again twice as its owner/);
 });

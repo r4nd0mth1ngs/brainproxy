@@ -165,8 +165,11 @@ Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToAccess` (Traffic's *Test access control…*: Access opens its new-run form set to those
 history ids) and `showJob` (opens Scans › Tasks on a job, e.g. from the toast after Traffic's
 *Scan this request…*). The arguments, which rows can be scanned (not one with no response),
-and the questions asked before a scan or before Access replays a POST, are built in
-`views/trafficActions.ts`. The table selects one row at a time, so these act on one request.
+and the questions asked before a scan or before Access replays a POST, a GraphQL mutation
+(read from the recorded request, as the scanner reads it) or a logout-like path (authz's
+default `--exclude`), are built in `views/trafficActions.ts`. The table selects one row at a
+time, so these act on one request. A greyed-out menu item shows why under its label
+(`MenuItem.hint`); it stays focusable, with `aria-disabled`.
 
 ## Look
 

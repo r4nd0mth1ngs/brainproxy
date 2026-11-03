@@ -9,10 +9,10 @@ import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
+import { afterStart, grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { proxyListen, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
-import { accessConfirm, unsafeMethods } from "./trafficActions";
+import { accessConfirm, changeKinds, isLogout } from "./trafficActions";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
 
@@ -310,18 +310,21 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
   useEffect(() => {
     if (app.accessInput) set({ select: "history", history: app.accessInput });
   }, [app.accessInput]);
-  const unsafe = unsafeMethods(f.history);
+  const unsafe = changeKinds(f.history);
+  const logouts = f.history.filter(isLogout);
 
   const toggle = (name: string) => set({ identities: f.identities.includes(name) ? f.identities.filter((n) => n !== name) : [...f.identities, name] });
 
   const start = async () => {
     try {
       const args = runArgs(f);
-      // Requests from Traffic are replayed whatever their method: a POST is asked about first.
+      // Requests from Traffic are replayed whatever their method or path: a POST, a GraphQL
+      // mutation or a logout is asked about first.
       const q = f.select === "history" ? accessConfirm(f.history, f.identities, f.anonymous) : null;
       if (q && !(await confirm(q.title, q.message, q.ok, q.cancel))) return;
       setBusy(true);
       const d = await run<{ job: number }>([...args, "--background"]);
+      setF(afterStart);
       app.toast(`Access-control run #${d.job} started`);
       onStarted(d.job);
     } catch (e: any) {
@@ -371,7 +374,8 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       <p className="muted small">
         Requests from history are sent again as each identity (with the owner's credentials removed) and with no session, and
         compared with the owner's response. Only GET, HEAD and OPTIONS requests that carry credentials are picked; logout
-        paths are left alone. Every request stays inside the engagement scope.
+        paths are left alone. Requests sent from Traffic are the exception: they are tested as they are. Every request
+        stays inside the engagement scope.
       </p>
       <div className="sc-field">
         <span className="label">Send as</span>
@@ -455,8 +459,9 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
               </div>
             ))}
             <p className="muted small">
-              Tested whatever its method, and even if it carries no credentials.
+              Tested whatever its method or path, even a logout, and even if it carries no credentials.
               {unsafe.length > 0 && <b> {unsafe.join(", ")} requests are sent again as each identity: they may change data, now as another user.</b>}
+              {logouts.length > 0 && <b> {logouts.map((h) => `#${h.id}`).join(", ")} {logouts.length === 1 ? "looks" : "look"} like a logout: sending {logouts.length === 1 ? "it" : "them"} ends the owner's session and each identity's.</b>}
             </p>
           </div>
         )}

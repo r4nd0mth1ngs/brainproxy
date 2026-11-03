@@ -934,12 +934,19 @@ select {
   border-radius: 4px;
   cursor: pointer;
 }
-.menu-item:hover:not(:disabled) {
+.menu-item:hover:not([aria-disabled="true"]) {
   background: var(--accent);
   color: var(--accent-ink);
 }
-.menu-item:disabled {
-  opacity: 0.4;
+.menu-item[aria-disabled="true"] {
+  color: var(--faint);
+  cursor: default;
+}
+/* Why an item is disabled, under its label. */
+.menu-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
 }
 .menu-sep {
   height: 1px;
