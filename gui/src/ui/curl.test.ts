@@ -584,6 +584,10 @@ test("options are read as curl reads them, or refused", () => {
   // With --basic as well curl sends neither until the server's challenge.
   assert.match(refusal("curl -u a:b --basic --oauth2-bearer t https://h.test"), /challenge/);
   assert.match(parseCurl("curl -u a:b --basic --oauth2-bearer t --no-basic https://h.test").raw, /Authorization: Bearer t\n/);
+  // A custom Authorization header is sent at once instead, and -H 'Authorization:' sends none.
+  assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization: Custom' https://h.test").raw, /\nAuthorization: Custom\n/);
+  assert.doesNotMatch(parseCurl("curl -u a:b --basic --oauth2-bearer t -H 'Authorization:' https://h.test").raw, /authorization/i);
+  assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization;' https://h.test").raw, /\nAuthorization: \n/);
   // --no-get turns -G back off.
   assert.match(parseCurl("curl -G --no-get -d a=1 https://h.test").raw, /^POST \/ /);
 });
@@ -806,6 +810,12 @@ test("URL globbing is read as curl reads it, unless -g", () => {
   assert.match(parseCurl("curl 'http://h.test/{a}'").raw, /^GET \/a /);
   assert.match(parseCurl("curl 'http://h.test/{a\\,b}'").raw, /^GET \/a,b /);
   assert.match(parseCurl("curl 'http://h.test/[1-1]x[05-5][c-c]'").raw, /^GET \/1x05c /);
+  // Big numbers keep every digit; curl refuses one above 2^63 - 2.
+  assert.match(parseCurl("curl 'http://h.test/[9007199254740993-9007199254740993]'").raw, /^GET \/9007199254740993 /);
+  assert.match(parseCurl("curl 'http://h.test/[09223372036854775806-9223372036854775806]'").raw, /^GET \/09223372036854775806 /);
+  assert.match(refusal("curl 'http://h.test/[9007199254740992-9007199254740993]'"), /several requests/);
+  assert.match(refusal("curl 'http://h.test/[9223372036854775807-9223372036854775807]'"), /-g/);
+  assert.match(refusal("curl 'http://h.test/[1-1:9223372036854775807]'"), /-g/);
   assert.match(parseCurl("curl 'http://h.test/\\{a\\}\\[1-3\\]'").raw, /^GET \/\{a\}\[1-3\] /);
   assert.match(parseCurl("curl 'http://h.test/?a[]=1'").raw, /^GET \/\?a\[\]=1 /);
   assert.equal(parseCurl("curl 'http://[::1]:8080/x'").target, "http://[::1]:8080");
@@ -839,4 +849,8 @@ test("-G and --url-query add & only after a query with something in it", () => {
   assert.match(parseCurl("curl -G -d x 'http://h.test/a?b=1'").raw, /^GET \/a\?b=1&x /);
   assert.match(parseCurl("curl --url-query y 'http://h.test/a?'").raw, /^GET \/a\?y /);
   assert.match(parseCurl("curl --url-query y --url-query z 'http://h.test/a?#f'").raw, /^GET \/a\?y&z /);
+  // A query ending in a literal ? still gets a &, and the parts are joined before they are added.
+  assert.match(parseCurl("curl -G -d x 'http://h.test/a?b?'").raw, /^GET \/a\?b\?&x /);
+  assert.match(parseCurl("curl --url-query '+a&' --url-query b http://h.test/").raw, /^GET \/\?a&&b /);
+  assert.match(parseCurl("curl -G -d 'x&' -d y http://h.test/").raw, /^GET \/\?x&&y /);
 });

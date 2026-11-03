@@ -772,11 +772,14 @@ function unglob(url: string): string {
         continue;
       }
       // [a-z] or [0-9], with an optional :step. curl pads numbers to a leading 0's width.
+      // BigInt, as a Number would round a big one; curl refuses one above 2^63 - 2.
       const m = /^\[(?:([A-Za-z])-([^]))?(?:(\d+)-[ \t]*(\d+))?(?::(\d+))?\]/.exec(rest);
       if (!m || !(m[1] ?? m[3]) || (m[1] && m[3])) bad();
-      const [lo, hi] = m![1] ? [m![1].charCodeAt(0), m![2].charCodeAt(0)] : [Number(m![3]), Number(m![4])];
-      const step = m![5] === undefined ? 1 : Number(m![5]);
-      if (!step || (lo === hi && step !== 1) || lo > hi || (lo < hi && step > hi - lo) || (m![1] && hi - lo > 25)) bad();
+      const [lo, hi] = m![1] ? [BigInt(m![1].charCodeAt(0)), BigInt(m![2].charCodeAt(0))] : [BigInt(m![3]), BigInt(m![4])];
+      const step = m![5] === undefined ? 1n : BigInt(m![5]);
+      const max = 2n ** 63n - 2n;
+      if (hi > max || step > max) bad();
+      if (!step || (lo === hi && step !== 1n) || lo > hi || (lo < hi && step > hi - lo) || (m![1] && hi - lo > 25n)) bad();
       if (lo !== hi) many();
       out += m![1] ?? (m![3].startsWith("0") ? String(lo).padStart(m![3].length, "0") : String(lo));
       i += m![0].length;
@@ -863,8 +866,12 @@ export function parseCurl(command: string): ParsedCurl {
   let path = o.flags.has("path-as-is") ? url.path : removeDots(url.path);
   const joined = o.data.map((d, n) => (n > 0 && !d.json ? "&" : "") + d.bytes).join("");
   const query = [...(get && o.data.length ? [joined] : []), ...o.urlQuery];
-  // curl adds & only after a query that has something in it and doesn't already end in &.
-  for (const q of query) path += (!path.includes("?") ? "?" : /[?&]$/.test(path) ? "" : "&") + q;
+  if (query.length) {
+    // The parts are joined with & and added once: after a & only when the URL's query (what
+    // follows its first ?) has something in it and doesn't already end in &.
+    const q = path.indexOf("?");
+    path += (q < 0 ? "?" : q === path.length - 1 || path.endsWith("&") ? "" : "&") + query.join("&");
+  }
 
   const method = o.method ?? (o.flags.has("head") ? "HEAD" : hasBody ? "POST" : "GET");
   if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) throw new CurlError(`-X ${decodeOr(method)} isn't a valid method.`);
@@ -891,8 +898,10 @@ export function parseCurl(command: string): ParsedCurl {
 
   // curl's own headers, in its order; a custom header of the same name replaces one.
   // A bearer token wins over -u, which wins over user:password in the URL: curl asks for Bearer
-  // auth alone. With --basic too it waits for the server's challenge to pick one.
-  if (o.bearer != null && o.flags.has("basic")) throw new CurlError("--oauth2-bearer with --basic makes curl wait for the server's challenge before it sends either; keep one of them.");
+  // auth alone. With --basic too it waits for the server's challenge to pick one, unless a custom
+  // Authorization header (or -H 'Authorization:', which removes it) stands in for both.
+  const customAuth = o.headers.some((h) => /^[ \t]*authorization[ \t]*[:;]/i.test(h));
+  if (o.bearer != null && o.flags.has("basic") && !customAuth) throw new CurlError("--oauth2-bearer with --basic makes curl wait for the server's challenge before it sends either; keep one of them.");
   const defaults: [string, string][] = [["Host", url.host]];
   if (o.bearer != null) defaults.push(["Authorization", `Bearer ${o.bearer}`]);
   else if (o.user != null) defaults.push(["Authorization", basic(o.user)]);
