@@ -766,7 +766,9 @@ Crawl and active-scan scope and safety flags:
   GET, HEAD, OPTIONS and POST unless `--include-methods` adds others. Credentials in the
   document (Postman auth, secret-named headers, query parameters and body fields, and variables
   they use) are reported by name in `credentials` and never sent or stored; use an auth profile.
-  A document fetched from a URL isn't kept in history either.
+  A document fetched from a URL is recorded in history (source `import`) as it was sent and
+  answered, like any other request (so are `--graphql`'s introspection and `scan active --api`'s
+  fetch); the response is the document, so whatever it holds is in the project too.
 - Postman environments: `--environment FILE` reads an environment export for the collection's
   variables (a local file only; `--var` goes on top). Values the environment marks secret, or whose
   names look like credentials, are withheld like the collection's own, and the preview lists them as
@@ -966,6 +968,11 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
 - An HTTP/2 race (`send --race N --http2`) that fails after connecting records each copy
   with the error, as the HTTP/1.1 race does. Every item in the output, failed or not, has its
   history `id`.
+- The requests a `scan active --checks` template sends, and the document fetches of `import`
+  and `scan active --api` (with `--graphql`, the introspection), are recorded the same way: a row
+  just before the request goes out, completed with the response or the failure. A check request
+  cut off by its timeout, or by a stopped scan, keeps `sent; no response recorded (the check
+  timed out or the scan stopped)`.
 - `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
   for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
   before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent.

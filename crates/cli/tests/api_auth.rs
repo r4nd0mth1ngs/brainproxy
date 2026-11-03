@@ -858,10 +858,16 @@ fn import_api_introspects_a_graphql_endpoint() {
     // --include-destructive says it takes GraphQL mutations too.
     let d = ok(&p, &["import", "api", "--graphql", "--dry-run", "--include-destructive", "--", &endpoint], &[]);
     assert_eq!(row(&d, "mutation deleteUser")["included"], true, "{d}");
-    // Only the introspection went out, and nothing was recorded.
-    assert!(api.hits().iter().all(|h| h.body.contains("__schema")), "{:?}", api.hits());
-    let n = ok(&p, &["query", "SELECT count(*) FROM history"], &[]);
-    assert_eq!(n["rows"][0][0], 0);
+    // Only the introspection went out, and each one is recorded as sent.
+    let hits = api.hits();
+    assert!(hits.len() == 2 && hits.iter().all(|h| h.body.contains("__schema")), "{hits:?}");
+    let sql = "SELECT source, method, status, CAST(request AS TEXT) FROM history ORDER BY id";
+    let rows = ok(&p, &["query", sql], &[])["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (row, hit) in rows.iter().zip(&hits) {
+        assert_eq!((row[0].as_str(), row[1].as_str(), row[2].as_u64()), (Some("import"), Some("POST"), Some(200)));
+        assert!(row[3].as_str().unwrap().ends_with(&hit.body), "{row:?}");
+    }
 
     ok(&p, &["import", "api", "--graphql", "--", &endpoint], &[]);
     assert_eq!(graphql_bodies(&api, 0, "query me").len(), 1);

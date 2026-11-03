@@ -423,7 +423,6 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             let fetch = crate::import_cmd::Fetcher {
                 project,
                 send: &send,
-                record: false,
                 auth: auth.as_deref(),
                 headers: &[],
                 tool: Tool::Scan,
