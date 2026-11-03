@@ -1,13 +1,10 @@
-import { afterEach, test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_SETUP,
-  PROXY_SETUP,
-  forgetProxySetup,
   hostOf,
   isLoopback,
   isWildcard,
-  moveProxySetup,
   networkNote,
   redirectError,
   redirectOrigin,
@@ -19,6 +16,8 @@ import {
   scopeCheckArgs,
   scopeProblem,
   setupChanges,
+  setupArgs,
+  setupFrom,
   setupHost,
   setupOptions,
   targetHost,
@@ -26,31 +25,11 @@ import {
 } from "./proxyMode.ts";
 import { proxyOptions } from "./accessMatrix.ts";
 
-// localStorage: a small stub on globalThis, put back after each test.
-const realStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
-
-function stubStorage(initial: Record<string, string> = {}, overrides: object = {}) {
-  const items = new Map(Object.entries(initial));
-  const stub = {
-    getItem: (key: string) => items.get(key) ?? null,
-    setItem: (key: string, value: string) => void items.set(key, value),
-    removeItem: (key: string) => void items.delete(key),
-    ...overrides,
-  };
-  Object.defineProperty(globalThis, "localStorage", { value: stub, configurable: true, writable: true });
-  return items;
+/** A fake CLI: answers each call with `reply(args)`, and records the calls. */
+function fakeCli(reply: (args: string[]) => unknown = () => ({})) {
+  const calls: string[][] = [];
+  return { calls, cli: async (args: string[]) => (calls.push(args), reply(args)) };
 }
-
-afterEach(() => {
-  delete (globalThis as any).localStorage;
-  if (realStorage) Object.defineProperty(globalThis, "localStorage", realStorage);
-});
-
-const PROJECT = "/work/acme.bpdb";
-const OTHER = "/work/other.bpdb";
-
-/** Storage entries for a project's saved setup, as saveProxySetup writes it. */
-const stored = (project: string, value: object | string) => ({ [PROXY_SETUP + project]: typeof value === "string" ? value : JSON.stringify(value) });
 
 test("redirectProblem accepts empty (none) and http(s) origins", () => {
   for (const text of ["", "  ", "https://app.acme.test", "http://app.acme.test:8080", " https://app.acme.test/ ", "HTTPS://App.Acme.Test:8443", "http://10.0.0.5:81", "https://[::1]:8443"]) {
@@ -94,69 +73,46 @@ test("the scope check: engagement check on the origin, and its answer", () => {
   assert.match(scopeProblem({ results: [] })!, /couldn't be checked/);
 });
 
-test("the setup round-trips per project, as one value", () => {
-  const items = stubStorage();
-  assert.deepEqual(savedProxySetup(PROJECT), DEFAULT_SETUP);
-  const setup = { allInterfaces: true, invisible: true, redirect: "https://app.acme.test" };
-  assert.equal(saveProxySetup(setup, PROJECT), true);
-  assert.deepEqual([...items.keys()], [PROXY_SETUP + PROJECT]);
-  assert.deepEqual(JSON.parse(items.get(PROXY_SETUP + PROJECT)!), { network: "all", invisible: true, redirect: "https://app.acme.test" });
-  assert.deepEqual(savedProxySetup(PROJECT), setup);
+test("the setup is read from the project file and saved there in one call (proxy setup)", async () => {
+  const shown = { network: "all", invisible: true, redirect: "https://app.acme.test", host: "0.0.0.0", start_options: [] };
+  const read = fakeCli(() => shown);
+  assert.deepEqual(await savedProxySetup(read.cli), { allInterfaces: true, invisible: true, redirect: "https://app.acme.test" });
+  assert.deepEqual(read.calls, [["proxy", "setup", "show"]]);
 
-  assert.equal(saveProxySetup(DEFAULT_SETUP, PROJECT), true);
-  assert.equal(items.size, 0);
-  assert.deepEqual(savedProxySetup(PROJECT), DEFAULT_SETUP);
+  // `set` replaces the whole setup; what it prints back is what was saved.
+  const saved = fakeCli(() => ({ network: "local", invisible: true, redirect: null }));
+  assert.deepEqual(await saveProxySetup(saved.cli, { ...DEFAULT_SETUP, invisible: true }), { ...DEFAULT_SETUP, invisible: true });
+  assert.deepEqual(saved.calls, [["proxy", "setup", "set", "--network=local", "--invisible"]]);
 });
 
-test("every network interface, chosen for one project, is never used by another or without one", () => {
-  stubStorage();
-  assert.equal(saveProxySetup({ allInterfaces: true, invisible: true, redirect: "https://app.acme.test" }, PROJECT), true);
-  assert.deepEqual(savedProxySetup(OTHER), DEFAULT_SETUP);
-  assert.deepEqual(savedProxySetup(), DEFAULT_SETUP);
-  assert.deepEqual(savedProxySetup(""), DEFAULT_SETUP);
-  // The keys an earlier build kept for every project are ignored.
-  stubStorage({ "proxy-network": "all", "proxy-invisible": "on", ["proxy-redirect:" + PROJECT]: "https://app.acme.test" });
-  assert.deepEqual(savedProxySetup(PROJECT), DEFAULT_SETUP);
+test("setupArgs: every field, every time, so a save leaves nothing of the earlier setup", () => {
+  assert.deepEqual(setupArgs(DEFAULT_SETUP), ["proxy", "setup", "set", "--network=local"]);
+  assert.deepEqual(setupArgs({ allInterfaces: true, invisible: true, redirect: null }), ["proxy", "setup", "set", "--network=all", "--invisible"]);
+  // The redirect implies invisible mode.
+  assert.deepEqual(setupArgs({ allInterfaces: false, invisible: true, redirect: "https://app.acme.test" }), [
+    "proxy",
+    "setup",
+    "set",
+    "--network=local",
+    "--redirect=https://app.acme.test",
+  ]);
 });
 
-test("a corrupt saved setup falls back to the defaults", () => {
-  for (const value of ["{", "null", "\"all\"", "[]", "42", { network: "ALL", invisible: "true", redirect: "ftp://x" }, { network: true, invisible: 1, redirect: 5 }]) {
-    stubStorage(stored(PROJECT, value));
-    assert.deepEqual(savedProxySetup(PROJECT), DEFAULT_SETUP, JSON.stringify(value));
-  }
-});
-
-test("saving is one write: storage that refuses it leaves the earlier setup whole", () => {
-  // A quota or storage failure: the earlier choice (this computer only) stays, nothing half-written.
-  const items = stubStorage(stored(PROJECT, { invisible: true }), {
-    setItem: () => {
-      throw new Error("quota");
-    },
-  });
-  assert.equal(saveProxySetup({ allInterfaces: true, invisible: false, redirect: "https://app.acme.test" }, PROJECT), false);
-  assert.deepEqual(savedProxySetup(PROJECT), { ...DEFAULT_SETUP, invisible: true });
-  assert.equal(items.size, 1);
-
-  let writes = 0;
-  stubStorage({}, {
-    setItem: () => void writes++,
-    removeItem: () => void writes++,
-  });
-  saveProxySetup({ allInterfaces: true, invisible: true, redirect: "https://app.acme.test" }, PROJECT);
-  saveProxySetup(DEFAULT_SETUP, PROJECT);
-  assert.equal(writes, 2);
-});
-
-test("storage that throws, or none: the defaults, and saving says it failed", () => {
-  const fail = () => {
-    throw new Error("denied");
+test("a setup that can't be read or saved rejects, with the CLI's message", async () => {
+  const failing = async () => {
+    throw new Error("not_found: no such project");
   };
-  stubStorage({}, { getItem: fail, setItem: fail, removeItem: fail });
-  assert.deepEqual(savedProxySetup(PROJECT), DEFAULT_SETUP);
-  assert.equal(saveProxySetup(DEFAULT_SETUP, PROJECT), false);
-  delete (globalThis as any).localStorage;
-  assert.deepEqual(savedProxySetup(PROJECT), DEFAULT_SETUP);
-  assert.equal(saveProxySetup(DEFAULT_SETUP, PROJECT), false);
+  await assert.rejects(savedProxySetup(failing), { message: "not_found: no such project" });
+  await assert.rejects(saveProxySetup(failing, DEFAULT_SETUP), { message: "not_found: no such project" });
+});
+
+test("setupFrom: the defaults for anything missing or invalid", () => {
+  for (const value of [null, undefined, "all", [], 42, {}, { network: "ALL", invisible: "true", redirect: "ftp://x" }, { network: true, invisible: 1, redirect: 5 }]) {
+    assert.deepEqual(setupFrom(value), DEFAULT_SETUP, JSON.stringify(value));
+  }
+  assert.deepEqual(setupFrom({ network: "all" }), { ...DEFAULT_SETUP, allInterfaces: true });
+  // A redirect means invisible mode, however it was saved.
+  assert.deepEqual(setupFrom({ redirect: "https://app.acme.test" }), { ...DEFAULT_SETUP, invisible: true, redirect: "https://app.acme.test" });
 });
 
 test("the address and options the setup starts the proxy with", () => {
@@ -296,31 +252,16 @@ test("scopeProblem: one refused port refuses it; an answer it can't read is neve
 
 test("a saved redirect that isn't a plain origin is ignored, an untidy one normalised", () => {
   for (const redirect of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "ftp://app.acme.test", "https://app.acme.test --listen=0.0.0.0:80", "--invisible", ""]) {
-    stubStorage(stored(PROJECT, { redirect }));
-    assert.equal(savedProxySetup(PROJECT).redirect, null, redirect);
+    assert.equal(setupFrom({ redirect }).redirect, null, redirect);
   }
-  stubStorage(stored(PROJECT, { redirect: "HTTPS://App.Acme.Test:443/" }));
-  assert.equal(savedProxySetup(PROJECT).redirect, "https://app.acme.test");
+  assert.equal(setupFrom({ redirect: "HTTPS://App.Acme.Test:443/" }).redirect, "https://app.acme.test");
 });
 
-test("without a project nothing is read, not even a setup stored under an empty path", () => {
-  stubStorage({ ...stored("", { network: "all", redirect: "https://app.acme.test" }), ...stored("undefined", { network: "all" }) });
-  assert.deepEqual(savedProxySetup(), DEFAULT_SETUP);
-  assert.deepEqual(savedProxySetup(""), DEFAULT_SETUP);
-});
-
-test("saveProxySetup stores the redirect as an origin, and never an invalid one", () => {
-  const items = stubStorage(stored(PROJECT, { redirect: "https://old.test" }));
-  assert.equal(saveProxySetup({ ...DEFAULT_SETUP, redirect: "HTTPS://App.Acme.Test:443/" }, PROJECT), true);
-  assert.equal(JSON.parse(items.get(PROXY_SETUP + PROJECT)!).redirect, "https://app.acme.test");
-  for (const redirect of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "ftp://app.acme.test"]) {
-    assert.equal(saveProxySetup({ ...DEFAULT_SETUP, redirect }, PROJECT), true);
-    assert.equal(items.has(PROXY_SETUP + PROJECT), false, redirect);
+test("setupArgs sends the redirect as an origin, and never an invalid one", () => {
+  assert.deepEqual(setupArgs({ ...DEFAULT_SETUP, redirect: "HTTPS://App.Acme.Test:443/" }).at(-1), "--redirect=https://app.acme.test");
+  for (const redirect of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "ftp://app.acme.test", "https://x.test --network=all"]) {
+    assert.deepEqual(setupArgs({ ...DEFAULT_SETUP, redirect }), ["proxy", "setup", "set", "--network=local"], redirect);
   }
-  // Another project's setup is left alone.
-  Object.entries(stored(OTHER, { network: "all" })).forEach(([k, v]) => items.set(k, v));
-  saveProxySetup(DEFAULT_SETUP, PROJECT);
-  assert.equal(savedProxySetup(OTHER).allInterfaces, true);
 });
 
 test("withSetup on a shell's split --redirect leaves no stray value behind", () => {
@@ -370,45 +311,6 @@ test("redirectError: a refusal counts only for the origin it was made for", () =
   assert.equal(redirectError("https://evil.test", null), null);
   // An invalid URL says why, whatever was refused before.
   assert.match(redirectError("https://evil.test/api", refused)!, /scheme, host and port/);
-});
-
-test("Save as… carries the setup to the new path; a discarded project's is forgotten", () => {
-  const setup = { allInterfaces: true, invisible: false, redirect: "https://app.acme.test" };
-  const items = stubStorage({ ...stored(PROJECT, { network: "all", redirect: "https://app.acme.test" }), ...stored(OTHER, { network: "all" }) });
-  const dest = "/work/saved.bpdb";
-  assert.equal(moveProxySetup(PROJECT, dest), true);
-  assert.equal(items.has(PROXY_SETUP + PROJECT), false);
-  assert.deepEqual(savedProxySetup(dest), setup);
-
-  forgetProxySetup(dest);
-  assert.equal(items.has(PROXY_SETUP + dest), false);
-  // Only that project's key.
-  assert.equal(savedProxySetup(OTHER).allInterfaces, true);
-});
-
-test("Save as… over a path that had a setup: the new file doesn't inherit it", () => {
-  const items = stubStorage(stored("/work/old.bpdb", { network: "all", redirect: "https://old.test" }));
-  assert.equal(moveProxySetup("/work/temp-1", "/work/old.bpdb"), true);
-  assert.equal(items.has(PROXY_SETUP + "/work/old.bpdb"), false);
-  assert.deepEqual(savedProxySetup("/work/old.bpdb"), DEFAULT_SETUP);
-
-  // Storage that refuses the copy still leaves nothing behind at the new path.
-  const left = stubStorage({ ...stored(PROJECT, { invisible: true }), ...stored("/work/old.bpdb", { network: "all" }) }, {
-    setItem: () => {
-      throw new Error("quota");
-    },
-  });
-  assert.equal(moveProxySetup(PROJECT, "/work/old.bpdb"), false);
-  assert.equal(left.has(PROXY_SETUP + "/work/old.bpdb"), false);
-});
-
-test("moveProxySetup and forgetProxySetup with storage that throws", () => {
-  const fail = () => {
-    throw new Error("denied");
-  };
-  stubStorage({}, { getItem: fail, setItem: fail, removeItem: fail });
-  assert.equal(moveProxySetup(PROJECT, "/work/saved.bpdb"), false);
-  assert.doesNotThrow(() => forgetProxySetup(PROJECT));
 });
 
 test("redirectToCheck: Save checks a refused origin again, since the refusal may not hold any more", () => {

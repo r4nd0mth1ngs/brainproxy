@@ -8,7 +8,6 @@ import type { TempInfo } from "../store";
 import { confirm } from "../ui/Confirm";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
-import { forgetProxySetup, moveProxySetup } from "./proxyMode";
 
 const RECENT = "recent-projects";
 
@@ -212,7 +211,6 @@ function Leftovers({ open }: { open: Open }) {
     act(async () => {
       const dest = await saveTempAs(l.path, l.name);
       if (!dest) return;
-      moveProxySetup(l.path, dest);
       await tempProjects.discard(l.path).catch(() => {});
       await open(dest);
     });
@@ -226,7 +224,6 @@ function Leftovers({ open }: { open: Open }) {
       );
       if (!yes) return;
       await tempProjects.discard(l.path);
-      forgetProxySetup(l.path);
       await load();
     });
 
@@ -296,8 +293,6 @@ function NewEngagement({ open, cancel, temp }: { open: Open; cancel: () => void;
     try {
       // The shell makes the folder and locks it for this app; a crash leaves it to be offered on the next launch.
       const t = await tempProjects.create();
-      // A new engagement starts with this computer only, whatever an earlier one at that path had (Settings › Proxy).
-      forgetProxySetup(t.path);
       setProject(t.path);
       try {
         await engagementStart();
@@ -319,8 +314,6 @@ function NewEngagement({ open, cancel, temp }: { open: Open; cancel: () => void;
     setProject(projectPath);
     try {
       await engagementStart();
-      // A new engagement starts with this computer only, whatever an earlier one at that path had (Settings › Proxy).
-      forgetProxySetup(projectPath);
       remember(projectPath);
       await open(projectPath);
     } catch (e: any) {

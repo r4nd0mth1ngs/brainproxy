@@ -19,7 +19,6 @@ import {
   withPort,
   withPortHint,
 } from "./proxyPort.ts";
-import { PROXY_SETUP, savedProxySetup } from "./proxyMode.ts";
 
 // localStorage: a small stub on globalThis, put back after each test.
 const realStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -56,8 +55,11 @@ function fakeCli(answer: (args: string[], call: number) => unknown = () => {}) {
 
 const isStart = (args: string[]) => args[1] === "start";
 
-/** Storage entries for a project's saved setup (proxyMode.ts). */
-const stored = (project: string, value: object) => ({ [PROXY_SETUP + project]: JSON.stringify(value) });
+const SHOW = ["proxy", "setup", "show"];
+
+/** A `fakeCli` answer: the project's saved setup for `proxy setup show`, `rest` for the others. */
+const withSaved = (setup: object, rest: (args: string[], call: number) => unknown = () => {}) => (args: string[], call: number) =>
+  args[1] === "setup" ? setup : rest(args, call);
 
 test("portProblem accepts empty (automatic) and ports from 1 to 65535", () => {
   for (const text of ["", "  ", "1", "80", "8080", " 9090 ", "65535", "08080"]) {
@@ -148,20 +150,22 @@ test("startProxy uses the saved port, or the default", async () => {
   stubStorage({ [PROXY_PORT]: "9090" });
   let fake = fakeCli();
   await startProxy(fake.cli, proxyControl());
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
+  assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:9090"]]);
 
   stubStorage();
   fake = fakeCli();
   await startProxy(fake.cli, proxyControl());
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:8080"]]);
+  assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:8080"]]);
 });
 
 test("startProxy: a failed bind still rejects, now with the hint; other errors are unchanged", async () => {
   stubStorage();
   const failing = (message: string) =>
-    fakeCli(() => {
-      throw new Error(message);
-    }).cli;
+    fakeCli(
+      withSaved({}, () => {
+        throw new Error(message);
+      }),
+    ).cli;
   await assert.rejects(startProxy(failing(BIND_FAILURE), proxyControl()), { message: HINTED });
   await assert.rejects(startProxy(failing("conflict: proxy already running"), proxyControl()), { message: "conflict: proxy already running" });
 });
@@ -256,7 +260,7 @@ test("during a move, other starts wait for it and start nothing if the proxy is 
   assert.deepEqual(calls, [["proxy", "stop"]]);
   release();
   assert.equal(await moved, "127.0.0.1:9090");
-  assert.equal(await started, false);
+  assert.equal(await started, null);
   assert.deepEqual(calls.slice(1), [
     ["proxy", "start", "--listen=127.0.0.1:9090", "--timeout=30"],
     ["proxy", "status"],
@@ -286,7 +290,7 @@ test("during a move that leaves the proxy off, a start waits and then starts it"
   });
   const ctl = proxyControl();
   const moved = moveProxy(cli, ctl, movable, 9090);
-  assert.equal(await startProxy(cli, ctl), true);
+  assert.equal(await startProxy(cli, ctl), "127.0.0.1:8080");
   await assert.rejects(moved);
   assert.deepEqual(calls.at(-1), ["proxy", "start", "--listen=127.0.0.1:8080"]);
   assert.equal(ctl.moving, null);
@@ -297,6 +301,7 @@ test("during a move that leaves the proxy off, a start waits and then starts it"
 /** `proxy status` answers with `status`; `proxy start` with the next pid of `pids`; `fail` makes a call fail to bind. */
 function proxyCli(status: () => object, pids: number[] = [], fail: (args: string[]) => boolean = () => false) {
   return fakeCli((args) => {
+    if (args[1] === "setup") return {};
     if (fail(args)) throw new Error(BIND_FAILURE);
     if (args[1] === "status") return status();
     if (isStart(args)) return { pid: pids.shift(), listen: args[2].slice(9) };
@@ -321,7 +326,7 @@ test("startProxy takes an explicit port, and a failed start records nothing", as
   const ctl = proxyControl();
   const { calls, cli } = proxyCli(() => ({}), [], () => true);
   await assert.rejects(startProxy(cli, ctl, 8083), { message: HINTED });
-  assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8083"]]);
+  assert.deepEqual(calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:8083"]]);
   assert.equal(ctl.owned, null);
 });
 
@@ -379,23 +384,27 @@ test("moveProxy: a proxy the app didn't start doesn't become the app's", async (
 
 // The setup (proxyMode.ts): who can connect, invisible mode and the redirect.
 
-test("startProxy starts with the setup saved for the control's project", async () => {
-  stubStorage({ [PROXY_PORT]: "80", ...stored("/work/a.bpdb", { network: "all", invisible: true, redirect: "https://app.acme.test" }) });
-  const fake = fakeCli();
-  await startProxy(fake.cli, proxyControl("/work/a.bpdb"));
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=0.0.0.0:80", "--redirect=https://app.acme.test"]]);
-  assert.equal(proxyListen(undefined, savedProxySetup("/work/a.bpdb")), "0.0.0.0:80");
+test("startProxy starts with the setup saved in the project file", async () => {
+  stubStorage({ [PROXY_PORT]: "80" });
+  const fake = fakeCli(withSaved({ network: "all", invisible: true, redirect: "https://app.acme.test" }));
+  assert.equal(await startProxy(fake.cli, proxyControl()), "0.0.0.0:80");
+  assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=0.0.0.0:80", "--redirect=https://app.acme.test"]]);
   assert.equal(proxyListen(), "127.0.0.1:80");
 });
 
-test("startProxy for another project: every network interface chosen for one is never used", async () => {
-  // As when the app opens a project and starts its proxy: another project's choice isn't asked for.
-  stubStorage({ ...stored("/work/a.bpdb", { network: "all", invisible: true }), "proxy-network": "all", "proxy-invisible": "on" });
-  for (const ctl of [proxyControl("/work/b.bpdb"), proxyControl(), proxyControl("")]) {
-    const { calls, cli } = fakeCli();
-    await startProxy(cli, ctl, 8080);
-    assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8080"]], String(ctl.project));
-  }
+test("startProxy: a setup that can't be read starts nothing", async () => {
+  const fake = fakeCli((args) => {
+    if (args[1] === "setup") throw new Error("internal: database is locked");
+  });
+  await assert.rejects(startProxy(fake.cli, proxyControl(), 8080), { message: "internal: database is locked" });
+  assert.deepEqual(fake.calls, [SHOW]);
+});
+
+test("startProxy returns the address the proxy reports, or the one it asked for", async () => {
+  let fake = fakeCli(withSaved({}, (args) => (isStart(args) ? { pid: 3, listen: "127.0.0.1:41000" } : {})));
+  assert.equal(await startProxy(fake.cli, proxyControl(), 8080), "127.0.0.1:41000");
+  fake = fakeCli();
+  assert.equal(await startProxy(fake.cli, proxyControl(), 8080), "127.0.0.1:8080");
 });
 
 test("moveProxy with a setup: its host, invisible mode and redirect, the other options kept", async () => {
@@ -463,46 +472,31 @@ test("moveProxy without a setup keeps a shell's invisible mode and redirect, as 
 
 test("startProxy: a saved redirect that isn't a plain origin never reaches the start", async () => {
   for (const redirect of ["https://me:pw@app.acme.test", "https://app.acme.test/api", "https://app.acme.test --listen=0.0.0.0:80"]) {
-    stubStorage(stored("/work/a.bpdb", { redirect }));
-    const { calls, cli } = fakeCli();
-    await startProxy(cli, proxyControl("/work/a.bpdb"));
-    assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:8080"]], redirect);
+    const { calls, cli } = fakeCli(withSaved({ redirect }));
+    await startProxy(cli, proxyControl());
+    assert.deepEqual(calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:8080"]], redirect);
   }
 });
 
-test("startProxy without a project: this computer only, no invisible mode or redirect", async () => {
-  stubStorage({ ...stored("", { network: "all", invisible: true, redirect: "https://app.acme.test" }), ...stored("undefined", { network: "all" }) });
-  const { calls, cli } = fakeCli();
-  await startProxy(cli, proxyControl(), 9090);
-  assert.deepEqual(calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
-});
-
-test("startProxy: corrupt or unreadable setup storage starts on this computer only", async () => {
-  stubStorage({ [PROXY_SETUP + "/work/a.bpdb"]: '{"network":"ALL","invisible":"1"' });
-  let fake = fakeCli();
-  await startProxy(fake.cli, proxyControl("/work/a.bpdb"), 9090);
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
-
-  const fail = () => {
-    throw new Error("denied");
-  };
-  stubStorage({}, { getItem: fail });
-  fake = fakeCli();
-  await startProxy(fake.cli, proxyControl("/work/a.bpdb"), 9090);
-  assert.deepEqual(fake.calls, [["proxy", "start", "--listen=127.0.0.1:9090"]]);
+test("startProxy: an unreadable saved setup starts on this computer only", async () => {
+  for (const saved of [null, "all", { network: "ALL", invisible: "1" }]) {
+    const fake = fakeCli(withSaved(saved as object));
+    await startProxy(fake.cli, proxyControl(), 9090);
+    assert.deepEqual(fake.calls, [SHOW, ["proxy", "start", "--listen=127.0.0.1:9090"]], JSON.stringify(saved));
+  }
 });
 
 test("a start waiting on a setup move that left the proxy off starts it with the saved setup", async () => {
-  stubStorage(stored("/work/a.bpdb", { network: "all", redirect: "https://app.acme.test" }));
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));
   const { calls, cli } = fakeCli(async (args) => {
+    if (args[1] === "setup") return { network: "all", redirect: "https://app.acme.test" };
     if (args[1] === "stop") await held;
     if (args[1] === "status") return { running: false, proxy: null };
     if (isStart(args)) throw new Error(BIND_FAILURE);
     return {};
   });
-  const ctl = proxyControl("/work/a.bpdb");
+  const ctl = proxyControl();
   const moved = moveProxy(cli, ctl, { listen: "127.0.0.1:8080" }, 80, { allInterfaces: true, invisible: false, redirect: "https://app.acme.test" });
   const started = startProxy(cli, ctl, 8080).catch((e) => e);
   release();

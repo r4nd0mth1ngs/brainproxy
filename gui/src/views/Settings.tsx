@@ -11,6 +11,7 @@ import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
 import { DEFAULT_PROXY_PORT, lowPortNote, moveProxy, portOf, portProblem, proxyListen, saveProxyPort, savedProxyPort, startProxy } from "./proxyPort";
 import {
+  DEFAULT_SETUP,
   networkNote,
   redirectError,
   redirectOrigin,
@@ -1400,7 +1401,7 @@ function ProxyPort(p: { saved: number | null; onSaved: (port: number | null) => 
 }
 
 const EXPOSED =
-  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours, with this project's auth profiles, session rules and platform auth (Basic, Digest, NTLM) applied, and are recorded in this project. It applies to this project only, and the proxy starts that way whenever the project opens. Use it only on a network you trust, or block the port in a firewall.";
+  "Anyone who can reach this computer over the network can then use the proxy, without a password: their requests go to the engagement's targets like yours, with this project's auth profiles, session rules and platform auth (Basic, Digest, NTLM) applied, and are recorded in this project. Live access-control testing started from Access uses the same listener, so their requests are also sent as each identity. It is saved in this project file, and the proxy starts that way whenever the file is opened. Use it only on a network you trust, or block the port in a firewall.";
 
 /** Who can connect to the proxy, invisible mode and the redirect (proxyMode.ts). */
 function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => void }) {
@@ -1418,8 +1419,9 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
   const input = useRef<HTMLInputElement>(null);
   const problem = redirectError(redirect, refused);
   const origin = redirectOrigin(redirect);
-  const draft: ProxySetup = { allInterfaces: all, invisible, redirect: origin };
-  const changed = all !== p.saved.allInterfaces || invisible !== p.saved.invisible || origin !== p.saved.redirect;
+  // A redirect turns invisible mode on, and is saved that way.
+  const draft: ProxySetup = { allInterfaces: all, invisible: invisible || !!origin, redirect: origin };
+  const changed = all !== p.saved.allInterfaces || draft.invisible !== p.saved.invisible || origin !== p.saved.redirect;
 
   const save = async () => {
     if (redirectProblem(redirect)) {
@@ -1432,7 +1434,13 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
     try {
       const check = redirectToCheck(redirect, p.saved.redirect);
       if (check) {
-        const why = scopeProblem(await run(scopeCheckArgs(check)));
+        let why: string | null;
+        try {
+          why = scopeProblem(await run(scopeCheckArgs(check)));
+        } catch (e: any) {
+          // Not a refusal: Save tries again.
+          return app.toast(`Not saved: the redirect couldn't be checked against the engagement scope: ${e.message}`, "error");
+        }
         setRefused(why ? { origin: check, why } : null);
         if (why) {
           setAttempt((n) => n + 1);
@@ -1441,12 +1449,10 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
         }
       }
       if (all && !p.saved.allInterfaces && !(await confirm("Listen on every network interface?", EXPOSED, "Listen on every interface", "Cancel"))) return;
-      if (!saveProxySetup(draft, app.project)) return app.toast("The settings weren't saved: this app's settings storage is unavailable.", "error");
-      p.onSaved(draft);
-      app.toast("Saved. The proxy uses these settings when it next starts.");
+      p.onSaved(await saveProxySetup(run, draft));
+      app.toast("Saved in this project. The proxy uses these settings when it next starts.");
     } catch (e: any) {
-      // Not a refusal: Save tries again.
-      app.toast(`Not saved: the redirect couldn't be checked against the engagement scope: ${e.message}`, "error");
+      app.toast(`Not saved: ${e.message}`, "error");
     } finally {
       setChecking(false);
     }
@@ -1462,12 +1468,18 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
       <h3>
         <label htmlFor={`${id}-net`}>Who can connect</label>
       </h3>
-      <select id={`${id}-net`} className="input" value={all ? "all" : "local"} onChange={(e) => setAll(e.target.value === "all")}>
+      <select
+        id={`${id}-net`}
+        className="input"
+        value={all ? "all" : "local"}
+        aria-describedby={all ? `${id}-exposed` : undefined}
+        onChange={(e) => setAll(e.target.value === "all")}
+      >
         <option value="local">This computer only (127.0.0.1)</option>
         <option value="all">Every network interface (0.0.0.0)</option>
       </select>
       {all && (
-        <div className="wiz-warn danger" style={{ marginTop: 8 }}>
+        <div id={`${id}-exposed`} className="wiz-warn danger" style={{ marginTop: 8 }}>
           {EXPOSED}
         </div>
       )}
@@ -1480,9 +1492,10 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
         For a device or program with no proxy setting: point the target's name at this computer with DNS or the hosts file
         (<span className="mono">/etc/hosts</span>, on Windows <span className="mono">C:\Windows\System32\drivers\etc\hosts</span>), and
         it connects here as if to the site. Plain requests go to the host in their Host header, TLS to the name the client asks
-        for (SNI) on port 443, and the client has to trust the brainproxy CA (TLS / CA). Ordinary proxy requests still work. Such
-        clients use the site's own port, usually 80 or 443: set Port to match, and choose every network interface for another
-        device. {lowPortNote(80)}
+        for (SNI) on port 443 whatever port it connected to, and the client has to trust the brainproxy CA (TLS / CA). Ordinary
+        proxy requests still work. Such clients use the site's own port, usually 80 or 443: set Port to match, and choose every
+        network interface for another device. The proxy listens on one port, so it covers the site's plain HTTP (80) or its
+        HTTPS (443), not both: choose the one the client uses. {lowPortNote(80)}
       </p>
       <h3>
         <label htmlFor={`${id}-redirect`}>Send everything to</label>
@@ -1511,7 +1524,10 @@ function ProxyListen(p: { saved: ProxySetup; onSaved: (setup: ProxySetup) => voi
         its path. It turns invisible mode on, and browsers opened with Open browser go there too. It has to be in this
         engagement's scope (checked each time you save).
       </p>
-      <p className="muted small">Who can connect, invisible mode and the redirect are kept for this project only.</p>
+      <p className="muted small">
+        Who can connect, invisible mode and the redirect are saved in this project file, so a copy of it has them too (
+        <span className="mono">brainproxy proxy setup show</span>).
+      </p>
       {/* Enabled with an invalid redirect too: pressing it (or Enter) points at the error. */}
       <button className="btn small primary" disabled={checking || (!problem && !changed)}>
         {checking ? "Checking…" : "Save"}
@@ -1598,7 +1614,12 @@ function ProxySetup() {
   // Set while the proxy starts or moves: a status poll can catch it off, mid-restart.
   const [busy, setBusy] = useState(false);
   const [port, setPort] = useState(savedProxyPort);
-  const [setup, setSetup] = useState(() => savedProxySetup(app.project));
+  // Saved in the project file; null until read.
+  const [setup, setSetup] = useState<ProxySetup | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
+  useEffect(() => {
+    savedProxySetup(run).then(setSetup, (e: any) => setSetupError(e.message));
+  }, []);
   const start = async () => {
     setBusy(true);
     try {
@@ -1666,25 +1687,34 @@ function ProxySetup() {
           </dd>
         </dl>
       ) : (
-        <p className="muted">Start the proxy (it will listen on {proxyListen(port, setup)}), then point a browser at it to record traffic into this project.</p>
+        <p className="muted">
+          Start the proxy{setup ? ` (it will listen on ${proxyListen(port, setup)})` : ""}, then point a browser at it to record
+          traffic into this project.
+        </p>
       )}
       <ProxyPort
         saved={port}
-        setup={setup}
+        setup={setup ?? DEFAULT_SETUP}
         running={proxy?.running ? (proxy.proxy?.listen ?? null) : null}
         onSaved={(n) => {
           setPort(n);
           refresh();
         }}
       />
-      <ProxyListen
-        saved={setup}
-        onSaved={(s) => {
-          setSetup(s);
-          refresh();
-        }}
-      />
-      <ProxyRestart proxy={proxy} port={port} setup={setup} refresh={refresh} busy={busy} setBusy={setBusy} />
+      {setup ? (
+        <>
+          <ProxyListen
+            saved={setup}
+            onSaved={(s) => {
+              setSetup(s);
+              refresh();
+            }}
+          />
+          <ProxyRestart proxy={proxy} port={port} setup={setup} refresh={refresh} busy={busy} setBusy={setBusy} />
+        </>
+      ) : (
+        <p className="muted">{setupError ? `Who can connect, invisible mode and the redirect couldn't be read: ${setupError}` : "Loading…"}</p>
+      )}
     </div>
   );
 }

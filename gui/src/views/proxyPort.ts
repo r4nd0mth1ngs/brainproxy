@@ -82,12 +82,10 @@ export interface ProxyControl {
   owned: number | null;
   /** Set while a move has stopped the proxy and starts it again; other starts wait for it. Never rejects. */
   moving: Promise<void> | null;
-  /** The project's path, for its saved redirect (proxyMode.ts). */
-  project?: string;
 }
 
-export function proxyControl(project?: string): ProxyControl {
-  return { owned: null, moving: null, project };
+export function proxyControl(): ProxyControl {
+  return { owned: null, moving: null };
 }
 
 interface Status {
@@ -99,22 +97,25 @@ interface Status {
 const pidOf = (started: unknown) => (started as { pid?: number } | null)?.pid ?? null;
 
 /**
- * Starts the proxy on `port` (the saved one by default), with the saved setup, and records it as the
- * app's. During a move it waits for that first, and starts nothing if the proxy is up after it: false then.
+ * Starts the proxy on `port` (the saved one by default), with the project's saved setup, and records
+ * it as the app's; returns the address it listens on. During a move it waits for that first, and
+ * starts nothing if the proxy is up after it: null then.
  */
-export async function startProxy(cli: Cli, ctl: ProxyControl, port = savedProxyPort()): Promise<boolean> {
+export async function startProxy(cli: Cli, ctl: ProxyControl, port = savedProxyPort()): Promise<string | null> {
   if (ctl.moving) {
     await ctl.moving;
-    if (((await cli(["proxy", "status"])) as Status).running) return false;
+    if (((await cli(["proxy", "status"])) as Status).running) return null;
   }
+  const setup = await savedProxySetup(cli);
+  const listen = proxyListen(port, setup);
   try {
-    const setup = savedProxySetup(ctl.project);
-    ctl.owned = pidOf(await cli(["proxy", "start", `--listen=${proxyListen(port, setup)}`, ...setupOptions(setup)]));
+    const started = (await cli(["proxy", "start", `--listen=${listen}`, ...setupOptions(setup)])) as { pid?: number; listen?: string } | null;
+    ctl.owned = pidOf(started);
+    return started?.listen ?? listen;
   } catch (e: any) {
     e.message = withPortHint(e.message);
     throw e;
   }
-  return true;
 }
 
 /** Stops the proxy, whoever started it; it is no longer the app's. */

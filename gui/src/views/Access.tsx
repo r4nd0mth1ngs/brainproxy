@@ -10,7 +10,7 @@ import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { proxyListen, withPortHint } from "./proxyPort";
-import { savedProxySetup, setupOptions } from "./proxyMode";
+import { DEFAULT_SETUP, savedProxySetup, setupOptions } from "./proxyMode";
 import { stateClass, type Job } from "./Scanner";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
@@ -324,10 +324,11 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       const live = liveArgs(f);
       setBusy(true);
       const s = await run<ProxyStatus>(["proxy", "status"]);
-      // A proxy that isn't running starts with this project's saved setup, as elsewhere.
-      const setup = savedProxySetup(app.project);
-      const listen = `--listen=${s.proxy?.listen ?? proxyListen(undefined, setup)}`;
-      const before = s.proxy ? proxyOptions(s.proxy.args ?? []) : setupOptions(setup);
+      // A proxy that isn't running starts with this project's saved setup, as elsewhere: on every
+      // network interface too, if chosen, so other devices' requests are also tried as each identity.
+      const setup = s.proxy ? null : await savedProxySetup(run);
+      const listen = `--listen=${s.proxy?.listen ?? proxyListen(undefined, setup ?? undefined)}`;
+      const before = s.proxy ? proxyOptions(s.proxy.args ?? []) : setupOptions(setup ?? DEFAULT_SETUP);
       // The app's proxy (one it starts here, or restarts) stops when the project closes; not one a shell or an agent started.
       const ours = !s.running || (app.proxy.owned != null && app.proxy.owned === s.proxy?.pid);
       if (s.running) await run(["proxy", "stop"]);

@@ -72,6 +72,113 @@ pub enum ProxyCmd {
     },
     /// Show whether a proxy is running, with capture and intercept counts.
     Status,
+    /// How the app starts this project's proxy (Settings › Proxy): who can connect, invisible mode
+    /// and a redirect. Saved in the project file; `proxy start` doesn't read it.
+    #[command(subcommand)]
+    Setup(SetupCmd),
+}
+
+#[derive(Subcommand)]
+pub enum SetupCmd {
+    /// Show the saved setup, with the `proxy start` options it stands for.
+    Show,
+    /// Replace the saved setup in one write; whatever isn't given goes back to its default. It applies
+    /// the next time the app starts the proxy.
+    Set {
+        /// Who can connect: `local` (127.0.0.1, this computer only) or `all` (0.0.0.0, every network
+        /// interface: anyone who can reach this computer can use the proxy, with this project's auth
+        /// profiles and platform auth). Not `all` in an MCP tool call.
+        #[arg(long, value_enum, default_value = "local")]
+        network: NetworkArg,
+        /// Also serve clients that don't know they're proxied (`proxy start --invisible`).
+        #[arg(long)]
+        invisible: bool,
+        /// Send every request to this origin (`proxy start --redirect`); a path is dropped. Implies
+        /// --invisible.
+        #[arg(long, value_name = "URL")]
+        redirect: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkArg {
+    #[default]
+    Local,
+    All,
+}
+
+/// Settings key of the app's proxy setup (`setting.proxy_setup` in `meta`).
+const SETUP_KEY: &str = "proxy_setup";
+
+/// The app's proxy setup as stored; defaults are left out.
+#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+struct ProxySetup {
+    #[serde(default, skip_serializing_if = "is_local")]
+    network: NetworkArg,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    invisible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect: Option<String>,
+}
+
+fn is_local(n: &NetworkArg) -> bool {
+    *n == NetworkArg::Local
+}
+
+impl ProxySetup {
+    fn json(&self) -> Value {
+        let host = if self.network == NetworkArg::All { "0.0.0.0" } else { "127.0.0.1" };
+        let mut options = vec![];
+        match &self.redirect {
+            Some(r) => options.push(format!("--redirect={r}")),
+            None if self.invisible => options.push("--invisible".to_string()),
+            None => {}
+        }
+        json!({
+            "network": self.network,
+            "invisible": self.invisible || self.redirect.is_some(),
+            "redirect": self.redirect,
+            "host": host,
+            "start_options": options,
+        })
+    }
+
+    fn text(&self) -> String {
+        let who = if self.network == NetworkArg::All {
+            "every network interface (0.0.0.0)"
+        } else {
+            "this computer only (127.0.0.1)"
+        };
+        let mode = match &self.redirect {
+            Some(r) => format!("invisible, everything sent to {r}"),
+            None if self.invisible => "invisible".into(),
+            None => "not invisible".into(),
+        };
+        format!("who can connect: {who}; {mode}")
+    }
+}
+
+fn setup(project: &Path, cmd: SetupCmd, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    let saved = match cmd {
+        SetupCmd::Show => store.setting::<ProxySetup>(SETUP_KEY)?,
+        SetupCmd::Set { network, invisible, redirect } => {
+            if network == NetworkArg::All && crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "--network=all isn't offered through MCP: it lets anyone who can reach this computer use the \
+                     proxy, so a person chooses it (Settings › Proxy in the app, or a terminal)"
+                        .into(),
+                ));
+            }
+            let redirect = redirect.map(|r| Target::from_url(&r).map(|t| t.origin())).transpose()?;
+            let setup = ProxySetup { network, invisible: invisible && redirect.is_none(), redirect };
+            store.set_setting(SETUP_KEY, &setup)?;
+            setup
+        }
+    };
+    out.ok(saved.json(), || saved.text());
+    Ok(())
 }
 
 #[derive(clap::Args, Clone)]
@@ -486,6 +593,15 @@ pub(crate) fn connect_addr(listen: &str) -> String {
     }
 }
 
+/// A listen address for text output: its URL, or for a wildcard address what it is and the
+/// URL to use here.
+fn listen_text(listen: &str) -> String {
+    match connect_addr(listen) {
+        addr if addr == listen => format!("http://{listen}"),
+        addr => format!("{listen}, every network interface (here: http://{addr})"),
+    }
+}
+
 fn usage_hints(state: &ProxyState) -> Value {
     let url = format!("http://{}", connect_addr(&state.listen));
     let ca = state.ca_cert.display();
@@ -513,6 +629,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
     match cmd {
         ProxyCmd::Start(args) => start(project, home, args, out),
         ProxyCmd::Run(args) => run_foreground(project, home, args, out),
+        ProxyCmd::Setup(cmd) => setup(project, cmd, out),
         ProxyCmd::Stop { forget: true } => {
             let store = Store::open(project)?;
             let pid = forget(&store)?.ok_or_else(|| Error::NotFound("no proxy recorded for this project".into()))?;
@@ -564,7 +681,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             out.ok(data, || match &state {
                 Some(s) => format!(
                     "running on {} ({}), {captures} captures, {pending} pending{}",
-                    s.listen,
+                    listen_text(&s.listen),
                     process::pid_text(s.pid, pid_ns.as_deref()),
                     live_text(s.authz_run)
                 ),
@@ -638,7 +755,12 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
         }
         if let Some(Saved { state, .. }) = read_state(&store)?.filter(|s| s.state.pid == child.id()) {
             out.ok(state_json(&state), || {
-                format!("proxy listening on http://{} (pid {}){}", state.listen, state.pid, live_text(state.authz_run))
+                format!(
+                    "proxy listening on {} (pid {}){}",
+                    listen_text(&state.listen),
+                    state.pid,
+                    live_text(state.authz_run)
+                )
             });
             return Ok(());
         }
@@ -791,7 +913,9 @@ fn serve(
         };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&saved).unwrap_or_default()))?;
         let state = saved.state;
-        out.ok(state_json(&state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));
+        out.ok(state_json(&state), || {
+            format!("proxy listening on {}{}", listen_text(&state.listen), live_text(state.authz_run))
+        });
 
         let shutdown = process::shutdown(&store, STOP_KEY);
         let opts = ProxyOptions {
@@ -1041,6 +1165,23 @@ mod tests {
         ] {
             assert_eq!(connect_addr(listen), addr, "{listen}");
         }
+    }
+
+    #[test]
+    fn listen_text_names_a_wildcard_address_and_where_to_connect() {
+        assert_eq!(listen_text("127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(listen_text("0.0.0.0:8080"), "0.0.0.0:8080, every network interface (here: http://127.0.0.1:8080)");
+        assert_eq!(listen_text("[::]:80"), "[::]:80, every network interface (here: http://[::1]:80)");
+    }
+
+    #[test]
+    fn the_saved_setup_leaves_defaults_out() {
+        let json = |s: &ProxySetup| serde_json::to_string(s).unwrap();
+        assert_eq!(json(&ProxySetup::default()), "{}");
+        let all = ProxySetup { network: NetworkArg::All, invisible: true, redirect: None };
+        assert_eq!(json(&all), r#"{"network":"all","invisible":true}"#);
+        assert_eq!(serde_json::from_str::<ProxySetup>(&json(&all)).unwrap(), all);
+        assert!(serde_json::from_str::<ProxySetup>(r#"{"network":"ALL"}"#).is_err());
     }
 
     #[test]

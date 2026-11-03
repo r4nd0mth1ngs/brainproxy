@@ -102,7 +102,7 @@ export function AppProvider({
   const [wizardOpen, setWizardOpen] = useState(false);
   const nextKey = useRef(1);
   // Mutated in place: the views read it when they act, nothing renders from it.
-  const proxy = useRef(proxyControl(project)).current;
+  const proxy = useRef(proxyControl()).current;
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info", onClick?: () => void) => {
     const id = nextKey.current++;

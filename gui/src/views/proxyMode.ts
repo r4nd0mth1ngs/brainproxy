@@ -1,13 +1,10 @@
 // How the app's proxy listens (Settings › Proxy), besides its port: on this machine only or on
 // every network interface, invisible mode, and a redirect that sends everything to one origin.
-// Kept per project, as one value under its path, so a save is all or nothing: on every interface
-// other machines' requests pick up that project's auth profiles and platform auth, so the choice
-// is never carried to another project, and the redirect has to be in that engagement's scope.
+// Saved in the project file (`proxy setup`), in one write: on every interface other machines'
+// requests pick up that project's auth profiles and platform auth, so the choice belongs to that
+// file and nothing else, and the redirect has to be in that engagement's scope.
 
 import { proxyOptions } from "./accessMatrix.ts";
-
-/** Followed by the project's path. */
-export const PROXY_SETUP = "proxy-setup:";
 
 export const LOCAL_HOST = "127.0.0.1";
 export const ALL_HOST = "0.0.0.0";
@@ -66,65 +63,35 @@ export function scopeProblem(check: ScopeCheck): string | null {
   return refused ? `It isn't in this engagement's scope${refused.reason ? `: ${refused.reason}` : "."}` : null;
 }
 
-/** The saved setup for `project`; defaults for anything unset, invalid or unreadable, and without a project. */
-export function savedProxySetup(project?: string): ProxySetup {
-  if (!project) return DEFAULT_SETUP;
-  let saved: any;
-  try {
-    saved = JSON.parse(localStorage.getItem(PROXY_SETUP + project) ?? "null");
-  } catch {
-    return DEFAULT_SETUP;
-  }
-  if (!saved || typeof saved !== "object") return DEFAULT_SETUP;
-  return {
-    allInterfaces: saved.network === "all",
-    invisible: saved.invisible === true,
-    redirect: typeof saved.redirect === "string" ? redirectOrigin(saved.redirect) : null,
-  };
+type Cli = (args: string[]) => Promise<unknown>;
+
+/** `proxy setup show` / `set` output as a setup; defaults for anything missing or invalid. */
+export function setupFrom(data: unknown): ProxySetup {
+  const d = (data && typeof data === "object" ? data : {}) as { network?: unknown; invisible?: unknown; redirect?: unknown };
+  const redirect = typeof d.redirect === "string" ? redirectOrigin(d.redirect) : null;
+  return { allInterfaces: d.network === "all", invisible: d.invisible === true || redirect != null, redirect };
 }
 
-/** Stores the setup for `project`, in one write; false when it couldn't be stored. */
-export function saveProxySetup(setup: ProxySetup, project: string): boolean {
+/** The project's saved setup (`proxy setup show`). */
+export async function savedProxySetup(cli: Cli): Promise<ProxySetup> {
+  return setupFrom(await cli(["proxy", "setup", "show"]));
+}
+
+/** `proxy setup set` for `setup`: it replaces the whole setup, in one write. */
+export function setupArgs(setup: ProxySetup): string[] {
   const redirect = setup.redirect ? redirectOrigin(setup.redirect) : null;
-  const value = {
-    ...(setup.allInterfaces ? { network: "all" } : {}),
-    ...(setup.invisible ? { invisible: true } : {}),
-    ...(redirect ? { redirect } : {}),
-  };
-  try {
-    if (Object.keys(value).length) localStorage.setItem(PROXY_SETUP + project, JSON.stringify(value));
-    else localStorage.removeItem(PROXY_SETUP + project);
-    return true;
-  } catch {
-    return false;
-  }
+  return [
+    "proxy",
+    "setup",
+    "set",
+    `--network=${setup.allInterfaces ? "all" : "local"}`,
+    ...(redirect ? [`--redirect=${redirect}`] : setup.invisible ? ["--invisible"] : []),
+  ];
 }
 
-/**
- * Carries a project's setup over to its new path (Save as…), replacing whatever that path had;
- * false when it couldn't be.
- */
-export function moveProxySetup(from: string, to: string): boolean {
-  try {
-    const value = localStorage.getItem(PROXY_SETUP + from);
-    if (value != null) localStorage.setItem(PROXY_SETUP + to, value);
-    else localStorage.removeItem(PROXY_SETUP + to);
-    localStorage.removeItem(PROXY_SETUP + from);
-    return true;
-  } catch {
-    // Never leave the new path with what it had before.
-    forgetProxySetup(to);
-    return false;
-  }
-}
-
-/** Forgets the setup kept for a path: a deleted project's, or one left over where a new project is made. */
-export function forgetProxySetup(project: string) {
-  try {
-    localStorage.removeItem(PROXY_SETUP + project);
-  } catch {
-    /* storage unavailable */
-  }
+/** Saves the setup in the project file; returns it as saved. */
+export async function saveProxySetup(cli: Cli, setup: ProxySetup): Promise<ProxySetup> {
+  return setupFrom(await cli(setupArgs(setup)));
 }
 
 /** A scope check's refusal, for the origin it was made for. */

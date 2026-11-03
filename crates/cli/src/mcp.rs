@@ -133,6 +133,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("proxy start", ADD),
     ("proxy stop", REPLACE),
     ("proxy status", READ),
+    ("proxy setup show", READ),
+    ("proxy setup set", SET),
     ("ca init", REPLACE),
     // --out writes a file (refused if it exists unless --force).
     ("ca export", REPLACE),
