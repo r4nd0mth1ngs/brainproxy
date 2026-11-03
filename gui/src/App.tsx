@@ -62,9 +62,9 @@ export function App() {
 
   // Leaving the project unmounts the shell, which stops a proxy it started. The shell's
   // discard also stops the proxy, OOB listener and jobs of a temporary one before deleting it;
-  // if that fails it is kept, and offered again on the next launch.
+  // if that fails it is kept, and offered again on the next launch. The shell has already asked
+  // (and checked it is still on this project), so this closes straight away.
   const close = useCallback(async () => {
-    if (temp && !(await confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"))) return;
     const leaving = project;
     setProj(null);
     setTemp(null);
@@ -261,8 +261,9 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
 
   const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
   // Switching project: Replay's tabs are saved before it closes (so reopening it shows them),
-  // and if they can't be, it stays open unless the user chooses to close it anyway. Clicks
-  // while that runs join it, and it closes nothing once this shell or its project is gone.
+  // and if they can't be, it stays open unless the user chooses to close it anyway; a temporary
+  // one is asked about instead. Clicks while that runs join it, and it closes nothing once this
+  // shell or its project is gone.
   const leaving = useMemo(leaver, []);
   useEffect(() => leaving.attach(), [leaving, app.project]);
   const leave = () =>
@@ -277,6 +278,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
             "Close anyway",
             "Keep open",
           ),
+        discard: () => confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"),
         close: onClose,
         stale,
       }),

@@ -37,16 +37,25 @@ export function leaver() {
   };
 }
 
-/** Saves the tabs (not for a temporary project, which is discarded), asks on failure, closes. */
+/**
+ * Saves the tabs, or for a temporary project (which isn't saved) asks whether to discard it;
+ * asks whether to close anyway if the save fails; closes. Every question is asked here, and
+ * after each wait a switch whose shell or project has gone closes nothing, so `close` itself
+ * never asks anything.
+ */
 export async function leaveProject(o: {
   temp: boolean;
   flush: () => Promise<void>;
   /** The tabs couldn't be saved: true to close anyway. */
   ask: (e: Error) => Promise<boolean>;
+  /** A temporary project is about to be deleted: true to discard it. */
+  discard: () => Promise<boolean>;
   close: () => unknown;
   stale: () => boolean;
 }): Promise<void> {
-  if (!o.temp) {
+  if (o.temp) {
+    if (!(await o.discard()) || o.stale()) return;
+  } else {
     const failed = await o.flush().then(
       () => null,
       (e: Error) => e,
@@ -54,6 +63,5 @@ export async function leaveProject(o: {
     if (o.stale()) return;
     if (failed && (!(await o.ask(failed)) || o.stale())) return;
   }
-  // Awaited, so a click while a temporary project's discard question is open joins it.
   await o.close();
 }

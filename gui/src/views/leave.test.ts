@@ -26,6 +26,7 @@ function shell(temp = false) {
         temp,
         flush: () => (s.schedule("tabs"), s.flush()),
         ask: () => (asks.push(deferred<boolean>()), asks.at(-1)!.promise),
+        discard: () => assert.fail("not a temporary project"),
         close: () => void closed++,
         stale,
       }),
@@ -112,7 +113,7 @@ test("after the project changes, an old switch closes nothing and a click starts
 
 test("a temporary project isn't saved, and clicks during its discard question join it", async () => {
   let closes = 0;
-  const answer = deferred();
+  const answer = deferred<boolean>();
   const guard = leaver();
   guard.attach();
   const leave = () =>
@@ -121,13 +122,53 @@ test("a temporary project isn't saved, and clicks during its discard question jo
         temp: true,
         flush: () => assert.fail("not saved"),
         ask: () => assert.fail("not asked"),
-        close: () => (closes++, answer.promise),
+        discard: () => answer.promise,
+        close: () => void closes++,
         stale,
       }),
     );
   const p = leave();
   assert.equal(leave(), p);
-  answer.resolve();
+  answer.resolve(true);
   await p;
   assert.equal(closes, 1);
+
+  // Keep open keeps it open.
+  const kept = deferred<boolean>();
+  const q = guard.run((stale) =>
+    leaveProject({ temp: true, flush: assert.fail, ask: assert.fail, discard: () => kept.promise, close: () => void closes++, stale }),
+  );
+  kept.resolve(false);
+  await q;
+  assert.equal(closes, 1);
+});
+
+test("Discard answered after Save as opened the saved project leaves that project open", async () => {
+  // The app's state: the temporary project, until Save as or a close replaces it.
+  let open: string | null = "temp";
+  let closes = 0;
+  const answer = deferred<boolean>();
+  const guard = leaver();
+  const detach = guard.attach();
+  const p = guard.run((stale) =>
+    leaveProject({
+      temp: true,
+      flush: () => assert.fail("not saved"),
+      ask: () => assert.fail("not asked"),
+      discard: () => answer.promise,
+      close: () => void (closes++, (open = null)),
+      stale,
+    }),
+  );
+  await tick();
+  // Save as, already copying, finishes while the question is open: this shell goes and the
+  // saved project opens in a new one.
+  detach();
+  open = "saved.bpx";
+  leaver().attach();
+  answer.resolve(true);
+  await p;
+  // Nothing was closed, before the answer or after it.
+  assert.equal(closes, 0);
+  assert.equal(open, "saved.bpx");
 });
