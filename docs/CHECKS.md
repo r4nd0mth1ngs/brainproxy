@@ -21,8 +21,17 @@ brainproxy checks status
   and system scope guard, the `--auth` session, `--rate`, `--max-minutes`, and `job stop`
   all apply. A `path` or `raw` request whose URL points to another origin than the
   target being scanned is skipped.
+- Every request a check sends is recorded in history (source `scan`), whether or not it
+  backs a finding: a template can hold any request, so its rows show what went out. Each
+  row is written just before the request goes out and completed with the response or the
+  failure (see MANUAL.md, *What is recorded when a request doesn't finish*).
+- A check's request with a method other than GET, HEAD, OPTIONS or POST, or one carrying a
+  GraphQL mutation (`MUTATION`), is sent only when `scan active --include-methods` names
+  that method (or `all`), as for the requests the ZAP rules attack. Without it the request
+  isn't sent, and the scan output counts it in `check_skipped_methods`. This holds for every
+  store and for template files given by path.
 - Findings are recorded like other active findings (`alert_ref` `check:<id>`, source
-  `active`), with the attack exchange in history.
+  `active`), pointing at that exchange's history row.
 - `checks update` downloads only from GitHub, over verified TLS, through the guarded
   client with a scope of `api.github.com`, `raw.githubusercontent.com`, and
   `codeload.github.com`; the system scope still applies, so a locked-down runner refuses

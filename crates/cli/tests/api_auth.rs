@@ -252,11 +252,26 @@ fn client_credentials_get_a_token_kept_out_of_history() {
     for h in api.at("/v1/a").iter().chain(&api.at("/v1/b")) {
         assert_eq!(h.header("Authorization"), Some("Bearer tok-1"), "{h:?}");
     }
-    // No token in history, and neither token request nor secret in it at all.
+    // The token request went on the wire, so it has a row, but without its content: neither
+    // the secret nor the token is anywhere in history.
     let rows = ok(&p, &["history", "list", "--limit", "50"], &[]);
-    assert!(!rows.to_string().contains("/token"), "{rows}");
+    let token_row = &rows["items"][0];
+    assert!(token_row["url"].as_str().unwrap().ends_with("/token"), "{rows}");
+    assert!(token_row["error"].as_str().unwrap().starts_with("token request: content omitted"), "{rows}");
+    let leaks = ok(
+        &p,
+        &[
+            "query",
+            "SELECT count(*) FROM history WHERE instr(request, 'FAKE-CLIENT-SECRET') OR instr(response, 'tok-1') \
+             OR instr(request, 'client_secret') OR (id = ?1 AND length(response) > 0)",
+            "-p",
+            &token_row["id"].to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(leaks["rows"][0][0], 0, "{leaks}");
     let raw =
-        ok(&p, &["history", "show", rows["items"][0]["id"].to_string().as_str(), "--part", "request", "--raw"], &[]);
+        ok(&p, &["history", "show", rows["items"][1]["id"].to_string().as_str(), "--part", "request", "--raw"], &[]);
     assert!(!raw.to_string().contains("tok-1"), "{raw}");
     // The status says there is a refresh token, not what it is.
     let status = ok(&p, &["auth", "status", "cc", "--offline"], &[]);
@@ -858,10 +873,16 @@ fn import_api_introspects_a_graphql_endpoint() {
     // --include-destructive says it takes GraphQL mutations too.
     let d = ok(&p, &["import", "api", "--graphql", "--dry-run", "--include-destructive", "--", &endpoint], &[]);
     assert_eq!(row(&d, "mutation deleteUser")["included"], true, "{d}");
-    // Only the introspection went out, and nothing was recorded.
-    assert!(api.hits().iter().all(|h| h.body.contains("__schema")), "{:?}", api.hits());
-    let n = ok(&p, &["query", "SELECT count(*) FROM history"], &[]);
-    assert_eq!(n["rows"][0][0], 0);
+    // Only the introspection went out, and each one is recorded as sent.
+    let hits = api.hits();
+    assert!(hits.len() == 2 && hits.iter().all(|h| h.body.contains("__schema")), "{hits:?}");
+    let sql = "SELECT source, method, status, CAST(request AS TEXT) FROM history ORDER BY id";
+    let rows = ok(&p, &["query", sql], &[])["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (row, hit) in rows.iter().zip(&hits) {
+        assert_eq!((row[0].as_str(), row[1].as_str(), row[2].as_u64()), (Some("import"), Some("POST"), Some(200)));
+        assert!(row[3].as_str().unwrap().ends_with(&hit.body), "{row:?}");
+    }
 
     ok(&p, &["import", "api", "--graphql", "--", &endpoint], &[]);
     assert_eq!(graphql_bodies(&api, 0, "query me").len(), 1);
@@ -885,7 +906,7 @@ fn a_mutation_sent_once_is_not_attacked_by_a_later_scan() {
     assert!(graphql_bodies(&api, start, "query user").len() > 1, "the queries were attacked");
     assert!(graphql_bodies(&api, start, "deleteUser").is_empty(), "the mutation was replayed");
 
-    // Opting in, or naming the request, attacks it.
+    // Opting in attacks it.
     let start = api.at("/graphql").len();
     args.push("--include-methods=MUTATION");
     let r = ok(&p, &args, &[]);
@@ -897,8 +918,14 @@ fn a_mutation_sent_once_is_not_attacked_by_a_later_scan() {
         &[],
     );
     let id = id["rows"][0][0].to_string();
+    // Naming it isn't opting in: refused before anything is sent.
     let start = api.at("/graphql").len();
-    ok(&p, &["scan", "active", "--history-id", &id, "--rules", "30001", "--strength", "low"], &[]);
+    let named = ["scan", "active", "--history-id", &id, "--rules", "30001", "--strength", "low"];
+    let o = run(&p, &named, &[]);
+    assert_eq!(o.code, 2, "{}", o.all);
+    assert!(o.all.contains("--include-methods MUTATION"), "{}", o.all);
+    assert_eq!(api.at("/graphql").len(), start);
+    ok(&p, &[&named[..], &["--include-methods", "MUTATION"]].concat(), &[]);
     assert!(!graphql_bodies(&api, start, "deleteUser").is_empty());
 }
 
@@ -931,8 +958,14 @@ fn oauth_discover_reads_where_tokens_and_sign_ins_go() {
     let d = ok(&p, &["auth", "oauth", "discover", &url], &[]);
     assert_eq!(d["token_url"], format!("{}/token", api.origin()), "{d}");
     assert_eq!(d["authorize_url"], format!("{}/authorize", api.origin()), "{d}");
+    // The fetch is on record, as sent.
+    let sql = "SELECT source, method, url, status FROM history";
+    let rows = ok(&p, &["query", sql], &[])["rows"].clone();
+    assert_eq!(rows, serde_json::json!([["auth", "GET", url, 200]]), "{rows}");
     let o = run(&p, &["auth", "oauth", "discover", "https://id.elsewhere.test/.well-known/openid-configuration"], &[]);
     assert_eq!((o.code, o.json["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{}", o.all);
+    // Refused before anything went out, so nothing more is recorded.
+    assert_eq!(ok(&p, &["query", "SELECT count(*) FROM history"], &[])["rows"][0][0], 1);
     // The API's own JSON is no discovery document.
     let o = run(&p, &["auth", "oauth", "discover", &format!("{}/v1/a", api.origin())], &[]);
     let d = &o.json["data"];

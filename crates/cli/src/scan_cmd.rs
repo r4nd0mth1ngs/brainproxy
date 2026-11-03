@@ -22,7 +22,9 @@ pub enum ScanCmd {
     /// Run the passive rules over captures not scanned yet (this also happens
     /// automatically after send, proxy traffic, and before `findings`).
     Passive {
-        /// Delete passive findings and rescan all history.
+        /// Rescan all history and count passive findings again. Findings found again keep their
+        /// id, state, note and who set them; ones not found again are removed, except triaged
+        /// ones (state changed or a note), which are kept with 0 hits.
         #[arg(long)]
         rescan: bool,
     },
@@ -149,7 +151,15 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
         ScanCmd::Active(_) | ScanCmd::Data(_) => unreachable!(),
         ScanCmd::Passive { rescan } => {
             let stats = if rescan { passive::rescan(&mut store)? } else { passive::scan_pending(&mut store)? };
-            out.ok(json!(stats), || format!("scanned {} captures, {} new findings", stats.scanned, stats.new_findings));
+            out.ok(json!(stats), || {
+                let mut text = format!("scanned {} captures, {} new findings", stats.scanned, stats.new_findings);
+                if let (Some(removed), Some(kept)) = (stats.removed, stats.kept_not_found) {
+                    text += &format!(
+                        "; {removed} not found again and removed, {kept} triaged ones not found again and kept"
+                    );
+                }
+                text
+            });
         }
         ScanCmd::Rules { filter, active: true } => {
             let rules: Vec<_> = brainproxy_core::scan::active::all_rules()
@@ -304,12 +314,13 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                         .iter()
                         .map(|f| {
                             format!(
-                                "{:>5}  {:<6} {:<45} {} {}",
+                                "{:>5}  {:<6} {:<45} {} {}  (added {})",
                                 f["id"],
                                 f["risk"].as_str().unwrap_or(""),
                                 f["name"].as_str().unwrap_or(""),
                                 f["url"].as_str().unwrap_or(""),
-                                f["param"].as_str().unwrap_or("")
+                                f["param"].as_str().unwrap_or(""),
+                                brainproxy_core::provenance::describe(f["origin"].as_str())
                             )
                         })
                         .collect::<Vec<_>>()

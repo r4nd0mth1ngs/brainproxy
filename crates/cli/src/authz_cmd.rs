@@ -100,7 +100,8 @@ pub struct RunArgs {
     /// Don't send the requests without credentials (the anonymous control).
     #[arg(long)]
     no_anonymous: bool,
-    /// History entry to test (any method, also without credentials). Repeatable.
+    /// History entry to test, also without credentials. Its method needs --include-methods
+    /// unless GET, HEAD or OPTIONS, and a path matching --exclude is refused. Repeatable.
     #[arg(long = "history-id")]
     history_ids: Vec<i64>,
     /// SQL condition selecting history rows, e.g. "host = 'app.test' AND path LIKE '/api/%'".
@@ -372,24 +373,36 @@ fn select(
             out_of_scope += 1;
             continue;
         }
-        if !explicit {
-            let method = item.entry.method.to_ascii_uppercase();
-            let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
-            if !(all_methods
-                || SAFE_METHODS.contains(&method.as_str())
-                || args.include_methods.iter().any(|m| m.eq_ignore_ascii_case(&method)))
-            {
-                methods += 1;
-                continue;
+        let method = item.entry.method.to_ascii_uppercase();
+        let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
+        // Naming a request isn't consent to replay what it changes, or to log every identity out:
+        // a named one that would be skipped is refused before anything is sent.
+        if !(all_methods
+            || SAFE_METHODS.contains(&method.as_str())
+            || args.include_methods.iter().any(|m| m.eq_ignore_ascii_case(&method)))
+        {
+            if explicit {
+                return Err(Error::InvalidInput(format!(
+                    "--history-id {id} is a {method} request, and replaying it as each identity can change or \
+                     delete data; add --include-methods {method} to test it"
+                )));
             }
-            if exclude.is_match(&path) {
-                excluded += 1;
-                continue;
+            methods += 1;
+            continue;
+        }
+        if exclude.is_match(&path) {
+            if explicit {
+                return Err(Error::InvalidInput(format!(
+                    "--history-id {id}: {path} matches --exclude (logout paths), and replaying it can end the \
+                     identities' sessions; give --exclude a pattern it doesn't match to test it"
+                )));
             }
-            if !authz::has_credentials(&item.request, &profiles) {
-                no_credentials += 1;
-                continue;
-            }
+            excluded += 1;
+            continue;
+        }
+        if !explicit && !authz::has_credentials(&item.request, &profiles) {
+            no_credentials += 1;
+            continue;
         }
         targets.push((explicit, AuthzTarget { history_id: Some(id), target: item.target, request: item.request }));
     }

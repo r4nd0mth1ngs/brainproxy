@@ -23,12 +23,14 @@ mod proxy_cmd;
 mod report_cmd;
 mod request_args;
 mod scan_cmd;
+mod sent;
 mod update_cmd;
 mod ws_cmd;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use brainproxy_core::auth::Attempt;
 use brainproxy_core::capture::decode_body;
 use brainproxy_core::codec;
 use brainproxy_core::http::request::split_head_body;
@@ -232,7 +234,8 @@ struct SendArgs {
     /// Send with this auth profile's session (cookies/headers; re-login if logged out).
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
-    /// Don't record the exchange in history.
+    /// Keep no content in history: each row has only the request line (method, URL), the
+    /// time, and the target; its error starts "not stored (--no-store)".
     #[arg(long)]
     no_store: bool,
     /// Maximum response body bytes to include in output.
@@ -285,6 +288,10 @@ enum HistoryCmd {
         source: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Who or what recorded the entry: gui (the desktop app), cli (a terminal or script), mcp (an
+        /// agent through MCP), or unknown (recorded before brainproxy kept it).
+        #[arg(long, value_parser = ["gui", "cli", "mcp", "unknown"])]
+        origin: Option<String>,
         /// Substring to search for in raw requests and responses.
         #[arg(long)]
         contains: Option<String>,
@@ -585,12 +592,17 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
 }
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
+    mcp::check_no_store(args.no_store)?;
     let (req, target) = args.req.prepare(None)?;
     let guard = project_guard(project)?;
     // Refuse out-of-scope targets up front, before any connection is attempted.
     require_in_scope(&guard, &target)?;
     let send_opts = args.req.send_options(guard);
     let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
+    if let Some(s) = session.as_ref().filter(|_| args.no_store) {
+        // Its logins, checks and macros keep no content either.
+        s.keep_no_content();
+    }
     let client = Client::new(send_opts);
     if let Some(n) = args.race {
         // Every racing request carries the same session, applied once.
@@ -604,34 +616,66 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         };
         return race(project, &args, req, target, client, n, out);
     }
+    let mut log = sent::SentLog::open(project, "send", args.no_store)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-    let result = match &session {
-        Some(s) => {
-            let r = rt.block_on(s.send(&req, &target));
-            s.save()?;
-            r
-        }
-        None => rt.block_on(client.send(&req, &target)),
-    };
-
-    let store = if args.no_store { None } else { Some(Store::open(project)?) };
-    let ex = match result {
-        Ok(ex) => ex,
-        Err(e) => {
-            if let Some(s) = &store {
-                s.record_failure("send", &target, req.as_bytes(), &e.to_string())?;
+    // Each request is on record (its row and the bytes recorded) before it goes out. `open`
+    // is the one out and unanswered; a row answered already is never rewritten.
+    let mut rows: Vec<i64> = Vec::new();
+    let mut open: Option<(i64, Vec<u8>)> = None;
+    let result = {
+        let (log, rows, open) = (&mut log, &mut rows, &mut open);
+        let sending = async {
+            let sending = |log: &mut sent::SentLog, rows: &mut Vec<i64>, open: &mut Option<_>, r: &RawRequest| {
+                let recorded = client.recorded_request(r, &target)?;
+                let id = log.pending(&target, &recorded)?;
+                rows.push(id);
+                *open = Some((id, recorded));
+                Ok::<_, Error>(())
+            };
+            match &session {
+                Some(s) => {
+                    let watch = |a: Attempt<'_>| match a {
+                        Attempt::Sending(r) => sending(log, rows, open, r),
+                        Attempt::Answered(ex) => match open.take() {
+                            Some((id, _)) => log.answered(id, ex),
+                            None => Ok(()),
+                        },
+                    };
+                    s.send_as_watched(brainproxy_core::session::Tool::Send, &req, &target, watch).await
+                }
+                None => {
+                    sending(log, rows, open, &req)?;
+                    let ex = client.send(&req, &target).await?;
+                    if let Some((id, _)) = open.take() {
+                        log.answered(id, &ex)?;
+                    }
+                    Ok(ex)
+                }
             }
-            return Err(e);
+        };
+        rt.block_on(async {
+            tokio::select! {
+                r = sending => Some(r),
+                _ = process::interrupted() => None,
+            }
+        })
+    };
+    // Rows first: a failure saving the session mustn't leave one pending.
+    // An answered request's row is complete already.
+    let outcome = match (result, open) {
+        (Some(Ok(ex)), None) => Ok((*rows.last().expect("every request is recorded before it is sent"), ex)),
+        (Some(Ok(_)), Some(_)) => unreachable!("an answer completes its row"),
+        (Some(Err(e)), Some((id, recorded))) => log.failed(id, &target, &recorded, &e.to_string()).and(Err(e)),
+        (Some(Err(e)), None) => Err(e),
+        (None, Some((id, recorded))) => {
+            log.failed(id, &target, &recorded, sent::CANCELLED).and(Err(sent::cancelled(&rows)))
         }
+        (None, None) => Err(sent::cancelled(&rows)),
     };
-    let id = match &store {
-        Some(s) => Some(s.record_exchange("send", &ex)?),
-        None => None,
-    };
-    let new_findings = match store {
-        Some(mut s) => brainproxy_core::scan::passive::scan_pending(&mut s)?.new_findings,
-        None => 0,
-    };
+    let saved = session.as_ref().map(|s| s.save()).transpose();
+    let (id, ex) = outcome?;
+    let new_findings = log.scan(&rows)?;
+    let id = Some(id);
 
     if args.raw {
         out.raw(&ex.response);
@@ -643,6 +687,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if new_findings > 0 {
         data["new_findings"] = json!(new_findings);
+    }
+    if let Err(e) = saved {
+        data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
@@ -662,20 +709,58 @@ fn race(
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
     let h2 = args.req.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"));
+    let max = brainproxy_core::race::SINGLE_PACKET_MAX;
+    if h2 && n > max {
+        return Err(Error::InvalidInput(format!("single-packet races take 1 to {max} requests")));
+    }
+    // Every copy is on record before any goes out.
+    let recorded = client.recorded_request(&req, &target)?;
+    let mut log = sent::SentLog::open(project, "race", args.no_store)?;
+    let ids = log.pending_many(&target, &recorded, n)?;
     let requests = vec![req.as_bytes().to_vec(); n];
-    let (results, sync, synced) = if h2 {
-        let run = rt.block_on(brainproxy_core::race::single_packet(&client, &target, requests))?;
-        (run.results, "single-packet", Some(run.synced))
-    } else {
-        (rt.block_on(brainproxy_core::race::last_byte_sync(&client, &target, requests)), "last-byte", None)
+    let racing = async {
+        if h2 {
+            brainproxy_core::race::single_packet(&client, &target, requests)
+                .await
+                .map(|run| (run.results, "single-packet", Some(run.synced)))
+        } else {
+            Ok((brainproxy_core::race::last_byte_sync(&client, &target, requests).await, "last-byte", None))
+        }
     };
-    let store = if args.no_store { None } else { Some(Store::open(project)?) };
+    let outcome = rt.block_on(async {
+        tokio::select! {
+            r = racing => Some(r),
+            _ = process::interrupted() => None,
+        }
+    });
+    // Every row is completed before a store error is reported, so none stays pending.
+    let mut store_error = None;
+    let mut done = |r: Result<(), Error>| {
+        if let Err(e) = r {
+            store_error.get_or_insert(e);
+        }
+    };
+    let (results, sync, synced) = match outcome {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => {
+            for id in &ids {
+                done(log.failed(*id, &target, &recorded, &e.to_string()));
+            }
+            return Err(store_error.unwrap_or(e));
+        }
+        None => {
+            for id in &ids {
+                done(log.failed(*id, &target, &recorded, sent::CANCELLED));
+            }
+            return Err(store_error.unwrap_or_else(|| sent::cancelled(&ids)));
+        }
+    };
     let mut items = Vec::new();
     let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
-    for r in &results {
+    for (r, &id) in results.iter().zip(&ids) {
         match r {
             Ok(ex) => {
-                let id = store.as_ref().map(|s| s.record_exchange("race", ex)).transpose()?;
+                done(log.answered(id, ex));
                 let head = parse_response_head(&ex.response).ok();
                 let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(&ex.response).1));
                 let status = head.as_ref().map(|h| h.status);
@@ -684,15 +769,25 @@ fn race(
                 items.push(json!({"id": id, "status": status, "length": length, "duration_ms": ex.duration_ms}));
             }
             Err(e) => {
-                if let Some(s) = &store {
-                    s.record_failure("race", &target, req.as_bytes(), &e.to_string())?;
-                }
+                done(log.failed(id, &target, &recorded, &e.to_string()));
                 *shapes.entry(format!("error: {}", e.kind())).or_default() += 1;
-                items.push(json!({"error": e.to_string(), "kind": e.kind()}));
+                items.push(json!({"id": id, "error": e.to_string(), "kind": e.kind()}));
             }
         }
     }
-    let data = json!({
+    if let Some(e) = store_error {
+        return Err(e);
+    }
+    // A single-packet race that got no response at all failed as a whole (its connection),
+    // as before; the rows of the copies are still in the output.
+    if let (true, Some(Err(e))) = (h2 && results.iter().all(|r| r.is_err()), results.first()) {
+        let rows = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        let data = json!({"race": n, "sync": sync, "target": target.origin(), "results": items});
+        out.error_with(e.kind(), &format!("{e} (every copy failed; history {rows})"), data);
+        std::process::exit(e.exit_code());
+    }
+    let new_findings = log.scan(&ids)?;
+    let mut data = json!({
         "race": n,
         "sync": sync,
         "synced": synced,
@@ -701,6 +796,9 @@ fn race(
         "results": items,
         "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2.",
     });
+    if new_findings > 0 {
+        data["new_findings"] = json!(new_findings);
+    }
     out.ok(data.clone(), || {
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
         lines.insert(0, format!("race x{n} ({sync}) -> {}", target.origin()));
@@ -823,13 +921,14 @@ fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
 fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        HistoryCmd::List { host, method, status, source, tag, contains, after, limit } => {
+        HistoryCmd::List { host, method, status, source, tag, origin, contains, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,
                 method,
                 status,
                 source,
                 tag,
+                origin,
                 contains,
                 after_id: after,
                 limit: Some(limit),
@@ -841,7 +940,13 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                     .map(|e| {
                         let status = e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
                         let len = e.resp_body_length.unwrap_or(0);
-                        format!("{:>6}  {:<4} {:<7} {}  {len}B", e.id, status, e.method, e.url)
+                        let origin = e.origin.as_deref().unwrap_or("unknown");
+                        let mut by: Vec<&str> =
+                            e.edited_by.iter().map(|x| x.by.as_deref().unwrap_or("unknown")).collect();
+                        by.dedup();
+                        let edited =
+                            if by.is_empty() { String::new() } else { format!("  edited by {}", by.join(",")) };
+                        format!("{:>6}  {:<4} {:<7} {}  {len}B  {origin}{edited}", e.id, status, e.method, e.url)
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -868,8 +973,26 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
             );
             data["request"] = body_value(&item.request, max_body);
             data["entry"] = json!(item.entry);
+            data["origin_text"] = json!(recorded_text(&item.entry));
             out.ok(data, || {
-                format!("{}\n\n{}", String::from_utf8_lossy(&item.request), String::from_utf8_lossy(&item.response))
+                let e = &item.entry;
+                let mut about = vec![format!("#{id} {} {}", e.source, recorded_text(e))];
+                if let Some(a) = &e.client_addr {
+                    about.push(format!("sent by proxy client {a}"));
+                }
+                about.extend(e.edited_by.iter().map(|x| x.describe()));
+                if let Some(n) = &e.sni {
+                    about.push(format!("TLS server name (SNI) {n}"));
+                }
+                if e.note.is_some() || e.note_origin.is_some() {
+                    about.push(format!("note set {}", brainproxy_core::provenance::describe(e.note_origin.as_deref())));
+                }
+                format!(
+                    "{}\n\n{}\n\n{}",
+                    about.join(" · "),
+                    String::from_utf8_lossy(&item.request),
+                    String::from_utf8_lossy(&item.response)
+                )
             });
         }
         HistoryCmd::Note { id, text } => {
@@ -882,6 +1005,17 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Who recorded an entry, in words. The proxy's origin is whoever started the proxy: the
+/// request came from its client, so a row must not read as if that person or agent sent it.
+fn recorded_text(e: &brainproxy_core::store::HistoryEntry) -> String {
+    let by = brainproxy_core::provenance::describe(e.origin.as_deref());
+    if e.source == "proxy" && e.origin.is_some() {
+        format!("recorded by a proxy started {by}")
+    } else {
+        format!("recorded {by}")
+    }
 }
 
 fn codec_cmd(a: CodecArgs, out: &Out, f: impl Fn(&str, &[u8]) -> Result<Vec<u8>, Error>) -> Result<(), Error> {
