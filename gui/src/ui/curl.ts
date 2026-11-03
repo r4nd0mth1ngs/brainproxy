@@ -900,7 +900,10 @@ export function parseCurl(command: string): ParsedCurl {
   // A bearer token wins over -u, which wins over user:password in the URL: curl asks for Bearer
   // auth alone. With --basic too it waits for the server's challenge to pick one, unless a custom
   // Authorization header (or -H 'Authorization:', which removes it) stands in for both.
-  const customAuth = o.headers.some((h) => /^[ \t]*authorization[ \t]*[:;]/i.test(h));
+  // Like curl, a custom header stands in for one of curl's own when its text, up to the first
+  // : or ;, is that name: "Authorization;x: y" does, "Authorization : y" doesn't.
+  const own = (h: string) => h.slice(0, h.search(/[:;]|$/)).toLowerCase();
+  const customAuth = o.headers.some((h) => own(h) === "authorization");
   if (o.bearer != null && o.flags.has("basic") && !customAuth) throw new CurlError("--oauth2-bearer with --basic makes curl wait for the server's challenge before it sends either; keep one of them.");
   const defaults: [string, string][] = [["Host", url.host]];
   if (o.bearer != null) defaults.push(["Authorization", `Bearer ${o.bearer}`]);
@@ -934,8 +937,8 @@ export function parseCurl(command: string): ParsedCurl {
     let name: string;
     let val: string | null;
     if (colon < 0) {
-      // "Name;" sends an empty header.
-      if (!h.endsWith(";")) throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
+      // "Name;" sends an empty header; curl leaves out one with anything after its first ;.
+      if (h.indexOf(";") !== h.length - 1) throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
       name = trimHws(h.slice(0, -1));
       val = "";
     } else {
@@ -947,13 +950,13 @@ export function parseCurl(command: string): ParsedCurl {
     if (!name || /[\s:]/.test(name)) {
       throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
     }
-    if (name.toLowerCase() === "host" && val != null) {
+    if (own(h) === "host" && val != null) {
       const k = defaults.findIndex(([n]) => n === "Host");
       if (k >= 0) defaults[k] = [name, val];
       else custom.push([name, val]);
       continue;
     }
-    drop(name);
+    drop(own(h));
     if (val != null) custom.push([name, val]);
   }
 

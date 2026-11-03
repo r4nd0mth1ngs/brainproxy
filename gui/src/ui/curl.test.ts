@@ -588,6 +588,25 @@ test("options are read as curl reads them, or refused", () => {
   assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization: Custom' https://h.test").raw, /\nAuthorization: Custom\n/);
   assert.doesNotMatch(parseCurl("curl -u a:b --basic --oauth2-bearer t -H 'Authorization:' https://h.test").raw, /authorization/i);
   assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization;' https://h.test").raw, /\nAuthorization: \n/);
+  // curl replaces its own header with one whose text starts with that name and then : or ;
+  // ("Authorization;foo: bar" too), and keeps it for "authorization : x" or "X-Authorization".
+  for (const flags of ["--basic --oauth2-bearer t", "--oauth2-bearer t", "-u a:b"]) {
+    const semi = parseCurl(`curl ${flags} -H 'Authorization;foo: bar' http://h.test/`).raw;
+    assert.equal(semi.match(/authorization/gi)?.length, 1, flags);
+    assert.match(semi, /\nAuthorization;foo: bar\n/);
+  }
+  for (const h of ["authorization : x", "X-Authorization: y", "Authorization ;", "Authorization :", " Authorization: z"]) {
+    assert.match(refusal(`curl --basic --oauth2-bearer t -H '${h}' http://h.test/`), /challenge/, h);
+    assert.match(parseCurl(`curl --oauth2-bearer t -H '${h}' http://h.test/`).raw, /\nAuthorization: Bearer t\n/, h);
+  }
+  assert.match(parseCurl("curl --oauth2-bearer t -H 'authorization : x' http://h.test/").raw, /\nauthorization: x\n/);
+  assert.match(parseCurl("curl --oauth2-bearer t -H 'X-Authorization: y' http://h.test/").raw, /\nX-Authorization: y\n/);
+  assert.doesNotMatch(parseCurl("curl --oauth2-bearer t -H 'Authorization :' http://h.test/").raw, /Authorization: \n/);
+  // The same goes for curl's other headers.
+  assert.doesNotMatch(parseCurl("curl -A ua -H 'User-Agent;x: y' http://h.test/").raw, /User-Agent: ua/);
+  assert.match(parseCurl("curl -A ua -H 'User-Agent : y' http://h.test/").raw, /\nUser-Agent: ua\n[^]*\nUser-Agent: y\n/);
+  // "Name;" sends an empty header only when nothing follows the ;.
+  for (const h of ["Authorization;foo;", "X-A;b;"]) assert.match(refusal(`curl -H '${h}' http://h.test/`), /isn't a header/, h);
   // --no-get turns -G back off.
   assert.match(parseCurl("curl -G --no-get -d a=1 https://h.test").raw, /^POST \/ /);
 });
