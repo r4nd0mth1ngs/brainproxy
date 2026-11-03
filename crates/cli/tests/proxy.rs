@@ -1147,6 +1147,7 @@ fn proxy_record(env: &Env) -> Option<String> {
 }
 
 /// Waits up to 10 s for `done`.
+#[cfg(unix)]
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
@@ -1797,8 +1798,11 @@ fn a_restart_killed_midway_still_goes_back() {
     assert_eq!(status["proxy"]["listen"], old["listen"], "{status}");
     assert_ne!(status["proxy"]["pid"], old["pid"], "{status}");
     assert!(strs(&status["proxy"]["args"]).windows(2).any(|w| w == ["--timeout", "12"]), "{status}");
-    let log = std::fs::read_to_string(env.project.with_extension("proxy.log")).unwrap();
-    assert!(log.contains("the restart that started it had gone, so the proxy was started again on"), "{log}");
+    // The failed proxy logs why once it has started the old one again, so it may still be writing.
+    let log = || std::fs::read_to_string(env.project.with_extension("proxy.log")).unwrap_or_default();
+    wait_for("the failed proxy to log why", || {
+        log().contains("the restart that started it had gone, so the proxy was started again on")
+    });
 }
 
 /// `proxy stop --pid` stops the proxy only while it is that pid: what the app does on closing a
