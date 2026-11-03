@@ -85,8 +85,8 @@ pub enum FindingsCmd {
         /// Alert ref or rule id, e.g. 10020 or 10020-1.
         #[arg(long)]
         alert: Option<String>,
-        /// open, confirmed, false_positive, removed, or all (default hides false positives and
-        /// removed findings added by hand).
+        /// open, confirmed, false_positive, removed, or all, or several separated by commas
+        /// (default hides false positives and removed findings added by hand).
         #[arg(long)]
         state: Option<String>,
         /// Only findings from this scanner, or those added by hand (manual).

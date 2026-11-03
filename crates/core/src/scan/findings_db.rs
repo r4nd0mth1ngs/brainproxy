@@ -797,8 +797,16 @@ impl FindingFilter {
         }
         match self.state.as_deref() {
             Some("all") => {}
-            // `mark` takes false-positive and stores false_positive; accept either spelling.
-            Some(s) => clauses.push(format!("state = {}", bind(&mut args, s.replace('-', "_")))),
+            // `mark` takes false-positive and stores false_positive; accept either spelling. Several
+            // states are separated by commas.
+            Some(s) => {
+                let states: Vec<String> =
+                    s.split(',').map(|s| s.trim().replace('-', "_")).filter(|s| !s.is_empty()).collect();
+                if !states.iter().any(|s| s == "all") {
+                    let list = serde_json::to_string(&states).unwrap_or_default();
+                    clauses.push(format!("state IN (SELECT value FROM json_each({}))", bind(&mut args, list)));
+                }
+            }
             None => clauses.push("state NOT IN ('false_positive', 'removed')".into()),
         }
         if let Some(s) = &self.source {
@@ -997,6 +1005,11 @@ mod tests {
         assert_eq!(s.findings_list(&all, 10).unwrap().len(), 3);
         let removed = FindingFilter { state: Some("removed".into()), ..Default::default() };
         assert_eq!(s.findings_list(&removed, 10).unwrap()[0]["id"], id);
+        // Several states, separated by commas, in either spelling.
+        let live = FindingFilter { state: Some("open, confirmed,false-positive".into()), ..Default::default() };
+        assert_eq!(s.findings_list(&live, 10).unwrap().len(), 2);
+        let confirmed = FindingFilter { state: Some("confirmed,removed".into()), ..Default::default() };
+        assert_eq!(s.findings_list(&confirmed, 10).unwrap().len(), 1);
         let v = s.finding_get(id).unwrap();
         assert_eq!((v["state"].as_str(), v["note"].as_str()), (Some("removed"), Some("seen twice")));
         assert_eq!(v["removed"]["state"], "confirmed");

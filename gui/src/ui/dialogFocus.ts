@@ -18,6 +18,7 @@ export function useDialogFocus(ref: RefObject<HTMLElement | null>) {
   // Read while rendering, before an autoFocus in the dialog moves focus.
   const [before] = useState(() => (typeof document === "undefined" ? null : (document.activeElement as HTMLElement | null)));
   useEffect(() => {
+    const dialog = ref.current;
     const onKey = (e: KeyboardEvent) => {
       const el = ref.current;
       if (e.key !== "Tab" || !el) return;
@@ -30,7 +31,11 @@ export function useDialogFocus(ref: RefObject<HTMLElement | null>) {
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
-      if (before?.isConnected) before.focus();
+      // Only once the dialog is gone: Strict Mode runs this cleanup and the setup again on mount,
+      // with the dialog still there and its autoFocus done.
+      setTimeout(() => {
+        if (!dialog?.isConnected && before?.isConnected) before.focus();
+      });
     };
   }, [ref, before]);
 }

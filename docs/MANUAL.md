@@ -998,7 +998,9 @@ brainproxy findings remove 17
   scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
   doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
   coverage. A finding added by hand and removed since (`findings remove`) is listed under
-  `removed` (with a count in `summary.removed`), not as fixed.
+  `removed` (with a count in `summary.removed`), not as fixed. A `--current` file needs
+  `--state all` for that, since only then does it keep removed findings; without it they count
+  as fixed, with a warning.
 - **A scan** (`--scan JOB`): a `scan active --background` job in this project, using the same logic
   as the app's *Compare with a scan*: first found by it, found again by it, or covered by it and not
   found again. Foreground scans have no job to name.

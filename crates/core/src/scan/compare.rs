@@ -265,6 +265,9 @@ pub struct LoadedSet {
     pub items: Vec<Item>,
     /// Why the set may be narrower than it looks.
     pub warnings: Vec<String>,
+    /// Written with `--state all`, so it has the tombstones of removed findings added by hand.
+    /// Without them, a removed finding is missing from the set, as a fixed one is.
+    pub tombstones: bool,
 }
 
 /// Loads a findings set from `report json` output: the file `--output` writes or a captured JSON
@@ -334,7 +337,8 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
             })
         })
         .collect();
-    Ok(LoadedSet { items, warnings })
+    let tombstones = report.filters["state"].as_str() == Some("all");
+    Ok(LoadedSet { items, warnings, tombstones })
 }
 
 /// The parts of a `report json` that identify its findings.
@@ -581,6 +585,13 @@ mod tests {
         opts.filter.state = Some("all".into());
         let path = temp("state-all", report::render(&report::build(&s, &opts).unwrap(), ReportKind::Json).as_bytes());
         assert!(load_set(&path).unwrap().warnings.is_empty());
+        // Only --state all keeps the tombstones of removed findings added by hand.
+        assert!(load_set(&path).unwrap().tombstones);
+        let path = temp(
+            "default",
+            report::render(&report::build(&s, &ReportOptions::default()).unwrap(), ReportKind::Json).as_bytes(),
+        );
+        assert!(!load_set(&path).unwrap().tombstones);
     }
 
     #[test]

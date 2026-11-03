@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use brainproxy_core::scan::compare::{self, Item, ScanScope};
+use brainproxy_core::scan::findings_db::MANUAL_SOURCE;
 use brainproxy_core::scan::passive;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -57,6 +58,8 @@ pub struct CompareArgs {
 
 pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
     let mut warnings = Vec::new();
+    // A --current file without tombstones, where a removed finding added by hand looks fixed.
+    let mut no_tombstones: Option<PathBuf> = None;
     let mut baseline = json!({"kind": "none"});
     let mut current = json!({"kind": "project", "path": project});
     let comparison = if let Some(job) = a.scan {
@@ -96,12 +99,24 @@ pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
                 }
                 current = json!({"kind": "report", "path": path});
                 warnings.extend(set.warnings);
+                if !set.tombstones {
+                    no_tombstones = Some(path.clone());
+                }
                 set.items
             }
             None => compare::project_items(&open_project(project)?)?,
         };
         compare::compare_sets(base, items)
     };
+    if let Some(path) = no_tombstones {
+        if comparison.fixed.iter().any(|f| f.source == MANUAL_SOURCE) {
+            warnings.push(format!(
+                "{} wasn't written with --state all, so a finding added by hand that was removed since \
+                 counts as fixed; write it with `report json --state all` to list it as removed",
+                path.display()
+            ));
+        }
+    }
 
     let gate = a.fail_on.map(|risk| {
         let risk = risk.get();

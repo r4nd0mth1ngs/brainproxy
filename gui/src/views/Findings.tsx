@@ -36,7 +36,9 @@ interface Group {
 
 export function FindingsView({ active }: { active: boolean }) {
   const app = useApp();
-  const [data, refresh] = usePoll<{ items: FindingItem[] }>(() => run(["findings", "list", "--all", "--state", "all", "--limit", "10000"]), 5000, active);
+  // Every triage state but removed: removed findings added by hand stay in the project for
+  // comparisons, not in the list (nor in the limit).
+  const [data, refresh] = usePoll<{ items: FindingItem[] }>(() => run(["findings", "list", "--all", "--state", "open,confirmed,false_positive", "--limit", "10000"]), 5000, active);
   const [risks, setRisks] = useState(new Set<Risk>(RISKS));
   const [hideFp, setHideFp] = useState(true);
   const [open, setOpen] = useState(new Set<string>());
@@ -61,8 +63,7 @@ export function FindingsView({ active }: { active: boolean }) {
   const groups = useMemo(() => {
     const by = new Map<string, Group>();
     for (const f of data?.items ?? []) {
-      // Removed findings added by hand stay in the project for comparisons, not in the list.
-      if (f.state === "removed" || !risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
+      if (!risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
       if (comparing && seen.get(f.id) !== compare) continue;
       const g = by.get(f.alert_ref) ?? { ref: f.alert_ref, name: f.name, risk: f.risk, items: [] };
       g.items.push(f);
@@ -73,7 +74,7 @@ export function FindingsView({ active }: { active: boolean }) {
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const f of data?.items ?? []) if (f.state !== "false_positive" && f.state !== "removed") c[f.risk] = (c[f.risk] ?? 0) + 1;
+    for (const f of data?.items ?? []) if (f.state !== "false_positive") c[f.risk] = (c[f.risk] ?? 0) + 1;
     return c;
   }, [data]);
 
