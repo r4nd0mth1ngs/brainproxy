@@ -194,6 +194,8 @@ export interface FindingItem {
   state: string;
   /** passive, active, authz, or manual (added by hand with `findings add`). */
   source: string;
+  /** Who added it: gui, cli or mcp (an agent); null for findings from before schema v13. */
+  origin?: string | null;
 }
 
 export interface Finding extends FindingItem {

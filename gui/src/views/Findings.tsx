@@ -6,6 +6,7 @@ import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
+import { addedBy } from "./manualFinding";
 import { NewFinding } from "./NewFinding";
 
 const RISKS: Risk[] = ["high", "medium", "low", "info"];
@@ -213,7 +214,12 @@ export function FindingsView({ active }: { active: boolean }) {
                 <span className="caret">{open.has(g.ref) ? "▾" : "▸"}</span>
                 <span className={`dot-risk risk-${g.risk}`} />
                 <span className="grow ellipsis">{g.name}</span>
-                {g.ref.startsWith("manual:") && <span className="tag">by hand</span>}
+                {g.ref.startsWith("manual:") &&
+                  [...new Set(g.items.map((f) => addedBy(f.origin).tag))].map((t) => (
+                    <span key={t} className="tag">
+                      {t}
+                    </span>
+                  ))}
                 <span className="muted">{g.items.length}</span>
               </button>
               {open.has(g.ref) &&
@@ -294,7 +300,8 @@ export function FindingsView({ active }: { active: boolean }) {
                   <>
                     <dt>Source</dt>
                     <dd>
-                      Added by hand{finding.cwe ? ` · CWE-${finding.cwe}` : ""}
+                      {addedBy(finding.origin).text}
+                      {finding.cwe ? ` · CWE-${finding.cwe}` : ""}
                       {finding.history_ids?.length ? ` · history ${finding.history_ids.map((h) => `#${h}`).join(", ")}` : ""}
                     </dd>
                   </>

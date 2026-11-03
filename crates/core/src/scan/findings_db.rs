@@ -515,7 +515,8 @@ impl Store {
                     replaced.join(" and ")
                 )));
             }
-            // The text it replaces is kept, with when it was replaced.
+            // The text it replaces is kept, with when it was replaced and by whom (gui, cli or
+            // mcp; MCP calls can't pass --replace-text, so an agent never does).
             let key = replaced_texts_key(&alert_ref);
             let earlier: Option<String> =
                 tx.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?;
@@ -526,7 +527,12 @@ impl Store {
                 [&alert_ref],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
-            list.push(json!({"time": time, "description": description, "solution": solution}));
+            list.push(json!({
+                "time": time,
+                "by": crate::provenance::origin(),
+                "description": description,
+                "solution": solution,
+            }));
             tx.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![key, Value::Array(list).to_string()],
@@ -620,9 +626,10 @@ impl Store {
             )?;
             removed += tx.execute(
                 "UPDATE findings SET state = ?1, dedupe = ?1 || ':' || id || ':' || dedupe,
-                    state_origin = ?3, state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    state_origin = ?3,
+                    state_changed_at = (SELECT json_extract(value, '$.time') FROM meta WHERE key = ?4)
                  WHERE id = ?2",
-                params![REMOVED, id, origin],
+                params![REMOVED, id, origin, removed_key(id)],
             )?;
         }
         tx.commit()?;
@@ -714,12 +721,14 @@ fn history_key(id: i64) -> String {
     format!("finding.{id}.history")
 }
 
-/// When a finding was removed, and the triage state it had.
+/// When a finding was removed and by whom (`by`: gui or cli), and the triage state it had and
+/// who set that.
 fn removed_key(id: i64) -> String {
     format!("finding.{id}.removed")
 }
 
-/// The descriptions and solutions an alert type of findings added by hand had before they were replaced.
+/// The descriptions and solutions an alert type of findings added by hand had before they were
+/// replaced, each with when and by whom (`by`) it was replaced.
 fn replaced_texts_key(alert_ref: &str) -> String {
     format!("finding_type.{alert_ref}.replaced")
 }

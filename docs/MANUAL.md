@@ -615,8 +615,9 @@ Access control across users: does the app let bob read alice's data? See
   parameter, CWE, the history entries that show it, description, solution and evidence.
   Nothing is sent; it is only recorded in the project. *Create finding…* in Traffic's
   right-click menu and in Replay opens the same form with the URL and the request filled in.
-  Findings with the same title are grouped together and tagged *by hand*; they appear in
-  reports like any other (marked *found by hand* in the HTML report) and can be removed
+  Findings with the same title are grouped together and tagged *by hand* (*via MCP* for one
+  an agent added); they appear in reports like any other (marked *found by hand*, or *added
+  via MCP (an agent)*, in the HTML report) and can be removed
   again (*Remove*); the project keeps a record of a removed one, so comparing with an
   earlier report shows it as removed, not fixed. Scanner findings can't be removed, only
   marked. If the description or solution differs from the one findings with that title
@@ -1336,7 +1337,7 @@ brainproxy findings remove 17
   reports group them. The type holds the description and solution: leaving them out keeps the
   type's, and one that differs from it is refused with `conflict` unless `--replace-text` is
   given. Replacing keeps the earlier text: `findings show` lists it in `replaced_texts`, with
-  when it was replaced. Through MCP `--replace-text` is refused, since the text may be a
+  when it was replaced and who replaced it (`by`). Through MCP `--replace-text` is refused, since the text may be a
   person's. A long title is shortened and ends in a short hash, so only titles that are the
   same apart from case and punctuation share a type.
 - Each finding keeps its own `--cwe`. Reports show the first one given for the type, and an
@@ -1362,6 +1363,8 @@ brainproxy findings remove 17
 - Like any finding, each records who added it in `origin` (`gui`, `cli` or `mcp`; see
   [Who recorded what](#who-recorded-what)); `findings remove` sets `state_origin` and `state_changed_at`, and
   `removed` in `findings show` also says who removed it (`by`) and who set the state it had.
+  Reports say how each was added, and one an agent added is marked *added via MCP (an agent)*
+  in the HTML report and in the app, never *found by hand*.
 
 ### What is recorded when a request doesn't finish
 

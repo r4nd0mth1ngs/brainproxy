@@ -27,6 +27,14 @@ export interface FindingForm {
   replaceText: boolean;
 }
 
+/**
+ * How a finding added with `findings add` came in, by its `origin`: an agent's (MCP) isn't a
+ * person's manual testing, so it never reads as "by hand", as the reports say.
+ */
+export function addedBy(origin: string | null | undefined): { tag: string; text: string } {
+  return origin === "mcp" ? { tag: "via MCP", text: "Added via MCP (an agent)" } : { tag: "by hand", text: "Added by hand" };
+}
+
 export function formFromDraft(d: FindingDraft | null): FindingForm {
   return {
     title: "",

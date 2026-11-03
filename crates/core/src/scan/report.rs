@@ -1085,11 +1085,14 @@ fn html(r: &Report) -> String {
                     " <span class=\"tag\">confirmed via MCP (an agent)</span>"
                 }
                 "confirmed" => " <span class=\"tag\">confirmed (by whom is unknown)</span>",
-                // Only in a report written with --state all or removed.
-                "removed" => " <span class=\"tag\">removed</span>",
                 _ => "",
             }
             .to_string();
+            // Who removed it; MCP calls can't remove, so this names a person or an unknown origin.
+            if inst.state == "removed" {
+                let by = provenance::describe(inst.state_origin.as_deref());
+                let _ = write!(state, " <span class=\"tag\">removed {by}</span>");
+            }
             // A finding an agent recorded through `findings add` isn't a person's manual testing.
             if inst.source == MANUAL_SOURCE && inst.origin.as_deref() == Some("mcp") {
                 state.push_str(" <span class=\"tag\">added via MCP (an agent)</span>");
@@ -1920,6 +1923,6 @@ mod tests {
         let r = build(&s, &all).unwrap();
         let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
         assert_eq!(g.instances[0].state, "removed");
-        assert!(render(&r, ReportKind::Html).contains("<span class=\"tag\">removed</span>"));
+        assert!(render(&r, ReportKind::Html).contains("<span class=\"tag\">removed from the command line</span>"));
     }
 }

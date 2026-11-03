@@ -402,8 +402,9 @@ entry on another host or port, or a replaced description or solution) shows with
 confirmation. Risk and confidence are named groups whose picked button is pressed
 (`aria-pressed`), the method and URL inputs have their own labels, and Tab stays inside the dialog (`ui/dialogFocus.ts`, shared with the confirmation
 dialog), with focus going back to where it was when it closes. Findings added by hand are
-grouped by title, tagged *by hand*, show *Added by hand* and their history entries instead of a
-rule, and have *Remove* (`findings remove`, after asking). A removed finding is kept with state
+grouped by title, tagged *by hand* (*via MCP* for one an agent added, by its `origin`:
+`addedBy` in `views/manualFinding.ts`), show *Added by hand* (or *Added via MCP (an agent)*)
+and their history entries instead of a rule, and have *Remove* (`findings remove`, after asking). A removed finding is kept with state
 `removed`, which the list leaves out. The scan comparison leaves them out, since no scan looks
 for them.
 

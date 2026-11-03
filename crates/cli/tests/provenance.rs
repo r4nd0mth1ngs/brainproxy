@@ -475,3 +475,118 @@ fn reports_say_who_triaged_each_finding() {
     assert_eq!(all["summary"]["false_positives_left_out"], serde_json::json!([]));
     assert_eq!(all["agent_false_positives"], serde_json::json!([]));
 }
+
+/// A finding added by hand says who added it everywhere it shows, and removing it or replacing
+/// its title's shared text records who did that and when. An agent's never reads as found by
+/// hand, and an agent can do neither of the two.
+#[test]
+fn findings_added_by_hand_say_who_added_and_removed_them() {
+    let env = Env::new("manual");
+    let add = |vars: &[(&str, &str)], title: &str, url: &str, more: &[&str]| {
+        let mut args = vec!["findings", "add", "--title", title, "--risk", "high", "--url", url];
+        args.extend_from_slice(more);
+        env.ok(vars, &args)["finding"]["id"].as_i64().unwrap()
+    };
+    let by_agent = add(&[(MCP, "1")], "Agent IDOR", "http://127.0.0.1:9/agent", &["--description", "agent text"]);
+    let by_person = add(&[(CLIENT, "gui")], "Person IDOR", "http://127.0.0.1:9/person", &["--description", "first"]);
+
+    // findings list and show.
+    let items = env.ok(&[], &["findings", "list", "--all", "--source", "manual"])["items"].as_array().unwrap().clone();
+    let item = |id: i64| items.iter().find(|i| i["id"] == id).unwrap().clone();
+    assert_eq!((item(by_agent)["origin"].as_str(), item(by_person)["origin"].as_str()), (Some("mcp"), Some("gui")));
+    let show = |id: i64| env.ok(&[], &["findings", "show", &id.to_string()]);
+    assert_eq!(show(by_agent)["origin_text"], "added via MCP (an agent)");
+    assert_eq!(show(by_person)["origin_text"], "added from the desktop app");
+
+    // Every report format.
+    let report = |kind: &str, more: &[&str]| {
+        let out = env.project.with_extension(format!("manual.{kind}"));
+        let mut args = vec!["report", kind, "--output", out.to_str().unwrap(), "--force"];
+        args.extend_from_slice(more);
+        env.ok(&[], &args);
+        std::fs::read_to_string(&out).unwrap()
+    };
+    let json: Value = serde_json::from_str(&report("json", &[])).unwrap();
+    let insts: Vec<&Value> =
+        json["alerts"].as_array().unwrap().iter().flat_map(|g| g["instances"].as_array().unwrap()).collect();
+    let inst = |id: i64| *insts.iter().find(|i| i["id"] == id).unwrap();
+    assert_eq!((inst(by_agent)["origin"].as_str(), inst(by_person)["origin"].as_str()), (Some("mcp"), Some("gui")));
+    let md = report("markdown", &[]);
+    assert!(
+        md.contains(&format!("Finding #{by_agent} · manual · ")) && md.contains("added via MCP (an agent)"),
+        "{md}"
+    );
+    assert!(md.contains("added from the desktop app"), "{md}");
+    let html = report("html", &[]);
+    let row = |path: &str| {
+        let at = html.find(&format!("http://127.0.0.1:9/{path}</code>")).unwrap();
+        html[at..at + html[at..].find("</td>").unwrap()].to_string()
+    };
+    assert!(row("agent").contains("added via MCP (an agent)") && !row("agent").contains("found by hand"), "{html}");
+    assert!(row("person").contains("found by hand") && !row("person").contains("via MCP"), "{html}");
+    let sarif: Value = serde_json::from_str(&report("sarif", &[])).unwrap();
+    let res = |id: i64| {
+        sarif["runs"][0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["properties"]["findingId"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        (res(by_agent)["properties"]["origin"].as_str(), res(by_person)["properties"]["origin"].as_str()),
+        (Some("mcp"), Some("gui"))
+    );
+
+    // compare items.
+    let cmp = env.ok(&[], &["findings", "compare"]);
+    let new = cmp["new"].as_array().unwrap();
+    let origin = |id: i64| new.iter().find(|f| f["id"] == id).unwrap()["origin"].clone();
+    assert_eq!((origin(by_agent), origin(by_person)), ("mcp".into(), "gui".into()));
+
+    // An agent can neither replace a title's shared text nor remove a finding.
+    let refused = |args: &[&str]| {
+        let (code, v, _) = env.run(&[(MCP, "1")], args);
+        assert_eq!(code, 2, "{v}");
+    };
+    refused(&[
+        "findings",
+        "add",
+        "--title",
+        "Person IDOR",
+        "--risk",
+        "high",
+        "--url",
+        "http://127.0.0.1:9/b",
+        "--description",
+        "agent's",
+        "--replace-text",
+    ]);
+    refused(&["findings", "remove", &by_person.to_string()]);
+    assert_eq!(show(by_person)["state"], "open");
+
+    // A person replacing it: the earlier text is kept with who replaced it.
+    add(&[], "Person IDOR", "http://127.0.0.1:9/c", &["--description", "second", "--replace-text"]);
+    let earlier = show(by_person)["replaced_texts"].clone();
+    assert_eq!(
+        (earlier[0]["description"].as_str(), earlier[0]["by"].as_str()),
+        (Some("first"), Some("cli")),
+        "{earlier}"
+    );
+
+    // A person removing it: the tombstone says who removed it, and when, as `findings mark` does.
+    env.ok(&[(CLIENT, "gui")], &["findings", "mark", &by_person.to_string(), "--state", "confirmed"]);
+    env.ok(&[(CLIENT, "gui")], &["findings", "remove", &by_person.to_string()]);
+    let f = show(by_person);
+    assert_eq!((f["state"].as_str(), f["state_origin"].as_str()), (Some("removed"), Some("gui")), "{f}");
+    assert_eq!(f["removed"]["by"], "gui", "{f}");
+    assert_eq!(f["state_changed_at"], f["removed"]["time"], "{f}");
+    // The state it had, and who set that.
+    assert_eq!(
+        (f["removed"]["state"].as_str(), f["removed"]["state_origin"].as_str()),
+        (Some("confirmed"), Some("gui"))
+    );
+    let html = report("html", &["--state", "all"]);
+    assert!(html.contains("<span class=\"tag\">removed from the desktop app</span>"), "{html}");
+}

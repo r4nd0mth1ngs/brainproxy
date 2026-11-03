@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { asksToReplace, draftFromRequest, findingAddArgs, formFromDraft, formProblem, historyIds, type FindingForm } from "./manualFinding.ts";
+import { addedBy, asksToReplace, draftFromRequest, findingAddArgs, formFromDraft, formProblem, historyIds, type FindingForm } from "./manualFinding.ts";
 
 const filled = (over: Partial<FindingForm> = {}): FindingForm => ({
   ...formFromDraft({ url: "https://app.test/orders/7?x=1", method: "post", history: [12] }),
@@ -157,4 +157,9 @@ test("Replay drafts keep the path and query as written", () => {
   // Anything else isn't a URL to record.
   assert.equal(url("OPTIONS * HTTP/1.1"), undefined);
   assert.equal(url("GET /x HTTP/1.1", "not a url"), undefined);
+});
+
+test("a finding an agent added never reads as found by hand", () => {
+  assert.deepEqual(addedBy("mcp"), { tag: "via MCP", text: "Added via MCP (an agent)" });
+  for (const o of ["gui", "cli", null, undefined]) assert.equal(addedBy(o).text, "Added by hand");
 });
