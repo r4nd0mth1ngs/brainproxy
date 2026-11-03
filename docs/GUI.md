@@ -27,9 +27,12 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     bodies exact.
   - `env` adds variables to the child, only names starting with `BRAINPROXY_SECRET_`, for
     secrets that shouldn't be in argv (visible in `ps`).
-  - `call` names the call, so `cli_cancel(call)` can kill its process (`cancelCli` in
+  - `call` names the call, so `cli_cancel(call)` can stop its process (`cancelCli` in
     `api.ts`); it then fails with kind `cancelled`. For a command that waits on the user,
-    such as the browser sign-in.
+    such as the browser sign-in. The process gets SIGTERM, so a request it already sent
+    is recorded as cancelled, and SIGKILL if it is still running 3 s later. Windows has no
+    SIGTERM: the process is killed at once, and a sent request keeps the row written before
+    it went out.
 - Value flags are passed as `--flag=value` and free-text positionals after `--`, so values
   starting with `-` aren't read as flags.
 - Messages the GUI edits or resends are loaded with `--max-body=2000000`. One larger than
@@ -37,7 +40,7 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   an intercepted one read-only (forward or drop it as is).
 - `npm run dev` also serves the UI to a plain browser: `vite.config.ts` adds `POST /api/cli`
   and `POST /api/cli-cancel` (dev server only; localhost Host and an `X-Brainproxy: 1` header
-  required). It runs
+  required; cancelling sends SIGTERM, then SIGKILL after 3 s). It runs
   `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
   1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue

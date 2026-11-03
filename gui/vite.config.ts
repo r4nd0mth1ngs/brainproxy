@@ -8,7 +8,7 @@ import react from "@vitejs/plugin-react";
 // the brainproxy CLI the same way the Tauri `cli` command does. It answers only requests
 // to a localhost Host with the X-Brainproxy header, which blocks DNS rebinding and simple
 // cross-site posts. Never part of a build. POST /api/cli-cancel {call} stops a call started
-// with that `call` id, as the Tauri `cli_cancel` command does.
+// with that `call` id (SIGTERM, then SIGKILL), as the Tauri `cli_cancel` command does.
 function cliBridge(): Plugin {
   const running = new Map<string, ChildProcess>();
   const cancelled = new Set<ChildProcess>();
@@ -34,7 +34,11 @@ function cliBridge(): Plugin {
           const child = running.get(call);
           if (child) {
             cancelled.add(child);
-            child.kill();
+            // SIGTERM first, so a request already sent is recorded as cancelled; SIGKILL if it is
+            // still running after 3 s. (On Windows both end the process at once.)
+            child.kill("SIGTERM");
+            const timer = setTimeout(() => child.kill("SIGKILL"), 3000);
+            child.once("close", () => clearTimeout(timer));
           }
           res.end("{}");
         });

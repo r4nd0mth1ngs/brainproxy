@@ -52,10 +52,17 @@ impl Cancellable {
     }
 }
 
+/// How long a cancelled call may take to finish after SIGTERM (recording what it sent)
+/// before it is killed.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Runs `brainproxy --format json --project PROJECT ARGS...` and returns its JSON envelope.
 /// `stdin` is written byte for byte; `env` adds BRAINPROXY_SECRET_* variables to the child.
-/// With a `call` id, `cli_cancel` with that id kills the child (a browser sign-in waiting
-/// for the user, say), and the envelope says it was cancelled.
+/// With a `call` id, `cli_cancel` with that id stops the child (a browser sign-in waiting
+/// for the user, say), and the envelope says it was cancelled. On unix the child gets
+/// SIGTERM first, so a request it already sent is recorded as cancelled, and is killed if
+/// it is still running after `CANCEL_GRACE`. Windows has no SIGTERM: the child is killed at
+/// once, and a sent request keeps the row it was given before it went out.
 #[tauri::command]
 async fn cli(
     app: tauri::AppHandle,
@@ -70,15 +77,40 @@ async fn cli(
         return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
     }
     let Some(call) = call else { return run(&project, &args, stdin, &env).await };
+    let child = match spawn(&project, &args, stdin, &env) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let (tx, rx) = oneshot::channel();
     app.state::<Cancellable>().held().insert(call.clone(), tx);
-    // Dropping the run drops the child, which kills it (kill_on_drop).
+    let pid = child.id();
+    let output = output(child);
+    tokio::pin!(output);
     let out = tokio::select! {
-        out = run(&project, &args, stdin, &env) => out,
-        _ = rx => json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}}),
+        out = &mut output => out,
+        _ = rx => {
+            terminate(pid);
+            // Dropping the output drops the child, which kills it (kill_on_drop).
+            let _ = tokio::time::timeout(CANCEL_GRACE, &mut output).await;
+            json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}})
+        }
     };
     app.state::<Cancellable>().held().remove(&call);
     out
+}
+
+/// Asks the child to exit (SIGTERM). Elsewhere there is no such request; the child is killed
+/// when it is dropped.
+fn terminate(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()).filter(|&p| p > 1) {
+        // SAFETY: kill() only sends a signal; the pid is our own child's, still unreaped.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Stops the `cli` call started with this id, if it is still running.
@@ -90,6 +122,19 @@ fn cli_cancel(call: String, running: tauri::State<'_, Cancellable>) {
 }
 
 async fn run(project: &str, args: &[String], stdin: Option<Vec<u8>>, env: &HashMap<String, String>) -> Value {
+    match spawn(project, args, stdin, env) {
+        Ok(child) => output(child).await,
+        Err(e) => e,
+    }
+}
+
+/// Starts the CLI and feeds it `stdin`; an error comes back as the envelope to return.
+fn spawn(
+    project: &str,
+    args: &[String],
+    stdin: Option<Vec<u8>>,
+    env: &HashMap<String, String>,
+) -> Result<tokio::process::Child, Value> {
     let mut cmd = Command::new(binary());
     cmd.args(["--format", "json", "--project"]).arg(project).args(args).envs(env);
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -99,15 +144,17 @@ async fn run(project: &str, args: &[String], stdin: Option<Vec<u8>>, env: &HashM
     // CREATE_NO_WINDOW: the CLI is a console program; without it each call flashes a console window.
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return failure(format!("can't run {}: {e}", binary().display())),
-    };
+    let mut child = cmd.spawn().map_err(|e| failure(format!("can't run {}: {e}", binary().display())))?;
     if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
         tokio::spawn(async move {
             let _ = pipe.write_all(&data).await;
         });
     }
+    Ok(child)
+}
+
+/// The child's JSON envelope, once it exits.
+async fn output(child: tokio::process::Child) -> Value {
     match child.wait_with_output().await {
         Ok(out) => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
             let text = String::from_utf8_lossy(if out.stdout.is_empty() { &out.stderr } else { &out.stdout });
