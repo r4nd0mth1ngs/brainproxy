@@ -451,31 +451,31 @@ fn history_list(ids: &[i64]) -> String {
 /// Code spans and fenced blocks keep their text as written (often a request to copy), each in
 /// a fence of our own that nothing inside can close.
 fn md_no_html(s: &str) -> String {
-    // In a GFM table a pipe ends the cell even inside a code span, so there a span with one
-    // is text like the rest.
-    let table = s.lines().any(|l| {
-        let l = l.trim();
-        l.contains('-')
-            && (l.contains('|') || l.contains(':'))
-            && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
-    });
     let lines: Vec<&str> = s.lines().collect();
     let mut out = String::new();
+    // In a GFM table a pipe ends the cell even inside a code span, so in a table's rows (its
+    // header, delimiter row and the rows up to a blank line) a span with one is text like the rest.
+    let mut table = false;
     let mut i = 0;
     while i < lines.len() {
         let Some((indent, mark, run, lang)) = md_fence_open(lines[i]) else {
+            if lines[i].trim().is_empty() {
+                table = false;
+            } else if !table && lines.get(i + 1).is_some_and(|l| md_table_delimiter(l)) {
+                table = true;
+            }
             out.push_str(&md_inline(lines[i], table));
             out.push('\n');
             i += 1;
             continue;
         };
+        table = false;
         let mut body = String::new();
         i += 1;
         while i < lines.len() {
             let l = lines[i];
             i += 1;
-            let t = l.trim();
-            if t.len() >= run && t.chars().all(|c| c == mark) {
+            if md_fence_close(l, mark, run) {
                 break;
             }
             // The fence's own indent comes off its lines, as in CommonMark.
@@ -506,6 +506,23 @@ fn md_fence_open(line: &str) -> Option<(usize, char, usize, String)> {
     let lang = info.split_whitespace().next().unwrap_or("");
     let ok = lang.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '#' | '.' | '_' | '-'));
     Some((indent, mark, run, if ok { lang.to_string() } else { String::new() }))
+}
+
+/// A line that closes a fence opened by `run` of `mark`: up to three spaces of indent, at least
+/// as long a run of the same character, then only spaces or tabs.
+fn md_fence_close(line: &str, mark: char, run: usize) -> bool {
+    let rest = line.trim_start_matches(' ');
+    let n = rest.len() - rest.trim_start_matches(mark).len();
+    line.len() - rest.len() <= 3 && n >= run && rest[n..].chars().all(|c| matches!(c, ' ' | '\t'))
+}
+
+/// A GFM table's delimiter row (`|---|:-:|`), also indented in a list item. Generous on
+/// purpose: a row taken for a table only shows a span with a pipe as text.
+fn md_table_delimiter(line: &str) -> bool {
+    let l = line.trim();
+    l.contains('-')
+        && (l.contains('|') || l.contains(':'))
+        && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
 }
 
 /// One line of a tester's text: code spans as written, the rest through [`md_escape`]. A
@@ -1540,6 +1557,30 @@ mod tests {
         let t = md_no_html("| a | b |\n|---|---|\n| `x|<b>` | `<i>` |");
         assert_eq!(t, "| a | b |\n|---|---|\n| \\`x|&lt;b&gt;\\` | `<i>` |");
         assert_eq!(md_no_html("`a|<b>`"), "`a|<b>`");
+    }
+
+    #[test]
+    fn only_table_rows_show_a_span_with_a_pipe_as_text() {
+        let t =
+            md_no_html("Try `GET /f?p=*a*|b` first.\n\n| a | b |\n|---|---|\n| `x|y` | z |\nrow `p|q`\n\nAfter `c|d`.");
+        assert_eq!(
+            t,
+            "Try `GET /f?p=*a*|b` first.\n\n| a | b |\n|---|---|\n| \\`x|y\\` | z |\nrow \\`p|q\\`\n\nAfter `c|d`."
+        );
+        // A table in a list item is a table too; a fence ends one.
+        let t = md_no_html("  | `a|b` |\n  |:-:|\n```\nx\n```\n`c|d`");
+        assert_eq!(t, "  | \\`a|b\\` |\n  |:-:|\n```\nx\n```\n`c|d`");
+        // A delimiter row with nothing above it starts no table.
+        assert_eq!(md_no_html("|---|\n`a|b`"), "|---|\n`a|b`");
+    }
+
+    #[test]
+    fn a_fence_closes_only_as_commonmark_allows() {
+        // Four spaces of indent, a shorter run, the other character or text after: payload.
+        let s = "````\n    ````\n```\n~~~~\n```` x\n   `````  \n<b>after</b>";
+        assert_eq!(md_no_html(s), "`````\n    ````\n```\n~~~~\n```` x\n`````\n&lt;b&gt;after&lt;/b&gt;");
+        let s = "  ~~~\n      ~~~\n  x\n\t~~~\n ~~~\nok";
+        assert_eq!(md_no_html(s), "```\n    ~~~\nx\n\t~~~\n```\nok");
     }
 
     fn by_hand(title: &str, history: Vec<i64>) -> crate::scan::findings_db::ManualFinding {
