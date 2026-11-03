@@ -550,6 +550,12 @@ test("coming back to the window shows an agent's tabs without a save", async () 
   a.tabs.push({ key: 50, title: "x", target: "", raw: "x" });
   await Promise.all([a.revs.save(a.body()), a.revs.check()]);
   assert.deepEqual(a.added, [["ws"]], "its own save isn't taken for someone else's");
+  // A save made while a check was waiting goes after it, with the tabs it took in.
+  f.append({ kind: "http", title: "late", target: "", request: "late" });
+  const stale = a.body();
+  await Promise.all([a.revs.check(), a.revs.save(stale)]);
+  assert.deepEqual(a.added.at(-1), ["late"]);
+  assert.deepEqual(f.db.set.tabs.map((t) => t.request), ["ws", "x", "late"]);
 });
 
 test("a set saved by a newer version isn't saved over", async () => {

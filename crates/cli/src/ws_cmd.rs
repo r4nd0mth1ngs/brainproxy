@@ -367,10 +367,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         .transpose()
         .map_err(|e| Error::InvalidInput(format!("--until: {e}")))?;
     // Checked here, not clamped: a saved Replay tab can carry the value to a person's Send.
-    let wait = Duration::try_from_secs_f64(args.wait.max(0.0))
-        .ok()
-        .filter(|_| args.wait <= MAX_WAIT_SECS)
-        .ok_or_else(|| Error::InvalidInput(format!("--wait: at most {MAX_WAIT_SECS} seconds (a day)")))?;
+    let wait = Duration::try_from_secs_f64(args.wait.max(0.0)).ok().filter(|_| args.wait <= MAX_WAIT_SECS).ok_or_else(
+        || Error::InvalidInput(format!("--wait: at most {MAX_WAIT_SECS} seconds (a day), not {}", args.wait)),
+    )?;
     let guard = store.guard()?;
     // Refuse out-of-scope targets up front, before any connection is attempted.
     crate::require_in_scope(&guard, &target)?;

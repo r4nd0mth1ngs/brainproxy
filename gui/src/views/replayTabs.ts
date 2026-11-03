@@ -162,8 +162,11 @@ export function revisions(o: {
       known = tabTexts(data);
     },
     /** Saves `body`, or takes in tabs saved elsewhere since and saves them with the app's. Returns what it wrote. */
-    save: (body: string) =>
-      one(async () => {
+    save: (body: string) => {
+      const seen = rev;
+      return one(async () => {
+        // A check queued before took in tabs meanwhile: `body` was made without them.
+        if (rev !== seen) body = o.body();
         let r: { rev: number };
         try {
           r = await o.cli(saveArgs(rev), body);
@@ -176,7 +179,8 @@ export function revisions(o: {
         rev = r.rev;
         known = tabTexts(body);
         return body;
-      }),
+      });
+    },
     /** Takes in tabs saved elsewhere since (the window came back to the front); reads them only if the revision moved. */
     check: () =>
       one(async () => {

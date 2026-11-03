@@ -113,6 +113,8 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
             let saved = load(&Store::open(project)?)?;
             let tabs = saved["tabs"].as_array().cloned().unwrap_or_default();
             let rev = saved["rev"].as_u64().unwrap_or(0);
+            // The app shows a newer format's tabs but doesn't save over them.
+            let v = saved["v"].as_u64().unwrap_or(VERSION);
             // Typed or prepared by someone else: shown escaped, stored and in JSON as is.
             let line = |i: usize, t: &Value| {
                 let kind = escape_controls(t["kind"].as_str().unwrap_or("http"));
@@ -124,7 +126,7 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
                 let tab = tabs.get(i).ok_or_else(|| {
                     Error::NotFound(format!("Replay tab {i}: there are {} (numbered from 0)", tabs.len()))
                 })?;
-                let data = json!({"count": tabs.len(), "rev": rev, "index": i, "tab": tab});
+                let data = json!({"count": tabs.len(), "rev": rev, "v": v, "index": i, "tab": tab});
                 out.ok(data, || {
                     let mut lines = vec![line(i, tab)];
                     let text = tab["request"].as_str().unwrap_or_default();
@@ -151,7 +153,7 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
             } else {
                 tabs.clone()
             };
-            let data = json!({"count": tabs.len(), "active": saved["active"], "rev": rev, "tabs": listed});
+            let data = json!({"count": tabs.len(), "active": saved["active"], "rev": rev, "v": v, "tabs": listed});
             out.ok(data, || {
                 if tabs.is_empty() {
                     return "no saved Replay tabs".into();

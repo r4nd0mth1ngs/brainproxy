@@ -601,7 +601,7 @@ fn replay_tabs_are_saved_in_the_project() {
     // can be paged through under an output cap.
     let (code, v) = run(&["replay", "tabs", "list", "--summary"], &project, None);
     assert_eq!(code, 0, "{v}");
-    assert_eq!(v["data"]["rev"], 1);
+    assert_eq!((&v["data"]["rev"], &v["data"]["v"]), (&1.into(), &1.into()));
     assert_eq!(
         v["data"]["tabs"][0],
         serde_json::json!({"index": 0, "kind": "http", "title": "one",
@@ -648,7 +648,13 @@ fn replay_tabs_are_saved_in_the_project() {
     let (code, v) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
     assert_eq!(v["error"]["kind"], "conflict", "{v}");
     assert_ne!(code, 0);
-    assert_eq!(run(&["replay", "tabs", "list"], &project, None).1["data"]["tabs"][0]["kind"], "grpc");
+    // The listing says which format, so the app can tell and not try to save over it.
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(
+        (&v["data"]["tabs"][0]["kind"], &v["data"]["v"], &v["data"]["rev"]),
+        (&"grpc".into(), &2.into(), &7.into())
+    );
+    assert_eq!(run(&["replay", "tabs", "list", "--summary"], &project, None).1["data"]["v"], 2);
 }
 
 #[test]
