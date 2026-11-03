@@ -6,13 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brainproxy_core::apiimport::{self, api, graphql, openapi, postman, ApiRequest, Built, RunConfig};
-use brainproxy_core::auth::AuthSession;
+use brainproxy_core::auth::{Attempt, AuthSession};
 use brainproxy_core::capture::decode_body;
 use brainproxy_core::guard::Guard;
 use brainproxy_core::http::request::split_head_body;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use brainproxy_core::session::Tool;
-use brainproxy_core::store::Store;
 use brainproxy_core::Error;
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -50,7 +49,7 @@ pub enum ImportCmd {
 
 #[derive(clap::Args)]
 pub struct DocArgs {
-    /// Document file, '-' for stdin, or an http(s) URL (fetched in scope; recorded in history, except by `import api`).
+    /// Document file, '-' for stdin, or an http(s) URL (fetched in scope and recorded in history).
     source: String,
     /// Send to this server instead: scheme://host[:port] replaces the origin; with a path, the whole base.
     #[arg(long)]
@@ -206,8 +205,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         http2: false,
     };
     let auth = crate::auth_cmd::maybe_session(project, c.auth.as_deref(), &send)?;
-    let record = !matches!(cmd, ImportCmd::Api(_));
-    let fetch = Fetcher { project, send: &send, record, auth: auth.as_deref(), headers: &headers, tool: Tool::Crawl };
+    let fetch = Fetcher { project, send: &send, auth: auth.as_deref(), headers: &headers, tool: Tool::Crawl };
     if let ImportCmd::Api(a) = &cmd {
         return import_api(project, a, &fetch, auth.clone(), &headers, out);
     }
@@ -506,8 +504,7 @@ pub(crate) fn check_remote_vars(
         http2: false,
     };
     let auth = crate::auth_cmd::maybe_session(project, from.auth, &send)?;
-    let fetch =
-        Fetcher { project, send: &send, record: false, auth: auth.as_deref(), headers: from.headers, tool: from.tool };
+    let fetch = Fetcher { project, send: &send, auth: auth.as_deref(), headers: from.headers, tool: from.tool };
     check_background_doc(&load_api(&fetch, source, opts)?)
 }
 
@@ -582,12 +579,12 @@ pub(crate) fn read_local(source: &str) -> Result<String, Error> {
     String::from_utf8(bytes).map_err(|_| Error::InvalidInput(format!("{source:?} is not UTF-8 text")))
 }
 
-/// Fetches specs and introspection results through the guarded client.
+/// Fetches specs and introspection results through the guarded client. Each fetch is
+/// recorded in history (source `import`) as it is sent, like any other request: the row is
+/// written before it goes out and completed when it is answered or fails.
 pub(crate) struct Fetcher<'a> {
     pub project: &'a Path,
     pub send: &'a SendOptions,
-    /// Keep the fetch in history. `import api` and `scan active --api` don't: a document may hold credentials.
-    pub record: bool,
     pub auth: Option<&'a AuthSession>,
     pub headers: &'a [(String, String)],
     /// Whose session rules apply to the fetch.
@@ -614,13 +611,51 @@ impl Fetcher<'_> {
         headers.extend(self.headers.iter().cloned());
         let (req, target): (RawRequest, Target) = RawRequest::build(method, url, &headers, body)?;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let ex = match self.auth {
-            Some(a) => rt.block_on(a.send_as(self.tool, &req, &target))?,
-            None => rt.block_on(Client::new(self.send.clone()).send(&req, &target))?,
+        let client = Client::new(self.send.clone());
+        let mut log = crate::sent::SentLog::open(self.project, apiimport::SOURCE, false)?
+            .without_response_body(brainproxy_core::sent::DOCUMENT_OMITTED);
+        // Each request (a lost session's retry too) is on record before it goes out. `open` is
+        // the one out and unanswered; a row answered already is never rewritten.
+        let mut open: Option<(i64, Vec<u8>)> = None;
+        let sent = {
+            let (log, open) = (&mut log, &mut open);
+            let sending = |log: &mut crate::sent::SentLog, open: &mut Option<_>, r: &RawRequest| {
+                let recorded = client.recorded_request(r, &target)?;
+                *open = Some((log.pending(&target, &recorded)?, recorded));
+                Ok::<_, Error>(())
+            };
+            match self.auth {
+                Some(a) => {
+                    let watch = |at: Attempt<'_>| match at {
+                        Attempt::Sending(r) => sending(log, open, r),
+                        Attempt::Answered(ex) => match open.take() {
+                            Some((id, _)) => log.answered(id, ex),
+                            None => Ok(()),
+                        },
+                    };
+                    rt.block_on(a.send_as_watched(self.tool, &req, &target, watch))
+                }
+                None => {
+                    sending(log, open, &req)?;
+                    let r = rt.block_on(client.send(&req, &target));
+                    if let Ok(ex) = &r {
+                        if let Some((id, _)) = open.take() {
+                            log.answered(id, ex)?;
+                        }
+                    }
+                    r
+                }
+            }
         };
-        if self.record {
-            Store::open(self.project)?.record_exchange(apiimport::SOURCE, &ex)?;
-        }
+        let ex = match (sent, open) {
+            (Ok(ex), None) => ex,
+            (Ok(_), Some(_)) => unreachable!("an answer completes its row"),
+            (Err(e), Some((id, recorded))) => {
+                log.failed(id, &target, &recorded, &e.to_string())?;
+                return Err(e);
+            }
+            (Err(e), None) => return Err(e),
+        };
         let head = parse_response_head(&ex.response)?;
         let body = decode_body(&head.headers, split_head_body(&ex.response).1);
         if body.len() > apiimport::MAX_DOCUMENT {

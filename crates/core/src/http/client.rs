@@ -139,6 +139,7 @@ fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> R
 impl Client {
     pub fn new(opts: SendOptions) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::provenance::note_sni(opts.sni.as_deref());
         let config = tls_config(opts.verify_tls, b"http/1.1", None).expect("TLS configuration without a certificate");
         let h2_config = tls_config(opts.verify_tls, b"h2", None).expect("TLS configuration without a certificate");
         Self {
@@ -233,10 +234,25 @@ impl Client {
             .map(std::borrow::Cow::Owned)
     }
 
+    /// Whether [`Client::send`] sends `req` over HTTP/2.
+    fn sends_h2(&self, req: &RawRequest) -> bool {
+        self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"))
+    }
+
+    /// The request as [`Client::send`] records it (its `Exchange::request`): the bytes given,
+    /// or their HTTP/2 text form; auth placeholders stay. Callers that record a request before
+    /// it goes out use this, so the row matches what is sent.
+    pub fn recorded_request(&self, req: &RawRequest, target: &Target) -> Result<Vec<u8>> {
+        if self.sends_h2(req) {
+            return Ok(H2Request::from_raw(req.as_bytes(), target)?.recorded);
+        }
+        Ok(req.as_bytes().to_vec())
+    }
+
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
-        if self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")) {
+        if self.sends_h2(req) {
             let filled = self.fill_auth(req.as_bytes(), target).await?;
             let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
                 .await
@@ -244,7 +260,7 @@ impl Client {
             return Ok(Exchange {
                 target: target.clone(),
                 // Recorded with the auth placeholders, not the values sent.
-                request: H2Request::from_raw(req.as_bytes(), target)?.recorded,
+                request: self.recorded_request(req, target)?,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
             });
@@ -580,6 +596,16 @@ impl Client {
         target: &Target,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let name = self.opts.sni.as_deref().unwrap_or(&target.host);
+        // The server name picks the site on a shared front end as much as the address does, so a
+        // different one must be in scope by name too: else an in-scope host on a CDN reaches any tenant.
+        if let Some(sni) = &self.opts.sni {
+            let guard = self.opts.guard.as_ref().ok_or_else(|| Error::OutOfScope("no engagement scope".into()))?;
+            if !sni.eq_ignore_ascii_case(&target.host) && !guard.confirms(sni, target.port) {
+                return Err(Error::OutOfScope(format!(
+                    "--sni {sni}: a server name other than the target's must be listed by name in the scope"
+                )));
+            }
+        }
         let server_name = ServerName::try_from(name.to_string())
             .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))?;
         connector.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))

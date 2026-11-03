@@ -29,6 +29,7 @@ pub fn describe(cmd: &Command) -> Value {
         "env": {
             "BRAINPROXY_PROJECT": "project file path",
             "BRAINPROXY_FORMAT": "auto | json | text",
+            "BRAINPROXY_CLIENT": "gui marks what is recorded as the desktop app's (the app sets it); else cli, or mcp under an MCP tool call",
         },
         "codecs": {
             "encode": codec::ENCODINGS,

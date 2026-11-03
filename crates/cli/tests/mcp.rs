@@ -123,7 +123,7 @@ fn protocol_and_tool_list() {
     {
         assert!(tool(name).is_some(), "missing {name}");
     }
-    for name in ["mcp_serve", "proxy_run", "oob_run"] {
+    for name in ["mcp_serve", "proxy_run", "oob_run", "browser_open"] {
         assert!(tool(name).is_none(), "{name} should not be a tool");
     }
     let send = tool("send").unwrap();
@@ -410,6 +410,84 @@ fn an_agent_cannot_add_a_script_open_a_browser_or_read_any_variable() {
     // From a terminal it opens one.
     let o = cli(&["auth", "oauth", "authorize", "c", "--wait", "1"]);
     assert!(!o.status.success());
-    let url = std::fs::read_to_string(&opened).unwrap_or_default();
+    // The browser is started, not waited for: give the stand-in a moment to write its mark.
+    let mut url = String::new();
+    for _ in 0..50 {
+        url = std::fs::read_to_string(&opened).unwrap_or_default();
+        if !url.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(url.starts_with("https://id.test/authorize?"), "{url}");
+}
+
+#[test]
+fn an_agent_cannot_send_unrecorded_or_open_the_proxy_to_the_network() {
+    let p = tmp_project("record");
+    let mut m = Mcp::start_env(&p, &[], &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{e}");
+    let url = "http://127.0.0.1:9/";
+    for (tool, args) in [
+        ("send", json!({"url": url, "no_store": true})),
+        ("send", json!({"url": url, "no_store": true, "race": 2})),
+        ("ws_send", json!({"url": "ws://127.0.0.1:9/", "no_store": true})),
+    ] {
+        let (err, e) = m.call(tool, args);
+        assert!(err, "{tool}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("--no-store"), "{tool}: {e}");
+    }
+    // Fuzzing with fewer exchanges in history: refused before anything is sent.
+    let port = serve(0);
+    let fuzz_url = format!("http://127.0.0.1:{port}/?q=§x§");
+    for store in ["none", "matches"] {
+        let (err, e) = m.call("fuzz_run", json!({"url": fuzz_url, "payloads": ["list:1,2"], "store": store}));
+        assert!(err, "{store}: {e}");
+        let message = e["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("--store {store}")) && message.contains("recorded"), "{message}");
+    }
+    let (err, e) = m.call("history_list", json!({}));
+    assert!(!err && e["data"]["items"].as_array().is_some_and(|a| a.is_empty()), "{e}");
+    // `browser open` isn't a tool, and a tool call's command refuses it too.
+    let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["browser", "open", "http://127.0.0.1:9/"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("browser open isn't offered through MCP"), "{out}");
+    let (err, e) = m.call("proxy_start", json!({"listen": "0.0.0.0:0"}));
+    assert!(err, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("loopback"), "{e}");
+}
+
+#[test]
+fn an_agent_cannot_pass_its_records_off_as_the_apps() {
+    // Even a server started from the app's environment marks what its tool calls record as an
+    // agent's: tool arguments can't set or clear environment variables.
+    let port = serve(1);
+    let project = tmp_project("origin");
+    let mut m = Mcp::start_env(&project, &[], &[("BRAINPROXY_CLIENT", "gui")]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, env) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{env}");
+    let (err, env) = m.call("send", json!({"url": format!("http://127.0.0.1:{port}/")}));
+    assert!(!err, "{env}");
+    let (_, env) = m.call("history_list", json!({}));
+    assert_eq!(env["data"]["items"][0]["origin"], "mcp", "{env}");
+    let (_, env) = m.call("history_list", json!({"origin": "gui"}));
+    assert_eq!(env["data"]["count"], 0, "{env}");
+    // No tool takes the environment or a way to name the client.
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for t in &tools {
+        let props = t["inputSchema"]["properties"].as_object().cloned().unwrap_or_default();
+        for key in props.keys() {
+            assert!(!["env", "client", "set_origin"].contains(&key.as_str()), "{}: {key}", t["name"]);
+        }
+    }
 }

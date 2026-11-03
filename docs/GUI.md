@@ -27,18 +27,35 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     bodies exact.
   - `env` adds variables to the child, only names starting with `BRAINPROXY_SECRET_`, for
     secrets that shouldn't be in argv (visible in `ps`).
-  - `call` names the call, so `cli_cancel(call)` can kill its process (`cancelCli` in
+  - Every call also gets `BRAINPROXY_CLIENT=gui` (the Vite dev bridge sets it too), so what
+    the CLI records, and what the proxy and jobs it starts record, is marked as the app's
+    (origin `gui`). Traffic shows it in the **By** column (app, CLI, agent); for a proxy entry
+    that is who started the proxy, and hovering it shows the client's address. An agent's
+    `intercept forward` or `rules add` against the app's proxy is recorded in the entry's
+    `edited_by` and the intercept's `resolved_by`, not in this column.
+  - `call` names the call, so `cli_cancel(call)` can stop its process (`cancelCli` in
     `api.ts`); it then fails with kind `cancelled`. For a command that waits on the user,
-    such as the browser sign-in.
+    such as the browser sign-in. The process gets SIGTERM, so a request it already sent
+    is recorded as cancelled, and SIGKILL if it is still running 3 s later. Windows has no
+    SIGTERM: the process is killed at once, and a sent request keeps the row written before
+    it went out. A process that exits in time answers with its own envelope, marked
+    `cancelled: true` (a failure gets kind `cancelled`, with its own in `error.cli_kind`), so
+    its message still names the history rows; the dev bridge does the same.
 - Value flags are passed as `--flag=value` and free-text positionals after `--`, so values
   starting with `-` aren't read as flags.
 - Messages the GUI edits or resends are loaded with `--max-body=2000000`. One larger than
   that arrives truncated; the GUI then refuses to send it to Replay or the Fuzzer and shows
   an intercepted one read-only (forward or drop it as is).
 - `npm run dev` also serves the UI to a plain browser: `vite.config.ts` adds `POST /api/cli`
-  and `POST /api/cli-cancel` (dev server only; localhost Host and an `X-Brainproxy: 1` header
-  required). It runs
-  `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
+  and `POST /api/cli-cancel` (dev server only; cancelling sends SIGTERM, then SIGKILL after
+  3 s). It runs `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
+  - The bridge runs any command, with none of the MCP limits, so it answers only a localhost
+    Host whose `X-Brainproxy` header is a random token made when the dev server starts. It is
+    printed under the server's URLs (`brainproxy dev bridge: open http://127.0.0.1:5173/#bridge=...`);
+    open that link. `api.ts` keeps the token for the tab (sessionStorage) and takes it off the
+    address bar. The fragment never reaches a server, and no page or file the dev server serves
+    holds the token, so an agent that can reach the port through `send` can't learn it.
+  - Requests with brainproxy's own `User-Agent` (`brainproxy/...`) are refused as well.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
   1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue
   every second while its tab is open. The project is SQLite in WAL mode, so the GUI, the
@@ -182,7 +199,7 @@ anything above 5 MB only after a click.
 ```sh
 cargo build                      # the CLI the GUI runs
 cd gui && npm install
-npm run dev                      # UI in a browser at http://127.0.0.1:5173 (dev bridge)
+npm run dev                      # UI in a browser: open the #bridge= link it prints (dev bridge)
 cargo tauri dev                  # desktop window (from gui/)
 npm run check                    # TypeScript
 npm test                         # unit tests (node --test, e.g. ui/urlencode.test.ts)

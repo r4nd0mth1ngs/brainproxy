@@ -30,9 +30,10 @@ use crate::error::{Error, Result};
 use crate::http::client::{close_after, cut_short, final_response, Conn};
 use crate::http::h2::h2_error;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, WireReader};
+use crate::provenance::Edit;
 use crate::proxy::ca::CertAuthority;
 use crate::proxy::config::{
-    apply_request_rules, apply_response_rules, compile_rules, CompiledIntercept, CompiledRule, CompiledScope,
+    apply_request_rules_traced, apply_response_rules, compile_rules, CompiledIntercept, CompiledRule, CompiledScope,
     InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY, SCOPE_KEY,
 };
 use crate::proxy::h2 as h2p;
@@ -48,6 +49,12 @@ const SETTINGS_REFRESH: Duration = Duration::from_millis(300);
 const RECORD_BUDGET: usize = 64 * 1024 * 1024;
 /// What a queued record counts for besides its bodies, so small ones are bounded too.
 const RECORD_OVERHEAD: usize = 1024;
+/// How long stopping waits for requests already sent upstream to be answered. `proxy stop`
+/// waits up to 30 seconds for the process to exit, which leaves the rest for writing out
+/// the queued captures.
+const DRAIN: Duration = Duration::from_secs(3);
+/// The error of a request still unanswered when the proxy stopped.
+const STOPPED: &str = "proxy stopped before the response arrived";
 
 pub struct ProxyOptions {
     pub project: PathBuf,
@@ -62,6 +69,17 @@ pub struct ProxyOptions {
     pub redirect: Option<Target>,
     /// Live access-control testing: in-scope requests are offered to it once recorded.
     pub authz: Option<Arc<LiveAuthz>>,
+}
+
+tokio::task_local! {
+    /// The client of the connection being served, for the captures made while serving it
+    /// (set per connection, and again on each HTTP/2 stream's task).
+    static PEER: SocketAddr;
+}
+
+/// The address of the proxy client being served, outside a connection None.
+pub(crate) fn client_addr() -> Option<String> {
+    PEER.try_with(|p| p.to_string()).ok()
 }
 
 /// A capture for the writer, with the request to offer for live access-control testing.
@@ -96,6 +114,78 @@ struct Ctx {
     h2_origins: Mutex<HashMap<String, bool>>,
     invisible: bool,
     redirect: Option<Target>,
+    in_flight: Arc<InFlight>,
+}
+
+/// Requests forwarded upstream whose exchange isn't recorded yet. Stopping waits for them
+/// for a while, then records the ones left as failures; meanwhile no new request goes out.
+#[derive(Default)]
+struct InFlight(Mutex<FlightState>);
+
+#[derive(Default)]
+struct FlightState {
+    next: u64,
+    stopping: bool,
+    /// The row to record if it is still unanswered at the end (none if it isn't recorded),
+    /// and whether its exchange is being recorded (claimed). The row is made on the
+    /// connection's task, as every proxy capture is, so it has what that task knows.
+    open: HashMap<u64, (Option<Capture>, bool)>,
+}
+
+/// One request in [`InFlight`], until dropped: once its exchange is queued for the recorder.
+struct Flight {
+    set: Arc<InFlight>,
+    id: u64,
+}
+
+impl InFlight {
+    /// Registers a request about to go upstream; `None` once the proxy is stopping, when
+    /// nothing more may be sent.
+    fn start(self: &Arc<Self>, target: &Target, request: &[u8], record: bool) -> Option<Flight> {
+        let unanswered = record.then(|| unanswered(target, request));
+        let mut s = self.0.lock().unwrap();
+        if s.stopping {
+            return None;
+        }
+        s.next += 1;
+        let id = s.next;
+        s.open.insert(id, (unanswered, false));
+        Some(Flight { set: self.clone(), id })
+    }
+
+    fn stop(&self) {
+        self.0.lock().unwrap().stopping = true;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().open.is_empty()
+    }
+
+    /// Removes the requests nobody is recording yet: their exchanges won't be recorded by
+    /// whoever sent them. Returns their rows, as unanswered.
+    fn take_unclaimed(&self) -> Vec<Capture> {
+        let mut s = self.0.lock().unwrap();
+        let ids: Vec<u64> = s.open.iter().filter(|(_, v)| !v.1).map(|(k, _)| *k).collect();
+        ids.into_iter().filter_map(|id| s.open.remove(&id)).filter_map(|v| v.0).collect()
+    }
+}
+
+/// The row of a request still unanswered when the proxy stopped.
+fn unanswered(target: &Target, request: &[u8]) -> Capture {
+    Capture::new("proxy", target, request, None, None, Some(STOPPED))
+}
+
+impl Flight {
+    /// Claims the exchange for recording. False if stopping already recorded it as unanswered.
+    fn claim(&self) -> bool {
+        self.set.0.lock().unwrap().open.get_mut(&self.id).map(|v| v.1 = true).is_some()
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.set.0.lock().unwrap().open.remove(&self.id);
+    }
 }
 
 /// What the recorder thread writes, in order.
@@ -169,6 +259,10 @@ pub async fn run(
     let budget = recorder.budget.clone();
     let mut writer_store = Store::open(&opts.project)?;
     let authz = opts.authz.clone();
+    // Once the proxy stops, the writer only writes: passive checks of the last captures are
+    // left for the next scan, so the queue is flushed before `proxy stop` gives up waiting.
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stopping = stopping.clone();
     let writer = std::thread::spawn(move || {
         let mut ws_ids = HashMap::new();
         while let Ok(first) = rx.recv() {
@@ -200,6 +294,9 @@ pub async fn run(
             // Written (or given up on): their room is free again.
             drop((captures, ws));
             budget.add_permits(cost);
+            if writer_stopping.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Err(e) = crate::scan::passive::scan_pending(&mut writer_store) {
                 eprintln!("brainproxy: passive scan failed: {e}");
             }
@@ -224,6 +321,7 @@ pub async fn run(
         h2_origins: Mutex::default(),
         invisible: opts.invisible || opts.redirect.is_some(),
         redirect: opts.redirect,
+        in_flight: Arc::default(),
     });
     reload(&ctx).await;
 
@@ -246,18 +344,35 @@ pub async fn run(
                 tcp.set_nodelay(true).ok();
                 ctx.stats.connections.fetch_add(1, Ordering::Relaxed);
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                tokio::spawn(PEER.scope(peer, async move {
                     if let Err(e) = handle_connection(&ctx, tcp, peer).await {
                         ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
                         if !matches!(e, Error::Io(_)) {
                             eprintln!("brainproxy: {peer}: {e}");
                         }
                     }
-                });
+                }));
             }
         }
     }
     refresher.abort();
+    // Requests already sent upstream get a moment to be answered and recorded; the ones
+    // still waiting then are recorded as unanswered.
+    ctx.in_flight.stop();
+    stopping.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + DRAIN;
+    while !ctx.in_flight.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for capture in ctx.in_flight.take_unclaimed() {
+        send_capture(&ctx, capture, None).await;
+    }
+    // Ones being recorded right now are only waiting for room in the queue (or for a
+    // WebSocket connection's opening to be queued).
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !ctx.in_flight.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // Dropping the last sender ends the writer thread once queued captures are written.
     drop(std::mem::replace(&mut *ctx.recorder.tx.lock().unwrap(), mpsc::channel().0));
     drop(ctx);
@@ -555,8 +670,14 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
                 continue;
             }
-            Reply::Upgrade(upgrade) => {
-                client.write_all(&upgrade.response).await?;
+            Reply::Upgrade(mut upgrade) => {
+                if let Err(e) = client.write_all(&upgrade.response).await {
+                    // The client is gone, but the upgrade went upstream and was answered.
+                    if let Some(c) = upgrade.capture.take() {
+                        send_capture(ctx, c, None).await;
+                    }
+                    return Err(e.into());
+                }
                 client.flush().await?;
                 return relay_upgrade(ctx, client, reader.into_leftover(), *upgrade).await;
             }
@@ -595,14 +716,19 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let (req, respond) = accepted.map_err(h2_error)?;
         ctx.stats.requests.fetch_add(1, Ordering::Relaxed);
         let (ctx, target) = (ctx.clone(), target.clone());
-        tokio::spawn(async move {
+        let stream = async move {
             if let Err(e) = serve_h2_stream(&ctx, req, respond, &target).await {
                 ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
                 if !matches!(e, Error::Io(_)) {
                     eprintln!("brainproxy: {}: HTTP/2 stream: {e}", target.origin());
                 }
             }
-        });
+        };
+        // A task of its own doesn't see the connection's client address: hand it on.
+        match PEER.try_with(|p| *p) {
+            Ok(peer) => tokio::spawn(PEER.scope(peer, stream)),
+            Err(_) => tokio::spawn(stream),
+        };
     }
     Ok(())
 }
@@ -666,6 +792,8 @@ struct Upgrade {
     conn: Option<Conn>,
     /// The upgrade exchange, when it is to be recorded.
     capture: Option<Capture>,
+    /// Keeps stopping waiting until the capture is queued.
+    flight: Option<Flight>,
     /// Intercept may apply (as to the upgrade request).
     in_scope: bool,
     host: String,
@@ -694,8 +822,12 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
 
     let auth = ctx.auth.as_ref().filter(|_| in_scope);
     let mut prepared = None;
+    // Who changed the request on its way: the row's origin is the proxy's, not theirs.
+    let mut edited_by = Vec::new();
     if in_scope {
-        request = apply_request_rules(&live.rules, request);
+        let (ruled, changed_by) = apply_request_rules_traced(&live.rules, request);
+        request = ruled;
+        edited_by.extend(changed_by.iter().map(|r| Edit { by: r.origin.clone(), intercept: None, rule: Some(r.id) }));
         if let Some(a) = auth {
             let p = a.prepare(Tool::Proxy, target, &request, &[], &[]).await;
             request = p.request.clone();
@@ -703,7 +835,10 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         }
         if live.intercept.matches(false, &method, &target.host, &path) {
             match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
-                Some(edited) => request = edited,
+                Some(released) => {
+                    request = released.message;
+                    edited_by.extend(released.edit);
+                }
                 None => {
                     return Ok(Reply::Error(error_response(502, "dropped", "request dropped by brainproxy"), false))
                 }
@@ -714,16 +849,31 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // A rule or an edit may have changed the method (GET to HEAD): the response is framed
     // by the one sent.
     let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or(method);
-    let started = Instant::now();
+    let Some(mut flight) = ctx.in_flight.start(target, &request, record) else {
+        return Ok(Reply::Error(error_response(503, "stopping", "the proxy is stopping"), true));
+    };
+    let mut started = Instant::now();
     let mut upstream = forward(ctx, target, &request, &method, h2).await;
-    if let (Some(a), Some(p), Ok(up)) = (auth, &prepared, &upstream) {
+    if let (Some(a), Some(p), Ok(Upstream { sent, response, .. })) = (auth, &prepared, &upstream) {
         // Session lost or stale session values: log in again or refresh them, and
         // replay the request with the new session.
-        if a.after_response(p, &up.response).await {
-            request = a.prepare(Tool::Proxy, target, &request, &[], &[]).await.request;
-            upstream = forward(ctx, target, &request, &method, h2).await;
-            if let Ok(up) = &upstream {
-                a.observe(&up.response);
+        if a.after_response(p, response).await {
+            let retry = a.prepare(Tool::Proxy, target, &request, &[], &[]).await.request;
+            // Not once the proxy is stopping: then the first answer stands.
+            if let Some(next) = ctx.in_flight.start(target, &retry, record) {
+                // The first exchange went out and was answered: it has its own row.
+                if record && flight.claim() {
+                    let ms = Some(started.elapsed().as_millis() as i64);
+                    let c = Capture::new("proxy", target, sent, Some(response), ms, None);
+                    send_capture(ctx, Capture { edited_by: edited_by.clone(), ..c }, None).await;
+                }
+                flight = next;
+                request = retry;
+                started = Instant::now();
+                upstream = forward(ctx, target, &request, &method, h2).await;
+                if let Ok(up) = &upstream {
+                    a.observe(&up.response);
+                }
             }
         }
     }
@@ -731,9 +881,10 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         Ok(v) => v,
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
-            if record {
-                send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())), None)
-                    .await;
+            if record && flight.claim() {
+                let mut c = Capture::new("proxy", target, &request, None, None, Some(&e.to_string()));
+                c.edited_by = edited_by;
+                send_capture(ctx, c, None).await;
             }
             let status = if matches!(e, Error::OutOfScope(_)) { 403 } else { 502 };
             return Ok(Reply::Error(error_response(status, e.kind(), &e.to_string()), false));
@@ -741,9 +892,13 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     };
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
-    let capture = record.then(|| Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
+    // Not recorded again if stopping has already recorded it as unanswered.
+    let capture = (record && flight.claim())
+        .then(|| Capture { edited_by, ..Capture::new("proxy", target, &sent, Some(&response), Some(duration), None) });
     if status == Some(101) {
-        let upgrade = Upgrade { response, conn, capture, in_scope, host: target.host.clone(), path, url };
+        // In flight until its connection's opening is queued.
+        let flight = Some(flight);
+        let upgrade = Upgrade { response, conn, capture, flight, in_scope, host: target.host.clone(), path, url };
         return Ok(Reply::Upgrade(Box::new(upgrade)));
     }
     if let Some(c) = capture {
@@ -751,6 +906,8 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         let authz = (in_scope && ctx.authz.is_some()).then(|| (target.clone(), sent.clone()));
         send_capture(ctx, c, authz).await;
     }
+    // Recorded: stopping needn't wait for the response rules or a response held in intercept.
+    drop(flight);
     if let Some(conn) = conn.filter(|_| !close_after(&sent, &response, &method)) {
         ctx.client.checkin(target, conn);
     }
@@ -758,7 +915,8 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let mut response = if in_scope { apply_response_rules(&live.rules, response) } else { response };
     if in_scope && live.intercept.matches(true, &method, &target.host, &path) {
         match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
-            Some(edited) => response = edited,
+            // The exchange is recorded as received; the intercept row says who edited the response.
+            Some(released) => response = released.message,
             None => return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true)),
         }
     }
@@ -773,8 +931,13 @@ async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
     from_client: Vec<u8>,
     upgrade: Upgrade,
 ) -> Result<()> {
-    let Upgrade { response, conn, capture, in_scope, host, path, url } = upgrade;
-    let Some(mut conn) = conn else { return Ok(()) };
+    let Upgrade { response, conn, capture, flight, in_scope, host, path, url } = upgrade;
+    let Some(mut conn) = conn else {
+        if let Some(c) = capture {
+            send_capture(ctx, c, None).await;
+        }
+        return Ok(());
+    };
     let from_server = std::mem::take(&mut conn.reader).into_leftover();
     // After any 1xx interim responses (103 Early Hints).
     let head = parse_response_head(final_response(&response)).ok().filter(crate::ws::is_upgrade_response);
@@ -782,6 +945,7 @@ async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
         if let Some(c) = capture {
             send_capture(ctx, c, None).await;
         }
+        drop(flight);
         conn.stream.write_all(&from_client).await?;
         client.write_all(&from_server).await?;
         tokio::io::copy_bidirectional(&mut client, &mut conn.stream).await?;
@@ -801,6 +965,7 @@ async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
         };
         ctx.recorder.send(Record::Ws(open), bytes).await;
     }
+    drop(flight);
     let hooks = WsHooks { ctx: ctx.clone(), key, recording, in_scope, host, path, url, unrecorded: AtomicU64::new(0) };
     let ended =
         crate::ws::relay::relay(client, from_client, conn.stream, from_server, Deflate::from_response(&head), &hooks)
@@ -865,7 +1030,7 @@ impl Hooks for WsHooks {
             message.payload.clone(),
         )
         .await;
-        match held {
+        match held.map(|r| r.map(|r| r.message)) {
             Ok(Some(p)) if p == message.payload => Hold::Forward,
             Ok(Some(p)) => Hold::Edited(p),
             Ok(None) => Hold::Drop,
@@ -995,10 +1160,16 @@ impl Drop for HeldRow {
             // Not on this thread: drop may run on the async runtime, and the write can wait for a lock.
             std::thread::spawn(move || {
                 // It may have been resolved at the same moment; then there is nothing to do.
-                let _ = ctx.control.lock().unwrap().intercept_resolve(id, "dropped", None);
+                let _ = ctx.control.lock().unwrap().intercept_resolve(id, "dropped", None, None);
             });
         }
     }
+}
+
+/// A held message once it may go on: as forwarded, and who edited it, if anyone did.
+struct Released {
+    message: Vec<u8>,
+    edit: Option<Edit>,
 }
 
 /// Holds a message in the intercept queue until it is forwarded (possibly
@@ -1011,7 +1182,7 @@ async fn hold(
     url: &str,
     status: Option<u16>,
     message: Vec<u8>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Released>> {
     let id = {
         let (c, method, url, msg) = (ctx.clone(), method.to_string(), url.to_string(), message.clone());
         tokio::task::spawn_blocking(move || {
@@ -1025,13 +1196,19 @@ async fn hold(
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         let c = ctx.clone();
-        let (state, edited) = tokio::task::spawn_blocking(move || c.control.lock().unwrap().intercept_state(id))
+        let held = tokio::task::spawn_blocking(move || c.control.lock().unwrap().intercept_state(id))
             .await
             .map_err(|e| Error::Protocol(e.to_string()))??;
-        match state.as_str() {
+        match held.state.as_str() {
             "forwarded" => {
                 row.decided = true;
-                return Ok(Some(edited.unwrap_or(message)));
+                // A replacement identical to the message as held is no edit.
+                let edit = held.edited.as_ref().filter(|e| **e != message).map(|_| Edit {
+                    by: held.resolved_by.clone(),
+                    intercept: Some(id),
+                    rule: None,
+                });
+                return Ok(Some(Released { message: held.edited.unwrap_or(message), edit }));
             }
             "dropped" => {
                 row.decided = true;
@@ -1041,7 +1218,7 @@ async fn hold(
                 let c = ctx.clone();
                 // The CLI may resolve it at the same moment; whoever wins decides.
                 let expired = tokio::task::spawn_blocking(move || {
-                    c.control.lock().unwrap().intercept_resolve(id, "expired", None)
+                    c.control.lock().unwrap().intercept_resolve(id, "expired", None, None)
                 })
                 .await
                 .map_err(|e| Error::Protocol(e.to_string()))?;
@@ -1050,7 +1227,7 @@ async fn hold(
                 }
                 row.decided = true;
                 return Ok(match intercept.settings.timeout_action {
-                    TimeoutAction::Forward => Some(message),
+                    TimeoutAction::Forward => Some(Released { message, edit: None }),
                     TimeoutAction::Drop => None,
                 });
             }
@@ -1088,6 +1265,7 @@ pub(crate) fn error_response(status: u16, kind: &str, message: &str) -> Vec<u8> 
     let reason = match status {
         400 => "Bad Request",
         403 => "Forbidden",
+        503 => "Service Unavailable",
         _ => "Bad Gateway",
     };
     let body = format!("brainproxy: {message}\n");

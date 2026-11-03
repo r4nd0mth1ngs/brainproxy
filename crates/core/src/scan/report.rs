@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::guard::ScopeSpec;
+use crate::provenance;
 use crate::scan::findings_db::FindingFilter;
 use crate::store::Store;
 
@@ -71,7 +72,26 @@ pub struct Report {
     pub filters: Value,
     pub summary: Summary,
     pub alerts: Vec<AlertGroup>,
+    /// Findings an agent marked false positive that the state filter leaves out (at most
+    /// [`MAX_AGENT_FALSE_POSITIVES`]), so a reader sees what an agent hid.
+    pub agent_false_positives: Vec<HiddenFinding>,
 }
+
+/// A finding left out of the report because it was marked false positive.
+#[derive(Debug, Clone, Serialize)]
+pub struct HiddenFinding {
+    pub id: i64,
+    pub name: String,
+    pub risk: String,
+    pub method: String,
+    pub url: String,
+    pub param: String,
+    pub state_changed_at: Option<String>,
+    pub note: Option<String>,
+}
+
+/// How many findings an agent marked false positive a report lists by name.
+pub const MAX_AGENT_FALSE_POSITIVES: usize = 100;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Tool {
@@ -89,6 +109,16 @@ pub struct Summary {
     pub alert_types: usize,
     /// Matching findings per risk, high to info.
     pub by_risk: Vec<RiskCount>,
+    /// Findings matching the other filters that are left out because they were marked false
+    /// positive, by who marked them (none when the state filter includes false positives).
+    pub false_positives_left_out: Vec<OriginCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OriginCount {
+    /// gui, cli or mcp; None when unknown (marked before brainproxy kept it).
+    pub origin: Option<String>,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +162,17 @@ pub struct Instance {
     pub state: String,
     pub note: Option<String>,
     pub history_id: Option<i64>,
+    /// Who or what added it: gui, cli, mcp; None from before brainproxy kept it.
+    pub origin: Option<String>,
+    /// Who last changed its state with `findings mark` (gui, cli, mcp), and when; None if
+    /// nobody has.
+    pub state_origin: Option<String>,
+    pub state_changed_at: Option<String>,
+    /// The state and who set it, in words: "confirmed via MCP (an agent) at ...".
+    pub state_text: String,
+    /// Who last set the note, and when.
+    pub note_origin: Option<String>,
+    pub note_changed_at: Option<String>,
     pub request: Option<HttpRequest>,
     pub response: Option<HttpResponse>,
 }
@@ -184,6 +225,25 @@ impl Body {
 
 const RISKS: [&str; 4] = ["high", "medium", "low", "info"];
 
+/// A finding's state and who set it, in words.
+fn state_text(state: &str, by: Option<&str>, at: Option<&str>) -> String {
+    let state = state.replace('_', " ");
+    match (by, at) {
+        (None, None) if state == "open" => state,
+        (None, None) => format!("{state} (by whom is unknown)"),
+        (by, at) => {
+            let at = at.map(|t| format!(" at {t}")).unwrap_or_default();
+            format!("{state} {}{at}", provenance::describe(by))
+        }
+    }
+}
+
+/// A person (the desktop app or the command line) set this state, as opposed to an agent or
+/// someone unknown.
+fn by_a_person(origin: Option<&str>) -> bool {
+    matches!(origin, Some("gui" | "cli"))
+}
+
 /// Builds a report from the project's findings.
 pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     if opts.limit == 0 {
@@ -210,7 +270,8 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         "SELECT f.id, f.time, f.source, f.risk, f.confidence, f.host, f.method, f.url, f.param, f.evidence,
             coalesce(f.attack, ''), f.other_info, f.hits, f.state, f.note, f.history_id,
             f.alert_ref, f.rule_id, f.name, f.cwe, f.wasc,
-            coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]')
+            coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]'),
+            f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
          ORDER BY f.risk_level DESC, f.alert_ref, f.id LIMIT {}",
         opts.limit
@@ -221,6 +282,8 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     let mut included = 0;
     while let Some(r) = rows.next()? {
         included += 1;
+        let (state, state_origin, state_changed_at): (String, Option<String>, Option<String>) =
+            (r.get(13)?, r.get(26)?, r.get(27)?);
         let inst = Instance {
             id: r.get(0)?,
             time: r.get(1)?,
@@ -235,9 +298,15 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             attack: r.get(10)?,
             other_info: r.get(11)?,
             hits: r.get(12)?,
-            state: r.get(13)?,
+            state_text: state_text(&state, state_origin.as_deref(), state_changed_at.as_deref()),
+            state,
             note: r.get(14)?,
             history_id: r.get(15)?,
+            origin: r.get(25)?,
+            state_origin,
+            state_changed_at,
+            note_origin: r.get(28)?,
+            note_changed_at: r.get(29)?,
             request: None,
             response: None,
         };
@@ -277,6 +346,43 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         }
     }
 
+    // False positives the state filter leaves out: counted by who marked them, and the ones an
+    // agent marked listed, so they don't vanish from the report unseen.
+    let mut false_positives_left_out = Vec::new();
+    let mut agent_false_positives = Vec::new();
+    let fp_included =
+        matches!(opts.filter.state.as_deref().map(|s| s.replace('-', "_")).as_deref(), Some("all" | "false_positive"));
+    if !fp_included {
+        let fp = FindingFilter { state: Some("false_positive".into()), ..opts.filter.clone() };
+        let (fp_where, fp_args) = fp.sql();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT state_origin, count(*) FROM findings WHERE {fp_where} GROUP BY state_origin ORDER BY 2 DESC"
+        ))?;
+        false_positives_left_out = stmt
+            .query_map(rusqlite::params_from_iter(fp_args.iter()), |r| {
+                Ok(OriginCount { origin: r.get(0)?, count: r.get::<_, i64>(1)? as usize })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, name, risk, method, url, param, state_changed_at, note FROM findings
+             WHERE {fp_where} AND state_origin = 'mcp' ORDER BY risk_level DESC, id LIMIT {MAX_AGENT_FALSE_POSITIVES}"
+        ))?;
+        agent_false_positives = stmt
+            .query_map(rusqlite::params_from_iter(fp_args.iter()), |r| {
+                Ok(HiddenFinding {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    risk: r.get(2)?,
+                    method: r.get(3)?,
+                    url: r.get(4)?,
+                    param: r.get(5)?,
+                    state_changed_at: r.get(6)?,
+                    note: r.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+    }
+
     let generated: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
     let f = &opts.filter;
     let mut filters = json!({
@@ -296,8 +402,16 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         tool: Tool { name: "brainproxy", version: env!("CARGO_PKG_VERSION") },
         scope: store.engagement().ok().flatten(),
         filters,
-        summary: Summary { total, included, truncated: included < total, alert_types: groups.len(), by_risk },
+        summary: Summary {
+            total,
+            included,
+            truncated: included < total,
+            alert_types: groups.len(),
+            by_risk,
+            false_positives_left_out,
+        },
         alerts: groups,
+        agent_false_positives,
     })
 }
 
@@ -341,6 +455,29 @@ pub fn render(report: &Report, kind: ReportKind) -> String {
         ReportKind::Html => html(report),
         ReportKind::Sarif => serde_json::to_string_pretty(&sarif(report)).unwrap_or_default() + "\n",
     }
+}
+
+/// "3 findings marked false positive are left out: 2 via MCP (an agent), 1 from the desktop app."
+fn left_out_text(r: &Report) -> Option<String> {
+    let total: usize = r.summary.false_positives_left_out.iter().map(|c| c.count).sum();
+    if total == 0 {
+        return None;
+    }
+    let by: Vec<String> = r
+        .summary
+        .false_positives_left_out
+        .iter()
+        .map(|c| match c.origin.as_deref() {
+            None => format!("{} by whom is unknown", c.count),
+            by => format!("{} {}", c.count, provenance::describe(by)),
+        })
+        .collect();
+    Some(format!(
+        "{total} finding{} marked false positive {} left out of this report: {}.",
+        if total == 1 { "" } else { "s" },
+        if total == 1 { "is" } else { "are" },
+        by.join(", ")
+    ))
 }
 
 fn risk_title(risk: &str) -> &'static str {
@@ -444,8 +581,12 @@ fn markdown(r: &Report) -> String {
             r.summary.included, r.summary.total
         );
     }
+    if let Some(t) = left_out_text(r) {
+        let _ = writeln!(s, "> {t}\n");
+    }
     if r.alerts.is_empty() {
         s.push_str("No findings match the filters.\n");
+        md_agent_false_positives(&mut s, r);
         return s;
     }
     s.push_str("| # | Risk | Alert | Instances |\n|---:|---|---|---:|\n");
@@ -481,8 +622,13 @@ fn markdown(r: &Report) -> String {
             let _ = writeln!(s, "#### {} {}\n", inst.method, md_code(&inst.url));
             let _ = writeln!(
                 s,
-                "- Finding #{} · {} · confidence {} · {} · seen {}×",
-                inst.id, inst.source, inst.confidence, inst.state, inst.hits
+                "- Finding #{} · {} · confidence {} · {} · seen {}× · added {}",
+                inst.id,
+                inst.source,
+                inst.confidence,
+                inst.state_text,
+                inst.hits,
+                provenance::describe(inst.origin.as_deref())
             );
             if !inst.param.is_empty() {
                 let _ = writeln!(s, "- Parameter: {}", md_code(&inst.param));
@@ -494,7 +640,7 @@ fn markdown(r: &Report) -> String {
                 let _ = writeln!(s, "- Attack: {}", md_code(&inst.attack));
             }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
-                let _ = writeln!(s, "- Note: {}", md_code(n));
+                let _ = writeln!(s, "- Note ({}): {}", note_by(inst), md_code(n));
             }
             s.push('\n');
             if !inst.other_info.is_empty() {
@@ -510,7 +656,45 @@ fn markdown(r: &Report) -> String {
             }
         }
     }
+    md_agent_false_positives(&mut s, r);
     s
+}
+
+/// Who wrote a finding's note, in words.
+fn note_by(inst: &Instance) -> String {
+    match (&inst.note_origin, &inst.note_changed_at) {
+        (None, _) => "by whom is unknown".into(),
+        (by, at) => {
+            let at = at.as_deref().map(|t| format!(" at {t}")).unwrap_or_default();
+            format!("written {}{at}", provenance::describe(by.as_deref()))
+        }
+    }
+}
+
+fn md_agent_false_positives(s: &mut String, r: &Report) {
+    if r.agent_false_positives.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "## Marked false positive by an agent\n\nThese findings were marked false positive via MCP (an agent), \
+         not by a person, and are left out above.\n"
+    );
+    for h in &r.agent_false_positives {
+        let _ =
+            write!(s, "- #{} {} ({}) · {} {}", h.id, md_text(&h.name), risk_title(&h.risk), h.method, md_code(&h.url));
+        if !h.param.is_empty() {
+            let _ = write!(s, " · parameter {}", md_code(&h.param));
+        }
+        if let Some(t) = &h.state_changed_at {
+            let _ = write!(s, " · at {t}");
+        }
+        if let Some(n) = h.note.as_deref().filter(|n| !n.is_empty()) {
+            let _ = write!(s, " · note {}", md_code(n));
+        }
+        s.push('\n');
+    }
+    s.push('\n');
 }
 
 // ---------- HTML ----------
@@ -691,6 +875,14 @@ fn html(r: &Report) -> String {
             r.summary.included, r.summary.total
         );
     }
+    if let Some(t) = left_out_text(r) {
+        let link = if r.agent_false_positives.is_empty() {
+            ""
+        } else {
+            " <a href=\"#agent-fp\">See the ones an agent marked.</a>"
+        };
+        let _ = writeln!(s, "<p class=\"note\">{}{link}</p>", esc(&t));
+    }
     let urgent: Vec<(usize, &AlertGroup)> =
         r.alerts.iter().enumerate().filter(|(_, g)| g.risk == "high" || g.risk == "medium").take(10).collect();
     if !urgent.is_empty() {
@@ -749,8 +941,13 @@ fn html(r: &Report) -> String {
             "<table class=\"where\"><thead><tr><th>Address</th><th>Field</th><th>Certainty</th></tr></thead><tbody>",
         );
         for inst in &g.instances {
+            // Only a person's confirmation reads as checked by the tester.
             let state = match inst.state.as_str() {
-                "confirmed" => " <span class=\"tag\">confirmed</span>",
+                "confirmed" if by_a_person(inst.state_origin.as_deref()) => " <span class=\"tag\">confirmed</span>",
+                "confirmed" if inst.state_origin.as_deref() == Some("mcp") => {
+                    " <span class=\"tag\">confirmed via MCP (an agent)</span>"
+                }
+                "confirmed" => " <span class=\"tag\">confirmed (by whom is unknown)</span>",
                 _ => "",
             };
             let _ = write!(
@@ -799,13 +996,17 @@ fn html(r: &Report) -> String {
                 "Finding",
                 format!("#{} · {} · {}× seen · {}", inst.id, esc(&inst.source), inst.hits, esc(&inst.state)),
             );
+            row("Added", esc(provenance::describe(inst.origin.as_deref())));
+            if inst.state_origin.is_some() || inst.state != "open" {
+                row("State", esc(&inst.state_text));
+            }
             for (k, v) in [("Parameter", &inst.param), ("Evidence", &inst.evidence), ("Attack", &inst.attack)] {
                 if !v.is_empty() {
                     row(k, format!("<code>{}</code>", esc(v)));
                 }
             }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
-                row("Note", esc(n));
+                row("Note", format!("{} <span class=\"muted\">({})</span>", esc(n), esc(&note_by(inst))));
             }
             s.push_str("</dl>");
             if !inst.other_info.is_empty() {
@@ -824,13 +1025,43 @@ fn html(r: &Report) -> String {
         s.push_str("</details></section>\n");
     }
 
+    // ---- What an agent hid.
+    if !r.agent_false_positives.is_empty() {
+        s.push_str(
+            "<h2 id=\"agent-fp\">Marked false positive by an agent</h2><p>These findings were marked false positive \
+             via MCP (an agent), not by a person, and are left out above.</p>\
+             <table><thead><tr><th class=\"n\">#</th><th>Issue</th><th>Risk</th><th>Address</th><th>Marked</th>\
+             <th>Note</th></tr></thead><tbody>\n",
+        );
+        for h in &r.agent_false_positives {
+            let _ = writeln!(
+                s,
+                "<tr><td class=\"n\">{}</td><td>{}</td><td><span class=\"badge {}\">{}</span></td>\
+                 <td><code>{} {}</code>{}</td><td>{}</td><td>{}</td></tr>",
+                h.id,
+                esc(&h.name),
+                esc(&h.risk),
+                risk_title(&h.risk),
+                esc(&h.method),
+                esc(&h.url),
+                if h.param.is_empty() { String::new() } else { format!(" <code>{}</code>", esc(&h.param)) },
+                esc(h.state_changed_at.as_deref().unwrap_or("")),
+                esc(h.note.as_deref().unwrap_or(""))
+            );
+        }
+        s.push_str("</tbody></table>\n");
+    }
+
     // ---- How to read it.
     s.push_str(
         "<h2>About this report</h2>\
          <p>The findings come from automated tests that look at the site's traffic and send attack requests, as an \
          attacker would. <strong>Certainty</strong> says how sure a test is: low-certainty findings need a person to \
          confirm them, and some may turn out not to be real. A finding marked <span class=\"tag\">confirmed</span> was \
-         checked by the tester. Automated tests can't find every problem (for example flaws in business logic), so \
+         checked by the tester, from the desktop app or the command line; one marked <span class=\"tag\">confirmed via \
+         MCP (an agent)</span> was confirmed by an AI agent and not by a person. Each finding also says how it was \
+         added (from the desktop app, from the command line, or via MCP, by an AI agent) and, in its technical \
+         details, who last changed its state and when. Automated tests can't find every problem (for example flaws in business logic), so \
          a short or empty report doesn't prove a site is secure.</p>\n",
     );
     s.push_str("</main></body></html>\n");
@@ -961,10 +1192,17 @@ fn sarif(r: &Report) -> Value {
                     "hits": inst.hits,
                     "state": inst.state,
                     "historyId": inst.history_id,
+                    "origin": inst.origin,
+                    "originText": format!("added {}", provenance::describe(inst.origin.as_deref())),
+                    "stateOrigin": inst.state_origin,
+                    "stateChangedAt": inst.state_changed_at,
+                    "stateText": inst.state_text,
                 },
             });
             if let Some(n) = &inst.note {
                 res["properties"]["note"] = json!(n);
+                res["properties"]["noteOrigin"] = json!(inst.note_origin);
+                res["properties"]["noteChangedAt"] = json!(inst.note_changed_at);
             }
             if inst.state == "confirmed" {
                 res["baselineState"] = json!("unchanged");
@@ -1011,7 +1249,12 @@ fn sarif(r: &Report) -> Value {
             "automationDetails": {"id": format!("brainproxy/{}", r.generated)},
             "columnKind": "unicodeCodePoints",
             "results": results,
-            "properties": {"summary": r.summary, "scope": r.scope, "filters": r.filters},
+            "properties": {
+                "summary": r.summary,
+                "scope": r.scope,
+                "filters": r.filters,
+                "agentFalsePositives": r.agent_false_positives,
+            },
         }],
     })
 }

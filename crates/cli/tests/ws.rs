@@ -533,6 +533,21 @@ fn ws_send_replays_a_connection() {
     assert_eq!(r["stopped"], "wait");
     assert_eq!(r["connection_id"], Value::Null);
     assert_eq!(r["messages"][1]["payload"]["encoding"], "base64");
+    // --no-store keeps the handshake's request line, and nothing of the connection.
+    let row = env.ok(&[
+        "query",
+        "SELECT request, status, error FROM history WHERE id = ?1",
+        "-p",
+        &r["history_id"].to_string(),
+    ]);
+    assert_eq!(
+        row["rows"],
+        serde_json::json!([[
+            "GET /fresh HTTP/1.1\r\n\r\n",
+            null,
+            "not stored (--no-store): content omitted; response status 101"
+        ]])
+    );
     assert!(started.elapsed() < Duration::from_secs(5));
 
     // A 101 after 103 Early Hints is an upgrade; closing on --until still records the server's close.
@@ -549,4 +564,54 @@ fn ws_send_replays_a_connection() {
     // The engagement scope applies.
     let (code, v) = env.run(&["ws", "send", "--url", "ws://192.0.2.1/x", "-m", "x"]);
     assert_eq!((code, v["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{v}");
+}
+
+/// Starts `ws send` that keeps listening, and waits until its message and the echo are recorded.
+fn ws_send_listening(env: &Env, port: u16) -> std::process::Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&env.project)
+        .arg("--home")
+        .arg(&env.home)
+        .args(["ws", "send", "--url", &format!("ws://127.0.0.1:{port}/live"), "-m", "hello", "--wait", "60"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        let rows = env.ok(&["query", "SELECT direction, payload_text FROM ws_messages ORDER BY id"])["rows"].clone();
+        if rows.as_array().unwrap().len() == 2 {
+            assert_eq!(rows, serde_json::json!([["to-server", "hello"], ["to-client", "echo: hello"]]));
+            return child;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("ws send didn't record its messages as they happened");
+}
+
+#[test]
+fn ws_send_records_as_it_goes() {
+    let env = Env::new("live");
+    let port = spawn_ws_echo();
+    // Killed while listening: the handshake, the connection, and both messages are on record.
+    let mut child = ws_send_listening(&env, port);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let sql =
+        "SELECT c.source, c.state, h.status, h.source FROM ws_connections c JOIN history h ON h.id = c.history_id";
+    let c = env.ok(&["query", sql]);
+    assert_eq!(c["rows"], serde_json::json!([["replay", "open", 101, "ws"]]));
+
+    // Stopped with SIGTERM: the close is recorded with why.
+    #[cfg(unix)]
+    {
+        let env = Env::new("live-term");
+        let child = ws_send_listening(&env, port);
+        Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_ne!(out.status.code(), Some(0));
+        let c = env.ok(&["query", "SELECT state, error FROM ws_connections"]);
+        assert_eq!(c["rows"], serde_json::json!([["closed", "cancelled by user before a response was recorded"]]));
+    }
 }
