@@ -64,10 +64,12 @@ pub fn project(path: &Path, cmd: ProjectCmd, out: &Out) -> Result<(), Error> {
 fn stop_all(path: &Path) -> Result<Value, Error> {
     let store = Store::open(path)?;
     // A `proxy restart` under way refuses a stop until its proxy is up: the rest is stopped
-    // meanwhile, and that proxy afterwards.
-    let first = crate::proxy_cmd::stop(&store);
-    let restarting = first.is_err() && crate::proxy_cmd::restarting(&store)?;
-    let mut proxy = if restarting { None } else { first?.map(|(pid, _)| pid) };
+    // meanwhile, and that proxy afterwards. The stop says so as it reads the record, so a
+    // restart finishing in between is stopped too.
+    let (mut proxy, restarting) = match crate::proxy_cmd::stop_or_held(&store)? {
+        crate::proxy_cmd::Stop::Done(stopped) => (stopped.map(|(pid, _)| pid), false),
+        crate::proxy_cmd::Stop::Held(_) => (None, true),
+    };
     let oob = crate::oob_cmd::stop(&store)?.map(|(pid, _)| pid);
     let work = store.unfinished_work()?;
 

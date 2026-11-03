@@ -37,6 +37,8 @@ pub(crate) const RESTART_WAIT: Duration = Duration::from_secs(60);
 /// finish its tests and save the run.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 const STOP_WAIT_AUTHZ: Duration = Duration::from_secs(30);
+/// The longest `--wait` that `start` and `restart` take, in seconds.
+const MAX_WAIT: f64 = 3600.0;
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -97,7 +99,7 @@ pub struct ProxyRunArgs {
     /// Upstream connect/response timeout in seconds.
     #[arg(long, default_value_t = 30.0)]
     timeout: f64,
-    /// Seconds `start` waits for the proxy to come up.
+    /// Seconds `start` waits for the proxy to come up (at most 3600).
     #[arg(long, default_value_t = 10.0)]
     wait: f64,
     /// Log file for `start` (default: next to the project file).
@@ -410,7 +412,7 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
 
 /// The stored state plus the proxy's process start time, so a later process that reuses
 /// the pid isn't taken for the proxy. States written by older versions lack it.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Saved {
     #[serde(flatten)]
     state: ProxyState,
@@ -425,6 +427,15 @@ struct Saved {
     /// another namespace it is judged by [`RESTART_LOCK`], not by the proxy's lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     restart: Option<String>,
+    /// A restart's hold only: the record of the proxy it replaces, as stored. If the restart goes
+    /// away while that proxy still runs, the proxy gets it back (see [`recorded`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    was: Option<String>,
+    /// Set by `proxy stop` from before it asks the proxy to exit until the proxy is gone, so that
+    /// a restart can't take the record meanwhile and start a proxy the stop meant to be off. The
+    /// request itself ([`STOP_KEY`]) doesn't last that long: the proxy takes it as it sees it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stopping: bool,
     /// The record as stored. It is only ever replaced or cleared if it still reads the same.
     #[serde(skip)]
     raw: String,
@@ -444,16 +455,27 @@ fn liveness(store: &Store, s: &Saved) -> Liveness {
     process::liveness(store, lock, s.state.pid, s.start_time, s.pid_ns.as_deref())
 }
 
-/// The saved state and what is known about it, clearing stale state left by a crash.
+/// The saved state and what is known about it, clearing stale state left by a crash. A
+/// restart's hold whose restart has gone gives the record back to the proxy it was replacing,
+/// if that still runs.
 fn recorded(store: &Store) -> Result<Option<(Saved, Liveness)>, Error> {
     let Some(s) = read_state(store)? else { return Ok(None) };
     match liveness(store, &s) {
         Liveness::Gone => {
-            store.meta_swap(STATE_KEY, Some(&s.raw), None)?;
-            Ok(None)
+            let back = replaced(store, &s);
+            if store.meta_swap(STATE_KEY, Some(&s.raw), back.as_ref().map(|b| b.raw.as_str()))? && back.is_none() {
+                return Ok(None);
+            }
+            // Given back, or changed meanwhile: judge what is there now.
+            recorded(store)
         }
         known => Ok(Some((s, known))),
     }
+}
+
+/// The proxy that the restart holding `s` was replacing, if that proxy still runs.
+fn replaced(store: &Store, s: &Saved) -> Option<Saved> {
+    s.was.as_deref().and_then(parse_state).filter(|w| w.restart.is_none() && liveness(store, w) != Liveness::Gone)
 }
 
 /// The running proxy's saved state, clearing stale state left by a crash. Not a restart's
@@ -475,14 +497,60 @@ pub(crate) fn running_here(store: &Store) -> Result<Option<ProxyState>, Error> {
 /// Stops this project's proxy if one runs: its pid, and whether it had to be killed. Refused
 /// while a restart holds the record.
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
-    let Some((saved, known)) = recorded(store)? else { return Ok(None) };
-    if saved.restart.is_some() {
-        return Err(already_running(&saved, known));
+    match stop_or_held(store)? {
+        Stop::Done(stopped) => Ok(stopped),
+        Stop::Held(refusal) => Err(refusal),
     }
-    let forced = halt(store, &saved)?;
-    store.meta_swap(STATE_KEY, Some(&saved.raw), None)?;
+}
+
+/// What [`stop_or_held`] did.
+pub(crate) enum Stop {
+    /// The proxy's pid and whether it had to be killed, or `None` if none ran.
+    Done(Option<(u32, bool)>),
+    /// A restart that still runs holds the record, so nothing was stopped: `stop`'s refusal.
+    Held(Error),
+}
+
+/// [`stop`], telling a restart's hold from a failure as it reads the record.
+pub(crate) fn stop_or_held(store: &Store) -> Result<Stop, Error> {
+    // Marked as being stopped before it is asked to exit (see `Saved::stopping`).
+    let (saved, stopping) = loop {
+        let Some((saved, known)) = recorded(store)? else { return Ok(Stop::Done(None)) };
+        if saved.restart.is_some() {
+            let refusal = already_running(&saved, known);
+            return if known == Liveness::Running { Ok(Stop::Held(refusal)) } else { Err(refusal) };
+        }
+        if saved.stopping {
+            let raw = saved.raw.clone();
+            break (saved, raw);
+        }
+        let stopping = serde_json::to_string(&Saved { stopping: true, ..saved.clone() }).unwrap_or_default();
+        if store.meta_swap(STATE_KEY, Some(&saved.raw), Some(&stopping))? {
+            break (saved, stopping);
+        }
+        // A restart took it, or the proxy exited, since it was read.
+    };
+    let forced = match halt(store, &saved) {
+        Ok(forced) => forced,
+        Err(e) => {
+            // It still runs: back to its record as found.
+            store.meta_swap(STATE_KEY, Some(&stopping), Some(&saved.raw))?;
+            return Err(e);
+        }
+    };
     store.meta_set(STOP_KEY, None)?;
-    Ok(Some((saved.state.pid, forced)))
+    // The proxy clears its record as it exits. Anything there now is another proxy's.
+    store.meta_swap(STATE_KEY, Some(&stopping), None)?;
+    if let Some((now, _)) = recorded(store)? {
+        return Err(Error::Conflict(format!(
+            "stopped the proxy ({}), but another one has started since, on {} ({}); `brainproxy proxy stop` stops \
+             that one",
+            process::pid_text(saved.state.pid, saved.pid_ns.as_deref()),
+            now.state.listen,
+            process::pid_text(now.state.pid, now.pid_ns.as_deref())
+        )));
+    }
+    Ok(Stop::Done(Some((saved.state.pid, forced))))
 }
 
 /// Whether a `proxy restart` that still runs holds the record.
@@ -658,6 +726,10 @@ struct Launch {
 
 impl Launch {
     fn prepare(project: &Path, home: &Path, args: &ProxyRunArgs, store: &Store) -> Result<Self, Error> {
+        // NaN fails this too.
+        if !(0.0..=MAX_WAIT).contains(&args.wait) {
+            return Err(Error::InvalidInput(format!("--wait must be from 0 to {MAX_WAIT} seconds")));
+        }
         load_ca(home)?; // Surface CA and scope problems here rather than in the log.
         store.guard()?;
         let project = std::fs::canonicalize(project)?;
@@ -748,7 +820,8 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
             "no proxy running for this project; start one with `brainproxy proxy start`".into(),
         ));
     };
-    if known != Liveness::Running || old.restart.is_some() {
+    // A `proxy stop` under way (`stopping`) wants the proxy off: leave it to that.
+    if known != Liveness::Running || old.restart.is_some() || old.stopping {
         return Err(already_running(&old, known));
     }
     // Everything that can be checked is, before anything stops.
@@ -765,22 +838,15 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
         start_time: process::start_time(me),
         pid_ns: lock.as_ref().and_then(|_| process::pid_namespace()),
         restart: Some(token.clone()),
+        was: Some(old.raw.clone()),
+        stopping: false,
         raw: String::new(),
     };
     let hold = serde_json::to_string(&hold).unwrap_or_default();
+    // Fails if a stop has marked the record since it was read.
     if !store.meta_swap(STATE_KEY, Some(&old.raw), Some(&hold))? {
         return Err(Error::Conflict(
             "the proxy was stopped or replaced while restarting it; see `brainproxy proxy status`".into(),
-        ));
-    }
-    // A `proxy stop` already under way wants the proxy off: leave it to that.
-    let stopping = store.meta_get(STOP_KEY).map(|k| k == Some(old.state.pid.to_string()));
-    if !matches!(stopping, Ok(false)) {
-        store.meta_swap(STATE_KEY, Some(&hold), Some(&old.raw))?;
-        stopping?;
-        return Err(Error::Conflict(
-            "the proxy is being stopped (`brainproxy proxy stop`); start it with `brainproxy proxy start` once it has"
-                .into(),
         ));
     }
     let forced = match halt(&store, &old) {
@@ -889,6 +955,12 @@ fn already_running(s: &Saved, known: Liveness) -> Error {
             "the proxy is being restarted (`brainproxy proxy restart`, {pid}); try again once that has finished"
         ));
     }
+    if s.stopping {
+        return Error::Conflict(format!(
+            "the proxy is being stopped (`brainproxy proxy stop`, {pid}); start it with `brainproxy proxy start` once \
+             it has"
+        ));
+    }
     Error::Conflict(format!("proxy already running on {} ({pid})", s.state.listen))
 }
 
@@ -979,7 +1051,7 @@ fn take_record(store: &Store, saved: &str) -> Result<(), Error> {
     let raw = store.meta_get(STATE_KEY)?;
     let free = match raw.as_deref().map(parse_state) {
         None | Some(None) => true,
-        Some(Some(s)) => replaceable(&s) || liveness(store, &s) == Liveness::Gone,
+        Some(Some(s)) => replaceable(&s) || (liveness(store, &s) == Liveness::Gone && replaced(store, &s).is_none()),
     };
     if free && store.meta_swap(STATE_KEY, raw.as_deref(), Some(saved))? {
         return Ok(());
@@ -988,6 +1060,17 @@ fn take_record(store: &Store, saved: &str) -> Result<(), Error> {
         Some((s, known)) => already_running(&s, known),
         None => Error::Conflict("another proxy for this project started at the same time; try again".into()),
     })
+}
+
+/// Clears the record of the proxy recorded as `me` as it exits, as written or as a stop marked
+/// it, but not a restart's hold or another proxy's record.
+fn release(store: &Store, me: &Saved) -> Result<(), Error> {
+    let Some(now) = read_state(store)? else { return Ok(()) };
+    let id = |s: &Saved| (s.state.pid, s.state.started.clone(), s.start_time, s.pid_ns.clone());
+    if now.restart.is_none() && id(&now) == id(me) {
+        store.meta_swap(STATE_KEY, Some(&now.raw), None)?;
+    }
+    Ok(())
 }
 
 /// Why the address can't be bound, by error kind: the system's own text is localised on Windows.
@@ -1044,12 +1127,14 @@ fn serve(
             start_time: process::start_time(std::process::id()),
             pid_ns: lock.as_ref().and_then(|_| process::pid_namespace()),
             restart: None,
+            was: None,
+            stopping: false,
             raw: String::new(),
         };
         let raw = serde_json::to_string(&saved).unwrap_or_default();
         take_record(&store, &raw)?;
-        let state = saved.state;
-        out.ok(state_json(&state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));
+        let state = &saved.state;
+        out.ok(state_json(state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));
 
         let shutdown = process::shutdown(&store, STOP_KEY);
         let opts = ProxyOptions {
@@ -1067,8 +1152,7 @@ fn serve(
             Some(w) => w.finish().await,
             None => Ok(Value::Null),
         };
-        // Only the record as written: a restart may hold it by now.
-        store.meta_swap(STATE_KEY, Some(&raw), None)?;
+        release(&store, &saved)?;
         if let Some(a) = &auth {
             a.save()?;
         }
@@ -1333,10 +1417,12 @@ mod tests {
             start_time: Some(1),
             pid_ns: None,
             restart: Some("7-1".into()),
+            was: None,
+            stopping: false,
             raw: String::new(),
         };
         let raw = serde_json::to_string(&saved).unwrap();
-        assert!(!raw.contains("\"raw\""), "{raw}");
+        assert!(!raw.contains("\"raw\"") && !raw.contains("stopping"), "{raw}");
         let back = parse_state(&raw).unwrap();
         assert_eq!((back.restart.as_deref(), back.raw.as_str()), (Some("7-1"), raw.as_str()));
         let Error::Conflict(text) = already_running(&back, Liveness::Running) else { panic!() };
@@ -1344,6 +1430,91 @@ mod tests {
         // A record from before restarts were held has none.
         let old = r#"{"pid":7,"listen":"127.0.0.1:1","started":"0","ca_cert":"/x","log":null}"#;
         assert_eq!(parse_state(old).unwrap().restart, None);
+    }
+
+    /// A record for `pid`, as stored: a restart's hold if `restart` is given.
+    fn record(pid: u32, restart: Option<&str>, was: Option<&Saved>) -> Saved {
+        let saved = Saved {
+            state: ProxyState { pid, ..state_with(&["proxy", "run"]) },
+            start_time: process::start_time(pid),
+            pid_ns: None,
+            restart: restart.map(String::from),
+            was: was.map(|w| w.raw.clone()),
+            stopping: false,
+            raw: String::new(),
+        };
+        let raw = serde_json::to_string(&saved).unwrap();
+        parse_state(&raw).unwrap()
+    }
+
+    fn put(store: &Store, s: &Saved) {
+        store.meta_set(STATE_KEY, Some(&s.raw)).unwrap();
+    }
+
+    /// Pid 0 is never a process.
+    const GONE: u32 = 0;
+
+    #[test]
+    fn a_proxy_clears_its_own_record_as_it_exits_even_once_a_stop_marked_it() {
+        let store = Store::open_in_memory().unwrap();
+        let me = record(std::process::id(), None, None);
+        let stopping = parse_state(&serde_json::to_string(&Saved { stopping: true, ..me.clone() }).unwrap()).unwrap();
+        assert!(stopping.raw.contains("\"stopping\":true"), "{}", stopping.raw);
+        for (now, cleared) in [
+            (&me, true),
+            (&stopping, true),
+            (&record(std::process::id(), Some("t"), Some(&me)), false),
+            (&record(GONE, None, None), false),
+        ] {
+            put(&store, now);
+            release(&store, &me).unwrap();
+            assert_eq!(store.meta_get(STATE_KEY).unwrap().is_none(), cleared, "{}", now.raw);
+        }
+    }
+
+    /// A stop under way refuses a restart, and the refusal says so.
+    #[test]
+    fn a_record_being_stopped_is_left_to_the_stop() {
+        let me = record(std::process::id(), None, None);
+        let Error::Conflict(text) = already_running(&Saved { stopping: true, ..me }, Liveness::Running) else {
+            panic!()
+        };
+        assert!(text.starts_with("the proxy is being stopped (`brainproxy proxy stop`, pid "), "{text}");
+    }
+
+    /// A restart that went away while the proxy it was replacing still ran gives that proxy its
+    /// record back, so that it can be seen and stopped. Gone too, the record is cleared.
+    #[test]
+    fn an_abandoned_restart_gives_the_record_back_to_a_proxy_still_running() {
+        let store = Store::open_in_memory().unwrap();
+        let old = record(std::process::id(), None, None);
+        put(&store, &record(GONE, Some("t"), Some(&old)));
+        // Nothing else takes it meanwhile.
+        let Err(Error::Conflict(text)) = take_record(&store, "{}") else { panic!("taken") };
+        assert!(text.starts_with("proxy already running on"), "{text}");
+        put(&store, &record(GONE, Some("t"), Some(&old)));
+        let (back, known) = recorded(&store).unwrap().expect("given back");
+        assert_eq!((back.raw.as_str(), known), (old.raw.as_str(), Liveness::Running));
+        assert_eq!(store.meta_get(STATE_KEY).unwrap(), Some(old.raw.clone()));
+
+        put(&store, &record(GONE, Some("t"), Some(&record(GONE, None, None))));
+        assert!(recorded(&store).unwrap().is_none());
+        assert_eq!(store.meta_get(STATE_KEY).unwrap(), None);
+    }
+
+    /// `project stop` learns of a restart's hold from the stop itself, so a restart that finishes
+    /// in between can't leave it with a stale refusal.
+    #[test]
+    fn a_stop_tells_a_restart_hold_from_a_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let hold = record(std::process::id(), Some("t"), None);
+        put(&store, &hold);
+        assert!(matches!(stop_or_held(&store), Ok(Stop::Held(Error::Conflict(_)))));
+        let Err(Error::Conflict(text)) = stop(&store) else { panic!("stopped") };
+        assert!(text.contains("being restarted"), "{text}");
+        assert_eq!(store.meta_get(STATE_KEY).unwrap(), Some(hold.raw));
+        store.meta_set(STATE_KEY, None).unwrap();
+        assert!(matches!(stop_or_held(&store), Ok(Stop::Done(None))));
     }
 
     #[test]

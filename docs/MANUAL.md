@@ -704,12 +704,19 @@ restarted" instead of getting in between, and `proxy status` shows `"restarting"
 new proxy doesn't come up (the port is taken, say), the old one is started again on the address
 it had, with its options, and the command fails with an error that ends with where the proxy
 is now. With no proxy running it starts nothing and fails with `not_found`: use `proxy start`.
-On success it prints what `proxy start` does, plus `replaced` (the old pid and address).
-While a restart runs it holds `brainproxy.bpdb-proxy-restart.lock`, which is how another
-container on the same volume knows it is still under way. A restart started while a
-`proxy stop` is under way leaves the proxy to that stop and fails. `project stop` during a
-restart stops the OOB listener, jobs and fuzz runs at once, then waits (up to a minute) for
-the restart to finish and stops the proxy it left running.
+`--wait` (0 to 3600 seconds, for `proxy start` too) is checked with the other options, before
+anything stops. On success it prints what `proxy start` does, plus `replaced` (the old pid and
+address). While a restart runs it holds `brainproxy.bpdb-proxy-restart.lock`, which is how another
+container on the same volume knows it is still under way. If the restart is killed (Ctrl-C, say)
+before the old proxy has exited, the next command gives the old proxy its record back, so that
+`proxy status` shows it and `proxy stop` stops it.
+
+`proxy stop` marks the record as being stopped until the proxy has exited, so a restart (or
+start) meanwhile fails with "the proxy is being stopped" and the proxy ends up off. If another
+proxy has taken the record by the time the old one is gone, the stop fails and names it rather
+than reporting the proxy off. `project stop` during a restart stops the OOB listener, jobs and
+fuzz runs at once, then waits (up to a minute) for the restart to finish and stops the proxy it
+left running.
 
 Crawl and active-scan scope and safety flags:
 
@@ -1145,7 +1152,8 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | Container: "can't open the proxy lock file" | A lock file is there that this user can't open, so starting would go unseen from other containers. Make it readable (`chmod 644`), or remove it if no proxy (or OOB listener) runs for this project anywhere. |
 | Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: none of ports 8080-8089 could be opened" | Other programs hold or block those ports. Stop them, or choose a port in **Settings › Proxy**. From a shell: `brainproxy proxy start --listen 127.0.0.1:9090`. |
-| "the proxy is being restarted" | A `proxy restart` (from the app's *Restart on port N* or *Test live while browsing*, a shell or an agent) is between stopping the proxy and starting it again. Try again once it has finished. If its process was killed, the next command clears its hold. |
+| "the proxy is being restarted" | A `proxy restart` (from the app's *Restart on port N* or *Test live while browsing*, a shell or an agent) is between stopping the proxy and starting it again. Try again once it has finished. If its process was killed, the next command clears its hold, and gives the record back to the old proxy if that still runs. |
+| "the proxy is being stopped" | A `proxy stop` (or `project stop`) is waiting for the proxy to exit. Start it again once it has. |
 | "cannot listen on …: the port is already in use" | Another program or another project's proxy holds that port. Stop it, or choose another port in **Settings › Proxy** (or with `--listen`). A chosen port is never swapped for another, so the proxy stays off until then. |
 | "cannot listen on …: permission denied" | Ports below 1024 usually need elevated privileges, and the system can reserve others (Windows does, in ranges that change). Choose another port in **Settings › Proxy** (or with `--listen`). |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
