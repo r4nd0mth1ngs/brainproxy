@@ -523,6 +523,48 @@ test("an existing profile whose query key doesn't go to this server", () => {
   assert.deepEqual(profileRemoved(again, "other"), { queryKeys: again.queryKeys }, "another profile changes nothing");
 });
 
+test("a query key saved over one set aside: the old one isn't brought back", () => {
+  const A = "https://a.test";
+  const B = "https://b.test";
+  // As `KeyFields`, `leaveSaved` and load() change the state.
+  const save = (a: AuthState, origins: string[]): AuthState => {
+    const patch = keySaved(a, origins);
+    return { ...a, ...(typeof patch === "function" ? patch(a) : patch) };
+  };
+  const move = (a: AuthState, origins: string[]): AuthState => ({ ...a, ...afterServerChange(a, origins) });
+  const keep = (a: AuthState): AuthState => (a.dropped ? { ...a, dropped: { ...a.dropped, kept: true } } : a);
+  const enterAnother = (a: AuthState): AuthState => ({ ...a, savedProfile: "", profileName: "pets-api-3" });
+
+  const saved = save({ ...EMPTY_AUTH, mode: "key", place: "query", keyName: "api_key", profileName: "pets-api" }, [A]);
+  const away = move(saved, [B]);
+  // Saved again for B, and A's profile kept when offered.
+  const again = keep(save({ ...away, profileName: "pets-api-2" }, [B]));
+  assert.equal(again.dropped, null, "the key set aside is replaced");
+  assert.deepEqual(again.queryKeys, [
+    { profile: "pets-api", origins: [A] },
+    { profile: "pets-api-2", origins: [B] },
+  ]);
+
+  // "Enter a different one" for B, then back to A before saving: A's old key isn't used without being asked for.
+  const back = move(enterAnother(again), [A]);
+  assert.equal(back.savedProfile, "");
+  assert.equal(authProfile(back), "");
+  assert.deepEqual(authProblems(back), ["Save the key, or choose No authentication."]);
+  assert.equal(droppedKeyText(back, [A]), "");
+  // Chosen explicitly as an existing profile, A's still works, and on B it's said to run without its key.
+  const chosen: AuthState = { ...back, mode: "profile", existing: "pets-api" };
+  assert.equal(authProfile(chosen), "pets-api");
+  assert.equal(profileKeyText(chosen, [A]), "");
+  assert.match(profileKeyText(chosen, [B]), /"pets-api" only goes to https:\/\/a\.test/);
+
+  // A header key or bearer token saved over it replaces it the same way.
+  for (const kind of [{ place: "header" as const }, { keyKind: "bearer" as const }]) {
+    const other = keep(save({ ...away, ...kind, profileName: "pets-api-2" }, [B]));
+    assert.equal(other.dropped, null, JSON.stringify(kind));
+    assert.equal(move(enterAnother(other), [A]).savedProfile, "", JSON.stringify(kind));
+  }
+});
+
 test("signer coverage", () => {
   const signer = { name: "hm", origins: ["https://api.test"] };
   const urls = ["https://api.test/v1/a"];

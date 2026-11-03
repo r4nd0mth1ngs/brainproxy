@@ -156,9 +156,9 @@ query key goes only to the origins it was saved for (`--key-origin`), so a serve
 origin sets it aside (`afterServerChange`): the Authentication step and the review say so, the
 scan can't start until it's saved again or another choice is made, either of which offers to
 remove the old profile once (kept, it's there to use again with its own server), and going back
-to a server it covers brings it back; an existing profile, where one holding a query key saved in
-the wizard for other origins is said to run without the key (`profileKeyText`), on that step and
-in the review; optional signing via `SignerBuilder` (HMAC, private key, JWT or AWS SigV4,
+to a server it covers before then brings it back; an existing profile, where one holding a query
+key saved in the wizard for other origins is said to run without the key (`profileKeyText`), on
+that step and in the review; optional signing via `SignerBuilder` (HMAC, private key, JWT or AWS SigV4,
 prefilled from a collection's `aws`) or a collection's pre-request script, shown with
 `--show-scripts` before it can be chosen, with text-direction and invisible characters flagged
 and written out, and a session rule), and the operations to send

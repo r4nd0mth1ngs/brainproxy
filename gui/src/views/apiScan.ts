@@ -700,12 +700,17 @@ export function profileKeyText(a: AuthState, origins: string[]): string {
   return `The key saved in the profile "${k.profile}" only goes to ${listWords(k.origins)}, which it was saved for, not to ${listWords(elsewhere) || "this server"}, so the scan runs without it. To send a key, choose API key or bearer token and save it again for this server, or go back to the server it was saved for.`;
 }
 
-/** Once `auth add` saved the key in `saved` for `origins`: its profile is the one used, and a query key is remembered with its origins. */
+/**
+ * Once `auth add` saved the key in `saved` for `origins`: its profile is the one used, and a query key is remembered
+ * with its origins. A key set aside is replaced, so it isn't brought back by a later server change; its profile, if
+ * kept, is still known as an existing one.
+ */
 export function keySaved(saved: AuthState, origins: string[]): AuthPatch {
   const profile = saved.profileName.trim();
   return (prev) => ({
     savedProfile: profile,
     keyOrigins: origins,
+    dropped: null,
     queryKeys: isQueryKey(saved) ? [...prev.queryKeys.filter((k) => k.profile !== profile), { profile, origins }] : prev.queryKeys,
   });
 }
