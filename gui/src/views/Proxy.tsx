@@ -132,7 +132,7 @@ function History() {
   const { menu, open, close } = useMenu();
   // Opened to show one source's requests: that source alone, and none of them hidden by another filter.
   useEffect(() => {
-    if (app.traffic) setFilter({ text: "", sources: new Set([app.traffic.source]), hideErrors: false, hideAssets: false, hideRefused: true });
+    if (app.traffic) setFilter({ ...DEFAULT_FILTER, sources: [app.traffic.source] });
   }, [app.traffic]);
 
   // Contents search: the CLI matches the text inside requests and responses. It runs page by
