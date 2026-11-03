@@ -139,6 +139,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
   person's proxy with the saved setup the next time the project opens, on every network
   interface, where anyone who can reach the computer can use it, or sending everything they
   browse to the redirect's origin; a person chooses those. Saving the defaults is allowed.
+- `proxy_start` and `proxy_restart` with `invisible` or `redirect`, for the same reason; and
+  `proxy_restart` of a proxy running with either, which a tool call couldn't start again if the
+  restart failed.
 
 `scan_active` with `checks` takes any template file, including one the agent wrote. Its
 requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DELETE or GraphQL

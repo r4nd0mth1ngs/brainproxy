@@ -1020,6 +1020,7 @@ impl Launch {
             return Err(Error::InvalidInput(format!("--wait must be from 0 to {max_wait} seconds")));
         }
         check_listen_arg(&args.listen)?;
+        check_routing(args.invisible, args.redirect.is_some())?;
         load_ca(home)?; // Surface CA and scope problems here rather than in the log.
         store.guard()?;
         let project = std::fs::canonicalize(project)?;
@@ -1151,6 +1152,14 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
              started there again if the restart failed; a person can restart it in the app or a terminal",
             back.listen
         )));
+    }
+    // Nor could it go back to a redirect or invisible mode, which an agent can't start.
+    if crate::mcp::in_tool_call() && (back.invisible || back.redirect.is_some()) {
+        return Err(Error::InvalidInput(
+            "can't restart the proxy through MCP: it runs with --invisible or --redirect, which a tool call can't \
+             start again if the restart failed; a person can restart it in the app or a terminal"
+                .into(),
+        ));
     }
     let launch = Launch::prepare(project, home, &args, &store, MAX_RESTART_WAIT)?;
 
@@ -1514,6 +1523,20 @@ fn check_listen_arg(listen: &str) -> Result<(), Error> {
 }
 
 /// Why the address can't be bound, by error kind: the system's own text is localised on Windows.
+/// Under an MCP tool call, refuses a proxy that sends the person's browsing anywhere but where
+/// it was going: an agent's `--redirect` (or invisible mode, which picks the upstream from the
+/// request) on the person's proxy would send everything they browse to an origin it chose.
+fn check_routing(invisible: bool, redirect: bool) -> Result<(), Error> {
+    if (invisible || redirect) && crate::mcp::in_tool_call() {
+        return Err(Error::InvalidInput(
+            "--invisible and --redirect aren't offered through MCP: they change where the person's browsing goes, \
+             so a person chooses them (Settings › Proxy in the app, or a terminal)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn listen_error(addr: &str, e: &std::io::Error) -> Error {
     Error::Conflict(match e.kind() {
         std::io::ErrorKind::AddrInUse => {

@@ -1301,6 +1301,38 @@ fn proxy_restart_through_mcp_stays_on_loopback() {
     assert_eq!(moved["replaced"]["pid"].as_u64(), Some(pid2), "{moved}");
 }
 
+/// Through MCP no proxy is started, or restarted, with a redirect or invisible mode: either
+/// would send the person's browsing where an agent chose. Nor is a person's such proxy restarted.
+#[test]
+fn an_agent_cannot_reroute_the_persons_proxy() {
+    let agent = [("BRAINPROXY_MCP_CALL", "1")];
+    let env = Env::new("reroute-mcp");
+    for flags in [&["--redirect", "http://127.0.0.1:9"][..], &["--invisible"][..]] {
+        let (code, v) = env.run_env(&[&["proxy", "start", "--listen", "127.0.0.1:0"][..], flags].concat(), &agent);
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{flags:?}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("aren't offered through MCP"), "{v}");
+    }
+    assert!(!env.ok(&["proxy", "status"])["running"].as_bool().unwrap());
+
+    let pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    let before = proxy_record(&env);
+    let args = ["proxy", "restart", "--listen", "127.0.0.1:0", "--redirect", "http://127.0.0.1:9"];
+    let (code, v) = env.run_env(&args, &agent);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    assert_eq!(proxy_record(&env), before, "the person's proxy wasn't touched");
+    assert_eq!(env.ok(&["proxy", "status"])["proxy"]["pid"].as_u64(), Some(pid));
+    env.ok(&["proxy", "stop"]);
+
+    // A person's invisible proxy: the agent couldn't start it again if its restart failed.
+    env.ok(&["proxy", "start", "--listen", "127.0.0.1:0", "--invisible"]);
+    let before = proxy_record(&env);
+    let (code, v) = env.run_env(&["proxy", "restart", "--listen", "127.0.0.1:0"], &agent);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("can't restart the proxy through MCP"), "{v}");
+    assert_eq!(proxy_record(&env), before);
+    env.ok(&["proxy", "stop"]);
+}
+
 /// Going back starts the old proxy with all of its options, not only --listen and --timeout.
 #[test]
 fn proxy_restart_goes_back_with_every_option() {
