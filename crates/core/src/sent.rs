@@ -113,24 +113,19 @@ impl SentLog {
         self.store.record(&self.capture(target, request, None, None, Some(PENDING)))
     }
 
-    /// Records `n` copies of `request` as about to go out, in one transaction.
-    pub fn pending_many(&mut self, target: &Target, request: &[u8], n: usize) -> Result<Vec<i64>> {
-        let c = self.capture(target, request, None, None, Some(PENDING));
-        self.store.record_batch(&vec![c; n])
-    }
-
     /// Records `n` copies of `request` as about to go out, in one transaction, copy `i`
     /// tagged `tags(i)` (a race's rows say which race and where in it). Completing a row
     /// keeps its tags.
-    pub fn pending_tagged(
+    pub fn pending_many(
         &mut self,
         target: &Target,
         request: &[u8],
         n: usize,
-        mut tags: impl FnMut(usize) -> Vec<String>,
+        tags: impl FnMut(usize) -> Vec<String>,
     ) -> Result<Vec<i64>> {
         let c = self.capture(target, request, None, None, Some(PENDING));
-        self.store.record_each(n, |i| Capture { tags: tags(i), ..c.clone() })
+        let copies: Vec<Capture> = (0..n).map(tags).map(|tags| Capture { tags, ..c.clone() }).collect();
+        self.store.record_batch(&copies)
     }
 
     /// Completes row `id`; returns the capture it now holds.

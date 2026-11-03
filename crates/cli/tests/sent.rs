@@ -133,6 +133,39 @@ fn a_killed_send_leaves_its_pending_row() {
     assert_eq!(r[0][3].as_str().unwrap().as_bytes(), &received[..]);
 }
 
+/// A race is grouped before anything goes out: killed or stopped while waiting, every copy's
+/// row still carries the race's tags.
+#[test]
+fn a_stopped_or_killed_race_keeps_its_rows_grouped() {
+    for term in [cfg!(unix), false] {
+        let p = project(if term { "race-term" } else { "race-kill" });
+        let (port, got) = silent();
+        let url = format!("http://127.0.0.1:{port}/slow");
+        let mut child = spawn(&p, &["send", "--url", &url, "--race", "3", "--timeout", "60"]);
+        for _ in 0..3 {
+            got.recv_timeout(Duration::from_secs(20)).expect("a copy never arrived");
+        }
+        if term {
+            assert!(Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap().success());
+        } else {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        let r = rows(&p, "SELECT error, tags FROM history WHERE source = 'race' ORDER BY id");
+        assert_eq!(r.len(), 3, "{r:?}");
+        let want = if term { "cancelled by user before a response was recorded" } else { "sent; no response recorded" };
+        let mut races = std::collections::BTreeSet::new();
+        for (i, row) in r.iter().enumerate() {
+            assert!(row[0].as_str().unwrap().starts_with(want), "{row}");
+            let tags: Vec<String> = serde_json::from_str(row[1].as_str().unwrap()).unwrap();
+            assert_eq!(tags[1..], ["race-sync:last-byte".to_string(), format!("race-pos:{}/3", i + 1)], "{tags:?}");
+            races.insert(tags[0].clone());
+        }
+        assert_eq!(races.len(), 1, "{races:?}");
+        assert!(races.first().unwrap().starts_with("race:"));
+    }
+}
+
 #[test]
 fn a_finished_send_completes_its_row() {
     let p = project("done");

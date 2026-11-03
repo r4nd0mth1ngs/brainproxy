@@ -756,7 +756,7 @@ fn race(
     let recorded = client.recorded_request(&req, &target)?;
     let mut log = sent::SentLog::open(project, "race", args.no_store)?;
     let ids =
-        log.pending_tagged(&target, &recorded, n, |i| brainproxy_core::race::row_tags(&race_id, sync, false, i, n))?;
+        log.pending_many(&target, &recorded, n, |i| brainproxy_core::race::row_tags(&race_id, sync, false, i, n))?;
     let requests = vec![req.as_bytes().to_vec(); n];
     let racing = async {
         if h2 {
