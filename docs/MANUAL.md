@@ -455,7 +455,10 @@ Access control across users: does the app let bob read alice's data? See
   right-click menu and in Replay opens the same form with the URL and the request filled in.
   Findings with the same title are grouped together and tagged *by hand*; they appear in
   reports like any other (marked *found by hand* in the HTML report) and can be removed
-  again (*Remove*). Scanner findings can't be removed, only marked.
+  again (*Remove*); the project keeps a record of a removed one, so comparing with an
+  earlier report shows it as removed, not fixed. Scanner findings can't be removed, only
+  marked. If the description or solution differs from the one findings with that title
+  already share, the form says so and offers to replace it (the earlier text is kept).
 - **Compare with a scan:** pick a finished active scan to show only what it found for the
   first time (*New in*), what it found again (*Still found by*), or what it covered but
   didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
@@ -943,7 +946,9 @@ brainproxy findings remove 17
   is not resolved to `/admin`); only the scheme, host and port are normalised, and a space or
   non-ASCII character is percent-encoded.
 - `--history-id` (repeatable or comma-separated) links the history entries that show the issue;
-  the first is the request and response in reports.
+  the first is the request and response in reports. The result lists each linked entry's method
+  and URL in `history`, and warns about one on another host or port than the finding's URL
+  (`other_site`), which may be linked by mistake.
 - `--description`, `--solution` and `--evidence` take the text; `--description-file`,
   `--solution-file` and `--evidence-file` read it from a file, or stdin with `-` (one of them).
   Through MCP the file flags only take `-`, the call's stdin.
@@ -952,25 +957,36 @@ brainproxy findings remove 17
   code blocks (a line of three or more backticks or tildes, indented at most three spaces) keep
   their text as written, as code; leading spaces on other lines are dropped.
 - `--input-json` reads all three from stdin instead, as
-  `{"description": "...", "solution": "...", "evidence": "..."}` (each optional). Text on the
-  command line is visible in the process list, so use it for evidence that holds a token.
+  `{"description": "...", "solution": "...", "evidence": "...", "url": "...", "method": "..."}`
+  (each optional; `url` and `method` in place of `--url` and `--method`). Text on the command
+  line is visible in the process list, so use it for evidence or a URL that holds a token.
 - Findings with the same title share an alert type, `manual:<title>` (`manual:order-idor`), so
-  reports group them. The type holds the description and solution: a new one replaces it (with a
-  warning), and leaving it out keeps it. A long title is shortened and ends in a short hash, so
-  only titles that are the same apart from case and punctuation share a type.
+  reports group them. The type holds the description and solution: leaving them out keeps the
+  type's, and one that differs from it is refused with `conflict` unless `--replace-text` is
+  given. Replacing keeps the earlier text: `findings show` lists it in `replaced_texts`, with
+  when it was replaced. Through MCP `--replace-text` is refused, since the text may be a
+  person's. A long title is shortened and ends in a short hash, so only titles that are the
+  same apart from case and punctuation share a type.
 - Each finding keeps its own `--cwe`. Reports show the first one given for the type, and an
   instance's own when it differs.
 - The same title, method, URL without its query, and parameter as an existing finding is refused
   with `conflict`.
-- `findings mark` triages them like any other. `findings remove ID...` deletes findings added by
+- `findings mark` triages them like any other. `findings remove ID...` removes findings added by
   hand; scanner findings are refused (mark them false positive instead), and then nothing is
-  removed.
+  removed. A removed finding is kept with state `removed`: `findings list`, `report` and
+  `findings compare` leave it out unless `--state all` (or `removed`), `findings show` gives
+  when it was removed and the state it had in `removed`, and it can't be marked. The same issue
+  can then be added again, as a new finding. `findings remove` is refused through MCP (and not
+  offered as a tool): an agent can't tell a person's finding from its own, so it marks one
+  `false_positive` with a note instead.
 - `findings show` lists every linked entry in `history_ids`; in the `findings` table (`query`),
   `history_id` is the first and `last_history_id` the last.
-- `findings list`, `report` and `findings compare` show them with `source: manual`; `--source
-  manual` picks only them. `findings compare --scan` leaves them out (no scan looks for them, so
-  a scan never "fixes" them and its gate doesn't count them), while a file baseline and the plain
-  `--fail-on` gate compare them like any other.
+- `findings list`, `report` and `findings compare` show them with `source: manual` (each group
+  of the grouped `findings list` has a `source` too); `--source manual` picks only them.
+  `findings compare --scan` leaves them out (no scan looks for them, so a scan never "fixes"
+  them and its gate doesn't count them), while a file baseline and the plain `--fail-on` gate
+  compare them like any other. A finding of the baseline that was removed here is listed under
+  `removed`, never `fixed`, and no gate counts it.
 
 ### Comparing findings and failing a build (`findings compare`)
 
@@ -981,7 +997,8 @@ brainproxy findings remove 17
   Findings match by alert, method, URL without its query, and parameter, so the URL's
   scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
   doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
-  coverage.
+  coverage. A finding added by hand and removed since (`findings remove`) is listed under
+  `removed` (with a count in `summary.removed`), not as fixed.
 - **A scan** (`--scan JOB`): a `scan active --background` job in this project, using the same logic
   as the app's *Compare with a scan*: first found by it, found again by it, or covered by it and not
   found again. Foreground scans have no job to name.

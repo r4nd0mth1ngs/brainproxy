@@ -85,7 +85,8 @@ pub enum FindingsCmd {
         /// Alert ref or rule id, e.g. 10020 or 10020-1.
         #[arg(long)]
         alert: Option<String>,
-        /// open, confirmed, false_positive, or all (default hides false positives).
+        /// open, confirmed, false_positive, removed, or all (default hides false positives and
+        /// removed findings added by hand).
         #[arg(long)]
         state: Option<String>,
         /// Only findings from this scanner, or those added by hand (manual).
@@ -122,13 +123,20 @@ pub enum FindingsCmd {
     },
     /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
-        description and solution: a new one replaces the type's, leaving it out keeps it. The same title, method, \
-        URL without its query, and parameter as an existing finding is refused (kind conflict). Without \
-        --url, the URL and method are the first --history-id entry's. The first linked entry is the report's \
-        evidence. Through MCP, the *-file flags only take '-' (the call's stdin). Text on the command line is \
-        visible in the process list; --input-json keeps evidence and write-ups off it.")]
+        description and solution: leaving one out keeps the type's, and one that differs from it is refused \
+        (kind conflict) unless --replace-text, which keeps the earlier text (findings show lists it in \
+        replaced_texts). The same title, method, URL without its query, and parameter as an existing finding \
+        is refused (kind conflict). Without --url, the URL and method are the first --history-id entry's; a \
+        linked entry on another host or port is warned about. The first linked entry is the report's \
+        evidence. Through MCP, the *-file flags only take '-' (the call's stdin) and --replace-text is \
+        refused. Text on the command line is visible in the process list; --input-json keeps the URL, \
+        evidence and write-ups off it.")]
     Add(Box<AddArgs>),
     /// Remove findings added by hand (`findings add`); scanner findings can only be marked.
+    #[command(after_help = "A removed finding is kept with state removed, hidden unless --state all, so a \
+        compare against a baseline that had it lists it as removed, not fixed. findings show says when it \
+        was removed and the state it had. The same issue can be added again. Refused through MCP: an agent \
+        marks a finding false_positive with a note instead.")]
     Remove {
         #[arg(required = true)]
         ids: Vec<i64>,
@@ -176,12 +184,17 @@ pub struct AddArgs {
     /// Read the evidence from FILE ('-' reads stdin).
     #[arg(long, value_name = "FILE")]
     evidence_file: Option<String>,
-    /// Read JSON from stdin: {"description": "...", "solution": "...", "evidence": "..."}. Each is
-    /// optional; use it instead of the text flags above.
+    /// Read JSON from stdin: {"description": "...", "solution": "...", "evidence": "...", "url":
+    /// "...", "method": "..."}. Each is optional; use it instead of the text flags above (and of
+    /// --url and --method, to keep a token in the URL out of the process list).
     #[arg(long, conflicts_with_all = [
         "description", "description_file", "solution", "solution_file", "evidence", "evidence_file",
     ])]
     input_json: bool,
+    /// Replace the description or solution that findings with this title share when the one
+    /// given differs (the earlier text is kept). Refused through MCP.
+    #[arg(long)]
+    replace_text: bool,
 }
 
 /// What `--input-json` reads from stdin.
@@ -194,6 +207,10 @@ struct TextInput {
     solution: String,
     #[serde(default)]
     evidence: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
 }
 
 impl AddArgs {
@@ -208,7 +225,15 @@ impl AddArgs {
                 "only one of --description-file, --solution-file and --evidence-file can read stdin".into(),
             ));
         }
-        let texts = if self.input_json {
+        // An agent can't tell whose write-up it would replace, so it can't replace one.
+        if self.replace_text && crate::mcp::in_tool_call() {
+            return Err(Error::InvalidInput(
+                "--replace-text is refused through MCP: the shared write-up may be a person's; leave the \
+                 description and solution out, or use another title"
+                    .into(),
+            ));
+        }
+        let texts: TextInput = if self.input_json {
             serde_json::from_slice(&crate::read_input(None)?)
                 .map_err(|e| Error::InvalidInput(format!("--input-json: {e}")))?
         } else {
@@ -216,20 +241,31 @@ impl AddArgs {
                 description: text_arg("--description-file", self.description, self.description_file)?,
                 solution: text_arg("--solution-file", self.solution, self.solution_file)?,
                 evidence: text_arg("--evidence-file", self.evidence, self.evidence_file)?,
+                url: None,
+                method: None,
             }
         };
+        for (flag, given, from_json) in [("--url", &self.url, &texts.url), ("--method", &self.method, &texts.method)] {
+            if given.is_some() && from_json.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "give the {} either as {flag} or in --input-json, not both",
+                    &flag[2..]
+                )));
+            }
+        }
         Ok(ManualFinding {
             title: self.title,
             risk: self.risk.get(),
             confidence: self.confidence.get(),
-            url: self.url,
-            method: self.method,
+            url: self.url.or(texts.url),
+            method: self.method.or(texts.method),
             param: self.param,
             evidence: texts.evidence,
             description: texts.description,
             solution: texts.solution,
             cwe: self.cwe,
             history: self.history,
+            replace_text: self.replace_text,
         })
     }
 }
@@ -496,17 +532,34 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let mut warnings: Vec<String> = outside_scope(&store, url).into_iter().collect();
             if !replaced.is_empty() {
                 warnings.push(format!(
-                    "replaced the {} that every finding titled {:?} shares",
+                    "replaced the {} that every finding titled {:?} shares (the earlier text is kept in replaced_texts)",
                     replaced.join(" and "),
                     f.title.trim()
                 ));
             }
+            // An entry on another site may be linked by mistake, and would be the report's evidence.
+            let links = store.finding_links(id)?;
+            for l in links.iter().filter(|l| l["other_site"] == true) {
+                warnings.push(format!(
+                    "history entry {} is {} {}, not on the finding's host and port",
+                    l["id"],
+                    l["method"].as_str().unwrap_or_default(),
+                    l["url"].as_str().unwrap_or_default()
+                ));
+            }
             let text = format!("added finding {id} ({})", finding["alert_ref"].as_str().unwrap_or_default());
-            out.ok(json!({"id": id, "finding": finding, "warnings": warnings}), || {
+            out.ok(json!({"id": id, "finding": finding, "history": links, "warnings": warnings}), || {
                 warnings.iter().map(|w| format!("warning: {w}\n")).collect::<String>() + &text
             });
         }
         FindingsCmd::Remove { ids } => {
+            // An agent can't tell a person's finding from its own, so it marks rather than removes.
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "findings remove is refused through MCP: mark the finding false_positive with a note instead"
+                        .into(),
+                ));
+            }
             let removed = store.findings_remove(&ids)?;
             out.ok(json!({"removed": removed, "ids": ids}), || format!("removed {removed} finding(s)"));
         }

@@ -63,7 +63,9 @@ One tool per leaf command of the clap definition, so the list can't drift from t
 from `capabilities`: `send`, `history_list`, `scan_active`, `job_wait`, ... (the command path
 joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy run` and
 `oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
-and `project save`, since copying the project elsewhere is for the person running the server.
+`project save`, since copying the project elsewhere is for the person running the server; and
+`findings remove`, since an agent can't tell a finding a person added from its own (it marks
+one `false_positive` with a note instead; the command refuses a tool call too).
 
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it
@@ -100,6 +102,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
   would copy any file the server can read into the project for the agent to read back; pass the
   text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `findings_add` with `replace_text`: the description and solution findings of the same title
+  share may be a person's. A different one is refused (`conflict`) without it, so an agent
+  leaves them out or uses another title.
 
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep

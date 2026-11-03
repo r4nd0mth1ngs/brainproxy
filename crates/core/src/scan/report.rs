@@ -888,6 +888,8 @@ fn html(r: &Report) -> String {
         for inst in &g.instances {
             let mut state = match inst.state.as_str() {
                 "confirmed" => " <span class=\"tag\">confirmed</span>",
+                // Only in a report written with --state all or removed.
+                "removed" => " <span class=\"tag\">removed</span>",
                 _ => "",
             }
             .to_string();
@@ -982,8 +984,8 @@ fn html(r: &Report) -> String {
     );
     if r.alerts.iter().flat_map(|g| &g.instances).any(|i| i.source == MANUAL_SOURCE) {
         s.push_str(
-            " A finding marked <span class=\"tag\">found by hand</span> was found and written up by the tester, \
-             not by an automated test.",
+            " A finding marked <span class=\"tag\">found by hand</span> was recorded during manual testing \
+             rather than raised by an automated test.",
         );
     }
     s.push_str("</p>\n");
@@ -1351,6 +1353,7 @@ mod tests {
                 solution: "Check the owner.".into(),
                 cwe: Some(639),
                 history: vec![1, second, third],
+                replace_text: false,
             })
             .unwrap();
         s.finding_add(&crate::scan::findings_db::ManualFinding {
@@ -1365,6 +1368,7 @@ mod tests {
             solution: String::new(),
             cwe: None,
             history: vec![],
+            replace_text: false,
         })
         .unwrap();
         let r = build(&s, &ReportOptions::default()).unwrap();
@@ -1600,6 +1604,7 @@ mod tests {
             solution: String::new(),
             cwe: None,
             history,
+            replace_text: false,
         }
     }
 
@@ -1642,5 +1647,26 @@ mod tests {
             .unwrap();
         assert_eq!(g["instances"][0]["history_ids"], json!([1]));
         assert_eq!(g["instances"][0]["source"], "manual");
+    }
+
+    #[test]
+    fn a_removed_finding_is_left_out_unless_asked_for() {
+        let mut s = store_with_findings();
+        let id = s.finding_add(&by_hand("Order IDOR", vec![1])).unwrap();
+        // The About note doesn't say who recorded it: a person or an agent.
+        let html = render(&build(&s, &ReportOptions::default()).unwrap(), ReportKind::Html);
+        assert!(html.contains("recorded during manual testing") && !html.contains("written up by the tester"));
+        s.findings_remove(&[id]).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        assert!(r.alerts.iter().all(|g| g.alert_ref != "manual:order-idor"));
+        assert!(!render(&r, ReportKind::Html).contains("found by hand"));
+        let all = ReportOptions {
+            filter: FindingFilter { state: Some("all".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let r = build(&s, &all).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
+        assert_eq!(g.instances[0].state, "removed");
+        assert!(render(&r, ReportKind::Html).contains("<span class=\"tag\">removed</span>"));
     }
 }

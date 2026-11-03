@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::scan::findings_db::{dedupe_key, MANUAL_SOURCE};
+use crate::scan::findings_db::{dedupe_key, MANUAL_SOURCE, REMOVED};
 use crate::scan::Risk;
 use crate::store::Store;
 
@@ -44,6 +44,11 @@ impl Item {
         self.state == FALSE_POSITIVE
     }
 
+    /// Added by hand and then removed (`findings remove`): a tombstone, not a finding.
+    pub fn removed(&self) -> bool {
+        self.state == REMOVED
+    }
+
     /// A risk this build doesn't know (from a file) counts as the highest, so a gate can't miss it.
     pub fn at_least(&self, risk: Risk) -> bool {
         Risk::parse(&self.risk).unwrap_or(Risk::High).level() >= risk.level()
@@ -55,6 +60,8 @@ pub struct Comparison {
     pub new: Vec<Item>,
     pub unchanged: Vec<Item>,
     pub fixed: Vec<Item>,
+    /// Findings of the baseline that someone removed (`findings remove`) rather than fixed.
+    pub removed: Vec<Item>,
     /// Findings a scan comparison says nothing about: outside what the scan covered.
     pub other: usize,
 }
@@ -68,7 +75,7 @@ impl Comparison {
     }
 
     fn sort(mut self) -> Self {
-        for list in [&mut self.new, &mut self.unchanged, &mut self.fixed] {
+        for list in [&mut self.new, &mut self.unchanged, &mut self.fixed, &mut self.removed] {
             let level = |f: &Item| Risk::parse(&f.risk).map_or(Risk::High.level(), Risk::level);
             list.sort_by(|a, b| {
                 level(b).cmp(&level(a)).then_with(|| (&a.alert_ref, &a.url).cmp(&(&b.alert_ref, &b.url)))
@@ -80,9 +87,11 @@ impl Comparison {
 
 /// Compares two sets by finding identity. A false-positive mark on either side stays with the
 /// finding: rediscovering a finding triaged in the baseline doesn't reopen it, and one marked
-/// here isn't "fixed" just because it is hidden.
+/// here isn't "fixed" just because it is hidden. A finding removed here (a tombstone) that the
+/// baseline has is "removed", never "fixed"; tombstones are otherwise left out on both sides.
 pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
-    let mut base: HashMap<String, Item> = baseline.into_iter().map(|f| (f.key(), f)).collect();
+    let mut base: HashMap<String, Item> = baseline.into_iter().filter(|f| !f.removed()).map(|f| (f.key(), f)).collect();
+    let (gone, current): (Vec<Item>, Vec<Item>) = current.into_iter().partition(Item::removed);
     let mut out = Comparison::default();
     let mut seen = HashSet::new();
     for mut f in current {
@@ -98,6 +107,12 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
                 out.unchanged.push(f);
             }
             None => out.new.push(f),
+        }
+    }
+    // A tombstone stands for the baseline's finding only when nothing current has taken its place.
+    for f in gone {
+        if base.remove(&f.key()).is_some() {
+            out.removed.push(f);
         }
     }
     out.fixed = base.into_values().collect();
@@ -195,7 +210,7 @@ pub fn compare_scan(store: &Store, scope: &ScanScope) -> Result<Comparison> {
     let mut stmt = store.conn.prepare(
         "SELECT f.id, f.alert_ref, f.name, f.risk, f.confidence, f.source, f.method, f.url, f.param, f.state,
             f.time, coalesce(h.time, f.time), f.rule_id
-         FROM findings f LEFT JOIN history h ON h.id = f.last_history_id",
+         FROM findings f LEFT JOIN history h ON h.id = f.last_history_id WHERE f.state != 'removed'",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Comparison::default();
@@ -235,7 +250,7 @@ fn item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     })
 }
 
-/// Every finding of a project, false positives included.
+/// Every finding of a project, false positives and removed ones (tombstones) included.
 pub fn project_items(store: &Store) -> Result<Vec<Item>> {
     let mut stmt = store
         .conn
@@ -619,6 +634,7 @@ mod tests {
             solution: String::new(),
             cwe: None,
             history: vec![1],
+            replace_text: false,
         };
         s.finding_add(&manual).unwrap();
         // No scan finds it, so it is never fixed and never trips a --scan gate.
@@ -634,7 +650,52 @@ mod tests {
         let c = compare_sets(scanned.clone(), project_items(&s).unwrap());
         assert_eq!((c.new.len(), c.new[0].source.as_str()), (1, "manual"));
         assert_eq!(c.gate(Risk::High, true).len(), 1);
-        let c = compare_sets(project_items(&s).unwrap(), scanned);
+        let c = compare_sets(project_items(&s).unwrap(), scanned.clone());
         assert_eq!(c.fixed.len(), 1);
+    }
+
+    #[test]
+    fn a_removed_finding_is_removed_not_fixed() {
+        let mut s = store_with_findings();
+        let scanned = project_items(&s).unwrap();
+        let manual = |param: &str| crate::scan::findings_db::ManualFinding {
+            title: "IDOR on orders".into(),
+            risk: Risk::High,
+            confidence: crate::scan::Confidence::High,
+            url: Some("http://a.test/orders/7".into()),
+            method: None,
+            param: param.into(),
+            evidence: String::new(),
+            description: String::new(),
+            solution: String::new(),
+            cwe: None,
+            history: vec![],
+            replace_text: false,
+        };
+        let id = s.finding_add(&manual("id")).unwrap();
+        let other = s.finding_add(&manual("owner")).unwrap();
+        let baseline = project_items(&s).unwrap();
+        s.findings_remove(&[id]).unwrap();
+        let c = compare_sets(baseline.clone(), project_items(&s).unwrap());
+        assert!(c.fixed.is_empty(), "{c:?}");
+        assert_eq!(c.removed.iter().map(|f| (f.id, f.state.as_str())).collect::<Vec<_>>(), [(Some(id), "removed")]);
+        assert!(c.gate(Risk::Info, false).iter().all(|f| f.id != Some(id)));
+        assert!(c.unchanged.iter().any(|f| f.id == Some(other)));
+        // A tombstone in the baseline isn't a finding there: added again, the issue is new.
+        let with_tombstone = project_items(&s).unwrap();
+        let again = s.finding_add(&manual("id")).unwrap();
+        let c = compare_sets(with_tombstone.clone(), project_items(&s).unwrap());
+        assert_eq!((c.new.len(), c.new[0].id), (1, Some(again)));
+        assert!(c.removed.is_empty() && c.fixed.is_empty(), "{c:?}");
+        // Against the first baseline, the finding added again is unchanged; its tombstone isn't counted.
+        let c = compare_sets(baseline, project_items(&s).unwrap());
+        assert!(c.removed.is_empty() && c.fixed.is_empty(), "{c:?}");
+        assert!(c.unchanged.iter().any(|f| f.id == Some(again)));
+        // Tombstones that no baseline had say nothing, and no scan sees them.
+        let c = compare_sets(scanned, with_tombstone);
+        assert!(c.removed.is_empty() && c.new.iter().all(|f| f.id != Some(id)), "{c:?}");
+        let window = ScanScope { start: "2000-01-01T00:00:00.000Z".into(), ..Default::default() };
+        let c = compare_scan(&s, &window).unwrap();
+        assert_eq!(c.other, 2, "{c:?}");
     }
 }

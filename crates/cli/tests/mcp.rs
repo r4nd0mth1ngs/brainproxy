@@ -425,9 +425,9 @@ fn an_agent_adds_findings_from_stdin_but_reads_no_files() {
     let tools = list["result"]["tools"].as_array().unwrap();
     let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}")).clone();
     assert!(tool("findings_add")["inputSchema"]["properties"]["stdin"].is_object());
-    // A description or solution replaces the one findings of the same title share.
-    assert_eq!(tool("findings_add")["annotations"]["destructiveHint"], true);
-    assert_eq!(tool("findings_remove")["annotations"]["destructiveHint"], true);
+    // An agent can't replace the write-up findings of the same title share, nor remove findings.
+    assert_eq!(tool("findings_add")["annotations"]["destructiveHint"], false);
+    assert!(tools.iter().all(|t| t["name"] != "findings_remove"));
 
     let base = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/7"});
     let mut from_file = base.clone();
@@ -443,19 +443,30 @@ fn an_agent_adds_findings_from_stdin_but_reads_no_files() {
     assert!(!err, "{e}");
     assert_eq!(e["data"]["finding"]["description"], "Any user can read any order.");
     let id = e["data"]["id"].as_i64().unwrap();
-    // Texts as JSON on stdin; replacing the shared description says so.
-    let args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/8", "input_json": true,
+    // Texts as JSON on stdin; another description than the shared one is refused, and an agent
+    // can't ask to replace it.
+    let mut args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/8", "input_json": true,
         "stdin": r#"{"description": "Newer text.", "evidence": "{\"owner\": 2}"}"#});
+    let (err, e) = m.call("findings_add", args.clone());
+    assert!(err && e["error"]["kind"] == "conflict", "{e}");
+    args["replace_text"] = json!(true);
+    let (err, e) = m.call("findings_add", args);
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("through MCP"), "{e}");
+    let args = json!({"title": "Order IDOR", "risk": "high", "url": "https://app.test/orders/8", "input_json": true,
+        "stdin": r#"{"evidence": "{\"owner\": 2}"}"#});
     let (err, e) = m.call("findings_add", args);
     assert!(!err, "{e}");
     assert_eq!(
         (e["data"]["finding"]["evidence"].as_str(), e["data"]["finding"]["description"].as_str()),
-        (Some(r#"{"owner": 2}"#), Some("Newer text."))
+        (Some(r#"{"owner": 2}"#), Some("Any user can read any order."))
     );
-    assert!(e["data"]["warnings"][0].as_str().unwrap().contains("replaced the description"), "{e}");
-    m.call("findings_remove", json!({"ids": [e["data"]["id"]]}));
-    let (err, e) = m.call("findings_remove", json!({"ids": [id]}));
-    assert!(!err && e["data"]["removed"] == 1, "{e}");
+    // Nothing can be removed: the agent marks instead.
+    let r = m.request("tools/call", json!({"name": "findings_remove", "arguments": {"ids": [id]}}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let (err, e) = m.call("findings_mark", json!({"id": id, "state": "false_positive", "note": "not a bug"}));
+    assert!(!err, "{e}");
+    let (_, e) = m.call("findings_show", json!({"id": id}));
+    assert_eq!(e["data"]["state"], "false_positive", "{e}");
 }
 
 #[test]
@@ -467,10 +478,8 @@ fn an_agent_reads_no_file_through_any_finding_text_flag() {
     m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
     let list = m.request("tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    for name in ["findings_add", "findings_remove"] {
-        let t = tools.iter().find(|t| t["name"] == name).unwrap();
-        assert_eq!(t["annotations"]["readOnlyHint"], false, "{t}");
-    }
+    let t = tools.iter().find(|t| t["name"] == "findings_add").unwrap();
+    assert_eq!(t["annotations"]["readOnlyHint"], false, "{t}");
     let abs = dir.join("notes.txt");
     for flag in ["description_file", "solution_file", "evidence_file"] {
         for path in [abs.to_str().unwrap(), "notes.txt", "/etc/hostname"] {

@@ -28,10 +28,11 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Commands not offered as tools: the server itself, foreground servers that never
 /// return (their `start` variants run them in the background), the feed signing
-/// key's commands (publishing checks is for a maintainer, not an agent), and `project save`
-/// (copying the project elsewhere is for the person running the server).
+/// key's commands (publishing checks is for a maintainer, not an agent), `project save`
+/// (copying the project elsewhere is for the person running the server), and `findings remove`
+/// (an agent can't tell a person's finding from its own; it marks one false_positive instead).
 const EXCLUDED: &[&str] =
-    &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save"];
+    &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save", "findings remove"];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
 /// do alone (run a collection's script, open the user's browser, read any environment variable).
@@ -213,8 +214,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings compare", READ),
     ("findings show", READ),
     ("findings mark", SET),
-    // A description or solution replaces the one every finding of that title shares.
-    ("findings add", REPLACE),
+    // Through MCP it can't replace the write-up findings of the same title share (--replace-text).
+    ("findings add", ADD),
     ("findings remove", REPLACE),
     // --output writes a file (refused if it exists unless --force).
     ("report", REPLACE),

@@ -39,8 +39,9 @@ pub struct ReportArgs {
     /// Only findings from this scanner, or those added by hand (manual).
     #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
     source: Option<String>,
-    /// Triage state to include (default: open and confirmed, i.e. hides false positives).
-    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "all"])]
+    /// Triage state to include (default: open and confirmed, i.e. hides false positives and
+    /// removed findings added by hand; all includes both).
+    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "removed", "all"])]
     state: Option<String>,
     #[arg(long)]
     host: Option<String>,

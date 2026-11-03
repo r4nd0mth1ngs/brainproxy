@@ -1011,26 +1011,86 @@ fn findings_add_reads_texts_from_files_and_stdin() {
     // None of these was stored.
     let (_, v) = run(&["findings", "list", "--source", "manual", "--all"], &project, None);
     assert_eq!(v["data"]["items"].as_array().unwrap().len(), 1, "{v}");
-    // --input-json takes the texts from stdin as JSON, and not with a text flag too.
-    let (code, v) = run(
-        &args(&with(&["--param", "g", "--input-json"])),
-        &project,
-        Some(br#"{"solution": "Check the owner, always.", "evidence": "token=abc"}"#),
-    );
+    // --input-json takes the texts from stdin as JSON, and not with a text flag too. Another
+    // solution than the one findings of this title share is refused unless --replace-text.
+    let json = br#"{"solution": "Check the owner, always.", "evidence": "token=abc"}"#;
+    let (code, kind, msg) = fail(&["--param", "g", "--input-json"], Some(json));
+    assert!(code == 2 && kind == "conflict" && msg.contains("--replace-text"), "{kind} {msg}");
+    let (code, v) = run(&args(&with(&["--param", "g", "--input-json", "--replace-text"])), &project, Some(json));
     assert_eq!(code, 0, "{v}");
     let f = &v["data"]["finding"];
     assert_eq!((f["evidence"].as_str(), f["solution"].as_str()), (Some("token=abc"), Some("Check the owner, always.")));
+    assert_eq!(f["replaced_texts"][0]["solution"], "Check the owner.", "{v}");
     let w = v["data"]["warnings"].as_array().unwrap();
     assert!(w.len() == 1 && w[0].as_str().unwrap().contains("replaced the solution"), "{v}");
     let (code, kind, _) = fail(&["--param", "h", "--input-json", "--evidence", "x"], Some(b"{}"));
     assert_eq!((code, kind.as_str()), (2, "usage"));
     let (code, _, msg) = fail(&["--param", "h", "--input-json"], Some(br#"{"notes": "x"}"#));
     assert!(code == 2 && msg.contains("--input-json"), "{msg}");
-    let (_, v) = run(&["findings", "remove", &v["data"]["id"].to_string()], &project, None);
+    let g = v["data"]["id"].to_string();
+    let (_, v) = run(&["findings", "remove", &g], &project, None);
     assert_eq!(v["data"]["removed"], 1, "{v}");
     // Removing one that isn't there removes nothing.
     let (code, v) = run(&["findings", "remove", &id, "99"], &project, None);
     assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
     let (code, v) = run(&["findings", "remove", &id], &project, None);
     assert_eq!((code, v["data"]["removed"].as_i64()), (0, Some(1)));
+    // Removed findings stay, hidden unless asked for; removing one again is refused.
+    let (code, v) = run(&["findings", "remove", &id], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    let (_, v) = run(&["findings", "list", "--source", "manual", "--all"], &project, None);
+    assert_eq!(v["data"]["items"].as_array().unwrap().len(), 0, "{v}");
+    let (_, v) = run(&["findings", "list", "--source", "manual", "--all", "--state", "all"], &project, None);
+    let items = v["data"]["items"].as_array().unwrap();
+    assert!(items.len() == 2 && items.iter().all(|i| i["state"] == "removed"), "{v}");
+    let (_, v) = run(&["findings", "show", &g], &project, None);
+    assert_eq!((v["data"]["state"].as_str(), v["data"]["removed"]["state"].as_str()), (Some("removed"), Some("open")));
+    let (code, v) = run(&["findings", "mark", &g, "--state", "confirmed"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    // A tool call can't remove findings, even when run outside the server.
+    let out = bin()
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["findings", "remove", "99"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["error"]["message"].as_str().unwrap().contains("false_positive"), "{v}");
+}
+
+/// The URL can come on stdin with the texts, out of the process list, and a linked entry on
+/// another site is warned about, with every linked entry's method and URL in the result.
+#[test]
+fn findings_add_takes_the_url_on_stdin_and_checks_its_links() {
+    let project = tmp_project("manual-links");
+    let (here, there) = (serve(1), serve(1));
+    let sent: Vec<String> = [here, there]
+        .iter()
+        .map(|port| {
+            let (code, v) = run(&["send", "--url", &format!("http://127.0.0.1:{port}/orders/7")], &project, None);
+            assert_eq!(code, 0, "{v}");
+            v["data"]["id"].to_string()
+        })
+        .collect();
+    let add = |more: &[&str], stdin: Option<&[u8]>| {
+        let mut a = vec!["findings", "add", "--title", "Token in URL", "--risk", "medium"];
+        a.extend_from_slice(more);
+        run(&a, &project, stdin)
+    };
+    let json = format!(r#"{{"url": "http://127.0.0.1:{here}/reset?token=FAKE-TOKEN", "method": "post"}}"#);
+    let (code, v) = add(&["--input-json", "--history-id", &sent.join(",")], Some(json.as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    let f = &v["data"]["finding"];
+    let url = format!("http://127.0.0.1:{here}/reset?token=FAKE-TOKEN");
+    assert_eq!((f["url"].as_str(), f["method"].as_str()), (Some(url.as_str()), Some("POST")));
+    let links = v["data"]["history"].as_array().unwrap();
+    assert_eq!(links.len(), 2, "{v}");
+    assert_eq!(links[1]["url"], format!("http://127.0.0.1:{there}/orders/7"));
+    assert_eq!((links[0]["other_site"].as_bool(), links[1]["other_site"].as_bool()), (Some(false), Some(true)));
+    let w = v["data"]["warnings"].as_array().unwrap();
+    assert!(w.len() == 1 && w[0].as_str().unwrap().contains(&format!("GET http://127.0.0.1:{there}/orders/7")), "{v}");
+    // Not both ways.
+    let (code, v) = add(&["--url", "http://127.0.0.1/a", "--input-json"], Some(br#"{"url": "http://127.0.0.1/b"}"#));
+    assert!(code == 2 && v["error"]["message"].as_str().unwrap().contains("--url"), "{v}");
 }

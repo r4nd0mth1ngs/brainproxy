@@ -46,9 +46,9 @@ pub struct CompareArgs {
     /// With --fail-on: only count new findings, not those already in the baseline.
     #[arg(long, requires = "fail_on")]
     new_only: bool,
-    /// Triage state to list: open, confirmed, false_positive, or all (default hides false
+    /// Triage state to list: open, confirmed, false_positive, removed, or all (default hides false
     /// positives). --fail-on doesn't depend on it.
-    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "all"])]
+    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "removed", "all"])]
     state: Option<String>,
     /// Maximum findings listed per group; counts and the gate always cover all of them.
     #[arg(long, default_value_t = 1000)]
@@ -119,13 +119,14 @@ pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
         })
     });
 
-    let (new, unchanged, fixed) = (
+    let (new, unchanged, fixed, removed) = (
         listed(&comparison.new, &a.state),
         listed(&comparison.unchanged, &a.state),
         listed(&comparison.fixed, &a.state),
+        listed(&comparison.removed, &a.state),
     );
     let gate_cut = gate.as_ref().is_some_and(|(_, hits)| hits.len() > a.limit);
-    let truncated = gate_cut || [&new, &unchanged, &fixed].iter().any(|l| l.len() > a.limit);
+    let truncated = gate_cut || [&new, &unchanged, &fixed, &removed].iter().any(|l| l.len() > a.limit);
     let data = json!({
         "baseline": baseline,
         "current": current,
@@ -133,13 +134,20 @@ pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
             "new": new.len(),
             "unchanged": unchanged.len(),
             "fixed": fixed.len(),
+            "removed": removed.len(),
             "other": comparison.other,
-            "by_risk": {"new": by_risk(&new), "unchanged": by_risk(&unchanged), "fixed": by_risk(&fixed)},
+            "by_risk": {
+                "new": by_risk(&new),
+                "unchanged": by_risk(&unchanged),
+                "fixed": by_risk(&fixed),
+                "removed": by_risk(&removed),
+            },
             "truncated": truncated,
         },
         "new": &new[..new.len().min(a.limit)],
         "unchanged": &unchanged[..unchanged.len().min(a.limit)],
         "fixed": &fixed[..fixed.len().min(a.limit)],
+        "removed": &removed[..removed.len().min(a.limit)],
         "gate": gate_json,
         "warnings": warnings,
     });
@@ -275,8 +283,12 @@ fn text(data: &Value) -> String {
     if sum["other"].as_u64().unwrap_or(0) > 0 {
         lines.push(format!("{} outside the scan", sum["other"]));
     }
+    if sum["removed"].as_u64().unwrap_or(0) > 0 {
+        lines.push(format!("{} removed by hand (not fixed)", sum["removed"]));
+    }
     lines.extend(list(&data["new"]).iter().map(|f| row("new", f)));
     lines.extend(list(&data["fixed"]).iter().map(|f| row("fixed", f)));
+    lines.extend(list(&data["removed"]).iter().map(|f| row("removed", f)));
     let gate = &data["gate"];
     if !gate.is_null() {
         let what = if gate["new_only"] == true { "new findings" } else { "findings" };

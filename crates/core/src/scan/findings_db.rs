@@ -75,7 +75,11 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
         "history.id where last seen (source manual: the last linked entry; `findings show` lists them all in history_ids)",
     ),
     ("hits", "INTEGER", "Times seen (same alert, method, URL without query, param)"),
-    ("state", "TEXT", "open, confirmed, false_positive"),
+    (
+        "state",
+        "TEXT",
+        "open, confirmed, false_positive, or removed (source manual, by `findings remove`; hidden unless --state all)",
+    ),
     ("note", "TEXT", "Free-text note"),
 ];
 
@@ -253,7 +257,8 @@ impl Store {
             "SELECT alert_ref, name, risk, max(risk_level) AS risk_level, count(*) AS instances, sum(hits) AS hits,
                 count(DISTINCT host) AS hosts, min(id) AS first_id,
                 json_group_array(json_object('id', id, 'url', url, 'param', param, 'evidence', substr(evidence, 1, 200)))
-                    AS examples
+                    AS examples,
+                group_concat(DISTINCT source) AS sources
              FROM findings WHERE {where_sql} GROUP BY alert_ref ORDER BY risk_level DESC, instances DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -266,6 +271,8 @@ impl Store {
                 "alert_ref": r.get::<_, String>(0)?,
                 "name": r.get::<_, String>(1)?,
                 "risk": r.get::<_, String>(2)?,
+                // One source, or several joined by commas when scanners share an alert type.
+                "source": r.get::<_, String>(9)?,
                 "instances": r.get::<_, i64>(4)?,
                 "hits": r.get::<_, i64>(5)?,
                 "hosts": r.get::<_, i64>(6)?,
@@ -326,18 +333,33 @@ impl Store {
         }
         if obj.get("source").and_then(Value::as_str) == Some(MANUAL_SOURCE) {
             obj.insert("history_ids".into(), json!(self.finding_history_ids(id)?));
+            let stored = |key: String| -> Result<Option<Value>> {
+                Ok(self.meta_get(&key)?.and_then(|v| serde_json::from_str(&v).ok()))
+            };
+            if let Some(removed) = stored(removed_key(id))? {
+                obj.insert("removed".into(), removed);
+            }
+            let alert_ref = obj.get("alert_ref").and_then(Value::as_str).unwrap_or_default().to_string();
+            if let Some(earlier) = stored(replaced_texts_key(&alert_ref))? {
+                obj.insert("replaced_texts".into(), earlier);
+            }
         }
         Ok(Value::Object(obj))
     }
 
-    /// Sets a finding's triage state and/or note.
+    /// Sets a finding's triage state and/or note. A removed finding stays as it was removed.
     pub fn finding_mark(&self, id: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note) WHERE id = ?3",
+            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note)
+             WHERE id = ?3 AND state != 'removed'",
             params![state, note, id],
         )?;
         if n == 0 {
-            return Err(Error::NotFound(format!("finding {id}")));
+            let exists = self.conn.query_row("SELECT 1 FROM findings WHERE id = ?1", [id], |_| Ok(())).optional()?;
+            return Err(match exists {
+                Some(()) => Error::Conflict(format!("finding {id} was removed; add it again to record it")),
+                None => Error::NotFound(format!("finding {id}")),
+            });
         }
         Ok(())
     }
@@ -349,7 +371,8 @@ impl Store {
 
     /// Records a finding a person found by hand; returns its id. Nothing is sent. Findings with
     /// the same title share an alert type (`manual:<title>`), which holds the description and
-    /// solution: one given here replaces the type's, one left out keeps it.
+    /// solution: one left out keeps the type's, and one that differs from it is refused unless
+    /// `replace_text`, when the type's earlier text is kept in meta (`findings show` lists it).
     pub fn finding_add(&mut self, f: &ManualFinding) -> Result<i64> {
         let title = f.title.trim();
         if title.is_empty() || title.len() > MANUAL_TITLE_MAX {
@@ -415,6 +438,32 @@ impl Store {
                 "finding {id} is already this issue (same title, method, URL without its query, and parameter)"
             )));
         }
+        let replaced = texts_replaced(&tx, &alert_ref, f)?;
+        if !replaced.is_empty() {
+            if !f.replace_text {
+                return Err(Error::Conflict(format!(
+                    "the {} differs from the one every finding titled {title:?} shares; leave it out to keep \
+                     that one, or give --replace-text to replace it",
+                    replaced.join(" and ")
+                )));
+            }
+            // The text it replaces is kept, with when it was replaced.
+            let key = replaced_texts_key(&alert_ref);
+            let earlier: Option<String> =
+                tx.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?;
+            let mut list: Vec<Value> = earlier.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+            let (description, solution, time): (String, String, String) = tx.query_row(
+                "SELECT description, solution, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM finding_types
+                 WHERE alert_ref = ?1",
+                [&alert_ref],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            list.push(json!({"time": time, "description": description, "solution": solution}));
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, Value::Array(list).to_string()],
+            )?;
+        }
         tx.execute(
             "INSERT INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
              VALUES (?1, 0, ?2, ?3, ?4, '[]', '[\"manual\"]')
@@ -458,33 +507,50 @@ impl Store {
     }
 
     /// Removes findings added by hand; scanner findings are refused (mark them instead), and
-    /// nothing is removed unless every id can be. Returns how many were removed.
+    /// nothing is removed unless every id can be. A removed finding stays as a tombstone: state
+    /// `removed` (hidden unless `--state all`), with when it was removed and the state it had in
+    /// meta, so a comparison can tell it from a fixed one. Its identity is freed, so the same
+    /// issue can be added again. Returns how many were removed.
     pub fn findings_remove(&mut self, ids: &[i64]) -> Result<usize> {
-        let tx = self.write_tx()?;
+        let mut unique: Vec<i64> = Vec::new();
         for &id in ids {
-            let source: Option<String> =
-                tx.query_row("SELECT source FROM findings WHERE id = ?1", [id], |r| r.get(0)).optional()?;
-            match source.as_deref() {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        let tx = self.write_tx()?;
+        for &id in &unique {
+            let row: Option<(String, String)> = tx
+                .query_row("SELECT source, state FROM findings WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            match row {
                 None => return Err(Error::NotFound(format!("finding {id}"))),
-                Some(MANUAL_SOURCE) => {}
-                Some(s) => {
+                Some((s, _)) if s != MANUAL_SOURCE => {
                     return Err(Error::InvalidInput(format!(
                         "finding {id} came from the {s} scanner; only findings added by hand can be removed \
                          (mark it false_positive instead)"
                     )))
                 }
+                Some((_, state)) if state == REMOVED => {
+                    return Err(Error::Conflict(format!("finding {id} was already removed")));
+                }
+                Some(_) => {}
             }
         }
         let mut removed = 0;
-        for &id in ids {
-            removed += tx.execute("DELETE FROM findings WHERE id = ?1", [id])?;
-            tx.execute("DELETE FROM meta WHERE key = ?1", [history_key(id)])?;
+        for &id in &unique {
+            tx.execute(
+                "INSERT INTO meta (key, value)
+                 SELECT ?1, json_object('time', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'state', state)
+                 FROM findings WHERE id = ?2
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![removed_key(id), id],
+            )?;
+            removed += tx.execute(
+                "UPDATE findings SET state = ?1, dedupe = ?1 || ':' || id || ':' || dedupe WHERE id = ?2",
+                params![REMOVED, id],
+            )?;
         }
-        tx.execute(
-            "DELETE FROM finding_types WHERE alert_ref LIKE 'manual:%'
-                AND alert_ref NOT IN (SELECT alert_ref FROM findings)",
-            [],
-        )?;
         tx.commit()?;
         Ok(removed)
     }
@@ -492,25 +558,34 @@ impl Store {
     /// Which texts of its alert type adding `f` would replace ("description", "solution"): those
     /// the type already has, shared with every finding of the same title, and `f` changes.
     pub fn manual_texts_replaced(&self, f: &ManualFinding) -> Result<Vec<&'static str>> {
-        let alert_ref = manual_alert_ref(f.title.trim())?;
-        let old: Option<(String, String)> = self
+        texts_replaced(&self.conn, &manual_alert_ref(f.title.trim())?, f)
+    }
+
+    /// Each history entry a finding added by hand links to, in order: its id, method and URL, and
+    /// whether it went to another host or port than the finding's URL (linked by mistake, maybe).
+    pub fn finding_links(&self, id: i64) -> Result<Vec<Value>> {
+        let url: String = self
             .conn
-            .query_row(
-                "SELECT coalesce(description, ''), coalesce(solution, '') FROM finding_types WHERE alert_ref = ?1",
-                [&alert_ref],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((description, solution)) = old else { return Ok(Vec::new()) };
-        let changed = |old: &str, new: &str| !old.is_empty() && !new.trim().is_empty() && old != new.trim();
-        let mut replaced = Vec::new();
-        if changed(&description, &f.description) {
-            replaced.push("description");
+            .query_row("SELECT url FROM findings WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
+        let site = url::Url::parse(&url)
+            .ok()
+            .map(|u| (bare_host(u.host_str().unwrap_or_default()), u.port_or_known_default()));
+        let mut links = Vec::new();
+        for h in self.finding_history_ids(id)? {
+            let row: Option<(String, String, String, i64)> = self
+                .conn
+                .query_row("SELECT method, url, host, port FROM history WHERE id = ?1", [h], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()?;
+            let Some((method, url, host, port)) = row else { continue };
+            let other_site =
+                site.as_ref().is_some_and(|(h, p)| *h != bare_host(&host) || p.map(i64::from) != Some(port));
+            links.push(json!({"id": h, "method": method, "url": url, "other_site": other_site}));
         }
-        if changed(&solution, &f.solution) {
-            replaced.push("solution");
-        }
-        Ok(replaced)
+        Ok(links)
     }
 
     /// The history entries a finding added by hand links to, in the order given.
@@ -533,6 +608,8 @@ impl Store {
 
 /// `findings.source` of a finding added by hand.
 pub const MANUAL_SOURCE: &str = "manual";
+/// `findings.state` of a finding added by hand and then removed.
+pub const REMOVED: &str = "removed";
 const MANUAL_TITLE_MAX: usize = 300;
 const MANUAL_EVIDENCE_MAX: usize = 10_000;
 const MANUAL_TEXT_MAX: usize = 100_000;
@@ -555,10 +632,48 @@ pub struct ManualFinding {
     pub cwe: Option<u32>,
     /// History entries it was seen in; the first is the report's evidence.
     pub history: Vec<i64>,
+    /// Replace the description or solution the type has when this one differs.
+    pub replace_text: bool,
 }
 
 fn history_key(id: i64) -> String {
     format!("finding.{id}.history")
+}
+
+/// When a finding was removed, and the triage state it had.
+fn removed_key(id: i64) -> String {
+    format!("finding.{id}.removed")
+}
+
+/// The descriptions and solutions an alert type of findings added by hand had before they were replaced.
+fn replaced_texts_key(alert_ref: &str) -> String {
+    format!("finding_type.{alert_ref}.replaced")
+}
+
+/// A host as compared: lower case, without an IPv6 address's brackets.
+fn bare_host(host: &str) -> String {
+    host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()
+}
+
+/// Which texts of the type `alert_ref` `f` would replace: those it has and `f` gives differently.
+fn texts_replaced(conn: &rusqlite::Connection, alert_ref: &str, f: &ManualFinding) -> Result<Vec<&'static str>> {
+    let old: Option<(String, String)> = conn
+        .query_row(
+            "SELECT coalesce(description, ''), coalesce(solution, '') FROM finding_types WHERE alert_ref = ?1",
+            [alert_ref],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((description, solution)) = old else { return Ok(Vec::new()) };
+    let changed = |old: &str, new: &str| !old.is_empty() && !new.trim().is_empty() && old != new.trim();
+    let mut replaced = Vec::new();
+    if changed(&description, &f.description) {
+        replaced.push("description");
+    }
+    if changed(&solution, &f.solution) {
+        replaced.push("solution");
+    }
+    Ok(replaced)
 }
 
 /// `manual:` and the title in lower case, words joined by `-`, so findings with the same
@@ -684,7 +799,7 @@ impl FindingFilter {
             Some("all") => {}
             // `mark` takes false-positive and stores false_positive; accept either spelling.
             Some(s) => clauses.push(format!("state = {}", bind(&mut args, s.replace('-', "_")))),
-            None => clauses.push("state != 'false_positive'".into()),
+            None => clauses.push("state NOT IN ('false_positive', 'removed')".into()),
         }
         if let Some(s) = &self.source {
             clauses.push(format!("source = {}", bind(&mut args, s.clone())));
@@ -716,6 +831,7 @@ mod tests {
             solution: String::new(),
             cwe: None,
             history,
+            replace_text: false,
         }
     }
 
@@ -792,8 +908,7 @@ mod tests {
         again.method = Some("post".into());
         let e = s.finding_add(&again).unwrap_err();
         assert!(matches!(e, Error::Conflict(_)), "{e}");
-        // Another URL with the same title joins the type; a new description replaces its text,
-        // none keeps it.
+        // Another URL with the same title joins the type; no description keeps its text.
         let other = s.finding_add(&manual("Order IDOR", Some("https://app.test/orders/8"), vec![])).unwrap();
         assert_eq!(s.finding_get(other).unwrap()["description"], "Read anyone's order.");
         assert_eq!(s.finding_get(other).unwrap()["method"], "GET");
@@ -802,12 +917,23 @@ mod tests {
         assert_eq!(s.manual_texts_replaced(&f).unwrap(), ["description"]);
         f.description = " Read anyone's order. ".into();
         assert!(s.manual_texts_replaced(&f).unwrap().is_empty());
+        // Another description is refused unless asked for, and nothing is added.
         f.description = "Newer text.".into();
+        assert!(matches!(s.finding_add(&f), Err(Error::Conflict(ref m)) if m.contains("--replace-text")));
+        assert_eq!(s.finding_get(id).unwrap()["description"], "Read anyone's order.");
+        assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 2);
+        // Asked for, it replaces the text and keeps the earlier one.
+        f.replace_text = true;
         s.finding_add(&f).unwrap();
-        assert_eq!(s.finding_get(id).unwrap()["description"], "Newer text.");
+        let v = s.finding_get(id).unwrap();
+        assert_eq!(v["description"], "Newer text.");
+        let earlier = v["replaced_texts"].as_array().unwrap();
+        assert_eq!((earlier.len(), earlier[0]["description"].as_str()), (1, Some("Read anyone's order.")));
+        assert!(earlier[0]["time"].as_str().is_some_and(|t| t.ends_with('Z')), "{v}");
         let groups =
             s.findings_grouped(&FindingFilter { source: Some("manual".into()), ..Default::default() }).unwrap();
         assert_eq!((groups.len(), groups[0]["instances"].as_i64()), (1, Some(3)));
+        assert_eq!(groups[0]["source"], "manual");
         // Marked like any other.
         s.finding_mark(id, Some("confirmed"), Some("checked")).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["state"], "confirmed");
@@ -862,12 +988,53 @@ mod tests {
         assert!(matches!(s.findings_remove(&[id, scanner]), Err(Error::InvalidInput(_))));
         assert!(matches!(s.findings_remove(&[id, 999]), Err(Error::NotFound(_))));
         assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 3);
+        s.finding_mark(id, Some("confirmed"), Some("seen twice")).unwrap();
         assert_eq!(s.findings_remove(&[id]).unwrap(), 1);
-        assert_eq!(s.meta_get(&history_key(id)).unwrap(), None);
+
+        // Removed, it is a tombstone: hidden unless asked for, with when and what it was.
+        let all = FindingFilter { state: Some("all".into()), ..Default::default() };
+        assert_eq!(s.findings_list(&FindingFilter::default(), 10).unwrap().len(), 2);
+        assert_eq!(s.findings_list(&all, 10).unwrap().len(), 3);
+        let removed = FindingFilter { state: Some("removed".into()), ..Default::default() };
+        assert_eq!(s.findings_list(&removed, 10).unwrap()[0]["id"], id);
+        let v = s.finding_get(id).unwrap();
+        assert_eq!((v["state"].as_str(), v["note"].as_str()), (Some("removed"), Some("seen twice")));
+        assert_eq!(v["removed"]["state"], "confirmed");
+        assert!(v["removed"]["time"].as_str().is_some_and(|t| t.ends_with('Z')), "{v}");
+        assert_eq!(v["history_ids"], json!(want));
+        assert!(matches!(s.finding_mark(id, Some("open"), None), Err(Error::Conflict(_))));
+        assert!(matches!(s.findings_remove(&[id]), Err(Error::Conflict(_))));
         let types = |s: &Store| s.query("SELECT alert_ref FROM finding_types", &[], 10, 100).unwrap().rows.len();
-        assert_eq!(types(&s), 1);
-        s.findings_remove(&[two]).unwrap();
-        assert_eq!(types(&s), 0);
+        assert_eq!(types(&s), 2);
+        // The same issue can be added again, as a new finding.
+        let again = s.finding_add(&manual("Many", None, vec![h])).unwrap();
+        assert_ne!(again, id);
+        assert_eq!(s.finding_get(again).unwrap()["state"], "open");
+        assert_eq!(s.finding_get(id).unwrap()["state"], "removed");
+    }
+
+    #[test]
+    fn links_to_another_site_are_told_apart() {
+        let (mut s, h) = store();
+        let target = Target { scheme: "https".into(), host: "b.test".into(), port: 8443 };
+        let other = s
+            .record(&Capture::new("send", &target, b"GET /x HTTP/1.1\r\nHost: b.test\r\n\r\n", None, None, None))
+            .unwrap();
+        let id = s.finding_add(&manual("Mixed", Some("https://APP.test/orders/7"), vec![h, other])).unwrap();
+        let links = s.finding_links(id).unwrap();
+        assert_eq!(
+            links,
+            [
+                json!({"id": h, "method": "POST", "url": "https://app.test/orders/7?x=1", "other_site": false}),
+                json!({"id": other, "method": "GET", "url": "https://b.test:8443/x", "other_site": true}),
+            ]
+        );
+        // Same host, another port is another site too; ws(s) URLs use their default ports.
+        let port = s.finding_add(&manual("Port", Some("https://app.test:8443/"), vec![h])).unwrap();
+        assert_eq!(s.finding_links(port).unwrap()[0]["other_site"], true);
+        let socket = s.finding_add(&manual("Socket", Some("wss://app.test/live"), vec![h])).unwrap();
+        assert_eq!(s.finding_links(socket).unwrap()[0]["other_site"], false);
+        assert!(matches!(s.finding_links(999), Err(Error::NotFound(_))));
     }
 
     #[test]
@@ -983,9 +1150,10 @@ mod tests {
         let id = s.finding_add(&f).unwrap();
         f.description = "Second.".into();
         f.url = Some("https://app.test/orders/7?other=1".into());
-        assert!(matches!(s.finding_add(&f), Err(Error::Conflict(_))));
+        assert!(matches!(s.finding_add(&f), Err(Error::Conflict(ref m)) if m.contains("already this issue")));
         assert_eq!(s.finding_get(id).unwrap()["description"], "First.");
         // Another parameter or method is another issue.
+        f.description = "First.".into();
         f.param = "id".into();
         s.finding_add(&f).unwrap();
         f.method = Some("DELETE".into());
@@ -1018,7 +1186,10 @@ mod tests {
         assert_eq!(s.findings_remove(&[]).unwrap(), 0);
         let types = s.query("SELECT alert_ref FROM finding_types WHERE alert_ref = '10037'", &[], 10, 10).unwrap();
         assert_eq!(types.rows.len(), 1);
-        assert!(matches!(s.finding_get(id), Err(Error::NotFound(_))));
-        assert!(matches!(s.findings_remove(&[id]), Err(Error::NotFound(_))));
+        assert_eq!(s.finding_get(id).unwrap()["state"], "removed");
+        assert!(matches!(s.findings_remove(&[id]), Err(Error::Conflict(_))));
+        // A passive rescan leaves the tombstone too.
+        s.findings_reset("passive").unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["state"], "removed");
     }
 }

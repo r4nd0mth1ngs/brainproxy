@@ -543,17 +543,24 @@ fn findings_added_by_hand_and_the_gates() {
     let (code, v) = env.compare(&["--baseline", &baseline, "--fail-on", "high", "--new-only"]);
     assert_eq!(code, 5, "{v}");
     assert_eq!(v["data"]["gate"]["findings"][0]["source"], "manual");
-    // Triaged as a false positive, it no longer trips a gate; removed, it is "fixed" against a
-    // baseline that had it.
+    // Triaged as a false positive, it no longer trips a gate; removed, it is "removed", never
+    // "fixed", against a baseline that had it, and a baseline written after has its tombstone.
     let with = env.save_baseline("with.json");
     ok(&env.project, &["findings", "mark", &id.to_string(), "--state", "false-positive"]);
     assert_eq!(env.compare(&["--fail-on", "high"]).0, 0);
     ok(&env.project, &["findings", "remove", &id.to_string()]);
     let (_, v) = env.compare(&["--baseline", &with, "--state", "all"]);
-    assert!(v["data"]["fixed"].as_array().unwrap().iter().any(|f| f["source"] == "manual"), "{v}");
+    assert!(v["data"]["fixed"].as_array().unwrap().iter().all(|f| f["source"] != "manual"), "{v}");
+    let removed = v["data"]["removed"].as_array().unwrap();
+    assert!(removed.len() == 1 && removed[0]["id"] == id && removed[0]["state"] == "removed", "{v}");
+    assert_eq!(v["data"]["summary"]["removed"], 1, "{v}");
+    let after = env.save_baseline("after.json");
+    let (code, v) = env.compare(&["--baseline", &after, "--state", "all"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["data"]["summary"]["removed"].as_i64(), v["data"]["summary"]["new"].as_i64()), (Some(0), Some(0)));
 
     // Only findings added by hand can be removed.
-    let scanner = env.ids_on("/a")[0].to_string();
+    let scanner = env.ids_on("/a").into_iter().find(|&f| f != id).unwrap().to_string();
     let (code, v) = run(&env.project, &["findings", "remove", &scanner]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("false_positive"), "{v}");
