@@ -200,7 +200,9 @@ mutations opt-in in the same way), then a review in place of depth and speed. It
 source `import`; nothing is attacked. Its own progress card (`job status`, *Stop*) ends with how
 many requests were recorded, any rejected (401/403), unanswered or out-of-scope operations, what the
 passive checks found, and links to the Site map and Proxy › Traffic (shown filtered to source
-`import`, `openTraffic` in `store.tsx`). *Hide* shows the map while the job runs, with a *Show* link
+`import`, `openTraffic` in `store.tsx`; a definition fetched from a URL is there too, its rows
+holding the response head only, so the GUI never reads a document from history: the wizard works
+from `import api --dry-run`'s output). *Hide* shows the map while the job runs, with a *Show* link
 in the toolbar. The Site map keeps the job id per project, so the card comes back after a reload; a
 remembered id that is gone or names another kind of job (the project file replaced since) is
 forgotten. *Stop* is disabled while the job stops. One import runs at a time. The guided API scan's

@@ -244,7 +244,8 @@ The sidebar groups the tools by what you are doing.
   once, as written, in scope only (`import api`). *Hide* shows the map while it runs; *Show* in the
   toolbar brings the progress back. It ends with how many requests were recorded and links to the
   Site map and **Proxy › Traffic**, which opens showing only the source `import`; right-click one to
-  send it to Replay. One import runs at a time. The guided API scan's first step links here too.
+  send it to Replay. A definition read from a URL shows there too, as its fetch: each fetch (the
+  preview's and the import's) keeps the response's head only, not the document. One import runs at a time. The guided API scan's first step links here too.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
   the proxy scope.
 
