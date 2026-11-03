@@ -1127,6 +1127,7 @@ fn proxy_record(env: &Env) -> Option<String> {
 }
 
 /// Waits up to 10 s for `done`.
+#[cfg(unix)]
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
