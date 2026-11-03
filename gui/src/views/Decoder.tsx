@@ -1,26 +1,32 @@
 // Stacked transform pipeline: the input, then one panel per step, each step applied to the
-// previous panel's output by `brainproxy encode|decode|hash KIND -`.
+// previous panel's output by `brainproxy encode|decode|hash KIND -`. Smart decode asks
+// `brainproxy decode auto -` which decodings apply and makes them the steps.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { bodyText, isBinary, run, textBytes, type Body } from "../api";
-
-type Op = "encode" | "decode" | "hash";
-
-const KINDS: Record<Op, string[]> = {
-  encode: ["base64", "base64url", "url", "url-all", "hex", "html"],
-  decode: ["base64", "base64url", "url", "hex", "html", "jwt"],
-  hash: ["md5", "sha1", "sha256", "sha512"],
-};
-
-interface Step {
-  op: Op;
-  kind: string;
-}
+import { KINDS, SmartRuns, smartNote, smartSteps, smartStopped, type Op, type Step } from "./codec";
 
 export function DecoderView() {
   const [input, setInput] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ op: "decode", kind: "url" }]);
   const [outputs, setOutputs] = useState<{ text: string; error?: string }[]>([]);
+  const [note, setNote] = useState<{ text: string; error?: boolean } | null>(null);
+  // A Smart decode is running: the CLI may take a moment on a large input.
+  const [busy, setBusy] = useState(false);
+  // Any input or step edit drops a pending Smart decode, so its answer can't undo the edit.
+  const smartRuns = useRef(new SmartRuns()).current;
+
+  const changeInput = (text: string) => {
+    smartRuns.edit();
+    setInput(text);
+    setNote(null);
+  };
+
+  // Every step edit goes through here (codec.test.ts checks).
+  const editSteps = (f: (ss: Step[]) => Step[]) => {
+    smartRuns.edit();
+    setSteps(f);
+  };
 
   useEffect(() => {
     let live = true;
@@ -53,7 +59,7 @@ export function DecoderView() {
   }, [input, steps]);
 
   const update = (i: number, s: Partial<Step>) =>
-    setSteps((ss) =>
+    editSteps((ss) =>
       ss.map((x, j) => {
         if (j !== i) return x;
         const next = { ...x, ...s };
@@ -62,13 +68,50 @@ export function DecoderView() {
       }),
     );
 
+  const smartDecode = async () => {
+    const id = smartRuns.start();
+    setNote(null);
+    setBusy(true);
+    try {
+      const d = await run<{ steps?: unknown; stopped?: unknown }>(["decode", "auto", "-"], textBytes(input));
+      if (!smartRuns.current(id)) return;
+      const found = smartSteps(d.steps);
+      if (found.length) setSteps(found);
+      setNote({ text: smartNote(found, smartStopped(d.stopped)) });
+    } catch (e: any) {
+      if (smartRuns.current(id)) setNote({ text: e.message, error: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="decoder">
       <div className="dec-panel">
         <div className="dec-head">
           <span className="label">Input</span>
+          {/* Always there, so screen readers announce the note when it changes. */}
+          <span className={note?.error ? "error" : "muted small"} aria-live="polite">
+            {note?.text}
+          </span>
+          <span className="grow" />
+          <button
+            className="btn small"
+            onClick={smartDecode}
+            disabled={!input || busy}
+            aria-busy={busy}
+            title="Find the URL, Base64, hex, HTML, JWT, gzip, and zlib layers and make them the steps below"
+          >
+            {busy ? "Decoding…" : "Smart decode"}
+          </button>
         </div>
-        <textarea className="code dec-text" spellCheck={false} value={input} onChange={(e) => setInput(e.target.value)} placeholder="Paste text to transform" />
+        <textarea
+          className="code dec-text"
+          spellCheck={false}
+          value={input}
+          onChange={(e) => changeInput(e.target.value)}
+          placeholder="Paste text to transform"
+        />
       </div>
       {steps.map((s, i) => (
         <div className="dec-panel" key={i}>
@@ -89,17 +132,17 @@ export function DecoderView() {
             <button className="btn small" onClick={() => navigator.clipboard.writeText(outputs[i]?.text ?? "")}>
               Copy
             </button>
-            <button className="btn small" onClick={() => setInput(outputs[i]?.text ?? "")} title="Use this output as the input">
+            <button className="btn small" onClick={() => changeInput(outputs[i]?.text ?? "")} title="Use this output as the input">
               Use as input
             </button>
-            <button className="btn small" onClick={() => setSteps((ss) => ss.filter((_, j) => j !== i))} disabled={steps.length === 1}>
+            <button className="btn small" onClick={() => editSteps((ss) => ss.filter((_, j) => j !== i))} disabled={steps.length === 1}>
               Remove
             </button>
           </div>
           {outputs[i]?.error ? <div className="error">{outputs[i].error}</div> : <pre className="code dec-text">{outputs[i]?.text}</pre>}
         </div>
       ))}
-      <button className="btn" onClick={() => setSteps((ss) => [...ss, { op: "decode", kind: "base64" }])}>
+      <button className="btn" onClick={() => editSteps((ss) => [...ss, { op: "decode", kind: "base64" }])}>
         + Add step
       </button>
     </div>

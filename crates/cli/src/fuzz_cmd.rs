@@ -22,8 +22,8 @@ pub enum FuzzCmd {
         everywhere), pitchfork (1 set per position, in step), cluster-bomb (1 set per position, every combination).\n\
         Payload sources (-p, one per set, in position order): list:a,b,c | file:PATH | file:- | range:1-100[:step] | \
         wordlist:NAME (built-in: sqli, xss, path-traversal, content-discovery, ...; see `wordlists list`).\n\
-        Processing (--process, applied left to right): url, url-all, base64, base64url, hex, html, md5, sha1, sha256, \
-        sha512, upper, lower, prefix:TEXT, suffix:TEXT. Prefix with N= to apply to set N only (e.g. 2=base64).\n\
+        Processing (--process, applied left to right): url, url-all, base64, base64url, hex, html, gzip, zlib, \
+        deflate, md5, sha1, sha256, sha512, upper, lower, prefix:TEXT, suffix:TEXT. Prefix with N= to apply to set N only (e.g. 2=base64).\n\
         Results: the summary lists the baseline response shape, outliers (rare status+word-count shapes), and \
         matches. All results are in the fuzz_results table.")]
     Run(Box<RunArgs>),

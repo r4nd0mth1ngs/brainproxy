@@ -160,6 +160,102 @@ fn codecs_chain() {
     assert_eq!(v["data"]["output"]["content"], "a b");
     let (_, v) = run(&["hash", "sha1", "abc"], &project, None);
     assert_eq!(v["data"]["output"]["content"], "a9993e364706816aba3e25717850c26c9cd0d89d");
+
+    // Compression output is binary, so it comes back as base64.
+    let (code, v) = run(&["encode", "gzip,base64,url", "-"], &project, Some(b"{\"role\":\"admin\"}"));
+    assert_eq!(code, 0);
+    let layered = v["data"]["output"]["content"].as_str().unwrap().to_string();
+    let (code, v) = run(&["decode", "auto", &layered], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["url", "base64", "gzip"]));
+    assert_eq!(v["data"]["output"]["content"], "{\"role\":\"admin\"}");
+    let (_, v) = run(&["decode", "url,auto", &layered], &project, None);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["url", "base64", "gzip"]));
+    // Nothing to undo: no steps, the input unchanged.
+    let (code, v) = run(&["decode", "auto", "password"], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!(
+        (v["data"]["steps"].clone(), v["data"]["output"]["content"].clone()),
+        (serde_json::json!([]), serde_json::json!("password"))
+    );
+    let (code, v) = run(&["decode", "gzip", "not gzip"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")));
+}
+
+#[test]
+fn decode_auto_steps_and_limits() {
+    let project = tmp_project("codec-auto");
+    let (_, v) = run(&["encode", "gzip,base64,url", "-"], &project, Some(b"{\"role\":\"admin\"}"));
+    let layered = v["data"]["output"]["content"].as_str().unwrap().to_string();
+    // The steps replay as an ordinary chain, and a second `auto` finds nothing more.
+    let (_, auto) = run(&["decode", "auto", &layered], &project, None);
+    let steps: Vec<&str> = auto["data"]["steps"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    let (code, v) = run(&["decode", &steps.join(","), &layered], &project, None);
+    assert_eq!(code, 0);
+    assert_eq!((&v["data"]["steps"], &v["data"]["output"]), (&auto["data"]["steps"], &auto["data"]["output"]));
+    let (_, v) = run(&["decode", "auto,auto", &layered], &project, None);
+    assert_eq!((&v["data"]["steps"], v["data"]["chain"].as_str()), (&auto["data"]["steps"], Some("auto,auto")));
+    // `stopped` says why the last `auto` stopped: here the JSON it reached.
+    assert_eq!(auto["data"]["stopped"], "json");
+    let (_, v) = run(&["decode", "auto", "plain"], &project, None);
+    assert_eq!((&v["data"]["steps"], &v["data"]["stopped"]), (&serde_json::json!([]), &serde_json::json!("nothing")));
+    let (_, v) = run(&["encode", &["base64"; 10].join(","), "deep"], &project, None);
+    let (_, v) = run(&["decode", "auto", v["data"]["output"]["content"].as_str().unwrap()], &project, None);
+    assert_eq!((v["data"]["steps"].as_array().unwrap().len(), &v["data"]["stopped"]), (8, &serde_json::json!("depth")));
+    // Without `auto`, steps are the chain as given and there is no `stopped`.
+    let (_, v) = run(&["decode", "base64,url", "YSUyMGI="], &project, None);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["base64", "url"]));
+    assert!(v["data"].get("stopped").is_none(), "{v}");
+    // --raw prints the bytes alone.
+    let out = bin().arg("--project").arg(&project).args(["decode", "auto", "--raw", &layered]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"{\"role\":\"admin\"}");
+    // Piped input with a trailing line break.
+    let (_, v) = run(&["decode", "auto", "-"], &project, Some(b"SGVsbG8sIHdvcmxkIQ==\n"));
+    assert_eq!(
+        (&v["data"]["steps"], v["data"]["output"]["content"].as_str()),
+        (&serde_json::json!(["base64"]), Some("Hello, world!"))
+    );
+    // Binary output comes back as base64.
+    let (_, v) = run(&["encode", "gzip,base64", "-"], &project, Some(&[0xff, 0x00, 0xfe]));
+    let (_, v) = run(&["decode", "auto", v["data"]["output"]["content"].as_str().unwrap()], &project, None);
+    assert_eq!(v["data"]["steps"], serde_json::json!(["base64", "gzip"]));
+    assert_eq!(
+        (v["data"]["output"]["encoding"].as_str(), v["data"]["output"]["content"].as_str()),
+        (Some("base64"), Some("/wD+"))
+    );
+    // brotli and auto only decode.
+    for kind in ["brotli", "auto"] {
+        let (code, v) = run(&["encode", kind, "x"], &project, None);
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{kind}");
+    }
+    let (_, v) = run(&["capabilities"], &project, None);
+    let codecs = &v["data"]["codecs"];
+    for (op, kind, listed) in
+        [("decode", "auto", true), ("decode", "brotli", true), ("encode", "brotli", false), ("encode", "gzip", true)]
+    {
+        assert_eq!(codecs[op].as_array().unwrap().contains(&serde_json::json!(kind)), listed, "{op} {kind}");
+    }
+}
+
+#[test]
+fn decode_refuses_decompression_bombs() {
+    let project = tmp_project("codec-bomb");
+    let (code, v) = run(&["encode", "gzip,base64", "-"], &project, Some(&vec![0u8; 16 * 1024 * 1024 + 1]));
+    assert_eq!(code, 0);
+    let bomb = v["data"]["output"]["content"].as_str().unwrap().to_string();
+    assert!(bomb.len() < 64 * 1024);
+    let (code, v) = run(&["decode", "base64,gzip", &bomb], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")));
+    assert!(v["error"]["message"].as_str().unwrap().contains("16 MB limit"), "{v}");
+    // `auto` stops before the bomb and hands back the compressed bytes.
+    let (code, v) = run(&["decode", "auto", &bomb], &project, None);
+    assert_eq!((code, &v["data"]["steps"]), (0, &serde_json::json!(["base64"])));
+    // It says so, rather than looking like there was nothing more to undo.
+    assert_eq!(v["data"]["stopped"]["refused"], "gzip", "{v}");
+    assert!(v["data"]["stopped"]["error"].as_str().unwrap().contains("16 MB limit"), "{v}");
+    assert_eq!(v["data"]["output"]["encoding"], "base64");
+    assert!(v["data"]["output"]["length"].as_u64().unwrap() < 64 * 1024);
 }
 
 #[test]

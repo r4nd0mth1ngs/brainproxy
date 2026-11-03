@@ -393,7 +393,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
                 <input
                   className="input mono grow"
                   placeholder="e.g. url  or  prefix:admin,base64"
-                  title="Applied left to right: url, url-all, base64, base64url, hex, html, md5, sha1, sha256, sha512, upper, lower, prefix:TEXT, suffix:TEXT"
+                  title="Applied left to right: url, url-all, base64, base64url, hex, html, gzip, zlib, deflate, md5, sha1, sha256, sha512, upper, lower, prefix:TEXT, suffix:TEXT"
                   value={s.process}
                   onChange={(e) => setSet(i, { process: e.target.value })}
                 />
