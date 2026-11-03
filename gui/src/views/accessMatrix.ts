@@ -1,7 +1,7 @@
 // Access control across users (`authz`): the arguments for a run, and `authz matrix` as a grid
 // of requests by identities, each cell coloured by its verdict.
 
-import type { HistoryPick } from "./trafficActions.ts";
+import { authzOptIns, type HistoryPick } from "./trafficActions.ts";
 
 export interface MatrixCell {
   verdict: string;
@@ -182,7 +182,7 @@ export function hostOf(text: string): string {
 }
 
 /** Throws with a message to show when the form can't make a run. */
-export function runArgs(f: RunForm): string[] {
+export function runArgs(f: RunForm, confirmed = false): string[] {
   if (!f.identities.length && !f.anonymous) throw new Error("Pick at least one identity, or keep the anonymous control on");
   const args = ["authz", "run"];
   if (f.identities.length) args.push(`--as=${f.identities.join(",")}`);
@@ -201,6 +201,9 @@ export function runArgs(f: RunForm): string[] {
   } else if (f.select === "history") {
     if (!f.history.length) throw new Error("No request picked: right-click one in Proxy › Traffic");
     for (const h of f.history) args.push(`--history-id=${h.id}`);
+    // authz refuses a named request that can change data or looks like a logout unless it is
+    // opted in to, which only the user's yes to `accessConfirm` does.
+    if (confirmed) args.push(...authzOptIns(f.history));
   }
   const cookies = cookieNames(f.keepCookies);
   if (cookies.length) args.push(`--keep-cookie=${cookies.join(",")}`);

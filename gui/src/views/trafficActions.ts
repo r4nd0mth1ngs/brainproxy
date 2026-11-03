@@ -131,17 +131,40 @@ export interface ScanDefaults {
 }
 
 /**
+ * What `scan active --history-id` needs opted in to attack the picks: MUTATION for a GraphQL
+ * mutation, whatever its method, and each other method besides GET, HEAD, OPTIONS and POST (which
+ * it attacks by default). Empty when none needs it.
+ */
+export function scanOptIns(picks: HistoryPick[]): string[] {
+  const mutation = picks.some((p) => p.mutation) ? ["MUTATION"] : [];
+  return [...mutation, ...unsafeMethods(picks.filter((p) => !p.mutation)).filter((m) => m !== "POST")];
+}
+
+/**
+ * What `authz run --history-id` needs to replay the picks: `--include-methods` for each method
+ * besides GET, HEAD and OPTIONS (it goes by the method alone, so a mutation needs its POST), and an
+ * `--exclude` that matches no path when one looks like a logout. Empty when none needs either.
+ */
+export function authzOptIns(picks: HistoryPick[]): string[] {
+  const methods = unsafeMethods(picks);
+  return [...(methods.length ? [`--include-methods=${methods.join(",")}`] : []), ...(picks.some(isLogout) ? ["--exclude=^$"] : [])];
+}
+
+/**
  * `scan active` on these history entries, in the background, with the Scans view's defaults:
  * medium strength and, once the Nuclei templates are downloaded, those of high severity and up
- * plus the end-of-life checks. Entries named by id are attacked whatever their method.
+ * plus the end-of-life checks. A pick that can change data is opted in to (`scanOptIns`) only
+ * once the user said yes to `scanConfirm`; without that, the scanner refuses it and sends nothing.
  */
-export function scanArgs(picks: HistoryPick[], d: ScanDefaults): string[] {
+export function scanArgs(picks: HistoryPick[], d: ScanDefaults, confirmed = false): string[] {
   if (!picks.length) throw new Error("No request picked");
+  const optIns = confirmed ? scanOptIns(picks) : [];
   return [
     "scan",
     "active",
     ...picks.map((p) => `--history-id=${p.id}`),
     "--strength=medium",
+    ...(optIns.length ? [`--include-methods=${optIns.join(",")}`] : []),
     ...(d.nuclei ? ["--checks=nuclei,brainproxy", "--check-include-tags=eol", "--check-severity=high"] : []),
     "--background",
   ];
@@ -168,7 +191,10 @@ export function scanConfirm(picks: HistoryPick[], d: ScanDefaults): { title: str
     : one
       ? " It looks like a logout: sending it again can end the session it was recorded with."
       : ` ${logouts === 1 ? "One of them looks" : `${logouts} of them look`} like a logout: sending ${logouts === 1 ? "it" : "them"} again can end the session ${logouts === 1 ? "it was" : "they were"} recorded with.`;
-  const nuclei = d.nuclei ? ` The downloaded Nuclei templates also run against ${one ? "its site" : "their sites"}, on paths of their own.` : "";
+  // --include-methods also lets the templates send those methods (`check_methods`).
+  const optIns = scanOptIns(picks).map((m) => (m === "MUTATION" ? "GraphQL mutation" : m));
+  const templateOptIns = optIns.length ? ` Their ${optIns.join(", ")} requests are sent too.` : "";
+  const nuclei = d.nuclei ? ` The downloaded Nuclei templates also run against ${one ? "its site" : "their sites"}, on paths of their own.${templateOptIns}` : "";
   return {
     title: one ? "Scan this request?" : `Scan ${picks.length} requests?`,
     message: `This sends real attack traffic to the site: ${what} ${one ? "is" : "are"} sent again with attack data, often many times.${replay}${logout}${nuclei} Every request stays inside the engagement scope.`,

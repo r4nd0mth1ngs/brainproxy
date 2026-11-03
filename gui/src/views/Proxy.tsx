@@ -255,7 +255,7 @@ function History() {
     const q = scanConfirm(picks, defaults);
     if (!(await confirm(q.title, q.message, q.ok, q.cancel))) return;
     try {
-      const d = await run<{ job: number }>(scanArgs(picks, defaults));
+      const d = await run<{ job: number }>(scanArgs(picks, defaults, true));
       app.toast(`Active scan started (job ${d.job}). Click to follow it in Scans.`, "info", () => app.showJob(d.job));
     } catch (e: any) {
       app.toast(e.message, "error");

@@ -149,6 +149,33 @@ test("requests from Traffic: by id only, and only while that selection is on", (
   assert.throws(() => runArgs({ ...form, select: "history", history, rate: "-1" }), /Rate/);
 });
 
+test("requests from Traffic are opted in to only once the run's question was answered yes", () => {
+  const history = [
+    { id: 4, method: "GET", url: "https://shop.test/logout" },
+    { id: 8, method: "PUT", url: "https://shop.test/orders/8" },
+    { id: 9, method: "POST", url: "https://shop.test/graphql", mutation: true },
+  ];
+  const base = ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8", "--history-id=9"];
+  // Unconfirmed, authz refuses the PUT, the mutation's POST and the logout, and sends nothing.
+  assert.deepEqual(runArgs({ ...form, select: "history", history }), base);
+  assert.deepEqual(runArgs({ ...form, select: "history", history }, true), [...base, "--include-methods=PUT,POST", "--exclude=^$"]);
+  // A GET that isn't a logout needs nothing, confirmed or not.
+  const get = [{ id: 5, method: "GET", url: "https://shop.test/orders/5" }];
+  assert.deepEqual(runArgs({ ...form, select: "history", history: get }, true), runArgs({ ...form, select: "history", history: get }));
+  // Another selection never carries them, whatever the form still holds.
+  assert.deepEqual(runArgs({ ...form, history }, true), ["authz", "run", "--as=bob,carol"]);
+  assert.deepEqual(runArgs({ ...form, select: "tag", tag: "api", history }, true), ["authz", "run", "--as=bob,carol", "--tag=api"]);
+  // The opt-ins come before the other options.
+  assert.deepEqual(runArgs({ ...form, select: "history", history: history.slice(1, 2), rate: "2" }, true), [
+    "authz",
+    "run",
+    "--as=bob,carol",
+    "--history-id=8",
+    "--include-methods=PUT",
+    "--rate=2",
+  ]);
+});
+
 test("live testing options, and the running proxy's options kept on a restart", () => {
   assert.deepEqual(liveArgs(form), ["--authz=anonymous,bob,carol"]);
   assert.deepEqual(liveArgs({ ...form, anonymous: false, identities: ["bob"], keepCookies: "lang, theme", rate: "2.5" }), ["--authz=bob", "--authz-keep-cookie=lang,theme", "--authz-rate=2.5"]);

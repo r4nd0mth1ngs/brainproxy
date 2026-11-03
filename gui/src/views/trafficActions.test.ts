@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { accessConfirm, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { accessConfirm, authzOptIns, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, scanArgs, scanBlocker, scanConfirm, scanOptIns, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
 import { isRefused } from "./trafficFilter.ts";
 
 const get: HistoryPick = { id: 7, method: "GET", url: "https://shop.test/search?q=x" };
@@ -252,4 +252,70 @@ test("a GraphQL mutation is named as one in both questions, whatever its method"
   const q = accessConfirm([{ ...m, method: "GET" }], ["alice"], true);
   assert.equal(q?.title, "Replay this GraphQL mutation?");
   assert.match(q?.message ?? "", /^This GraphQL mutation is sent again twice as its owner/);
+});
+
+const del: HistoryPick = { id: 12, method: "delete", url: "https://shop.test/cart/3" };
+const mutation: HistoryPick = { id: 14, method: "POST", url: "https://shop.test/graphql", mutation: true };
+
+test("a scan opts in to what can change data only once the user said yes", () => {
+  // Unconfirmed: no opt-in, so `scan active` refuses a DELETE or a mutation and sends nothing.
+  for (const picks of [[get], [post], [del], [mutation], [get, del, mutation]]) {
+    assert.ok(!scanArgs(picks, off).some((a) => a.startsWith("--include-methods")), JSON.stringify(picks));
+    assert.ok(!scanArgs(picks, { nuclei: true }).some((a) => a.startsWith("--include-methods")));
+  }
+  // Confirmed: MUTATION for a mutation, the method for the others; GET and POST are attacked anyway.
+  assert.deepEqual(scanArgs([get], off, true), scanArgs([get], off));
+  assert.deepEqual(scanArgs([post], off, true), scanArgs([post], off));
+  assert.deepEqual(scanArgs([del], off, true), ["scan", "active", "--history-id=12", "--strength=medium", "--include-methods=DELETE", "--background"]);
+  assert.deepEqual(scanArgs([mutation, del, { ...del, id: 13, method: "PATCH" }, post], { nuclei: true }, true), [
+    "scan",
+    "active",
+    "--history-id=14",
+    "--history-id=12",
+    "--history-id=13",
+    "--history-id=9",
+    "--strength=medium",
+    "--include-methods=MUTATION,DELETE,PATCH",
+    "--checks=nuclei,brainproxy",
+    "--check-include-tags=eol",
+    "--check-severity=high",
+    "--background",
+  ]);
+  // A mutation is opted in to as MUTATION whatever its method, as the scanner decides.
+  assert.deepEqual(scanOptIns([{ ...mutation, method: "PUT" }]), ["MUTATION"]);
+  assert.deepEqual(scanOptIns([{ ...mutation, method: "GET" }]), ["MUTATION"]);
+  // Not known to be a mutation (history show failed): the method alone, and the scanner refuses a mutation.
+  assert.deepEqual(scanOptIns([{ ...mutation, mutation: undefined }]), []);
+});
+
+test("every scan opt-in is named in the question first", () => {
+  for (const picks of [[get], [post], [del], [mutation], [get, del, mutation], [{ ...del, method: "PUT" }, { ...mutation, method: "GET" }]]) {
+    const q = scanConfirm(picks, off).message;
+    for (const m of scanOptIns(picks)) assert.match(q, new RegExp(m === "MUTATION" ? "GraphQL mutation" : m), `${m} in ${q}`);
+  }
+  // With the templates on, the opt-in reaches their requests too, and the question says so.
+  assert.match(scanConfirm([del], { nuclei: true }).message, /on paths of their own\. Their DELETE requests are sent too\./);
+  assert.match(scanConfirm([mutation], { nuclei: true }).message, /Their GraphQL mutation requests are sent too\./);
+  assert.doesNotMatch(scanConfirm([post], { nuclei: true }).message, /are sent too/);
+  assert.doesNotMatch(scanConfirm([del], off).message, /are sent too/);
+});
+
+test("an access-control run's opt-ins: methods past GET, HEAD and OPTIONS, and an exclude for a logout", () => {
+  assert.deepEqual(authzOptIns([get]), []);
+  assert.deepEqual(authzOptIns([post]), ["--include-methods=POST"]);
+  // authz goes by the method: a mutation needs its POST, and a GET one needs nothing.
+  assert.deepEqual(authzOptIns([mutation]), ["--include-methods=POST"]);
+  assert.deepEqual(authzOptIns([{ ...mutation, method: "GET" }]), []);
+  assert.deepEqual(authzOptIns([get, post, del, { ...del, id: 13 }]), ["--include-methods=POST,DELETE"]);
+  // A logout: an exclude that matches no path, so the named request is replayed.
+  assert.deepEqual(authzOptIns([logout]), ["--exclude=^$"]);
+  assert.deepEqual(authzOptIns([{ ...logout, method: "POST" }, get]), ["--include-methods=POST", "--exclude=^$"]);
+  assert.ok(!/^$/.test("/") && !/^$/.test("/account/logout"));
+});
+
+test("an access-control run needs no opt-in that its question doesn't ask about", () => {
+  const cases: HistoryPick[][] = [[get], [post], [del], [mutation], [{ ...mutation, method: "GET" }], [logout], [get, logout], [get, { ...get, id: 8 }]];
+  for (const picks of cases) {
+    if (authzOptIns(picks).length) assert.ok(accessConfirm(picks, ["alice"], true), JSON.stringify(picks));
+  }
 });

@@ -271,7 +271,9 @@ The sidebar groups the tools by what you are doing.
     some of them request paths of their own (such as `/.git/config`); the question says so. The
     request is attacked whatever its method, so a POST or a GraphQL mutation is replayed
     with attack data too, and the question names it; it also says when the path looks like a
-    logout, since replaying it can end the session it was recorded with. Click the toast to
+    logout, since replaying it can end the session it was recorded with. Only your *Start
+    scan* opts a DELETE, PUT, PATCH or mutation in (`--include-methods`); that lets the
+    templates send requests of that kind too, and the question says so. Click the toast to
     follow it in **Scans › Tasks**. A request that got no response (a connection error, a
     timeout, or dropped in **Intercept**) has nothing to scan, so the item is greyed out,
     with the reason under it.
@@ -473,8 +475,9 @@ Access control across users: does the app let bob read alice's data? See
   twice as its owner, then as each identity and with no session. The form warns when it is a
   POST, a GraphQL mutation or another request that may change data, or when its path looks
   like a logout (which can end the owner's and each identity's session, so later results may
-  not be reliable), and *Start run* asks first. Once the run has started, the form goes back
-  to all recorded requests.
+  not be reliable), and *Start run* asks first. Only a yes passes what `authz run` needs to
+  replay it: `--include-methods` with its method, and for a logout an `--exclude` that matches
+  no path. Once the run has started, the form goes back to all recorded requests.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
   those identities in the background. If it doesn't start, the

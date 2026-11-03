@@ -317,11 +317,12 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
 
   const start = async () => {
     try {
-      const args = runArgs(f);
-      // Requests from Traffic are replayed whatever their method or path: a POST, a GraphQL
-      // mutation or a logout is asked about first.
+      runArgs(f); // the form is checked before anything is asked
+      // Requests from Traffic are replayed whatever their method or path once the user says so: a
+      // POST, a GraphQL mutation or a logout is asked about first, and only a yes opts them in.
       const q = f.select === "history" ? accessConfirm(f.history, f.identities, f.anonymous) : null;
       if (q && !(await confirm(q.title, q.message, q.ok, q.cancel))) return;
+      const args = runArgs(f, !!q);
       setBusy(true);
       const d = await run<{ job: number }>([...args, "--background"]);
       setF(afterStart);
