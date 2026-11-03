@@ -175,9 +175,14 @@ agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
   (POST with data, GET with `-G`, HEAD with `-I`), joins several `-d` with `&`, builds `-F`
   fields as multipart, turns `-u` into Basic auth (an `--oauth2-bearer` token wins over it, as
   in curl), and keeps curl's own `Host` and `Accept` headers unless the command replaces or
-  removes them (it adds no `User-Agent`). `-G` and `--url-query` add `&` only after a query
-  that has something in it. Long options take a value after `=` (`--data=x`), as curl 8.16 and
-  later do. `--http2` on an `http://` URL stays HTTP/1.1, as curl only asks such a server to
+  removes them (it adds no `User-Agent`). A `-H` is read only as `Name: value` (or
+  `Name:value`), `Name:` (removes curl's own header) or `Name;` (an empty one), with `Name` a
+  token and nothing between it and the `:` or `;`; each replaces curl's header of that name,
+  and only the first custom `Host` is sent, as curl does. Any other form (`Name : x`,
+  `Name;x: y`, a space before the name) is refused, as curl reads those by rules of its own;
+  write it in one of the three forms and edit the header in the tab. `-G` and `--url-query`
+  add `&` only after a query that has something in it. Long options take a value after `=`
+  (`--data=x`), as curl 8.16 and later do. `--http2` on an `http://` URL stays HTTP/1.1, as curl only asks such a server to
   upgrade. A URL with a space or control character is refused, as curl refuses it. A URL that
   curl's globbing makes several requests of (`{a,b}`, `[1-3]`) is refused unless the command
   has `-g`; then the brackets are sent as they are. Options that don't change the request
@@ -197,8 +202,9 @@ agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
   to an `https://` target (curl would negotiate HTTP/2 there) and `--http1.0` for HTTP/1.0,
   `--globoff` for `[]{}` in the URL, `--path-as-is` for `..` segments, `--request-target` for a
   target a URL can't hold, and empty `-H 'Name:'` to remove the headers curl would add (`Host`
-  too, when the request has none). A header whose name starts with `@` is left out with a note,
-  since curl would read it as a file. Replay copies what Send would send (auto URL-encoding
+  too, when the request has none). Headers go only as `-H 'Name: value'` or `-H 'Name;'` (empty);
+  one whose name isn't a token (an `@`, which curl would read as a file, a space, `;`, a control
+  byte) is left out with a note. Replay copies what Send would send (auto URL-encoding
   included). A `--data-raw` body over 128 KB gets a warning (Linux limits one argument to that
   size); a body over 2 MB is refused.
 

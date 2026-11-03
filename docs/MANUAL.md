@@ -280,7 +280,10 @@ Edit a raw request and send it as often as you like, in separate tabs.
   Connections). A command that reads a file (`-d @file`, `-F field=@file`), uses shell
   variables, has an option brainproxy doesn't know, or has a URL that curl's globbing turns
   into several requests (`{a,b}`, `[1-3]`; add `-g` to send it as written) is refused with
-  the reason.
+  the reason. Headers are read as `-H 'Name: value'`, `-H 'Name:'` (leave out the header
+  curl would add) and `-H 'Name;'` (send it empty); a header written any other way, such as
+  `Name : value` or `Name;x: y`, is refused because curl reads those by its own rules: rewrite
+  it in one of those forms, then edit the header in the tab after pasting.
 - **Copy as cURL:** copies the request, as Send would send it, as a curl command for a POSIX
   shell (it works in fish too). It goes to the tab's target, as Send does. Every value is
   quoted, so headers or a body that came from the target can't run anything when you paste it.

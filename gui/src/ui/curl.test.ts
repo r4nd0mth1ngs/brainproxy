@@ -61,7 +61,7 @@ test("headers replace, remove and add to curl's own", () => {
   assert.equal(p.target, "https://h.test");
   // Removing Content-Type leaves the body without one.
   assert.doesNotMatch(parseCurl("curl -H 'Content-Type:' -d a https://h.test").raw, /Content-Type/);
-  assert.match(refusal("curl -H 'Bad header' https://h.test"), /isn't a header/);
+  assert.match(refusal("curl -H 'Bad header' https://h.test"), /"Bad header" can't be imported exactly/);
   assert.match(refusal("curl -H $'X: a\\r\\nInjected: 1' https://h.test"), /line break/);
   assert.match(refusal("curl -A $'x\\nY: z' https://h.test"), /line break/);
   assert.match(refusal("curl -H @headers.txt https://h.test"), /reads headers from a file/);
@@ -475,6 +475,11 @@ test("sh, dash, bash, zsh and fish read the same command the same way", { skip: 
     const [head, ...rest] = raw.split(/\r?\n\r?\n/);
     for (const line of head.split(/\r?\n/).slice(1)) {
       if (/^(host|content-length):/i.test(line)) continue;
+      // A name that isn't a token is left out with a note.
+      if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+:/.test(line)) {
+        assert.ok(!want.args.some((a) => a.includes(textBytes(line.split(":")[0], binary))), `${JSON.stringify(line)}: ${command}`);
+        continue;
+      }
       const header = textBytes(line.replace(/^([^:]*):\s*/, "$1: "), binary);
       assert.ok(want.args.some((a) => a.equals(header)), `${JSON.stringify(line)}: ${command}`);
     }
@@ -588,25 +593,38 @@ test("options are read as curl reads them, or refused", () => {
   assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization: Custom' https://h.test").raw, /\nAuthorization: Custom\n/);
   assert.doesNotMatch(parseCurl("curl -u a:b --basic --oauth2-bearer t -H 'Authorization:' https://h.test").raw, /authorization/i);
   assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization;' https://h.test").raw, /\nAuthorization: \n/);
-  // curl replaces its own header with one whose text starts with that name and then : or ;
-  // ("Authorization;foo: bar" too), and keeps it for "authorization : x" or "X-Authorization".
+  // A custom Authorization in any of the three forms stands in for -u and a bearer token.
   for (const flags of ["--basic --oauth2-bearer t", "--oauth2-bearer t", "-u a:b"]) {
-    const semi = parseCurl(`curl ${flags} -H 'Authorization;foo: bar' http://h.test/`).raw;
-    assert.equal(semi.match(/authorization/gi)?.length, 1, flags);
-    assert.match(semi, /\nAuthorization;foo: bar\n/);
+    assert.match(parseCurl(`curl ${flags} -H 'Authorization:x' http://h.test/`).raw, /\nAuthorization: x\n/, flags);
+    assert.doesNotMatch(parseCurl(`curl ${flags} -H 'Authorization:  ' http://h.test/`).raw, /authorization/i, flags);
+    const empty = parseCurl(`curl ${flags} -H 'authorization;' http://h.test/`).raw;
+    assert.equal(empty.match(/authorization/gi)?.length, 1, flags);
+    assert.match(empty, /\nauthorization: \n/, flags);
   }
-  for (const h of ["authorization : x", "X-Authorization: y", "Authorization ;", "Authorization :", " Authorization: z"]) {
-    assert.match(refusal(`curl --basic --oauth2-bearer t -H '${h}' http://h.test/`), /challenge/, h);
-    assert.match(parseCurl(`curl --oauth2-bearer t -H '${h}' http://h.test/`).raw, /\nAuthorization: Bearer t\n/, h);
+  // A header named otherwise doesn't, so a bearer token stays where curl sends it.
+  assert.match(refusal("curl --basic --oauth2-bearer t -H 'X-Authorization: y' http://h.test/"), /challenge/);
+  assert.match(parseCurl("curl --oauth2-bearer t -H 'X-Authorization: y' http://h.test/").raw, /\nAuthorization: Bearer t\n[^]*\nX-Authorization: y\n/);
+  // Forms curl reads by rules of its own are refused, whatever the name, so none can leave a
+  // second copy of curl's header beside a custom one, or drop it without a replacement.
+  for (const h of ["Authorization;foo: bar", "Authorization : x", "authorization :", "Authorization ;", " Authorization: z", "Authorization;foo;", "Host;other.test:80", "Host : other.test", "User-Agent;x: y", "User-Agent : y", "Content-Type ;", "X-A;b;", "X-A; ", "X-A", ";", "X A: b", "X\"A: b", "X(A): b", "Accept\t: x"]) {
+    for (const flags of ["", "--oauth2-bearer t", "--basic --oauth2-bearer t", "-A ua -d a"]) {
+      assert.match(refusal(`curl ${flags} -H $'${h}' http://h.test/`), /can't be imported exactly/, `${flags} ${h}`);
+    }
   }
-  assert.match(parseCurl("curl --oauth2-bearer t -H 'authorization : x' http://h.test/").raw, /\nauthorization: x\n/);
-  assert.match(parseCurl("curl --oauth2-bearer t -H 'X-Authorization: y' http://h.test/").raw, /\nX-Authorization: y\n/);
-  assert.doesNotMatch(parseCurl("curl --oauth2-bearer t -H 'Authorization :' http://h.test/").raw, /Authorization: \n/);
-  // The same goes for curl's other headers.
-  assert.doesNotMatch(parseCurl("curl -A ua -H 'User-Agent;x: y' http://h.test/").raw, /User-Agent: ua/);
-  assert.match(parseCurl("curl -A ua -H 'User-Agent : y' http://h.test/").raw, /\nUser-Agent: ua\n[^]*\nUser-Agent: y\n/);
-  // "Name;" sends an empty header only when nothing follows the ;.
-  for (const h of ["Authorization;foo;", "X-A;b;"]) assert.match(refusal(`curl -H '${h}' http://h.test/`), /isn't a header/, h);
+  // The three forms for curl's other headers.
+  const forms = (h: string) => parseCurl(`curl -A ua -d a -H '${h}' http://h.test/`).raw.split("\n\n")[0].split("\n").slice(1);
+  assert.deepEqual(forms("Host:other.test:80"), ["Host: other.test:80", "User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("host:"), ["User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Host;"), ["Host: ", "User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("user-agent: u2"), ["Host: h.test", "Accept: */*", "user-agent: u2", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("User-Agent:"), ["Host: h.test", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("User-Agent;"), ["Host: h.test", "Accept: */*", "User-Agent: ", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Accept;"), ["Host: h.test", "User-Agent: ua", "Accept: ", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Content-Type:\ttext/plain"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: text/plain", "Content-Length: 1"]);
+  assert.deepEqual(forms("Content-Type;"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: ", "Content-Length: 1"]);
+  assert.deepEqual(forms("Content-Length:"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: application/x-www-form-urlencoded"]);
+  // Only the first custom Host is sent, in Host's place, as curl does; "Host:" after it removes nothing.
+  assert.match(parseCurl("curl -H 'X: 1' -H 'Host: a.test' -H 'Host: b.test' -H 'Host:' http://h.test/").raw, /^GET \/ HTTP\/1\.1\nHost: a\.test\nAccept: \*\/\*\nX: 1\n\n$/);
   // --no-get turns -G back off.
   assert.match(parseCurl("curl -G --no-get -d a=1 https://h.test").raw, /^POST \/ /);
 });
@@ -650,8 +668,11 @@ test("toCurl: a target, method or header can't add shell syntax", () => {
   const m = toCurl("$(id) / HTTP/1.1\nHost: h.test\n\n", "https://h.test").command;
   assert.match(m, /-X '\$\(id\)'/);
   assert.match(toCurl("GET / HTTP/1.1\n\n", "https://h'$(id).test").command, /^curl 'https:\/\/h'\\''\$\(id\)\.test\/'/);
-  // Control characters in a header name or the request target go through printf.
-  assert.match(toCurl("GET / HTTP/1.1\nX\x1b[2J: v\n\n", "https://h.test").command, /-H 'X'"\$\(printf '\\033'\)"'\[2J: v'/);
+  // A header name that isn't a token is left out; control characters in the request target
+  // go through printf.
+  const ctl = toCurl("GET / HTTP/1.1\nX\x1b[2J: v\nA;b: c\nX Y: z\n\n", "https://h.test");
+  assert.doesNotMatch(ctl.command, /-H '(X|A;)/);
+  assert.equal(ctl.warnings.length, 3);
   assert.match(toCurl("GET /a\x01b HTTP/1.1\n\n", "https://h.test").command, /--request-target '\/a'"\$\(printf '\\001'\)"'b'/);
   // Placeholders (an auth macro's values) are copied as they are, never resolved.
   assert.match(toCurl("GET / HTTP/1.1\nCookie: «auth:main:var:csrf#7»\n\n", "https://h.test").command, /-H 'Cookie: «auth:main:var:csrf#7»'/);
@@ -760,7 +781,7 @@ test("a header named @… isn't copied, as curl would read it as a file", () => 
   assert.doesNotMatch(c.command, /@/);
   assert.match(c.command, /-H 'X-A: 1'/);
   assert.equal(c.warnings.length, 2);
-  assert.match(c.warnings[0], /starts with @/);
+  assert.match(c.warnings[0], /isn't a valid token/);
 });
 
 test("Windows cmd is told apart from a POSIX command holding ^", () => {
@@ -851,7 +872,8 @@ test("long options take a value after =", () => {
   assert.match(parseCurl("curl --data=x https://h.test").raw, /^POST [^]*\n\nx$/);
   // An empty value is a value, and only the first = splits.
   assert.match(parseCurl("curl --data= https://h.test").raw, /Content-Length: 0\n/);
-  assert.match(parseCurl("curl --header==X:1 --header=Y:a=b https://h.test").raw, /\n=X: 1\nY: a=b\n/);
+  assert.match(parseCurl("curl --header=X:1 --header=Y:a=b https://h.test").raw, /\nX: 1\nY: a=b\n/);
+  assert.match(refusal("curl --header==X:1 https://h.test"), /"=X:1" can't be imported exactly/);
   assert.match(parseCurl("curl --url=https://h.test/u --request=PUT").raw, /^PUT \/u /);
   assert.equal(parseCurl("curl --output=/dev/null --max-time=5 --proxy=http://p.test https://h.test").warnings.length, 1);
   // A switch ignores a value, as curl does.

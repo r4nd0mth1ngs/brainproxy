@@ -827,6 +827,29 @@ const CRLF = /[\r\n\0]/;
 /** Without HTTP whitespace at either end. (trim() would also strip 0xA0, a byte of UTF-8 text.) */
 const trimHws = (s: string) => s.replace(/^[ \t]+|[ \t]+$/g, "");
 
+/** An HTTP token (RFC 9110): a method or a header name. */
+const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/**
+ * A -H value in one of the three forms read exactly: "Name: value" (or "Name:value"), "Name:"
+ * (removes curl's own header) and "Name;" (an empty header), with Name a token and nothing
+ * between it and the separator; the value is null for "Name:". curl reads other forms by
+ * rules of its own ("Name ;", "Name;x: y", "Name : x"), so they are refused rather than guessed.
+ */
+function customHeader(h: string): [string, string | null] {
+  const sep = h.search(/[:;]/);
+  const name = sep < 0 ? "" : h.slice(0, sep);
+  const rest = h.slice(sep + 1);
+  if (TOKEN.test(name) && (h[sep] === ":" || rest === "")) {
+    // curl drops the spaces and tabs after the colon; with nothing else it removes the header.
+    const val = h[sep] === ";" ? "" : rest.replace(/^[ \t]+/, "");
+    return [name, h[sep] === ":" && !val ? null : val];
+  }
+  throw new CurlError(
+    `The header ${JSON.stringify(decodeOr(h))} can't be imported exactly: only "Name: value", "Name:" (no header) and "Name;" (empty) are read. Write it in one of those forms, and edit it in the tab after pasting if it must differ.`,
+  );
+}
+
 /** Parses a cURL command line into a raw request for Replay. Throws CurlError with what's wrong. */
 export function parseCurl(command: string): ParsedCurl {
   let src = command.replace(/\r\n?/g, "\n").trim();
@@ -874,7 +897,7 @@ export function parseCurl(command: string): ParsedCurl {
   }
 
   const method = o.method ?? (o.flags.has("head") ? "HEAD" : hasBody ? "POST" : "GET");
-  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) throw new CurlError(`-X ${decodeOr(method)} isn't a valid method.`);
+  if (!TOKEN.test(method)) throw new CurlError(`-X ${decodeOr(method)} isn't a valid method.`);
   const reqTarget = o.requestTarget ?? path;
   if (CRLF.test(reqTarget)) throw new CurlError("The URL holds a line break or NUL byte.");
 
@@ -896,14 +919,23 @@ export function parseCurl(command: string): ParsedCurl {
     contentType = o.flags.has("json") ? "application/json" : "application/x-www-form-urlencoded";
   }
 
+  // Custom headers, read before curl's own so the Authorization rule below can see them.
+  const custom: [string, string | null][] = [];
+  for (const h of o.headers) {
+    if (h.startsWith(":")) {
+      o.warnings.push(`Left out the HTTP/2 pseudo-header ${decodeOr(/^:[^:]*/.exec(h)![0])}.`);
+      continue;
+    }
+    if (h.startsWith("@")) throw new CurlError(`-H ${decodeOr(h)} reads headers from a file; paste them instead.`);
+    if (CRLF.test(h)) throw new CurlError(`The header ${JSON.stringify(decodeOr(h))} holds a line break or NUL byte.`);
+    custom.push(customHeader(h));
+  }
+
   // curl's own headers, in its order; a custom header of the same name replaces one.
   // A bearer token wins over -u, which wins over user:password in the URL: curl asks for Bearer
   // auth alone. With --basic too it waits for the server's challenge to pick one, unless a custom
   // Authorization header (or -H 'Authorization:', which removes it) stands in for both.
-  // Like curl, a custom header stands in for one of curl's own when its text, up to the first
-  // : or ;, is that name: "Authorization;x: y" does, "Authorization : y" doesn't.
-  const own = (h: string) => h.slice(0, h.search(/[:;]|$/)).toLowerCase();
-  const customAuth = o.headers.some((h) => own(h) === "authorization");
+  const customAuth = custom.some(([n]) => n.toLowerCase() === "authorization");
   if (o.bearer != null && o.flags.has("basic") && !customAuth) throw new CurlError("--oauth2-bearer with --basic makes curl wait for the server's challenge before it sends either; keep one of them.");
   const defaults: [string, string][] = [["Host", url.host]];
   if (o.bearer != null) defaults.push(["Authorization", `Bearer ${o.bearer}`]);
@@ -918,49 +950,22 @@ export function parseCurl(command: string): ParsedCurl {
   const trailing: [string, string][] = [];
   if (hasBody) trailing.push(["Content-Length", String(body.length)], ["Content-Type", contentType!]);
 
-  const custom: [string, string][] = [];
-  const drop = (name: string) => {
+  // Each custom header drops curl's own of that name; "Name:" (a null value) sends nothing.
+  // A custom Host goes first, where curl writes it, and only the first is sent, as in curl.
+  let customHost: [string, string] | undefined;
+  const added: [string, string][] = [];
+  for (const [name, val] of custom) {
     const lower = name.toLowerCase();
     for (const list of [defaults, trailing]) {
       const k = list.findIndex(([n]) => n.toLowerCase() === lower);
       if (k >= 0) list.splice(k, 1);
     }
-  };
-  for (const h of o.headers) {
-    if (h.startsWith(":")) {
-      o.warnings.push(`Left out the HTTP/2 pseudo-header ${decodeOr(/^:[^:]*/.exec(h)![0])}.`);
-      continue;
-    }
-    if (h.startsWith("@")) throw new CurlError(`-H ${decodeOr(h)} reads headers from a file; paste them instead.`);
-    if (CRLF.test(h)) throw new CurlError(`The header ${JSON.stringify(decodeOr(h))} holds a line break or NUL byte.`);
-    const colon = h.indexOf(":");
-    let name: string;
-    let val: string | null;
-    if (colon < 0) {
-      // "Name;" sends an empty header; curl leaves out one with anything after its first ;.
-      if (h.indexOf(";") !== h.length - 1) throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
-      name = trimHws(h.slice(0, -1));
-      val = "";
-    } else {
-      name = trimHws(h.slice(0, colon));
-      const v = h.slice(colon + 1).replace(/^[ \t]+/, "");
-      // "Name:" with nothing after it removes one of curl's headers.
-      val = v ? v : null;
-    }
-    if (!name || /[\s:]/.test(name)) {
-      throw new CurlError(`-H ${decodeOr(h)} isn't a header (Name: value).`);
-    }
-    if (own(h) === "host" && val != null) {
-      const k = defaults.findIndex(([n]) => n === "Host");
-      if (k >= 0) defaults[k] = [name, val];
-      else custom.push([name, val]);
-      continue;
-    }
-    drop(own(h));
-    if (val != null) custom.push([name, val]);
+    if (val == null) continue;
+    if (lower !== "host") added.push([name, val]);
+    else customHost ??= [name, val];
   }
 
-  const headers = [...defaults, ...custom, ...trailing];
+  const headers = [...(customHost ? [customHost] : []), ...defaults, ...added, ...trailing];
   const bad = headers.find(([, v]) => CRLF.test(v));
   if (bad) throw new CurlError(`The ${decodeOr(bad[0])} header would hold a line break or NUL byte.`);
   const head = [`${method} ${reqTarget} ${o.version}`, ...headers.map(([n, v]) => `${n}: ${v}`)].join("\n");
@@ -1101,9 +1106,10 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
     }
     const name = trimHws(line.slice(0, colon));
     const value = trimHws(line.slice(colon + 1));
-    // curl reads -H @NAME as a file of headers.
-    if (name.startsWith("@")) {
-      warnings.push(`Left out a header whose name starts with @ (curl would read a file): ${decodeOr(name).slice(0, 60)}`);
+    // Only a token name goes in a -H that curl and a paste both read as written (curl reads
+    // -H @NAME as a file of headers).
+    if (!TOKEN.test(name)) {
+      warnings.push(`Left out a header whose name isn't a valid token (curl may read it otherwise, or as a file): ${decodeOr(name).slice(0, 60)}`);
       continue;
     }
     const lower = name.toLowerCase();
