@@ -6,7 +6,7 @@ import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { confirm } from "../ui/Confirm";
 import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
-import { activeLabels, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
+import { activeLabels, curlOptions, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
@@ -182,8 +182,12 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     if (endCall(key, id)) sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
   };
 
-  // The request as Send would send it, auto URL-encoding included.
-  const copyCurl = () => copyAsCurl(requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, withScheme(guessTarget(raw, target)), tab.binary, app.toast);
+  // The request as Send would send it (auto URL-encoding, CRLF body), with the tab's options.
+  const copyCurl = () => {
+    const problem = optionsProblem(options);
+    if (problem) return app.toast(problem, "error");
+    copyAsCurl(requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, withScheme(guessTarget(raw, target)), tab.binary, app.toast, curlOptions(options));
+  };
 
   const go = (d: number) => {
     const at = sent.at + d;

@@ -4,15 +4,18 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { pathOf } from "../api";
 import { useApp } from "../store";
-import { parseCurl, toCurl } from "./curl";
+import { parseCurl, toCurl, type CurlSendOptions } from "./curl";
 import { keepFocusIn } from "./focus";
 
-/** Copies a raw request to `target` as a cURL command, with a toast for the result. */
-export function copyAsCurl(raw: string, target: string, binary: boolean | undefined, toast: (text: string, kind?: "info" | "error") => void) {
+/**
+ * Copies a raw request to `target` as a cURL command, with a toast for the result. `send` is a
+ * Replay tab's options, so the command sends the way the tab does.
+ */
+export function copyAsCurl(raw: string, target: string, binary: boolean | undefined, toast: (text: string, kind?: "info" | "error") => void, send?: CurlSendOptions) {
   let command: string;
   let warnings: string[];
   try {
-    ({ command, warnings } = toCurl(raw, target, binary));
+    ({ command, warnings } = toCurl(raw, target, binary, send));
   } catch (e: any) {
     return toast(e.message, "error");
   }

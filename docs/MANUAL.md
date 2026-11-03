@@ -346,6 +346,9 @@ Edit a raw request and send it as often as you like, in separate tabs.
   is). The toast notes what curl will send differently (only the first of several `Host`
   headers, its own `Content-Length`, HTTP/2's dropped `Connection` or `Upgrade`) and when the
   command holds credentials (`Authorization`, `Cookie`), so take care where you paste it.
+  It follows the tab's **Options**: `--http2` with HTTP/2 on, `-k` for https unless Verify TLS
+  is on (Send doesn't check certificates either), `--max-time` for a timeout, and the CRLF
+  body; the toast says when Send as typed or SNI is set, since curl can't do either.
   The command runs outside brainproxy, so the engagement scope doesn't apply to it. Bodies
   over 128 KB may be too long for one shell argument; save those to a file and use
   `--data-binary @FILE`.

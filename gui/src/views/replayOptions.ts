@@ -92,6 +92,18 @@ export function sendArgs(target: string, o: Partial<ReplayOptions> | undefined):
   return ["send", `--target=${target}`, ...optionArgs(o, "http"), "-"];
 }
 
+/**
+ * How Copy as cURL follows the tab's options (`toCurl`'s `send`): HTTP/2, `-k` unless Verify
+ * TLS is on (Send doesn't check certificates either), the timeout as `--max-time`, and a
+ * warning for "send as typed" and SNI, which curl can't reproduce. The CRLF body is already in
+ * the text requestToSend gives; Don't record has nothing to do with curl.
+ */
+export function curlOptions(o: Partial<ReplayOptions> | undefined): { http2: boolean; insecure: boolean; asTyped: boolean; sni: string; timeout?: number } {
+  const f = withDefaults(o);
+  const t = timeoutSeconds(f);
+  return { http2: f.http2, insecure: !f.verifyTls, asTyped: sendsAsTyped(f), sni: f.sni.trim(), ...(typeof t === "number" ? { timeout: t } : {}) };
+}
+
 /** Short labels for the options that aren't the default, shown on the tab. */
 export function activeLabels(o: Partial<ReplayOptions> | undefined, kind: TabKind): string[] {
   const f = withDefaults(o);

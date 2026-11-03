@@ -25,6 +25,23 @@ export interface ParsedCurl {
   warnings: string[];
 }
 
+/**
+ * How a Replay tab sends (its Options), for a command that sends the same way. Left out, the
+ * command follows the request line alone, as for a recorded request.
+ */
+export interface CurlSendOptions {
+  /** HTTP/2 whatever the request line says (`send --http2`). */
+  http2?: boolean;
+  /** Don't check the server certificate (`-k`), as `send` does without `--verify-tls`. */
+  insecure?: boolean;
+  /** Sent as typed (`send --verbatim`), which curl can't reproduce: only a warning. */
+  asTyped?: boolean;
+  /** A TLS server name other than the target's (`send --sni`), which curl can't send: only a warning. */
+  sni?: string;
+  /** Seconds the request may take (`send --timeout`), as `--max-time`. */
+  timeout?: number;
+}
+
 /** A request written as a cURL command. */
 export interface CurlCommand {
   command: string;
@@ -1070,7 +1087,7 @@ function printfQuote(bytes: string): string {
  * (scheme://host[:port]) as a POSIX shell cURL command that sends the same request.
  * Throws CurlError when it can't be written; `warnings` says what may not work.
  */
-export function toCurl(raw: string, target: string, binary = false): CurlCommand {
+export function toCurl(raw: string, target: string, binary = false, send: CurlSendOptions = {}): CurlCommand {
   const origin = utf8(target.trim().replace(/\/+$/, ""));
   const om = /^(https?):\/\/([^/?#\s]+)$/i.exec(origin);
   if (!om) throw new CurlError("Set a target (scheme://host[:port]) first.");
@@ -1083,7 +1100,7 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   const rl = /^(\S+)[ \t]+(.+?)(?:[ \t]+(HTTP\/\S+))?[ \t]*$/i.exec(lines[0] ?? "");
   if (!rl) throw new CurlError("The request line isn't METHOD target HTTP/version.");
   const [, method, reqTarget, version = "HTTP/1.1"] = rl;
-  const h2 = /^HTTP\/2/i.test(version);
+  const h2 = !!send.http2 || /^HTTP\/2/i.test(version);
 
   const args: string[] = [];
   let url: string;
@@ -1103,6 +1120,11 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   else if (/^HTTP\/1\.0$/i.test(version)) args.push("--http1.0");
   // Over https curl negotiates HTTP/2 when the server offers it.
   else if (scheme === "https") args.push("--http1.1");
+  if (send.insecure && scheme === "https") args.push("-k");
+  if (send.timeout) args.push(`--max-time ${send.timeout}`);
+  if (send.asTyped)
+    warnings.push("Send as typed can't be reproduced by curl: it writes the head itself (line breaks, header end) and sends its own Content-Length, so a malformed request goes out as curl builds it.");
+  if (send.sni?.trim() && scheme === "https") warnings.push(`curl sends the target's host as the TLS server name, not the tab's SNI (${send.sni.trim()}).`);
 
   const hasLength = lines.some((l) => /^content-length\s*:/i.test(l));
   const hasData = body.length > 0 || hasLength;

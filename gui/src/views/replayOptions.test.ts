@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_OPTIONS, activeLabels, crlfBody, crlfHead, optionArgs, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
+import { DEFAULT_OPTIONS, activeLabels, crlfBody, crlfHead, curlOptions, optionArgs, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
 import { autoEncodeRequest } from "../ui/urlencode.ts";
+import { parseCurl, toCurl } from "../ui/curl.ts";
 import { wsSendArgs } from "./ws.ts";
 
 test("default options add no flags and show nothing", () => {
@@ -242,4 +243,35 @@ test("WebSocket options go after --until and before the stdin flags", () => {
   // No options, or the defaults: the same arguments as before options existed.
   assert.deepEqual(wsSendArgs({ target: "ws://a", wait: 1, options: DEFAULT_OPTIONS }), wsSendArgs({ target: "ws://a", wait: 1 }));
   assert.ok(!wsSendArgs({ target: "ws://a", wait: 1, options: { timeout: "30" } }).some((a) => a.startsWith("--timeout")));
+});
+
+test("Copy as cURL sends the way the tab does", () => {
+  const raw = "POST /a HTTP/1.1\nHost: h.test\nContent-Type: text/plain\n\nl1\nl2";
+  const copy = (o: Parameters<typeof curlOptions>[0], target = "https://h.test") =>
+    toCurl(requestToSend(raw, { autoEncode: true, options: o }).text, target, false, curlOptions(o));
+  // Defaults: HTTP/1.1 kept, -k as Send doesn't check certificates, no warnings.
+  const plain = copy(undefined);
+  assert.match(plain.command, /--http1\.1 \\\n {2}-k /);
+  assert.doesNotMatch(plain.command, /--max-time/);
+  assert.deepEqual(plain.warnings, []);
+  // -k only for https, and not with Verify TLS.
+  assert.doesNotMatch(copy(undefined, "http://h.test").command, / -k/);
+  assert.doesNotMatch(copy({ verifyTls: true }).command, / -k/);
+  // HTTP/2 with an HTTP/1.1 request line, as send --http2.
+  const h2 = copy({ http2: true });
+  assert.match(h2.command, /--http2 /);
+  assert.doesNotMatch(h2.command, /--http1/);
+  assert.match(copy({ http2: true }, "http://h.test").command, /--http2-prior-knowledge/);
+  // CRLF body: the body's line breaks go out as CRLF (through printf, as \r is a control byte).
+  const crlf = copy({ crlfBody: true });
+  assert.match(crlf.command, /printf 'l1\\015\\nl2'/);
+  assert.equal(parseCurl(crlf.command).raw.split("\n\n")[1], "l1\r\nl2");
+  // A timeout other than the default is --max-time; the default isn't written.
+  assert.match(copy({ timeout: "2.5" }).command, /--max-time 2\.5/);
+  assert.doesNotMatch(copy({ timeout: "30" }).command, /--max-time/);
+  // What curl can't do is said.
+  assert.match(copy({ verbatim: true }).warnings.join("\n"), /Send as typed can't be reproduced by curl/);
+  assert.deepEqual(copy({ verbatim: true, http2: true }).warnings, []);
+  assert.match(copy({ sni: "other.test" }).warnings.join("\n"), /not the tab's SNI \(other\.test\)/);
+  assert.deepEqual(copy({ sni: "other.test" }, "http://h.test").warnings, []);
 });
