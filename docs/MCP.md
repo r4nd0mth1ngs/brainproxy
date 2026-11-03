@@ -45,8 +45,10 @@ Tool calls run concurrently, each on its own thread and child process, up to 16 
 (more are refused with `-32000`; a second call with the id of a running one gets `-32600`),
 so a long `job_wait` doesn't hold up other calls; replies can arrive out of order. Other
 requests are answered right away. `notifications/cancelled` with a running call's
-`requestId` kills its child process, and no response is sent for that call. When stdin
-closes, running calls are killed and the server exits.
+`requestId` stops its child process (SIGTERM, so a request it already sent is recorded as
+cancelled; killed 3 s later if still running; on Windows killed at once), and no response is
+sent for that call. When stdin closes, running calls are stopped the same way and the server
+exits.
 
 Progress: when a `tools/call` request has `params._meta.progressToken` (string or number),
 the server sends `notifications/progress` with that token every second while the command
@@ -97,6 +99,51 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
+- `send` and `ws_send` with `no_store` (races too), and `fuzz_run` with `store` `none` or
+  `matches`: what an agent sends is always recorded in full, so a person can see what was sent
+  on their behalf. A person can keep a send's content out of history from the app or a
+  terminal; it still gets a row. These are the only options of a sending command that keep
+  requests out of history. (Every request a `scan_active` check template sends, and the
+  document fetches of `import_api` and `scan_active` with `api`, are recorded whoever runs
+  them.)
+- `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
+  project's profile, with the person's cookies and sign-ins, and the pages it loads would be
+  recorded as the proxy's traffic, not the agent's.
+- `proxy_start` with a `listen` address other than loopback: an agent can't open the person's
+  proxy, with their auth profiles, to the network.
+
+`scan_active` with `checks` takes any template file, including one the agent wrote. Its
+requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DELETE or GraphQL
+mutation in a template isn't sent unless `include_methods` names it, and every request a
+check sends is recorded with origin `mcp`. The same holds outside MCP.
+
+The GUI's development server (`npm run dev`) runs CLI commands for the UI without these
+limits, so it only answers requests carrying a token it makes up each time it starts and
+prints in its terminal; `send` can't learn it (see GUI.md).
+
+Everything a tool call records is marked as an agent's: history entries and findings get
+origin `mcp`, and so does a finding state change (`findings_mark` sets `state_origin`). A
+proxy, job or fuzz run started by a tool call records `mcp` too. `BRAINPROXY_MCP_CALL` wins
+over `BRAINPROXY_CLIENT=gui` (what the desktop app sets), and tool arguments can't set
+environment variables, so an agent can't make its records look like a person's. List them
+with `history_list` and `origin: "mcp"`.
+
+Origin is per process: it is who started the process that recorded a row. A proxy a person
+started from the app records `gui` even for requests an agent's actions sent through it, so
+an agent's changes to proxied traffic are recorded on their own:
+
+- `intercept_forward` and `intercept_drop` set the intercept's `resolved_by` to `mcp`, and
+  `edited` says whether the message was replaced. A request forwarded edited gets
+  `edited_by: [{"by": "mcp", "intercept": ID}]` on its history row.
+- `rules_add` (and `rules_enable` of a disabled rule) gives the rule origin `mcp`; a request
+  the rule changes gets `edited_by: [{"by": "mcp", "rule": ID}]`.
+- `findings_mark` with a note sets `note_origin`; `history_note` and `history_tag` set
+  `note_origin` and `tags_origin`.
+- `scan_passive` with `rescan` keeps every finding's state, note and origins, and keeps a
+  triaged finding it doesn't find again (with 0 hits), so it can't erase a person's triage.
+
+Reports name an agent's confirmations ("confirmed via MCP (an agent)") and list the findings
+an agent marked false positive, which the default state filter leaves out.
 
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep
@@ -139,7 +186,7 @@ No subscriptions or templates.
 - `--max-output` (default 1,000,000 bytes): stdout beyond this is dropped and the text ends
   with `[output cut off at N bytes]`. Use the commands' own `--limit`, `--max-body`, and
   `--max-cell` to stay under it.
-- `--timeout` (default 600 s): a call running longer is killed and returns an error envelope
+- `--timeout` (default 600 s): a call running longer is stopped (as a cancelled one is) and returns an error envelope
   with kind `timeout`. Crawls, scans, fuzzing, and imports take `background: true`; then
   poll with `job_status` / `job_wait` (with its own `timeout`).
 

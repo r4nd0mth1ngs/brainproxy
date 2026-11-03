@@ -86,7 +86,8 @@ pub struct ActiveArgs {
     /// Also attack requests from history with these methods (comma-separated, or `all`).
     /// By default only GET, HEAD, OPTIONS and POST are replayed, and POST can change data or
     /// trigger side effects such as email. GraphQL mutations are MUTATION, whatever their
-    /// method. --history-id is always attacked.
+    /// method. A request named by --history-id needs its method here too, and so does a
+    /// --checks template's request (one with another method isn't sent).
     #[arg(long, value_delimiter = ',', value_name = "METHODS")]
     include_methods: Vec<String>,
     /// History entry to attack. Repeatable.
@@ -109,6 +110,7 @@ pub struct ActiveArgs {
     no_rules: bool,
     /// Declarative checks to run as well: `nuclei` (templates from `checks update`), `local`
     /// (<home>/checks/local), `all`, or a template file/directory. Repeatable or comma-separated.
+    /// Every request a check sends is recorded in history (source scan), finding or not.
     #[arg(long, value_delimiter = ',', value_name = "SELECTOR")]
     checks: Vec<String>,
     /// Only checks with any of these tags (comma-separated), e.g. cve,exposure.
@@ -421,7 +423,6 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             let fetch = crate::import_cmd::Fetcher {
                 project,
                 send: &send,
-                record: false,
                 auth: auth.as_deref(),
                 headers: &[],
                 tool: Tool::Scan,
@@ -465,6 +466,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         auth: auth.clone(),
         oob,
         oob_wait: Duration::from_secs_f64(args.oob_wait.clamp(0.0, 3600.0)),
+        check_methods: args.include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(),
     };
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -522,6 +524,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     where_sql: None,
                     max_targets: usize::MAX,
                     include_methods: vec![],
+                    preapproved: true,
                 };
                 let mut picked = select_targets(project, &selection, &cfg.send, &cfg.points, auth.as_deref())?;
                 if let Some(cap) = args.max_targets {
@@ -609,6 +612,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         if skipped_methods > 0 {
             v["skipped_methods"] = json!(skipped_methods);
             v["methods_hint"] = json!("Requests other than GET, HEAD, OPTIONS and POST were not attacked; add --include-methods to attack them.");
+        }
+        if summary.check_skipped_methods > 0 {
+            v["check_methods_hint"] = json!("Check requests other than GET, HEAD, OPTIONS and POST (and GraphQL mutations) were not sent; add --include-methods to send them.");
         }
         if posts > 0 {
             v["post_targets"] = json!(posts);
@@ -702,6 +708,8 @@ struct Selection {
     max_targets: usize,
     /// Methods attacked besides the default ones (upper case; `ALL` for every method).
     include_methods: Vec<String>,
+    /// The history ids were opted in already (`--api` baselines, sent under the import's own opt-in).
+    preapproved: bool,
 }
 
 const POST_HINT: &str = "POST requests are replayed with attack payloads, often many times, and can change data or trigger side effects such as email.";
@@ -724,6 +732,7 @@ impl Selection {
             where_sql: args.where_sql.clone(),
             max_targets: args.max_targets.unwrap_or(200),
             include_methods: args.include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(),
+            preapproved: false,
         }
     }
 
@@ -853,10 +862,17 @@ fn select_targets(
             method.clone()
         };
         if !(all_methods
-            || explicit
+            || (explicit && args.preapproved)
             || DEFAULT_METHODS.contains(&opt_in.as_str())
             || args.include_methods.contains(&opt_in))
         {
+            // Naming a request isn't consent to attack what it changes: say so before anything is sent.
+            if let Some(id) = t.history_id.filter(|_| explicit) {
+                return Err(Error::InvalidInput(format!(
+                    "--history-id {id} is a {opt_in} request, and attacking it can change or delete data; add \
+                     --include-methods {opt_in} to attack it"
+                )));
+            }
             skipped_methods += 1;
             continue;
         }

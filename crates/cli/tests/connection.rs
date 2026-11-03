@@ -183,6 +183,9 @@ fn passthrough_and_upstream_proxy_apply_to_a_running_proxy() {
     assert_eq!(rows[0][1], "localhost");
     assert!(rows[0][3].is_null() && rows[0][4].as_str().unwrap().contains("not decrypted"), "{rows}");
     assert_eq!(env.rows("SELECT count(*) FROM history WHERE path = '/secret'")[0][0], 0);
+    // Every proxy entry names the client it came from.
+    let clients = env.rows("SELECT count(*) FROM history WHERE source = 'proxy' AND client_addr LIKE '127.0.0.1:%'");
+    assert_eq!(clients[0][0], env.rows("SELECT count(*) FROM history WHERE source = 'proxy'")[0][0]);
     // Still scope-checked: out-of-engagement hosts aren't tunnelled.
     env.ok(&["connection", "passthrough", "add", "*"]);
     wait_for_settings();
@@ -285,6 +288,8 @@ fn invisible_proxy_routes_by_host_and_redirects() {
     std::thread::sleep(Duration::from_millis(300));
     let rows = env.rows("SELECT port FROM history WHERE path = '/redirected'");
     assert_eq!(rows[0][0], https, "{rows}");
+    let rows = env.rows("SELECT count(*) FROM history WHERE source = 'proxy' AND client_addr IS NULL");
+    assert_eq!(rows[0][0], 0, "every invisible-proxy entry names its client");
 }
 
 #[test]

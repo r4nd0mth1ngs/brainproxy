@@ -417,3 +417,54 @@ fn feed_checks_update_scan_and_switch_off() {
     assert_eq!(code, 4);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A template an agent could write anywhere: a DELETE whose matcher never matches.
+const DELETE_PROBE: &str = r#"
+id: delete-probe
+info: {name: Delete probe, severity: info}
+http:
+  - raw:
+      - |
+        DELETE /items/1 HTTP/1.1
+        Host: {{Hostname}}
+
+    matchers:
+      - type: word
+        words: ["never in a response"]
+"#;
+
+#[test]
+fn a_check_file_from_a_tool_call_sends_only_what_is_opted_in_and_on_record() {
+    let (dir, project, home) = setup("mcp-file");
+    let file = dir.join("probe.yaml");
+    std::fs::write(&file, DELETE_PROBE).unwrap();
+    let port = serve();
+    let url = format!("http://127.0.0.1:{port}/");
+    let scan = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .env("BRAINPROXY_MCP_CALL", "1")
+            .args(["--format", "json", "--project"])
+            .arg(&project)
+            .arg("--home")
+            .arg(&home)
+            .args(["scan", "active", &url, "--no-rules", "--checks", file.to_str().unwrap()])
+            .args(extra)
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        v
+    };
+    let rows = || {
+        let sql = "SELECT method, path, source, origin FROM history WHERE method = 'DELETE'";
+        run(&["query", sql], &project, &home).1["data"]["rows"].clone()
+    };
+    let v = scan(&[]);
+    assert_eq!(v["data"]["check_skipped_methods"], 1, "{v}");
+    assert!(v["data"]["check_methods_hint"].as_str().unwrap().contains("--include-methods"), "{v}");
+    assert_eq!(rows(), serde_json::json!([]));
+    let v = scan(&["--include-methods", "DELETE"]);
+    assert_eq!(v["data"]["check_skipped_methods"], 0, "{v}");
+    assert_eq!(rows(), serde_json::json!([["DELETE", "/items/1", "scan", "mcp"]]));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

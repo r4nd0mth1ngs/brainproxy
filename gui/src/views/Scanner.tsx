@@ -1018,7 +1018,7 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
             <button className="btn" disabled={busy} onClick={() => runPassive(false)}>
               Run passive scan now
             </button>
-            <button className="btn" disabled={busy} onClick={() => window.confirm("Delete passive findings and rescan all history?") && runPassive(true)}>
+            <button className="btn" disabled={busy} onClick={() => window.confirm("Rescan all history? Findings found again keep their state and notes; untriaged ones not found again are removed.") && runPassive(true)}>
               Rescan all
             </button>
           </>

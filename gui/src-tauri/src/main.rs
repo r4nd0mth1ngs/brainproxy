@@ -52,10 +52,19 @@ impl Cancellable {
     }
 }
 
+/// How long a cancelled call may take to finish after SIGTERM (recording what it sent)
+/// before it is killed.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Runs `brainproxy --format json --project PROJECT ARGS...` and returns its JSON envelope.
 /// `stdin` is written byte for byte; `env` adds BRAINPROXY_SECRET_* variables to the child.
-/// With a `call` id, `cli_cancel` with that id kills the child (a browser sign-in waiting
-/// for the user, say), and the envelope says it was cancelled.
+/// With a `call` id, `cli_cancel` with that id stops the child (a browser sign-in waiting
+/// for the user, say), and the envelope says it was cancelled. On unix the child gets
+/// SIGTERM first, so a request it already sent is recorded as cancelled, and is killed if
+/// it is still running after `CANCEL_GRACE`. Windows has no SIGTERM: the child is killed at
+/// once, and a sent request keeps the row it was given before it went out. A child that
+/// exits in time answers with its own envelope, marked `cancelled: true` (a failure gets
+/// kind `cancelled`, its own in `cli_kind`), so the UI can still show the rows it names.
 #[tauri::command]
 async fn cli(
     app: tauri::AppHandle,
@@ -70,15 +79,65 @@ async fn cli(
         return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
     }
     let Some(call) = call else { return run(&project, &args, stdin, &env).await };
+    let mut child = match spawn(&project, &args, stdin, &env) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let (tx, rx) = oneshot::channel();
     app.state::<Cancellable>().held().insert(call.clone(), tx);
-    // Dropping the run drops the child, which kills it (kill_on_drop).
-    let out = tokio::select! {
-        out = run(&project, &args, stdin, &env) => out,
-        _ = rx => json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}}),
+    let (stdout, stderr) = (read_all(child.stdout.take()), read_all(child.stderr.take()));
+    let cancelled = tokio::select! {
+        _ = child.wait() => false,
+        _ = rx => true,
     };
+    if cancelled {
+        terminate(&child);
+        if tokio::time::timeout(CANCEL_GRACE, child.wait()).await.is_err() {
+            let _ = child.kill().await;
+        }
+    }
     app.state::<Cancellable>().held().remove(&call);
-    out
+    let (stdout, stderr) = (stdout.await.unwrap_or_default(), stderr.await.unwrap_or_default());
+    if !cancelled {
+        return envelope(&stdout, &stderr);
+    }
+    match serde_json::from_slice::<Value>(&stdout) {
+        Ok(mut v @ Value::Object(_)) => {
+            v["cancelled"] = json!(true);
+            if v["ok"] == false {
+                v["error"]["cli_kind"] = v["error"]["kind"].clone();
+                v["error"]["kind"] = json!("cancelled");
+            }
+            v
+        }
+        _ => json!({"ok": false, "command": "gui", "error": {"kind": "cancelled", "message": "cancelled"}}),
+    }
+}
+
+/// Reads a pipe to the end.
+fn read_all<R: tokio::io::AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
+        }
+        buf
+    })
+}
+
+/// Asks the child to exit (SIGTERM). Elsewhere there is no such request; the child is killed
+/// after the grace period instead.
+fn terminate(child: &tokio::process::Child) {
+    // None once the child has been reaped, so a reused pid is never signalled.
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()).filter(|&p| p > 1) {
+        // SAFETY: kill() only sends a signal; the pid is our own child's, not yet reaped.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 /// Stops the `cli` call started with this id, if it is still running.
@@ -90,8 +149,23 @@ fn cli_cancel(call: String, running: tauri::State<'_, Cancellable>) {
 }
 
 async fn run(project: &str, args: &[String], stdin: Option<Vec<u8>>, env: &HashMap<String, String>) -> Value {
+    match spawn(project, args, stdin, env) {
+        Ok(child) => output(child).await,
+        Err(e) => e,
+    }
+}
+
+/// Starts the CLI and feeds it `stdin`; an error comes back as the envelope to return.
+fn spawn(
+    project: &str,
+    args: &[String],
+    stdin: Option<Vec<u8>>,
+    env: &HashMap<String, String>,
+) -> Result<tokio::process::Child, Value> {
     let mut cmd = Command::new(binary());
     cmd.args(["--format", "json", "--project"]).arg(project).args(args).envs(env);
+    // What the CLI records is marked as the app's (origin `gui`).
+    cmd.env("BRAINPROXY_CLIENT", "gui");
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -99,22 +173,29 @@ async fn run(project: &str, args: &[String], stdin: Option<Vec<u8>>, env: &HashM
     // CREATE_NO_WINDOW: the CLI is a console program; without it each call flashes a console window.
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return failure(format!("can't run {}: {e}", binary().display())),
-    };
+    let mut child = cmd.spawn().map_err(|e| failure(format!("can't run {}: {e}", binary().display())))?;
     if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
         tokio::spawn(async move {
             let _ = pipe.write_all(&data).await;
         });
     }
+    Ok(child)
+}
+
+/// The child's JSON envelope, once it exits.
+async fn output(child: tokio::process::Child) -> Value {
     match child.wait_with_output().await {
-        Ok(out) => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
-            let text = String::from_utf8_lossy(if out.stdout.is_empty() { &out.stderr } else { &out.stdout });
-            failure(text.trim().to_string())
-        }),
+        Ok(out) => envelope(&out.stdout, &out.stderr),
         Err(e) => failure(e.to_string()),
     }
+}
+
+/// The JSON envelope the CLI printed, or a failure with what it said instead.
+fn envelope(stdout: &[u8], stderr: &[u8]) -> Value {
+    serde_json::from_slice(stdout).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(if stdout.is_empty() { stderr } else { stdout });
+        failure(text.trim().to_string())
+    })
 }
 
 /// The locks on the temp projects this app has, with whether each is a leftover it is asking

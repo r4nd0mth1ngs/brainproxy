@@ -210,7 +210,47 @@ fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<WsMessage> {
     })
 }
 
+/// A connection row for the upgrade recorded as history row `history_id`.
+fn insert_connection(
+    conn: &rusqlite::Connection,
+    history_id: i64,
+    capture: &Capture,
+    source: &str,
+    url: &str,
+    time: &str,
+) -> Result<i64> {
+    let resp = crate::http::parse_response_head(crate::http::client::final_response(&capture.response)).ok();
+    let header = |n: &str| resp.as_ref().and_then(|h| h.header(n)).map(str::to_string);
+    conn.execute(
+        "INSERT INTO ws_connections (time, source, history_id, url, host, extensions, protocol)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            time,
+            source,
+            history_id,
+            url,
+            capture.host,
+            header("sec-websocket-extensions"),
+            header("sec-websocket-protocol")
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 impl Store {
+    /// Records a connection whose upgrade is already history row `history_id` (`capture`, its
+    /// request and 101 response); returns its id, for the keys of later [`Store::ws_record`] calls.
+    pub fn ws_open_recorded(
+        &self,
+        history_id: i64,
+        capture: &Capture,
+        source: &str,
+        url: &str,
+        time: &str,
+    ) -> Result<i64> {
+        insert_connection(&self.conn, history_id, capture, source, url, time)
+    }
+
     /// Records WebSocket events in one transaction. `ids` maps the recorder's connection keys
     /// to database ids across calls; a closed connection's key is removed. Events for a key
     /// with no `Open` (it failed to record) are skipped.
@@ -220,23 +260,7 @@ impl Store {
             match e {
                 WsEvent::Open { key, capture, source, url, time } => {
                     let history_id = insert_capture(&tx, capture)?;
-                    let resp =
-                        crate::http::parse_response_head(crate::http::client::final_response(&capture.response)).ok();
-                    let header = |n: &str| resp.as_ref().and_then(|h| h.header(n)).map(str::to_string);
-                    tx.execute(
-                        "INSERT INTO ws_connections (time, source, history_id, url, host, extensions, protocol)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            time,
-                            source,
-                            history_id,
-                            url,
-                            capture.host,
-                            header("sec-websocket-extensions"),
-                            header("sec-websocket-protocol")
-                        ],
-                    )?;
-                    ids.insert(*key, tx.last_insert_rowid());
+                    ids.insert(*key, insert_connection(&tx, history_id, capture, source, url, time)?);
                 }
                 WsEvent::Message { key, direction, message, intercept } => {
                     let Some(&conn) = ids.get(key) else { continue };
