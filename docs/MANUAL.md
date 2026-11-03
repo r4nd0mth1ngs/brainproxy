@@ -291,7 +291,10 @@ The sidebar groups the tools by what you are doing.
     timeout, or dropped in **Intercept**) has nothing to scan, so the item is greyed out,
     with the reason under it.
   - **Test access control…** opens **Access** with a new run set to test that request
-    (`authz run --history-id`). Pick the identities and start it.
+    (`authz run --history-id`). Pick the identities and start it. A request other than GET,
+    HEAD or OPTIONS, or one whose path looks like a logout, is asked about first; saying yes
+    passes the opt-ins the CLI needs for it (`--include-methods`, and an `--exclude` it doesn't
+    match).
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
   ones Replay opened. Select a connection to see its messages in both directions (→ to the
   server, ← to the client), with pings, pongs and the close; select a message to read its
