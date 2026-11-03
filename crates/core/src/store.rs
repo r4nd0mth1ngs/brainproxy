@@ -70,15 +70,25 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 /// Provenance: who or what recorded a row (rows from before stay NULL, "unknown"), the proxy
-/// client's address, the overridden TLS server name, and who last changed a finding's state.
+/// client's address, the overridden TLS server name, who changed a proxied request before it
+/// went out, who last changed a finding's state and a note or tags, and who resolved an
+/// intercept.
 const SCHEMA_V13: &str = "
 ALTER TABLE history ADD COLUMN origin TEXT;
 ALTER TABLE history ADD COLUMN client_addr TEXT;
 ALTER TABLE history ADD COLUMN sni TEXT;
+ALTER TABLE history ADD COLUMN edited_by TEXT;
+ALTER TABLE history ADD COLUMN note_origin TEXT;
+ALTER TABLE history ADD COLUMN note_changed_at TEXT;
+ALTER TABLE history ADD COLUMN tags_origin TEXT;
+ALTER TABLE history ADD COLUMN tags_changed_at TEXT;
 CREATE INDEX IF NOT EXISTS history_origin ON history(origin);
 ALTER TABLE findings ADD COLUMN origin TEXT;
 ALTER TABLE findings ADD COLUMN state_origin TEXT;
 ALTER TABLE findings ADD COLUMN state_changed_at TEXT;
+ALTER TABLE findings ADD COLUMN note_origin TEXT;
+ALTER TABLE findings ADD COLUMN note_changed_at TEXT;
+ALTER TABLE intercepts ADD COLUMN resolved_by TEXT;
 ";
 
 const SCHEMA_V2: &str = "
@@ -182,6 +192,12 @@ pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
     ("original", "BLOB", "The message as held (a WebSocket message's payload)"),
     ("edited", "BLOB", "Replacement message, if one was forwarded"),
     ("resolved_time", "TEXT", "When it was forwarded, dropped, or expired"),
+    (
+        "resolved_by",
+        "TEXT",
+        "gui, cli or mcp: who forwarded or dropped it; NULL while pending, when it expired, or when the proxy \
+         dropped it itself (its connection closed)",
+    ),
 ];
 
 /// Column documentation, served by `brainproxy schema` so an agent can write SQL
@@ -218,11 +234,23 @@ pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
     (
         "origin",
         "TEXT",
-        "Who or what recorded it: gui (the desktop app), cli (a terminal or script), mcp (an agent through MCP); \
-         NULL for entries recorded before brainproxy kept it",
+        "Who or what started the process that recorded it: gui (the desktop app), cli (a terminal or script), \
+         mcp (an agent through MCP); NULL for entries recorded before brainproxy kept it. For source proxy this is \
+         who started the proxy, not who sent the request: see client_addr and edited_by",
     ),
     ("client_addr", "TEXT", "Proxy client address (ip:port) for source proxy; NULL otherwise"),
     ("sni", "TEXT", "TLS server name sent when overridden with --sni; NULL when it was the target host"),
+    (
+        "edited_by",
+        "TEXT",
+        "Proxy only: JSON array of the changes made to the request before it went out, e.g. \
+         [{\"by\":\"mcp\",\"intercept\":4}] (an intercept edit) or [{\"by\":\"gui\",\"rule\":2}] (a match-and-replace \
+         rule and who added it); NULL when nothing changed it",
+    ),
+    ("note_origin", "TEXT", "gui, cli or mcp: who last set the note; NULL if never set"),
+    ("note_changed_at", "TEXT", "UTC time the note was last set"),
+    ("tags_origin", "TEXT", "gui, cli or mcp: who last changed the tags; NULL if never changed"),
+    ("tags_changed_at", "TEXT", "UTC time the tags were last changed"),
 ];
 
 pub const FUNCTIONS: &[(&str, &str)] = &[
@@ -272,6 +300,14 @@ pub struct HistoryEntry {
     pub client_addr: Option<String>,
     /// The TLS server name sent, when overridden.
     pub sni: Option<String>,
+    /// Who changed a proxied request before it went out; empty when nobody did.
+    pub edited_by: Vec<crate::provenance::Edit>,
+    /// Who last set the note, and when.
+    pub note_origin: Option<String>,
+    pub note_changed_at: Option<String>,
+    /// Who last changed the tags, and when.
+    pub tags_origin: Option<String>,
+    pub tags_changed_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +345,19 @@ pub struct InterceptEntry {
     pub status: Option<u16>,
     pub length: i64,
     pub resolved_time: Option<String>,
+    /// gui, cli or mcp: who forwarded or dropped it; None while pending or when the proxy
+    /// resolved it itself (expired, connection closed).
+    pub resolved_by: Option<String>,
+    /// It was forwarded with a replacement that differs from the message as held.
+    pub edited: bool,
+}
+
+/// An intercept's state as the proxy polls it.
+#[derive(Debug, Clone)]
+pub struct InterceptState {
+    pub state: String,
+    pub edited: Option<Vec<u8>>,
+    pub resolved_by: Option<String>,
 }
 
 /// Result of a read-only SQL query, in a compact column/row shape.
@@ -760,23 +809,28 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Current state and edited message (if any) of an intercept.
-    pub fn intercept_state(&self, id: i64) -> Result<(String, Option<Vec<u8>>)> {
+    /// Current state, edited message (if any) and resolver of an intercept.
+    pub fn intercept_state(&self, id: i64) -> Result<InterceptState> {
         self.conn
-            .query_row("SELECT state, edited FROM intercepts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("SELECT state, edited, resolved_by FROM intercepts WHERE id = ?1", [id], |r| {
+                Ok(InterceptState { state: r.get(0)?, edited: r.get(1)?, resolved_by: r.get(2)? })
+            })
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("intercept {id}")))
     }
 
-    /// Moves a pending intercept to `state`. Fails if it isn't pending any more.
-    pub fn intercept_resolve(&self, id: i64, state: &str, edited: Option<&[u8]>) -> Result<()> {
+    /// Moves a pending intercept to `state`. Fails if it isn't pending any more. `by` is who
+    /// decided (this process's origin, for `intercept forward` and `drop`); None when the
+    /// proxy resolves it itself.
+    pub fn intercept_resolve(&self, id: i64, state: &str, edited: Option<&[u8]>, by: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE intercepts SET state = ?1, edited = ?2, resolved_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            "UPDATE intercepts SET state = ?1, edited = ?2, resolved_by = ?4,
+                resolved_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
              WHERE id = ?3 AND state = 'pending'",
-            params![state, edited, id],
+            params![state, edited, id, by],
         )?;
         if n == 0 {
-            let (current, _) = self.intercept_state(id)?;
+            let current = self.intercept_state(id)?.state;
             return Err(Error::Conflict(format!("intercept {id} is {current}, not pending")));
         }
         Ok(())
@@ -784,7 +838,8 @@ impl Store {
 
     pub fn intercept_list(&self, state: Option<&str>, limit: u32) -> Result<Vec<InterceptEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, time, direction, state, method, url, status, length(original), resolved_time
+            "SELECT id, time, direction, state, method, url, status, length(original), resolved_time, resolved_by,
+                coalesce(edited != original, 0)
              FROM intercepts WHERE (?1 IS NULL OR state = ?1) ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![state, limit], |r| {
@@ -798,6 +853,8 @@ impl Store {
                 status: r.get(6)?,
                 length: r.get(7)?,
                 resolved_time: r.get(8)?,
+                resolved_by: r.get(9)?,
+                edited: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -806,7 +863,8 @@ impl Store {
     pub fn intercept_get(&self, id: i64) -> Result<(InterceptEntry, Vec<u8>, Option<Vec<u8>>)> {
         self.conn
             .query_row(
-                "SELECT id, time, direction, state, method, url, status, length(original), resolved_time, original, edited
+                "SELECT id, time, direction, state, method, url, status, length(original), resolved_time, original, edited,
+                    resolved_by, coalesce(edited != original, 0)
                  FROM intercepts WHERE id = ?1",
                 [id],
                 |r| {
@@ -820,6 +878,8 @@ impl Store {
                         status: r.get(6)?,
                         length: r.get(7)?,
                         resolved_time: r.get(8)?,
+                        resolved_by: r.get(11)?,
+                        edited: r.get(12)?,
                     };
                     Ok((entry, r.get(9)?, r.get(10)?))
                 },
@@ -971,8 +1031,13 @@ impl Store {
             .ok_or_else(|| Error::NotFound(format!("history item {id}")))
     }
 
+    /// Sets or clears an entry's note, recording who did it and when.
     pub fn set_note(&self, id: i64, note: Option<&str>) -> Result<()> {
-        let n = self.conn.execute("UPDATE history SET note = ?1 WHERE id = ?2", params![note, id])?;
+        let n = self.conn.execute(
+            "UPDATE history SET note = ?1, note_origin = ?3, note_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?2",
+            params![note, id, crate::provenance::origin()],
+        )?;
         if n == 0 {
             return Err(Error::NotFound(format!("history item {id}")));
         }
@@ -994,7 +1059,12 @@ impl Store {
             }
         }
         let json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
-        self.conn.execute("UPDATE history SET tags = ?1 WHERE id = ?2", params![json, id])?;
+        // Who changed them is kept only when something changed.
+        self.conn.execute(
+            "UPDATE history SET tags = ?1, tags_origin = ?3, tags_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?2 AND tags != ?1",
+            params![json, id, crate::provenance::origin()],
+        )?;
         Ok(tags)
     }
 
@@ -1087,9 +1157,9 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
         "INSERT INTO history (source, scheme, host, port, method, url, path, query,
             req_headers, req_content_type, req_body, req_body_text,
             status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
-            title, duration_ms, error, request, response, origin, client_addr, sni)
+            title, duration_ms, error, request, response, origin, client_addr, sni, edited_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-            ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+            ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             c.source,
             c.scheme,
@@ -1118,6 +1188,7 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
             c.origin.as_deref().unwrap_or(crate::provenance::origin()),
             c.client_addr,
             c.sni.clone().or_else(|| crate::provenance::sni_for(&c.scheme)),
+            (!c.edited_by.is_empty()).then(|| serde_json::to_string(&c.edited_by).unwrap_or_default()),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1206,7 +1277,8 @@ fn text_arg(ctx: &rusqlite::functions::Context, idx: usize) -> rusqlite::Result<
 }
 
 const ENTRY_COLS: &str = "id, time, source, method, url, status, resp_content_type, resp_body_length, \
-    title, duration_ms, error, note, tags, origin, client_addr, sni";
+    title, duration_ms, error, note, tags, origin, client_addr, sni, edited_by, note_origin, note_changed_at, \
+    tags_origin, tags_changed_at";
 
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<HistoryEntry> {
     let tags: String = r.get(12)?;
@@ -1227,6 +1299,11 @@ fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<HistoryEntry> {
         origin: r.get(13)?,
         client_addr: r.get(14)?,
         sni: r.get(15)?,
+        edited_by: r.get::<_, Option<String>>(16)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+        note_origin: r.get(17)?,
+        note_changed_at: r.get(18)?,
+        tags_origin: r.get(19)?,
+        tags_changed_at: r.get(20)?,
     })
 }
 
@@ -1247,8 +1324,12 @@ mod tests {
     /// Takes a project back to before schema v13.
     const UNDO_V13: &str = "DROP INDEX history_origin;
         ALTER TABLE history DROP COLUMN origin; ALTER TABLE history DROP COLUMN client_addr;
-        ALTER TABLE history DROP COLUMN sni; ALTER TABLE findings DROP COLUMN origin;
-        ALTER TABLE findings DROP COLUMN state_origin; ALTER TABLE findings DROP COLUMN state_changed_at;";
+        ALTER TABLE history DROP COLUMN sni; ALTER TABLE history DROP COLUMN edited_by;
+        ALTER TABLE history DROP COLUMN note_origin; ALTER TABLE history DROP COLUMN note_changed_at;
+        ALTER TABLE history DROP COLUMN tags_origin; ALTER TABLE history DROP COLUMN tags_changed_at;
+        ALTER TABLE findings DROP COLUMN origin; ALTER TABLE findings DROP COLUMN state_origin;
+        ALTER TABLE findings DROP COLUMN state_changed_at; ALTER TABLE findings DROP COLUMN note_origin;
+        ALTER TABLE findings DROP COLUMN note_changed_at; ALTER TABLE intercepts DROP COLUMN resolved_by;";
 
     #[test]
     fn a_project_on_v11_gets_the_websocket_tables() {
@@ -1338,6 +1419,25 @@ mod tests {
         let f = store.finding_get(1).unwrap();
         assert_eq!(f["state_origin"], crate::provenance::origin());
         assert!(f["state_changed_at"].is_string(), "{f}");
+        assert!(f["note_origin"].is_null(), "{f}");
+        store.finding_mark(1, None, Some("seen")).unwrap();
+        let f = store.finding_get(1).unwrap();
+        assert_eq!(f["note_origin"], crate::provenance::origin());
+        assert!(f["note_changed_at"].is_string(), "{f}");
+
+        // Notes, tags and intercept decisions say who made them.
+        store.set_note(1, Some("n")).unwrap();
+        store.update_tags(1, &["t".into()], &[]).unwrap();
+        let e = store.get(1).unwrap().entry;
+        assert_eq!(
+            (e.note_origin.as_deref(), e.tags_origin.as_deref()),
+            (Some(crate::provenance::origin()), Some(crate::provenance::origin()))
+        );
+        assert!(e.note_changed_at.is_some() && e.tags_changed_at.is_some() && e.edited_by.is_empty());
+        let held = store.intercept_create("request", "GET", "http://a.test/", None, b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        store.intercept_resolve(held, "forwarded", Some(b"GET /x HTTP/1.1\r\n\r\n"), Some("mcp")).unwrap();
+        let (entry, _, _) = store.intercept_get(held).unwrap();
+        assert_eq!((entry.resolved_by.as_deref(), entry.edited), (Some("mcp"), true));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

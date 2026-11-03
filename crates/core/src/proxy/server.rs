@@ -30,9 +30,10 @@ use crate::error::{Error, Result};
 use crate::http::client::{close_after, cut_short, final_response, Conn};
 use crate::http::h2::h2_error;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, WireReader};
+use crate::provenance::Edit;
 use crate::proxy::ca::CertAuthority;
 use crate::proxy::config::{
-    apply_request_rules, apply_response_rules, compile_rules, CompiledIntercept, CompiledRule, CompiledScope,
+    apply_request_rules_traced, apply_response_rules, compile_rules, CompiledIntercept, CompiledRule, CompiledScope,
     InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY, SCOPE_KEY,
 };
 use crate::proxy::h2 as h2p;
@@ -811,8 +812,12 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
 
     let auth = ctx.auth.as_ref().filter(|_| in_scope);
     let mut prepared = None;
+    // Who changed the request on its way: the row's origin is the proxy's, not theirs.
+    let mut edited_by = Vec::new();
     if in_scope {
-        request = apply_request_rules(&live.rules, request);
+        let (ruled, changed_by) = apply_request_rules_traced(&live.rules, request);
+        request = ruled;
+        edited_by.extend(changed_by.iter().map(|r| Edit { by: r.origin.clone(), intercept: None, rule: Some(r.id) }));
         if let Some(a) = auth {
             let p = a.prepare(Tool::Proxy, target, &request, &[], &[]).await;
             request = p.request.clone();
@@ -820,7 +825,10 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         }
         if live.intercept.matches(false, &method, &target.host, &path) {
             match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
-                Some(edited) => request = edited,
+                Some(released) => {
+                    request = released.message;
+                    edited_by.extend(released.edit);
+                }
                 None => {
                     return Ok(Reply::Error(error_response(502, "dropped", "request dropped by brainproxy"), false))
                 }
@@ -853,8 +861,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
             if record && flight.claim() {
-                send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())), None)
-                    .await;
+                let mut c = Capture::new("proxy", target, &request, None, None, Some(&e.to_string()));
+                c.edited_by = edited_by;
+                send_capture(ctx, c, None).await;
             }
             let status = if matches!(e, Error::OutOfScope(_)) { 403 } else { 502 };
             return Ok(Reply::Error(error_response(status, e.kind(), &e.to_string()), false));
@@ -863,8 +872,8 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
     // Not recorded again if stopping has already recorded it as unanswered.
-    let capture =
-        (record && flight.claim()).then(|| Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
+    let capture = (record && flight.claim())
+        .then(|| Capture { edited_by, ..Capture::new("proxy", target, &sent, Some(&response), Some(duration), None) });
     if status == Some(101) {
         let upgrade = Upgrade { response, conn, capture, in_scope, host: target.host.clone(), path, url };
         return Ok(Reply::Upgrade(Box::new(upgrade)));
@@ -881,7 +890,8 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let mut response = if in_scope { apply_response_rules(&live.rules, response) } else { response };
     if in_scope && live.intercept.matches(true, &method, &target.host, &path) {
         match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
-            Some(edited) => response = edited,
+            // The exchange is recorded as received; the intercept row says who edited the response.
+            Some(released) => response = released.message,
             None => return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true)),
         }
     }
@@ -988,7 +998,7 @@ impl Hooks for WsHooks {
             message.payload.clone(),
         )
         .await;
-        match held {
+        match held.map(|r| r.map(|r| r.message)) {
             Ok(Some(p)) if p == message.payload => Hold::Forward,
             Ok(Some(p)) => Hold::Edited(p),
             Ok(None) => Hold::Drop,
@@ -1118,10 +1128,16 @@ impl Drop for HeldRow {
             // Not on this thread: drop may run on the async runtime, and the write can wait for a lock.
             std::thread::spawn(move || {
                 // It may have been resolved at the same moment; then there is nothing to do.
-                let _ = ctx.control.lock().unwrap().intercept_resolve(id, "dropped", None);
+                let _ = ctx.control.lock().unwrap().intercept_resolve(id, "dropped", None, None);
             });
         }
     }
+}
+
+/// A held message once it may go on: as forwarded, and who edited it, if anyone did.
+struct Released {
+    message: Vec<u8>,
+    edit: Option<Edit>,
 }
 
 /// Holds a message in the intercept queue until it is forwarded (possibly
@@ -1134,7 +1150,7 @@ async fn hold(
     url: &str,
     status: Option<u16>,
     message: Vec<u8>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Released>> {
     let id = {
         let (c, method, url, msg) = (ctx.clone(), method.to_string(), url.to_string(), message.clone());
         tokio::task::spawn_blocking(move || {
@@ -1148,13 +1164,19 @@ async fn hold(
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         let c = ctx.clone();
-        let (state, edited) = tokio::task::spawn_blocking(move || c.control.lock().unwrap().intercept_state(id))
+        let held = tokio::task::spawn_blocking(move || c.control.lock().unwrap().intercept_state(id))
             .await
             .map_err(|e| Error::Protocol(e.to_string()))??;
-        match state.as_str() {
+        match held.state.as_str() {
             "forwarded" => {
                 row.decided = true;
-                return Ok(Some(edited.unwrap_or(message)));
+                // A replacement identical to the message as held is no edit.
+                let edit = held.edited.as_ref().filter(|e| **e != message).map(|_| Edit {
+                    by: held.resolved_by.clone(),
+                    intercept: Some(id),
+                    rule: None,
+                });
+                return Ok(Some(Released { message: held.edited.unwrap_or(message), edit }));
             }
             "dropped" => {
                 row.decided = true;
@@ -1164,7 +1186,7 @@ async fn hold(
                 let c = ctx.clone();
                 // The CLI may resolve it at the same moment; whoever wins decides.
                 let expired = tokio::task::spawn_blocking(move || {
-                    c.control.lock().unwrap().intercept_resolve(id, "expired", None)
+                    c.control.lock().unwrap().intercept_resolve(id, "expired", None, None)
                 })
                 .await
                 .map_err(|e| Error::Protocol(e.to_string()))?;
@@ -1173,7 +1195,7 @@ async fn hold(
                 }
                 row.decided = true;
                 return Ok(match intercept.settings.timeout_action {
-                    TimeoutAction::Forward => Some(message),
+                    TimeoutAction::Forward => Some(Released { message, edit: None }),
                     TimeoutAction::Drop => None,
                 });
             }

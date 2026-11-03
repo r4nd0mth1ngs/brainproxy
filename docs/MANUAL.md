@@ -169,7 +169,8 @@ permissions of the folder it is saved in: keep it in your own folders on a share
 **Who recorded it.** Every request in history and every finding says where it came from:
 the desktop app (`gui`), the command line or a script (`cli`), or an AI agent through MCP
 (`mcp`). A proxy, crawl or scan keeps the origin of whoever started it, so a proxy an agent
-started records `mcp`. Entries from before brainproxy kept this show as unknown.
+started records `mcp`, even for a person's browsing through it. Entries from before
+brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what).
 
 ---
 
@@ -245,8 +246,9 @@ The sidebar groups the tools by what you are doing.
   imports.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
-  - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). Hover a proxy
-    entry's to see the address of the client that sent it.
+  - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). For a proxy entry
+    that is who started the proxy, not who sent the request: hover it to see the address of
+    the client that sent it.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
@@ -680,20 +682,64 @@ Each history entry has:
   jobs, fuzz runs and the proxy record the origin of the command that started them.
 - `client_addr`: for proxy entries, the address (`ip:port`) of the client that sent the
   request, whether intercepted, passed through, a WebSocket upgrade, or invisible.
+- `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
+  list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
+  `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
+  the rule). NULL when nothing changed it; an intercept forwarded unchanged isn't an edit.
 - `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`); NULL
   when it was the target host, and for plain HTTP.
+- `note_origin`, `note_changed_at`, `tags_origin`, `tags_changed_at`: who last set the note
+  (`history note`) or changed the tags (`history tag`), and when.
+
+**Origin is per process.** `origin` is who started the process that recorded the row, not
+who sent the request. For proxy rows that is whoever started the proxy: a proxy started via
+MCP records a person's browsing as `mcp`, and a proxy started from the app records an
+agent's requests through it (say, from `browser open`) as `gui`. For proxy rows,
+`client_addr` says which client sent it and `edited_by` who changed it on the way, and
+`history show` says "recorded by a proxy started from ..." rather than "recorded from ...".
+The same holds for findings: a finding's `origin` is who started the scan that raised it (the
+proxy's passive scan, a scan job), not who sent the traffic it was found in.
 
 ```sh
-brainproxy history list --origin mcp         # what agents sent; also gui, cli, unknown
-brainproxy history show 42                   # entry.origin, entry.client_addr, entry.sni
+brainproxy history list --origin mcp         # what agents' processes recorded; also gui, cli, unknown
+brainproxy history show 42                   # entry.origin, client_addr, edited_by, sni, note_origin
 brainproxy query "SELECT origin, count(*) FROM history GROUP BY origin"
+brainproxy query "SELECT id, url, edited_by FROM history WHERE edited_by LIKE '%\"mcp\"%'"   # what agents edited
 ```
+
+The intercept queue keeps who decided each held message: `resolved_by` is `gui`, `cli` or
+`mcp` for `intercept forward` and `intercept drop`, and NULL when it expired or the proxy
+dropped it itself; `edited` says whether it was forwarded with a different message
+(`intercept list`, `intercept show`, the `intercepts` table). An edited request's history
+row names the intercept in `edited_by`. A response edited at intercept, or changed by a
+response rule, is recorded in history as the server sent it; the intercept row has the
+edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
+enabled it.
 
 Findings have an `origin` too (who added them: the proxy's passive scan, a scan job, ...),
 and `state_origin` and `state_changed_at` say who last changed the state with `findings mark`
-and when, so a finding an agent marked as a false positive says so. `findings list` and
-`findings show` include them; reports say it in words ("added via MCP (an agent)") in
-Markdown and HTML, and as `origin` in JSON, SARIF and `findings compare` items.
+and when, so a finding an agent marked as a false positive says so. `note_origin` and
+`note_changed_at` do the same for the note. `findings list` and `findings show` include
+them. Reports carry them in every format:
+
+- JSON: each instance has `state_origin`, `state_changed_at`, `note_origin`,
+  `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
+- Markdown and HTML say it in words on each finding. In HTML a finding a person confirmed
+  (from the app or the command line) is tagged **confirmed**, one an agent confirmed
+  **confirmed via MCP (an agent)**.
+- SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
+  result's properties.
+
+False positives are left out of a report by default. The report counts them by who marked
+them (`summary.false_positives_left_out`), and lists the ones an agent marked
+(`agent_false_positives`; a "Marked false positive by an agent" section in Markdown and HTML,
+`agentFalsePositives` in SARIF run properties), so an agent can't make a finding vanish
+from a report unseen.
+
+`scan passive --rescan` rescans all history and keeps what people decided: a finding found
+again keeps its id, state, note, origin and who set them. One not found again (its rule was
+turned off, say) is removed, unless it was triaged (its state was changed or it has a note):
+that one is kept with `hits` 0. The result counts `removed` and `kept_not_found`.
 
 The app sets `BRAINPROXY_CLIENT=gui` on the commands it runs; the MCP server sets
 `BRAINPROXY_MCP_CALL`, which wins over it, and an agent can set neither.

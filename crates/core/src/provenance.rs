@@ -11,6 +11,8 @@
 
 use std::sync::RwLock;
 
+use serde::{Deserialize, Serialize};
+
 /// Set on every command an MCP tool call runs.
 pub const MCP_ENV: &str = "BRAINPROXY_MCP_CALL";
 
@@ -54,6 +56,39 @@ pub fn describe(origin: Option<&str>) -> &'static str {
         Some("gui") => "from the desktop app",
         Some("cli") => "from the command line",
         _ => "from an unknown origin (recorded before brainproxy kept it)",
+    }
+}
+
+/// A change made to a proxied request before it went out, by someone other than the process
+/// that recorded it: an edit forwarded from the intercept queue, or a match-and-replace rule.
+/// The history row keeps the list as `edited_by`, so an agent's edit to a person's request
+/// (or the reverse) is on the record even though the row's origin is the proxy's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edit {
+    /// gui, cli or mcp; None for a rule added before brainproxy kept it.
+    pub by: Option<String>,
+    /// The intercept it was edited in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<i64>,
+    /// The match-and-replace rule that changed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<u32>,
+}
+
+impl Edit {
+    /// "edited in intercept 4 via MCP (an agent)", for people.
+    pub fn describe(&self) -> String {
+        let how = match (self.intercept, self.rule) {
+            (Some(i), _) => format!("edited in intercept {i}"),
+            (_, Some(r)) => format!("changed by rule {r}"),
+            _ => "edited".to_string(),
+        };
+        let by = match self.by.as_deref() {
+            None => "added by an unknown origin".to_string(),
+            Some(o) if self.rule.is_some() => format!("added {}", describe(Some(o))),
+            Some(o) => describe(Some(o)).to_string(),
+        };
+        format!("{how} {by}")
     }
 }
 

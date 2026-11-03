@@ -869,8 +869,15 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         }
         RulesCmd::Add { location, pattern, replace, comment, disabled } => {
             let id = rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-            let rule =
-                Rule { id, location: RuleLocation::parse(&location)?, pattern, replace, enabled: !disabled, comment };
+            let rule = Rule {
+                id,
+                location: RuleLocation::parse(&location)?,
+                pattern,
+                replace,
+                enabled: !disabled,
+                comment,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
+            };
             brainproxy_core::proxy::config::validate_rule(&rule)?;
             rules.push(rule);
         }
@@ -881,6 +888,10 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Enable { id } => {
             let i = find(&mut rules, id)?;
             brainproxy_core::proxy::config::validate_rule(&rules[i])?;
+            // Whoever turns a rule on answers for what it changes from then on.
+            if !rules[i].enabled {
+                rules[i].origin = Some(brainproxy_core::provenance::origin().to_string());
+            }
             rules[i].enabled = true;
         }
         RulesCmd::Disable { id } => {
@@ -997,12 +1008,16 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     )
                 }
             };
-            store.intercept_resolve(id, "forwarded", edited.as_deref())?;
-            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some()}), || format!("forwarded #{id}"));
+            let by = brainproxy_core::provenance::origin();
+            store.intercept_resolve(id, "forwarded", edited.as_deref(), Some(by))?;
+            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by}), || {
+                format!("forwarded #{id}")
+            });
         }
         InterceptCmd::Drop { id } => {
-            store.intercept_resolve(id, "dropped", None)?;
-            out.ok(json!({"id": id, "state": "dropped"}), || format!("dropped #{id}"));
+            let by = brainproxy_core::provenance::origin();
+            store.intercept_resolve(id, "dropped", None, Some(by))?;
+            out.ok(json!({"id": id, "state": "dropped", "resolved_by": by}), || format!("dropped #{id}"));
         }
     }
     Ok(())

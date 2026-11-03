@@ -105,6 +105,12 @@ pub struct ScanStats {
     pub scanned: usize,
     pub new_findings: usize,
     pub last_id: i64,
+    /// Rescan: findings it didn't find again and removed (none of them triaged).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<usize>,
+    /// Rescan: triaged findings it didn't find again, kept with 0 hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_not_found: Option<usize>,
 }
 
 /// Scans every capture recorded since the last call.
@@ -153,9 +159,16 @@ pub fn scan_late(store: &mut Store, id: i64) -> Result<usize> {
     Ok(new)
 }
 
-/// Clears passive findings and rescans all history from the start.
+/// Rescans all history from the start and counts every passive finding again. Findings found
+/// again keep their id, state, note and origins; ones not found again are removed unless
+/// someone triaged them, which are kept with 0 hits.
 pub fn rescan(store: &mut Store) -> Result<ScanStats> {
-    store.findings_reset("passive")?;
+    let before = store.findings_rescan_start("passive")?;
     store.meta_set(WATERMARK_KEY, None)?;
-    scan_pending(store)
+    let mut stats = scan_pending(store)?;
+    let (removed, kept) = store.findings_rescan_finish("passive")?;
+    stats.new_findings = store.findings_count_after("passive", before)?;
+    stats.removed = Some(removed);
+    stats.kept_not_found = Some(kept);
+    Ok(stats)
 }
