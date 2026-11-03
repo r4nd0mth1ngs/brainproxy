@@ -46,16 +46,16 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
 - The app's proxy: every place that starts the proxy (opening a project, the pill, Open
   browser, Settings, Record a login, Access's live restart) goes through `views/proxyPort.ts`,
   which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
-  proxy when a project opens* on, closing the project or the window stops the proxy only if
-  `proxy status` still shows that pid running here, so one a shell, an agent or another
-  container started is left alone. Settings moves the proxy to another port, and Access's
+  proxy when a project opens* on, closing the project or the window stops the proxy with
+  `proxy stop --pid`, which stops it only if that pid is still the one running here, so one a
+  shell, an agent or another container started is left alone, even if it started a moment ago. Settings moves the proxy to another port, and Access's
   live restart adds live testing to it, with one `proxy restart`, which holds the project's
   proxy record from the stop to the start, so a `proxy start` from a shell or an agent fails
   instead of getting in between; if the new proxy doesn't come up, the CLI starts the old one
   again where it was. The control keeps the proxy the app's at its new pid (or the pid it went
-  back to) and marks the restart: Open browser, Record a login and Start proxy wait for it,
-  and the pill and Access's live restart ask to try again. A failed restart reports where the
-  proxy is from a fresh `proxy status`.
+  back to, from the error's `data`, not its wording) and marks the restart: Open browser,
+  Record a login and Start proxy wait for it, and the pill and Access's live restart ask to try
+  again. A failed restart reports where the proxy is from a fresh `proxy status`.
 - The GUI is built on its own (`gui/src-tauri` is its own Cargo workspace, not a member
   of the root one), so the CLI build and CI need no webview or Node.
 
