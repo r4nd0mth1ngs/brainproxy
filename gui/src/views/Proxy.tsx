@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { bodyText, cancelCli, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
 import { ask, confirm } from "../ui/Confirm";
+import { copyAsCurl } from "../ui/CurlDialog";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
@@ -282,6 +283,7 @@ function History() {
       { label: "Test access control…", action: () => withMutation(pick).then((p) => app.sendToAccess([p])), disabled: refused, hint: refused ? REFUSED_HINT : undefined },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
+      { label: "Copy as cURL", action: () => handoff(r.id, (h) => copyAsCurl(h.raw, h.target, h.binary, app.toast)) },
       {
         label: "Add note…",
         action: () => {

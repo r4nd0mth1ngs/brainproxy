@@ -233,7 +233,8 @@ The sidebar groups the tools by what you are doing.
   mostly browser background calls. *Include scanner and fuzzer requests* shows attack
   traffic too.
 - **Actions:** right-click a node or request to send it to Replay, crawl from there, run an
-  active scan of that branch or request, or copy the URL.
+  active scan of that branch or request, or copy the URL. A request can also be copied as a
+  curl command.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
   the proxy scope.
 
@@ -263,8 +264,8 @@ The sidebar groups the tools by what you are doing.
     that is who started the proxy, not who sent the request: hover it to see the address of
     the client that sent it.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
-  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight
-    (*Remove highlight* on a highlighted row).
+  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, copy the URL or the request
+    as a curl command, add a note, or highlight (*Remove highlight* on a highlighted row).
   - **Scan this request…** asks first, naming the request, then runs an active scan of that
     request in the background (`scan active --history-id`, medium strength). Once the Nuclei
     templates are downloaded, those of high severity and up also run against its site, and
@@ -308,6 +309,29 @@ Edit a raw request and send it as often as you like, in separate tabs.
   `?q=x'%20OR%201=1--`.
 - **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
   works in every request editor.
+- **From cURL** (**+ cURL**): paste a curl command, for example from a browser's *Copy as
+  cURL* (bash or Windows cmd), and it opens as a new tab. Nothing is sent until you press
+  Send. Options that only change curl's output (`-k`, `-s`, `-L`, `-o`) are ignored. A proxy,
+  `--resolve`, `--connect-to`, a Unix socket or a client certificate is left out (set those in
+  Settings › Connections): the dialog lists what was left out before the tab opens, since the
+  request may then go elsewhere than curl's would, and **Open anyway** opens it. A command
+  that reads a file (`-d @file`, `-F field=@file`), uses shell variables, has an option
+  brainproxy doesn't know, or has a URL that curl's globbing turns into several requests
+  (`{a,b}`, `[1-3]`; add `-g` to send it as written) is refused with the reason. Headers are read as `-H 'Name: value'`, `-H 'Name:'` (leave out the header
+  curl would add) and `-H 'Name;'` (send it empty); a header written any other way, such as
+  `Name : value` or `Name;x: y`, is refused because curl reads those by its own rules: rewrite
+  it in one of those forms, then edit the header in the tab after pasting. A header comes in
+  as curl sends it, with its spaces.
+- **Copy as cURL:** copies the request, as Send would send it, as a curl command for a POSIX
+  shell (it works in fish too). It goes to the tab's target, as Send does. Every value is
+  quoted, so headers or a body that came from the target can't run anything when you paste it.
+  Headers are copied as recorded, spaces included (`Transfer-Encoding : chunked` stays as it
+  is). The toast notes what curl will send differently (only the first of several `Host`
+  headers, its own `Content-Length`, HTTP/2's dropped `Connection` or `Upgrade`) and when the
+  command holds credentials (`Authorization`, `Cookie`), so take care where you paste it.
+  The command runs outside brainproxy, so the engagement scope doesn't apply to it. Bodies
+  over 128 KB may be too long for one shell argument; save those to a file and use
+  `--data-binary @FILE`.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the

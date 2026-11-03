@@ -87,6 +87,10 @@ and `project save`, since copying the project elsewhere is for the person runnin
   `query`, `encode`, `import openapi`, `intercept forward`, ...). Without it, the command's
   stdin is empty, never the server's own stdin.
 
+Some features are in the desktop app only, with no command and so no tool: pasting a curl
+command into Replay and *Copy as cURL* among them. An agent sends the same request with `send`
+(`url`, `method`, `headers`, `data`) and reads a recorded one with `history_show`.
+
 Some arguments need a person, so a command run for a tool call (the server sets
 `BRAINPROXY_MCP_CALL` on it) refuses them, with an error saying so:
 

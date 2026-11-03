@@ -132,9 +132,9 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Group | Tool | Parts | CLI used |
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
-| Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, saved filters per project, request/response; right-click to scan a request after a confirmation, test it in Access, or highlight it and remove the highlight), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `scan active --history-id --background`, `checks status`, `ws list/messages` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
+| Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node, copy a request as cURL), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, saved filters per project, request/response, copy as cURL; right-click to scan a request after a confirmation, test it in Access, or highlight it and remove the highlight), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `scan active --history-id --background`, `checks status`, `ws list/messages` |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor; **+ cURL** opens a pasted curl command as a tab and *Copy as cURL* copies the request (both below). WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, a SQL condition, or the requests sent from Traffic), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background` (with `--history-id` for requests from Traffic), `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
@@ -202,6 +202,68 @@ a named request without (`scanOptIns`: `--include-methods` with MUTATION or the 
 only when told the question was answered yes. The table selects one row at a
 time, so these act on one request. A greyed-out menu item shows why under its label
 (`MenuItem.hint`); it stays focusable, with `aria-disabled`.
+
+### cURL
+
+`ui/curl.ts` converts between curl commands and raw requests in the UI, with no CLI call: a
+paste only opens a tab, and sending it is Replay's `send` as usual, so the scope applies. An
+agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`; neither
+direction is a CLI command or an MCP tool.
+
+- **Paste** (**+ cURL** in Replay): reads POSIX shell quoting (`'…'`, `"…"`, `$'…'`, `\` line
+  breaks), Windows cmd as Chrome's *Copy as cURL (cmd)* writes it (`^` escapes and line
+  breaks), and the `printf` forms *Copy as cURL* writes (`"$(printf '…')"` only inside double
+  quotes; unquoted, a shell would split what it prints). It follows curl's rules for the method
+  (POST with data, GET with `-G`, HEAD with `-I`), joins several `-d` with `&`, builds `-F`
+  fields as multipart, turns `-u` into Basic auth (an `--oauth2-bearer` token wins over it, as
+  in curl), and keeps curl's own `Host` and `Accept` headers unless the command replaces or
+  removes them (it adds no `User-Agent`). A `-H` is read only as `Name: value` (or
+  `Name:value`), `Name:` (removes curl's own header) or `Name;` (an empty one), with `Name` a
+  token and nothing between it and the `:` or `;`; each replaces curl's header of that name
+  and goes in as curl sends it (`Name: value` as written, spaces kept; `Name;` as `Name:`),
+  and a command that sets `Host` more than once is refused. Any other form (`Name : x`,
+  `Name;x: y`, a space before the name) is refused, as curl reads those by rules of its own;
+  write it in one of the three forms and edit the header in the tab. `-G` and `--url-query`
+  add `&` only after a query that has something in it. Long options take a value after `=`
+  (`--data=x`), as curl 8.16 and later do. `--http2` on an `http://` URL stays HTTP/1.1, as curl only asks such a server to
+  upgrade. A URL with a space or control character is refused, as curl refuses it. A URL that
+  curl's globbing makes several requests of (`{a,b}`, `[1-3]`) is refused unless the command
+  has `-g`; then the brackets are sent as they are. Options that don't change the request
+  (`-k`, `-s`, `-L`, `-o`, timeouts) are ignored. A proxy, `--resolve`, `--connect-to`, a Unix
+  socket and client certificates are left out: the dialog lists them before the tab opens, as
+  the request may then go elsewhere than curl's would, and **Open anyway** opens it. Anything
+  that reads a file (`-d @file`, `-F f=@file`, `-b file`, `-T`, `-K`), shell variables or
+  command substitution, a NUL byte in an argument, challenge auth (`--digest`, `--ntlm`) and
+  unknown options are refused with the reason, so nothing that changes the request is dropped
+  silently.
+- **Copy as cURL** (Replay, and right-click a request in Traffic or the Site map): a POSIX
+  shell command with every value in single quotes. A `'` or `\` is written outside the quotes
+  (`\'`, `\\`), and control, bidi and non-UTF-8 bytes as `"$(printf '\NNN')"`, so a header or
+  body from the target can't run anything in sh, dash, bash, zsh or fish. So do format
+  characters (`\p{Cf}`: bidi controls, zero-width characters, the soft hyphen, tag characters),
+  which a terminal doesn't show. A plain-text body goes in `--data-raw` (which never reads a
+  file, even for a body starting with `@`); any other body (NUL, control or non-UTF-8 bytes)
+  goes through `printf '…' | curl … --data-binary @-`.
+  The command goes to the tab's target, like Send: an absolute URL in the request line goes in
+  `--request-target`. It adds `--http2` for an HTTP/2 request, `--http1.1` for an HTTP/1.1 one
+  to an `https://` target (curl would negotiate HTTP/2 there) and `--http1.0` for HTTP/1.0,
+  `--globoff` for `[]{}` in the URL, `--path-as-is` for `..` segments, `--request-target` for a
+  target a URL can't hold, and empty `-H 'Name:'` to remove the headers curl would add (`Host`
+  too, when the request has none). Each header line goes in `-H` as recorded, as curl sends a
+  `-H` line as written: spaces after the colon and at the end stay, and so does a space before
+  the colon (`Transfer-Encoding : chunked`), which curl doesn't read as its own header; that one
+  gets a note, as pasting the command back is refused. An empty header goes as `-H 'Name;'`
+  (curl sends `Name:`, with a note when spaces are lost). A header whose name isn't a token (an
+  `@`, which curl would read as a file, `;`, a control byte) is left out with a note. Notes
+  also say when curl sends something else: only the first of several `Host` headers, its own
+  `Content-Length` (the body's) in place of a different one, a body chunked again under
+  `Transfer-Encoding: chunked`, or, over HTTP/2, no `Connection`, `Keep-Alive`,
+  `Proxy-Connection`, `Transfer-Encoding`, `Upgrade` or `TE` other than `trailers`. A request
+  with a `Transfer-Encoding` or a spaced `Content-Length` and no `Content-Length` of its own is
+  copied with `-H 'Content-Length:'`, so curl adds none. When the copy holds `Authorization`,
+  `Cookie` or an API key header, the toast says so. Replay copies what Send would send (auto
+  URL-encoding included). A `--data-raw` body over 128 KB gets a warning (Linux limits one
+  argument to that size); a body over 2 MB is refused.
 
 ## Look
 
