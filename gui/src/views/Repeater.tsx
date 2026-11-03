@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { bodyText, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { copyAsCurl, CurlDialog } from "../ui/CurlDialog";
@@ -39,6 +39,7 @@ export function RepeaterView() {
   const tabs = app.repeater;
   const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
   const [pasting, setPasting] = useState(false);
+  const curlButton = useRef<HTMLButtonElement>(null);
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
@@ -74,7 +75,7 @@ export function RepeaterView() {
         <button onClick={newWsTab} title="New WebSocket tab">
           + WS
         </button>
-        <button onClick={() => setPasting(true)} title="New tab from a pasted cURL command">
+        <button ref={curlButton} onClick={() => setPasting(true)} title="New tab from a pasted cURL command">
           + cURL
         </button>
       </div>
@@ -95,7 +96,7 @@ export function RepeaterView() {
           </button>
         </div>
       )}
-      {pasting && <CurlDialog close={() => setPasting(false)} />}
+      {pasting && <CurlDialog close={() => setPasting(false)} opener={curlButton} />}
     </div>
   );
 }

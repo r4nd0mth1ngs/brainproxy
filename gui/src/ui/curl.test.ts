@@ -57,7 +57,8 @@ test("headers replace, remove and add to curl's own", () => {
   const p = parseCurl(
     "curl -H 'Accept: text/html' -H 'User-Agent:' -H 'X-Empty;' -H 'host: other.test' -H 'X-A:  spaced' -A ua -e 'https://ref.test/;auto' https://h.test",
   );
-  assert.equal(p.raw, lines("GET / HTTP/1.1", "host: other.test", "Referer: https://ref.test/", "Accept: text/html", "X-Empty: ", "X-A: spaced", "", ""));
+  // A custom header goes as curl sends it: as written, spaces kept, and "Name;" as "Name:".
+  assert.equal(p.raw, lines("GET / HTTP/1.1", "host: other.test", "Referer: https://ref.test/", "Accept: text/html", "X-Empty:", "X-A:  spaced", "", ""));
   assert.equal(p.target, "https://h.test");
   // Removing Content-Type leaves the body without one.
   assert.doesNotMatch(parseCurl("curl -H 'Content-Type:' -d a https://h.test").raw, /Content-Type/);
@@ -135,7 +136,7 @@ test("POSIX quoting: single, double, $'…', continuations", () => {
   );
   assert.equal(p.raw, lines("GET /a%20b HTTP/1.1", "Host: h.test", "Accept: */*", 'X-D: a "b" $x \\ \\z', "X-S: it's $HOME", "X-C: tab\there AAé'q'", "", ""));
   // Clusters and attached values.
-  assert.match(parseCurl("curl -sSLkXPOST -HX-A:1 -d1 https://h.test").raw, /^POST \/ HTTP\/1\.1\n[^]*X-A: 1\n/);
+  assert.match(parseCurl("curl -sSLkXPOST -HX-A:1 -d1 https://h.test").raw, /^POST \/ HTTP\/1\.1\n[^]*X-A:1\n/);
   assert.match(parseCurl("curl -- https://h.test/-x").raw, /^GET \/-x /);
   assert.match(parseCurl("/usr/bin/curl --url https://h.test/u").raw, /^GET \/u /);
   // Bytes that aren't UTF-8 make a binary request.
@@ -592,14 +593,14 @@ test("options are read as curl reads them, or refused", () => {
   // A custom Authorization header is sent at once instead, and -H 'Authorization:' sends none.
   assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization: Custom' https://h.test").raw, /\nAuthorization: Custom\n/);
   assert.doesNotMatch(parseCurl("curl -u a:b --basic --oauth2-bearer t -H 'Authorization:' https://h.test").raw, /authorization/i);
-  assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization;' https://h.test").raw, /\nAuthorization: \n/);
+  assert.match(parseCurl("curl --basic --oauth2-bearer t -H 'Authorization;' https://h.test").raw, /\nAuthorization:\n/);
   // A custom Authorization in any of the three forms stands in for -u and a bearer token.
   for (const flags of ["--basic --oauth2-bearer t", "--oauth2-bearer t", "-u a:b"]) {
-    assert.match(parseCurl(`curl ${flags} -H 'Authorization:x' http://h.test/`).raw, /\nAuthorization: x\n/, flags);
+    assert.match(parseCurl(`curl ${flags} -H 'Authorization:x' http://h.test/`).raw, /\nAuthorization:x\n/, flags);
     assert.doesNotMatch(parseCurl(`curl ${flags} -H 'Authorization:  ' http://h.test/`).raw, /authorization/i, flags);
     const empty = parseCurl(`curl ${flags} -H 'authorization;' http://h.test/`).raw;
     assert.equal(empty.match(/authorization/gi)?.length, 1, flags);
-    assert.match(empty, /\nauthorization: \n/, flags);
+    assert.match(empty, /\nauthorization:\n/, flags);
   }
   // A header named otherwise doesn't, so a bearer token stays where curl sends it.
   assert.match(refusal("curl --basic --oauth2-bearer t -H 'X-Authorization: y' http://h.test/"), /challenge/);
@@ -611,17 +612,17 @@ test("options are read as curl reads them, or refused", () => {
       assert.match(refusal(`curl ${flags} -H $'${h}' http://h.test/`), /can't be imported exactly/, `${flags} ${h}`);
     }
   }
-  // The three forms for curl's other headers.
+  // The three forms for curl's other headers, each written as curl sends it.
   const forms = (h: string) => parseCurl(`curl -A ua -d a -H '${h}' http://h.test/`).raw.split("\n\n")[0].split("\n").slice(1);
-  assert.deepEqual(forms("Host:other.test:80"), ["Host: other.test:80", "User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Host:other.test:80"), ["Host:other.test:80", "User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
   assert.deepEqual(forms("host:"), ["User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
-  assert.deepEqual(forms("Host;"), ["Host: ", "User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Host;"), ["Host:", "User-Agent: ua", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
   assert.deepEqual(forms("user-agent: u2"), ["Host: h.test", "Accept: */*", "user-agent: u2", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
   assert.deepEqual(forms("User-Agent:"), ["Host: h.test", "Accept: */*", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
-  assert.deepEqual(forms("User-Agent;"), ["Host: h.test", "Accept: */*", "User-Agent: ", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
-  assert.deepEqual(forms("Accept;"), ["Host: h.test", "User-Agent: ua", "Accept: ", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
-  assert.deepEqual(forms("Content-Type:\ttext/plain"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: text/plain", "Content-Length: 1"]);
-  assert.deepEqual(forms("Content-Type;"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: ", "Content-Length: 1"]);
+  assert.deepEqual(forms("User-Agent;"), ["Host: h.test", "Accept: */*", "User-Agent:", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Accept;"), ["Host: h.test", "User-Agent: ua", "Accept:", "Content-Length: 1", "Content-Type: application/x-www-form-urlencoded"]);
+  assert.deepEqual(forms("Content-Type:\ttext/plain"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type:\ttext/plain", "Content-Length: 1"]);
+  assert.deepEqual(forms("Content-Type;"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type:", "Content-Length: 1"]);
   assert.deepEqual(forms("Content-Length:"), ["Host: h.test", "User-Agent: ua", "Accept: */*", "Content-Type: application/x-www-form-urlencoded"]);
   // A custom Host goes in Host's place.
   assert.match(parseCurl("curl -H 'X: 1' -H 'Host: a.test' http://h.test/").raw, /^GET \/ HTTP\/1\.1\nHost: a\.test\nAccept: \*\/\*\nX: 1\n\n$/);
@@ -875,7 +876,7 @@ test("long options take a value after =", () => {
   assert.match(parseCurl("curl --data=x https://h.test").raw, /^POST [^]*\n\nx$/);
   // An empty value is a value, and only the first = splits.
   assert.match(parseCurl("curl --data= https://h.test").raw, /Content-Length: 0\n/);
-  assert.match(parseCurl("curl --header=X:1 --header=Y:a=b https://h.test").raw, /\nX: 1\nY: a=b\n/);
+  assert.match(parseCurl("curl --header=X:1 --header=Y:a=b https://h.test").raw, /\nX:1\nY:a=b\n/);
   assert.match(refusal("curl --header==X:1 https://h.test"), /"=X:1" can't be imported exactly/);
   assert.match(parseCurl("curl --url=https://h.test/u --request=PUT").raw, /^PUT \/u /);
   assert.equal(parseCurl("curl --output=/dev/null --max-time=5 --proxy=http://p.test https://h.test").warnings.length, 1);
@@ -897,4 +898,95 @@ test("-G and --url-query add & only after a query with something in it", () => {
   assert.match(parseCurl("curl -G -d x 'http://h.test/a?b?'").raw, /^GET \/a\?b\?&x /);
   assert.match(parseCurl("curl --url-query '+a&' --url-query b http://h.test/").raw, /^GET \/\?a&&b /);
   assert.match(parseCurl("curl -G -d 'x&' -d y http://h.test/").raw, /^GET \/\?x&&y /);
+});
+
+// ---------- headers as recorded, and what the copy can't carry over ----------
+
+test("toCurl copies header lines as written, spaces included", () => {
+  // A space before the colon (a Transfer-Encoding obfuscation probe) and spaces in a value are
+  // sent by curl as written, so they are copied that way.
+  const te = toCurl("POST / HTTP/1.1\nHost: h.test\nTransfer-Encoding : chunked\nX-Foo: bar  \nX-B:  v\nY:z\nContent-Type: x\n\n1\r\na\r\n0\r\n\r\n", "http://h.test");
+  assert.match(te.command, /-H 'Transfer-Encoding : chunked'/);
+  assert.match(te.command, /-H 'X-Foo: bar {2}'/);
+  assert.match(te.command, /-H 'X-B: {2}v'/);
+  assert.match(te.command, /-H 'Y:z'/);
+  // curl doesn't read that header as chunked, so it would add a Content-Length the request
+  // didn't have: removed.
+  assert.match(te.command, /-H 'Content-Length:'/);
+  assert.doesNotMatch(te.warnings.join("\n"), /chunks the body/);
+  assert.match(te.warnings.join("\n"), /space before the colon: Transfer-Encoding\.[^]*pasting the command back into brainproxy is refused/);
+  assert.match(refusal(te.command), /can't be imported exactly/);
+  // The shell hands curl those exact lines.
+  if (hasBash) {
+    const { args } = underBash(te.command);
+    for (const h of ["Transfer-Encoding : chunked", "X-Foo: bar  ", "X-B:  v", "Y:z", "Content-Length:"]) assert.ok(args.some((a) => a.toString() === h), h);
+  }
+  // A spaced name is none of curl's own headers: curl's Host, User-Agent and Accept are still
+  // removed, and a spaced Content-Length goes as written in place of curl's.
+  const own = toCurl("POST / HTTP/1.1\nHost : h.test\nUser-Agent : u\nContent-Length : 5\nContent-Type: x\n\nabc", "http://h.test").command;
+  for (const h of ["Host : h.test", "User-Agent : u", "Content-Length : 5", "Host:", "User-Agent:", "Accept:", "Content-Length:"]) assert.ok(own.includes(`-H '${h}'`), `${h}: ${own}`);
+  // An empty value can only go as "Name:", which curl writes for "Name;".
+  const empty = toCurl("GET / HTTP/1.1\nHost: h.test\nX-E: \nX-F:\nX-G :\n\n", "http://h.test");
+  assert.match(empty.command, /-H 'X-E;' \\\n {2}-H 'X-F;' \\\n {2}-H 'X-G;'/);
+  assert.match(empty.warnings.join("\n"), /X-E, X-G lose the spaces around the colon/);
+  // Plain headers bring no notes.
+  assert.deepEqual(toCurl("GET / HTTP/1.1\nHost: h.test\nX-A: 1\n\n", "https://h.test").warnings, []);
+});
+
+test("toCurl warns when curl would send another Host, Content-Length or HTTP/2 header", () => {
+  // curl sends only the first of several Host headers; all are written, in order.
+  const hosts = toCurl("GET / HTTP/1.1\nHost: h.test\nHost: evil.test\n\n", "https://h.test");
+  assert.match(hosts.command, /-H 'Host: h\.test' \\\n {2}-H 'Host: evil\.test'/);
+  assert.match(hosts.warnings.join("\n"), /2 Host headers and curl sends only the first \(h\.test\)/);
+  // A Content-Length that isn't the body's is replaced by curl's.
+  const wrong = toCurl("POST / HTTP/1.1\nContent-Type: x\nContent-Length: 10\n\nabc", "https://h.test");
+  assert.doesNotMatch(wrong.command, /Content-Length/);
+  assert.match(wrong.warnings.join("\n"), /curl sends Content-Length: 3, the body's length, in place of the request's 10\./);
+  assert.match(toCurl("POST / HTTP/1.1\nContent-Type: x\nContent-Length: 3\nContent-Length: 3\n\nabc", "https://h.test").warnings.join("\n"), /in place of the request's 3, 3/);
+  assert.deepEqual(toCurl("POST / HTTP/1.1\nContent-Type: x\nContent-Length: 3\n\nabc", "https://h.test").warnings, []);
+  // With chunked, curl sends no Content-Length at all.
+  assert.match(toCurl("POST / HTTP/1.1\nTransfer-Encoding: chunked\nContent-Length: 4\n\nabcd", "https://h.test").warnings.join("\n"), /chunked twice, and it sends no Content-Length/);
+  // Another Transfer-Encoding: curl adds no Content-Length the request didn't have.
+  const gzip = toCurl("POST / HTTP/1.1\nTransfer-Encoding: gzip\nContent-Type: x\n\nabc", "https://h.test");
+  assert.match(gzip.command, /-H 'Content-Length:'/);
+  assert.doesNotMatch(toCurl("POST / HTTP/1.1\nContent-Type: x\n\nabc", "https://h.test").command, /Content-Length/);
+  // HTTP/2 has no connection-specific headers: curl leaves them out.
+  const h2 = toCurl("POST / HTTP/2\nhost: h.test\nconnection: keep-alive\nupgrade: h2c\ntransfer-encoding: chunked\nte: trailers\ncontent-type: x\n\na", "https://h.test");
+  assert.match(h2.warnings.join("\n"), /Over HTTP\/2 curl leaves out connection, upgrade, transfer-encoding,/);
+  assert.doesNotMatch(h2.warnings.join("\n"), /chunks the body|leaves out[^\n]*\bte\b/);
+  assert.match(toCurl("GET / HTTP/2\nte: gzip\n\n", "https://h.test").warnings.join("\n"), /leaves out te,/);
+  assert.deepEqual(toCurl("GET / HTTP/1.1\nConnection: close\nTE: gzip\n\n", "https://h.test").warnings, []);
+});
+
+test("toCurl notes the credentials a command carries", () => {
+  const c = toCurl("GET / HTTP/1.1\nHost: h.test\nAuthorization: Bearer t\nCookie: s=1\ncookie: t=2\nX-Api-Key: k\n\n", "https://h.test");
+  assert.equal(c.warnings.length, 1);
+  assert.match(c.warnings[0], /credentials as they are \(Authorization, Cookie, X-Api-Key\)/);
+});
+
+test("pasted headers are kept as curl sends them", () => {
+  assert.match(parseCurl("curl -H 'X: a  ' -H 'Y:\tb' https://h.test").raw, /\nX: a {2}\nY:\tb\n/);
+  // Only curl's spaces make a header empty, so it is removed.
+  assert.doesNotMatch(parseCurl("curl -H $'X: \\v\\f' https://h.test").raw, /\nX:/);
+  // toCurl's lines come back the same.
+  assert.match(parseCurl(toCurl("GET / HTTP/1.1\nHost: h.test\nX-Foo: bar  \nY:z\n\n", "https://h.test").command).raw, /\nX-Foo: bar {2}\nY:z\n/);
+});
+
+test("$(printf …) is read only inside double quotes", () => {
+  // Unquoted, a shell would split what printf prints into words.
+  assert.match(refusal("curl -H X:$(printf '\\101') https://h.test"), /shell variables or command substitution/);
+  assert.match(refusal("curl -d $(printf 'a b') https://h.test"), /shell variables or command substitution/);
+  assert.match(parseCurl(`curl -H "X:$(printf '\\101')" https://h.test`).raw, /\nX:A\n/);
+});
+
+test("format characters go through printf", () => {
+  // Soft hyphen, word joiner and invisible operators, zero-width joiner, a tag character, and
+  // the bidi and zero-width ones as before.
+  for (const ch of ["\u00ad", "\u2060", "\u2062", "\u2064", "\u200d", "\u{e0041}", "\u202e", "\u200b", "\ufeff", "\u2028", "\u2029"]) {
+    const q = shellQuote(Buffer.from(`a${ch}b`).toString("latin1"));
+    assert.match(q, /^'a'"\$\(printf '(\\\d{3})+'\)"'b'$/, JSON.stringify(ch));
+    assert.match(parseCurl(`curl -H X:${q} https://h.test`).raw, new RegExp(`\\nX:a${ch}b\\n`, "u"));
+  }
+  // Ordinary text, accents and emoji stay in the quotes.
+  assert.equal(shellQuote(Buffer.from("é ü € 😀").toString("latin1")), "'é ü € 😀'");
 });

@@ -167,17 +167,20 @@ Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 
 `ui/curl.ts` converts between curl commands and raw requests in the UI, with no CLI call: a
 paste only opens a tab, and sending it is Replay's `send` as usual, so the scope applies. An
-agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
+agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`; neither
+direction is a CLI command or an MCP tool.
 
 - **Paste** (**+ cURL** in Replay): reads POSIX shell quoting (`'…'`, `"…"`, `$'…'`, `\` line
   breaks), Windows cmd as Chrome's *Copy as cURL (cmd)* writes it (`^` escapes and line
-  breaks), and the `printf` forms *Copy as cURL* writes. It follows curl's rules for the method
+  breaks), and the `printf` forms *Copy as cURL* writes (`"$(printf '…')"` only inside double
+  quotes; unquoted, a shell would split what it prints). It follows curl's rules for the method
   (POST with data, GET with `-G`, HEAD with `-I`), joins several `-d` with `&`, builds `-F`
   fields as multipart, turns `-u` into Basic auth (an `--oauth2-bearer` token wins over it, as
   in curl), and keeps curl's own `Host` and `Accept` headers unless the command replaces or
   removes them (it adds no `User-Agent`). A `-H` is read only as `Name: value` (or
   `Name:value`), `Name:` (removes curl's own header) or `Name;` (an empty one), with `Name` a
-  token and nothing between it and the `:` or `;`; each replaces curl's header of that name,
+  token and nothing between it and the `:` or `;`; each replaces curl's header of that name
+  and goes in as curl sends it (`Name: value` as written, spaces kept; `Name;` as `Name:`),
   and a command that sets `Host` more than once is refused. Any other form (`Name : x`,
   `Name;x: y`, a space before the name) is refused, as curl reads those by rules of its own;
   write it in one of the three forms and edit the header in the tab. `-G` and `--url-query`
@@ -186,15 +189,18 @@ agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
   upgrade. A URL with a space or control character is refused, as curl refuses it. A URL that
   curl's globbing makes several requests of (`{a,b}`, `[1-3]`) is refused unless the command
   has `-g`; then the brackets are sent as they are. Options that don't change the request
-  (`-k`, `-s`, `-L`, `-o`, timeouts) are ignored; a proxy, `--resolve`, `--connect-to` and
-  client certificates are left out with a note. Anything that reads a file (`-d @file`,
+  (`-k`, `-s`, `-L`, `-o`, timeouts) are ignored. A proxy, `--resolve`, `--connect-to`, a Unix
+  socket and client certificates are left out: the dialog lists them before the tab opens, as
+  the request may then go elsewhere than curl's would, and **Open anyway** opens it. Anything that reads a file (`-d @file`,
   `-F f=@file`, `-b file`, `-T`, `-K`), shell variables or command substitution, a NUL byte in
   an argument, challenge auth (`--digest`, `--ntlm`) and unknown options are refused with the
   reason, so nothing that changes the request is dropped silently.
 - **Copy as cURL** (Replay, and right-click a request in Traffic or the Site map): a POSIX
   shell command with every value in single quotes. A `'` or `\` is written outside the quotes
   (`\'`, `\\`), and control, bidi and non-UTF-8 bytes as `"$(printf '\NNN')"`, so a header or
-  body from the target can't run anything in sh, dash, bash, zsh or fish. A plain-text body
+  body from the target can't run anything in sh, dash, bash, zsh or fish. So do format
+  characters (`\p{Cf}`: bidi controls, zero-width characters, the soft hyphen, tag characters),
+  which a terminal doesn't show. A plain-text body
   goes in `--data-raw` (which never reads a file, even for a body starting with `@`); any other
   body (NUL, control or non-UTF-8 bytes) goes through `printf '…' | curl … --data-binary @-`.
   The command goes to the tab's target, like Send: an absolute URL in the request line goes in
@@ -202,9 +208,19 @@ agent sends the same kind of request with `send --url URL -X ... -H ... -d ...`.
   to an `https://` target (curl would negotiate HTTP/2 there) and `--http1.0` for HTTP/1.0,
   `--globoff` for `[]{}` in the URL, `--path-as-is` for `..` segments, `--request-target` for a
   target a URL can't hold, and empty `-H 'Name:'` to remove the headers curl would add (`Host`
-  too, when the request has none). Headers go only as `-H 'Name: value'` or `-H 'Name;'` (empty);
-  one whose name isn't a token (an `@`, which curl would read as a file, a space, `;`, a control
-  byte) is left out with a note. Replay copies what Send would send (auto URL-encoding
+  too, when the request has none). Each header line goes in `-H` as recorded, as curl sends a
+  `-H` line as written: spaces after the colon and at the end stay, and so does a space before
+  the colon (`Transfer-Encoding : chunked`), which curl doesn't read as its own header; that one
+  gets a note, as pasting the command back is refused. An empty header goes as `-H 'Name;'`
+  (curl sends `Name:`, with a note when spaces are lost). A header whose name isn't a token (an
+  `@`, which curl would read as a file, `;`, a control byte) is left out with a note. Notes
+  also say when curl sends something else: only the first of several `Host` headers, its own
+  `Content-Length` (the body's) in place of a different one, a body chunked again under
+  `Transfer-Encoding: chunked`, or, over HTTP/2, no `Connection`, `Keep-Alive`,
+  `Proxy-Connection`, `Transfer-Encoding`, `Upgrade` or `TE` other than `trailers`. A request
+  with a `Transfer-Encoding` and no `Content-Length` is copied with `-H 'Content-Length:'`, so
+  curl adds none. When the copy holds `Authorization`, `Cookie` or an API key header, the
+  toast says so. Replay copies what Send would send (auto URL-encoding
   included). A `--data-raw` body over 128 KB gets a warning (Linux limits one argument to that
   size); a body over 2 MB is refused.
 

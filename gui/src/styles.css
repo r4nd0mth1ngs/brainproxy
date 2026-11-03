@@ -1002,6 +1002,17 @@ select {
   color: var(--high);
   white-space: pre-wrap;
 }
+.curl-dialog .curl-warnings {
+  margin: 0 0 12px;
+  color: var(--medium);
+}
+.curl-dialog .curl-warnings p,
+.curl-dialog .curl-warnings ul {
+  margin: 0;
+}
+.curl-dialog .curl-warnings ul {
+  padding-left: 20px;
+}
 
 .toasts {
   position: fixed;

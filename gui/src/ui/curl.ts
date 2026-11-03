@@ -127,12 +127,9 @@ function posixWords(src: string): string[] {
       }
       lit(s);
       i++;
-    } else if (c === "$" && cs[i + 1] === "(") {
-      const [bytes, next] = printfSubst(cs, i);
-      cur += bytes;
-      inWord = true;
-      i = next;
     } else if ((c === "$" && NAME_START.test(cs[i + 1] ?? "")) || c === "`") {
+      // $(printf …) only inside "…", the form toCurl writes: unquoted, a shell would split
+      // what it prints into words.
       expansion();
     } else if ("|&;<>()".includes(c)) {
       throw new CurlError(`Unquoted "${c}" ends the curl command in a shell: paste a single command, and quote URLs that contain & or ;.`);
@@ -830,20 +827,30 @@ const trimHws = (s: string) => s.replace(/^[ \t]+|[ \t]+$/g, "");
 /** An HTTP token (RFC 9110): a method or a header name. */
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
+/** What curl reads as an empty header value: nothing but its ISSPACE characters. */
+const BLANK = /^[ \t\n\v\f\r]*$/;
+
+/** Headers curl leaves out of an HTTP/2 request (connection-specific, RFC 9113 8.2.2). */
+const H2_DROPPED = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]);
+
+/** Headers that carry credentials, which a copied command holds as they are. */
+const CREDENTIALS = /^(authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth-token)$/;
+
 /**
  * A -H value in one of the three forms read exactly: "Name: value" (or "Name:value"), "Name:"
  * (removes curl's own header) and "Name;" (an empty header), with Name a token and nothing
- * between it and the separator; the value is null for "Name:". curl reads other forms by
- * rules of its own ("Name ;", "Name;x: y", "Name : x"), so they are refused rather than guessed.
+ * between it and the separator. Returns the name and the line curl sends: "Name: value" as
+ * written, spaces included, "Name;" as "Name:", and null for "Name:". curl reads other forms
+ * by rules of its own ("Name ;", "Name;x: y", "Name : x"), so they are refused rather than guessed.
  */
 function customHeader(h: string): [string, string | null] {
   const sep = h.search(/[:;]/);
   const name = sep < 0 ? "" : h.slice(0, sep);
   const rest = h.slice(sep + 1);
   if (TOKEN.test(name) && (h[sep] === ":" || rest === "")) {
-    // curl drops the spaces and tabs after the colon; with nothing else it removes the header.
-    const val = h[sep] === ";" ? "" : rest.replace(/^[ \t]+/, "");
-    return [name, h[sep] === ":" && !val ? null : val];
+    if (h[sep] === ";") return [name, `${name}:`];
+    // With only spaces after the colon curl removes the header; otherwise it sends it as written.
+    return [name, BLANK.test(rest) ? null : h];
   }
   throw new CurlError(
     `The header ${JSON.stringify(decodeOr(h))} can't be imported exactly: only "Name: value", "Name:" (no header) and "Name;" (empty) are read. Write it in one of those forms, and edit it in the tab after pasting if it must differ.`,
@@ -955,23 +962,24 @@ export function parseCurl(command: string): ParsedCurl {
   // depends on their order and forms, so more than one is refused rather than guessed.
   if (custom.filter(([n]) => n.toLowerCase() === "host").length > 1)
     throw new CurlError("The command sets Host more than once, which can't be imported exactly; keep one -H 'Host: …' and edit the request after pasting.");
-  let customHost: [string, string] | undefined;
-  const added: [string, string][] = [];
-  for (const [name, val] of custom) {
+  let customHost: string | undefined;
+  const added: string[] = [];
+  for (const [name, line] of custom) {
     const lower = name.toLowerCase();
     for (const list of [defaults, trailing]) {
       const k = list.findIndex(([n]) => n.toLowerCase() === lower);
       if (k >= 0) list.splice(k, 1);
     }
-    if (val == null) continue;
-    if (lower !== "host") added.push([name, val]);
-    else customHost ??= [name, val];
+    if (line == null) continue;
+    if (lower !== "host") added.push(line);
+    else customHost ??= line;
   }
 
-  const headers = [...(customHost ? [customHost] : []), ...defaults, ...added, ...trailing];
-  const bad = headers.find(([, v]) => CRLF.test(v));
+  const bad = [...defaults, ...trailing].find(([, v]) => CRLF.test(v));
   if (bad) throw new CurlError(`The ${decodeOr(bad[0])} header would hold a line break or NUL byte.`);
-  const head = [`${method} ${reqTarget} ${o.version}`, ...headers.map(([n, v]) => `${n}: ${v}`)].join("\n");
+  const own = ([n, v]: [string, string]) => `${n}: ${v}`;
+  const headers = [...(customHost ? [customHost] : []), ...defaults.map(own), ...added, ...trailing.map(own)];
+  const head = [`${method} ${reqTarget} ${o.version}`, ...headers].join("\n");
   const bytes = `${head}\n\n${body}`;
   const text = decodeUtf8(bytes);
   const host = decodeOr(url.host);
@@ -988,10 +996,12 @@ export function parseCurl(command: string): ParsedCurl {
 // ---------- writing a command ----------
 
 /**
- * Characters shown as they are inside '…': printable text and newlines, no control or bidi
- * characters. A string, so no tool writes U+2028 out as a raw line break in a regex literal.
+ * Characters shown as they are inside '…': printable text and newlines, no control, line
+ * separator or format characters (\p{Cf}: bidi controls, zero-width ones, the soft hyphen, the
+ * invisible operators U+2060-2064, tag characters). A string, so no tool writes U+2028 out as a
+ * raw line break in a regex literal.
  */
-const PLAIN = new RegExp("^[^\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u061c\\u200b-\\u200f\\u2028-\\u202e\\u2066-\\u2069\\ufeff]*$");
+const PLAIN = new RegExp("^[^\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029\\p{Cf}]*$", "u");
 
 /** Plain UTF-8 text, which goes in '…' as it is. */
 const isPlainText = (bytes: string) => {
@@ -1099,7 +1109,10 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   if (method === "HEAD" && !hasData) args.push("--head");
   else if (method !== (hasData ? "POST" : "GET")) args.push(`-X ${shellQuote(method)}`);
 
-  const seen = new Set<string>();
+  // curl knows a header by the name right before its colon and sends a -H line as written, so
+  // each line is copied as it is, spaces included. With spaces before the colon
+  // ("Transfer-Encoding : chunked", a smuggling probe) it is none of curl's own headers.
+  const parsed: { name: string; lower: string; value: string; line: string; spaced: boolean; blank: boolean }[] = [];
   for (const line of lines.slice(1)) {
     if (!line) continue;
     const colon = line.indexOf(":");
@@ -1107,21 +1120,41 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
       warnings.push(`Left out a line that isn't a header: ${decodeOr(line).slice(0, 60)}`);
       continue;
     }
-    const name = trimHws(line.slice(0, colon));
-    const value = trimHws(line.slice(colon + 1));
-    // Only a token name goes in a -H that curl and a paste both read as written (curl reads
-    // -H @NAME as a file of headers).
+    const name = line.slice(0, colon).replace(/[ \t]+$/, "");
+    // Only a token name goes in a -H that curl reads as written (curl reads -H @NAME as a
+    // file of headers).
     if (!TOKEN.test(name)) {
       warnings.push(`Left out a header whose name isn't a valid token (curl may read it otherwise, or as a file): ${decodeOr(name).slice(0, 60)}`);
       continue;
     }
-    const lower = name.toLowerCase();
-    seen.add(lower);
-    // curl writes these itself: the length from the body, Host from the URL unless it differs.
-    if (lower === "content-length") continue;
-    if (lower === "host" && value.toLowerCase() === authority) continue;
-    if (lower === "transfer-encoding" && /chunked/i.test(value)) warnings.push("curl chunks the body itself with Transfer-Encoding: chunked, so a body already chunked is chunked twice.");
-    args.push(`-H ${shellQuote(value ? `${name}: ${value}` : `${name};`)}`);
+    const rest = line.slice(colon + 1);
+    parsed.push({ name, lower: name.toLowerCase(), value: trimHws(rest), line, spaced: name.length < colon, blank: BLANK.test(rest) });
+  }
+  const named = (lower: string) => parsed.filter((h) => !h.spaced && h.lower === lower);
+  const hosts = named("host");
+  const lengths = named("content-length");
+  // curl reads only the first Transfer-Encoding, and chunks the body when it says chunked
+  // (not over HTTP/2).
+  const chunked = !h2 && /chunked/i.test(named("transfer-encoding")[0]?.value ?? "");
+
+  const seen = new Set<string>();
+  const spaced: string[] = [];
+  const blanked: string[] = [];
+  for (const h of parsed) {
+    if (!h.spaced) {
+      seen.add(h.lower);
+      // curl writes these itself: the length from the body, Host from the URL unless it differs.
+      if (h.lower === "content-length") continue;
+      if (h.lower === "host" && hosts.length === 1 && h.value.toLowerCase() === authority) continue;
+    }
+    if (!h.blank) {
+      if (h.spaced) spaced.push(h.name);
+      args.push(`-H ${shellQuote(h.line)}`);
+      continue;
+    }
+    // "Name:" with nothing after it removes curl's header; "Name;" sends it empty, as "Name:".
+    args.push(`-H ${shellQuote(`${h.name};`)}`);
+    if (h.line !== `${h.name}:`) blanked.push(h.name);
   }
   // Headers curl would add that the request doesn't have. (Over HTTP/2 both use the target's
   // authority when there's no Host.)
@@ -1130,6 +1163,24 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   if (!seen.has("accept")) args.push("-H 'Accept:'");
   if (hasData && !seen.has("content-type")) args.push("-H 'Content-Type:'");
   if (body.length > 1024 && !seen.has("expect")) args.push("-H 'Expect:'");
+  // curl adds a Content-Length unless it chunks the body. A request with a Transfer-Encoding
+  // or a spaced Content-Length and no Content-Length of its own goes without one, as written.
+  if (hasData && !lengths.length && !chunked && parsed.some((h) => h.lower === "transfer-encoding" || h.lower === "content-length")) args.push("-H 'Content-Length:'");
+
+  if (hosts.length > 1) warnings.push(`The request has ${hosts.length} Host headers and curl sends only the first (${decodeOr(hosts[0].value).slice(0, 60)}), so the command sends a different request.`);
+  if (chunked) warnings.push(`curl chunks the body itself with Transfer-Encoding: chunked, so a body already chunked is chunked twice${lengths.length ? ", and it sends no Content-Length" : ""}.`);
+  else if (lengths.length > 1 || (lengths.length && lengths[0].value !== String(body.length)))
+    warnings.push(`curl sends Content-Length: ${body.length}, the body's length, in place of the request's ${lengths.map((h) => decodeOr(h.value).slice(0, 20)).join(", ")}.`);
+  if (spaced.length)
+    warnings.push(`Copied as written with a space before the colon: ${spaced.map(decodeOr).join(", ")}. curl sends such a header as it is over HTTP/1, but pasting the command back into brainproxy is refused; edit the header in the tab instead.`);
+  if (blanked.length) warnings.push(`curl sends an empty header only as "Name:", so ${blanked.map(decodeOr).join(", ")} lose${blanked.length > 1 ? "" : "s"} the spaces around the colon.`);
+  if (h2) {
+    // Not allowed in HTTP/2: curl leaves them out (TE stays only as "trailers").
+    const hop = parsed.filter((h) => !h.spaced && (H2_DROPPED.has(h.lower) || (h.lower === "te" && h.value.toLowerCase() !== "trailers")));
+    if (hop.length) warnings.push(`Over HTTP/2 curl leaves out ${[...new Set(hop.map((h) => decodeOr(h.name)))].join(", ")}, which HTTP/2 doesn't allow (TE only as "trailers").`);
+  }
+  const secrets = new Map(parsed.filter((h) => CREDENTIALS.test(h.lower)).reverse().map((h) => [h.lower, decodeOr(h.name)]));
+  if (secrets.size) warnings.push(`The command carries the request's credentials as they are (${[...secrets.values()].reverse().join(", ")}); keep it where you would keep them.`);
 
   let pipe = "";
   if (hasData) {
