@@ -278,10 +278,10 @@ Edit a raw request and send it as often as you like, in separate tabs.
   Send. Options that only change curl's output (`-k`, `-s`, `-L`, `-o`) are ignored. A proxy,
   `--resolve`, `--connect-to`, a Unix socket or a client certificate is left out (set those in
   Settings › Connections): the dialog lists what was left out before the tab opens, since the
-  request may then go elsewhere than curl's would, and **Open anyway** opens it. A command that reads a file (`-d @file`, `-F field=@file`), uses shell
-  variables, has an option brainproxy doesn't know, or has a URL that curl's globbing turns
-  into several requests (`{a,b}`, `[1-3]`; add `-g` to send it as written) is refused with
-  the reason. Headers are read as `-H 'Name: value'`, `-H 'Name:'` (leave out the header
+  request may then go elsewhere than curl's would, and **Open anyway** opens it. A command
+  that reads a file (`-d @file`, `-F field=@file`), uses shell variables, has an option
+  brainproxy doesn't know, or has a URL that curl's globbing turns into several requests
+  (`{a,b}`, `[1-3]`; add `-g` to send it as written) is refused with the reason. Headers are read as `-H 'Name: value'`, `-H 'Name:'` (leave out the header
   curl would add) and `-H 'Name;'` (send it empty); a header written any other way, such as
   `Name : value` or `Name;x: y`, is refused because curl reads those by its own rules: rewrite
   it in one of those forms, then edit the header in the tab after pasting. A header comes in

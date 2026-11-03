@@ -946,6 +946,13 @@ test("toCurl warns when curl would send another Host, Content-Length or HTTP/2 h
   assert.deepEqual(toCurl("POST / HTTP/1.1\nContent-Type: x\nContent-Length: 3\n\nabc", "https://h.test").warnings, []);
   // With chunked, curl sends no Content-Length at all.
   assert.match(toCurl("POST / HTTP/1.1\nTransfer-Encoding: chunked\nContent-Length: 4\n\nabcd", "https://h.test").warnings.join("\n"), /chunked twice, and it sends no Content-Length/);
+  // chunked counts as one of the codings, not as part of a word.
+  assert.match(toCurl("POST / HTTP/1.1\nTransfer-Encoding: gzip, CHUNKED \nContent-Type: x\n\nabcd", "https://h.test").warnings.join("\n"), /chunked twice/);
+  for (const v of ["xchunked", "chunked;x"]) {
+    const c = toCurl(`POST / HTTP/1.1\nTransfer-Encoding: ${v}\nContent-Type: x\n\nabcd`, "https://h.test");
+    assert.doesNotMatch(c.warnings.join("\n"), /chunked twice/, v);
+    assert.match(c.command, /-H 'Content-Length:'/, v);
+  }
   // Another Transfer-Encoding: curl adds no Content-Length the request didn't have.
   const gzip = toCurl("POST / HTTP/1.1\nTransfer-Encoding: gzip\nContent-Type: x\n\nabc", "https://h.test");
   assert.match(gzip.command, /-H 'Content-Length:'/);
@@ -953,8 +960,12 @@ test("toCurl warns when curl would send another Host, Content-Length or HTTP/2 h
   // HTTP/2 has no connection-specific headers: curl leaves them out.
   const h2 = toCurl("POST / HTTP/2\nhost: h.test\nconnection: keep-alive\nupgrade: h2c\ntransfer-encoding: chunked\nte: trailers\ncontent-type: x\n\na", "https://h.test");
   assert.match(h2.warnings.join("\n"), /Over HTTP\/2 curl leaves out connection, upgrade, transfer-encoding,/);
-  assert.doesNotMatch(h2.warnings.join("\n"), /chunks the body|leaves out[^\n]*\bte\b/);
+  assert.doesNotMatch(h2.warnings.join("\n"), /chunks the body|leaves out[^\n]*\bte\b|TE as/);
   assert.match(toCurl("GET / HTTP/2\nte: gzip\n\n", "https://h.test").warnings.join("\n"), /leaves out te,/);
+  // TE naming trailers among other codings is cut to "trailers", not left out.
+  const te = toCurl("GET / HTTP/2\nte: gzip, Trailers\n\n", "https://h.test").warnings.join("\n");
+  assert.match(te, /sends TE as "trailers" alone/);
+  assert.doesNotMatch(te, /leaves out/);
   assert.deepEqual(toCurl("GET / HTTP/1.1\nConnection: close\nTE: gzip\n\n", "https://h.test").warnings, []);
 });
 
@@ -966,8 +977,10 @@ test("toCurl notes the credentials a command carries", () => {
 
 test("pasted headers are kept as curl sends them", () => {
   assert.match(parseCurl("curl -H 'X: a  ' -H 'Y:\tb' https://h.test").raw, /\nX: a {2}\nY:\tb\n/);
-  // Only curl's spaces make a header empty, so it is removed.
-  assert.doesNotMatch(parseCurl("curl -H $'X: \\v\\f' https://h.test").raw, /\nX:/);
+  // Only spaces and tabs make a header empty, so it is removed; \v and \f are sent.
+  assert.doesNotMatch(parseCurl("curl -H $'X: \\t ' https://h.test").raw, /\nX:/);
+  assert.match(parseCurl("curl -H $'X: \\v\\f' https://h.test").raw, /\nX: \v\f\n/);
+  assert.match(toCurl("GET / HTTP/1.1\nHost: h.test\nX: \v\f\n\n", "https://h.test").command, /-H 'X: '"\$\(printf '\\013\\014'\)"/);
   // toCurl's lines come back the same.
   assert.match(parseCurl(toCurl("GET / HTTP/1.1\nHost: h.test\nX-Foo: bar  \nY:z\n\n", "https://h.test").command).raw, /\nX-Foo: bar {2}\nY:z\n/);
 });

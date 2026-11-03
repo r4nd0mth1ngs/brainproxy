@@ -827,8 +827,8 @@ const trimHws = (s: string) => s.replace(/^[ \t]+|[ \t]+$/g, "");
 /** An HTTP token (RFC 9110): a method or a header name. */
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
-/** What curl reads as an empty header value: nothing but its ISSPACE characters. */
-const BLANK = /^[ \t\n\v\f\r]*$/;
+/** What curl reads as an empty header value: nothing but spaces and tabs (\v and \f are sent). */
+const BLANK = /^[ \t]*$/;
 
 /** Headers curl leaves out of an HTTP/2 request (connection-specific, RFC 9113 8.2.2). */
 const H2_DROPPED = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]);
@@ -1133,9 +1133,10 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
   const named = (lower: string) => parsed.filter((h) => !h.spaced && h.lower === lower);
   const hosts = named("host");
   const lengths = named("content-length");
-  // curl reads only the first Transfer-Encoding, and chunks the body when it says chunked
-  // (not over HTTP/2).
-  const chunked = !h2 && /chunked/i.test(named("transfer-encoding")[0]?.value ?? "");
+  // curl reads only the first Transfer-Encoding, and chunks the body when one of its
+  // comma-separated codings is chunked (not over HTTP/2).
+  const te = named("transfer-encoding")[0]?.value ?? "";
+  const chunked = !h2 && te.split(",").some((c) => trimHws(c).toLowerCase() === "chunked");
 
   const seen = new Set<string>();
   const spaced: string[] = [];
@@ -1175,9 +1176,13 @@ export function toCurl(raw: string, target: string, binary = false): CurlCommand
     warnings.push(`Copied as written with a space before the colon: ${spaced.map(decodeOr).join(", ")}. curl sends such a header as it is over HTTP/1, but pasting the command back into brainproxy is refused; edit the header in the tab instead.`);
   if (blanked.length) warnings.push(`curl sends an empty header only as "Name:", so ${blanked.map(decodeOr).join(", ")} lose${blanked.length > 1 ? "" : "s"} the spaces around the colon.`);
   if (h2) {
-    // Not allowed in HTTP/2: curl leaves them out (TE stays only as "trailers").
-    const hop = parsed.filter((h) => !h.spaced && (H2_DROPPED.has(h.lower) || (h.lower === "te" && h.value.toLowerCase() !== "trailers")));
-    if (hop.length) warnings.push(`Over HTTP/2 curl leaves out ${[...new Set(hop.map((h) => decodeOr(h.name)))].join(", ")}, which HTTP/2 doesn't allow (TE only as "trailers").`);
+    // Not allowed in HTTP/2: curl leaves them out, and keeps TE only as "trailers", when it
+    // names that coding.
+    const codings = (v: string) => v.split(",").map((c) => trimHws(c).toLowerCase());
+    const te = parsed.filter((h) => !h.spaced && h.lower === "te");
+    const hop = parsed.filter((h) => !h.spaced && (H2_DROPPED.has(h.lower) || (h.lower === "te" && !codings(h.value).includes("trailers"))));
+    if (hop.length) warnings.push(`Over HTTP/2 curl leaves out ${[...new Set(hop.map((h) => decodeOr(h.name)))].join(", ")}, which HTTP/2 doesn't allow.`);
+    if (te.some((h) => codings(h.value).includes("trailers") && h.value !== "trailers")) warnings.push('Over HTTP/2 curl sends TE as "trailers" alone.');
   }
   const secrets = new Map(parsed.filter((h) => CREDENTIALS.test(h.lower)).reverse().map((h) => [h.lower, decodeOr(h.name)]));
   if (secrets.size) warnings.push(`The command carries the request's credentials as they are (${[...secrets.values()].reverse().join(", ")}); keep it where you would keep them.`);

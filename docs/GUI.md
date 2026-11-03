@@ -191,18 +191,19 @@ direction is a CLI command or an MCP tool.
   has `-g`; then the brackets are sent as they are. Options that don't change the request
   (`-k`, `-s`, `-L`, `-o`, timeouts) are ignored. A proxy, `--resolve`, `--connect-to`, a Unix
   socket and client certificates are left out: the dialog lists them before the tab opens, as
-  the request may then go elsewhere than curl's would, and **Open anyway** opens it. Anything that reads a file (`-d @file`,
-  `-F f=@file`, `-b file`, `-T`, `-K`), shell variables or command substitution, a NUL byte in
-  an argument, challenge auth (`--digest`, `--ntlm`) and unknown options are refused with the
-  reason, so nothing that changes the request is dropped silently.
+  the request may then go elsewhere than curl's would, and **Open anyway** opens it. Anything
+  that reads a file (`-d @file`, `-F f=@file`, `-b file`, `-T`, `-K`), shell variables or
+  command substitution, a NUL byte in an argument, challenge auth (`--digest`, `--ntlm`) and
+  unknown options are refused with the reason, so nothing that changes the request is dropped
+  silently.
 - **Copy as cURL** (Replay, and right-click a request in Traffic or the Site map): a POSIX
   shell command with every value in single quotes. A `'` or `\` is written outside the quotes
   (`\'`, `\\`), and control, bidi and non-UTF-8 bytes as `"$(printf '\NNN')"`, so a header or
   body from the target can't run anything in sh, dash, bash, zsh or fish. So do format
   characters (`\p{Cf}`: bidi controls, zero-width characters, the soft hyphen, tag characters),
-  which a terminal doesn't show. A plain-text body
-  goes in `--data-raw` (which never reads a file, even for a body starting with `@`); any other
-  body (NUL, control or non-UTF-8 bytes) goes through `printf '…' | curl … --data-binary @-`.
+  which a terminal doesn't show. A plain-text body goes in `--data-raw` (which never reads a
+  file, even for a body starting with `@`); any other body (NUL, control or non-UTF-8 bytes)
+  goes through `printf '…' | curl … --data-binary @-`.
   The command goes to the tab's target, like Send: an absolute URL in the request line goes in
   `--request-target`. It adds `--http2` for an HTTP/2 request, `--http1.1` for an HTTP/1.1 one
   to an `https://` target (curl would negotiate HTTP/2 there) and `--http1.0` for HTTP/1.0,
@@ -218,11 +219,11 @@ direction is a CLI command or an MCP tool.
   `Content-Length` (the body's) in place of a different one, a body chunked again under
   `Transfer-Encoding: chunked`, or, over HTTP/2, no `Connection`, `Keep-Alive`,
   `Proxy-Connection`, `Transfer-Encoding`, `Upgrade` or `TE` other than `trailers`. A request
-  with a `Transfer-Encoding` and no `Content-Length` is copied with `-H 'Content-Length:'`, so
-  curl adds none. When the copy holds `Authorization`, `Cookie` or an API key header, the
-  toast says so. Replay copies what Send would send (auto URL-encoding
-  included). A `--data-raw` body over 128 KB gets a warning (Linux limits one argument to that
-  size); a body over 2 MB is refused.
+  with a `Transfer-Encoding` or a spaced `Content-Length` and no `Content-Length` of its own is
+  copied with `-H 'Content-Length:'`, so curl adds none. When the copy holds `Authorization`,
+  `Cookie` or an API key header, the toast says so. Replay copies what Send would send (auto
+  URL-encoding included). A `--data-raw` body over 128 KB gets a warning (Linux limits one
+  argument to that size); a body over 2 MB is refused.
 
 ## Look
 

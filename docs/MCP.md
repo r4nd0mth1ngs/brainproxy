@@ -65,10 +65,6 @@ joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy
 `oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
 and `project save`, since copying the project elsewhere is for the person running the server.
 
-Some features are in the desktop app only, with no command and so no tool: pasting a curl
-command into Replay and *Copy as cURL* among them. An agent sends the same request with `send`
-(`url`, `method`, `headers`, `data`) and reads a recorded one with `history_show`.
-
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it
   (the clap id: `targets` for `--target`, `max_body` for `--max-body`). Flags are
@@ -88,6 +84,10 @@ command into Replay and *Copy as cURL* among them. An agent sends the same reque
 - **stdin**: an extra string property on commands that read standard input (`send`,
   `query`, `encode`, `import openapi`, `intercept forward`, ...). Without it, the command's
   stdin is empty, never the server's own stdin.
+
+Some features are in the desktop app only, with no command and so no tool: pasting a curl
+command into Replay and *Copy as cURL* among them. An agent sends the same request with `send`
+(`url`, `method`, `headers`, `data`) and reads a recorded one with `history_show`.
 
 Some arguments need a person, so a command run for a tool call (the server sets
 `BRAINPROXY_MCP_CALL` on it) refuses them, with an error saying so:

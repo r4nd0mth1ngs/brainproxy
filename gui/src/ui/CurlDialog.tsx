@@ -31,8 +31,15 @@ export function CurlDialog({ close, opener }: { close: () => void; opener?: RefO
   // go elsewhere than curl's would), shown before it opens; the next open goes ahead.
   const [warnings, setWarnings] = useState<string[]>([]);
   const box = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => () => opener?.current?.focus(), [opener]);
+  // Focus starts in the command and goes back to the opener on close. (Set here rather than
+  // with autoFocus alone: StrictMode runs the cleanup once on mount, which would leave focus
+  // outside the open dialog.)
+  useEffect(() => {
+    input.current?.focus();
+    return () => opener?.current?.focus();
+  }, [opener]);
 
   const open = () => {
     try {
@@ -66,6 +73,7 @@ export function CurlDialog({ close, opener }: { close: () => void; opener?: RefO
           you press Send.
         </p>
         <textarea
+          ref={input}
           className="input multiline mono full"
           rows={10}
           autoFocus
