@@ -171,7 +171,12 @@ fn setup(project: &Path, cmd: SetupCmd, out: &Out) -> Result<(), Error> {
                         .into(),
                 ));
             }
-            let redirect = redirect.map(|r| Target::from_url(&r).map(|t| t.origin())).transpose()?;
+            let redirect = match redirect.as_deref().map(Target::from_url).transpose()? {
+                Some(t) if t.port == 0 => {
+                    return Err(Error::InvalidInput("--redirect needs a port from 1 to 65535".into()))
+                }
+                t => t.map(|t| t.origin()),
+            };
             let setup = ProxySetup { network, invisible: invisible && redirect.is_none(), redirect };
             store.set_setting(SETUP_KEY, &setup)?;
             setup

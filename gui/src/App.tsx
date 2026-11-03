@@ -200,13 +200,14 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     let cancelled = false;
     (async () => {
       if (!autoProxy()) return;
-      const s = await run<ProxyStatus>(["proxy", "status"]).catch(() => null);
+      const s = (await inProject(["proxy", "status"]).catch(() => null)) as ProxyStatus | null;
       if (cancelled || !s || s.running) return;
       const chosen = savedProxyPort();
       for (const port of startPorts(chosen)) {
         if (cancelled) return;
         try {
-          const listen = await startProxy(run, proxyCtl, port);
+          // Pinned: the setup is read and the proxy started in this project, even if another opens meanwhile.
+          const listen = await startProxy(inProject, proxyCtl, port);
           // The project closed while it started.
           if (cancelled) return stopOwned(inProject, proxyCtl).catch(() => {});
           refreshStatus();

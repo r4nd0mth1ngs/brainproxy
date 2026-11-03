@@ -1033,8 +1033,10 @@ fn proxy_setup_is_saved_in_the_project_file() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(2), "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("isn't offered through MCP"), "{v}");
-    let (code, v) = env.run(&["proxy", "setup", "set", "--redirect=ftp://app.example.test"]);
-    assert_eq!(code, 2, "{v}");
+    for bad in ["--redirect=ftp://app.example.test", "--redirect=http://127.0.0.1:0"] {
+        let (code, v) = env.run(&["proxy", "setup", "set", bad]);
+        assert_eq!(code, 2, "{bad}: {v}");
+    }
     assert_eq!(env.ok(&["proxy", "setup", "show"]), saved);
 
     // Set replaces the whole setup.
