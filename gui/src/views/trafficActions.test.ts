@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { accessConfirm, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, isRefused, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { accessConfirm, accessOptIns, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, isRefused, scanArgs, scanBlocker, scanConfirm, scanOptIns, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
 
 const get: HistoryPick = { id: 7, method: "GET", url: "https://shop.test/search?q=x" };
 const post: HistoryPick = { id: 9, method: "post", url: "https://shop.test/contact" };
@@ -25,6 +25,23 @@ test("a scan from Traffic uses the Scans view's defaults", () => {
     "--background",
   ]);
   assert.throws(() => scanArgs([], { nuclei: false }), /No request/);
+});
+
+test("a scan opts in the methods its defaults leave out, after the question names them", () => {
+  const del: HistoryPick = { id: 3, method: "delete", url: "https://shop.test/orders/3" };
+  const gql: HistoryPick = { id: 5, method: "POST", url: "https://shop.test/graphql", mutation: true };
+  assert.deepEqual(scanOptIns([get, post]), []);
+  assert.deepEqual(scanOptIns([del, gql, { ...del, id: 4 }, { ...get, mutation: true }]), ["DELETE", "MUTATION"]);
+  assert.deepEqual(scanArgs([del, gql], off), ["scan", "active", "--history-id=3", "--history-id=5", "--include-methods=DELETE,MUTATION", "--strength=medium", "--background"]);
+  assert.match(scanConfirm([del], { nuclei: true }).message, /as DELETE requests are allowed for this scan, theirs are sent too/);
+  assert.doesNotMatch(scanConfirm([post], { nuclei: true }).message, /allowed for this scan/);
+});
+
+test("an access-control run opts in the picks' methods and a logout", () => {
+  assert.deepEqual(accessOptIns([get]), []);
+  assert.deepEqual(accessOptIns([get, post, { ...post, method: "DELETE" }]), ["--include-methods=POST,DELETE"]);
+  assert.deepEqual(accessOptIns([{ ...get, url: "https://shop.test/account/logout" }]), ["--exclude=^$"]);
+  assert.deepEqual(accessOptIns([{ ...post, url: "https://shop.test/sign-off" }]), ["--include-methods=POST", "--exclude=^$"]);
 });
 
 test("the question before a scan names the request and warns about a POST", () => {

@@ -258,12 +258,17 @@ The sidebar groups the tools by what you are doing.
     some of them request paths of their own (such as `/.git/config`); the question says so. The
     request is attacked whatever its method, so a POST or a GraphQL mutation is replayed
     with attack data too, and the question names it; it also says when the path looks like a
-    logout, since replaying it can end the session it was recorded with. Click the toast to
+    logout, since replaying it can end the session it was recorded with. Saying yes opts its
+    method in (`--include-methods`, `MUTATION` for a mutation) when the scan's defaults leave
+    it out, which lets the Nuclei templates send that method too. Click the toast to
     follow it in **Scans › Tasks**. A request that got no response (a connection error, a
     timeout, or dropped in **Intercept**) has nothing to scan, so the item is greyed out,
     with the reason under it.
   - **Test access control…** opens **Access** with a new run set to test that request
-    (`authz run --history-id`). Pick the identities and start it.
+    (`authz run --history-id`). Pick the identities and start it. A request other than GET,
+    HEAD or OPTIONS, or one whose path looks like a logout, is asked about first; saying yes
+    passes the opt-ins the CLI needs for it (`--include-methods`, and an `--exclude` it doesn't
+    match).
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
   ones Replay opened. Select a connection to see its messages in both directions (→ to the
   server, ← to the client), with pings, pongs and the close; select a message to read its

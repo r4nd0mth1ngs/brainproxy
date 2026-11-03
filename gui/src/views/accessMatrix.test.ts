@@ -124,7 +124,7 @@ test("a run's arguments come from the form", () => {
     { id: 4, method: "GET", url: "https://shop.test/orders/4" },
     { id: 8, method: "POST", url: "https://shop.test/orders" },
   ];
-  assert.deepEqual(runArgs({ ...form, select: "history", history }), ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8"]);
+  assert.deepEqual(runArgs({ ...form, select: "history", history }), ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8", "--include-methods=POST"]);
   assert.throws(() => runArgs({ ...form, select: "history" }), /No request picked/);
 });
 
@@ -140,10 +140,11 @@ test("requests from Traffic: by id only, and only while that selection is on", (
     "run",
     "--owner=alice",
     "--history-id=31",
+    "--include-methods=DELETE",
     "--keep-cookie=theme,lang",
     "--rate=2",
   ]);
-  assert.deepEqual(runArgs({ ...form, select: "history", history, anonymous: false }), ["authz", "run", "--as=bob,carol", "--no-anonymous", "--history-id=31"]);
+  assert.deepEqual(runArgs({ ...form, select: "history", history, anonymous: false }), ["authz", "run", "--as=bob,carol", "--no-anonymous", "--history-id=31", "--include-methods=DELETE"]);
   // The form's own checks come first.
   assert.throws(() => runArgs({ ...form, select: "history", history, identities: [], anonymous: false }), /at least one identity/);
   assert.throws(() => runArgs({ ...form, select: "history", history, rate: "-1" }), /Rate/);

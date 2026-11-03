@@ -319,7 +319,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
     try {
       const args = runArgs(f);
       // Requests from Traffic are replayed whatever their method or path: a POST, a GraphQL
-      // mutation or a logout is asked about first.
+      // mutation or a logout is asked about first, and `runArgs` then passes the opt-ins.
       const q = f.select === "history" ? accessConfirm(f.history, f.identities, f.anonymous) : null;
       if (q && !(await confirm(q.title, q.message, q.ok, q.cancel))) return;
       setBusy(true);

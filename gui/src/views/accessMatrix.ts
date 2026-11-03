@@ -1,7 +1,7 @@
 // Access control across users (`authz`): the arguments for a run, and `authz matrix` as a grid
 // of requests by identities, each cell coloured by its verdict.
 
-import type { HistoryPick } from "./trafficActions.ts";
+import { accessOptIns, type HistoryPick } from "./trafficActions.ts";
 
 export interface MatrixCell {
   verdict: string;
@@ -201,6 +201,8 @@ export function runArgs(f: RunForm): string[] {
   } else if (f.select === "history") {
     if (!f.history.length) throw new Error("No request picked: right-click one in Proxy › Traffic");
     for (const h of f.history) args.push(`--history-id=${h.id}`);
+    // Asked about first (`accessConfirm`): the CLI refuses a named request without its opt-ins.
+    args.push(...accessOptIns(f.history));
   }
   const cookies = cookieNames(f.keepCookies);
   if (cookies.length) args.push(`--keep-cookie=${cookies.join(",")}`);
