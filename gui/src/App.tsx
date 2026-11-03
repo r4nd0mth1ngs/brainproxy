@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { inTauri, run, setProject, tempProjects } from "./api";
 import { AppProvider, autoProxy, useApp, type Tab, type TempInfo } from "./store";
 import { ProxyView } from "./views/Proxy";
@@ -22,6 +22,7 @@ import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
 import { Welcome, remember, saveTempAs } from "./views/Welcome";
 import { usePoll } from "./ui/usePoll";
+import { leaveProject, leaver } from "./views/leave";
 import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
 
@@ -143,7 +144,7 @@ interface ProxyStatus {
   intercept_enabled: boolean;
 }
 
-function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () => void }) {
+function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleTheme: () => void }) {
   const app = useApp();
   const [scope, setScope] = useState<string[] | null>(null);
   const [engName, setEngName] = useState("");
@@ -260,20 +261,26 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
 
   const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
   // Switching project: Replay's tabs are saved before it closes (so reopening it shows them),
-  // and if they can't be, it stays open unless the user chooses to close it anyway.
-  const leave = async () => {
-    if (!app.temp) {
-      const failed = await app.flushReplayTabs().then(
-        () => null,
-        (e: Error) => e,
-      );
-      if (failed) {
-        const msg = `They couldn't be saved to the project: ${failed.message}. Changes since the last save are lost if it closes.`;
-        if (!(await confirm("Close without saving Replay's tabs?", msg, "Close anyway", "Keep open"))) return;
-      }
-    }
-    onClose();
-  };
+  // and if they can't be, it stays open unless the user chooses to close it anyway. Clicks
+  // while that runs join it, and it closes nothing once this shell or its project is gone.
+  const leaving = useMemo(leaver, []);
+  useEffect(() => leaving.attach(), [leaving, app.project]);
+  const leave = () =>
+    leaving.run((stale) =>
+      leaveProject({
+        temp: !!app.temp,
+        flush: app.flushReplayTabs,
+        ask: (e) =>
+          confirm(
+            "Close without saving Replay's tabs?",
+            `They couldn't be saved to the project: ${e.message}. Changes since the last save are lost if it closes.`,
+            "Close anyway",
+            "Keep open",
+          ),
+        close: onClose,
+        stale,
+      }),
+    );
   const tempTitle = app.temp
     ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and deleted when you discard it. Click to save it as a project file.`
     : "";
