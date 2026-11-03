@@ -20,7 +20,8 @@ export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, source
 
 const ASSET = /\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\?|$)/i;
 
-export const isRefused = (r: HistoryItem) => !!r.error?.startsWith("out of scope");
+/** The proxy refused it (outside the engagement scope). */
+export const isRefused = (r: { error?: string | null }) => !!r.error?.startsWith("out of scope");
 
 /** Whether a row passes the filters checked here. The text counts only outside contents mode. */
 export function matchesFilter(r: HistoryItem, f: TrafficFilter): boolean {

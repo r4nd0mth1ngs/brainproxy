@@ -1,6 +1,8 @@
 // Traffic's right-click actions on recorded requests: an active scan of them, the highlight tag,
 // and what Access is handed to test them as other users.
 
+import { isRefused } from "./trafficFilter.ts";
+
 /** A recorded request picked in Traffic. */
 export interface HistoryPick {
   id: number;
@@ -183,11 +185,6 @@ export interface HistoryRow {
 
 /** Why a refused row's actions are disabled. */
 export const REFUSED_HINT = "Out of scope: the proxy refused this request";
-
-/** The proxy refused it (outside the engagement scope), so there is nothing to replay. */
-export function isRefused(r: HistoryRow): boolean {
-  return !!r.error?.startsWith("out of scope");
-}
 
 /**
  * Why a row can't be scanned, or null when it can. A scan needs the recorded response to compare

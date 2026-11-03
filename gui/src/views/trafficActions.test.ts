@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { accessConfirm, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, isRefused, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { accessConfirm, changeKinds, definesMutation, graphqlDocuments, highlightArgs, isLogout, isMutationRequest, scanArgs, scanBlocker, scanConfirm, unsafeMethods, withHighlight, type HistoryPick } from "./trafficActions.ts";
+import { isRefused } from "./trafficFilter.ts";
 
 const get: HistoryPick = { id: 7, method: "GET", url: "https://shop.test/search?q=x" };
 const post: HistoryPick = { id: 9, method: "post", url: "https://shop.test/contact" };
@@ -132,8 +133,8 @@ test("a request with no response, or one the proxy refused, can't be scanned", (
   assert.equal(scanBlocker({ status: null }), "No response recorded to scan");
   assert.equal(scanBlocker({ status: null, error: "connection refused" }), "No response recorded to scan");
   assert.match(scanBlocker({ status: null, error: "out of scope: other.test" }) ?? "", /Out of scope/);
-  assert.ok(isRefused({ status: null, error: "out of scope: other.test" }));
-  assert.ok(!isRefused({ status: null, error: "timed out" }));
+  assert.ok(isRefused({ error: "out of scope: other.test" }));
+  assert.ok(!isRefused({ error: "timed out" }));
 });
 
 test("an access-control run of a POST from Traffic asks first, naming who sends it", () => {
