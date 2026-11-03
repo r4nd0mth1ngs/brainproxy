@@ -221,6 +221,7 @@ mod e2e {
             auth: None,
             oob: None,
             oob_wait: std::time::Duration::ZERO,
+            check_methods: vec![],
         };
         let summary = run(&project, targets, cfg, JobControl::default()).await.unwrap();
         let _ = std::fs::remove_file(&project);

@@ -166,6 +166,12 @@ templates live once per user (`~/.local/share/brainproxy`, on Windows
 `%APPDATA%\brainproxy`) and are shared by all projects. A project file gets the
 permissions of the folder it is saved in: keep it in your own folders on a shared machine.
 
+**Who recorded it.** Every request in history and every finding says where it came from:
+the desktop app (`gui`), the command line or a script (`cli`), or an AI agent through MCP
+(`mcp`). A proxy, crawl or scan keeps the origin of whoever started it, so a proxy an agent
+started records `mcp`, even for a person's browsing through it. Entries from before
+brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what).
+
 ---
 
 ## First engagement (desktop app)
@@ -240,6 +246,9 @@ The sidebar groups the tools by what you are doing.
   imports.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
+  - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). For a proxy entry
+    that is who started the proxy, not who sent the request: hover it to see the address of
+    the client that sent it.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
@@ -292,7 +301,7 @@ Edit a raw request and send it as often as you like, in separate tabs.
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
-  reply matches **Until**. Each run is recorded like proxied traffic.
+  reply matches **Until**. Each run is recorded like proxied traffic, as it happens.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -631,7 +640,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 133 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 137 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -680,6 +689,77 @@ brainproxy scan active https://app.acme.test/account --auth app
 brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe while in use; never overwrites
 brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
 ```
+
+### Who recorded what
+
+Each history entry has:
+
+- `origin`: `gui` (the desktop app), `cli` (a terminal or script) or `mcp` (an agent through
+  MCP); NULL, shown as unknown, for entries recorded before brainproxy kept it. Background
+  jobs, fuzz runs and the proxy record the origin of the command that started them.
+- `client_addr`: for proxy entries, the address (`ip:port`) of the client that sent the
+  request, whether intercepted, passed through, a WebSocket upgrade, or invisible.
+- `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
+  list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
+  `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
+  the rule). NULL when nothing changed it; an intercept forwarded unchanged isn't an edit.
+- `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`); NULL
+  when it was the target host, and for plain HTTP.
+- `note_origin`, `note_changed_at`, `tags_origin`, `tags_changed_at`: who last set the note
+  (`history note`) or changed the tags (`history tag`), and when.
+
+**Origin is per process.** `origin` is who started the process that recorded the row, not
+who sent the request. For proxy rows that is whoever started the proxy: a proxy started via
+MCP records a person's browsing as `mcp`, and a proxy started from the app records an
+agent's requests through it (say, from `browser open`) as `gui`. For proxy rows,
+`client_addr` says which client sent it and `edited_by` who changed it on the way, and
+`history show` says "recorded by a proxy started from ..." rather than "recorded from ...".
+The same holds for findings: a finding's `origin` is who started the scan that raised it (the
+proxy's passive scan, a scan job), not who sent the traffic it was found in.
+
+```sh
+brainproxy history list --origin mcp         # what agents' processes recorded; also gui, cli, unknown
+brainproxy history show 42                   # entry.origin, client_addr, edited_by, sni, note_origin
+brainproxy query "SELECT origin, count(*) FROM history GROUP BY origin"
+brainproxy query "SELECT id, url, edited_by FROM history WHERE edited_by LIKE '%\"mcp\"%'"   # what agents edited
+```
+
+The intercept queue keeps who decided each held message: `resolved_by` is `gui`, `cli` or
+`mcp` for `intercept forward` and `intercept drop`, and NULL when it expired or the proxy
+dropped it itself; `edited` says whether it was forwarded with a different message
+(`intercept list`, `intercept show`, the `intercepts` table). An edited request's history
+row names the intercept in `edited_by`. A response edited at intercept, or changed by a
+response rule, is recorded in history as the server sent it; the intercept row has the
+edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
+enabled it.
+
+Findings have an `origin` too (who added them: the proxy's passive scan, a scan job, ...),
+and `state_origin` and `state_changed_at` say who last changed the state with `findings mark`
+and when, so a finding an agent marked as a false positive says so. `note_origin` and
+`note_changed_at` do the same for the note. `findings list` and `findings show` include
+them. Reports carry them in every format:
+
+- JSON: each instance has `state_origin`, `state_changed_at`, `note_origin`,
+  `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
+- Markdown and HTML say it in words on each finding. In HTML a finding a person confirmed
+  (from the app or the command line) is tagged **confirmed**, one an agent confirmed
+  **confirmed via MCP (an agent)**.
+- SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
+  result's properties.
+
+False positives are left out of a report by default. The report counts them by who marked
+them (`summary.false_positives_left_out`), and lists the ones an agent marked
+(`agent_false_positives`; a "Marked false positive by an agent" section in Markdown and HTML,
+`agentFalsePositives` in SARIF run properties), so an agent can't make a finding vanish
+from a report unseen.
+
+`scan passive --rescan` rescans all history and keeps what people decided: a finding found
+again keeps its id, state, note, origin and who set them. One not found again (its rule was
+turned off, say) is removed, unless it was triaged (its state was changed or it has a note):
+that one is kept with `hits` 0. The result counts `removed` and `kept_not_found`.
+
+The app sets `BRAINPROXY_CLIENT=gui` on the commands it runs; the MCP server sets
+`BRAINPROXY_MCP_CALL`, which wins over it, and an agent can set neither.
 
 Connection options (see Settings › Connections above for what each does):
 
@@ -734,7 +814,12 @@ Crawl and active-scan scope and safety flags:
   `application/graphql` body or the URL, defines one) is `MUTATION` whatever its method and however
   it was recorded, so one sent once by `import api --include-methods MUTATION`, a one-request check
   or the proxy isn't replayed by a later scan unless `--include-methods MUTATION` (or `all`) says
-  so. Requests picked with `--history-id` are attacked whatever their method.
+  so. A request picked with `--history-id` needs the same opt-in: naming a DELETE or a mutation
+  without `--include-methods DELETE` (or `MUTATION`) is refused with exit code 2 before anything is sent.
+- `scan active --checks`: the same opt-in applies to the requests a template sends, from any
+  store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
+  without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
+  check does send is recorded in history (source `scan`), finding or not.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
   GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
@@ -744,7 +829,11 @@ Crawl and active-scan scope and safety flags:
   GET, HEAD, OPTIONS and POST unless `--include-methods` adds others. Credentials in the
   document (Postman auth, secret-named headers, query parameters and body fields, and variables
   they use) are reported by name in `credentials` and never sent or stored; use an auth profile.
-  A document fetched from a URL isn't kept in history either.
+  A document fetched from a URL is recorded in history (source `import`) as it was sent and
+  answered, like any other request (so are `--graphql`'s introspection and `scan active --api`'s
+  fetch), except the document itself: the row keeps the response's head, and its error says
+  `API document: body omitted (it can hold credentials the import withholds)` with the body's
+  length and sha256 (the `document_sha256` the import reports).
 - Postman environments: `--environment FILE` reads an environment export for the collection's
   variables (a local file only; `--var` goes on top). Values the environment marks secret, or whose
   names look like credentials, are withheld like the collection's own, and the preview lists them as
@@ -829,15 +918,16 @@ OAuth 2.0 in an auth profile, in place of a login:
   registered with a fixed port; any free port otherwise) with PKCE (S256) and a `state` check. A
   redirect without the right `state`, or on another path, is refused and the wait goes on.
 - `auth oauth discover URL` reads an OpenID Connect discovery document (in scope) and prints the
-  token and sign-in URLs.
+  token and sign-in URLs. The fetch is recorded in history (source `auth`), as `send` records.
 - The token goes on requests as `Authorization: Bearer «auth:NAME:token»`, filled on the wire like a
   login's token. A token due to expire within 30 seconds is renewed before the next request, once
   however many requests notice, with the refresh token when there is one (a rotated one replaces
   it) and the flow's own grant when it fails; a 401 renews it too, within `--max-relogins`. A
   browser sign-in that can't be renewed asks for `auth oauth authorize` again.
 - The token endpoint must be in the engagement's scope; nothing widens it. Token requests get none
-  of the profile's other credentials, follow no redirects, and aren't recorded in history, since they
-  carry the client secret and the answers hold tokens. Errors give the endpoint's `error` code, never
+  of the profile's other credentials and follow no redirects. Their history rows keep only the
+  method, URL without its query, and outcome, since they carry the client secret and the answers
+  hold tokens. Errors give the endpoint's `error` code, never
   its description. `auth status` says whether there is a token and a refresh token, and when the
   token expires, never what they are.
 - Only bearer tokens are taken. Not built: the device code and implicit flows, private-key JWT
@@ -926,6 +1016,56 @@ and targets that want a JWT you choose the claims of:
   `--session-token-env` (and by `auth add`'s `--header-env`, `--query-key`, `--password-env` and
   `--oauth-*-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
   browser.
+
+### What is recorded when a request doesn't finish
+
+Every request brainproxy puts on the wire leaves a history row, whatever happens next.
+
+- `send`, `send --race` and `ws send` write each request's row just before it goes out, with
+  the error `sent; no response recorded (cancelled or interrupted)`, and complete it with the
+  response or the failure. A command that is killed or crashes keeps that row. Ctrl-C or
+  SIGTERM while it waits records `cancelled by user before a response was recorded` instead
+  (the request may not have gone out yet, if its connection was still opening), and the
+  command fails. A row already answered is never changed.
+- With `--auth`, the session's own requests (login, CSRF page, check URL, macro steps) are
+  recorded the same way, with source `auth`. A request answered with "logged out" keeps its
+  row (the 401, say); the request sent again after the re-login gets a second row. Stopped
+  during the re-login, the login's row keeps the pending error.
+- OAuth token requests carry the client secret and the answers hold tokens, so their rows
+  keep no content: method, URL without its query string, time, and how they ended, with an
+  error starting `token request: content omitted`.
+- The app, and the MCP server when a call is cancelled or times out, stop a command with
+  SIGTERM and kill it 3 seconds later if it is still running. Windows has no SIGTERM: there
+  the command is killed at once, and its row keeps the pending error.
+- `ws send` records the connection and each message as they happen, not at the end (a
+  message to the server when it is queued, so one queued just before the connection dropped
+  may not have gone out). Killed while listening, the connection stays `open` with every
+  message up to then; stopped with Ctrl-C or SIGTERM, it is closed with that error.
+- An HTTP/2 race (`send --race N --http2`) that fails after connecting records each copy
+  with the error. If no copy got a response, the command fails with the error's kind (exit
+  3) and the message lists the rows; with `--format json` the envelope's `data.results`
+  has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
+- The requests a `scan active --checks` template sends, and the document fetches of `import`
+  and `scan active --api` (with `--graphql`, the introspection), are recorded the same way: a row
+  just before the request goes out, completed with the response or the failure. A check request
+  cut off by its timeout, or by a stopped scan, keeps `sent; no response recorded (the check
+  timed out or the scan stopped)`.
+- `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
+  for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
+  before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent, and
+  neither is a re-login retry. The proxy then writes out every capture still queued
+  (passive checks of the last ones wait for the next scan); `proxy stop` waits up to 30
+  seconds for it to exit before killing it.
+- `--no-store` (`send`, `send --race`, `ws send`) keeps no content, but still writes a row:
+  the time, source, target, method, and path. The query string is left out too, since it
+  often holds a token: `query` is empty, and `url` and the stored request line stop at the
+  path. Headers, bodies, and the response are left out, `status` is empty (so passive checks
+  skip it), and `error` starts with `not stored (--no-store): content omitted`, then
+  `; query string omitted` if there was one, then how it ended (`; response status 200`,
+  or the failure). The session's own requests for that command (`--auth`) are recorded the
+  same way. Find these rows with `SELECT * FROM history WHERE error LIKE 'not stored%'`.
+  `ws send --no-store` records the handshake that way and nothing of the connection or its
+  messages.
 
 ### Comparing findings and failing a build (`findings compare`)
 
@@ -1045,7 +1185,9 @@ control. Low ones are only in the results, to review.
 Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
 replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
 another user. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
-so the owner stays logged in. `--history-id` picks a request whatever its method. URLs on
+so the owner stays logged in. A request picked with `--history-id` may lack credentials, but its
+method needs `--include-methods` like any other, and one matching `--exclude` is refused
+(exit code 2, nothing sent) unless `--exclude` is given a pattern it doesn't match. URLs on
 the command line are fetched with GET and need `--owner`. Every request stays inside the
 engagement scope and is recorded in history with source `authz`.
 
@@ -1096,6 +1238,14 @@ and capabilities are available as resources. Add it to an MCP client:
 ```
 
 The agent works under the same engagement scope; it cannot reach anything outside it.
+Everything its tool calls record (history, findings, finding state changes) is marked with
+origin `mcp`, including what a proxy or job it started records; see
+[Who recorded what](#who-recorded-what).
+
+A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
+and `fuzz run --store none` or `--store matches` are refused. `browser open` isn't offered (the
+project's browser profile keeps the person's sign-ins), and other options that need a person are
+refused too; docs/MCP.md lists them.
 
 ---
 

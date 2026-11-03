@@ -70,9 +70,24 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("attack", "TEXT", "Payload that triggered an active finding"),
     ("history_id", "INTEGER", "history.id where first seen"),
     ("last_history_id", "INTEGER", "history.id where last seen"),
-    ("hits", "INTEGER", "Times seen (same alert, method, URL without query, param)"),
+    (
+        "hits",
+        "INTEGER",
+        "Times seen (same alert, method, URL without query, param); 0 for a triaged passive finding that \
+         `scan passive --rescan` didn't find again (kept so its triage isn't lost)",
+    ),
     ("state", "TEXT", "open, confirmed, false_positive"),
     ("note", "TEXT", "Free-text note"),
+    (
+        "origin",
+        "TEXT",
+        "Who or what added it: gui (the desktop app), cli (a terminal or script), mcp (an agent through MCP); \
+         NULL for findings from before brainproxy kept it",
+    ),
+    ("state_origin", "TEXT", "gui, cli or mcp: who last changed state with `findings mark`; NULL if never changed"),
+    ("state_changed_at", "TEXT", "UTC time of the last state change; NULL if never changed"),
+    ("note_origin", "TEXT", "gui, cli or mcp: who last set the note with `findings mark --note`; NULL if never set"),
+    ("note_changed_at", "TEXT", "UTC time the note was last set"),
 ];
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
@@ -192,8 +207,8 @@ impl Store {
             )?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, wasc, host,
-                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18)
+                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id
                  RETURNING hits",
             )?;
@@ -230,6 +245,7 @@ impl Store {
                         msg.history_id,
                         dedupe,
                         truncate(&f.attack, 2000),
+                        crate::provenance::origin(),
                     ],
                     |r| r.get(0),
                 )?;
@@ -277,7 +293,7 @@ impl Store {
         let (where_sql, args) = filter.sql();
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
-                hits, history_id, state
+                hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -296,6 +312,11 @@ impl Store {
                 "hits": r.get::<_, i64>(10)?,
                 "history_id": r.get::<_, Option<i64>>(11)?,
                 "state": r.get::<_, String>(12)?,
+                "origin": r.get::<_, Option<String>>(13)?,
+                "state_origin": r.get::<_, Option<String>>(14)?,
+                "state_changed_at": r.get::<_, Option<String>>(15)?,
+                "note_origin": r.get::<_, Option<String>>(16)?,
+                "note_changed_at": r.get::<_, Option<String>>(17)?,
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -313,6 +334,8 @@ impl Store {
         let row = r.rows.into_iter().next().ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
         let mut obj: serde_json::Map<String, Value> = r.columns.into_iter().zip(row).collect();
         obj.remove("dedupe");
+        let origin = obj.get("origin").and_then(Value::as_str).map(str::to_string);
+        obj.insert("origin_text".into(), json!(format!("added {}", crate::provenance::describe(origin.as_deref()))));
         for k in ["refs", "tags"] {
             if let Some(Value::String(s)) = obj.get(k) {
                 let v = serde_json::from_str(s).unwrap_or(Value::Null);
@@ -322,11 +345,19 @@ impl Store {
         Ok(Value::Object(obj))
     }
 
-    /// Sets a finding's triage state and/or note.
+    /// Sets a finding's triage state and/or note. Each change records who made it and when,
+    /// so a finding hidden as a false positive, or a note replaced, says by whom.
     pub fn finding_mark(&self, id: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note) WHERE id = ?3",
-            params![state, note, id],
+            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note),
+                state_origin = CASE WHEN ?1 IS NULL THEN state_origin ELSE ?4 END,
+                state_changed_at = CASE WHEN ?1 IS NULL THEN state_changed_at
+                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
+                note_origin = CASE WHEN ?2 IS NULL THEN note_origin ELSE ?4 END,
+                note_changed_at = CASE WHEN ?2 IS NULL THEN note_changed_at
+                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
+             WHERE id = ?3",
+            params![state, note, id, crate::provenance::origin()],
         )?;
         if n == 0 {
             return Err(Error::NotFound(format!("finding {id}")));
@@ -334,9 +365,42 @@ impl Store {
         Ok(())
     }
 
-    /// Removes passive findings and resets the scan watermark, for a full rescan.
-    pub fn findings_reset(&self, source: &str) -> Result<usize> {
-        Ok(self.conn.execute("DELETE FROM findings WHERE source = ?1", [source])?)
+    /// Starts a full rescan of `source` findings: their hit counts go to 0, to be counted again,
+    /// and nothing else changes, so a finding found again keeps its id, state, note and who
+    /// set them. Returns the highest finding id, to tell new findings from the ones found again.
+    pub(crate) fn findings_rescan_start(&mut self, source: &str) -> Result<i64> {
+        let tx = self.write_tx()?;
+        tx.execute("UPDATE findings SET hits = 0 WHERE source = ?1", [source])?;
+        let max: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM findings", [], |r| r.get(0))?;
+        tx.commit()?;
+        Ok(max)
+    }
+
+    /// Ends a rescan: a finding it didn't find again goes, unless someone triaged it (changed
+    /// its state or wrote a note). That one stays with 0 hits, so a person's decision isn't lost
+    /// to a rescan an agent ran. Returns (removed, kept).
+    pub(crate) fn findings_rescan_finish(&mut self, source: &str) -> Result<(usize, usize)> {
+        let tx = self.write_tx()?;
+        let triaged = "(state != 'open' OR note IS NOT NULL OR state_origin IS NOT NULL)";
+        let removed =
+            tx.execute(&format!("DELETE FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}"), [source])?;
+        let kept: i64 = tx.query_row(
+            &format!("SELECT count(*) FROM findings WHERE source = ?1 AND hits = 0 AND {triaged}"),
+            [source],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok((removed, kept as usize))
+    }
+
+    /// Findings of `source` added after finding `after`.
+    pub(crate) fn findings_count_after(&self, source: &str, after: i64) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM findings WHERE source = ?1 AND id > ?2",
+            params![source, after],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 }
 

@@ -36,6 +36,15 @@ pub struct Capture {
     pub response: Vec<u8>,
     /// Recorded in the tags column (a race tags each of its rows, for one).
     pub tags: Vec<String>,
+    /// Who or what recorded it (`gui`, `cli`, `mcp`); None: this process's origin.
+    pub origin: Option<String>,
+    /// The proxy client's address (`ip:port`), for captures the proxy records.
+    pub client_addr: Option<String>,
+    /// The TLS server name sent when it was overridden (`--sni`); None: the SNI override in
+    /// effect for this process, if any.
+    pub sni: Option<String>,
+    /// Who changed the request before it went out (intercept edits, rules), for the proxy.
+    pub edited_by: Vec<crate::provenance::Edit>,
 }
 
 impl Capture {
@@ -80,6 +89,7 @@ impl Capture {
             duration_ms,
             error: error.map(str::to_string),
             request: request.to_vec(),
+            client_addr: (source == "proxy").then(crate::proxy::server::client_addr).flatten(),
             ..Default::default()
         };
 

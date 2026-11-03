@@ -110,13 +110,29 @@ pub struct Outcome {
 /// answers as it goes can't block the sending), answers pings, and records everything until a
 /// stop condition, then closes the connection.
 pub async fn talk(opened: Opened, messages: &[(u8, Vec<u8>)], opts: &Options) -> Outcome {
+    talk_watched(opened, messages, opts, |_| {}).await
+}
+
+/// [`talk`], calling `watch` with each event as it happens: a message to the server when it
+/// is queued to be written (the ones given are all queued at the start, so a connection that
+/// drops early may not have sent the last of them), one from the server as it arrives. A
+/// caller can record as it goes, so what was sent is on record even if it never gets the
+/// outcome. `watch` runs on the reading task: it mustn't block.
+pub async fn talk_watched(
+    opened: Opened,
+    messages: &[(u8, Vec<u8>)],
+    opts: &Options,
+    mut watch: impl FnMut(&Event),
+) -> Outcome {
     let started = Instant::now();
     let Opened { conn: Conn { stream, reader, .. }, deflate, .. } = opened;
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut out = Outcome { stopped: "wait", ..Default::default() };
     let elapsed = |s: Instant| s.elapsed().as_millis() as u64;
-    let sent = |out: &mut Outcome, m: Message| {
-        out.events.push(Event { direction: Direction::ToServer, message: m, elapsed_ms: elapsed(started) })
+    let mut push = |out: &mut Outcome, direction: Direction, message: Message| {
+        let e = Event { direction, message, elapsed_ms: elapsed(started) };
+        watch(&e);
+        out.events.push(e);
     };
 
     // The writer sends the messages, says when they are all out, then whatever the reader
@@ -126,7 +142,7 @@ pub async fn talk(opened: Opened, messages: &[(u8, Vec<u8>)], opts: &Options) ->
     let first: Vec<Vec<u8>> =
         messages.iter().map(|(op, p)| encode_frame(true, 0, *op, p, Some(random_mask()))).collect();
     for (opcode, payload) in messages {
-        sent(&mut out, Message::new(*opcode, payload.clone()));
+        push(&mut out, Direction::ToServer, Message::new(*opcode, payload.clone()));
     }
     let writer = async move {
         for frame in first {
@@ -170,15 +186,11 @@ pub async fn talk(opened: Opened, messages: &[(u8, Vec<u8>)], opts: &Options) ->
                         break 'read;
                     }
                 };
-                out.events.push(Event {
-                    direction: Direction::ToClient,
-                    message: m.clone(),
-                    elapsed_ms: elapsed(started),
-                });
+                push(&mut out, Direction::ToClient, m.clone());
                 match m.opcode {
                     OP_PING => {
                         if queue.send(encode_frame(true, 0, OP_PONG, &m.payload, Some(random_mask()))).is_ok() {
-                            sent(&mut out, Message::new(OP_PONG, m.payload.clone()));
+                            push(&mut out, Direction::ToServer, Message::new(OP_PONG, m.payload.clone()));
                         }
                     }
                     OP_CLOSE => {
@@ -190,7 +202,7 @@ pub async fn talk(opened: Opened, messages: &[(u8, Vec<u8>)], opts: &Options) ->
                             out.stopped = "closed";
                             let payload = code.map(|c| c.to_be_bytes().to_vec()).unwrap_or_default();
                             if queue.send(encode_frame(true, 0, OP_CLOSE, &payload, Some(random_mask()))).is_ok() {
-                                sent(&mut out, Message::new(OP_CLOSE, payload));
+                                push(&mut out, Direction::ToServer, Message::new(OP_CLOSE, payload));
                             }
                         }
                         break 'read;
@@ -212,7 +224,7 @@ pub async fn talk(opened: Opened, messages: &[(u8, Vec<u8>)], opts: &Options) ->
                 close_sent = true;
                 let payload = close_payload(1000, "");
                 if queue.send(encode_frame(true, 0, OP_CLOSE, &payload, Some(random_mask()))).is_ok() {
-                    sent(&mut out, Message::new(OP_CLOSE, payload));
+                    push(&mut out, Direction::ToServer, Message::new(OP_CLOSE, payload));
                 }
                 deadline = Instant::now() + CLOSE_WAIT;
             }

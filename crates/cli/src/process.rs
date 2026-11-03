@@ -70,6 +70,15 @@ pub(crate) async fn shutdown(store: &Store, key: &str) {
             }
         }
     };
+    tokio::select! {
+        _ = interrupted() => {}
+        _ = flagged => {}
+    }
+}
+
+/// Resolves on ctrl-c or, on unix, SIGTERM: how a shell, `proxy stop`, and the GUI's Stop ask
+/// a command to end. (Windows has no SIGTERM; the GUI's Stop ends the process there.)
+pub(crate) async fn interrupted() {
     #[cfg(unix)]
     let term = async {
         use tokio::signal::unix::{signal, SignalKind};
@@ -85,8 +94,23 @@ pub(crate) async fn shutdown(store: &Store, key: &str) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term => {}
-        _ = flagged => {}
     }
+}
+
+/// Ends a child we started: asks it to exit (SIGTERM, so a command that already sent
+/// something records it as cancelled), and kills it if it is still running after `grace`.
+/// Windows has no such request: the child is killed at once.
+pub(crate) fn end_child(child: &mut std::process::Child, grace: Duration) {
+    // Not reaped until it is waited for, so its pid is still ours to signal.
+    if cfg!(unix) && matches!(child.try_wait(), Ok(None)) {
+        sys::ask_to_exit(child.id());
+        let deadline = Instant::now() + grace;
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Whether `pid` is a live process we may stop.

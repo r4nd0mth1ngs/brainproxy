@@ -114,7 +114,8 @@ pub struct SinglePacket {
 }
 
 /// Sends `requests` with the HTTP/2 single-packet attack. `duration_ms` is
-/// measured from the release of the final frames.
+/// measured from the release of the final frames. An error means nothing was sent (bad
+/// requests); once connecting starts, a failure comes back as each request's result.
 pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u8>>) -> Result<SinglePacket> {
     if requests.is_empty() || requests.len() > SINGLE_PACKET_MAX {
         return Err(Error::InvalidInput(format!("single-packet races take 1 to {SINGLE_PACKET_MAX} requests")));
@@ -126,19 +127,31 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
     // Recorded with the auth placeholders, not the values sent.
     let recorded: Vec<Vec<u8>> =
         requests.iter().map(|r| H2Request::from_raw(r, target).map(|h| h.recorded)).collect::<Result<_>>()?;
+    // From here on, requests may be on the wire: a failure is every request's result, so
+    // each copy is recorded with it.
+    let failed = |e: Error| {
+        let results = (0..requests.len()).map(|_| Err(e.duplicate())).collect();
+        Ok(SinglePacket { results, synced: 0 })
+    };
     // Kept until the responses are read: dropping every sender closes the connection.
     // The timeout also covers servers allowing fewer concurrent streams than requests.
     let timeout = client.options().timeout;
-    let (_sender, pending, state) = tokio::time::timeout(timeout, send_all_but_last(client, target, &converted))
+    let (_sender, pending, state) = match tokio::time::timeout(timeout, send_all_but_last(client, target, &converted))
         .await
-        .map_err(|_| Error::Timeout(timeout))?
-        .map_err(|e| setup_error(target, e))?;
+        .map_err(|_| Error::Timeout(timeout))
+        .and_then(|r| r.map_err(|e| setup_error(target, e)))
+    {
+        Ok(v) => v,
+        Err(e) => return failed(e),
+    };
 
     // 3. Hold writes, queue the final frames, release them in one write.
     state.lock().unwrap().held = Some(Vec::new());
     let mut futures = Vec::new();
     for (fut, mut stream, last) in pending {
-        stream.send_data(last, true).map_err(h2_error)?;
+        if let Err(e) = stream.send_data(last, true) {
+            return failed(h2_error(e));
+        }
         futures.push(fut);
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -427,6 +440,29 @@ mod tests {
             .await
             .expect("race ignored the client timeout");
         assert!(results.iter().all(|r| matches!(r, Err(Error::Timeout(_)))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_single_packet_race_fails_every_request() {
+        // A server that answers HTTP/2 prior knowledge with HTTP/1.1 and hangs up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await;
+            }
+        });
+        let target = Target { scheme: "http".into(), host: "127.0.0.1".into(), port };
+        let req = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes();
+        let run = single_packet(&client(false), &target, vec![req.clone(); 3]).await.unwrap();
+        assert_eq!((run.results.len(), run.synced), (3, 0));
+        assert!(
+            run.results.iter().all(|r| matches!(r, Err(Error::Protocol(_)))),
+            "{:?}",
+            run.results[0].as_ref().err()
+        );
+        // Requests that can't be sent at all are still one error.
+        assert!(single_packet(&client(false), &target, vec![req; SINGLE_PACKET_MAX + 1]).await.is_err());
     }
 
     #[tokio::test]
