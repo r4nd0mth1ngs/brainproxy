@@ -34,6 +34,8 @@ pub struct Capture {
     pub error: Option<String>,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
+    /// Recorded in the tags column (a race tags each of its rows, for one).
+    pub tags: Vec<String>,
     /// Who or what recorded it (`gui`, `cli`, `mcp`); None: this process's origin.
     pub origin: Option<String>,
     /// The proxy client's address (`ip:port`), for captures the proxy records.

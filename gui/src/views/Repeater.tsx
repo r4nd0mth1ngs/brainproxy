@@ -1,12 +1,33 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { bodyText, cancelCli, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
+import { bodyText, cancelCli, isBinary, MAX_BODY, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { copyAsCurl, CurlDialog } from "../ui/CurlDialog";
+import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { confirm } from "../ui/Confirm";
 import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { activeLabels, curlOptions, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
+import {
+  firstOpenable,
+  openable,
+  parseRaceCount,
+  patchOpen,
+  plannedTechnique,
+  RACE_MAX_HTTP2,
+  RACE_MIN,
+  raceArgs,
+  raceMax,
+  raceRows,
+  raceSummary,
+  sentRequestLine,
+  shapeLabel,
+  syncNote,
+  techniqueLabel,
+  type Raced,
+  type RaceResult,
+  type RaceRow,
+} from "./race";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
@@ -22,6 +43,8 @@ interface Sent {
   labels: string[];
   result: SendResult | null;
   error: string | null;
+  /** A race (`send --race`): its results and the one open in the response pane. */
+  race?: Raced;
 }
 
 const BLANK = "GET / HTTP/1.1\nHost: \nUser-Agent: brainproxy\nAccept: */*\n\n";
@@ -117,6 +140,16 @@ export function RepeaterView() {
 }
 
 const AUTO_ENCODE = "repeater-auto-encode";
+const RACE_COUNT = "repeater-race-count";
+
+const RACE_COLUMNS: Column<RaceRow>[] = [
+  { key: "idx", label: "#", width: 50, value: (r) => r.idx + 1, align: "right" },
+  { key: "status", label: "Status", width: 70, value: (r) => r.status ?? r.error, render: (r) => r.status ?? <span className="error">{r.error}</span> },
+  { key: "length", label: "Length", width: 80, value: (r) => r.length, align: "right" },
+  { key: "time", label: "Time (ms)", width: 80, value: (r) => r.duration_ms, align: "right" },
+  { key: "id", label: "History", width: 70, value: (r) => r.id, render: (r) => (r.id == null ? "" : `#${r.id}`) },
+  { key: "differs", label: "", width: 120, value: (r) => (r.differs ? 1 : 0), render: (r) => (r.differs ? <span className="race-differs-tag">differs</span> : "") },
+];
 
 function storedAutoEncode(): boolean {
   try {
@@ -127,11 +160,14 @@ function storedAutoEncode(): boolean {
 }
 
 // Send history survives switching tabs (the tab view remounts), keyed by tab; so does a send
-// in flight, so its result lands in its tab and Stop stays (replayCalls.ts).
+// or race in flight, so its result lands in its tab and Stop stays (replayCalls.ts). A race
+// can run for a while: coming back to its tab shows it still running.
 const sentByTab = tabSlot<{ list: Sent[]; at: number }>({ list: [], at: -1 });
 
 function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const app = useApp();
+  // Pinned to this project: another may be open by the time a send or race ends.
+  const { project } = app;
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
@@ -143,6 +179,14 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   // The send in flight, so Stop can cancel it (a long timeout would otherwise hold the tab).
   const [call] = useTabSlot(replayCalls, tab.key);
   const busy = call != null;
+  const racing = busy && call.startsWith("replay-race-");
+  const [raceCount, setRaceCount] = useState(() => {
+    try {
+      return localStorage.getItem(RACE_COUNT) || "20";
+    } catch {
+      return "20";
+    }
+  });
 
   // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
   // tabs return the same array, so React skips the update; a new array every time changed
@@ -173,7 +217,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const id = beginCall(key, "replay-send");
     let entry: Sent;
     try {
-      const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: id });
+      const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: id, project });
       entry = { raw, sent, encoded, labels, result, error: null };
     } catch (e: any) {
       entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "http") };
@@ -187,6 +231,56 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const problem = optionsProblem(options);
     if (problem) return app.toast(problem, "error");
     copyAsCurl(requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, withScheme(guessTarget(raw, target)), tab.binary, app.toast, curlOptions(options));
+  };
+
+  const race = async () => {
+    // The limit depends on the request line as sent (HTTP/2 or not), after auto URL-encoding.
+    const { text: sent, encoded } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
+    const n = parseRaceCount(raceCount, sent);
+    if (n == null) return app.toast(`Race takes ${RACE_MIN} to ${raceMax(sent)} requests (${plannedTechnique(sent)})`, "error");
+    const to = withScheme(guessTarget(raw, target));
+    if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
+    setTarget(to);
+    try {
+      localStorage.setItem(RACE_COUNT, String(n));
+    } catch {
+      /* storage unavailable */
+    }
+    const labels = activeLabels(options, "http");
+    const key = tab.key;
+    const id = beginCall(key, "replay-race");
+    let entry: Sent;
+    try {
+      const result = await run<RaceResult>(raceArgs(to, n), { stdin: textBytes(sent, tab.binary), call: id, project });
+      entry = { raw, sent, encoded, labels, result: null, error: null, race: { result, open: null } };
+    } catch (e: any) {
+      entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "http") };
+    }
+    // The tab or the project closed while it ran: nothing to show the response in.
+    if (!endCall(key, id)) return;
+    sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
+    if (entry.race) {
+      const first = firstOpenable(raceRows(entry.race.result));
+      if (first != null) openRaced(first, entry.race.result);
+    }
+  };
+
+  // Opens one raced response in the response pane (`history show`). The race's entry is found by
+  // its result (the list may have grown since), and the response only lands if that row is
+  // still the one open in it.
+  const openRaced = async (idx: number, result: RaceResult) => {
+    const key = tab.key;
+    const item = raceRows(result)[idx];
+    sentByTab.update(key, (s) => ({ ...s, list: s.list.map((e) => (e.race?.result === result ? { ...e, race: { result, open: idx }, result: null, error: item.error } : e)) }));
+    // A failure's row holds only its error, shown already.
+    if (!openable(item)) return;
+    const patch = (p: Partial<Sent>) => sentByTab.update(key, (s) => ({ ...s, list: patchOpen(s.list, result, idx, p) }));
+    try {
+      const entry = await run<HistoryEntry>(["history", "show", String(item.id), MAX_BODY], { project });
+      patch({ result: entry, error: null });
+    } catch (e: any) {
+      patch({ error: e.message });
+    }
   };
 
   const go = (d: number) => {
@@ -211,17 +305,44 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
 
   const r = current?.result;
   const note = current ? sentWithNote(current.labels, activeLabels(options, "http")) : null;
+  const raced = current?.race;
+  const line = sentRequestLine(raw, autoEncode);
+  const rows = raced ? raceRows(raced.result) : [];
+  const summary = raced ? raceSummary(raced.result) : null;
+  const partial = raced ? syncNote(raced.result) : null;
+  const response = (
+    <HttpView
+      title={raced?.open != null ? `Response #${raced.open + 1} of ${rows.length}` : "Response"}
+      value={responseText(r ?? null)}
+      binary={isBinary(r?.response?.body)}
+      placeholder={current?.error ?? (busy ? "Waiting for the response…" : raced ? (raced.open != null ? "Loading the response…" : "Select a response above") : "Send the request to see the response")}
+      extra={
+        r && (
+          <button className="btn small" onClick={() => app.sendToComparer(responseText(r))}>
+            To Diff
+          </button>
+        )
+      }
+    />
+  );
   return (
     <div className="col fill" onKeyDown={() => {}}>
       <div className="toolbar">
         <button className="btn primary" disabled={busy} onClick={send} title="Send (⌘/Ctrl+Enter)">
-          {busy ? "Sending…" : "Send"}
+          {busy && !racing ? "Sending…" : "Send"}
         </button>
         {busy && (
           <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request. It may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded).">
             Stop
           </button>
         )}
+        <div className="race-ctl" title={`Send the request ${raceCount || "N"} times at once to look for race conditions: ${plannedTechnique(line)}. A request line ending in HTTP/2 uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}>
+          <button className="btn" disabled={busy} onClick={race}>
+            {racing ? "Racing…" : "Race"}
+          </button>
+          <span className="label">×</span>
+          <input className="input mono" type="number" aria-label="Race count" min={RACE_MIN} max={raceMax(line)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+        </div>
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
             ‹
@@ -270,6 +391,18 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
             {current.encoded} char{current.encoded === 1 ? "" : "s"} URL-encoded
           </span>
         )}
+        {raced && summary && (
+          <span className="tag" title={[partial, raced.result.race_id && `History rows tagged race:${raced.result.race_id}`].filter(Boolean).join("\n") || undefined}>
+            race ×{raced.result.race} · {techniqueLabel(raced.result.sync)}
+            {partial ? " (partial)" : ""}
+          </span>
+        )}
+        {raced && summary && (
+          <span className="muted" title={summary.baseline == null ? undefined : `Compared with the most common result: ${shapeLabel(raced.result.results[summary.baseline])} (first at #${summary.baseline + 1})`}>
+            {summary.spread == null ? "no responses" : `spread ${summary.spread} ms`} · {summary.differing ? `${summary.differing} differ from the most common` : "all alike"}
+            {summary.errors ? ` · ${summary.errors} failed` : ""}
+          </span>
+        )}
         {r?.response && (
           <span className="muted">
             {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms ·{" "}
@@ -280,19 +413,22 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
       {showOptions && <OptionsRow id={optionsId} options={options} set={setOptions} kind="http" binary={tab.binary} />}
       <Split id="repeater" dir="row">
         <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} />
-        <HttpView
-          title="Response"
-          value={responseText(r ?? null)}
-          binary={isBinary(r?.response?.body)}
-          placeholder={current?.error ?? (busy ? "Waiting for the response…" : "Send the request to see the response")}
-          extra={
-            r && (
-              <button className="btn small" onClick={() => app.sendToComparer(responseText(r))}>
-                To Diff
-              </button>
-            )
-          }
-        />
+        {raced ? (
+          <Split id="repeater-race" dir="col" initial={0.35}>
+            <DataTable
+              rows={rows}
+              columns={RACE_COLUMNS}
+              rowKey={(x) => x.idx}
+              selected={raced.open}
+              onSelect={(x) => openRaced(x.idx, raced.result)}
+              rowClass={(x) => (x.differs ? "race-differs" : undefined)}
+              initialSort={{ key: "idx", desc: false }}
+            />
+            {response}
+          </Split>
+        ) : (
+          response
+        )}
       </Split>
     </div>
   );

@@ -269,6 +269,9 @@ brainproxy fuzz stop 3
 brainproxy send req.http --race 20
 # HTTP/2 single-packet attack: one connection, all final frames in one TCP packet
 brainproxy send req.http --race 20 --http2
+# Every copy is recorded and tagged race:RACE_ID (race_id in the output), race-sync:...,
+# race-pos:I/N, and race-partial when not every final frame fitted in the one packet
+brainproxy history list --tag race:RACE_ID
 
 # HTTP/2 (ALPN h2; h2c prior knowledge for http://) on send, fuzz, crawl, scan active.
 # Recorded as "GET /x HTTP/2"; such a request is re-sent over HTTP/2 automatically.

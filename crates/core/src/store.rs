@@ -241,10 +241,14 @@ pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
     ("resp_body_text", "TEXT", "Response body as text if valid UTF-8, else NULL"),
     ("resp_body_length", "INTEGER", "Length of the decoded response body"),
     ("title", "TEXT", "HTML <title>, if any"),
-    ("duration_ms", "INTEGER", "Round-trip time"),
+    ("duration_ms", "INTEGER", "Round-trip time (race rows: from the release of the final bytes)"),
     ("error", "TEXT", "Error message when no response was received"),
     ("note", "TEXT", "Free-text note (set with `history note`)"),
-    ("tags", "TEXT", "JSON array of tags (set with `history tag`)"),
+    (
+        "tags",
+        "TEXT",
+        "JSON array of tags (set with `history tag`; send --race adds race:ID, race-sync:..., race-pos:I/N)",
+    ),
     ("request", "BLOB", "Raw request bytes exactly as sent"),
     ("response", "BLOB", "Raw response bytes exactly as received"),
     (
@@ -584,6 +588,18 @@ impl Store {
         let mut ids = Vec::with_capacity(captures.len());
         for c in captures {
             ids.push(insert_capture(&tx, c)?);
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// [`Store::record_batch`] for `n` captures built one at a time by `capture(i)`, so only
+    /// one (decoded bodies and all) is held at once.
+    pub fn record_each(&mut self, n: usize, mut capture: impl FnMut(usize) -> Capture) -> Result<Vec<i64>> {
+        let tx = self.write_tx()?;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(insert_capture(&tx, &capture(i))?);
         }
         tx.commit()?;
         Ok(ids)
@@ -1086,6 +1102,29 @@ impl Store {
         Ok(())
     }
 
+    /// Adds `add` to the tags of rows `ids`, in one transaction, as the tags they were recorded
+    /// with (a race marking its rows partial once it knows): who last changed the tags stays
+    /// as it was, unlike [`Store::update_tags`].
+    pub fn add_recorded_tags(&mut self, ids: &[i64], add: &[String]) -> Result<()> {
+        let tx = self.write_tx()?;
+        for id in ids {
+            let current: String = tx
+                .query_row("SELECT tags FROM history WHERE id = ?1", [id], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| Error::NotFound(format!("history item {id}")))?;
+            let mut tags: Vec<String> = serde_json::from_str(&current).unwrap_or_default();
+            for t in add {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+            let json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
+            tx.execute("UPDATE history SET tags = ?1 WHERE id = ?2", params![json, id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Adds and removes tags; returns the resulting tag list.
     pub fn update_tags(&self, id: i64, add: &[String], remove: &[String]) -> Result<Vec<String>> {
         let current: String = self
@@ -1199,9 +1238,9 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
         "INSERT INTO history (source, scheme, host, port, method, url, path, query,
             req_headers, req_content_type, req_body, req_body_text,
             status, reason, resp_headers, resp_content_type, resp_body, resp_body_text, resp_body_length,
-            title, duration_ms, error, request, response, origin, client_addr, sni, edited_by)
+            title, duration_ms, error, request, response, origin, client_addr, sni, edited_by, tags)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-            ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+            ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             c.source,
             c.scheme,
@@ -1231,6 +1270,7 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
             c.client_addr,
             c.sni.clone().or_else(|| crate::provenance::sni_for(&c.scheme)),
             (!c.edited_by.is_empty()).then(|| serde_json::to_string(&c.edited_by).unwrap_or_default()),
+            serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1594,6 +1634,28 @@ mod tests {
         a.record_batch(&[capture]).unwrap();
         holder.join().unwrap();
         assert_eq!(a.list(&HistoryFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn records_a_capture_with_its_tags() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let mut c = Capture::new("race", &target, b"GET / HTTP/1.1\r\n\r\n", None, None, Some("boom"));
+        c.tags = vec!["race:x".into(), "race-pos:1/2".into()];
+        // Built one at a time, recorded together.
+        let ids = s.record_each(2, |i| Capture { title: Some(format!("#{i}")), ..c.clone() }).unwrap();
+        let untagged = s.record_failure("send", &target, b"GET / HTTP/1.1\r\n\r\n", "boom").unwrap();
+        let f = HistoryFilter { tag: Some("race:x".into()), ..Default::default() };
+        let mut found: Vec<(i64, Vec<String>)> = s.list(&f).unwrap().into_iter().map(|e| (e.id, e.tags)).collect();
+        found.sort();
+        let tags = vec!["race:x".to_string(), "race-pos:1/2".into()];
+        assert_eq!(found, [(ids[0], tags.clone()), (ids[1], tags)]);
+        assert_eq!(s.update_tags(untagged, &[], &[]).unwrap(), Vec::<String>::new());
+        // Tags added later as recorded ones (a partial race) aren't a change anyone made.
+        s.add_recorded_tags(&ids, &["race-partial".into()]).unwrap();
+        let e = s.get(ids[1]).unwrap().entry;
+        assert_eq!(e.tags, ["race:x", "race-pos:1/2", "race-partial"]);
+        assert_eq!(e.tags_origin, None);
     }
 
     #[test]

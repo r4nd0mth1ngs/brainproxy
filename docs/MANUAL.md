@@ -373,6 +373,23 @@ Edit a raw request and send it as often as you like, in separate tabs.
   - **Don't record** (`--no-store`): history keeps only a row with the time, target, method
     and path, without the query string, headers, bodies or response. Agents can't use it
     through MCP.
+- **Race:** set how many copies to send (2 to 1000) and click **Race** to send the request
+  that many times at once, to look for race conditions such as a coupon redeemed twice. Over
+  HTTP/1.1 each copy gets its own connection and the last byte of every copy is released
+  together (last-byte sync). When the request line ends in `HTTP/2`, all copies go on one
+  connection and their final frames leave in a single packet (single-packet attack, up to 100
+  copies). The toolbar shows which was used, the spread between the fastest and slowest
+  response, and how many responses differ from the most common one. Each copy is listed with
+  its status (or error), length, time since the release and history id; ones whose status or
+  length differ from the most common response are highlighted, and so is every failure. Select
+  one to open it. Every copy is recorded in Traffic (source `race`), tagged with the race it was
+  in (`race:ID`), how it was sent (`race-sync:last-byte` or `race-sync:single-packet`), its place
+  (`race-pos:3/20`), and `race-partial` when not every final frame fitted in the one packet;
+  its time is measured from the release. A last-byte race needs a connection per copy: if the
+  open-file limit (`ulimit -n`) has no room for that many, the race is refused before anything
+  is sent. You can switch tabs while a race runs; its results show up in its tab when it ends
+  (not if you close the project first). The same as `brainproxy send req.http --race 20`; in
+  the app the request line decides HTTP/2, while on the command line `--http2` does it too.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the

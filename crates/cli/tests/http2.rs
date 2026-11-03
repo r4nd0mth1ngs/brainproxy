@@ -92,8 +92,22 @@ fn send_race_and_fuzz_over_http2() {
     assert_eq!((d["sync"].as_str(), d["synced"].as_u64()), (Some("single-packet"), Some(8)), "{d}");
     assert_eq!(d["distinct_responses"].as_object().unwrap().values().map(|v| v.as_u64().unwrap()).sum::<u64>(), 8);
 
+    // Replay's Race: a raw request whose request line says HTTP/2 races single-packet without --http2.
+    let raw = format!("GET /race HTTP/2\r\nhost: 127.0.0.1:{port}\r\n\r\n");
+    let d = run(&["send", &format!("--target={base}"), "--race=3", "-"], &p, Some(raw.as_bytes()));
+    assert_eq!((d["sync"].as_str(), d["synced"].as_u64()), (Some("single-packet"), Some(3)), "{d}");
+    for r in d["results"].as_array().unwrap() {
+        assert!(r["id"].is_i64() && r["status"] == 200 && r["length"].is_u64() && r["duration_ms"].is_u64(), "{r}");
+    }
+    // Its rows say how it was run (all three final frames went out together: not partial).
+    let id = d["results"][2]["id"].to_string();
+    let tags = &run(&["history", "show", &id], &p, None)["entry"]["tags"];
+    let want =
+        [format!("race:{}", d["race_id"].as_str().unwrap()), "race-sync:single-packet".into(), "race-pos:3/3".into()];
+    assert_eq!(tags, &serde_json::json!(want), "{tags}");
+
     let d = run(&["fuzz", "run", "--http2", "--url", &format!("{base}/f?q=§x§"), "-p", "list:a,b,c,d"], &p, None);
     assert_eq!(d["run"]["done"], 4, "{d}");
-    // send, send, race, and fuzz: one connection each.
-    assert_eq!(accepted.load(Ordering::Relaxed), 4);
+    // send, send, race, race, and fuzz: one connection each.
+    assert_eq!(accepted.load(Ordering::Relaxed), 5);
 }

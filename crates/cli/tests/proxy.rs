@@ -390,6 +390,10 @@ fn fuzz_race_and_diff() {
     assert_eq!(r["results"].as_array().unwrap().len(), 5);
     assert!(r["results"].as_array().unwrap().iter().all(|i| i["status"] == 200));
     assert_eq!(env.count("SELECT count(*) FROM history WHERE source = 'race'"), 5);
+    // What Replay's Race shows: the technique, and per request a history id, length and time.
+    assert_eq!((r["sync"].as_str(), r["synced"].is_null()), (Some("last-byte"), true));
+    let first = &r["results"][0];
+    assert!(first["id"].is_i64() && first["length"].is_u64() && first["duration_ms"].is_u64(), "{first}");
 
     // Diff two different fuzz responses.
     let ids = env.ok(&["query", "SELECT min(id), max(id) FROM history WHERE source = 'fuzz'"]);

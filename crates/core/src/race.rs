@@ -320,6 +320,70 @@ impl AsyncWrite for Gate {
     }
 }
 
+/// A new race id: a random UUID (version 4), tagged on every row the race records.
+pub fn new_race_id() -> Result<String> {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut b).map_err(|_| Error::InvalidInput("no random bytes".into()))?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex::encode(b);
+    Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+}
+
+/// The tags on request `pos` (from 0) of a race of `n`: which race it was (`race:ID`), how it
+/// was synchronised (`race-sync:last-byte` or `race-sync:single-packet`), its position
+/// (`race-pos:3/20`), and `race-partial` when not every final frame went out together.
+pub fn row_tags(race_id: &str, sync: &str, partial: bool, pos: usize, n: usize) -> Vec<String> {
+    let mut tags = vec![format!("race:{race_id}"), format!("race-sync:{sync}"), format!("race-pos:{}/{n}", pos + 1)];
+    if partial {
+        tags.push("race-partial".into());
+    }
+    tags
+}
+
+/// Raises the soft limit on open files to the hard limit. A last-byte race holds a connection
+/// per request, and an app started from Finder or the Dock on macOS gets a soft limit of 256.
+/// Best effort: the limit stays as it was if it can't be raised.
+#[cfg(unix)]
+pub fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit and setrlimit only read or write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 || lim.rlim_cur >= lim.rlim_max {
+        return;
+    }
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: lim.rlim_max, ..lim }) } == 0 {
+        return;
+    }
+    // macOS refuses a soft limit above kern.maxfilesperproc, which an unlimited hard limit is;
+    // OPEN_MAX (10240) is always accepted.
+    let capped = lim.rlim_max.min(10240);
+    if capped > lim.rlim_cur {
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: capped, ..lim }) };
+    }
+}
+
+#[cfg(not(unix))]
+pub fn raise_fd_limit() {}
+
+/// The soft limit on open files and how many are open now, or None where there's no such
+/// limit to run into.
+#[cfg(unix)]
+pub fn fd_usage() -> Option<(usize, usize)> {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit only writes the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 || lim.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    let open = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+    Some((usize::try_from(lim.rlim_cur).unwrap_or(usize::MAX), open))
+}
+
+#[cfg(not(unix))]
+pub fn fd_usage() -> Option<(usize, usize)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +396,29 @@ mod tests {
         buf.extend([0, 0, 0, 0, 0, 0, 0, 0, 5]); // DATA without END_STREAM
         buf.extend([0, 0, 0, 1, 1, 0, 0, 0, 7]); // HEADERS with END_STREAM
         assert_eq!(end_streams(&buf), 2);
+    }
+
+    #[test]
+    fn race_ids_and_tags() {
+        let id = new_race_id().unwrap();
+        assert_eq!((id.len(), id.matches('-').count(), &id[14..15]), (36, 4, "4"), "{id}");
+        assert_ne!(id, new_race_id().unwrap());
+        assert_eq!(row_tags("x", "last-byte", false, 0, 20), ["race:x", "race-sync:last-byte", "race-pos:1/20"]);
+        assert_eq!(
+            row_tags("x", "single-packet", true, 19, 20),
+            ["race:x", "race-sync:single-packet", "race-pos:20/20", "race-partial"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_limit_is_raised_and_read() {
+        raise_fd_limit();
+        let (limit, open) = fd_usage().unwrap();
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        assert!(lim.rlim_cur == lim.rlim_max || lim.rlim_cur >= 10240, "{} of {}", lim.rlim_cur, lim.rlim_max);
+        assert!(open >= 3 && open < limit, "{open} of {limit}");
     }
 
     #[tokio::test]
