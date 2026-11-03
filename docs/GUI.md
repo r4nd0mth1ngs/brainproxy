@@ -177,8 +177,8 @@ Nothing is sent. When the description or solution differs from the one findings 
 title share, `findings add` refuses; the form then shows a checkbox to replace it
 (`--replace-text`, which keeps the earlier text). A warning (outside the scope, a linked history
 entry on another host or port, or a replaced description or solution) shows with the
-confirmation. Risk and confidence are radio groups, the method and URL inputs have their own
-labels, and Tab stays inside the dialog (`ui/dialogFocus.ts`, shared with the confirmation
+confirmation. Risk and confidence are named groups whose picked button is pressed
+(`aria-pressed`), the method and URL inputs have their own labels, and Tab stays inside the dialog (`ui/dialogFocus.ts`, shared with the confirmation
 dialog), with focus going back to where it was when it closes. Findings added by hand are
 grouped by title, tagged *by hand*, show *Added by hand* and their history entries instead of a
 rule, and have *Remove* (`findings remove`, after asking). A removed finding is kept with state

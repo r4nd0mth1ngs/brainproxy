@@ -30,7 +30,7 @@ function Field({ label, children, wide, group }: { label: string; children: Reac
   );
 }
 
-/** One of a few choices: a radio group, so a screen reader names the group and says which is picked. */
+/** One of a few choices: a named group of buttons, the picked one pressed, so a screen reader says both. */
 function Choice<T extends string>({ label, value, options, onPick, render }: { label: string; value: T; options: T[]; onPick: (v: T) => void; render?: (v: T) => ReactNode }) {
   const id = useId();
   return (
@@ -38,9 +38,9 @@ function Choice<T extends string>({ label, value, options, onPick, render }: { l
       <span className="label" id={id}>
         {label}
       </span>
-      <div className="seg" role="radiogroup" aria-labelledby={id}>
+      <div className="seg" role="group" aria-labelledby={id}>
         {options.map((o) => (
-          <button key={o} type="button" role="radio" aria-checked={value === o} className={value === o ? "on" : ""} onClick={() => onPick(o)}>
+          <button key={o} type="button" aria-pressed={value === o} className={value === o ? "on" : ""} onClick={() => onPick(o)}>
             {render ? render(o) : o}
           </button>
         ))}
