@@ -414,11 +414,14 @@ mod tests {
     #[test]
     fn fd_limit_is_raised_and_read() {
         raise_fd_limit();
-        let (limit, open) = fd_usage().unwrap();
         let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
         assert!(lim.rlim_cur == lim.rlim_max || lim.rlim_cur >= 10240, "{} of {}", lim.rlim_cur, lim.rlim_max);
-        assert!(open >= 3 && open < limit, "{open} of {limit}");
+        // Raised to an unlimited hard limit (which some systems accept), there is no limit to read.
+        match fd_usage() {
+            Some((limit, open)) => assert!(open >= 3 && open < limit, "{open} of {limit}"),
+            None => assert_eq!(lim.rlim_cur, libc::RLIM_INFINITY),
+        }
     }
 
     #[tokio::test]
