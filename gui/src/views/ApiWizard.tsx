@@ -312,7 +312,7 @@ export function ApiWizard(p: Props) {
           <h2>Check an API for security problems</h2>
         </div>
         <div className="wiz-row">
-          {/* Not while the scan starts: it may run with a profile offered for removal. */}
+          {/* Not while the scan starts, nor Back below: it may run with a profile offered for removal. */}
           <button className="link" disabled={busy} onClick={leave(p.onBack)}>
             Test a website instead
           </button>
@@ -367,7 +367,7 @@ export function ApiWizard(p: Props) {
 
       <footer className="row gap">
         {step > 0 && (
-          <button className="btn" onClick={() => setStep(step - 1)}>
+          <button className="btn" disabled={busy} onClick={() => setStep(step - 1)}>
             Back
           </button>
         )}
