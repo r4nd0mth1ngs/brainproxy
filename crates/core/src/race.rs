@@ -342,24 +342,63 @@ pub fn row_tags(race_id: &str, sync: &str, partial: bool, pos: usize, n: usize) 
     tags
 }
 
-/// Raises the soft limit on open files to the hard limit. A last-byte race holds a connection
-/// per request, and an app started from Finder or the Dock on macOS gets a soft limit of 256.
-/// Best effort: the limit stays as it was if it can't be raised.
+/// The highest soft limit on open files [`raise_fd_limit`] sets: far more than a race of 1000
+/// needs, and a real number, so a race's connections are still checked against a limit.
+pub const FD_SOFT_MAX: u64 = 65536;
+
+/// macOS's OPEN_MAX: a soft limit it always accepts.
+#[cfg(unix)]
+const OPEN_MAX: libc::rlim_t = 10240;
+
+/// Raises the soft limit on open files towards the hard limit, to at most [`FD_SOFT_MAX`] (on
+/// macOS also at most kern.maxfilesperproc). A last-byte race holds a connection per request,
+/// and an app started from Finder or the Dock on macOS gets a soft limit of 256. It never sets
+/// the soft limit to unlimited, even when the hard limit is, so `fd_usage` keeps a limit to
+/// check a race against, and never lowers it. Best effort: the limit stays as it was if it
+/// can't be raised.
 #[cfg(unix)]
 pub fn raise_fd_limit() {
     let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: getrlimit and setrlimit only read or write the struct passed in.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 || lim.rlim_cur >= lim.rlim_max {
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
         return;
     }
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: lim.rlim_max, ..lim }) } == 0 {
+    let set = |cur: libc::rlim_t| unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: cur, ..lim }) } == 0;
+    let want = lim.rlim_max.min(fd_soft_cap());
+    if want <= lim.rlim_cur || set(want) {
         return;
     }
-    // macOS refuses a soft limit above kern.maxfilesperproc, which an unlimited hard limit is;
-    // OPEN_MAX (10240) is always accepted.
-    let capped = lim.rlim_max.min(10240);
-    if capped > lim.rlim_cur {
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: capped, ..lim }) };
+    // Refused (macOS, above what the kernel allows a process): OPEN_MAX is always accepted.
+    let fallback = lim.rlim_max.min(OPEN_MAX);
+    if fallback > lim.rlim_cur {
+        set(fallback);
+    }
+}
+
+/// The most [`raise_fd_limit`] asks for: [`FD_SOFT_MAX`], and on macOS no more than
+/// kern.maxfilesperproc (OPEN_MAX if that can't be read), which it refuses to go above.
+#[cfg(unix)]
+fn fd_soft_cap() -> libc::rlim_t {
+    #[cfg(target_os = "macos")]
+    {
+        let mut per_proc: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: sysctlbyname writes at most `len` bytes into `per_proc`.
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&mut per_proc as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        let per_proc = if read && per_proc > 0 { per_proc as libc::rlim_t } else { OPEN_MAX };
+        per_proc.min(FD_SOFT_MAX as libc::rlim_t)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        FD_SOFT_MAX as libc::rlim_t
     }
 }
 
@@ -413,15 +452,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fd_limit_is_raised_and_read() {
+        let get = || {
+            let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+            lim
+        };
+        let before = get();
         raise_fd_limit();
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
-        assert!(lim.rlim_cur == lim.rlim_max || lim.rlim_cur >= 10240, "{} of {}", lim.rlim_cur, lim.rlim_max);
-        // Raised to an unlimited hard limit (which some systems accept), there is no limit to read.
-        match fd_usage() {
-            Some((limit, open)) => assert!(open >= 3 && open < limit, "{open} of {limit}"),
-            None => assert_eq!(lim.rlim_cur, libc::RLIM_INFINITY),
+        let after = get();
+        assert_eq!(after.rlim_max, before.rlim_max);
+        if before.rlim_cur == libc::RLIM_INFINITY {
+            // Set so by whoever started the tests; raise_fd_limit never lowers it.
+            assert_eq!(after.rlim_cur, libc::RLIM_INFINITY);
+            return;
         }
+        // Raised, as far as the hard limit and OPEN_MAX allow at least, but never to unlimited
+        // (even when the hard limit is) nor above FD_SOFT_MAX, unless it was already higher.
+        assert!(
+            after.rlim_cur >= before.rlim_cur.max(before.rlim_max.min(OPEN_MAX)),
+            "{} of {}",
+            after.rlim_cur,
+            after.rlim_max
+        );
+        assert_ne!(after.rlim_cur, libc::RLIM_INFINITY);
+        assert!(after.rlim_cur <= before.rlim_cur.max(FD_SOFT_MAX as libc::rlim_t), "{}", after.rlim_cur);
+        // So a race is always checked against a real limit.
+        let (limit, open) = fd_usage().unwrap();
+        assert_eq!(limit as libc::rlim_t, after.rlim_cur);
+        assert!(open >= 3 && open < limit, "{open} of {limit}");
     }
 
     #[tokio::test]
