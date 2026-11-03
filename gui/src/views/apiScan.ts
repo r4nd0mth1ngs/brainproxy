@@ -909,6 +909,21 @@ export function apiResultNotes(r: ImportSummary | null | undefined): string[] {
 export const importLive = (jobId: number | null, state: string | null | undefined): boolean => jobId != null && (state == null || ["queued", "running", "stopping"].includes(state));
 
 /**
+ * A remembered import job's `job status`, or "gone": one that doesn't exist, or isn't an import (the
+ * project file was replaced since its id was kept), is forgotten, so the card never shows, or stops,
+ * a scan or fuzz job. Other errors are passed on.
+ */
+export function readImportJob<J extends { kind: string }>(status: Promise<J>): Promise<J | "gone"> {
+  return status.then(
+    (j) => (j.kind === "import" ? j : "gone"),
+    (e) => {
+      if (e?.kind === "not_found") return "gone";
+      throw e;
+    },
+  );
+}
+
+/**
  * What the Site map does when Import API is asked for from elsewhere (the guided API scan): a
  * running import, or one whose start hasn't been answered yet, is never replaced, only shown; an
  * Import API already open is replaced if the user agrees.

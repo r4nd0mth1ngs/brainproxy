@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Calls `apply` with each promise's value, except one that settles after a later call's value was
- * applied: polls can overlap, and a slow older one must not undo a newer answer.
+ * applied: polls can overlap, and a slow older one must not undo a newer answer. A failed poll
+ * changes nothing, so an older one still out is then the latest answer and is applied when it lands.
  */
 export function inOrder<T>(apply: (value: T) => void): (p: Promise<T>) => void {
   let issued = 0;

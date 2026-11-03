@@ -58,6 +58,7 @@ import {
   previewArgs,
   previewTitle,
   profileProblems,
+  readImportJob,
   scanArgs,
   scrubSecret,
   selectShown,
@@ -398,6 +399,17 @@ test("a running import in the Site map is never replaced", () => {
   // One being set up is replaced only if the user agrees; otherwise it opens.
   assert.equal(importRequest({ live: false, starting: false, wizardOpen: true }), "ask");
   assert.equal(importRequest({ live: false, starting: false, wizardOpen: false }), "open");
+});
+
+test("a remembered import job id is only trusted for an import", async () => {
+  const job = (kind: string) => ({ id: 4, kind, state: "running" });
+  assert.deepEqual(await readImportJob(Promise.resolve(job("import"))), job("import"));
+  // The project file was replaced since: the id now names a scan or a fuzz, which the card mustn't show or stop.
+  assert.equal(await readImportJob(Promise.resolve(job("active-scan"))), "gone");
+  assert.equal(await readImportJob(Promise.resolve(job("fuzz"))), "gone");
+  assert.equal(await readImportJob(Promise.reject({ kind: "not_found", message: "no job 4" })), "gone");
+  // Anything else (the project busy, say) isn't a reason to forget the job.
+  await assert.rejects(readImportJob(Promise.reject({ kind: "io", message: "busy" })), { kind: "io" });
 });
 
 test("what the key form starts on", () => {

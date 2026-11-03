@@ -57,6 +57,7 @@ import {
   pickCheckOperation,
   previewArgs,
   previewTitle,
+  readImportJob,
   scanArgs,
   scrubSecret,
   selectShown,
@@ -452,7 +453,7 @@ function DefinitionStep(p: {
       {p.onImport && (
         <p className="muted">
           <button className="link" onClick={p.onImport}>
-            Only want its requests in history, to try them by hand? Import it without scanning
+            Only want its requests in history, to try them by hand? Send each operation once and record it, without scanning
           </button>
         </p>
       )}
@@ -1340,7 +1341,8 @@ function ImportStep(p: { preview: ApiPreview; source: string; target: ApiTarget;
 
 /**
  * An import job's status, read every 1.5 s while `active` until it ends; null until read, and for
- * no job. `onGone` runs when the job doesn't exist (a remembered id from another copy of the project).
+ * no job. `onGone` runs when the job doesn't exist or isn't an import (a remembered id from another
+ * copy of the project).
  */
 export function useImportJob(jobId: number | null, active: boolean, onGone: () => void): Job | null {
   const [ended, setEnded] = useState<number | null>(null);
@@ -1350,9 +1352,10 @@ export function useImportJob(jobId: number | null, active: boolean, onGone: () =
     () =>
       jobId == null
         ? Promise.resolve(null)
-        : run<Job>(["job", "status", String(jobId)]).catch((e) => {
-            if (e.kind === "not_found") gone.current();
-            throw e;
+        : readImportJob(run<Job>(["job", "status", String(jobId)])).then((j) => {
+            if (j !== "gone") return j;
+            gone.current();
+            return null;
           }),
     1500,
     jobId != null && active && ended !== jobId,
@@ -1387,8 +1390,8 @@ export function ImportProgress({ jobId, job, onClose, onHide }: { jobId: number;
               Hide
             </button>
             {job && (
-              <button className="btn" onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
-                Stop
+              <button className="btn" disabled={job.state === "stopping"} onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
+                {job.state === "stopping" ? "Stopping…" : "Stop"}
               </button>
             )}
           </div>
@@ -1401,7 +1404,15 @@ export function ImportProgress({ jobId, job, onClose, onHide }: { jobId: number;
       </header>
       {!done ? (
         <div className="wiz-body">
-          <div className="wiz-bar">
+          <div
+            className="wiz-bar"
+            role="progressbar"
+            aria-label="Operations sent"
+            aria-valuemin={0}
+            aria-valuemax={pr.total || undefined}
+            aria-valuenow={frac == null ? undefined : (pr.sent ?? 0)}
+            aria-valuetext={importProgressText(pr)}
+          >
             <span style={{ width: frac == null ? "100%" : `${Math.round(frac * 100)}%` }} className={frac == null ? "indeterminate" : ""} />
           </div>
           <p className="muted">{importProgressText(pr)}</p>

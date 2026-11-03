@@ -9,7 +9,7 @@ import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
-import { importLive, importRequest } from "./apiScan";
+import { importLive, importRequest, readImportJob } from "./apiScan";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -210,7 +210,11 @@ function SiteMap({ active }: { active: boolean }) {
   const decide = async (req: { source: string; graphql: boolean; key: number }) => {
     // A remembered job that hasn't been read yet (the map not shown since a reload) is read first.
     let state: string | undefined = job?.state;
-    if (importJob != null && state == null) state = await run<Job>(["job", "status", String(importJob)]).then((j) => j.state, (e) => (e.kind === "not_found" ? "gone" : undefined));
+    if (importJob != null && state == null)
+      state = await readImportJob(run<Job>(["job", "status", String(importJob)])).then(
+        (j) => (j === "gone" ? "gone" : j.state),
+        () => undefined,
+      );
     if (state === "gone") setImportJob(null);
     const what = importRequest({ live: state !== "gone" && importLive(importJob, state), starting: importStarting, wizardOpen: !!importing });
     if (what === "show_job") {
@@ -371,7 +375,7 @@ function SiteMap({ active }: { active: boolean }) {
           onClick={() => openImport({ source: "", graphql: false, key: 0 })}
           title={importRunning ? "An API import is running" : "Send an API definition's operations once each and record them, without scanning"}
         >
-          Import API…
+          Import API (sends each once)…
         </button>
       </div>
       {importing ? (
