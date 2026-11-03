@@ -313,7 +313,13 @@ The sidebar groups the tools by what you are doing.
 
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
-- **Sending:** ⌘/Ctrl+Enter sends; ‹ › step back and forward through what you sent.
+- **Sending:** ⌘/Ctrl+Enter sends; **Stop** gives up on a request that is still waiting.
+  A stopped request may already have reached the server; if it went out, history has it,
+  without a response.
+  A send carries on while you look at another tab, and its response lands in its own tab;
+  closing the tab (or the project, or quitting) stops it, so the app asks first while one
+  is running. ‹ › step back and forward through what you sent. A step sent with other
+  options than the tab has now says which, next to the response.
 - **Auto URL-encode** (on by default): on send, characters that aren't valid in a URL
   (spaces, quotes, `<>`, `#`, non-ASCII) are encoded in the request line and in form bodies.
   `&`, `=`, `'` and existing `%XX` stay as typed, so `?q=x' OR 1=1--` arrives as
@@ -343,11 +349,33 @@ Edit a raw request and send it as often as you like, in separate tabs.
   The command runs outside brainproxy, so the engagement scope doesn't apply to it. Bodies
   over 128 KB may be too long for one shell argument; save those to a file and use
   `--data-binary @FILE`.
+- **Options** (per tab): each option that isn't the default shows as a chip next to the
+  button, so you can see how the tab sends.
+  - **HTTP/2**: send over HTTP/2 (`send --http2`). The request line can stay `HTTP/1.1`.
+  - **Send as typed** (`send --verbatim`): for request smuggling and other malformed
+    requests. HTTP/1 only: HTTP/2 rebuilds the request into frames, so it is greyed out
+    while **HTTP/2** is on (and applies again when it is turned off). Content-Length isn't
+    updated, auto URL-encode is skipped, and no blank line is added after the headers. The
+    editor can't hold a CR, so the head's line breaks go out as CRLF. The body goes out as
+    the editor holds it: one sent from Traffic keeps its own line breaks, and one you typed
+    has bare LF ones.
+  - **CRLF body**: every line break in the body goes out as CRLF, for chunked bodies typed
+    by hand. Not offered for a binary body, which always keeps its bytes.
+  - **SNI**: the TLS server name to send instead of the target's host.
+  - **Timeout**: seconds the request may take, as a plain number such as `60` or `2.5`
+    (30 by default, at most a day).
+  - **Verify TLS**: refuse a server certificate that isn't valid (off by default).
+  - **Don't record** (`--no-store`): history keeps only a row with the time, target, method
+    and path, without the query string, headers, bodies or response. Agents can't use it
+    through MCP.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
-  reply matches **Until**. Each run is recorded like proxied traffic, as it happens.
+  reply matches **Until**. Each run is recorded like proxied traffic, as it happens; with
+  **Don't record** on, only the handshake gets a row, without its content. Their Options are
+  SNI, Timeout, Verify TLS and Don't record. **Stop** ends a run early; what it sent may
+  already have reached the server, and history keeps what was recorded up to then.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an

@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState } from "react";
-import { bodyText, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
+import { useEffect, useId, useRef, useState } from "react";
+import { bodyText, cancelCli, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { copyAsCurl, CurlDialog } from "../ui/CurlDialog";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
-import { autoEncodeRequest } from "../ui/urlencode";
+import { confirm } from "../ui/Confirm";
+import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
+import { activeLabels, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
+import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
@@ -12,9 +15,11 @@ type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response">;
 
 interface Sent {
   raw: string;
-  /** What was actually sent (after auto URL-encoding) and how many characters were encoded. */
+  /** What was actually sent (after auto URL-encoding, or with a CRLF head when sent as typed) and how many characters were encoded. */
   sent: string;
   encoded: number;
+  /** The tab's options that weren't the default when this was sent (activeLabels). */
+  labels: string[];
   result: SendResult | null;
   error: string | null;
 }
@@ -43,7 +48,11 @@ export function RepeaterView() {
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
-  const closeTab = (key: number) => {
+  const closeTab = async (key: number) => {
+    // Closing stops a send still running, which may already have reached the server.
+    const q = closeQuestion(key);
+    if (q && !(await confirm(q.title, q.message, "Stop and close", "Keep open"))) return;
+    forgetTab(key, cancelCli);
     app.setRepeater((ts) => ts.filter((t) => t.key !== key));
     if (key === active?.key) {
       const rest = tabs.filter((t) => t.key !== key);
@@ -55,7 +64,13 @@ export function RepeaterView() {
     <div className="col fill">
       <div className="subtabs">
         {tabs.map((t) => (
-          <button key={t.key} className={t.key === active?.key ? "on" : ""} onClick={() => app.setRepeaterActive(t.key)} onAuxClick={(e) => e.button === 1 && closeTab(t.key)}>
+          <button
+            key={t.key}
+            className={t.key === active?.key ? "on" : ""}
+            title={activeLabels(t.options, t.ws ? "ws" : "http").join(", ") || undefined}
+            onClick={() => app.setRepeaterActive(t.key)}
+            onAuxClick={(e) => e.button === 1 && closeTab(t.key)}
+          >
             {t.title}
             <span
               className="x"
@@ -111,21 +126,23 @@ function storedAutoEncode(): boolean {
   }
 }
 
-// Send history survives switching tabs (the tab view remounts), keyed by tab.
-const sentByTab = new Map<number, { list: Sent[]; at: number }>();
+// Send history survives switching tabs (the tab view remounts), keyed by tab; so does a send
+// in flight, so its result lands in its tab and Stop stays (replayCalls.ts).
+const sentByTab = tabSlot<{ list: Sent[]; at: number }>({ list: [], at: -1 });
 
 function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const app = useApp();
   const [raw, setRaw] = useState(tab.raw);
   const [target, setTarget] = useState(tab.target);
-  const [busy, setBusy] = useState(false);
   const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
-  const [sent, setSent] = useState(() => sentByTab.get(tab.key) ?? { list: [], at: -1 });
+  const [options, setOptions] = useSendOptions(tab);
+  const [showOptions, setShowOptions] = useState(false);
+  const optionsId = useId();
+  const [sent, setSent] = useTabSlot(sentByTab, tab.key);
   const current = sent.list[sent.at];
-
-  useEffect(() => {
-    sentByTab.set(tab.key, sent);
-  }, [tab.key, sent]);
+  // The send in flight, so Stop can cancel it (a long timeout would otherwise hold the tab).
+  const [call] = useTabSlot(replayCalls, tab.key);
+  const busy = call != null;
 
   // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
   // tabs return the same array, so React skips the update; a new array every time changed
@@ -147,27 +164,31 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   const send = async () => {
     const to = withScheme(guessTarget(raw, target));
     if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
+    const problem = optionsProblem(options);
+    if (problem) return app.toast(problem, "error");
     setTarget(to);
-    setBusy(true);
-    const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+    const { text: sent, encoded } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
+    const labels = activeLabels(options, "http");
+    const key = tab.key;
+    const id = beginCall(key, "replay-send");
     let entry: Sent;
     try {
-      const result = await run<SendResult>(["send", `--target=${to}`, "-"], textBytes(sent, tab.binary));
-      entry = { raw, sent, encoded, result, error: null };
+      const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: id });
+      entry = { raw, sent, encoded, labels, result, error: null };
     } catch (e: any) {
-      entry = { raw, sent, encoded, result: null, error: e.message };
+      entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "http") };
     }
-    setBusy(false);
-    setSent((s) => ({ list: [...s.list, entry], at: s.list.length }));
+    // Into the tab's history even if the view was remounted meanwhile; not if the tab closed.
+    if (endCall(key, id)) sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
   };
 
   // The request as Send would send it, auto URL-encoding included.
-  const copyCurl = () => copyAsCurl(autoEncode ? autoEncodeRequest(raw).text : raw, withScheme(guessTarget(raw, target)), tab.binary, app.toast);
+  const copyCurl = () => copyAsCurl(requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, withScheme(guessTarget(raw, target)), tab.binary, app.toast);
 
   const go = (d: number) => {
     const at = sent.at + d;
     if (at < 0 || at >= sent.list.length) return;
-    setSent({ ...sent, at });
+    setSent((s) => ({ ...s, at }));
     setRaw(sent.list[at].raw);
   };
 
@@ -185,12 +206,18 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
   });
 
   const r = current?.result;
+  const note = current ? sentWithNote(current.labels, activeLabels(options, "http")) : null;
   return (
     <div className="col fill" onKeyDown={() => {}}>
       <div className="toolbar">
         <button className="btn primary" disabled={busy} onClick={send} title="Send (⌘/Ctrl+Enter)">
           {busy ? "Sending…" : "Send"}
         </button>
+        {busy && (
+          <button className="btn" onClick={() => stopCall(tab.key, cancelCli)} title="Stop waiting for this request. It may already have reached the server; if it went out, history has it without a response.">
+            Stop
+          </button>
+        )}
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
             ‹
@@ -201,10 +228,18 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         </div>
         <span className="label">Target</span>
         <input className="input mono" style={{ width: 300 }} placeholder="https://example.com" value={target} onChange={(e) => setTarget(e.target.value)} />
-        <label className="check" title="Before sending, percent-encode characters that aren't valid in a URL (spaces, quotes, <>, #, non-ASCII) in the request line and in form bodies. & = ? / and existing %XX stay as typed.">
+        <label
+          className="check"
+          title={
+            sendsAsTyped(options)
+              ? "Off while this tab sends as typed (Options)"
+              : "Before sending, percent-encode characters that aren't valid in a URL (spaces, quotes, <>, #, non-ASCII) in the request line and in form bodies. & = ? / and existing %XX stay as typed."
+          }
+        >
           <input
             type="checkbox"
-            checked={autoEncode}
+            checked={autoEncode && !sendsAsTyped(options)}
+            disabled={sendsAsTyped(options)}
             onChange={(e) => {
               setAutoEncode(e.target.checked);
               try {
@@ -219,7 +254,13 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         <button className="btn" onClick={copyCurl} title="Copy this request as a curl command (POSIX shell)">
           Copy as cURL
         </button>
+        <OptionsToggle options={options} kind="http" open={showOptions} onToggle={() => setShowOptions(!showOptions)} controls={optionsId} />
         <span className="grow" />
+        {note && (
+          <span className="tag" title="This step was sent with other options than the tab has now">
+            {note}
+          </span>
+        )}
         {!!current?.encoded && (
           <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>
             {current.encoded} char{current.encoded === 1 ? "" : "s"} URL-encoded
@@ -227,10 +268,12 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         )}
         {r?.response && (
           <span className="muted">
-            {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms · history #{r.id}
+            {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms ·{" "}
+            {r.id != null ? `history #${r.id}` : "not recorded"}
           </span>
         )}
       </div>
+      {showOptions && <OptionsRow id={optionsId} options={options} set={setOptions} kind="http" binary={tab.binary} />}
       <Split id="repeater" dir="row">
         <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} />
         <HttpView
