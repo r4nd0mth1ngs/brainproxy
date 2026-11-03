@@ -816,6 +816,61 @@ impl Store {
         insert_capture(&self.conn, c)
     }
 
+    /// Rewrites history row `id` from `c`: a request recorded before it went out, now
+    /// answered or failed. Its time, note, and tags stay; the full-text index follows.
+    pub fn update_capture(&mut self, id: i64, c: &Capture) -> Result<()> {
+        const FTS: &str = "url, req_headers, req_body_text, resp_headers, resp_body_text";
+        let tx = self.write_tx()?;
+        tx.execute(
+            &format!("INSERT INTO history_fts(history_fts, rowid, {FTS}) SELECT 'delete', id, {FTS} FROM history WHERE id = ?1"),
+            [id],
+        )?;
+        let n = tx.execute(
+            "UPDATE history SET source = ?2, scheme = ?3, host = ?4, port = ?5, method = ?6, url = ?7, path = ?8,
+                query = ?9, req_headers = ?10, req_content_type = ?11, req_body = ?12, req_body_text = ?13,
+                status = ?14, reason = ?15, resp_headers = ?16, resp_content_type = ?17, resp_body = ?18,
+                resp_body_text = ?19, resp_body_length = ?20, title = ?21, duration_ms = ?22, error = ?23,
+                request = ?24, response = ?25
+             WHERE id = ?1",
+            params![
+                id,
+                c.source,
+                c.scheme,
+                c.host,
+                c.port,
+                c.method,
+                c.url,
+                c.path,
+                c.query,
+                c.req_headers,
+                c.req_content_type,
+                c.req_body,
+                c.req_body_text,
+                c.status,
+                c.reason,
+                c.resp_headers,
+                c.resp_content_type,
+                c.resp_body,
+                c.resp_body_text,
+                c.resp_body.as_ref().map(|b| b.len() as i64),
+                c.title,
+                c.duration_ms,
+                c.error,
+                c.request,
+                c.response,
+            ],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("history item {id}")));
+        }
+        tx.execute(
+            &format!("INSERT INTO history_fts(rowid, {FTS}) SELECT id, {FTS} FROM history WHERE id = ?1"),
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list(&self, f: &HistoryFilter) -> Result<Vec<HistoryEntry>> {
         let mut sql = format!("SELECT {ENTRY_COLS} FROM history WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1264,6 +1319,23 @@ mod tests {
         assert_eq!(q("SELECT regexp_extract(resp_body_text, '\"token\":\"(\\w+)\"', 1) FROM history")[0][0], "abc");
         assert_eq!(q("SELECT json_extract(resp_body_text, '$.token') FROM history")[0][0], "abc");
         assert_eq!(q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'syntax'").len(), 1);
+    }
+
+    #[test]
+    fn a_pending_row_is_completed_in_place() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = Target::from_url("http://a.test").unwrap();
+        let req = b"GET /pending HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let id = s.record_failure("send", &t, req, "sent; no response yet").unwrap();
+        s.set_note(id, Some("kept")).unwrap();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nzebrafish";
+        s.update_capture(id, &Capture::new("send", &t, req, Some(resp), Some(5), None)).unwrap();
+        let item = s.get(id).unwrap();
+        assert_eq!((item.entry.status, item.entry.error, item.entry.note.as_deref()), (Some(200), None, Some("kept")));
+        let q = |sql: &str| s.query(sql, &[], 10, 100).unwrap().rows;
+        assert_eq!(q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'zebrafish'").len(), 1);
+        assert_eq!(s.count().unwrap(), 1);
+        assert!(matches!(s.update_capture(99, &Capture::default()), Err(Error::NotFound(_))));
     }
 
     #[test]

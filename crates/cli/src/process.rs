@@ -70,6 +70,15 @@ pub(crate) async fn shutdown(store: &Store, key: &str) {
             }
         }
     };
+    tokio::select! {
+        _ = interrupted() => {}
+        _ = flagged => {}
+    }
+}
+
+/// Resolves on ctrl-c or, on unix, SIGTERM: how a shell, `proxy stop`, and the GUI's Stop ask
+/// a command to end. (Windows has no SIGTERM; the GUI's Stop ends the process there.)
+pub(crate) async fn interrupted() {
     #[cfg(unix)]
     let term = async {
         use tokio::signal::unix::{signal, SignalKind};
@@ -85,7 +94,6 @@ pub(crate) async fn shutdown(store: &Store, key: &str) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term => {}
-        _ = flagged => {}
     }
 }
 

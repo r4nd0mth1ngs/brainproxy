@@ -23,12 +23,14 @@ mod proxy_cmd;
 mod report_cmd;
 mod request_args;
 mod scan_cmd;
+mod sent;
 mod update_cmd;
 mod ws_cmd;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use brainproxy_core::auth::Attempt;
 use brainproxy_core::capture::decode_body;
 use brainproxy_core::codec;
 use brainproxy_core::http::request::split_head_body;
@@ -232,7 +234,8 @@ struct SendArgs {
     /// Send with this auth profile's session (cookies/headers; re-login if logged out).
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
-    /// Don't record the exchange in history.
+    /// Keep no content in history: each row has only the request line (method, URL), the
+    /// time, and the target; its error starts "not stored (--no-store)".
     #[arg(long)]
     no_store: bool,
     /// Maximum response body bytes to include in output.
@@ -603,34 +606,63 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         };
         return race(project, &args, req, target, client, n, out);
     }
+    let mut log = sent::SentLog::open(project, "send", args.no_store)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-    let result = match &session {
-        Some(s) => {
-            let r = rt.block_on(s.send(&req, &target));
-            s.save()?;
-            r
-        }
-        None => rt.block_on(client.send(&req, &target)),
-    };
-
-    let store = if args.no_store { None } else { Some(Store::open(project)?) };
-    let ex = match result {
-        Ok(ex) => ex,
-        Err(e) => {
-            if let Some(s) = &store {
-                s.record_failure("send", &target, req.as_bytes(), &e.to_string())?;
+    // Each request is on record (its row and the bytes recorded) before it goes out.
+    let mut pending: Vec<(i64, Vec<u8>)> = Vec::new();
+    let result = {
+        let (log, pending) = (&mut log, &mut pending);
+        let sending = async {
+            match &session {
+                Some(s) => {
+                    let watch = |a: Attempt<'_>| match a {
+                        Attempt::Sending(r) => {
+                            let recorded = client.recorded_request(r, &target)?;
+                            pending.push((log.pending(&target, &recorded)?, recorded));
+                            Ok(())
+                        }
+                        Attempt::Replaced(ex) => log.answered(pending.last().map_or(0, |p| p.0), ex),
+                    };
+                    s.send_as_watched(brainproxy_core::session::Tool::Send, &req, &target, watch).await
+                }
+                None => {
+                    let recorded = client.recorded_request(&req, &target)?;
+                    pending.push((log.pending(&target, &recorded)?, recorded));
+                    client.send(&req, &target).await
+                }
             }
+        };
+        rt.block_on(async {
+            tokio::select! {
+                r = sending => Some(r),
+                _ = process::interrupted() => None,
+            }
+        })
+    };
+    if let Some(s) = &session {
+        s.save()?;
+    }
+    let last = pending.last().cloned();
+    let (id, ex) = match (result, last) {
+        (Some(Ok(ex)), Some((id, _))) => {
+            log.answered(id, &ex)?;
+            (id, ex)
+        }
+        (None, Some((id, recorded))) => {
+            log.failed(id, &target, &recorded, sent::CANCELLED)?;
+            return Err(sent::cancelled(&[id]));
+        }
+        (Some(Err(e)), Some((id, recorded))) => {
+            log.failed(id, &target, &recorded, &e.to_string())?;
             return Err(e);
         }
+        // Stopped or failed before anything went out.
+        (None, None) => return Err(sent::cancelled(&[])),
+        (Some(Err(e)), None) => return Err(e),
+        (Some(Ok(_)), None) => unreachable!("every request is recorded before it is sent"),
     };
-    let id = match &store {
-        Some(s) => Some(s.record_exchange("send", &ex)?),
-        None => None,
-    };
-    let new_findings = match store {
-        Some(mut s) => brainproxy_core::scan::passive::scan_pending(&mut s)?.new_findings,
-        None => 0,
-    };
+    let new_findings = log.scan(&pending.iter().map(|p| p.0).collect::<Vec<_>>())?;
+    let id = Some(id);
 
     if args.raw {
         out.raw(&ex.response);
@@ -661,20 +693,51 @@ fn race(
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
     let h2 = args.req.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"));
+    let max = brainproxy_core::race::SINGLE_PACKET_MAX;
+    if h2 && n > max {
+        return Err(Error::InvalidInput(format!("single-packet races take 1 to {max} requests")));
+    }
+    // Every copy is on record before any goes out.
+    let recorded = client.recorded_request(&req, &target)?;
+    let mut log = sent::SentLog::open(project, "race", args.no_store)?;
+    let ids = log.pending_many(&target, &recorded, n)?;
     let requests = vec![req.as_bytes().to_vec(); n];
-    let (results, sync, synced) = if h2 {
-        let run = rt.block_on(brainproxy_core::race::single_packet(&client, &target, requests))?;
-        (run.results, "single-packet", Some(run.synced))
-    } else {
-        (rt.block_on(brainproxy_core::race::last_byte_sync(&client, &target, requests)), "last-byte", None)
+    let racing = async {
+        if h2 {
+            brainproxy_core::race::single_packet(&client, &target, requests)
+                .await
+                .map(|run| (run.results, "single-packet", Some(run.synced)))
+        } else {
+            Ok((brainproxy_core::race::last_byte_sync(&client, &target, requests).await, "last-byte", None))
+        }
     };
-    let store = if args.no_store { None } else { Some(Store::open(project)?) };
+    let outcome = rt.block_on(async {
+        tokio::select! {
+            r = racing => Some(r),
+            _ = process::interrupted() => None,
+        }
+    });
+    let (results, sync, synced) = match outcome {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => {
+            for id in &ids {
+                log.failed(*id, &target, &recorded, &e.to_string())?;
+            }
+            return Err(e);
+        }
+        None => {
+            for id in &ids {
+                log.failed(*id, &target, &recorded, sent::CANCELLED)?;
+            }
+            return Err(sent::cancelled(&ids));
+        }
+    };
     let mut items = Vec::new();
     let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
-    for r in &results {
+    for (r, &id) in results.iter().zip(&ids) {
         match r {
             Ok(ex) => {
-                let id = store.as_ref().map(|s| s.record_exchange("race", ex)).transpose()?;
+                log.answered(id, ex)?;
                 let head = parse_response_head(&ex.response).ok();
                 let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(&ex.response).1));
                 let status = head.as_ref().map(|h| h.status);
@@ -683,15 +746,14 @@ fn race(
                 items.push(json!({"id": id, "status": status, "length": length, "duration_ms": ex.duration_ms}));
             }
             Err(e) => {
-                if let Some(s) = &store {
-                    s.record_failure("race", &target, req.as_bytes(), &e.to_string())?;
-                }
+                log.failed(id, &target, &recorded, &e.to_string())?;
                 *shapes.entry(format!("error: {}", e.kind())).or_default() += 1;
-                items.push(json!({"error": e.to_string(), "kind": e.kind()}));
+                items.push(json!({"id": id, "error": e.to_string(), "kind": e.kind()}));
             }
         }
     }
-    let data = json!({
+    let new_findings = log.scan(&ids)?;
+    let mut data = json!({
         "race": n,
         "sync": sync,
         "synced": synced,
@@ -700,6 +762,9 @@ fn race(
         "results": items,
         "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2.",
     });
+    if new_findings > 0 {
+        data["new_findings"] = json!(new_findings);
+    }
     out.ok(data.clone(), || {
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
         lines.insert(0, format!("race x{n} ({sync}) -> {}", target.origin()));
