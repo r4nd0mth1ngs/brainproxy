@@ -427,9 +427,10 @@ Access control across users: does the app let bob read alice's data? See
   OPTIONS requests are replayed, and logout paths never are.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
-  those identities in the background. If it doesn't start, the
-  previous proxy is started again. Results fill the grid as you go; stopping the proxy ends
-  the run.
+  those identities in the background. It is one `proxy restart`, as in **Settings › Proxy**, so
+  a proxy started meanwhile from a shell or MCP can't take its place. If it doesn't start, the
+  previous proxy is started again and the message says where the proxy is. Results fill the
+  grid as you go; stopping the proxy ends the run.
 - **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
   red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
   a dashed outline inconclusive (a successful response with nothing to compare, so check it
@@ -704,6 +705,11 @@ new proxy doesn't come up (the port is taken, say), the old one is started again
 it had, with its options, and the command fails with an error that ends with where the proxy
 is now. With no proxy running it starts nothing and fails with `not_found`: use `proxy start`.
 On success it prints what `proxy start` does, plus `replaced` (the old pid and address).
+While a restart runs it holds `brainproxy.bpdb-proxy-restart.lock`, which is how another
+container on the same volume knows it is still under way. A restart started while a
+`proxy stop` is under way leaves the proxy to that stop and fails. `project stop` during a
+restart stops the OOB listener, jobs and fuzz runs at once, then waits (up to a minute) for
+the restart to finish and stops the proxy it left running.
 
 Crawl and active-scan scope and safety flags:
 
@@ -1139,7 +1145,7 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | Container: "can't open the proxy lock file" | A lock file is there that this user can't open, so starting would go unseen from other containers. Make it readable (`chmod 644`), or remove it if no proxy (or OOB listener) runs for this project anywhere. |
 | Container: "unable to open database file" | The user in the container can't write to the folder mounted at `/work`. Add `--user "$(id -u):$(id -g)"` for a host folder you own. See [Container image](#container-image). |
 | "The proxy didn't start: none of ports 8080-8089 could be opened" | Other programs hold or block those ports. Stop them, or choose a port in **Settings › Proxy**. From a shell: `brainproxy proxy start --listen 127.0.0.1:9090`. |
-| "the proxy is being restarted" | A `proxy restart` (from the app's *Restart on port N*, a shell or an agent) is between stopping the proxy and starting it again. Try again once it has finished. If its process was killed, the next command clears its hold. |
+| "the proxy is being restarted" | A `proxy restart` (from the app's *Restart on port N* or *Test live while browsing*, a shell or an agent) is between stopping the proxy and starting it again. Try again once it has finished. If its process was killed, the next command clears its hold. |
 | "cannot listen on …: the port is already in use" | Another program or another project's proxy holds that port. Stop it, or choose another port in **Settings › Proxy** (or with `--listen`). A chosen port is never swapped for another, so the proxy stays off until then. |
 | "cannot listen on …: permission denied" | Ports below 1024 usually need elevated privileges, and the system can reserve others (Windows does, in ranges that change). Choose another port in **Settings › Proxy** (or with `--listen`). |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |

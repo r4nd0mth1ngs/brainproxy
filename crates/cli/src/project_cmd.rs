@@ -28,7 +28,8 @@ pub enum ProjectCmd {
     },
     /// Stop everything running for this project: its proxy, OOB listener, jobs and fuzz runs.
     #[command(after_help = "Jobs and fuzz runs are asked to stop and given 10 s to finish; it fails, naming \
-        them, if any are still running. Nothing is deleted.")]
+        them, if any are still running. A proxy being restarted is stopped once the restart has finished. \
+        Nothing is deleted.")]
     Stop,
 }
 
@@ -62,7 +63,11 @@ pub fn project(path: &Path, cmd: ProjectCmd, out: &Out) -> Result<(), Error> {
 /// fails if some work is still running after being asked to stop.
 fn stop_all(path: &Path) -> Result<Value, Error> {
     let store = Store::open(path)?;
-    let proxy = crate::proxy_cmd::stop(&store)?.map(|(pid, _)| pid);
+    // A `proxy restart` under way refuses a stop until its proxy is up: the rest is stopped
+    // meanwhile, and that proxy afterwards.
+    let first = crate::proxy_cmd::stop(&store);
+    let restarting = first.is_err() && crate::proxy_cmd::restarting(&store)?;
+    let mut proxy = if restarting { None } else { first?.map(|(pid, _)| pid) };
     let oob = crate::oob_cmd::stop(&store)?.map(|(pid, _)| pid);
     let work = store.unfinished_work()?;
 
@@ -90,6 +95,9 @@ fn stop_all(path: &Path) -> Result<Value, Error> {
     while !left.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
         left = busy()?;
+    }
+    if restarting {
+        proxy = crate::proxy_cmd::stop_after_restart(&store, crate::proxy_cmd::RESTART_WAIT)?.map(|(pid, _)| pid);
     }
     // Work that never got a process has nothing to stop. Work that can't be verified may well be
     // gone, and its pid may be another process here: point to `stop --forget`, not to the pid.

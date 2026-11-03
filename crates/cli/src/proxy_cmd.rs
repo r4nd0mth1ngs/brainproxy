@@ -26,6 +26,12 @@ const STOP_KEY: &str = "proxy.stop";
 const LOCK_NAME: &str = "proxy";
 /// Hands a `proxy restart`'s hold on the record to the proxy it starts (see `Saved::restart`).
 const RESTART_ENV: &str = "BRAINPROXY_PROXY_RESTART";
+/// Held by `proxy restart` for as long as it holds the record: what tells another container
+/// that the restart still runs, since its pid means nothing there (see `process`).
+const RESTART_LOCK: &str = "proxy-restart";
+/// How long `project stop` waits for a restart under way to finish before it stops the proxy:
+/// the old proxy's stop with a live authz run, then two starts at `--wait`'s default.
+pub(crate) const RESTART_WAIT: Duration = Duration::from_secs(60);
 
 /// How long a proxy may take to exit when asked to. With a live authz run it also has to
 /// finish its tests and save the run.
@@ -415,7 +421,8 @@ struct Saved {
     pid_ns: Option<String>,
     /// Set while `proxy restart` holds the record, from before it stops the proxy until the
     /// proxy it starts takes the record over: the pid is the restart's own, so every other start
-    /// finds the record taken. The proxy it starts gets this token in [`RESTART_ENV`].
+    /// finds the record taken. The proxy it starts gets this token in [`RESTART_ENV`]. From
+    /// another namespace it is judged by [`RESTART_LOCK`], not by the proxy's lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     restart: Option<String>,
     /// The record as stored. It is only ever replaced or cleared if it still reads the same.
@@ -432,7 +439,9 @@ fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
 }
 
 fn liveness(store: &Store, s: &Saved) -> Liveness {
-    process::liveness(store, LOCK_NAME, s.state.pid, s.start_time, s.pid_ns.as_deref())
+    // Between a restart's stop and its start nobody holds the proxy's lock.
+    let lock = if s.restart.is_some() { RESTART_LOCK } else { LOCK_NAME };
+    process::liveness(store, lock, s.state.pid, s.start_time, s.pid_ns.as_deref())
 }
 
 /// The saved state and what is known about it, clearing stale state left by a crash.
@@ -474,6 +483,21 @@ pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     store.meta_swap(STATE_KEY, Some(&saved.raw), None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some((saved.state.pid, forced)))
+}
+
+/// Whether a `proxy restart` that still runs holds the record.
+pub(crate) fn restarting(store: &Store) -> Result<bool, Error> {
+    Ok(recorded(store)?.is_some_and(|(s, known)| s.restart.is_some() && known == Liveness::Running))
+}
+
+/// [`stop`], after waiting up to `wait` for a restart under way to finish: then it stops the
+/// proxy that restart left running. Still refused if the restart takes longer.
+pub(crate) fn stop_after_restart(store: &Store, wait: Duration) -> Result<Option<(u32, bool)>, Error> {
+    let deadline = Instant::now() + wait;
+    while restarting(store)? && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop(store)
 }
 
 /// Asks the proxy recorded as `saved` to exit and waits until it has; whether it had to be
@@ -731,13 +755,15 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
     let back = ProxyRunArgs { listen: old.state.listen.clone(), ..previous_args(&old.state)? };
     let launch = Launch::prepare(project, home, &args, &store)?;
 
+    // Before the hold goes in, so that from the moment it is there the lock vouches for it.
+    let lock = process::RunLock::acquire(&store, RESTART_LOCK)?;
     let me = std::process::id();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let token = format!("{me}-{}", now.as_nanos());
     let hold = Saved {
         state: ProxyState { pid: me, started: now.as_secs().to_string(), authz_run: None, ..old.state.clone() },
         start_time: process::start_time(me),
-        pid_ns: process::pid_namespace(),
+        pid_ns: lock.as_ref().and_then(|_| process::pid_namespace()),
         restart: Some(token.clone()),
         raw: String::new(),
     };
@@ -745,6 +771,16 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
     if !store.meta_swap(STATE_KEY, Some(&old.raw), Some(&hold))? {
         return Err(Error::Conflict(
             "the proxy was stopped or replaced while restarting it; see `brainproxy proxy status`".into(),
+        ));
+    }
+    // A `proxy stop` already under way wants the proxy off: leave it to that.
+    let stopping = store.meta_get(STOP_KEY).map(|k| k == Some(old.state.pid.to_string()));
+    if !matches!(stopping, Ok(false)) {
+        store.meta_swap(STATE_KEY, Some(&hold), Some(&old.raw))?;
+        stopping?;
+        return Err(Error::Conflict(
+            "the proxy is being stopped (`brainproxy proxy stop`); start it with `brainproxy proxy start` once it has"
+                .into(),
         ));
     }
     let forced = match halt(&store, &old) {
@@ -755,7 +791,9 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
             return Err(e);
         }
     };
-    store.meta_set(STOP_KEY, None)?;
+    // The proxy is off from here, so every way out says where it is now. A request left behind
+    // names the old pid, and a new proxy clears it as it starts anyway.
+    let _ = store.meta_set(STOP_KEY, None);
 
     let state = match launch.spawn(&store, Some(&token)) {
         Ok(state) => state,
@@ -764,13 +802,15 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
             let note = match again {
                 Ok(s) => format!("the proxy was started again on {} (pid {})", s.listen, s.pid),
                 Err(e2) => {
-                    store.meta_swap(STATE_KEY, Some(&hold), None)?;
+                    // Not cleared, it goes when this process does.
+                    let _ = store.meta_swap(STATE_KEY, Some(&hold), None);
                     format!("the proxy couldn't be started again on {}: {e2}. {}", back.listen, where_now(&store))
                 }
             };
             return Err(noted(e, &note));
         }
     };
+    drop(lock);
     let mut data = state_json(&state);
     data["replaced"] = json!({"pid": old.state.pid, "listen": old.state.listen, "forced": forced});
     out.ok(data, || {

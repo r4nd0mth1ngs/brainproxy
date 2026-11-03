@@ -158,10 +158,10 @@ pub(crate) fn liveness(store: &Store, what: &str, pid: u32, start: Option<u64>, 
 }
 
 fn label(what: &str) -> &str {
-    if what == "oob" {
-        "OOB listener"
-    } else {
-        what
+    match what {
+        "oob" => "OOB listener",
+        "proxy-restart" => "proxy restart",
+        _ => what,
     }
 }
 
