@@ -57,7 +57,9 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     holds the token, so an agent that can reach the port through `send` can't learn it.
   - Requests with brainproxy's own `User-Agent` (`brainproxy/...`) are refused as well.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
-  1.5 s with `history list --after <last id>`, proxy status every 2 s, the intercept queue
+  1.5 s with `history list --after <last id>` (with a contents search on, the rows each poll
+  adds are then searched with `history list --contains TEXT --after <searched up to>`, so a
+  new row shows only once it is known to match; `views/trafficFilter.ts`), proxy status every 2 s, the intercept queue
   every second while its tab is open. The project is SQLite in WAL mode, so the GUI, the
   proxy, background jobs, and an agent share it safely.
 - The app's proxy: every place that starts the proxy (opening a project, the pill, Open
@@ -101,7 +103,8 @@ CLI has no command for it, so a project a script or agent starts always keeps it
   Save as…), and the sidebar and Settings › Project have *Save as…*: `project save --output
   FILE` (refused inside a temp folder, `temp_is_inside`), then discard, then open FILE.
 - **Discarding:** Switch project or closing the window asks first (an in-app dialog,
-  `ui/Confirm.tsx`, since native ones differ per OS). `temp_discard` then runs `project stop`
+  `ui/Confirm.tsx`, since native ones differ per OS; its `ask` takes typed answers such as a
+  saved filter's name, because the macOS webview has no `window.prompt`). `temp_discard` then runs `project stop`
   (proxy, OOB listener, jobs and fuzz runs; it deletes nothing) and, once everything has
   stopped, deletes the folder. If something won't stop, the folder is kept.
 - **Leftovers:** the OS releases `owner.lock` when the app exits or crashes, so a folder
@@ -130,7 +133,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, saved filters per project, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `ws list/messages` |
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
@@ -269,4 +272,16 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   `auth macro add` on the command line. A macro or rule is replaced or removed, not edited
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
+- Traffic's contents search is case-sensitive and literal, like `history list --contains`
+  (no `--ignore-case` yet), and stops at the first 10,000 matches the other filters show
+  (oldest first; the toolbar says so). Only a new text or a different single source starts a
+  new search, and the CLI call still running for the old one is stopped (`cancelCli`); the
+  checkboxes and several sources are applied to the matches in the app, searching on only if
+  the cap no longer applies. Whitespace-only text doesn't search. A failed search is tried
+  again after 2 s, doubling up to a minute.
+- Saved Traffic filters are kept by the app (localStorage, per project path, plain text), not
+  in the owner-only project file, so the CLI and agents don't see them, they don't follow a
+  copied project, and a saved search for a secret stays in the webview's storage until it is
+  deleted. *Save as…* on a temporary engagement copies them to the saved file (and says so if
+  it can't); discarding one leaves its (unused) entry behind.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

@@ -1,11 +1,35 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bodyText, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
+import { bodyText, cancelCli, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
+import { ask, confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import {
+  appliedSaved,
+  DEFAULT_FILTER,
+  failPage,
+  isCurrent,
+  isRefused,
+  loadSaved,
+  mergePage,
+  needsSearch,
+  newSearch,
+  refilter,
+  searchArgs,
+  searchFor,
+  searchNote,
+  storeSaved,
+  visibleRows,
+  withSaved,
+  withoutSaved,
+  type ContentSearch,
+  type SavedFilter,
+  type SearchQuery,
+  type TrafficFilter,
+} from "./trafficFilter";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
@@ -93,25 +117,102 @@ function History() {
   const [rows, setRows] = useState<HistoryItem[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
-  // Refused requests (outside the engagement scope) are mostly browser background noise.
-  const [filter, setFilter] = useState({ text: "", sources: new Set<string>(), hideErrors: false, hideAssets: false, hideRefused: true });
+  const [filter, setFilter] = useState<TrafficFilter>(DEFAULT_FILTER);
+  const [saved, setSaved] = useState<SavedFilter[]>(() => loadSaved(app.project));
+  // The saved filter last chosen or saved, so two with the same state stay apart.
+  const [picked, setPicked] = useState<string | null>(null);
   const lastId = useRef(0);
   const { menu, open, close } = useMenu();
 
-  // Fetch only new rows each tick (ids only grow).
+  // Contents search: the CLI matches the text inside requests and responses. It runs page by
+  // page up to the newest polled row, then searches only the rows each poll adds. A failed
+  // page is tried again on a later poll, waiting longer after each failure.
+  const search = useRef<ContentSearch | null>(null);
+  const [found, setFound] = useState<ContentSearch | null>(null);
+  const searching = useRef(false);
+  // The CLI call running for the search, stopped when the query changes.
+  const searchCall = useRef<string | null>(null);
+  // The filter in force, which decides which matches count toward the cap.
+  const current = useRef(filter);
+  current.current = filter;
+  const searchMore = async () => {
+    if (searching.current) return;
+    searching.current = true;
+    try {
+      for (;;) {
+        const s = search.current;
+        const upTo = lastId.current;
+        if (!s || !needsSearch(s, upTo)) return;
+        const call = `traffic-search-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        searchCall.current = call;
+        let next: ContentSearch;
+        try {
+          next = mergePage(s, (await run<{ items: HistoryItem[] }>(searchArgs(s), { call })).items, upTo, current.current);
+        } catch (e: any) {
+          next = failPage(s, e.message);
+        } finally {
+          searchCall.current = null;
+        }
+        // The query changed (this call was stopped) or the cap was worked out again
+        // meanwhile: drop this page and carry on with the search as it is now.
+        if (search.current !== s) continue;
+        search.current = next;
+        setFound(next);
+        if (next.error) return;
+      }
+    } finally {
+      searching.current = false;
+    }
+  };
+
+  // Fetch only new rows each tick (ids only grow), then search them.
   usePoll(async () => {
     for (;;) {
       const d = await run<{ items: HistoryItem[] }>(["history", "list", "--after", String(lastId.current), "--limit", "2000"]);
-      if (!d.items.length) return;
+      if (!d.items.length) break;
       lastId.current = d.items[d.items.length - 1].id;
       // Overlapping polls can fetch the same rows; keep each id once.
       setRows((r) => {
         const max = r.length ? r[r.length - 1].id : 0;
         return [...r, ...d.items.filter((i) => i.id > max)];
       });
-      if (d.items.length < 2000) return;
+      if (d.items.length < 2000) break;
     }
+    await searchMore();
   }, 1500);
+
+  // A new search shortly after the text or the single source stops changing. The old one's
+  // CLI call is stopped at once: it may be reading every body in the project.
+  const wanted = JSON.stringify(searchFor(filter));
+  useEffect(() => {
+    const want = JSON.parse(wanted) as SearchQuery | null;
+    if (!want) {
+      setFound(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      search.current = newSearch(want);
+      setFound(search.current);
+      searchMore();
+    }, 300);
+    return () => {
+      clearTimeout(t);
+      search.current = null;
+      if (searchCall.current) cancelCli(searchCall.current).catch(() => {});
+    };
+  }, [wanted]);
+
+  // The other filters only decide which matches show and count toward the cap: work that out
+  // again here, searching on only if the cap no longer applies.
+  useEffect(() => {
+    const s = search.current;
+    if (!isCurrent(s, filter)) return;
+    const next = refilter(s, filter);
+    if (next === s) return;
+    search.current = next;
+    setFound(next);
+    searchMore();
+  }, [filter]);
 
   useEffect(() => {
     if (selected == null) return setEntry(null);
@@ -124,18 +225,10 @@ function History() {
     };
   }, [selected, app.toast]);
 
-  const refused = useMemo(() => rows.filter((r) => r.error?.startsWith("out of scope")).length, [rows]);
-  const shown = useMemo(() => {
-    const t = filter.text.toLowerCase();
-    return rows.filter(
-      (r) =>
-        (!t || r.url.toLowerCase().includes(t) || (r.title ?? "").toLowerCase().includes(t) || r.method.toLowerCase() === t) &&
-        (filter.sources.size === 0 || filter.sources.has(r.source)) &&
-        (!filter.hideErrors || (r.status != null && r.status < 400)) &&
-        (!filter.hideAssets || !/\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\?|$)/i.test(r.url)) &&
-        (!filter.hideRefused || !r.error?.startsWith("out of scope")),
-    );
-  }, [rows, filter]);
+  const refused = useMemo(() => rows.filter(isRefused).length, [rows]);
+  const shown = useMemo(() => visibleRows(rows, filter, found), [rows, filter, found]);
+  const contents = searchFor(filter) != null;
+  const note = contents ? (isCurrent(found, filter) ? searchNote(found, lastId.current) : "Searching…") : "";
 
   const handoff = (id: number, f: (h: Handoff & { entry: HistoryEntry }) => void) =>
     historyRequest(id).then(
@@ -171,19 +264,42 @@ function History() {
     ]);
 
   const toggleSource = (s: string) =>
-    setFilter((f) => {
-      const sources = new Set(f.sources);
-      sources.has(s) ? sources.delete(s) : sources.add(s);
-      return { ...f, sources };
-    });
+    setFilter((f) => ({ ...f, sources: f.sources.includes(s) ? f.sources.filter((x) => x !== s) : [...f.sources, s] }));
+
+  // Saved filters are kept per project in this app (localStorage).
+  const applied = appliedSaved(saved, filter, picked);
+  const keepSaved = (list: SavedFilter[]) => {
+    setSaved(list);
+    if (!storeSaved(app.project, list)) app.toast("Saved filters can't be stored here; they last until the app closes.", "error");
+  };
+  const saveFilter = async () => {
+    const name = (await ask("Save the current filter", "Name it to apply it again later.", "Save", "Cancel", applied ?? ""))?.trim();
+    if (!name) return;
+    if (name !== applied && saved.some((s) => s.name === name) && !(await confirm(`Replace the filter ${name}?`, "A saved filter already has that name.", "Replace", "Cancel"))) return;
+    keepSaved(withSaved(saved, name, filter));
+    setPicked(name);
+  };
+  const deleteFilter = async () => {
+    if (!applied || !(await confirm(`Delete the filter ${applied}?`, "Only the saved filter is deleted, not any traffic.", "Delete", "Cancel"))) return;
+    keepSaved(withoutSaved(saved, applied));
+  };
 
   return (
     <div className="col fill">
-      <div className="toolbar">
-        <input className="input" style={{ width: 260 }} placeholder="Filter: URL, title, or method" value={filter.text} onChange={(e) => setFilter({ ...filter, text: e.target.value })} />
+      <div className="toolbar" style={{ flexWrap: "wrap" }}>
+        <input
+          className="input"
+          style={{ width: 260 }}
+          placeholder={filter.contents ? "Search requests and responses" : "Filter: URL, title, or method"}
+          value={filter.text}
+          onChange={(e) => setFilter({ ...filter, text: e.target.value })}
+        />
+        <label className="check" title="Search inside requests and responses: headers and bodies, compressed bodies included. Case-sensitive and literal: the text must appear as stored (URL-encoded or JSON-escaped text included). Runs history list --contains.">
+          <input type="checkbox" checked={filter.contents} onChange={(e) => setFilter({ ...filter, contents: e.target.checked })} /> Contents
+        </label>
         <div className="seg">
           {SOURCES.map((s) => (
-            <button key={s} className={filter.sources.has(s) ? "on" : ""} onClick={() => toggleSource(s)}>
+            <button key={s} className={filter.sources.includes(s) ? "on" : ""} onClick={() => toggleSource(s)}>
               {s}
             </button>
           ))}
@@ -198,9 +314,44 @@ function History() {
           <input type="checkbox" checked={filter.hideRefused} onChange={(e) => setFilter({ ...filter, hideRefused: e.target.checked })} /> Hide out-of-scope
           {filter.hideRefused && refused > 0 && <span className="muted"> ({refused})</span>}
         </label>
+        <span className="sep" />
+        <select
+          className="input"
+          aria-label="Saved filters"
+          value={applied ?? ""}
+          disabled={!saved.length}
+          title="Saved filters for this project"
+          onChange={(e) => {
+            const s = saved.find((x) => x.name === e.target.value);
+            if (s) {
+              setPicked(s.name);
+              setFilter(s.filter);
+            }
+          }}
+        >
+          <option value="">{saved.length ? "Saved filters" : "No saved filters"}</option>
+          {saved.map((s) => (
+            <option key={s.name} value={s.name}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+        <button className="btn" onClick={saveFilter} title="Name the current filter to apply it again later">
+          Save…
+        </button>
+        <button className="btn" disabled={!applied} onClick={deleteFilter} title={applied ? `Delete the saved filter ${applied}` : "Pick a saved filter to delete it"}>
+          Delete
+        </button>
         <span className="grow" />
+        <span className={found?.error && isCurrent(found, filter) ? "s5" : "muted"} aria-live="polite">
+          {note}
+        </span>
         <span className="muted">
-          {shown.length === rows.length ? `${rows.length} items` : `${shown.length} of ${rows.length} items`}
+          {contents
+            ? `${shown.length} match${shown.length === 1 ? "" : "es"} of ${rows.length} items`
+            : shown.length === rows.length
+              ? `${rows.length} items`
+              : `${shown.length} of ${rows.length} items`}
         </span>
       </div>
       <Split id="history" dir="col" initial={0.5}>
@@ -214,7 +365,13 @@ function History() {
           onContextMenu={rowMenu}
           rowClass={(r) => (r.tags.includes("highlight") ? "hl" : undefined)}
           initialSort={{ key: "id", desc: true }}
-          empty="No traffic yet. Start the proxy and point a browser at it, or use Replay."
+          empty={
+            contents
+              ? note || "Nothing matches."
+              : rows.length
+                ? "Nothing matches the filter."
+                : "No traffic yet. Start the proxy and point a browser at it, or use Replay."
+          }
         />
         <Split id="history-msg" dir="row">
           <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />

@@ -8,6 +8,7 @@ import type { TempInfo } from "../store";
 import { confirm } from "../ui/Confirm";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
+import { copySaved } from "./trafficFilter";
 
 const RECENT = "recent-projects";
 
@@ -79,7 +80,8 @@ export function parseTarget(line: string): { value: string; ok: boolean } | null
   return { value: t, ok: TARGET.test(t) };
 }
 
-type Open = (path: string, temp?: TempInfo | null) => Promise<void>;
+/** `notice` is shown in the project once it is open (e.g. what Save as… couldn't take along). */
+type Open = (path: string, temp?: TempInfo | null, notice?: string) => Promise<void>;
 
 export function Welcome({ open, notice }: { open: Open; notice?: string }) {
   const [mode, setMode] = useState<"home" | "new" | "temp">("home");
@@ -174,13 +176,20 @@ export function Welcome({ open, notice }: { open: Open; notice?: string }) {
   );
 }
 
-/** Saves a temporary engagement's project to a file the user picks; the saved path, or null if cancelled. */
-export async function saveTempAs(project: string, name: string): Promise<string | null> {
+const COPY_FAILED = "Saved, but the saved Traffic filters couldn't be copied to this file (this app's storage is full or unavailable), so they aren't here.";
+
+/**
+ * Saves a temporary engagement's project to a file the user picks: the saved path, and a notice
+ * to show once it is open ("" for none); null if cancelled.
+ */
+export async function saveTempAs(project: string, name: string): Promise<{ dest: string; notice: string } | null> {
   const dest = await chooseProjectFile(name);
   if (!dest) return null;
   if (await tempProjects.isInside(dest)) throw new Error(`${dest} is inside a temporary engagement's folder, which is deleted with it`);
   await run(["project", "save", `--output=${dest}`], { project });
-  return dest;
+  // Saved Traffic filters are kept by the app per project path, so they move with it.
+  const notice = copySaved(project, dest) ? "" : COPY_FAILED;
+  return { dest, notice };
 }
 
 /** Temporary engagements an app left without discarding (closed while one couldn't be deleted, or crashed). */
@@ -209,10 +218,10 @@ function Leftovers({ open }: { open: Open }) {
   // Saved, the copy is opened and the temporary one deleted, as Save as… does in an open one.
   const saveAs = (l: TempLeftover & { name: string }) =>
     act(async () => {
-      const dest = await saveTempAs(l.path, l.name);
-      if (!dest) return;
+      const saved = await saveTempAs(l.path, l.name);
+      if (!saved) return;
       await tempProjects.discard(l.path).catch(() => {});
-      await open(dest);
+      await open(saved.dest, null, saved.notice);
     });
   const remove = (l: TempLeftover) =>
     act(async () => {

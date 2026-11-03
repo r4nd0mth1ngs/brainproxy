@@ -344,7 +344,8 @@ pub struct HistoryFilter {
     pub tag: Option<String>,
     /// gui, cli, mcp, or unknown (entries from before origins were kept).
     pub origin: Option<String>,
-    /// Substring searched in the raw request and response.
+    /// Substring searched in the raw request and response, and in their decoded bodies
+    /// (so a gzip or chunked body matches too). Case-sensitive.
     pub contains: Option<String>,
     pub after_id: Option<i64>,
     pub limit: Option<u32>,
@@ -1014,7 +1015,10 @@ impl Store {
         if let Some(c) = &f.contains {
             args.push(Box::new(c.clone().into_bytes()));
             let n = args.len();
-            sql.push_str(&format!(" AND (instr(request, ?{n}) > 0 OR instr(response, ?{n}) > 0)"));
+            sql.push_str(&format!(
+                " AND (instr(request, ?{n}) > 0 OR instr(response, ?{n}) > 0 \
+                 OR instr(req_body, ?{n}) > 0 OR instr(resp_body, ?{n}) > 0)"
+            ));
         }
         sql.push_str(" ORDER BY id");
         if let Some(l) = f.limit {
@@ -1570,6 +1574,28 @@ mod tests {
         let hits = s.list(&HistoryFilter { method: Some("post".into()), ..Default::default() }).unwrap();
         assert_eq!(hits[0].error.as_deref(), Some("boom"));
 
+        // Compressed and chunked bodies are searched decoded.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, b"{\"session\":\"hidden-in-gzip\"}").unwrap();
+        let gz = gz.finish().unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            gz.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&gz);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let target = Target::from_url("http://a.test").unwrap();
+        let request =
+            b"POST /z HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nuser\r\n4\r\n=bob\r\n0\r\n\r\n".to_vec();
+        let gz_id = s.record_exchange("proxy", &Exchange { target, request, response, duration_ms: 1 }).unwrap();
+        for needle in ["hidden-in-gzip", "user=bob", "Content-Encoding: gzip"] {
+            let hits = s.list(&HistoryFilter { contains: Some(needle.into()), ..Default::default() }).unwrap();
+            assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [gz_id], "{needle}");
+        }
+        let hits = s.list(&HistoryFilter { contains: Some("HIDDEN-IN-GZIP".into()), ..Default::default() }).unwrap();
+        assert!(hits.is_empty(), "case-sensitive");
+
         s.set_note(id, Some("interesting")).unwrap();
         assert_eq!(s.get(id).unwrap().entry.note.as_deref(), Some("interesting"));
         assert_eq!(s.update_tags(id, &["sqli".into(), "todo".into()], &[]).unwrap(), ["sqli", "todo"]);
@@ -1577,6 +1603,76 @@ mod tests {
         let hits = s.list(&HistoryFilter { tag: Some("sqli".into()), ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(s.get(99), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn contains_is_literal_and_pages_with_the_other_filters() {
+        let s = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let ok = |s: &Store, source: &str, body: &str| {
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+            let request = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec();
+            s.record_exchange(source, &Exchange { target: target.clone(), request, response, duration_ms: 1 }).unwrap()
+        };
+        let a = ok(&s, "proxy", "needle one, 50% off");
+        let b = ok(&s, "send", "needle two");
+        let c = ok(&s, "proxy", "needle three, it's café");
+        ok(&s, "proxy", "no match here");
+        // A refused request has no response: its request is still searched.
+        let refused =
+            s.record_failure("proxy", &target, b"POST /only-in-request HTTP/1.1\r\n\r\n", "out of scope").unwrap();
+        let ids = |f: HistoryFilter| s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>();
+        let has = |c: &str| HistoryFilter { contains: Some(c.into()), ..Default::default() };
+        assert_eq!(ids(has("needle")), [a, b, c]);
+        assert_eq!(ids(has("only-in-request")), [refused]);
+        assert_eq!(ids(has("café")), [c]);
+        // LIKE wildcards and quotes are plain text.
+        assert_eq!(ids(has("%")), [a]);
+        assert!(ids(has("_")).is_empty());
+        assert_eq!(ids(has("it's")), [c]);
+        assert!(ids(has("') OR 1=1 --")).is_empty());
+
+        // The way the GUI pages a search: --contains with --source, --after and --limit, oldest first.
+        let page = |after: i64, limit: u32| HistoryFilter {
+            contains: Some("needle".into()),
+            source: Some("proxy".into()),
+            after_id: Some(after),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        assert_eq!(ids(page(0, 1)), [a]);
+        assert_eq!(ids(page(a, 1)), [c]);
+        assert!(ids(page(c, 1)).is_empty());
+        assert_eq!(ids(page(0, 2000)), [a, c]);
+        let narrowed = HistoryFilter {
+            status: Some(200),
+            host: Some("a.test".into()),
+            method: Some("get".into()),
+            ..has("needle")
+        };
+        assert_eq!(ids(narrowed), [a, b, c]);
+        s.update_tags(b, &["keep".into()], &[]).unwrap();
+        assert_eq!(ids(HistoryFilter { tag: Some("keep".into()), ..has("needle") }), [b]);
+        assert!(ids(HistoryFilter { status: Some(404), ..has("needle") }).is_empty());
+
+        // A deflate body is searched decoded; one that can't be decoded is searched as stored.
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut z, b"deflated-word").unwrap();
+        let z = z.finish().unwrap();
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\nContent-Length: {}\r\n\r\n", z.len()).into_bytes();
+        response.extend_from_slice(&z);
+        let request = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let deflated = s
+            .record_exchange("proxy", &Exchange { target: target.clone(), request, response, duration_ms: 1 })
+            .unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 13\r\n\r\nnot-gzip-text".to_vec();
+        let request = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let corrupt = s
+            .record_exchange("proxy", &Exchange { target: target.clone(), request, response, duration_ms: 1 })
+            .unwrap();
+        assert_eq!(ids(has("deflated-word")), [deflated]);
+        assert_eq!(ids(has("not-gzip-text")), [corrupt]);
     }
 
     #[test]

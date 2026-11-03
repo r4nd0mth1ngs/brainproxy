@@ -50,12 +50,15 @@ export function App() {
   }, [theme]);
 
   // `temp` is set for a temporary engagement (made by the shell); those never go in Recent.
-  const open = useCallback(async (path: string, tempInfo: TempInfo | null = null) => {
+  // `opened` is toasted in the project once it is open (from Save as…, whose shell is gone).
+  const [opened, setOpened] = useState("");
+  const open = useCallback(async (path: string, tempInfo: TempInfo | null = null, notice = "") => {
     setProject(path);
     await run(["project", "init"]);
     if (!tempInfo) remember(path);
     setTemp(tempInfo);
     setNotice("");
+    setOpened(notice);
     setProj(path);
   }, []);
 
@@ -76,21 +79,22 @@ export function App() {
     const leaving = project;
     if (!leaving) return;
     const eng = await run<{ engagement: { name: string | null } | null }>(["engagement", "show"]).catch(() => null);
-    const dest = await saveTempAs(leaving, eng?.engagement?.name ?? "");
-    if (!dest) return;
+    const saved = await saveTempAs(leaving, eng?.engagement?.name ?? "");
+    if (!saved) return;
+    const { dest, notice } = saved;
     setProj(null);
     setTemp(null);
     // The saved file has everything; if this fails it is offered again on the next launch.
     await tempProjects.discard(leaving).catch(() => {});
     // The shell is gone by now, so a failure is shown on the welcome screen.
-    await open(dest).catch((e) => setNotice(`Saved to ${dest}, but it didn't open: ${e.message}`));
+    await open(dest, null, notice).catch((e) => setNotice(`Saved to ${dest}, but it didn't open: ${e.message}`));
   }, [open, project]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   return (
     <>
       {project ? (
-        <AppProvider project={project} temp={temp} saveAs={saveAs}>
+        <AppProvider project={project} temp={temp} saveAs={saveAs} notice={opened}>
           <Shell onClose={close} toggleTheme={toggleTheme} />
         </AppProvider>
       ) : (

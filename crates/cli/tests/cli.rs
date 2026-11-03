@@ -993,6 +993,69 @@ fn auth_secrets_stay_out_of_history_and_replay_fills_them_in() {
 }
 
 #[test]
+fn history_contains_takes_the_gui_arguments_and_finds_no_secrets() {
+    let (port, _) = serve_recording();
+    let project = tmp_project("contains");
+    let base = format!("http://127.0.0.1:{port}");
+    let login_url = format!("{base}/login");
+    let args = [
+        "auth",
+        "add",
+        "p",
+        "--login-url",
+        &login_url,
+        "--login-body",
+        "u={{username}}&pw={{password}}",
+        "--username",
+        "alice",
+        "--password",
+        "S3cretPW",
+        "--header",
+        "X-Api-Key: APIKEY123",
+    ];
+    let (code, v) = run(&args, &project, None);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["send", "--url", &format!("{base}/data"), "--auth", "p"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let mut sent = Vec::new();
+    for body in ["q=-tok=1&a", "q=other", "q=-tok=3&b"] {
+        let req = format!("POST /f HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+        sent.push(v["data"]["id"].as_i64().unwrap());
+    }
+    let ids = |args: &[&str]| {
+        let (code, v) = run(&[&["history", "list"], args].concat(), &project, None);
+        assert_eq!(code, 0, "{v}");
+        v["data"]["items"].as_array().unwrap().iter().map(|i| i["id"].as_i64().unwrap()).collect::<Vec<_>>()
+    };
+
+    // The GUI passes the text as --contains=TEXT, so a leading dash or an = sign is part of it.
+    let first = sent[0].to_string();
+    assert_eq!(ids(&["--contains=-tok=", "--source=send", "--after=0", "--limit=2000"]), [sent[0], sent[2]]);
+    assert_eq!(ids(&["--contains=-tok=", "--source=send", "--after=0", "--limit=1"]), [sent[0]]);
+    assert_eq!(ids(&["--contains=-tok=", "--source=send", &format!("--after={first}"), "--limit=2000"]), [sent[2]]);
+    assert!(ids(&["--contains=-tok=", "--source=proxy", "--after=0", "--limit=2000"]).is_empty());
+    assert!(ids(&["--contains=-TOK=", "--after=0"]).is_empty(), "case-sensitive");
+
+    // Auth secrets are stored as placeholders, so searching for them finds nothing.
+    for secret in ["S3cretPW", "APIKEY123"] {
+        assert!(ids(&[&format!("--contains={secret}")]).is_empty(), "{secret}");
+    }
+    assert!(!ids(&["--contains=«auth:p:password:form»"]).is_empty());
+    assert!(!ids(&["--contains=«auth:p:header:X-Api-Key»"]).is_empty());
+
+    // The flag's help (and the history_list MCP tool, built from it) says how it matches.
+    let (code, v) = run(&["capabilities", "history", "list"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let arg = v["data"]["args"].as_array().unwrap().iter().find(|a| a["flag"] == "--contains").unwrap();
+    let help = arg["help"].as_str().unwrap();
+    for words in ["decoded bodies", "Case-sensitive and literal", "URL-encoded", "JSON-escaped"] {
+        assert!(help.contains(words), "{help}");
+    }
+}
+
+#[test]
 fn auth_add_reads_a_literal_password_from_the_environment() {
     let project = tmp_project("pwenv");
     let out = bin()

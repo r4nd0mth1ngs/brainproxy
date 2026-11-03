@@ -246,6 +246,19 @@ The sidebar groups the tools by what you are doing.
   imports.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
+  - **Contents:** tick it to search the text inside requests and responses instead: headers
+    and bodies, compressed and chunked bodies included. Unlike the plain filter, the search is
+    case-sensitive and literal: it matches the bytes as stored, so `a@b.com` doesn't find
+    `a%40b.com`, a JSON-escaped value has to be typed escaped, and HTTP/2 header names are
+    lower-case. Text that is only spaces is ignored. The other filters still apply, and
+    changing one doesn't search again. New traffic that matches shows up as it arrives. A
+    search stops at the first 10,000 matches the other filters show and says so; narrow it to
+    see later ones.
+  - **Saved filters:** *Save…* names the current filters (text, Contents, sources and the
+    checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept per
+    project on this computer, in the app's own storage in plain text, not in the owner-only
+    project file: a saved search for a token or password stays there until you delete it.
+    *Save as…* on a temporary engagement takes them along.
   - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). For a proxy entry
     that is who started the proxy, not who sent the request: hover it to see the address of
     the client that sent it.
@@ -702,6 +715,7 @@ echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   #
 brainproxy findings list
 brainproxy findings show 12
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
+brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
 brainproxy report html -o acme-report.html
 
 # Session handling: a macro that fetches a fresh CSRF token (history #42 is the form page),
