@@ -27,6 +27,10 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     bodies exact.
   - `env` adds variables to the child, only names starting with `BRAINPROXY_SECRET_`, for
     secrets that shouldn't be in argv (visible in `ps`).
+  - Every call also gets `BRAINPROXY_CLIENT=gui` (the Vite dev bridge sets it too), so what
+    the CLI records, and what the proxy and jobs it starts record, is marked as the app's
+    (origin `gui`). Traffic shows it in the **By** column (app, CLI, agent); hovering it on a
+    proxy entry shows the client's address.
   - `call` names the call, so `cli_cancel(call)` can kill its process (`cancelCli` in
     `api.ts`); it then fails with kind `cancelled`. For a command that waits on the user,
     such as the browser sign-in.

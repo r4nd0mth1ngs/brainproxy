@@ -235,6 +235,8 @@ fn proxy_end_to_end() {
     assert_eq!(env.count("SELECT count(*) FROM history"), before);
     env.ok(&["scope", "clear"]);
 
+    // Every entry, intercepted ones included, names the client it came from.
+    assert_eq!(env.count("SELECT count(*) FROM history WHERE source = 'proxy' AND client_addr IS NULL"), 0);
     let status = env.ok(&["proxy", "status"]);
     assert_eq!(status["running"], true);
     env.ok(&["proxy", "stop"]);
@@ -716,6 +718,8 @@ fn proxy_serves_http2() {
     env.ok(&["intercept", "disable"]);
     env.ok(&["rules", "clear"]);
     env.ok(&["proxy", "stop"]);
+    // HTTP/2 streams run on tasks of their own: they still name the client.
+    assert_eq!(env.count("SELECT count(*) FROM history WHERE source = 'proxy' AND client_addr IS NULL"), 0);
 
     // --no-http2 keeps clients on HTTP/1.1.
     let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0", "--no-http2"]);

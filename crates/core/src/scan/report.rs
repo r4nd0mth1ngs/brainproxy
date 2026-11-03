@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::guard::ScopeSpec;
+use crate::provenance;
 use crate::scan::findings_db::FindingFilter;
 use crate::store::Store;
 
@@ -132,6 +133,8 @@ pub struct Instance {
     pub state: String,
     pub note: Option<String>,
     pub history_id: Option<i64>,
+    /// Who or what added it: gui, cli, mcp; None from before brainproxy kept it.
+    pub origin: Option<String>,
     pub request: Option<HttpRequest>,
     pub response: Option<HttpResponse>,
 }
@@ -210,7 +213,8 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         "SELECT f.id, f.time, f.source, f.risk, f.confidence, f.host, f.method, f.url, f.param, f.evidence,
             coalesce(f.attack, ''), f.other_info, f.hits, f.state, f.note, f.history_id,
             f.alert_ref, f.rule_id, f.name, f.cwe, f.wasc,
-            coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]')
+            coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]'),
+            f.origin
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
          ORDER BY f.risk_level DESC, f.alert_ref, f.id LIMIT {}",
         opts.limit
@@ -238,6 +242,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             state: r.get(13)?,
             note: r.get(14)?,
             history_id: r.get(15)?,
+            origin: r.get(25)?,
             request: None,
             response: None,
         };
@@ -481,8 +486,13 @@ fn markdown(r: &Report) -> String {
             let _ = writeln!(s, "#### {} {}\n", inst.method, md_code(&inst.url));
             let _ = writeln!(
                 s,
-                "- Finding #{} · {} · confidence {} · {} · seen {}×",
-                inst.id, inst.source, inst.confidence, inst.state, inst.hits
+                "- Finding #{} · {} · confidence {} · {} · seen {}× · added {}",
+                inst.id,
+                inst.source,
+                inst.confidence,
+                inst.state,
+                inst.hits,
+                provenance::describe(inst.origin.as_deref())
             );
             if !inst.param.is_empty() {
                 let _ = writeln!(s, "- Parameter: {}", md_code(&inst.param));
@@ -799,6 +809,7 @@ fn html(r: &Report) -> String {
                 "Finding",
                 format!("#{} · {} · {}× seen · {}", inst.id, esc(&inst.source), inst.hits, esc(&inst.state)),
             );
+            row("Added", esc(provenance::describe(inst.origin.as_deref())));
             for (k, v) in [("Parameter", &inst.param), ("Evidence", &inst.evidence), ("Attack", &inst.attack)] {
                 if !v.is_empty() {
                     row(k, format!("<code>{}</code>", esc(v)));
@@ -830,7 +841,8 @@ fn html(r: &Report) -> String {
          <p>The findings come from automated tests that look at the site's traffic and send attack requests, as an \
          attacker would. <strong>Certainty</strong> says how sure a test is: low-certainty findings need a person to \
          confirm them, and some may turn out not to be real. A finding marked <span class=\"tag\">confirmed</span> was \
-         checked by the tester. Automated tests can't find every problem (for example flaws in business logic), so \
+         checked by the tester. Each finding also says how it was added: from the desktop app, from the \
+         command line, or via MCP (by an AI agent). Automated tests can't find every problem (for example flaws in business logic), so \
          a short or empty report doesn't prove a site is secure.</p>\n",
     );
     s.push_str("</main></body></html>\n");
@@ -961,6 +973,8 @@ fn sarif(r: &Report) -> Value {
                     "hits": inst.hits,
                     "state": inst.state,
                     "historyId": inst.history_id,
+                    "origin": inst.origin,
+                    "originText": format!("added {}", provenance::describe(inst.origin.as_deref())),
                 },
             });
             if let Some(n) = &inst.note {

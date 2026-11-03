@@ -166,6 +166,11 @@ templates live once per user (`~/.local/share/brainproxy`, on Windows
 `%APPDATA%\brainproxy`) and are shared by all projects. A project file gets the
 permissions of the folder it is saved in: keep it in your own folders on a shared machine.
 
+**Who recorded it.** Every request in history and every finding says where it came from:
+the desktop app (`gui`), the command line or a script (`cli`), or an AI agent through MCP
+(`mcp`). A proxy, crawl or scan keeps the origin of whoever started it, so a proxy an agent
+started records `mcp`. Entries from before brainproxy kept this show as unknown.
+
 ---
 
 ## First engagement (desktop app)
@@ -240,6 +245,8 @@ The sidebar groups the tools by what you are doing.
   imports.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
+  - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). Hover a proxy
+    entry's to see the address of the client that sent it.
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
 - **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
@@ -664,6 +671,33 @@ brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe
 brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
 ```
 
+### Who recorded what
+
+Each history entry has:
+
+- `origin`: `gui` (the desktop app), `cli` (a terminal or script) or `mcp` (an agent through
+  MCP); NULL, shown as unknown, for entries recorded before brainproxy kept it. Background
+  jobs, fuzz runs and the proxy record the origin of the command that started them.
+- `client_addr`: for proxy entries, the address (`ip:port`) of the client that sent the
+  request, whether intercepted, passed through, a WebSocket upgrade, or invisible.
+- `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`); NULL
+  when it was the target host, and for plain HTTP.
+
+```sh
+brainproxy history list --origin mcp         # what agents sent; also gui, cli, unknown
+brainproxy history show 42                   # entry.origin, entry.client_addr, entry.sni
+brainproxy query "SELECT origin, count(*) FROM history GROUP BY origin"
+```
+
+Findings have an `origin` too (who added them: the proxy's passive scan, a scan job, ...),
+and `state_origin` and `state_changed_at` say who last changed the state with `findings mark`
+and when, so a finding an agent marked as a false positive says so. `findings list` and
+`findings show` include them; reports say it in words ("added via MCP (an agent)") in
+Markdown and HTML, and as `origin` in JSON, SARIF and `findings compare` items.
+
+The app sets `BRAINPROXY_CLIENT=gui` on the commands it runs; the MCP server sets
+`BRAINPROXY_MCP_CALL`, which wins over it, and an agent can set neither.
+
 Connection options (see Settings › Connections above for what each does):
 
 ```sh
@@ -1079,6 +1113,9 @@ and capabilities are available as resources. Add it to an MCP client:
 ```
 
 The agent works under the same engagement scope; it cannot reach anything outside it.
+Everything its tool calls record (history, findings, finding state changes) is marked with
+origin `mcp`, including what a proxy or job it started records; see
+[Who recorded what](#who-recorded-what).
 
 ---
 

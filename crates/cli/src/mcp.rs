@@ -34,8 +34,9 @@ const EXCLUDED: &[&str] =
     &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save"];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
-/// do alone (run a collection's script, open the user's browser, read any environment variable).
-const CHILD_ENV: &str = "BRAINPROXY_MCP_CALL";
+/// do alone (run a collection's script, open the user's browser, read any environment variable),
+/// and so everything it records is marked as an agent's (origin `mcp`).
+const CHILD_ENV: &str = brainproxy_core::provenance::MCP_ENV;
 
 /// Environment variables a command run by an agent may read secrets from: the prefix the
 /// app uses, so a person decides what the server's environment offers.

@@ -476,6 +476,7 @@ fn spawn_background(
     let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
+    brainproxy_core::provenance::pass_on(&mut cmd);
     process::detach(&mut cmd);
     let stdin = process::work_lock_stdin(store, &lock_name(run_id));
     let mut child =

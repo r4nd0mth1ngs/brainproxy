@@ -98,6 +98,13 @@ Some arguments need a person, so a command run for a tool call (the server sets
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.
 
+Everything a tool call records is marked as an agent's: history entries and findings get
+origin `mcp`, and so does a finding state change (`findings_mark` sets `state_origin`). A
+proxy, job or fuzz run started by a tool call records `mcp` too. `BRAINPROXY_MCP_CALL` wins
+over `BRAINPROXY_CLIENT=gui` (what the desktop app sets), and tool arguments can't set
+environment variables, so an agent can't make its records look like a person's. List them
+with `history_list` and `origin: "mcp"`.
+
 A call becomes `brainproxy --format json --project P [--home H] <path> --flag=value ... --
 <positionals>` run as a child process of the same executable (`--flag=value` and `--` keep
 values that start with `-` as values). It runs exactly the code a shell invocation runs: the

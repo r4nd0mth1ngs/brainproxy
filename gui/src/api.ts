@@ -126,6 +126,12 @@ export interface HistoryItem {
   error: string | null;
   note: string | null;
   tags: string[];
+  /** Who or what recorded it: gui, cli, mcp (an agent); null from before brainproxy kept it. */
+  origin?: string | null;
+  /** The proxy client's address, for proxy entries. */
+  client_addr?: string | null;
+  /** The TLS server name sent, when overridden with --sni. */
+  sni?: string | null;
 }
 
 export interface HistoryEntry {

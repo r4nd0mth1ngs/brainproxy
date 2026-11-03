@@ -304,12 +304,13 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                         .iter()
                         .map(|f| {
                             format!(
-                                "{:>5}  {:<6} {:<45} {} {}",
+                                "{:>5}  {:<6} {:<45} {} {}  (added {})",
                                 f["id"],
                                 f["risk"].as_str().unwrap_or(""),
                                 f["name"].as_str().unwrap_or(""),
                                 f["url"].as_str().unwrap_or(""),
-                                f["param"].as_str().unwrap_or("")
+                                f["param"].as_str().unwrap_or(""),
+                                brainproxy_core::provenance::describe(f["origin"].as_str())
                             )
                         })
                         .collect::<Vec<_>>()

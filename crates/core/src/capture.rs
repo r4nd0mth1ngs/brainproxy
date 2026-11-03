@@ -34,6 +34,13 @@ pub struct Capture {
     pub error: Option<String>,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
+    /// Who or what recorded it (`gui`, `cli`, `mcp`); None: this process's origin.
+    pub origin: Option<String>,
+    /// The proxy client's address (`ip:port`), for captures the proxy records.
+    pub client_addr: Option<String>,
+    /// The TLS server name sent when it was overridden (`--sni`); None: the SNI override in
+    /// effect for this process, if any.
+    pub sni: Option<String>,
 }
 
 impl Capture {
@@ -78,6 +85,7 @@ impl Capture {
             duration_ms,
             error: error.map(str::to_string),
             request: request.to_vec(),
+            client_addr: (source == "proxy").then(crate::proxy::server::client_addr).flatten(),
             ..Default::default()
         };
 

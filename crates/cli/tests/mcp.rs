@@ -413,3 +413,29 @@ fn an_agent_cannot_add_a_script_open_a_browser_or_read_any_variable() {
     let url = std::fs::read_to_string(&opened).unwrap_or_default();
     assert!(url.starts_with("https://id.test/authorize?"), "{url}");
 }
+
+#[test]
+fn an_agent_cannot_pass_its_records_off_as_the_apps() {
+    // Even a server started from the app's environment marks what its tool calls record as an
+    // agent's: tool arguments can't set or clear environment variables.
+    let port = serve(1);
+    let project = tmp_project("origin");
+    let mut m = Mcp::start_env(&project, &[], &[("BRAINPROXY_CLIENT", "gui")]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, env) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{env}");
+    let (err, env) = m.call("send", json!({"url": format!("http://127.0.0.1:{port}/")}));
+    assert!(!err, "{env}");
+    let (_, env) = m.call("history_list", json!({}));
+    assert_eq!(env["data"]["items"][0]["origin"], "mcp", "{env}");
+    let (_, env) = m.call("history_list", json!({"origin": "gui"}));
+    assert_eq!(env["data"]["count"], 0, "{env}");
+    // No tool takes the environment or a way to name the client.
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for t in &tools {
+        let props = t["inputSchema"]["properties"].as_object().cloned().unwrap_or_default();
+        for key in props.keys() {
+            assert!(!["env", "client", "set_origin"].contains(&key.as_str()), "{}: {key}", t["name"]);
+        }
+    }
+}
