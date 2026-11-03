@@ -947,8 +947,10 @@ brainproxy findings remove 17
 - `--description`, `--solution` and `--evidence` take the text; `--description-file`,
   `--solution-file` and `--evidence-file` read it from a file, or stdin with `-` (one of them).
   Through MCP the file flags only take `-`, the call's stdin.
-- In Markdown reports and SARIF help, HTML in the description and solution shows as text and
-  links and images are left out; code spans and fenced code blocks keep their text as written.
+- In Markdown reports and SARIF help, the title, description and solution are plain text: HTML,
+  links, images, code spans, emphasis, lists and tables show as typed, not rendered. Only fenced
+  code blocks (a line of three or more backticks or tildes, indented at most three spaces) keep
+  their text as written, as code; leading spaces on other lines are dropped.
 - `--input-json` reads all three from stdin instead, as
   `{"description": "...", "solution": "...", "evidence": "..."}` (each optional). Text on the
   command line is visible in the process list, so use it for evidence that holds a token.

@@ -446,17 +446,20 @@ fn history_list(ids: &[i64]) -> String {
     ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ")
 }
 
-/// Markdown whose HTML is shown as text, not rendered, and with no links or images, which
-/// would load or point to anything quoted (`![x](https://...)`). Emphasis, lists and code stay.
-/// Code spans on a line with no pipe, and fenced blocks, keep their text as written (often a
-/// request to copy), each in a fence of our own that nothing inside can close.
+/// Markdown from a tester's text that renders nothing it holds. Fenced code blocks keep their
+/// text as written (often a request to copy), each in a fence of our own that nothing inside can
+/// close; every other line is plain text through [`md_escape`], so no HTML, link, image, code
+/// span, emphasis or table survives outside a fence. A fence indented four or more spaces, as in
+/// a list item, isn't one here: its lines are text like the rest.
 fn md_no_html(s: &str) -> String {
+    let s = s.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<&str> = s.lines().collect();
     let mut out = String::new();
     let mut i = 0;
     while i < lines.len() {
         let Some((indent, mark, run, lang)) = md_fence_open(lines[i]) else {
-            out.push_str(&md_inline(lines[i]));
+            // Leading blanks come off, so no line starts an indented code block.
+            out.push_str(&md_escape(lines[i].trim_start_matches([' ', '\t'])));
             out.push('\n');
             i += 1;
             continue;
@@ -466,7 +469,7 @@ fn md_no_html(s: &str) -> String {
         while i < lines.len() {
             let l = lines[i];
             i += 1;
-            if md_fence_close(l, indent, mark, run) {
+            if md_fence_close(l, mark, run) {
                 break;
             }
             // The fence's own indent comes off its lines, as in CommonMark.
@@ -496,80 +499,36 @@ fn md_fence_open(line: &str) -> Option<(usize, char, usize, String)> {
     }
     // Only a plain language name is kept from the info string.
     let lang = info.split_whitespace().next().unwrap_or("");
-    let ok = lang.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '#' | '.' | '_' | '-'));
+    let ok = lang.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-'));
     Some((indent, mark, run, if ok { lang.to_string() } else { String::new() }))
 }
 
-/// A line that closes a fence opened at `indent` by `run` of `mark`: up to three spaces more
-/// indent than the opener (which may sit in a list item), at least as long a run of the same
-/// character, then only spaces or tabs.
-fn md_fence_close(line: &str, indent: usize, mark: char, run: usize) -> bool {
+/// A line that closes a fence of `run` `mark`s: up to three spaces, at least as long a run of
+/// the same character, then only spaces or tabs.
+fn md_fence_close(line: &str, mark: char, run: usize) -> bool {
     let rest = line.trim_start_matches(' ');
     let n = rest.len() - rest.trim_start_matches(mark).len();
-    line.len() - rest.len() <= indent + 3 && n >= run && rest[n..].chars().all(|c| matches!(c, ' ' | '\t'))
+    line.len() - rest.len() <= 3 && n >= run && rest[n..].chars().all(|c| matches!(c, ' ' | '\t'))
 }
 
-/// One line of a tester's text: code spans as written, the rest through [`md_escape`]. A
-/// backtick that opens no span is escaped, so it can't pair with one of ours on another line.
-/// On a line with a pipe, which may be a GFM table row where a pipe ends the cell even inside a
-/// span, every span is text like the rest, whether or not the line is in a table.
-fn md_inline(line: &str) -> String {
-    let pipe = line.contains('|');
-    let mut out = String::new();
-    let mut rest = line;
-    while let Some(start) = rest.find('`') {
-        out.push_str(&md_escape(&rest[..start]));
-        let after = &rest[start..];
-        let n = after.len() - after.trim_start_matches('`').len();
-        let body = &after[n..];
-        match md_closing_run(body, n) {
-            Some(end) if !pipe => {
-                out.push_str(&md_code(&body[..end]));
-                rest = &body[end + n..];
-            }
-            Some(end) => {
-                // On a line with a pipe: shown as text, with every backtick escaped.
-                out.push_str(&"\\`".repeat(n));
-                out.push_str(&md_escape(&body[..end]));
-                out.push_str(&"\\`".repeat(n));
-                rest = &body[end + n..];
-            }
-            None => {
-                out.push_str(&"\\`".repeat(n));
-                rest = body;
-            }
-        }
-    }
-    out.push_str(&md_escape(rest));
-    out
-}
-
-/// Where the first run of exactly `n` backticks starts, which closes a code span opened by `n`.
-fn md_closing_run(s: &str, n: usize) -> Option<usize> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let j = i + b[i..].iter().take_while(|&&c| c == b'`').count();
-        if j - i == n {
-            return Some(i);
-        }
-        i = j;
-    }
-    None
-}
-
-/// Text with its HTML shown as text, and no links or images: brackets and backslashes escaped.
+/// Text that Markdown shows as written: every ASCII punctuation character backslash-escaped,
+/// except `&`, `<` and `>`, which become entities, so even a renderer that ignores backslash
+/// escapes reads no HTML in it.
 fn md_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            c if c.is_ascii_punctuation() => {
+                o.push('\\');
+                o.push(c);
+            }
+            _ => o.push(c),
+        }
+    }
+    o
 }
 
 /// Text from our own rule definitions; only table pipes and line breaks need care.
@@ -577,10 +536,10 @@ fn md_text(s: &str) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
-/// An alert type's name for a heading or table cell; a tester's title gets no raw HTML.
+/// An alert type's name for a heading or table cell; a tester's title is plain text.
 fn md_name(g: &AlertGroup) -> String {
     if is_manual(g) {
-        md_text(&md_escape(&g.name))
+        md_escape(&g.name.replace(['\r', '\n'], " "))
     } else {
         md_text(&g.name)
     }
@@ -633,7 +592,7 @@ fn markdown(r: &Report) -> String {
             meta.push(format!("**WASC:** {w}"));
         }
         let _ = writeln!(s, "{}\n", meta.join(" · "));
-        // A tester's own text keeps its Markdown, but not raw HTML: it may quote the target.
+        // A tester's own text is plain text, fenced code apart: it may quote the target.
         let prose = |t: &str| if is_manual(g) { md_no_html(t.trim()) } else { t.trim().to_string() };
         if !g.description.is_empty() {
             let _ = writeln!(s, "### Description\n\n{}\n", prose(&g.description));
@@ -1108,7 +1067,7 @@ fn sarif(r: &Report) -> Value {
                 },
             });
             if !g.solution.is_empty() {
-                // A tester's text may quote the target: no raw HTML or remote images.
+                // A tester's text may quote the target: plain text, fenced code apart.
                 let markdown = if is_manual(g) { md_no_html(&g.solution) } else { g.solution.clone() };
                 rule["help"] = json!({"text": g.solution, "markdown": markdown});
             }
@@ -1418,7 +1377,7 @@ mod tests {
         assert_eq!(inst.request.as_ref().unwrap().url, "http://app.test/a?q=1");
 
         let md = render(&r, ReportKind::Markdown);
-        assert!(md.contains("Any **user** can read &lt;script&gt;x&lt;/script&gt; orders."), "{md}");
+        assert!(md.contains("Any \\*\\*user\\*\\* can read &lt;script&gt;x&lt;\\/script&gt; orders\\."), "{md}");
         assert!(md.contains(&format!("- History: #1, #{second}, #{third}")));
         let html = render(&r, ReportKind::Html);
         assert!(html.contains("found by hand") && !html.contains("<script>x"));
@@ -1435,7 +1394,7 @@ mod tests {
         assert_eq!(only("manual"), 2);
         assert_eq!(only("passive") + 2, r.summary.total);
         // A title is the tester's text: no raw HTML in Markdown either.
-        assert!(md.contains("&lt;img src=x&gt; \\| note") && !md.contains("<img"), "{md}");
+        assert!(md.contains("&lt;img src\\=x&gt; \\| note") && !md.contains("<img"), "{md}");
     }
 
     #[test]
@@ -1499,19 +1458,21 @@ mod tests {
             .unwrap()
             .clone();
         let help = rule["help"]["markdown"].as_str().unwrap();
-        assert!(!help.contains("<img") && help.contains("&lt;img"), "{help}");
-        assert!(!help.contains("![p](") && help.contains("!\\[p\\](https://attacker.test"), "{help}");
+        assert_inert(help);
+        assert!(help.contains("&lt;img src\\=x onerror\\=alert\\(1\\)&gt;"), "{help}");
+        assert!(help.contains("\\!\\[p\\]\\(https\\:\\/\\/attacker\\.test\\/p\\?d\\=1\\)"), "{help}");
         // The plain text stays as written.
         assert!(rule["help"]["text"].as_str().unwrap().contains("<img src=x"));
         // The Markdown report has no link or image either, even after a backslash.
         let md = render(&r, ReportKind::Markdown);
-        assert!(md.contains("See \\[here\\](https://attacker.test/)"), "{md}");
-        assert!(md.contains("and \\\\\\[x\\](https://attacker.test/b)"), "{md}");
+        assert!(md.contains("See \\[here\\]\\(https\\:\\/\\/attacker\\.test\\/\\)"), "{md}");
+        assert!(md.contains("and \\\\\\[x\\]\\(https\\:\\/\\/attacker\\.test\\/b\\)\\."), "{md}");
         assert!(!md.contains("![p]("), "{md}");
+        assert_eq!(md_no_html("![x](http://e/)"), "\\!\\[x\\]\\(http\\:\\/\\/e\\/\\)");
     }
 
     #[test]
-    fn a_tester_code_is_kept_as_written() {
+    fn a_tester_fence_is_kept_as_written() {
         let mut s = store_with_findings();
         let mut f = by_hand("Order IDOR", vec![]);
         f.description = "Send `GET /orders?ids[]=1&a=2` as <b>bob</b>:\n\n  ```http\n  POST /x?a[0]=<script> HTTP/1.1\n  \\[y](https://attacker.test/)\n  ```\nDone.".into();
@@ -1519,16 +1480,18 @@ mod tests {
         s.finding_add(&f).unwrap();
         let r = build(&s, &ReportOptions::default()).unwrap();
         let md = render(&r, ReportKind::Markdown);
-        // Code keeps its text; everything around it is still escaped.
-        assert!(md.contains("Send `GET /orders?ids[]=1&a=2` as &lt;b&gt;bob&lt;/b&gt;:"), "{md}");
+        // A fence keeps its text, in a fence of ours; a code span around it is text.
         assert!(
-            md.contains("```http\nPOST /x?a[0]=<script> HTTP/1.1\n\\[y](https://attacker.test/)\n```\nDone."),
+            md.contains("Send \\`GET \\/orders\\?ids\\[\\]\\=1&amp;a\\=2\\` as &lt;b&gt;bob&lt;\\/b&gt;\\:"),
             "{md}"
         );
-        // A backtick that opens no span is escaped, and an unclosed fence is closed in our own,
-        // longer than any backtick run inside it.
         assert!(
-            md.contains("Use ``a`b`` and `<i>` but not \\` &lt;img src=x&gt;.\n````\n```\n<img src=x>\n````\n"),
+            md.contains("\n```http\nPOST /x?a[0]=<script> HTTP/1.1\n\\[y](https://attacker.test/)\n```\nDone\\."),
+            "{md}"
+        );
+        // An unclosed fence is closed in our own, longer than any backtick run inside it.
+        assert!(
+            md.contains("Use \\`\\`a\\`b\\`\\` and \\`&lt;i&gt;\\` but not \\` &lt;img src\\=x&gt;\\.\n````\n```\n<img src=x>\n````\n"),
             "{md}"
         );
         let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
@@ -1540,35 +1503,50 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(rule["help"]["markdown"], md_no_html(f.solution.trim()));
-        // In a table, a pipe in a span would end the cell: on a line with a pipe, spans are text.
-        let t = md_no_html("| a | b |\n|---|---|\n| `x|<b>` | `<i>` |");
-        assert_eq!(t, "| a | b |\n|---|---|\n| \\`x|&lt;b&gt;\\` | \\`&lt;i&gt;\\` |");
-        assert_eq!(md_no_html("`a|<b>` `<i>`"), "\\`a|&lt;b&gt;\\` \\`&lt;i&gt;\\`");
+        // The HTML report escapes the same text its own way: no backslashes, no fences.
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("Use ``a`b`` and `&lt;i&gt;` but not ` &lt;img src=x&gt;.<br>~~~<br>```"), "{html}");
+        assert!(!html.contains("\\`") && !html.contains("<img"), "{html}");
     }
 
     #[test]
-    fn a_line_with_a_pipe_shows_its_spans_as_text() {
-        let t = md_no_html("| a |\n|---|\nrow `p<q`\n\nAfter `<c>` and `d|<e>`.\n```\n|<f>\n```");
-        assert_eq!(t, "| a |\n|---|\nrow `p<q`\n\nAfter \\`&lt;c&gt;\\` and \\`d|&lt;e&gt;\\`.\n```\n|<f>\n```");
-        // A line of only U+00A0 is no blank line: GFM keeps the table going and splits the span
-        // at its pipe, leaving the rest to be read as HTML.
+    fn spans_tables_and_pipes_are_text() {
+        // Backtick runs that would pair across lines into a span hiding HTML.
+        let t = md_no_html("`x``y` |\n``<img src=x onerror=alert(1)>`z``");
+        assert_eq!(t, "\\`x\\`\\`y\\` \\|\n\\`\\`&lt;img src\\=x onerror\\=alert\\(1\\)&gt;\\`z\\`\\`");
+        // A line of only U+00A0 is no blank line, but there's no table to keep going.
         let t = md_no_html("| a |\n|---|\n\u{a0}\n| `x|<img src=x onerror=alert(1)>` |");
-        assert!(!t.contains("<img") && t.contains("\\`x|&lt;img src=x onerror=alert(1)&gt;\\`"), "{t}");
-        // Nor does a pipe line outside any table keep raw HTML in a span.
-        let t = md_no_html("Try `x|<img src=x>` here.");
-        assert_eq!(t, "Try \\`x|&lt;img src=x&gt;\\` here.");
+        assert_inert(&t);
+        assert!(t.starts_with("\\| a \\|\n\\|\\-\\-\\-\\|\n\u{a0}\n\\| \\`x\\|&lt;img"), "{t}");
+        let t = md_no_html("| a | b |\n|---|---|\n| `x|<b>` | `<i>` |");
+        assert_eq!(t, "\\| a \\| b \\|\n\\|\\-\\-\\-\\|\\-\\-\\-\\|\n\\| \\`x\\|&lt;b&gt;\\` \\| \\`&lt;i&gt;\\` \\|");
+        assert_eq!(md_no_html("Try `x|<img src=x>` here."), "Try \\`x\\|&lt;img src\\=x&gt;\\` here\\.");
+        assert_eq!(md_no_html("After `<c>` and **b**_i_"), "After \\`&lt;c&gt;\\` and \\*\\*b\\*\\*\\_i\\_");
+        // Leading blanks come off, so no indented code block; entities can't be smuggled in.
+        assert_eq!(md_no_html("a\n\n    &lt;b&gt;\n\t1. x"), "a\n\n&amp;lt\\;b&amp;gt\\;\n1\\. x");
+        for t in ["`x``y` |\n``<img src=x onerror=alert(1)>`z``", "| `x|<img src=x>` |", "<a href=x>\r<b>"] {
+            assert_inert(&md_no_html(t));
+        }
     }
 
     #[test]
     fn a_fence_closes_only_as_commonmark_allows() {
-        // Four spaces of indent, a shorter run, the other character or text after: payload.
+        // Four spaces of indent, a shorter run, the other character or text after: content.
         let s = "````\n    ````\n```\n~~~~\n```` x\n   `````  \n<b>after</b>";
-        assert_eq!(md_no_html(s), "`````\n    ````\n```\n~~~~\n```` x\n`````\n&lt;b&gt;after&lt;/b&gt;");
+        assert_eq!(md_no_html(s), "`````\n    ````\n```\n~~~~\n```` x\n`````\n&lt;b&gt;after&lt;\\/b&gt;");
         let s = "  ~~~\n      ~~~\n  x\n\t~~~\n ~~~\nok";
         assert_eq!(md_no_html(s), "```\n    ~~~\nx\n\t~~~\n```\nok");
-        // In a list item the closer may sit up to three spaces past the opener.
-        let s = "- step:\n  ```\n  GET /x\n    ```\n- then <b>y</b>";
-        assert_eq!(md_no_html(s), "- step:\n```\nGET /x\n```\n- then &lt;b&gt;y&lt;/b&gt;");
+        // A closer may have up to three spaces of indent, whatever the opener's.
+        let s = "```\nx\n    ```\n<img src=x onerror=alert(1)>\n```\nok";
+        assert_eq!(md_no_html(s), "````\nx\n    ```\n<img src=x onerror=alert(1)>\n````\nok");
+        let s = "  ```\nx\n     ```\n<img src=x>\n```";
+        assert_eq!(md_no_html(s), "````\nx\n   ```\n<img src=x>\n````");
+        // Our fence is longer than any backtick run inside, and the info string is a plain name.
+        assert_eq!(md_no_html("```js\na ````` b\n```"), "``````js\na ````` b\n``````");
+        assert_eq!(md_no_html("~~~ <b>x\n<i>\n~~~"), "```\n<i>\n```");
+        // A fence in a list item, four spaces in, is text like the rest.
+        let s = "- step:\n    ```\n    <b>y</b>\n    ```";
+        assert_eq!(md_no_html(s), "\\- step\\:\n\\`\\`\\`\n&lt;b&gt;y&lt;\\/b&gt;\n\\`\\`\\`");
     }
 
     #[test]
@@ -1576,7 +1554,37 @@ mod tests {
         // Whatever follows a fence that never closes is literal code in a block of ours, closed
         // by a fence longer than any run inside it, so none of it is read as HTML.
         let s = "Repro:\n  ```\n  x\n      ```\n\n<img src=x onerror=alert(1)>\n````` x";
-        assert_eq!(md_no_html(s), "Repro:\n``````\nx\n    ```\n\n<img src=x onerror=alert(1)>\n````` x\n``````");
+        let t = md_no_html(s);
+        assert_eq!(t, "Repro\\:\n``````\nx\n    ```\n\n<img src=x onerror=alert(1)>\n````` x\n``````");
+        assert_inert(&t);
+    }
+
+    /// Outside our own fences (a backtick run at column 0, closed by the same run alone), no
+    /// ASCII punctuation is left but backslash escapes and the `&amp;`, `&lt;` and `&gt;` entities.
+    fn assert_inert(md: &str) {
+        let mut fence: Option<&str> = None;
+        for line in md.lines() {
+            if let Some(f) = fence {
+                if line == f {
+                    fence = None;
+                }
+                continue;
+            }
+            let run = line.len() - line.trim_start_matches('`').len();
+            if run >= 3 {
+                fence = Some(&line[..run]);
+                continue;
+            }
+            let rest = line.replace("&amp;", "").replace("&lt;", "").replace("&gt;", "");
+            let mut chars = rest.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    assert!(chars.next().is_some_and(|e| e.is_ascii_punctuation()), "{md}");
+                } else {
+                    assert!(!c.is_ascii_punctuation(), "raw {c:?} in {md}");
+                }
+            }
+        }
     }
 
     fn by_hand(title: &str, history: Vec<i64>) -> crate::scan::findings_db::ManualFinding {
@@ -1619,7 +1627,7 @@ mod tests {
         let r = build(&s, &ReportOptions::default()).unwrap();
         let md = render(&r, ReportKind::Markdown);
         assert!(!md.lines().any(|l| l.starts_with("## Fake")), "{md}");
-        assert!(md.contains("Broken ## Fake heading &lt;b&gt;x&lt;/b&gt;"), "{md}");
+        assert!(md.contains("Broken \\#\\# Fake heading &lt;b&gt;x&lt;\\/b&gt;"), "{md}");
         // One linked entry is the evidence; no History line or row for it.
         assert!(!md.contains("- History:"), "{md}");
         let html = render(&r, ReportKind::Html);
