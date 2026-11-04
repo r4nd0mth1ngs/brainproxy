@@ -1651,7 +1651,6 @@ const SCOPE_CHANGES_SHOWN: usize = 20;
 pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
     let mut scope: Scope = store.setting(SCOPE_KEY)?;
-    let before = scope.clone();
     match cmd {
         ScopeCmd::Show => {
             let changes = store.recording_changes()?;
@@ -1687,8 +1686,8 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
         }
     }
     scope.compile()?; // Validate before saving.
-    store.set_setting(SCOPE_KEY, &scope)?;
-    store.note_scope_change(&before, &scope)?;
+                      // Logged with who changed it, against the scope as saved just before (see `save_scope`).
+    store.save_scope(&scope)?;
     out.ok(json!(scope), || serde_json::to_string_pretty(&scope).unwrap_or_default());
     Ok(())
 }

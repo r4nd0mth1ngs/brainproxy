@@ -253,7 +253,8 @@ The sidebar groups the tools by what you are doing.
   list, with who made each and whether it narrowed recording. While an agent's narrowing
   change hasn't been changed by a person since, the tab says so, and so does a **Recording
   narrowed by an agent** pill in the top bar, which opens this tab. Saving the scope yourself
-  (or changing the pass-through list), even unchanged, clears it.
+  (or changing the pass-through list), even unchanged, clears it, and so does **Keep as it
+  is**, which keeps what the agent changed.
 
 ### Proxy
 - **Intercept:** turn it on to hold requests (and optionally responses) before they are
@@ -974,15 +975,20 @@ history (only request lines and tunnels' rows remain), so each change to either 
 `connection clear`. A change has `time`, `by` (`gui`, `cli` or `mcp`), `setting` (`scope` or
 `passthrough`), `summary` (`include: added ^a\.test$`), `before` and `after`, and `narrowed`:
 whether it left traffic out that was recorded in full before. That is an include list that
-went from empty (everything) to some hosts or lost a pattern, a new exclude pattern, or
-`--record-out-of-scope` turned off (none of which counts while out-of-scope traffic is still
-recorded in full), or a new pass-through pattern. `scope show` lists the latest 20
+went from empty (everything) to some hosts or lost a pattern (patterns are compared exactly,
+as the regexes they are), a new exclude pattern, or `--record-out-of-scope` turned off while
+something is out of scope, or a new pass-through pattern. `--record-out-of-scope` doesn't make
+a smaller scope harmless: HTTPS to a host outside it is tunnelled, never decrypted. The
+setting and its log entry are saved in one transaction, so a change by another process
+can't slip between them unlogged. `scope show` lists the latest 20
 (`recording_changes`, newest first); `proxy status` has the last one
 (`recording_last_change`). A narrowing change made through MCP is also listed in
 `narrowed_by_agent` (`scope show`) and `recording_narrowed_by_agent` (`proxy status`, whose
 text says `not reviewed: recording scope changed via MCP (an agent) at ...`) until a person
-changes that setting from the app or a terminal (saving it unchanged counts), or the agent
-puts it back as it was; the agent's later changes don't clear it. The log keeps the last 100
+changes that setting from the app or a terminal (saving it unchanged with a command that edits
+it counts: `scope add` with nothing to add, say), or the agent puts it back as it was; the
+agent's later changes don't clear it, nor does another connection command saving the settings
+the pass-through list is kept with. The log keeps the last 100
 changes, as JSON in the `meta` table (`proxy.recording_changes`).
 
 ```sh
@@ -1454,7 +1460,9 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   HTTPS tunnel (`CONNECT`) outside the scope is never decrypted and gets one `CONNECT` row
   for the tunnel with the byte counts, `error` starting `outside the recording scope:
   tunnelled, not decrypted`, as a TLS pass-through connection gets one starting `TLS
-  pass-through, not decrypted`. Narrowing the scope hides what went out, never that it did. A
+  pass-through, not decrypted`. A tunnel still open when the proxy stops is recorded then,
+  its `error` ending `still open when the proxy stopped` (stopping doesn't wait for it).
+  Narrowing the scope hides what went out, never that it did. A
   request outside both scopes is refused by the engagement before it goes out and gets no
   row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.
 

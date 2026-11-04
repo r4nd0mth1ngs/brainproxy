@@ -139,7 +139,9 @@ Top bar: brainproxy, the project and its engagement scope chips; on the right, w
 agent's change that narrowed what the proxy records (`proxy status`'s
 `recording_narrowed_by_agent`) hasn't been changed by a person since, a "Recording narrowed by
 an agent" pill (when and what in its tooltip; it opens Target › Scope, which shows the same
-notice and the latest changes to the proxy scope and the pass-through list from `scope show`);
+notice, a *Keep as it is* that saves each flagged setting unchanged (`views/recording.ts`
+`reviewCommands`), and the latest changes to the proxy scope and the pass-through list from
+`scope show`; the pill reloads that tab even when it is showing, keeping edits not saved yet);
 then the intercept and proxy pills (the proxy pill starts/stops `proxy start` on the address and with the options
 set in Settings › Proxy, 127.0.0.1:8080 by default) and the theme toggle, and **Open browser**: a menu of the
 installed browsers (`browser list`) that starts the proxy if needed and runs `browser open`,

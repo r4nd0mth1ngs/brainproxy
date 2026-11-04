@@ -44,3 +44,18 @@ export function narrowedNotice(changes: RecordingChange[] | null | undefined, wh
   if (!flagged.length) return null;
   return flagged.map((c) => `Recording narrowed by an agent at ${when(c.time)}: ${changeText(c)}`).join("\n");
 }
+
+/**
+ * The commands that keep the flagged settings as they are and show a person has seen them: each
+ * saved unchanged (`scope add` with nothing to add; the pass-through list by adding a pattern it
+ * already holds, or clearing it while empty). `passthrough` is the list as it is now.
+ */
+export function reviewCommands(flagged: RecordingChange[] | null | undefined, passthrough: string[]): string[][] {
+  const settings = new Set((flagged ?? []).map((c) => c.setting));
+  return [
+    ...(settings.has("scope") ? [["scope", "add"]] : []),
+    ...(settings.has("passthrough")
+      ? [passthrough.length ? ["connection", "passthrough", "add", "--", passthrough[0]] : ["connection", "passthrough", "clear"]]
+      : []),
+  ];
+}

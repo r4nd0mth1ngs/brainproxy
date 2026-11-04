@@ -12,8 +12,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use rusqlite::{params, OptionalExtension};
+
+use crate::connection::{ConnectionSettings, CONNECTION_KEY};
 use crate::error::{Error, Result};
-use crate::proxy::config::Scope;
+use crate::proxy::config::{Scope, SCOPE_KEY};
 use crate::store::Store;
 
 /// Key in the project `meta` table holding the [`Changes`].
@@ -83,11 +86,21 @@ impl Changes {
         self.flagged.values().map(|f| &f.change).collect()
     }
 
-    /// Adds a change of `setting` by `by` (`summary` None: saved unchanged).
-    fn note(&mut self, by: &str, setting: &str, before: Value, after: Value, summary: Option<(bool, String)>) {
+    /// Adds a change of `setting` by `by` (`summary` None: saved unchanged). `reviewed`: the
+    /// command saved that setting itself, so saving it unchanged shows a person has seen it;
+    /// another command saving the settings it is kept with doesn't.
+    fn note(
+        &mut self,
+        by: &str,
+        setting: &str,
+        before: Value,
+        after: Value,
+        summary: Option<(bool, String)>,
+        reviewed: bool,
+    ) {
         let Some((narrowed, summary)) = summary else {
             // A person saving it as it is has seen it; an agent doing so changes nothing.
-            if by != "mcp" {
+            if by != "mcp" && reviewed {
                 self.flagged.remove(setting);
             }
             return;
@@ -101,13 +114,13 @@ impl Changes {
             before: before.clone(),
             after: after.clone(),
         };
-        if by != "mcp" {
+        // Put back as it was before the agent's first narrowing, it is as a person left it,
+        // whatever this last change did on its own.
+        if by != "mcp" || self.flagged.get(setting).is_some_and(|f| f.baseline == after) {
             self.flagged.remove(setting);
         } else if narrowed {
             let baseline = self.flagged.get(setting).map_or(before, |f| f.baseline.clone());
             self.flagged.insert(setting.to_string(), Flag { change: change.clone(), baseline });
-        } else if self.flagged.get(setting).is_some_and(|f| f.baseline == after) {
-            self.flagged.remove(setting);
         }
         self.changes.push(change);
         let extra = self.changes.len().saturating_sub(KEEP);
@@ -115,20 +128,26 @@ impl Changes {
     }
 }
 
-/// Whether out-of-scope traffic is recorded in full: it is recorded too, or nothing is out of scope.
-fn records_everything(s: &Scope) -> bool {
-    s.record_out_of_scope || (s.include.is_empty() && s.exclude.is_empty())
+/// Whether nothing is out of scope.
+fn everything_in_scope(s: &Scope) -> bool {
+    s.include.is_empty() && s.exclude.is_empty()
 }
 
-/// Whether `list` holds pattern `p`, compared as the commands that edit the lists do.
-fn has(list: &[String], p: &str) -> bool {
-    list.iter().any(|q| q.trim().eq_ignore_ascii_case(p.trim()))
+/// How two patterns of a list compare: the scope's regexes exactly (`\d` isn't `\D`), the
+/// pass-through list's host patterns as the commands that edit it do.
+type Same = fn(&str, &str) -> bool;
+const EXACT: Same = |a, b| a == b;
+const HOST: Same = |a, b| a.trim().eq_ignore_ascii_case(b.trim());
+
+/// Whether `list` holds pattern `p`.
+fn has(same: Same, list: &[String], p: &str) -> bool {
+    list.iter().any(|q| same(q, p))
 }
 
 /// "added a, b, removed c" between two pattern lists, or None if they hold the same patterns.
-fn list_diff(before: &[String], after: &[String]) -> Option<String> {
-    let added: Vec<&str> = after.iter().filter(|p| !has(before, p)).map(String::as_str).collect();
-    let removed: Vec<&str> = before.iter().filter(|p| !has(after, p)).map(String::as_str).collect();
+fn list_diff(same: Same, before: &[String], after: &[String]) -> Option<String> {
+    let added: Vec<&str> = after.iter().filter(|p| !has(same, before, p)).map(String::as_str).collect();
+    let removed: Vec<&str> = before.iter().filter(|p| !has(same, after, p)).map(String::as_str).collect();
     let mut parts = Vec::new();
     if !added.is_empty() {
         parts.push(format!("added {}", added.join(", ")));
@@ -142,15 +161,18 @@ fn list_diff(before: &[String], after: &[String]) -> Option<String> {
 /// Whether going from `before` to `after` narrowed recording, and what changed; None if
 /// nothing did. It narrowed when traffic is now left out that wasn't before: an include list
 /// that went from empty (everything) to some hosts, or lost a pattern; a new exclude pattern;
-/// or out-of-scope recording turned off. None of that narrows anything while out-of-scope
-/// traffic is recorded in full anyway.
+/// or out-of-scope recording turned off while something is out of scope. Out-of-scope
+/// recording doesn't make a smaller scope harmless: HTTPS to a host outside it is tunnelled,
+/// never decrypted, so only the connection is recorded.
 pub fn scope_change(before: &Scope, after: &Scope) -> Option<(bool, String)> {
-    let include = list_diff(&before.include, &after.include);
-    let exclude = list_diff(&before.exclude, &after.exclude);
+    let include = list_diff(EXACT, &before.include, &after.include);
+    let exclude = list_diff(EXACT, &before.exclude, &after.exclude);
     let include_narrowed = !after.include.is_empty()
-        && (before.include.is_empty() || before.include.iter().any(|p| !has(&after.include, p)));
-    let exclude_grew = after.exclude.iter().any(|p| !has(&before.exclude, p));
-    let narrowed = !records_everything(after) && (records_everything(before) || include_narrowed || exclude_grew);
+        && (before.include.is_empty() || before.include.iter().any(|p| !has(EXACT, &after.include, p)));
+    let exclude_grew = after.exclude.iter().any(|p| !has(EXACT, &before.exclude, p));
+    let smaller = everything_in_scope(before) || include_narrowed || exclude_grew;
+    let recording_off = before.record_out_of_scope && !after.record_out_of_scope;
+    let narrowed = !everything_in_scope(after) && (smaller || recording_off);
     let mut parts = Vec::new();
     if let Some(d) = include {
         parts.push(format!("include: {d}"));
@@ -168,8 +190,8 @@ pub fn scope_change(before: &Scope, after: &Scope) -> Option<(bool, String)> {
 /// Whether the pass-through list narrowed recording (a pattern was added: its hosts' TLS is
 /// no longer decrypted, so only the connection is recorded), and what changed; None if nothing did.
 pub fn passthrough_change(before: &[String], after: &[String]) -> Option<(bool, String)> {
-    let added = after.iter().any(|p| !has(before, p));
-    list_diff(before, after).map(|d| (added, d))
+    let added = after.iter().any(|p| !has(HOST, before, p));
+    list_diff(HOST, before, after).map(|d| (added, d))
 }
 
 impl Store {
@@ -181,35 +203,60 @@ impl Store {
         }
     }
 
-    /// Notes that this process saved the recording scope, `before` as it was.
-    pub fn note_scope_change(&mut self, before: &Scope, after: &Scope) -> Result<()> {
+    /// Saves the recording scope and logs the change (see [`Store::save_logged`]).
+    pub fn save_scope(&mut self, scope: &Scope) -> Result<()> {
         let to_json = |s: &Scope| serde_json::to_value(s).unwrap_or_default();
-        self.note_recording_change("scope", to_json(before), to_json(after), scope_change(before, after))
+        self.save_logged(SCOPE_KEY, scope, true, |before: Scope| {
+            ("scope", to_json(&before), to_json(scope), scope_change(&before, scope))
+        })
     }
 
-    /// Notes that this process saved the TLS pass-through list, `before` as it was.
-    pub fn note_passthrough_change(&mut self, before: &[String], after: &[String]) -> Result<()> {
-        let summary = passthrough_change(before, after);
-        self.note_recording_change("passthrough", Value::from(before), Value::from(after), summary)
+    /// Saves the connection settings, validated, and logs a change to their TLS pass-through
+    /// list (see [`Store::save_logged`]). `reviewed`: the command was one that edits that list.
+    pub fn save_connection_settings(&mut self, s: &ConnectionSettings, reviewed: bool) -> Result<()> {
+        s.validate()?;
+        self.save_logged(CONNECTION_KEY, s, reviewed, |before: ConnectionSettings| {
+            let summary = passthrough_change(&before.passthrough, &s.passthrough);
+            ("passthrough", Value::from(before.passthrough), Value::from(s.passthrough.clone()), summary)
+        })
     }
 
-    fn note_recording_change(
+    /// Writes setting `key`, bumps the settings version so running proxies reload, and logs
+    /// what `change` makes of the setting as it was, in one write transaction: a save by another
+    /// process can't land between them, unlogged, or have its flag cleared by this one.
+    fn save_logged<T: Serialize + serde::de::DeserializeOwned + Default>(
         &mut self,
-        setting: &str,
-        before: Value,
-        after: Value,
-        summary: Option<(bool, String)>,
+        key: &str,
+        value: &T,
+        reviewed: bool,
+        change: impl FnOnce(T) -> (&'static str, Value, Value, Option<(bool, String)>),
     ) -> Result<()> {
         let by = crate::provenance::origin();
-        self.meta_update(CHANGES_KEY, |old| {
-            let mut changes: Changes = match old {
-                Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("{CHANGES_KEY}: {e}")))?,
-                None => Changes::default(),
-            };
-            changes.note(by, setting, before, after, summary);
-            let json = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
-            Ok((Some(json), ()))
-        })
+        let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let key = format!("setting.{key}");
+        let tx = self.write_tx()?;
+        let get = |k: &str| tx.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0));
+        let before: T = match get(&key).optional()? {
+            Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("{key}: {e}")))?,
+            None => T::default(),
+        };
+        let mut changes: Changes = match get(CHANGES_KEY).optional()? {
+            Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("{CHANGES_KEY}: {e}")))?,
+            None => Changes::default(),
+        };
+        let (setting, before, after, summary) = change(before);
+        changes.note(by, setting, before, after, summary, reviewed);
+        let log = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let set = "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        tx.execute(set, params![key, json])?;
+        tx.execute(set, params![CHANGES_KEY, log])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('settings_version', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -235,11 +282,21 @@ mod tests {
         assert_eq!(scope_change(&all, &scope(&[], &["x"], false)), Some((true, "exclude: added x".into())));
         assert_eq!(scope_change(&scope(&[], &["x"], false), &all), Some((false, "exclude: removed x".into())));
         assert_eq!(scope_change(&a, &a), None);
-        // Out-of-scope traffic recorded in full: the scope narrows interception, not recording.
+        // Regexes are compared exactly: `\d` isn't `\D`.
+        assert_eq!(
+            scope_change(&scope(&[r"^\D+$"], &[], false), &scope(&[r"^\d+$"], &[], false)),
+            Some((true, r"include: added ^\d+$, removed ^\D+$".into()))
+        );
+        // Out-of-scope traffic recorded too doesn't make a smaller scope harmless: HTTPS outside
+        // it is tunnelled, never decrypted.
         let a_rec = scope(&["a"], &[], true);
         assert_eq!(
             scope_change(&all, &a_rec),
-            Some((false, "include: added a; out-of-scope recording turned on".into()))
+            Some((true, "include: added a; out-of-scope recording turned on".into()))
+        );
+        assert_eq!(
+            scope_change(&a_rec, &ab),
+            Some((true, "include: added b; out-of-scope recording turned off".into()))
         );
         assert_eq!(scope_change(&a_rec, &a), Some((true, "out-of-scope recording turned off".into())));
         assert_eq!(
@@ -261,11 +318,11 @@ mod tests {
         let (all, a, ab) = (scope(&[], &[], false), scope(&["a"], &[], false), scope(&["a", "b"], &[], false));
         let j = |s: &Scope| serde_json::to_value(s).unwrap();
         let mut c = Changes::default();
-        c.note("mcp", "scope", j(&all), j(&a), scope_change(&all, &a));
+        c.note("mcp", "scope", j(&all), j(&a), scope_change(&all, &a), true);
         assert_eq!(c.narrowed_by_agent().len(), 1);
         // The agent widening it a little, or saving it unchanged, doesn't hide it.
-        c.note("mcp", "scope", j(&a), j(&ab), scope_change(&a, &ab));
-        c.note("mcp", "scope", j(&ab), j(&ab), None);
+        c.note("mcp", "scope", j(&a), j(&ab), scope_change(&a, &ab), true);
+        c.note("mcp", "scope", j(&ab), j(&ab), None, true);
         assert_eq!(c.narrowed_by_agent()[0].summary, "include: added a");
         // Nor does pushing it out of the log.
         for _ in 0..KEEP {
@@ -275,17 +332,28 @@ mod tests {
                 Value::from(Vec::<String>::new()),
                 Value::from(vec!["x"]),
                 Some((false, "x".into())),
+                true,
             );
         }
         assert_eq!(c.recent(usize::MAX).len(), KEEP);
         assert_eq!(c.narrowed_by_agent().iter().filter(|c| c.setting == "scope").count(), 1);
         // A person saving it, even unchanged, has seen it.
-        c.note("gui", "scope", j(&ab), j(&ab), None);
+        c.note("gui", "scope", j(&ab), j(&ab), None, true);
         assert!(c.narrowed_by_agent().iter().all(|c| c.setting != "scope"));
         // An agent putting it back as it was clears it too.
-        c.note("mcp", "scope", j(&ab), j(&a), scope_change(&ab, &a));
+        c.note("mcp", "scope", j(&ab), j(&a), scope_change(&ab, &a), true);
         assert_eq!(c.narrowed_by_agent().len(), 1);
-        c.note("mcp", "scope", j(&a), j(&ab), scope_change(&a, &ab));
+        c.note("mcp", "scope", j(&a), j(&ab), scope_change(&a, &ab), true);
         assert!(c.narrowed_by_agent().is_empty());
+        // Put back by a change that narrows on its own (b replaced by a): cleared all the same.
+        let b = scope(&["b"], &[], false);
+        c.note("mcp", "scope", j(&a), j(&b), scope_change(&a, &b), true);
+        assert_eq!(c.narrowed_by_agent().len(), 1);
+        c.note("mcp", "scope", j(&b), j(&a), scope_change(&b, &a), true);
+        assert!(c.narrowed_by_agent().is_empty());
+        // Saved unchanged by a command that doesn't edit the setting: not a person's review.
+        c.note("mcp", "scope", j(&a), j(&b), scope_change(&a, &b), true);
+        c.note("gui", "scope", j(&b), j(&b), None, false);
+        assert_eq!(c.narrowed_by_agent().len(), 1);
     }
 }

@@ -293,6 +293,34 @@ fn proxy_end_to_end() {
     assert_eq!(env.ok(&["proxy", "status"])["running"], false);
 }
 
+/// A tunnel outside the recording scope still open when the proxy stops leaves its row all the
+/// same: the proxy doesn't wait for it, and it would otherwise be recorded only as it closes.
+#[test]
+fn a_tunnel_still_open_when_the_proxy_stops_leaves_a_row() {
+    use std::io::{Read, Write};
+    let env = Env::new("open-tunnel");
+    let http_port = spawn_echo(false, &env.dir);
+    env.ok(&["scope", "set", "--include", r"^example\.test$"]);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    let mut tunnel = std::net::TcpStream::connect(&listen).unwrap();
+    write!(tunnel, "CONNECT 127.0.0.1:{http_port} HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\r\n").unwrap();
+    tunnel.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut reply = [0u8; 12];
+    tunnel.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"HTTP/1.1 200", "{}", String::from_utf8_lossy(&reply));
+    let stopped = Instant::now();
+    env.ok(&["proxy", "stop"]);
+    // Not held up by the tunnel, as it is by a request still waiting for its response.
+    assert!(stopped.elapsed() < Duration::from_secs(10));
+    let rows = env.ok(&["query", "SELECT method, url, error FROM history"])["rows"].clone();
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(rows[0][0], "CONNECT");
+    assert_eq!(rows[0][1], format!("https://127.0.0.1:{http_port}"));
+    assert_eq!(rows[0][2], "outside the recording scope: tunnelled, not decrypted: still open when the proxy stopped");
+    drop(tunnel);
+}
+
 /// A server that closes before sending all of its Content-Length: the client gets what came,
 /// then the connection ends, as it would without the proxy, instead of waiting for the rest.
 #[test]

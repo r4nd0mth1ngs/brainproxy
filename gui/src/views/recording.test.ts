@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { byText, changeText, narrowedNotice, type RecordingChange } from "./recording.ts";
+import { byText, changeText, narrowedNotice, reviewCommands, type RecordingChange } from "./recording.ts";
 
 const change = (c: Partial<RecordingChange>): RecordingChange => ({
   time: "2026-01-31T12:00:00.000Z",
@@ -29,4 +29,11 @@ test("no notice without an agent's narrowing", () => {
 test("changes in words", () => {
   assert.equal(changeText(change({ setting: "passthrough", summary: "removed b.test" })), "TLS pass-through list: removed b.test");
   assert.deepEqual(["mcp", "gui", "cli", "x"].map(byText), ["an agent", "the app", "the command line", "an unknown origin"]);
+});
+
+test("marking an agent's narrowing as reviewed saves each flagged setting unchanged", () => {
+  assert.deepEqual(reviewCommands([], ["a.test"]), []);
+  assert.deepEqual(reviewCommands([change({})], []), [["scope", "add"]]);
+  assert.deepEqual(reviewCommands([change({ setting: "passthrough" })], ["a.test", "b.test"]), [["connection", "passthrough", "add", "--", "a.test"]]);
+  assert.deepEqual(reviewCommands([change({ setting: "passthrough" }), change({})], []), [["scope", "add"], ["connection", "passthrough", "clear"]]);
 });

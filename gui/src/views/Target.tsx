@@ -12,7 +12,7 @@ import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
 import { isMutationRequest, scanConfirm, scanOptIns, siteMapScanArgs, type HistoryPick } from "./trafficActions";
-import { byText, changeText, narrowedNotice, SHOW_SCOPE, type RecordingChange } from "./recording";
+import { byText, changeText, narrowedNotice, reviewCommands, SHOW_SCOPE, type RecordingChange } from "./recording";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -511,6 +511,25 @@ function Scope({ active }: { active: boolean }) {
   useEffect(() => {
     if (active) loadScope();
   }, [active]);
+  // The header's notice reloads it even when it is showing already: the change it names came
+  // since. Edits not saved yet stay as they are.
+  const dirty = !!scope && (edit.include !== scope.include.join("\n") || edit.exclude !== scope.exclude.join("\n") || edit.record !== scope.record_out_of_scope);
+  useEffect(() => {
+    const reload = () => (dirty ? run<ProxyScope>(["scope", "show"]).then(setScope, (e) => app.toast(e.message, "error")) : loadScope());
+    window.addEventListener(SHOW_SCOPE, reload);
+    return () => window.removeEventListener(SHOW_SCOPE, reload);
+  }, [dirty]);
+
+  // Keeps what the agent changed, as it is, and clears the notice.
+  const markReviewed = async () => {
+    try {
+      const { passthrough } = await run<{ passthrough: string[] }>(["connection", "show"]);
+      for (const args of reviewCommands(scope?.narrowed_by_agent, passthrough ?? [])) await run(args);
+      await loadScope();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
 
   const scopeCmd = async (args: string[]) => {
     try {
@@ -648,7 +667,11 @@ function Scope({ active }: { active: boolean }) {
       {narrowedNotice(scope?.narrowed_by_agent) && (
         <p className="error">
           {narrowedNotice(scope?.narrowed_by_agent)}
-          {"\n"}Saving the scope (or changing the pass-through list in Settings › Connections) yourself clears this.
+          {"\n"}Saving the scope (or changing the pass-through list in Settings › Connections) yourself clears this, and so
+          does keeping it as it is.{" "}
+          <button className="btn small" onClick={markReviewed}>
+            Keep as it is
+          </button>
         </p>
       )}
       {scope && (

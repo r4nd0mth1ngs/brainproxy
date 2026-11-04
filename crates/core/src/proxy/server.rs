@@ -66,6 +66,8 @@ pub const OUT_OF_SCOPE: &str = "outside the recording scope: content omitted";
 pub const OUT_OF_SCOPE_TUNNEL: &str = "outside the recording scope: tunnelled, not decrypted";
 /// How the error of the `CONNECT` row for a TLS pass-through connection starts.
 pub const PASSED_THROUGH: &str = "TLS pass-through, not decrypted";
+/// The rest of the error of a tunnel's row when it was still open as the proxy stopped.
+const TUNNEL_OPEN: &str = "still open when the proxy stopped";
 
 pub struct ProxyOptions {
     pub project: PathBuf,
@@ -141,10 +143,19 @@ struct FlightState {
     /// being recorded (claimed). The row is made on the connection's task, as every proxy
     /// capture is, so it has what that task knows.
     open: HashMap<u64, (Capture, bool)>,
+    /// Tunnels open now (never decrypted), each with its row should it still be open at the
+    /// end. Stopping doesn't wait for them: they can stay open for as long as a client likes.
+    tunnels: HashMap<u64, Capture>,
 }
 
 /// One request in [`InFlight`], until dropped: once its exchange is queued for the recorder.
 struct Flight {
+    set: Arc<InFlight>,
+    id: u64,
+}
+
+/// One tunnel in [`InFlight`], until dropped.
+struct OpenTunnel {
     set: Arc<InFlight>,
     id: u64,
 }
@@ -163,6 +174,19 @@ impl InFlight {
         Some(Flight { set: self.clone(), id })
     }
 
+    /// Registers a tunnel about to open, with its row should it still be open when the proxy
+    /// stops; `None` once it is stopping.
+    fn open_tunnel(self: &Arc<Self>, still_open: Capture) -> Option<OpenTunnel> {
+        let mut s = self.0.lock().unwrap();
+        if s.stopping {
+            return None;
+        }
+        s.next += 1;
+        let id = s.next;
+        s.tunnels.insert(id, still_open);
+        Some(OpenTunnel { set: self.clone(), id })
+    }
+
     fn stop(&self) {
         self.0.lock().unwrap().stopping = true;
     }
@@ -172,11 +196,13 @@ impl InFlight {
     }
 
     /// Removes the requests nobody is recording yet: their exchanges won't be recorded by
-    /// whoever sent them. Returns their rows, as unanswered.
+    /// whoever sent them. Returns their rows, as unanswered, and those of the tunnels still open.
     fn take_unclaimed(&self) -> Vec<Capture> {
         let mut s = self.0.lock().unwrap();
         let ids: Vec<u64> = s.open.iter().filter(|(_, v)| !v.1).map(|(k, _)| *k).collect();
-        ids.into_iter().filter_map(|id| s.open.remove(&id)).map(|v| v.0).collect()
+        let mut rows: Vec<Capture> = ids.into_iter().filter_map(|id| s.open.remove(&id)).map(|v| v.0).collect();
+        rows.extend(s.tunnels.drain().map(|(_, c)| c));
+        rows
     }
 }
 
@@ -190,6 +216,19 @@ impl Flight {
 impl Drop for Flight {
     fn drop(&mut self) {
         self.set.0.lock().unwrap().open.remove(&self.id);
+    }
+}
+
+impl OpenTunnel {
+    /// Takes the tunnel's row over as it closes. False if stopping already recorded it.
+    fn close(&self) -> bool {
+        self.set.0.lock().unwrap().tunnels.remove(&self.id).is_some()
+    }
+}
+
+impl Drop for OpenTunnel {
+    fn drop(&mut self) {
+        self.set.0.lock().unwrap().tunnels.remove(&self.id);
     }
 }
 
@@ -492,6 +531,11 @@ async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     let upstream_target = ctx.redirect.as_ref().unwrap_or(target);
     let authority = target.host_header();
     let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    let https = Target { scheme: "https".into(), ..target.clone() };
+    // Recorded at the end whether or not it is still open then: the proxy doesn't wait for it.
+    let still_open = format!("{why}: {TUNNEL_OPEN}");
+    let still_open = Capture::new("proxy", &https, request.as_bytes(), None, None, Some(&still_open));
+    let Some(open) = ctx.in_flight.open_tunnel(still_open) else { return Ok(()) };
     let started = Instant::now();
     let plain = Target { scheme: "http".into(), ..upstream_target.clone() };
     let result = async {
@@ -503,9 +547,10 @@ async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
         Ok((up, down)) => format!("{why}: {up} bytes sent, {down} received"),
         Err(e) => format!("{why}: {e}"),
     };
-    let https = Target { scheme: "https".into(), ..target.clone() };
     let duration = Some(started.elapsed().as_millis() as i64);
-    send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None).await;
+    if open.close() {
+        send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None).await;
+    }
     result.map(|_| ())
 }
 
