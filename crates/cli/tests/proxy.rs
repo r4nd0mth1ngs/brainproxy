@@ -1749,7 +1749,7 @@ fn proxy_stop_says_so_when_another_proxy_has_the_record_since() {
 }
 
 /// `proxy restart` with these arguments in the background, as an MCP call runs it, to be killed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn restart_in_background(env: &Env, args: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_brainproxy"))
         .args(["--format", "json", "--project"])
@@ -1927,6 +1927,35 @@ fn a_restart_killed_midway_still_goes_back() {
     wait_for("the failed proxy to log why", || {
         log().contains("the restart that started it had gone, so the proxy was started again on")
     });
+}
+
+/// A restart killed while its new proxy logs in (`--auth`) to a server that never answers: once
+/// the restart's wait is over, that proxy gives up and goes back to the old one, rather than
+/// holding off every start for as long as the login hangs.
+#[cfg(unix)]
+#[test]
+fn a_restarted_proxy_stuck_logging_in_gives_up_once_the_restart_has_gone() {
+    let env = Env::new("restart-stuck");
+    let (login, arrived, release) = held_login_server();
+    env.ok(&["auth", "add", "slow", "--login-url", &login, "--login-body", "a=b", "--logged-in", "Welcome"]);
+    let old = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let mut restart = restart_in_background(&env, &["--listen", "127.0.0.1:0", "--auth", "slow", "--wait", "2"]);
+    arrived.recv_timeout(Duration::from_secs(10)).expect("the new proxy logs in");
+    restart.kill().unwrap();
+    restart.wait().unwrap();
+
+    wait_for("the old proxy to be back", || env.ok(&["proxy", "status"])["running"] == true);
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["proxy"]["listen"], &status["restarting"]), (&old["listen"], &false.into()), "{status}");
+    assert_ne!(status["proxy"]["pid"], old["pid"], "{status}");
+    let log = || std::fs::read_to_string(env.project.with_extension("proxy.log")).unwrap_or_default();
+    wait_for("the stuck proxy to log why", || {
+        log().contains(
+            "gave up: not up within the restart's wait (2 s); the restart that started it had gone, so the proxy was \
+             started again on",
+        )
+    });
+    drop(release);
 }
 
 /// `proxy stop --pid` stops the proxy only while it is that pid: what the app does on closing a

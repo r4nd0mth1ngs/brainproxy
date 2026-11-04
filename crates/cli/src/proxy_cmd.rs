@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use brainproxy_core::authz::live::{Live, LiveOptions};
@@ -60,6 +60,16 @@ const STOP_WAIT_OLD: Duration = Duration::from_secs(5);
 /// Set once this process, a `proxy run`, has recorded itself as the proxy: from then on a failure
 /// is its own, not a failure to come up that a restart's proxy goes back from (see [`go_back`]).
 static TOOK_RECORD: AtomicBool = AtomicBool::new(false);
+/// A `proxy run` started on a restart's behalf either goes on to take the record (or fails by
+/// itself), or gives up waiting to (see [`give_up_after`]), never both: whichever comes first
+/// settles it here, from `WAITING` to `OWN` or `GAVE_UP`.
+static SETTLED: AtomicU8 = AtomicU8::new(WAITING);
+const WAITING: u8 = 0;
+const OWN: u8 = 1;
+const GAVE_UP: u8 = 2;
+/// How long a proxy started on a restart's behalf has to take the record: the wait the restart
+/// gives it, after which it kills it. Once the restart has gone, the proxy gives up by itself.
+const WAIT_ENV: &str = "BRAINPROXY_PROXY_RESTART_WAIT";
 
 /// The longest `--wait` that `start` takes, in seconds.
 const MAX_WAIT: f64 = 3600.0;
@@ -917,9 +927,17 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
         ProxyCmd::Run(_) if std::env::var_os(GUARD_ENV).is_some() => guard(project, home, out),
         ProxyCmd::Run(args) => {
             let hold = restart_hold();
-            run_foreground(project, home, args, out).map_err(|e| match TOOK_RECORD.load(Ordering::SeqCst) {
-                true => e,
-                false => go_back(project, home, hold, e),
+            std::thread::scope(|s| {
+                if let Some(wait) = restart_wait() {
+                    let hold = hold.clone();
+                    s.spawn(move || give_up_after(project, home, wait, hold, out));
+                }
+                let result = run_foreground(project, home, args, out);
+                settle_own();
+                result.map_err(|e| match TOOK_RECORD.load(Ordering::SeqCst) {
+                    true => e,
+                    false => go_back(project, home, hold, e),
+                })
             })
         }
         ProxyCmd::Restart(args) => restart(project, home, args, out),
@@ -1093,8 +1111,8 @@ impl Launch {
         let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&self.log)?;
         let log_start = log_file.metadata()?.len() as usize;
         match restart {
-            Some(token) => self.cmd.env(RESTART_ENV, token),
-            None => self.cmd.env_remove(RESTART_ENV),
+            Some(token) => self.cmd.env(RESTART_ENV, token).env(WAIT_ENV, self.wait.max(0.1).to_string()),
+            None => self.cmd.env_remove(RESTART_ENV).env_remove(WAIT_ENV),
         };
         process::detach(&mut self.cmd);
         let mut child = self
@@ -1397,6 +1415,54 @@ fn restart_hold() -> Option<(String, String)> {
         return None;
     }
     Some((std::env::var(RESTART_ENV).ok()?, std::env::var(WAS_ENV).ok()?))
+}
+
+/// How long this `proxy run` has to take the record, if a restart started it: the wait the
+/// restart gave it ([`WAIT_ENV`]).
+fn restart_wait() -> Option<Duration> {
+    std::env::var_os(RESTART_ENV)?;
+    let wait = std::env::var(WAIT_ENV).ok().and_then(|w| w.parse::<f64>().ok());
+    let wait = wait.filter(|w| (0.0..=MAX_RESTART_WAIT).contains(w)).unwrap_or(MAX_RESTART_WAIT);
+    Some(Duration::from_secs_f64(wait.max(0.1)))
+}
+
+/// A `proxy run` started on a restart's behalf that hasn't taken the record `wait` after it
+/// started gives up, once the restart has gone: hung before it is up (logging in for `--auth`
+/// to a server that never answers, say), it would otherwise keep the restart's hold, and every
+/// other start out, for as long as it hangs. While the restart runs, giving up is its job: it
+/// kills this proxy at the same deadline. The proxy started in place of the old one goes back
+/// to that one as it gives up (see [`go_back`]). Runs beside the proxy's own start until either
+/// settles how it ends (see [`SETTLED`]), so the proxy can't take the record once this has gone
+/// back, nor this go back once it has.
+fn give_up_after(project: &Path, home: &Path, wait: Duration, back: Option<(String, String)>, out: &Out) {
+    let deadline = Instant::now() + wait;
+    let token = std::env::var(RESTART_ENV).ok();
+    while SETTLED.load(Ordering::SeqCst) == WAITING {
+        std::thread::sleep(Duration::from_millis(50));
+        if Instant::now() < deadline {
+            continue;
+        }
+        let restart_runs = Store::open(project).is_ok_and(|store| {
+            read_state(&store).ok().flatten().is_some_and(|now| now.restart == token && !restart_gone(&store, &now))
+        });
+        if restart_runs || SETTLED.compare_exchange(WAITING, GAVE_UP, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            continue;
+        }
+        let e = Error::Conflict(format!("gave up: not up within the restart's wait ({} s)", wait.as_secs_f64()));
+        let e = go_back(project, home, back, e);
+        out.error(e.kind(), &e.to_string());
+        std::process::exit(e.exit_code());
+    }
+}
+
+/// Settles that this `proxy run` goes on to take the record, or fails, by itself (see
+/// [`SETTLED`]). If it has given up waiting to instead, it waits for that to end the process.
+fn settle_own() {
+    if SETTLED.compare_exchange(WAITING, OWN, Ordering::SeqCst, Ordering::SeqCst) == Err(GAVE_UP) {
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 /// Records in the hold of the restart whose token this is that it is starting `pid`.
@@ -1704,6 +1770,7 @@ fn serve(
                 "the restart starting this proxy was called off by `brainproxy proxy stop`".into(),
             ));
         }
+        settle_own();
         take_record(&store, &raw)?;
         TOOK_RECORD.store(true, Ordering::SeqCst);
         let state = &saved.state;

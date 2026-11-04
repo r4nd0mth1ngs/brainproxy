@@ -1054,10 +1054,11 @@ until the new proxy is started. If the restart is killed (Ctrl-C, say, or an MCP
 timeout or cancel) in between, while it stops the old proxy or just after, the guard finishes
 stopping it and starts it again on the address it had, with its options. Killed while its new
 proxy starts, the hold lasts until that proxy is up or has failed, and that proxy goes back to
-the old one itself if it can't come up. Either way the hold lasts meanwhile, and a `proxy stop`
-stops the guard or that proxy instead, leaving the proxy off. (Killed before it started the
-guard, the restart hadn't stopped anything: the next command gives the old proxy its record
-back.)
+the old one itself if it can't come up, or isn't up within the restart's `--wait` (logging in
+for `--auth` to a server that never answers, say). Either way the hold lasts meanwhile, and a
+`proxy stop` stops the guard or that proxy instead, leaving the proxy off. (Killed before it
+started the guard, the restart hadn't stopped anything: the next command gives the old proxy
+its record back.)
 
 `proxy stop` during a restart calls the restart off: the proxy it was starting is killed, the
 proxy it replaced stays off, and the restart fails saying so (`"called_off": true` in its
