@@ -67,9 +67,12 @@ brainproxy scan data reset                   # back to the embedded copies
   Retire.js database of vulnerable JavaScript library versions, which ZAP refreshes from
   Retire.js regularly).
 - The ref is resolved to a commit (GitHub API) and every file is fetched at that commit
-  from raw.githubusercontent.com: only GitHub, verified TLS, through the guarded client
-  with the system scope applied (a locked-down runner refuses; the provisioner uses
-  `--from`).
+  from raw.githubusercontent.com. A full 40-character commit id is used as it is, with no
+  API request; this matters when GitHub's limit for unauthenticated API requests (60 an
+  hour per address) is used up, which the error then says, with when it resets. The same
+  holds for `checks update --ref`. Downloads are only from GitHub, over verified TLS,
+  through the guarded client with the system scope applied (a locked-down runner
+  refuses; the provisioner uses `--from`).
 - Each file is parsed by the rules' own parser (regexes must compile) and must keep at
   least half the embedded entry count; a rejected file keeps the previous copy. Accepted
   files go to `<home>/rules/` with `manifest.json` (ref, commit, sha256, entries).

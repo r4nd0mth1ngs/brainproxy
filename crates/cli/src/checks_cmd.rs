@@ -114,7 +114,8 @@ pub struct UpdateArgs {
     /// Which checks: Nuclei templates or brainproxy's signed feed.
     #[arg(long, value_enum, default_value = "nuclei")]
     source: FeedSource,
-    /// Branch, tag, or commit of the repository.
+    /// Branch, tag, or commit of the repository. A full 40-character commit id needs no GitHub
+    /// API request.
     #[arg(long = "ref", default_value = "main")]
     reference: String,
     /// Default: projectdiscovery/nuclei-templates, or r4nd0mth1ngs/brainproxy for the feed.

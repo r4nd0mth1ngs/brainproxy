@@ -82,6 +82,9 @@ impl GitHub {
                 None => break (ex, head),
             }
         };
+        if let Some(msg) = rate_limited(head.status, &head.headers) {
+            return Err(Error::Protocol(format!("{url}: {msg}")));
+        }
         if head.status != 200 {
             let kind = if head.status == 404 || head.status == 422 { Error::NotFound } else { Error::Protocol };
             return Err(kind(format!("{url}: HTTP {}", head.status)));
@@ -96,9 +99,13 @@ impl GitHub {
     /// Resolves a branch, tag, or commit of `repo` ("owner/name") to a commit sha.
     pub async fn resolve(&self, repo: &str, reference: &str) -> Result<String> {
         check_repo_ref(repo, reference)?;
+        // A full commit id needs no lookup, and so works when the API limit is used up.
+        if is_commit(reference) {
+            return Ok(reference.to_ascii_lowercase());
+        }
         let url = format!("https://api.github.com/repos/{repo}/commits/{reference}");
         let sha = String::from_utf8_lossy(&self.get(&url, "application/vnd.github.sha").await?).trim().to_string();
-        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_commit(&sha) {
             return Err(Error::Protocol(format!("unexpected commit id from GitHub: {sha:.60}")));
         }
         Ok(sha)
@@ -114,6 +121,29 @@ impl GitHub {
         check_repo_ref(repo, commit)?;
         self.get(&format!("https://codeload.github.com/{repo}/tar.gz/{commit}"), "*/*").await
     }
+}
+
+fn is_commit(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// GitHub answers 403 or 429 when the API limit for unauthenticated requests
+/// (60 an hour per address) is used up; says so, and when it resets.
+fn rate_limited(status: u16, headers: &[(String, String)]) -> Option<String> {
+    let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+    if !matches!(status, 403 | 429) || header("x-ratelimit-remaining") != Some("0") {
+        return None;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let when = match header("x-ratelimit-reset").and_then(|v| v.parse::<u64>().ok()) {
+        Some(reset) => format!("it resets in {} min", reset.saturating_sub(now).div_ceil(60).max(1)),
+        None => "it resets within the hour".into(),
+    };
+    Some(format!(
+        "HTTP {status}: GitHub's API limit for unauthenticated requests ({} an hour per address) is used up; \
+         {when}. Try again then, or pass a full 40-character commit id as --ref, which needs no API request",
+        header("x-ratelimit-limit").unwrap_or("60")
+    ))
 }
 
 /// Keeps user-supplied repo names and refs from changing the URL's meaning.
@@ -240,6 +270,29 @@ pub(crate) mod tests {
         })
         .unwrap();
         assert_eq!(got, vec![("repo-abc/http/a.yaml".to_string(), 6), ("repo-abc/README.md".to_string(), 700)]);
+    }
+
+    #[test]
+    fn says_when_the_api_limit_is_used_up() {
+        let h = |rem: &str| {
+            vec![
+                ("X-RateLimit-Limit".to_string(), "60".to_string()),
+                ("X-RateLimit-Remaining".to_string(), rem.to_string()),
+                ("X-RateLimit-Reset".to_string(), "0".to_string()),
+            ]
+        };
+        let msg = rate_limited(403, &h("0")).unwrap();
+        assert!(msg.contains("60 an hour") && msg.contains("resets in 1 min") && msg.contains("--ref"), "{msg}");
+        assert!(rate_limited(429, &h("0")).is_some());
+        assert!(rate_limited(403, &h("12")).is_none());
+        assert!(rate_limited(404, &h("0")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_commit_id_is_used_without_asking_github() {
+        let sha = "6F886171C0A2B3ED8F99C93A055D17E3FD7F7E0A";
+        let gh = GitHub::new().unwrap();
+        assert_eq!(gh.resolve("projectdiscovery/nuclei-templates", sha).await.unwrap(), sha.to_ascii_lowercase());
     }
 
     #[test]

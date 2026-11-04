@@ -62,7 +62,8 @@ pub enum DataCmd {
         with a zap-extensions checkout or a directory holding the files. New data applies to commands started \
         afterwards (restart a running proxy).")]
     Update {
-        /// Branch, tag, or commit of zaproxy/zap-extensions.
+        /// Branch, tag, or commit of zaproxy/zap-extensions. A full 40-character commit id needs
+        /// no GitHub API request.
         #[arg(long = "ref", default_value = "main")]
         reference: String,
         #[arg(long, value_name = "DIR")]
