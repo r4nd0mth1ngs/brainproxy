@@ -21,6 +21,20 @@ These use IDs from 100000, so they never clash with ZAP's.
   get through or look filtered (the suggested stop-gap). Nothing it sends triggers the bug.
   The passive rule 100001 flags affected versions seen in any traffic. In the app:
   **Scans › New scan › PHP2Shell check**.
+- **100003 HQL Injection**, per parameter: input built into a Hibernate HQL or JPQL
+  (EclipseLink, OpenJPA) query. It closes the value and compares a random dotted path
+  (`apple' and bp9d8e7f.bp1a2b3c=1 and '1'='1`, also double quoted and numeric). Only an
+  ORM's query parser answers "could not resolve property: bp9d8e7f of: com.shop.Product"
+  or "Could not interpret path expression", so that confirms it (high confidence), and the
+  finding names the entity where the message does; a database would name a table or
+  column instead. Failing that, it looks for a query parser error (Hibernate 3 to 6,
+  EclipseLink, OpenJPA) that quotes and brackets cause and the original page lacks (medium
+  confidence). Both need the error to reach the page, also HTML or JSON escaped. Spring
+  Boot 2.3 and later leave the message out of error responses by default, so there, and
+  wherever errors are hidden, HQL injection is left to 40018's boolean checks, which
+  report it as "SQL Injection". Input used as an ORDER BY or entity name isn't covered.
+  Requests per parameter: 3 at LOW, 6 at MEDIUM, 9 at HIGH and INSANE. 40018 no longer
+  takes Hibernate's "unexpected token:" for Hypersonic SQL's error.
 
 ## Rules
 
@@ -79,6 +93,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 90037 | Remote OS Command Injection (Time Based) | param | high | 90037 |
 | 90039 | NoSQL Injection - MongoDB (Time Based) | param | high | 90039 |
 | 100002 | PHP2Shell PHP Remote Code Execution (Suspected) | host | high | 100002 |
+| 100003 | HQL Injection | param | high | 100003 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
 headers and URL path segments when enabled), `page` once per target request, `host` once per scheme://host:port.

@@ -172,7 +172,7 @@ static RDBMS: [Rdbms; 17] = [
             r"\QUnexpected end of command in statement\E",
             r"\QColumn count does not match in statement\E",
             r"\QTable not found in statement\E",
-            r"\QUnexpected token:\E",
+            HYPERSONIC_UNEXPECTED_TOKEN,
         ],
         union_errors: &[r"\QUnexpected end of command in statement\E", r"\QColumn count does not match in statement\E"],
     },
@@ -201,6 +201,8 @@ static RDBMS: [Rdbms; 17] = [
         union_errors: &[r"\QSELECTs to the left and right of UNION do not have the same number of result columns\E"],
     },
 ];
+
+const HYPERSONIC_UNEXPECTED_TOKEN: &str = r"\QUnexpected token:\E";
 
 /// The patterns compiled once, case-insensitive and multi-line (ZAP's PATTERN_PARAM).
 struct Compiled {
@@ -532,6 +534,13 @@ impl Scan<'_> {
         let body = resp.body_str();
         for (j, pattern) in COMPILED[i].errors.iter().enumerate() {
             if self.base_hits()[i][j] {
+                continue;
+            }
+            // Hibernate's HQL parser says "unexpected token:" too; HQL injection is
+            // rule 100003's.
+            if RDBMS[i].errors[j] == HYPERSONIC_UNEXPECTED_TOKEN
+                && super::hql_injection::is_hibernate_parser_error(body)
+            {
                 continue;
             }
             if let Some(m) = pattern.find(body) {

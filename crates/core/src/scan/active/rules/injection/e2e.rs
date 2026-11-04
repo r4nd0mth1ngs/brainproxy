@@ -33,6 +33,43 @@ fn eval(expr: &str) -> Option<i64> {
     }
 }
 
+/// A query parser's answer to `query`: unbalanced quotes are a syntax error, a `bp…`
+/// property is unknown.
+fn hql(query: &str, hibernate6: bool) -> String {
+    // The query with its string literals taken out.
+    let (mut outside, mut quote) = (String::new(), None);
+    for c in query.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                outside.push('?');
+            }
+            None => outside.push(c),
+        }
+    }
+    if quote.is_some() {
+        return html(&if hibernate6 {
+            format!("<pre>org.hibernate.query.SyntaxException: At 1:41 and token &#39;&#39;&#39;, token recognition error at: &#39;&#39;&#39; [{query}]</pre>")
+        } else {
+            format!("<pre>org.hibernate.hql.internal.ast.QuerySyntaxException: unexpected token: ' near line 1, column 41 [{query}]</pre>")
+        });
+    }
+    let unknown = outside.split(" and ").find_map(|c| c.strip_suffix("=1").filter(|p| p.starts_with("bp")));
+    match unknown {
+        Some(_) if hibernate6 => html("<p>Something went wrong.</p>"),
+        // Hibernate 5 reads the unknown alias as a property of the entity.
+        Some(p) => {
+            let p = p.split('.').next().unwrap_or(p);
+            html(&format!(
+                "<pre>org.hibernate.QueryException: could not resolve property: {p} of: com.shop.Product</pre>"
+            ))
+        }
+        None => html("<ul><li>apple</li></ul>"),
+    }
+}
+
 fn handle(path: &str, query: &str) -> String {
     let param = |name: &str| -> String {
         query.split('&').find_map(|p| p.strip_prefix(&format!("{name}="))).map(url_decode).unwrap_or_default()
@@ -117,6 +154,12 @@ fn handle(path: &str, query: &str) -> String {
             }
             html("<p>item</p>")
         }
+        // Hibernate 5, `from com.shop.Product where name = '<value>'`, errors shown.
+        "/hql" => hql(&format!("from com.shop.Product where name = '{}'", param("name")), false),
+        // The same with a numeric column.
+        "/hqlnum" => hql(&format!("from com.shop.Product where id = {}", param("id")), false),
+        // Hibernate 6 behind a page that shows parser errors (HTML-escaped) but not others.
+        "/hql6" => hql(&format!("from com.shop.Product where name = '{}'", param("name")), true),
         // Safe: the same page whatever the parameter is.
         "/safe" => html("<p>static content</p>"),
         // Safe: small pages that echo what they were sent.
@@ -417,6 +460,37 @@ async fn fixed_path_segments_are_attacked_for_each_method() {
     post.request = String::from_utf8(post.request).unwrap().replacen("GET ", "POST ", 1).into_bytes();
     let (s, _) = scan_points("methods", 40018, Strength::Low, paths, vec![get, post]).await;
     assert_eq!(s.insertion_points, 4, "{s:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hql_injection_unknown_property_and_parser_errors() {
+    let port = spawn_app();
+    let targets = vec![
+        target(port, "/hql?name=apple"),
+        target(port, "/hqlnum?id=5"),
+        target(port, "/hql6?name=apple"),
+        target(port, "/echo?q=1"),
+        target(port, "/safe?id=1"),
+    ];
+    let (s, found) = scan("hql", 100003, Strength::Medium, targets).await;
+    assert_eq!(s.raised.get("100003"), Some(&3), "{found:?}");
+    let attacks: Vec<&str> = found.iter().map(|f| f.3.as_str()).collect();
+    assert!(
+        attacks.iter().any(|a| a.starts_with("apple' and bp") && a.contains(".bp") && a.ends_with("=1 and '1'='1")),
+        "{attacks:?}"
+    );
+    assert!(attacks.iter().any(|a| a.starts_with("5 and bp")), "{attacks:?}");
+    // The unknown path error isn't shown there: only the parser error is left.
+    assert!(attacks.contains(&"'"), "{attacks:?}");
+    assert!(found.iter().all(|f| f.1 == "HQL Injection"), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_doesnt_name_a_database_after_an_hql_error() {
+    let port = spawn_app();
+    let (_, found) = scan("hqlsqli", 40018, Strength::Medium, vec![target(port, "/hql?name=apple")]).await;
+    // Hibernate 5's "unexpected token:" used to read as Hypersonic SQL.
+    assert!(found.iter().all(|f| f.1 == "SQL Injection"), "{found:?}");
 }
 
 #[test]

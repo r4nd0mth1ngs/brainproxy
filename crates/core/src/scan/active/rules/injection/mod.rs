@@ -20,6 +20,7 @@ mod code_injection;
 mod command_injection;
 mod command_injection_timing;
 mod common;
+mod hql_injection;
 mod nosql_mongodb;
 mod nosql_mongodb_timing;
 mod sql_injection;
@@ -50,6 +51,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(command_injection_timing::CommandInjectionTiming),
         Box::new(nosql_mongodb::MongoDbInjection),
         Box::new(nosql_mongodb_timing::MongoDbInjectionTiming),
+        Box::new(hql_injection::HqlInjection),
     ]
 }
 
@@ -65,7 +67,7 @@ mod tests {
         let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
-            HashSet::from([40018, 40019, 40020, 40021, 40022, 40027, 40033, 90019, 90020, 90036, 90037, 90039])
+            HashSet::from([40018, 40019, 40020, 40021, 40022, 40027, 40033, 90019, 90020, 90036, 90037, 90039, 100003])
         );
         let mut refs = HashSet::new();
         for r in &rules {
