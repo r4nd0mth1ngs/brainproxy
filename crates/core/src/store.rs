@@ -953,14 +953,8 @@ impl Store {
     }
 
     pub fn record_exchange(&self, source: &str, ex: &Exchange) -> Result<i64> {
-        self.record(&Capture::new(
-            source,
-            &ex.target,
-            &ex.request,
-            Some(&ex.response),
-            Some(ex.duration_ms as i64),
-            None,
-        ))
+        let c = Capture::new(source, &ex.target, &ex.request, Some(&ex.response), Some(ex.duration_ms as i64), None);
+        self.record(&Capture { sni: ex.sni.clone(), ..c })
     }
 
     pub fn record_failure(&self, source: &str, target: &Target, request: &[u8], error: &str) -> Result<i64> {
@@ -1277,7 +1271,7 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
             c.response,
             c.origin.as_deref().unwrap_or(crate::provenance::origin()),
             c.client_addr,
-            c.sni.clone().or_else(|| crate::provenance::sni_for(&c.scheme)),
+            c.sni,
             (!c.edited_by.is_empty()).then(|| serde_json::to_string(&c.edited_by).unwrap_or_default()),
             serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into()),
         ],
@@ -1408,6 +1402,7 @@ mod tests {
             request: b"GET /x?id=1 HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(),
             response: b"HTTP/1.1 500 Oops\r\nServer: nginx\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"token\":\"abc\",\"msg\":\"You have SQL syntax\"}".to_vec(),
             duration_ms: 7,
+            sni: None,
         };
         store.record_exchange("send", &ex).unwrap()
     }
@@ -1711,7 +1706,8 @@ mod tests {
         let target = Target::from_url("http://a.test").unwrap();
         let request =
             b"POST /z HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nuser\r\n4\r\n=bob\r\n0\r\n\r\n".to_vec();
-        let gz_id = s.record_exchange("proxy", &Exchange { target, request, response, duration_ms: 1 }).unwrap();
+        let gz_id =
+            s.record_exchange("proxy", &Exchange { target, request, response, duration_ms: 1, sni: None }).unwrap();
         for needle in ["hidden-in-gzip", "user=bob", "Content-Encoding: gzip"] {
             let hits = s.list(&HistoryFilter { contains: Some(needle.into()), ..Default::default() }).unwrap();
             assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [gz_id], "{needle}");
@@ -1735,7 +1731,11 @@ mod tests {
         let ok = |s: &Store, source: &str, body: &str| {
             let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
             let request = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec();
-            s.record_exchange(source, &Exchange { target: target.clone(), request, response, duration_ms: 1 }).unwrap()
+            s.record_exchange(
+                source,
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None },
+            )
+            .unwrap()
         };
         let a = ok(&s, "proxy", "needle one, 50% off");
         let b = ok(&s, "send", "needle two");
@@ -1787,12 +1787,18 @@ mod tests {
         response.extend_from_slice(&z);
         let request = b"GET / HTTP/1.1\r\n\r\n".to_vec();
         let deflated = s
-            .record_exchange("proxy", &Exchange { target: target.clone(), request, response, duration_ms: 1 })
+            .record_exchange(
+                "proxy",
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None },
+            )
             .unwrap();
         let response = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 13\r\n\r\nnot-gzip-text".to_vec();
         let request = b"GET / HTTP/1.1\r\n\r\n".to_vec();
         let corrupt = s
-            .record_exchange("proxy", &Exchange { target: target.clone(), request, response, duration_ms: 1 })
+            .record_exchange(
+                "proxy",
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None },
+            )
             .unwrap();
         assert_eq!(ids(has("deflated-word")), [deflated]);
         assert_eq!(ids(has("not-gzip-text")), [corrupt]);

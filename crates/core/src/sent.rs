@@ -18,9 +18,9 @@ use std::path::Path;
 
 use crate::capture::Capture;
 use crate::error::Result;
-use crate::http::client::final_response;
+use crate::http::client::{final_response, sent_sni};
 use crate::http::request::split_head_body;
-use crate::http::{parse_response_head, Exchange, Target};
+use crate::http::{parse_response_head, Client, Exchange, Target};
 use crate::store::Store;
 
 /// The error of a row whose request went out and whose outcome was never recorded.
@@ -44,6 +44,8 @@ pub struct SentLog {
     omit: Option<&'static str>,
     /// Keep the request and the response's head, not its body: the error's first words.
     omit_body: Option<&'static str>,
+    /// The sending client's `--sni`, recorded on the rows of TLS targets (see [`sent_sni`]).
+    sni: Option<String>,
 }
 
 impl SentLog {
@@ -53,7 +55,7 @@ impl SentLog {
     }
 
     pub fn new(store: Store, source: &'static str, no_store: bool) -> Self {
-        Self { store, source, omit: no_store.then_some(NOT_STORED), omit_body: None }
+        Self { store, source, omit: no_store.then_some(NOT_STORED), omit_body: None, sni: None }
     }
 
     /// Rows keep no content, marked with `reason`.
@@ -73,8 +75,28 @@ impl SentLog {
         self.omit.is_some()
     }
 
+    /// Rows record the TLS server name `client` sends in place of a target's host (`--sni`).
+    pub fn sent_by(mut self, client: &Client) -> Self {
+        self.sni = client.options().sni.clone();
+        self
+    }
+
     /// The row for `request` (as recorded) and how it ended.
     fn capture(
+        &self,
+        target: &Target,
+        request: &[u8],
+        response: Option<&[u8]>,
+        duration_ms: Option<u64>,
+        error: Option<&str>,
+    ) -> Capture {
+        let c = self.content(target, request, response, duration_ms, error);
+        Capture { sni: sent_sni(self.sni.as_deref(), target), ..c }
+    }
+
+    /// What the row keeps of the request and how it ended; [`SentLog::capture`] adds the
+    /// server name.
+    fn content(
         &self,
         target: &Target,
         request: &[u8],
@@ -208,5 +230,30 @@ mod tests {
         );
         assert_eq!(item.entry.duration_ms, Some(12));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rows_record_the_server_name_their_client_sends() {
+        let client = |sni: Option<&str>| {
+            Client::new(crate::http::SendOptions { sni: sni.map(str::to_string), ..Default::default() })
+        };
+        let sni = |log: &mut SentLog, url: &str| {
+            let target = Target::from_url(url).unwrap();
+            let id = log.pending(&target, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
+            log.store.get(id).unwrap().entry.sni
+        };
+        let mut overridden =
+            SentLog::new(Store::open_in_memory().unwrap(), "send", false).sent_by(&client(Some("b.test")));
+        assert_eq!(sni(&mut overridden, "https://a.test").as_deref(), Some("b.test"));
+        // Plain HTTP sends no server name.
+        assert_eq!(sni(&mut overridden, "http://a.test"), None);
+        // Another client's override in the same process isn't this one's.
+        let mut plain = SentLog::new(Store::open_in_memory().unwrap(), "send", false).sent_by(&client(None));
+        assert_eq!(sni(&mut plain, "https://a.test"), None);
+        // An IP address can't be a server name: none is sent, so none is recorded.
+        for ip in ["127.0.0.1", "::1"] {
+            let mut log = SentLog::new(Store::open_in_memory().unwrap(), "send", false).sent_by(&client(Some(ip)));
+            assert_eq!(sni(&mut log, "https://a.test"), None, "{ip}");
+        }
     }
 }

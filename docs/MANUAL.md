@@ -931,8 +931,10 @@ Each history entry has:
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
   the rule). NULL when nothing changed it; an intercept forwarded unchanged isn't an edit.
-- `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`); NULL
-  when it was the target host, and for plain HTTP.
+- `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
+  a session's own requests in those); NULL when it was the target host, for plain HTTP, and
+  when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
+  the scope refuses fails before any connection is opened.
 - `note_origin`, `note_changed_at`, `tags_origin`, `tags_changed_at`: who last set the note
   (`history note`) or changed the tags (`history tag`), and when.
 

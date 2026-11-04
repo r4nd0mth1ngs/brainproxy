@@ -642,7 +642,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         };
         return race(project, &args, req, target, client, n, h2, out);
     }
-    let mut log = sent::SentLog::open(project, "send", args.no_store)?;
+    let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request is on record (its row and the bytes recorded) before it goes out. `open`
     // is the one out and unanswered; a row answered already is never rewritten.
@@ -764,7 +764,7 @@ fn race(
     let race_id = brainproxy_core::race::new_race_id()?;
     let sync = if h2 { "single-packet" } else { "last-byte" };
     let recorded = client.recorded_request(&req, &target)?;
-    let mut log = sent::SentLog::open(project, "race", args.no_store)?;
+    let mut log = sent::SentLog::open(project, "race", args.no_store)?.sent_by(&client);
     let ids =
         log.pending_many(&target, &recorded, n, |i| brainproxy_core::race::row_tags(&race_id, sync, false, i, n))?;
     let requests = vec![req.as_bytes().to_vec(); n];
