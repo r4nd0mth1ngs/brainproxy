@@ -178,10 +178,11 @@ fn passthrough_and_upstream_proxy_apply_to_a_running_proxy() {
     assert!(body.starts_with("GET /secret HTTP/1.1"), "{body}");
     std::thread::sleep(Duration::from_millis(300));
     // Recorded as a connection only: nothing decrypted, no request path.
-    let rows = env.rows("SELECT method, host, port, status, error FROM history WHERE method = 'CONNECT'");
+    let rows = env.rows("SELECT method, host, port, status, error, url FROM history WHERE method = 'CONNECT'");
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0][1], "localhost");
-    assert!(rows[0][3].is_null() && rows[0][4].as_str().unwrap().contains("not decrypted"), "{rows}");
+    assert!(rows[0][3].is_null() && rows[0][4].as_str().unwrap().starts_with("TLS pass-through, not decrypted: "));
+    assert_eq!(rows[0][5], format!("https://localhost:{https}"), "{rows}");
     assert_eq!(env.rows("SELECT count(*) FROM history WHERE path = '/secret'")[0][0], 0);
     // Every proxy entry names the client it came from.
     let clients = env.rows("SELECT count(*) FROM history WHERE source = 'proxy' AND client_addr LIKE '127.0.0.1:%'");

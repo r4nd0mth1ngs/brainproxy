@@ -3,6 +3,9 @@
 //! resolved through the project database, capture recording, and live access-control
 //! testing of recorded requests.
 //!
+//! Traffic outside the recording scope is forwarded and still leaves a row: a request keeps
+//! its request line only, and a CONNECT tunnel (never decrypted) is recorded as a connection.
+//!
 //! Connection options: TLS pass-through hosts are tunnelled without being
 //! decrypted (still scope-checked, and recorded as a connection), and with
 //! `invisible` the listener also serves clients that don't know they're proxied:
@@ -55,6 +58,14 @@ const RECORD_OVERHEAD: usize = 1024;
 const DRAIN: Duration = Duration::from_secs(3);
 /// The error of a request still unanswered when the proxy stopped.
 const STOPPED: &str = "proxy stopped before the response arrived";
+/// How the error of a row for a request forwarded outside the recording scope starts. The
+/// row keeps the request line only, like a `--no-store` row, so narrowing the scope hides
+/// what went out but never that it did.
+pub const OUT_OF_SCOPE: &str = "outside the recording scope: content omitted";
+/// How the error of the `CONNECT` row for a tunnel outside the recording scope starts.
+pub const OUT_OF_SCOPE_TUNNEL: &str = "outside the recording scope: tunnelled, not decrypted";
+/// How the error of the `CONNECT` row for a TLS pass-through connection starts.
+pub const PASSED_THROUGH: &str = "TLS pass-through, not decrypted";
 
 pub struct ProxyOptions {
     pub project: PathBuf,
@@ -126,10 +137,10 @@ struct InFlight(Mutex<FlightState>);
 struct FlightState {
     next: u64,
     stopping: bool,
-    /// The row to record if it is still unanswered at the end (none if it isn't recorded),
-    /// and whether its exchange is being recorded (claimed). The row is made on the
-    /// connection's task, as every proxy capture is, so it has what that task knows.
-    open: HashMap<u64, (Option<Capture>, bool)>,
+    /// The row to record if it is still unanswered at the end, and whether its exchange is
+    /// being recorded (claimed). The row is made on the connection's task, as every proxy
+    /// capture is, so it has what that task knows.
+    open: HashMap<u64, (Capture, bool)>,
 }
 
 /// One request in [`InFlight`], until dropped: once its exchange is queued for the recorder.
@@ -139,10 +150,9 @@ struct Flight {
 }
 
 impl InFlight {
-    /// Registers a request about to go upstream; `None` once the proxy is stopping, when
-    /// nothing more may be sent.
-    fn start(self: &Arc<Self>, target: &Target, request: &[u8], record: bool) -> Option<Flight> {
-        let unanswered = record.then(|| unanswered(target, request));
+    /// Registers a request about to go upstream, with its row should it go unanswered;
+    /// `None` once the proxy is stopping, when nothing more may be sent.
+    fn start(self: &Arc<Self>, unanswered: Capture) -> Option<Flight> {
         let mut s = self.0.lock().unwrap();
         if s.stopping {
             return None;
@@ -166,13 +176,8 @@ impl InFlight {
     fn take_unclaimed(&self) -> Vec<Capture> {
         let mut s = self.0.lock().unwrap();
         let ids: Vec<u64> = s.open.iter().filter(|(_, v)| !v.1).map(|(k, _)| *k).collect();
-        ids.into_iter().filter_map(|id| s.open.remove(&id)).filter_map(|v| v.0).collect()
+        ids.into_iter().filter_map(|id| s.open.remove(&id)).map(|v| v.0).collect()
     }
-}
-
-/// The row of a request still unanswered when the proxy stopped.
-fn unanswered(target: &Target, request: &[u8]) -> Capture {
-    Capture::new("proxy", target, request, None, None, Some(STOPPED))
 }
 
 impl Flight {
@@ -444,10 +449,10 @@ async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr
     let mut stream = Prefixed::new(reader.into_leftover(), tcp);
 
     if passthrough(ctx, &target) {
-        return pass_through(ctx, stream, &target).await;
+        return tunnel(ctx, stream, &target, PASSED_THROUGH).await;
     }
     if !live(ctx).scope.allows(&target.host) {
-        return tunnel(ctx, stream, &target).await;
+        return tunnel(ctx, stream, &target, OUT_OF_SCOPE_TUNNEL).await;
     }
     // TLS records start with 0x16 (handshake). Anything else is plain HTTP over the tunnel.
     let first = stream.peek_byte().await?;
@@ -473,24 +478,17 @@ async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr
     serve_http(ctx, tls, WireReader::new(), Some(target)).await
 }
 
-/// Relays bytes without inspecting them (out-of-scope CONNECT). The upstream
-/// connection goes through the guard (and the connection options) like any other.
-async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut client: S, target: &Target) -> Result<()> {
-    let target = ctx.redirect.as_ref().unwrap_or(target);
-    let plain = Target { scheme: "http".into(), ..target.clone() };
-    let mut upstream = ctx.client.connect(&plain).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-    Ok(())
-}
-
-/// Whether the connection options say to tunnel this host's TLS undecrypted.
-fn passthrough(ctx: &Ctx, target: &Target) -> bool {
-    ctx.guard.as_ref().is_some_and(|g| g.net.get().passthrough(&target.host, target.port))
-}
-
-/// A TLS pass-through connection: tunnelled like [`tunnel`] and recorded as a
-/// `CONNECT` entry (no response: nothing was decrypted) with the byte counts.
-async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut client: S, target: &Target) -> Result<()> {
+/// Relays bytes without inspecting them: a CONNECT outside the recording scope (`why` is
+/// [`OUT_OF_SCOPE_TUNNEL`]) or to a TLS pass-through host ([`PASSED_THROUGH`]). The upstream
+/// connection goes through the guard (and the connection options) like any other. Either
+/// way the tunnel is recorded as a `CONNECT` entry (no response: nothing was decrypted) with
+/// the byte counts, so traffic the proxy doesn't record still leaves a row.
+async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
+    ctx: &Arc<Ctx>,
+    mut client: S,
+    target: &Target,
+    why: &str,
+) -> Result<()> {
     let upstream_target = ctx.redirect.as_ref().unwrap_or(target);
     let authority = target.host_header();
     let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
@@ -502,13 +500,18 @@ async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut cli
     }
     .await;
     let note = match &result {
-        Ok((up, down)) => format!("TLS pass-through, not decrypted: {up} bytes sent, {down} received"),
-        Err(e) => format!("TLS pass-through: {e}"),
+        Ok((up, down)) => format!("{why}: {up} bytes sent, {down} received"),
+        Err(e) => format!("{why}: {e}"),
     };
     let https = Target { scheme: "https".into(), ..target.clone() };
     let duration = Some(started.elapsed().as_millis() as i64);
     send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None).await;
     result.map(|_| ())
+}
+
+/// Whether the connection options say to tunnel this host's TLS undecrypted.
+fn passthrough(ctx: &Ctx, target: &Target) -> bool {
+    ctx.guard.as_ref().is_some_and(|g| g.net.get().passthrough(&target.host, target.port))
 }
 
 /// A client that sent TLS straight to the listener (invisible proxying): the host
@@ -530,10 +533,10 @@ async fn serve_invisible_tls(ctx: &Arc<Ctx>, mut tcp: TcpStream) -> Result<()> {
     let named = Target { host: name.clone(), port: 443, scheme: "https".into() };
     let stream = Prefixed::new(hello, tcp);
     if passthrough(ctx, &named) {
-        return pass_through(ctx, stream, &named).await;
+        return tunnel(ctx, stream, &named, PASSED_THROUGH).await;
     }
     if !live(ctx).scope.allows(&name) {
-        return tunnel(ctx, stream, &named).await;
+        return tunnel(ctx, stream, &named, OUT_OF_SCOPE_TUNNEL).await;
     }
     let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
     let start = acceptor.await.map_err(|e| Error::Tls(format!("client hello: {e}")))?;
@@ -813,7 +816,14 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let path = req_head.target.split('?').next().unwrap_or("/").to_string();
 
     let live = live(ctx);
-    let record = live.scope.allows(&target.host) || live.scope.record_out_of_scope;
+    // Outside the recording scope the row keeps the request line only (unless out-of-scope
+    // traffic is recorded too): every request that goes out leaves a row.
+    let omit = (!live.scope.allows(&target.host) && !live.scope.record_out_of_scope).then_some(OUT_OF_SCOPE);
+    let row =
+        |target: &Target, request: &[u8], response: Option<&[u8]>, ms: Option<i64>, error: Option<&str>| match omit {
+            Some(reason) => crate::sent::content_omitted("proxy", target, request, response, ms, error, reason),
+            None => Capture::new("proxy", target, request, response, ms, error),
+        };
     // Intercept, rules, and the auth session apply only to requests that can go out: in the
     // proxy scope and allowed by the engagement. A request the guard will refuse anyway is
     // never held for a decision.
@@ -849,7 +859,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // A rule or an edit may have changed the method (GET to HEAD): the response is framed
     // by the one sent.
     let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or(method);
-    let Some(mut flight) = ctx.in_flight.start(target, &request, record) else {
+    let Some(mut flight) = ctx.in_flight.start(row(target, &request, None, None, Some(STOPPED))) else {
         return Ok(Reply::Error(error_response(503, "stopping", "the proxy is stopping"), true));
     };
     let mut started = Instant::now();
@@ -860,11 +870,11 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         if a.after_response(p, response).await {
             let retry = a.prepare(Tool::Proxy, target, &request, &[], &[]).await.request;
             // Not once the proxy is stopping: then the first answer stands.
-            if let Some(next) = ctx.in_flight.start(target, &retry, record) {
+            if let Some(next) = ctx.in_flight.start(row(target, &retry, None, None, Some(STOPPED))) {
                 // The first exchange went out and was answered: it has its own row.
-                if record && flight.claim() {
+                if flight.claim() {
                     let ms = Some(started.elapsed().as_millis() as i64);
-                    let c = Capture::new("proxy", target, sent, Some(response), ms, None);
+                    let c = row(target, sent, Some(response), ms, None);
                     send_capture(ctx, Capture { edited_by: edited_by.clone(), ..c }, None).await;
                 }
                 flight = next;
@@ -881,8 +891,10 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         Ok(v) => v,
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
-            if record && flight.claim() {
-                let mut c = Capture::new("proxy", target, &request, None, None, Some(&e.to_string()));
+            // A request outside both scopes was refused before it went out: no row, as before.
+            let refused = omit.is_some() && matches!(e, Error::OutOfScope(_));
+            if !refused && flight.claim() {
+                let mut c = row(target, &request, None, None, Some(&e.to_string()));
                 c.edited_by = edited_by;
                 send_capture(ctx, c, None).await;
             }
@@ -893,9 +905,15 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
     // Not recorded again if stopping has already recorded it as unanswered.
-    let capture = (record && flight.claim())
-        .then(|| Capture { edited_by, ..Capture::new("proxy", target, &sent, Some(&response), Some(duration), None) });
+    let mut capture =
+        flight.claim().then(|| Capture { edited_by, ..row(target, &sent, Some(&response), Some(duration), None) });
     if status == Some(101) {
+        // Outside the recording scope the upgrade's row is all that is kept: no messages.
+        if omit.is_some() {
+            if let Some(c) = capture.take() {
+                send_capture(ctx, c, None).await;
+            }
+        }
         // In flight until its connection's opening is queued.
         let flight = Some(flight);
         let upgrade = Upgrade { response, conn, capture, flight, in_scope, host: target.host.clone(), path, url };

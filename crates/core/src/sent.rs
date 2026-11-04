@@ -94,18 +94,7 @@ impl SentLog {
             }
             return Capture::new(self.source, target, request, response, ms, error);
         };
-        let (line, had_query) = request_line(request);
-        let mut note = omit.to_string();
-        if had_query {
-            note.push_str("; query string omitted");
-        }
-        let status = response.and_then(|r| parse_response_head(final_response(r)).ok()).map(|h| h.status);
-        match (error, status) {
-            (Some(e), _) => note.push_str(&format!("; {e}")),
-            (None, Some(s)) => note.push_str(&format!("; response status {s}")),
-            (None, None) => {}
-        }
-        Capture::new(self.source, target, &line, None, ms, Some(&note))
+        content_omitted(self.source, target, request, response, ms, error, omit)
     }
 
     /// Records `request` as about to go out; returns its row.
@@ -164,6 +153,33 @@ impl SentLog {
         }
         Ok(new + crate::scan::passive::scan_pending(&mut self.store)?.new_findings)
     }
+}
+
+/// A row that keeps no content: the request line without its query string, the time, source
+/// and target. The response is left out (no status, so passive checks skip it); the error
+/// starts with `reason`, then says whether a query string was left out and how the request
+/// ended. The proxy writes these too, for traffic it forwards outside the recording scope.
+pub fn content_omitted(
+    source: &str,
+    target: &Target,
+    request: &[u8],
+    response: Option<&[u8]>,
+    duration_ms: Option<i64>,
+    error: Option<&str>,
+    reason: &str,
+) -> Capture {
+    let (line, had_query) = request_line(request);
+    let mut note = reason.to_string();
+    if had_query {
+        note.push_str("; query string omitted");
+    }
+    let status = response.and_then(|r| parse_response_head(final_response(r)).ok()).map(|h| h.status);
+    match (error, status) {
+        (Some(e), _) => note.push_str(&format!("; {e}")),
+        (None, Some(s)) => note.push_str(&format!("; response status {s}")),
+        (None, None) => {}
+    }
+    Capture::new(source, target, &line, None, duration_ms, Some(&note))
 }
 
 /// The request line alone, as a request without headers or body, its query string cut off;
