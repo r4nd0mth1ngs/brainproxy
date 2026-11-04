@@ -141,8 +141,11 @@ pub enum PassthroughCmd {
 }
 
 pub fn connection(project: &Path, cmd: ConnectionCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
     let mut s = store.connection_settings()?;
+    let passthrough_before = s.passthrough.clone();
+    // The pass-through list decides what the proxy decrypts and records: its changes are logged.
+    let passthrough_saved = matches!(cmd, ConnectionCmd::Passthrough(_) | ConnectionCmd::Clear);
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
     match cmd {
         ConnectionCmd::Show => {
@@ -225,6 +228,9 @@ pub fn connection(project: &Path, cmd: ConnectionCmd, out: &Out) -> Result<(), E
         ConnectionCmd::Clear => s = ConnectionSettings::default(),
     }
     store.set_connection_settings(&s)?;
+    if passthrough_saved {
+        store.note_passthrough_change(&passthrough_before, &s.passthrough)?;
+    }
     let data = view(&store, &s)?;
     out.ok(data, || "connection settings saved".into());
     Ok(())

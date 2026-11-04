@@ -1,8 +1,10 @@
-//! Intercepting proxy: CA, settings (scope, rules, intercept), and the server.
+//! Intercepting proxy: CA, settings (scope, rules, intercept), the log of changes to what it
+//! records, and the server.
 
 pub mod ca;
 pub mod config;
 pub mod h2;
+pub mod recording;
 pub mod server;
 
 pub use ca::{CaInfo, CertAuthority};
