@@ -186,7 +186,10 @@ impl Live {
         let method = head.method.to_ascii_uppercase();
         let path = head.target.split('?').next().unwrap_or("/");
         // A GraphQL mutation is MUTATION whatever its method, so one sent as GET isn't tested.
-        let skip = if !SAFE_METHODS.contains(&crate::apiimport::api::opt_in(request).as_str()) {
+        // Only a request with a safe method is read for one: the others are skipped anyway.
+        let unsafe_method =
+            !SAFE_METHODS.contains(&method.as_str()) || crate::apiimport::graphql::is_mutation_request(request);
+        let skip = if unsafe_method {
             Some(&c.methods)
         } else if self.exclude.is_match(path) {
             Some(&c.excluded)

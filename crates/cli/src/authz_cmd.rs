@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brainproxy_core::apiimport::api;
+use brainproxy_core::apiimport::{api, graphql};
 use brainproxy_core::auth::{AuthProfile, AuthSession};
 use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS, DEFAULT_EXCLUDE, SAFE_METHODS};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
@@ -376,7 +376,10 @@ fn select(
             continue;
         }
         // A GraphQL mutation travels as POST (or GET) but is opted in to as MUTATION, as in a scan.
-        let method = api::opt_in(&item.request);
+        let method = match graphql::is_mutation_request(&item.request) {
+            true => api::MUTATION.to_string(),
+            false => item.entry.method.to_ascii_uppercase(),
+        };
         let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
         // Naming a request isn't consent to replay what it changes, or to log every identity out:
         // a named one that would be skipped is refused before anything is sent.

@@ -43,6 +43,8 @@ pub fn is_mutation_request(request: &[u8]) -> bool {
 pub fn documents(request: &[u8]) -> Vec<String> {
     let Ok(head) = crate::http::RawRequest::from_bytes(request.to_vec()).head() else { return vec![] };
     let (_, body) = crate::http::request::split_head_body(request);
+    // Read as the server reads it: a chunked or compressed mutation is a mutation too.
+    let body = &crate::capture::decode_body(&head.headers, body)[..];
     let mut out: Vec<String> = head
         .target
         .split_once('?')
@@ -764,6 +766,9 @@ mod tests {
             "mutation { a }"
         )));
         assert!(is_mutation_request(&req("GET /graphql?query=mutation%20%7B%20a%20%7D HTTP/1.1", "")));
+        // Read as the server reads it, chunked framing removed.
+        let chunked = format!("{:x}\r\n{m}\r\n0\r\n\r\n", m.len());
+        assert!(is_mutation_request(&req("POST /graphql HTTP/1.1\r\nTransfer-Encoding: chunked", &chunked)));
         assert!(!is_mutation_request(&req("POST /graphql HTTP/1.1", r#"{"query": "query { a }"}"#)));
         assert!(!is_mutation_request(&req("POST /form HTTP/1.1", "mutation=1")));
     }
