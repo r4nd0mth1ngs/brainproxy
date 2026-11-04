@@ -78,8 +78,9 @@ pub struct Scope {
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Record out-of-scope traffic too. Out-of-scope HTTPS is always tunneled
-    /// without interception.
+    /// Record out-of-scope traffic in full too; without it each request keeps only its
+    /// request line. Out-of-scope HTTPS is always tunneled without interception (a row per
+    /// tunnel either way).
     #[serde(default)]
     pub record_out_of_scope: bool,
 }

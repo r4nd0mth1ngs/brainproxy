@@ -331,7 +331,8 @@ pub enum ScopeCmd {
         include: Vec<String>,
         #[arg(long)]
         exclude: Vec<String>,
-        /// Also record out-of-scope traffic (it is never intercepted or modified).
+        /// Record out-of-scope traffic in full too (it is never intercepted or modified). Without
+        /// it, each out-of-scope request keeps only its request line, and an HTTPS tunnel a row.
         #[arg(long)]
         record_out_of_scope: bool,
     },
