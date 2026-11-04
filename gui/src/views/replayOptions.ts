@@ -77,19 +77,58 @@ export function optionsProblem(o: Partial<ReplayOptions> | undefined): string | 
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 
 /**
+ * Whether `name` is an IPv6 address as rustls reads one: Rust's own parser, which this follows
+ * step by step. Eight groups of 1 to 4 hex digits, or fewer with one `::` standing for at least
+ * one zero group; the last two groups may be an IPv4 address, but not before a `::`. No brackets
+ * and no zone (`%eth0`). A URL's host parser is looser: it takes `::1]/x/[`, say.
+ */
+function validIpv6(name: string): boolean {
+  let at = 0;
+  // Each read moves on only if it succeeds.
+  const char = (c: string) => name[at] === c && ++at > 0;
+  const number = (digit: RegExp, maxDigits: number, max: number, zeroPrefix: boolean) => {
+    let n = 0;
+    while (at + n < name.length && digit.test(name[at + n])) n++;
+    if (n === 0 || n > maxDigits || (!zeroPrefix && n > 1 && name[at] === "0")) return false;
+    if (parseInt(name.slice(at, at + n), digit === HEX ? 16 : 10) > max) return false;
+    at += n;
+    return true;
+  };
+  const atomically = (read: () => boolean) => {
+    const from = at;
+    if (read()) return true;
+    at = from;
+    return false;
+  };
+  const ipv4 = () => [0, 1, 2, 3].every((i) => (i === 0 || char(".")) && number(DEC, 3, 255, false));
+  // Up to `limit` groups, the first without a ':' before it: how many, and whether the last two
+  // were an IPv4 address.
+  const groups = (limit: number): [number, boolean] => {
+    for (let i = 0; i < limit; i++) {
+      if (i < limit - 1 && atomically(() => (i === 0 || char(":")) && ipv4())) return [i + 2, true];
+      if (!atomically(() => (i === 0 || char(":")) && number(HEX, 4, 0xffff, true))) return [i, false];
+    }
+    return [limit, false];
+  };
+  const [head, headIpv4] = groups(8);
+  if (head < 8) {
+    if (headIpv4 || !char(":") || !char(":")) return false;
+    groups(7 - head);
+  }
+  return at === name.length;
+}
+
+const HEX = /[0-9A-Fa-f]/;
+const DEC = /[0-9]/;
+
+/**
  * Whether `name` is a TLS server name `--sni` takes: an IP address, or a DNS name as rustls
  * reads one (at most 253 bytes; labels of 1 to 63 letters, digits, `_` and `-`, not starting or
  * ending with `-`; a trailing dot allowed; the last label not all digits).
  */
 export function validServerName(name: string): boolean {
   if (IPV4.test(name)) return true;
-  if (name.includes(":")) {
-    try {
-      return new URL(`https://[${name}]/`).hostname !== "";
-    } catch {
-      return false;
-    }
-  }
+  if (name.includes(":")) return validIpv6(name);
   if (!name || name.length > 253) return false;
   const labels = (name.endsWith(".") ? name.slice(0, -1) : name).split(".");
   if (!labels.every((l) => /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/.test(l))) return false;
