@@ -874,7 +874,8 @@ function Connections() {
       <h3>TLS pass-through</h3>
       <p className="muted small">
         The proxy tunnels these hosts' TLS without decrypting it (for certificate pinning, or traffic you shouldn't see).
-        Still scope-checked; each connection is recorded without its content.
+        Still scope-checked; each connection is recorded without its content. Who changed this list, and when, is listed in
+        Target › Scope.
       </p>
       <div className="toolbar flat">
         {s.passthrough.map((p) => (

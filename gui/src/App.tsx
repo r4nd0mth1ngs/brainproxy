@@ -15,6 +15,7 @@ import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
 import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, stopOwned, stopProxy } from "./views/proxyPort";
 import { hostOf, isWildcard } from "./views/proxyMode";
+import { narrowedNotice, SHOW_SCOPE, type RecordingChange } from "./views/recording";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -159,6 +160,8 @@ interface ProxyStatus {
   proxy: { listen?: string; pid?: number } | null;
   pending_intercepts: number;
   intercept_enabled: boolean;
+  /** An agent's changes that narrowed what the proxy records, not changed by a person since. */
+  recording_narrowed_by_agent?: RecordingChange[];
 }
 
 function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleTheme: () => void }) {
@@ -329,6 +332,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
   const listen = status?.proxy?.listen ?? proxyListen();
   // On 0.0.0.0 or [::]: other machines can use it, so it is shown however it was started.
   const exposed = !!status?.running && isWildcard(hostOf(listen));
+  const narrowed = narrowedNotice(status?.recording_narrowed_by_agent);
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("sidebar") === "collapsed";
@@ -385,6 +389,18 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
           </div>
         </div>
         <div className="top-right">
+          {narrowed && (
+            <button
+              className="pill hold"
+              onClick={() => {
+                app.setTab("target");
+                window.dispatchEvent(new Event(SHOW_SCOPE));
+              }}
+              title={`${narrowed}\nTraffic left out keeps only its request line (or a tunnel's row). Target › Scope lists the changes; changing the setting yourself clears this.`}
+            >
+              Recording narrowed by an agent
+            </button>
+          )}
           {status?.intercept_enabled && (
             <button className="pill hold" onClick={() => app.setTab("proxy")}>
               Intercept on{status.pending_intercepts ? ` · ${status.pending_intercepts} held` : ""}

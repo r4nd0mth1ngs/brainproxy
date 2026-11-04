@@ -12,6 +12,7 @@ import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
 import { isMutationRequest, scanConfirm, scanOptIns, siteMapScanArgs, type HistoryPick } from "./trafficActions";
+import { byText, changeText, narrowedNotice, SHOW_SCOPE, type RecordingChange } from "./recording";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -20,6 +21,12 @@ export function TargetView({ active }: { active: boolean }) {
   useEffect(() => {
     if (app.apiImport) setSub("map");
   }, [app.apiImport]);
+  // The header's "Recording narrowed by an agent" opens the scope, where the changes are listed.
+  useEffect(() => {
+    const show = () => setSub("scope");
+    window.addEventListener(SHOW_SCOPE, show);
+    return () => window.removeEventListener(SHOW_SCOPE, show);
+  }, []);
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -470,6 +477,9 @@ interface ProxyScope {
   include: string[];
   exclude: string[];
   record_out_of_scope: boolean;
+  /** The latest changes to the scope and the pass-through list, newest first. */
+  recording_changes?: RecordingChange[];
+  narrowed_by_agent?: RecordingChange[];
 }
 
 interface CheckResult {
@@ -633,7 +643,14 @@ function Scope({ active }: { active: boolean }) {
       <h3>Proxy recording scope</h3>
       <p className="muted small">
         Which hosts the proxy intercepts, modifies, and records. Patterns are case-insensitive regexes on host names; empty means everything.
+        Traffic outside it still leaves a row with only the request line (a tunnel's row for HTTPS), unless it is recorded too.
       </p>
+      {narrowedNotice(scope?.narrowed_by_agent) && (
+        <p className="error">
+          {narrowedNotice(scope?.narrowed_by_agent)}
+          {"\n"}Saving the scope (or changing the pass-through list in Settings › Connections) yourself clears this.
+        </p>
+      )}
       {scope && (
         <div className="tg-form">
           <label className="label">Include, one per line</label>
@@ -655,6 +672,33 @@ function Scope({ active }: { active: boolean }) {
             </button>
           </div>
         </div>
+      )}
+
+      {!!scope?.recording_changes?.length && (
+        <>
+          <h3>Changes to what the proxy records</h3>
+          <p className="muted small">The recording scope and the TLS pass-through list, newest first, with who changed them.</p>
+          <table className="set-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>By</th>
+                <th>Change</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {scope.recording_changes.map((c) => (
+                <tr key={`${c.time}-${c.setting}`}>
+                  <td>{new Date(c.time).toLocaleString()}</td>
+                  <td>{byText(c.by)}</td>
+                  <td className="mono">{changeText(c)}</td>
+                  <td>{c.narrowed && <span className={c.by === "mcp" ? "s5" : "muted"}>narrowed recording</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
       )}
     </div>
   );
