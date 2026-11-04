@@ -539,9 +539,10 @@ impl Client {
             return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
         let connector = self.connector(true, target, net)?;
+        let name = self.server_name_for(target)?;
         let tcp = self.connect_tcp(target, net).await?;
         let refused = || Error::Protocol(format!("{}:{} did not negotiate HTTP/2 (ALPN h2)", target.host, target.port));
-        let tls = self.tls_handshake(&connector, tcp, target).await.map_err(|e| match e {
+        let tls = self.tls_handshake(&connector, tcp, name).await.map_err(|e| match e {
             Error::Tls(m) if m.contains("NoApplicationProtocol") => refused(),
             e => e,
         })?;
@@ -564,10 +565,12 @@ impl Client {
         if !target.is_tls() {
             return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
-        // A client certificate that can't be loaded fails before any connection.
+        // A client certificate that can't be loaded, or a server name refused, fails before any
+        // connection.
         let connector = self.connector(false, target, net)?;
+        let name = self.server_name_for(target)?;
         let tcp = self.connect_tcp(target, net).await?;
-        Ok(Box::new(self.tls_handshake(&connector, tcp, target).await?))
+        Ok(Box::new(self.tls_handshake(&connector, tcp, name).await?))
     }
 
     /// The TLS configuration for `target`: with the client certificate its host
@@ -589,12 +592,9 @@ impl Client {
         Ok(connector)
     }
 
-    async fn tls_handshake(
-        &self,
-        connector: &TlsConnector,
-        tcp: TcpStream,
-        target: &Target,
-    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    /// The TLS server name for `target`: its host, or the `--sni` override once the scope
+    /// allows it. Checked before the connection opens, so a refused name opens none.
+    fn server_name_for(&self, target: &Target) -> Result<ServerName<'static>> {
         let name = self.opts.sni.as_deref().unwrap_or(&target.host);
         // The server name picks the site on a shared front end as much as the address does, so a
         // different one must be in scope by name too: else an in-scope host on a CDN reaches any tenant.
@@ -606,8 +606,16 @@ impl Client {
                 )));
             }
         }
-        let server_name = server_name(name)?;
-        connector.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))
+        server_name(name)
+    }
+
+    async fn tls_handshake(
+        &self,
+        connector: &TlsConnector,
+        tcp: TcpStream,
+        name: ServerName<'static>,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        connector.connect(name, tcp).await.map_err(|e| Error::Tls(e.to_string()))
     }
 
     /// The only place sockets to targets are opened: resolves through the scope
