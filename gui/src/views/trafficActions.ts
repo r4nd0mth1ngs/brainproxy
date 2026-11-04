@@ -141,12 +141,13 @@ export function scanOptIns(picks: HistoryPick[]): string[] {
 }
 
 /**
- * What `authz run --history-id` needs to replay the picks: `--include-methods` for each method
- * besides GET, HEAD and OPTIONS (it goes by the method alone, so a mutation needs its POST), and an
+ * What `authz run --history-id` needs to replay the picks: `--include-methods` with MUTATION for a
+ * GraphQL mutation, whatever its method, and each other method besides GET, HEAD and OPTIONS, and an
  * `--exclude` that matches no path when one looks like a logout. Empty when none needs either.
  */
 export function authzOptIns(picks: HistoryPick[]): string[] {
-  const methods = unsafeMethods(picks);
+  const mutation = picks.some((p) => p.mutation) ? ["MUTATION"] : [];
+  const methods = [...mutation, ...unsafeMethods(picks.filter((p) => !p.mutation))];
   return [...(methods.length ? [`--include-methods=${methods.join(",")}`] : []), ...(picks.some(isLogout) ? ["--exclude=^$"] : [])];
 }
 

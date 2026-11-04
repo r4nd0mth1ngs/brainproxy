@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brainproxy_core::apiimport::api;
 use brainproxy_core::auth::{AuthProfile, AuthSession};
 use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS, DEFAULT_EXCLUDE, SAFE_METHODS};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
@@ -29,7 +30,7 @@ pub enum AuthzCmd {
         identity's own data), inconclusive (nothing to compare: an empty body, or HEAD or OPTIONS). Bypasses of medium or high confidence are also findings (source authz). The \
         owner is found from the auth placeholders or session values in the request; --owner sets it. Only \
         GET, HEAD and OPTIONS requests that carry credentials are picked from history unless \
-        --include-methods or --history-id says otherwise.")]
+        --include-methods or --history-id says otherwise; a GraphQL mutation is MUTATION, whatever its method.")]
     Run(Box<RunArgs>),
     /// Result rows of a run: one per request and identity.
     Results {
@@ -111,7 +112,8 @@ pub struct RunArgs {
     #[arg(long)]
     tag: Option<String>,
     /// Also replay requests from history with these methods (comma-separated, or `all`).
-    /// They may change data, now as another user.
+    /// They may change data, now as another user. GraphQL mutations are MUTATION, whatever
+    /// their method.
     #[arg(long, value_delimiter = ',', value_name = "METHODS")]
     include_methods: Vec<String>,
     /// Regex on the path of requests from history not to replay.
@@ -373,7 +375,8 @@ fn select(
             out_of_scope += 1;
             continue;
         }
-        let method = item.entry.method.to_ascii_uppercase();
+        // A GraphQL mutation travels as POST (or GET) but is opted in to as MUTATION, as in a scan.
+        let method = api::opt_in(&item.request);
         let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
         // Naming a request isn't consent to replay what it changes, or to log every identity out:
         // a named one that would be skipped is refused before anything is sent.
@@ -436,7 +439,8 @@ fn select(
     }
     if methods > 0 {
         skipped["methods_hint"] = json!(
-            "Only GET, HEAD and OPTIONS are replayed from history; --include-methods POST,PUT (or all) adds others."
+            "Only GET, HEAD and OPTIONS are replayed from history; --include-methods POST,PUT (or all) adds others, \
+             and MUTATION adds GraphQL mutations."
         );
     }
     Ok((targets.into_iter().map(|(_, t)| t).collect(), skipped))

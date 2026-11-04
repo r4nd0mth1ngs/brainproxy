@@ -33,7 +33,7 @@ pub fn introspection_body() -> Vec<u8> {
 
 /// Whether a recorded request carries a GraphQL mutation: a JSON body (or batch) whose
 /// `query` defines one, an `application/graphql` body, or a `query` URL parameter. A scan
-/// treats it like PUT or DELETE, whatever its method and wherever it was recorded.
+/// and `authz run` treat it like PUT or DELETE, whatever its method and wherever it was recorded.
 pub fn is_mutation_request(request: &[u8]) -> bool {
     documents(request).iter().any(|d| defines_mutation(d))
 }

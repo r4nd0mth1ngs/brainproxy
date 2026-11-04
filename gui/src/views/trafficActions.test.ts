@@ -303,9 +303,10 @@ test("every scan opt-in is named in the question first", () => {
 test("an access-control run's opt-ins: methods past GET, HEAD and OPTIONS, and an exclude for a logout", () => {
   assert.deepEqual(authzOptIns([get]), []);
   assert.deepEqual(authzOptIns([post]), ["--include-methods=POST"]);
-  // authz goes by the method: a mutation needs its POST, and a GET one needs nothing.
-  assert.deepEqual(authzOptIns([mutation]), ["--include-methods=POST"]);
-  assert.deepEqual(authzOptIns([{ ...mutation, method: "GET" }]), []);
+  // A GraphQL mutation is MUTATION whatever its method, as in a scan: its POST isn't enough.
+  assert.deepEqual(authzOptIns([mutation]), ["--include-methods=MUTATION"]);
+  assert.deepEqual(authzOptIns([{ ...mutation, method: "GET" }]), ["--include-methods=MUTATION"]);
+  assert.deepEqual(authzOptIns([post, mutation]), ["--include-methods=MUTATION,POST"]);
   assert.deepEqual(authzOptIns([get, post, del, { ...del, id: 13 }]), ["--include-methods=POST,DELETE"]);
   // A logout: an exclude that matches no path, so the named request is replayed.
   assert.deepEqual(authzOptIns([logout]), ["--exclude=^$"]);

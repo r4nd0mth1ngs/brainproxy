@@ -156,9 +156,9 @@ test("requests from Traffic are opted in to only once the run's question was ans
     { id: 9, method: "POST", url: "https://shop.test/graphql", mutation: true },
   ];
   const base = ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8", "--history-id=9"];
-  // Unconfirmed, authz refuses the PUT, the mutation's POST and the logout, and sends nothing.
+  // Unconfirmed, authz refuses the PUT, the mutation and the logout, and sends nothing.
   assert.deepEqual(runArgs({ ...form, select: "history", history }), base);
-  assert.deepEqual(runArgs({ ...form, select: "history", history }, true), [...base, "--include-methods=PUT,POST", "--exclude=^$"]);
+  assert.deepEqual(runArgs({ ...form, select: "history", history }, true), [...base, "--include-methods=MUTATION,PUT", "--exclude=^$"]);
   // A GET that isn't a logout needs nothing, confirmed or not.
   const get = [{ id: 5, method: "GET", url: "https://shop.test/orders/5" }];
   assert.deepEqual(runArgs({ ...form, select: "history", history: get }, true), runArgs({ ...form, select: "history", history: get }));

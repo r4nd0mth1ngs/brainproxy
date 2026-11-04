@@ -268,7 +268,7 @@ and the questions asked before a scan or before Access replays a POST, a GraphQL
 (read from the recorded request, as the scanner reads it) or a logout-like path (authz's
 default `--exclude`), are built in `views/trafficActions.ts`. So are the opt-ins the CLI refuses
 a named request without (`scanOptIns`: `--include-methods` with MUTATION or the method;
-`authzOptIns`: the method, and `--exclude=^$` for a logout): `scanArgs` and `runArgs` add them
+`authzOptIns`: the same, though POST too, and `--exclude=^$` for a logout): `scanArgs` and `runArgs` add them
 only when told the question was answered yes. The Site map's *Active scan this request* asks
 the same question and adds the same opt-in (`scanConfirm`, `scanOptIns`). Also `openApiImport`, `openTraffic`, and
 `newFinding`, which opens Findings with the *New finding* form prefilled with a URL, method
