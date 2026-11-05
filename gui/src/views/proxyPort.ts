@@ -90,6 +90,8 @@ export function proxyControl(): ProxyControl {
 
 interface Status {
   running: boolean;
+  /** A `proxy restart` (or its guard) holds the record. */
+  restarting?: boolean;
   proxy: { listen: string; pid?: number; args?: string[] } | null;
 }
 
@@ -238,9 +240,46 @@ async function restart(cli: Cli, ctl: ProxyControl, running: Running, listen: st
     return started;
   } catch (e: any) {
     const failed = restartFailure(e);
-    // Refused before anything stopped: the proxy runs as it did.
-    if (!failed.stopped) throw e;
+    if (!failed.stopped) {
+      // Ended without saying what it did (killed, or cancelled): its guard may start the proxy
+      // again by itself, under a new pid. Starts in the app, and closing, wait until that's known.
+      if (ours && (e?.data as RestartData | undefined)?.stopped === undefined) {
+        const adopting: Promise<void> = adoptAfter(cli, ctl, running, listen, options).finally(() => {
+          if (ctl.moving === adopting) ctl.moving = null;
+        });
+        ctl.moving = adopting;
+      }
+      // Otherwise refused before anything stopped: the proxy runs as it did.
+      throw e;
+    }
     if (ours) ctl.owned = failed.pid;
     throw new Error(`${withPortHint(failed.message)} ${await whereNow(cli, running.listen)}`);
+  }
+}
+
+/** How often (ms), and how many times, the app looks whether a restart that ended unsaid still holds the proxy. */
+export const ADOPT_POLL = { every: 1000, times: 120 };
+
+const sameOptions = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
+
+/**
+ * After a restart of the app's proxy (`running`) that ended without saying what it did: once the
+ * restart's hold is gone, the proxy running then is the app's if it is the old one given back, the
+ * old one started again where it was with its options (a new pid), or the new one on `listen` with
+ * `options`. Anything else isn't; with no status nothing changes. Never rejects.
+ */
+async function adoptAfter(cli: Cli, ctl: ProxyControl, running: Running, listen: string, options: string[]): Promise<void> {
+  for (let i = 0; ; i++) {
+    const s = (await cli(["proxy", "status"]).catch(() => null)) as Status | null;
+    if (!s) return;
+    if (s.restarting && i < ADOPT_POLL.times) {
+      await new Promise((resolve) => setTimeout(resolve, ADOPT_POLL.every));
+      continue;
+    }
+    const p = s.running ? s.proxy : null;
+    if (p?.pid != null && p.pid === running.pid) return;
+    const runs = (where: string, opts: string[]) => p?.listen === where && sameOptions(proxyOptions(p.args ?? []), opts);
+    ctl.owned = p?.pid != null && (runs(running.listen, proxyOptions(running.args ?? [])) || runs(listen, options)) ? p.pid : null;
+    return;
   }
 }

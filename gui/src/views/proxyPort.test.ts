@@ -1,6 +1,7 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  ADOPT_POLL,
   DEFAULT_PROXY_PORT,
   PROXY_PORT,
   PROXY_PORTS,
@@ -225,8 +226,9 @@ test("moveProxy: a restart refused before stopping anything rejects as it is, an
   for (const message of ["not found: no proxy running for this project", "conflict: the proxy is being restarted (pid 5)"]) {
     const ctl = proxyControl();
     ctl.owned = 7;
+    // The CLI's refusals say nothing stopped.
     const { calls, cli } = fakeCli(() => {
-      throw new Error(message);
+      throw cliError(message, { stopped: false });
     });
     await assert.rejects(moveProxy(cli, ctl, { listen: "127.0.0.1:8080", pid: 7 }, 9090), { message });
     assert.deepEqual(calls, [["proxy", "restart", "--listen=127.0.0.1:9090"]]);
@@ -481,6 +483,90 @@ test("closing during a move that went back stops the app's proxy at the pid it w
   assert.equal(ctl.owned, null);
 });
 
+// A restart that ends without saying what it did (killed, or cancelled): its guard may start the
+// old proxy again by itself, as it was and under a new pid.
+
+ADOPT_POLL.every = 1;
+const KILLED = "failed: the CLI ended without a result";
+const oldArgs = ["proxy", "run", "--listen", "127.0.0.1:8080", "--timeout", "30"];
+const ownedMove = { ...movable, pid: 7 };
+
+/** A `cli` whose restart ends unsaid, and whose status reads `statuses` in turn (the last one repeats). */
+function killedRestart(statuses: object[]) {
+  return fakeCli((args) => {
+    if (args[1] === "restart") throw cliError(KILLED);
+    if (args[1] === "status") return statuses.length > 1 ? statuses.shift() : statuses[0];
+    return {};
+  });
+}
+
+test("moveProxy: a restart killed unsaid leaves the app owning the proxy its guard started again", async () => {
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const back = { running: true, proxy: { listen: "127.0.0.1:8080", pid: 12, args: [...oldArgs, "--log", "/p.log", "--wait", "60"] } };
+  const { calls, cli } = killedRestart([{ running: false, restarting: true, proxy: null }, { running: false, restarting: true, proxy: null }, back]);
+  // It rejects as it ended, at once; closing waits until the guard is done, and stops that proxy.
+  await assert.rejects(moveProxy(cli, ctl, ownedMove, 9090), { message: KILLED });
+  await stopOwned(cli, ctl);
+  assert.deepEqual(calls.filter((c) => c[1] === "status").length, 3);
+  assert.deepEqual(calls.at(-1), ["proxy", "stop", "--pid=12"]);
+});
+
+test("moveProxy: after a restart killed unsaid, a start in the app waits for the guard and starts nothing", async () => {
+  stubStorage();
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const back = { running: true, proxy: { listen: "127.0.0.1:8080", pid: 12, args: oldArgs } };
+  const { calls, cli } = killedRestart([{ running: false, restarting: true, proxy: null }, back]);
+  await assert.rejects(moveProxy(cli, ctl, ownedMove, 9090));
+  assert.equal(await startProxy(cli, ctl), null);
+  assert.ok(!calls.some(isStart), JSON.stringify(calls));
+  assert.equal(ctl.owned, 12);
+});
+
+test("moveProxy: after a restart killed unsaid, the app owns the old proxy given back, or the new one it started", async () => {
+  const cases: [object, number | null][] = [
+    // Killed before it stopped anything: the old proxy, as it was.
+    [{ running: true, proxy: { listen: "127.0.0.1:8080", pid: 7, args: oldArgs } }, 7],
+    // Killed once its new proxy was up, before it said so.
+    [{ running: true, proxy: { listen: "127.0.0.1:9090", pid: 13, args: ["proxy", "run", "--listen", "127.0.0.1:9090", "--timeout", "30"] } }, 13],
+    // Another proxy, started since by a shell or an agent: not the app's.
+    [{ running: true, proxy: { listen: "127.0.0.1:8080", pid: 14, args: [...oldArgs, "--invisible"] } }, null],
+    [{ running: true, proxy: { listen: "127.0.0.1:7000", pid: 15, args: oldArgs } }, null],
+    // Left off.
+    [{ running: false, proxy: null }, null],
+  ];
+  for (const [status, owned] of cases) {
+    const ctl = proxyControl();
+    ctl.owned = 7;
+    const { cli } = killedRestart([status]);
+    await assert.rejects(moveProxy(cli, ctl, ownedMove, 9090));
+    await ctl.moving;
+    assert.equal(ctl.owned, owned, JSON.stringify(status));
+    assert.equal(ctl.moving, null);
+  }
+});
+
+test("moveProxy: a restart killed unsaid of a proxy the app didn't start asks nothing more", async () => {
+  const ctl = proxyControl();
+  const { calls, cli } = killedRestart([{ running: true, proxy: { listen: "127.0.0.1:8080", pid: 12, args: oldArgs } }]);
+  await assert.rejects(moveProxy(cli, ctl, ownedMove, 9090), { message: KILLED });
+  assert.equal(calls.length, 1);
+  assert.equal(ctl.owned, null);
+  assert.equal(ctl.moving, null);
+});
+
+test("moveProxy: after a restart killed unsaid, a status that fails changes nothing", async () => {
+  const ctl = proxyControl();
+  ctl.owned = 7;
+  const { cli } = fakeCli((args) => {
+    throw args[1] === "restart" ? cliError(KILLED) : new Error("status failed");
+  });
+  await assert.rejects(moveProxy(cli, ctl, ownedMove, 9090), { message: KILLED });
+  await ctl.moving;
+  assert.equal(ctl.owned, 7);
+});
+
 test("during a move that went back, a start waits and starts nothing", async () => {
   stubStorage();
   const { calls, cli } = proxyCli(() => runningAs(9), [9], (args) => args[1] === "restart");
@@ -577,7 +663,7 @@ test("startLive: a restart refused before stopping anything rejects as it is, an
   const ctl = proxyControl();
   ctl.owned = 7;
   const { calls, cli } = fakeCli((args) => {
-    if (args[1] === "restart") throw new Error(message);
+    if (args[1] === "restart") throw cliError(message, { stopped: false });
     return { running: true, proxy: liveRunning };
   });
   await assert.rejects(startLive(cli, ctl, LIVE), { message });
