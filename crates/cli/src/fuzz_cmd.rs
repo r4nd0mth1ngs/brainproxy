@@ -337,6 +337,8 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let (req, target) = prepared?;
     let guard = crate::project_guard(project)?;
     crate::require_in_scope(&guard, &target)?;
+    // So is a server name the scope doesn't list, before a row could say it was sent.
+    args.req.send_options(guard.clone()).check_sni(&target)?;
     let template = Template::parse(req.as_bytes(), &args.marker)?;
 
     let mut stdin = || crate::read_input(None);

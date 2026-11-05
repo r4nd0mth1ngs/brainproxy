@@ -52,6 +52,24 @@ impl Default for SendOptions {
     }
 }
 
+impl SendOptions {
+    /// Refuses a `--sni` the scope doesn't list by name, for a TLS `target` (plain HTTP sends
+    /// none). Every connection checks it; a command checks it first too, before its rows, so a
+    /// refused name leaves none claiming it was sent.
+    pub fn check_sni(&self, target: &Target) -> Result<()> {
+        // The server name picks the site on a shared front end as much as the address does, so a
+        // different one must be in scope by name too: else an in-scope host on a CDN reaches any tenant.
+        let Some(sni) = self.sni.as_ref().filter(|_| target.is_tls()) else { return Ok(()) };
+        let guard = self.guard.as_ref().ok_or_else(|| Error::OutOfScope("no engagement scope".into()))?;
+        if !sni.eq_ignore_ascii_case(&target.host) && !guard.confirms(sni, target.port) {
+            return Err(Error::OutOfScope(format!(
+                "--sni {sni}: a server name other than the target's must be listed by name in the scope"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A completed round trip.
 #[derive(Debug, Clone, Serialize)]
 pub struct Exchange {
@@ -606,18 +624,13 @@ impl Client {
     /// The TLS server name for `target`: its host, or the `--sni` override once the scope
     /// allows it. Checked before the connection opens, so a refused name opens none.
     fn server_name_for(&self, target: &Target) -> Result<ServerName<'static>> {
-        let name = self.opts.sni.as_deref().unwrap_or(&target.host);
-        // The server name picks the site on a shared front end as much as the address does, so a
-        // different one must be in scope by name too: else an in-scope host on a CDN reaches any tenant.
-        if let Some(sni) = &self.opts.sni {
-            let guard = self.opts.guard.as_ref().ok_or_else(|| Error::OutOfScope("no engagement scope".into()))?;
-            if !sni.eq_ignore_ascii_case(&target.host) && !guard.confirms(sni, target.port) {
-                return Err(Error::OutOfScope(format!(
-                    "--sni {sni}: a server name other than the target's must be listed by name in the scope"
-                )));
-            }
-        }
-        server_name(name)
+        self.check_sni(target)?;
+        server_name(self.opts.sni.as_deref().unwrap_or(&target.host))
+    }
+
+    /// See [`SendOptions::check_sni`].
+    pub fn check_sni(&self, target: &Target) -> Result<()> {
+        self.opts.check_sni(target)
     }
 
     async fn tls_handshake(
@@ -836,10 +849,11 @@ pub fn server_name(name: &str) -> Result<ServerName<'static>> {
 }
 
 /// The server name sent to `target` in place of its host when `sni` overrides it: none over
-/// plain HTTP (or ws), and none for an IP address, which can't be a server name, so no SNI is
-/// sent then.
+/// plain HTTP (or ws), none when it is the target's host anyway, and none for an IP address,
+/// which can't be a server name, so no SNI is sent then.
 pub fn sent_sni(sni: Option<&str>, target: &Target) -> Option<String> {
-    sni.filter(|n| target.is_tls() && n.parse::<std::net::IpAddr>().is_err()).map(str::to_string)
+    sni.filter(|n| target.is_tls() && !n.eq_ignore_ascii_case(&target.host) && n.parse::<std::net::IpAddr>().is_err())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

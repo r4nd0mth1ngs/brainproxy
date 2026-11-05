@@ -20,11 +20,16 @@ struct Env {
 
 impl Env {
     fn new(name: &str) -> Self {
+        Self::with_scope(name, &["--target", "127.0.0.1"])
+    }
+
+    /// A project whose engagement is started with `scope`.
+    fn with_scope(name: &str, scope: &[&str]) -> Self {
         let dir = std::env::temp_dir().join(format!("bp-prov-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let env = Env { project: dir.join("p.bpdb"), home: dir.join("home") };
-        env.ok(&[], &["engagement", "start", "--target", "127.0.0.1"]);
+        env.ok(&[], &[&["engagement", "start"][..], scope].concat());
         env
     }
 
@@ -244,7 +249,8 @@ fn an_overridden_server_name_is_recorded() {
         }
     });
     let http = serve();
-    let env = Env::new("sni");
+    // The scope lists app.test by name, so it may be sent in place of 127.0.0.1.
+    let env = Env::with_scope("sni", &["--target", "127.0.0.1", "--target", "app.test"]);
     let https = format!("https://127.0.0.1:{port}/");
     let (code, _, _) = env.run(&[], &["send", "--url", &https, "--sni", "app.test"]);
     assert_ne!(code, 0);
@@ -255,10 +261,33 @@ fn an_overridden_server_name_is_recorded() {
     // Nor does an IP address: it can't be a server name.
     let (code, _, _) = env.run(&[], &["send", "--url", &https, "--sni", "127.0.0.1"]);
     assert_ne!(code, 0);
+    // HTTP/2, a race and a WebSocket handshake record it too.
+    let (code, _, _) = env.run(&[], &["send", "--url", &https, "--sni", "app.test", "--http2"]);
+    assert_ne!(code, 0);
+    // A race reports each copy's failure, as its rows do.
+    env.ok(&[], &["send", "--url", &https, "--sni", "app.test", "--race", "2"]);
+    let wss = format!("wss://127.0.0.1:{port}/");
+    let (code, _, _) = env.run(&[], &["ws", "send", "--url", &wss, "--sni", "app.test", "--wait", "1"]);
+    assert_ne!(code, 0);
+    let fuzz = format!("{https}?q=§x§");
+    env.run(&[], &["fuzz", "run", "--url", &fuzz, "-p", "list:a,b", "-c", "1", "--sni", "app.test"]);
+    // A name the scope doesn't list is refused before a row could say it was sent.
+    let refused: [&[&str]; 4] = [
+        &["send", "--url", &https],
+        &["send", "--url", &https, "--race", "2"],
+        &["ws", "send", "--url", &wss],
+        &["fuzz", "run", "--url", &fuzz, "-p", "list:a"],
+    ];
+    for args in refused {
+        let (code, v, _) = env.run(&[], &[args, &["--sni", "other-tenant.test"]].concat());
+        assert_ne!(code, 0, "{args:?}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("--sni other-tenant.test"), "{v}");
+    }
 
     let rows = env.rows("SELECT sni FROM history ORDER BY id");
-    let null = serde_json::json!([null]);
-    assert_eq!(rows, vec![serde_json::json!(["app.test"]), null.clone(), null.clone(), null]);
+    let (app, null) = (serde_json::json!(["app.test"]), serde_json::json!([null]));
+    let want = [&app, &null, &null, &null, &app, &app, &app, &app, &app, &app].map(Clone::clone);
+    assert_eq!(rows, want.to_vec());
     assert_eq!(env.ok(&[], &["history", "show", "1"])["entry"]["sni"], "app.test");
     assert!(env.text(&["history", "show", "1"]).lines().next().unwrap().ends_with("TLS server name (SNI) app.test"));
 }

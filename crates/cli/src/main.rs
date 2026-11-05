@@ -624,6 +624,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     // Refuse out-of-scope targets up front, before any connection is attempted.
     require_in_scope(&guard, &target)?;
     let send_opts = args.req.send_options(guard);
+    // So is a server name the scope doesn't list, before a row could say it was sent.
+    send_opts.check_sni(&target)?;
     let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
         // Its logins, checks and macros keep no content either.

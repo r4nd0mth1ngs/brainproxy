@@ -382,6 +382,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         sni: args.sni.clone(),
         http2: false,
     };
+    // So is a server name the scope doesn't list, before a row could say it was sent.
+    send_opts.check_sni(&target)?;
     let session = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     let client = Client::new(send_opts);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;

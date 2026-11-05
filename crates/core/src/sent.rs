@@ -266,6 +266,9 @@ mod tests {
         // Another client's override in the same process isn't this one's.
         let mut plain = SentLog::new(Store::open_in_memory().unwrap(), "send", false).sent_by(&client(None));
         assert_eq!(sni(&mut plain, "https://a.test"), None);
+        // Naming the target's own host overrides nothing.
+        let mut same = SentLog::new(Store::open_in_memory().unwrap(), "send", false).sent_by(&client(Some("A.test")));
+        assert_eq!(sni(&mut same, "https://a.test"), None);
         // An IP address can't be a server name: none is sent, so none is recorded.
         for ip in ["127.0.0.1", "::1"] {
             let mut log = SentLog::new(Store::open_in_memory().unwrap(), "send", false).sent_by(&client(Some(ip)));

@@ -945,7 +945,8 @@ Each history entry has:
 - `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
   a session's own requests in those); NULL when it was the target host, for plain HTTP, and
   when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
-  the scope refuses fails before any connection is opened.
+  the scope refuses fails before any connection is opened, and before any row is written, as an
+  out-of-scope target does.
 - `note_origin`, `note_changed_at`, `tags_origin`, `tags_changed_at`: who last set the note
   (`history note`) or changed the tags (`history tag`), and when.
 
