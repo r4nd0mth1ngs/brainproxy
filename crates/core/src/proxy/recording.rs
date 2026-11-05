@@ -3,7 +3,9 @@
 //! only a request line, or a tunnel's row), so each change is kept with who made it and when.
 //! One an agent made that narrowed recording stays flagged until a person changes that
 //! setting again (from the app or a terminal, even saving it unchanged), or the agent puts it
-//! back as it was: later changes by the agent, or more of them than the log keeps, don't hide it.
+//! back as it was: later changes by the agent, or any number of other changes, don't hide it.
+//! The log keeps every change made through MCP or that narrowed recording; only a person's
+//! routine ones are dropped, the oldest first, past [`KEEP`].
 //!
 //! The log is one JSON value in `meta` ([`CHANGES_KEY`]), so it needs no schema change.
 
@@ -21,7 +23,8 @@ use crate::store::Store;
 
 /// Key in the project `meta` table holding the [`Changes`].
 pub const CHANGES_KEY: &str = "proxy.recording_changes";
-/// Changes kept, the oldest dropped first.
+/// A person's changes that didn't narrow recording kept, the oldest dropped first. Changes
+/// through MCP and narrowing ones are never dropped.
 const KEEP: usize = 100;
 
 /// One change to the recording scope or the pass-through list.
@@ -42,6 +45,11 @@ pub struct Change {
 }
 
 impl Change {
+    /// Whether the log keeps it for good: it came through MCP or narrowed recording.
+    pub fn kept(&self) -> bool {
+        self.narrowed || self.by == "mcp"
+    }
+
     /// "recording scope changed via MCP (an agent) at 2026-01-31T12:00:00.000Z, narrowing
     /// recording: include: added ^a\.test$", for people.
     pub fn describe(&self) -> String {
@@ -66,7 +74,7 @@ struct Flag {
 /// The log of changes, and the agents' narrowing changes not changed by a person since.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Changes {
-    /// Oldest first, at most [`KEEP`].
+    /// Oldest first: every [kept](Change::kept) one and at most [`KEEP`] others.
     #[serde(default)]
     changes: Vec<Change>,
     /// By setting.
@@ -78,6 +86,17 @@ impl Changes {
     /// The latest `n` changes, newest first.
     pub fn recent(&self, n: usize) -> Vec<&Change> {
         self.changes.iter().rev().take(n).collect()
+    }
+
+    /// The latest `n` changes and every [kept](Change::kept) one before them, newest first:
+    /// any number of later changes can't push an agent's or a narrowing change out of view.
+    pub fn shown(&self, n: usize) -> Vec<&Change> {
+        self.changes.iter().rev().enumerate().filter(|(i, c)| *i < n || c.kept()).map(|(_, c)| c).collect()
+    }
+
+    /// Every [kept](Change::kept) change, newest first.
+    pub fn kept(&self) -> Vec<&Change> {
+        self.shown(0)
     }
 
     /// Per setting, the latest change through MCP that narrowed recording, while no person
@@ -123,8 +142,13 @@ impl Changes {
             self.flagged.insert(setting.to_string(), Flag { change: change.clone(), baseline });
         }
         self.changes.push(change);
-        let extra = self.changes.len().saturating_sub(KEEP);
-        self.changes.drain(..extra);
+        // Past KEEP routine changes, drop the oldest of them; the kept ones stay wherever they are.
+        let mut extra = self.changes.iter().filter(|c| !c.kept()).count().saturating_sub(KEEP);
+        self.changes.retain(|c| {
+            let drop = extra > 0 && !c.kept();
+            extra -= usize::from(drop);
+            !drop
+        });
     }
 }
 
@@ -324,10 +348,10 @@ mod tests {
         c.note("mcp", "scope", j(&a), j(&ab), scope_change(&a, &ab), true);
         c.note("mcp", "scope", j(&ab), j(&ab), None, true);
         assert_eq!(c.narrowed_by_agent()[0].summary, "include: added a");
-        // Nor does pushing it out of the log.
+        // Nor do more changes than the log keeps: those through MCP are never dropped.
         for _ in 0..KEEP {
             c.note(
-                "mcp",
+                "gui",
                 "passthrough",
                 Value::from(Vec::<String>::new()),
                 Value::from(vec!["x"]),
@@ -335,7 +359,8 @@ mod tests {
                 true,
             );
         }
-        assert_eq!(c.recent(usize::MAX).len(), KEEP);
+        assert_eq!(c.recent(usize::MAX).len(), KEEP + 2);
+        assert_eq!(c.kept().len(), 2);
         assert_eq!(c.narrowed_by_agent().iter().filter(|c| c.setting == "scope").count(), 1);
         // A person saving it, even unchanged, has seen it.
         c.note("gui", "scope", j(&ab), j(&ab), None, true);
@@ -355,5 +380,39 @@ mod tests {
         c.note("mcp", "scope", j(&a), j(&b), scope_change(&a, &b), true);
         c.note("gui", "scope", j(&b), j(&b), None, false);
         assert_eq!(c.narrowed_by_agent().len(), 1);
+    }
+
+    #[test]
+    fn an_agents_narrowing_stays_in_the_log_however_many_changes_follow() {
+        let (all, none) = (scope(&[], &[], false), scope(&["^nothing$"], &[], false));
+        let j = |s: &Scope| serde_json::to_value(s).unwrap();
+        let list = |l: &[&str]| Value::from(l.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let mut c = Changes::default();
+        // The agent narrows the scope to nothing, sends its traffic, and puts it back: no flag.
+        c.note("mcp", "scope", j(&all), j(&none), scope_change(&all, &none), true);
+        c.note("mcp", "scope", j(&none), j(&all), scope_change(&none, &all), true);
+        assert!(c.narrowed_by_agent().is_empty());
+        // Then adds and removes a pass-through pattern again and again, and a person makes a
+        // lot of routine changes.
+        for _ in 0..2 * KEEP {
+            c.note("mcp", "passthrough", list(&[]), list(&["z.test"]), Some((true, "added z.test".into())), true);
+            c.note("mcp", "passthrough", list(&["z.test"]), list(&[]), Some((false, "removed z.test".into())), true);
+            c.note("gui", "scope", j(&all), j(&all), Some((false, "include: removed b".into())), true);
+        }
+        assert!(c.narrowed_by_agent().is_empty());
+        // The narrowing is still in the log and in what `scope show` lists; the routine changes
+        // are capped.
+        let narrowing = |l: &[&Change]| l.iter().any(|c| c.setting == "scope" && c.by == "mcp" && c.narrowed);
+        assert!(narrowing(&c.recent(usize::MAX)));
+        assert!(narrowing(&c.shown(20)));
+        assert!(narrowing(&c.kept()));
+        assert_eq!(c.recent(usize::MAX).iter().filter(|c| !c.kept()).count(), KEEP);
+        assert_eq!(c.kept().len(), 2 + 4 * KEEP);
+        // The latest changes come first, whatever they are.
+        assert_eq!(c.shown(1)[0].by, "gui");
+        assert_eq!(c.shown(1).len(), 1 + c.kept().len());
+        // It survives being saved and read back.
+        let back: Changes = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(narrowing(&back.shown(20)));
     }
 }

@@ -982,20 +982,23 @@ as the regexes they are), a new exclude pattern, or `--record-out-of-scope` turn
 something is out of scope, or a new pass-through pattern. `--record-out-of-scope` doesn't make
 a smaller scope harmless: HTTPS to a host outside it is tunnelled, never decrypted. The
 setting and its log entry are saved in one transaction, so a change by another process
-can't slip between them unlogged. `scope show` lists the latest 20
-(`recording_changes`, newest first); `proxy status` has the last one
-(`recording_last_change`). A narrowing change made through MCP is also listed in
+can't slip between them unlogged. `scope show` lists the latest 20 and every earlier one
+made through MCP or that narrowed recording (`recording_changes`, newest first); `proxy
+status` has the last one (`recording_last_change`) and those made through MCP or that narrowed
+recording (`recording_kept_changes`, newest first). A narrowing change made through MCP is also listed in
 `narrowed_by_agent` (`scope show`) and `recording_narrowed_by_agent` (`proxy status`, whose
 text says `not reviewed: recording scope changed via MCP (an agent) at ...`) until a person
 changes that setting from the app or a terminal (saving it unchanged with a command that edits
 it counts: `scope add` with nothing to add, say), or the agent puts it back as it was; the
 agent's later changes don't clear it, nor does another connection command saving the settings
-the pass-through list is kept with. The log keeps the last 100
-changes, as JSON in the `meta` table (`proxy.recording_changes`).
+the pass-through list is kept with. The log keeps every change made through MCP or that
+narrowed recording, and the last 100 others, as JSON in the `meta` table
+(`proxy.recording_changes`): however many changes follow, an agent's narrowing stays listed,
+even once its flag is cleared.
 
 ```sh
 brainproxy scope show                        # recording_changes, narrowed_by_agent
-brainproxy proxy status                      # recording_last_change, recording_narrowed_by_agent
+brainproxy proxy status                      # recording_last_change, recording_narrowed_by_agent, recording_kept_changes
 ```
 
 Findings have an `origin` too (who added them: the proxy's passive scan, a scan job,

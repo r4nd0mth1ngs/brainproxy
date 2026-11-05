@@ -1020,6 +1020,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "scope": scope,
                 "recording_last_change": changes.recent(1).first(),
                 "recording_narrowed_by_agent": narrowed,
+                "recording_kept_changes": changes.kept(),
                 "authz": authz,
             });
             let notes: String = narrowed.iter().map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
@@ -1867,7 +1868,8 @@ fn serve(
     })
 }
 
-/// Changes to what the proxy records that `scope show` lists.
+/// The latest changes to what the proxy records that `scope show` lists, besides every one
+/// through MCP or that narrowed recording.
 const SCOPE_CHANGES_SHOWN: usize = 20;
 
 pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
@@ -1877,7 +1879,7 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
         ScopeCmd::Show => {
             let changes = store.recording_changes()?;
             let mut data = json!(scope);
-            data["recording_changes"] = json!(changes.recent(SCOPE_CHANGES_SHOWN));
+            data["recording_changes"] = json!(changes.shown(SCOPE_CHANGES_SHOWN));
             data["narrowed_by_agent"] = json!(changes.narrowed_by_agent());
             out.ok(data, || {
                 let mut text = serde_json::to_string_pretty(&scope).unwrap_or_default();

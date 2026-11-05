@@ -700,7 +700,9 @@ function Scope({ active }: { active: boolean }) {
       {!!scope?.recording_changes?.length && (
         <>
           <h3>Changes to what the proxy records</h3>
-          <p className="muted small">The recording scope and the TLS pass-through list, newest first, with who changed them.</p>
+          <p className="muted small">
+            The latest changes to the recording scope and the TLS pass-through list, and every earlier one an agent made or that narrowed recording, newest first, with who changed them.
+          </p>
           <table className="set-table">
             <thead>
               <tr>
@@ -711,8 +713,9 @@ function Scope({ active }: { active: boolean }) {
               </tr>
             </thead>
             <tbody>
-              {scope.recording_changes.map((c) => (
-                <tr key={`${c.time}-${c.setting}`}>
+              {scope.recording_changes.map((c, i) => (
+                // Two changes can share a millisecond; the list is only ever replaced whole.
+                <tr key={i}>
                   <td>{new Date(c.time).toLocaleString()}</td>
                   <td>{byText(c.by)}</td>
                   <td className="mono">{changeText(c)}</td>

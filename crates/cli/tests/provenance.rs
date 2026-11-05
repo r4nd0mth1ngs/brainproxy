@@ -652,3 +652,26 @@ fn narrowing_what_the_proxy_records_says_who_did_it() {
     );
     assert!(!env.text(&["proxy", "status"]).contains("not reviewed"));
 }
+
+#[test]
+fn an_agents_narrowing_stays_listed_however_many_changes_follow() {
+    let env = Env::new("recording-kept");
+    let agent = [(MCP, "1")];
+    // The agent narrows recording to nothing, and puts it back once its traffic is sent.
+    env.ok(&agent, &["scope", "set", "--include", "^nothing$"]);
+    env.ok(&agent, &["scope", "clear"]);
+    // Then buries it under more changes than `scope show` lists.
+    for _ in 0..11 {
+        env.ok(&agent, &["connection", "passthrough", "add", "z.test"]);
+        env.ok(&agent, &["connection", "passthrough", "remove", "z.test"]);
+    }
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert_eq!(shown["narrowed_by_agent"], serde_json::json!([]), "{shown}");
+    let narrowing = |list: &Value| {
+        list.as_array().unwrap().iter().any(|c| c["setting"] == "scope" && c["by"] == "mcp" && c["narrowed"] == true)
+    };
+    assert!(narrowing(&shown["recording_changes"]), "{shown}");
+    let status = env.ok(&[], &["proxy", "status"]);
+    assert!(narrowing(&status["recording_kept_changes"]), "{status}");
+    assert_eq!(status["recording_kept_changes"].as_array().unwrap().len(), 24, "{status}");
+}
