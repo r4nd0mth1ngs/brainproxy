@@ -1169,7 +1169,8 @@ impl AuthSession {
         target: &Target,
         omit: Option<&'static str>,
     ) -> (Option<i64>, Result<Exchange>) {
-        let opened = crate::sent::SentLog::open(&self.project, "auth", self.no_store.load(Ordering::SeqCst));
+        let opened = crate::sent::SentLog::open(&self.project, "auth", self.no_store.load(Ordering::SeqCst))
+            .map(|log| log.sent_by(&self.client));
         let mut log = match opened {
             Ok(log) => match omit {
                 Some(reason) => log.without_content(reason),

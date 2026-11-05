@@ -266,6 +266,8 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
         assert_eq!(curl_as_alice(&proxy, &srv.url(path), &[]), 200, "{path}");
     }
     assert_eq!(curl_as_alice(&proxy, &srv.url("/api/me"), &["-X", "POST", "-d", "x=1"]), 200);
+    // Nor a GraphQL mutation sent as GET: it is MUTATION, not GET (skipped before its 404 counts).
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/graphql?query=mutation%20%7B%20a%20%7D"), &[]), 404);
     // Static assets and responses other than 2xx aren't tested either.
     assert_eq!(curl_as_alice(&proxy, &srv.url("/static/app.js"), &[]), 200);
     assert_eq!(curl_as_alice(&proxy, &srv.url("/no/such/page"), &[]), 404);
@@ -308,7 +310,7 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
     assert_eq!(progress["tested"], 2, "{status}");
     assert_eq!(progress["duplicates"], 1, "{status}");
     assert_eq!(progress["skipped_excluded_paths"], 1, "{status}");
-    assert_eq!(progress["skipped_methods"], 1, "{status}");
+    assert_eq!(progress["skipped_methods"], 2, "{status}");
     assert_eq!(progress["skipped_no_credentials"], 1, "{status}");
     assert_eq!(progress["skipped_static"], 1, "{status}");
     assert_eq!(progress["skipped_status"], 1, "{status}");
@@ -425,5 +427,34 @@ fn a_named_request_still_needs_its_opt_ins() {
     assert_eq!(code, 2, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods DELETE"), "{v}");
     let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &delete, "--include-methods", "DELETE"]);
+    assert_eq!(r["requests"], 1, "{r}");
+}
+
+#[test]
+fn a_graphql_mutation_is_opted_in_to_as_mutation() {
+    let srv = Server::start();
+    let p = tmp_project("mutation");
+    let gql = srv.url("/graphql");
+    let send = |query: &str| {
+        let body = format!(r#"{{"query": "{query}"}}"#);
+        let args = ["send", "-X", "POST", "--url", &gql, "-H", "Content-Type: application/json", "-d", &body];
+        ok(&p, &[&args[..], &["--auth", "alice"]].concat())["id"].to_string()
+    };
+    send("query { me { email } }");
+    let mutation = send("mutation { deleteAccount }");
+
+    // POST replays the query but not the mutation, which travels as POST too.
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--include-methods", "POST"]);
+    assert_eq!(r["requests"], 1, "{r}");
+    assert_eq!(r["skipped"]["methods"], 1, "{r}");
+    assert!(r["skipped"]["methods_hint"].as_str().unwrap().contains("MUTATION"), "{r}");
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--include-methods", "POST,MUTATION"]);
+    assert_eq!(r["requests"], 2, "{r}");
+
+    // Named, it needs MUTATION, not its method.
+    let (code, v) = run(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "POST"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods MUTATION"), "{v}");
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "mutation"]);
     assert_eq!(r["requests"], 1, "{r}");
 }

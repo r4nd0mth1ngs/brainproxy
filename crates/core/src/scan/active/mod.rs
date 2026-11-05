@@ -398,7 +398,8 @@ impl Cx {
             let ex = client.send(&req, target).await?;
             return Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms));
         }
-        let opt_in = check_opt_in(req.as_bytes());
+        // As for the targets the ported rules attack.
+        let opt_in = crate::apiimport::api::opt_in(req.as_bytes());
         let all = self.shared.check_methods.iter().any(|m| m == "ALL");
         if !(all
             || crate::apiimport::api::DEFAULT_METHODS.contains(&opt_in.as_str())
@@ -645,15 +646,6 @@ impl Drop for CheckRow<'_> {
             self.finish(capture);
         }
     }
-}
-
-/// What a check's request is opted in as: its method, or MUTATION for a GraphQL mutation
-/// (as for the targets the ported rules attack).
-fn check_opt_in(request: &[u8]) -> String {
-    if crate::apiimport::graphql::is_mutation_request(request) {
-        return crate::apiimport::api::MUTATION.to_string();
-    }
-    RawRequest::from_bytes(request.to_vec()).head().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default()
 }
 
 fn signature(r: &Response) -> String {

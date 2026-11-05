@@ -61,6 +61,10 @@ pub struct Exchange {
     #[serde(skip)]
     pub response: Vec<u8>,
     pub duration_ms: u64,
+    /// The TLS server name sent in place of the target's host, recorded with the exchange
+    /// (see [`Client::sni`]).
+    #[serde(skip)]
+    pub sni: Option<String>,
 }
 
 /// Idle connections kept per target, and how long one may sit unused.
@@ -139,7 +143,6 @@ fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> R
 impl Client {
     pub fn new(opts: SendOptions) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        crate::provenance::note_sni(opts.sni.as_deref());
         let config = tls_config(opts.verify_tls, b"http/1.1", None).expect("TLS configuration without a certificate");
         let h2_config = tls_config(opts.verify_tls, b"h2", None).expect("TLS configuration without a certificate");
         Self {
@@ -179,6 +182,12 @@ impl Client {
 
     pub fn options(&self) -> &SendOptions {
         &self.opts
+    }
+
+    /// The server name this client sends to `target` in place of its host (`--sni`), which
+    /// the target's history rows record. See [`sent_sni`].
+    pub fn sni(&self, target: &Target) -> Option<String> {
+        sent_sni(self.opts.sni.as_deref(), target)
     }
 
     /// Connections opened so far (pooled reuse doesn't count).
@@ -263,6 +272,7 @@ impl Client {
                 request: self.recorded_request(req, target)?,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
+                sni: self.sni(target),
             });
         }
         let response = tokio::time::timeout(self.opts.timeout, self.round_trip(req.as_bytes(), target, &method))
@@ -273,6 +283,7 @@ impl Client {
             request: req.as_bytes().to_vec(),
             response,
             duration_ms: started.elapsed().as_millis() as u64,
+            sni: self.sni(target),
         })
     }
 
@@ -539,9 +550,10 @@ impl Client {
             return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
         let connector = self.connector(true, target, net)?;
+        let name = self.server_name_for(target)?;
         let tcp = self.connect_tcp(target, net).await?;
         let refused = || Error::Protocol(format!("{}:{} did not negotiate HTTP/2 (ALPN h2)", target.host, target.port));
-        let tls = self.tls_handshake(&connector, tcp, target).await.map_err(|e| match e {
+        let tls = self.tls_handshake(&connector, tcp, name).await.map_err(|e| match e {
             Error::Tls(m) if m.contains("NoApplicationProtocol") => refused(),
             e => e,
         })?;
@@ -564,10 +576,12 @@ impl Client {
         if !target.is_tls() {
             return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
-        // A client certificate that can't be loaded fails before any connection.
+        // A client certificate that can't be loaded, or a server name refused, fails before any
+        // connection.
         let connector = self.connector(false, target, net)?;
+        let name = self.server_name_for(target)?;
         let tcp = self.connect_tcp(target, net).await?;
-        Ok(Box::new(self.tls_handshake(&connector, tcp, target).await?))
+        Ok(Box::new(self.tls_handshake(&connector, tcp, name).await?))
     }
 
     /// The TLS configuration for `target`: with the client certificate its host
@@ -589,12 +603,9 @@ impl Client {
         Ok(connector)
     }
 
-    async fn tls_handshake(
-        &self,
-        connector: &TlsConnector,
-        tcp: TcpStream,
-        target: &Target,
-    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    /// The TLS server name for `target`: its host, or the `--sni` override once the scope
+    /// allows it. Checked before the connection opens, so a refused name opens none.
+    fn server_name_for(&self, target: &Target) -> Result<ServerName<'static>> {
         let name = self.opts.sni.as_deref().unwrap_or(&target.host);
         // The server name picks the site on a shared front end as much as the address does, so a
         // different one must be in scope by name too: else an in-scope host on a CDN reaches any tenant.
@@ -606,8 +617,16 @@ impl Client {
                 )));
             }
         }
-        let server_name = server_name(name)?;
-        connector.connect(server_name, tcp).await.map_err(|e| Error::Tls(e.to_string()))
+        server_name(name)
+    }
+
+    async fn tls_handshake(
+        &self,
+        connector: &TlsConnector,
+        tcp: TcpStream,
+        name: ServerName<'static>,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        connector.connect(name, tcp).await.map_err(|e| Error::Tls(e.to_string()))
     }
 
     /// The only place sockets to targets are opened: resolves through the scope
@@ -814,6 +833,13 @@ impl ServerCertVerifier for NoVerify {
 pub fn server_name(name: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(name.to_string())
         .map_err(|e| Error::InvalidInput(format!("bad TLS server name {name:?}: {e}")))
+}
+
+/// The server name sent to `target` in place of its host when `sni` overrides it: none over
+/// plain HTTP (or ws), and none for an IP address, which can't be a server name, so no SNI is
+/// sent then.
+pub fn sent_sni(sni: Option<&str>, target: &Target) -> Option<String> {
+    sni.filter(|n| target.is_tls() && n.parse::<std::net::IpAddr>().is_err()).map(str::to_string)
 }
 
 #[cfg(test)]

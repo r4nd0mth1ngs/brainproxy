@@ -40,8 +40,8 @@ pub struct Capture {
     pub origin: Option<String>,
     /// The proxy client's address (`ip:port`), for captures the proxy records.
     pub client_addr: Option<String>,
-    /// The TLS server name sent when it was overridden (`--sni`); None: the SNI override in
-    /// effect for this process, if any.
+    /// The TLS server name sent in place of the target's host (`--sni`), if any: the sending
+    /// client says which ([`crate::http::Client::sni`]).
     pub sni: Option<String>,
     /// Who changed the request before it went out (intercept edits, rules), for the proxy.
     pub edited_by: Vec<crate::provenance::Edit>,

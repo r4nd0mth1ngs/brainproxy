@@ -250,6 +250,7 @@ pub async fn run(
                             .then(|| Capture::new("fuzz", &target, &request, None, None, Some(&e.to_string())))
                     }
                 };
+                let capture = capture.map(|c| Capture { sni: client.sni(&target), ..c });
                 if res.matched && cfg.stop_on_match {
                     matched_stop.store(true, Ordering::Relaxed);
                     stop.store(true, Ordering::Relaxed);

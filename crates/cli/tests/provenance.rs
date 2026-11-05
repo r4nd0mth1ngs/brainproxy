@@ -252,9 +252,13 @@ fn an_overridden_server_name_is_recorded() {
     assert_ne!(code, 0);
     // Plain HTTP sends no server name at all.
     env.ok(&[], &["send", "--url", &format!("http://127.0.0.1:{http}/"), "--sni", "app.test"]);
+    // Nor does an IP address: it can't be a server name.
+    let (code, _, _) = env.run(&[], &["send", "--url", &https, "--sni", "127.0.0.1"]);
+    assert_ne!(code, 0);
 
     let rows = env.rows("SELECT sni FROM history ORDER BY id");
-    assert_eq!(rows, vec![serde_json::json!(["app.test"]), serde_json::json!([null]), serde_json::json!([null])]);
+    let null = serde_json::json!([null]);
+    assert_eq!(rows, vec![serde_json::json!(["app.test"]), null.clone(), null.clone(), null]);
     assert_eq!(env.ok(&[], &["history", "show", "1"])["entry"]["sni"], "app.test");
     assert!(env.text(&["history", "show", "1"]).lines().next().unwrap().ends_with("TLS server name (SNI) app.test"));
 }

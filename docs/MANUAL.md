@@ -590,7 +590,7 @@ Access control across users: does the app let bob read alice's data? See
   POST, a GraphQL mutation or another request that may change data, or when its path looks
   like a logout (which can end the owner's and each identity's session, so later results may
   not be reliable), and *Start run* asks first. Only a yes passes what `authz run` needs to
-  replay it: `--include-methods` with its method, and for a logout an `--exclude` that matches
+  replay it: `--include-methods` with its method (`MUTATION` for a mutation), and for a logout an `--exclude` that matches
   no path. Once the run has started, the form goes back to all recorded requests.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
@@ -931,8 +931,10 @@ Each history entry has:
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
   the rule). NULL when nothing changed it; an intercept forwarded unchanged isn't an edit.
-- `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`); NULL
-  when it was the target host, and for plain HTTP.
+- `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
+  a session's own requests in those); NULL when it was the target host, for plain HTTP, and
+  when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
+  the scope refuses fails before any connection is opened.
 - `note_origin`, `note_changed_at`, `tags_origin`, `tags_changed_at`: who last set the note
   (`history note`) or changed the tags (`history tag`), and when.
 
@@ -1546,7 +1548,8 @@ control. Low ones are only in the results, to review.
 
 Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
 replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
-another user. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
+another user. A GraphQL mutation is `MUTATION` whatever its method, as in a scan, so
+`--include-methods POST` doesn't replay one and `--include-methods MUTATION` does. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
 so the owner stays logged in. A request picked with `--history-id` may lack credentials, but its
 method needs `--include-methods` like any other, and one matching `--exclude` is refused
 (exit code 2, nothing sent) unless `--exclude` is given a pattern it doesn't match. URLs on
@@ -1557,8 +1560,8 @@ engagement scope and is recorded in history with source `authz`.
 `authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
 
 **Live mode.** `proxy start --authz bob,anonymous` tests requests while you browse. Each
-in-scope request the proxy records that carries credentials, uses GET, HEAD or OPTIONS,
-doesn't match `--authz-exclude` (default: logout and sign-off) and got a 2xx response that
+in-scope request the proxy records that carries credentials, uses GET, HEAD or OPTIONS
+(and isn't a GraphQL mutation), doesn't match `--authz-exclude` (default: logout and sign-off) and got a 2xx response that
 isn't a static asset (scripts, stylesheets, images, fonts, media) is also sent, in the
 background, as each listed profile and/or with no credentials (`anonymous`), exactly as
 `authz run` does. To test a request live mode leaves out, such as a private image, use

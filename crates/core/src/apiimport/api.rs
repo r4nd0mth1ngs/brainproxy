@@ -20,7 +20,7 @@ use crate::auth::MARK;
 use crate::error::{Error, Result};
 use crate::guard::Guard;
 use crate::http::request::find;
-use crate::http::Target;
+use crate::http::{RawRequest, Target};
 
 /// Methods sent and attacked by default. Not all safe: POST can change data or send email,
 /// but a scan without it misses too much, so it stays on with a warning. Replaying the
@@ -34,6 +34,16 @@ const ACCEPTED: &str = "accepted formats: OpenAPI 3.x, Swagger 2.0, and Postman 
 
 /// What `--include-methods` calls GraphQL mutations, which all travel as POST.
 pub const MUTATION: &str = "MUTATION";
+
+/// What a recorded request is opted in to as by `--include-methods`: its method, or MUTATION
+/// for a GraphQL mutation, whatever its method (a scan's check, `authz run`, the proxy's
+/// live authz testing).
+pub fn opt_in(request: &[u8]) -> String {
+    if super::graphql::is_mutation_request(request) {
+        return MUTATION.to_string();
+    }
+    RawRequest::from_bytes(request.to_vec()).head().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

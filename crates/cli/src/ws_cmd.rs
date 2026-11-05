@@ -403,7 +403,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     // The handshake is on record before it goes out (its row and the bytes sent), and so is
     // a retry with a renewed session. `last` is the latest row and whether its request is
     // still unanswered; a row answered already is never rewritten.
-    let mut log = crate::sent::SentLog::new(store, "ws", args.no_store);
+    let mut log = crate::sent::SentLog::new(store, "ws", args.no_store).sent_by(&client);
     let mut rows: Vec<i64> = Vec::new();
     let mut last: Option<(i64, RawRequest, bool)> = None;
     let opened = {

@@ -1605,22 +1605,31 @@ fn findings_add_takes_the_url_on_stdin_and_checks_its_links() {
 
 #[test]
 fn a_server_name_outside_the_scope_is_refused() {
-    // Accepts connections and says nothing: the check comes before the TLS handshake.
+    // Accepts connections, counts them and says nothing: the check comes before the connection.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = accepted.clone();
     std::thread::spawn(move || {
         let mut held = vec![];
         for s in listener.incoming().flatten() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             held.push(s);
         }
     });
     let project = tmp_project("sni");
     let url = format!("https://127.0.0.1:{port}/");
-    let (code, v) = run(&["send", "--url", &url, "--sni", "other-tenant.test", "--timeout", "2"], &project, None);
-    assert_ne!(code, 0, "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("--sni other-tenant.test"), "{v}");
+    for http2 in [false, true] {
+        let mut args = vec!["send", "--url", &url, "--sni", "other-tenant.test", "--timeout", "2"];
+        args.extend(http2.then_some("--http2"));
+        let (code, v) = run(&args, &project, None);
+        assert_ne!(code, 0, "{v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("--sni other-tenant.test"), "{v}");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0, "no connection is opened");
+    }
     // A name the scope lists gets as far as the handshake.
     let (code, v) = run(&["send", "--url", &url, "--sni", "localhost", "--timeout", "2"], &project, None);
     assert_ne!(code, 0, "{v}");
     assert!(!v["error"]["message"].as_str().unwrap().contains("--sni"), "{v}");
+    assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) > 0);
 }

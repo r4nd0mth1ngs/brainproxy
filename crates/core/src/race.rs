@@ -86,14 +86,14 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
     // 4. Read the responses concurrently.
     let mut reads = Vec::new();
     for (stream, req) in streams.into_iter().zip(requests) {
-        let target = target.clone();
+        let (target, sni) = (target.clone(), client.sni(target));
         reads.push(tokio::spawn(async move {
             let mut s = stream?;
             let method = crate::http::RawRequest::from_bytes(req.clone()).head().map(|h| h.method).unwrap_or_default();
             let response = tokio::time::timeout(timeout, WireReader::new().read_response(&mut s, &method))
                 .await
                 .map_err(|_| Error::Timeout(timeout))??;
-            Ok(Exchange { target, request: req, response, duration_ms: released.elapsed().as_millis() as u64 })
+            Ok(Exchange { target, request: req, response, duration_ms: released.elapsed().as_millis() as u64, sni })
         }));
     }
     let mut out = Vec::new();
@@ -167,11 +167,11 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
     // 4. Read the responses.
     let mut reads = Vec::new();
     for (fut, request) in futures.into_iter().zip(recorded) {
-        let target = target.clone();
+        let (target, sni) = (target.clone(), client.sni(target));
         reads.push(tokio::spawn(async move {
             let response =
                 tokio::time::timeout(timeout, read_response(fut)).await.map_err(|_| Error::Timeout(timeout))??;
-            Ok(Exchange { target, request, response, duration_ms: released.elapsed().as_millis() as u64 })
+            Ok(Exchange { target, request, response, duration_ms: released.elapsed().as_millis() as u64, sni })
         }));
     }
     let mut out = Vec::new();
