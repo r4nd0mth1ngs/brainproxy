@@ -997,7 +997,10 @@ show` and `proxy status` (whose text says `not reviewed: host overrides changed 
 agent) at ...`), until a person changes that setting (a `connection upstream`, `hosts` or `cert`
 command, or `connection clear`), runs `connection review [upstream|hosts|client_certs]` to keep
 it as it is, or the agent puts it back as it was. `connection review` isn't available through
-MCP, and refuses a tool call: an agent can't approve its own changes. Like an agent's other
+MCP, and refuses a tool call: an agent can't approve its own changes. A flagged change's
+`summary` says everything that changed since the agent's first change to that setting, so a
+small later one can't stand in for it; `connection review --seen TIME` (the flagged changes'
+`time`s, as the app passes them) keeps nothing if what is flagged has changed since. Like an agent's other
 changes, these are kept in the log for good. A change has `time`, `by` (`gui`, `cli` or `mcp`),
 `setting` (`scope`, `passthrough`, `upstream`, `hosts` or `client_certs`), `summary`
 (`include: added ^a\.test$`), `before` and `after`, and `narrowed`:

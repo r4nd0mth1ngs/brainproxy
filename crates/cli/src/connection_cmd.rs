@@ -56,6 +56,10 @@ pub enum ConnectionCmd {
     Review {
         /// Only these: upstream, hosts, client_certs (default: all of them).
         settings: Vec<String>,
+        /// The time of a flagged change you were shown (repeatable): if what is flagged
+        /// differs, nothing is kept.
+        #[arg(long)]
+        seen: Vec<String>,
     },
 }
 
@@ -155,8 +159,8 @@ pub fn connection(project: &Path, cmd: ConnectionCmd, out: &Out) -> Result<(), E
             return Ok(());
         }
         ConnectionCmd::Route { target } => return route(&store, target, out),
-        ConnectionCmd::Review { settings } => {
-            let cleared = store.review_routing(settings)?;
+        ConnectionCmd::Review { settings, seen } => {
+            let cleared = store.review_routing(settings, seen)?;
             let text = format!("{} change(s) by an agent marked as seen", cleared.len());
             out.ok(json!({"reviewed": cleared}), || text);
             return Ok(());

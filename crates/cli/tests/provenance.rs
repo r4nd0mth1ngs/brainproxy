@@ -748,6 +748,19 @@ fn an_agent_rerouting_traffic_is_logged() {
     assert_eq!(shown["routing_changed_by_agent"], serde_json::json!([]));
     let up = env.ok(&[], &["connection", "show"]);
     assert_eq!(up["upstream"][0]["proxy"], "http://192.0.2.7:3128", "{up}");
+    // The notice says everything since the agent's first change, not just its latest one,
+    // and keeping it needs exactly what was shown.
+    env.ok(&agent, &["connection", "upstream", "add", "--host", "*.corp.test", "--proxy", "http://192.0.2.9:8080"]);
+    env.ok(&agent, &["connection", "upstream", "add", "--host", "x.test", "--direct"]);
+    env.ok(&agent, &["connection", "upstream", "remove", "--host", "x.test"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    let flag = &shown["routing_changed_by_agent"][0];
+    assert_eq!(flag["summary"], "added *.corp.test via http://192.0.2.9:8080", "{shown}");
+    let (code, v, _) = env.run(&[], &["connection", "review", "--seen", "2000-01-01T00:00:00.000Z"]);
+    assert_eq!(code, 2, "{v}");
+    let time = flag["time"].as_str().unwrap();
+    env.ok(&[], &["connection", "review", "--seen", time]);
+    assert_eq!(env.ok(&[], &["scope", "show"])["routing_changed_by_agent"], serde_json::json!([]));
     // The agent putting it back as it was clears its flag too.
     env.ok(&agent, &["connection", "hosts", "add", "b.test", "10.0.0.8"]);
     env.ok(&agent, &["connection", "hosts", "remove", "b.test"]);

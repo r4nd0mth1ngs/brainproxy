@@ -550,7 +550,8 @@ function Scope({ active }: { active: boolean }) {
         app.toast("What the agent changed has changed since this was shown. Nothing was kept: check the notice again.", "error");
         return;
       }
-      await run(["connection", "review"]);
+      // Only what was shown: one the agent made since is refused, not approved unseen.
+      await run(["connection", "review", ...(fresh.routing_changed_by_agent ?? []).map((c) => `--seen=${c.time}`)]);
       await loadScope();
     } catch (e: any) {
       app.toast(e.message, "error");

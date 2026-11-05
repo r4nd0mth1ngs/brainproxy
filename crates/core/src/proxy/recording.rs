@@ -143,6 +143,17 @@ impl Changes {
         self.flagged.iter().filter(|(s, _)| ROUTING.contains(&s.as_str())).map(|(_, f)| &f.change).collect()
     }
 
+    /// Restates the flag of `setting`, when this save just set it, as everything that changed
+    /// since the agent's first change to it (`diff` of the setting before that and now): a later
+    /// small change mustn't stand in for an earlier one that matters.
+    fn restate(&mut self, setting: &str, after: &Value, diff: Diff) {
+        if let Some(f) = self.flagged.get_mut(setting).filter(|f| &f.change.after == after) {
+            if let Some((_, summary)) = diff(&f.baseline, after) {
+                f.change.summary = summary;
+            }
+        }
+    }
+
     /// Adds a change of `setting` by `by` (`summary` None: saved unchanged). `reviewed`: the
     /// command saved that setting itself, so saving it unchanged shows a person has seen it;
     /// another command saving the settings it is kept with doesn't.
@@ -301,8 +312,36 @@ fn json<T: Serialize>(v: &T) -> Value {
 }
 
 /// One part of a setting for [`Store::save_logged`]: its name, whether the command reviews
-/// it, its value before and after, and what changed.
-type Part = (&'static str, bool, Value, Value, Option<(bool, String)>);
+/// it, its value before and after, what changed, and how to tell what changed between two of
+/// its values as saved.
+type Part = (&'static str, bool, Value, Value, Option<(bool, String)>, Diff);
+
+/// What changed between two values of a setting as saved, as [`scope_change`] and the others say.
+type Diff = fn(&Value, &Value) -> Option<(bool, String)>;
+
+fn typed<T: serde::de::DeserializeOwned + Default>(v: &Value) -> T {
+    serde_json::from_value(v.clone()).unwrap_or_default()
+}
+
+fn scope_diff(a: &Value, b: &Value) -> Option<(bool, String)> {
+    scope_change(&typed(a), &typed(b))
+}
+
+fn passthrough_diff(a: &Value, b: &Value) -> Option<(bool, String)> {
+    passthrough_change(&typed::<Vec<String>>(a), &typed::<Vec<String>>(b))
+}
+
+fn upstream_diff(a: &Value, b: &Value) -> Option<(bool, String)> {
+    upstream_change(&typed::<Vec<UpstreamRule>>(a), &typed::<Vec<UpstreamRule>>(b))
+}
+
+fn hosts_diff(a: &Value, b: &Value) -> Option<(bool, String)> {
+    hosts_change(&typed::<Vec<HostOverride>>(a), &typed::<Vec<HostOverride>>(b))
+}
+
+fn certs_diff(a: &Value, b: &Value) -> Option<(bool, String)> {
+    client_certs_change(&typed::<Vec<ClientCert>>(a), &typed::<Vec<ClientCert>>(b))
+}
 
 /// The log as stored. One that doesn't parse (edited by hand, or written by a later version)
 /// is an error, never an empty log: saving over it would lose it.
@@ -337,7 +376,7 @@ impl Store {
     pub fn update_scope(&mut self, edit: impl FnOnce(&mut Scope) -> Result<()>) -> Result<Scope> {
         let to_json = |s: &Scope| serde_json::to_value(s).unwrap_or_default();
         self.save_logged(SCOPE_KEY, edit, |before: &Scope, after: &Scope| {
-            vec![("scope", true, to_json(before), to_json(after), scope_change(before, after))]
+            vec![("scope", true, to_json(before), to_json(after), scope_change(before, after), scope_diff as Diff)]
         })
     }
 
@@ -363,6 +402,7 @@ impl Store {
                     json(&before.passthrough),
                     json(&after.passthrough),
                     passthrough_change(&before.passthrough, &after.passthrough),
+                    passthrough_diff as Diff,
                 ),
                 (
                     "upstream",
@@ -370,6 +410,7 @@ impl Store {
                     json(&before.upstream),
                     json(&after.upstream),
                     upstream_change(&before.upstream, &after.upstream),
+                    upstream_diff,
                 ),
                 (
                     "hosts",
@@ -377,6 +418,7 @@ impl Store {
                     json(&before.hosts),
                     json(&after.hosts),
                     hosts_change(&before.hosts, &after.hosts),
+                    hosts_diff,
                 ),
                 (
                     "client_certs",
@@ -384,15 +426,18 @@ impl Store {
                     json(&before.client_certs),
                     json(&after.client_certs),
                     client_certs_change(&before.client_certs, &after.client_certs),
+                    certs_diff,
                 ),
             ]
         })
     }
 
     /// Marks the agents' flagged [routing](ROUTING) changes as seen by a person, leaving the
-    /// settings as they are; `settings` names which, all of them when empty. Refused through
-    /// MCP: an agent can't approve its own changes. Returns the changes it cleared.
-    pub fn review_routing(&mut self, settings: &[String]) -> Result<Vec<Change>> {
+    /// settings as they are; `settings` names which, all of them when empty. `seen`: the times
+    /// of the flagged changes the person was shown; when given, any other flagged change refuses
+    /// it all, so one made since isn't approved unseen. Refused through MCP: an agent can't
+    /// approve its own changes. Returns the changes it cleared.
+    pub fn review_routing(&mut self, settings: &[String], seen: &[String]) -> Result<Vec<Change>> {
         if crate::provenance::origin() == "mcp" {
             return Err(Error::InvalidInput(
                 "an agent's changes to where traffic goes are reviewed by a person, not through MCP".into(),
@@ -404,11 +449,23 @@ impl Store {
         let tx = self.write_tx()?;
         let get = |k: &str| tx.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0));
         let mut changes = parse_changes(get(CHANGES_KEY).optional()?)?;
-        let cleared: Vec<Change> = ROUTING
-            .iter()
-            .filter(|s| settings.is_empty() || settings.iter().any(|n| n == *s))
-            .filter_map(|s| changes.flagged.remove(*s).map(|f| f.change))
-            .collect();
+        let named: Vec<&str> =
+            ROUTING.iter().copied().filter(|s| settings.is_empty() || settings.iter().any(|n| n == s)).collect();
+        if !seen.is_empty() {
+            let mut now: Vec<&str> =
+                named.iter().filter_map(|s| changes.flagged.get(*s)).map(|f| f.change.time.as_str()).collect();
+            let mut shown: Vec<&str> = seen.iter().map(String::as_str).collect();
+            now.sort_unstable();
+            shown.sort_unstable();
+            if now != shown {
+                return Err(Error::InvalidInput(
+                    "the agent's changes to where traffic goes aren't the ones seen (changed since?): \
+                     nothing was kept; look at them again"
+                        .into(),
+                ));
+            }
+        }
+        let cleared: Vec<Change> = named.iter().filter_map(|s| changes.flagged.remove(*s).map(|f| f.change)).collect();
         let log = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
         tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -441,8 +498,9 @@ impl Store {
         let mut value = before.clone();
         edit(&mut value)?;
         let json = serde_json::to_string(&value).map_err(|e| Error::InvalidInput(e.to_string()))?;
-        for (setting, reviewed, before, after, summary) in change(&before, &value) {
-            changes.note(by, setting, before, after, summary, reviewed);
+        for (setting, reviewed, before, after, summary, diff) in change(&before, &value) {
+            changes.note(by, setting, before, after.clone(), summary, reviewed);
+            changes.restate(setting, &after, diff);
         }
         let log = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
         let set = "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
