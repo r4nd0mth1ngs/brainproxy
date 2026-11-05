@@ -706,9 +706,17 @@ fn warn_unresolved(built: &mut Built, label: &str, r: &ApiRequest) {
     }
 }
 
-/// The name to opt in to a request by, if its method doesn't say: a GraphQL mutation.
+/// The name to opt in to a request by, if its method doesn't say: a GraphQL mutation, from a
+/// schema's mutation type, or from the request as built (a Postman GraphQL body, a persisted
+/// query's hash), as a scan reads it.
 fn opt_in_name(format: Format, r: &ApiRequest) -> Option<String> {
-    (format == Format::Graphql && r.name.starts_with("mutation ")).then(|| MUTATION.to_string())
+    let from_schema = format == Format::Graphql && r.name.starts_with("mutation ");
+    (from_schema || built(r).is_some_and(|req| super::graphql::is_mutation_request(&req))).then(|| MUTATION.to_string())
+}
+
+/// The request as it goes out, for reading it as a scan does.
+fn built(r: &ApiRequest) -> Option<Vec<u8>> {
+    RawRequest::build(&r.method, &r.url, &r.headers, &r.body).ok().map(|(req, _)| req.into_bytes())
 }
 
 /// A Postman pre-request script's facts: enough to choose one and to fetch its text.
@@ -806,8 +814,10 @@ impl Loaded {
             let method = request.method.to_ascii_uppercase();
             let in_scope = guard.may_allow(&target.host, target.port);
             let scope_confirmed = in_scope && guard.confirms(&target.host, target.port);
-            let method = opt_in_name(self.format, request).unwrap_or(method);
-            let method_ok = all || DEFAULT_METHODS.contains(&method.as_str()) || sel.include_methods.contains(&method);
+            // Its method, and MUTATION too for a mutation: neither stands for the other.
+            let given = |m: &str| all || DEFAULT_METHODS.contains(&m) || sel.include_methods.iter().any(|i| i == m);
+            let mutation = opt_in_name(self.format, request);
+            let method_ok = given(&method) && mutation.as_deref().is_none_or(given);
             let excluded_reason = if sel.only.as_ref().is_some_and(|o| !o.contains(&index)) {
                 Some("not_selected")
             } else if !method_ok {
@@ -1210,6 +1220,32 @@ mod tests {
         assert!(load(text, &o).is_ok());
         let o = Options { expect_sha256: Some("00".into()), ..opts() };
         assert!(load(text, &o).unwrap_err().to_string().contains("changed"));
+    }
+
+    #[test]
+    fn a_postman_graphql_mutation_needs_mutation_and_a_delete_its_method() {
+        let doc = json!({
+            "info": {"name": "c"},
+            "item": [
+                {"name": "Delete user", "request": {"method": "POST", "url": "https://api.test/graphql",
+                    "body": {"mode": "graphql", "graphql": {"query": "mutation { deleteUser(id: 1) }"}}}},
+                {"name": "Unshare", "request": {"method": "DELETE", "url": "https://api.test/shares?documentId=42"}},
+                {"name": "Me", "request": {"method": "POST", "url": "https://api.test/graphql",
+                    "body": {"mode": "graphql", "graphql": {"query": "{ me { id } }"}}}}]});
+        let l = load(&doc.to_string(), &opts()).unwrap();
+        let g = guard();
+        let reasons = |methods: &[&str]| {
+            let sel = Selection { include_methods: methods.iter().map(|m| m.to_string()).collect(), only: None };
+            l.plan(&sel, &g).unwrap().items.iter().map(|i| i.excluded_reason).collect::<Vec<_>>()
+        };
+        assert_eq!(reasons(&[]), [Some("method"), Some("method"), None]);
+        assert_eq!(reasons(&["MUTATION"]), [None, Some("method"), None]);
+        assert_eq!(reasons(&["DELETE"]), [Some("method"), Some("method"), None]);
+        assert_eq!(reasons(&["DELETE", "MUTATION"]), [None, None, None]);
+        assert_eq!(reasons(&["ALL"]), [None, None, None]);
+        let p = l.preview(&l.plan(&Selection::default(), &g).unwrap(), 100);
+        assert_eq!(p.requests[0].opt_in.as_deref(), Some("MUTATION"));
+        assert!(p.requests[0].state_changing && !p.requests[2].state_changing);
     }
 
     #[test]
