@@ -997,7 +997,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
             let rules: Vec<Rule> = store.setting(RULES_KEY)?;
             let scope: Scope = store.setting(SCOPE_KEY)?;
-            let changes = store.recording_changes()?;
+            // A log that doesn't parse is reported, not allowed to hide the rest.
+            let (changes, problem) = store.recording_changes_or_problem()?;
             let narrowed = changes.narrowed_by_agent();
             let authz = match state.as_ref().and_then(|s| s.authz_run) {
                 Some(id) => {
@@ -1021,9 +1022,13 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "recording_last_change": changes.recent(1).first(),
                 "recording_narrowed_by_agent": narrowed,
                 "recording_kept_changes": changes.kept(),
+                "recording_changes_problem": problem,
                 "authz": authz,
             });
-            let notes: String = narrowed.iter().map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
+            let mut notes: String = narrowed.iter().map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
+            if let Some(p) = &problem {
+                notes.push_str(&format!("\nwarning: {p}"));
+            }
             out.ok(data, || {
                 let status = match &state {
                     Some(s) => format!(
@@ -1874,13 +1879,14 @@ const SCOPE_CHANGES_SHOWN: usize = 20;
 
 pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
-    let mut scope: Scope = store.setting(SCOPE_KEY)?;
-    match cmd {
+    let scope: Scope = store.setting(SCOPE_KEY)?;
+    match &cmd {
         ScopeCmd::Show => {
-            let changes = store.recording_changes()?;
+            let (changes, problem) = store.recording_changes_or_problem()?;
             let mut data = json!(scope);
             data["recording_changes"] = json!(changes.shown(SCOPE_CHANGES_SHOWN));
             data["narrowed_by_agent"] = json!(changes.narrowed_by_agent());
+            data["recording_changes_problem"] = json!(problem);
             out.ok(data, || {
                 let mut text = serde_json::to_string_pretty(&scope).unwrap_or_default();
                 for c in changes.narrowed_by_agent() {
@@ -1889,29 +1895,39 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
                 if let Some(c) = changes.recent(1).first() {
                     text.push_str(&format!("\nlast change: {}", c.describe()));
                 }
+                if let Some(p) = &problem {
+                    text.push_str(&format!("\nwarning: {p}"));
+                }
                 text
             });
             return Ok(());
         }
-        ScopeCmd::Set { include, exclude, record_out_of_scope } => {
-            scope = Scope { include, exclude, record_out_of_scope };
-        }
-        ScopeCmd::Add { include, exclude } => {
-            scope.include.extend(include);
-            scope.exclude.extend(exclude);
-        }
-        ScopeCmd::Clear => scope = Scope::default(),
         ScopeCmd::Check { host } => {
-            let allowed = scope.compile()?.allows(&host);
+            let allowed = scope.compile()?.allows(host);
             out.ok(json!({"host": host, "in_scope": allowed}), || {
                 format!("{host}: {}", if allowed { "in scope" } else { "out of scope" })
             });
             return Ok(());
         }
+        _ => {}
     }
-    scope.compile()?; // Validate before saving.
-                      // Logged with who changed it, against the scope as saved just before (see `save_scope`).
-    store.save_scope(&scope)?;
+    // Edited as saved when the change is logged, so a save by another process in between
+    // isn't overwritten, and logged with who changed it (see `update_scope`).
+    let scope = store.update_scope(|scope| {
+        match cmd {
+            ScopeCmd::Set { include, exclude, record_out_of_scope } => {
+                *scope = Scope { include, exclude, record_out_of_scope };
+            }
+            ScopeCmd::Add { include, exclude } => {
+                scope.include.extend(include);
+                scope.exclude.extend(exclude);
+            }
+            ScopeCmd::Clear => *scope = Scope::default(),
+            ScopeCmd::Show | ScopeCmd::Check { .. } => unreachable!("answered above"),
+        }
+        // Validate before saving.
+        scope.compile().map(|_| ())
+    })?;
     out.ok(json!(scope), || serde_json::to_string_pretty(&scope).unwrap_or_default());
     Ok(())
 }

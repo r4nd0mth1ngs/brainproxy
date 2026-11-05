@@ -142,92 +142,99 @@ pub enum PassthroughCmd {
 
 pub fn connection(project: &Path, cmd: ConnectionCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
-    let mut s = store.connection_settings()?;
+    match &cmd {
+        ConnectionCmd::Show => {
+            let data = view(&store, &store.connection_settings()?)?;
+            out.ok(data.clone(), || serde_json::to_string_pretty(&data).unwrap_or_default());
+            return Ok(());
+        }
+        ConnectionCmd::Route { target } => return route(&store, target, out),
+        _ => {}
+    }
     // The pass-through list decides what the proxy decrypts and records: its changes are logged,
     // whichever command saves it, and saving it unchanged with one of these shows it was seen.
     let passthrough_saved = matches!(cmd, ConnectionCmd::Passthrough(_) | ConnectionCmd::Clear);
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-    match cmd {
-        ConnectionCmd::Show => {
-            let data = view(&store, &s)?;
-            out.ok(data.clone(), || serde_json::to_string_pretty(&data).unwrap_or_default());
-            return Ok(());
-        }
-        ConnectionCmd::Route { target } => return route(&store, &target, out),
-        ConnectionCmd::Upstream(c) => match c {
-            UpstreamCmd::Add { host, proxy, direct: _, username, password_env, first } => {
-                HostPattern::parse(&host)?;
-                let rule = UpstreamRule { host, proxy, username, password_env };
-                match s.upstream.iter_mut().find(|r| same(&r.host, &rule.host)) {
-                    Some(r) => *r = rule,
-                    None if first => s.upstream.insert(0, rule),
-                    None => s.upstream.push(rule),
+    // Edited as saved when the change is logged, so a save by another process in between
+    // isn't overwritten, and logged with who changed it (see `update_connection_settings`).
+    let s = store.update_connection_settings(passthrough_saved, |s| {
+        match cmd {
+            ConnectionCmd::Show | ConnectionCmd::Route { .. } => unreachable!("answered above"),
+            ConnectionCmd::Upstream(c) => match c {
+                UpstreamCmd::Add { host, proxy, direct: _, username, password_env, first } => {
+                    HostPattern::parse(&host)?;
+                    let rule = UpstreamRule { host, proxy, username, password_env };
+                    match s.upstream.iter_mut().find(|r| same(&r.host, &rule.host)) {
+                        Some(r) => *r = rule,
+                        None if first => s.upstream.insert(0, rule),
+                        None => s.upstream.push(rule),
+                    }
                 }
-            }
-            UpstreamCmd::Remove { host } => {
-                let before = s.upstream.len();
-                s.upstream.retain(|r| !same(&r.host, &host));
-                if s.upstream.len() == before {
-                    return Err(Error::NotFound(format!("upstream rule for {host:?}")));
+                UpstreamCmd::Remove { host } => {
+                    let before = s.upstream.len();
+                    s.upstream.retain(|r| !same(&r.host, &host));
+                    if s.upstream.len() == before {
+                        return Err(Error::NotFound(format!("upstream rule for {host:?}")));
+                    }
                 }
-            }
-            UpstreamCmd::Clear => s.upstream.clear(),
-        },
-        ConnectionCmd::Hosts(c) => match c {
-            HostsCmd::Add { host, ip } => match s.hosts.iter_mut().find(|h| same(&h.host, &host)) {
-                Some(h) => h.ip = ip,
-                None => s.hosts.push(HostOverride { host, ip }),
+                UpstreamCmd::Clear => s.upstream.clear(),
             },
-            HostsCmd::Remove { host } => {
-                let before = s.hosts.len();
-                s.hosts.retain(|h| !same(&h.host, &host));
-                if s.hosts.len() == before {
-                    return Err(Error::NotFound(format!("host override for {host:?}")));
-                }
-            }
-            HostsCmd::Clear => s.hosts.clear(),
-        },
-        ConnectionCmd::Cert(c) => match c {
-            CertCmd::Add { host, cert, key, pkcs12, password_env } => {
-                HostPattern::parse(&host)?;
-                let abs = |p: Option<PathBuf>| p.map(|p| std::path::absolute(&p).unwrap_or(p));
-                let entry = ClientCert { host, cert: abs(cert), key: abs(key), pkcs12: abs(pkcs12), password_env };
-                match s.client_certs.iter_mut().find(|c| same(&c.host, &entry.host)) {
-                    Some(c) => *c = entry,
-                    None => s.client_certs.push(entry),
-                }
-            }
-            CertCmd::Remove { host } => {
-                let before = s.client_certs.len();
-                s.client_certs.retain(|c| !same(&c.host, &host));
-                if s.client_certs.len() == before {
-                    return Err(Error::NotFound(format!("client certificate for {host:?}")));
-                }
-            }
-            CertCmd::Clear => s.client_certs.clear(),
-        },
-        ConnectionCmd::Passthrough(c) => match c {
-            PassthroughCmd::Add { hosts } => {
-                for h in hosts {
-                    HostPattern::parse(&h)?;
-                    if !s.passthrough.iter().any(|p| same(p, &h)) {
-                        s.passthrough.push(h);
+            ConnectionCmd::Hosts(c) => match c {
+                HostsCmd::Add { host, ip } => match s.hosts.iter_mut().find(|h| same(&h.host, &host)) {
+                    Some(h) => h.ip = ip,
+                    None => s.hosts.push(HostOverride { host, ip }),
+                },
+                HostsCmd::Remove { host } => {
+                    let before = s.hosts.len();
+                    s.hosts.retain(|h| !same(&h.host, &host));
+                    if s.hosts.len() == before {
+                        return Err(Error::NotFound(format!("host override for {host:?}")));
                     }
                 }
-            }
-            PassthroughCmd::Remove { hosts } => {
-                for h in &hosts {
-                    if !s.passthrough.iter().any(|p| same(p, h)) {
-                        return Err(Error::NotFound(format!("pass-through pattern {h:?}")));
+                HostsCmd::Clear => s.hosts.clear(),
+            },
+            ConnectionCmd::Cert(c) => match c {
+                CertCmd::Add { host, cert, key, pkcs12, password_env } => {
+                    HostPattern::parse(&host)?;
+                    let abs = |p: Option<PathBuf>| p.map(|p| std::path::absolute(&p).unwrap_or(p));
+                    let entry = ClientCert { host, cert: abs(cert), key: abs(key), pkcs12: abs(pkcs12), password_env };
+                    match s.client_certs.iter_mut().find(|c| same(&c.host, &entry.host)) {
+                        Some(c) => *c = entry,
+                        None => s.client_certs.push(entry),
                     }
                 }
-                s.passthrough.retain(|p| !hosts.iter().any(|h| same(p, h)));
-            }
-            PassthroughCmd::Clear => s.passthrough.clear(),
-        },
-        ConnectionCmd::Clear => s = ConnectionSettings::default(),
-    }
-    store.save_connection_settings(&s, passthrough_saved)?;
+                CertCmd::Remove { host } => {
+                    let before = s.client_certs.len();
+                    s.client_certs.retain(|c| !same(&c.host, &host));
+                    if s.client_certs.len() == before {
+                        return Err(Error::NotFound(format!("client certificate for {host:?}")));
+                    }
+                }
+                CertCmd::Clear => s.client_certs.clear(),
+            },
+            ConnectionCmd::Passthrough(c) => match c {
+                PassthroughCmd::Add { hosts } => {
+                    for h in hosts {
+                        HostPattern::parse(&h)?;
+                        if !s.passthrough.iter().any(|p| same(p, &h)) {
+                            s.passthrough.push(h);
+                        }
+                    }
+                }
+                PassthroughCmd::Remove { hosts } => {
+                    for h in &hosts {
+                        if !s.passthrough.iter().any(|p| same(p, h)) {
+                            return Err(Error::NotFound(format!("pass-through pattern {h:?}")));
+                        }
+                    }
+                    s.passthrough.retain(|p| !hosts.iter().any(|h| same(p, h)));
+                }
+                PassthroughCmd::Clear => s.passthrough.clear(),
+            },
+            ConnectionCmd::Clear => *s = ConnectionSettings::default(),
+        }
+        Ok(())
+    })?;
     let data = view(&store, &s)?;
     out.ok(data, || "connection settings saved".into());
     Ok(())

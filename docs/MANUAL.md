@@ -981,8 +981,9 @@ went from empty (everything) to some hosts or lost a pattern (patterns are compa
 as the regexes they are), a new exclude pattern, or `--record-out-of-scope` turned off while
 something is out of scope, or a new pass-through pattern. `--record-out-of-scope` doesn't make
 a smaller scope harmless: HTTPS to a host outside it is tunnelled, never decrypted. The
-setting and its log entry are saved in one transaction, so a change by another process
-can't slip between them unlogged. `scope show` lists the latest 20 and every earlier one
+setting is read, edited and saved with its log entry in one transaction, so a change by
+another process can't slip between them unlogged, or be overwritten and logged as this one's
+undoing it. `scope show` lists the latest 20 and every earlier one
 made through MCP or that narrowed recording (`recording_changes`, newest first); `proxy
 status` has the last one (`recording_last_change`) and those made through MCP or that narrowed
 recording (`recording_kept_changes`, newest first). A narrowing change made through MCP is also listed in
@@ -994,7 +995,15 @@ agent's later changes don't clear it, nor does another connection command saving
 the pass-through list is kept with. The log keeps every change made through MCP or that
 narrowed recording, and the last 100 others, as JSON in the `meta` table
 (`proxy.recording_changes`): however many changes follow, an agent's narrowing stays listed,
-even once its flag is cleared.
+even once its flag is cleared. If that value doesn't parse (edited by hand, say), `proxy
+status` and `scope show` still answer, with the problem in `recording_changes_problem` (and a
+`warning:` line in text), but scope and connection changes are refused until it is repaired,
+so the log isn't silently replaced.
+
+An agent that can run commands in a shell, as well as through MCP, and runs `brainproxy`
+there counts as `cli`: brainproxy can't tell who typed a command. Such a change clears the
+flag like a person's would, but it is still logged, with `by: "cli"`, and the agent's
+narrowing stays in the log.
 
 ```sh
 brainproxy scope show                        # recording_changes, narrowed_by_agent

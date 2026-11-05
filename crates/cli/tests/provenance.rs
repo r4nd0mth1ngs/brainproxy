@@ -675,3 +675,24 @@ fn an_agents_narrowing_stays_listed_however_many_changes_follow() {
     assert!(narrowing(&status["recording_kept_changes"]), "{status}");
     assert_eq!(status["recording_kept_changes"].as_array().unwrap().len(), 24, "{status}");
 }
+
+#[test]
+fn a_change_log_that_doesnt_parse_is_reported_and_kept() {
+    let env = Env::new("recording-corrupt");
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    store.meta_set("proxy.recording_changes", Some("{not json")).unwrap();
+    // Status and scope show still answer, and say what's wrong.
+    let status = env.ok(&[], &["proxy", "status"]);
+    assert!(status["recording_changes_problem"].as_str().unwrap().contains("doesn't parse"), "{status}");
+    assert_eq!(status["running"], false);
+    assert!(env.text(&["proxy", "status"]).contains("warning: the log of changes to what the proxy records"));
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert!(shown["recording_changes_problem"].is_string(), "{shown}");
+    // Saves refuse, so the log isn't silently reset.
+    let (code, _, text) = env.run(&[], &["scope", "add", "--include", "^a$"]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("repaired by hand"), "{text}");
+    let (code, _, _) = env.run(&[], &["connection", "passthrough", "add", "a.test"]);
+    assert_ne!(code, 0);
+    assert_eq!(store.meta_get("proxy.recording_changes").unwrap().as_deref(), Some("{not json"));
+}

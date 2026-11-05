@@ -218,45 +218,74 @@ pub fn passthrough_change(before: &[String], after: &[String]) -> Option<(bool, 
     list_diff(HOST, before, after).map(|d| (added, d))
 }
 
+/// The log as stored. One that doesn't parse (edited by hand, or written by a later version)
+/// is an error, never an empty log: saving over it would lose it.
+fn parse_changes(v: Option<String>) -> Result<Changes> {
+    let Some(v) = v else { return Ok(Changes::default()) };
+    serde_json::from_str(&v).map_err(|e| {
+        Error::InvalidInput(format!(
+            "the log of changes to what the proxy records (meta key {CHANGES_KEY}) doesn't parse: {e}; \
+             the recording scope and the connection settings can't be changed until it is repaired \
+             by hand, so that it isn't lost"
+        ))
+    })
+}
+
 impl Store {
     /// The log of changes to what the proxy records.
     pub fn recording_changes(&self) -> Result<Changes> {
-        match self.meta_get(CHANGES_KEY)? {
-            Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("{CHANGES_KEY}: {e}"))),
-            None => Ok(Changes::default()),
+        parse_changes(self.meta_get(CHANGES_KEY)?)
+    }
+
+    /// The log, or an empty one and why when it doesn't parse: for showing it next to other
+    /// things a broken log mustn't hide. Saves refuse instead (see [`Store::save_logged`]).
+    pub fn recording_changes_or_problem(&self) -> Result<(Changes, Option<String>)> {
+        match self.recording_changes() {
+            Err(Error::InvalidInput(e)) => Ok((Changes::default(), Some(e))),
+            r => r.map(|c| (c, None)),
         }
     }
 
-    /// Saves the recording scope and logs the change (see [`Store::save_logged`]).
-    pub fn save_scope(&mut self, scope: &Scope) -> Result<()> {
+    /// Edits the recording scope as saved, with `edit` (which may refuse it), saves it and logs
+    /// the change (see [`Store::save_logged`]). Returns the scope saved.
+    pub fn update_scope(&mut self, edit: impl FnOnce(&mut Scope) -> Result<()>) -> Result<Scope> {
         let to_json = |s: &Scope| serde_json::to_value(s).unwrap_or_default();
-        self.save_logged(SCOPE_KEY, scope, true, |before: Scope| {
-            ("scope", to_json(&before), to_json(scope), scope_change(&before, scope))
+        self.save_logged(SCOPE_KEY, true, edit, |before: &Scope, after: &Scope| {
+            ("scope", to_json(before), to_json(after), scope_change(before, after))
         })
     }
 
-    /// Saves the connection settings, validated, and logs a change to their TLS pass-through
-    /// list (see [`Store::save_logged`]). `reviewed`: the command was one that edits that list.
-    pub fn save_connection_settings(&mut self, s: &ConnectionSettings, reviewed: bool) -> Result<()> {
-        s.validate()?;
-        self.save_logged(CONNECTION_KEY, s, reviewed, |before: ConnectionSettings| {
-            let summary = passthrough_change(&before.passthrough, &s.passthrough);
-            ("passthrough", Value::from(before.passthrough), Value::from(s.passthrough.clone()), summary)
+    /// Edits the connection settings as saved, with `edit` (which may refuse them), validates
+    /// and saves them, and logs a change to their TLS pass-through list (see
+    /// [`Store::save_logged`]). `reviewed`: the command was one that edits that list. Returns
+    /// the settings saved.
+    pub fn update_connection_settings(
+        &mut self,
+        reviewed: bool,
+        edit: impl FnOnce(&mut ConnectionSettings) -> Result<()>,
+    ) -> Result<ConnectionSettings> {
+        let edit = |s: &mut ConnectionSettings| {
+            edit(s)?;
+            s.validate()
+        };
+        self.save_logged(CONNECTION_KEY, reviewed, edit, |before: &ConnectionSettings, after| {
+            let summary = passthrough_change(&before.passthrough, &after.passthrough);
+            ("passthrough", Value::from(before.passthrough.clone()), Value::from(after.passthrough.clone()), summary)
         })
     }
 
-    /// Writes setting `key`, bumps the settings version so running proxies reload, and logs
-    /// what `change` makes of the setting as it was, in one write transaction: a save by another
-    /// process can't land between them, unlogged, or have its flag cleared by this one.
-    fn save_logged<T: Serialize + serde::de::DeserializeOwned + Default>(
+    /// Reads setting `key`, has `edit` change it, writes it, bumps the settings version so
+    /// running proxies reload, and logs what `change` makes of it before and after, in one
+    /// write transaction: a save by another process can't land between them, be overwritten
+    /// with what this one read earlier, go unlogged, or have its flag cleared by this one.
+    fn save_logged<T: Serialize + serde::de::DeserializeOwned + Default + Clone>(
         &mut self,
         key: &str,
-        value: &T,
         reviewed: bool,
-        change: impl FnOnce(T) -> (&'static str, Value, Value, Option<(bool, String)>),
-    ) -> Result<()> {
+        edit: impl FnOnce(&mut T) -> Result<()>,
+        change: impl FnOnce(&T, &T) -> (&'static str, Value, Value, Option<(bool, String)>),
+    ) -> Result<T> {
         let by = crate::provenance::origin();
-        let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
         let key = format!("setting.{key}");
         let tx = self.write_tx()?;
         let get = |k: &str| tx.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0));
@@ -264,11 +293,11 @@ impl Store {
             Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("{key}: {e}")))?,
             None => T::default(),
         };
-        let mut changes: Changes = match get(CHANGES_KEY).optional()? {
-            Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("{CHANGES_KEY}: {e}")))?,
-            None => Changes::default(),
-        };
-        let (setting, before, after, summary) = change(before);
+        let mut changes = parse_changes(get(CHANGES_KEY).optional()?)?;
+        let mut value = before.clone();
+        edit(&mut value)?;
+        let json = serde_json::to_string(&value).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let (setting, before, after, summary) = change(&before, &value);
         changes.note(by, setting, before, after, summary, reviewed);
         let log = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
         let set = "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
@@ -280,7 +309,7 @@ impl Store {
             [],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(value)
     }
 }
 
@@ -414,5 +443,37 @@ mod tests {
         // It survives being saved and read back.
         let back: Changes = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert!(narrowing(&back.shown(20)));
+    }
+
+    #[test]
+    fn a_save_edits_the_setting_as_saved_when_it_is_logged() {
+        let mut store = Store::open_in_memory().unwrap();
+        // Saved by another process after this one read it.
+        store.set_setting(SCOPE_KEY, &scope(&["a"], &[], false)).unwrap();
+        let saved = store.update_scope(|s| s.compile().map(|_| s.include.push("b".into()))).unwrap();
+        assert_eq!(saved, scope(&["a", "b"], &[], false));
+        let log = store.recording_changes().unwrap();
+        assert_eq!(log.recent(1)[0].summary, "include: added b");
+        // An edit that refuses saves and logs nothing.
+        let refused = store.update_scope(|_| Err(Error::InvalidInput("no".into())));
+        assert!(refused.is_err());
+        assert_eq!(store.setting::<Scope>(SCOPE_KEY).unwrap(), saved);
+        assert_eq!(store.recording_changes().unwrap().recent(usize::MAX).len(), 1);
+    }
+
+    #[test]
+    fn a_log_that_doesnt_parse_refuses_saves_but_not_reading() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.meta_set(CHANGES_KEY, Some("{not json")).unwrap();
+        let err = store.update_scope(|s| s.compile().map(|_| s.include.push("a".into()))).unwrap_err().to_string();
+        assert!(err.contains("proxy.recording_changes") && err.contains("repaired by hand"), "{err}");
+        let err = store.update_connection_settings(true, |_| Ok(())).unwrap_err().to_string();
+        assert!(err.contains("proxy.recording_changes"), "{err}");
+        // Nothing was saved, and the log is left as it was.
+        assert_eq!(store.setting::<Scope>(SCOPE_KEY).unwrap(), Scope::default());
+        assert_eq!(store.meta_get(CHANGES_KEY).unwrap().as_deref(), Some("{not json"));
+        let (log, problem) = store.recording_changes_or_problem().unwrap();
+        assert!(log.recent(1).is_empty());
+        assert!(problem.unwrap().contains("doesn't parse"));
     }
 }
