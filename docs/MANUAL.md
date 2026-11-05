@@ -841,7 +841,8 @@ byte, side by side or unified.
     by address, even for a name listed exactly, because whoever runs brainproxy chooses the
     override (an exact name's DNS answer may be private; an override's may not). A public
     address needs no listing, and that name's traffic, logins included, then goes there.
-    TLS SNI and Host stay the name.
+    TLS SNI and Host stay the name. Each change is logged with who made it, as is each
+    change to the upstream proxies (Site map › Scope lists them).
   - *Client certificates:* for mutual TLS, a PEM certificate and key or a PKCS#12 file (its
     password from an environment variable), by host pattern, over HTTP/1.1 and HTTP/2. A
     file that can't be read makes connections to its hosts fail with the reason, never go
@@ -976,8 +977,14 @@ enabled it.
 Narrowing the proxy scope or adding a TLS pass-through host keeps traffic's content out of
 history (only request lines and tunnels' rows remain), so each change to either is logged:
 `scope set`, `scope add` and `scope clear`, and `connection passthrough add|remove|clear` and
-`connection clear`. A change has `time`, `by` (`gui`, `cli` or `mcp`), `setting` (`scope` or
-`passthrough`), `summary` (`include: added ^a\.test$`), `before` and `after`, and `narrowed`:
+`connection clear`. Changes to where traffic goes are logged the same way: upstream proxies
+(`connection upstream ...`, setting `upstream`, summary `added * via http://10.0.0.1:3128`) and
+host overrides (`connection hosts ...`, setting `hosts`, summary `added app.test -> 10.0.0.7`).
+They never narrow recording, so they are never flagged, but one made through MCP is kept for
+good like an agent's other changes: an agent sending the person's traffic through a proxy or
+to an address of its choice leaves a trace. A change has `time`, `by` (`gui`, `cli` or `mcp`),
+`setting` (`scope`, `passthrough`, `upstream` or `hosts`), `summary`
+(`include: added ^a\.test$`), `before` and `after`, and `narrowed`:
 whether it left traffic out that was recorded in full before. That is an include list that
 went from empty (everything) to some hosts or lost a pattern (patterns are compared exactly,
 as the regexes they are), a new exclude pattern, or `--record-out-of-scope` turned off while

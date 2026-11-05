@@ -677,6 +677,31 @@ fn an_agents_narrowing_stays_listed_however_many_changes_follow() {
 }
 
 #[test]
+fn an_agent_rerouting_traffic_is_logged() {
+    let env = Env::new("routing");
+    let agent = [(MCP, "1")];
+    env.ok(&agent, &["connection", "upstream", "add", "--host", "*", "--proxy", "http://192.0.2.7:3128"]);
+    env.ok(&agent, &["connection", "hosts", "add", "app.test", "10.0.0.7"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    let changes = shown["recording_changes"].as_array().unwrap();
+    let find = |setting: &str| changes.iter().find(|c| c["setting"] == setting).unwrap_or_else(|| panic!("{shown}"));
+    let (up, hosts) = (find("upstream"), find("hosts"));
+    assert_eq!((up["by"].as_str(), up["summary"].as_str()), (Some("mcp"), Some("added * via http://192.0.2.7:3128")));
+    assert_eq!(hosts["summary"], "added app.test -> 10.0.0.7");
+    // Routing doesn't narrow recording, so nothing is flagged; the agent's changes are kept for good.
+    assert!(changes.iter().all(|c| c["narrowed"] == false), "{shown}");
+    assert_eq!(shown["narrowed_by_agent"], serde_json::json!([]));
+    let status = env.ok(&[], &["proxy", "status"]);
+    assert_eq!(status["recording_kept_changes"].as_array().unwrap().len(), 2, "{status}");
+    let text = env.text(&["scope", "show"]);
+    assert!(text.contains("last change: host overrides changed via MCP (an agent)"), "{text}");
+    // A pass-through change doesn't log the untouched routing again.
+    env.ok(&[], &["connection", "passthrough", "add", "c.test"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert_eq!(shown["recording_changes"].as_array().unwrap().len(), 3, "{shown}");
+}
+
+#[test]
 fn a_change_log_that_doesnt_parse_is_reported_and_kept() {
     let env = Env::new("recording-corrupt");
     let store = brainproxy_core::store::Store::open(&env.project).unwrap();

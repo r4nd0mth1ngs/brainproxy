@@ -1,6 +1,9 @@
-//! Every change to what the proxy records: the recording scope and the TLS pass-through list.
-//! Agents change both legitimately, but narrowing either hides traffic (the proxy then keeps
-//! only a request line, or a tunnel's row), so each change is kept with who made it and when.
+//! Every change to what the proxy records: the recording scope and the TLS pass-through list,
+//! and to where traffic goes: upstream proxies and host overrides. Agents change them all
+//! legitimately, but narrowing recording hides traffic (the proxy then keeps only a request
+//! line, or a tunnel's row) and routing sends the person's traffic elsewhere, so each change
+//! is kept with who made it and when. Only narrowing is flagged: routing changes don't hide
+//! anything from the record.
 //! One an agent made that narrowed recording stays flagged until a person changes that
 //! setting again (from the app or a terminal, even saving it unchanged), or the agent puts it
 //! back as it was: later changes by the agent, or any number of other changes, don't hide it.
@@ -16,7 +19,7 @@ use serde_json::Value;
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::connection::{ConnectionSettings, CONNECTION_KEY};
+use crate::connection::{ConnectionSettings, HostOverride, UpstreamRule, CONNECTION_KEY};
 use crate::error::{Error, Result};
 use crate::proxy::config::{Scope, SCOPE_KEY};
 use crate::store::Store;
@@ -33,7 +36,7 @@ pub struct Change {
     pub time: String,
     /// gui, cli or mcp.
     pub by: String,
-    /// `scope` or `passthrough`.
+    /// `scope`, `passthrough`, `upstream` or `hosts`.
     pub setting: String,
     /// Whether it left less traffic recorded in full than before. See [`scope_change`] and
     /// [`passthrough_change`].
@@ -53,7 +56,12 @@ impl Change {
     /// "recording scope changed via MCP (an agent) at 2026-01-31T12:00:00.000Z, narrowing
     /// recording: include: added ^a\.test$", for people.
     pub fn describe(&self) -> String {
-        let what = if self.setting == "passthrough" { "TLS pass-through list" } else { "recording scope" };
+        let what = match self.setting.as_str() {
+            "passthrough" => "TLS pass-through list",
+            "upstream" => "upstream proxies",
+            "hosts" => "host overrides",
+            _ => "recording scope",
+        };
         let narrowing = if self.narrowed { ", narrowing recording" } else { "" };
         format!(
             "{what} changed {} at {}{narrowing}: {}",
@@ -211,12 +219,41 @@ pub fn scope_change(before: &Scope, after: &Scope) -> Option<(bool, String)> {
     (!parts.is_empty()).then(|| (narrowed, parts.join("; ")))
 }
 
+/// What changed in the upstream proxy rules, as "added a.test via socks5://p:1080"; None if
+/// nothing did. Routing never narrows recording.
+pub fn upstream_change(before: &[UpstreamRule], after: &[UpstreamRule]) -> Option<(bool, String)> {
+    let line = |r: &UpstreamRule| {
+        let via = r.proxy.as_deref().unwrap_or("direct");
+        let user = r.username.as_deref().map_or(String::new(), |u| format!(" as {u}"));
+        format!("{} via {via}{user}", r.host)
+    };
+    let (before, after): (Vec<String>, Vec<String>) =
+        (before.iter().map(line).collect(), after.iter().map(line).collect());
+    list_diff(EXACT, &before, &after).map(|d| (false, d))
+}
+
+/// What changed in the host overrides, as "added a.test -> 10.0.0.5"; None if nothing did.
+pub fn hosts_change(before: &[HostOverride], after: &[HostOverride]) -> Option<(bool, String)> {
+    let line = |h: &HostOverride| format!("{} -> {}", h.host, h.ip);
+    let (before, after): (Vec<String>, Vec<String>) =
+        (before.iter().map(line).collect(), after.iter().map(line).collect());
+    list_diff(EXACT, &before, &after).map(|d| (false, d))
+}
+
 /// Whether the pass-through list narrowed recording (a pattern was added: its hosts' TLS is
 /// no longer decrypted, so only the connection is recorded), and what changed; None if nothing did.
 pub fn passthrough_change(before: &[String], after: &[String]) -> Option<(bool, String)> {
     let added = after.iter().any(|p| !has(HOST, before, p));
     list_diff(HOST, before, after).map(|d| (added, d))
 }
+
+fn json<T: Serialize>(v: &T) -> Value {
+    serde_json::to_value(v).unwrap_or_default()
+}
+
+/// One part of a setting for [`Store::save_logged`]: its name, whether the command reviews
+/// it, its value before and after, and what changed.
+type Part = (&'static str, bool, Value, Value, Option<(bool, String)>);
 
 /// The log as stored. One that doesn't parse (edited by hand, or written by a later version)
 /// is an error, never an empty log: saving over it would lose it.
@@ -250,15 +287,15 @@ impl Store {
     /// the change (see [`Store::save_logged`]). Returns the scope saved.
     pub fn update_scope(&mut self, edit: impl FnOnce(&mut Scope) -> Result<()>) -> Result<Scope> {
         let to_json = |s: &Scope| serde_json::to_value(s).unwrap_or_default();
-        self.save_logged(SCOPE_KEY, true, edit, |before: &Scope, after: &Scope| {
-            ("scope", to_json(before), to_json(after), scope_change(before, after))
+        self.save_logged(SCOPE_KEY, edit, |before: &Scope, after: &Scope| {
+            vec![("scope", true, to_json(before), to_json(after), scope_change(before, after))]
         })
     }
 
     /// Edits the connection settings as saved, with `edit` (which may refuse them), validates
-    /// and saves them, and logs a change to their TLS pass-through list (see
-    /// [`Store::save_logged`]). `reviewed`: the command was one that edits that list. Returns
-    /// the settings saved.
+    /// and saves them, and logs changes to their TLS pass-through list, upstream proxies and
+    /// host overrides (see [`Store::save_logged`]). `reviewed`: the command was one that edits
+    /// the pass-through list. Returns the settings saved.
     pub fn update_connection_settings(
         &mut self,
         reviewed: bool,
@@ -268,22 +305,37 @@ impl Store {
             edit(s)?;
             s.validate()
         };
-        self.save_logged(CONNECTION_KEY, reviewed, edit, |before: &ConnectionSettings, after| {
-            let summary = passthrough_change(&before.passthrough, &after.passthrough);
-            ("passthrough", Value::from(before.passthrough.clone()), Value::from(after.passthrough.clone()), summary)
+        self.save_logged(CONNECTION_KEY, edit, |before: &ConnectionSettings, after| {
+            vec![
+                (
+                    "passthrough",
+                    reviewed,
+                    json(&before.passthrough),
+                    json(&after.passthrough),
+                    passthrough_change(&before.passthrough, &after.passthrough),
+                ),
+                (
+                    "upstream",
+                    false,
+                    json(&before.upstream),
+                    json(&after.upstream),
+                    upstream_change(&before.upstream, &after.upstream),
+                ),
+                ("hosts", false, json(&before.hosts), json(&after.hosts), hosts_change(&before.hosts, &after.hosts)),
+            ]
         })
     }
 
     /// Reads setting `key`, has `edit` change it, writes it, bumps the settings version so
-    /// running proxies reload, and logs what `change` makes of it before and after, in one
+    /// running proxies reload, and logs what `change` makes of it before and after (per part
+    /// of it: name, whether this command reviews it, before, after, what changed), in one
     /// write transaction: a save by another process can't land between them, be overwritten
     /// with what this one read earlier, go unlogged, or have its flag cleared by this one.
     fn save_logged<T: Serialize + serde::de::DeserializeOwned + Default + Clone>(
         &mut self,
         key: &str,
-        reviewed: bool,
         edit: impl FnOnce(&mut T) -> Result<()>,
-        change: impl FnOnce(&T, &T) -> (&'static str, Value, Value, Option<(bool, String)>),
+        change: impl FnOnce(&T, &T) -> Vec<Part>,
     ) -> Result<T> {
         let by = crate::provenance::origin();
         let key = format!("setting.{key}");
@@ -297,8 +349,9 @@ impl Store {
         let mut value = before.clone();
         edit(&mut value)?;
         let json = serde_json::to_string(&value).map_err(|e| Error::InvalidInput(e.to_string()))?;
-        let (setting, before, after, summary) = change(&before, &value);
-        changes.note(by, setting, before, after, summary, reviewed);
+        for (setting, reviewed, before, after, summary) in change(&before, &value) {
+            changes.note(by, setting, before, after, summary, reviewed);
+        }
         let log = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
         let set = "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
         tx.execute(set, params![key, json])?;

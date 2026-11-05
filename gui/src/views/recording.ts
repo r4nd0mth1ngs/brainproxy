@@ -1,14 +1,14 @@
-// Changes to what the proxy records: the recording scope and the TLS pass-through list, as
-// `scope show` and `proxy status` give them. An agent narrowing either hides traffic (the proxy
-// then keeps only a request line, or a tunnel's row), so the app says so until a person changes
-// that setting again.
+// Changes to what the proxy records (the recording scope and the TLS pass-through list) and to
+// where traffic goes (upstream proxies, host overrides), as `scope show` and `proxy status` give
+// them. An agent narrowing recording hides traffic (the proxy then keeps only a request line, or a
+// tunnel's row), so the app says so until a person changes that setting again.
 
 /** One change, as the CLI logs it. */
 export interface RecordingChange {
   time: string;
   /** gui, cli or mcp. */
   by: string;
-  setting: "scope" | "passthrough";
+  setting: "scope" | "passthrough" | "upstream" | "hosts";
   /** It left less traffic recorded in full than before. */
   narrowed: boolean;
   /** What changed: "include: added ^a\.test$". */
@@ -21,6 +21,8 @@ export const SHOW_SCOPE = "show-scope";
 const SETTING: Record<RecordingChange["setting"], string> = {
   scope: "recording scope",
   passthrough: "TLS pass-through list",
+  upstream: "upstream proxies",
+  hosts: "host overrides",
 };
 
 const BY: Record<string, string> = { mcp: "an agent", gui: "the app", cli: "the command line" };
