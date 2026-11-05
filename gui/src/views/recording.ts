@@ -8,7 +8,7 @@ export interface RecordingChange {
   time: string;
   /** gui, cli or mcp. */
   by: string;
-  setting: "scope" | "passthrough" | "upstream" | "hosts";
+  setting: "scope" | "passthrough" | "upstream" | "hosts" | "client_certs";
   /** It left less traffic recorded in full than before. */
   narrowed: boolean;
   /** What changed: "include: added ^a\.test$". */
@@ -23,6 +23,7 @@ const SETTING: Record<RecordingChange["setting"], string> = {
   passthrough: "TLS pass-through list",
   upstream: "upstream proxies",
   hosts: "host overrides",
+  client_certs: "client certificates",
 };
 
 const BY: Record<string, string> = { mcp: "an agent", gui: "the app", cli: "the command line" };

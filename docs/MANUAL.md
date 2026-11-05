@@ -980,11 +980,13 @@ history (only request lines and tunnels' rows remain), so each change to either 
 `scope set`, `scope add` and `scope clear`, and `connection passthrough add|remove|clear` and
 `connection clear`. Changes to where traffic goes are logged the same way: upstream proxies
 (`connection upstream ...`, setting `upstream`, summary `added * via http://10.0.0.1:3128`) and
-host overrides (`connection hosts ...`, setting `hosts`, summary `added app.test -> 10.0.0.7`).
+host overrides (`connection hosts ...`, setting `hosts`, summary `added app.test -> 10.0.0.7`), and
+client certificates, which decide who the person is to a server (`connection cert ...`,
+setting `client_certs`). Password variables are named, never their values.
 They never narrow recording, so they are never flagged, but one made through MCP is kept for
 good like an agent's other changes: an agent sending the person's traffic through a proxy or
 to an address of its choice leaves a trace. A change has `time`, `by` (`gui`, `cli` or `mcp`),
-`setting` (`scope`, `passthrough`, `upstream` or `hosts`), `summary`
+`setting` (`scope`, `passthrough`, `upstream`, `hosts` or `client_certs`), `summary`
 (`include: added ^a\.test$`), `before` and `after`, and `narrowed`:
 whether it left traffic out that was recorded in full before. That is an include list that
 went from empty (everything) to some hosts or lost a pattern (patterns are compared exactly,
@@ -1168,7 +1170,9 @@ Crawl and active-scan scope and safety flags:
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. A GraphQL mutation (a request whose `query`, in a JSON body or batch, an
   `application/graphql` body, a multipart upload's `operations`, a form body or the URL, defines
-  one) is `MUTATION` whatever its method and however it was recorded. So is an operation sent
+  one) is `MUTATION` however it was recorded, and needs `MUTATION` as well as its method when
+  that isn't sent by default: a DELETE that names a persisted query needs both, so neither
+  opt-in stands for the other. So is an operation sent
   without its document (a persisted query's hash in `extensions.persistedQuery`, a `doc_id`, or an
   `id` with `operationName` or `variables`), and a body at a GraphQL-looking request that can't be
   decoded (zstd, say): neither can be shown to be read-only. So one sent once by `import api
@@ -1628,9 +1632,10 @@ control. Low ones are only in the results, to review.
 
 Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
 replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
-another user. A GraphQL mutation is `MUTATION` whatever its method, as in a scan (a persisted
-query sent without its document counts as one too), so `--include-methods POST` doesn't replay
-one and `--include-methods MUTATION` does. A URL given to `authz run` needs the same opt-in: one
+another user. A GraphQL mutation needs `MUTATION` as well as its method, as in a scan (a
+persisted query sent without its document counts as one too), so a mutation sent as POST is
+replayed with `--include-methods POST,MUTATION`, not with either alone, and one sent as GET with
+`--include-methods MUTATION`. A URL given to `authz run` needs the same opt-in: one
 whose `query` parameter is a mutation is refused (exit code 2, nothing sent) without
 `--include-methods MUTATION`. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
 so the owner stays logged in. A request picked with `--history-id` may lack credentials, but its

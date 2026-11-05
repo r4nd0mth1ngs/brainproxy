@@ -8,7 +8,8 @@
 //! setting again (from the app or a terminal, even saving it unchanged), or the agent puts it
 //! back as it was: later changes by the agent, or any number of other changes, don't hide it.
 //! The log keeps every change made through MCP or that narrowed recording; only a person's
-//! routine ones are dropped, the oldest first, past [`KEEP`].
+//! routine ones are dropped, the oldest first, past [`KEEP`]. Past [`KEEP_KEPT`] of the
+//! others (only a flood of changes gets there), the oldest go too, and are counted.
 //!
 //! The log is one JSON value in `meta` ([`CHANGES_KEY`]), so it needs no schema change.
 
@@ -19,7 +20,7 @@ use serde_json::Value;
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::connection::{ConnectionSettings, HostOverride, UpstreamRule, CONNECTION_KEY};
+use crate::connection::{ClientCert, ConnectionSettings, HostOverride, UpstreamRule, CONNECTION_KEY};
 use crate::error::{Error, Result};
 use crate::proxy::config::{Scope, SCOPE_KEY};
 use crate::store::Store;
@@ -29,6 +30,9 @@ pub const CHANGES_KEY: &str = "proxy.recording_changes";
 /// A person's changes that didn't narrow recording kept, the oldest dropped first. Changes
 /// through MCP and narrowing ones are never dropped.
 const KEEP: usize = 100;
+/// Changes through MCP or narrowing ones kept; past that, the oldest are dropped and counted
+/// in [`Changes::kept_dropped`], so a flood of them shows rather than growing the log for good.
+const KEEP_KEPT: usize = 5000;
 
 /// One change to the recording scope or the pass-through list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,7 +40,7 @@ pub struct Change {
     pub time: String,
     /// gui, cli or mcp.
     pub by: String,
-    /// `scope`, `passthrough`, `upstream` or `hosts`.
+    /// `scope`, `passthrough`, `upstream`, `hosts` or `client_certs`.
     pub setting: String,
     /// Whether it left less traffic recorded in full than before. See [`scope_change`] and
     /// [`passthrough_change`].
@@ -60,6 +64,7 @@ impl Change {
             "passthrough" => "TLS pass-through list",
             "upstream" => "upstream proxies",
             "hosts" => "host overrides",
+            "client_certs" => "client certificates",
             _ => "recording scope",
         };
         let narrowing = if self.narrowed { ", narrowing recording" } else { "" };
@@ -88,6 +93,9 @@ pub struct Changes {
     /// By setting.
     #[serde(default)]
     flagged: BTreeMap<String, Flag>,
+    /// How many changes through MCP or narrowing ones were dropped past [`KEEP_KEPT`].
+    #[serde(default)]
+    kept_dropped: u64,
 }
 
 impl Changes {
@@ -105,6 +113,17 @@ impl Changes {
     /// Every [kept](Change::kept) change, newest first.
     pub fn kept(&self) -> Vec<&Change> {
         self.shown(0)
+    }
+
+    /// How many [kept](Change::kept) changes there were: those in the log and those dropped
+    /// past [`KEEP_KEPT`].
+    pub fn kept_total(&self) -> u64 {
+        self.changes.iter().filter(|c| c.kept()).count() as u64 + self.kept_dropped
+    }
+
+    /// How many [kept](Change::kept) changes were dropped, the oldest first, past [`KEEP_KEPT`].
+    pub fn kept_dropped(&self) -> u64 {
+        self.kept_dropped
     }
 
     /// Per setting, the latest change through MCP that narrowed recording, while no person
@@ -150,11 +169,15 @@ impl Changes {
             self.flagged.insert(setting.to_string(), Flag { change: change.clone(), baseline });
         }
         self.changes.push(change);
-        // Past KEEP routine changes, drop the oldest of them; the kept ones stay wherever they are.
+        // Past KEEP routine changes, drop the oldest of them; the kept ones stay wherever they
+        // are, up to KEEP_KEPT.
         let mut extra = self.changes.iter().filter(|c| !c.kept()).count().saturating_sub(KEEP);
+        let mut extra_kept = self.changes.iter().filter(|c| c.kept()).count().saturating_sub(KEEP_KEPT);
+        self.kept_dropped += extra_kept as u64;
         self.changes.retain(|c| {
-            let drop = extra > 0 && !c.kept();
-            extra -= usize::from(drop);
+            let left = if c.kept() { &mut extra_kept } else { &mut extra };
+            let drop = *left > 0;
+            *left -= usize::from(drop);
             !drop
         });
     }
@@ -225,7 +248,8 @@ pub fn upstream_change(before: &[UpstreamRule], after: &[UpstreamRule]) -> Optio
     let line = |r: &UpstreamRule| {
         let via = r.proxy.as_deref().unwrap_or("direct");
         let user = r.username.as_deref().map_or(String::new(), |u| format!(" as {u}"));
-        format!("{} via {via}{user}", r.host)
+        let password = r.password_env.as_deref().map_or(String::new(), |e| format!(" (password from ${e})"));
+        format!("{} via {via}{user}{password}", r.host)
     };
     let (before, after): (Vec<String>, Vec<String>) =
         (before.iter().map(line).collect(), after.iter().map(line).collect());
@@ -235,6 +259,20 @@ pub fn upstream_change(before: &[UpstreamRule], after: &[UpstreamRule]) -> Optio
 /// What changed in the host overrides, as "added a.test -> 10.0.0.5"; None if nothing did.
 pub fn hosts_change(before: &[HostOverride], after: &[HostOverride]) -> Option<(bool, String)> {
     let line = |h: &HostOverride| format!("{} -> {}", h.host, h.ip);
+    let (before, after): (Vec<String>, Vec<String>) =
+        (before.iter().map(line).collect(), after.iter().map(line).collect());
+    list_diff(EXACT, &before, &after).map(|d| (false, d))
+}
+
+/// What changed in the client certificates, as "added a.test: cert.pem, key.pem"; None if
+/// nothing did. They decide who the person is to a server, so they're logged too.
+pub fn client_certs_change(before: &[ClientCert], after: &[ClientCert]) -> Option<(bool, String)> {
+    let line = |c: &ClientCert| {
+        let files: Vec<String> =
+            [&c.cert, &c.key, &c.pkcs12].into_iter().flatten().map(|p| p.display().to_string()).collect();
+        let password = c.password_env.as_deref().map_or(String::new(), |e| format!(" (password from ${e})"));
+        format!("{}: {}{password}", c.host, files.join(", "))
+    };
     let (before, after): (Vec<String>, Vec<String>) =
         (before.iter().map(line).collect(), after.iter().map(line).collect());
     list_diff(EXACT, &before, &after).map(|d| (false, d))
@@ -322,6 +360,13 @@ impl Store {
                     upstream_change(&before.upstream, &after.upstream),
                 ),
                 ("hosts", false, json(&before.hosts), json(&after.hosts), hosts_change(&before.hosts, &after.hosts)),
+                (
+                    "client_certs",
+                    false,
+                    json(&before.client_certs),
+                    json(&after.client_certs),
+                    client_certs_change(&before.client_certs, &after.client_certs),
+                ),
             ]
         })
     }
@@ -496,6 +541,18 @@ mod tests {
         // It survives being saved and read back.
         let back: Changes = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert!(narrowing(&back.shown(20)));
+    }
+
+    #[test]
+    fn a_flood_of_kept_changes_is_capped_and_counted() {
+        let mut c = Changes::default();
+        let (none, x) = (Value::from(Vec::<String>::new()), Value::from(vec!["x".to_string()]));
+        for _ in 0..KEEP_KEPT + 7 {
+            c.note("mcp", "passthrough", none.clone(), x.clone(), passthrough_change(&[], &["x".into()]), true);
+        }
+        assert_eq!((c.kept().len(), c.kept_dropped(), c.kept_total()), (KEEP_KEPT, 7, KEEP_KEPT as u64 + 7));
+        // The latest is still there, and the flag with it.
+        assert_eq!(c.narrowed_by_agent().len(), 1);
     }
 
     #[test]

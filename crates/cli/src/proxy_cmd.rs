@@ -1029,7 +1029,10 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "scope": scope,
                 "recording_last_change": changes.recent(1).first(),
                 "recording_narrowed_by_agent": narrowed,
-                "recording_kept_changes": changes.kept(),
+                // Polled by the app: the latest, and how many there are (`scope show` has them all).
+                "recording_kept_changes": changes.kept().into_iter().take(STATUS_KEPT_SHOWN).collect::<Vec<_>>(),
+                "recording_kept_total": changes.kept_total(),
+                "recording_kept_dropped": changes.kept_dropped(),
                 "recording_changes_problem": problem,
                 "authz": authz,
                 "restart_gone": gone,
@@ -1040,6 +1043,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             if let Some(p) = &problem {
                 notes.push_str(&format!("\nwarning: {p}"));
             }
+            notes.push_str(&kept_dropped_note(&changes));
             out.ok(data, || {
                 let status = match &state {
                     Some(s) => format!(
@@ -2026,6 +2030,21 @@ fn serve(
 /// through MCP or that narrowed recording.
 const SCOPE_CHANGES_SHOWN: usize = 20;
 
+/// The kept changes `proxy status` lists, newest first, with a count of all of them.
+const STATUS_KEPT_SHOWN: usize = 50;
+
+/// A warning line when changes through MCP or narrowing ones were dropped: a flood of them.
+fn kept_dropped_note(changes: &brainproxy_core::proxy::recording::Changes) -> String {
+    match changes.kept_dropped() {
+        0 => String::new(),
+        n => format!(
+            "\nwarning: {n} older changes made through MCP or narrowing recording were dropped from the log \
+             ({} in all): that many changes is itself worth a look",
+            changes.kept_total()
+        ),
+    }
+}
+
 pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
     let scope: Scope = store.setting(SCOPE_KEY)?;
@@ -2036,6 +2055,7 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
             data["recording_changes"] = json!(changes.shown(SCOPE_CHANGES_SHOWN));
             data["narrowed_by_agent"] = json!(changes.narrowed_by_agent());
             data["recording_changes_problem"] = json!(problem);
+            data["recording_kept_dropped"] = json!(changes.kept_dropped());
             out.ok(data, || {
                 let mut text = serde_json::to_string_pretty(&scope).unwrap_or_default();
                 for c in changes.narrowed_by_agent() {
@@ -2047,6 +2067,7 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
                 if let Some(p) = &problem {
                     text.push_str(&format!("\nwarning: {p}"));
                 }
+                text.push_str(&kept_dropped_note(&changes));
                 text
             });
             return Ok(());
