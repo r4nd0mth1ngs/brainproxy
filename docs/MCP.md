@@ -82,7 +82,8 @@ one `false_positive` with a note instead; the command refuses a tool call too).
   `fuzz_run`, `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`.
   Destructive locally: `engagement_start` (write-once), `*_stop`, `proxy_restart` (its `wait` is at
   most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
-  goes back to the old proxy if it had stopped it and the new one isn't up), `*_remove`, `*_clear`,
+  goes back to the old proxy if it had stopped it and the new one isn't up: with its old options
+  and a new pid, which `proxy_status` shows in `restart_gone`), `*_remove`, `*_clear`,
   `scope_set`, `ca_init`, `scan_data_reset`. `replay_tabs_save` is local and not
   destructive: through MCP it only adds Replay tabs (below), and it sends nothing. A command
   missing from the table gets the spec's cautious defaults (not read-only, destructive, not

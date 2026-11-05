@@ -1115,8 +1115,14 @@ proxy starts, the hold lasts until that proxy is up or has failed, and that prox
 the old one itself if it can't come up, or isn't up within the restart's `--wait` (logging in
 for `--auth` to a server that never answers, say). Either way the hold lasts meanwhile, and a
 `proxy stop` stops the guard or that proxy instead, leaving the proxy off. (Killed before it
-started the guard, the restart hadn't stopped anything: the next command gives the old proxy
-its record back.)
+asked the old proxy to stop, the restart hadn't stopped anything: the guard, or the next
+command, gives the old proxy its record back, and it runs on as it was.) The proxy started again
+this way is a new process with a new pid and the old options, not the ones the restart asked
+for, and a live authz run it had ends as a new one starts. The guard shows in `ps` as a
+`brainproxy ... proxy run` without `--listen`. `proxy status` says it happened in
+`restart_gone`, until a proxy next starts: `{"at": <Unix time>, "by": "the restart's guard",
+"restart_pid": N, "restart_origin": "mcp", "proxy": {"pid": N, "listen": "ADDR"}, "note": null}`,
+with `"proxy": null` and the reason in `note` if the proxy was left off.
 
 `proxy stop` during a restart calls the restart off: the proxy it was starting is killed, the
 proxy it replaced stays off, and the restart fails saying so (`"called_off": true` in its

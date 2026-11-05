@@ -1987,6 +1987,17 @@ fn a_restart_killed_while_stopping_the_proxy_starts_it_again() {
     let log = || std::fs::read_to_string(env.project.with_extension("proxy.log")).unwrap_or_default();
     let said = format!("\"data\":{{\"restarted\":{{\"pid\":{},", status["proxy"]["pid"]);
     wait_for("the guard to log what it did", || log().contains(&said));
+    // And `proxy status` says so, until a proxy next starts.
+    let gone = &env.ok(&["proxy", "status"])["restart_gone"];
+    assert_eq!(
+        (&gone["proxy"]["pid"], &gone["restart_pid"]),
+        (&status["proxy"]["pid"], &Value::from(restart.id())),
+        "{gone}"
+    );
+    assert_eq!(gone["by"], "the restart's guard", "{gone}");
+    env.ok(&["proxy", "stop"]);
+    env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    assert_eq!(env.ok(&["proxy", "status"])["restart_gone"], Value::Null);
 }
 
 /// A stop after a restart was killed while stopping the old proxy calls off the restart's guard:

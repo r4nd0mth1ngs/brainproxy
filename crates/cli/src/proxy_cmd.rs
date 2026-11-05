@@ -42,6 +42,12 @@ const GUARD_ENV: &str = "BRAINPROXY_PROXY_RESTART_GUARD";
 /// Held by a restart's guard for as long as it runs: what tells another container that the
 /// restart's hold lasts while the guard does, once the restart's own lock is free.
 const GUARD_LOCK: &str = "proxy-restart-guard";
+/// What was done in place of a restart that had gone before it started its new proxy: written by
+/// its guard, or by its new proxy as that gives up, and shown by `proxy status` until a proxy
+/// next takes the record (see [`note_gone`]).
+const GONE_KEY: &str = "proxy.restart.gone";
+/// How long a restart's guard keeps trying to read the store before it gives up (see [`guard`]).
+const GUARD_RETRY: Duration = Duration::from_secs(30);
 /// `proxy stop` calls off a restart under way by writing its token here; the restart looks
 /// between its steps and while it waits for a proxy to come up, and so does a proxy started on
 /// its behalf before it takes the record (see [`call_off`]). Tokens are never reused, so a
@@ -1000,6 +1006,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             // A log that doesn't parse is reported, not allowed to hide the rest.
             let (changes, problem) = store.recording_changes_or_problem()?;
             let narrowed = changes.narrowed_by_agent();
+            // What was done for a restart that had gone before it started its new proxy.
+            let gone = store.meta_get(GONE_KEY)?.and_then(|g| serde_json::from_str::<Value>(&g).ok());
             let authz = match state.as_ref().and_then(|s| s.authz_run) {
                 Some(id) => {
                     let job = store.job_get(id)?;
@@ -1024,7 +1032,10 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "recording_kept_changes": changes.kept(),
                 "recording_changes_problem": problem,
                 "authz": authz,
+                "restart_gone": gone,
             });
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let gone_note = gone.as_ref().map(|g| format!("\n{}", gone_text(g, now))).unwrap_or_default();
             let mut notes: String = narrowed.iter().map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
             if let Some(p) = &problem {
                 notes.push_str(&format!("\nwarning: {p}"));
@@ -1043,7 +1054,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                         None => "not running".into(),
                     },
                 };
-                status + &notes
+                status + &gone_note + &notes
             });
             Ok(())
         }
@@ -1253,8 +1264,11 @@ fn restart(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result
         return Err(e);
     }
     // Marked before the old proxy is asked to stop, so that the guard tells a restart gone
-    // before that, which leaves the old proxy running, from one gone during it.
-    if let Err(e) = mark_stopping(&store, &token) {
+    // before that, which leaves the old proxy running, from one gone during it. Until it is
+    // asked, the stop request reads as not yet made (see [`stop_pending`]).
+    let pending = stop_pending(&token);
+    if let Err(e) = store.meta_set(STOP_KEY, Some(&pending)).and_then(|()| mark_stopping(&store, &token)) {
+        let _ = store.meta_swap(STOP_KEY, Some(&pending), None);
         let_go_to(&store, &token, Some(&old.raw))?;
         return Err(e);
     }
@@ -1350,14 +1364,18 @@ fn go_back(project: &Path, home: &Path, back: Option<(String, String)>, e: Error
     }
     let Some(back) = parse_state(&was).and_then(|w| back_args(&w.state).ok()) else { return e };
     let note = match back_to(project, home, &store, &token, &back) {
-        Ok(s) => format!(
-            "the restart that started it had gone, so the proxy was started again on {} (pid {})",
-            s.listen, s.pid
-        ),
-        Err(e2) => format!(
-            "the restart that started it had gone, and the proxy couldn't be started again on {}: {e2}",
-            back.listen
-        ),
+        Ok(s) => {
+            note_gone(&store, &token, Ok(&s), "the restart's new proxy, as it gave up");
+            format!(
+                "the restart that started it had gone, so the proxy was started again on {} (pid {})",
+                s.listen, s.pid
+            )
+        }
+        Err(e2) => {
+            let note = format!("the proxy couldn't be started again on {}: {e2}", back.listen);
+            note_gone(&store, &token, Err(&note), "the restart's new proxy, as it gave up");
+            format!("the restart that started it had gone, and {note}")
+        }
     };
     noted(e, &note)
 }
@@ -1391,36 +1409,58 @@ fn start_guard(project: &Path, home: &Path, token: &str, was: &str, log: &Path) 
 /// Stands by for the restart whose token is in [`RESTART_ENV`], from just before it stops the old
 /// proxy until it records the proxy it starts. Should the restart go away meanwhile (killed by an
 /// MCP timeout or cancel, say), nothing would start the old proxy again: this finishes stopping it
-/// and starts it again where it was, as the restart would have. Until then it is the hold's
-/// `starting`, so the hold lasts while it does that, and a stop that calls the restart off stops
-/// it. It exits quietly once the restart has recorded its proxy or let go of the record.
+/// and starts it again where it was, as the restart would have, and notes what it did (see
+/// [`note_gone`]). Until then it is the hold's `starting`, so the hold lasts while it does that,
+/// and a stop that calls the restart off stops it. It exits quietly once the restart has recorded
+/// its proxy or let go of the record. A store it can't read for [`GUARD_RETRY`] ends it.
 fn guard(project: &Path, home: &Path, out: &Out) -> Result<(), Error> {
     let (Ok(token), Ok(was)) = (std::env::var(RESTART_ENV), std::env::var(WAS_ENV)) else { return Ok(()) };
-    let store = Store::open(project)?;
+    let store = retrying(|| Store::open(project))?;
     // Taken as it starts, so that from another container the hold lasts while this runs (see
     // [`guard_held`]), and held until it exits. Without it (the guard of a restart just before
     // still exiting, say) this still stands by: only another container can't tell.
     let _lock = process::RunLock::acquire(&store, GUARD_LOCK).ok().flatten();
     let me = std::process::id();
+    let old = parse_state(&was);
+    let pending = stop_pending(&token);
     loop {
-        let Some(hold) = read_state(&store)?.filter(|s| s.restart.as_deref() == Some(token.as_str())) else {
-            return Ok(());
-        };
+        let hold = retrying(|| read_state(&store))?;
+        let Some(hold) = hold.filter(|s| s.restart.as_deref() == Some(token.as_str())) else { return Ok(()) };
         let recorded_me = match hold.starting {
             Some((pid, _)) if pid != me => return Ok(()),
             starting => starting.is_some(),
         };
-        if restart_gone(&store, &hold) {
-            if recorded_me && hold.stopping {
-                break;
+        let step = match restart_gone(&store, &hold) {
+            false => GuardStep::Wait,
+            true => guard_step(GuardLook {
+                restart_gone: true,
+                recorded_me,
+                stopping: hold.stopping,
+                stop_requested: retrying(|| store.meta_get(STOP_KEY))?.as_deref() != Some(pending.as_str()),
+                old_alive: old.as_ref().is_none_or(|o| liveness(&store, o) != Liveness::Gone),
+            }),
+        };
+        match step {
+            GuardStep::Wait => std::thread::sleep(Duration::from_millis(50)),
+            // The restart hadn't asked the old proxy to stop: it runs as it was.
+            GuardStep::GiveBack => {
+                let _ = store.meta_swap(STOP_KEY, Some(&pending), None);
+                return let_go_to(&store, &token, Some(&was));
             }
-            // Gone before it asked the old proxy to stop, the restart hadn't stopped anything:
-            // that proxy gets its record back.
-            return let_go_to(&store, &token, Some(&was));
+            GuardStep::Finish => break,
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    let Some(old) = parse_state(&was) else { return Ok(()) };
+    let had_gone = "the restart had gone before it started the new proxy";
+    // Left off, the proxy is noted as off, and why.
+    let off = |e: Error, note: String| {
+        note_gone(&store, &token, Err(&note), "the restart's guard");
+        let _ = let_go(&store, &token);
+        Err(noted(e, &format!("{had_gone}, and {note}")))
+    };
+    // `restart` read it before it held the record, so this doesn't happen.
+    let Some(old) = old else {
+        return off(Error::Conflict("the old proxy's record can't be read".into()), "the proxy is off".into());
+    };
     // It may have exited already, or be on its way out.
     if let Err(e) = halt(&store, &old) {
         // It still runs: give it its record back.
@@ -1428,14 +1468,17 @@ fn guard(project: &Path, home: &Path, out: &Out) -> Result<(), Error> {
         return Err(e);
     }
     let _ = store.meta_set(STOP_KEY, None);
-    let back = back_args(&old.state)?;
+    let back = match back_args(&old.state) {
+        Ok(back) => back,
+        Err(e) => return off(e, "the proxy is off".into()),
+    };
     let again = match called_off(&store, &token) {
         false => back_to(project, home, &store, &token, &back),
         true => Err(Error::Conflict("called off by `brainproxy proxy stop`".into())),
     };
-    let had_gone = "the restart had gone before it started the new proxy";
     match again {
         Ok(s) => {
+            note_gone(&store, &token, Ok(&s), "the restart's guard");
             out.ok(json!({"restarted": {"pid": s.pid, "listen": s.listen}}), || {
                 format!("{had_gone}, so the proxy was started again on {} (pid {})", s.listen, s.pid)
             });
@@ -1443,11 +1486,113 @@ fn guard(project: &Path, home: &Path, out: &Out) -> Result<(), Error> {
         }
         // Called off by `proxy stop`: the proxy stays off.
         Err(_) if called_off(&store, &token) => let_go(&store, &token),
-        Err(e) => {
-            let _ = let_go(&store, &token);
-            Err(noted(e, &format!("{had_gone}, and the proxy couldn't be started again on {}", back.listen)))
+        Err(e) => off(e, format!("the proxy couldn't be started again on {}", back.listen)),
+    }
+}
+
+/// What a restart's guard sees on one look at a hold that is still its restart's and names no
+/// other process as `starting` (see [`guard_step`]).
+#[derive(Clone, Copy, Debug)]
+struct GuardLook {
+    /// The restart itself has gone.
+    restart_gone: bool,
+    /// The hold names this guard as `starting`.
+    recorded_me: bool,
+    /// The hold is marked `stopping`: the restart was about to ask the old proxy to stop.
+    stopping: bool,
+    /// The stop request no longer reads as not yet made (see [`stop_pending`]): the restart has
+    /// asked the old proxy to stop, whether or not that proxy has taken the request yet.
+    stop_requested: bool,
+    /// The old proxy still runs.
+    old_alive: bool,
+}
+
+/// What a restart's guard does next (see [`guard_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardStep {
+    /// The restart still runs: look again.
+    Wait,
+    /// The restart went before it asked the old proxy to stop: that one gets its record back.
+    GiveBack,
+    /// The restart went while it stopped the old proxy: finish that and start it again.
+    Finish,
+}
+
+/// The guard's decision. The old proxy is only stopped and started again if the restart had
+/// asked it to stop, or it has gone anyway: one the restart never asked runs as it was, and
+/// only needs its record back.
+fn guard_step(look: GuardLook) -> GuardStep {
+    let GuardLook { restart_gone, recorded_me, stopping, stop_requested, old_alive } = look;
+    if !restart_gone {
+        GuardStep::Wait
+    } else if recorded_me && stopping && (stop_requested || !old_alive) {
+        GuardStep::Finish
+    } else {
+        GuardStep::GiveBack
+    }
+}
+
+/// What the stop request ([`STOP_KEY`]) reads as from just before the restart whose token this
+/// is marks its hold `stopping` until it asks the old proxy to stop: no proxy's pid, so no proxy
+/// takes it. Asking replaces it with the pid, which the proxy clears as it takes it, so once
+/// this is gone the old proxy was asked.
+fn stop_pending(token: &str) -> String {
+    format!("restart {token}: not asked yet")
+}
+
+/// `read` until it works, for up to [`GUARD_RETRY`]: through a store locked for a while, say.
+fn retrying<T>(mut read: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+    let until = Instant::now() + GUARD_RETRY;
+    loop {
+        match read() {
+            Err(_) if Instant::now() < until => std::thread::sleep(Duration::from_millis(200)),
+            done => return done,
         }
     }
+}
+
+/// Notes in [`GONE_KEY`] that the restart whose token this is had gone before it started its new
+/// proxy, and what `by` did in its place: started the old proxy again as it was (`back`), or
+/// left it off, and why. With the time and the restart's origin, which this process shares.
+fn note_gone(store: &Store, token: &str, back: Result<&ProxyState, &str>, by: &str) {
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (proxy, note) = match back {
+        Ok(s) => (json!({"pid": s.pid, "listen": s.listen}), None),
+        Err(note) => (Value::Null, Some(note)),
+    };
+    let gone = json!({"at": at, "by": by, "restart_pid": restart_pid(token),
+        "restart_origin": brainproxy_core::provenance::origin(), "proxy": proxy, "note": note});
+    let _ = store.meta_set(GONE_KEY, Some(&gone.to_string()));
+}
+
+/// The pid of the restart whose token this is: its token starts with it.
+fn restart_pid(token: &str) -> Option<u32> {
+    token.split('-').next()?.parse().ok()
+}
+
+/// [`note_gone`]'s note as `proxy status` says it, `now` seconds after the Unix epoch.
+fn gone_text(gone: &Value, now: u64) -> String {
+    let ago = now.saturating_sub(gone["at"].as_u64().unwrap_or(now));
+    let ago = match ago {
+        0..=119 => format!("{ago} s ago"),
+        120..=7199 => format!("{} min ago", ago / 60),
+        _ => format!("{} h ago", ago / 3600),
+    };
+    let origin = brainproxy_core::provenance::describe(gone["restart_origin"].as_str());
+    let restart = match gone["restart_pid"].as_u64() {
+        Some(pid) => format!("a restart (pid {pid}, {origin})"),
+        None => format!("a restart ({origin})"),
+    };
+    let what = match (&gone["proxy"]["pid"], gone["proxy"]["listen"].as_str()) {
+        (Value::Number(pid), Some(listen)) => {
+            format!(
+                "{} started the proxy again on {listen} (pid {pid}) with its old options",
+                gone["by"].as_str().unwrap_or("its guard")
+            )
+        }
+        _ => format!("the proxy was left off: {}", gone["note"].as_str().unwrap_or("it couldn't be started again")),
+    };
+    format!("{ago}, {restart} had gone before it started its new proxy, and {what}")
 }
 
 /// The token of the restart that started this process and the record of the proxy it replaces,
@@ -1489,9 +1634,11 @@ fn give_up_after(project: &Path, home: &Path, wait: Duration, back: Option<(Stri
         if store.is_none() {
             store = Store::open(project).ok();
         }
-        let restart_runs = store.as_ref().is_some_and(|store| {
-            read_state(store).ok().flatten().is_some_and(|now| now.restart == token && !restart_gone(store, &now))
-        });
+        // Only a clean read says the restart has gone: one that fails is taken as still running.
+        let restart_runs = match store.as_ref().map(|store| (store, read_state(store))) {
+            Some((store, Ok(now))) => now.is_some_and(|now| now.restart == token && !restart_gone(store, &now)),
+            _ => true,
+        };
         if restart_runs || SETTLED.compare_exchange(WAITING, GAVE_UP, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             continue;
         }
@@ -1717,6 +1864,8 @@ fn take_record(store: &Store, saved: &str) -> Result<(), Error> {
         Some(Some(s)) => replaceable(&s) || (liveness(store, &s) == Liveness::Gone && replaced(store, &s).is_none()),
     };
     if free && store.meta_swap(STATE_KEY, raw.as_deref(), Some(saved))? {
+        // What was done for a restart that had gone is shown until a proxy next takes the record.
+        let _ = store.meta_set(GONE_KEY, None);
         return Ok(());
     }
     Err(match recorded(store)? {
@@ -2319,6 +2468,87 @@ mod tests {
         }
         assert_eq!(liveness(&store, &hold), Liveness::Gone);
         child.wait().unwrap();
+    }
+
+    /// The guard waits while the restart runs. Once it has gone, the guard stops the old proxy
+    /// and starts it again only if the restart had asked it to stop, or it has gone anyway; else
+    /// the old proxy gets its record back.
+    #[test]
+    fn the_guard_only_starts_the_proxy_again_if_the_restart_had_asked_it_to_stop() {
+        for bits in 0..32u8 {
+            let bit = |i: u8| bits & (1 << i) != 0;
+            let look = GuardLook {
+                restart_gone: bit(0),
+                recorded_me: bit(1),
+                stopping: bit(2),
+                stop_requested: bit(3),
+                old_alive: bit(4),
+            };
+            let want = match look {
+                GuardLook { restart_gone: false, .. } => GuardStep::Wait,
+                // Gone before it recorded its guard, or before it marked the stop: nothing stopped.
+                GuardLook { recorded_me: false, .. } | GuardLook { stopping: false, .. } => GuardStep::GiveBack,
+                // Marked, but gone before it asked: the old proxy runs as it was.
+                GuardLook { stop_requested: false, old_alive: true, .. } => GuardStep::GiveBack,
+                _ => GuardStep::Finish,
+            };
+            assert_eq!(guard_step(look), want, "{look:?}");
+        }
+    }
+
+    /// The stop request reads as not yet made until a pid replaces it, and no proxy takes it.
+    #[test]
+    fn a_pending_stop_request_names_no_proxy() {
+        let pending = stop_pending("7-1");
+        assert_ne!(stop_pending("7-2"), pending);
+        assert!(pending.parse::<u32>().is_err(), "{pending}");
+        assert_eq!(restart_pid("7-1"), Some(7));
+        assert_eq!(restart_pid("x"), None);
+    }
+
+    /// What was done for a restart that had gone is noted, and said with its time and origin.
+    #[test]
+    fn a_restart_that_had_gone_is_noted() {
+        let store = Store::open_in_memory().unwrap();
+        let state = ProxyState { pid: 9, ..state_with(&["proxy", "run"]) };
+        note_gone(&store, "7-1", Ok(&state), "the restart's guard");
+        let gone: Value = serde_json::from_str(&store.meta_get(GONE_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!((&gone["restart_pid"], &gone["proxy"]["pid"], &gone["note"]), (&json!(7), &json!(9), &Value::Null));
+        assert_eq!(gone["restart_origin"], brainproxy_core::provenance::origin());
+        let at = gone["at"].as_u64().unwrap();
+        let text = gone_text(&gone, at + 300);
+        assert!(text.starts_with("5 min ago, a restart (pid 7, "), "{text}");
+        assert!(
+            text.ends_with(
+                "the restart's guard started the proxy again on 127.0.0.1:8080 (pid 9) with its old options"
+            ),
+            "{text}"
+        );
+
+        note_gone(&store, "7-1", Err("the proxy couldn't be started again on 127.0.0.1:8080"), "the restart's guard");
+        let gone: Value = serde_json::from_str(&store.meta_get(GONE_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(gone["proxy"], Value::Null);
+        let text = gone_text(&gone, gone["at"].as_u64().unwrap());
+        assert!(text.starts_with("0 s ago, "), "{text}");
+        assert!(
+            text.ends_with("the proxy was left off: the proxy couldn't be started again on 127.0.0.1:8080"),
+            "{text}"
+        );
+    }
+
+    /// The guard tries a failing read again for a while, and gets what works.
+    #[test]
+    fn the_guard_reads_again_after_a_failure() {
+        let mut tries = 0;
+        let got = retrying(|| {
+            tries += 1;
+            if tries < 3 {
+                Err(Error::Conflict("locked".into()))
+            } else {
+                Ok(tries)
+            }
+        });
+        assert_eq!(got.unwrap(), 3);
     }
 
     /// A restart's hold that can't be verified points at the proxy's own `stop --forget`.
