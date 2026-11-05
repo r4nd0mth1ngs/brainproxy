@@ -46,6 +46,17 @@ export function narrowedNotice(changes: RecordingChange[] | null | undefined, wh
 }
 
 /**
+ * Whether two lists of flagged changes (`narrowed_by_agent`) name the same changes, in any order:
+ * keeping the flagged settings as they are must not approve a narrowing the person hasn't seen.
+ */
+export function sameFlagged(shown: RecordingChange[] | null | undefined, now: RecordingChange[] | null | undefined): boolean {
+  const key = (c: RecordingChange) => JSON.stringify([c.setting, c.time, c.by, c.summary]);
+  const a = (shown ?? []).map(key).sort();
+  const b = (now ?? []).map(key).sort();
+  return a.length === b.length && a.every((k, i) => k === b[i]);
+}
+
+/**
  * The commands that keep the flagged settings as they are and show a person has seen them: each
  * saved unchanged (`scope add` with nothing to add; the pass-through list by adding a pattern it
  * already holds, or clearing it while empty). `passthrough` is the list as it is now.

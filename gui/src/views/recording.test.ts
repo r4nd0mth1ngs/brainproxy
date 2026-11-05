@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { byText, changeText, narrowedNotice, reviewCommands, type RecordingChange } from "./recording.ts";
+import { byText, changeText, narrowedNotice, reviewCommands, sameFlagged, type RecordingChange } from "./recording.ts";
 
 const change = (c: Partial<RecordingChange>): RecordingChange => ({
   time: "2026-01-31T12:00:00.000Z",
@@ -36,4 +36,17 @@ test("marking an agent's narrowing as reviewed saves each flagged setting unchan
   assert.deepEqual(reviewCommands([change({})], []), [["scope", "add"]]);
   assert.deepEqual(reviewCommands([change({ setting: "passthrough" })], ["a.test", "b.test"]), [["connection", "passthrough", "add", "--", "a.test"]]);
   assert.deepEqual(reviewCommands([change({ setting: "passthrough" }), change({})], []), [["scope", "add"], ["connection", "passthrough", "clear"]]);
+});
+
+test("keeping it as it is only approves the narrowing shown", () => {
+  const a = change({});
+  const b = change({ setting: "passthrough", summary: "added b.test", time: "2026-01-31T13:05:00.000Z" });
+  assert.equal(sameFlagged([a, b], [b, a]), true);
+  assert.equal(sameFlagged([], undefined), true);
+  // The agent narrowed the same setting again since: the flag now holds a change not shown.
+  assert.equal(sameFlagged([a], [change({ summary: "exclude: added .*", time: "2026-01-31T12:01:00.000Z" })]), false);
+  // Or another setting.
+  assert.equal(sameFlagged([a], [a, b]), false);
+  // Or the flag went (a person kept it elsewhere): nothing to approve.
+  assert.equal(sameFlagged([a], []), false);
 });

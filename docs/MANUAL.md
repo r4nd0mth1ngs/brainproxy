@@ -252,9 +252,11 @@ The sidebar groups the tools by what you are doing.
   the proxy scope. Below it, the latest changes to the proxy scope and the TLS pass-through
   list, with who made each and whether it narrowed recording. While an agent's narrowing
   change hasn't been changed by a person since, the tab says so, and so does a **Recording
-  narrowed by an agent** pill in the top bar, which opens this tab. Saving the scope yourself
-  (or changing the pass-through list), even unchanged, clears it, and so does **Keep as it
-  is**, which keeps what the agent changed.
+  narrowed by an agent** pill in the top bar, which opens this tab. Saving the scope yourself,
+  even unchanged, clears the scope's flag, and changing the pass-through list clears the
+  pass-through list's; **Keep as it is** keeps what the agent changed and clears every flag
+  shown (if the agent narrowed something since the tab showed it, it shows that instead and
+  keeps nothing), and the agent putting a setting back as it was clears that setting's.
 
 ### Proxy
 - **Intercept:** turn it on to hold requests (and optionally responses) before they are
@@ -1671,8 +1673,10 @@ origin `mcp`, including what a proxy or job it started records; see
 A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
 and `fuzz run --store none` or `--store matches` are refused. An agent can change the proxy
 scope and the TLS pass-through list, but traffic left out still leaves rows, and a change
-that narrows recording is flagged until a person changes that setting (see [Who recorded
-what](#who-recorded-what)). `browser open` isn't offered (the
+that narrows recording is flagged until a person changes that setting or the agent puts it
+back as it was, and stays in the log either way (see [Who recorded what](#who-recorded-what)).
+An agent that also runs `brainproxy` in a shell counts as `cli` there, as a person would, so
+it can clear the flag that way; the change is still logged. `browser open` isn't offered (the
 project's browser profile keeps the person's sign-ins), and other options that need a person are
 refused too; docs/MCP.md lists them.
 

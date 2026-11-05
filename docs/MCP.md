@@ -181,6 +181,11 @@ an agent's changes to proxied traffic are recorded on their own:
   MANUAL.md). A narrowing change through MCP stays in `scope_show`'s `narrowed_by_agent` and
   `proxy_status`'s `recording_narrowed_by_agent` until a person changes that setting or the
   agent puts it back as it was, and the app shows "Recording narrowed by an agent" meanwhile.
+  Every change through MCP, and every narrowing one, stays in the log however many follow.
+  An agent that can also run commands in a shell (Claude Code's Bash, say) and runs
+  `brainproxy` there is logged as `cli`, not `mcp`: brainproxy can't tell who typed a
+  command. Such a change clears the flag as a person's would; it is still logged, with
+  `by: "cli"`, and the agent's earlier narrowing stays listed.
 
 Reports name an agent's confirmations ("confirmed via MCP (an agent)") and list the findings
 an agent marked false positive, which the default state filter leaves out.

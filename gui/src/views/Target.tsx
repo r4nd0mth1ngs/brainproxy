@@ -12,7 +12,7 @@ import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
 import { isMutationRequest, scanConfirm, scanOptIns, siteMapScanArgs, type HistoryPick } from "./trafficActions";
-import { byText, changeText, narrowedNotice, reviewCommands, SHOW_SCOPE, type RecordingChange } from "./recording";
+import { byText, changeText, narrowedNotice, reviewCommands, sameFlagged, SHOW_SCOPE, type RecordingChange } from "./recording";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -520,11 +520,19 @@ function Scope({ active }: { active: boolean }) {
     return () => window.removeEventListener(SHOW_SCOPE, reload);
   }, [dirty]);
 
-  // Keeps what the agent changed, as it is, and clears the notice.
+  // Keeps what the agent changed, as it is, and clears the notice. Read again first: if the
+  // agent narrowed something since this was shown, show that instead of approving it unseen.
   const markReviewed = async () => {
     try {
+      const fresh = await run<ProxyScope>(["scope", "show"]);
+      if (!sameFlagged(scope?.narrowed_by_agent, fresh.narrowed_by_agent)) {
+        setScope(fresh);
+        if (!dirty) setEdit({ include: fresh.include.join("\n"), exclude: fresh.exclude.join("\n"), record: fresh.record_out_of_scope });
+        app.toast("What the agent changed has changed since this was shown. Nothing was kept: check the notice again.", "error");
+        return;
+      }
       const { passthrough } = await run<{ passthrough: string[] }>(["connection", "show"]);
-      for (const args of reviewCommands(scope?.narrowed_by_agent, passthrough ?? [])) await run(args);
+      for (const args of reviewCommands(fresh.narrowed_by_agent, passthrough ?? [])) await run(args);
       await loadScope();
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -667,8 +675,8 @@ function Scope({ active }: { active: boolean }) {
       {narrowedNotice(scope?.narrowed_by_agent) && (
         <p className="error">
           {narrowedNotice(scope?.narrowed_by_agent)}
-          {"\n"}Saving the scope (or changing the pass-through list in Settings › Connections) yourself clears this, and so
-          does keeping it as it is.{" "}
+          {"\n"}Saving the scope yourself clears the scope's flag; changing the pass-through list in Settings › Connections
+          clears the pass-through list's. Keeping it as it is clears every flag shown here; the agent putting a setting back as it was clears that one.{" "}
           <button className="btn small" onClick={markReviewed}>
             Keep as it is
           </button>

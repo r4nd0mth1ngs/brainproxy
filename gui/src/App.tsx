@@ -396,7 +396,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
                 app.setTab("target");
                 window.dispatchEvent(new Event(SHOW_SCOPE));
               }}
-              title={`${narrowed}\nTraffic left out keeps only its request line (or a tunnel's row). Target › Scope lists the changes; changing the setting yourself clears this.`}
+              title={`${narrowed}\nTraffic left out keeps only its request line (or a tunnel's row). Target › Scope lists the changes. Changing a setting yourself clears that setting's flag (the scope's or the pass-through list's), and Keep as it is there clears every flag shown.`}
             >
               Recording narrowed by an agent
             </button>
