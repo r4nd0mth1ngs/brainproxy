@@ -12,7 +12,7 @@ import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
 import { isMutationRequest, scanConfirm, scanOptIns, siteMapScanArgs, type HistoryPick } from "./trafficActions";
-import { byText, changeText, narrowedNotice, reviewCommands, sameFlagged, SHOW_SCOPE, type RecordingChange } from "./recording";
+import { byText, changeText, narrowedNotice, reviewCommands, sameFlagged, SHOW_SCOPE, type RecordingChange, reroutedNotice } from "./recording";
 
 export function TargetView({ active }: { active: boolean }) {
   const app = useApp();
@@ -480,6 +480,7 @@ interface ProxyScope {
   /** The latest changes to the scope and the pass-through list, newest first. */
   recording_changes?: RecordingChange[];
   narrowed_by_agent?: RecordingChange[];
+  routing_changed_by_agent?: RecordingChange[];
 }
 
 interface CheckResult {
@@ -533,6 +534,23 @@ function Scope({ active }: { active: boolean }) {
       }
       const { passthrough } = await run<{ passthrough: string[] }>(["connection", "show"]);
       for (const args of reviewCommands(fresh.narrowed_by_agent, passthrough ?? [])) await run(args);
+      await loadScope();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  // Keeps the agent's routing changes as they are and clears their notice, read again first in
+  // the same way. `connection review` is the person's word; an agent can't run it.
+  const markRoutingReviewed = async () => {
+    try {
+      const fresh = await run<ProxyScope>(["scope", "show"]);
+      if (!sameFlagged(scope?.routing_changed_by_agent, fresh.routing_changed_by_agent)) {
+        setScope(fresh);
+        app.toast("What the agent changed has changed since this was shown. Nothing was kept: check the notice again.", "error");
+        return;
+      }
+      await run(["connection", "review"]);
       await loadScope();
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -678,6 +696,16 @@ function Scope({ active }: { active: boolean }) {
           {"\n"}Saving the scope yourself clears the scope's flag; changing the pass-through list in Settings › Connections
           clears the pass-through list's. Keeping it as it is clears every flag shown here; the agent putting a setting back as it was clears that one.{" "}
           <button className="btn small" onClick={markReviewed}>
+            Keep as it is
+          </button>
+        </p>
+      )}
+      {reroutedNotice(scope?.routing_changed_by_agent) && (
+        <p className="error">
+          {reroutedNotice(scope?.routing_changed_by_agent)}
+          {"\n"}Traffic to these hosts goes through the proxy, address or certificate the agent set (Settings › Connections).
+          Changing that setting yourself clears its flag, and so does the agent putting it back as it was.{" "}
+          <button className="btn small" onClick={markRoutingReviewed}>
             Keep as it is
           </button>
         </p>

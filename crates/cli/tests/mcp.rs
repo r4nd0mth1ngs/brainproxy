@@ -123,7 +123,7 @@ fn protocol_and_tool_list() {
     {
         assert!(tool(name).is_some(), "missing {name}");
     }
-    for name in ["mcp_serve", "proxy_run", "oob_run", "browser_open"] {
+    for name in ["mcp_serve", "proxy_run", "oob_run", "browser_open", "connection_review"] {
         assert!(tool(name).is_none(), "{name} should not be a tool");
     }
     let send = tool("send").unwrap();

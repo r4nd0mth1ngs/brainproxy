@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { byText, changeText, narrowedNotice, reviewCommands, sameFlagged, type RecordingChange } from "./recording.ts";
+import { byText, changeText, narrowedNotice, reroutedNotice, reviewCommands, sameFlagged, type RecordingChange } from "./recording.ts";
 
 const change = (c: Partial<RecordingChange>): RecordingChange => ({
   time: "2026-01-31T12:00:00.000Z",
@@ -24,6 +24,14 @@ test("no notice without an agent's narrowing", () => {
   assert.equal(narrowedNotice(null, when), null);
   // Only an agent's narrowing is flagged; anything else that turns up isn't one.
   assert.equal(narrowedNotice([change({ by: "gui" }), change({ narrowed: false })], when), null);
+});
+
+test("an agent's routing change gets its own notice", () => {
+  const up = change({ setting: "upstream", narrowed: false, summary: "added * via http://192.0.2.7:3128" });
+  assert.equal(reroutedNotice([up], when), "Routing changed by an agent at 12:00: upstream proxies: added * via http://192.0.2.7:3128");
+  assert.equal(reroutedNotice([change({ setting: "hosts", by: "gui", narrowed: false })], when), null);
+  assert.equal(reroutedNotice(undefined, when), null);
+  assert.equal(changeText(change({ setting: "client_certs", summary: "added a.test: c.pem" })), "client certificates: added a.test: c.pem");
 });
 
 test("changes in words", () => {

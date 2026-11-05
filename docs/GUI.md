@@ -143,6 +143,10 @@ notice, a *Keep as it is* that reads `scope show` again and, if the flagged chan
 the ones shown (`sameFlagged`), saves each flagged setting unchanged (`views/recording.ts`
 `reviewCommands`), or else reloads the tab and says so without saving, and the latest changes to the proxy scope and the pass-through list from
 `scope show`, with every earlier one an agent made or that narrowed recording; the pill reloads that tab even when it is showing, keeping edits not saved yet);
+likewise a "Routing changed by an agent" pill for `routing_changed_by_agent` (an agent's change
+to upstream proxies, host overrides or client certificates; `reroutedNotice`), whose notice on
+the Scope tab has its own *Keep as it is*, which reads `scope show` again in the same way and runs
+`connection review`;
 then the intercept and proxy pills (the proxy pill starts/stops `proxy start` on the address and with the options
 set in Settings › Proxy, 127.0.0.1:8080 by default) and the theme toggle, and **Open browser**: a menu of the
 installed browsers (`browser list`) that starts the proxy if needed and runs `browser open`,

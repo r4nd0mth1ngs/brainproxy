@@ -51,6 +51,12 @@ pub enum ConnectionCmd {
     Passthrough(PassthroughCmd),
     /// Remove every connection option.
     Clear,
+    /// Mark an agent's changes to where traffic goes (upstream proxies, host overrides, client
+    /// certificates) as seen, keeping them as they are. Not available through MCP.
+    Review {
+        /// Only these: upstream, hosts, client_certs (default: all of them).
+        settings: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -149,17 +155,31 @@ pub fn connection(project: &Path, cmd: ConnectionCmd, out: &Out) -> Result<(), E
             return Ok(());
         }
         ConnectionCmd::Route { target } => return route(&store, target, out),
+        ConnectionCmd::Review { settings } => {
+            let cleared = store.review_routing(settings)?;
+            let text = format!("{} change(s) by an agent marked as seen", cleared.len());
+            out.ok(json!({"reviewed": cleared}), || text);
+            return Ok(());
+        }
         _ => {}
     }
-    // The pass-through list decides what the proxy decrypts and records: its changes are logged,
-    // whichever command saves it, and saving it unchanged with one of these shows it was seen.
-    let passthrough_saved = matches!(cmd, ConnectionCmd::Passthrough(_) | ConnectionCmd::Clear);
+    // Every change is logged, whichever command saves it; saving a setting unchanged with a
+    // command that edits it shows a person has seen it (see `update_connection_settings`).
+    let reviewed: &[&str] = match &cmd {
+        ConnectionCmd::Upstream(_) => &["upstream"],
+        ConnectionCmd::Hosts(_) => &["hosts"],
+        ConnectionCmd::Cert(_) => &["client_certs"],
+        ConnectionCmd::Passthrough(_) => &["passthrough"],
+        _ => &["passthrough", "upstream", "hosts", "client_certs"],
+    };
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
     // Edited as saved when the change is logged, so a save by another process in between
     // isn't overwritten, and logged with who changed it (see `update_connection_settings`).
-    let s = store.update_connection_settings(passthrough_saved, |s| {
+    let s = store.update_connection_settings(reviewed, |s| {
         match cmd {
-            ConnectionCmd::Show | ConnectionCmd::Route { .. } => unreachable!("answered above"),
+            ConnectionCmd::Show | ConnectionCmd::Route { .. } | ConnectionCmd::Review { .. } => {
+                unreachable!("answered above")
+            }
             ConnectionCmd::Upstream(c) => match c {
                 UpstreamCmd::Add { host, proxy, direct: _, username, password_env, first } => {
                     HostPattern::parse(&host)?;

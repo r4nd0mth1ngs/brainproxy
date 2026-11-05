@@ -49,6 +49,17 @@ export function narrowedNotice(changes: RecordingChange[] | null | undefined, wh
 }
 
 /**
+ * The notice for the agents' changes to where traffic goes (upstream proxies, host overrides,
+ * client certificates) nobody has reviewed since (`routing_changed_by_agent`), or null when there
+ * are none: "Routing changed by an agent at <time>: <what>".
+ */
+export function reroutedNotice(changes: RecordingChange[] | null | undefined, when = (t: string) => new Date(t).toLocaleString()): string | null {
+  const flagged = (changes ?? []).filter((c) => c.by === "mcp");
+  if (!flagged.length) return null;
+  return flagged.map((c) => `Routing changed by an agent at ${when(c.time)}: ${changeText(c)}`).join("\n");
+}
+
+/**
  * Whether two lists of flagged changes (`narrowed_by_agent`) name the same changes, in any order:
  * keeping the flagged settings as they are must not approve a narrowing the person hasn't seen.
  */

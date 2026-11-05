@@ -32,7 +32,8 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// (copying the project elsewhere is for the person running the server), `browser open`
 /// (the browser profile holds the person's sign-ins; the command refuses a tool call too), and
 /// `findings remove` (an agent can't tell a person's finding from its own; it marks one
-/// false_positive instead; the command refuses a tool call too).
+/// false_positive instead; the command refuses a tool call too), and `connection review`
+/// (an agent can't approve its own changes to where traffic goes; it refuses a tool call too).
 const EXCLUDED: &[&str] = &[
     "mcp serve",
     "proxy run",
@@ -42,6 +43,7 @@ const EXCLUDED: &[&str] = &[
     "project save",
     "browser open",
     "findings remove",
+    "connection review",
 ];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not

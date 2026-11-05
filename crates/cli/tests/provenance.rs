@@ -717,17 +717,42 @@ fn an_agent_rerouting_traffic_is_logged() {
     let (up, hosts) = (find("upstream"), find("hosts"));
     assert_eq!((up["by"].as_str(), up["summary"].as_str()), (Some("mcp"), Some("added * via http://192.0.2.7:3128")));
     assert_eq!(hosts["summary"], "added app.test -> 10.0.0.7");
-    // Routing doesn't narrow recording, so nothing is flagged; the agent's changes are kept for good.
+    // Routing doesn't narrow recording, but an agent changing it is flagged, apart from narrowing.
     assert!(changes.iter().all(|c| c["narrowed"] == false), "{shown}");
     assert_eq!(shown["narrowed_by_agent"], serde_json::json!([]));
+    assert_eq!(shown["routing_changed_by_agent"].as_array().unwrap().len(), 2, "{shown}");
     let status = env.ok(&[], &["proxy", "status"]);
     assert_eq!(status["recording_kept_changes"].as_array().unwrap().len(), 2, "{status}");
+    assert_eq!(status["routing_changed_by_agent"].as_array().unwrap().len(), 2, "{status}");
+    assert_eq!(status["recording_narrowed_by_agent"], serde_json::json!([]));
+    let text = env.text(&["proxy", "status"]);
+    assert!(text.contains("not reviewed: host overrides changed via MCP (an agent)"), "{text}");
     let text = env.text(&["scope", "show"]);
     assert!(text.contains("last change: host overrides changed via MCP (an agent)"), "{text}");
-    // A pass-through change doesn't log the untouched routing again.
+    // A pass-through change doesn't log the untouched routing again, nor clear its flags.
     env.ok(&[], &["connection", "passthrough", "add", "c.test"]);
     let shown = env.ok(&[], &["scope", "show"]);
     assert_eq!(shown["recording_changes"].as_array().unwrap().len(), 3, "{shown}");
+    assert_eq!(shown["routing_changed_by_agent"].as_array().unwrap().len(), 2, "{shown}");
+    // The agent can't approve its own changes.
+    let (code, v, _) = env.run(&agent, &["connection", "review"]);
+    assert_eq!(code, 2, "{v}");
+    // A person changing the host overrides clears theirs; reviewing clears the rest, as they are.
+    env.ok(&[], &["connection", "hosts", "add", "app.test", "10.0.0.7"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    let flagged = shown["routing_changed_by_agent"].as_array().unwrap();
+    assert_eq!((flagged.len(), flagged[0]["setting"].as_str()), (1, Some("upstream")), "{shown}");
+    let reviewed = env.ok(&[], &["connection", "review"]);
+    assert_eq!(reviewed["reviewed"][0]["setting"], "upstream", "{reviewed}");
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert_eq!(shown["routing_changed_by_agent"], serde_json::json!([]));
+    let up = env.ok(&[], &["connection", "show"]);
+    assert_eq!(up["upstream"][0]["proxy"], "http://192.0.2.7:3128", "{up}");
+    // The agent putting it back as it was clears its flag too.
+    env.ok(&agent, &["connection", "hosts", "add", "b.test", "10.0.0.8"]);
+    env.ok(&agent, &["connection", "hosts", "remove", "b.test"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert_eq!(shown["routing_changed_by_agent"], serde_json::json!([]), "{shown}");
 }
 
 #[test]

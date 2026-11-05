@@ -514,6 +514,7 @@ fn command_name(cmd: &Cmd) -> String {
             connection_cmd::ConnectionCmd::Cert(_) => "connection cert",
             connection_cmd::ConnectionCmd::Passthrough(_) => "connection passthrough",
             connection_cmd::ConnectionCmd::Clear => "connection clear",
+            connection_cmd::ConnectionCmd::Review { .. } => "connection review",
         },
         Cmd::Rules(_) => "rules",
         Cmd::Intercept(_) => "intercept",

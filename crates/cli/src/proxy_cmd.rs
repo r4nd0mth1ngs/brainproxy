@@ -1006,6 +1006,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             // A log that doesn't parse is reported, not allowed to hide the rest.
             let (changes, problem) = store.recording_changes_or_problem()?;
             let narrowed = changes.narrowed_by_agent();
+            let rerouted = changes.rerouted_by_agent();
             // What was done for a restart that had gone before it started its new proxy.
             let gone = store.meta_get(GONE_KEY)?.and_then(|g| serde_json::from_str::<Value>(&g).ok());
             let authz = match state.as_ref().and_then(|s| s.authz_run) {
@@ -1029,6 +1030,7 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "scope": scope,
                 "recording_last_change": changes.recent(1).first(),
                 "recording_narrowed_by_agent": narrowed,
+                "routing_changed_by_agent": rerouted,
                 // Polled by the app: the latest, and how many there are (`scope show` has them all).
                 "recording_kept_changes": changes.kept().into_iter().take(STATUS_KEPT_SHOWN).collect::<Vec<_>>(),
                 "recording_kept_total": changes.kept_total(),
@@ -1039,7 +1041,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             });
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             let gone_note = gone.as_ref().map(|g| format!("\n{}", gone_text(g, now))).unwrap_or_default();
-            let mut notes: String = narrowed.iter().map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
+            let mut notes: String =
+                narrowed.iter().chain(&rerouted).map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
             if let Some(p) = &problem {
                 notes.push_str(&format!("\nwarning: {p}"));
             }
@@ -2054,11 +2057,12 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
             let mut data = json!(scope);
             data["recording_changes"] = json!(changes.shown(SCOPE_CHANGES_SHOWN));
             data["narrowed_by_agent"] = json!(changes.narrowed_by_agent());
+            data["routing_changed_by_agent"] = json!(changes.rerouted_by_agent());
             data["recording_changes_problem"] = json!(problem);
             data["recording_kept_dropped"] = json!(changes.kept_dropped());
             out.ok(data, || {
                 let mut text = serde_json::to_string_pretty(&scope).unwrap_or_default();
-                for c in changes.narrowed_by_agent() {
+                for c in changes.narrowed_by_agent().into_iter().chain(changes.rerouted_by_agent()) {
                     text.push_str(&format!("\nnot reviewed: {}", c.describe()));
                 }
                 if let Some(c) = changes.recent(1).first() {

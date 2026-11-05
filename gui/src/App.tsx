@@ -15,7 +15,7 @@ import { ScannerView } from "./views/Scanner";
 import { AccessView } from "./views/Access";
 import { PROXY_PORTS, proxyListen, savedProxyPort, startPorts, startProxy, stopOwned, stopProxy } from "./views/proxyPort";
 import { hostOf, isWildcard } from "./views/proxyMode";
-import { narrowedNotice, SHOW_SCOPE, type RecordingChange } from "./views/recording";
+import { narrowedNotice, SHOW_SCOPE, type RecordingChange, reroutedNotice } from "./views/recording";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -162,6 +162,7 @@ interface ProxyStatus {
   intercept_enabled: boolean;
   /** An agent's changes that narrowed what the proxy records, not changed by a person since. */
   recording_narrowed_by_agent?: RecordingChange[];
+  routing_changed_by_agent?: RecordingChange[];
 }
 
 function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleTheme: () => void }) {
@@ -333,6 +334,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
   // On 0.0.0.0 or [::]: other machines can use it, so it is shown however it was started.
   const exposed = !!status?.running && isWildcard(hostOf(listen));
   const narrowed = narrowedNotice(status?.recording_narrowed_by_agent);
+  const rerouted = reroutedNotice(status?.routing_changed_by_agent);
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("sidebar") === "collapsed";
@@ -399,6 +401,18 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
               title={`${narrowed}\nTraffic left out keeps only its request line (or a tunnel's row). Target › Scope lists the changes. Changing a setting yourself clears that setting's flag (the scope's or the pass-through list's), and Keep as it is there clears every flag shown.`}
             >
               Recording narrowed by an agent
+            </button>
+          )}
+          {rerouted && (
+            <button
+              className="pill hold"
+              onClick={() => {
+                app.setTab("target");
+                window.dispatchEvent(new Event(SHOW_SCOPE));
+              }}
+              title={`${rerouted}\nTraffic to those hosts goes where the agent set. Target › Scope lists the changes. Changing a setting yourself clears its flag, and Keep as it is there clears them all.`}
+            >
+              Routing changed by an agent
             </button>
           )}
           {status?.intercept_enabled && (

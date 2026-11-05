@@ -2,8 +2,8 @@
 //! and to where traffic goes: upstream proxies and host overrides. Agents change them all
 //! legitimately, but narrowing recording hides traffic (the proxy then keeps only a request
 //! line, or a tunnel's row) and routing sends the person's traffic elsewhere, so each change
-//! is kept with who made it and when. Only narrowing is flagged: routing changes don't hide
-//! anything from the record.
+//! is kept with who made it and when. An agent's narrowing is flagged, and so is any routing
+//! change it makes (see [`ROUTING`]): neither shows in the traffic itself.
 //! One an agent made that narrowed recording stays flagged until a person changes that
 //! setting again (from the app or a terminal, even saving it unchanged), or the agent puts it
 //! back as it was: later changes by the agent, or any number of other changes, don't hide it.
@@ -24,6 +24,10 @@ use crate::connection::{ClientCert, ConnectionSettings, HostOverride, UpstreamRu
 use crate::error::{Error, Result};
 use crate::proxy::config::{Scope, SCOPE_KEY};
 use crate::store::Store;
+
+/// The settings that decide where traffic goes, and as whom: an agent changing any of them is
+/// flagged, whatever the change.
+pub const ROUTING: [&str; 3] = ["upstream", "hosts", "client_certs"];
 
 /// Key in the project `meta` table holding the [`Changes`].
 pub const CHANGES_KEY: &str = "proxy.recording_changes";
@@ -129,7 +133,14 @@ impl Changes {
     /// Per setting, the latest change through MCP that narrowed recording, while no person
     /// has changed that setting since and the agent hasn't put it back.
     pub fn narrowed_by_agent(&self) -> Vec<&Change> {
-        self.flagged.values().map(|f| &f.change).collect()
+        self.flagged.iter().filter(|(s, _)| !ROUTING.contains(&s.as_str())).map(|(_, f)| &f.change).collect()
+    }
+
+    /// Per [routing](ROUTING) setting, the latest change through MCP, while no person has
+    /// changed or [reviewed](Store::review_routing) that setting since and the agent hasn't
+    /// put it back.
+    pub fn rerouted_by_agent(&self) -> Vec<&Change> {
+        self.flagged.iter().filter(|(s, _)| ROUTING.contains(&s.as_str())).map(|(_, f)| &f.change).collect()
     }
 
     /// Adds a change of `setting` by `by` (`summary` None: saved unchanged). `reviewed`: the
@@ -164,7 +175,7 @@ impl Changes {
         // whatever this last change did on its own.
         if by != "mcp" || self.flagged.get(setting).is_some_and(|f| f.baseline == after) {
             self.flagged.remove(setting);
-        } else if narrowed {
+        } else if narrowed || ROUTING.contains(&setting) {
             let baseline = self.flagged.get(setting).map_or(before, |f| f.baseline.clone());
             self.flagged.insert(setting.to_string(), Flag { change: change.clone(), baseline });
         }
@@ -332,11 +343,12 @@ impl Store {
 
     /// Edits the connection settings as saved, with `edit` (which may refuse them), validates
     /// and saves them, and logs changes to their TLS pass-through list, upstream proxies and
-    /// host overrides (see [`Store::save_logged`]). `reviewed`: the command was one that edits
-    /// the pass-through list. Returns the settings saved.
+    /// host overrides (see [`Store::save_logged`]). `reviewed`: the parts the command edits
+    /// (`passthrough`, `upstream`, `hosts`, `client_certs`); saving one unchanged with such a
+    /// command shows a person has seen it. Returns the settings saved.
     pub fn update_connection_settings(
         &mut self,
-        reviewed: bool,
+        reviewed: &[&str],
         edit: impl FnOnce(&mut ConnectionSettings) -> Result<()>,
     ) -> Result<ConnectionSettings> {
         let edit = |s: &mut ConnectionSettings| {
@@ -347,28 +359,63 @@ impl Store {
             vec![
                 (
                     "passthrough",
-                    reviewed,
+                    reviewed.contains(&"passthrough"),
                     json(&before.passthrough),
                     json(&after.passthrough),
                     passthrough_change(&before.passthrough, &after.passthrough),
                 ),
                 (
                     "upstream",
-                    false,
+                    reviewed.contains(&"upstream"),
                     json(&before.upstream),
                     json(&after.upstream),
                     upstream_change(&before.upstream, &after.upstream),
                 ),
-                ("hosts", false, json(&before.hosts), json(&after.hosts), hosts_change(&before.hosts, &after.hosts)),
+                (
+                    "hosts",
+                    reviewed.contains(&"hosts"),
+                    json(&before.hosts),
+                    json(&after.hosts),
+                    hosts_change(&before.hosts, &after.hosts),
+                ),
                 (
                     "client_certs",
-                    false,
+                    reviewed.contains(&"client_certs"),
                     json(&before.client_certs),
                     json(&after.client_certs),
                     client_certs_change(&before.client_certs, &after.client_certs),
                 ),
             ]
         })
+    }
+
+    /// Marks the agents' flagged [routing](ROUTING) changes as seen by a person, leaving the
+    /// settings as they are; `settings` names which, all of them when empty. Refused through
+    /// MCP: an agent can't approve its own changes. Returns the changes it cleared.
+    pub fn review_routing(&mut self, settings: &[String]) -> Result<Vec<Change>> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "an agent's changes to where traffic goes are reviewed by a person, not through MCP".into(),
+            ));
+        }
+        if let Some(bad) = settings.iter().find(|s| !ROUTING.contains(&s.as_str())) {
+            return Err(Error::InvalidInput(format!("{bad:?}: name one of {}", ROUTING.join(", "))));
+        }
+        let tx = self.write_tx()?;
+        let get = |k: &str| tx.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0));
+        let mut changes = parse_changes(get(CHANGES_KEY).optional()?)?;
+        let cleared: Vec<Change> = ROUTING
+            .iter()
+            .filter(|s| settings.is_empty() || settings.iter().any(|n| n == *s))
+            .filter_map(|s| changes.flagged.remove(*s).map(|f| f.change))
+            .collect();
+        let log = serde_json::to_string(&changes).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![CHANGES_KEY, log],
+        )?;
+        tx.commit()?;
+        Ok(cleared)
     }
 
     /// Reads setting `key`, has `edit` change it, writes it, bumps the settings version so
@@ -577,7 +624,7 @@ mod tests {
         store.meta_set(CHANGES_KEY, Some("{not json")).unwrap();
         let err = store.update_scope(|s| s.compile().map(|_| s.include.push("a".into()))).unwrap_err().to_string();
         assert!(err.contains("proxy.recording_changes") && err.contains("repaired by hand"), "{err}");
-        let err = store.update_connection_settings(true, |_| Ok(())).unwrap_err().to_string();
+        let err = store.update_connection_settings(&["passthrough"], |_| Ok(())).unwrap_err().to_string();
         assert!(err.contains("proxy.recording_changes"), "{err}");
         // Nothing was saved, and the log is left as it was.
         assert_eq!(store.setting::<Scope>(SCOPE_KEY).unwrap(), Scope::default());

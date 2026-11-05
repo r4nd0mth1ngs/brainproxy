@@ -185,9 +185,12 @@ an agent's changes to proxied traffic are recorded on their own:
   MANUAL.md). A narrowing change through MCP stays in `scope_show`'s `narrowed_by_agent` and
   `proxy_status`'s `recording_narrowed_by_agent` until a person changes that setting or the
   agent puts it back as it was, and the app shows "Recording narrowed by an agent" meanwhile.
-  The `connection_upstream_*` and `connection_hosts_*` tools are logged the same way (settings
-  `upstream` and `hosts`): they send traffic elsewhere rather than hide it, so they are never
-  flagged, but the log keeps them.
+  The `connection_upstream_*`, `connection_hosts_*` and `connection_cert_*` tools are logged
+  the same way (settings `upstream`, `hosts`, `client_certs`). They send traffic elsewhere
+  rather than hide it, and an agent's change to any of them is flagged in
+  `routing_changed_by_agent` (`scope_show`, `proxy_status`), with a "Routing changed by an
+  agent" notice in the app, until a person changes that setting, keeps it with `connection
+  review`, or the agent puts it back. `connection review` isn't a tool.
   Every change through MCP, and every narrowing one, stays in the log however many follow.
   An agent that can also run commands in a shell (Claude Code's Bash, say) and runs
   `brainproxy` there is logged as `cli`, not `mcp`: brainproxy can't tell who typed a

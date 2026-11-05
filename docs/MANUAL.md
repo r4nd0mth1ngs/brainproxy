@@ -256,7 +256,11 @@ The sidebar groups the tools by what you are doing.
   even unchanged, clears the scope's flag, and changing the pass-through list clears the
   pass-through list's; **Keep as it is** keeps what the agent changed and clears every flag
   shown (if the agent narrowed something since the tab showed it, it shows that instead and
-  keeps nothing), and the agent putting a setting back as it was clears that setting's.
+  keeps nothing), and the agent putting a setting back as it was clears that setting's. An
+  agent's change to where traffic goes (upstream proxies, host overrides, client
+  certificates) gets its own notice there and a **Routing changed by an agent** pill; changing
+  that setting in Settings › Connections clears it, and its **Keep as it is** runs
+  `connection review`.
 
 ### Proxy
 - **Intercept:** turn it on to hold requests (and optionally responses) before they are
@@ -874,7 +878,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 144 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 145 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -986,9 +990,15 @@ history (only request lines and tunnels' rows remain), so each change to either 
 host overrides (`connection hosts ...`, setting `hosts`, summary `added app.test -> 10.0.0.7`), and
 client certificates, which decide who the person is to a server (`connection cert ...`,
 setting `client_certs`). Password variables are named, never their values.
-They never narrow recording, so they are never flagged, but one made through MCP is kept for
-good like an agent's other changes: an agent sending the person's traffic through a proxy or
-to an address of its choice leaves a trace. A change has `time`, `by` (`gui`, `cli` or `mcp`),
+They never narrow recording, but an agent sending the person's traffic through a proxy, to an
+address or as a certificate of its choice doesn't show in the traffic either, so any routing
+change made through MCP is flagged, apart from narrowing: `routing_changed_by_agent` in `scope
+show` and `proxy status` (whose text says `not reviewed: host overrides changed via MCP (an
+agent) at ...`), until a person changes that setting (a `connection upstream`, `hosts` or `cert`
+command, or `connection clear`), runs `connection review [upstream|hosts|client_certs]` to keep
+it as it is, or the agent puts it back as it was. `connection review` isn't available through
+MCP, and refuses a tool call: an agent can't approve its own changes. Like an agent's other
+changes, these are kept in the log for good. A change has `time`, `by` (`gui`, `cli` or `mcp`),
 `setting` (`scope`, `passthrough`, `upstream`, `hosts` or `client_certs`), `summary`
 (`include: added ^a\.test$`), `before` and `after`, and `narrowed`:
 whether it left traffic out that was recorded in full before. That is an include list that
@@ -1064,6 +1074,7 @@ brainproxy connection hosts add app.acme.test 10.20.0.5
 brainproxy connection cert add --host api.acme.test --pkcs12 me.p12 --password-env P12_PW
 brainproxy connection passthrough add login.acme.test
 brainproxy connection route https://app.acme.test/      # what a request there would use
+brainproxy connection review                            # keep an agent's routing changes as they are
 brainproxy connection show
 brainproxy auth add corp --platform ntlm --platform-host '*.acme.test' --username 'ACME\me' --password-env CORP_PW
 brainproxy proxy start --listen 0.0.0.0:8080 --invisible  # also serve clients that don't know they're proxied
