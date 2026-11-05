@@ -314,12 +314,6 @@ impl crate::store::Store {
         self.setting(CONNECTION_KEY)
     }
 
-    /// Validates and saves the settings; running proxies reload them.
-    pub fn set_connection_settings(&self, s: &ConnectionSettings) -> Result<()> {
-        s.validate()?;
-        self.set_setting(CONNECTION_KEY, s)
-    }
-
     /// The connection options with every auth profile's platform credentials.
     pub fn connection_compiled(&self) -> Result<Compiled> {
         let platform = self
