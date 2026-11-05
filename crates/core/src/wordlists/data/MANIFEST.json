@@ -65,7 +65,7 @@
     "sqli-time": {
       "description": "Time-based blind SQL injection (sleep, benchmark, waitfor); look for slow responses",
       "caution": "each hit makes the server wait; keep concurrency low",
-      "count": 42,
+      "count": 41,
       "dropped_destructive": 0,
       "sources": [
         {

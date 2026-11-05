@@ -448,6 +448,9 @@ attack type, and pick payloads:
     `path-traversal`, `command-injection`, `ssti`, `nosqli`, `naughty-strings`,
     `special-chars`, `content-discovery`, `parameters`, `headers`, `usernames`, `passwords`,
     `http-methods`, `extensions`. *Edit as list* copies one so you can change it.
+    `sqli-time`'s sleep and wait payloads ask for 5 seconds, so a hit stands out in the
+    response times; *Edit as list* to change it (`benchmark` ones take as long as the
+    server's CPU does).
   - **List:** type your own payloads.
   - **Numbers:** a range.
   - **File:** a wordlist on disk.

@@ -58,7 +58,9 @@ LISTS = {
         "Time-based blind SQL injection (sleep, benchmark, waitfor); look for slow responses",
         "each hit makes the server wait; keep concurrency low",
         True,
-        [("seclists", "Fuzzing/Databases/SQLi/Generic-BlindSQLi.fuzzdb.txt", {})],
+        # The source leaves the delay as __TIME__ for its tool to fill in; the fuzzer sends
+        # payloads as they are, so give it a delay that stands out: 5 seconds.
+        [("seclists", "Fuzzing/Databases/SQLi/Generic-BlindSQLi.fuzzdb.txt", {"replace": {"__TIME__": "5"}, "comments": True})],
     ),
     "sqli-login-bypass": (
         "SQL injection login bypass for username/password fields",

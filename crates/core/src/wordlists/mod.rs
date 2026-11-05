@@ -57,4 +57,15 @@ mod tests {
         }
         assert!(get("nope").is_none());
     }
+
+    #[test]
+    fn payloads_have_no_placeholder_left_for_another_tool() {
+        // The fuzzer sends a payload as it is: `sleep(__TIME__)` would never delay anything.
+        let placeholder = regex::Regex::new(r"__[A-Z][A-Z0-9_]*__").unwrap();
+        for name in names() {
+            for line in get(name).unwrap() {
+                assert!(!placeholder.is_match(line), "{name}: {line}");
+            }
+        }
+    }
 }
