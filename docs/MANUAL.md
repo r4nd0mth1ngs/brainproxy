@@ -1165,11 +1165,14 @@ Crawl and active-scan scope and safety flags:
   DELETE. It tries at most 40 elements per page state and chains of up to 6 clicks, and
   waits at most 10 s for a page to settle.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
-  these methods. A GraphQL mutation (a request whose `query`, in a JSON body, an
-  `application/graphql` body or the URL, defines one) is `MUTATION` whatever its method and however
-  it was recorded, so one sent once by `import api --include-methods MUTATION`, a one-request check
-  or the proxy isn't replayed by a later scan unless `--include-methods MUTATION` (or `all`) says
-  so. A request picked with `--history-id` needs the same opt-in: naming a DELETE or a mutation
+  these methods. A GraphQL mutation (a request whose `query`, in a JSON body or batch, an
+  `application/graphql` body, a multipart upload's `operations`, a form body or the URL, defines
+  one) is `MUTATION` whatever its method and however it was recorded. So is an operation sent
+  without its document (a persisted query's hash in `extensions.persistedQuery`, a `doc_id`, or an
+  `id` with `operationName` or `variables`), and a body at a GraphQL-looking request that can't be
+  decoded (zstd, say): neither can be shown to be read-only. So one sent once by `import api
+  --include-methods MUTATION`, a one-request check or the proxy isn't replayed by a later scan
+  unless `--include-methods MUTATION` (or `all`) says so. A request picked with `--history-id` needs the same opt-in: naming a DELETE or a mutation
   without `--include-methods DELETE` (or `MUTATION`) is refused with exit code 2 before anything is sent.
 - `scan active --checks`: the same opt-in applies to the requests a template sends, from any
   store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
@@ -1624,8 +1627,11 @@ control. Low ones are only in the results, to review.
 
 Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
 replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
-another user. A GraphQL mutation is `MUTATION` whatever its method, as in a scan, so
-`--include-methods POST` doesn't replay one and `--include-methods MUTATION` does. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
+another user. A GraphQL mutation is `MUTATION` whatever its method, as in a scan (a persisted
+query sent without its document counts as one too), so `--include-methods POST` doesn't replay
+one and `--include-methods MUTATION` does. A URL given to `authz run` needs the same opt-in: one
+whose `query` parameter is a mutation is refused (exit code 2, nothing sent) without
+`--include-methods MUTATION`. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
 so the owner stays logged in. A request picked with `--history-id` may lack credentials, but its
 method needs `--include-methods` like any other, and one matching `--exclude` is refused
 (exit code 2, nothing sent) unless `--exclude` is given a pattern it doesn't match. URLs on

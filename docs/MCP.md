@@ -148,8 +148,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
 requests get the same method opt-in as the ZAP rules' targets: a PUT, PATCH, DELETE or GraphQL
 mutation in a template isn't sent unless `include_methods` names it, and every request a
 check sends is recorded with origin `mcp`. `authz_run` opts in the same way: a GraphQL mutation
-is replayed as each identity only when `include_methods` names MUTATION, not POST. The same
-holds outside MCP.
+is replayed as each identity only when `include_methods` names MUTATION, not POST, whether it
+comes from history or a URL. An operation sent without its document (a persisted query's hash, a
+`doc_id`) counts as a mutation in both, since it can't be shown to be read-only. The same holds
+outside MCP.
 
 The GUI's development server (`npm run dev`) runs CLI commands for the UI without these
 limits, so it only answers requests carrying a token it makes up each time it starts and

@@ -457,4 +457,20 @@ fn a_graphql_mutation_is_opted_in_to_as_mutation() {
     assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods MUTATION"), "{v}");
     let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "mutation"]);
     assert_eq!(r["requests"], 1, "{r}");
+
+    // So does a mutation named by URL, sent as GET.
+    let url = srv.url("/graphql?query=mutation%20%7B%20deleteAccount%20%7D");
+    let (code, v) = run(&p, &["authz", "run", "--owner", "alice", "--as", "bob", &url]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods MUTATION"), "{v}");
+    let r = ok(&p, &["authz", "run", "--owner", "alice", "--as", "bob", "--include-methods", "MUTATION", &url]);
+    assert_eq!(r["requests"], 1, "{r}");
+
+    // A persisted query sends a hash, not its document: it can't be shown read-only.
+    let body = r#"{"operationName":"DeleteAccount","extensions":{"persistedQuery":{"version":1,"sha256Hash":"ab"}}}"#;
+    let args = ["send", "-X", "POST", "--url", &gql, "-H", "Content-Type: application/json", "-d", body];
+    let persisted = ok(&p, &[&args[..], &["--auth", "alice"]].concat())["id"].to_string();
+    let (code, v) = run(&p, &["authz", "run", "--as", "bob", "--history-id", &persisted, "--include-methods", "POST"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods MUTATION"), "{v}");
 }

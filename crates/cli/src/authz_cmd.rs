@@ -340,9 +340,23 @@ fn select(
     exclude: &regex::Regex,
     guard: &brainproxy_core::guard::Guard,
 ) -> Result<(Vec<AuthzTarget>, Value), Error> {
+    let all_methods = args.include_methods.iter().any(|m| m.eq_ignore_ascii_case("all"));
+    // Opted in to as a history row's method is: a GraphQL mutation in the URL is a MUTATION.
+    let opted_in = |method: &str| {
+        all_methods
+            || SAFE_METHODS.contains(&method)
+            || args.include_methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+    };
     let mut targets = Vec::new();
     for u in &args.urls {
         let (req, target) = RawRequest::build("GET", u, &[], b"")?;
+        let method = api::opt_in(req.as_bytes());
+        if !opted_in(&method) {
+            return Err(Error::InvalidInput(format!(
+                "--url {u} is a {method} request, and replaying it as each identity can change or delete data; \
+                 add --include-methods {method} to test it"
+            )));
+        }
         targets.push((true, AuthzTarget { history_id: None, target, request: req.into_bytes() }));
     }
     let mut ids: Vec<(i64, bool)> = args.history_ids.iter().map(|id| (*id, true)).collect();
@@ -367,7 +381,6 @@ fn select(
     }
     let store = Store::open(project)?;
     let profiles: Vec<AuthProfile> = store.auth_list()?.into_iter().map(|(p, _)| p).collect();
-    let all_methods = args.include_methods.iter().any(|m| m.eq_ignore_ascii_case("all"));
     let (mut out_of_scope, mut methods, mut excluded, mut no_credentials) = (0, 0, 0, 0);
     for (id, explicit) in ids {
         let item = store.get(id)?;
@@ -383,10 +396,7 @@ fn select(
         let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
         // Naming a request isn't consent to replay what it changes, or to log every identity out:
         // a named one that would be skipped is refused before anything is sent.
-        if !(all_methods
-            || SAFE_METHODS.contains(&method.as_str())
-            || args.include_methods.iter().any(|m| m.eq_ignore_ascii_case(&method)))
-        {
+        if !opted_in(&method) {
             if explicit {
                 return Err(Error::InvalidInput(format!(
                     "--history-id {id} is a {method} request, and replaying it as each identity can change or \
