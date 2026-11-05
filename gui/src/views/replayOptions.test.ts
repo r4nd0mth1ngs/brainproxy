@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_OPTIONS, validServerName, activeLabels, crlfBody, crlfHead, curlOptions, optionArgs, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
+import { DEFAULT_OPTIONS, validServerName, activeLabels, crlfBody, crlfHead, curlOptions, optionArgs, optionsProblem, requestToSend, savedOptions, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
 import { autoEncodeRequest } from "../ui/urlencode.ts";
 import { parseCurl, toCurl } from "../ui/curl.ts";
 import { wsSendArgs } from "./ws.ts";
@@ -282,4 +282,22 @@ test("an SNI must be a TLS server name, as the CLI's --sni takes", () => {
     assert.equal(validServerName(bad), false, bad);
   assert.match(optionsProblem({ sni: "-x.test" }) ?? "", /isn't a valid TLS server name/);
   assert.equal(optionsProblem({ sni: "x.test" }), null);
+});
+
+test("an IPv6 SNI is read as rustls reads it, which a URL's host parser isn't", () => {
+  // Each checked against rustls-pki-types' ServerName, which `--sni` and `replay tabs save` use.
+  for (const ok of ["::", "1::", "::2:3:4:5:6:7:8", "1:2:3:4:5:6:7::", "1:2:3:4:5:6:7:8", "ABCD::ef01", "0000::0001", "::1.2.3.4", "::ffff:10.0.0.1", "1:2:3:4:5::1.2.3.4", "1:2:3:4:5:6:1.2.3.4"])
+    assert.equal(validServerName(ok), true, ok);
+  for (const bad of [
+    // A URL takes these: the rest of a URL after the address.
+    "::1]/x/[", "::1]?a=[", "::1]#[", "::1:",
+    // Nor are these addresses.
+    "fe80::1%eth0", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7:8::", "1::2:3:4:5:6:7:8", "1::2::3", ":::", "1:::2", ":1", "1:", "12345::", "::0x1",
+    // An IPv4 part only at the end, with no octet over 255 or with a leading zero, and not before a ::.
+    "::1.2.3", "::1.2.3.04", "::256.1.1.1", "::1.2.3.4:5", "1.2.3.4::", "1:2:3:4:5:6::1.2.3.4", "1:2:3:4:5:6:7:1.2.3.4",
+  ])
+    assert.equal(validServerName(bad), false, bad);
+  // Left out of a saved tab rather than failing the save.
+  assert.equal(savedOptions({ sni: "::1]/x/[" }, "http"), undefined);
+  assert.deepEqual(savedOptions({ sni: " ::1 " }, "http"), { sni: "::1" });
 });

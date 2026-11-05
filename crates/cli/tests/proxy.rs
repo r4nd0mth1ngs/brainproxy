@@ -1748,35 +1748,74 @@ fn proxy_stop_says_so_when_another_proxy_has_the_record_since() {
     other.wait().unwrap();
 }
 
-/// A restart interrupted while the old proxy still runs (here: paused, so it doesn't exit)
-/// gives it its record back, so that it is seen and can be stopped.
-#[cfg(target_os = "linux")]
-#[test]
-fn an_interrupted_restart_gives_the_old_proxy_its_record_back() {
-    let env = Env::new("restart-interrupted");
-    let old_pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
-    signal("-STOP", old_pid);
-    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
-    let mut restart = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+/// `proxy restart` with these arguments in the background, as an MCP call runs it, to be killed.
+#[cfg(unix)]
+fn restart_in_background(env: &Env, args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_brainproxy"))
         .args(["--format", "json", "--project"])
         .arg(&env.project)
         .arg("--home")
         .arg(&env.home)
-        .args(["proxy", "restart", "--listen", "127.0.0.1:0"])
+        .args(["proxy", "restart"])
+        .args(args)
         .stdout(std::process::Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap()
+}
+
+/// A restart killed (by an MCP timeout or cancel, say) while it stops the old proxy, here paused
+/// so that it doesn't exit until it is let go. The guard the restart started first finishes the
+/// stop and starts the old proxy again where it was, with its options; the hold lasts meanwhile.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_killed_while_stopping_the_proxy_starts_it_again() {
+    let env = Env::new("restart-interrupted");
+    let old = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0", "--timeout", "12"]);
+    let old_pid = old["pid"].as_u64().unwrap();
+    signal("-STOP", old_pid);
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    let mut restart = restart_in_background(&env, &["--listen", "127.0.0.1:0"]);
+    wait_for("the restart to ask the old proxy to stop", || {
+        store.meta_get("proxy.stop").unwrap() == Some(old_pid.to_string())
+    });
+    let hold: Value = serde_json::from_str(&proxy_record(&env).unwrap()).unwrap();
+    assert!(hold["starting"].is_array(), "no guard recorded before the stop: {hold}");
+    restart.kill().unwrap();
+    restart.wait().unwrap();
+
+    let (code, v) = env.run(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "a start got in: {v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("being restarted"), "{v}");
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["restarting"]), (&false.into(), &true.into()), "{status}");
+    signal("-CONT", old_pid);
+    wait_gone(old_pid);
+    wait_for("the old proxy to be back", || env.ok(&["proxy", "status"])["running"] == true);
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["proxy"]["listen"], &status["restarting"]), (&old["listen"], &false.into()), "{status}");
+    assert_ne!(status["proxy"]["pid"], old["pid"], "{status}");
+    assert!(strs(&status["proxy"]["args"]).windows(2).any(|w| w == ["--timeout", "12"]), "{status}");
+    let log = || std::fs::read_to_string(env.project.with_extension("proxy.log")).unwrap_or_default();
+    let said = format!("\"data\":{{\"restarted\":{{\"pid\":{},", status["proxy"]["pid"]);
+    wait_for("the guard to log what it did", || log().contains(&said));
+}
+
+/// A stop after a restart was killed while stopping the old proxy calls off the restart's guard:
+/// the old proxy is stopped, and nothing starts it again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_calls_off_the_guard_of_a_killed_restart() {
+    let env = Env::new("restart-guard-called-off");
+    let old_pid = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["pid"].as_u64().unwrap();
+    signal("-STOP", old_pid);
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    let mut restart = restart_in_background(&env, &["--listen", "127.0.0.1:0"]);
     wait_for("the restart to ask the old proxy to stop", || {
         store.meta_get("proxy.stop").unwrap() == Some(old_pid.to_string())
     });
     restart.kill().unwrap();
     restart.wait().unwrap();
 
-    let status = env.ok(&["proxy", "status"]);
-    assert_eq!((&status["running"], &status["restarting"]), (&true.into(), &false.into()), "{status}");
-    assert_eq!(status["proxy"]["pid"].as_u64(), Some(old_pid), "{status}");
-    let (code, v) = env.run(&["proxy", "start", "--listen", "127.0.0.1:0"]);
-    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
     let stopped = std::thread::scope(|s| {
         let stop = s.spawn(|| env.ok(&["proxy", "stop"]));
         wait_for("the stop to mark the record", || proxy_record(&env).is_some_and(|r| r.contains("\"stopping\":true")));
@@ -1784,8 +1823,12 @@ fn an_interrupted_restart_gives_the_old_proxy_its_record_back() {
         stop.join().unwrap()
     });
     assert_eq!(stopped["stopped"].as_u64(), Some(old_pid), "{stopped}");
+    assert_eq!(stopped["restart_called_off"].as_u64(), Some(restart.id().into()), "{stopped}");
     wait_gone(old_pid);
-    assert_eq!(env.ok(&["proxy", "status"])["running"], false);
+    std::thread::sleep(Duration::from_secs(1));
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["running"], &status["restarting"]), (&false.into(), &false.into()), "{status}");
+    assert_eq!(proxy_record(&env), None);
 }
 
 /// `project stop` stops a proxy that took the record while it stopped the last one, too, rather
@@ -1884,6 +1927,35 @@ fn a_restart_killed_midway_still_goes_back() {
     wait_for("the failed proxy to log why", || {
         log().contains("the restart that started it had gone, so the proxy was started again on")
     });
+}
+
+/// A restart killed while its new proxy logs in (`--auth`) to a server that never answers: once
+/// the restart's wait is over, that proxy gives up and goes back to the old one, rather than
+/// holding off every start for as long as the login hangs.
+#[cfg(unix)]
+#[test]
+fn a_restarted_proxy_stuck_logging_in_gives_up_once_the_restart_has_gone() {
+    let env = Env::new("restart-stuck");
+    let (login, arrived, release) = held_login_server();
+    env.ok(&["auth", "add", "slow", "--login-url", &login, "--login-body", "a=b", "--logged-in", "Welcome"]);
+    let old = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let mut restart = restart_in_background(&env, &["--listen", "127.0.0.1:0", "--auth", "slow", "--wait", "2"]);
+    arrived.recv_timeout(Duration::from_secs(10)).expect("the new proxy logs in");
+    restart.kill().unwrap();
+    restart.wait().unwrap();
+
+    wait_for("the old proxy to be back", || env.ok(&["proxy", "status"])["running"] == true);
+    let status = env.ok(&["proxy", "status"]);
+    assert_eq!((&status["proxy"]["listen"], &status["restarting"]), (&old["listen"], &false.into()), "{status}");
+    assert_ne!(status["proxy"]["pid"], old["pid"], "{status}");
+    let log = || std::fs::read_to_string(env.project.with_extension("proxy.log")).unwrap_or_default();
+    wait_for("the stuck proxy to log why", || {
+        log().contains(
+            "gave up: not up within the restart's wait (2 s); the restart that started it had gone, so the proxy was \
+             started again on",
+        )
+    });
+    drop(release);
 }
 
 /// `proxy stop --pid` stops the proxy only while it is that pid: what the app does on closing a
