@@ -44,28 +44,130 @@ export function isLogout(p: HistoryPick): boolean {
   return LOGOUT.test(target.split("?")[0]);
 }
 
-/**
- * The GraphQL documents a raw request carries, as `graphql::documents` reads them: `query` URL
- * parameters, an `application/graphql` body, or the `query` of a JSON body or batch. Like the
- * scanner's parser, it needs CRLF line endings and the blank line ending the head.
- */
-export function graphqlDocuments(raw: string): string[] {
-  const sep = raw.indexOf("\r\n\r\n");
-  if (sep < 0) return [];
-  const body = raw.slice(sep + 4);
-  const [line = "", ...headers] = raw.slice(0, sep).split("\r\n");
-  const target = line.split(" ")[1] ?? "";
-  const q = target.indexOf("?");
-  const out = q < 0 ? [] : new URLSearchParams(target.slice(q + 1)).getAll("query");
-  if (headers.some((h) => /^content-type\s*:.*application\/graphql/i.test(h))) return [...out, body];
-  const query = (v: unknown) => (v && typeof v === "object" && typeof (v as { query?: unknown }).query === "string" ? [(v as { query: string }).query] : []);
+/** What a raw request carries of GraphQL, as `graphql::read` reads it. */
+interface GraphqlRead {
+  documents: string[];
+  /**
+   * An operation sent without its document (a persisted query's hash, a `doc_id`, an `id` with
+   * `operationName` or `variables`), or a body this view can't decode at a GraphQL-looking
+   * request: it can't be shown to be read-only.
+   */
+  unproven: boolean;
+}
+
+/** One operation: its `query`, or, without one, whether it names a document the server keeps. */
+function readOperation(v: unknown, out: GraphqlRead) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return;
+  const o = v as Record<string, unknown>;
+  if (typeof o.query === "string") {
+    out.documents.push(o.query);
+    return;
+  }
+  const ext = o.extensions;
+  const persisted = !!ext && typeof ext === "object" && "persistedQuery" in ext;
+  const id = "id" in o && ("operationName" in o || "variables" in o);
+  if (persisted || "doc_id" in o || "documentId" in o || id) out.unproven = true;
+}
+
+/** A JSON body or batch: each operation's `query`. */
+function readJson(body: string, out: GraphqlRead) {
   try {
     const v: unknown = JSON.parse(body);
-    out.push(...(Array.isArray(v) ? v.flatMap(query) : query(v)));
+    if (Array.isArray(v)) v.forEach((op) => readOperation(op, out));
+    else readOperation(v, out);
   } catch {
     // Not JSON: no documents in the body.
   }
+}
+
+/** URL or form parameters: `query`, or an operation named by `extensions`, `doc_id` or `id`. */
+function readForm(params: string, out: GraphqlRead) {
+  const op: Record<string, unknown> = {};
+  for (const [k, v] of new URLSearchParams(params)) {
+    if (k === "query") {
+      out.documents.push(v);
+      continue;
+    }
+    // `extensions` and `variables` travel as JSON in a parameter.
+    let value: unknown = v;
+    if (k === "extensions" || k === "variables") {
+      try {
+        value = JSON.parse(v);
+      } catch {
+        // Kept as text.
+      }
+    }
+    op[k] = value;
+  }
+  if (Object.keys(op).length) readOperation(op, out);
+}
+
+/** The body without its chunked framing, or null when the framing is broken. */
+function dechunk(body: string): string | null {
+  let [out, at] = ["", 0];
+  for (;;) {
+    const eol = body.indexOf("\r\n", at);
+    if (eol < 0) return null;
+    const size = parseInt(body.slice(at, eol).split(";")[0].trim(), 16);
+    if (Number.isNaN(size)) return null;
+    if (size === 0) return out;
+    out += body.slice(eol + 2, eol + 2 + size);
+    at = eol + 2 + size + 2;
+  }
+}
+
+/**
+ * What a raw request carries of GraphQL, as `graphql::documents` and `is_mutation_request` read
+ * it: `query` URL parameters, an `application/graphql` body, the `query` of a JSON body or batch,
+ * the `operations` field of a multipart upload, or the `query` of a form body. Chunked framing is
+ * removed; a Content-Encoding is not (the Rust side removes gzip, deflate and br), so such a body
+ * counts as unproven at a GraphQL-looking request or when the word `mutation` appears in it. Like
+ * the scanner's parser, it needs CRLF line endings and the blank line ending the head.
+ */
+function readGraphql(raw: string): GraphqlRead {
+  const out: GraphqlRead = { documents: [], unproven: false };
+  const sep = raw.indexOf("\r\n\r\n");
+  if (sep < 0) return out;
+  let body = raw.slice(sep + 4);
+  const [line = "", ...headers] = raw.slice(0, sep).split("\r\n");
+  const target = line.split(" ")[1] ?? "";
+  const q = target.indexOf("?");
+  if (q >= 0) readForm(target.slice(q + 1), out);
+  // Every value of a header, as sent (any one saying so counts, as on the Rust side).
+  const header = (name: string) =>
+    headers.filter((h) => h.includes(":") && h.slice(0, h.indexOf(":")).trim().toLowerCase() === name).map((h) => h.slice(h.indexOf(":") + 1).trim());
+  const typeValues = header("content-type");
+  const types = typeValues.map((t) => t.toLowerCase());
+  const encoded = header("content-encoding").some((v) => v.split(",").some((c) => !["", "identity"].includes(c.trim().toLowerCase())));
+  const chunked = header("transfer-encoding").some((v) => /chunked/i.test(v));
+  const dechunked = chunked ? dechunk(body) : body;
+  if (encoded || dechunked === null) {
+    // Not readable here: at a GraphQL-looking request, or naming a mutation, it may be one.
+    const looks = types.some((t) => t.includes("graphql")) || /graphql/i.test(target) || out.documents.length > 0;
+    out.unproven ||= looks || /\bmutation\b/.test(body);
+    return out;
+  }
+  body = dechunked;
+  if (types.some((t) => t.includes("application/graphql"))) {
+    out.documents.push(body);
+  } else if (types.some((t) => t.startsWith("multipart/form-data"))) {
+    // A file upload (the GraphQL multipart request spec): the operation is in `operations`.
+    const boundary = /;\s*boundary="?([^";]+)"?/i.exec(typeValues.find((t) => /^multipart\/form-data/i.test(t)) ?? "")?.[1];
+    for (const part of boundary ? body.split(`--${boundary}`) : []) {
+      const end = part.indexOf("\r\n\r\n");
+      if (end >= 0 && /^content-disposition:.*\bname="operations"/im.test(part.slice(0, end))) readJson(part.slice(end + 4).replace(/\r\n$/, ""), out);
+    }
+  } else if (types.some((t) => t.startsWith("application/x-www-form-urlencoded"))) {
+    readForm(body, out);
+  } else {
+    readJson(body, out);
+  }
   return out;
+}
+
+/** The GraphQL documents a raw request carries, as `graphql::documents` reads them (see `readGraphql`). */
+export function graphqlDocuments(raw: string): string[] {
+  return readGraphql(raw).documents;
 }
 
 /**
@@ -111,12 +213,15 @@ export function definesMutation(doc: string): boolean {
 }
 
 /**
- * The raw request carries a GraphQL mutation, which can change data whatever its method. A
- * request cut short (`truncated`, over the app's --max-body) may no longer parse, so it is taken
- * as one when the word appears anywhere in it: the questions then ask rather than stay silent.
+ * The raw request may carry a GraphQL mutation, which can change data whatever its method: a
+ * document defines one, or an operation can't be shown to be read-only (see `readGraphql`), as
+ * `graphql::is_mutation_request` decides. A request cut short (`truncated`, over the app's
+ * --max-body) may no longer parse, so it is taken as one when the word appears anywhere in it:
+ * the questions then ask rather than stay silent.
  */
 export function isMutationRequest(raw: string, truncated = false): boolean {
-  return graphqlDocuments(raw).some(definesMutation) || (truncated && /\bmutation\b/.test(raw));
+  const read = readGraphql(raw);
+  return read.unproven || read.documents.some(definesMutation) || (truncated && /\bmutation\b/.test(raw));
 }
 
 /** "alice", "alice and bob", "alice, bob and carol". */

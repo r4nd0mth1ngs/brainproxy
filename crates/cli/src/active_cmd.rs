@@ -855,12 +855,9 @@ fn select_targets(
         let explicit = t.history_id.is_some_and(|id| args.history_ids.contains(&id));
         // A GraphQL mutation travels as POST but is opted in to as MUTATION, like PUT or
         // DELETE, wherever it was recorded (an `import api` someone opted in to once, the proxy).
+        // So is an operation that can't be shown to be read-only (a persisted query's hash).
         let documents = graphql::documents(&t.request);
-        let opt_in = if documents.iter().any(|d| graphql::defines_mutation(d)) {
-            api::MUTATION.to_string()
-        } else {
-            method.clone()
-        };
+        let opt_in = if graphql::is_mutation_request(&t.request) { api::MUTATION.to_string() } else { method.clone() };
         if !(all_methods
             || (explicit && args.preapproved)
             || DEFAULT_METHODS.contains(&opt_in.as_str())

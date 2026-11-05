@@ -31,45 +31,112 @@ pub fn introspection_body() -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Whether a recorded request carries a GraphQL mutation: a JSON body (or batch) whose
-/// `query` defines one, an `application/graphql` body, or a `query` URL parameter. A scan
-/// and `authz run` treat it like PUT or DELETE, whatever its method and wherever it was recorded.
+/// Whether a recorded request may carry a GraphQL mutation: a document that defines one (see
+/// [`documents`]), or an operation that can't be shown to be read-only: one sent without its
+/// document (a persisted query's hash, a `doc_id`, an `id` with `operationName` or
+/// `variables`), or a body at a GraphQL-looking request that couldn't be decoded. A scan and
+/// `authz run` treat it like PUT or DELETE, whatever its method and wherever it was recorded.
 pub fn is_mutation_request(request: &[u8]) -> bool {
-    documents(request).iter().any(|d| defines_mutation(d))
+    let read = read(request);
+    read.unproven || read.documents.iter().any(|d| defines_mutation(d))
 }
 
 /// The GraphQL documents a request carries, so two operations at one endpoint with the same
-/// variables can be told apart; empty for anything else.
+/// variables can be told apart; empty for anything else. They are read from `query` URL
+/// parameters, an `application/graphql` body, the `query` of a JSON body or batch, the
+/// `operations` field of a multipart upload, and the `query` of a form-encoded body.
 pub fn documents(request: &[u8]) -> Vec<String> {
-    let Ok(head) = crate::http::RawRequest::from_bytes(request.to_vec()).head() else { return vec![] };
-    let (_, body) = crate::http::request::split_head_body(request);
-    // Read as the server reads it: a chunked or compressed mutation is a mutation too.
-    let body = &crate::capture::decode_body(&head.headers, body)[..];
-    let mut out: Vec<String> = head
-        .target
-        .split_once('?')
-        .map(|(_, q)| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .filter(|(k, _)| k == "query")
-                .map(|(_, v)| v.into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    let graphql_body = head
+    read(request).documents
+}
+
+/// What a request carries of GraphQL.
+#[derive(Default)]
+struct Read {
+    documents: Vec<String>,
+    /// An operation whose document isn't in the request, or a GraphQL-looking body that
+    /// couldn't be decoded: it can't be shown to be read-only.
+    unproven: bool,
+}
+
+fn read(request: &[u8]) -> Read {
+    let Ok(head) = crate::http::RawRequest::from_bytes(request.to_vec()).head() else { return Read::default() };
+    let (head_bytes, body) = crate::http::request::split_head_body(request);
+    // Any Content-Type header saying so.
+    let types: Vec<String> = head
         .headers
         .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().contains("application/graphql"));
-    if graphql_body {
-        out.push(String::from_utf8_lossy(body).into_owned());
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+        .collect();
+    let typed = |f: &dyn Fn(&str) -> bool| types.iter().any(|t| f(t));
+    let mut out = Read::default();
+    form(head.target.split_once('?').map_or("", |(_, q)| q).as_bytes(), &mut out);
+    // Read as the server reads it: a chunked or compressed mutation is a mutation too.
+    let Some(body) = crate::capture::decode_body_fully(&head.headers, body) else {
+        // A zstd or corrupt body can't be read: at a GraphQL-looking request, it may be a mutation.
+        out.unproven |= typed(&|t| t.contains("graphql"))
+            || head.target.to_ascii_lowercase().contains("graphql")
+            || !out.documents.is_empty();
         return out;
-    }
-    let query = |v: &Value| v.get("query").and_then(Value::as_str).map(str::to_string);
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Array(batch)) => out.extend(batch.iter().filter_map(query)),
-        Ok(v) => out.extend(query(&v)),
-        Err(_) => {}
+    };
+    if typed(&|t| t.contains("application/graphql")) {
+        out.documents.push(String::from_utf8_lossy(&body).into_owned());
+    } else if typed(&|t| t.starts_with("multipart/form-data")) {
+        // A file upload (the GraphQL multipart request spec): the operation is in `operations`.
+        let decoded = [head_bytes, &body[..]].concat();
+        for (name, value) in crate::session::multipart_fields(&decoded) {
+            if name == "operations" {
+                json(&decoded[value], &mut out);
+            }
+        }
+    } else if typed(&|t| t.starts_with("application/x-www-form-urlencoded")) {
+        form(&body, &mut out);
+    } else {
+        json(&body, &mut out);
     }
     out
+}
+
+/// A JSON body or batch: each operation's `query`.
+fn json(body: &[u8], out: &mut Read) {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Array(batch)) => batch.iter().for_each(|v| operation(v, out)),
+        Ok(v) => operation(&v, out),
+        Err(_) => {}
+    }
+}
+
+/// URL or form parameters: `query`, or an operation named by `extensions`, `doc_id` or `id`.
+fn form(params: &[u8], out: &mut Read) {
+    let mut op = Map::new();
+    for (k, v) in url::form_urlencoded::parse(params) {
+        if k == "query" {
+            out.documents.push(v.into_owned());
+            continue;
+        }
+        // `extensions` and `variables` travel as JSON in a parameter.
+        let value = match &*k {
+            "extensions" | "variables" => serde_json::from_str(&v).unwrap_or_else(|_| Value::String(v.to_string())),
+            _ => Value::String(v.to_string()),
+        };
+        op.insert(k.into_owned(), value);
+    }
+    if !op.is_empty() {
+        operation(&Value::Object(op), out);
+    }
+}
+
+/// One operation: its `query`, or, without one, whether it names a document the server keeps.
+fn operation(v: &Value, out: &mut Read) {
+    let Some(o) = v.as_object() else { return };
+    if let Some(q) = o.get("query").and_then(Value::as_str) {
+        out.documents.push(q.to_string());
+        return;
+    }
+    let persisted = o.get("extensions").and_then(|e| e.get("persistedQuery")).is_some();
+    let doc_id = ["doc_id", "documentId"].iter().any(|k| o.contains_key(*k));
+    let id = o.contains_key("id") && (o.contains_key("operationName") || o.contains_key("variables"));
+    out.unproven |= persisted || doc_id || id;
 }
 
 /// Whether a GraphQL document defines a mutation operation. Strings and comments are
@@ -771,6 +838,42 @@ mod tests {
         assert!(is_mutation_request(&req("POST /graphql HTTP/1.1\r\nTransfer-Encoding: chunked", &chunked)));
         assert!(!is_mutation_request(&req("POST /graphql HTTP/1.1", r#"{"query": "query { a }"}"#)));
         assert!(!is_mutation_request(&req("POST /form HTTP/1.1", "mutation=1")));
+    }
+
+    #[test]
+    fn uploads_forms_and_documentless_operations_are_read() {
+        let req = |head: &str, body: &str| format!("{head}\r\nHost: g.test\r\n\r\n{body}").into_bytes();
+        let json = "POST /graphql HTTP/1.1\r\nContent-Type: application/json";
+        // A multipart upload carries its operation in `operations`.
+        let upload = "--b\r\nContent-Disposition: form-data; name=\"operations\"\r\n\r\n\
+                      {\"query\": \"mutation ($f: Upload!) { upload(file: $f) }\"}\r\n\
+                      --b\r\nContent-Disposition: form-data; name=\"0\"; filename=\"a.txt\"\r\n\r\nquery\r\n--b--\r\n";
+        let multipart = "POST /graphql HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=b";
+        assert!(is_mutation_request(&req(multipart, upload)));
+        assert_eq!(documents(&req(multipart, &upload.replace("mutation", "query"))).len(), 1);
+        // A form body, as a server reading `query=` takes it.
+        let form = "POST /graphql HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded";
+        assert!(is_mutation_request(&req(form, "query=mutation%20%7B%20a%20%7D")));
+        assert!(!is_mutation_request(&req(form, "query=%7B%20a%20%7D")));
+        // An operation sent without its document can't be shown to be read-only.
+        for body in [
+            r#"{"operationName":"Del","extensions":{"persistedQuery":{"version":1,"sha256Hash":"ab"}}}"#,
+            r#"[{"query":"{ a }"},{"doc_id":"123","variables":{}}]"#,
+            r#"{"id":"Del","variables":{"id":1}}"#,
+        ] {
+            assert!(is_mutation_request(&req(json, body)), "{body}");
+        }
+        let get = "GET /graphql?operationName=Del&extensions=%7B%22persistedQuery%22%3A%7B%7D%7D HTTP/1.1";
+        assert!(is_mutation_request(&req(get, "")));
+        // With its document as well, the document decides.
+        let apq = r#"{"query":"{ a }","extensions":{"persistedQuery":{"version":1,"sha256Hash":"ab"}}}"#;
+        assert!(!is_mutation_request(&req(json, apq)));
+        assert!(!is_mutation_request(&req(json, r#"{"id": 1, "name": "x"}"#)));
+        assert!(!is_mutation_request(&req("GET /items?id=1 HTTP/1.1", "")));
+        // A body that can't be decoded, at a GraphQL endpoint, may be a mutation; elsewhere not.
+        let zstd = "POST /graphql HTTP/1.1\r\nContent-Encoding: zstd";
+        assert!(is_mutation_request(&req(zstd, "\x28\u{b5}\x2f\u{fd}")));
+        assert!(!is_mutation_request(&req("POST /upload HTTP/1.1\r\nContent-Encoding: zstd", "x")));
     }
 
     #[test]

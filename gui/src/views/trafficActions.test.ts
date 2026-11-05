@@ -242,6 +242,32 @@ test("a GraphQL mutation is named as one in both questions, whatever its method"
   assert.ok(!isMutationRequest(cut));
   assert.ok(isMutationRequest(cut, true));
   assert.ok(!isMutationRequest(graphqlPost('{"query":"query { mutations }","variables":{"f":"AA'), true));
+  // A multipart upload carries its operation in `operations`; a form body in `query`.
+  const upload = (doc: string) =>
+    graphqlPost(
+      `--Bx\r\nContent-Disposition: form-data; name="operations"\r\n\r\n{"query":"${doc}"}\r\n--Bx\r\nContent-Disposition: form-data; name="0"; filename="a"\r\n\r\nquery\r\n--Bx--\r\n`,
+      "multipart/form-data; boundary=Bx",
+    );
+  assert.ok(isMutationRequest(upload("mutation ($f: Upload!) { up(f: $f) }")));
+  assert.deepEqual(graphqlDocuments(upload("{ a }")), ["{ a }"]);
+  assert.ok(isMutationRequest(graphqlPost("query=mutation%20%7B%20a%20%7D", "application/x-www-form-urlencoded")));
+  assert.ok(!isMutationRequest(graphqlPost("query=%7B%20a%20%7D", "application/x-www-form-urlencoded")));
+  // An operation sent without its document can't be shown to be read-only.
+  assert.ok(isMutationRequest(graphqlPost('{"operationName":"Del","extensions":{"persistedQuery":{"version":1,"sha256Hash":"ab"}}}')));
+  assert.ok(isMutationRequest(graphqlPost('[{"query":"{ a }"},{"doc_id":"1","variables":{}}]')));
+  assert.ok(isMutationRequest(graphqlPost('{"id":"Del","variables":{"id":1}}')));
+  assert.ok(isMutationRequest("GET /graphql?operationName=Del&extensions=%7B%22persistedQuery%22%3A%7B%7D%7D HTTP/1.1\r\nHost: shop.test\r\n\r\n"));
+  assert.ok(!isMutationRequest(graphqlPost('{"query":"{ a }","extensions":{"persistedQuery":{"version":1}}}')));
+  assert.ok(!isMutationRequest(graphqlPost('{"id":1,"name":"x"}')));
+  // Chunked framing is removed, as the CLI does.
+  const mut = '{"query":"mutation { a }"}';
+  const chunked = `POST /api HTTP/1.1\r\nHost: shop.test\r\nTransfer-Encoding: chunked\r\n\r\n${mut.length.toString(16)}\r\n${mut}\r\n0\r\n\r\n`;
+  assert.ok(isMutationRequest(chunked));
+  assert.ok(!isMutationRequest(chunked.replace("mutation", "query   ")));
+  // A Content-Encoding isn't decoded here: at a GraphQL endpoint, or naming a mutation, it may be one.
+  assert.ok(isMutationRequest(graphqlPost("\x1f\x8b...", "application/json\r\nContent-Encoding: gzip")));
+  assert.ok(isMutationRequest(`POST /api HTTP/1.1\r\nContent-Encoding: zstd\r\n\r\nmutation`));
+  assert.ok(!isMutationRequest(`POST /api HTTP/1.1\r\nContent-Encoding: zstd\r\n\r\n(\xb5/\xfd`));
   const m: HistoryPick = { ...post, method: "POST", url: "https://shop.test/graphql", mutation: true };
   assert.deepEqual(changeKinds([m]), ["GraphQL mutation"]);
   assert.deepEqual(changeKinds([{ ...m, mutation: false }]), ["POST"]);

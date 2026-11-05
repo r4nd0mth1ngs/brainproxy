@@ -272,7 +272,9 @@ Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 history ids) and `showJob` (opens Scans › Tasks on a job, e.g. from the toast after Traffic's
 *Scan this request…*). The arguments, which rows can be scanned (not one with no response),
 and the questions asked before a scan or before Access replays a POST, a GraphQL mutation
-(read from the recorded request, as the scanner reads it) or a logout-like path (authz's
+(read from the recorded request, as the scanner reads it; a persisted query sent without its
+document counts as one, and so does a compressed body at a GraphQL endpoint, which the view
+doesn't decode) or a logout-like path (authz's
 default `--exclude`), are built in `views/trafficActions.ts`. So are the opt-ins the CLI refuses
 a named request without (`scanOptIns`: `--include-methods` with MUTATION or the method;
 `authzOptIns`: the same, though POST too, a mutation's method as well as MUTATION (a truncated
