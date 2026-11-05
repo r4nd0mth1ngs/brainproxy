@@ -309,6 +309,14 @@ fn a_tunnel_still_open_when_the_proxy_stops_leaves_a_row() {
     let mut reply = [0u8; 12];
     tunnel.read_exact(&mut reply).unwrap();
     assert_eq!(&reply, b"HTTP/1.1 200", "{}", String::from_utf8_lossy(&reply));
+    // The row is there while the tunnel is open, so a proxy that is killed still leaves it.
+    let open = "outside the recording scope: tunnelled, not decrypted: open, no close recorded yet";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count("SELECT count(*) FROM history") < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let rows = env.ok(&["query", "SELECT method, status, error FROM history"])["rows"].clone();
+    assert_eq!(rows, serde_json::json!([["CONNECT", null, open]]));
     let stopped = Instant::now();
     env.ok(&["proxy", "stop"]);
     // Not held up by the tunnel, as it is by a request still waiting for its response.
@@ -319,6 +327,51 @@ fn a_tunnel_still_open_when_the_proxy_stops_leaves_a_row() {
     assert_eq!(rows[0][1], format!("https://127.0.0.1:{http_port}"));
     assert_eq!(rows[0][2], "outside the recording scope: tunnelled, not decrypted: still open when the proxy stopped");
     drop(tunnel);
+}
+
+/// A tunnel's row is written as it opens and completed with the byte counts as it closes.
+#[test]
+fn a_tunnel_row_is_written_as_it_opens_and_completed_as_it_closes() {
+    use std::io::{Read, Write};
+    let env = Env::new("tunnel-row");
+    let http_port = spawn_echo(false, &env.dir);
+    env.ok(&["scope", "set", "--include", r"^example\.test$"]);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    let mut tunnel = std::net::TcpStream::connect(&listen).unwrap();
+    write!(tunnel, "CONNECT 127.0.0.1:{http_port} HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\r\n").unwrap();
+    tunnel.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut reply = [0u8; 39];
+    tunnel.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"HTTP/1.1 200 Connection established\r\n\r\n");
+    let rows = |sql: &str| env.ok(&["query", sql])["rows"].clone();
+    let sql = "SELECT method, status, error, duration_ms FROM history";
+    let open = "outside the recording scope: tunnelled, not decrypted: open, no close recorded yet";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count("SELECT count(*) FROM history") < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(rows(sql), serde_json::json!([["CONNECT", null, open, null]]));
+    // Bytes through the tunnel, then the client closes it.
+    write!(tunnel, "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    let mut answer = [0u8; 12];
+    tunnel.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"HTTP/1.1 200");
+    tunnel.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut rest = Vec::new();
+    let _ = tunnel.read_to_end(&mut rest);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rows(sql)[0][2] == open && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = rows(sql);
+    assert_eq!(r.as_array().map(Vec::len), Some(1), "{r}");
+    let error = r[0][2].as_str().unwrap();
+    assert!(error.starts_with("outside the recording scope: tunnelled, not decrypted: 36 bytes sent, "), "{r}");
+    assert!(error.ends_with(" received") && r[0][1].is_null() && r[0][3].is_i64(), "{r}");
+    env.ok(&["proxy", "stop"]);
+    // Stopping leaves a closed tunnel's row as it is.
+    assert_eq!(rows(sql), r);
 }
 
 /// A server that closes before sending all of its Content-Length: the client gets what came,

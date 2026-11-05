@@ -1466,10 +1466,12 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   only the request line, `error` starting `outside the recording scope: content omitted`,
   then as for `--no-store`. A WebSocket upgrade gets that row and nothing of its messages. An
   HTTPS tunnel (`CONNECT`) outside the scope is never decrypted and gets one `CONNECT` row
-  for the tunnel with the byte counts, `error` starting `outside the recording scope:
-  tunnelled, not decrypted`, as a TLS pass-through connection gets one starting `TLS
-  pass-through, not decrypted`. A tunnel still open when the proxy stops is recorded then,
-  its `error` ending `still open when the proxy stopped` (stopping doesn't wait for it).
+  for the tunnel, `error` starting `outside the recording scope: tunnelled, not decrypted`,
+  as a TLS pass-through connection gets one starting `TLS pass-through, not decrypted`. The
+  row is written as the tunnel opens, before anything goes upstream, its `error` ending
+  `open, no close recorded yet`, and completed with the byte counts as it closes. A tunnel
+  still open when the proxy stops gets `still open when the proxy stopped` instead (stopping
+  doesn't wait for it); one whose proxy was killed keeps the first text.
   Narrowing the scope hides what went out, never that it did. A
   request outside both scopes is refused by the engagement before it goes out and gets no
   row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.

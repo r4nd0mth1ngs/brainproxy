@@ -66,6 +66,9 @@ pub const OUT_OF_SCOPE: &str = "outside the recording scope: content omitted";
 pub const OUT_OF_SCOPE_TUNNEL: &str = "outside the recording scope: tunnelled, not decrypted";
 /// How the error of the `CONNECT` row for a TLS pass-through connection starts.
 pub const PASSED_THROUGH: &str = "TLS pass-through, not decrypted";
+/// The rest of the error of a tunnel's row while it is open. The row is written as the tunnel
+/// opens and completed as it closes, so a proxy that is killed leaves this.
+const TUNNEL_OPENED: &str = "open, no close recorded yet";
 /// The rest of the error of a tunnel's row when it was still open as the proxy stopped.
 const TUNNEL_OPEN: &str = "still open when the proxy stopped";
 
@@ -143,9 +146,10 @@ struct FlightState {
     /// being recorded (claimed). The row is made on the connection's task, as every proxy
     /// capture is, so it has what that task knows.
     open: HashMap<u64, (Capture, bool)>,
-    /// Tunnels open now (never decrypted), each with its row should it still be open at the
-    /// end. Stopping doesn't wait for them: they can stay open for as long as a client likes.
-    tunnels: HashMap<u64, Capture>,
+    /// Tunnels open now (never decrypted), each with the history id of its row and what the
+    /// row says should it still be open at the end. Stopping doesn't wait for them: they can
+    /// stay open for as long as a client likes.
+    tunnels: HashMap<u64, (i64, Capture)>,
 }
 
 /// One request in [`InFlight`], until dropped: once its exchange is queued for the recorder.
@@ -174,16 +178,16 @@ impl InFlight {
         Some(Flight { set: self.clone(), id })
     }
 
-    /// Registers a tunnel about to open, with its row should it still be open when the proxy
-    /// stops; `None` once it is stopping.
-    fn open_tunnel(self: &Arc<Self>, still_open: Capture) -> Option<OpenTunnel> {
+    /// Registers a tunnel about to open, whose row is `row`, with what the row says should it
+    /// still be open when the proxy stops; `None` once it is stopping.
+    fn open_tunnel(self: &Arc<Self>, row: i64, still_open: Capture) -> Option<OpenTunnel> {
         let mut s = self.0.lock().unwrap();
         if s.stopping {
             return None;
         }
         s.next += 1;
         let id = s.next;
-        s.tunnels.insert(id, still_open);
+        s.tunnels.insert(id, (row, still_open));
         Some(OpenTunnel { set: self.clone(), id })
     }
 
@@ -196,13 +200,13 @@ impl InFlight {
     }
 
     /// Removes the requests nobody is recording yet: their exchanges won't be recorded by
-    /// whoever sent them. Returns their rows, as unanswered, and those of the tunnels still open.
-    fn take_unclaimed(&self) -> Vec<Capture> {
+    /// whoever sent them. Returns their rows, as unanswered, and the history ids and final rows
+    /// of the tunnels still open.
+    fn take_unclaimed(&self) -> (Vec<Capture>, Vec<(i64, Capture)>) {
         let mut s = self.0.lock().unwrap();
         let ids: Vec<u64> = s.open.iter().filter(|(_, v)| !v.1).map(|(k, _)| *k).collect();
-        let mut rows: Vec<Capture> = ids.into_iter().filter_map(|id| s.open.remove(&id)).map(|v| v.0).collect();
-        rows.extend(s.tunnels.drain().map(|(_, c)| c));
-        rows
+        let rows: Vec<Capture> = ids.into_iter().filter_map(|id| s.open.remove(&id)).map(|v| v.0).collect();
+        (rows, s.tunnels.drain().map(|(_, t)| t).collect())
     }
 }
 
@@ -408,8 +412,12 @@ pub async fn run(
     while !ctx.in_flight.is_empty() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    for capture in ctx.in_flight.take_unclaimed() {
+    let (unanswered, tunnels) = ctx.in_flight.take_unclaimed();
+    for capture in unanswered {
         send_capture(&ctx, capture, None).await;
+    }
+    for (id, capture) in tunnels {
+        complete_tunnel_row(&ctx, id, capture).await;
     }
     // Ones being recorded right now are only waiting for room in the queue (or for a
     // WebSocket connection's opening to be queued).
@@ -520,8 +528,11 @@ async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr
 /// Relays bytes without inspecting them: a CONNECT outside the recording scope (`why` is
 /// [`OUT_OF_SCOPE_TUNNEL`]) or to a TLS pass-through host ([`PASSED_THROUGH`]). The upstream
 /// connection goes through the guard (and the connection options) like any other. Either
-/// way the tunnel is recorded as a `CONNECT` entry (no response: nothing was decrypted) with
-/// the byte counts, so traffic the proxy doesn't record still leaves a row.
+/// way the tunnel is recorded as a `CONNECT` entry (no response: nothing was decrypted), so
+/// traffic the proxy doesn't record still leaves a row. The row is written before anything
+/// goes upstream, saying the tunnel is open, and completed with the byte counts as it closes
+/// (or as the proxy stops), so a long-lived tunnel shows at once and one killed with the
+/// proxy still leaves its row.
 async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     ctx: &Arc<Ctx>,
     mut client: S,
@@ -532,10 +543,13 @@ async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     let authority = target.host_header();
     let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
     let https = Target { scheme: "https".into(), ..target.clone() };
-    // Recorded at the end whether or not it is still open then: the proxy doesn't wait for it.
-    let still_open = format!("{why}: {TUNNEL_OPEN}");
-    let still_open = Capture::new("proxy", &https, request.as_bytes(), None, None, Some(&still_open));
-    let Some(open) = ctx.in_flight.open_tunnel(still_open) else { return Ok(()) };
+    let row = |note: &str, duration| Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(note));
+    let id = record_tunnel_row(ctx, row(&format!("{why}: {TUNNEL_OPENED}"), None)).await?;
+    // Completed at the end whether or not it is still open then: the proxy doesn't wait for it.
+    let Some(open) = ctx.in_flight.open_tunnel(id, row(&format!("{why}: {TUNNEL_OPEN}"), None)) else {
+        complete_tunnel_row(ctx, id, row(&format!("{why}: not opened, the proxy was stopping"), None)).await;
+        return Ok(());
+    };
     let started = Instant::now();
     let plain = Target { scheme: "http".into(), ..upstream_target.clone() };
     let result = async {
@@ -549,9 +563,30 @@ async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let duration = Some(started.elapsed().as_millis() as i64);
     if open.close() {
-        send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None).await;
+        complete_tunnel_row(ctx, id, row(&note, duration)).await;
     }
     result.map(|_| ())
+}
+
+/// Writes a tunnel's row as it opens, straight to the project rather than through the
+/// recorder's queue: it must be there before the tunnel carries anything. Returns its id.
+async fn record_tunnel_row(ctx: &Arc<Ctx>, capture: Capture) -> Result<i64> {
+    let c = ctx.clone();
+    tokio::task::spawn_blocking(move || c.control.lock().unwrap().record(&capture))
+        .await
+        .map_err(|e| Error::Protocol(format!("recording a tunnel: {e}")))?
+}
+
+/// Rewrites tunnel row `id` with how it ended.
+async fn complete_tunnel_row(ctx: &Arc<Ctx>, id: i64, capture: Capture) {
+    let c = ctx.clone();
+    let done = tokio::task::spawn_blocking(move || c.control.lock().unwrap().update_capture(id, &capture)).await;
+    let err = match done {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("brainproxy: tunnel row {id} not completed: {err}");
 }
 
 /// Whether the connection options say to tunnel this host's TLS undecrypted.
