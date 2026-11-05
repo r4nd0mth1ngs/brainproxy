@@ -513,9 +513,30 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
 
     // A page only a logged-in user gets, and what tells the two apart.
     let login_page = exs[..li].iter().rev().find(|e| e.has_password_input());
-    let check = exs[li + 1..].iter().rev().find(|e| {
-        e.method == "GET" && e.status == 200 && e.is_page() && Some(e.origin()) == app_origin && !e.has_password_input()
+    let after: Vec<&Ex> = exs[li + 1..]
+        .iter()
+        .filter(|e| e.method == "GET" && e.status == 200 && e.is_page() && Some(e.origin()) == app_origin)
+        .collect();
+    // What says the login form is showing: on the login page, and on none of the pages after
+    // the login. Any password field is the plainest, but a logged-in page may have one too (a
+    // change-password form), so the login form's own field, by name, or the form that posts
+    // to the login are tried next.
+    let logged_out = login_page.and_then(|l| {
+        let names = password_names(std::slice::from_ref(l));
+        let action = regex::escape(le.url.path());
+        let candidates = std::iter::once(PASSWORD_INPUT.as_str().to_string())
+            .chain(names.iter().map(|n| format!(r#"(?i)<input[^>]*\bname=["']?{}["'\s/>]"#, regex::escape(n))))
+            .chain([format!(r#"(?i)<form[^>]*action=["']?[^"'\s>]*{action}["'\s>?]"#)]);
+        candidates.into_iter().find(|p| {
+            let re = Regex::new(p).unwrap();
+            re.is_match(&l.text) && !after.iter().any(|e| re.is_match(&e.text))
+        })
     });
+    let looks_logged_out = |e: &Ex| match &logged_out {
+        Some(p) => Regex::new(p).unwrap().is_match(&e.text),
+        None => e.has_password_input(),
+    };
+    let check = after.iter().rev().copied().find(|e| !looks_logged_out(e));
     match check {
         Some(c) => {
             let not_on_login = |p: &str| {
@@ -542,9 +563,17 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
                 .into(),
         ),
     }
-    if login_page.is_some() && !check.is_some_and(|c| c.has_password_input()) {
-        profile.logged_out = Some(r#"(?i)<input[^>]*type=["']?password"#.into());
-        found.push("Logged-out pattern: the login form's password field".into());
+    match logged_out {
+        Some(p) => {
+            found.push(format!("Logged-out pattern: {p}, which the login page matches and the pages after it don't"));
+            profile.logged_out = Some(p);
+        }
+        None if login_page.is_some() => warnings.push(
+            "Nothing on the login page tells it apart from the pages after the login (they have a password field \
+             too), so there is no logged-out pattern."
+                .into(),
+        ),
+        None => {}
     }
     Proposal { mode: Mode::Replay, profile, evidence, found, warnings }
 }
@@ -629,6 +658,44 @@ mod tests {
         assert!(pr.logged_out.is_some());
         assert_eq!((p.evidence.login, p.evidence.csrf, p.evidence.check), (Some(2), Some(1), Some(3)));
         pr.validate().unwrap();
+    }
+
+    #[test]
+    fn a_change_password_form_after_login_isnt_taken_for_the_login_form() {
+        let form = r#"<form method=post action="/wdp/login"><input name=username><input type="password" name="password"></form>"#;
+        let home = r#"<h1>Driver portal</h1><a href=/wdp/logout>Logout</a>
+            <label>Current password</label><input type="password" class="form-control" id="currentpwd">
+            <label>New password</label><input type="password" class="form-control" id="pwd">"#;
+        let body = "username=ross%40corp.test&password=s3cret";
+        let recs = vec![
+            rec(1, "GET /wdp/login HTTP/1.1\nHost: app.test\n\n", &html(form, "Set-Cookie: SESSION=anon; Path=/\n")),
+            rec(
+                2,
+                &format!("POST /wdp/login HTTP/1.1\nHost: app.test\nCookie: SESSION=anon\nContent-Type: application/x-www-form-urlencoded\nContent-Length: {}\n\n{body}", body.len()),
+                "HTTP/1.1 302 Found\nLocation: /wdp/user/driverdetails\nSet-Cookie: SESSION=live; Path=/\nContent-Length: 0\n\n",
+            ),
+            rec(3, "GET /wdp/user/driverdetails HTTP/1.1\nHost: app.test\nCookie: SESSION=live\n\n", &html(home, "")),
+        ];
+        let p = analyze(&recs, "wdp", Some("https://app.test/"));
+        assert_eq!(p.mode, Mode::Replay, "{p:?}");
+        let pr = &p.profile;
+        // The logged-in page is still the check, though it has password fields.
+        assert_eq!(pr.check_url.as_deref(), Some("https://app.test/wdp/user/driverdetails"), "{p:?}");
+        assert_eq!(pr.logged_in.as_deref(), Some(r"(?i)\b(log ?out|sign ?out)\b"));
+        // The logged-out pattern is the login form's own field, which the logged-in page lacks.
+        let out = Regex::new(pr.logged_out.as_deref().unwrap()).unwrap();
+        assert!(out.is_match(form) && !out.is_match(home), "{:?}", pr.logged_out);
+        // With nothing that tells them apart, no logged-out pattern rather than a wrong one.
+        let same = r#"<form method=post action="/wdp/login"><input type="password" name="password"></form>"#;
+        let mut recs = recs;
+        recs[2] = rec(
+            3,
+            "GET /wdp/user/driverdetails HTTP/1.1\nHost: app.test\nCookie: SESSION=live\n\n",
+            &html(&format!("{same}<a href=/wdp/logout>Logout</a>"), ""),
+        );
+        let p = analyze(&recs, "wdp", Some("https://app.test/"));
+        assert!(p.profile.logged_out.is_none(), "{p:?}");
+        assert!(p.warnings.iter().any(|w| w.contains("no logged-out pattern")), "{:?}", p.warnings);
     }
 
     #[test]
