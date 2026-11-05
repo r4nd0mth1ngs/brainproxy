@@ -594,3 +594,61 @@ fn findings_added_by_hand_say_who_added_and_removed_them() {
     let html = report("html", &["--state", "all"]);
     assert!(html.contains("<span class=\"tag\">removed from the desktop app</span>"), "{html}");
 }
+
+#[test]
+fn narrowing_what_the_proxy_records_says_who_did_it() {
+    let env = Env::new("recording");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+
+    // The agent narrows the recording scope: the change says it came through MCP.
+    env.ok(&agent, &["scope", "set", "--include", r"^a\.test$"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    let last = &shown["recording_changes"][0];
+    assert_eq!(
+        (last["by"].as_str(), last["setting"].as_str(), last["narrowed"].as_bool()),
+        (Some("mcp"), Some("scope"), Some(true)),
+        "{shown}"
+    );
+    assert_eq!(last["summary"], r"include: added ^a\.test$");
+    assert_eq!(last["before"]["include"], serde_json::json!([]));
+    assert_eq!(last["after"]["include"], serde_json::json!([r"^a\.test$"]));
+    assert_eq!(shown["narrowed_by_agent"][0]["time"], last["time"], "{shown}");
+
+    // `proxy status` says so too, and in words.
+    let status = env.ok(&[], &["proxy", "status"]);
+    assert_eq!(status["recording_narrowed_by_agent"][0]["summary"], last["summary"], "{status}");
+    assert_eq!(status["recording_last_change"]["time"], last["time"]);
+    let text = env.text(&["proxy", "status"]);
+    assert!(text.contains("not reviewed: recording scope changed via MCP (an agent) at "), "{text}");
+    assert!(text.contains(r", narrowing recording: include: added ^a\.test$"), "{text}");
+
+    // Widening it a little afterwards doesn't hide the narrowing.
+    env.ok(&agent, &["scope", "add", "--include", r"^b\.test$"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert_eq!(shown["recording_changes"][0]["narrowed"], false);
+    assert_eq!(shown["narrowed_by_agent"][0]["summary"], r"include: added ^a\.test$", "{shown}");
+
+    // A pass-through pattern the agent adds narrows recording too.
+    env.ok(&agent, &["connection", "passthrough", "add", "c.test"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    let last = &shown["recording_changes"][0];
+    assert_eq!((last["setting"].as_str(), last["summary"].as_str()), (Some("passthrough"), Some("added c.test")));
+    assert_eq!(shown["narrowed_by_agent"].as_array().unwrap().len(), 2, "{shown}");
+
+    // A person saving the scope in the app, even unchanged, has seen it; the pass-through stays flagged.
+    env.ok(&gui, &["scope", "set", "--include", r"^a\.test$", "--include", r"^b\.test$"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    let flagged = shown["narrowed_by_agent"].as_array().unwrap();
+    assert_eq!((flagged.len(), flagged[0]["setting"].as_str()), (1, Some("passthrough")), "{shown}");
+    // Saved unchanged, it isn't logged as a change.
+    assert_eq!(shown["recording_changes"][0]["setting"], "passthrough");
+    env.ok(&gui, &["connection", "passthrough", "remove", "c.test"]);
+    let shown = env.ok(&[], &["scope", "show"]);
+    assert_eq!(shown["narrowed_by_agent"], serde_json::json!([]));
+    assert_eq!(
+        (shown["recording_changes"][0]["by"].as_str(), shown["recording_changes"][0]["narrowed"].as_bool()),
+        (Some("gui"), Some(false))
+    );
+    assert!(!env.text(&["proxy", "status"]).contains("not reviewed"));
+}

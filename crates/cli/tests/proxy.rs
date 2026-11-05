@@ -231,14 +231,58 @@ fn proxy_end_to_end() {
     assert_eq!(env.ok(&["intercept", "list"])["count"], 0);
     env.ok(&["intercept", "disable"]);
 
-    // Out-of-scope traffic still flows but is not recorded.
+    // Out-of-scope traffic still flows, and leaves a row that keeps only the request line.
     env.ok(&["scope", "set", "--include", r"^example\.test$"]);
     wait_for_settings();
-    let before = env.count("SELECT count(*) FROM history");
-    let (status, _) = curl(&proxy, &env.ca(), &format!("http://127.0.0.1:{http_port}/oos"), &[]);
+    let before = env.count("SELECT max(id) FROM history");
+    let url = format!("http://127.0.0.1:{http_port}/oos?token=secret");
+    let (status, _) = curl(&proxy, &env.ca(), &url, &["-H", "Cookie: sid=secret"]);
     assert_eq!(status, 200);
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(env.count("SELECT count(*) FROM history"), before);
+    // A CONNECT outside the scope is tunnelled, not decrypted, and leaves a row for the tunnel.
+    let (status, _) = curl(&proxy, &env.ca(), &format!("https://localhost:{https_port}/tunnelled"), &["-k"]);
+    assert_eq!(status, 200);
+    let rows = |sql: &str| env.ok(&["query", sql])["rows"].clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count(&format!("SELECT count(*) FROM history WHERE id > {before}")) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = rows(&format!(
+        "SELECT method, url, query, status, error, req_headers, CAST(request AS TEXT), length(response), client_addr \
+         FROM history WHERE id > {before} ORDER BY id"
+    ));
+    assert_eq!(r.as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(
+        (r[0][0].as_str(), r[0][1].as_str()),
+        (Some("GET"), Some(&*format!("http://127.0.0.1:{http_port}/oos")))
+    );
+    assert!(r[0][2].is_null() && r[0][3].is_null(), "{r}");
+    assert_eq!(
+        r[0][4], "outside the recording scope: content omitted; query string omitted; response status 200",
+        "{r}"
+    );
+    assert_eq!((&r[0][5], &r[0][6], &r[0][7]), (&"[]".into(), &"GET /oos HTTP/1.1\r\n\r\n".into(), &0.into()));
+    assert!(r[0][8].as_str().is_some_and(|a| a.starts_with("127.0.0.1:")), "{r}");
+    assert_eq!(
+        (r[1][0].as_str(), r[1][1].as_str()),
+        (Some("CONNECT"), Some(&*format!("https://localhost:{https_port}")))
+    );
+    assert!(r[1][4].as_str().unwrap().starts_with("outside the recording scope: tunnelled, not decrypted: "), "{r}");
+    assert!(!r.to_string().contains("secret") && !r.to_string().contains("/tunnelled"), "{r}");
+    // Nothing for the passive checks: the rows keep no response.
+    std::thread::sleep(Duration::from_millis(500));
+    let scanned = format!("SELECT count(*) FROM findings WHERE history_id > {before} OR last_history_id > {before}");
+    assert_eq!(env.count(&scanned), 0);
+    // Recording out-of-scope traffic too keeps all of it.
+    env.ok(&["scope", "set", "--include", r"^example\.test$", "--record-out-of-scope"]);
+    wait_for_settings();
+    let (status, _) = curl(&proxy, &env.ca(), &format!("http://127.0.0.1:{http_port}/recorded?q=1"), &[]);
+    assert_eq!(status, 200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count("SELECT count(*) FROM history WHERE path = '/recorded'") < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = rows("SELECT status, query, error FROM history WHERE path = '/recorded'");
+    assert_eq!(r, serde_json::json!([[200, "q=1", null]]));
     env.ok(&["scope", "clear"]);
 
     // Every entry, intercepted ones included, names the client it came from.
@@ -247,6 +291,34 @@ fn proxy_end_to_end() {
     assert_eq!(status["running"], true);
     env.ok(&["proxy", "stop"]);
     assert_eq!(env.ok(&["proxy", "status"])["running"], false);
+}
+
+/// A tunnel outside the recording scope still open when the proxy stops leaves its row all the
+/// same: the proxy doesn't wait for it, and it would otherwise be recorded only as it closes.
+#[test]
+fn a_tunnel_still_open_when_the_proxy_stops_leaves_a_row() {
+    use std::io::{Read, Write};
+    let env = Env::new("open-tunnel");
+    let http_port = spawn_echo(false, &env.dir);
+    env.ok(&["scope", "set", "--include", r"^example\.test$"]);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    let mut tunnel = std::net::TcpStream::connect(&listen).unwrap();
+    write!(tunnel, "CONNECT 127.0.0.1:{http_port} HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\r\n").unwrap();
+    tunnel.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut reply = [0u8; 12];
+    tunnel.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"HTTP/1.1 200", "{}", String::from_utf8_lossy(&reply));
+    let stopped = Instant::now();
+    env.ok(&["proxy", "stop"]);
+    // Not held up by the tunnel, as it is by a request still waiting for its response.
+    assert!(stopped.elapsed() < Duration::from_secs(10));
+    let rows = env.ok(&["query", "SELECT method, url, error FROM history"])["rows"].clone();
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(rows[0][0], "CONNECT");
+    assert_eq!(rows[0][1], format!("https://127.0.0.1:{http_port}"));
+    assert_eq!(rows[0][2], "outside the recording scope: tunnelled, not decrypted: still open when the proxy stopped");
+    drop(tunnel);
 }
 
 /// A server that closes before sending all of its Content-Length: the client gets what came,

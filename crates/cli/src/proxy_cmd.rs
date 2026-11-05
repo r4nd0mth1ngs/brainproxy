@@ -341,7 +341,8 @@ impl ProxyRunArgs {
 
 #[derive(Subcommand)]
 pub enum ScopeCmd {
-    /// Show the current scope.
+    /// Show the current scope and the latest changes to what the proxy records (scope and
+    /// TLS pass-through: who made each, when, and whether it narrowed recording).
     Show,
     /// Replace the scope. Patterns are case-insensitive regexes matched against host names.
     Set {
@@ -349,7 +350,8 @@ pub enum ScopeCmd {
         include: Vec<String>,
         #[arg(long)]
         exclude: Vec<String>,
-        /// Also record out-of-scope traffic (it is never intercepted or modified).
+        /// Record out-of-scope traffic in full too (it is never intercepted or modified). Without
+        /// it, each out-of-scope request keeps only its request line, and an HTTPS tunnel a row.
         #[arg(long)]
         record_out_of_scope: bool,
     },
@@ -995,6 +997,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
             let rules: Vec<Rule> = store.setting(RULES_KEY)?;
             let scope: Scope = store.setting(SCOPE_KEY)?;
+            let changes = store.recording_changes()?;
+            let narrowed = changes.narrowed_by_agent();
             let authz = match state.as_ref().and_then(|s| s.authz_run) {
                 Some(id) => {
                     let job = store.job_get(id)?;
@@ -1014,20 +1018,26 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "intercept_enabled": intercept.enabled,
                 "rules_enabled": rules.iter().filter(|r| r.enabled).count(),
                 "scope": scope,
+                "recording_last_change": changes.recent(1).first(),
+                "recording_narrowed_by_agent": narrowed,
                 "authz": authz,
             });
-            out.ok(data, || match &state {
-                Some(s) => format!(
-                    "running on {} ({}), {captures} captures, {pending} pending{}",
-                    listen_text(&s.listen),
-                    process::pid_text(s.pid, pid_ns.as_deref()),
-                    live_text(s.authz_run)
-                ),
-                None => match &unverified {
-                    Some(u) => u["reason"].as_str().unwrap_or_default().to_string(),
-                    None if held => "not running: being restarted".into(),
-                    None => "not running".into(),
-                },
+            let notes: String = narrowed.iter().map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
+            out.ok(data, || {
+                let status = match &state {
+                    Some(s) => format!(
+                        "running on {} ({}), {captures} captures, {pending} pending{}",
+                        listen_text(&s.listen),
+                        process::pid_text(s.pid, pid_ns.as_deref()),
+                        live_text(s.authz_run)
+                    ),
+                    None => match &unverified {
+                        Some(u) => u["reason"].as_str().unwrap_or_default().to_string(),
+                        None if held => "not running: being restarted".into(),
+                        None => "not running".into(),
+                    },
+                };
+                status + &notes
             });
             Ok(())
         }
@@ -1857,11 +1867,30 @@ fn serve(
     })
 }
 
+/// Changes to what the proxy records that `scope show` lists.
+const SCOPE_CHANGES_SHOWN: usize = 20;
+
 pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
     let mut scope: Scope = store.setting(SCOPE_KEY)?;
     match cmd {
-        ScopeCmd::Show => {}
+        ScopeCmd::Show => {
+            let changes = store.recording_changes()?;
+            let mut data = json!(scope);
+            data["recording_changes"] = json!(changes.recent(SCOPE_CHANGES_SHOWN));
+            data["narrowed_by_agent"] = json!(changes.narrowed_by_agent());
+            out.ok(data, || {
+                let mut text = serde_json::to_string_pretty(&scope).unwrap_or_default();
+                for c in changes.narrowed_by_agent() {
+                    text.push_str(&format!("\nnot reviewed: {}", c.describe()));
+                }
+                if let Some(c) = changes.recent(1).first() {
+                    text.push_str(&format!("\nlast change: {}", c.describe()));
+                }
+                text
+            });
+            return Ok(());
+        }
         ScopeCmd::Set { include, exclude, record_out_of_scope } => {
             scope = Scope { include, exclude, record_out_of_scope };
         }
@@ -1879,7 +1908,8 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
         }
     }
     scope.compile()?; // Validate before saving.
-    store.set_setting(SCOPE_KEY, &scope)?;
+                      // Logged with who changed it, against the scope as saved just before (see `save_scope`).
+    store.save_scope(&scope)?;
     out.ok(json!(scope), || serde_json::to_string_pretty(&scope).unwrap_or_default());
     Ok(())
 }

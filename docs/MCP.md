@@ -175,6 +175,12 @@ an agent's changes to proxied traffic are recorded on their own:
   `note_origin` and `tags_origin`.
 - `scan_passive` with `rescan` keeps every finding's state, note and origins, and keeps a
   triaged finding it doesn't find again (with 0 hits), so it can't erase a person's triage.
+- `scope_set`, `scope_add`, `scope_clear` and the `connection_passthrough_*` tools (and
+  `connection_clear`) are logged with who made the change, when, and whether it narrowed what
+  the proxy records. Traffic left out still leaves rows (a request line, or a tunnel's row; see
+  MANUAL.md). A narrowing change through MCP stays in `scope_show`'s `narrowed_by_agent` and
+  `proxy_status`'s `recording_narrowed_by_agent` until a person changes that setting or the
+  agent puts it back as it was, and the app shows "Recording narrowed by an agent" meanwhile.
 
 Reports name an agent's confirmations ("confirmed via MCP (an agent)") and list the findings
 an agent marked false positive, which the default state filter leaves out.

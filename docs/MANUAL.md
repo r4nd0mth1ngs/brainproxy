@@ -159,7 +159,9 @@ a new engagement.
 
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
 recorded and intercepted. It is empty by default, which means everything the engagement
-allows.
+allows. Traffic outside it still goes out and leaves a row in history, with only its request
+line (see [What is recorded when a request doesn't finish](#what-is-recorded-when-a-request-doesnt-finish)),
+and each change to it says who made it (see [Who recorded what](#who-recorded-what)).
 
 **Data folder.** The interception certificate (CA), downloaded rule data, and Nuclei
 templates live once per user (`~/.local/share/brainproxy`, on Windows
@@ -247,7 +249,12 @@ The sidebar groups the tools by what you are doing.
   send it to Replay. A definition read from a URL shows there too, as its fetch: each fetch (the
   preview's and the import's) keeps the response's head only, not the document. One import runs at a time. The guided API scan's first step links here too.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
-  the proxy scope.
+  the proxy scope. Below it, the latest changes to the proxy scope and the TLS pass-through
+  list, with who made each and whether it narrowed recording. While an agent's narrowing
+  change hasn't been changed by a person since, the tab says so, and so does a **Recording
+  narrowed by an agent** pill in the top bar, which opens this tab. Saving the scope yourself
+  (or changing the pass-through list), even unchanged, clears it, and so does **Keep as it
+  is**, which keeps what the agent changed.
 
 ### Proxy
 - **Intercept:** turn it on to hold requests (and optionally responses) before they are
@@ -839,7 +846,8 @@ byte, side by side or unified.
     out without the certificate.
   - *TLS pass-through:* hosts whose TLS the proxy tunnels without decrypting (certificate
     pinning, traffic you mustn't see). Still scope-checked; each connection is recorded as a
-    `CONNECT` entry with the byte counts and no content.
+    `CONNECT` entry with the byte counts and no content. Each change to the list is logged
+    with who made it (Site map › Scope lists them).
   - *Check a target:* the address and where it came from, the proxy, certificate, and
     platform auth a request to it would use (`connection route`).
   - Passwords are never stored: give the variable's name, and set it where the command or
@@ -962,6 +970,33 @@ row names the intercept in `edited_by`. A response edited at intercept, or chang
 response rule, is recorded in history as the server sent it; the intercept row has the
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
 enabled it.
+
+Narrowing the proxy scope or adding a TLS pass-through host keeps traffic's content out of
+history (only request lines and tunnels' rows remain), so each change to either is logged:
+`scope set`, `scope add` and `scope clear`, and `connection passthrough add|remove|clear` and
+`connection clear`. A change has `time`, `by` (`gui`, `cli` or `mcp`), `setting` (`scope` or
+`passthrough`), `summary` (`include: added ^a\.test$`), `before` and `after`, and `narrowed`:
+whether it left traffic out that was recorded in full before. That is an include list that
+went from empty (everything) to some hosts or lost a pattern (patterns are compared exactly,
+as the regexes they are), a new exclude pattern, or `--record-out-of-scope` turned off while
+something is out of scope, or a new pass-through pattern. `--record-out-of-scope` doesn't make
+a smaller scope harmless: HTTPS to a host outside it is tunnelled, never decrypted. The
+setting and its log entry are saved in one transaction, so a change by another process
+can't slip between them unlogged. `scope show` lists the latest 20
+(`recording_changes`, newest first); `proxy status` has the last one
+(`recording_last_change`). A narrowing change made through MCP is also listed in
+`narrowed_by_agent` (`scope show`) and `recording_narrowed_by_agent` (`proxy status`, whose
+text says `not reviewed: recording scope changed via MCP (an agent) at ...`) until a person
+changes that setting from the app or a terminal (saving it unchanged with a command that edits
+it counts: `scope add` with nothing to add, say), or the agent puts it back as it was; the
+agent's later changes don't clear it, nor does another connection command saving the settings
+the pass-through list is kept with. The log keeps the last 100
+changes, as JSON in the `meta` table (`proxy.recording_changes`).
+
+```sh
+brainproxy scope show                        # recording_changes, narrowed_by_agent
+brainproxy proxy status                      # recording_last_change, recording_narrowed_by_agent
+```
 
 Findings have an `origin` too (who added them: the proxy's passive scan, a scan job,
 `findings add`, ...), and `state_origin` and `state_changed_at` say who last changed the state
@@ -1426,6 +1461,18 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   same way. Find these rows with `SELECT * FROM history WHERE error LIKE 'not stored%'`.
   `ws send --no-store` records the handshake that way and nothing of the connection or its
   messages.
+- The proxy forwards traffic outside its proxy (recording) scope and keeps it the same way,
+  unless out-of-scope traffic is recorded too (`scope set --record-out-of-scope`): a row with
+  only the request line, `error` starting `outside the recording scope: content omitted`,
+  then as for `--no-store`. A WebSocket upgrade gets that row and nothing of its messages. An
+  HTTPS tunnel (`CONNECT`) outside the scope is never decrypted and gets one `CONNECT` row
+  for the tunnel with the byte counts, `error` starting `outside the recording scope:
+  tunnelled, not decrypted`, as a TLS pass-through connection gets one starting `TLS
+  pass-through, not decrypted`. A tunnel still open when the proxy stops is recorded then,
+  its `error` ending `still open when the proxy stopped` (stopping doesn't wait for it).
+  Narrowing the scope hides what went out, never that it did. A
+  request outside both scopes is refused by the engagement before it goes out and gets no
+  row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.
 
 ### Comparing findings and failing a build (`findings compare`)
 
@@ -1608,7 +1655,10 @@ origin `mcp`, including what a proxy or job it started records; see
 [Who recorded what](#who-recorded-what).
 
 A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
-and `fuzz run --store none` or `--store matches` are refused. `browser open` isn't offered (the
+and `fuzz run --store none` or `--store matches` are refused. An agent can change the proxy
+scope and the TLS pass-through list, but traffic left out still leaves rows, and a change
+that narrows recording is flagged until a person changes that setting (see [Who recorded
+what](#who-recorded-what)). `browser open` isn't offered (the
 project's browser profile keeps the person's sign-ins), and other options that need a person are
 refused too; docs/MCP.md lists them.
 

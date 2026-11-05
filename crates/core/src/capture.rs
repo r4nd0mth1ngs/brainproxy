@@ -65,6 +65,8 @@ impl Capture {
         // with `/` and may carry URLs in the query: `/fetch?url=http://x/y`).
         let path_and_query = match req_target.find("://").filter(|_| !req_target.starts_with('/')) {
             Some(i) => req_target[i + 3..].find('/').map(|j| req_target[i + 3 + j..].to_string()).unwrap_or("/".into()),
+            // A CONNECT's authority-form target (`host:port`) names the origin, no path under it.
+            None if method.eq_ignore_ascii_case("CONNECT") => String::new(),
             None => req_target.clone(),
         };
         let (path, query) = match path_and_query.split_once('?') {
