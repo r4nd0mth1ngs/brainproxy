@@ -409,6 +409,70 @@ fn a_body_cut_short_ends_the_connection() {
     assert_eq!(env.count("SELECT COUNT(*) FROM history"), 1);
 }
 
+/// The rows the proxy has written, waiting up to 5 s for there to be `n`.
+fn wait_rows(env: &Env, n: i64, sql: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count("SELECT count(*) FROM history") < n && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    env.ok(&["query", sql])["rows"].clone()
+}
+
+/// A WebSocket upgrade outside the recording scope still goes through, and leaves a row with
+/// only its request line.
+#[test]
+fn a_websocket_upgrade_outside_the_recording_scope_leaves_a_row() {
+    let env = Env::new("ws-oos");
+    let http_port = spawn_echo(false, &env.dir);
+    env.ok(&["scope", "set", "--include", r"^example\.test$"]);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut s = tokio::net::TcpStream::connect(&listen).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{http_port}/ws?token=secret HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\
+             Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let resp = WireReader::new().read_response(&mut s, "GET").await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 101"));
+        s.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf, b"ping");
+    });
+    let rows = wait_rows(&env, 1, "SELECT method, path, status, error, CAST(request AS TEXT) FROM history");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!((rows[0][0].as_str(), rows[0][1].as_str()), (Some("GET"), Some("/ws")), "{rows}");
+    assert!(rows[0][2].is_null(), "{rows}");
+    let error = rows[0][3].as_str().unwrap();
+    assert!(error.starts_with("outside the recording scope: content omitted; query string omitted"), "{rows}");
+    assert_eq!(rows[0][4], "GET /ws HTTP/1.1\r\n\r\n");
+    assert!(!rows.to_string().contains("secret"), "{rows}");
+}
+
+/// A request outside the recording scope whose upstream fails leaves a row saying so.
+#[test]
+fn an_upstream_failure_outside_the_recording_scope_leaves_a_row() {
+    let env = Env::new("fail-oos");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    env.ok(&["scope", "set", "--include", r"^example\.test$"]);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let proxy = format!("http://{}", started["listen"].as_str().unwrap());
+    let (status, _) = curl(&proxy, &env.ca(), &format!("http://127.0.0.1:{port}/down"), &[]);
+    assert!(status >= 500, "{status}");
+    let rows = wait_rows(&env, 1, "SELECT method, url, status, error FROM history");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(rows[0][1], format!("http://127.0.0.1:{port}/down"));
+    assert!(rows[0][2].is_null(), "{rows}");
+    let error = rows[0][3].as_str().unwrap();
+    assert!(error.starts_with("outside the recording scope: content omitted; "), "{rows}");
+    assert!(!error.contains("response status"), "{rows}");
+}
+
 #[test]
 fn proxy_websocket_upgrade_and_intercept_timeout() {
     let env = Env::new("ws");
