@@ -35,7 +35,7 @@ pub fn introspection_body() -> Vec<u8> {
 /// [`documents`]), or an operation that can't be shown to be read-only: one sent without its
 /// document (a persisted query's hash, a `doc_id`, an `id` with `operationName` or
 /// `variables`), or a body at a GraphQL-looking request that couldn't be decoded. A scan and
-/// `authz run` treat it like PUT or DELETE, whatever its method and wherever it was recorded.
+/// `authz run` treat it like PUT or DELETE, on top of its method, wherever it was recorded.
 pub fn is_mutation_request(request: &[u8]) -> bool {
     let read = read(request);
     read.unproven || read.documents.iter().any(|d| defines_mutation(d))
@@ -79,7 +79,11 @@ fn read(request: &[u8]) -> Read {
             || !out.documents.is_empty();
         return out;
     };
-    if typed(&|t| t.contains("application/graphql")) {
+    // Exactly application/graphql: application/graphql+json and the like are JSON. A body that
+    // parses as JSON is read as JSON either way, so a mutation's `query` string isn't skipped
+    // as a string literal of a raw document.
+    let raw = typed(&|t| t.split(';').next().unwrap_or("").trim() == "application/graphql");
+    if raw && serde_json::from_slice::<Value>(&body).is_err() {
         out.documents.push(String::from_utf8_lossy(&body).into_owned());
     } else if typed(&|t| t.starts_with("multipart/form-data")) {
         // A file upload (the GraphQL multipart request spec): the operation is in `operations`.
@@ -825,6 +829,13 @@ mod tests {
             assert!(!defines_mutation(doc), "{doc}");
         }
         let req = |head: &str, body: &str| format!("{head}\r\nHost: g.test\r\n\r\n{body}").into_bytes();
+        // application/graphql+json is JSON, not a raw document whose strings are skipped.
+        let plus = "POST /graphql HTTP/1.1\r\nContent-Type: application/graphql+json";
+        assert!(is_mutation_request(&req(plus, r#"{"query": "mutation { a }"}"#)));
+        let raw = "POST /graphql HTTP/1.1\r\nContent-Type: application/graphql; charset=utf-8";
+        assert!(is_mutation_request(&req(raw, "mutation { a }")));
+        assert!(is_mutation_request(&req(raw, r#"{"query": "mutation { a }"}"#)));
+        assert!(!is_mutation_request(&req(raw, "{ a }")));
         let m = r#"{"query": "mutation deleteUser { deleteUser(id: 1) }"}"#;
         assert!(is_mutation_request(&req("POST /graphql HTTP/1.1\r\nContent-Type: application/json", m)));
         assert!(is_mutation_request(&req("POST /graphql HTTP/1.1", &format!("[{m}]"))));

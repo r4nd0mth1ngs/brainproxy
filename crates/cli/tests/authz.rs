@@ -451,11 +451,15 @@ fn a_graphql_mutation_is_opted_in_to_as_mutation() {
     let r = ok(&p, &["authz", "run", "--as", "bob", "--include-methods", "POST,MUTATION"]);
     assert_eq!(r["requests"], 2, "{r}");
 
-    // Named, it needs MUTATION, not its method.
+    // Named, it needs MUTATION as well as its method: neither stands for the other.
     let (code, v) = run(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "POST"]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods MUTATION"), "{v}");
-    let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "mutation"]);
+    let (code, v) =
+        run(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "mutation"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--include-methods POST"), "{v}");
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &mutation, "--include-methods", "post,mutation"]);
     assert_eq!(r["requests"], 1, "{r}");
 
     // So does a mutation named by URL, sent as GET.

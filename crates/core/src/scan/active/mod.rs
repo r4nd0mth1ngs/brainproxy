@@ -399,12 +399,8 @@ impl Cx {
             return Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms));
         }
         // As for the targets the ported rules attack.
-        let opt_in = crate::apiimport::api::opt_in(req.as_bytes());
-        let all = self.shared.check_methods.iter().any(|m| m == "ALL");
-        if !(all
-            || crate::apiimport::api::DEFAULT_METHODS.contains(&opt_in.as_str())
-            || self.shared.check_methods.contains(&opt_in))
-        {
+        use crate::apiimport::api::{missing_opt_in, DEFAULT_METHODS};
+        if let Some(opt_in) = missing_opt_in(req.as_bytes(), DEFAULT_METHODS, &self.shared.check_methods) {
             self.shared.check_skipped_methods.fetch_add(1, Ordering::Relaxed);
             return Err(Error::InvalidInput(format!(
                 "a check's {opt_in} request isn't sent without --include-methods {opt_in}"

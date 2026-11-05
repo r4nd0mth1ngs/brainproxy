@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brainproxy_core::apiimport::{api, graphql};
+use brainproxy_core::apiimport::api;
 use brainproxy_core::auth::{AuthProfile, AuthSession};
 use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS, DEFAULT_EXCLUDE, SAFE_METHODS};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
@@ -30,7 +30,7 @@ pub enum AuthzCmd {
         identity's own data), inconclusive (nothing to compare: an empty body, or HEAD or OPTIONS). Bypasses of medium or high confidence are also findings (source authz). The \
         owner is found from the auth placeholders or session values in the request; --owner sets it. Only \
         GET, HEAD and OPTIONS requests that carry credentials are picked from history unless \
-        --include-methods or --history-id says otherwise; a GraphQL mutation is MUTATION, whatever its method.")]
+        --include-methods or --history-id says otherwise; a GraphQL mutation needs MUTATION as well as its method.")]
     Run(Box<RunArgs>),
     /// Result rows of a run: one per request and identity.
     Results {
@@ -340,18 +340,12 @@ fn select(
     exclude: &regex::Regex,
     guard: &brainproxy_core::guard::Guard,
 ) -> Result<(Vec<AuthzTarget>, Value), Error> {
-    let all_methods = args.include_methods.iter().any(|m| m.eq_ignore_ascii_case("all"));
-    // Opted in to as a history row's method is: a GraphQL mutation in the URL is a MUTATION.
-    let opted_in = |method: &str| {
-        all_methods
-            || SAFE_METHODS.contains(&method)
-            || args.include_methods.iter().any(|m| m.eq_ignore_ascii_case(method))
-    };
+    // Its method, and MUTATION too for a GraphQL mutation, as in a scan.
+    let missing = |request: &[u8]| api::missing_opt_in(request, SAFE_METHODS, &args.include_methods);
     let mut targets = Vec::new();
     for u in &args.urls {
         let (req, target) = RawRequest::build("GET", u, &[], b"")?;
-        let method = api::opt_in(req.as_bytes());
-        if !opted_in(&method) {
+        if let Some(method) = missing(req.as_bytes()) {
             return Err(Error::InvalidInput(format!(
                 "--url {u} is a {method} request, and replaying it as each identity can change or delete data; \
                  add --include-methods {method} to test it"
@@ -388,15 +382,10 @@ fn select(
             out_of_scope += 1;
             continue;
         }
-        // A GraphQL mutation travels as POST (or GET) but is opted in to as MUTATION, as in a scan.
-        let method = match graphql::is_mutation_request(&item.request) {
-            true => api::MUTATION.to_string(),
-            false => item.entry.method.to_ascii_uppercase(),
-        };
         let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
         // Naming a request isn't consent to replay what it changes, or to log every identity out:
         // a named one that would be skipped is refused before anything is sent.
-        if !opted_in(&method) {
+        if let Some(method) = missing(&item.request) {
             if explicit {
                 return Err(Error::InvalidInput(format!(
                     "--history-id {id} is a {method} request, and replaying it as each identity can change or \

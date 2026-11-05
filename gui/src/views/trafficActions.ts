@@ -102,6 +102,16 @@ function readForm(params: string, out: GraphqlRead) {
   if (Object.keys(op).length) readOperation(op, out);
 }
 
+/** Whether the text parses as JSON. */
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The body without its chunked framing, or null when the framing is broken. */
 function dechunk(body: string): string | null {
   let [out, at] = ["", 0];
@@ -148,7 +158,9 @@ function readGraphql(raw: string): GraphqlRead {
     return out;
   }
   body = dechunked;
-  if (types.some((t) => t.includes("application/graphql"))) {
+  // Exactly application/graphql (application/graphql+json is JSON), and only when it isn't JSON.
+  const rawDocument = types.some((t) => t.split(";")[0].trim() === "application/graphql");
+  if (rawDocument && !isJson(body)) {
     out.documents.push(body);
   } else if (types.some((t) => t.startsWith("multipart/form-data"))) {
     // A file upload (the GraphQL multipart request spec): the operation is in `operations`.
@@ -237,12 +249,13 @@ export interface ScanDefaults {
 
 /**
  * What `scan active --history-id` needs opted in to attack the picks: MUTATION for a GraphQL
- * mutation, whatever its method, and each other method besides GET, HEAD, OPTIONS and POST (which
- * it attacks by default). Empty when none needs it.
+ * mutation, and each method besides GET, HEAD, OPTIONS and POST (which it attacks by default), a
+ * mutation's too. Empty when none needs it.
  */
 export function scanOptIns(picks: HistoryPick[]): string[] {
   const mutation = picks.some((p) => p.mutation) ? ["MUTATION"] : [];
-  return [...mutation, ...unsafeMethods(picks.filter((p) => !p.mutation)).filter((m) => m !== "POST")];
+  // A mutation's own method too: the CLI needs both (a DELETE naming a persisted query).
+  return [...mutation, ...unsafeMethods(picks).filter((m) => m !== "POST")];
 }
 
 /**

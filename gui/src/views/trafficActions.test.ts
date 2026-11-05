@@ -237,6 +237,10 @@ test("a GraphQL document defines a mutation when a top-level definition starts w
 test("a GraphQL mutation is named as one in both questions, whatever its method", () => {
   assert.ok(isMutationRequest(graphqlPost('{"query":"mutation { delete(id: 1) }"}')));
   assert.ok(!isMutationRequest(graphqlPost('{"query":"{ me { id } }"}')));
+  // application/graphql+json is JSON; application/graphql that parses as JSON is read as JSON.
+  assert.ok(isMutationRequest(graphqlPost('{"query":"mutation { a }"}', "application/graphql+json")));
+  assert.ok(isMutationRequest(graphqlPost('{"query":"mutation { a }"}', "application/graphql")));
+  assert.ok(isMutationRequest(graphqlPost("mutation { a }", "application/graphql; charset=utf-8")));
   // Cut short, the JSON no longer parses: the word is enough to ask.
   const cut = graphqlPost('{"query":"mutation Upload($f: String) { upload(f: $f) }","variables":{"f":"AAAA');
   assert.ok(!isMutationRequest(cut));
@@ -307,8 +311,8 @@ test("a scan opts in to what can change data only once the user said yes", () =>
     "--check-severity=high",
     "--background",
   ]);
-  // A mutation is opted in to as MUTATION whatever its method, as the scanner decides.
-  assert.deepEqual(scanOptIns([{ ...mutation, method: "PUT" }]), ["MUTATION"]);
+  // A mutation needs MUTATION as well as its method, when that isn't attacked anyway, as the scanner decides.
+  assert.deepEqual(scanOptIns([{ ...mutation, method: "PUT" }]), ["MUTATION", "PUT"]);
   assert.deepEqual(scanOptIns([{ ...mutation, method: "GET" }]), ["MUTATION"]);
   // Not known to be a mutation (history show failed): the method alone, and the scanner refuses a mutation.
   assert.deepEqual(scanOptIns([{ ...mutation, mutation: undefined }]), []);

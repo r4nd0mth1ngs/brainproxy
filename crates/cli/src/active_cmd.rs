@@ -857,12 +857,8 @@ fn select_targets(
         // DELETE, wherever it was recorded (an `import api` someone opted in to once, the proxy).
         // So is an operation that can't be shown to be read-only (a persisted query's hash).
         let documents = graphql::documents(&t.request);
-        let opt_in = if graphql::is_mutation_request(&t.request) { api::MUTATION.to_string() } else { method.clone() };
-        if !(all_methods
-            || (explicit && args.preapproved)
-            || DEFAULT_METHODS.contains(&opt_in.as_str())
-            || args.include_methods.contains(&opt_in))
-        {
+        let missing = api::missing_opt_in(&t.request, DEFAULT_METHODS, &args.include_methods);
+        if let Some(opt_in) = missing.filter(|_| !all_methods && !(explicit && args.preapproved)) {
             // Naming a request isn't consent to attack what it changes: say so before anything is sent.
             if let Some(id) = t.history_id.filter(|_| explicit) {
                 return Err(Error::InvalidInput(format!(

@@ -35,14 +35,20 @@ const ACCEPTED: &str = "accepted formats: OpenAPI 3.x, Swagger 2.0, and Postman 
 /// What `--include-methods` calls GraphQL mutations, which all travel as POST.
 pub const MUTATION: &str = "MUTATION";
 
-/// What a recorded request is opted in to as by `--include-methods`: its method, or MUTATION
-/// for a GraphQL mutation, whatever its method (a scan's check, `authz run`, the proxy's
-/// live authz testing).
-pub fn opt_in(request: &[u8]) -> String {
-    if super::graphql::is_mutation_request(request) {
-        return MUTATION.to_string();
+/// What a recorded request needs opting in to with `--include-methods`, unless sent by
+/// default (`free`): its method, and MUTATION too for a GraphQL mutation, or an operation
+/// that can't be shown read-only. Both count: a DELETE that looks like a persisted query
+/// needs DELETE as well as MUTATION. None when `included` has them all, or ALL (a scan's
+/// check, a scan's or `authz run`'s named request).
+pub fn missing_opt_in(request: &[u8], free: &[&str], included: &[String]) -> Option<String> {
+    if included.iter().any(|m| m.eq_ignore_ascii_case("ALL")) {
+        return None;
     }
-    RawRequest::from_bytes(request.to_vec()).head().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default()
+    let method =
+        RawRequest::from_bytes(request.to_vec()).head().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default();
+    let mutation = super::graphql::is_mutation_request(request).then(|| MUTATION.to_string());
+    let given = |m: &str| free.contains(&m) || included.iter().any(|i| i.eq_ignore_ascii_case(m));
+    [Some(method), mutation].into_iter().flatten().find(|m| !given(m))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -1127,6 +1133,21 @@ fn replace_parts(text: &str, with: &mut Replace<'_>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_request_needs_its_method_and_mutation_opted_in() {
+        let given = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let delete = b"DELETE /api/shares?documentId=42 HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert_eq!(missing_opt_in(delete, DEFAULT_METHODS, &given(&["MUTATION"])).as_deref(), Some("DELETE"));
+        assert_eq!(missing_opt_in(delete, DEFAULT_METHODS, &given(&["delete"])).as_deref(), Some("MUTATION"));
+        assert_eq!(missing_opt_in(delete, DEFAULT_METHODS, &given(&["DELETE", "MUTATION"])), None);
+        assert_eq!(missing_opt_in(delete, DEFAULT_METHODS, &given(&["all"])), None);
+        let mutation = b"POST /graphql HTTP/1.1\r\nHost: a.test\r\n\r\n{\"query\":\"mutation { a }\"}";
+        assert_eq!(missing_opt_in(mutation, DEFAULT_METHODS, &[]).as_deref(), Some("MUTATION"));
+        assert_eq!(missing_opt_in(mutation, crate::authz::SAFE_METHODS, &[]).as_deref(), Some("POST"));
+        let get = b"GET /items HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert_eq!(missing_opt_in(get, crate::authz::SAFE_METHODS, &[]), None);
+    }
 
     fn opts() -> Options {
         Options::default()

@@ -276,7 +276,7 @@ and the questions asked before a scan or before Access replays a POST, a GraphQL
 document counts as one, and so does a compressed body at a GraphQL endpoint, which the view
 doesn't decode) or a logout-like path (authz's
 default `--exclude`), are built in `views/trafficActions.ts`. So are the opt-ins the CLI refuses
-a named request without (`scanOptIns`: `--include-methods` with MUTATION or the method;
+a named request without (`scanOptIns`: `--include-methods` with MUTATION and the method, when the scan doesn't attack it by default;
 `authzOptIns`: the same, though POST too, a mutation's method as well as MUTATION (a truncated
 request is only guessed to be one), and `--exclude=^$` for a logout): `scanArgs` and `runArgs` add them
 only when told the question was answered yes. The Site map's *Active scan this request* asks
