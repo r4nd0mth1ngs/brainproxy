@@ -197,7 +197,8 @@ fn vulnerable<'a>(lib: &'a Library, version: &str, evidence: &str) -> Option<Hit
         };
         if affected {
             let risk = match v.severity.as_deref().map(str::to_ascii_lowercase).as_deref() {
-                Some("critical" | "high") => Risk::High,
+                Some("critical") => Risk::Critical,
+                Some("high") => Risk::High,
                 Some("low") => Risk::Low,
                 _ => Risk::Medium,
             };

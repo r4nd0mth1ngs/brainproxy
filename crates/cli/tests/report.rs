@@ -83,6 +83,13 @@ fn report_formats_filters_and_files() {
     assert_eq!(inst["request"]["method"], "GET");
     assert_eq!(inst["response"]["status"], 200);
     assert!(inst["response"]["body"]["text"].as_str().unwrap().contains("<script>"));
+    // Redacted by default: the session cookie's value is masked; --no-redact says it isn't.
+    assert!(r["summary"]["redacted"].as_u64().unwrap() > 0);
+    let set_cookie = inst["response"]["headers"].as_array().unwrap().iter().find(|h| h[0] == "Set-Cookie").unwrap();
+    assert_eq!(set_cookie[1], "sid=[redacted]; Path=/");
+    let (code, v) = run(&["report", "--no-redact", "--no-evidence"], &project);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["data"]["summary"]["redacted"].is_null());
 
     // Files for every format.
     for (kind, file) in [("json", "r.json"), ("markdown", "r.md"), ("html", "r.html"), ("sarif", "r.sarif")] {

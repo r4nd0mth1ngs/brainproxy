@@ -909,7 +909,7 @@ interface Rule {
 }
 
 const SOURCES = ["proxy", "send", "crawl", "crawl-browser", "fuzz", "scan", "import", "auth", "race"];
-const RISK_RANK: Record<Risk, number> = { info: 0, low: 1, medium: 2, high: 3 };
+const RISK_RANK: Record<Risk, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 
 function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<number>) => void }) {
   const app = useApp();

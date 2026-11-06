@@ -167,7 +167,7 @@ export interface HistoryEntry {
   entry: HistoryItem;
 }
 
-export type Risk = "high" | "medium" | "low" | "info";
+export type Risk = "critical" | "high" | "medium" | "low" | "info";
 
 export interface FindingGroup {
   alert_ref: string;
@@ -196,6 +196,31 @@ export interface FindingItem {
   source: string;
   /** Who added it: gui, cli or mcp (an agent); null for findings from before schema v13. */
   origin?: string | null;
+  /** The issue (root cause: alert type and host) it is an instance of. */
+  issue_id?: number | null;
+}
+
+/** One change on a finding's timeline (`findings timeline`). */
+export interface FindingEvent {
+  id: number;
+  time: string;
+  kind: string;
+  old: string | null;
+  new: string | null;
+  text: string | null;
+  /** Who, in words: "via MCP (an agent)", "in the desktop app", ... */
+  by: string;
+  history_id: number | null;
+}
+
+/** `findings posture`. */
+export interface Posture {
+  open: { issues: Record<Risk, number>; instances: Record<Risk, number> };
+  by_state: Record<string, number>;
+  hosts: { host: string; risk: Risk; open: number }[];
+  scans: { job: number; started: string | null; finished: string | null; new: number; still: number; gone: number }[];
+  retests: Record<string, number>;
+  regressed: number;
 }
 
 export interface Finding extends FindingItem {
@@ -209,6 +234,9 @@ export interface Finding extends FindingItem {
   refs?: string[];
   tags: string[];
   note: string | null;
+  /** Who last set the note (gui, cli or mcp) and when; null if never set. */
+  note_origin?: string | null;
+  note_changed_at?: string | null;
   /** A finding added by hand: every history entry it links to. */
   history_ids?: number[];
 }
