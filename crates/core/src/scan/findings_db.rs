@@ -110,6 +110,18 @@ pub const STATES: &[&str] = &["open", "confirmed", "false_positive", "fixed", "a
 /// Sets a finding's state and/or note and who set them, and puts each change on its
 /// timeline. An empty note clears it.
 pub(crate) fn mark_one(conn: &rusqlite::Connection, id: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
+    mark_with(conn, id, state, note, None)
+}
+
+/// [`mark_one`], with what caused a state change (its text and request) on its event: a
+/// retest's outcome stays with the fix it made.
+pub(crate) fn mark_with(
+    conn: &rusqlite::Connection,
+    id: i64,
+    state: Option<&str>,
+    note: Option<&str>,
+    cause: Option<(&str, Option<i64>)>,
+) -> Result<()> {
     if let Some(s) = state.filter(|s| !STATES.contains(s)) {
         return Err(Error::InvalidInput(format!("unknown state {s:?}: one of {}", STATES.join(", "))));
     }
@@ -137,19 +149,19 @@ pub(crate) fn mark_one(conn: &rusqlite::Connection, id: i64, state: Option<&str>
         });
     }
     let (old_state, old_note) = before.unwrap_or_default();
-    let event = |kind, old: Option<&str>, new: Option<&str>, text: Option<&str>| {
+    let event = |kind, old: Option<&str>, new: Option<&str>, text: Option<&str>, history_id: Option<i64>| {
         crate::scan::issues::record(
             conn,
-            &crate::scan::issues::Event { finding: Some(id), kind, old, new, text, ..Default::default() },
+            &crate::scan::issues::Event { finding: Some(id), kind, old, new, text, history_id, ..Default::default() },
         )
     };
     if let Some(s) = state.filter(|s| *s != old_state) {
-        event("state", Some(&old_state), Some(s), None)?;
+        event("state", Some(&old_state), Some(s), cause.map(|c| c.0), cause.and_then(|c| c.1))?;
     }
     if let Some(n) = note.map(str::trim).map(|n| Some(n).filter(|n| !n.is_empty())) {
         // Compared as the note is shown: a note re-saved with other spacing isn't a change.
         if n != old_note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            event("note", old_note.as_deref(), None, n)?;
+            event("note", old_note.as_deref(), None, n, None)?;
         }
     }
     Ok(())

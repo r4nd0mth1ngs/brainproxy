@@ -204,11 +204,12 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
 5. **Review.** **Findings** groups issues by type and risk. Each one shows a description,
    evidence, the solution, references, and the request and response. Mark false positives
    and confirmed issues; send a request to **Replay** to verify it by hand.
-6. **Report.** **Findings › Report…** saves a readable HTML report, leaving out false
-   positives: a summary in plain words, what to fix first, then each issue with what it
-   means, how to fix it, and where it was found, with the technical evidence folded away.
-   Print it from a browser to make a PDF. On the command line: `brainproxy report html -o
-   report.html` (also `markdown`, `json`, `sarif`). Every format masks session secrets
+6. **Report.** **Findings › Report…** builds a report with a live preview, leaving out
+   false positives, accepted risks and fixed findings: a summary in plain words, what to fix
+   first, then each issue with what it means, how to fix it, and where it was found, with
+   the technical evidence folded away. Pick who it is for (see [Report layouts](#report-layouts)),
+   your branding and the format: HTML, PDF, Word (DOCX) or Markdown. On the command line:
+   `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`, `pdf`, `docx`). Every format masks session secrets
    (cookie values, `Authorization` credentials, API-key headers, token and password
    parameters in URLs, forms, multipart and JSON bodies, hidden form fields, JWTs, and every
    password, token, cookie and key the project's auth profiles hold) as `[redacted]`,
@@ -676,8 +677,10 @@ Access control across users: does the app let bob read alice's data? See
   passive findings (headers, cookies) count only when the scan crawled. Findings added by
   hand are left out: no scan looks for them. The command line
   has the same comparison: [`findings compare`](#comparing-findings-and-failing-a-build-findings-compare).
-- **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
-  and shows it in Finder or Explorer.
+- **Report…:** the report builder: a saved layout to start from, who it is for, its
+  sections, a title, your company, colour and logo, and the format, with a preview of the
+  HTML beside them. *Save layout* keeps the choices as a report profile; *Save report…*
+  writes the file and shows it in Finder or Explorer.
 
 ### Callbacks
 Out-of-band testing for blind vulnerabilities (SSRF, XXE, blind command injection,
@@ -1618,6 +1621,52 @@ vulnerable JavaScript libraries rated critical are critical; SARIF gives critica
 `security-severity` of 9.5. A finding found again at a higher risk than it was stored with
 moves up (never down), so `scan passive --rescan` brings findings recorded as high by older
 builds up to critical.
+
+### Report layouts
+
+One project gives a report for each reader. `report --preset` picks the sections:
+
+| Preset | For | Sections |
+|---|---|---|
+| `technical` (default) | testers, security teams | summary, fixfirst, list, issues, evidence, about |
+| `executive` | management | summary, fixfirst, posture, list, about |
+| `developer` | the people fixing it | list, issues, evidence, reproduce |
+| `retest` | a retest letter | retest, about |
+
+`--sections a,b,c` names them instead: `summary` (at a glance), `fixfirst` (the ten most
+serious, with their fixes), `posture` (open issues by risk, what recent scans found new and
+no longer found, retests), `list` (the table of issues), `issues` (a section per issue),
+`evidence` (each finding's details, request and response), `reproduce` (a curl command per
+finding, with masked secrets still masked), `retest` (fixed, still there, back after a fix
+and awaiting a retest since `--since DAY`, default the last 30 days, each with the retest
+request as proof), `about`. `evidence` and `reproduce` sit in the issue sections, so
+either brings `issues` with it. The curl lines send the request as recorded
+(`--globoff --path-as-is`, the recorded `Host`), masked secrets still masked.
+
+Branding: `--company NAME` on the cover, `--accent #rrggbb` for the cover and headings,
+`--logo FILE` (PNG, JPEG, GIF or WebP, at most 256 KiB, embedded; SVG is refused because it
+can carry script). Through MCP `--logo` reads no file: save the logo in a profile from a
+terminal or the app.
+
+`report-profile save NAME [layout flags]` keeps a layout in the project (`report-profile
+list | show | remove`; `--from PROFILE` saves on top of another, keeping its logo), and
+`report --profile NAME` starts from it; flags given with it override it, and an empty one
+(`--company=`, `--accent=`, `--logo=`, `--since=`) clears what the profile has. The
+retest, posture and list sections keep to the report's filters (`--host`, `--risk`, ...),
+and a note says when the report is cut short by `--limit` whatever its sections.
+
+Formats: `pdf` prints the HTML report in a headless Chromium (the one `browser list` finds;
+nothing is fetched while it prints), and `docx` writes a Word document with the same
+sections as headings, tables and code paragraphs, for consultancies that edit and restyle
+the deliverable. Both need `--output`. The logo goes on the HTML and PDF cover, not in
+the Word document.
+
+CVSS 4.0: `findings issue cvss ISSUE 'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N'`
+rates an issue ("" removes it). The score follows FIRST's method (the macrovector table of
+FIRST's reference calculator), including threat (`E`) and environmental metrics. Reports show
+the score, its severity and the vector on the issue and in the list; JSON and SARIF carry
+them on each finding (`cvss`, SARIF `properties.cvssV4`), and SARIF's `security-severity` is
+the highest score of the alert type when one is rated. CVSS 3.1 vectors are refused.
 
 ### Comparing findings and failing a build (`findings compare`)
 

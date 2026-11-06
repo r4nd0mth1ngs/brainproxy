@@ -193,11 +193,15 @@ enum Cmd {
     #[command(subcommand)]
     Findings(scan_cmd::FindingsCmd),
 
-    /// Generate a report from findings: json, markdown, html (self-contained), or sarif (2.1.0).
+    /// Generate a report from findings: json, markdown, html (self-contained), sarif (2.1.0), pdf or docx.
     #[command(after_help = "Findings are grouped by alert type with description, solution, references, and the \
         request/response from history as evidence. False positives are left out unless --state asks for them. \
         Use --output FILE for large reports; stdout then only gets a summary.")]
     Report(report_cmd::ReportArgs),
+
+    /// Saved report layouts (preset, sections, branding) for `report --profile NAME`.
+    #[command(subcommand, name = "report-profile")]
+    ReportProfile(report_cmd::ProfileCmd),
 
     /// Compare two history entries (Comparer): line, word, or byte diff.
     Diff(fuzz_cmd::DiffArgs),
@@ -506,6 +510,7 @@ fn command_name(cmd: &Cmd) -> String {
         },
         Cmd::Findings(_) => "findings",
         Cmd::Report(_) => "report",
+        Cmd::ReportProfile(_) => "report-profile",
         Cmd::Scope(_) => "scope",
         Cmd::Connection(c) => match c {
             connection_cmd::ConnectionCmd::Show => "connection show",
@@ -572,6 +577,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Authz(cmd) => authz_cmd::authz(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Report(args) => report_cmd::report(&cli.project, args, out)?,
+        Cmd::ReportProfile(cmd) => report_cmd::profile(&cli.project, cmd, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
         Cmd::Connection(cmd) => connection_cmd::connection(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,

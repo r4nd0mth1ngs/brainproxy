@@ -31,9 +31,12 @@ Only use it against systems you are authorized to test.
   (CVE-2026-109618, CVE-2026-109619) has its own built-in check.
 - **Passive checks.** Feed and local checks with `scope: passive` look at the traffic you
   record and send nothing, next to the built-in passive rules.
-- **Reports people can read.** Findings › Report… saves an HTML report with a plain-words
-  summary, what to fix first, and the technical evidence folded away. Session cookies,
-  credentials and tokens are masked, so it can be handed over. It prints cleanly to PDF.
+- **Reports people can read.** Findings › Report… builds a report for its reader, with a
+  live preview: technical, an executive summary with posture and trends, a developer
+  handoff with a curl line per finding, or a retest letter of what changed since a day.
+  Add your company, logo and colour, rate issues with CVSS 4.0, and save it as HTML, PDF,
+  Word or Markdown. Session cookies, credentials and tokens are masked, so it can be handed
+  over; saved layouts keep the choices for next time.
 - **See what a retest fixed.** Compare findings with a scan: new in it, still found, or
   not found again (likely fixed), counting only what that scan actually covered.
 - **WebSockets.** The proxy records every WebSocket connection and message (fragments

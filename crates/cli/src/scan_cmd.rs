@@ -218,6 +218,9 @@ pub enum IssueCmd {
     },
     /// Give an issue a title of its own, shown in place of the alert's name; "" restores it.
     Title { id: i64, title: String },
+    /// Rate an issue with a CVSS 4.0 vector (CVSS:4.0/AV:N/AC:L/...); "" removes it. Reports
+    /// show its score, and SARIF's security-severity is the score.
+    Cvss { id: i64, vector: String },
 }
 
 #[derive(clap::Args)]
@@ -623,6 +626,15 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 let moved = store.issues_merge(into, &from)?;
                 out.ok(json!({"into": into, "from": from, "moved": moved}), || {
                     format!("moved {moved} finding(s) into issue {into}")
+                });
+            }
+            IssueCmd::Cvss { id, vector } => {
+                let score = store.issue_set_cvss(id, &vector)?;
+                let issue = store.issue_get(id).ok();
+                let cvss = issue.map(|i| i["cvss"].clone()).unwrap_or(serde_json::Value::Null);
+                out.ok(json!({"id": id, "cvss": cvss}), || match score {
+                    Some(s) => format!("issue {id}: CVSS 4.0 {s:.1} ({})", brainproxy_core::scan::cvss::severity(s)),
+                    None => format!("issue {id}: no CVSS rating"),
                 });
             }
             IssueCmd::Title { id, title } => {

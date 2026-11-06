@@ -14,7 +14,9 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::guard::ScopeSpec;
 use crate::provenance;
+use crate::scan::cvss;
 use crate::scan::findings_db::{fingerprint, FindingFilter, MANUAL_SOURCE};
+use crate::scan::layout::{Layout, Section};
 use crate::scan::redact::Redactor;
 use crate::store::Store;
 
@@ -54,6 +56,8 @@ pub struct ReportOptions {
     pub baseline: Option<std::collections::HashMap<i64, bool>>,
     /// Mask session secrets (cookies, credentials, tokens) in everything taken from traffic.
     pub redact: bool,
+    /// Which sections the report has, and its branding.
+    pub layout: Layout,
 }
 
 impl Default for ReportOptions {
@@ -67,6 +71,7 @@ impl Default for ReportOptions {
             scan: None,
             baseline: None,
             redact: true,
+            layout: Layout::default(),
         }
     }
 }
@@ -83,6 +88,49 @@ pub struct Report {
     /// Findings an agent marked false positive that the state filter leaves out (at most
     /// [`MAX_AGENT_FALSE_POSITIVES`]), so a reader sees what an agent hid.
     pub agent_false_positives: Vec<HiddenFinding>,
+    /// With a posture section: `findings posture`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub posture: Option<Value>,
+    /// With a retest section: what changed since a day.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retest: Option<RetestLetter>,
+    #[serde(skip)]
+    pub layout: Layout,
+}
+
+/// What changed since a day: findings fixed (by a person or a retest), still there after a
+/// retest, back after a fix, and waiting for a retest.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RetestLetter {
+    pub since: String,
+    pub fixed: Vec<RetestRow>,
+    pub still_present: Vec<RetestRow>,
+    pub regressed: Vec<RetestRow>,
+    pub pending: Vec<RetestRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetestRow {
+    pub id: i64,
+    pub name: String,
+    pub risk: String,
+    pub method: String,
+    pub url: String,
+    pub param: String,
+    pub state: String,
+    /// The event that put it here, and when; None for one only waiting.
+    pub event: Option<String>,
+    pub time: Option<String>,
+    /// The retest's request, or the sighting it came back in.
+    pub history_id: Option<i64>,
+}
+
+/// An issue's CVSS 4.0 rating.
+#[derive(Debug, Clone, Serialize)]
+pub struct CvssRating {
+    pub vector: String,
+    pub score: f64,
+    pub severity: &'static str,
 }
 
 /// A finding left out of the report because it was marked false positive.
@@ -151,6 +199,9 @@ pub struct AlertGroup {
     pub solution: String,
     pub references: Vec<String>,
     pub tags: Vec<String>,
+    /// The highest CVSS 4.0 score among its instances' issues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cvss: Option<CvssRating>,
     pub instances: Vec<Instance>,
 }
 
@@ -205,6 +256,10 @@ pub struct Instance {
     /// parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
     /// matches a saved report by, since redaction may change the URL.
     pub fingerprint: String,
+    /// The issue (alert type and host) it is an instance of, and that issue's CVSS rating.
+    pub issue_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cvss: Option<CvssRating>,
 }
 
 impl Instance {
@@ -316,9 +371,10 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             f.alert_ref, f.rule_id, f.name, f.cwe, f.wasc,
             coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]'),
             f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at,
-            f.last_history_id, h.time
+            f.last_history_id, h.time, f.issue_id, i.cvss_vector, i.cvss_score
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
             LEFT JOIN history h ON h.id = coalesce(f.last_history_id, f.history_id)
+            LEFT JOIN issues i ON i.id = f.issue_id
          ORDER BY f.risk_level DESC, f.alert_ref, f.id LIMIT {}",
         opts.limit
     );
@@ -362,6 +418,11 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             latest: None,
             fingerprint: String::new(),
             baseline_state: None,
+            issue_id: r.get(32)?,
+            cvss: match (r.get::<_, Option<String>>(33)?, r.get::<_, Option<f64>>(34)?) {
+                (Some(vector), Some(score)) => Some(CvssRating { vector, score, severity: cvss::severity(score) }),
+                _ => None,
+            },
         };
         let alert_ref: String = r.get(16)?;
         inst.baseline_state =
@@ -372,6 +433,9 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             Some(g) => {
                 // Each finding added by hand has its own CWE; the type takes the first one given.
                 g.cwe = g.cwe.or(inst.cwe);
+                if inst.cvss.as_ref().is_some_and(|c| g.cvss.as_ref().is_none_or(|h| c.score > h.score)) {
+                    g.cvss = inst.cvss.clone();
+                }
                 g.instances.push(inst)
             }
             None => {
@@ -387,6 +451,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                     solution: r.get(22)?,
                     references: list(r.get(23)?),
                     tags: list(r.get(24)?),
+                    cvss: inst.cvss.clone(),
                     instances: vec![inst],
                 })
             }
@@ -477,8 +542,26 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             .collect::<std::result::Result<_, _>>()?;
     }
 
+    // The extra sections cover the same findings as the report: its filters, any state.
+    let scope = FindingFilter { state: Some("all".into()), ..opts.filter.clone() };
+    let posture = if opts.layout.has(Section::Posture) { Some(store.posture_of(Some(&scope))?) } else { None };
+    let mut retest =
+        if opts.layout.has(Section::Retest) { Some(retest_letter(store, &opts.layout, &scope)?) } else { None };
+
     if let Some(red) = redactor.as_mut() {
-        redact_findings(red, &mut groups, &mut agent_false_positives);
+        // Findings the report names outside its list (the retest letter's, those an agent
+        // hid): their exchanges are read only to learn their secrets, so the scrub masks
+        // those wherever the report quotes them.
+        let mut ids: Vec<i64> = agent_false_positives.iter().map(|h| h.id).collect();
+        let mut sightings = Vec::new();
+        if let Some(l) = &retest {
+            for row in [&l.fixed, &l.still_present, &l.regressed, &l.pending].into_iter().flatten() {
+                ids.push(row.id);
+                sightings.extend(row.history_id);
+            }
+        }
+        learn_secrets(store, red, &ids, sightings)?;
+        redact_findings(red, &mut groups, &mut agent_false_positives, retest.as_mut());
     }
 
     let generated: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
@@ -511,12 +594,99 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         },
         alerts: groups,
         agent_false_positives,
+        posture,
+        retest,
+        layout: opts.layout.clone(),
     })
+}
+
+/// The retest section: the latest retest, regression or fix of each finding `scope` selects
+/// since the layout's day (default: the last 30 days), and those waiting for a retest.
+fn retest_letter(store: &Store, layout: &Layout, scope: &FindingFilter) -> Result<RetestLetter> {
+    let (within, mut args) = scope.sql();
+    let conn = &store.conn;
+    let since: String = match &layout.since {
+        Some(d) => d.clone(),
+        None => conn.query_row("SELECT strftime('%Y-%m-%d', 'now', '-30 days')", [], |r| r.get(0))?,
+    };
+    let row = |r: &rusqlite::Row, event: bool| -> rusqlite::Result<RetestRow> {
+        Ok(RetestRow {
+            id: r.get("id")?,
+            name: r.get("name")?,
+            risk: r.get("risk")?,
+            method: r.get("method")?,
+            url: r.get("url")?,
+            param: r.get("param")?,
+            state: r.get("state")?,
+            event: if event { r.get("event")? } else { None },
+            time: if event { r.get("etime")? } else { None },
+            history_id: if event { r.get("ehistory")? } else { None },
+        })
+    };
+    // A fix a retest made carries the retest's outcome and request on its own event.
+    args.push(since.clone());
+    let since_at = args.len();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT f.id, f.name, f.risk, f.method, f.url, f.param, f.state,
+            CASE WHEN e.kind = 'retest' THEN 'retest: ' || replace(e.new, '_', ' ')
+                WHEN e.kind = 'regressed' THEN 'seen again after a fix'
+                ELSE coalesce(e.text, 'marked fixed') END AS event,
+            e.time AS etime, e.history_id AS ehistory, e.kind AS kind, e.new AS outcome
+         FROM finding_events e JOIN findings f ON f.id = e.finding_id
+         WHERE e.id IN (SELECT max(id) FROM finding_events
+                        WHERE time >= ?{since_at}
+                          AND (kind IN ('retest', 'regressed') OR (kind = 'state' AND new = 'fixed'))
+                        GROUP BY finding_id)
+           AND f.state != 'removed' AND f.id IN (SELECT id FROM findings WHERE {within})
+         ORDER BY f.risk_level DESC, e.time"
+    ))?;
+    let mut letter = RetestLetter { since: since.clone(), ..Default::default() };
+    let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
+    while let Some(r) = rows.next()? {
+        let item = row(r, true)?;
+        let kind: String = r.get("kind")?;
+        let outcome: Option<String> = r.get("outcome")?;
+        // A retest that still saw it says so, even of one marked fixed (--no-mark).
+        let still = kind == "retest" && outcome.as_deref() == Some("still_present");
+        if still {
+            letter.still_present.push(item);
+        } else if item.state == "fixed" {
+            letter.fixed.push(item);
+        } else if kind == "regressed" {
+            letter.regressed.push(item);
+        }
+    }
+    drop(rows);
+    args.pop();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, name, risk, method, url, param, state FROM findings
+         WHERE state = 'retest_pending' AND id IN (SELECT id FROM findings WHERE {within})
+         ORDER BY risk_level DESC, id"
+    ))?;
+    letter.pending = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), |r| row(r, false))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(letter)
 }
 
 /// Masks secrets in everything a report quotes from the target. Notes and write-ups are the
 /// tester's own words and are left alone.
-fn redact_findings(red: &mut Redactor, groups: &mut [AlertGroup], hidden: &mut [HiddenFinding]) {
+fn redact_findings(
+    red: &mut Redactor,
+    groups: &mut [AlertGroup],
+    hidden: &mut [HiddenFinding],
+    mut letter: Option<&mut RetestLetter>,
+) {
+    let mut letter_fields = |red: &mut Redactor, pass: fn(&mut Redactor, &mut String)| {
+        if let Some(l) = letter.as_deref_mut() {
+            for list in [&mut l.fixed, &mut l.still_present, &mut l.regressed, &mut l.pending] {
+                for row in list.iter_mut() {
+                    pass(red, &mut row.url);
+                    pass(red, &mut row.param);
+                }
+            }
+        }
+    };
     // First by place, so every secret is known; then each known value wherever it appears.
     for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
         for s in [&mut inst.url, &mut inst.param, &mut inst.evidence, &mut inst.attack, &mut inst.other_info] {
@@ -525,7 +695,9 @@ fn redact_findings(red: &mut Redactor, groups: &mut [AlertGroup], hidden: &mut [
     }
     for h in hidden.iter_mut() {
         red.text(&mut h.url);
+        red.text(&mut h.param);
     }
+    letter_fields(red, Redactor::text);
     for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
         for s in [&mut inst.url, &mut inst.param, &mut inst.evidence, &mut inst.attack, &mut inst.other_info] {
             red.scrub(s);
@@ -539,7 +711,31 @@ fn redact_findings(red: &mut Redactor, groups: &mut [AlertGroup], hidden: &mut [
     }
     for h in hidden.iter_mut() {
         red.scrub(&mut h.url);
+        red.scrub(&mut h.param);
     }
+    letter_fields(red, Redactor::scrub);
+}
+
+/// Reads the first and latest exchanges of findings `ids`, and the history entries
+/// `sightings`, only so the redactor learns the secrets in them.
+fn learn_secrets(store: &Store, red: &mut Redactor, ids: &[i64], sightings: Vec<i64>) -> Result<()> {
+    let mut history: std::collections::BTreeSet<i64> = sightings.into_iter().collect();
+    if !ids.is_empty() {
+        let list = serde_json::to_string(ids).unwrap_or_default();
+        let mut stmt = store.conn.prepare(
+            "SELECT history_id, last_history_id FROM findings WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        for row in stmt.query_map([list], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)))? {
+            let (first, last) = row?;
+            history.extend(first.into_iter().chain(last));
+        }
+    }
+    for h in history {
+        if let Some((mut req, mut resp)) = evidence(store, h, 64 * 1024)? {
+            red.exchange(&mut req, resp.as_mut());
+        }
+    }
+    Ok(())
 }
 
 fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, Option<HttpResponse>)>> {
@@ -575,6 +771,27 @@ fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, O
 }
 
 /// Renders a report in the given format.
+#[path = "report_docx.rs"]
+mod docx;
+
+/// The report as a Word document (DOCX).
+pub fn render_docx(report: &Report) -> Vec<u8> {
+    docx::render(report)
+}
+
+/// The HTML report for printing (PDF): its folded evidence open, and shown in print. Folded
+/// sections are the report's own markup (everything quoted from traffic is escaped), so
+/// opening them by text is safe.
+pub fn render_print_html(report: &Report) -> String {
+    let html = render(report, ReportKind::Html);
+    if !report.layout.has(Section::Evidence) {
+        return html;
+    }
+    html.replace("<details class=\"tech\">", "<details class=\"tech\" open>")
+        .replace("<details><summary>", "<details open><summary>")
+        .replacen("</head>", "<style>@media print{.tech{display:block}}</style></head>", 1)
+}
+
 pub fn render(report: &Report, kind: ReportKind) -> String {
     match kind {
         ReportKind::Json => serde_json::to_string_pretty(report).unwrap_or_default() + "\n",
@@ -803,7 +1020,11 @@ fn md_name(g: &AlertGroup) -> String {
 
 fn markdown(r: &Report) -> String {
     let mut s = String::new();
+    let layout = &r.layout;
     let _ = writeln!(s, "# {}\n", md_text(&r.title));
+    if let Some(c) = &layout.company {
+        let _ = writeln!(s, "Security assessment by {}.\n", md_escape(c));
+    }
     let _ = writeln!(s, "Generated {} by {} {}.\n", r.generated, r.tool.name, r.tool.version);
     if let Some(scope) = &r.scope {
         let inc: Vec<String> = scope.include.iter().map(|x| md_code(x)).collect();
@@ -817,11 +1038,13 @@ fn markdown(r: &Report) -> String {
     if let Some(job) = r.filters["scan"].as_i64() {
         let _ = writeln!(s, "Only the findings scan job {job} found, for the first time or again.\n");
     }
-    s.push_str("## Summary\n\n| Risk | Findings |\n|---|---:|\n");
-    for rc in &r.summary.by_risk {
-        let _ = writeln!(s, "| {} | {} |", risk_title(&rc.risk), rc.count);
+    if layout.has(Section::Summary) {
+        s.push_str("## Summary\n\n| Risk | Findings |\n|---|---:|\n");
+        for rc in r.summary.by_risk.iter().filter(|rc| rc.risk != "critical" || rc.count > 0) {
+            let _ = writeln!(s, "| {} | {} |", risk_title(&rc.risk), rc.count);
+        }
+        let _ = writeln!(s, "| **Total** | **{}** |\n", r.summary.total);
     }
-    let _ = writeln!(s, "| **Total** | **{}** |\n", r.summary.total);
     if r.summary.truncated {
         let _ = writeln!(
             s,
@@ -833,19 +1056,62 @@ fn markdown(r: &Report) -> String {
         let _ = writeln!(s, "> {t}\n");
     }
     let _ = writeln!(s, "> {}\n", redaction_text(r));
+    if layout.has(Section::FixFirst) {
+        let urgent: Vec<_> =
+            r.alerts.iter().filter(|g| matches!(g.risk.as_str(), "critical" | "high" | "medium")).take(10).collect();
+        if !urgent.is_empty() {
+            s.push_str("## Fix these first\n\n");
+            for (i, g) in urgent.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "{}. **{}** ({}, {} place{}): {}",
+                    i + 1,
+                    md_name(g),
+                    risk_title(&g.risk),
+                    g.instances.len(),
+                    if g.instances.len() == 1 { "" } else { "s" },
+                    md_escape(first_sentence(&g.solution))
+                );
+            }
+            s.push('\n');
+        }
+    }
+    if let Some(p) = r.posture.as_ref().filter(|_| layout.has(Section::Posture)) {
+        md_posture(&mut s, p);
+    }
+    if let Some(l) = r.retest.as_ref().filter(|_| layout.has(Section::Retest)) {
+        md_retest(&mut s, l);
+    }
     if r.alerts.is_empty() {
         s.push_str("No findings match the filters.\n");
         md_agent_false_positives(&mut s, r);
         return s;
     }
-    s.push_str("| # | Risk | Alert | Instances |\n|---:|---|---|---:|\n");
-    for (i, g) in r.alerts.iter().enumerate() {
-        let _ = writeln!(s, "| {} | {} | {} | {} |", i + 1, risk_title(&g.risk), md_name(g), g.instances.len());
+    if layout.has(Section::List) || layout.has(Section::Summary) {
+        // A CVSS column only when a tester rated something.
+        let rated = r.alerts.iter().any(|g| g.cvss.is_some());
+        s.push_str(if rated {
+            "| # | Risk | Alert | CVSS | Instances |\n|---:|---|---|---:|---:|\n"
+        } else {
+            "| # | Risk | Alert | Instances |\n|---:|---|---|---:|\n"
+        });
+        for (i, g) in r.alerts.iter().enumerate() {
+            let cvss = match (&g.cvss, rated) {
+                (Some(c), _) => format!(" {:.1} |", c.score),
+                (None, true) => " – |".into(),
+                (None, false) => String::new(),
+            };
+            let _ =
+                writeln!(s, "| {} | {} | {} |{cvss} {} |", i + 1, risk_title(&g.risk), md_name(g), g.instances.len());
+        }
+        s.push('\n');
     }
-    s.push('\n');
-    for (i, g) in r.alerts.iter().enumerate() {
+    for (i, g) in r.alerts.iter().enumerate().filter(|_| layout.has(Section::Issues)) {
         let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_name(g), risk_title(&g.risk));
         let mut meta = vec![format!("**Alert:** `{}`", g.alert_ref)];
+        if let Some(c) = &g.cvss {
+            meta.push(format!("**CVSS 4.0:** {:.1} ({}) `{}`", c.score, c.severity, c.vector));
+        }
         if let Some(c) = g.cwe {
             meta.push(format!("**CWE:** [{c}]({})", cwe_url(c)));
         }
@@ -868,9 +1134,18 @@ fn markdown(r: &Report) -> String {
             }
             s.push('\n');
         }
+        if layout.has(Section::Reproduce) {
+            let lines: Vec<String> = g.instances.iter().filter_map(|i| i.request.as_ref().map(curl)).collect();
+            if !lines.is_empty() {
+                let _ = writeln!(s, "### How to reproduce\n\n{}", md_block(&lines.join("\n\n"), "sh"));
+            }
+        }
         let _ = writeln!(s, "### Instances ({})\n", g.instances.len());
         for inst in &g.instances {
             let _ = writeln!(s, "#### {} {}\n", inst.method, md_code(&inst.url));
+            if !layout.has(Section::Evidence) {
+                continue;
+            }
             let _ = writeln!(
                 s,
                 "- Finding #{} · {} · confidence {} · {} · seen {}× · added {}",
@@ -926,6 +1201,91 @@ fn markdown(r: &Report) -> String {
     }
     md_agent_false_positives(&mut s, r);
     s
+}
+
+/// The posture section in Markdown.
+fn md_posture(s: &mut String, p: &Value) {
+    s.push_str("## Posture\n\n| Risk | Open issues | Places |\n|---|---:|---:|\n");
+    for risk in RISKS {
+        let issues = p["open"]["issues"][risk].as_i64().unwrap_or(0);
+        if risk == "critical" && issues == 0 {
+            continue;
+        }
+        let _ =
+            writeln!(s, "| {} | {issues} | {} |", risk_title(risk), p["open"]["instances"][risk].as_i64().unwrap_or(0));
+    }
+    let state = |k: &str| p["by_state"][k].as_i64().unwrap_or(0);
+    let retests = |k: &str| p["retests"][k].as_i64().unwrap_or(0);
+    let _ = writeln!(
+        s,
+        "\n{} fixed, {} accepted as a risk, {} awaiting a retest. Retests: {} not reproduced, {} still there. \
+         {} came back after a fix.\n",
+        state("fixed"),
+        state("accepted_risk"),
+        state("retest_pending"),
+        retests("not_reproduced"),
+        retests("still_present"),
+        p["regressed"].as_i64().unwrap_or(0)
+    );
+    let scans = p["scans"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !scans.is_empty() {
+        s.push_str("| Scan | Finished | New | Still there | No longer found |\n|---|---|---:|---:|---:|\n");
+        for scan in scans.iter().rev().take(10) {
+            let _ = writeln!(
+                s,
+                "| #{} | {} | {} | {} | {} |",
+                scan["job"],
+                day(scan["finished"].as_str().unwrap_or("")),
+                scan["new"],
+                scan["still"],
+                scan["gone"]
+            );
+        }
+        s.push('\n');
+    }
+}
+
+/// The retest section in Markdown.
+fn md_retest(s: &mut String, l: &RetestLetter) {
+    let _ = writeln!(
+        s,
+        "## Retest since {}\n\n**{} fixed**, {} still there, {} came back after a fix, {} awaiting a retest.\n",
+        md_escape(&l.since),
+        l.fixed.len(),
+        l.still_present.len(),
+        l.regressed.len(),
+        l.pending.len()
+    );
+    for (title, rows) in [
+        ("Fixed", &l.fixed),
+        ("Still there", &l.still_present),
+        ("Came back after a fix", &l.regressed),
+        ("Awaiting a retest", &l.pending),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            s,
+            "### {title}\n\n| # | Issue | Risk | Address | What happened | Proof |\n|---:|---|---|---|---|---|"
+        );
+        for row in rows {
+            let what = match (&row.event, &row.time) {
+                (Some(e), Some(t)) => format!("{e} on {}", day(t)),
+                _ => row.state.replace('_', " "),
+            };
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {what} | {} |",
+                row.id,
+                md_escape(&row.name),
+                risk_title(&row.risk),
+                md_code(&format!("{} {}", row.method, row.url)),
+                row.history_id.map(|h| format!("history #{h}")).unwrap_or_default()
+            );
+        }
+        s.push('\n');
+    }
 }
 
 /// When a finding was first and last seen, when it was seen in more than one history entry.
@@ -1032,6 +1392,8 @@ a{color:var(--info)}
 .fixfirst li{margin:6px 0}
 .tag{display:inline-block;padding:0 6px;border:1px solid var(--line);border-radius:4px;font-size:.8em}
 .tech{margin:12px 0;border:1px solid var(--line);border-radius:8px;padding:6px 12px}
+.cover{border-top:6px solid var(--brand,transparent);padding-top:12px}.cover .logo{max-height:56px;max-width:240px;display:block;margin-bottom:12px}
+h1,h2{color:var(--brand-ink,inherit)}.cvss{font-size:.9em}.letter td.n{white-space:nowrap}
 @media print{body{font-size:11pt;background:#fff;color:#000}main{max-width:none;padding:0}a{color:inherit;text-decoration:none}
 .card,.inst,tr{break-inside:avoid}h2,h3{break-after:avoid}.tech{display:none}}
 "#;
@@ -1074,9 +1436,17 @@ fn html(r: &Report) -> String {
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">\
          <meta name=\"referrer\" content=\"no-referrer\">\
-         <title>{}</title><style>{CSS}</style></head><body><main>\n",
-        esc(&r.title)
+         <title>{}</title><style>{CSS}</style>{}</head><body><main>\n",
+        esc(&r.title),
+        // Only #rrggbb, checked here too, so it can't leave the declaration.
+        r.layout
+            .accent
+            .as_deref()
+            .filter(|a| a.len() == 7 && a.starts_with('#') && a[1..].chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|a| format!("<style>:root{{--brand:{a};--brand-ink:{a}}}</style>"))
+            .unwrap_or_default()
     );
+    let layout = &r.layout;
     let count = |risk: &str| r.summary.by_risk.iter().find(|c| c.risk == risk).map_or(0, |c| c.count);
     let instances = || r.alerts.iter().flat_map(|g| &g.instances);
     let mut hosts: Vec<&str> = instances().map(|i| i.host.as_str()).collect();
@@ -1085,11 +1455,13 @@ fn html(r: &Report) -> String {
     let first = instances().map(|i| i.time.as_str()).min();
     let last = instances().map(|i| i.time.as_str()).max();
 
-    let _ = writeln!(
-        s,
-        "<header class=\"cover\"><div class=\"kicker\">Security assessment</div><h1>{}</h1>",
-        esc(&r.title)
-    );
+    let logo =
+        layout.logo.as_deref().map(|l| format!("<img class=\"logo\" alt=\"\" src=\"{}\">", esc(l))).unwrap_or_default();
+    let kicker = match &layout.company {
+        Some(c) => format!("Security assessment by {}", esc(c)),
+        None => "Security assessment".to_string(),
+    };
+    let _ = writeln!(s, "<header class=\"cover\">{logo}<div class=\"kicker\">{kicker}</div><h1>{}</h1>", esc(&r.title));
     let mut facts = vec![format!("Report generated {}", esc(day(&r.generated)))];
     if let (Some(a), Some(b)) = (first, last) {
         facts.push(if day(a) == day(b) {
@@ -1104,31 +1476,32 @@ fn html(r: &Report) -> String {
     let _ = writeln!(s, "<p class=\"muted\">{} · {} {}</p></header>", facts.join(" · "), r.tool.name, r.tool.version);
 
     // ---- At a glance: for readers who stop after the first page.
-    s.push_str("<h2>At a glance</h2>\n");
-    // Critical and high are both "serious" here; the cards tell them apart.
-    let (high, medium) = (count("critical") + count("high"), count("medium"));
-    let verdict = if r.summary.total == 0 {
-        "The automated tests found no issues that match this report's filters.".to_string()
-    } else if high > 0 {
-        format!(
-            "The tests found <strong>{high} serious issue{}</strong> that should be fixed as soon as possible, \
+    if layout.has(Section::Summary) {
+        s.push_str("<h2>At a glance</h2>\n");
+        // Critical and high are both "serious" here; the cards tell them apart.
+        let (high, medium) = (count("critical") + count("high"), count("medium"));
+        let verdict = if r.summary.total == 0 {
+            "The automated tests found no issues that match this report's filters.".to_string()
+        } else if high > 0 {
+            format!(
+                "The tests found <strong>{high} serious issue{}</strong> that should be fixed as soon as possible, \
              because they could let an attacker steal data or take over accounts.",
-            if high == 1 { "" } else { "s" }
-        )
-    } else if medium > 0 {
-        format!(
-            "No serious issues were found, but <strong>{medium} important weakness{}</strong> make attacks easier \
+                if high == 1 { "" } else { "s" }
+            )
+        } else if medium > 0 {
+            format!(
+                "No serious issues were found, but <strong>{medium} important weakness{}</strong> make attacks easier \
              and should be fixed soon.",
-            if medium == 1 { "" } else { "es" }
-        )
-    } else {
-        "No serious or important issues were found; what remains is minor hardening and observations.".to_string()
-    };
-    let _ = writeln!(s, "<p class=\"verdict\">{verdict}</p>");
-    s.push_str("<div class=\"cards\">");
-    // A critical card only when there is something critical, so most reports keep four.
-    for risk in RISKS.into_iter().filter(|&r| r != "critical" || count(r) > 0) {
-        let _ = write!(
+                if medium == 1 { "" } else { "es" }
+            )
+        } else {
+            "No serious or important issues were found; what remains is minor hardening and observations.".to_string()
+        };
+        let _ = writeln!(s, "<p class=\"verdict\">{verdict}</p>");
+        s.push_str("<div class=\"cards\">");
+        // A critical card only when there is something critical, so most reports keep four.
+        for risk in RISKS.into_iter().filter(|&r| r != "critical" || count(r) > 0) {
+            let _ = write!(
             s,
             "<div class=\"card {risk}-edge\"><div class=\"num\">{}</div><div><span class=\"badge {risk}\">{}</span>\
              <p>{}</p></div></div>",
@@ -1136,30 +1509,32 @@ fn html(r: &Report) -> String {
             risk_title(risk),
             risk_meaning(risk)
         );
+        }
+        s.push_str("</div>\n");
+        let mut tested: Vec<String> =
+            r.scope.iter().flat_map(|sc| &sc.include).map(|x| format!("<code>{}</code>", esc(x))).collect();
+        if tested.is_empty() {
+            tested = hosts.iter().map(|h| format!("<code>{}</code>", esc(h))).collect();
+        }
+        if !tested.is_empty() {
+            let _ = writeln!(s, "<p><strong>What was tested:</strong> {}</p>", tested.join(", "));
+        }
+        if let Some(t) = left_out_text(r) {
+            let link = if r.agent_false_positives.is_empty() {
+                ""
+            } else {
+                " <a href=\"#agent-fp\">See the ones an agent marked.</a>"
+            };
+            let _ = writeln!(s, "<p class=\"note\">{}{link}</p>", esc(&t));
+        }
     }
-    s.push_str("</div>\n");
-    let mut tested: Vec<String> =
-        r.scope.iter().flat_map(|sc| &sc.include).map(|x| format!("<code>{}</code>", esc(x))).collect();
-    if tested.is_empty() {
-        tested = hosts.iter().map(|h| format!("<code>{}</code>", esc(h))).collect();
-    }
-    if !tested.is_empty() {
-        let _ = writeln!(s, "<p><strong>What was tested:</strong> {}</p>", tested.join(", "));
-    }
+    // That it is cut short, or unredacted, is said whatever sections the report has.
     if r.summary.truncated {
         let _ = writeln!(
             s,
             "<p class=\"note\">This report shows {} of {} findings (raise <code>--limit</code> to include more).</p>",
             r.summary.included, r.summary.total
         );
-    }
-    if let Some(t) = left_out_text(r) {
-        let link = if r.agent_false_positives.is_empty() {
-            ""
-        } else {
-            " <a href=\"#agent-fp\">See the ones an agent marked.</a>"
-        };
-        let _ = writeln!(s, "<p class=\"note\">{}{link}</p>", esc(&t));
     }
     if r.summary.redacted.is_none() {
         let _ = writeln!(s, "<p class=\"note\"><strong>{}</strong></p>", esc(&redaction_text(r)));
@@ -1171,16 +1546,19 @@ fn html(r: &Report) -> String {
         .filter(|(_, g)| matches!(g.risk.as_str(), "critical" | "high" | "medium"))
         .take(10)
         .collect();
-    if !urgent.is_empty() {
+    // Links go to the issue sections, when there are any.
+    let issues = layout.has(Section::Issues);
+    let anchor =
+        |i: usize, name: &str| if issues { format!("<a href=\"#a{}\">{}</a>", i + 1, esc(name)) } else { esc(name) };
+    if layout.has(Section::FixFirst) && !urgent.is_empty() {
         s.push_str("<h3>Fix these first</h3><ol class=\"fixfirst\">");
         for (i, g) in urgent {
             let n = g.instances.len();
             let _ = write!(
                 s,
-                "<li><a href=\"#a{}\">{}</a> <span class=\"badge {}\">{}</span> \
+                "<li>{} <span class=\"badge {}\">{}</span> \
                  <span class=\"muted\">· {n} place{}</span><br>{}</li>",
-                i + 1,
-                esc(&g.name),
+                anchor(i, &g.name),
                 g.risk,
                 risk_title(&g.risk),
                 if n == 1 { "" } else { "s" },
@@ -1190,16 +1568,32 @@ fn html(r: &Report) -> String {
         s.push_str("</ol>\n");
     }
 
+    if let Some(p) = r.posture.as_ref().filter(|_| layout.has(Section::Posture)) {
+        html_posture(&mut s, p);
+    }
+    if let Some(letter) = r.retest.as_ref().filter(|_| layout.has(Section::Retest)) {
+        html_retest(&mut s, letter);
+    }
+
     // ---- All issues, most serious first.
-    if !r.alerts.is_empty() {
-        s.push_str("<h2>All issues</h2>\n<table><thead><tr><th class=\"n\">#</th><th>Issue</th><th>Risk</th><th class=\"n\">Places</th></tr></thead><tbody>\n");
+    let rated = r.alerts.iter().any(|g| g.cvss.is_some());
+    if layout.has(Section::List) && !r.alerts.is_empty() {
+        let _ = writeln!(
+            s,
+            "<h2>All issues</h2>\n<table><thead><tr><th class=\"n\">#</th><th>Issue</th><th>Risk</th>{}<th class=\"n\">Places</th></tr></thead><tbody>",
+            if rated { "<th class=\"n\">CVSS</th>" } else { "" }
+        );
         for (i, g) in r.alerts.iter().enumerate() {
+            let cvss = match (&g.cvss, rated) {
+                (Some(c), _) => format!("<td class=\"n\">{:.1}</td>", c.score),
+                (None, true) => "<td class=\"n muted\">–</td>".to_string(),
+                (None, false) => String::new(),
+            };
             let _ = writeln!(
                 s,
-                "<tr><td class=\"n\">{}</td><td><a href=\"#a{}\">{}</a></td><td><span class=\"badge {}\">{}</span></td><td class=\"n\">{}</td></tr>",
+                "<tr><td class=\"n\">{}</td><td>{}</td><td><span class=\"badge {}\">{}</span></td>{cvss}<td class=\"n\">{}</td></tr>",
                 i + 1,
-                i + 1,
-                esc(&g.name),
+                anchor(i, &g.name),
                 g.risk,
                 risk_title(&g.risk),
                 g.instances.len()
@@ -1207,7 +1601,7 @@ fn html(r: &Report) -> String {
         }
         s.push_str("</tbody></table>\n");
     }
-    for (i, g) in r.alerts.iter().enumerate() {
+    for (i, g) in r.alerts.iter().enumerate().filter(|_| issues) {
         let _ = writeln!(
             s,
             "<section class=\"issue\"><h2 id=\"a{}\">{}. {} <span class=\"badge {}\">{}</span></h2>",
@@ -1217,6 +1611,15 @@ fn html(r: &Report) -> String {
             g.risk,
             risk_title(&g.risk)
         );
+        if let Some(c) = &g.cvss {
+            let _ = writeln!(
+                s,
+                "<p class=\"cvss\"><strong>CVSS 4.0 {:.1}</strong> ({}) <code>{}</code></p>",
+                c.score,
+                c.severity,
+                esc(&c.vector)
+            );
+        }
         for (h, text) in [("What this means", &g.description), ("How to fix it", &g.solution)] {
             if !text.trim().is_empty() {
                 let _ = writeln!(s, "<h3>{h}</h3><p>{}</p>", paragraphs(text));
@@ -1263,6 +1666,16 @@ fn html(r: &Report) -> String {
         }
         s.push_str("</tbody></table>\n");
 
+        if layout.has(Section::Reproduce) {
+            let lines: Vec<String> = g.instances.iter().filter_map(|i| i.request.as_ref().map(curl)).collect();
+            if !lines.is_empty() {
+                let _ = writeln!(s, "<h3>How to reproduce</h3><pre>{}</pre>", esc(&lines.join("\n\n")));
+            }
+        }
+        if !layout.has(Section::Evidence) {
+            s.push_str("</section>\n");
+            continue;
+        }
         // Everything a developer needs to reproduce it, folded away.
         s.push_str("<details class=\"tech\"><summary>Technical details</summary>");
         let mut meta = vec![format!("Rule <code>{}</code>", esc(&g.alert_ref))];
@@ -1341,7 +1754,7 @@ fn html(r: &Report) -> String {
     }
 
     // ---- What an agent hid.
-    if !r.agent_false_positives.is_empty() {
+    if (issues || layout.has(Section::List)) && !r.agent_false_positives.is_empty() {
         s.push_str(
             "<h2 id=\"agent-fp\">Marked false positive by an agent</h2><p>These findings were marked false positive \
              via MCP (an agent), not by a person, and are left out above.</p>\
@@ -1368,6 +1781,10 @@ fn html(r: &Report) -> String {
     }
 
     // ---- How to read it.
+    if !layout.has(Section::About) {
+        s.push_str("</main></body></html>\n");
+        return s;
+    }
     s.push_str(
         "<h2>About this report</h2>\
          <p>The findings come from automated tests that look at the site's traffic and send attack requests, as an \
@@ -1398,6 +1815,133 @@ fn html(r: &Report) -> String {
     s.push_str("</p>\n");
     s.push_str("</main></body></html>\n");
     s
+}
+
+/// A shell word in single quotes.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A curl command that sends `req` again (as the report shows it: masked secrets stay masked).
+fn curl(req: &HttpRequest) -> String {
+    // A method token may hold | & $ and backquotes: it is quoted like everything else.
+    // --globoff: [ ] { } in the URL (a masked "[redacted]") are text, not curl patterns;
+    // --path-as-is: /a/../b is sent as recorded.
+    let mut out = format!("curl -sS --globoff --path-as-is -X {} {}", sh_quote(&req.method), sh_quote(&req.url));
+    // Host goes as recorded, so a virtual host or Host header test reproduces.
+    for (k, v) in &req.headers {
+        if !k.eq_ignore_ascii_case("content-length") {
+            out.push_str(&format!(" \\\n  -H {}", sh_quote(&format!("{k}: {v}"))));
+        }
+    }
+    if req.body.binary {
+        out.push_str(" \\\n  # the body is binary: send it from the request in history");
+    } else if !req.body.text.is_empty() {
+        out.push_str(&format!(" \\\n  --data-raw {}", sh_quote(&req.body.text)));
+    }
+    out
+}
+
+/// The posture section: open issues by risk, recent scans, retests.
+fn html_posture(s: &mut String, p: &Value) {
+    s.push_str("<h2>Posture</h2>\n<div class=\"cards\">");
+    for risk in RISKS {
+        let issues = p["open"]["issues"][risk].as_i64().unwrap_or(0);
+        if risk == "critical" && issues == 0 {
+            continue;
+        }
+        let instances = p["open"]["instances"][risk].as_i64().unwrap_or(0);
+        let _ = write!(
+            s,
+            "<div class=\"card {risk}-edge\"><div class=\"num\">{issues}</div><div><span class=\"badge {risk}\">{}</span>\
+             <p>open issue{} in {instances} place{}</p></div></div>",
+            risk_title(risk),
+            if issues == 1 { "" } else { "s" },
+            if instances == 1 { "" } else { "s" }
+        );
+    }
+    s.push_str("</div>\n");
+    let state = |k: &str| p["by_state"][k].as_i64().unwrap_or(0);
+    let retests = |k: &str| p["retests"][k].as_i64().unwrap_or(0);
+    let _ = writeln!(
+        s,
+        "<p>{} fixed, {} accepted as a risk, {} awaiting a retest. Retests: {} not reproduced, {} still there. \
+         {} came back after a fix.</p>",
+        state("fixed"),
+        state("accepted_risk"),
+        state("retest_pending"),
+        retests("not_reproduced"),
+        retests("still_present"),
+        p["regressed"].as_i64().unwrap_or(0)
+    );
+    let scans = p["scans"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !scans.is_empty() {
+        s.push_str(
+            "<table><thead><tr><th>Scan</th><th>Finished</th><th class=\"n\">New</th><th class=\"n\">Still there</th>\
+             <th class=\"n\">No longer found</th></tr></thead><tbody>",
+        );
+        for scan in scans.iter().rev().take(10) {
+            let _ = write!(
+                s,
+                "<tr><td>#{}</td><td>{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td></tr>",
+                scan["job"],
+                esc(day(scan["finished"].as_str().unwrap_or(""))),
+                scan["new"],
+                scan["still"],
+                scan["gone"]
+            );
+        }
+        s.push_str("</tbody></table>\n");
+    }
+}
+
+/// The retest section: what changed since a day, with the requests that show it.
+fn html_retest(s: &mut String, l: &RetestLetter) {
+    let _ = writeln!(
+        s,
+        "<h2>Retest since {}</h2><p><strong>{} fixed</strong>, {} still there, {} came back after a fix, \
+         {} awaiting a retest.</p>",
+        esc(&l.since),
+        l.fixed.len(),
+        l.still_present.len(),
+        l.regressed.len(),
+        l.pending.len()
+    );
+    for (title, rows) in [
+        ("Fixed", &l.fixed),
+        ("Still there", &l.still_present),
+        ("Came back after a fix", &l.regressed),
+        ("Awaiting a retest", &l.pending),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        let _ = write!(
+            s,
+            "<h3>{title}</h3><table class=\"letter\"><thead><tr><th class=\"n\">#</th><th>Issue</th><th>Risk</th>\
+             <th>Address</th><th>What happened</th><th>Proof</th></tr></thead><tbody>"
+        );
+        for row in rows {
+            let _ = write!(
+                s,
+                "<tr><td class=\"n\">{}</td><td>{}</td><td><span class=\"badge {}\">{}</span></td><td><code>{} {}</code>{}</td>\
+                 <td>{}</td><td>{}</td></tr>",
+                row.id,
+                esc(&row.name),
+                esc(&row.risk),
+                risk_title(&row.risk),
+                esc(&row.method),
+                esc(&row.url),
+                if row.param.is_empty() { String::new() } else { format!(" <code>{}</code>", esc(&row.param)) },
+                esc(&match (&row.event, &row.time) {
+                    (Some(e), Some(t)) => format!("{e} on {}", day(t)),
+                    _ => row.state.replace('_', " "),
+                }),
+                row.history_id.map(|h| format!("history #{h}")).unwrap_or_default()
+            );
+        }
+        s.push_str("</tbody></table>\n");
+    }
 }
 
 /// "2026-10-22" from an RFC 3339 time.
@@ -1471,7 +2015,7 @@ fn sarif(r: &Report) -> Value {
                 "defaultConfiguration": {"level": sarif_level(&g.risk)},
                 "properties": {
                     "tags": tags,
-                    "security-severity": security_severity(&g.risk),
+                    "security-severity": g.cvss.as_ref().map_or_else(|| security_severity(&g.risk).to_string(), |c| format!("{:.1}", c.score)),
                     "risk": g.risk,
                     "pluginId": g.rule_id,
                 },
@@ -1539,6 +2083,9 @@ fn sarif(r: &Report) -> Value {
             }
             if let Some(c) = inst.cwe {
                 res["properties"]["cwe"] = json!(c);
+            }
+            if let Some(c) = &inst.cvss {
+                res["properties"]["cvssV4"] = json!({"vector": c.vector, "score": c.score, "severity": c.severity});
             }
             if let Some(n) = &inst.note {
                 res["properties"]["note"] = json!(n);
@@ -1764,6 +2311,190 @@ mod tests {
             json!([{"kind": "external", "status": "accepted", "justification": "Framework banner is public"}])
         );
         assert!(results.iter().filter(|x| x["ruleId"] != "10037").all(|x| x.get("suppressions").is_none()));
+    }
+
+    #[test]
+    fn presets_branding_cvss_and_the_retest_letter() {
+        use crate::scan::layout::{Layout, Preset};
+        let mut s = store_with_findings();
+        let xpb = s.findings_list(&FindingFilter { alert_ref: Some("10037".into()), ..Default::default() }, 1).unwrap()
+            [0]["id"]
+            .as_i64()
+            .unwrap();
+        let issue = s.finding_get(xpb).unwrap()["issue_id"].as_i64().unwrap();
+        s.issue_set_cvss(issue, "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N").unwrap();
+        let with = |s: &Store, layout: Layout| build(s, &ReportOptions { layout, ..Default::default() }).unwrap();
+
+        // Technical, branded: everything, with the issue's CVSS and the brand on the cover.
+        let brand = Layout {
+            company: Some("Acme <Labs>".into()),
+            accent: Some("#0a7cff".into()),
+            logo: Some("data:image/png;base64,iVBORw0KGgo=".into()),
+            ..Default::default()
+        };
+        let html = render(&with(&s, brand), ReportKind::Html);
+        assert!(html.contains("Security assessment by Acme &lt;Labs&gt;") && html.contains("--brand:#0a7cff"));
+        assert!(html.contains("<img class=\"logo\" alt=\"\" src=\"data:image/png;base64,iVBORw0KGgo=\">"));
+        assert!(html.contains("CVSS 4.0 6.9</strong> (medium)") && html.contains("Technical details"));
+        let sarif: Value = serde_json::from_str(&render(&with(&s, Layout::default()), ReportKind::Sarif)).unwrap();
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "10037")
+            .unwrap()
+            .clone();
+        assert_eq!(rule["properties"]["security-severity"], "6.9");
+
+        // Executive: the posture, no evidence or issue sections. Developer: curl, no summary.
+        let exec = render(&with(&s, Layout { preset: Preset::Executive, ..Default::default() }), ReportKind::Html);
+        assert!(exec.contains("<h2>Posture</h2>") && exec.contains("At a glance"));
+        assert!(!exec.contains("Technical details") && !exec.contains("<section class=\"issue\">"));
+        let dev = render(&with(&s, Layout { preset: Preset::Developer, ..Default::default() }), ReportKind::Html);
+        let at = dev.find("How to reproduce").map(|i| &dev[i..(i + 300).min(dev.len())]);
+        assert!(
+            at.is_some_and(|a| a.contains("curl -sS --globoff --path-as-is -X ")) && !dev.contains("At a glance"),
+            "{at:?}"
+        );
+        // Every part of a curl line is quoted for the shell, a method token included.
+        let req = HttpRequest {
+            method: "GET|id".into(),
+            url: "http://a.test/it's".into(),
+            headers: vec![("X-A".into(), "$(id)".into()), ("Host".into(), "a.test".into())],
+            body: Body { text: "a'b".into(), length: 3, truncated: false, binary: false },
+        };
+        assert_eq!(
+            curl(&req),
+            "curl -sS --globoff --path-as-is -X 'GET|id' 'http://a.test/it'\\''s' \\\n  -H 'X-A: $(id)' \\\n  -H 'Host: a.test' \\\n  --data-raw 'a'\\''b'"
+        );
+        let md = render(&with(&s, Layout { preset: Preset::Developer, ..Default::default() }), ReportKind::Markdown);
+        assert!(md.contains("### How to reproduce") && !md.contains("## Summary"));
+
+        // Retest letter: a fix since the day, and one waiting.
+        s.finding_retested(xpb, crate::scan::issues::Retest::NotReproduced, Some(1), "GET /", true).unwrap();
+        let other = s.findings_list(&FindingFilter::default(), 10).unwrap()[0]["id"].as_i64().unwrap();
+        s.finding_mark(other, Some("retest_pending"), None).unwrap();
+        let r = with(&s, Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() });
+        let letter = r.retest.as_ref().unwrap();
+        assert_eq!((letter.fixed.len(), letter.pending.len()), (1, 1));
+        assert_eq!(letter.fixed[0].history_id, Some(1));
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("Retest since 2000-01-01") && html.contains("retest: not reproduced on"));
+        assert!(!html.contains("At a glance"));
+
+        // A fix by hand after a retest that still saw it is "marked fixed", with no proof.
+        s.finding_retested(xpb, crate::scan::issues::Retest::StillPresent, Some(1), "GET /", true).unwrap();
+        s.finding_mark(xpb, Some("fixed"), None).unwrap();
+        let r = with(&s, Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() });
+        let fixed = &r.retest.as_ref().unwrap().fixed[0];
+        assert_eq!((fixed.event.as_deref(), fixed.history_id), (Some("marked fixed"), None));
+        // A retest that still sees it, recorded without marking, puts it under "still there".
+        s.finding_retested(xpb, crate::scan::issues::Retest::StillPresent, Some(1), "GET /", false).unwrap();
+        let r = with(&s, Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() });
+        let letter = r.retest.as_ref().unwrap();
+        assert_eq!((letter.fixed.len(), letter.still_present.len()), (0, 1));
+        assert_eq!(letter.still_present[0].state, "fixed");
+        // The extra sections keep to the report's filters.
+        let other_host = ReportOptions {
+            filter: FindingFilter { host: Some("b.test".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let scoped = build(
+            &s,
+            &ReportOptions {
+                layout: Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() },
+                ..other_host.clone()
+            },
+        )
+        .unwrap();
+        let letter = scoped.retest.as_ref().unwrap();
+        assert!(letter.fixed.is_empty() && letter.pending.is_empty());
+        let posture = build(
+            &s,
+            &ReportOptions { layout: Layout { preset: Preset::Executive, ..Default::default() }, ..other_host },
+        )
+        .unwrap();
+        assert_eq!(posture.posture.as_ref().unwrap()["open"]["instances"]["low"], 0);
+
+        // Markdown has the executive sections; a developer report says it was cut short; the
+        // print version opens its evidence.
+        let md = render(&with(&s, Layout { preset: Preset::Executive, ..Default::default() }), ReportKind::Markdown);
+        assert!(md.contains("## Posture") && md.contains("## Fix these first"), "{md}");
+        let cut = build(
+            &s,
+            &ReportOptions {
+                limit: 1,
+                layout: Layout { preset: Preset::Developer, ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(render(&cut, ReportKind::Html).contains("This report shows 1 of"));
+        let print = render_print_html(&with(&s, Layout::default()));
+        assert!(
+            print.contains("<details class=\"tech\" open>") && print.contains("@media print{.tech{display:block}}")
+        );
+    }
+
+    #[test]
+    fn the_retest_letter_masks_secrets_of_findings_the_report_leaves_out() {
+        use crate::scan::layout::{Layout, Preset};
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET /LIVECOOKIE987654 HTTP/1.1\r\nHost: app.test\r\nCookie: sid=LIVECOOKIE987654\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
+        let ids: Vec<i64> =
+            s.findings_list(&FindingFilter::default(), 50).unwrap().iter().map(|f| f["id"].as_i64().unwrap()).collect();
+        s.findings_mark(&ids, Some("fixed"), None).unwrap();
+        // The fixed findings are out of the list (the default state), but in the letter.
+        let opts = ReportOptions {
+            layout: Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let r = build(&s, &opts).unwrap();
+        assert!(r.alerts.is_empty() && !r.retest.as_ref().unwrap().fixed.is_empty());
+        let json = render(&r, ReportKind::Json);
+        assert!(!json.contains("LIVECOOKIE987654"), "{json}");
+    }
+
+    #[test]
+    fn retest_rows_are_redacted_like_the_findings() {
+        let row = |url: &str, param: &str| RetestRow {
+            id: 1,
+            name: "x".into(),
+            risk: "low".into(),
+            method: "GET".into(),
+            url: url.into(),
+            param: param.into(),
+            state: "fixed".into(),
+            event: None,
+            time: None,
+            history_id: None,
+        };
+        let mut letter = RetestLetter {
+            fixed: vec![row("http://a.test/?access_token=LETTERSECRET9", "access_token=LETTERSECRET9")],
+            ..Default::default()
+        };
+        let mut groups = vec![AlertGroup {
+            alert_ref: "1".into(),
+            rule_id: 1,
+            name: "x".into(),
+            risk: "low".into(),
+            cwe: None,
+            wasc: None,
+            description: String::new(),
+            solution: String::new(),
+            references: vec![],
+            tags: vec![],
+            cvss: None,
+            instances: vec![],
+        }];
+        let mut red = Redactor::default();
+        redact_findings(&mut red, &mut groups, &mut [], Some(&mut letter));
+        assert_eq!(letter.fixed[0].url, "http://a.test/?access_token=[redacted]");
+        assert_eq!(letter.fixed[0].param, "access_token=[redacted]");
     }
 
     #[test]

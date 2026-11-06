@@ -6,8 +6,10 @@
 
 pub mod active;
 pub mod compare;
+pub mod cvss;
 pub mod findings_db;
 pub mod issues;
+pub mod layout;
 pub mod message;
 pub mod passive;
 pub mod redact;

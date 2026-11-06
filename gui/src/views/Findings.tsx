@@ -9,6 +9,7 @@ import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from
 import { CLOSED, eventText, type FindingFilter, groupKey, hostsOf, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, SOURCES, type Source, STATES } from "./findingsFilter";
 import { addedBy } from "./manualFinding";
 import { NewFinding } from "./NewFinding";
+import { ReportBuilder } from "./ReportBuilder";
 
 const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
 const RANK: Record<Risk, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -228,26 +229,9 @@ export function FindingsView({ active }: { active: boolean }) {
     }
   };
 
-  // A readable HTML report (summary, how to fix, evidence folded away) saved where the user picks.
+  // The report builder: audience, sections, branding, format, with a preview.
   const [reporting, setReporting] = useState(false);
-  const saveReport = async () => {
-    const name = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
-    const dialog = await import("@tauri-apps/plugin-dialog");
-    const path = await dialog.save({ defaultPath: `${name}-report.html`, filters: [{ name: "HTML report", extensions: ["html"] }] });
-    if (typeof path !== "string") return;
-    setReporting(true);
-    try {
-      const file = /\.html?$/i.test(path) ? path : `${path}.html`;
-      const r = await run<{ total: number; redacted: number | null }>(["report", "html", "--output", file, "--force", `--title=${name} security report`]);
-      const masked = r.redacted ? ` Session secrets are masked in ${r.redacted} place${r.redacted === 1 ? "" : "s"}.` : "";
-      app.toast(`Report saved with ${r.total} finding${r.total === 1 ? "" : "s"}.${masked} Open it in a browser; print it to make a PDF.`);
-      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
-      await revealItemInDir(file).catch(() => {});
-    } catch (e: any) {
-      app.toast(e.message, "error");
-    }
-    setReporting(false);
-  };
+  const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
 
   const toggle = <T,>(set: Set<T>, v: T) => {
     const s = new Set(set);
@@ -317,8 +301,8 @@ export function FindingsView({ active }: { active: boolean }) {
         <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
           New finding…
         </button>
-        <button className="btn small" disabled={reporting} onClick={saveReport} title="Save a readable HTML report of all findings except false positives">
-          {reporting ? "Saving…" : "Report…"}
+        <button className="btn small" onClick={() => setReporting(true)} title="Build a report: who it is for, its sections and branding; HTML, PDF, Word or Markdown">
+          Report…
         </button>
       </div>
       {picked.length > 0 && (
@@ -567,6 +551,7 @@ export function FindingsView({ active }: { active: boolean }) {
           <div className="blank">Select a finding to see its details and evidence.</div>
         )}
       </Split>
+      {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
     </div>
   );

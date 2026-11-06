@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -574,6 +574,9 @@ impl Store {
         }
         if version < 15 {
             crate::scan::issues::migrate_v15(&self.conn)?;
+        }
+        if version < 16 {
+            crate::scan::layout::migrate_v16(&self.conn)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

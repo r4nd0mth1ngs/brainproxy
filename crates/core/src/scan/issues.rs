@@ -60,6 +60,8 @@ pub const ISSUE_COLUMNS: &[(&str, &str, &str)] = &[
     ("alert_ref", "TEXT", "Alert type of its findings"),
     ("host", "TEXT", "Host of its findings"),
     ("title", "TEXT", "Title a tester gave it (NULL: the alert's name)"),
+    ("cvss_vector", "TEXT", "CVSS 4.0 vector a tester gave it (`findings issue cvss`)"),
+    ("cvss_score", "REAL", "Its score, 0.0 to 10.0"),
 ];
 
 pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -68,7 +70,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, removed"),
+    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, cvss, removed"),
     ("old", "TEXT", "Value before (a state, a note, an issue id)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
@@ -225,7 +227,8 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.alert_ref, i.host, COALESCE(i.title, 
         i.title IS NOT NULL AS titled, max(f.risk_level) AS risk_level, count(f.id) AS instances,
         sum(f.hits) AS hits, min(f.time) AS first_seen,
         max(COALESCE((SELECT h.time FROM history h WHERE h.id = f.last_history_id), f.time)) AS last_seen,
-        json_group_object(f.state, 1) AS states, group_concat(DISTINCT f.source) AS sources
+        json_group_object(f.state, 1) AS states, group_concat(DISTINCT f.source) AS sources,
+        i.cvss_vector, i.cvss_score
     FROM issues i JOIN findings f ON f.issue_id = i.id";
 
 fn risk_name(level: i64) -> &'static str {
@@ -252,6 +255,10 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "last_seen": r.get::<_, String>("last_seen")?,
         "states": states,
         "sources": sources.map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>()).unwrap_or_default(),
+        "cvss": r.get::<_, Option<String>>("cvss_vector")?.map(|v| {
+            let score: f64 = r.get("cvss_score").unwrap_or(0.0);
+            json!({"vector": v, "score": score, "severity": crate::scan::cvss::severity(score)})
+        }),
     }))
 }
 
@@ -440,7 +447,8 @@ impl Store {
         }
         let after = match after_retest(&state, outcome).filter(|_| mark && !outdated) {
             Some(next) => {
-                crate::scan::findings_db::mark_one(&tx, id, Some(next), None)?;
+                let cause = format!("retest: {}", outcome.as_str().replace('_', " "));
+                crate::scan::findings_db::mark_with(&tx, id, Some(next), None, Some((&cause, history_id)))?;
                 next.to_string()
             }
             None => state,
@@ -476,14 +484,28 @@ impl Store {
     /// found new and no longer found, and retest outcomes. "Open" is open, confirmed and
     /// awaiting retest.
     pub fn posture(&self) -> Result<Value> {
-        let open = "state IN ('open', 'confirmed', 'retest_pending')";
+        self.posture_of(None)
+    }
+
+    /// [`Store::posture`] over the findings `scope` selects (its state ignored), or all.
+    pub fn posture_of(&self, scope: Option<&FindingFilter>) -> Result<Value> {
+        let (within, args) = match scope {
+            Some(f) => {
+                let f = FindingFilter { state: Some("all".into()), ..f.clone() };
+                let (w, a) = f.sql();
+                (format!("SELECT id FROM findings WHERE {w}"), a)
+            }
+            None => ("SELECT id FROM findings".to_string(), Vec::new()),
+        };
+        let p = || rusqlite::params_from_iter(args.iter());
+        let open = format!("state IN ('open', 'confirmed', 'retest_pending') AND id IN ({within})");
         let by_risk = |sql: &str| -> Result<Map<String, Value>> {
             let mut stmt = self.conn.prepare(sql)?;
             let mut m = Map::new();
             for level in (0..=4).rev() {
                 m.insert(risk_name(level).into(), json!(0));
             }
-            for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            for row in stmt.query_map(p(), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
                 let (level, n) = row?;
                 m.insert(risk_name(level).into(), json!(n));
             }
@@ -495,10 +517,11 @@ impl Store {
             "SELECT lvl, count(*) FROM (SELECT max(risk_level) AS lvl FROM findings WHERE {open} AND issue_id IS NOT NULL
              GROUP BY issue_id) GROUP BY lvl"
         ))?;
-        let mut stmt =
-            self.conn.prepare("SELECT state, count(*) FROM findings WHERE state != 'removed' GROUP BY state")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT state, count(*) FROM findings WHERE state != 'removed' AND id IN ({within}) GROUP BY state"
+        ))?;
         let mut by_state = Map::new();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        for row in stmt.query_map(p(), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
             let (s, n) = row?;
             by_state.insert(s, json!(n));
         }
@@ -506,7 +529,7 @@ impl Store {
             "SELECT risk_level, confidence, count(*) FROM findings WHERE {open} GROUP BY risk_level, confidence"
         ))?;
         let mut grid: Vec<Value> = Vec::new();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+        for row in stmt.query_map(p(), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
             let (level, conf, n) = row?;
             grid.push(json!({"risk": risk_name(level), "confidence": conf, "count": n}));
         }
@@ -516,7 +539,7 @@ impl Store {
              FROM findings WHERE {open} GROUP BY host ORDER BY max(risk_level) DESC, count(*) DESC, host LIMIT 20"
         ))?;
         let hosts: Vec<Value> = stmt
-            .query_map([], |r| {
+            .query_map(p(), |r| {
                 Ok(json!({
                     "host": r.get::<_, String>(0)?,
                     "risk": risk_name(r.get(1)?),
@@ -526,13 +549,13 @@ impl Store {
                 }))
             })?
             .collect::<std::result::Result<_, _>>()?;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT o.job_id, j.time, j.finished_time, j.state, sum(o.seen = 'new'), sum(o.seen = 'still'), sum(o.seen = 'gone')
-             FROM scan_observations o LEFT JOIN jobs j ON j.id = o.job_id
-             GROUP BY o.job_id ORDER BY COALESCE(j.time, o.time) DESC, o.job_id DESC LIMIT 50",
-        )?;
+             FROM scan_observations o LEFT JOIN jobs j ON j.id = o.job_id WHERE o.finding_id IN ({within})
+             GROUP BY o.job_id ORDER BY COALESCE(j.time, o.time) DESC, o.job_id DESC LIMIT 50"
+        ))?;
         let mut scans: Vec<Value> = stmt
-            .query_map([], |r| {
+            .query_map(p(), |r| {
                 Ok(json!({
                     "job": r.get::<_, i64>(0)?,
                     "started": r.get::<_, Option<String>>(1)?,
@@ -545,15 +568,19 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?;
         scans.reverse();
-        let mut stmt =
-            self.conn.prepare("SELECT new, count(*) FROM finding_events WHERE kind = 'retest' GROUP BY new")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT new, count(*) FROM finding_events WHERE kind = 'retest' AND finding_id IN ({within}) GROUP BY new"
+        ))?;
         let mut retests = Map::new();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        for row in stmt.query_map(p(), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
             let (outcome, n) = row?;
             retests.insert(outcome, json!(n));
         }
-        let regressed: i64 =
-            self.conn.query_row("SELECT count(*) FROM finding_events WHERE kind = 'regressed'", [], |r| r.get(0))?;
+        let regressed: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM finding_events WHERE kind = 'regressed' AND finding_id IN ({within})"),
+            p(),
+            |r| r.get(0),
+        )?;
         Ok(json!({
             "open": {"issues": issues, "instances": instances},
             "by_state": by_state,
