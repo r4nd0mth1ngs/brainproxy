@@ -297,24 +297,32 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
     assert!(row["source_id"].as_i64().is_some(), "points at the proxied request: {row}");
     assert_eq!(srv.logouts.load(Ordering::SeqCst), 1, "/logout isn't replayed");
 
-    // The job's progress is stored every half second, so it may trail the results a little.
+    // The job's progress is stored every half second, and the proxy counts a request only
+    // once it has recorded it, which can be after both orders were tested: wait for all of it.
+    let expected = [
+        ("tested", 2),
+        ("waiting", 0),
+        ("duplicates", 1),
+        ("skipped_excluded_paths", 1),
+        ("skipped_methods", 2),
+        ("skipped_no_credentials", 1),
+        ("skipped_static", 1),
+        ("skipped_status", 1),
+        ("dropped_queue_full", 0),
+    ];
     let status = loop {
         let status = ok(&p, &["--home", home, "proxy", "status"]);
-        if status["authz"]["progress"]["tested"] == 2 || std::time::Instant::now() > deadline {
+        let progress = &status["authz"]["progress"];
+        if expected.iter().all(|(k, n)| progress[k] == *n) || std::time::Instant::now() > deadline {
             break status;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     assert_eq!(status["authz"]["run_id"].as_i64().unwrap().to_string(), run_id, "{status}");
     let progress = &status["authz"]["progress"];
-    assert_eq!(progress["tested"], 2, "{status}");
-    assert_eq!(progress["duplicates"], 1, "{status}");
-    assert_eq!(progress["skipped_excluded_paths"], 1, "{status}");
-    assert_eq!(progress["skipped_methods"], 2, "{status}");
-    assert_eq!(progress["skipped_no_credentials"], 1, "{status}");
-    assert_eq!(progress["skipped_static"], 1, "{status}");
-    assert_eq!(progress["skipped_status"], 1, "{status}");
-    assert_eq!(progress["dropped_queue_full"], 0, "{status}");
+    for (k, n) in expected {
+        assert_eq!(progress[k], n, "{k}: {status}");
+    }
 
     let f = ok(&p, &["findings", "list", "--source", "authz"]);
     assert!(f.to_string().contains("Access Control Bypass"), "{f}");
