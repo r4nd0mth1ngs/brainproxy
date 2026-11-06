@@ -44,6 +44,9 @@ const EXCLUDED: &[&str] = &[
     "browser open",
     "findings remove",
     "connection review",
+    // A person reviews what an agent drafted; an agent can't vouch for itself.
+    "findings issue review",
+    "report-summary review",
 ];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
@@ -263,6 +266,26 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings compare", READ),
     ("findings show", READ),
     ("findings mark", SET),
+    ("findings issues", READ),
+    ("findings issue show", READ),
+    ("findings issue split", ADD),
+    ("findings issue merge", SET),
+    ("findings issue title", SET),
+    ("findings issue cvss", SET),
+    ("findings issue narrative", SET),
+    ("findings trail", READ),
+    // --output writes a file (refused if it exists unless --force).
+    ("findings repro", REPLACE),
+    ("findings ticket", SET),
+    ("report-summary show", READ),
+    ("report-summary set", SET),
+    ("report-profile list", READ),
+    ("report-profile show", READ),
+    ("report-profile save", SET),
+    ("report-profile remove", REPLACE),
+    ("findings timeline", READ),
+    ("findings retest", NET),
+    ("findings posture", READ),
     // Through MCP it can't replace the write-up findings of the same title share (--replace-text).
     ("findings add", ADD),
     ("findings remove", REPLACE),
@@ -689,7 +712,12 @@ fn tool(path: &[String], cmd: &Command) -> Value {
                     s["enum"] = json!(possible);
                 }
                 if repeatable(a) {
-                    s = json!({"type": "array", "items": s});
+                    let list = json!({"type": "array", "items": s});
+                    s = if WAS_ONE_VALUE.contains(&(path.join(" ").as_str(), id.as_str())) {
+                        json!({"anyOf": [s, list]})
+                    } else {
+                        list
+                    };
                 }
                 s
             }
@@ -725,6 +753,11 @@ fn tool(path: &[String], cmd: &Command) -> Value {
         "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": false},
     })
 }
+
+/// Arguments that took one value before they took several: (command, argument). Their
+/// schema says either, so a client that checks arguments against it still sends one value,
+/// as agents written against the old schema do. ([`argv`] takes one value for any list.)
+const WAS_ONE_VALUE: &[(&str, &str)] = &[("findings mark", "id")];
 
 fn repeatable(a: &Arg) -> bool {
     matches!(a.get_action(), ArgAction::Append) || a.get_num_args().is_some_and(|n| n.max_values() > 1)
@@ -866,5 +899,24 @@ mod tests {
         assert_eq!(p["tag"]["type"], "array");
         assert_eq!(p["rest"]["type"], "array");
         assert_eq!(p["first"]["type"], "string");
+    }
+
+    #[test]
+    fn an_argument_that_took_one_value_still_says_so() {
+        use clap::CommandFactory;
+        let cli = crate::Cli::command();
+        let mark = cli.find_subcommand("findings").and_then(|f| f.find_subcommand("mark")).unwrap();
+        let t = tool(&["findings".into(), "mark".into()], mark);
+        let id = &t["inputSchema"]["properties"]["id"];
+        assert_eq!(id["anyOf"][0]["type"], "integer");
+        assert_eq!(id["anyOf"][1]["type"], "array");
+        assert_eq!(id["anyOf"][1]["items"]["type"], "integer");
+        for (path, arg) in WAS_ONE_VALUE {
+            let mut c = &cli;
+            for part in path.split(' ') {
+                c = c.find_subcommand(part).unwrap_or_else(|| panic!("WAS_ONE_VALUE names a missing command: {path}"));
+            }
+            assert!(c.get_arguments().any(|a| a.get_id() == arg && repeatable(a)), "{path} {arg}");
+        }
     }
 }

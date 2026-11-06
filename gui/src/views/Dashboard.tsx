@@ -1,4 +1,4 @@
-import { run, type Risk } from "../api";
+import { run, type Posture, type Risk } from "../api";
 import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
 import { useState } from "react";
@@ -8,19 +8,17 @@ import { ScanWizard } from "./Wizard";
 import { UpdatesCard } from "./Updates";
 import { AppUpdateCard } from "./AppUpdate";
 
-const RISKS: Risk[] = ["high", "medium", "low", "info"];
+const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
 
 const STATS_SQL = `SELECT count(*) AS requests, count(DISTINCT host) AS hosts, count(DISTINCT host || ':' || port || path) AS paths,
   min(time) AS first, max(time) AS last FROM history`;
 
-const RISK_SQL = `SELECT risk, count(*) AS n FROM findings WHERE state NOT IN ('false_positive', 'removed') GROUP BY risk`;
-
-const RECENT_SQL = `SELECT id, name, risk, url, param, time FROM findings WHERE state NOT IN ('false_positive', 'removed') ORDER BY id DESC LIMIT 8`;
+const RECENT_SQL = `SELECT id, name, risk, url, param, time FROM findings WHERE state IN ('open', 'confirmed', 'retest_pending') ORDER BY id DESC LIMIT 8`;
 
 export function DashboardView({ active }: { active: boolean }) {
   const app = useApp();
   const [jobs] = usePoll<{ jobs: Job[] }>(() => run(["job", "list", "--limit", "8"]), 3000, active);
-  const [byRisk] = usePoll<{ rows: [Risk, number][] }>(() => run(["query", RISK_SQL]), 5000, active);
+  const [posture] = usePoll<Posture>(() => run(["findings", "posture"]), 5000, active);
   const [recent] = usePoll<{ rows: { id: number; name: string; risk: Risk; url: string; param: string; time: string }[] }>(
     () => run(["query", RECENT_SQL, "--shape", "objects"]),
     5000,
@@ -89,10 +87,11 @@ export function DashboardView({ active }: { active: boolean }) {
             Open Findings
           </button>
         </header>
+        {/* Open issues: a root cause counts once however many pages show it. Critical only when there is one. */}
         <div className="dash-risks">
-          {RISKS.map((r) => (
-            <button key={r} className="dash-risk" onClick={() => app.setTab("findings")}>
-              <span className={`dash-num risk-text-${r}`}>{byRisk?.rows.find((x) => x[0] === r)?.[1] ?? 0}</span>
+          {RISKS.filter((r) => r !== "critical" || (posture?.open.issues.critical ?? 0) > 0).map((r) => (
+            <button key={r} className="dash-risk" onClick={() => app.setTab("findings")} title={`${posture?.open.instances[r] ?? 0} open finding(s)`}>
+              <span className={`dash-num risk-text-${r}`}>{posture?.open.issues[r] ?? 0}</span>
               <span className="row gap">
                 <span className={`dot-risk risk-${r}`} /> {r}
               </span>
@@ -147,6 +146,8 @@ export function DashboardView({ active }: { active: boolean }) {
         )}
       </section>
 
+      {posture && <PostureCard posture={posture} onOpen={() => app.setTab("findings")} />}
+
       <section className="dash-card dash-wide">
         <header>
           <span className="label">History</span>
@@ -175,5 +176,59 @@ export function DashboardView({ active }: { active: boolean }) {
         )}
       </section>
     </div>
+  );
+}
+
+/** What scans found new and no longer found, the hosts with most open work, and retests. */
+function PostureCard({ posture, onOpen }: { posture: Posture; onOpen: () => void }) {
+  const scans = posture.scans.slice(-20);
+  const top = Math.max(1, ...scans.map((s) => s.new + s.gone));
+  const fixed = posture.by_state.fixed ?? 0;
+  const accepted = posture.by_state.accepted_risk ?? 0;
+  const retests = (posture.retests.still_present ?? 0) + (posture.retests.not_reproduced ?? 0);
+  return (
+    <section className="dash-card">
+      <header>
+        <span className="label">Posture</span>
+        <button className="btn small" onClick={onOpen}>
+          Open Findings
+        </button>
+      </header>
+      {scans.length ? (
+        <>
+          <div className="trend" role="img" aria-label={`New and no-longer-found findings over the last ${scans.length} scans`}>
+            {scans.map((s) => (
+              <div key={s.job} className="trend-scan" title={`Scan #${s.job}${s.finished ? ` (${new Date(s.finished).toLocaleDateString()})` : ""}: ${s.new} new, ${s.gone} no longer found, ${s.still} still there`}>
+                <div className="trend-new" style={{ height: `${(s.new / top) * 100}%` }} />
+                <div className="trend-gone" style={{ height: `${(s.gone / top) * 100}%` }} />
+              </div>
+            ))}
+          </div>
+          <p className="muted small">
+            <span className="legend-swatch trend-new" />
+            new <span className="legend-swatch trend-gone" />
+            no longer found, per completed scan (oldest left)
+          </p>
+        </>
+      ) : (
+        <p className="muted">Completed active scans show here: what each found new and no longer found.</p>
+      )}
+      <p className="muted small">
+        {fixed} fixed · {accepted} accepted · {retests} retest{retests === 1 ? "" : "s"}
+        {posture.regressed > 0 && ` · ${posture.regressed} came back after a fix`}
+      </p>
+      {posture.hosts.length > 1 && (
+        <>
+          <div className="label dash-sub">Hosts with most open findings</div>
+          {posture.hosts.slice(0, 5).map((h) => (
+            <div key={h.host} className="row gap dash-row">
+              <span className={`dot-risk risk-${h.risk}`} />
+              <span className="ellipsis grow">{h.host}</span>
+              <span className="muted">{h.open}</span>
+            </div>
+          ))}
+        </>
+      )}
+    </section>
   );
 }

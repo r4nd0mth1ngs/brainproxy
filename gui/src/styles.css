@@ -20,6 +20,7 @@
   --sel: oklch(0.64 0.24 320 / 0.2);
   --hl: oklch(0.78 0.16 80 / 0.12);
   --gradient: linear-gradient(90deg, oklch(0.58 0.24 320), oklch(0.6 0.15 300));
+  --critical: oklch(0.64 0.2 295);
   --high: oklch(0.66 0.2 25);
   --medium: oklch(0.72 0.17 50);
   --low: oklch(0.8 0.15 85);
@@ -53,6 +54,7 @@
   --sel: oklch(0.56 0.24 320 / 0.14);
   --hl: oklch(0.8 0.16 80 / 0.18);
   --gradient: linear-gradient(90deg, oklch(0.56 0.24 320), oklch(0.56 0.15 300));
+  --critical: oklch(0.5 0.2 295);
   --high: oklch(0.55 0.22 25);
   --medium: oklch(0.6 0.17 50);
   --low: oklch(0.62 0.14 85);
@@ -1162,6 +1164,9 @@ select {
   border-radius: 4px;
   color: #fff;
 }
+.risk-critical {
+  background: var(--critical);
+}
 .risk-high {
   background: var(--high);
 }
@@ -1218,6 +1223,38 @@ select {
 }
 .tree-item.struck .ellipsis {
   text-decoration: line-through;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+}
+.tree-row > .tree-group,
+.tree-row > .tree-item {
+  flex: 1;
+  min-width: 0;
+}
+.tree-check {
+  accent-color: var(--accent);
+  margin: 0 0 0 10px;
+  flex: none;
+}
+.tree-check.item {
+  margin-left: 26px;
+}
+.tree-row > .tree-group {
+  padding-left: 6px;
+}
+.tree-row > .tree-item {
+  padding-left: 8px;
+}
+.bulk-bar {
+  padding: 6px 10px;
+  background: var(--sel);
+  border-bottom: 1px solid var(--border);
+}
+.note-input {
+  width: 100%;
+  resize: vertical;
 }
 .caret {
   width: 10px;
@@ -1925,6 +1962,9 @@ button.dash-risk:hover {
   font-size: 22px;
   font-weight: 600;
   line-height: 1.1;
+}
+.risk-text-critical {
+  color: var(--critical);
 }
 .risk-text-high {
   color: var(--high);
@@ -2663,4 +2703,99 @@ button.chip {
 .az-error {
   border-color: var(--border-strong);
   color: var(--high);
+}
+
+/* A finding's timeline. */
+.timeline {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+/* Posture: what each scan found new and no longer found. */
+.trend {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 64px;
+  margin: 4px 0;
+}
+.trend-scan {
+  flex: 1;
+  max-width: 28px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 1px;
+  height: 100%;
+}
+.trend-new {
+  background: var(--high);
+  border-radius: 2px 2px 0 0;
+}
+.trend-gone {
+  background: var(--ok);
+  border-radius: 0 0 2px 2px;
+}
+.legend-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 4px;
+}
+/* Six triage states and the actions beside them wrap in a narrow detail pane. */
+.detail .toolbar.flat {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+/* The report builder (views/ReportBuilder.tsx): choices on the left, the preview on the right. */
+.report-dialog {
+  width: min(1180px, 100%);
+  height: calc(100vh - 32px);
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 16px;
+}
+.report-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+.report-form label:not(.check) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.report-form .check {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.report-colour {
+  width: 56px;
+  padding: 2px;
+}
+.report-preview {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.report-preview iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+@media (max-width: 900px) {
+  .report-dialog {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(300px, 1fr);
+  }
+}
+/* An agent's work nobody has looked at yet. */
+.warn-text {
+  color: var(--medium);
 }

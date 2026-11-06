@@ -56,8 +56,8 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("rule_id", "INTEGER", "Rule id (ZAP plugin id for ported rules)"),
     ("alert_ref", "TEXT", "Alert type id; join finding_types for description/solution"),
     ("name", "TEXT", "Alert name"),
-    ("risk", "TEXT", "info, low, medium, high"),
-    ("risk_level", "INTEGER", "0 info, 1 low, 2 medium, 3 high (for sorting/filtering)"),
+    ("risk", "TEXT", "info, low, medium, high, critical"),
+    ("risk_level", "INTEGER", "0 info, 1 low, 2 medium, 3 high, 4 critical (for sorting/filtering)"),
     ("confidence", "TEXT", "low, medium, high"),
     ("cwe", "INTEGER", "CWE id"),
     ("wasc", "INTEGER", "WASC id"),
@@ -83,7 +83,8 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     (
         "state",
         "TEXT",
-        "open, confirmed, false_positive, or removed (source manual, by `findings remove`; hidden unless --state all)",
+        "open, confirmed, false_positive, fixed, accepted_risk, retest_pending, or removed (source manual, by \
+         `findings remove`; hidden unless --state all). A fixed finding a scanner sees again is open again",
     ),
     ("note", "TEXT", "Free-text note"),
     (
@@ -100,13 +101,86 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("state_changed_at", "TEXT", "UTC time of the last state change; NULL if never changed"),
     ("note_origin", "TEXT", "gui, cli or mcp: who last set the note with `findings mark --note`; NULL if never set"),
     ("note_changed_at", "TEXT", "UTC time the note was last set"),
+    ("issue_id", "INTEGER", "The issue (root cause: alert type and host) it is an instance of; join issues"),
 ];
+
+/// Triage states a finding can be marked with. `removed` is set only by `findings remove`.
+pub const STATES: &[&str] = &["open", "confirmed", "false_positive", "fixed", "accepted_risk", "retest_pending"];
+
+/// Sets a finding's state and/or note and who set them, and puts each change on its
+/// timeline. An empty note clears it.
+pub(crate) fn mark_one(conn: &rusqlite::Connection, id: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
+    mark_with(conn, id, state, note, None)
+}
+
+/// [`mark_one`], with what caused a state change (its text and request) on its event: a
+/// retest's outcome stays with the fix it made.
+pub(crate) fn mark_with(
+    conn: &rusqlite::Connection,
+    id: i64,
+    state: Option<&str>,
+    note: Option<&str>,
+    cause: Option<(&str, Option<i64>)>,
+) -> Result<()> {
+    if let Some(s) = state.filter(|s| !STATES.contains(s)) {
+        return Err(Error::InvalidInput(format!("unknown state {s:?}: one of {}", STATES.join(", "))));
+    }
+    let before: Option<(String, Option<String>)> = conn
+        .prepare_cached("SELECT state, note FROM findings WHERE id = ?1 AND state != 'removed'")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let n = conn.execute(
+        "UPDATE findings SET state = COALESCE(?1, state),
+            note = CASE WHEN ?2 IS NULL THEN note ELSE NULLIF(?2, '') END,
+            state_origin = CASE WHEN ?1 IS NULL THEN state_origin ELSE ?4 END,
+            state_changed_at = CASE WHEN ?1 IS NULL THEN state_changed_at
+                ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
+            note_origin = CASE WHEN ?2 IS NULL THEN note_origin ELSE ?4 END,
+            note_changed_at = CASE WHEN ?2 IS NULL THEN note_changed_at
+                ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
+         WHERE id = ?3 AND state != 'removed'",
+        params![state, note, id, crate::provenance::origin()],
+    )?;
+    if n == 0 {
+        let exists = conn.query_row("SELECT 1 FROM findings WHERE id = ?1", [id], |_| Ok(())).optional()?;
+        return Err(match exists {
+            Some(()) => Error::Conflict(format!("finding {id} was removed; add it again to record it")),
+            None => Error::NotFound(format!("finding {id}")),
+        });
+    }
+    let (old_state, old_note) = before.unwrap_or_default();
+    let event = |kind, old: Option<&str>, new: Option<&str>, text: Option<&str>, history_id: Option<i64>| {
+        crate::scan::issues::record(
+            conn,
+            &crate::scan::issues::Event { finding: Some(id), kind, old, new, text, history_id, ..Default::default() },
+        )
+    };
+    if let Some(s) = state.filter(|s| *s != old_state) {
+        event("state", Some(&old_state), Some(s), cause.map(|c| c.0), cause.and_then(|c| c.1))?;
+    }
+    if let Some(n) = note.map(str::trim).map(|n| Some(n).filter(|n| !n.is_empty())) {
+        // Compared as the note is shown: a note re-saved with other spacing isn't a change.
+        if n != old_note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            event("note", old_note.as_deref(), None, n, None)?;
+        }
+    }
+    Ok(())
+}
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
 /// services on one host are different findings) and drops the query (parameters are `param`).
 pub(crate) fn dedupe_key(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
     let base = url.split('?').next().unwrap_or(url);
     format!("{alert_ref}|{method}|{base}|{param}")
+}
+
+/// A finding's identity ([`dedupe_key`]) as a hash: what reports export (SARIF's
+/// `partialFingerprints`, `report json`'s `fingerprint`) so a redacted report still matches
+/// its findings, and a secret in the URL's path doesn't travel with it.
+pub fn fingerprint(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(dedupe_key(alert_ref, method, url, param).as_bytes());
+    hex::encode(&hash[..16])
 }
 
 /// Schema v10: re-keys findings stored with the old key (which included the evidence and
@@ -212,6 +286,10 @@ impl Store {
         }
         let tx = self.write_tx()?;
         let mut new = 0;
+        // A row inserted now has an id above every earlier one; one found again keeps its own
+        // (hits alone can't tell: a rescan sets them to 0 first).
+        let before: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM findings", [], |r| r.get(0))?;
+        let mut created = std::collections::HashSet::new();
         {
             let mut types = tx.prepare_cached(
                 "INSERT OR IGNORE INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
@@ -221,8 +299,18 @@ impl Store {
                 "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, wasc, host,
                     method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19)
-                 ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id
-                 RETURNING hits",
+                 ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id,
+                    risk = CASE WHEN excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
+                    risk_level = max(risk_level, excluded.risk_level)
+                 RETURNING id",
+            )?;
+            // A finding marked fixed that is seen again is open again, when what saw it was
+            // recorded after it was marked: a rescan of older traffic doesn't reopen it.
+            let mut reopen = tx.prepare_cached(
+                "UPDATE findings SET state = 'open', state_origin = ?2,
+                    state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1 AND state = 'fixed'
+                    AND (state_changed_at IS NULL OR (SELECT time FROM history WHERE id = ?3) >= state_changed_at)",
             )?;
             for f in findings {
                 let d = f.def;
@@ -237,7 +325,7 @@ impl Store {
                     serde_json::to_string(d.tags).unwrap_or_default(),
                 ])?;
                 let dedupe = dedupe_key(d.alert_ref, &msg.method, &msg.url, &f.param);
-                let hits: i64 = insert.query_row(
+                let id: i64 = insert.query_row(
                     params![
                         source,
                         rule_id,
@@ -261,8 +349,21 @@ impl Store {
                     ],
                     |r| r.get(0),
                 )?;
-                if hits == 1 {
+                if id > before && created.insert(id) {
                     new += 1;
+                    crate::scan::issues::created(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
+                } else if reopen.execute(params![id, crate::provenance::origin(), msg.history_id])? > 0 {
+                    crate::scan::issues::record(
+                        &tx,
+                        &crate::scan::issues::Event {
+                            finding: Some(id),
+                            kind: "regressed",
+                            old: Some("fixed"),
+                            new: Some("open"),
+                            history_id: Some(msg.history_id),
+                            ..Default::default()
+                        },
+                    )?;
                 }
             }
         }
@@ -308,7 +409,8 @@ impl Store {
         let (where_sql, args) = filter.sql();
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
-                hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source
+                hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
+                issue_id
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -333,6 +435,7 @@ impl Store {
                 "note_origin": r.get::<_, Option<String>>(16)?,
                 "note_changed_at": r.get::<_, Option<String>>(17)?,
                 "source": r.get::<_, String>(18)?,
+                "issue_id": r.get::<_, Option<i64>>(19)?,
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -378,24 +481,17 @@ impl Store {
     /// so a finding hidden as a false positive, or a note replaced, says by whom. A removed
     /// finding stays as it was removed.
     pub fn finding_mark(&self, id: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE findings SET state = COALESCE(?1, state), note = COALESCE(?2, note),
-                state_origin = CASE WHEN ?1 IS NULL THEN state_origin ELSE ?4 END,
-                state_changed_at = CASE WHEN ?1 IS NULL THEN state_changed_at
-                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
-                note_origin = CASE WHEN ?2 IS NULL THEN note_origin ELSE ?4 END,
-                note_changed_at = CASE WHEN ?2 IS NULL THEN note_changed_at
-                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
-             WHERE id = ?3 AND state != 'removed'",
-            params![state, note, id, crate::provenance::origin()],
-        )?;
-        if n == 0 {
-            let exists = self.conn.query_row("SELECT 1 FROM findings WHERE id = ?1", [id], |_| Ok(())).optional()?;
-            return Err(match exists {
-                Some(()) => Error::Conflict(format!("finding {id} was removed; add it again to record it")),
-                None => Error::NotFound(format!("finding {id}")),
-            });
+        mark_one(&self.conn, id, state, note)
+    }
+
+    /// Triages several findings at once: all of them change, or none does (an unknown or
+    /// removed one fails the whole call).
+    pub fn findings_mark(&mut self, ids: &[i64], state: Option<&str>, note: Option<&str>) -> Result<()> {
+        let tx = self.write_tx()?;
+        for &id in ids {
+            mark_one(&tx, id, state, note)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -411,11 +507,20 @@ impl Store {
     }
 
     /// Ends a rescan: a finding it didn't find again goes, unless someone triaged it (changed
-    /// its state or wrote a note). That one stays with 0 hits, so a person's decision isn't lost
+    /// its state, or wrote or cleared a note). That one stays with 0 hits, so a person's decision isn't lost
     /// to a rescan an agent ran. Returns (removed, kept).
     pub(crate) fn findings_rescan_finish(&mut self, source: &str) -> Result<(usize, usize)> {
         let tx = self.write_tx()?;
-        let triaged = "(state != 'open' OR note IS NOT NULL OR state_origin IS NOT NULL)";
+        // Clearing a note is a decision too: note_origin says someone touched it.
+        // So is anything else on its timeline (a retest, a move to another issue, a ticket) or
+        // on its issue's (a title, a rating, a write-up): a record someone made stays.
+        let triaged = "(state != 'open' OR note IS NOT NULL OR state_origin IS NOT NULL OR note_origin IS NOT NULL
+            OR EXISTS (SELECT 1 FROM finding_events e WHERE e.finding_id = findings.id AND e.kind != 'created')
+            OR EXISTS (SELECT 1 FROM finding_events e WHERE e.finding_id IS NULL AND e.issue_id = findings.issue_id))";
+        // A finding that goes takes its timeline and scan observations with it.
+        let gone = format!("SELECT id FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}");
+        tx.execute(&format!("DELETE FROM finding_events WHERE finding_id IN ({gone})"), [source])?;
+        tx.execute(&format!("DELETE FROM scan_observations WHERE finding_id IN ({gone})"), [source])?;
         let removed =
             tx.execute(&format!("DELETE FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}"), [source])?;
         let kept: i64 = tx.query_row(
@@ -570,6 +675,7 @@ impl Store {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        crate::scan::issues::created(&tx, id, &alert_ref, &host, history.first().copied())?;
         // The table holds a first and a last entry; the whole list goes in meta.
         if history.len() > 2 {
             tx.execute(
@@ -630,6 +736,15 @@ impl Store {
                     state_changed_at = (SELECT json_extract(value, '$.time') FROM meta WHERE key = ?4)
                  WHERE id = ?2",
                 params![REMOVED, id, origin, removed_key(id)],
+            )?;
+            crate::scan::issues::record(
+                &tx,
+                &crate::scan::issues::Event {
+                    finding: Some(id),
+                    kind: "removed",
+                    new: Some(REMOVED),
+                    ..Default::default()
+                },
             )?;
         }
         tx.commit()?;
@@ -852,6 +967,8 @@ pub struct FindingFilter {
     pub source: Option<String>,
     /// Only these findings.
     pub ids: Option<Vec<i64>>,
+    /// Only the findings of this issue.
+    pub issue: Option<i64>,
     pub examples: usize,
 }
 
@@ -890,7 +1007,8 @@ impl FindingFilter {
                     clauses.push(format!("state IN (SELECT value FROM json_each({}))", bind(&mut args, list)));
                 }
             }
-            None => clauses.push("state NOT IN ('false_positive', 'removed')".into()),
+            // Work still to do: not dismissed, resolved or removed.
+            None => clauses.push("state NOT IN ('false_positive', 'fixed', 'accepted_risk', 'removed')".into()),
         }
         if let Some(s) = &self.source {
             clauses.push(format!("source = {}", bind(&mut args, s.clone())));
@@ -898,6 +1016,9 @@ impl FindingFilter {
         if let Some(ids) = &self.ids {
             let list = serde_json::to_string(ids).unwrap_or_default();
             clauses.push(format!("id IN (SELECT value FROM json_each({}))", bind(&mut args, list)));
+        }
+        if let Some(i) = self.issue {
+            clauses.push(format!("issue_id = CAST({} AS INTEGER)", bind(&mut args, i.to_string())));
         }
         (clauses.join(" AND "), args)
     }
@@ -1100,6 +1221,20 @@ mod tests {
         assert_eq!(v["history_ids"], json!(want));
         assert!(matches!(s.finding_mark(id, Some("open"), None), Err(Error::Conflict(_))));
         assert!(matches!(s.findings_remove(&[id]), Err(Error::Conflict(_))));
+        // Several at once: all or none, and an empty note clears it.
+        let live: Vec<i64> =
+            s.findings_list(&FindingFilter::default(), 10).unwrap().iter().filter_map(|v| v["id"].as_i64()).collect();
+        let other = *live.iter().find(|&&f| f != scanner).unwrap();
+        assert!(matches!(s.findings_mark(&[other, scanner, id], Some("confirmed"), None), Err(Error::Conflict(_))));
+        assert_eq!(s.finding_get(other).unwrap()["state"], "open");
+        s.findings_mark(&[other, scanner], Some("false_positive"), Some("both noise")).unwrap();
+        for f in [other, scanner] {
+            let v = s.finding_get(f).unwrap();
+            assert_eq!((v["state"].as_str(), v["note"].as_str()), (Some("false_positive"), Some("both noise")));
+        }
+        s.finding_mark(other, None, Some("")).unwrap();
+        let v = s.finding_get(other).unwrap();
+        assert!(v["note"].is_null() && v["state"] == "false_positive", "{v}");
         let types = |s: &Store| s.query("SELECT alert_ref FROM finding_types", &[], 10, 100).unwrap().rows.len();
         assert_eq!(types(&s), 2);
         // The same issue can be added again, as a new finding.
@@ -1286,5 +1421,24 @@ mod tests {
         // A passive rescan leaves the tombstone too.
         crate::scan::passive::rescan(&mut s).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["state"], "removed");
+    }
+
+    #[test]
+    fn a_cleared_note_is_triage_a_rescan_keeps() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        s.record(&Capture::new("send", &target, b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", Some(resp), None, None))
+            .unwrap();
+        crate::scan::passive::scan_pending(&mut s).unwrap();
+        let ids: Vec<i64> =
+            s.findings_list(&FindingFilter::default(), 100).unwrap().iter().filter_map(|v| v["id"].as_i64()).collect();
+        assert!(ids.len() > 1);
+        s.finding_mark(ids[0], None, Some("")).unwrap();
+        // Nothing is found again: only the finding someone touched stays.
+        s.findings_rescan_start("passive").unwrap();
+        assert_eq!(s.findings_rescan_finish("passive").unwrap(), (ids.len() - 1, 1));
+        let v = s.finding_get(ids[0]).unwrap();
+        assert!(v["note"].is_null() && v["hits"] == 0, "{v}");
     }
 }

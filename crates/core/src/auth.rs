@@ -237,6 +237,32 @@ impl AuthProfile {
         p.oauth = p.oauth.as_ref().map(crate::oauth::OAuth::redacted);
         p
     }
+
+    /// Every secret value this profile and its session hold (passwords, client secrets,
+    /// static header values and their credentials, query keys, cookies, tokens, macro
+    /// values), for a report to mask wherever it quotes them. A password read from an unset
+    /// environment variable is left out.
+    pub fn secret_values(&self, st: &SessionState) -> Vec<String> {
+        let resolve = |s: &Option<Secret>| s.as_ref().and_then(|s| s.resolve().ok());
+        let mut out: Vec<String> = [&self.password].into_iter().filter_map(resolve).collect();
+        if let Some(o) = &self.oauth {
+            out.extend([&o.client_secret, &o.refresh_token].into_iter().filter_map(resolve));
+        }
+        out.extend(static_cookies(self).into_iter().map(|(_, v)| v));
+        for (_, v) in self.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
+            // "Bearer xyz": the credential alone is what other places quote.
+            if let Some((_, cred)) = v.trim().split_once(' ') {
+                out.push(cred.trim().to_string());
+            }
+            out.push(v.trim().to_string());
+        }
+        out.extend(self.query_keys.iter().map(|q| q.value.clone()));
+        out.extend(st.cookies.iter().map(|(_, v)| v.clone()));
+        out.extend(st.token.iter().chain(&st.refresh_token).cloned());
+        out.extend(st.vars.iter().map(|v| v.value.clone()));
+        out.retain(|v| !v.is_empty());
+        out
+    }
 }
 
 /// Session state persisted between commands.
