@@ -286,6 +286,11 @@ brainproxy findings list --risk medium --all      # one row per instance
 brainproxy findings show 7                        # description, solution, references, evidence
 brainproxy findings mark 7 --state false-positive --note "test cookie"
 brainproxy findings mark 7 8 9 --state confirmed     # several at once: all or none
+brainproxy findings issues                        # one row per root cause (alert type on a host)
+brainproxy findings mark --issue 3 --state accepted-risk   # every finding of an issue
+brainproxy findings retest 7                      # send it again: not reproduced marks it fixed
+brainproxy findings timeline 7                    # found, triaged, retested, seen again, by whom
+brainproxy findings posture                       # open issues by risk, trends across scans
 brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --description-file idor.md   # found by hand; nothing is sent
 brainproxy findings remove 17                     # only findings added by hand; kept as removed
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off

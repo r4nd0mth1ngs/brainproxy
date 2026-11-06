@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -90,6 +90,12 @@ ALTER TABLE findings ADD COLUMN note_origin TEXT;
 ALTER TABLE findings ADD COLUMN note_changed_at TEXT;
 ALTER TABLE intercepts ADD COLUMN resolved_by TEXT;
 ";
+
+/// Whether `table` has `column`.
+pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?;
+    Ok(stmt.exists([column])?)
+}
 
 /// Runs each `ALTER TABLE t ADD COLUMN c ...` line of `schema` whose column `t` lacks, and
 /// every other line as it is (they must be idempotent, like `CREATE INDEX IF NOT EXISTS`).
@@ -565,6 +571,9 @@ impl Store {
         if version < 14 {
             // Builds before the release recorded v13 with fewer of its columns: add any missing.
             add_missing_columns(&self.conn, SCHEMA_V13)?;
+        }
+        if version < 15 {
+            crate::scan::issues::migrate_v15(&self.conn)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

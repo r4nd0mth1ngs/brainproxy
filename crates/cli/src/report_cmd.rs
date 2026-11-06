@@ -39,9 +39,10 @@ pub struct ReportArgs {
     /// Only findings from this scanner, or those added by hand (manual).
     #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
     source: Option<String>,
-    /// Triage state to include (default: open and confirmed, i.e. hides false positives and
-    /// removed findings added by hand; all includes both).
-    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "removed", "all"])]
+    /// Triage state to include (default: work still to do, i.e. open, confirmed and retest
+    /// pending: false positives, accepted risks, fixed findings and removed findings added by
+    /// hand are left out; all includes them).
+    #[arg(long, value_parser = crate::scan_cmd::STATE_VALUES)]
     state: Option<String>,
     #[arg(long)]
     host: Option<String>,
@@ -100,6 +101,7 @@ impl RiskArg {
             RiskArg::Low => Risk::Low,
             RiskArg::Medium => Risk::Medium,
             RiskArg::High => Risk::High,
+            RiskArg::Critical => Risk::Critical,
         }
     }
 }
@@ -140,6 +142,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
             state: a.state,
             source: a.source,
             ids,
+            issue: None,
             examples: 0,
         },
         title: a.title,

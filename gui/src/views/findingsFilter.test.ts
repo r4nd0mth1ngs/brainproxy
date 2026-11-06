@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { FindingItem } from "../api.ts";
-import { hostsOf, MARK_BATCH, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand } from "./findingsFilter.ts";
+import { CLOSED, eventText, groupKey, hostsOf, MARK_BATCH, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, STATES } from "./findingsFilter.ts";
 
 const item = (over: Partial<FindingItem>): FindingItem => ({
   id: 1,
@@ -55,4 +55,22 @@ test("who wrote a note is said in words", () => {
   assert.equal(noteBy("mcp", null), "by an agent (via MCP)");
   assert.equal(noteBy(null, null), "");
   assert.ok(noteBy("gui", "2026-11-05T10:00:00Z").startsWith("by the desktop app on "));
+});
+
+test("findings group by issue, and retests say when they may change data", () => {
+  assert.equal(groupKey(item({ issue_id: 4 })), "issue:4");
+  assert.equal(groupKey(item({ issue_id: null })), "alert:10037");
+  assert.deepEqual(retestCommand(7), ["findings", "retest", "7"]);
+  assert.deepEqual(retestCommand(7, true), ["findings", "retest", "7", "--allow-unsafe"]);
+  assert.ok(STATES.every((s) => s.id === "open" || s.id === "confirmed" || s.id === "retest_pending" || CLOSED.has(s.id)));
+});
+
+test("timeline events read as sentences", () => {
+  const e = (over: object) => ({ id: 1, time: "", kind: "state", old: null, new: null, text: null, by: "", history_id: null, ...over });
+  assert.equal(eventText(e({ old: "open", new: "false_positive" })), "Marked false positive (was open)");
+  assert.equal(eventText(e({ kind: "created", history_id: 3 })), "Found in history #3");
+  assert.equal(eventText(e({ kind: "note", text: "" })), "Note cleared");
+  assert.equal(eventText(e({ kind: "retest", new: "not_reproduced", text: "GET /a" })), "Retest: not reproduced (GET /a)");
+  assert.equal(eventText(e({ kind: "regressed", history_id: 9 })), "Seen again after it was fixed (history #9): open again");
+  assert.equal(eventText(e({ kind: "moved", old: "1", new: "2" })), "Moved from issue #1 to #2");
 });

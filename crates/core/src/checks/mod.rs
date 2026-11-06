@@ -502,7 +502,8 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
     let name = info.get("name").and_then(s).unwrap_or_else(|| id.clone());
     let severity = info.get("severity").and_then(s).unwrap_or_else(|| "info".into()).to_ascii_lowercase();
     let risk = match severity.as_str() {
-        "critical" | "high" => Risk::High,
+        "critical" => Risk::Critical,
+        "high" => Risk::High,
         "medium" => Risk::Medium,
         "low" => Risk::Low,
         "info" | "unknown" => Risk::Info,

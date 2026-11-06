@@ -271,6 +271,28 @@ pub fn child_args() -> Vec<String> {
     out
 }
 
+/// Stores what an active scan that ran to its end saw of each finding it covered (new, still
+/// there, gone), for trends. One that timed out (--max-minutes) didn't cover everything, so
+/// it says nothing is gone. A failure here leaves the scan's own result as it is.
+fn observe_scan(project: &Path, id: i64, result: &Value) {
+    let observe = || -> Result<(), Error> {
+        let mut store = Store::open(project)?;
+        if store.job_get(id)?["kind"] != "active-scan" {
+            return Ok(());
+        }
+        let (scope, _) = crate::compare_cmd::scan_baseline(&store, id, false, &mut Vec::new())?;
+        let mut seen = brainproxy_core::scan::compare::compare_scan(&store, &scope)?;
+        if result["timed_out"] == true || result["crawl"]["timed_out"] == true {
+            seen.fixed.clear();
+        }
+        store.scan_observations_record(id, &seen)?;
+        Ok(())
+    };
+    if let Err(e) = observe() {
+        eprintln!("warning: scan {id}'s observations weren't stored: {e}");
+    }
+}
+
 /// Runs a job body in this process: marks the job running, watches for stop
 /// requests and persists progress, then stores the result and final state.
 /// Without a job id (a foreground run) it just runs the body.
@@ -296,6 +318,10 @@ pub fn run_job(
         match &result {
             Ok(v) => {
                 store.job_result(id, v)?;
+                // Stored before the job says it completed, so whoever waits for it sees them.
+                if !ctl.stopped() {
+                    observe_scan(project, id, v);
+                }
                 store.job_set_state(id, if ctl.stopped() { "stopped" } else { "completed" }, None, None, true)?;
             }
             Err(e) => store.job_set_state(id, "failed", None, Some(&e.to_string()), true)?,

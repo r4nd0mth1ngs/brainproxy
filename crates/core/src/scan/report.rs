@@ -267,7 +267,7 @@ impl Body {
     }
 }
 
-const RISKS: [&str; 4] = ["high", "medium", "low", "info"];
+const RISKS: [&str; 5] = ["critical", "high", "medium", "low", "info"];
 
 /// A finding's state and who set it, in words.
 fn state_text(state: &str, by: Option<&str>, at: Option<&str>) -> String {
@@ -488,7 +488,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         "min_confidence": f.min_confidence.map(|c| c.as_str()),
         "host": f.host,
         "alert": f.alert_ref,
-        "state": f.state.clone().unwrap_or_else(|| "open,confirmed".into()),
+        "state": f.state.clone().unwrap_or_else(|| "open,confirmed,retest_pending".into()),
         "source": f.source,
     });
     if let Some(job) = opts.scan {
@@ -625,6 +625,7 @@ fn redaction_text(r: &Report) -> String {
 
 fn risk_title(risk: &str) -> &'static str {
     match risk {
+        "critical" => "Critical",
         "high" => "High",
         "medium" => "Medium",
         "low" => "Low",
@@ -999,9 +1000,9 @@ fn link(url: &str, text: &str) -> String {
 
 const CSS: &str = r#"
 :root{--bg:#fff;--fg:#1d1f23;--muted:#5d6370;--line:#dfe2e7;--card:#f6f7f9;--code:#eef0f3;
---high:#c62828;--medium:#d9730d;--low:#b59a00;--info:#3d6fb6}
+--critical:#7b1fa2;--high:#c62828;--medium:#d9730d;--low:#b59a00;--info:#3d6fb6}
 @media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e4e6ea;--muted:#9aa0aa;--line:#2e323a;
---card:#1e2126;--code:#262a31;--high:#ef5350;--medium:#f0953e;--low:#d8c13c;--info:#6c9be0}}
+--card:#1e2126;--code:#262a31;--critical:#ce93d8;--high:#ef5350;--medium:#f0953e;--low:#d8c13c;--info:#6c9be0}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:980px;margin:0 auto;padding:24px 16px 64px}
@@ -1012,7 +1013,7 @@ table{border-collapse:collapse;width:100%;margin:12px 0}
 th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
 td.n,th.n{text-align:right}
 .badge{display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;font-size:.8em;font-weight:600}
-.high{background:var(--high)}.medium{background:var(--medium)}.low{background:var(--low)}.info{background:var(--info)}
+.critical{background:var(--critical)}.high{background:var(--high)}.medium{background:var(--medium)}.low{background:var(--low)}.info{background:var(--info)}
 .inst{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0}
 .inst dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin:6px 0}
 .inst dt{color:var(--muted)}.inst dd{margin:0;min-width:0}
@@ -1027,7 +1028,7 @@ a{color:var(--info)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:14px 0}
 .card{display:flex;gap:12px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-left-width:5px;border-radius:8px;padding:10px 12px}
 .card .num{font-size:2em;font-weight:700;line-height:1;min-width:1.4em}.card p{margin:4px 0 0;font-size:.9em;color:var(--muted)}
-.high-edge{border-left-color:var(--high)}.medium-edge{border-left-color:var(--medium)}.low-edge{border-left-color:var(--low)}.info-edge{border-left-color:var(--info)}
+.critical-edge{border-left-color:var(--critical)}.high-edge{border-left-color:var(--high)}.medium-edge{border-left-color:var(--medium)}.low-edge{border-left-color:var(--low)}.info-edge{border-left-color:var(--info)}
 .fixfirst li{margin:6px 0}
 .tag{display:inline-block;padding:0 6px;border:1px solid var(--line);border-radius:4px;font-size:.8em}
 .tech{margin:12px 0;border:1px solid var(--line);border-radius:8px;padding:6px 12px}
@@ -1038,6 +1039,7 @@ a{color:var(--info)}
 /// What a risk level means, in plain words, for the report's readers.
 fn risk_meaning(risk: &str) -> &'static str {
     match risk {
+        "critical" => "Severe: an attacker could take over the system or its data with little effort. Fix now.",
         "high" => "Serious: could let an attacker steal data or take over accounts. Fix these first.",
         "medium" => "Important weaknesses that make attacks easier. Plan fixes soon.",
         "low" => "Minor issues and missing hardening. Fix when convenient.",
@@ -1103,7 +1105,8 @@ fn html(r: &Report) -> String {
 
     // ---- At a glance: for readers who stop after the first page.
     s.push_str("<h2>At a glance</h2>\n");
-    let (high, medium) = (count("high"), count("medium"));
+    // Critical and high are both "serious" here; the cards tell them apart.
+    let (high, medium) = (count("critical") + count("high"), count("medium"));
     let verdict = if r.summary.total == 0 {
         "The automated tests found no issues that match this report's filters.".to_string()
     } else if high > 0 {
@@ -1123,7 +1126,8 @@ fn html(r: &Report) -> String {
     };
     let _ = writeln!(s, "<p class=\"verdict\">{verdict}</p>");
     s.push_str("<div class=\"cards\">");
-    for risk in RISKS {
+    // A critical card only when there is something critical, so most reports keep four.
+    for risk in RISKS.into_iter().filter(|&r| r != "critical" || count(r) > 0) {
         let _ = write!(
             s,
             "<div class=\"card {risk}-edge\"><div class=\"num\">{}</div><div><span class=\"badge {risk}\">{}</span>\
@@ -1160,8 +1164,13 @@ fn html(r: &Report) -> String {
     if r.summary.redacted.is_none() {
         let _ = writeln!(s, "<p class=\"note\"><strong>{}</strong></p>", esc(&redaction_text(r)));
     }
-    let urgent: Vec<(usize, &AlertGroup)> =
-        r.alerts.iter().enumerate().filter(|(_, g)| g.risk == "high" || g.risk == "medium").take(10).collect();
+    let urgent: Vec<(usize, &AlertGroup)> = r
+        .alerts
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| matches!(g.risk.as_str(), "critical" | "high" | "medium"))
+        .take(10)
+        .collect();
     if !urgent.is_empty() {
         s.push_str("<h3>Fix these first</h3><ol class=\"fixfirst\">");
         for (i, g) in urgent {
@@ -1400,7 +1409,7 @@ fn day(t: &str) -> &str {
 
 fn sarif_level(risk: &str) -> &'static str {
     match risk {
-        "high" => "error",
+        "critical" | "high" => "error",
         "medium" => "warning",
         "low" => "note",
         _ => "none",
@@ -1410,6 +1419,7 @@ fn sarif_level(risk: &str) -> &'static str {
 /// GitHub code scanning reads `security-severity` (0.0–10.0) to bucket alerts.
 fn security_severity(risk: &str) -> &'static str {
     match risk {
+        "critical" => "9.5",
         "high" => "8.0",
         "medium" => "5.5",
         "low" => "3.0",
@@ -1537,6 +1547,14 @@ fn sarif(r: &Report) -> Value {
             }
             if let Some(b) = inst.baseline_state {
                 res["baselineState"] = json!(b);
+            }
+            // Triaged as not to be fixed: code scanning shows it as dismissed, not open.
+            if matches!(inst.state.as_str(), "false_positive" | "accepted_risk") {
+                let mut s = json!({"kind": "external", "status": "accepted"});
+                if let Some(n) = &inst.note {
+                    s["justification"] = json!(n);
+                }
+                res["suppressions"] = json!([s]);
             }
             if let Some(l) = inst.latest_id() {
                 res["properties"]["lastHistoryId"] = json!(l);
@@ -1731,6 +1749,21 @@ mod tests {
         let r = build(&s, &ReportOptions::default()).unwrap();
         let hidden = r.agent_false_positives.iter().find(|h| h.id == xpb).unwrap();
         assert!(hidden.url.contains("jsessionid=[redacted]") && !hidden.url.contains("PATHSECRET99"), "{}", hidden.url);
+
+        // With every state, SARIF says which results were dismissed, and why.
+        s.finding_mark(xpb, None, Some("Framework banner is public")).unwrap();
+        let all = ReportOptions {
+            filter: FindingFilter { state: Some("all".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let v: Value = serde_json::from_str(&render(&build(&s, &all).unwrap(), ReportKind::Sarif)).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        let dismissed = results.iter().find(|x| x["ruleId"] == "10037").unwrap();
+        assert_eq!(
+            dismissed["suppressions"],
+            json!([{"kind": "external", "status": "accepted", "justification": "Framework banner is public"}])
+        );
+        assert!(results.iter().filter(|x| x["ruleId"] != "10037").all(|x| x.get("suppressions").is_none()));
     }
 
     #[test]

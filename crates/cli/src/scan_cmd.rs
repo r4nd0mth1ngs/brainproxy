@@ -88,8 +88,9 @@ pub enum FindingsCmd {
         /// Alert ref or rule id, e.g. 10020 or 10020-1.
         #[arg(long)]
         alert: Option<String>,
-        /// open, confirmed, false_positive, removed, or all, or several separated by commas
-        /// (default hides false positives and removed findings added by hand).
+        /// open, confirmed, false_positive, fixed, accepted_risk, retest_pending, removed, or all,
+        /// or several separated by commas (default: work still to do, so it hides false
+        /// positives, fixed and accepted findings, and removed findings added by hand).
         #[arg(long)]
         state: Option<String>,
         /// Only findings from this scanner, or those added by hand (manual).
@@ -107,7 +108,7 @@ pub enum FindingsCmd {
     /// Compare findings with a baseline (new, unchanged, fixed) and optionally fail on a risk (exit code 5).
     #[command(
         after_help = "The baseline is a file (`report json --state all --no-evidence`), a background active scan of this project (--scan), or nothing, when every finding is new. Findings \
-        match by alert, method, URL without its query, and parameter. A false-positive mark on either side stays \
+        match by alert, method, URL without its query, and parameter. A false-positive or accepted-risk mark on either side stays \
         with the finding. Findings added by hand are outside every --scan (no scan looks for them); against a \
         file they compare like any other. Exit codes: 5 when --fail-on finds something; 4 when the baseline, project, or job \
         doesn't exist (--allow-missing-baseline treats a missing baseline file as empty); 2 for a baseline that \
@@ -116,11 +117,57 @@ pub enum FindingsCmd {
     Compare(crate::compare_cmd::CompareArgs),
     /// One finding with description, solution, references, and evidence.
     Show { id: i64 },
-    /// Triage one or more findings: all of them change, or none does.
+    /// Issues: one root cause (an alert type on one host) with the findings it was seen at,
+    /// riskiest first.
+    Issues {
+        /// Minimum risk.
+        #[arg(long, value_enum)]
+        risk: Option<RiskArg>,
+        /// Minimum confidence.
+        #[arg(long, value_enum)]
+        confidence: Option<crate::report_cmd::ConfidenceArg>,
+        #[arg(long)]
+        host: Option<String>,
+        /// Alert ref or rule id, e.g. 10020 or 10020-1.
+        #[arg(long)]
+        alert: Option<String>,
+        /// States of the findings counted, as for `findings list` (default: work still to do).
+        #[arg(long)]
+        state: Option<String>,
+        /// Only findings from this scanner, or those added by hand (manual).
+        #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
+        source: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Show, split, merge, or rename an issue.
+    #[command(subcommand)]
+    Issue(IssueCmd),
+    /// A finding's timeline: found, triaged, noted, retested, moved between issues, seen again
+    /// after it was fixed, removed; each with who did it and when.
+    Timeline { id: i64 },
+    /// Send a finding's request again and record whether it is still there.
+    #[command(after_help = "Passive findings: the latest request is sent again (history source retest) \
+        and the finding's own rule reads that response. Not reproduced marks it fixed, and a fixed or \
+        retest_pending finding still there is open again (--no-mark records the outcome only; false \
+        positives and accepted risks keep their state). A rule that is switched off is refused (kind \
+        conflict), and so is a reply of another status class than the finding's request had (a \
+        login redirect, an error page) that doesn't show it. Only GET, HEAD and OPTIONS are sent unless --allow-unsafe. Active findings are \
+        retested by scanning again (the error gives the command), findings added by hand by hand, and \
+        access-control findings with authz run. The outcome is on the finding's timeline.")]
+    Retest(crate::retest_cmd::RetestArgs),
+    /// Open work at a glance: open issues and findings by risk, findings by state, risk ×
+    /// confidence, the hosts with most open findings, what each active scan found new and no
+    /// longer found, retest outcomes and regressions.
+    Posture,
+    /// Triage one or more findings, or every finding of an issue: all of them change, or none does.
     Mark {
         /// One or more finding ids. (Named `id`, so an agent's `{"id": 5}` keeps working.)
-        #[arg(value_name = "ID", required = true, num_args = 1..)]
+        #[arg(value_name = "ID", required_unless_present = "issue", num_args = 1..)]
         id: Vec<i64>,
+        /// Every finding of this issue (`findings issues`), as well as any IDs given. Repeatable.
+        #[arg(long, value_name = "ISSUE")]
+        issue: Vec<i64>,
         #[arg(long, value_enum)]
         state: Option<StateArg>,
         /// A note on the finding, shown in reports; an empty note clears it. Either way the
@@ -148,6 +195,29 @@ pub enum FindingsCmd {
         #[arg(required = true)]
         ids: Vec<i64>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum IssueCmd {
+    /// One issue with its findings and its own timeline (title changes).
+    Show { id: i64 },
+    /// Move findings out of their issue into a new one: two bugs that share a rule and host.
+    Split {
+        /// Findings of one issue.
+        #[arg(required = true)]
+        findings: Vec<i64>,
+        /// The new issue's title (default: the alert's name).
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Move every finding of the other issues into the first: one bug seen on several hosts.
+    Merge {
+        into: i64,
+        #[arg(required = true)]
+        from: Vec<i64>,
+    },
+    /// Give an issue a title of its own, shown in place of the alert's name; "" restores it.
+    Title { id: i64, title: String },
 }
 
 #[derive(clap::Args)]
@@ -301,7 +371,23 @@ pub enum RiskArg {
     Low,
     Medium,
     High,
+    Critical,
 }
+
+/// What `--state` takes where one state picks findings (report, compare).
+pub const STATE_VALUES: [&str; 11] = [
+    "open",
+    "confirmed",
+    "false_positive",
+    "false-positive",
+    "fixed",
+    "accepted_risk",
+    "accepted-risk",
+    "retest_pending",
+    "retest-pending",
+    "removed",
+    "all",
+];
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum StateArg {
@@ -309,6 +395,27 @@ pub enum StateArg {
     Confirmed,
     #[value(alias = "false_positive")]
     FalsePositive,
+    /// No longer there (a retest that doesn't reproduce it sets this too).
+    Fixed,
+    /// Known and accepted, not to be fixed; left out of gates like a false positive.
+    #[value(alias = "accepted_risk")]
+    AcceptedRisk,
+    /// Fixed by the developers, waiting for a retest.
+    #[value(alias = "retest_pending")]
+    RetestPending,
+}
+
+impl StateArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StateArg::Open => "open",
+            StateArg::Confirmed => "confirmed",
+            StateArg::FalsePositive => "false_positive",
+            StateArg::Fixed => "fixed",
+            StateArg::AcceptedRisk => "accepted_risk",
+            StateArg::RetestPending => "retest_pending",
+        }
+    }
 }
 
 pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), Error> {
@@ -463,11 +570,95 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     if let FindingsCmd::Compare(args) = cmd {
         return crate::compare_cmd::compare(project, args, out);
     }
+    if let FindingsCmd::Retest(args) = cmd {
+        return crate::retest_cmd::retest(project, args, out);
+    }
     let mut store = Store::open(project)?;
     // Findings always reflect everything captured so far.
     passive::scan_pending(&mut store)?;
     match cmd {
-        FindingsCmd::Compare(_) => unreachable!(),
+        FindingsCmd::Compare(_) | FindingsCmd::Retest(_) => unreachable!(),
+        FindingsCmd::Issues { risk, confidence, host, alert, state, source, limit } => {
+            let filter = FindingFilter {
+                min_risk: risk.map(RiskArg::get),
+                min_confidence: confidence.map(|c| c.get()),
+                host,
+                alert_ref: alert,
+                state,
+                source,
+                ids: None,
+                issue: None,
+                examples: 0,
+            };
+            let issues = store.issues_list(&filter, limit)?;
+            out.ok(json!({"count": issues.len(), "issues": issues}), || {
+                issues
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "{:>5}  {:<8} {:<50} {}  {} instance(s)",
+                            i["id"],
+                            i["risk"].as_str().unwrap_or(""),
+                            i["title"].as_str().unwrap_or(""),
+                            i["host"].as_str().unwrap_or(""),
+                            i["instances"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        FindingsCmd::Issue(cmd) => match cmd {
+            IssueCmd::Show { id } => {
+                let issue = store.issue_get(id)?;
+                out.ok(issue.clone(), || serde_json::to_string_pretty(&issue).unwrap_or_default());
+            }
+            IssueCmd::Split { findings, title } => {
+                let id = store.issue_split(&findings, title.as_deref())?;
+                out.ok(json!({"issue": id, "findings": findings}), || {
+                    format!("moved {} finding(s) to new issue {id}", findings.len())
+                });
+            }
+            IssueCmd::Merge { into, from } => {
+                let moved = store.issues_merge(into, &from)?;
+                out.ok(json!({"into": into, "from": from, "moved": moved}), || {
+                    format!("moved {moved} finding(s) into issue {into}")
+                });
+            }
+            IssueCmd::Title { id, title } => {
+                store.issue_set_title(id, &title)?;
+                let issue = store.issue_get(id).ok();
+                let shown = issue.as_ref().map(|i| i["title"].clone()).unwrap_or(json!(title));
+                out.ok(json!({"id": id, "title": shown}), || format!("issue {id} is now {shown}"));
+            }
+        },
+        FindingsCmd::Timeline { id } => {
+            let events = store.finding_events(id)?;
+            out.ok(json!({"id": id, "events": events}), || {
+                events
+                    .iter()
+                    .map(|e| {
+                        let change = match (e["old"].as_str(), e["new"].as_str()) {
+                            (Some(o), Some(n)) => format!("{o} -> {n}"),
+                            (None, Some(n)) => n.to_string(),
+                            _ => String::new(),
+                        };
+                        format!(
+                            "{}  {:<9} {change} {}  ({})",
+                            e["time"].as_str().unwrap_or(""),
+                            e["kind"].as_str().unwrap_or(""),
+                            e["text"].as_str().unwrap_or(""),
+                            e["by"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        FindingsCmd::Posture => {
+            let p = store.posture()?;
+            out.ok(p.clone(), || serde_json::to_string_pretty(&p).unwrap_or_default());
+        }
         FindingsCmd::List { risk, confidence, host, alert, state, source, all, examples, limit } => {
             let filter = FindingFilter {
                 min_risk: risk.map(RiskArg::get),
@@ -477,6 +668,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 state,
                 source,
                 ids: None,
+                issue: None,
                 examples,
             };
             if all {
@@ -527,15 +719,16 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let f = store.finding_get(id)?;
             out.ok(f.clone(), || serde_json::to_string_pretty(&f).unwrap_or_default());
         }
-        FindingsCmd::Mark { id: ids, state, note } => {
+        FindingsCmd::Mark { id: mut ids, issue, state, note } => {
             if state.is_none() && note.is_none() {
                 return Err(Error::InvalidInput("give --state and/or --note".into()));
             }
-            let state = state.map(|s| match s {
-                StateArg::Open => "open",
-                StateArg::Confirmed => "confirmed",
-                StateArg::FalsePositive => "false_positive",
-            });
+            for i in issue {
+                ids.extend(store.issue_finding_ids(i)?);
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            let state = state.map(StateArg::as_str);
             store.findings_mark(&ids, state, note.as_deref())?;
             // `note` is as given: "" when it was cleared, null when it was left alone.
             match ids.as_slice() {

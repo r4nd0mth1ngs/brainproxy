@@ -1,7 +1,7 @@
 // What the Findings view shows and the commands its triage runs. Kept apart from the view so
 // it can be tested without a window.
 
-import type { FindingItem } from "../api";
+import type { FindingEvent, FindingItem } from "../api";
 
 export type Source = "all" | "passive" | "active" | "authz" | "manual";
 
@@ -59,4 +59,53 @@ export function noteBy(origin: string | null | undefined, at: string | null | un
   const who = origin === "mcp" ? "an agent (via MCP)" : origin === "cli" ? "the command line" : origin === "gui" ? "the desktop app" : "";
   const when = at ? new Date(at).toLocaleString() : "";
   return [who && `by ${who}`, when && `on ${when}`].filter(Boolean).join(" ");
+}
+
+/** Triage states, in the order the buttons show them. */
+export const STATES: { id: string; label: string; title: string }[] = [
+  { id: "open", label: "open", title: "Still to look at or to fix" },
+  { id: "confirmed", label: "confirmed", title: "Checked: it is real" },
+  { id: "false_positive", label: "false positive", title: "Not a real issue; left out of reports and gates" },
+  { id: "accepted_risk", label: "accepted", title: "Real, but accepted and not to be fixed; left out of gates" },
+  { id: "retest_pending", label: "retest pending", title: "Fixed by the developers, waiting for a retest" },
+  { id: "fixed", label: "fixed", title: "No longer there; it is open again if a scan sees it again" },
+];
+
+/** States that need no more work: hidden with "Hide closed". */
+export const CLOSED = new Set(["false_positive", "accepted_risk", "fixed"]);
+
+/** What a finding is grouped under: its issue (alert type and host), or its alert type. */
+export function groupKey(f: FindingItem): string {
+  return f.issue_id != null ? `issue:${f.issue_id}` : `alert:${f.alert_ref}`;
+}
+
+/** The command that retests a finding; `unsafe` lets it send a request that may change data. */
+export function retestCommand(id: number, unsafe = false): string[] {
+  return ["findings", "retest", String(id), ...(unsafe ? ["--allow-unsafe"] : [])];
+}
+
+const said = (s: string | null) => (s ?? "").replace(/_/g, " ");
+
+/** A timeline event in words. */
+export function eventText(e: FindingEvent): string {
+  switch (e.kind) {
+    case "created":
+      return e.history_id != null ? `Found in history #${e.history_id}` : "Recorded";
+    case "state":
+      return e.old ? `Marked ${said(e.new)} (was ${said(e.old)})` : `Marked ${said(e.new)}`;
+    case "note":
+      return e.text ? `Note: ${e.text}` : "Note cleared";
+    case "retest":
+      return `Retest: ${e.new === "still_present" ? "still there" : "not reproduced"}${e.text ? ` (${e.text})` : ""}`;
+    case "regressed":
+      return `Seen again after it was fixed${e.history_id != null ? ` (history #${e.history_id})` : ""}: open again`;
+    case "moved":
+      return `Moved from issue #${e.old} to #${e.new}`;
+    case "title":
+      return e.new ? `Issue renamed "${e.new}"` : "Issue title reset";
+    case "removed":
+      return "Removed";
+    default:
+      return `${e.kind} ${said(e.new)}`.trim();
+  }
 }
