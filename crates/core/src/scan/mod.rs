@@ -12,6 +12,7 @@ pub mod issues;
 pub mod layout;
 pub mod message;
 pub mod passive;
+pub mod proof;
 pub mod redact;
 pub mod report;
 

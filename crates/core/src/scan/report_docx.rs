@@ -6,7 +6,8 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 
 use super::{
-    curl, day, first_sentence, http_text, left_out_text, redaction_text, risk_title, Report, RetestRow, RISKS,
+    curl, day, first_sentence, http_text, left_out_text, narrative_title, redaction_text, risk_title, trail_text,
+    Report, RetestRow, RISKS,
 };
 use crate::scan::layout::Section;
 
@@ -148,6 +149,11 @@ pub fn render(r: &Report) -> Vec<u8> {
             .map(|&k| vec![risk_title(k).to_string(), count(k).to_string()])
             .collect();
         d.table(&["Risk", "Findings"], &rows);
+        if let Some(n) = &r.summary_narrative {
+            d.heading(2, if n.reviewed() { "Executive summary" } else { "Executive summary (draft, not reviewed)" });
+            d.text(&n.text);
+            d.para("Subtitle", &n.credit());
+        }
     }
     // What the report leaves out, and whether it is redacted, whatever its sections.
     if r.summary.truncated {
@@ -247,6 +253,11 @@ pub fn render(r: &Report) -> Vec<u8> {
             if let Some(c) = &g.cvss {
                 d.labelled("CVSS 4.0:", &format!("{:.1} ({}) {}", c.score, c.severity, c.vector));
             }
+            for n in &g.narratives {
+                d.heading(2, &narrative_title(g, n));
+                d.text(&n.narrative.text);
+                d.para("Subtitle", &n.narrative.credit());
+            }
             for (h, text) in [("What this means", &g.description), ("How to fix it", &g.solution)] {
                 if !text.trim().is_empty() {
                     d.heading(2, h);
@@ -284,6 +295,12 @@ pub fn render(r: &Report) -> Vec<u8> {
                     }
                     if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                         d.labelled("Note:", n);
+                    }
+                    if let Some(t) = &inst.agent_trail {
+                        d.labelled("Agent trail:", &trail_text(t));
+                    }
+                    for t in &inst.tickets {
+                        d.labelled(&format!("Ticket ({}):", t.tracker), &t.url);
                     }
                     if let Some(req) = &inst.request {
                         d.code(&http_text(req, inst.response.as_ref()));

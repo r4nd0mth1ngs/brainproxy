@@ -17,6 +17,7 @@ use crate::provenance;
 use crate::scan::cvss;
 use crate::scan::findings_db::{fingerprint, FindingFilter, MANUAL_SOURCE};
 use crate::scan::layout::{Layout, Section};
+use crate::scan::proof::Narrative;
 use crate::scan::redact::Redactor;
 use crate::store::Store;
 
@@ -26,6 +27,9 @@ pub enum ReportKind {
     Markdown,
     Html,
     Sarif,
+    Csv,
+    Junit,
+    DefectDojo,
 }
 
 impl ReportKind {
@@ -35,6 +39,9 @@ impl ReportKind {
             ReportKind::Markdown => "markdown",
             ReportKind::Html => "html",
             ReportKind::Sarif => "sarif",
+            ReportKind::Csv => "csv",
+            ReportKind::Junit => "junit",
+            ReportKind::DefectDojo => "defectdojo",
         }
     }
 }
@@ -58,6 +65,8 @@ pub struct ReportOptions {
     pub redact: bool,
     /// Which sections the report has, and its branding.
     pub layout: Layout,
+    /// Print narratives nobody has reviewed yet, marked as drafts.
+    pub drafts: bool,
 }
 
 impl Default for ReportOptions {
@@ -72,6 +81,7 @@ impl Default for ReportOptions {
             baseline: None,
             redact: true,
             layout: Layout::default(),
+            drafts: false,
         }
     }
 }
@@ -94,6 +104,9 @@ pub struct Report {
     /// With a retest section: what changed since a day.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retest: Option<RetestLetter>,
+    /// The executive summary, once reviewed (or a draft, when drafts are asked for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_narrative: Option<Narrative>,
     #[serde(skip)]
     pub layout: Layout,
 }
@@ -202,7 +215,36 @@ pub struct AlertGroup {
     /// The highest CVSS 4.0 score among its instances' issues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
+    /// Write-ups of its issues (one per host), reviewed or, when asked for, drafts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub narratives: Vec<IssueNarrative>,
     pub instances: Vec<Instance>,
+}
+
+/// An issue's write-up in a report.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueNarrative {
+    pub issue_id: i64,
+    pub host: String,
+    #[serde(flatten)]
+    pub narrative: Narrative,
+}
+
+/// What an agent did for a finding, in short.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrailSummary {
+    pub requests: usize,
+    pub first_history_id: Option<i64>,
+    pub last_history_id: Option<i64>,
+    pub agent_changes: usize,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Ticket {
+    pub tracker: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,6 +302,12 @@ pub struct Instance {
     pub issue_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
+    /// When an agent added or changed it: what it sent and whether a person looked after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_trail: Option<TrailSummary>,
+    /// Tickets filed for it (`findings ticket --record`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tickets: Vec<Ticket>,
 }
 
 impl Instance {
@@ -418,6 +466,8 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             latest: None,
             fingerprint: String::new(),
             baseline_state: None,
+            agent_trail: None,
+            tickets: Vec::new(),
             issue_id: r.get(32)?,
             cvss: match (r.get::<_, Option<String>>(33)?, r.get::<_, Option<f64>>(34)?) {
                 (Some(vector), Some(score)) => Some(CvssRating { vector, score, severity: cvss::severity(score) }),
@@ -452,6 +502,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                     references: list(r.get(23)?),
                     tags: list(r.get(24)?),
                     cvss: inst.cvss.clone(),
+                    narratives: Vec::new(),
                     instances: vec![inst],
                 })
             }
@@ -472,6 +523,40 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             }
         }
     }
+
+    // Write-ups (reviewed, or drafts when asked for), agent trails and tickets. A trail is
+    // worked out only for the findings an agent touched, found in one query.
+    let ids: Vec<i64> = groups.iter().flat_map(|g| g.instances.iter().map(|i| i.id)).collect();
+    let touched = store.agent_touched(&ids)?;
+    let mut tickets = store.findings_tickets(&ids)?;
+    for g in &mut groups {
+        let mut seen = std::collections::BTreeSet::new();
+        for inst in &mut g.instances {
+            if let Some(issue) = inst.issue_id.filter(|i| seen.insert(*i)) {
+                if let Some(n) = store.issue_narrative(issue)?.filter(|n| n.reviewed() || opts.drafts) {
+                    g.narratives.push(IssueNarrative { issue_id: issue, host: inst.host.clone(), narrative: n });
+                }
+            }
+            let trail = if touched.contains(&inst.id) { Some(store.agent_trail(inst.id)?) } else { None };
+            if let Some(trail) = trail.filter(|t| t.agent_involved) {
+                inst.agent_trail = Some(TrailSummary {
+                    requests: trail.requests_total,
+                    first_history_id: trail.requests.first().map(|r| r.history_id),
+                    last_history_id: trail.requests.last().map(|r| r.history_id),
+                    agent_changes: trail.events.len(),
+                    reviewed_by: trail.reviewed_by,
+                    reviewed_at: trail.reviewed_at,
+                });
+            }
+            inst.tickets = tickets
+                .remove(&inst.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(tracker, url)| Ticket { tracker, url })
+                .collect();
+        }
+    }
+    let summary_narrative = store.summary()?.filter(|n| n.reviewed() || opts.drafts);
 
     // The exchanges, first and latest sighting, with their secrets masked; the values masked
     // there are then masked wherever else the report quotes them. Without evidence (a CI
@@ -548,6 +633,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     let mut retest =
         if opts.layout.has(Section::Retest) { Some(retest_letter(store, &opts.layout, &scope)?) } else { None };
 
+    let mut summary_narrative = summary_narrative;
     if let Some(red) = redactor.as_mut() {
         // Findings the report names outside its list (the retest letter's, those an agent
         // hid): their exchanges are read only to learn their secrets, so the scrub masks
@@ -561,7 +647,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             }
         }
         learn_secrets(store, red, &ids, sightings)?;
-        redact_findings(red, &mut groups, &mut agent_false_positives, retest.as_mut());
+        redact_findings(red, &mut groups, &mut agent_false_positives, retest.as_mut(), summary_narrative.as_mut());
     }
 
     let generated: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
@@ -596,6 +682,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         agent_false_positives,
         posture,
         retest,
+        summary_narrative,
         layout: opts.layout.clone(),
     })
 }
@@ -669,14 +756,41 @@ fn retest_letter(store: &Store, layout: &Layout, scope: &FindingFilter) -> Resul
     Ok(letter)
 }
 
-/// Masks secrets in everything a report quotes from the target. Notes and write-ups are the
-/// tester's own words and are left alone.
+/// Masks secrets in everything a report quotes from the target, and in the words people and
+/// agents wrote about it (notes, write-ups, ticket links), which may quote a live token.
 fn redact_findings(
     red: &mut Redactor,
     groups: &mut [AlertGroup],
     hidden: &mut [HiddenFinding],
     mut letter: Option<&mut RetestLetter>,
+    mut summary: Option<&mut Narrative>,
 ) {
+    // Notes, write-ups and tickets: someone's words and links, but they may quote a token.
+    let words = |red: &mut Redactor,
+                 groups: &mut [AlertGroup],
+                 hidden: &mut [HiddenFinding],
+                 summary: Option<&mut Narrative>,
+                 pass: fn(&mut Redactor, &mut String)| {
+        for g in groups.iter_mut() {
+            for n in g.narratives.iter_mut() {
+                pass(red, &mut n.narrative.text);
+            }
+            for i in g.instances.iter_mut() {
+                if let Some(n) = i.note.as_mut() {
+                    pass(red, n);
+                }
+                for t in i.tickets.iter_mut() {
+                    pass(red, &mut t.url);
+                }
+            }
+        }
+        for n in hidden.iter_mut().filter_map(|h| h.note.as_mut()) {
+            pass(red, n);
+        }
+        if let Some(n) = summary {
+            pass(red, &mut n.text);
+        }
+    };
     let mut letter_fields = |red: &mut Redactor, pass: fn(&mut Redactor, &mut String)| {
         if let Some(l) = letter.as_deref_mut() {
             for list in [&mut l.fixed, &mut l.still_present, &mut l.regressed, &mut l.pending] {
@@ -698,6 +812,7 @@ fn redact_findings(
         red.text(&mut h.param);
     }
     letter_fields(red, Redactor::text);
+    words(red, groups, hidden, summary.as_deref_mut(), Redactor::text);
     for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
         for s in [&mut inst.url, &mut inst.param, &mut inst.evidence, &mut inst.attack, &mut inst.other_info] {
             red.scrub(s);
@@ -714,6 +829,7 @@ fn redact_findings(
         red.scrub(&mut h.param);
     }
     letter_fields(red, Redactor::scrub);
+    words(red, groups, hidden, summary, Redactor::scrub);
 }
 
 /// Reads the first and latest exchanges of findings `ids`, and the history entries
@@ -773,6 +889,8 @@ fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, O
 /// Renders a report in the given format.
 #[path = "report_docx.rs"]
 mod docx;
+#[path = "report_exports.rs"]
+mod exports;
 
 /// The report as a Word document (DOCX).
 pub fn render_docx(report: &Report) -> Vec<u8> {
@@ -798,6 +916,9 @@ pub fn render(report: &Report, kind: ReportKind) -> String {
         ReportKind::Markdown => markdown(report),
         ReportKind::Html => html(report),
         ReportKind::Sarif => serde_json::to_string_pretty(&sarif(report)).unwrap_or_default() + "\n",
+        ReportKind::Csv => exports::csv(report),
+        ReportKind::Junit => exports::junit(report),
+        ReportKind::DefectDojo => exports::defectdojo(report),
     }
 }
 
@@ -1056,6 +1177,15 @@ fn markdown(r: &Report) -> String {
         let _ = writeln!(s, "> {t}\n");
     }
     let _ = writeln!(s, "> {}\n", redaction_text(r));
+    if let Some(n) = r.summary_narrative.as_ref().filter(|_| layout.has(Section::Summary)) {
+        let _ = writeln!(
+            s,
+            "## Executive summary{}\n\n{}\n\n_{}_\n",
+            if n.reviewed() { "" } else { " (draft, not reviewed)" },
+            md_no_html(n.text.trim()),
+            md_escape(&n.credit())
+        );
+    }
     if layout.has(Section::FixFirst) {
         let urgent: Vec<_> =
             r.alerts.iter().filter(|g| matches!(g.risk.as_str(), "critical" | "high" | "medium")).take(10).collect();
@@ -1119,6 +1249,15 @@ fn markdown(r: &Report) -> String {
             meta.push(format!("**WASC:** {w}"));
         }
         let _ = writeln!(s, "{}\n", meta.join(" · "));
+        for n in &g.narratives {
+            let _ = writeln!(
+                s,
+                "### {}\n\n{}\n\n_{}_\n",
+                md_escape(&narrative_title(g, n)),
+                md_no_html(n.narrative.text.trim()),
+                md_escape(&n.narrative.credit())
+            );
+        }
         // A tester's own text is plain text, fenced code apart: it may quote the target.
         let prose = |t: &str| if is_manual(g) { md_no_html(t.trim()) } else { t.trim().to_string() };
         if !g.description.is_empty() {
@@ -1176,6 +1315,12 @@ fn markdown(r: &Report) -> String {
             }
             if let Some(t) = latest_text(inst) {
                 let _ = writeln!(s, "- {t}");
+            }
+            if let Some(t) = &inst.agent_trail {
+                let _ = writeln!(s, "- Agent trail: {}", trail_text(t));
+            }
+            for t in &inst.tickets {
+                let _ = writeln!(s, "- Ticket ({}): <{}>", t.tracker, t.url.replace(['<', '>', ' '], ""));
             }
             s.push('\n');
             if !inst.other_info.is_empty() {
@@ -1392,7 +1537,7 @@ a{color:var(--info)}
 .fixfirst li{margin:6px 0}
 .tag{display:inline-block;padding:0 6px;border:1px solid var(--line);border-radius:4px;font-size:.8em}
 .tech{margin:12px 0;border:1px solid var(--line);border-radius:8px;padding:6px 12px}
-.cover{border-top:6px solid var(--brand,transparent);padding-top:12px}.cover .logo{max-height:56px;max-width:240px;display:block;margin-bottom:12px}
+.narrative{border-left:3px solid var(--line);padding-left:12px}.cover{border-top:6px solid var(--brand,transparent);padding-top:12px}.cover .logo{max-height:56px;max-width:240px;display:block;margin-bottom:12px}
 h1,h2{color:var(--brand-ink,inherit)}.cvss{font-size:.9em}.letter td.n{white-space:nowrap}
 @media print{body{font-size:11pt;background:#fff;color:#000}main{max-width:none;padding:0}a{color:inherit;text-decoration:none}
 .card,.inst,tr{break-inside:avoid}h2,h3{break-after:avoid}.tech{display:none}}
@@ -1498,6 +1643,15 @@ fn html(r: &Report) -> String {
             "No serious or important issues were found; what remains is minor hardening and observations.".to_string()
         };
         let _ = writeln!(s, "<p class=\"verdict\">{verdict}</p>");
+        if let Some(n) = &r.summary_narrative {
+            let _ = writeln!(
+                s,
+                "<div class=\"narrative\"><p>{}</p><p class=\"muted\">{}{}</p></div>",
+                paragraphs(&n.text),
+                if n.reviewed() { "" } else { "Draft: " },
+                esc(&n.credit())
+            );
+        }
         s.push_str("<div class=\"cards\">");
         // A critical card only when there is something critical, so most reports keep four.
         for risk in RISKS.into_iter().filter(|&r| r != "critical" || count(r) > 0) {
@@ -1620,6 +1774,15 @@ fn html(r: &Report) -> String {
                 esc(&c.vector)
             );
         }
+        for n in &g.narratives {
+            let _ = writeln!(
+                s,
+                "<h3>{}</h3><div class=\"narrative\"><p>{}</p><p class=\"muted\">{}</p></div>",
+                esc(&narrative_title(g, n)),
+                paragraphs(&n.narrative.text),
+                esc(&n.narrative.credit())
+            );
+        }
         for (h, text) in [("What this means", &g.description), ("How to fix it", &g.solution)] {
             if !text.trim().is_empty() {
                 let _ = writeln!(s, "<h3>{h}</h3><p>{}</p>", paragraphs(text));
@@ -1650,6 +1813,13 @@ fn html(r: &Report) -> String {
                 state.push_str(" <span class=\"tag\">added via MCP (an agent)</span>");
             } else if inst.source == MANUAL_SOURCE {
                 state.push_str(" <span class=\"tag\">found by hand</span>");
+            }
+            if let Some(t) = &inst.agent_trail {
+                state.push_str(if t.reviewed_by.is_some() {
+                    " <span class=\"tag\">agent's work reviewed</span>"
+                } else {
+                    " <span class=\"tag\">agent's work not reviewed</span>"
+                });
             }
             let _ = write!(
                 s,
@@ -1727,6 +1897,14 @@ fn html(r: &Report) -> String {
             }
             if let Some(t) = latest_text(inst) {
                 row("Seen", esc(&t));
+            }
+            if let Some(t) = &inst.agent_trail {
+                row("Agent trail", esc(&trail_text(t)));
+            }
+            if !inst.tickets.is_empty() {
+                let links: Vec<String> =
+                    inst.tickets.iter().map(|t| link(&t.url, &format!("{} ticket", t.tracker))).collect();
+                row("Tickets", links.join(", "));
             }
             s.push_str("</dl>");
             if !inst.other_info.is_empty() {
@@ -1815,6 +1993,194 @@ fn html(r: &Report) -> String {
     s.push_str("</p>\n");
     s.push_str("</main></body></html>\n");
     s
+}
+
+/// One finding as the report shows it: its texts, redacted evidence and fingerprint.
+fn one_finding(store: &Store, id: i64, redact: bool) -> Result<(AlertGroup, Instance)> {
+    let opts = ReportOptions {
+        filter: FindingFilter { ids: Some(vec![id]), state: Some("all".into()), ..Default::default() },
+        redact,
+        max_evidence: 16 * 1024,
+        drafts: false,
+        ..Default::default()
+    };
+    let r = build(store, &opts)?;
+    let mut g = r.alerts.into_iter().next().ok_or_else(|| crate::error::Error::NotFound(format!("finding {id}")))?;
+    let inst = g.instances.remove(0);
+    Ok((g, inst))
+}
+
+/// The text around a finding's evidence in a response, for a repro pack.
+fn excerpt(resp: &HttpResponse, evidence: &str) -> Option<String> {
+    let text = format!(
+        "{}\n{}",
+        resp.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"),
+        resp.body.text
+    );
+    let at = text.find(evidence).filter(|_| !evidence.is_empty())?;
+    let start = text[..at].char_indices().rev().nth(200).map_or(0, |(i, _)| i);
+    let end = text[at + evidence.len()..].char_indices().nth(200).map_or(text.len(), |(i, _)| at + evidence.len() + i);
+    Some(text[start..end].to_string())
+}
+
+/// A repro pack: everything needed to see a finding again by hand or in CI, secrets masked
+/// unless `redact` is off.
+pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
+    let (g, i) = one_finding(store, id, redact)?;
+    // An active check starts from a GET of the URL; another method or a body needs the scan
+    // to start from the original request, which the pack's (attack) exchange isn't.
+    let plain_get = i.method.eq_ignore_ascii_case("GET") && i.request.as_ref().is_none_or(|r| r.body.length == 0);
+    let what = match g.alert_ref.strip_prefix("check:") {
+        Some(c) => format!("--checks SOURCE --check-ids={}", sh_quote(c)),
+        None => format!("--rules={}", g.rule_id),
+    };
+    let check = match i.source.as_str() {
+        "passive" => format!("brainproxy findings retest {id}"),
+        "active" if plain_get => format!("brainproxy scan active {} {what}", sh_quote(&i.url)),
+        "active" => format!(
+            "brainproxy scan active --history-id BASELINE --include-methods {} {what}  \
+             # BASELINE: the history id of the original {} request, not the attack in this pack",
+            sh_quote(&i.method),
+            i.method
+        ),
+        "authz" => "brainproxy authz run (with the same identities)".to_string(),
+        _ => "retest by hand, then `brainproxy findings mark` with a note".to_string(),
+    };
+    let oracle = match i.source.as_str() {
+        "manual" => format!("Recorded by hand as \"{}\"; the tester's evidence is what to look for.", g.name),
+        s => format!(
+            "The {s} rule {} raises \"{}\" when it sees this{}.",
+            g.alert_ref,
+            g.name,
+            if i.evidence.is_empty() { String::new() } else { format!(": the response contains `{}`", i.evidence) }
+        ),
+    };
+    Ok(json!({
+        "finding": {
+            "id": i.id, "issue_id": i.issue_id, "fingerprint": i.fingerprint, "alert_ref": g.alert_ref, "name": g.name,
+            "risk": i.risk, "confidence": i.confidence, "state": i.state, "source": i.source,
+            "method": i.method, "url": i.url, "param": i.param, "evidence": i.evidence, "attack": i.attack,
+            "cvss": i.cvss,
+        },
+        "history_id": i.history_id,
+        "latest_history_id": i.last_history_id,
+        "request": i.request.as_ref().map(|r| http_text(r, None)),
+        "curl": i.request.as_ref().map(curl),
+        "response_excerpt": i.response.as_ref().and_then(|r| excerpt(r, &i.evidence)),
+        "oracle": oracle,
+        "check": check,
+        "redacted": redact,
+    }))
+}
+
+/// A finding written up for an issue tracker (github or jira): a title, a Markdown body with
+/// what it is, where, how to fix and reproduce it, and its fingerprint; secrets masked.
+pub fn ticket(store: &Store, id: i64, tracker: &str, target: Option<&str>) -> Result<Value> {
+    let (g, i) = one_finding(store, id, true)?;
+    let title = format!("[{}] {} on {}", risk_title(&i.risk), g.name, i.host);
+    let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "**Risk:** {} · **Confidence:** {} · **State:** {}",
+        risk_title(&i.risk),
+        i.confidence,
+        i.state.replace('_', " ")
+    );
+    if let Some(c) = &i.cvss {
+        let _ = writeln!(body, "**CVSS 4.0:** {:.1} ({}) {}", c.score, c.severity, md_code(&c.vector));
+    }
+    let _ = writeln!(
+        body,
+        "\n**Where:** {}{}",
+        // Quoted from the target: a backquote in it can't end the code span.
+        md_code(&format!("{} {}", i.method, i.url)),
+        if i.param.is_empty() { String::new() } else { format!(" (parameter {})", md_code(&i.param)) }
+    );
+    // The reviewed write-up, as the report has it (known secrets scrubbed).
+    for n in g.narratives.iter().filter(|n| Some(n.issue_id) == i.issue_id) {
+        let _ = writeln!(body, "\n{}\n\n_{}_", md_no_html(n.narrative.text.trim()), n.narrative.credit());
+    }
+    let prose = |t: &str| if is_manual(&g) { md_no_html(t.trim()) } else { t.trim().to_string() };
+    if !g.description.trim().is_empty() {
+        let _ = writeln!(body, "\n### What this means\n\n{}", prose(&g.description));
+    }
+    if !g.solution.trim().is_empty() {
+        let _ = writeln!(body, "\n### How to fix it\n\n{}", prose(&g.solution));
+    }
+    if let Some(req) = &i.request {
+        let _ = writeln!(body, "\n### How to reproduce\n\n{}", md_block(&curl(req), "sh"));
+    }
+    if !i.evidence.is_empty() {
+        let _ = writeln!(body, "\n**Evidence:** {}", md_code(&i.evidence));
+    }
+    if !g.references.is_empty() {
+        let _ = writeln!(body, "\n### References\n");
+        for u in &g.references {
+            let _ = writeln!(body, "- <{}>", u.replace(['<', '>', ' '], ""));
+        }
+    }
+    let _ = writeln!(body, "\n---\nbrainproxy finding #{} · fingerprint `{}`", i.id, i.fingerprint);
+    let labels = vec!["security".to_string(), format!("risk:{}", i.risk)];
+    Ok(match tracker {
+        "github" => {
+            let repo = sh_quote(target.unwrap_or("OWNER/REPO"));
+            let label_args: String = labels.iter().map(|l| format!(" --label {}", sh_quote(l))).collect();
+            json!({
+                "tracker": "github",
+                "title": title,
+                "body": body,
+                "labels": labels,
+                "command": format!("gh issue create --repo {repo} --title {}{label_args} --body-file -", sh_quote(&title)),
+            })
+        }
+        "jira" => json!({
+            "tracker": "jira",
+            "title": title,
+            "body": body,
+            "payload": {"fields": {
+                "project": {"key": target.unwrap_or("KEY")},
+                "summary": title,
+                "description": body,
+                "issuetype": {"name": "Bug"},
+                "labels": labels.iter().map(|l| l.replace(':', "-")).collect::<Vec<_>>(),
+            }},
+            "command": "curl -sS -u \"$JIRA_USER:$JIRA_TOKEN\" -H 'Content-Type: application/json' \
+                        -X POST \"$JIRA_URL/rest/api/2/issue\" --data @ticket.json",
+        }),
+        other => return Err(crate::error::Error::InvalidInput(format!("unknown tracker {other:?}: github or jira"))),
+    })
+}
+
+/// The agent-trail line of a finding, in words.
+fn trail_text(t: &TrailSummary) -> String {
+    let span = match (t.first_history_id, t.last_history_id) {
+        (Some(a), Some(b)) if a != b => format!(" (history #{a} to #{b})"),
+        (Some(a), _) => format!(" (history #{a})"),
+        _ => String::new(),
+    };
+    let review = match (&t.reviewed_by, &t.reviewed_at) {
+        (Some(by), Some(at)) => format!("reviewed by a person {by} on {}", day(at)),
+        _ => "not reviewed by a person since".to_string(),
+    };
+    format!(
+        "an agent sent {} request{}{span} and made {} change{} to it; {review}",
+        t.requests,
+        if t.requests == 1 { "" } else { "s" },
+        t.agent_changes,
+        if t.agent_changes == 1 { "" } else { "s" }
+    )
+}
+
+/// A write-up's heading line: "Write-up" or "Write-up for HOST", "(draft)" when unreviewed.
+fn narrative_title(g: &AlertGroup, n: &IssueNarrative) -> String {
+    let mut t = "Write-up".to_string();
+    if g.narratives.len() > 1 {
+        t.push_str(&format!(" for {}", n.host));
+    }
+    if !n.narrative.reviewed() {
+        t.push_str(" (draft, not reviewed)");
+    }
+    t
 }
 
 /// A shell word in single quotes.
@@ -2460,6 +2826,22 @@ mod tests {
     }
 
     #[test]
+    fn notes_are_masked_in_every_format() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET / HTTP/1.1\r\nHost: app.test\r\nCookie: sid=NOTECOOKIE5550\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
+        let id = s.findings_list(&FindingFilter::default(), 1).unwrap()[0]["id"].as_i64().unwrap();
+        s.finding_mark(id, None, Some("Replayed with sid=NOTECOOKIE5550 and it still works")).unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        for kind in [ReportKind::Csv, ReportKind::DefectDojo, ReportKind::Html, ReportKind::Sarif] {
+            assert!(!render(&r, kind).contains("NOTECOOKIE5550"), "{}", kind.as_str());
+        }
+    }
+
+    #[test]
     fn retest_rows_are_redacted_like_the_findings() {
         let row = |url: &str, param: &str| RetestRow {
             id: 1,
@@ -2489,10 +2871,11 @@ mod tests {
             references: vec![],
             tags: vec![],
             cvss: None,
+            narratives: vec![],
             instances: vec![],
         }];
         let mut red = Redactor::default();
-        redact_findings(&mut red, &mut groups, &mut [], Some(&mut letter));
+        redact_findings(&mut red, &mut groups, &mut [], Some(&mut letter), None);
         assert_eq!(letter.fixed[0].url, "http://a.test/?access_token=[redacted]");
         assert_eq!(letter.fixed[0].param, "access_token=[redacted]");
     }

@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -577,6 +577,9 @@ impl Store {
         }
         if version < 16 {
             crate::scan::layout::migrate_v16(&self.conn)?;
+        }
+        if version < 17 {
+            crate::scan::proof::migrate_v17(&self.conn)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1420,7 +1423,7 @@ mod tests {
     }
 
     /// Takes a project back to before schema v13.
-    const UNDO_V13: &str = "DROP INDEX history_origin;
+    const UNDO_V13: &str = "DROP INDEX history_origin; DROP INDEX IF EXISTS history_origin_host_time;
         ALTER TABLE history DROP COLUMN origin; ALTER TABLE history DROP COLUMN client_addr;
         ALTER TABLE history DROP COLUMN sni; ALTER TABLE history DROP COLUMN edited_by;
         ALTER TABLE history DROP COLUMN note_origin; ALTER TABLE history DROP COLUMN note_changed_at;

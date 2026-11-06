@@ -105,7 +105,48 @@ export function eventText(e: FindingEvent): string {
       return e.new ? `Issue renamed "${e.new}"` : "Issue title reset";
     case "removed":
       return "Removed";
+    case "ticket":
+      return `${e.new === "jira" ? "Jira" : "GitHub"} ticket filed${e.text ? `: ${e.text}` : ""}`;
     default:
       return `${e.kind} ${said(e.new)}`.trim();
   }
+}
+
+/** An issue's write-up and who wrote and reviewed it (`findings issue show`'s narrative). */
+export interface Narrative {
+  text: string;
+  /** What a review names: the hash of exactly this text. */
+  hash: string;
+  origin: string | null;
+  at: string | null;
+  reviewed_origin: string | null;
+  reviewed_at: string | null;
+}
+
+/** `findings trail`, in short. */
+export interface Trail {
+  agent_involved: boolean;
+  requests_total: number;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+}
+
+/** The command that saves an issue's write-up (a draft until reviewed); "" clears it. */
+export function narrativeCommand(issue: number, text: string): string[] {
+  return ["findings", "issue", "narrative", String(issue), `--text=${text.trim()}`];
+}
+
+/** Who wrote a write-up and whether a person has reviewed it, in words. */
+export function narrativeCredit(n: Narrative): string {
+  const who = (o: string | null) => (o === "mcp" ? "an agent (via MCP)" : o === "gui" ? "the desktop app" : o === "cli" ? "the command line" : "unknown");
+  const day = (t: string | null) => (t ? new Date(t).toLocaleDateString() : "");
+  const wrote = `${n.origin === "mcp" ? "Drafted" : "Written"} by ${who(n.origin)}${n.at ? ` on ${day(n.at)}` : ""}`;
+  return n.reviewed_at ? `${wrote}; reviewed by ${who(n.reviewed_origin)} on ${day(n.reviewed_at)}.` : `${wrote}; not reviewed, so reports leave it out.`;
+}
+
+/** An agent trail in a line, or "" when no agent was involved. */
+export function trailLine(t: Trail): string {
+  if (!t.agent_involved) return "";
+  const sent = `An agent sent ${t.requests_total} request${t.requests_total === 1 ? "" : "s"} for this finding`;
+  return t.reviewed_by ? `${sent}; a person looked at it after (${t.reviewed_by}).` : `${sent}; no person has looked at it since.`;
 }

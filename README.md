@@ -294,6 +294,8 @@ brainproxy findings mark --issue 3 --state accepted-risk   # every finding of an
 brainproxy findings retest 7                      # send it again: not reproduced marks it fixed
 brainproxy findings timeline 7                    # found, triaged, retested, seen again, by whom
 brainproxy findings posture                       # open issues by risk, trends across scans
+brainproxy findings ticket 7 --to github --repo acme/web   # a ready-to-file issue (nothing is sent)
+brainproxy report defectdojo -o dd.json           # also csv, junit, pdf, docx
 brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --description-file idor.md   # found by hand; nothing is sent
 brainproxy findings remove 17                     # only findings added by hand; kept as removed
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off

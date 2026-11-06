@@ -213,7 +213,8 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    (cookie values, `Authorization` credentials, API-key headers, token and password
    parameters in URLs, forms, multipart and JSON bodies, hidden form fields, JWTs, and every
    password, token, cookie and key the project's auth profiles hold) as `[redacted]`,
-   wherever the report quotes them, and says how many places it masked; `--no-redact` keeps
+   wherever the report quotes them (notes, write-ups and ticket links included), and says how
+   many places it masked; `--no-redact` keeps
    them as recorded. An issue seen in more than one
    request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
@@ -1667,6 +1668,43 @@ FIRST's reference calculator), including threat (`E`) and environmental metrics.
 the score, its severity and the vector on the issue and in the list; JSON and SARIF carry
 them on each finding (`cvss`, SARIF `properties.cvssV4`), and SARIF's `security-severity` is
 the highest score of the alert type when one is rated. CVSS 3.1 vectors are refused.
+
+### Proof, write-ups and agents
+
+- **Write-ups** (`findings issue narrative ISSUE --text T` or `--file F|-`; "" clears it): prose
+  for an issue in reports, often drafted by an agent through MCP. A new text is a draft:
+  reports leave it out (or show it marked as a draft with `report --drafts`) until a person
+  reviews it, and then print it with who drafted it and who reviewed it. A review names the
+  text it approves by its hash (`findings issue show` gives `narrative.hash`): `findings issue
+  review ISSUE --hash H`, or *Mark reviewed* in the app, which sends the hash of the text on
+  screen; a text an agent changed after it was read is refused, not approved in its place.
+  `report-summary set | show | review --hash H` is the same for the executive summary at the
+  top of reports. Reviewing isn't offered through MCP: an agent can't vouch for itself.
+  Reports mask credentials in write-ups and ticket links like everywhere else.
+- **Agent trail** (`findings trail ID`): for a finding an agent added, changed, re-raised in
+  its own traffic, or whose issue it changed (write-up, title, CVSS), the requests it sent to
+  that host (from half an hour before its first such act until its last), its changes, and the
+  first change a person made to the finding or its issue after them. Reports say it on each
+  such finding ("agent's work reviewed" or "not reviewed"), with the request range in the
+  technical details.
+- **Repro pack** (`findings repro ID [--output FILE] [--no-redact]`): the request (secrets
+  masked), a curl command, the response around the evidence, what the rule looks for, and the
+  command that checks it again (for an active finding on anything but a plain GET, the scan
+  has to start from the original request: the command says which history id to give it).
+- **Tickets** (`findings ticket ID --to github --repo OWNER/NAME` or `--to jira --key KEY`):
+  a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
+  reproduce it, its fingerprint) and the command that files it (`gh issue create`, or Jira's
+  REST call). Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
+  timeline and in reports. *Copy ticket* in the app copies the GitHub version.
+- **Exports**: `report csv` (a row per finding; cells starting `=`, `+`, `-` or `@` are
+  defused for spreadsheets), `report junit` (a test suite per alert type, a failing test per
+  finding still to fix, skipped once closed) and `report defectdojo` (DefectDojo's Generic
+  Findings Import JSON with its own name and type, `brainproxy`, and the fingerprint as
+  `unique_id_from_tool`). DefectDojo deduplicates Generic Findings Import by a hash that
+  includes the description by default, so a changed write-up or note would look new: set
+  `DD_DEDUPLICATION_ALGORITHM_PER_PARSER` to use `unique_id_from_tool` for this scan type to
+  have a re-import update its findings. Every export names a finding by the same fingerprint
+  as `report json`, SARIF and tickets.
 
 ### Comparing findings and failing a build (`findings compare`)
 

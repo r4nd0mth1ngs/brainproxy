@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { FindingItem } from "../api.ts";
-import { CLOSED, eventText, groupKey, hostsOf, MARK_BATCH, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, STATES } from "./findingsFilter.ts";
+import { CLOSED, eventText, narrativeCommand, narrativeCredit, trailLine, groupKey, hostsOf, MARK_BATCH, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, STATES } from "./findingsFilter.ts";
 
 const item = (over: Partial<FindingItem>): FindingItem => ({
   id: 1,
@@ -71,6 +71,16 @@ test("timeline events read as sentences", () => {
   assert.equal(eventText(e({ kind: "created", history_id: 3 })), "Found in history #3");
   assert.equal(eventText(e({ kind: "note", text: "" })), "Note cleared");
   assert.equal(eventText(e({ kind: "retest", new: "not_reproduced", text: "GET /a" })), "Retest: not reproduced (GET /a)");
+  assert.equal(eventText(e({ kind: "ticket", new: "github", text: "https://github.com/o/r/issues/3" })), "GitHub ticket filed: https://github.com/o/r/issues/3");
   assert.equal(eventText(e({ kind: "regressed", history_id: 9 })), "Seen again after it was fixed (history #9): open again");
   assert.equal(eventText(e({ kind: "moved", old: "1", new: "2" })), "Moved from issue #1 to #2");
+});
+
+test("write-ups and agent trails read as sentences", () => {
+  assert.deepEqual(narrativeCommand(3, " text "), ["findings", "issue", "narrative", "3", "--text=text"]);
+  const n = { text: "x", hash: "00", origin: "mcp", at: null, reviewed_origin: null, reviewed_at: null };
+  assert.equal(narrativeCredit(n), "Drafted by an agent (via MCP); not reviewed, so reports leave it out.");
+  assert.ok(narrativeCredit({ ...n, reviewed_origin: "gui", reviewed_at: "2026-11-06T10:00:00Z" }).includes("reviewed by the desktop app"));
+  assert.equal(trailLine({ agent_involved: false, requests_total: 0, reviewed_by: null, reviewed_at: null }), "");
+  assert.equal(trailLine({ agent_involved: true, requests_total: 1, reviewed_by: null, reviewed_at: null }), "An agent sent 1 request for this finding; no person has looked at it since.");
 });

@@ -173,14 +173,16 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
 
 /// How to retest an active finding: run its rule or check again, as a scan.
 fn rescan_hint(id: i64, f: &Value, history_id: Option<i64>) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let what = match f["alert_ref"].as_str().unwrap_or_default().strip_prefix("check:") {
-        Some(check) => format!("--checks SOURCE --check-ids={check}"),
+        Some(check) => format!("--checks SOURCE --check-ids={}", quote(check)),
         None => format!("--rules={}", f["rule_id"].as_i64().unwrap_or(0)),
     };
-    let url = f["url"].as_str().unwrap_or_default();
+    // The URL comes from the target: quoted, so the command can be pasted as it is.
+    let url = quote(f["url"].as_str().unwrap_or_default());
     let target = match history_id {
-        Some(_) => format!("{url} --include-methods {}", f["method"].as_str().unwrap_or("GET")),
-        None => url.to_string(),
+        Some(_) => format!("{url} --include-methods {}", quote(f["method"].as_str().unwrap_or("GET"))),
+        None => url,
     };
     format!(
         "finding {id} came from an active scan, whose evidence is an attack, not the request it started \

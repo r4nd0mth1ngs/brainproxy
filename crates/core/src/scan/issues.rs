@@ -62,6 +62,11 @@ pub const ISSUE_COLUMNS: &[(&str, &str, &str)] = &[
     ("title", "TEXT", "Title a tester gave it (NULL: the alert's name)"),
     ("cvss_vector", "TEXT", "CVSS 4.0 vector a tester gave it (`findings issue cvss`)"),
     ("cvss_score", "REAL", "Its score, 0.0 to 10.0"),
+    ("narrative", "TEXT", "Write-up for reports (`findings issue narrative`); printed once reviewed"),
+    ("narrative_origin", "TEXT", "Who wrote it: gui, cli or mcp"),
+    ("narrative_at", "TEXT", "When it was written"),
+    ("reviewed_origin", "TEXT", "Who reviewed it (a person: gui or cli); NULL while a draft"),
+    ("reviewed_at", "TEXT", "When it was reviewed"),
 ];
 
 pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -70,7 +75,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, cvss, removed"),
+    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, cvss, narrative, reviewed, ticket, removed"),
     ("old", "TEXT", "Value before (a state, a note, an issue id)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
@@ -313,6 +318,7 @@ impl Store {
             .prepare("SELECT * FROM finding_events WHERE issue_id = ?1 AND finding_id IS NULL ORDER BY time, id")?;
         let events: Vec<Value> = stmt.query_map([id], event_row)?.collect::<std::result::Result<_, _>>()?;
         issue["events"] = json!(events);
+        issue["narrative"] = json!(self.issue_narrative(id)?);
         Ok(issue)
     }
 

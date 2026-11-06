@@ -73,6 +73,46 @@ pub struct ReportArgs {
     /// Start from this saved layout (`report-profile save`); the flags above override it.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
+    /// Include narratives nobody has reviewed yet, marked as drafts.
+    #[arg(long)]
+    drafts: bool,
+}
+
+#[derive(clap::Subcommand)]
+pub enum SummaryCmd {
+    /// The executive summary and who wrote and reviewed it.
+    Show,
+    /// Write the executive summary ("" clears it). It is a draft, left out of reports (unless
+    /// report --drafts), until a person reviews it.
+    Set {
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read it from FILE ('-' for stdin; through MCP only '-').
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
+    },
+    /// Mark the summary reviewed; a person does this, not through MCP.
+    Review {
+        /// The hash of the text you read (`report-summary show` gives it).
+        #[arg(long)]
+        hash: String,
+    },
+}
+
+/// `report-summary`: the executive summary at the top of reports.
+pub fn summary(project: &Path, cmd: SummaryCmd, out: &Out) -> Result<(), Error> {
+    let mut store = Store::open(project)?;
+    match cmd {
+        SummaryCmd::Show => {}
+        SummaryCmd::Set { text, file } => store.summary_set(&crate::scan_cmd::text_arg("--text", text, file)?)?,
+        SummaryCmd::Review { hash } => store.summary_review(&hash)?,
+    }
+    let n = store.summary()?;
+    out.ok(json!({"summary": n}), || match &n {
+        Some(n) => format!("{}\n\n({})", n.text, n.credit()),
+        None => "no executive summary".into(),
+    });
+    Ok(())
 }
 
 /// How a report looks (HTML, Markdown, PDF, DOCX; JSON adds the posture and retest data).
@@ -164,6 +204,13 @@ enum KindArg {
     Pdf,
     /// A Word document (needs --output).
     Docx,
+    /// One row per finding, for spreadsheets.
+    Csv,
+    /// JUnit XML for CI dashboards: a failing test per open finding.
+    Junit,
+    /// DefectDojo's Generic Findings Import JSON.
+    #[value(name = "defectdojo")]
+    DefectDojo,
 }
 
 #[derive(clap::Subcommand)]
@@ -273,6 +320,9 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         KindArg::Markdown => ReportKind::Markdown,
         KindArg::Html | KindArg::Pdf | KindArg::Docx => ReportKind::Html,
         KindArg::Sarif => ReportKind::Sarif,
+        KindArg::Csv => ReportKind::Csv,
+        KindArg::Junit => ReportKind::Junit,
+        KindArg::DefectDojo => ReportKind::DefectDojo,
     };
     let binary = matches!(a.kind, KindArg::Pdf | KindArg::Docx);
     if binary && a.output.is_none() {
@@ -326,6 +376,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         baseline,
         redact: !a.no_redact,
         layout,
+        drafts: a.drafts,
     };
     let r = report::build(&store, &opts)?;
     let kind_name = match a.kind {

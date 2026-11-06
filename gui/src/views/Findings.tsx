@@ -6,7 +6,7 @@ import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
-import { CLOSED, eventText, type FindingFilter, groupKey, hostsOf, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, SOURCES, type Source, STATES } from "./findingsFilter";
+import { CLOSED, eventText, type FindingFilter, narrativeCommand, narrativeCredit, type Narrative, type Trail, trailLine, groupKey, hostsOf, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, SOURCES, type Source, STATES } from "./findingsFilter";
 import { addedBy } from "./manualFinding";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
@@ -61,6 +61,10 @@ export function FindingsView({ active }: { active: boolean }) {
   openId.current = selected;
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const [events, setEvents] = useState<FindingEvent[]>([]);
+  // The issue's write-up and the agent trail of the open finding.
+  const [narrative, setNarrative] = useState<Narrative | null>(null);
+  const [writeup, setWriteup] = useState("");
+  const [trail, setTrail] = useState<Trail | null>(null);
   const [retesting, setRetesting] = useState(false);
   // Compare with a scan: what's new, still there, or no longer found (likely fixed).
   const [compare, setCompare] = useState<Compare>("all");
@@ -108,12 +112,17 @@ export function FindingsView({ active }: { active: boolean }) {
     let live = true;
     setEntry(null);
     setEvents([]);
+    setNarrative(null);
+    setWriteup("");
+    setTrail(null);
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(selected)]).then((t) => live && setEvents(t.events), () => {});
+    run<Trail>(["findings", "trail", String(selected)]).then((t) => live && setTrail(t), () => {});
     run<Finding>(["findings", "show", String(selected)])
       .then((f) => {
         if (!live) return;
         setFinding(f);
         setNoteDraft(f.note ?? "");
+        if (f.issue_id != null) loadNarrative(f.issue_id, () => live);
         if (f.history_id != null) run<HistoryEntry>(["history", "show", String(f.history_id), MAX_BODY]).then((e) => live && setEntry(e), () => {});
       })
       .catch((e) => app.toast(e.message, "error"));
@@ -147,6 +156,45 @@ export function FindingsView({ active }: { active: boolean }) {
       setFinding(null);
       setEntry(null);
       refresh();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  // An issue's write-up, unless another finding was opened meanwhile.
+  const loadNarrative = (issue: number, live: () => boolean = () => true) =>
+    run<{ narrative: Narrative | null }>(["findings", "issue", "show", String(issue)]).then(
+      (i) => {
+        if (!live()) return;
+        setNarrative(i.narrative);
+        setWriteup(i.narrative?.text ?? "");
+      },
+      () => {},
+    );
+
+  const saveWriteup = async (review: boolean) => {
+    const issue = finding?.issue_id;
+    const id = finding?.id;
+    if (issue == null || id == null) return;
+    try {
+      if (!review) await run(narrativeCommand(issue, writeup));
+      // The review names the text on screen; one changed since (by an agent, say) is refused.
+      else await run(["findings", "issue", "review", String(issue), `--hash=${narrative?.hash ?? ""}`]);
+      // Another finding opened meanwhile keeps its own write-up.
+      if (openId.current === id) loadNarrative(issue, () => openId.current === id);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+      if (openId.current === id) loadNarrative(issue, () => openId.current === id);
+    }
+  };
+
+  // A GitHub issue's title and body, ready to paste.
+  const copyTicket = async () => {
+    if (!finding) return;
+    try {
+      const t = await run<{ title: string; body: string }>(["findings", "ticket", String(finding.id), "--to", "github"]);
+      await navigator.clipboard.writeText(`${t.title}\n\n${t.body}`);
+      app.toast("Ticket copied: paste it into a GitHub or Jira issue. Secrets are masked.");
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -434,6 +482,9 @@ export function FindingsView({ active }: { active: boolean }) {
                     Send to Replay
                   </button>
                 )}
+                <button className="btn small" onClick={copyTicket} title="Copy a GitHub or Jira issue for this finding: what, where, how to fix and reproduce it">
+                  Copy ticket
+                </button>
                 {finding.source === "manual" && (
                   <button className="btn small" onClick={remove} title="Take this finding out of the findings and reports">
                     Remove
@@ -484,6 +535,30 @@ export function FindingsView({ active }: { active: boolean }) {
                   </>
                 )}
               </dl>
+              {trail && trailLine(trail) && <p className={trail.reviewed_by ? "muted" : "warn-text"}>{trailLine(trail)}</p>}
+              {finding.issue_id != null && (
+                <>
+                  <h3>Write-up</h3>
+                  <textarea
+                    className="input note-input"
+                    rows={4}
+                    placeholder="What this issue means for this site, for the report. An agent can draft it; it's printed once a person reviews it."
+                    value={writeup}
+                    onChange={(e) => setWriteup(e.target.value)}
+                  />
+                  <div className="toolbar flat">
+                    <button className="btn small" disabled={writeup.trim() === (narrative?.text ?? "")} onClick={() => saveWriteup(false)}>
+                      {writeup.trim() === "" && narrative ? "Clear write-up" : "Save write-up"}
+                    </button>
+                    {narrative && !narrative.reviewed_at && writeup.trim() === narrative.text && (
+                      <button className="btn small" onClick={() => saveWriteup(true)} title="You've read it and it's right: reports print it">
+                        Mark reviewed
+                      </button>
+                    )}
+                    {narrative && <span className="muted">{narrativeCredit(narrative)}</span>}
+                  </div>
+                </>
+              )}
               <h3>Note</h3>
               <textarea
                 className="input note-input"

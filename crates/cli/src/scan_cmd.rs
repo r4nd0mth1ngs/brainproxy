@@ -156,6 +156,39 @@ pub enum FindingsCmd {
         retested by scanning again (the error gives the command), findings added by hand by hand, and \
         access-control findings with authz run. The outcome is on the finding's timeline.")]
     Retest(crate::retest_cmd::RetestArgs),
+    /// What an agent did for a finding: the requests it sent to that host around it, its
+    /// changes to the finding, and the first change a person made after them.
+    Trail { id: i64 },
+    /// A repro pack: the request (secrets masked), a curl command, the response around the
+    /// evidence, what the rule looks for, and the command that checks it again.
+    Repro {
+        id: i64,
+        /// Quote cookies, credentials and tokens as recorded.
+        #[arg(long)]
+        no_redact: bool,
+        /// Write the pack to FILE (JSON).
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Write a finding up for GitHub or Jira (nothing is sent): a title, a Markdown body with
+    /// what it is, where, how to fix and reproduce it, and its fingerprint, plus the command
+    /// that files it. --record keeps the ticket's link on the finding.
+    Ticket {
+        id: i64,
+        #[arg(long = "to", value_parser = ["github", "jira"], default_value = "github")]
+        tracker: String,
+        /// GitHub repository (owner/name) for the command.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Jira project key, e.g. SEC.
+        #[arg(long)]
+        key: Option<String>,
+        /// The filed ticket's link, kept on the finding's timeline and in reports.
+        #[arg(long, value_name = "URL")]
+        record: Option<String>,
+    },
     /// Open work at a glance: open issues and findings by risk, findings by state, risk ×
     /// confidence, the hosts with most open findings, what each active scan found new and no
     /// longer found, retest outcomes and regressions.
@@ -221,6 +254,25 @@ pub enum IssueCmd {
     /// Rate an issue with a CVSS 4.0 vector (CVSS:4.0/AV:N/AC:L/...); "" removes it. Reports
     /// show its score, and SARIF's security-severity is the score.
     Cvss { id: i64, vector: String },
+    /// Write an issue's narrative for reports ("" clears it). It is a draft, left out of
+    /// reports (unless report --drafts), until a person reviews it.
+    Narrative {
+        id: i64,
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read it from FILE ('-' for stdin; through MCP only '-').
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
+    },
+    /// Mark an issue's narrative reviewed: reports then print it, saying who drafted it and
+    /// who reviewed it. A person does this; it isn't offered through MCP.
+    Review {
+        id: i64,
+        /// The hash of the text you read (`findings issue show` gives it as narrative.hash), so a
+        /// text changed since isn't approved in its place.
+        #[arg(long)]
+        hash: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -352,7 +404,7 @@ impl AddArgs {
 
 /// A text flag's value, or its file's ('-' reads stdin). Through MCP only stdin: a file would
 /// copy anything the server can read into the project, for the agent to read back.
-fn text_arg(flag: &str, text: Option<String>, file: Option<String>) -> Result<String, Error> {
+pub(crate) fn text_arg(flag: &str, text: Option<String>, file: Option<String>) -> Result<String, Error> {
     match file.as_deref() {
         None => Ok(text.unwrap_or_default()),
         Some("-") => String::from_utf8(crate::read_input(None)?)
@@ -576,11 +628,71 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     if let FindingsCmd::Retest(args) = cmd {
         return crate::retest_cmd::retest(project, args, out);
     }
+    if let FindingsCmd::Repro { id, no_redact, output, force } = &cmd {
+        let store = Store::open(project)?;
+        let pack = brainproxy_core::scan::report::repro(&store, *id, !no_redact)?;
+        match output {
+            Some(path) => {
+                let text = serde_json::to_string_pretty(&pack).unwrap_or_default() + "\n";
+                crate::output::write_file(path, text.as_bytes(), *force)?;
+                out.ok(json!({"id": id, "path": path.display().to_string()}), || {
+                    format!("wrote the repro pack of finding {id} to {}", path.display())
+                });
+            }
+            None => out.ok(pack.clone(), || serde_json::to_string_pretty(&pack).unwrap_or_default()),
+        }
+        return Ok(());
+    }
     let mut store = Store::open(project)?;
     // Findings always reflect everything captured so far.
     passive::scan_pending(&mut store)?;
     match cmd {
-        FindingsCmd::Compare(_) | FindingsCmd::Retest(_) => unreachable!(),
+        FindingsCmd::Compare(_) | FindingsCmd::Retest(_) | FindingsCmd::Repro { .. } => unreachable!(),
+        FindingsCmd::Trail { id } => {
+            let t = store.agent_trail(id)?;
+            out.ok(json!(t), || {
+                if !t.agent_involved {
+                    return format!("finding {id}: no agent added or changed it");
+                }
+                let mut lines = vec![format!(
+                    "finding {id}: {} request(s) by the agent; {}",
+                    t.requests_total,
+                    match (&t.reviewed_by, &t.reviewed_at) {
+                        (Some(by), Some(at)) => format!("reviewed by a person {by} at {at}"),
+                        _ => "not reviewed by a person since".into(),
+                    }
+                )];
+                lines.extend(t.requests.iter().map(|r| {
+                    format!(
+                        "  #{} {} {} {}",
+                        r.history_id,
+                        r.method,
+                        r.url,
+                        r.status.map(|s| s.to_string()).unwrap_or_default()
+                    )
+                }));
+                lines.join("\n")
+            });
+        }
+        FindingsCmd::Ticket { id, tracker, repo, key, record } => {
+            if let Some(url) = &record {
+                store.finding_ticket_recorded(id, &tracker, url)?;
+                out.ok(json!({"id": id, "tracker": tracker, "url": url}), || {
+                    format!("recorded {tracker} ticket for finding {id}")
+                });
+            } else {
+                let target = if tracker == "github" { repo.as_deref() } else { key.as_deref() };
+                let t = brainproxy_core::scan::report::ticket(&store, id, &tracker, target)?;
+                out.ok(t.clone(), || {
+                    format!(
+                        "{}\n\n{}\n\n# file it with:\n{}",
+                        t["title"].as_str().unwrap_or(""),
+                        t["body"].as_str().unwrap_or(""),
+                        t["command"].as_str().unwrap_or("")
+                    )
+                });
+            }
+        }
         FindingsCmd::Issues { risk, confidence, host, alert, state, source, limit } => {
             let filter = FindingFilter {
                 min_risk: risk.map(RiskArg::get),
@@ -636,6 +748,24 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                     Some(s) => format!("issue {id}: CVSS 4.0 {s:.1} ({})", brainproxy_core::scan::cvss::severity(s)),
                     None => format!("issue {id}: no CVSS rating"),
                 });
+            }
+            IssueCmd::Narrative { id, text, file } => {
+                let text = text_arg("--text", text, file)?;
+                store.issue_set_narrative(id, &text)?;
+                let n = store.issue_narrative(id)?;
+                out.ok(json!({"id": id, "narrative": n}), || match &n {
+                    Some(n) => format!(
+                        "issue {id}: narrative saved as a draft; a person reviews it with \
+                         `findings issue review {id} --hash {}`",
+                        n.hash()
+                    ),
+                    None => format!("issue {id}: narrative cleared"),
+                });
+            }
+            IssueCmd::Review { id, hash } => {
+                store.issue_review_narrative(id, &hash)?;
+                let n = store.issue_narrative(id)?;
+                out.ok(json!({"id": id, "narrative": n}), || format!("issue {id}: narrative reviewed"));
             }
             IssueCmd::Title { id, title } => {
                 store.issue_set_title(id, &title)?;

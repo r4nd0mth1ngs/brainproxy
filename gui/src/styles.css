@@ -2795,3 +2795,7 @@ button.chip {
     grid-template-rows: auto minmax(300px, 1fr);
   }
 }
+/* An agent's work nobody has looked at yet. */
+.warn-text {
+  color: var(--medium);
+}

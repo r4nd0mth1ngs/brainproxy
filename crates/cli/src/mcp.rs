@@ -44,6 +44,9 @@ const EXCLUDED: &[&str] = &[
     "browser open",
     "findings remove",
     "connection review",
+    // A person reviews what an agent drafted; an agent can't vouch for itself.
+    "findings issue review",
+    "report-summary review",
 ];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
@@ -269,6 +272,13 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings issue merge", SET),
     ("findings issue title", SET),
     ("findings issue cvss", SET),
+    ("findings issue narrative", SET),
+    ("findings trail", READ),
+    // --output writes a file (refused if it exists unless --force).
+    ("findings repro", REPLACE),
+    ("findings ticket", SET),
+    ("report-summary show", READ),
+    ("report-summary set", SET),
     ("report-profile list", READ),
     ("report-profile show", READ),
     ("report-profile save", SET),
