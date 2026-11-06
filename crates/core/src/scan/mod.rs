@@ -9,6 +9,7 @@ pub mod compare;
 pub mod findings_db;
 pub mod message;
 pub mod passive;
+pub mod redact;
 pub mod report;
 
 use serde::Serialize;

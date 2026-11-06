@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::scan::findings_db::{dedupe_key, MANUAL_SOURCE, REMOVED};
+use crate::scan::findings_db::{fingerprint, MANUAL_SOURCE, REMOVED};
 use crate::scan::Risk;
 use crate::store::Store;
 
@@ -35,11 +35,15 @@ pub struct Item {
     pub state: String,
     /// Who or what added it (gui, cli, mcp); None when unknown.
     pub origin: Option<String>,
+    /// The identity a saved report gives (`fingerprint`), taken before its URL was redacted;
+    /// None for the project's own findings and reports written before it was kept.
+    #[serde(skip)]
+    pub fingerprint: Option<String>,
 }
 
 impl Item {
     fn key(&self) -> String {
-        dedupe_key(&self.alert_ref, &self.method, &self.url, &self.param)
+        self.fingerprint.clone().unwrap_or_else(|| fingerprint(&self.alert_ref, &self.method, &self.url, &self.param))
     }
 
     pub fn false_positive(&self) -> bool {
@@ -250,6 +254,7 @@ fn item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         param: r.get(8)?,
         state: r.get(9)?,
         origin: r.get("origin")?,
+        fingerprint: None,
     })
 }
 
@@ -338,6 +343,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
                 param: i.param,
                 state: i.state,
                 origin: i.origin,
+                fingerprint: i.fingerprint,
             })
         })
         .collect();
@@ -378,6 +384,9 @@ struct SavedInstance {
     /// Absent from reports written before origins were kept.
     #[serde(default)]
     origin: Option<String>,
+    /// Absent from reports written before fingerprints were kept.
+    #[serde(default)]
+    fingerprint: Option<String>,
 }
 
 #[cfg(test)]
@@ -401,6 +410,7 @@ mod tests {
             param: String::new(),
             state: state.into(),
             origin: None,
+            fingerprint: None,
         }
     }
 
@@ -554,11 +564,18 @@ mod tests {
 
     #[test]
     fn a_saved_report_loads_as_the_same_findings() {
-        let s = store_with_findings();
+        let mut s = store_with_findings();
+        // A session id in the path: the redacted report's URL differs from the project's.
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET /b;jsessionid=ABCDEF123456 HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 13\r\n\r\n<html></html>";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
         let live = project_items(&s).unwrap();
         assert!(!live.is_empty());
         let r = report::build(&s, &ReportOptions::default()).unwrap();
         let text = report::render(&r, ReportKind::Json);
+        assert!(!text.contains("ABCDEF123456") && r.summary.redacted.unwrap() > 0);
 
         // Both the file `report --output` writes and a captured envelope.
         let file = temp("report", text.as_bytes());

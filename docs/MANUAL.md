@@ -208,7 +208,13 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    positives: a summary in plain words, what to fix first, then each issue with what it
    means, how to fix it, and where it was found, with the technical evidence folded away.
    Print it from a browser to make a PDF. On the command line: `brainproxy report html -o
-   report.html` (also `markdown`, `json`, `sarif`). A project collects findings across
+   report.html` (also `markdown`, `json`, `sarif`). Every format masks session secrets
+   (cookie values, `Authorization` credentials, API-key headers, token and password
+   parameters in URLs, forms, multipart and JSON bodies, hidden form fields, JWTs, and every
+   password, token, cookie and key the project's auth profiles hold) as `[redacted]`,
+   wherever the report quotes them, and says how many places it masked; `--no-redact` keeps
+   them as recorded. An issue seen in more than one
+   request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
    first time or again, and leaves out older findings it didn't see again.
 7. **Retest.** After fixes, scan again and use the Findings comparison: *Not found again
@@ -625,8 +631,16 @@ Access control across users: does the app let bob read alice's data? See
   can check the owner's credentials were removed; *Diff* opens both in Diff.
 
 ### Findings
-- **Layout:** issues grouped by type, filterable by risk, with false positives hidden by
-  default.
+- **Layout:** issues grouped by type, filterable by risk, source (passive, active, access
+  control, by hand) and host, with false positives hidden by default. The search box keeps
+  findings whose name, alert, URL, parameter, evidence or state hold every word typed (or
+  `#id`), and opens the groups it matches.
+- **Bulk triage:** tick findings, or a whole group with its checkbox, then mark them *open*,
+  *confirmed* or *false positive* at once (`findings mark ID ID...` on the command line;
+  each call changes all of them or none).
+- **Note:** write why a finding is confirmed or a false positive; reports show it with who
+  wrote it and when. Saving an empty note clears it (`findings mark ID --note ""`); the
+  finding still counts as triaged, so a rescan that no longer finds it keeps it.
 - **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
   references, the evidence highlighted in the response, and the request.
 - **Actions:** mark *open*, *confirmed*, or *false positive*; send the request to Replay.
@@ -1052,6 +1066,18 @@ them. Reports carry them in every format:
   hand**, or **added via MCP (an agent)** when an agent added it.
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
+
+In SARIF, each result's `partialFingerprints["brainproxy/v2"]` is a hash of the key the
+project uses to tell findings apart (alert, method, URL without its query, parameter), so
+code scanning sees a finding found again with another query string as the same result, and
+no secret in the URL travels with it. `report json` gives the same hash as each instance's
+`fingerprint`; `findings compare --baseline` matches by it, so a redacted report still
+compares with the project as it was. (It was
+`brainproxy/v1`, which kept the query, so the first upload after updating may show existing
+alerts as closed and opened again.)
+`baselineState` is set only with `report sarif --scan JOB`: `new` for what that scan found
+first, `unchanged` for what it found again. `lastHistoryId` and `lastSeen` give the latest
+sighting.
 
 False positives are left out of a report by default. The report counts them by who marked
 them (`summary.false_positives_left_out`), and lists the ones an agent marked

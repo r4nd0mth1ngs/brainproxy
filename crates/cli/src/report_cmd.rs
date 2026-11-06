@@ -61,6 +61,10 @@ pub struct ReportArgs {
     /// Leave out the request/response evidence from history.
     #[arg(long)]
     no_evidence: bool,
+    /// Quote session cookies, credentials and tokens as recorded. By default they are shown as
+    /// [redacted], here and in the evidence, URLs and bodies the report quotes.
+    #[arg(long)]
+    no_redact: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -110,13 +114,22 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         KindArg::Html => ReportKind::Html,
         KindArg::Sarif => ReportKind::Sarif,
     };
-    let ids = match a.scan {
+    // With a scan: its findings, and whether each is new in it or was found before (SARIF's
+    // baselineState).
+    let (ids, baseline) = match a.scan {
         Some(job) => {
             let (scope, _) = crate::compare_cmd::scan_baseline(&store, job, false, &mut vec![])?;
             let found = compare::compare_scan(&store, &scope)?;
-            Some(found.new.iter().chain(&found.unchanged).filter_map(|f| f.id).collect())
+            let baseline: std::collections::HashMap<i64, bool> = found
+                .new
+                .iter()
+                .map(|f| (f, true))
+                .chain(found.unchanged.iter().map(|f| (f, false)))
+                .filter_map(|(f, new)| Some((f.id?, new)))
+                .collect();
+            (Some(baseline.keys().copied().collect()), Some(baseline))
         }
-        None => None,
+        None => (None, None),
     };
     let opts = ReportOptions {
         filter: FindingFilter {
@@ -134,6 +147,8 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         evidence: !a.no_evidence,
         max_evidence: a.max_evidence,
         scan: a.scan,
+        baseline,
+        redact: !a.no_redact,
     };
     let r = report::build(&store, &opts)?;
     let summary = json!({
@@ -143,6 +158,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         "truncated": r.summary.truncated,
         "alert_types": r.summary.alert_types,
         "by_risk": r.summary.by_risk,
+        "redacted": r.summary.redacted,
     });
 
     if let Some(path) = a.output {
