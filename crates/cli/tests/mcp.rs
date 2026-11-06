@@ -536,6 +536,9 @@ fn an_agent_adds_findings_from_stdin_but_reads_no_files() {
     let (_, e) = m.call("findings_show", json!({"id": id}));
     assert_eq!(e["data"]["state"], "false_positive", "{e}");
     assert_eq!(e["data"]["state_origin"], "mcp", "{e}");
+    // Several at once, as a list under the same name.
+    let (err, e) = m.call("findings_mark", json!({"id": [id], "state": "open"}));
+    assert!(!err && e["data"]["ids"] == json!([id]), "{e}");
 }
 
 #[test]

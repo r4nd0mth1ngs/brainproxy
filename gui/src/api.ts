@@ -209,6 +209,9 @@ export interface Finding extends FindingItem {
   refs?: string[];
   tags: string[];
   note: string | null;
+  /** Who last set the note (gui, cli or mcp) and when; null if never set. */
+  note_origin?: string | null;
+  note_changed_at?: string | null;
   /** A finding added by hand: every history entry it links to. */
   history_ids?: number[];
 }

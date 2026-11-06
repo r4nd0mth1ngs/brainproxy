@@ -1219,6 +1219,38 @@ select {
 .tree-item.struck .ellipsis {
   text-decoration: line-through;
 }
+.tree-row {
+  display: flex;
+  align-items: center;
+}
+.tree-row > .tree-group,
+.tree-row > .tree-item {
+  flex: 1;
+  min-width: 0;
+}
+.tree-check {
+  accent-color: var(--accent);
+  margin: 0 0 0 10px;
+  flex: none;
+}
+.tree-check.item {
+  margin-left: 26px;
+}
+.tree-row > .tree-group {
+  padding-left: 6px;
+}
+.tree-row > .tree-item {
+  padding-left: 8px;
+}
+.bulk-bar {
+  padding: 6px 10px;
+  background: var(--sel);
+  border-bottom: 1px solid var(--border);
+}
+.note-input {
+  width: 100%;
+  resize: vertical;
+}
 .caret {
   width: 10px;
   color: var(--muted);

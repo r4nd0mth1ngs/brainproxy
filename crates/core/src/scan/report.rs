@@ -14,7 +14,8 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::guard::ScopeSpec;
 use crate::provenance;
-use crate::scan::findings_db::{FindingFilter, MANUAL_SOURCE};
+use crate::scan::findings_db::{fingerprint, FindingFilter, MANUAL_SOURCE};
+use crate::scan::redact::Redactor;
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,11 @@ pub struct ReportOptions {
     pub max_evidence: usize,
     /// The scan job whose findings `filter.ids` are, to say so in the report.
     pub scan: Option<i64>,
+    /// With `scan`: whether each finding is new in that scan or was found before and again
+    /// (finding id, true when new), for SARIF's `baselineState`.
+    pub baseline: Option<std::collections::HashMap<i64, bool>>,
+    /// Mask session secrets (cookies, credentials, tokens) in everything taken from traffic.
+    pub redact: bool,
 }
 
 impl Default for ReportOptions {
@@ -59,6 +65,8 @@ impl Default for ReportOptions {
             evidence: true,
             max_evidence: 4096,
             scan: None,
+            baseline: None,
+            redact: true,
         }
     }
 }
@@ -112,6 +120,8 @@ pub struct Summary {
     /// Findings matching the other filters that are left out because they were marked false
     /// positive, by who marked them (none when the state filter includes false positives).
     pub false_positives_left_out: Vec<OriginCount>,
+    /// How many places a secret was masked in; None when the report isn't redacted.
+    pub redacted: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +172,9 @@ pub struct Instance {
     pub state: String,
     pub note: Option<String>,
     pub history_id: Option<i64>,
+    /// The latest sighting: the history entry the finding was last found in, and when.
+    pub last_history_id: Option<i64>,
+    pub last_seen: Option<String>,
     /// For a finding added by hand: every history entry it links to (the first is the evidence).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub history_ids: Vec<i64>,
@@ -180,6 +193,31 @@ pub struct Instance {
     pub note_origin: Option<String>,
     pub note_changed_at: Option<String>,
     pub request: Option<HttpRequest>,
+    pub response: Option<HttpResponse>,
+    /// `request` and `response` are from the first sighting; this is the latest one, when the
+    /// finding was seen again in another history entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<Exchange>,
+    /// With a `--scan`: new (first found by that scan) or unchanged (found before and again).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_state: Option<&'static str>,
+    /// What makes it the same finding in the project (alert, method, URL without its query,
+    /// parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
+    /// matches a saved report by, since redaction may change the URL.
+    pub fingerprint: String,
+}
+
+impl Instance {
+    /// The history entry of a later sighting than the first, if any. A finding added by hand
+    /// links its entries instead, and lists them all.
+    fn latest_id(&self) -> Option<i64> {
+        self.last_history_id.filter(|&l| Some(l) != self.history_id && self.source != MANUAL_SOURCE)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Exchange {
+    pub request: HttpRequest,
     pub response: Option<HttpResponse>,
 }
 
@@ -277,8 +315,10 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             coalesce(f.attack, ''), f.other_info, f.hits, f.state, f.note, f.history_id,
             f.alert_ref, f.rule_id, f.name, f.cwe, f.wasc,
             coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]'),
-            f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at
+            f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at,
+            f.last_history_id, h.time
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
+            LEFT JOIN history h ON h.id = coalesce(f.last_history_id, f.history_id)
          ORDER BY f.risk_level DESC, f.alert_ref, f.id LIMIT {}",
         opts.limit
     );
@@ -290,7 +330,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         included += 1;
         let (state, state_origin, state_changed_at): (String, Option<String>, Option<String>) =
             (r.get(13)?, r.get(26)?, r.get(27)?);
-        let inst = Instance {
+        let mut inst = Instance {
             id: r.get(0)?,
             time: r.get(1)?,
             source: r.get(2)?,
@@ -315,10 +355,18 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             state_changed_at,
             note_origin: r.get(28)?,
             note_changed_at: r.get(29)?,
+            last_history_id: r.get::<_, Option<i64>>(30)?.or(r.get(15)?),
+            last_seen: r.get(31)?,
             request: None,
             response: None,
+            latest: None,
+            fingerprint: String::new(),
+            baseline_state: None,
         };
         let alert_ref: String = r.get(16)?;
+        inst.baseline_state =
+            opts.baseline.as_ref().and_then(|b| b.get(&inst.id)).map(|&new| if new { "new" } else { "unchanged" });
+        inst.fingerprint = fingerprint(&alert_ref, &inst.method, &inst.url, &inst.param);
         // Rows are sorted by risk, so the first instance of a type carries its highest risk.
         match groups.iter_mut().find(|g| g.alert_ref == alert_ref) {
             Some(g) => {
@@ -360,13 +408,34 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         }
     }
 
+    // The exchanges, first and latest sighting, with their secrets masked; the values masked
+    // there are then masked wherever else the report quotes them. Without evidence (a CI
+    // baseline of many findings) nothing is read, and secrets are masked by their place only.
+    let mut redactor = opts.redact.then(Redactor::default);
+    if let Some(red) = redactor.as_mut() {
+        // The project's own session secrets, wherever the report quotes them, in any format.
+        for (profile, state) in store.auth_list()? {
+            red.know(profile.secret_values(&state));
+        }
+    }
     if opts.evidence {
         for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
-            if let Some(hid) = inst.history_id {
-                if let Some((req, resp)) = evidence(store, hid, opts.max_evidence)? {
-                    inst.request = Some(req);
-                    inst.response = resp;
+            if let Some((mut req, mut resp)) =
+                inst.history_id.map(|h| evidence(store, h, opts.max_evidence)).transpose()?.flatten()
+            {
+                if let Some(red) = redactor.as_mut() {
+                    red.exchange(&mut req, resp.as_mut());
                 }
+                inst.request = Some(req);
+                inst.response = resp;
+            }
+            if let Some((mut request, mut response)) =
+                inst.latest_id().map(|h| evidence(store, h, opts.max_evidence)).transpose()?.flatten()
+            {
+                if let Some(red) = redactor.as_mut() {
+                    red.exchange(&mut request, response.as_mut());
+                }
+                inst.latest = Some(Exchange { request, response });
             }
         }
     }
@@ -408,6 +477,10 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             .collect::<std::result::Result<_, _>>()?;
     }
 
+    if let Some(red) = redactor.as_mut() {
+        redact_findings(red, &mut groups, &mut agent_false_positives);
+    }
+
     let generated: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
     let f = &opts.filter;
     let mut filters = json!({
@@ -434,10 +507,39 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             alert_types: groups.len(),
             by_risk,
             false_positives_left_out,
+            redacted: redactor.map(|r| r.masked),
         },
         alerts: groups,
         agent_false_positives,
     })
+}
+
+/// Masks secrets in everything a report quotes from the target. Notes and write-ups are the
+/// tester's own words and are left alone.
+fn redact_findings(red: &mut Redactor, groups: &mut [AlertGroup], hidden: &mut [HiddenFinding]) {
+    // First by place, so every secret is known; then each known value wherever it appears.
+    for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
+        for s in [&mut inst.url, &mut inst.param, &mut inst.evidence, &mut inst.attack, &mut inst.other_info] {
+            red.text(s);
+        }
+    }
+    for h in hidden.iter_mut() {
+        red.text(&mut h.url);
+    }
+    for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
+        for s in [&mut inst.url, &mut inst.param, &mut inst.evidence, &mut inst.attack, &mut inst.other_info] {
+            red.scrub(s);
+        }
+        if let Some(req) = inst.request.as_mut() {
+            red.scrub_exchange(req, inst.response.as_mut());
+        }
+        if let Some(ex) = inst.latest.as_mut() {
+            red.scrub_exchange(&mut ex.request, ex.response.as_mut());
+        }
+    }
+    for h in hidden.iter_mut() {
+        red.scrub(&mut h.url);
+    }
 }
 
 fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, Option<HttpResponse>)>> {
@@ -503,6 +605,22 @@ fn left_out_text(r: &Report) -> Option<String> {
         if total == 1 { "is" } else { "are" },
         by.join(", ")
     ))
+}
+
+/// Whether the traffic quoted in the report had its secrets masked, in words.
+fn redaction_text(r: &Report) -> String {
+    match r.summary.redacted {
+        Some(0) => {
+            "Session secrets (cookie values, credentials, tokens) would be shown as [redacted]; none were found.".into()
+        }
+        Some(n) => format!(
+            "Session secrets (cookie values, credentials, tokens) are shown as [redacted], in {n} place{}.",
+            if n == 1 { "" } else { "s" }
+        ),
+        None => "This report is not redacted: it quotes session cookies, credentials and tokens as recorded. \
+                 Share it only with people who may use them."
+            .into(),
+    }
 }
 
 fn risk_title(risk: &str) -> &'static str {
@@ -713,6 +831,7 @@ fn markdown(r: &Report) -> String {
     if let Some(t) = left_out_text(r) {
         let _ = writeln!(s, "> {t}\n");
     }
+    let _ = writeln!(s, "> {}\n", redaction_text(r));
     if r.alerts.is_empty() {
         s.push_str("No findings match the filters.\n");
         md_agent_false_positives(&mut s, r);
@@ -779,6 +898,9 @@ fn markdown(r: &Report) -> String {
             if inst.history_ids.len() > 1 {
                 let _ = writeln!(s, "- History: {}", history_list(&inst.history_ids));
             }
+            if let Some(t) = latest_text(inst) {
+                let _ = writeln!(s, "- {t}");
+            }
             s.push('\n');
             if !inst.other_info.is_empty() {
                 let _ = writeln!(s, "Other info:\n\n{}", md_block(&inst.other_info, "text"));
@@ -791,10 +913,25 @@ fn markdown(r: &Report) -> String {
                     md_block(&http_text(req, inst.response.as_ref()), "http")
                 );
             }
+            if let Some(ex) = &inst.latest {
+                let _ = writeln!(
+                    s,
+                    "<details><summary>Latest sighting (history #{})</summary>\n\n{}\n</details>\n",
+                    inst.last_history_id.unwrap_or(0),
+                    md_block(&http_text(&ex.request, ex.response.as_ref()), "http")
+                );
+            }
         }
     }
     md_agent_false_positives(&mut s, r);
     s
+}
+
+/// When a finding was first and last seen, when it was seen in more than one history entry.
+fn latest_text(inst: &Instance) -> Option<String> {
+    let last = inst.latest_id()?;
+    let when = inst.last_seen.as_deref().map(|t| format!(" on {}", day(t))).unwrap_or_default();
+    Some(format!("First seen {}; last seen in history #{last}{when}", day(&inst.time)))
 }
 
 /// Who wrote a finding's note, in words.
@@ -1020,6 +1157,9 @@ fn html(r: &Report) -> String {
         };
         let _ = writeln!(s, "<p class=\"note\">{}{link}</p>", esc(&t));
     }
+    if r.summary.redacted.is_none() {
+        let _ = writeln!(s, "<p class=\"note\"><strong>{}</strong></p>", esc(&redaction_text(r)));
+    }
     let urgent: Vec<(usize, &AlertGroup)> =
         r.alerts.iter().enumerate().filter(|(_, g)| g.risk == "high" || g.risk == "medium").take(10).collect();
     if !urgent.is_empty() {
@@ -1163,6 +1303,9 @@ fn html(r: &Report) -> String {
             if inst.history_ids.len() > 1 {
                 row("History", history_list(&inst.history_ids));
             }
+            if let Some(t) = latest_text(inst) {
+                row("Seen", esc(&t));
+            }
             s.push_str("</dl>");
             if !inst.other_info.is_empty() {
                 let _ = write!(s, "<pre>{}</pre>", esc(&inst.other_info));
@@ -1173,6 +1316,14 @@ fn html(r: &Report) -> String {
                     "<details><summary>Request and response (history #{})</summary><pre>{}</pre></details>",
                     inst.history_id.unwrap_or(0),
                     esc(&http_text(req, inst.response.as_ref()))
+                );
+            }
+            if let Some(ex) = &inst.latest {
+                let _ = write!(
+                    s,
+                    "<details><summary>Latest sighting (history #{})</summary><pre>{}</pre></details>",
+                    inst.last_history_id.unwrap_or(0),
+                    esc(&http_text(&ex.request, ex.response.as_ref()))
                 );
             }
             s.push_str("</div>\n");
@@ -1231,6 +1382,9 @@ fn html(r: &Report) -> String {
             " A finding marked <span class=\"tag\">added via MCP (an agent)</span> was recorded by an AI agent, \
              not raised by an automated test nor checked by a person.",
         );
+    }
+    if r.summary.redacted.is_some() {
+        let _ = write!(s, " {}", esc(&redaction_text(r)));
     }
     s.push_str("</p>\n");
     s.push_str("</main></body></html>\n");
@@ -1347,9 +1501,9 @@ fn sarif(r: &Report) -> Value {
                 "level": sarif_level(&inst.risk),
                 "message": {"text": msg},
                 "locations": [{"physicalLocation": {"artifactLocation": {"uri": inst.url}}}],
-                "partialFingerprints": {
-                    "brainproxy/v1": format!("{}|{}|{}|{}|{}", g.alert_ref, inst.host, inst.method, inst.url, inst.param),
-                },
+                // The project's own dedup key, so a finding seen again with another query string
+                // is the same result to code scanning, as it is to brainproxy.
+                "partialFingerprints": {"brainproxy/v2": inst.fingerprint},
                 "properties": {
                     "findingId": inst.id,
                     "source": inst.source,
@@ -1381,9 +1535,14 @@ fn sarif(r: &Report) -> Value {
                 res["properties"]["noteOrigin"] = json!(inst.note_origin);
                 res["properties"]["noteChangedAt"] = json!(inst.note_changed_at);
             }
-            if inst.state == "confirmed" {
-                res["baselineState"] = json!("unchanged");
-                res["kind"] = json!("fail");
+            if let Some(b) = inst.baseline_state {
+                res["baselineState"] = json!(b);
+            }
+            if let Some(l) = inst.latest_id() {
+                res["properties"]["lastHistoryId"] = json!(l);
+            }
+            if let Some(t) = &inst.last_seen {
+                res["properties"]["lastSeen"] = json!(t);
             }
             if let Some(req) = &inst.request {
                 res["webRequest"] = json!({
@@ -1471,6 +1630,107 @@ mod tests {
         // Sorted by risk: no group is riskier than the one before it.
         let lv = |r: &str| RISKS.iter().position(|x| *x == r).unwrap();
         assert!(r.alerts.windows(2).all(|w| lv(&w[0].risk) <= lv(&w[1].risk)));
+    }
+
+    #[test]
+    fn secrets_are_masked_unless_asked_and_latest_sighting_kept() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET /a?q=1&access_token=QWERTY123456 HTTP/1.1\r\nHost: app.test\r\nCookie: sid=SESSION987654\r\nAuthorization: Bearer BEARERTOKEN42\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nSet-Cookie: sid=SESSION987654; Path=/\r\nContent-Length: 34\r\n\r\n<p>Welcome back SESSION987654</p>";
+        for _ in 0..2 {
+            s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        }
+        passive::scan_pending(&mut s).unwrap();
+        let secrets = ["QWERTY123456", "SESSION987654", "BEARERTOKEN42"];
+
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        assert!(r.summary.redacted.unwrap() > 0);
+        for kind in [ReportKind::Json, ReportKind::Markdown, ReportKind::Html, ReportKind::Sarif] {
+            let out = render(&r, kind);
+            for secret in secrets {
+                assert!(!out.contains(secret), "{secret} in {}", kind.as_str());
+            }
+            assert!(out.contains("[redacted]"), "{}", kind.as_str());
+        }
+        let html = render(&r, ReportKind::Html);
+        assert!(html.contains("Bearer [redacted]") && html.contains("sid=[redacted]") && html.contains("places."));
+
+        // Seen in two history entries: the latest sighting is carried alongside the first.
+        let xpb = r.alerts.iter().find(|g| g.alert_ref == "10037").unwrap();
+        let inst = &xpb.instances[0];
+        assert_eq!((inst.history_id, inst.last_history_id), (Some(1), Some(2)));
+        assert_eq!(
+            inst.latest.as_ref().unwrap().request.headers.iter().find(|(k, _)| k == "Cookie").unwrap().1,
+            "sid=[redacted]"
+        );
+        assert!(render(&r, ReportKind::Markdown).contains("Latest sighting (history #2)"));
+        // The SARIF fingerprint is the project's dedup key, hashed: no URL, so no secret in it.
+        let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
+        let res = sarif["runs"][0]["results"].as_array().unwrap().iter().find(|x| x["ruleId"] == "10037").unwrap();
+        assert_eq!(res["partialFingerprints"]["brainproxy/v2"], fingerprint("10037", "GET", "http://app.test/a", ""));
+        assert_eq!(res["partialFingerprints"]["brainproxy/v2"].as_str().unwrap().len(), 32);
+        assert_eq!(res["properties"]["lastHistoryId"], 2);
+        assert!(res.get("baselineState").is_none());
+
+        let raw = build(&s, &ReportOptions { redact: false, ..Default::default() }).unwrap();
+        assert_eq!(raw.summary.redacted, None);
+        let out = render(&raw, ReportKind::Html);
+        assert!(secrets.iter().all(|x| out.contains(x)) && out.contains("This report is not redacted"));
+
+        // --no-evidence: nothing is read from history, and secrets are still masked by place.
+        let bare = build(&s, &ReportOptions { evidence: false, ..Default::default() }).unwrap();
+        let out = render(&bare, ReportKind::Json);
+        assert!(bare.alerts.iter().flat_map(|g| &g.instances).all(|i| i.request.is_none() && i.latest.is_none()));
+        assert!(secrets.iter().all(|x| !out.contains(x)));
+    }
+
+    #[test]
+    fn known_secrets_baselines_and_hidden_findings() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        // A custom header no rule knows, echoed in a page: the auth profile says it is secret.
+        let req = b"GET /app;jsessionid=PATHSECRET99/a?token=QUERYSECRET1 HTTP/1.1\r\nHost: app.test\r\nX-Tenant-Auth: CUSTOMSECRET77\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 24\r\n\r\n<p>key CUSTOMSECRET77</p>";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
+        let profile = crate::auth::AuthProfile {
+            name: "tenant".into(),
+            headers: vec![("X-Tenant-Auth".into(), "CUSTOMSECRET77".into())],
+            ..Default::default()
+        };
+        s.auth_save_profile(&profile).unwrap();
+        let manual = s.finding_add(&by_hand("Order IDOR", vec![1, 1])).unwrap();
+
+        let id = |r: &Report, alert: &str| r.alerts.iter().find(|g| g.alert_ref == alert).unwrap().instances[0].id;
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let xpb = id(&r, "10037");
+        let opts =
+            ReportOptions { baseline: Some(std::collections::HashMap::from([(xpb, true)])), ..Default::default() };
+        let r = build(&s, &opts).unwrap();
+        for kind in [ReportKind::Json, ReportKind::Markdown, ReportKind::Html, ReportKind::Sarif] {
+            let out = render(&r, kind);
+            assert!(!out.contains("CUSTOMSECRET77") && !out.contains("QUERYSECRET1"), "{}", kind.as_str());
+        }
+        // A secret in the path stays out of the SARIF fingerprint.
+        let sarif = render(&r, ReportKind::Sarif);
+        assert!(!sarif.contains("PATHSECRET99"));
+        // With a baseline (`--scan`), each result says whether it is new; without one, nothing.
+        let v: Value = serde_json::from_str(&sarif).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        assert!(results.iter().any(|x| x["ruleId"] == "10037" && x["baselineState"] == "new"));
+        assert!(results.iter().filter(|x| x["ruleId"] != "10037").all(|x| x.get("baselineState").is_none()));
+        // A finding added by hand lists its entries; none is a "latest sighting".
+        let m = r.alerts.iter().flat_map(|g| &g.instances).find(|i| i.id == manual).unwrap();
+        assert!(m.latest.is_none() && m.latest_id().is_none());
+
+        // A false positive an agent marked is listed outside the findings, its URL masked too.
+        s.conn
+            .execute("UPDATE findings SET state = 'false_positive', state_origin = 'mcp' WHERE id = ?1", [xpb])
+            .unwrap();
+        let r = build(&s, &ReportOptions::default()).unwrap();
+        let hidden = r.agent_false_positives.iter().find(|h| h.id == xpb).unwrap();
+        assert!(hidden.url.contains("jsessionid=[redacted]") && !hidden.url.contains("PATHSECRET99"), "{}", hidden.url);
     }
 
     #[test]

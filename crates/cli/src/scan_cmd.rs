@@ -116,11 +116,15 @@ pub enum FindingsCmd {
     Compare(crate::compare_cmd::CompareArgs),
     /// One finding with description, solution, references, and evidence.
     Show { id: i64 },
-    /// Triage a finding.
+    /// Triage one or more findings: all of them change, or none does.
     Mark {
-        id: i64,
+        /// One or more finding ids. (Named `id`, so an agent's `{"id": 5}` keeps working.)
+        #[arg(value_name = "ID", required = true, num_args = 1..)]
+        id: Vec<i64>,
         #[arg(long, value_enum)]
         state: Option<StateArg>,
+        /// A note on the finding, shown in reports; an empty note clears it. Either way the
+        /// finding counts as triaged, so a rescan that no longer finds it keeps it.
         #[arg(long)]
         note: Option<String>,
     },
@@ -523,7 +527,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let f = store.finding_get(id)?;
             out.ok(f.clone(), || serde_json::to_string_pretty(&f).unwrap_or_default());
         }
-        FindingsCmd::Mark { id, state, note } => {
+        FindingsCmd::Mark { id: ids, state, note } => {
             if state.is_none() && note.is_none() {
                 return Err(Error::InvalidInput("give --state and/or --note".into()));
             }
@@ -532,8 +536,16 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 StateArg::Confirmed => "confirmed",
                 StateArg::FalsePositive => "false_positive",
             });
-            store.finding_mark(id, state, note.as_deref())?;
-            out.ok(json!({"id": id, "state": state, "note": note}), || format!("updated finding {id}"));
+            store.findings_mark(&ids, state, note.as_deref())?;
+            // `note` is as given: "" when it was cleared, null when it was left alone.
+            match ids.as_slice() {
+                [id] => out.ok(json!({"id": id, "ids": ids, "state": state, "note": note}), || {
+                    format!("updated finding {id}")
+                }),
+                _ => out.ok(json!({"ids": ids, "state": state, "note": note}), || {
+                    format!("updated {} findings", ids.len())
+                }),
+            }
         }
         FindingsCmd::Add(args) => {
             let f = args.finding()?;
