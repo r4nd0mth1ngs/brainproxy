@@ -36,13 +36,14 @@ export const SPEEDS: { id: Speed; title: string; text: string; args: string[]; d
 ];
 
 const RISK_TEXT: Record<Risk, string> = {
+  critical: "Severe: an attacker could take over the system or its data with little effort. Fix now.",
   high: "Serious: could let an attacker steal data or take over accounts. Fix these first.",
   medium: "Important weaknesses that make attacks easier. Plan fixes soon.",
   low: "Minor issues and missing hardening. Fix when convenient.",
   info: "Observations, not problems on their own.",
 };
 
-const RISK_SQL = `SELECT risk, count(*) FROM findings WHERE state NOT IN ('false_positive', 'removed') GROUP BY risk`;
+const RISK_SQL = `SELECT risk, count(*) FROM findings WHERE state IN ('open', 'confirmed', 'retest_pending') GROUP BY risk`;
 
 /** The warning at the Start step, in every guided scan. */
 export function PostWarning() {
@@ -359,17 +360,19 @@ export function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () 
             </div>
           ))}
           <div className="wiz-results">
-            {(["high", "medium", "low", "info"] as Risk[]).map((r) => (
-              <div key={r} className="wiz-result">
-                <span className={`dash-num risk-text-${r}`}>{count(r)}</span>
-                <div>
-                  <b className="wiz-risk">
-                    <span className={`dot-risk risk-${r}`} /> {r}
-                  </b>
-                  <span className="muted small">{RISK_TEXT[r]}</span>
+            {(["critical", "high", "medium", "low", "info"] as Risk[])
+              .filter((r) => r !== "critical" || count(r) > 0)
+              .map((r) => (
+                <div key={r} className="wiz-result">
+                  <span className={`dash-num risk-text-${r}`}>{count(r)}</span>
+                  <div>
+                    <b className="wiz-risk">
+                      <span className={`dot-risk risk-${r}`} /> {r}
+                    </b>
+                    <span className="muted small">{RISK_TEXT[r]}</span>
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
           </div>
           <div className="row gap wiz-next">
             <button className="btn primary" onClick={() => app.setTab("findings")}>

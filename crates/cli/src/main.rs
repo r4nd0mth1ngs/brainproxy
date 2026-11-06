@@ -23,6 +23,7 @@ mod proxy_cmd;
 mod replay_cmd;
 mod report_cmd;
 mod request_args;
+mod retest_cmd;
 mod scan_cmd;
 mod sent;
 mod update_cmd;
@@ -592,7 +593,7 @@ fn project_guard(project: &Path) -> Result<std::sync::Arc<brainproxy_core::guard
 }
 
 /// Fails with out_of_scope unless `target` passes the guard (resolving DNS like a real request).
-fn require_in_scope(guard: &brainproxy_core::guard::Guard, target: &Target) -> Result<(), Error> {
+pub(crate) fn require_in_scope(guard: &brainproxy_core::guard::Guard, target: &Target) -> Result<(), Error> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -914,6 +915,9 @@ fn schema_json() -> Value {
             {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
             {"name": "findings", "description": "Findings from the scanners or added by hand (source manual), de-duplicated (hits counts repeats). Join finding_types ON alert_ref for description/solution.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_COLUMNS)},
+            {"name": "issues", "description": "Root causes: one alert type on one host, holding the findings (instances) it was seen at. Join findings ON findings.issue_id = issues.id.", "columns": cols(brainproxy_core::scan::issues::ISSUE_COLUMNS)},
+            {"name": "finding_events", "description": "Each finding's timeline: created, state and note changes, retests, regressions, moves between issues, removals, with who and when.", "columns": cols(brainproxy_core::scan::issues::EVENT_COLUMNS)},
+            {"name": "scan_observations", "description": "What each completed active scan saw of the findings it covered: new, still or gone. Join jobs ON jobs.id = job_id.", "columns": cols(brainproxy_core::scan::issues::OBSERVATION_COLUMNS)},
             {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
             {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Not readable with query (it holds secrets); use auth list / auth show (redacted)."},
             {"name": "authz_results", "description": "Access-control test results: one row per request and identity (authz run). Join history ON history.id = authz_results.history_id (or baseline_history_id).", "columns": cols(brainproxy_core::authz::AUTHZ_RESULT_COLUMNS)},

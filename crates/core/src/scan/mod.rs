@@ -7,8 +7,10 @@
 pub mod active;
 pub mod compare;
 pub mod findings_db;
+pub mod issues;
 pub mod message;
 pub mod passive;
+pub mod redact;
 pub mod report;
 
 use serde::Serialize;
@@ -22,6 +24,7 @@ pub enum Risk {
     Low,
     Medium,
     High,
+    Critical,
 }
 
 impl Risk {
@@ -35,6 +38,7 @@ impl Risk {
             Risk::Low => "low",
             Risk::Medium => "medium",
             Risk::High => "high",
+            Risk::Critical => "critical",
         }
     }
 
@@ -44,6 +48,7 @@ impl Risk {
             "low" => Some(Risk::Low),
             "medium" => Some(Risk::Medium),
             "high" => Some(Risk::High),
+            "critical" => Some(Risk::Critical),
             _ => None,
         }
     }

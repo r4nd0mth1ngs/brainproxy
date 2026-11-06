@@ -39,9 +39,10 @@ pub struct ReportArgs {
     /// Only findings from this scanner, or those added by hand (manual).
     #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
     source: Option<String>,
-    /// Triage state to include (default: open and confirmed, i.e. hides false positives and
-    /// removed findings added by hand; all includes both).
-    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "removed", "all"])]
+    /// Triage state to include (default: work still to do, i.e. open, confirmed and retest
+    /// pending: false positives, accepted risks, fixed findings and removed findings added by
+    /// hand are left out; all includes them).
+    #[arg(long, value_parser = crate::scan_cmd::STATE_VALUES)]
     state: Option<String>,
     #[arg(long)]
     host: Option<String>,
@@ -61,6 +62,10 @@ pub struct ReportArgs {
     /// Leave out the request/response evidence from history.
     #[arg(long)]
     no_evidence: bool,
+    /// Quote session cookies, credentials and tokens as recorded. By default they are shown as
+    /// [redacted], here and in the evidence, URLs and bodies the report quotes.
+    #[arg(long)]
+    no_redact: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -96,6 +101,7 @@ impl RiskArg {
             RiskArg::Low => Risk::Low,
             RiskArg::Medium => Risk::Medium,
             RiskArg::High => Risk::High,
+            RiskArg::Critical => Risk::Critical,
         }
     }
 }
@@ -110,13 +116,22 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         KindArg::Html => ReportKind::Html,
         KindArg::Sarif => ReportKind::Sarif,
     };
-    let ids = match a.scan {
+    // With a scan: its findings, and whether each is new in it or was found before (SARIF's
+    // baselineState).
+    let (ids, baseline) = match a.scan {
         Some(job) => {
             let (scope, _) = crate::compare_cmd::scan_baseline(&store, job, false, &mut vec![])?;
             let found = compare::compare_scan(&store, &scope)?;
-            Some(found.new.iter().chain(&found.unchanged).filter_map(|f| f.id).collect())
+            let baseline: std::collections::HashMap<i64, bool> = found
+                .new
+                .iter()
+                .map(|f| (f, true))
+                .chain(found.unchanged.iter().map(|f| (f, false)))
+                .filter_map(|(f, new)| Some((f.id?, new)))
+                .collect();
+            (Some(baseline.keys().copied().collect()), Some(baseline))
         }
-        None => None,
+        None => (None, None),
     };
     let opts = ReportOptions {
         filter: FindingFilter {
@@ -127,6 +142,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
             state: a.state,
             source: a.source,
             ids,
+            issue: None,
             examples: 0,
         },
         title: a.title,
@@ -134,6 +150,8 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         evidence: !a.no_evidence,
         max_evidence: a.max_evidence,
         scan: a.scan,
+        baseline,
+        redact: !a.no_redact,
     };
     let r = report::build(&store, &opts)?;
     let summary = json!({
@@ -143,6 +161,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         "truncated": r.summary.truncated,
         "alert_types": r.summary.alert_types,
         "by_risk": r.summary.by_risk,
+        "redacted": r.summary.redacted,
     });
 
     if let Some(path) = a.output {
