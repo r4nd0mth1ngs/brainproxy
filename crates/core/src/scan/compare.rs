@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::scan::findings_db::{dedupe_key, MANUAL_SOURCE, REMOVED};
+use crate::scan::findings_db::{fingerprint, MANUAL_SOURCE, REMOVED};
 use crate::scan::Risk;
 use crate::store::Store;
 
 const FALSE_POSITIVE: &str = "false_positive";
+const ACCEPTED_RISK: &str = "accepted_risk";
+const FIXED: &str = "fixed";
 
 /// One finding in a comparison. `id` is set only for findings of the open project.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -39,16 +41,32 @@ pub struct Item {
     /// before reports had it. Not part of the output.
     #[serde(skip)]
     pub rule_id: Option<i64>,
+    /// The identity a saved report gives (`fingerprint`), taken before its URL was redacted;
+    /// None for the project's own findings and reports written before it was kept.
+    #[serde(skip)]
+    pub fingerprint: Option<String>,
 }
 
 impl Item {
-    /// The identity findings match by: alert, method, URL without its query, and parameter.
+    /// The identity findings match by: a hash of the alert, method, URL without its query, and
+    /// parameter, or the one a saved report gives.
     pub fn key(&self) -> String {
-        dedupe_key(&self.alert_ref, &self.method, &self.url, &self.param)
+        self.fingerprint.clone().unwrap_or_else(|| fingerprint(&self.alert_ref, &self.method, &self.url, &self.param))
     }
 
     pub fn false_positive(&self) -> bool {
         self.state == FALSE_POSITIVE
+    }
+
+    /// Not to be fixed: a false positive or an accepted risk. The mark stays with the finding
+    /// across a comparison, and a gate never counts it.
+    pub fn dismissed(&self) -> bool {
+        self.state == FALSE_POSITIVE || self.state == ACCEPTED_RISK
+    }
+
+    /// Marked fixed by a person or a retest.
+    pub fn marked_fixed(&self) -> bool {
+        self.state == FIXED
     }
 
     /// Added by hand and then removed (`findings remove`): a tombstone, not a finding.
@@ -58,7 +76,7 @@ impl Item {
 
     /// A risk this build doesn't know (from a file) counts as the highest, so a gate can't miss it.
     pub fn at_least(&self, risk: Risk) -> bool {
-        Risk::parse(&self.risk).unwrap_or(Risk::High).level() >= risk.level()
+        Risk::parse(&self.risk).unwrap_or(Risk::Critical).level() >= risk.level()
     }
 }
 
@@ -74,16 +92,16 @@ pub struct Comparison {
 }
 
 impl Comparison {
-    /// What a severity gate fails on: open or confirmed findings at or above `risk` that are
-    /// still there, or only the new ones. A fixed finding never counts.
+    /// What a severity gate fails on: findings at or above `risk` that are still there, or
+    /// only the new ones. A fixed, false-positive or accepted one never counts.
     pub fn gate(&self, risk: Risk, new_only: bool) -> Vec<&Item> {
         let still: &[Item] = if new_only { &[] } else { &self.unchanged };
-        self.new.iter().chain(still).filter(|f| !f.false_positive() && f.at_least(risk)).collect()
+        self.new.iter().chain(still).filter(|f| !f.dismissed() && !f.marked_fixed() && f.at_least(risk)).collect()
     }
 
     fn sort(mut self) -> Self {
         for list in [&mut self.new, &mut self.unchanged, &mut self.fixed, &mut self.removed] {
-            let level = |f: &Item| Risk::parse(&f.risk).map_or(Risk::High.level(), Risk::level);
+            let level = |f: &Item| Risk::parse(&f.risk).map_or(Risk::Critical.level(), Risk::level);
             list.sort_by(|a, b| {
                 level(b).cmp(&level(a)).then_with(|| (&a.alert_ref, &a.url).cmp(&(&b.alert_ref, &b.url)))
             });
@@ -92,12 +110,15 @@ impl Comparison {
     }
 }
 
-/// Compares two sets by finding identity. A false-positive mark on either side stays with the
-/// finding: rediscovering a finding triaged in the baseline doesn't reopen it, and one marked
-/// here isn't "fixed" just because it is hidden. A finding removed here (a tombstone) that the
-/// baseline has is "removed", never "fixed"; tombstones are otherwise left out on both sides.
+/// Compares two sets by finding identity. A false-positive or accepted-risk mark on either
+/// side stays with the finding: rediscovering a finding triaged in the baseline doesn't reopen
+/// it, and one marked here isn't "fixed" just because it is hidden. One marked fixed here is
+/// fixed when the baseline has it, and otherwise left out. A finding removed here (a
+/// tombstone) that the baseline has is "removed", never "fixed"; tombstones are otherwise left
+/// out on both sides.
 pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
     let mut base: HashMap<String, Item> = baseline.into_iter().filter(|f| !f.removed()).map(|f| (f.key(), f)).collect();
+    let current: Vec<Item> = current.into_iter().filter(|f| !f.marked_fixed()).collect();
     let (gone, current): (Vec<Item>, Vec<Item>) = current.into_iter().partition(Item::removed);
     let mut out = Comparison::default();
     let mut seen = HashSet::new();
@@ -108,8 +129,8 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
         }
         match base.remove(&key) {
             Some(old) => {
-                if old.false_positive() {
-                    f.state = FALSE_POSITIVE.into();
+                if old.dismissed() && !f.dismissed() {
+                    f.state = old.state;
                 }
                 out.unchanged.push(f);
             }
@@ -303,6 +324,7 @@ fn item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         state: r.get(9)?,
         origin: r.get("origin")?,
         rule_id: r.get("rule_id")?,
+        fingerprint: None,
     })
 }
 
@@ -365,7 +387,10 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
         .filter(|k| !report.filters[k].is_null())
         .collect();
     // `report` shows open and confirmed findings by default, and false positives only add to that.
-    if !matches!(report.filters["state"].as_str(), None | Some("open,confirmed" | "all")) {
+    if !matches!(
+        report.filters["state"].as_str(),
+        None | Some("open,confirmed" | "open,confirmed,retest_pending" | "all")
+    ) {
         narrowed.push("state");
     }
     if !narrowed.is_empty() {
@@ -393,6 +418,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
                 state: i.state,
                 origin: i.origin,
                 rule_id,
+                fingerprint: i.fingerprint,
             })
         })
         .collect();
@@ -419,9 +445,9 @@ pub fn load_marks(path: &Path) -> Result<LoadedSet> {
     })?;
     let mut items = Vec::with_capacity(list.len());
     for m in list {
-        if !matches!(m.state.as_str(), "open" | "confirmed" | FALSE_POSITIVE) {
+        if !matches!(m.state.as_str(), "open" | "confirmed" | FALSE_POSITIVE | ACCEPTED_RISK) {
             return Err(Error::InvalidInput(format!(
-                "{}: state {:?} for {} {}: give open, confirmed, or false_positive",
+                "{}: state {:?} for {} {}: give open, confirmed, false_positive, or accepted_risk",
                 path.display(),
                 m.state,
                 m.alert_ref,
@@ -441,6 +467,7 @@ pub fn load_marks(path: &Path) -> Result<LoadedSet> {
             state: m.state,
             origin: None,
             rule_id: None,
+            fingerprint: None,
         });
     }
     Ok(LoadedSet { items, warnings: vec![], tombstones: false })
@@ -489,12 +516,13 @@ pub fn plan_marks(store: &Store, marks: &[Item], state: Option<&str>) -> Result<
     for m in marks.iter().filter(|m| !m.removed()) {
         let to = match state {
             Some(s) => s,
-            None if m.false_positive() || m.state == "confirmed" => m.state.as_str(),
+            None if m.dismissed() || m.state == "confirmed" => m.state.as_str(),
             None => continue,
         };
-        // The same finding twice with different marks: a false positive wins, as in `rekey_findings`.
+        // The same finding twice with different marks: a false positive wins, as in
+        // `rekey_findings`, then an accepted risk.
         let e = want.entry(m.key()).or_insert(to);
-        if to == FALSE_POSITIVE {
+        if to == FALSE_POSITIVE || (to == ACCEPTED_RISK && *e != FALSE_POSITIVE) {
             *e = to;
         }
     }
@@ -554,6 +582,9 @@ struct SavedInstance {
     /// Absent from reports written before origins were kept.
     #[serde(default)]
     origin: Option<String>,
+    /// Absent from reports written before fingerprints were kept.
+    #[serde(default)]
+    fingerprint: Option<String>,
 }
 
 #[cfg(test)]
@@ -578,6 +609,7 @@ mod tests {
             state: state.into(),
             origin: None,
             rule_id: alert_ref.parse().ok(),
+            fingerprint: None,
         }
     }
 
@@ -632,8 +664,8 @@ mod tests {
         assert_eq!(hits(Risk::Medium, true), ["http://a/m"]);
         assert_eq!(hits(Risk::Low, true), ["http://a/m", "http://a/l"]);
         // A risk from a file that this build doesn't know can't slip through.
-        let odd = compare_sets(vec![], vec![f("1", "http://a/", "critical", "open")]);
-        assert_eq!(odd.gate(Risk::High, true).len(), 1);
+        let odd = compare_sets(vec![], vec![f("1", "http://a/", "catastrophic", "open")]);
+        assert_eq!(odd.gate(Risk::Critical, true).len(), 1);
     }
 
     fn scope() -> ScanScope {
@@ -753,11 +785,18 @@ mod tests {
 
     #[test]
     fn a_saved_report_loads_as_the_same_findings() {
-        let s = store_with_findings();
+        let mut s = store_with_findings();
+        // A session id in the path: the redacted report's URL differs from the project's.
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET /b;jsessionid=ABCDEF123456 HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 13\r\n\r\n<html></html>";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
         let live = project_items(&s).unwrap();
         assert!(!live.is_empty());
         let r = report::build(&s, &ReportOptions::default()).unwrap();
         let text = report::render(&r, ReportKind::Json);
+        assert!(!text.contains("ABCDEF123456") && r.summary.redacted.unwrap() > 0);
 
         // Both the file `report --output` writes and a captured envelope.
         let file = temp("report", text.as_bytes());

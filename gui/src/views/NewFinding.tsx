@@ -6,7 +6,7 @@ import { run, type Risk } from "../api";
 import { useDialogFocus } from "../ui/dialogFocus";
 import { asksToReplace, findingAddArgs, formFromDraft, formProblem, type FindingDraft, type FindingForm } from "./manualFinding";
 
-const RISKS: Risk[] = ["high", "medium", "low", "info"];
+const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
 const CONFIDENCES: FindingForm["confidence"][] = ["high", "medium", "low"];
 
 /** A labelled control. One with several controls (`group`) names the group, and each control has its own aria-label. */

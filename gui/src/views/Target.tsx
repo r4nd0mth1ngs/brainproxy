@@ -49,7 +49,7 @@ export function TargetView({ active }: { active: boolean }) {
 
 // ---------------- Site map ----------------
 
-const RISK_OF: Risk[] = ["info", "low", "medium", "high"];
+const RISK_OF: Risk[] = ["info", "low", "medium", "high", "critical"];
 
 /** One row per origin + path, with the highest open finding risk on that path. */
 const TREE_SQL = `SELECT h.scheme, h.host, h.port, h.path, group_concat(DISTINCT h.method) AS methods,

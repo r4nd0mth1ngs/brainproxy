@@ -892,6 +892,67 @@ fn describe(c: &Clickable) -> String {
     format!("<{}> {}", c.tag, label.chars().take(60).collect::<String>())
 }
 
+/// Prints an HTML page to PDF in a headless Chromium at `browser`. The page is set as the
+/// document's content, so nothing is fetched: the browser's proxy is a closed local port, and
+/// a report's own policy allows no requests. The PDF is read back in chunks.
+pub async fn print_pdf(browser: &Path, html: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let opts = cdp::LaunchOptions {
+        path: browser,
+        headless: true,
+        // Port 9 (discard) on loopback: anything the page tried to load would fail there.
+        proxy: std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
+        ca_spki: String::new(),
+        no_sandbox: cdp::sandbox_off(),
+    };
+    let chrome = cdp::Chrome::launch(&opts)?;
+    let result = async {
+        let target = chrome.call("Target.createTarget", json!({"url": "about:blank"}), None).await?;
+        let target = target["targetId"].as_str().unwrap_or_default().to_string();
+        let attached = chrome.call("Target.attachToTarget", json!({"targetId": target, "flatten": true}), None).await?;
+        let session = attached["sessionId"].as_str().unwrap_or_default().to_string();
+        let s = Some(session.as_str());
+        chrome.call("Page.enable", json!({}), s).await?;
+        let tree = chrome.call("Page.getFrameTree", json!({}), s).await?;
+        let frame = tree["frameTree"]["frame"]["id"].as_str().unwrap_or_default().to_string();
+        chrome.call("Page.setDocumentContent", json!({"frameId": frame, "html": html}), s).await?;
+        let printed = chrome
+            .call_timeout(
+                "Page.printToPDF",
+                json!({"printBackground": true, "preferCSSPageSize": true, "transferMode": "ReturnAsStream"}),
+                s,
+                Duration::from_secs(120),
+            )
+            .await?;
+        let handle = printed["stream"].as_str().unwrap_or_default().to_string();
+        let mut pdf = Vec::new();
+        loop {
+            let chunk = chrome.call("IO.read", json!({"handle": handle, "size": 1 << 20}), s).await?;
+            let data = chunk["data"].as_str().unwrap_or_default();
+            if chunk["base64Encoded"] == true {
+                pdf.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|e| Error::Protocol(format!("the browser's PDF isn't base64: {e}")))?,
+                );
+            } else {
+                pdf.extend_from_slice(data.as_bytes());
+            }
+            if chunk["eof"] == true {
+                break;
+            }
+        }
+        let _ = chrome.call("IO.close", json!({"handle": handle}), s).await;
+        if !pdf.starts_with(b"%PDF") {
+            return Err(Error::Protocol("the browser didn't return a PDF".into()));
+        }
+        Ok(pdf)
+    }
+    .await;
+    chrome.close().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

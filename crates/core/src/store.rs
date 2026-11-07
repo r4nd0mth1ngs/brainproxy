@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 17;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -90,6 +90,12 @@ ALTER TABLE findings ADD COLUMN note_origin TEXT;
 ALTER TABLE findings ADD COLUMN note_changed_at TEXT;
 ALTER TABLE intercepts ADD COLUMN resolved_by TEXT;
 ";
+
+/// Whether `table` has `column`.
+pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?;
+    Ok(stmt.exists([column])?)
+}
 
 /// Runs each `ALTER TABLE t ADD COLUMN c ...` line of `schema` whose column `t` lacks, and
 /// every other line as it is (they must be idempotent, like `CREATE INDEX IF NOT EXISTS`).
@@ -565,6 +571,15 @@ impl Store {
         if version < 14 {
             // Builds before the release recorded v13 with fewer of its columns: add any missing.
             add_missing_columns(&self.conn, SCHEMA_V13)?;
+        }
+        if version < 15 {
+            crate::scan::issues::migrate_v15(&self.conn)?;
+        }
+        if version < 16 {
+            crate::scan::layout::migrate_v16(&self.conn)?;
+        }
+        if version < 17 {
+            crate::scan::proof::migrate_v17(&self.conn)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1408,7 +1423,7 @@ mod tests {
     }
 
     /// Takes a project back to before schema v13.
-    const UNDO_V13: &str = "DROP INDEX history_origin;
+    const UNDO_V13: &str = "DROP INDEX history_origin; DROP INDEX IF EXISTS history_origin_host_time;
         ALTER TABLE history DROP COLUMN origin; ALTER TABLE history DROP COLUMN client_addr;
         ALTER TABLE history DROP COLUMN sni; ALTER TABLE history DROP COLUMN edited_by;
         ALTER TABLE history DROP COLUMN note_origin; ALTER TABLE history DROP COLUMN note_changed_at;

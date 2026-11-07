@@ -204,11 +204,19 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
 5. **Review.** **Findings** groups issues by type and risk. Each one shows a description,
    evidence, the solution, references, and the request and response. Mark false positives
    and confirmed issues; send a request to **Replay** to verify it by hand.
-6. **Report.** **Findings › Report…** saves a readable HTML report, leaving out false
-   positives: a summary in plain words, what to fix first, then each issue with what it
-   means, how to fix it, and where it was found, with the technical evidence folded away.
-   Print it from a browser to make a PDF. On the command line: `brainproxy report html -o
-   report.html` (also `markdown`, `json`, `sarif`). A project collects findings across
+6. **Report.** **Findings › Report…** builds a report with a live preview, leaving out
+   false positives, accepted risks and fixed findings: a summary in plain words, what to fix
+   first, then each issue with what it means, how to fix it, and where it was found, with
+   the technical evidence folded away. Pick who it is for (see [Report layouts](#report-layouts)),
+   your branding and the format: HTML, PDF, Word (DOCX) or Markdown. On the command line:
+   `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`, `pdf`, `docx`). Every format masks session secrets
+   (cookie values, `Authorization` credentials, API-key headers, token and password
+   parameters in URLs, forms, multipart and JSON bodies, hidden form fields, JWTs, and every
+   password, token, cookie and key the project's auth profiles hold) as `[redacted]`,
+   wherever the report quotes them (notes, write-ups and ticket links included), and says how
+   many places it masked; `--no-redact` keeps
+   them as recorded. An issue seen in more than one
+   request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
    first time or again, and leaves out older findings it didn't see again.
 7. **Retest.** After fixes, scan again and use the Findings comparison: *Not found again
@@ -625,11 +633,33 @@ Access control across users: does the app let bob read alice's data? See
   can check the owner's credentials were removed; *Diff* opens both in Diff.
 
 ### Findings
-- **Layout:** issues grouped by type, filterable by risk, with false positives hidden by
-  default.
+- **Layout:** one row per issue (an alert type on one host: a header missing on 500 pages
+  is one issue with 500 locations), filterable by risk (critical to info), source (passive,
+  active, access control, by hand) and host. *Hide closed* (on by default) hides false
+  positives, accepted risks and fixed findings. The search box keeps findings whose name,
+  alert, URL, parameter, evidence or state hold every word typed (or `#id`), and opens the
+  issues it matches.
+- **States:** *open*, *confirmed*, *false positive*, *accepted* (real, not to be fixed;
+  left out of gates), *retest pending* (fixed by the developers, waiting to be checked) and
+  *fixed*. A fixed finding a scanner sees again is open again, and its timeline says it
+  came back.
+- **Bulk triage:** tick findings, or a whole issue with its checkbox, then set their state
+  at once (`findings mark ID ID...` or `findings mark --issue ISSUE` on the command line;
+  each call changes all of them or none).
+- **Retest** (passive findings): sends the finding's request again and lets its rule read
+  the answer, then records the outcome: not reproduced marks it fixed, and a fixed finding
+  still there is open again (`findings retest ID`). Only GET, HEAD and OPTIONS go without
+  asking; anything else asks first (`--allow-unsafe`). Active findings are retested by
+  scanning again.
+- **Timeline:** every finding lists what happened to it, oldest first: found, marked,
+  noted, retested, moved between issues, seen again after a fix; each with who did it
+  (desktop app, command line, agent) and when (`findings timeline ID`).
+- **Note:** write why a finding is confirmed or a false positive; reports show it with who
+  wrote it and when. Saving an empty note clears it (`findings mark ID --note ""`); the
+  finding still counts as triaged, so a rescan that no longer finds it keeps it.
 - **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
   references, the evidence highlighted in the response, and the request.
-- **Actions:** mark *open*, *confirmed*, or *false positive*; send the request to Replay.
+- **Actions:** set its state, retest it, send the request to Replay.
 - **New finding…:** write up an issue you found by hand: title, risk, confidence, URL,
   parameter, CWE, the history entries that show it, description, solution and evidence.
   Nothing is sent; it is only recorded in the project. *Create finding…* in Traffic's
@@ -648,8 +678,10 @@ Access control across users: does the app let bob read alice's data? See
   passive findings (headers, cookies) count only when the scan crawled. Findings added by
   hand are left out: no scan looks for them. The command line
   has the same comparison: [`findings compare`](#comparing-findings-and-failing-a-build-findings-compare).
-- **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
-  and shows it in Finder or Explorer.
+- **Report…:** the report builder: a saved layout to start from, who it is for, its
+  sections, a title, your company, colour and logo, and the format, with a preview of the
+  HTML beside them. *Save layout* keeps the choices as a report profile; *Save report…*
+  writes the file and shows it in Finder or Explorer.
 
 ### Callbacks
 Out-of-band testing for blind vulnerabilities (SSRF, XXE, blind command injection,
@@ -1053,6 +1085,21 @@ them. Reports carry them in every format:
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
 
+In SARIF, each result's `partialFingerprints["brainproxy/v2"]` is a hash of the key the
+project uses to tell findings apart (alert, method, URL without its query, parameter), so
+code scanning sees a finding found again with another query string as the same result, and
+no secret in the URL travels with it. `report json` gives the same hash as each instance's
+`fingerprint`; `findings compare --baseline` matches by it, so a redacted report still
+compares with the project as it was. (It was
+`brainproxy/v1`, which kept the query, so the first upload after updating may show existing
+alerts as closed and opened again.)
+A result marked false positive or accepted risk (in a report written with `--state all`)
+carries `suppressions` (`kind` external, `status` accepted, the note as `justification`), so
+code scanning shows it as dismissed rather than open.
+`baselineState` is set only with `report sarif --scan JOB`: `new` for what that scan found
+first, `unchanged` for what it found again. `lastHistoryId` and `lastSeen` give the latest
+sighting.
+
 False positives are left out of a report by default. The report counts them by who marked
 them (`summary.false_positives_left_out`), and lists the ones an agent marked
 (`agent_false_positives`; a "Marked false positive by an agent" section in Markdown and HTML,
@@ -1061,8 +1108,9 @@ from a report unseen.
 
 `scan passive --rescan` rescans all history and keeps what people decided: a finding found
 again keeps its id, state, note, origin and who set them. One not found again (its rule was
-turned off, say) is removed, unless it was triaged (its state was changed or it has a note):
-that one is kept with `hits` 0. The result counts `removed` and `kept_not_found`.
+turned off, say) is removed, unless it was triaged (its state was changed or it has a note)
+or has other records (a retest, a move to another issue, a ticket, or a title, rating or
+write-up on its issue): that one is kept with `hits` 0. The result counts `removed` and `kept_not_found`.
 
 The app sets `BRAINPROXY_CLIENT=gui` on the commands it runs; the MCP server sets
 `BRAINPROXY_MCP_CALL`, which wins over it, and an agent can set neither.
@@ -1528,6 +1576,136 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   request outside both scopes is refused by the engagement before it goes out and gets no
   row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.
 
+### Issues, timelines, retests and posture
+
+Findings are records with a history, not just rows:
+
+- **Issues** (`findings issues`, `findings issue show ID`): each finding is an instance of an
+  issue, one alert type on one host. `findings issues` lists them riskiest first with their
+  instance count, first and last sighting, states and sources, and takes the same filters as
+  `findings list`. Grouping by rule and host can merge two bugs or split one:
+  `findings issue split ID... --title T` moves findings into a new issue, `findings issue
+  merge INTO FROM...` moves every finding of the others into the first, and `findings issue
+  title ID T` names an issue ("" goes back to the alert's name). New findings join the first
+  issue for their alert and host; a finding found again stays in its issue.
+- **States:** `open`, `confirmed`, `false_positive`, `accepted_risk`, `retest_pending` and
+  `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). `findings
+  list` and `report` show work still to do by default: open, confirmed and retest pending.
+  A fixed finding a scanner sees again goes back to open, with a `regressed` event.
+- **Timeline** (`findings timeline ID`): created, state and note changes, retests, moves
+  between issues, regressions and removals, each with who did it (`gui`, `cli`, `mcp`) and
+  when. The `finding_events` table holds them for `query`; a project from an older build gets
+  a timeline built from what its findings already recorded.
+- **Retest** (`findings retest ID [--auth PROFILE]`): a passive finding's latest request is
+  sent again, recorded with source `retest` (which the background passive scan leaves alone),
+  and the finding's own rule or passive check reads that one response. Not reproduced marks it
+  `fixed`; a `fixed` or `retest_pending` finding still there is `open` again; false positives
+  and accepted risks keep their state; `--no-mark` records the outcome only. A rule that is
+  switched off (or no longer loaded) can't tell, so the retest is refused (kind conflict), and
+  so is one whose reply has another kind of status than the finding's request had (a redirect
+  to a login page, an error) and doesn't show the finding: nothing is marked. A "not
+  reproduced" older than the finding's latest sighting is recorded but marks nothing. Only GET, HEAD and OPTIONS
+  are sent unless `--allow-unsafe`. An active finding's evidence is the attack, not the request
+  the scan started from, and its rule may send other methods, so it is retested by scanning
+  again: the error gives the `scan active` command. Findings added by hand are retested by
+  hand, access-control findings with `authz run`.
+- **Posture** (`findings posture`): open issues and findings by risk, findings by state, a
+  risk × confidence grid, the 20 hosts with most open findings, what each completed
+  background active scan found new, still and no longer (the `scan_observations` table, stored
+  as the scan ends, before `job wait` sees it complete; a scan that timed out records nothing
+  as gone), retest outcomes and regressions. The Overview shows it. Like `findings compare
+  --scan`, a scan's new and still are what was seen while it ran, so a finding raised by other
+  traffic at the same time counts too.
+
+Risks run `info`, `low`, `medium`, `high` and `critical` (`risk_level` 0 to 4). Checks and
+vulnerable JavaScript libraries rated critical are critical; SARIF gives critical a
+`security-severity` of 9.5. A finding found again at a higher risk than it was stored with
+moves up (never down), so `scan passive --rescan` brings findings recorded as high by older
+builds up to critical.
+
+### Report layouts
+
+One project gives a report for each reader. `report --preset` picks the sections:
+
+| Preset | For | Sections |
+|---|---|---|
+| `technical` (default) | testers, security teams | summary, fixfirst, list, issues, evidence, about |
+| `executive` | management | summary, fixfirst, posture, list, about |
+| `developer` | the people fixing it | list, issues, evidence, reproduce |
+| `retest` | a retest letter | retest, about |
+
+`--sections a,b,c` names them instead: `summary` (at a glance), `fixfirst` (the ten most
+serious, with their fixes), `posture` (open issues by risk, what recent scans found new and
+no longer found, retests), `list` (the table of issues), `issues` (a section per issue),
+`evidence` (each finding's details, request and response), `reproduce` (a curl command per
+finding, with masked secrets still masked), `retest` (fixed, still there, back after a fix
+and awaiting a retest since `--since DAY`, default the last 30 days, each with the retest
+request as proof), `about`. `evidence` and `reproduce` sit in the issue sections, so
+either brings `issues` with it. The curl lines send the request as recorded
+(`--globoff --path-as-is`, the recorded `Host`), masked secrets still masked.
+
+Branding: `--company NAME` on the cover, `--accent #rrggbb` for the cover and headings,
+`--logo FILE` (PNG, JPEG, GIF or WebP, at most 256 KiB, embedded; SVG is refused because it
+can carry script). Through MCP `--logo` reads no file: save the logo in a profile from a
+terminal or the app.
+
+`report-profile save NAME [layout flags]` keeps a layout in the project (`report-profile
+list | show | remove`; `--from PROFILE` saves on top of another, keeping its logo), and
+`report --profile NAME` starts from it; flags given with it override it, and an empty one
+(`--company=`, `--accent=`, `--logo=`, `--since=`) clears what the profile has. The
+retest, posture and list sections keep to the report's filters (`--host`, `--risk`, ...),
+and a note says when the report is cut short by `--limit` whatever its sections.
+
+Formats: `pdf` prints the HTML report in a headless Chromium (the one `browser list` finds;
+nothing is fetched while it prints), and `docx` writes a Word document with the same
+sections as headings, tables and code paragraphs, for consultancies that edit and restyle
+the deliverable. Both need `--output`. The logo goes on the HTML and PDF cover, not in
+the Word document.
+
+CVSS 4.0: `findings issue cvss ISSUE 'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N'`
+rates an issue ("" removes it). The score follows FIRST's method (the macrovector table of
+FIRST's reference calculator), including threat (`E`) and environmental metrics. Reports show
+the score, its severity and the vector on the issue and in the list; JSON and SARIF carry
+them on each finding (`cvss`, SARIF `properties.cvssV4`), and SARIF's `security-severity` is
+the highest score of the alert type when one is rated. CVSS 3.1 vectors are refused.
+
+### Proof, write-ups and agents
+
+- **Write-ups** (`findings issue narrative ISSUE --text T` or `--file F|-`; "" clears it): prose
+  for an issue in reports, often drafted by an agent through MCP. A new text is a draft:
+  reports leave it out (or show it marked as a draft with `report --drafts`) until a person
+  reviews it, and then print it with who drafted it and who reviewed it. A review names the
+  text it approves by its hash (`findings issue show` gives `narrative.hash`): `findings issue
+  review ISSUE --hash H`, or *Mark reviewed* in the app, which sends the hash of the text on
+  screen; a text an agent changed after it was read is refused, not approved in its place.
+  `report-summary set | show | review --hash H` is the same for the executive summary at the
+  top of reports. Reviewing isn't offered through MCP: an agent can't vouch for itself.
+  Reports mask credentials in write-ups and ticket links like everywhere else.
+- **Agent trail** (`findings trail ID`): for a finding an agent added, changed, re-raised in
+  its own traffic, or whose issue it changed (write-up, title, CVSS), the requests it sent to
+  that host (from half an hour before its first such act until its last), its changes, and the
+  first change a person made to the finding or its issue after them. Reports say it on each
+  such finding ("agent's work reviewed" or "not reviewed"), with the request range in the
+  technical details.
+- **Repro pack** (`findings repro ID [--output FILE] [--no-redact]`): the request (secrets
+  masked), a curl command, the response around the evidence, what the rule looks for, and the
+  command that checks it again (for an active finding on anything but a plain GET, the scan
+  has to start from the original request: the command says which history id to give it).
+- **Tickets** (`findings ticket ID --to github --repo OWNER/NAME` or `--to jira --key KEY`):
+  a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
+  reproduce it, its fingerprint) and the command that files it (`gh issue create`, or Jira's
+  REST call). Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
+  timeline and in reports. *Copy ticket* in the app copies the GitHub version.
+- **Exports**: `report csv` (a row per finding; cells starting `=`, `+`, `-` or `@` are
+  defused for spreadsheets), `report junit` (a test suite per alert type, a failing test per
+  finding still to fix, skipped once closed) and `report defectdojo` (DefectDojo's Generic
+  Findings Import JSON with its own name and type, `brainproxy`, and the fingerprint as
+  `unique_id_from_tool`). DefectDojo deduplicates Generic Findings Import by a hash that
+  includes the description by default, so a changed write-up or note would look new: set
+  `DD_DEDUPLICATION_ALGORITHM_PER_PARSER` to use `unique_id_from_tool` for this scan type to
+  have a re-import update its findings. Every export names a finding by the same fingerprint
+  as `report json`, SARIF and tickets.
+
 ### Comparing findings and failing a build (`findings compare`)
 
 `findings compare` reports which findings are new, unchanged, or fixed against a baseline, and
@@ -1546,8 +1724,9 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   found again. Foreground scans have no job to name.
 - **Nothing**: every finding is new, which makes `--fail-on` a plain severity gate.
 
-Write the baseline with `--state all`, so that false positives you've triaged stay triaged when a
-later run finds them again, and a `--limit` above the number of findings: a report cut off at its
+Write the baseline with `--state all`, so that false positives and accepted risks you've triaged
+stay triaged when a later run finds them again (a gate never counts them, nor a finding marked
+fixed; one marked fixed here counts as fixed against a baseline that has it), and a `--limit` above the number of findings: a report cut off at its
 limit is refused, because what it left out would look new. A report written with `--risk`, `--host`
 and similar filters is accepted with a warning in `warnings`, except as `--current` with `--fail-on`,
 where it is refused because the gate wouldn't see what it left out. Project files are refused: run

@@ -31,9 +31,12 @@ Only use it against systems you are authorized to test.
   (CVE-2026-109618, CVE-2026-109619) has its own built-in check.
 - **Passive checks.** Feed and local checks with `scope: passive` look at the traffic you
   record and send nothing, next to the built-in passive rules.
-- **Reports people can read.** Findings › Report… saves an HTML report with a plain-words
-  summary, what to fix first, and the technical evidence folded away. It prints cleanly to
-  PDF.
+- **Reports people can read.** Findings › Report… builds a report for its reader, with a
+  live preview: technical, an executive summary with posture and trends, a developer
+  handoff with a curl line per finding, or a retest letter of what changed since a day.
+  Add your company, logo and colour, rate issues with CVSS 4.0, and save it as HTML, PDF,
+  Word or Markdown. Session cookies, credentials and tokens are masked, so it can be handed
+  over; saved layouts keep the choices for next time.
 - **See what a retest fixed.** Compare findings with a scan: new in it, still found, or
   not found again (likely fixed), counting only what that scan actually covered.
 - **WebSockets.** The proxy records every WebSocket connection and message (fragments
@@ -285,6 +288,14 @@ brainproxy findings list                          # grouped by alert type, highe
 brainproxy findings list --risk medium --all      # one row per instance
 brainproxy findings show 7                        # description, solution, references, evidence
 brainproxy findings mark 7 --state false-positive --note "test cookie"
+brainproxy findings mark 7 8 9 --state confirmed     # several at once: all or none
+brainproxy findings issues                        # one row per root cause (alert type on a host)
+brainproxy findings mark --issue 3 --state accepted-risk   # every finding of an issue
+brainproxy findings retest 7                      # send it again: not reproduced marks it fixed
+brainproxy findings timeline 7                    # found, triaged, retested, seen again, by whom
+brainproxy findings posture                       # open issues by risk, trends across scans
+brainproxy findings ticket 7 --to github --repo acme/web   # a ready-to-file issue (nothing is sent)
+brainproxy report defectdojo -o dd.json           # also csv, junit, pdf, docx
 brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --description-file idor.md   # found by hand; nothing is sent
 brainproxy findings remove 17                     # only findings added by hand; kept as removed
 brainproxy scan rules                             # list rules; scan disable 10021 to switch one off

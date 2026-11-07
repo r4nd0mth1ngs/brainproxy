@@ -49,9 +49,9 @@ pub struct CompareArgs {
     /// With --fail-on: only count new findings, not those already in the baseline.
     #[arg(long, requires = "fail_on")]
     new_only: bool,
-    /// Triage state to list: open, confirmed, false_positive, removed, or all (default hides false
-    /// positives). --fail-on doesn't depend on it.
-    #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "removed", "all"])]
+    /// Triage state to list (default hides false positives and accepted risks). --fail-on
+    /// doesn't depend on it.
+    #[arg(long, value_parser = crate::scan_cmd::STATE_VALUES)]
     state: Option<String>,
     /// Maximum findings listed per group; counts and the gate always cover all of them.
     #[arg(long, default_value_t = 1000)]
@@ -282,13 +282,13 @@ fn since_scan(store: &Store, id: i64, scan: i64, scan_start: &str) -> Result<Str
     }
 }
 
-/// The findings a --state shows (default: all but false positives).
+/// The findings a --state shows (default: all but false positives and accepted risks).
 fn listed<'a>(items: &'a [Item], state: &Option<String>) -> Vec<&'a Item> {
     let state = state.as_ref().map(|s| s.replace('-', "_"));
     items
         .iter()
         .filter(|f| match state.as_deref() {
-            None => !f.false_positive(),
+            None => !f.dismissed(),
             Some("all") => true,
             Some(s) => f.state == s,
         })

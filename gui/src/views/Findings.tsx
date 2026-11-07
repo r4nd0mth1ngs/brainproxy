@@ -1,16 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, type Finding, type FindingItem, type HistoryEntry, type Risk } from "../api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, type Finding, type FindingEvent, type FindingItem, type HistoryEntry, type Risk } from "../api";
 import { originOf, useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
+import { CLOSED, eventText, type FindingFilter, narrativeCommand, narrativeCredit, type Narrative, type Trail, trailLine, groupKey, hostsOf, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, SOURCES, type Source, STATES } from "./findingsFilter";
 import { addedBy } from "./manualFinding";
 import { NewFinding } from "./NewFinding";
+import { ReportBuilder } from "./ReportBuilder";
 
-const RISKS: Risk[] = ["high", "medium", "low", "info"];
-const RANK: Record<Risk, number> = { high: 0, medium: 1, low: 2, info: 3 };
+const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
+const RANK: Record<Risk, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+const LIVE_STATES = STATES.map((s) => s.id).join(",");
 
 type Compare = "all" | Seen;
 const COMPARE: { id: Compare; label: string; title: string }[] = [
@@ -28,9 +31,12 @@ export function RiskBadge({ risk }: { risk: Risk }) {
   return <span className={`risk risk-${risk}`}>{risk}</span>;
 }
 
+/** An issue: one alert type on one host, with the findings it was seen at. */
 interface Group {
-  ref: string;
+  key: string;
+  alert: string;
   name: string;
+  host: string;
   risk: Risk;
   items: FindingItem[];
 }
@@ -39,13 +45,27 @@ export function FindingsView({ active }: { active: boolean }) {
   const app = useApp();
   // Every triage state but removed: removed findings added by hand stay in the project for
   // comparisons, not in the list (nor in the limit).
-  const [data, refresh] = usePoll<{ items: FindingItem[] }>(() => run(["findings", "list", "--all", "--state", "open,confirmed,false_positive", "--limit", "10000"]), 5000, active);
+  const [data, refresh] = usePoll<{ items: FindingItem[] }>(() => run(["findings", "list", "--all", "--state", LIVE_STATES, "--limit", "10000"]), 5000, active);
   const [risks, setRisks] = useState(new Set<Risk>(RISKS));
   const [hideFp, setHideFp] = useState(true);
+  const [filter, setFilter] = useState<FindingFilter>(NO_FILTER);
+  // Findings ticked for bulk triage; only the ones still shown are acted on.
+  const [checked, setChecked] = useState(new Set<number>());
+  const [busy, setBusy] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
   const [open, setOpen] = useState(new Set<string>());
   const [selected, setSelected] = useState<number | null>(null);
   const [finding, setFinding] = useState<Finding | null>(null);
+  // The finding open now, for a triage that finishes after another one was picked.
+  const openId = useRef(selected);
+  openId.current = selected;
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
+  const [events, setEvents] = useState<FindingEvent[]>([]);
+  // The issue's write-up and the agent trail of the open finding.
+  const [narrative, setNarrative] = useState<Narrative | null>(null);
+  const [writeup, setWriteup] = useState("");
+  const [trail, setTrail] = useState<Trail | null>(null);
+  const [retesting, setRetesting] = useState(false);
   // Compare with a scan: what's new, still there, or no longer found (likely fixed).
   const [compare, setCompare] = useState<Compare>("all");
   const [scanId, setScanId] = useState<number | null>(null);
@@ -64,18 +84,26 @@ export function FindingsView({ active }: { active: boolean }) {
   const groups = useMemo(() => {
     const by = new Map<string, Group>();
     for (const f of data?.items ?? []) {
-      if (!risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
+      if (!risks.has(f.risk) || (hideFp && CLOSED.has(f.state))) continue;
       if (comparing && seen.get(f.id) !== compare) continue;
-      const g = by.get(f.alert_ref) ?? { ref: f.alert_ref, name: f.name, risk: f.risk, items: [] };
+      if (!matchesFinding(f, filter)) continue;
+      const key = groupKey(f);
+      const g = by.get(key) ?? { key, alert: f.alert_ref, name: f.name, host: f.host, risk: f.risk, items: [] };
+      if (RANK[f.risk] < RANK[g.risk]) g.risk = f.risk;
       g.items.push(f);
-      by.set(f.alert_ref, g);
+      by.set(key, g);
     }
     return [...by.values()].sort((a, b) => RANK[a.risk] - RANK[b.risk] || a.name.localeCompare(b.name));
-  }, [data, risks, hideFp, comparing, seen, compare]);
+  }, [data, risks, hideFp, comparing, seen, compare, filter]);
+
+  const hosts = useMemo(() => hostsOf(data?.items ?? []), [data]);
+  const shown = useMemo(() => groups.flatMap((g) => g.items.map((f) => f.id)), [groups]);
+  const picked = useMemo(() => shown.filter((id) => checked.has(id)), [shown, checked]);
+  const filtering = filter.text !== "" || filter.source !== "all" || filter.host !== "";
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const f of data?.items ?? []) if (f.state !== "false_positive") c[f.risk] = (c[f.risk] ?? 0) + 1;
+    for (const f of data?.items ?? []) if (!CLOSED.has(f.state)) c[f.risk] = (c[f.risk] ?? 0) + 1;
     return c;
   }, [data]);
 
@@ -83,10 +111,18 @@ export function FindingsView({ active }: { active: boolean }) {
     if (selected == null) return;
     let live = true;
     setEntry(null);
+    setEvents([]);
+    setNarrative(null);
+    setWriteup("");
+    setTrail(null);
+    run<{ events: FindingEvent[] }>(["findings", "timeline", String(selected)]).then((t) => live && setEvents(t.events), () => {});
+    run<Trail>(["findings", "trail", String(selected)]).then((t) => live && setTrail(t), () => {});
     run<Finding>(["findings", "show", String(selected)])
       .then((f) => {
         if (!live) return;
         setFinding(f);
+        setNoteDraft(f.note ?? "");
+        if (f.issue_id != null) loadNarrative(f.issue_id, () => live);
         if (f.history_id != null) run<HistoryEntry>(["history", "show", String(f.history_id), MAX_BODY]).then((e) => live && setEntry(e), () => {});
       })
       .catch((e) => app.toast(e.message, "error"));
@@ -100,7 +136,11 @@ export function FindingsView({ active }: { active: boolean }) {
     app.toast([`Finding #${id} added.`, ...warnings].join("\n"));
     setRisks(new Set(RISKS));
     setCompare("all");
-    setOpen((o) => new Set(o).add(ref));
+    // Its issue's group opens once the finding says which issue that is.
+    run<Finding>(["findings", "show", String(id)]).then(
+      (f) => setOpen((o) => new Set(o).add(groupKey(f))),
+      () => setOpen((o) => new Set(o).add(`alert:${ref}`)),
+    );
     setSelected(id);
     refresh();
   };
@@ -121,36 +161,125 @@ export function FindingsView({ active }: { active: boolean }) {
     }
   };
 
+  // An issue's write-up, unless another finding was opened meanwhile.
+  const loadNarrative = (issue: number, live: () => boolean = () => true) =>
+    run<{ narrative: Narrative | null }>(["findings", "issue", "show", String(issue)]).then(
+      (i) => {
+        if (!live()) return;
+        setNarrative(i.narrative);
+        setWriteup(i.narrative?.text ?? "");
+      },
+      () => {},
+    );
+
+  const saveWriteup = async (review: boolean) => {
+    const issue = finding?.issue_id;
+    const id = finding?.id;
+    if (issue == null || id == null) return;
+    try {
+      if (!review) await run(narrativeCommand(issue, writeup));
+      // The review names the text on screen; one changed since (by an agent, say) is refused.
+      else await run(["findings", "issue", "review", String(issue), `--hash=${narrative?.hash ?? ""}`]);
+      // Another finding opened meanwhile keeps its own write-up.
+      if (openId.current === id) loadNarrative(issue, () => openId.current === id);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+      if (openId.current === id) loadNarrative(issue, () => openId.current === id);
+    }
+  };
+
+  // A GitHub issue's title and body, ready to paste.
+  const copyTicket = async () => {
+    if (!finding) return;
+    try {
+      const t = await run<{ title: string; body: string }>(["findings", "ticket", String(finding.id), "--to", "github"]);
+      await navigator.clipboard.writeText(`${t.title}\n\n${t.body}`);
+      app.toast("Ticket copied: paste it into a GitHub or Jira issue. Secrets are masked.");
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  // The open finding's timeline, again after a change to it.
+  const reloadEvents = (id: number) =>
+    run<{ events: FindingEvent[] }>(["findings", "timeline", String(id)]).then((t) => openId.current === id && setEvents(t.events), () => {});
+
   const mark = async (state: string) => {
     if (!finding) return;
     try {
       await run(["findings", "mark", String(finding.id), "--state", state]);
-      setFinding({ ...finding, state });
+      setFinding((cur) => (cur?.id === finding.id ? { ...cur, state } : cur));
+      reloadEvents(finding.id);
       refresh();
     } catch (e: any) {
       app.toast(e.message, "error");
     }
   };
 
-  // A readable HTML report (summary, how to fix, evidence folded away) saved where the user picks.
-  const [reporting, setReporting] = useState(false);
-  const saveReport = async () => {
-    const name = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
-    const dialog = await import("@tauri-apps/plugin-dialog");
-    const path = await dialog.save({ defaultPath: `${name}-report.html`, filters: [{ name: "HTML report", extensions: ["html"] }] });
-    if (typeof path !== "string") return;
-    setReporting(true);
+  // Sends the finding's request again; one that may change data is sent only once confirmed.
+  const retest = async () => {
+    if (!finding) return;
+    const id = finding.id;
+    setRetesting(true);
     try {
-      const file = /\.html?$/i.test(path) ? path : `${path}.html`;
-      const r = await run<{ total: number }>(["report", "html", "--output", file, "--force", `--title=${name} security report`]);
-      app.toast(`Report saved with ${r.total} finding${r.total === 1 ? "" : "s"}. Open it in a browser; print it to make a PDF.`);
-      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
-      await revealItemInDir(file).catch(() => {});
+      let r: { outcome: string; state: string };
+      try {
+        r = await run(retestCommand(id));
+      } catch (e: any) {
+        if (!/--allow-unsafe/.test(e.message)) throw e;
+        const ok = await confirm("Send this request again?", `${e.message.replace(/; pass --allow-unsafe.*$/, "")}.`, "Send it", "Cancel");
+        if (!ok) return;
+        r = await run(retestCommand(id, true));
+      }
+      app.toast(r.outcome === "still_present" ? `Still there: finding #${id} is ${r.state.replace("_", " ")}.` : `Not reproduced: finding #${id} is now ${r.state.replace("_", " ")}.`);
+      if (openId.current === id) setFinding((cur) => (cur?.id === id ? { ...cur, state: r.state } : cur));
+      reloadEvents(id);
+      refresh();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    } finally {
+      setRetesting(false);
+    }
+  };
+
+  // Several findings at once, in batches; a failed batch stops there and says so.
+  const markPicked = async (state: string) => {
+    setBusy(true);
+    let done = 0;
+    try {
+      for (const cmd of markCommands(picked, state)) {
+        await run(cmd);
+        done += cmd.length - 4;
+      }
+      app.toast(`Marked ${done} finding${done === 1 ? "" : "s"} ${state.replace("_", " ")}.`);
+      setChecked(new Set());
+      setFinding((cur) => (cur && picked.includes(cur.id) ? { ...cur, state } : cur));
+    } catch (e: any) {
+      app.toast(`${done ? `Marked ${done}, then: ` : ""}${e.message}`, "error");
+    }
+    setBusy(false);
+    refresh();
+  };
+
+  const saveNote = async () => {
+    if (!finding) return;
+    const id = finding.id;
+    try {
+      await run(noteCommand(id, noteDraft));
+      const f = await run<Finding>(["findings", "show", String(id)]);
+      // Another finding was opened meanwhile: the note is saved, and that one is shown.
+      if (openId.current !== id) return;
+      setFinding(f);
+      setNoteDraft(f.note ?? "");
+      reloadEvents(id);
     } catch (e: any) {
       app.toast(e.message, "error");
     }
-    setReporting(false);
   };
+
+  // The report builder: audience, sections, branding, format, with a preview.
+  const [reporting, setReporting] = useState(false);
+  const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
 
   const toggle = <T,>(set: Set<T>, v: T) => {
     const s = new Set(set);
@@ -168,8 +297,33 @@ export function FindingsView({ active }: { active: boolean }) {
             </button>
           ))}
         </div>
-        <label className="check">
-          <input type="checkbox" checked={hideFp} onChange={(e) => setHideFp(e.target.checked)} /> Hide false positives
+        <input
+          className="input"
+          style={{ width: 200 }}
+          placeholder="Search: name, URL, evidence, #id"
+          value={filter.text}
+          onChange={(e) => setFilter({ ...filter, text: e.target.value })}
+          onKeyDown={(e) => e.key === "Escape" && setFilter({ ...filter, text: "" })}
+        />
+        <select className="input" value={filter.source} onChange={(e) => setFilter({ ...filter, source: e.target.value as Source })} title="Which scanner raised it">
+          {SOURCES.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label}
+            </option>
+          ))}
+        </select>
+        {hosts.length > 1 && (
+          <select className="input" value={filter.host} onChange={(e) => setFilter({ ...filter, host: e.target.value })} title="The host it was found on">
+            <option value="">Any host</option>
+            {hosts.map((h) => (
+              <option key={h} value={h}>
+                {h}
+              </option>
+            ))}
+          </select>
+        )}
+        <label className="check" title="False positives, accepted risks and fixed findings">
+          <input type="checkbox" checked={hideFp} onChange={(e) => setHideFp(e.target.checked)} /> Hide closed
         </label>
         <select className="input" value={compare} onChange={(e) => setCompare(e.target.value as Compare)} title={COMPARE.find((c) => c.id === compare)!.title}>
           {COMPARE.map((c) => (
@@ -189,14 +343,37 @@ export function FindingsView({ active }: { active: boolean }) {
           </select>
         )}
         <span className="grow" />
-        <span className="muted">{groups.length} issue types</span>
+        <span className="muted">
+          {groups.length} issue{groups.length === 1 ? "" : "s"}
+        </span>
         <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
           New finding…
         </button>
-        <button className="btn small" disabled={reporting} onClick={saveReport} title="Save a readable HTML report of all findings except false positives">
-          {reporting ? "Saving…" : "Report…"}
+        <button className="btn small" onClick={() => setReporting(true)} title="Build a report: who it is for, its sections and branding; HTML, PDF, Word or Markdown">
+          Report…
         </button>
       </div>
+      {picked.length > 0 && (
+        <div className="toolbar bulk-bar">
+          <strong>{picked.length} selected</strong>
+          <span className="muted">Mark as</span>
+          <div className="seg">
+            {STATES.map((s) => (
+              <button key={s.id} disabled={busy} title={s.title} onClick={() => markPicked(s.id)}>
+                {s.label}
+              </button>
+            ))}
+          </div>
+          {picked.length < shown.length && (
+            <button className="btn small" disabled={busy} onClick={() => setChecked(new Set(shown))}>
+              Select all {shown.length} shown
+            </button>
+          )}
+          <button className="btn small" disabled={busy} onClick={() => setChecked(new Set())}>
+            Clear selection
+          </button>
+        </div>
+      )}
       <Split id="findings" dir="row" initial={0.34}>
         <div className="tree">
           {groups.length === 0 && (
@@ -205,37 +382,72 @@ export function FindingsView({ active }: { active: boolean }) {
                 ? compare === "gone"
                   ? "Nothing that this scan covered is missing: no fixes to show yet."
                   : "No findings match this comparison."
-                : "No findings. Passive rules run on recorded traffic; active scans add more."}
+                : filtering
+                  ? "No findings match the search and filters."
+                  : "No findings. Passive rules run on recorded traffic; active scans add more."}
             </div>
           )}
-          {groups.map((g) => (
-            <div key={g.ref}>
-              <button className="tree-group" onClick={() => setOpen(toggle(open, g.ref))}>
-                <span className="caret">{open.has(g.ref) ? "▾" : "▸"}</span>
-                <span className={`dot-risk risk-${g.risk}`} />
-                <span className="grow ellipsis">{g.name}</span>
-                {g.ref.startsWith("manual:") &&
-                  [...new Set(g.items.map((f) => addedBy(f.origin).tag))].map((t) => (
-                    <span key={t} className="tag">
-                      {t}
+          {groups.map((g) => {
+            const ids = g.items.map((f) => f.id);
+            const n = ids.filter((id) => checked.has(id)).length;
+            return (
+              <div key={g.key}>
+                <div className="tree-row">
+                  <input
+                    type="checkbox"
+                    className="tree-check"
+                    aria-label={`Select every ${g.name} finding on ${g.host}`}
+                    checked={n === ids.length}
+                    ref={(el) => {
+                      if (el) el.indeterminate = n > 0 && n < ids.length;
+                    }}
+                    onChange={(e) => {
+                      const next = new Set(checked);
+                      for (const id of ids) e.target.checked ? next.add(id) : next.delete(id);
+                      setChecked(next);
+                    }}
+                  />
+                  <button className="tree-group" onClick={() => setOpen(toggle(open, g.key))}>
+                    <span className="caret">{open.has(g.key) ? "▾" : "▸"}</span>
+                    <span className={`dot-risk risk-${g.risk}`} />
+                    <span className="grow ellipsis">
+                      {g.name}
+                      {hosts.length > 1 && <span className="muted"> · {g.host}</span>}
                     </span>
-                  ))}
-                <span className="muted">{g.items.length}</span>
-              </button>
-              {open.has(g.ref) &&
-                g.items.map((f) => (
-                  <button key={f.id} className={`tree-item ${selected === f.id ? "on" : ""} ${f.state === "false_positive" ? "struck" : ""}`} onClick={() => setSelected(f.id)}>
-                    <span className="ellipsis">
-                      {/* One rule can raise differently named alerts (e.g. 40018 for each database). */}
-                      {f.name !== g.name && <span className="tree-subname">{f.name} · </span>}
-                      {f.url}
-                      {f.param && <span className="muted"> [{f.param}]</span>}
-                    </span>
-                    {f.state === "confirmed" && <span className="tag">confirmed</span>}
+                    {g.alert.startsWith("manual:") &&
+                      [...new Set(g.items.map((f) => addedBy(f.origin).tag))].map((t) => (
+                        <span key={t} className="tag">
+                          {t}
+                        </span>
+                      ))}
+                    <span className="muted">{g.items.length}</span>
                   </button>
-                ))}
-            </div>
-          ))}
+                </div>
+                {/* A search opens every group it matches, so the matches are in view. */}
+                {(open.has(g.key) || filter.text !== "") &&
+                  g.items.map((f) => (
+                    <div key={f.id} className="tree-row">
+                      <input
+                        type="checkbox"
+                        className="tree-check item"
+                        aria-label={`Select finding ${f.id}`}
+                        checked={checked.has(f.id)}
+                        onChange={() => setChecked(toggle(checked, f.id))}
+                      />
+                      <button className={`tree-item ${selected === f.id ? "on" : ""} ${CLOSED.has(f.state) ? "struck" : ""}`} onClick={() => setSelected(f.id)}>
+                        <span className="ellipsis">
+                          {/* One rule can raise differently named alerts (e.g. 40018 for each database). */}
+                          {f.name !== g.name && <span className="tree-subname">{f.name} · </span>}
+                          {f.url}
+                          {f.param && <span className="muted"> [{f.param}]</span>}
+                        </span>
+                        {f.state !== "open" && <span className="tag">{STATES.find((s) => s.id === f.state)?.label ?? f.state}</span>}
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            );
+          })}
         </div>
         {finding ? (
           <Split id="finding-detail" dir="col" initial={0.5}>
@@ -246,12 +458,17 @@ export function FindingsView({ active }: { active: boolean }) {
               </div>
               <div className="toolbar flat">
                 <div className="seg">
-                  {["open", "confirmed", "false_positive"].map((s) => (
-                    <button key={s} className={finding.state === s ? "on" : ""} onClick={() => mark(s)}>
-                      {s.replace("_", " ")}
+                  {STATES.map((s) => (
+                    <button key={s.id} className={finding.state === s.id ? "on" : ""} title={s.title} onClick={() => mark(s.id)}>
+                      {s.label}
                     </button>
                   ))}
                 </div>
+                {finding.source === "passive" && (
+                  <button className="btn small" disabled={retesting} onClick={retest} title="Send the request again and record whether the finding is still there">
+                    {retesting ? "Retesting…" : "Retest"}
+                  </button>
+                )}
                 {entry && (
                   <button
                     className="btn small"
@@ -265,6 +482,9 @@ export function FindingsView({ active }: { active: boolean }) {
                     Send to Replay
                   </button>
                 )}
+                <button className="btn small" onClick={copyTicket} title="Copy a GitHub or Jira issue for this finding: what, where, how to fix and reproduce it">
+                  Copy ticket
+                </button>
                 {finding.source === "manual" && (
                   <button className="btn small" onClick={remove} title="Take this finding out of the findings and reports">
                     Remove
@@ -315,6 +535,57 @@ export function FindingsView({ active }: { active: boolean }) {
                   </>
                 )}
               </dl>
+              {trail && trailLine(trail) && <p className={trail.reviewed_by ? "muted" : "warn-text"}>{trailLine(trail)}</p>}
+              {finding.issue_id != null && (
+                <>
+                  <h3>Write-up</h3>
+                  <textarea
+                    className="input note-input"
+                    rows={4}
+                    placeholder="What this issue means for this site, for the report. An agent can draft it; it's printed once a person reviews it."
+                    value={writeup}
+                    onChange={(e) => setWriteup(e.target.value)}
+                  />
+                  <div className="toolbar flat">
+                    <button className="btn small" disabled={writeup.trim() === (narrative?.text ?? "")} onClick={() => saveWriteup(false)}>
+                      {writeup.trim() === "" && narrative ? "Clear write-up" : "Save write-up"}
+                    </button>
+                    {narrative && !narrative.reviewed_at && writeup.trim() === narrative.text && (
+                      <button className="btn small" onClick={() => saveWriteup(true)} title="You've read it and it's right: reports print it">
+                        Mark reviewed
+                      </button>
+                    )}
+                    {narrative && <span className="muted">{narrativeCredit(narrative)}</span>}
+                  </div>
+                </>
+              )}
+              <h3>Note</h3>
+              <textarea
+                className="input note-input"
+                rows={3}
+                placeholder="Your triage notes: why it's confirmed or a false positive, what to retest. Reports show it."
+                value={noteDraft}
+                onChange={(e) => setNoteDraft(e.target.value)}
+              />
+              <div className="toolbar flat">
+                <button className="btn small" disabled={noteDraft.trim() === (finding.note ?? "")} onClick={saveNote}>
+                  {noteDraft.trim() === "" && finding.note ? "Clear note" : "Save note"}
+                </button>
+                {finding.note && <span className="muted">Written {noteBy(finding.note_origin, finding.note_changed_at)}</span>}
+              </div>
+              {events.length > 0 && (
+                <>
+                  <h3>Timeline</h3>
+                  <ol className="timeline">
+                    {events.map((e) => (
+                      <li key={e.id}>
+                        <span className="muted">{new Date(e.time).toLocaleString()}</span> {eventText(e)}
+                        {e.by && <span className="muted"> · {e.by}</span>}
+                      </li>
+                    ))}
+                  </ol>
+                </>
+              )}
               {finding.description && (
                 <>
                   <h3>Description</h3>
@@ -355,6 +626,7 @@ export function FindingsView({ active }: { active: boolean }) {
           <div className="blank">Select a finding to see its details and evidence.</div>
         )}
       </Split>
+      {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
     </div>
   );
