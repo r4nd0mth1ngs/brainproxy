@@ -1,11 +1,13 @@
 //! Desktop shell for brainproxy. The window runs the React UI in `../src`; every engine call
 //! goes through the `brainproxy` CLI with `--format json`, the same way `mcp serve` runs
 //! tools, so scope enforcement, output, and errors are exactly the CLI's. The one thing the
-//! shell does itself is temporary engagements (`temp.rs`): creating and deleting their
-//! folders, which nothing reachable from the CLI or MCP may do.
+//! shell does itself is deleting projects: creating and deleting temporary engagements'
+//! folders (`temp.rs`) and deleting a project file with what it keeps beside it (`delete.rs`),
+//! which nothing reachable from the CLI or MCP may do.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod delete;
 mod temp;
 
 use std::collections::HashMap;
@@ -274,6 +276,37 @@ async fn temp_discard(project: String, locks: tauri::State<'_, TempLocks>) -> Re
     temp::remove(&path).map_err(|e| e.to_string())
 }
 
+/// Stops everything still running for the project (`project stop`, which deletes nothing),
+/// then deletes its file and what the CLI keeps beside it (`delete.rs`). Fails, deleting
+/// nothing, if it isn't a project file or is a temporary engagement (discarded instead).
+/// Returns `{state}`:
+/// - `gone`: the file was already gone. Nothing is deleted: what is beside it can't be told to
+///   be a project's.
+/// - `not_stopped`, with `error`: `project stop` failed (something won't stop, or the project
+///   can't be opened: damaged, or made by a newer brainproxy), and nothing was deleted. With
+///   `force` the project is deleted anyway, which is how a damaged one goes.
+/// - `deleted`, with `removed: [path]` and `left: [{path, error}]`: what couldn't be deleted
+///   once the project file was.
+#[tauri::command]
+async fn project_delete(project: String, force: Option<bool>) -> Result<Value, String> {
+    let path = PathBuf::from(&project);
+    if temp::marker(&path).is_some() {
+        return Err(format!("{project} is a temporary engagement; discard it instead"));
+    }
+    let checked = match delete::check(&path).map_err(|e| e.to_string())? {
+        delete::Found::Project(checked) => checked,
+        delete::Found::Missing => return Ok(json!({"state": "gone"})),
+    };
+    let stopped = run(&project, &["project".into(), "stop".into()], None, &HashMap::new()).await;
+    if stopped["ok"] != true && force != Some(true) {
+        let why = stopped["error"]["message"].as_str().unwrap_or("its processes didn't stop");
+        return Ok(json!({"state": "not_stopped", "error": why}));
+    }
+    let done = delete::remove(&checked).map_err(|e| e.to_string())?;
+    let left: Vec<Value> = done.left.iter().map(|(p, e)| json!({"path": p, "error": e})).collect();
+    Ok(json!({"state": "deleted", "removed": done.removed, "left": left}))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -287,7 +320,8 @@ fn main() {
             temp_create,
             temp_leftovers,
             temp_is_inside,
-            temp_discard
+            temp_discard,
+            project_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running brainproxy");
