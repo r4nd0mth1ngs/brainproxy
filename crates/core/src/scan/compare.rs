@@ -35,6 +35,10 @@ pub struct Item {
     pub state: String,
     /// Who or what added it (gui, cli, mcp); None when unknown.
     pub origin: Option<String>,
+    /// The ported rule that raised it, for what a scan covered; None from a report written
+    /// before reports had it. Not part of the output.
+    #[serde(skip)]
+    pub rule_id: Option<i64>,
 }
 
 impl Item {
@@ -121,6 +125,41 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
     out.sort()
 }
 
+/// A scan against a findings set from a file, for a pipeline that starts each run with a fresh
+/// project and keeps the known findings between runs. New: found by the scan and not in the
+/// set. Unchanged: found by the scan and in the set, keeping a false-positive mark from the set.
+/// Fixed: in the set, covered by the scan, and not found by it. The set's findings the scan
+/// didn't cover, and the project's own findings the scan didn't find, count as "other".
+pub fn compare_scan_with_set(store: &Store, scope: &ScanScope, baseline: Vec<Item>) -> Result<Comparison> {
+    let scan = compare_scan(store, scope)?;
+    let mut base: HashMap<String, Item> = baseline.into_iter().filter(|f| !f.removed()).map(|f| (f.key(), f)).collect();
+    let mut out = Comparison { other: scan.other + scan.fixed.len(), ..Default::default() };
+    let mut seen = HashSet::new();
+    for mut f in scan.new.into_iter().chain(scan.unchanged) {
+        let key = f.key();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        match base.remove(&key) {
+            Some(old) => {
+                if old.false_positive() {
+                    f.state = FALSE_POSITIVE.into();
+                }
+                out.unchanged.push(f);
+            }
+            None => out.new.push(f),
+        }
+    }
+    for f in base.into_values() {
+        if scope.covers_item(&f) {
+            out.fixed.push(f);
+        } else {
+            out.other += 1;
+        }
+    }
+    Ok(out.sort())
+}
+
 /// What a scan covered. `origins`: its sites (None = everything recorded, empty = only requests
 /// picked by a filter, so no whole site). `rules`: the ported rules it ran (None = all of them,
 /// less `exclude_rules`). `check_ids`: the declarative checks known to have run: those named by
@@ -184,6 +223,18 @@ impl ScanScope {
             "passive" => self.crawled && self.rules.is_none(),
             _ => false,
         }
+    }
+
+    /// `covers` for a finding from a file. Without its rule id, an active finding of a ported
+    /// rule is covered only by a scan that ran every rule.
+    fn covers_item(&self, f: &Item) -> bool {
+        let rule_id = match f.rule_id {
+            Some(id) => id,
+            None if self.rules.is_none() && self.exclude_rules.is_empty() => 0,
+            None if f.source == "active" && !f.alert_ref.starts_with("check:") => return false,
+            None => 0,
+        };
+        self.covers(&Sighting { time: "", last: "", source: &f.source, rule_id, alert_ref: &f.alert_ref, url: &f.url })
     }
 
     /// Timestamps are all the same UTC format, so they compare as text. A finding added by
@@ -250,13 +301,15 @@ fn item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         param: r.get(8)?,
         state: r.get(9)?,
         origin: r.get("origin")?,
+        rule_id: r.get("rule_id")?,
     })
 }
 
 /// Every finding of a project, false positives and removed ones (tombstones) included.
 pub fn project_items(store: &Store) -> Result<Vec<Item>> {
     let mut stmt = store.conn.prepare(
-        "SELECT id, alert_ref, name, risk, confidence, source, method, url, param, state, origin FROM findings",
+        "SELECT id, alert_ref, name, risk, confidence, source, method, url, param, state, origin, rule_id
+         FROM findings",
     )?;
     let rows = stmt.query_map([], item)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -325,7 +378,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
         .alerts
         .into_iter()
         .flat_map(|a| {
-            let (alert_ref, name) = (a.alert_ref, a.name);
+            let (alert_ref, name, rule_id) = (a.alert_ref, a.name, a.rule_id);
             a.instances.into_iter().map(move |i| Item {
                 id: None,
                 alert_ref: alert_ref.clone(),
@@ -338,6 +391,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
                 param: i.param,
                 state: i.state,
                 origin: i.origin,
+                rule_id,
             })
         })
         .collect();
@@ -362,6 +416,9 @@ struct SavedSummary {
 #[derive(Deserialize)]
 struct SavedAlert {
     alert_ref: String,
+    /// Absent from reports written before they had it.
+    #[serde(default)]
+    rule_id: Option<i64>,
     name: String,
     instances: Vec<SavedInstance>,
 }
@@ -401,6 +458,7 @@ mod tests {
             param: String::new(),
             state: state.into(),
             origin: None,
+            rule_id: alert_ref.parse().ok(),
         }
     }
 
@@ -495,6 +553,28 @@ mod tests {
 
     fn all(s: &ScanScope) -> Vec<Seen> {
         ROWS.iter().map(|r| seen(s, r.0)).collect()
+    }
+
+    /// A finding from a file is fixed only where the scan covered it, as one in the project is.
+    #[test]
+    fn findings_from_a_file_are_covered_like_the_projects() {
+        let s = scope();
+        assert!(s.covers_item(&f("40018", "http://a.test/y", "high", "open")));
+        // Another service, a rule the scan didn't run, a check it didn't name, one added by hand.
+        assert!(!s.covers_item(&f("40018", "http://a.test:8080/", "high", "open")));
+        assert!(!s.covers_item(&f("10020", "http://a.test/", "high", "open")));
+        assert!(!s.covers_item(&f("check:cve-1", "http://a.test/", "high", "open")));
+        assert!(!s
+            .covers_item(&Item { source: MANUAL_SOURCE.into(), ..f("manual:idor", "http://a.test/", "high", "open") }));
+        // An older report without rule ids: covered only by a scan of every rule.
+        let old = Item { rule_id: None, ..f("40018", "http://a.test/y", "high", "open") };
+        assert!(!s.covers_item(&old));
+        assert!(ScanScope { rules: None, ..scope() }.covers_item(&old));
+        assert!(!ScanScope { rules: None, exclude_rules: vec![1], ..scope() }.covers_item(&old));
+        // Passive findings need a crawl of every rule, with or without the id.
+        let passive = Item { source: "passive".into(), rule_id: None, ..f("10020", "http://a.test/", "low", "open") };
+        assert!(!s.covers_item(&passive));
+        assert!(ScanScope { rules: None, crawled: true, ..scope() }.covers_item(&passive));
     }
 
     #[test]

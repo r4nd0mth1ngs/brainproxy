@@ -1582,12 +1582,27 @@ an active scan that completed (not failed, stopped, or out of `--max-minutes`) a
 brainproxy --project app.bpdb findings compare --scan 14 --since-scan 12 --fail-on high --new-only
 ```
 
+`--scan JOB --baseline FILE` is for a pipeline that starts each run with a fresh project and keeps
+the findings it knows in a file between runs. The scan is compared with the file's findings instead
+of the project's: **new** if the scan found it and the file doesn't have it, **unchanged** if the
+scan found it and the file has it (a false-positive mark in the file holds), and **fixed** if the
+file has it, the scan covered it, and the scan didn't find it. Covered means the same as for `--scan`
+alone: the finding's site, and its rule for an active finding (a report written before reports had
+rule ids is covered only by a scan of every rule). The file's findings the scan didn't cover count
+in `summary.other`, not as fixed. `data.baseline` is the scan, with `report` naming the file.
+`--allow-missing-baseline` works as with a file baseline; `--since-scan` can't be combined with it.
+
+```bash
+# A fresh project each run; known.json holds what earlier runs found.
+brainproxy --project run.bpdb findings compare --scan 1 --baseline known.json --fail-on high --new-only
+```
+
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Compared, and the gate (if any) passed |
 | `5` | Compared, and the gate found something. The output is complete: `ok` is true, and `data.gate` has `passed: false`, the `count`, and the `findings` |
 | `4` | The baseline file, project, or scan job (`--scan` or `--since-scan`) doesn't exist |
-| `2` | Bad arguments; a file that isn't usable (not a report, cut off, or the baseline and the findings compared being the same file); `--fail-on` with a filtered `--current` or a scan that didn't complete; or a `--since-scan` job that didn't complete before the `--scan` one started |
+| `2` | Bad arguments; a file that isn't usable (not a report, cut off, or the baseline and the findings compared being the same file); `--fail-on` with a filtered `--current` or a scan that didn't complete; a `--since-scan` job that didn't complete before the `--scan` one started; or `--since-scan` with `--baseline` |
 
 These don't pass a gate:
 

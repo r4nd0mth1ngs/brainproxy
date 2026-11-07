@@ -32,13 +32,15 @@ pub struct CompareArgs {
     #[arg(long, value_name = "FILE", conflicts_with = "scan")]
     current: Option<PathBuf>,
     /// Compare with a background active scan of this project, by job id: first found by it,
-    /// found again by it, or covered by it and not found again.
-    #[arg(long, value_name = "JOB", conflicts_with = "baseline")]
+    /// found again by it, or covered by it and not found again. With --baseline, against that
+    /// file's findings instead of the project's: new if found and not in the file, unchanged if
+    /// found and in it, fixed if in it, covered by the scan, and not found.
+    #[arg(long, value_name = "JOB")]
     scan: Option<i64>,
     /// With --scan: also count as new what it found again that was first seen after this earlier
     /// scan, such as findings of a failed run in between. The earlier scan must have completed
     /// (not timed out) before the --scan one started.
-    #[arg(long, value_name = "JOB", requires = "scan")]
+    #[arg(long, value_name = "JOB", requires = "scan", conflicts_with = "baseline")]
     since_scan: Option<i64>,
     /// Exit with code 5 when a finding at or above this risk is present (false positives never
     /// count, and with --scan only what that scan found counts).
@@ -70,24 +72,29 @@ pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
             scan["since_scan"] = json!({"job": since, "end": scope.new_after});
             scan["scope"] = json!(scope);
         }
-        baseline = scan;
-        compare::compare_scan(&store, &scope)?
+        match &a.baseline {
+            None => {
+                baseline = scan;
+                compare::compare_scan(&store, &scope)?
+            }
+            Some(path) => {
+                let (items, missing) = load_baseline(path, a.allow_missing_baseline, &mut warnings)?;
+                scan["report"] = json!({"path": path, "missing": missing});
+                baseline = scan;
+                compare::compare_scan_with_set(&store, &scope, items)?
+            }
+        }
     } else {
         if let Some(path) = &a.baseline {
             refuse_same_file(path, a.current.as_deref().unwrap_or(project))?;
         }
         let base = match &a.baseline {
             None => vec![],
-            Some(path) if a.allow_missing_baseline && !path.exists() => {
-                baseline = json!({"kind": "none", "path": path, "missing": true});
-                warnings.push(format!("no baseline at {}: every finding counts as new", path.display()));
-                vec![]
-            }
             Some(path) => {
-                let set = compare::load_set(path)?;
-                baseline = json!({"kind": "report", "path": path, "missing": false});
-                warnings.extend(set.warnings);
-                set.items
+                let (items, missing) = load_baseline(path, a.allow_missing_baseline, &mut warnings)?;
+                let kind = if missing { "none" } else { "report" };
+                baseline = json!({"kind": kind, "path": path, "missing": missing});
+                items
             }
         };
         let items = match &a.current {
@@ -185,6 +192,17 @@ fn open_project(project: &Path) -> Result<Store, Error> {
 }
 
 /// A file compared with itself would show nothing new and pass any gate.
+/// The findings of a --baseline file, and whether it was missing and allowed to be (a first run).
+fn load_baseline(path: &Path, allow_missing: bool, warnings: &mut Vec<String>) -> Result<(Vec<Item>, bool), Error> {
+    if allow_missing && !path.exists() {
+        warnings.push(format!("no baseline at {}: every finding counts as new", path.display()));
+        return Ok((vec![], true));
+    }
+    let set = compare::load_set(path)?;
+    warnings.extend(set.warnings);
+    Ok((set.items, false))
+}
+
 fn refuse_same_file(baseline: &Path, current: &Path) -> Result<(), Error> {
     match (std::fs::canonicalize(baseline), std::fs::canonicalize(current)) {
         (Ok(b), Ok(c)) if b == c => Err(Error::InvalidInput(format!(

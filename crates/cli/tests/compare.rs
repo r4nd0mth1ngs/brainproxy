@@ -226,7 +226,7 @@ fn a_missing_baseline_fails_unless_allowed() {
     // --new-only and --allow-missing-baseline are usage errors alone.
     assert_eq!(env.compare(&["--new-only"]).0, 2);
     assert_eq!(env.compare(&["--allow-missing-baseline"]).0, 2);
-    assert_eq!(env.compare(&["--scan", "1", "--baseline", &path]).0, 2);
+    assert_eq!(env.compare(&["--scan", "1", "--since-scan", "1", "--baseline", &path]).0, 2);
 }
 
 #[test]
@@ -474,6 +474,70 @@ fn since_scan_must_be_a_completed_scan_before_the_compared_one() {
     assert_eq!(env.compare(&["--scan", &job, "--since-scan", "999"]).0, 4);
     // Only with --scan.
     assert_eq!(env.compare(&["--since-scan", &later.to_string()]).0, 2);
+}
+
+/// A pipeline that starts each run with a fresh project and keeps the known findings in a file:
+/// the scan against that file, with "fixed" only where the scan covered the finding.
+#[test]
+fn a_scan_against_a_baseline_file() {
+    let first = Env::new("scan-file");
+    let other = serve();
+    first.send("/old");
+    first.send("/fp");
+    first.send("/gone");
+    ok(&first.project, &["send", "--url", &format!("http://127.0.0.1:{other}/elsewhere")]);
+    for id in first.ids_on("/fp") {
+        ok(&first.project, &["findings", "mark", &id.to_string(), "--state", "false_positive"]);
+    }
+    let known = first.save_baseline("known.json");
+
+    let run = Env::on("scan-file-run", first.port);
+    let url = format!("http://127.0.0.1:{}/", run.port);
+    let args: Vec<String> = ["scan", "active", "--crawl", &url].iter().map(|s| s.to_string()).collect();
+    let job = scan_job(&run, &args, "completed", || {
+        run.send("/old");
+        run.send("/fp");
+        run.send("/new");
+    })
+    .to_string();
+
+    let (code, v) = run.compare(&["--scan", &job, "--baseline", &known, "--state", "all"]);
+    assert_eq!(code, 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["baseline"]["kind"], "scan");
+    assert_eq!(d["baseline"]["report"]["missing"], false);
+    assert!(ends_with(&d["new"], "/new"), "{d}");
+    let tail = |list: &Value| urls(list).iter().map(|u| u.rsplit('/').next().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(tail(&d["unchanged"]), ["fp", "old"], "{d}");
+    // The file's false-positive mark holds for the finding found again.
+    assert!(d["unchanged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["url"].as_str().unwrap().ends_with("/fp"))
+        .all(|f| f["state"] == "false_positive"));
+    // Gone from a site the scan crawled: fixed. On another service it never covered: neither.
+    assert!(ends_with(&d["fixed"], "/gone"), "{d}");
+    assert!(d["summary"]["other"].as_u64().unwrap() > 0, "{d}");
+
+    // The gate counts what the scan found; the file's findings it found again aren't new.
+    assert_eq!(run.compare(&["--scan", &job, "--baseline", &known, "--fail-on", "high"]).0, 0);
+    let (code, v) = run.compare(&["--scan", &job, "--baseline", &known, "--fail-on", "info", "--new-only"]);
+    assert_eq!(code, 5, "{v}");
+    assert!(ends_with(&v["data"]["gate"]["findings"], "/new"), "{v}");
+
+    // A first run: no file yet, so everything the scan found is new.
+    let none = run.path("none.json");
+    let (code, v) = run.compare(&["--scan", &job, "--baseline", &none, "--allow-missing-baseline"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["baseline"]["report"]["missing"], true);
+    assert_eq!(v["data"]["summary"]["unchanged"], 0);
+    assert_eq!(run.compare(&["--scan", &job, "--baseline", &none]).0, 4);
+
+    // A gate still refuses a scan that didn't complete.
+    let failed = scan_job(&run, &args, "failed", || {}).to_string();
+    let (code, v) = run.compare(&["--scan", &failed, "--baseline", &known, "--fail-on", "high"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
 }
 
 /// A report of one scan leaves out what the project knew before and the scan didn't see again.
