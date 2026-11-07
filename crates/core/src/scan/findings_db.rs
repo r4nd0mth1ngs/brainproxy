@@ -131,13 +131,13 @@ pub(crate) fn mark_with(
         .optional()?;
     // The state it already has is no change: who changed it and when stay as they were, so the
     // timeline and `state_changed_at` (what a later sighting of a fixed finding is compared
-    // with) keep telling the truth. A missing or removed finding matches no row below anyway.
-    let state = state.filter(|s| before.as_ref().is_none_or(|(old, _)| old != s));
+    // with) keep telling the truth. Decided by the row as the UPDATE finds it, so a scanner
+    // reopening it meanwhile can't turn a real mark into a no-op.
     let n = conn.execute(
         "UPDATE findings SET state = COALESCE(?1, state),
             note = CASE WHEN ?2 IS NULL THEN note ELSE NULLIF(?2, '') END,
-            state_origin = CASE WHEN ?1 IS NULL THEN state_origin ELSE ?4 END,
-            state_changed_at = CASE WHEN ?1 IS NULL THEN state_changed_at
+            state_origin = CASE WHEN ?1 IS NULL OR ?1 = state THEN state_origin ELSE ?4 END,
+            state_changed_at = CASE WHEN ?1 IS NULL OR ?1 = state THEN state_changed_at
                 ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
             note_origin = CASE WHEN ?2 IS NULL THEN note_origin ELSE ?4 END,
             note_changed_at = CASE WHEN ?2 IS NULL THEN note_changed_at
@@ -159,7 +159,7 @@ pub(crate) fn mark_with(
             &crate::scan::issues::Event { finding: Some(id), kind, old, new, text, history_id, ..Default::default() },
         )
     };
-    if let Some(s) = state {
+    if let Some(s) = state.filter(|s| *s != old_state) {
         event("state", Some(&old_state), Some(s), cause.map(|c| c.0), cause.and_then(|c| c.1))?;
     }
     if let Some(n) = note.map(str::trim).map(|n| Some(n).filter(|n| !n.is_empty())) {
@@ -478,9 +478,11 @@ impl Store {
         let mut created = std::collections::HashSet::new();
         // One response can raise the same finding twice (two versioned Server headers): it
         // takes the higher of the risks, as one sighting.
-        let mut risks: std::collections::HashMap<String, Risk> = std::collections::HashMap::new();
-        for f in findings {
-            let r = risks.entry(dedupe_key(f.def.alert_ref, &msg.method, &msg.url, &f.param)).or_insert(f.risk);
+        let keys: Vec<String> =
+            findings.iter().map(|f| dedupe_key(f.def.alert_ref, &msg.method, &msg.url, &f.param)).collect();
+        let mut risks: std::collections::HashMap<&str, Risk> = std::collections::HashMap::new();
+        for (f, key) in findings.iter().zip(&keys) {
+            let r = risks.entry(key).or_insert(f.risk);
             if f.risk.level() > r.level() {
                 *r = f.risk;
             }
@@ -495,12 +497,17 @@ impl Store {
                     method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id,
-                    risk = excluded.risk, risk_level = excluded.risk_level
-                 RETURNING id",
+                    risk = CASE WHEN hits = 0 OR excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
+                    risk_level = CASE WHEN hits = 0 THEN excluded.risk_level
+                        ELSE max(risk_level, excluded.risk_level) END
+                 RETURNING id, risk",
             )?;
-            // The risk a sighting gives is the rule's rating now, so a finding takes it either
-            // way: a rule that rated something too high, then fixed, lowers it again. Read first
-            // so the change goes on the timeline.
+            // A finding's risk is the highest any of its sightings gave since a rescan started
+            // counting them again (hits 0): a sighting rated higher raises it, and a rescan
+            // rates it afresh, so a rule that rated something too high, then was fixed, lowers
+            // it. Not simply the latest rating: one key can be rated differently at once (a
+            // library file served old and new under two query strings), and the high one must
+            // not hide behind the low. Read first so a change goes on the timeline.
             let mut risk_before = tx.prepare_cached("SELECT risk FROM findings WHERE dedupe = ?1")?;
             // A finding marked fixed that is seen again is open again, when what saw it was
             // recorded after it was marked: a rescan of older traffic doesn't reopen it.
@@ -510,7 +517,7 @@ impl Store {
                  WHERE id = ?1 AND state = 'fixed'
                     AND (state_changed_at IS NULL OR (SELECT time FROM history WHERE id = ?3) >= state_changed_at)",
             )?;
-            for f in findings {
+            for (f, dedupe) in findings.iter().zip(&keys) {
                 let d = f.def;
                 let rule_id: u32 = d.alert_ref.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 types.execute(params![
@@ -522,10 +529,9 @@ impl Store {
                     serde_json::to_string(d.references).unwrap_or_default(),
                     serde_json::to_string(d.tags).unwrap_or_default(),
                 ])?;
-                let dedupe = dedupe_key(d.alert_ref, &msg.method, &msg.url, &f.param);
-                let risk = risks.get(&dedupe).copied().unwrap_or(f.risk);
-                let old_risk: Option<String> = risk_before.query_row([&dedupe], |r| r.get(0)).optional()?;
-                let id: i64 = insert.query_row(
+                let risk = risks.get(dedupe.as_str()).copied().unwrap_or(f.risk);
+                let old_risk: Option<String> = risk_before.query_row([dedupe], |r| r.get(0)).optional()?;
+                let (id, now_risk): (i64, String) = insert.query_row(
                     params![
                         source,
                         rule_id,
@@ -547,21 +553,21 @@ impl Store {
                         truncate(&f.attack, 2000),
                         crate::provenance::origin(),
                     ],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 if id > before && created.insert(id) {
                     new += 1;
                     crate::scan::issues::created(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
                     continue;
                 }
-                if let Some(old) = old_risk.as_deref().filter(|old| *old != risk.as_str()) {
+                if let Some(old) = old_risk.as_deref().filter(|old| *old != now_risk) {
                     crate::scan::issues::record(
                         &tx,
                         &crate::scan::issues::Event {
                             finding: Some(id),
                             kind: "risk",
                             old: Some(old),
-                            new: Some(risk.as_str()),
+                            new: Some(&now_risk),
                             history_id: Some(msg.history_id),
                             ..Default::default()
                         },
@@ -1855,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sighting_sets_the_risk_either_way_and_says_so() {
+    fn a_sighting_raises_the_risk_a_rescan_rates_it_afresh_and_both_say_so() {
         let mut s = Store::open_in_memory().unwrap();
         let h = seen_at(&mut s, "/x");
         let id = xpb(&s)[0]["id"].as_i64().unwrap();
@@ -1864,14 +1870,20 @@ mod tests {
             .into_iter()
             .find(|f| f.def.alert_ref == "10037")
             .unwrap();
-        // A rule rating it higher raises it; one rating it lower (a fixed rule) lowers it again.
-        // Two ratings in one response are one sighting, at the higher.
         let rated = |risk| Finding { risk, ..def.clone() };
+        // A higher rating raises it; two in one response are one sighting, at the higher.
         s.record_findings("passive", &msg, &[rated(Risk::Low), rated(Risk::High)]).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["risk"], "high");
+        // A lower one between rescans doesn't lower it: the same URL may be rated both ways.
+        s.record_findings("passive", &msg, &[rated(Risk::Low)]).unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["risk"], "high");
+        // A rescan counts afresh, so its first sighting sets the risk (a fixed rule lowers it),
+        // and later ones raise it again.
+        s.findings_rescan_start("passive").unwrap();
         s.record_findings("passive", &msg, &[rated(Risk::Low)]).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["risk_level"], 1);
-        s.record_findings("passive", &msg, &[rated(Risk::Low)]).unwrap();
+        s.record_findings("passive", &msg, &[rated(Risk::Info)]).unwrap();
+        s.record_findings("passive", &msg, &[rated(Risk::Medium)]).unwrap();
         let risk: Vec<(String, String)> = s
             .finding_events(id)
             .unwrap()
@@ -1879,6 +1891,13 @@ mod tests {
             .filter(|e| e["kind"] == "risk")
             .map(|e| (e["old"].as_str().unwrap().into(), e["new"].as_str().unwrap().into()))
             .collect();
-        assert_eq!(risk, [("low".into(), "high".into()), ("high".into(), "low".into())]);
+        assert_eq!(
+            risk,
+            [("low".into(), "high".into()), ("high".into(), "low".into()), ("low".into(), "medium".into())]
+        );
+        // The scanner's own record isn't triage: a rescan that doesn't find it removes it.
+        s.findings_rescan_start("passive").unwrap();
+        s.findings_rescan_finish("passive").unwrap();
+        assert!(matches!(s.finding_get(id), Err(Error::NotFound(_))));
     }
 }

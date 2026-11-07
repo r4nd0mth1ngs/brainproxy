@@ -1604,6 +1604,40 @@ mod tests {
     }
 
     #[test]
+    fn a_project_on_v17_merges_findings_stored_once_per_session_id() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v17-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        // Two sightings v17 kept apart, each keyed with its session id.
+        let conn = Connection::open(&path).unwrap();
+        for sid in ["A", "B"] {
+            let url = format!("http://a.test/login;jsessionid={sid}");
+            conn.execute(
+                "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method,
+                    url, dedupe) VALUES ('passive', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET', ?1, '1|GET|' || ?1 || '|')",
+                [&url],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 17).unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (n, hits, key): (i64, i64, String) = store
+            .conn
+            .query_row("SELECT count(*), sum(hits), min(dedupe) FROM findings", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((n, hits, key.as_str()), (1, 2, "1|GET|http://a.test/login|"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_new_project_opened_by_many_at_once_is_migrated_once() {
         // Each step ran unlocked: two openers both ran `ALTER TABLE ... ADD COLUMN`
         // ("duplicate column name"), or the WAL switch failed at once ("database is locked").

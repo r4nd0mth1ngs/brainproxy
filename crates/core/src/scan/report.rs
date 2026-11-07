@@ -217,7 +217,7 @@ pub struct AlertGroup {
     /// The highest CVSS 4.0 score among its instances' issues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
-    /// Write-ups of its issues (one per host), reviewed or, when asked for, drafts.
+    /// Write-ups of its issues (usually one per host), reviewed or, when asked for, drafts.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub narratives: Vec<IssueNarrative>,
     pub instances: Vec<Instance>,
@@ -227,6 +227,8 @@ pub struct AlertGroup {
 #[derive(Debug, Clone, Serialize)]
 pub struct IssueNarrative {
     pub issue_id: i64,
+    /// The hosts of the issue's findings in the report, joined by ", " (several after issues
+    /// from two hosts were merged).
     pub host: String,
     #[serde(flatten)]
     pub narrative: Narrative,
@@ -300,7 +302,8 @@ pub struct Instance {
     /// path parameters, parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
     /// matches a saved report by, since redaction may change the URL.
     pub fingerprint: String,
-    /// The issue (alert type and host) it is an instance of, and that issue's CVSS rating.
+    /// The issue (alert type and host, or hosts once merged) it is an instance of, and that
+    /// issue's CVSS rating.
     pub issue_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,

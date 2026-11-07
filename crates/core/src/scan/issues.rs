@@ -253,9 +253,6 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let mut hosts: Vec<String> =
         serde_json::from_str::<Map<String, Value>>(&hosts).map(|m| m.keys().cloned().collect()).unwrap_or_default();
     hosts.sort();
-    if hosts.is_empty() {
-        hosts.push(r.get("host")?);
-    }
     Ok(json!({
         "id": r.get::<_, i64>("id")?,
         "alert_ref": r.get::<_, String>("alert_ref")?,

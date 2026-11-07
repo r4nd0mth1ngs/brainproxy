@@ -1098,8 +1098,9 @@ report still compares with the project as it was. (It was `brainproxy/v1`, which
 query, then `brainproxy/v2`, which kept path parameters: the first upload after updating may
 show existing alerts as closed and opened again. A URL without path parameters has the same
 hash as under v2, so only those findings change in `report json`, `report defectdojo` and
-baselines; a project opened by this version merges the findings it stored once per session
-id, keeping the latest state and note, the summed hits and the highest risk.)
+baselines: write a baseline again after updating, or they show as new and fixed once. A
+project opened by this version merges the findings it stored once per session id, keeping
+the latest state and note, the summed hits and the highest risk.)
 A result marked false positive or accepted risk (in a report written with `--state all`)
 carries `suppressions` (`kind` external, `status` accepted, the note as `justification`), so
 code scanning shows it as dismissed rather than open.
@@ -1604,8 +1605,8 @@ Findings are records with a history, not just rows:
   and retest pending.
   A fixed finding a scanner sees again goes back to open, with a `regressed` event.
 - **Timeline** (`findings timeline ID`): created, state and note changes, retests, moves
-  between issues, regressions, risk changes (a sighting rated it higher or lower: the
-  latest sighting's rating is the finding's) and removals, each with who did it (`gui`, `cli`, `mcp`) and
+  between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
+  afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets
   a timeline built from what its findings already recorded.
 - **Retest** (`findings retest ID [--auth PROFILE]`): a passive finding's latest request is
@@ -1635,8 +1636,11 @@ Findings are records with a history, not just rows:
 Risks run `info`, `low`, `medium`, `high` and `critical` (`risk_level` 0 to 4). Checks and
 vulnerable JavaScript libraries rated critical are critical; SARIF gives critical a
 `security-severity` of 9.5. A finding found again at a higher risk than it was stored with
-moves up (never down), so `scan passive --rescan` brings findings recorded as high by older
-builds up to critical.
+moves up, and `scan passive --rescan` rates passive findings afresh: each takes the highest
+risk its sightings give now, so findings recorded as high by older builds go up to critical,
+and one a rule rated too high before it was fixed comes down. Each change is a `risk` event on
+the finding's timeline. Between rescans a lower rating doesn't lower it, since one URL can be
+rated two ways at once (a library file served old and new under two query strings).
 
 ### Report layouts
 
