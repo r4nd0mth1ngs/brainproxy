@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use regex::{Captures, Regex};
 
 use crate::scan::report::{HttpRequest, HttpResponse};
@@ -62,8 +63,25 @@ const SECRET_NAME_PARTS: &[&str] = &[
 ];
 
 /// Parameter or JSON key names that hold a secret only as the whole name.
-const SECRET_NAMES: &[&str] =
-    &["pwd", "pass", "sid", "auth", "authorization", "otp", "sig", "key", "credential", "credentials"];
+const SECRET_NAMES: &[&str] = &[
+    "pwd",
+    "pass",
+    "sid",
+    "auth",
+    "authorization",
+    "otp",
+    "otp_code",
+    "sig",
+    "key",
+    "credential",
+    "credentials",
+    "x-amz-credential",
+];
+
+/// A name that says its value is a one-time code only when the value is long enough to be
+/// one: an OAuth `code=`, not `"code": 404`.
+const CODE_NAMES: &[&str] = &["code", "auth_code", "authorization_code"];
+const CODE_MIN: usize = 10;
 
 /// The header names [`HEADER_LINE`] and [`HEADER_INLINE`] look for, longest first so
 /// `set-cookie` is taken whole rather than as `cookie`.
@@ -74,27 +92,86 @@ fn header_names() -> String {
     names.join("|")
 }
 
-/// A header line inside free text, such as a finding's evidence.
+/// A `name: value` line inside free text, such as a header in a finding's evidence or a
+/// `password: x` line in a note; masked when the name is a credential header or secret.
 static HEADER_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"(?im)^([ \t]*)({})([ \t]*:[ \t]*)([^\r\n]+)", header_names())).unwrap());
+    LazyLock::new(|| Regex::new(r"(?im)^([ \t]*)([A-Za-z][A-Za-z0-9_\-]{0,63})([ \t]*:[ \t]*)([^\r\n]+)").unwrap());
 
 /// A header quoted inside a line (`curl -H "Authorization: Bearer ..."`, an escaped
-/// `\r\n`-joined header block): its value ends at a quote, a backslash or a tag.
-static HEADER_INLINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r#"(?i)(\b)({})([ \t]*:[ \t]*)([^\r\n"'\\<>]+)"#, header_names())).unwrap());
+/// `\r\n`-joined header block): its value ends at a quote, a backslash or a tag. The known
+/// credential headers, or any hyphenated name that says it is secret (`X-Refresh-Token`).
+static HEADER_INLINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?i)(\b)({}|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)([ \t]*:[ \t]*)([^\r\n"'\\<>]+)"#,
+        header_names()
+    ))
+    .unwrap()
+});
 
 /// A JSON string member; a body cut short may end before the closing quote.
 static JSON_MEMBER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""([A-Za-z0-9_.\-]{1,64})"(\s*:\s*)"((?:[^"\\]|\\.)*)("|$)"#).unwrap());
 
+/// A JSON member whose value is an array, such as a list of tokens.
+static JSON_ARRAY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""([A-Za-z0-9_.\-]{1,64})"(\s*:\s*)\[([^\]]{0,8192})\]"#).unwrap());
+static JSON_STRING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""((?:[^"\\]|\\.)*)""#).unwrap());
+
+/// A JSON member inside a JSON-encoded string (`"payload":"{\"secret\":\"x\"}"`).
+static JSON_ESCAPED_MEMBER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\\"([A-Za-z0-9_.\-]{1,64})\\"(\s*:\s*)\\"((?:[^"\\]|\\[^"])*)\\""#).unwrap());
+
+/// A key and quoted value in script or config text: `apiKey: "x"`, `'authToken': 'x'`,
+/// `token = "x"`. One pattern per quote, since a value may hold the other one.
+static KEY_DOUBLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(^|[\s{,(])(['"]?)([A-Za-z_$][A-Za-z0-9_$\-]{0,63})(['"]?\s*[:=]\s*")((?:[^"\\\r\n]|\\.)*)""#)
+        .unwrap()
+});
+static KEY_SINGLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(^|[\s{,(])(['"]?)([A-Za-z_$][A-Za-z0-9_$\-]{0,63})(['"]?\s*[:=]\s*')((?:[^'\\\r\n]|\\.)*)'"#)
+        .unwrap()
+});
+
+/// An XML element with text only: `<password>x</password>`, `<wsse:BinarySecurityToken>`.
+static XML_ELEMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<((?:[A-Za-z_][\w.\-]*:)?([A-Za-z_][\w.\-]*))(\s[^<>]*)?>([^<]{1,8192})</").unwrap());
+
+/// A quoted attribute anywhere (`data-token="x"`); masked when its name says it is secret.
+static QUOTED_ATTR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(\s)([A-Za-z_][A-Za-z0-9_:.\-]{0,63})(\s*=\s*")([^"]*)""#).unwrap());
+
+/// Credentials in a URL: `https://user:password@host`.
+static USERINFO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]{1,15}://[^/\s:@"'<>]{1,128}:)([^/\s@"'<>]{1,256})@"#).unwrap()
+});
+
+/// A secret named in a sentence: `password: x`, `token=x` (one word).
+static PROSE_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(password|passwd|passphrase|pwd|secret|api[_-]?key|access[_-]?token)(\s*[:=]\s*)([^\s"'<>,;&#?\\]{4,})"#)
+        .unwrap()
+});
+
+/// A Digest credential's response or client nonce, quoted where the header isn't whole (an
+/// escaped curl line).
+static DIGEST_PARAM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)(\b(?:response|cnonce)\s*=\s*(?:\\?")?)([^"\\\s,]{6,})"#).unwrap());
+
+/// A percent escape, to write in lowercase hex.
+static PERCENT_HEX: LazyLock<Regex> = LazyLock::new(|| Regex::new("%[0-9A-F]{2}").unwrap());
+
+/// What the Basic-auth rule wrote before it stopped quoting the password.
+static QUOTED_PASSWORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\band password \[)([^\]\r\n]*)(\])").unwrap());
+
 /// A JSON member whose value is a number, such as a one-time code.
 static JSON_NUMBER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""([A-Za-z0-9_.\-]{1,64})"(\s*:\s*)(-?[0-9][0-9.eE+\-]*)"#).unwrap());
 
-/// A `name=value` pair in a query string, form body or link; the name may be percent-encoded.
-/// A value ends at a backslash, which in quoted text starts an escape such as `\r\n`.
+/// A `name=value` pair in a query string, fragment, form body or link; the name may be
+/// percent-encoded. A value ends at a backslash, which in quoted text starts an escape such
+/// as `\r\n`, and at `?`, so a pair in a path (`;v=1?token=x`) or a nested URL
+/// (`next=/a?session=x`) leaves the query after it to be read too.
 static FORM_PAIR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(^|[?&;\s"'])([A-Za-z0-9_.%\-\[\]]{1,96})=([^&#\s;"'<>\\]+)"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"(^|[?&;#\s"'])([A-Za-z0-9_.%\-\[\]]{1,96})=([^&#?\s;"'<>\\]+)"#).unwrap());
 
 /// A multipart field: its headers, a blank line, then the value's first line.
 static MULTIPART_FIELD: LazyLock<Regex> = LazyLock::new(|| {
@@ -112,17 +189,17 @@ static ATTR_VALUE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)[\s/](?:value|content)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+))"#).unwrap());
 static PASSWORD_TYPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)[\s/]type\s*=\s*["']?password\b"#).unwrap());
 
-/// A JSON Web Token anywhere.
+/// A JSON Web Token anywhere, also one cut short before its signature.
 static JWT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*").unwrap());
+    LazyLock::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?").unwrap());
 
 #[derive(Debug, Default)]
 pub struct Redactor {
     /// Values masked so far, to find again elsewhere.
     secrets: BTreeSet<String>,
-    /// `secrets`, longest first (so a value that contains another is masked whole); rebuilt
-    /// when a secret is added.
-    order: Vec<String>,
+    /// A matcher for `secrets` (leftmost-longest, so a value that contains another is masked
+    /// whole; ASCII case ignored); rebuilt when a secret is added.
+    matcher: Option<AhoCorasick>,
     /// How many places a value was masked in.
     pub masked: usize,
 }
@@ -130,26 +207,70 @@ pub struct Redactor {
 fn secret_name(name: &str) -> bool {
     let n = percent_encoding::percent_decode_str(name).decode_utf8_lossy().to_ascii_lowercase();
     let n = n.trim_end_matches("[]");
+    // Rails' `csrf-param` names the token's field (authenticity_token), and isn't one.
+    if n.ends_with("-param") {
+        return false;
+    }
     SECRET_NAMES.contains(&n) || SECRET_NAME_PARTS.iter().any(|p| n.contains(p))
+}
+
+/// Whether `name = value` holds a secret: a secret name, or a code name with a long value.
+fn secret_pair(name: &str, value: &str) -> bool {
+    let code = value.len() >= CODE_MIN
+        && value.chars().any(|c| c.is_ascii_digit())
+        && value.chars().any(|c| c.is_ascii_alphabetic());
+    secret_name(name) || (code && CODE_NAMES.contains(&name.to_ascii_lowercase().as_str()))
+}
+
+/// Whether a header's whole value is a credential (beyond Cookie, Set-Cookie and
+/// Authorization, whose names or schemes are kept): a known API-key header, or a name that
+/// says it is secret.
+pub fn secret_header(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    SECRET_HEADERS.contains(&n.as_str()) || secret_name(&n)
 }
 
 /// Whether a value masked because of its name is worth finding elsewhere. A plain word or
 /// a short number (`"token_type":"bearer"`, `sid=deleted`, `"otp":123456`) is masked where
 /// it stands, but masking it everywhere would hide ordinary text.
-fn distinctive(v: &str) -> bool {
+pub fn distinctive(v: &str) -> bool {
     let word = v.len() < 12 && v.chars().all(|c| c.is_ascii_alphabetic());
     let number = v.len() < 10 && v.chars().all(|c| c.is_ascii_digit());
     v.len() >= MIN_SCRUB && !word && !number
 }
 
 /// The forms a value may take elsewhere in a report: as recorded, unquoted, with JSON
-/// escapes undone, percent-decoded, and percent-encoded.
+/// escapes undone, percent-decoded, percent-encoded (either case of hex), JSON-escaped
+/// (`\/`, as PHP writes it), HTML-escaped, and in base64. Case is ignored when matching.
 fn forms(v: &str) -> Vec<String> {
+    use base64::Engine;
     let bare = v.trim_matches(|c| c == '"' || c == '\'');
     let unescaped = serde_json::from_str::<String>(&format!("\"{bare}\"")).unwrap_or_else(|_| bare.to_string());
     let decoded = percent_encoding::percent_decode_str(bare).decode_utf8_lossy().into_owned();
-    let encoded = url::form_urlencoded::byte_serialize(bare.as_bytes()).collect::<String>();
-    let mut out = vec![v.to_string(), bare.to_string(), unescaped, decoded, encoded];
+    let mut out = vec![v.to_string(), bare.to_string(), unescaped.clone(), decoded.clone()];
+    for plain in [&unescaped, &decoded] {
+        let encoded = url::form_urlencoded::byte_serialize(plain.as_bytes()).collect::<String>();
+        // %2f as well as %2F: some frameworks write lowercase hex.
+        let lower = PERCENT_HEX.replace_all(&encoded, |c: &Captures| c[0].to_ascii_lowercase()).into_owned();
+        let json = plain.replace('\\', "\\\\").replace('"', "\\\"").replace('/', "\\/");
+        let html = plain
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('/', "&#x2F;");
+        // Every symbol as a hex entity, as some templates escape them.
+        let entities: String = plain
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_string() } else { format!("&#x{:X};", c as u32) })
+            .collect();
+        out.extend([encoded, lower, json, html, entities]);
+        if plain.len() >= MIN_SCRUB {
+            out.push(base64::engine::general_purpose::STANDARD.encode(plain));
+            out.push(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(plain));
+        }
+    }
     out.sort();
     out.dedup();
     out
@@ -171,8 +292,9 @@ impl Redactor {
         }
         for f in forms(v) {
             let keep = if known { f.len() >= MIN_SCRUB } else { distinctive(&f) };
-            if keep && f != MASK && self.secrets.insert(f) {
-                self.order.clear();
+            // A value the mask itself holds ("redacted") would mask the masks.
+            if keep && !MASK.to_ascii_lowercase().contains(&f.to_ascii_lowercase()) && self.secrets.insert(f) {
+                self.matcher = None;
             }
         }
     }
@@ -188,10 +310,20 @@ impl Redactor {
         MASK.to_string()
     }
 
-    /// `name=value` with the value masked; anything without `=` is kept.
+    /// A cookie's `name=value` with the value masked; anything without `=` is kept. The
+    /// parts of a signed value (`s:ID.signature`) are learned too, since a page may quote the
+    /// session id alone.
     fn pair(&mut self, item: &str) -> String {
         match item.split_once('=') {
-            Some((k, v)) => format!("{k}={}", self.secret(v)),
+            Some((k, v)) => {
+                let decoded = percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned();
+                for value in [v, decoded.as_str()] {
+                    for part in value.split(['.', ':', '|']).filter(|p| p.len() >= 12 && distinctive(p)) {
+                        self.remember(part, false);
+                    }
+                }
+                format!("{k}={}", self.secret(v))
+            }
             None => item.to_string(),
         }
     }
@@ -209,12 +341,42 @@ impl Redactor {
             },
             // The scheme (Basic, Bearer, ...) is useful to a reader; the credential is not.
             "authorization" | "proxy-authorization" => match value.trim().split_once(' ') {
-                Some((scheme, cred)) => format!("{scheme} {}", self.secret(cred)),
+                Some((scheme, cred)) => {
+                    self.credential_parts(scheme, cred.trim());
+                    format!("{scheme} {}", self.secret(cred))
+                }
                 None => self.secret(value),
             },
-            n if SECRET_HEADERS.contains(&n) => self.secret(value),
+            n if secret_header(n) => self.secret(value),
             _ => return None,
         })
+    }
+
+    /// Learns what an Authorization value quotes elsewhere: a Basic credential's decoded
+    /// `user:password` and password, and a Digest response's `response`, `nonce` and `cnonce`.
+    fn credential_parts(&mut self, scheme: &str, cred: &str) {
+        use base64::Engine;
+        if scheme.eq_ignore_ascii_case("basic") {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(cred.trim_end_matches('='))
+                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(cred))
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).into_owned());
+            if let Some(d) = decoded {
+                self.remember(&d, true);
+                if let Some((_, pass)) = d.split_once(':') {
+                    self.remember(pass, true);
+                }
+            }
+        } else if scheme.eq_ignore_ascii_case("digest") {
+            for part in cred.split(',') {
+                if let Some((k, v)) = part.split_once('=') {
+                    if matches!(k.trim().to_ascii_lowercase().as_str(), "response" | "nonce" | "cnonce") {
+                        self.remember(v.trim().trim_matches('"'), true);
+                    }
+                }
+            }
+        }
     }
 
     /// Masks credential headers, and secrets inside any other header's value: a token in a
@@ -237,6 +399,20 @@ impl Redactor {
         };
         let mut out = HEADER_LINE.replace_all(s, |c: &Captures| header(self, c)).into_owned();
         out = HEADER_INLINE.replace_all(&out, |c: &Captures| header(self, c)).into_owned();
+        out = USERINFO.replace_all(&out, |c: &Captures| format!("{}{}@", &c[1], self.secret(&c[2]))).into_owned();
+        if out.to_ascii_lowercase().contains("digest") {
+            out =
+                DIGEST_PARAM.replace_all(&out, |c: &Captures| format!("{}{}", &c[1], self.secret(&c[2]))).into_owned();
+        }
+        out = PROSE_SECRET
+            .replace_all(&out, |c: &Captures| format!("{}{}{}", &c[1], &c[2], self.secret(&c[3])))
+            .into_owned();
+        out = QUOTED_PASSWORD
+            .replace_all(&out, |c: &Captures| match &c[2] {
+                "null" | "not shown" => c[0].to_string(),
+                p => format!("{}{}{}", &c[1], self.secret(p), &c[3]),
+            })
+            .into_owned();
         out = MULTIPART_FIELD
             .replace_all(&out, |c: &Captures| {
                 if secret_name(&c[2]) {
@@ -248,8 +424,58 @@ impl Redactor {
             .into_owned();
         out = JSON_MEMBER
             .replace_all(&out, |c: &Captures| {
-                if secret_name(&c[1]) {
+                if secret_pair(&c[1], &c[3]) {
                     format!("\"{}\"{}\"{}{}", &c[1], &c[2], self.secret(&c[3]), &c[4])
+                } else {
+                    c[0].to_string()
+                }
+            })
+            .into_owned();
+        out = JSON_ESCAPED_MEMBER
+            .replace_all(&out, |c: &Captures| {
+                if secret_pair(&c[1], &c[3]) {
+                    format!("\\\"{}\\\"{}\\\"{}\\\"", &c[1], &c[2], self.secret(&c[3]))
+                } else {
+                    c[0].to_string()
+                }
+            })
+            .into_owned();
+        out = JSON_ARRAY
+            .replace_all(&out, |c: &Captures| {
+                if !secret_name(&c[1]) {
+                    return c[0].to_string();
+                }
+                let items = JSON_STRING.replace_all(&c[3], |v: &Captures| format!("\"{}\"", self.secret(&v[1])));
+                format!("\"{}\"{}[{items}]", &c[1], &c[2])
+            })
+            .into_owned();
+        for re in [&*KEY_DOUBLE, &*KEY_SINGLE] {
+            out = re
+                .replace_all(&out, |c: &Captures| {
+                    if secret_pair(&c[3], &c[5]) {
+                        let quote = &c[4][c[4].len() - 1..];
+                        format!("{}{}{}{}{}{quote}", &c[1], &c[2], &c[3], &c[4], self.secret(&c[5]))
+                    } else {
+                        c[0].to_string()
+                    }
+                })
+                .into_owned();
+        }
+        out = XML_ELEMENT
+            .replace_all(&out, |c: &Captures| {
+                if secret_name(&c[2]) {
+                    format!("<{}{}>{}</", &c[1], c.get(3).map_or("", |m| m.as_str()), self.secret(&c[4]))
+                } else {
+                    c[0].to_string()
+                }
+            })
+            .into_owned();
+        out = QUOTED_ATTR
+            .replace_all(&out, |c: &Captures| {
+                // name, id, value and content are read with the tag they are in.
+                let plain = matches!(c[2].to_ascii_lowercase().as_str(), "name" | "id" | "value" | "content" | "type");
+                if !plain && secret_name(&c[2]) {
+                    format!("{}{}{}{}\"", &c[1], &c[2], &c[3], self.secret(&c[4]))
                 } else {
                     c[0].to_string()
                 }
@@ -266,7 +492,7 @@ impl Redactor {
             .into_owned();
         out = FORM_PAIR
             .replace_all(&out, |c: &Captures| {
-                if secret_name(&c[2]) {
+                if secret_pair(&c[2], &c[3]) {
                     format!("{}{}={}", &c[1], &c[2], self.secret(&c[3]))
                 } else {
                     c[0].to_string()
@@ -284,7 +510,8 @@ impl Redactor {
         fn attr<'h>(c: &Captures<'h>) -> Option<regex::Match<'h>> {
             c.get(1).or(c.get(2)).or(c.get(3))
         }
-        let named = ATTR_NAME.captures(tag).and_then(|c| attr(&c).map(|m| secret_name(m.as_str()))).unwrap_or(false);
+        // Any name or id: `<input id="f1" name="_csrf">` is named by its second attribute.
+        let named = ATTR_NAME.captures_iter(tag).any(|c| attr(&c).is_some_and(|m| secret_name(m.as_str())));
         if !named && !PASSWORD_TYPE.is_match(tag) {
             return tag.to_string();
         }
@@ -312,21 +539,29 @@ impl Redactor {
         }
     }
 
-    /// Replaces every value known so far wherever it appears in `s`.
+    /// Replaces every value known so far wherever it appears in `s`, in one pass.
     pub fn scrub(&mut self, s: &mut String) {
         if self.secrets.is_empty() {
             return;
         }
-        if self.order.is_empty() {
-            self.order = self.secrets.iter().cloned().collect();
-            self.order.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        if self.matcher.is_none() {
+            self.matcher = AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .ascii_case_insensitive(true)
+                .build(&self.secrets)
+                .ok();
         }
-        for v in &self.order {
-            let n = s.matches(v.as_str()).count();
-            if n > 0 {
-                *s = s.replace(v.as_str(), MASK);
-                self.masked += n;
-            }
+        let Some(m) = &self.matcher else { return };
+        let mut n = 0;
+        let mut out = String::with_capacity(s.len());
+        m.replace_all_with(s, &mut out, |_, _, dst| {
+            n += 1;
+            dst.push_str(MASK);
+            true
+        });
+        if n > 0 {
+            *s = out;
+            self.masked += n;
         }
     }
 
@@ -460,6 +695,74 @@ mod tests {
         let mut text = "password letmein, abc".to_string();
         r.scrub(&mut text);
         assert_eq!(text, "password [redacted], abc");
+    }
+
+    #[test]
+    fn the_places_review_found_unmasked() {
+        // A URL's query after a path parameter, a nested URL, and a fragment.
+        assert_eq!(redacted("http://a/x;v=1?access_token=SWALLOW1&b=2"), "http://a/x;v=1?access_token=[redacted]&b=2");
+        assert_eq!(redacted("next=/acct?session=REFSESS1"), "next=/acct?session=[redacted]");
+        assert_eq!(
+            redacted("https://app/cb#access_token=FRAGTOK1&token_type=bearer"),
+            "https://app/cb#access_token=[redacted]&token_type=[redacted]"
+        );
+        // Secret-named headers, at a line's start and inside one.
+        assert_eq!(redacted("X-Refresh-Token: REFRESH1"), "X-Refresh-Token: [redacted]");
+        assert_eq!(redacted(r#"curl -H "x-api-token: ATTACK1" x"#), r#"curl -H "x-api-token: [redacted]" x"#);
+        // id before name; Rails' csrf-param isn't a token.
+        assert_eq!(
+            redacted(r#"<input id="f1" name="_csrf" value="HIDDEN1">"#),
+            r#"<input id="f1" name="_csrf" value="[redacted]">"#
+        );
+        let rails = r#"<meta name="csrf-param" content="authenticity_token">"#;
+        assert_eq!(redacted(rails), rails);
+        // JSON arrays and escaped JSON, XML, attributes, script and config text.
+        assert_eq!(redacted(r#"{"tokens":["ARR1","ARR2"]}"#), r#"{"tokens":["[redacted]","[redacted]"]}"#);
+        assert_eq!(redacted(r#""payload":"{\"secret\":\"NESTED1\"}""#), r#""payload":"{\"secret\":\"[redacted]\"}""#);
+        assert_eq!(
+            redacted("<wsse:BinarySecurityToken>XMLTOK1</wsse:BinarySecurityToken>"),
+            "<wsse:BinarySecurityToken>[redacted]</wsse:BinarySecurityToken>"
+        );
+        assert_eq!(redacted(r#"<div data-token="DATA1">"#), r#"<div data-token="[redacted]">"#);
+        assert_eq!(
+            redacted(r#"{apiKey: "JSKEY1", 'authToken': 'JSTOK1'}"#),
+            r#"{apiKey: "[redacted]", 'authToken': '[redacted]'}"#
+        );
+        assert_eq!(redacted("password: YAML1xx"), "password: [redacted]");
+        assert_eq!(redacted("Repro: password: NOTEPW1 then"), "Repro: password: [redacted] then");
+        // Credentials in a URL, a cut-short JWT, an OAuth code but not an error code.
+        assert_eq!(redacted("see https://bob:hunter22@h.test/"), "see https://bob:[redacted]@h.test/");
+        assert_eq!(redacted("t eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4eXoxMjM0NTY3OCJ9"), "t [redacted]");
+        assert_eq!(redacted("?code=OAUTHCODE77&state=x"), "?code=[redacted]&state=x");
+        assert_eq!(redacted(r#"{"code":"NOT_FOUND"}"#), r#"{"code":"NOT_FOUND"}"#);
+        // What the Basic-auth rule wrote before it stopped quoting the password.
+        assert_eq!(redacted("username [alice] and password [abc]."), "username [alice] and password [[redacted]].");
+    }
+
+    #[test]
+    fn credentials_are_found_again_decoded_and_in_any_case() {
+        use base64::Engine;
+        let mut r = Redactor::default();
+        let basic = base64::engine::general_purpose::STANDARD.encode("alice:BASICPASS1");
+        let mut h = vec![
+            ("Authorization".to_string(), format!("Basic {basic}")),
+            ("Cookie".to_string(), "connect.sid=s%3ACOOKIESECRET01.signaturepart; lang=en".to_string()),
+        ];
+        r.headers(&mut h);
+        r.know(["PROF/PASS+Q1".to_string()]);
+        let mut body = "your password is BASICPASS1; echo s%3acookiesecret01; PROF%2fPASS%2bQ1 PROF\\/PASS+Q1 \
+                        PROF&#x2F;PASS&#x2B;Q1"
+            .to_string();
+        r.scrub(&mut body);
+        for leak in ["BASICPASS1", "cookiesecret01", "PROF"] {
+            assert!(!body.to_ascii_lowercase().contains(&leak.to_ascii_lowercase()), "{leak}: {body}");
+        }
+        // A value inside a longer known one is masked once, whole.
+        let mut r = Redactor::default();
+        r.know(["abcdef12".to_string(), "ef12XYZW".to_string(), "redacted".to_string()]);
+        let mut s = "abcdef12XYZW and [redacted]".to_string();
+        r.scrub(&mut s);
+        assert_eq!(s, "[redacted]XYZW and [redacted]");
     }
 
     #[test]

@@ -249,7 +249,31 @@ impl AuthProfile {
             out.extend([&o.client_secret, &o.refresh_token].into_iter().filter_map(resolve));
         }
         out.extend(static_cookies(self).into_iter().map(|(_, v)| v));
-        for (_, v) in self.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
+        // A profile's headers are there to authenticate, except the ordinary ones a profile may
+        // set too: a User-Agent or Accept isn't a secret, and would be masked everywhere.
+        const ORDINARY: &[&str] = &[
+            "cookie",
+            "user-agent",
+            "accept",
+            "accept-language",
+            "accept-encoding",
+            "content-type",
+            "content-length",
+            "host",
+            "origin",
+            "referer",
+            "x-requested-with",
+            "cache-control",
+            "pragma",
+            "connection",
+            "dnt",
+            "upgrade-insecure-requests",
+        ];
+        let ordinary = |k: &str| {
+            let k = k.trim().to_ascii_lowercase();
+            ORDINARY.contains(&k.as_str()) || k.starts_with("sec-")
+        };
+        for (_, v) in self.headers.iter().filter(|(k, _)| !ordinary(k)) {
             // "Bearer xyz": the credential alone is what other places quote.
             if let Some((_, cred)) = v.trim().split_once(' ') {
                 out.push(cred.trim().to_string());
@@ -259,7 +283,8 @@ impl AuthProfile {
         out.extend(self.query_keys.iter().map(|q| q.value.clone()));
         out.extend(st.cookies.iter().map(|(_, v)| v.clone()));
         out.extend(st.token.iter().chain(&st.refresh_token).cloned());
-        out.extend(st.vars.iter().map(|v| v.value.clone()));
+        // Macro values are often tokens, but may be a user id or a name: only distinctive ones.
+        out.extend(st.vars.iter().map(|v| v.value.clone()).filter(|v| crate::scan::redact::distinctive(v)));
         out.retain(|v| !v.is_empty());
         out
     }

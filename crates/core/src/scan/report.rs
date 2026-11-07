@@ -776,6 +776,12 @@ fn redact_findings(
                  summary: Option<&mut Narrative>,
                  pass: fn(&mut Redactor, &mut String)| {
         for g in groups.iter_mut() {
+            // A tester's title and texts are their words too; a rule's are fixed.
+            if is_manual(g) {
+                for t in [&mut g.name, &mut g.description, &mut g.solution] {
+                    pass(red, t);
+                }
+            }
             for n in g.narratives.iter_mut() {
                 pass(red, &mut n.narrative.text);
             }
@@ -801,6 +807,8 @@ fn redact_findings(
                 for row in list.iter_mut() {
                     pass(red, &mut row.url);
                     pass(red, &mut row.param);
+                    // A title, which may be a tester's: only values known elsewhere go.
+                    red.scrub(&mut row.name);
                 }
             }
         }
@@ -831,6 +839,7 @@ fn redact_findings(
     for h in hidden.iter_mut() {
         red.scrub(&mut h.url);
         red.scrub(&mut h.param);
+        red.scrub(&mut h.name);
     }
     letter_fields(red, Redactor::scrub);
     words(red, groups, hidden, summary, Redactor::scrub);
@@ -2475,7 +2484,7 @@ fn sarif(r: &Report) -> Value {
                 "ruleIndex": idx,
                 "level": sarif_level(&inst.risk),
                 "message": {"text": msg},
-                "locations": [{"physicalLocation": {"artifactLocation": {"uri": inst.url}}}],
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": inst.url.replace(crate::scan::redact::MASK, "%5Bredacted%5D")}}}],
                 // The project's own dedup key, so a finding seen again with another query string
                 // is the same result to code scanning, as it is to brainproxy.
                 "partialFingerprints": {"brainproxy/v2": inst.fingerprint},
@@ -2523,6 +2532,11 @@ fn sarif(r: &Report) -> Value {
                     s["justification"] = json!(n);
                 }
                 res["suppressions"] = json!([s]);
+            }
+            // Marked fixed (listed with --state all): a pass, not an open problem.
+            if inst.state == "fixed" {
+                res["kind"] = json!("pass");
+                res["level"] = json!("none");
             }
             if let Some(l) = inst.latest_id() {
                 res["properties"]["lastHistoryId"] = json!(l);

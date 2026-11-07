@@ -210,10 +210,13 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    the technical evidence folded away. Pick who it is for (see [Report layouts](#report-layouts)),
    your branding and the format: HTML, PDF, Word (DOCX) or Markdown. On the command line:
    `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`, `pdf`, `docx`). Every format masks session secrets
-   (cookie values, `Authorization` credentials, API-key headers, token and password
-   parameters in URLs, forms, multipart and JSON bodies, hidden form fields, JWTs, and every
-   password, token, cookie and key the project's auth profiles hold) as `[redacted]`,
-   wherever the report quotes them (notes, write-ups and ticket links included), and says how
+   (cookie values, `Authorization` credentials and a Basic credential's decoded password,
+   API-key and other secret-named headers, token and password parameters in URLs and their
+   fragments, forms, multipart, JSON (arrays and JSON inside strings too), XML and script
+   bodies, hidden form fields and secret-named attributes, passwords in URLs, JWTs, and every
+   password, token, cookie and credential header the project's auth profiles hold) as
+   `[redacted]`, wherever the report quotes them, in any case and percent-, JSON-, HTML- or
+   base64-encoded (notes, write-ups, ticket links and findings added by hand included), and says how
    many places it masked; `--no-redact` keeps
    them as recorded. An issue seen in more than one
    request also carries its latest sighting next to the first. A project collects findings across

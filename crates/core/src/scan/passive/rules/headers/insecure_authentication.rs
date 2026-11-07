@@ -93,11 +93,13 @@ fn credentials(msg: &Message, v: &str) -> Option<Finding> {
             }
         }
         let risk = if pass.is_some() { Risk::High } else { Risk::Medium };
+        // The password is named, not quoted: the finding is read by people the tester's
+        // credentials aren't for.
         let other = format!(
             "[{method}] [{uri}] uses insecure authentication mechanism [{mech}], revealing username [{}] and password \
              [{}].",
             user.as_deref().unwrap_or("null"),
-            pass.as_deref().unwrap_or("null")
+            if pass.is_some() { "not shown" } else { "null" }
         );
         return Some(CREDENTIALS.raise("", "").risk(risk).other_info(other));
     }
@@ -154,7 +156,7 @@ mod tests {
         assert_eq!(
             f[0].other_info,
             "[GET] [http://a.test/x] uses insecure authentication mechanism [Basic], revealing username [user] and \
-             password [pass]."
+             password [not shown]."
         );
         // dXNlcg== = user (no password), and undecodable values still alert at Medium.
         let f = msg("http://a.test/x").req_header("Authorization", "basic dXNlcg==").scan(&InsecureAuthentication);

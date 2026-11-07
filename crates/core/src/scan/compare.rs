@@ -400,15 +400,6 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
             narrowed.join(", ")
         ));
     }
-    // Reports leave fixed and accepted findings out unless --state all: their marks can't
-    // carry over from a file that doesn't have them.
-    if report.filters["state"].as_str() != Some("all") {
-        warnings.push(format!(
-            "{} wasn't written with --state all, so it has no false positives, accepted risks or fixed \
-             findings to carry marks from",
-            path.display()
-        ));
-    }
     let items = report
         .alerts
         .into_iter()
@@ -427,7 +418,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
                 state: i.state,
                 origin: i.origin,
                 rule_id,
-                fingerprint: i.fingerprint,
+                fingerprint: i.fingerprint.filter(|f| !f.trim().is_empty()),
             })
         })
         .collect();
@@ -447,7 +438,17 @@ pub fn load_marks(path: &Path) -> Result<LoadedSet> {
         Err(e) => return Err(e.into()),
     };
     if !bytes.trim_ascii_start().starts_with(b"[") {
-        return load_set(path);
+        let mut set = load_set(path)?;
+        // Reports leave false positives, accepted risks and fixed findings out unless --state
+        // all: a file without them has none of those marks to copy.
+        if !set.tombstones {
+            set.warnings.push(format!(
+                "{} wasn't written with --state all, so it has no false positives, accepted risks or fixed \
+                 findings to copy marks from",
+                path.display()
+            ));
+        }
+        return Ok(set);
     }
     let list: Vec<Mark> = serde_json::from_slice(&bytes).map_err(|e| {
         Error::InvalidInput(format!("{}: not a list of findings ({{alert_ref, url, ...}}): {e}", path.display()))

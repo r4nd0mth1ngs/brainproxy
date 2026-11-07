@@ -436,6 +436,7 @@ dependencies = [
 name = "brainproxy-core"
 version = "0.6.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "base64",
  "boa_engine",
