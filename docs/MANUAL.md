@@ -1694,8 +1694,10 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
 - **Tickets** (`findings ticket ID --to github --repo OWNER/NAME` or `--to jira --key KEY`):
   a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
   reproduce it, its fingerprint) and the command that files it (`gh issue create`, or Jira's
-  REST call). Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
-  timeline and in reports. *Copy ticket* in the app copies the GitHub version.
+  REST call; its description is a `{noformat}` block, so nothing the target sent is read as
+  Jira markup). Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
+  timeline and in reports; it is refused through MCP, since the link would reach reports
+  without a person reading it. *Copy ticket* in the app copies the GitHub version.
 - **Exports**: `report csv` (a row per finding; cells starting `=`, `+`, `-` or `@` are
   defused for spreadsheets), `report junit` (a test suite per alert type, a failing test per
   finding still to fix, skipped once closed) and `report defectdojo` (DefectDojo's Generic
@@ -1779,8 +1781,9 @@ brainproxy --project run.bpdb findings compare --scan 1 --baseline known.json --
 A fresh project starts with every finding open, so its reports would show what earlier runs marked
 as false positives. `findings mark --from FILE` copies the marks first: each of the project's
 findings that matches one of FILE's (alert, method, URL without its query, and parameter, as
-`compare` matches them) gets that finding's mark where it is `confirmed` or `false_positive`, or
-`--state` for every match. FILE is a `report json`, or a list a team keeps of the findings it has
+`compare` matches them; a report's `fingerprint` where it has one, so a redacted report still
+matches) gets that finding's mark where it is `confirmed`, `false_positive` or `accepted_risk`,
+or `--state` for every match. FILE is a `report json`, or a list a team keeps of the findings it has
 accepted:
 
 ```json
@@ -1791,7 +1794,7 @@ accepted:
 `method` defaults to GET, `param` to empty and `state` to `false_positive`; `note` is for the
 list's readers and isn't copied. Removed findings are left as they are. The output lists each
 change (`marked`: id, from, to) and how many of the file's findings matched none (`unmatched`).
-Refused through MCP: an agent marks findings one at a time, with a note.
+Refused through MCP: an agent marks findings by id, with a note.
 
 ```bash
 brainproxy --project run.bpdb findings mark --from known.json

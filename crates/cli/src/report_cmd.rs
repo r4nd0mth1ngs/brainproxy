@@ -109,7 +109,14 @@ pub fn summary(project: &Path, cmd: SummaryCmd, out: &Out) -> Result<(), Error> 
     }
     let n = store.summary()?;
     out.ok(json!({"summary": n}), || match &n {
-        Some(n) => format!("{}\n\n({})", n.text, n.credit()),
+        Some(n) => {
+            let mut text = format!("{}\n\n({})", crate::output::escape_lines(&n.text), n.credit());
+            if !n.reviewed() {
+                text +=
+                    &format!("\ndraft; once you have read it: brainproxy report-summary review --hash {}", n.hash());
+            }
+            text
+        }
         None => "no executive summary".into(),
     });
     Ok(())
@@ -131,8 +138,9 @@ pub struct LayoutFlags {
     #[arg(long)]
     company: Option<String>,
     /// A PNG, JPEG, GIF or WebP logo for the cover (at most 256 KiB; "" clears a profile's).
-    #[arg(long, value_name = "FILE")]
-    logo: Option<PathBuf>,
+    // An OsString, not a PathBuf: clap refuses an empty path, and "" is how a logo is cleared.
+    #[arg(long, value_name = "FILE", value_parser = clap::value_parser!(std::ffi::OsString))]
+    logo: Option<std::ffi::OsString>,
     /// Colour of the cover and headings, #rrggbb ("" clears a profile's).
     #[arg(long, value_name = "COLOUR")]
     accent: Option<String>,
@@ -159,7 +167,7 @@ impl LayoutFlags {
         };
         let logo = match &self.logo {
             // An empty path clears a profile's logo.
-            Some(path) if path.as_os_str().is_empty() => Some(String::new()),
+            Some(path) if path.is_empty() => Some(String::new()),
             // A file would copy whatever the server can read into a report the agent reads back.
             Some(_) if crate::mcp::in_tool_call() => {
                 return Err(Error::InvalidInput(
@@ -170,7 +178,7 @@ impl LayoutFlags {
             }
             Some(path) => {
                 let bytes = std::fs::read(path).map_err(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound => Error::NotFound(format!("logo {}", path.display())),
+                    std::io::ErrorKind::NotFound => Error::NotFound(format!("logo {}", Path::new(path).display())),
                     _ => Error::Io(e),
                 })?;
                 Some(layout::logo_data_uri(&bytes)?)

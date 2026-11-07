@@ -2140,7 +2140,7 @@ pub fn ticket(store: &Store, id: i64, tracker: &str, target: Option<&str>) -> Re
             "payload": {"fields": {
                 "project": {"key": target.unwrap_or("KEY")},
                 "summary": title,
-                "description": body,
+                "description": jira_noformat(&body),
                 "issuetype": {"name": "Bug"},
                 "labels": labels.iter().map(|l| l.replace(':', "-")).collect::<Vec<_>>(),
             }},
@@ -2149,6 +2149,23 @@ pub fn ticket(store: &Store, id: i64, tracker: &str, target: Option<&str>) -> Re
         }),
         other => return Err(crate::error::Error::InvalidInput(format!("unknown tracker {other:?}: github or jira"))),
     })
+}
+
+/// Jira's REST v2 renders a description as wiki markup, where the Markdown's code spans protect
+/// nothing: a response quoting `!https://host/p.png!` would embed that image. The body goes in a
+/// `{noformat}` block instead, which Jira shows as it is; one inside it can't end the block.
+fn jira_noformat(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 32);
+    let mut rest = body;
+    while let Some(at) = rest.find('{') {
+        out.push_str(&rest[..=at]);
+        rest = &rest[at + 1..];
+        if rest.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("noformat")) {
+            out.push(' ');
+        }
+    }
+    out.push_str(rest);
+    format!("{{noformat}}\n{}\n{{noformat}}", out.trim_end())
 }
 
 /// The agent-trail line of a finding, in words.
@@ -2528,6 +2545,12 @@ fn sarif(r: &Report) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_jira_description_is_shown_as_it_is() {
+        let d = super::jira_noformat("see !https://evil.test/p.png! {noFormat}[a|https://evil.test]");
+        assert_eq!(d, "{noformat}\nsee !https://evil.test/p.png! { noFormat}[a|https://evil.test]\n{noformat}");
+    }
+
     use super::*;
     use crate::capture::Capture;
     use crate::http::Target;

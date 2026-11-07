@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_SPEC, layoutArgs, PRESET_SECTIONS, previewCommand, profileSaveCommand, reportCommand, specFromProfile, specProblem, toggleSection } from "./reportBuilder.ts";
+import { DEFAULT_SPEC, layoutArgs, PRESET_SECTIONS, previewCommand, profileSaveCommand, reportCommand, specFromProfile, specProblem, toggleSection } from "./reportSpec.ts";
 
 test("a preset's own sections aren't repeated; changed ones go in report order", () => {
   assert.deepEqual(layoutArgs(DEFAULT_SPEC), ["--preset", "technical"]);

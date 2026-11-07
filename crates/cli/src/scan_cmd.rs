@@ -713,6 +713,13 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
         }
         FindingsCmd::Ticket { id, tracker, repo, key, record } => {
             if let Some(url) = &record {
+                // A link in every report: an agent's would reach them without a person reading it.
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings ticket --record is refused through MCP: a person records the ticket they filed"
+                            .into(),
+                    ));
+                }
                 store.finding_ticket_recorded(id, &tracker, url)?;
                 out.ok(json!({"id": id, "tracker": tracker, "url": url}), || {
                     format!("recorded {tracker} ticket for finding {id}")
@@ -723,9 +730,9 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 out.ok(t.clone(), || {
                     format!(
                         "{}\n\n{}\n\n# file it with:\n{}",
-                        t["title"].as_str().unwrap_or(""),
-                        t["body"].as_str().unwrap_or(""),
-                        t["command"].as_str().unwrap_or("")
+                        crate::output::escape_lines(t["title"].as_str().unwrap_or("")),
+                        crate::output::escape_lines(t["body"].as_str().unwrap_or("")),
+                        crate::output::escape_lines(t["command"].as_str().unwrap_or(""))
                     )
                 });
             }

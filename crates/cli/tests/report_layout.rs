@@ -143,6 +143,11 @@ fn layouts_profiles_cvss_and_word() {
     ok(&project, &["report", "html", "--profile", "brand2", "--company=", "--output", &path("plain.html")]);
     let plain = read("plain.html");
     assert!(!plain.contains("Security assessment by") && plain.contains("data:image/png;base64,"));
+    // So does --logo= (and --logo "", which the app sends for "No logo").
+    let bare = ok(&project, &["report-profile", "save", "brand3", "--from", "brand2", "--logo="]);
+    assert!(bare["layout"]["logo"].is_null(), "{bare}");
+    ok(&project, &["report", "html", "--profile", "brand2", "--logo", "", "--output", &path("nologo.html")]);
+    assert!(!read("nologo.html").contains("data:image/png;base64,"));
     ok(&project, &["report-profile", "remove", "dev"]);
 
     // Word: a zip holding the document; binary formats need a file.

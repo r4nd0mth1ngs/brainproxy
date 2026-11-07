@@ -159,6 +159,10 @@ fn narratives_trails_repro_tickets_and_exports() {
     assert!(t["body"].as_str().unwrap().contains("**Where:** `GET http://127.0.0.1:"), "{t}");
     let j = ok(&project, &["findings", "ticket", &f, "--to", "jira", "--key", "SEC"]);
     assert_eq!(j["payload"]["fields"]["project"]["key"], "SEC");
+    assert!(j["payload"]["fields"]["description"].as_str().unwrap().starts_with("{noformat}\n"), "{j}");
+    // An agent writes a ticket up but doesn't record one: its link would be in every report.
+    let (code, e) = run_as(&project, &["findings", "ticket", &f, "--record", "https://evil.test/login"], None, true);
+    assert!(code != 0 && e["error"]["message"].as_str().unwrap().contains("through MCP"), "{e}");
     ok(&project, &["findings", "ticket", &f, "--record", "https://github.com/acme/web/issues/9"]);
     let report = ok(&project, &["report", "json"]);
     let inst = report["alerts"]

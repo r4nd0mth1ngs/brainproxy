@@ -148,16 +148,27 @@ impl Out {
 }
 
 /// Text for a terminal line: control characters (escape sequences, newlines, carriage returns)
-/// shown as escapes like `\u{1b}` or `\n`, so stored text can't move the cursor or add lines.
-/// For text mode only; JSON keeps the value as it is.
+/// and bidi overrides shown as escapes like `\u{1b}` or `\n`, so stored text can't move the
+/// cursor, add lines, or show in another order than it reads. For text mode only; JSON keeps
+/// the value as it is.
 pub fn escape_controls(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.chars().any(char::is_control) {
+    let bidi = |c: char| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    if !s.chars().any(|c| c.is_control() || bidi(c)) {
         return s.into();
     }
     s.chars()
-        .map(|c| if c.is_control() { c.escape_debug().to_string() } else { c.to_string() })
+        .map(|c| match c {
+            c if c.is_control() => c.escape_debug().to_string(),
+            c if bidi(c) => format!("\\u{{{:x}}}", c as u32),
+            c => c.to_string(),
+        })
         .collect::<String>()
         .into()
+}
+
+/// [`escape_controls`] for text of several lines: each line escaped, the line breaks kept.
+pub fn escape_lines(s: &str) -> String {
+    s.split('\n').map(|l| escape_controls(l.trim_end_matches('\r'))).collect::<Vec<_>>().join("\n")
 }
 
 /// Writes an output file named by the caller (`--out`, `-o`). An existing file is
@@ -200,6 +211,12 @@ pub fn body_value(bytes: &[u8], max: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_controls_shows_bidi_overrides() {
+        assert_eq!(escape_controls("ok\u{202e}txt.exe"), "ok\\u{202e}txt.exe");
+        assert_eq!(escape_lines("a\r\nb\u{1b}[8m"), "a\nb\\u{1b}[8m");
+    }
 
     #[test]
     fn escape_controls_keeps_printable_text() {

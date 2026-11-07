@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use crate::scan::findings_db::MANUAL_SOURCE;
 use crate::scan::issues::{record, Event};
 use crate::store::Store;
 
@@ -58,7 +59,7 @@ pub struct Narrative {
 /// changed after they read it isn't approved in its place.
 pub fn text_hash(text: &str) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(&Sha256::digest(text.as_bytes())[..8])
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 impl Narrative {
@@ -106,7 +107,7 @@ impl Serialize for Narrative {
 
 /// A review must name the text it read.
 fn same_text(current: &str, hash: &str) -> Result<()> {
-    if text_hash(current) != hash.trim() {
+    if !text_hash(current).eq_ignore_ascii_case(hash.trim()) {
         return Err(Error::Conflict(
             "the text changed since it was read (its hash differs): read it again, then review that".into(),
         ));
@@ -273,11 +274,11 @@ impl Store {
     pub fn agent_touched(&self, ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
         let list = serde_json::to_string(ids).unwrap_or_default();
         let mut stmt = self.conn.prepare(
-            "SELECT f.id FROM (SELECT id, origin, issue_id, host, method,
+            "SELECT f.id FROM (SELECT id, origin, source, issue_id, host, method,
                     CASE WHEN instr(url, '?') > 0 THEN substr(url, 1, instr(url, '?') - 1) ELSE url END AS base
                  FROM findings WHERE id IN (SELECT value FROM json_each(?1))) f
-             WHERE f.origin = 'mcp'
-                OR EXISTS (SELECT 1 FROM finding_events e WHERE e.origin = 'mcp'
+             WHERE (f.origin = 'mcp' AND f.source = 'manual')
+                OR EXISTS (SELECT 1 FROM finding_events e WHERE e.origin = 'mcp' AND e.kind NOT IN ('created', 'regressed')
                     AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id)))
                 OR EXISTS (SELECT 1 FROM history h WHERE h.origin = 'mcp' AND h.host = f.host AND h.method = f.method
                     AND (h.url = f.base OR substr(h.url, 1, length(f.base) + 1) = f.base || '?'))",
@@ -291,28 +292,36 @@ impl Store {
     /// and the agent's requests to that host from half an hour before its first such act
     /// until its last.
     pub fn agent_trail(&self, id: i64) -> Result<AgentTrail> {
-        type Row = (String, String, Option<String>, Option<i64>, String, String);
-        let (host, time, origin, issue, method, url): Row = self
-            .conn
-            .query_row("SELECT host, time, origin, issue_id, method, url FROM findings WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-            })
-            .optional()?
-            .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
-        // The agent's latest request to the finding's own method and URL (any query).
-        let base = url.split('?').next().unwrap_or(&url).to_string();
-        let last_seen: Option<(String, i64)> = self
+        type Row = (String, String, Option<String>, Option<i64>, String, String, String);
+        let (host, time, origin, issue, method, url, source): Row = self
             .conn
             .query_row(
-                "SELECT time, id FROM history WHERE origin = 'mcp' AND host = ?1 AND method = ?2
-                    AND (url = ?3 OR substr(url, 1, length(?3) + 1) = ?3 || '?') ORDER BY id DESC LIMIT 1",
-                params![host, method, base],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT host, time, origin, issue_id, method, url, source FROM findings WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
-            .optional()?;
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
+        // The agent's first and latest requests to the finding's own method and URL (any query).
+        let base = url.split('?').next().unwrap_or(&url).to_string();
+        let seen = |order: &str| -> Result<Option<String>> {
+            Ok(self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT time FROM history WHERE origin = 'mcp' AND host = ?1 AND method = ?2
+                        AND (url = ?3 OR substr(url, 1, length(?3) + 1) = ?3 || '?') ORDER BY id {order} LIMIT 1"
+                    ),
+                    params![host, method, base],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        };
+        let (first_seen, last_seen) = (seen("ASC")?, seen("DESC")?);
         let mut stmt = self.conn.prepare(
             "SELECT id, time, kind, old, new, text, history_id, finding_id IS NULL FROM finding_events
-             WHERE origin = 'mcp' AND (finding_id = ?1 OR (finding_id IS NULL AND issue_id = ?2)) ORDER BY time, id",
+             WHERE origin = 'mcp' AND kind NOT IN ('created', 'regressed')
+               AND (finding_id = ?1 OR (finding_id IS NULL AND issue_id = ?2)) ORDER BY time, id",
         )?;
         let events: Vec<Value> = stmt
             .query_map(params![id, issue], |r| {
@@ -329,15 +338,19 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?;
         // The agent's acts, as (time, event id): its events, its creating the finding, and its
-        // latest request to the finding (which has no event; it sorts after events at its time).
+        // first and latest requests to the finding (which have no event; they sort after events
+        // at their time).
         let mut acts: Vec<(String, i64)> = events
             .iter()
             .map(|e| (e["time"].as_str().unwrap_or("").to_string(), e["id"].as_i64().unwrap_or(0)))
             .collect();
-        if origin.as_deref() == Some("mcp") {
+        // A scanner's finding and its regressions are the process's that ran the scan, not
+        // necessarily the agent's: those count through the agent's requests above, if it sent
+        // them. A finding added by hand is the agent's own.
+        if origin.as_deref() == Some("mcp") && source == MANUAL_SOURCE {
             acts.push((time.clone(), 0));
         }
-        if let Some((t, _)) = &last_seen {
+        for t in first_seen.iter().chain(&last_seen) {
             acts.push((t.clone(), i64::MAX));
         }
         acts.sort();
@@ -367,13 +380,16 @@ impl Store {
                 })?
                 .collect::<std::result::Result<_, _>>()?;
             requests.reverse();
-            // A person's change to the finding or its issue after the agent's last act.
+            // A person's own triage of the finding after the agent's last act: a state, a note, a
+            // retest, or reviewing the issue's write-up. Changes made in bulk on the issue (its
+            // title or rating) and automatic events (a regression, a move) don't count.
             reviewed = self
                 .conn
                 .query_row(
                     "SELECT origin, time FROM finding_events
-                     WHERE origin IN ('gui', 'cli') AND kind != 'created'
-                       AND (finding_id = ?1 OR (finding_id IS NULL AND issue_id = ?2))
+                     WHERE origin IN ('gui', 'cli')
+                       AND ((finding_id = ?1 AND kind IN ('state', 'note', 'retest'))
+                         OR (finding_id IS NULL AND issue_id = ?2 AND kind = 'reviewed'))
                        AND (time > ?3 OR (time = ?3 AND id > ?4))
                      ORDER BY time, id LIMIT 1",
                     params![id, issue, last.0, last.1],
@@ -454,6 +470,9 @@ mod tests {
     fn narratives_are_drafts_until_a_person_reviews_them() {
         let (mut s, _, issue) = store();
         s.issue_set_narrative(issue, "An attacker learns the PHP version.").unwrap();
+        // The whole SHA-256, so two texts with the same hash can't be made to order.
+        let hash = text_hash("An attacker learns the PHP version.");
+        assert_eq!(hash.len(), 64);
         let n = s.issue_narrative(issue).unwrap().unwrap();
         assert!(!n.reviewed() && n.credit().ends_with("not reviewed"), "{}", n.credit());
         // A review names the text it read; a stale hash is refused.

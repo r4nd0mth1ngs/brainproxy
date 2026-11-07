@@ -19,7 +19,7 @@ import {
   toggleSection,
   type Preset,
   type ReportSpec,
-} from "./reportBuilder";
+} from "./reportSpec";
 
 interface Profile {
   name: string;
