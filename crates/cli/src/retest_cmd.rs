@@ -20,7 +20,9 @@ use brainproxy_core::auth::Attempt;
 use brainproxy_core::http::{Client, RawRequest, SendOptions};
 use brainproxy_core::scan::findings_db::fingerprint;
 use brainproxy_core::scan::issues::Retest;
-use brainproxy_core::scan::passive::{self, PassiveSettings};
+// A retest's request is recorded with source RETEST_SOURCE, which the background passive scan
+// never reads, so only the retest judges it.
+use brainproxy_core::scan::passive::{self, PassiveSettings, RETEST_SOURCE};
 
 use brainproxy_core::store::Store;
 use serde_json::{json, Value};
@@ -29,10 +31,6 @@ use brainproxy_core::Error;
 
 use crate::output::Out;
 use crate::{auth_cmd, process, sent};
-
-/// The history source of a retest's request: not one the background passive scan reads, so
-/// only the retest judges it.
-const RETEST_SOURCE: &str = "retest";
 
 /// Methods a retest sends without being told it may: they shouldn't change anything.
 const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];

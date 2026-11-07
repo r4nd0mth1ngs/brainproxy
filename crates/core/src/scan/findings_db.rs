@@ -1,7 +1,7 @@
 //! Findings storage. Repeated instances of the same issue (same alert, method, URL
-//! without its query, and parameter) are folded into one row with a hit count, so a
-//! missing header seen 500 times on a page is one finding, and a response with two
-//! versioned Server headers is one finding, not two. The first evidence is kept.
+//! without its query or path parameters, and parameter) are folded into one row with a hit
+//! count, so a missing header seen 500 times on a page is one finding, and a response with
+//! two versioned Server headers is one finding, not two. The first evidence is kept.
 
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -77,7 +77,7 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     (
         "hits",
         "INTEGER",
-        "Times seen (same alert, method, URL without query, param); 0 for a triaged passive finding that \
+        "Times seen (same alert, method, URL without query or path parameters, param); 0 for a triaged passive finding that \
          `scan passive --rescan` didn't find again (kept so its triage isn't lost)",
     ),
     (
@@ -129,6 +129,10 @@ pub(crate) fn mark_with(
         .prepare_cached("SELECT state, note FROM findings WHERE id = ?1 AND state != 'removed'")?
         .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
+    // The state it already has is no change: who changed it and when stay as they were, so the
+    // timeline and `state_changed_at` (what a later sighting of a fixed finding is compared
+    // with) keep telling the truth. A missing or removed finding matches no row below anyway.
+    let state = state.filter(|s| before.as_ref().is_none_or(|(old, _)| old != s));
     let n = conn.execute(
         "UPDATE findings SET state = COALESCE(?1, state),
             note = CASE WHEN ?2 IS NULL THEN note ELSE NULLIF(?2, '') END,
@@ -155,7 +159,7 @@ pub(crate) fn mark_with(
             &crate::scan::issues::Event { finding: Some(id), kind, old, new, text, history_id, ..Default::default() },
         )
     };
-    if let Some(s) = state.filter(|s| *s != old_state) {
+    if let Some(s) = state {
         event("state", Some(&old_state), Some(s), cause.map(|c| c.0), cause.and_then(|c| c.1))?;
     }
     if let Some(n) = note.map(str::trim).map(|n| Some(n).filter(|n| !n.is_empty())) {
@@ -168,10 +172,37 @@ pub(crate) fn mark_with(
 }
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
-/// services on one host are different findings) and drops the query (parameters are `param`).
+/// services on one host are different findings) and drops the query (parameters are `param`)
+/// and its path's `;name=value` parameters: a session id there (`/login;jsessionid=...`) is new
+/// each session, and would make the same finding a new one every time. A URL with neither
+/// keys as it did before, so its fingerprint stays the same.
 pub(crate) fn dedupe_key(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
     let base = url.split('?').next().unwrap_or(url);
-    format!("{alert_ref}|{method}|{base}|{param}")
+    format!("{alert_ref}|{method}|{}|{param}", without_path_params(base))
+}
+
+/// `url` without the `;name=value` parameters of its path segments: `/a;jsessionid=1/b` is
+/// `/a/b`. A `;` piece with no `=` stays, since it isn't a parameter and may be part of a name.
+fn without_path_params(url: &str) -> std::borrow::Cow<'_, str> {
+    if !url.contains(';') {
+        return url.into();
+    }
+    // The authority (which could hold a `;` in a user name) is left as it is.
+    let path_at = url.find("://").map_or(0, |i| url[i + 3..].find('/').map_or(url.len(), |j| i + 3 + j));
+    let (origin, path) = url.split_at(path_at);
+    let path: Vec<String> = path
+        .split('/')
+        .map(|segment| {
+            let mut pieces = segment.split(';');
+            let mut kept = pieces.next().unwrap_or_default().to_string();
+            for piece in pieces.filter(|p| !p.contains('=')) {
+                kept.push(';');
+                kept.push_str(piece);
+            }
+            kept
+        })
+        .collect();
+    format!("{origin}{}", path.join("/")).into()
 }
 
 /// A finding's identity ([`dedupe_key`]) as a hash: what reports export (SARIF's
@@ -238,6 +269,161 @@ pub(crate) fn rekey_findings(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Schema v18: the key drops path parameters (#99), so findings stored once per session id
+/// (`/login;jsessionid=A`, `/login;jsessionid=B`) are one finding again. Each set that is now
+/// one is merged into its first row: hits summed, the earliest first sighting and the latest
+/// last one kept, the highest risk, and the most recent state and note decisions with who
+/// made them. The others' timelines and scan observations move to it, so nothing a person
+/// recorded is lost. Removed findings (tombstones) keep their own keys.
+pub(crate) fn rekey_v18(conn: &rusqlite::Connection) -> Result<()> {
+    #[derive(Clone)]
+    struct Row {
+        id: i64,
+        dedupe: String,
+        source: String,
+        hits: i64,
+        history_id: Option<i64>,
+        last: Option<i64>,
+        risk: String,
+        risk_level: i64,
+        state: (String, Option<String>, Option<String>),
+        note: (Option<String>, Option<String>, Option<String>),
+    }
+    let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
+    {
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, dedupe, source, alert_ref, method, url, param, hits, history_id, last_history_id, risk,
+                risk_level, state, state_origin, state_changed_at, note, note_origin, note_changed_at
+             FROM findings WHERE state != 'removed' ORDER BY id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let key = dedupe_key(
+                &r.get::<_, String>(3)?,
+                &r.get::<_, String>(4)?,
+                &r.get::<_, String>(5)?,
+                &r.get::<_, String>(6)?,
+            );
+            let row = Row {
+                id: r.get(0)?,
+                dedupe: r.get(1)?,
+                source: r.get(2)?,
+                hits: r.get(7)?,
+                history_id: r.get(8)?,
+                last: r.get(9)?,
+                risk: r.get(10)?,
+                risk_level: r.get(11)?,
+                state: (r.get(12)?, r.get(13)?, r.get(14)?),
+                note: (r.get(15)?, r.get(16)?, r.get(17)?),
+            };
+            let at = *index.entry(key.clone()).or_insert_with(|| {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
+            });
+            groups[at].1.push(row);
+        }
+    }
+    groups.retain(|(key, rows)| rows.len() > 1 || rows[0].dedupe != *key);
+    if groups.is_empty() {
+        return Ok(());
+    }
+    // In the migration's transaction. Temporary unique keys first, so no update collides with
+    // a row that is about to go or get another key.
+    for row in groups.iter().flat_map(|(_, rows)| rows) {
+        conn.execute("UPDATE findings SET dedupe = 'v18-' || id WHERE id = ?1", [row.id])?;
+    }
+    for (key, rows) in groups {
+        let kept = rows[0].clone();
+        let dropped: Vec<&Row> = rows[1..].iter().collect();
+        // The latest decision wins; one with no time (from before brainproxy kept it) loses to
+        // one with a time, and among those the first that isn't open wins.
+        let latest = |at: fn(&Row) -> Option<&String>, set: fn(&Row) -> bool| -> &Row {
+            rows.iter()
+                .filter(|r| at(r).is_some())
+                .max_by(|a, b| at(a).cmp(&at(b)))
+                .or_else(|| rows.iter().find(|r| set(r)))
+                .unwrap_or(&rows[0])
+        };
+        let state = latest(|r| r.state.2.as_ref(), |r| r.state.0 != "open").state.clone();
+        let note = latest(|r| r.note.2.as_ref(), |r| r.note.0.is_some()).note.clone();
+        let riskiest = rows.iter().max_by_key(|r| r.risk_level).unwrap_or(&rows[0]);
+        let hits: i64 = rows.iter().map(|r| r.hits).sum();
+        let (mut first, mut last) = (rows.iter().find_map(|r| r.history_id), rows.iter().filter_map(|r| r.last).max());
+        for d in &dropped {
+            conn.execute("UPDATE finding_events SET finding_id = ?1 WHERE finding_id = ?2", [kept.id, d.id])?;
+            // One scan's view of the merged finding: found (new, then still) beats not found.
+            conn.execute(
+                "INSERT INTO scan_observations (job_id, finding_id, seen, time)
+                    SELECT job_id, ?1, seen, time FROM scan_observations WHERE finding_id = ?2 AND true
+                 ON CONFLICT(job_id, finding_id) DO UPDATE SET seen = CASE
+                    WHEN 'new' IN (seen, excluded.seen) THEN 'new'
+                    WHEN 'still' IN (seen, excluded.seen) THEN 'still' ELSE seen END",
+                [kept.id, d.id],
+            )?;
+            conn.execute("DELETE FROM scan_observations WHERE finding_id = ?1", [d.id])?;
+            conn.execute("DELETE FROM findings WHERE id = ?1", [d.id])?;
+        }
+        // A finding added by hand links history entries, the whole list in meta: the merged one
+        // links them all, in order.
+        if kept.source == MANUAL_SOURCE {
+            let mut links: Vec<i64> = Vec::new();
+            for r in &rows {
+                for h in history_ids(conn, r.id, r.history_id, r.last)? {
+                    if !links.contains(&h) {
+                        links.push(h);
+                    }
+                }
+            }
+            (first, last) = (links.first().copied(), links.last().copied());
+            for r in &rows {
+                conn.execute("DELETE FROM meta WHERE key = ?1", [history_key(r.id)])?;
+            }
+            if links.len() > 2 {
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![history_key(kept.id), serde_json::to_string(&links).unwrap_or_default()],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE findings SET dedupe = ?1, hits = ?2, history_id = ?3, last_history_id = ?4, risk = ?5,
+                risk_level = ?6, state = ?7, state_origin = ?8, state_changed_at = ?9, note = ?10, note_origin = ?11,
+                note_changed_at = ?12
+             WHERE id = ?13",
+            params![
+                key,
+                hits,
+                first,
+                last,
+                riskiest.risk,
+                riskiest.risk_level,
+                state.0,
+                state.1,
+                state.2,
+                note.0,
+                note.1,
+                note.2,
+                kept.id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The history entries a finding links: a finding added by hand keeps the whole list in meta
+/// when it has more than two; otherwise its first and last sighting.
+fn history_ids(conn: &rusqlite::Connection, id: i64, first: Option<i64>, last: Option<i64>) -> Result<Vec<i64>> {
+    let list: Option<String> =
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [history_key(id)], |r| r.get(0)).optional()?;
+    if let Some(list) = list {
+        return Ok(serde_json::from_str(&list).unwrap_or_default());
+    }
+    let mut ids: Vec<i64> = first.into_iter().collect();
+    ids.extend(last.filter(|l| Some(*l) != first));
+    Ok(ids)
+}
+
 impl Store {
     /// Captures after `after_id` from the given sources, ready for scanning.
     pub fn scan_messages_after(&self, after_id: i64, sources: &[String], limit: usize) -> Result<Vec<Message>> {
@@ -290,6 +476,15 @@ impl Store {
         // (hits alone can't tell: a rescan sets them to 0 first).
         let before: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM findings", [], |r| r.get(0))?;
         let mut created = std::collections::HashSet::new();
+        // One response can raise the same finding twice (two versioned Server headers): it
+        // takes the higher of the risks, as one sighting.
+        let mut risks: std::collections::HashMap<String, Risk> = std::collections::HashMap::new();
+        for f in findings {
+            let r = risks.entry(dedupe_key(f.def.alert_ref, &msg.method, &msg.url, &f.param)).or_insert(f.risk);
+            if f.risk.level() > r.level() {
+                *r = f.risk;
+            }
+        }
         {
             let mut types = tx.prepare_cached(
                 "INSERT OR IGNORE INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
@@ -300,10 +495,13 @@ impl Store {
                     method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id,
-                    risk = CASE WHEN excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
-                    risk_level = max(risk_level, excluded.risk_level)
+                    risk = excluded.risk, risk_level = excluded.risk_level
                  RETURNING id",
             )?;
+            // The risk a sighting gives is the rule's rating now, so a finding takes it either
+            // way: a rule that rated something too high, then fixed, lowers it again. Read first
+            // so the change goes on the timeline.
+            let mut risk_before = tx.prepare_cached("SELECT risk FROM findings WHERE dedupe = ?1")?;
             // A finding marked fixed that is seen again is open again, when what saw it was
             // recorded after it was marked: a rescan of older traffic doesn't reopen it.
             let mut reopen = tx.prepare_cached(
@@ -325,14 +523,16 @@ impl Store {
                     serde_json::to_string(d.tags).unwrap_or_default(),
                 ])?;
                 let dedupe = dedupe_key(d.alert_ref, &msg.method, &msg.url, &f.param);
+                let risk = risks.get(&dedupe).copied().unwrap_or(f.risk);
+                let old_risk: Option<String> = risk_before.query_row([&dedupe], |r| r.get(0)).optional()?;
                 let id: i64 = insert.query_row(
                     params![
                         source,
                         rule_id,
                         d.alert_ref,
                         d.name,
-                        f.risk.as_str(),
-                        f.risk.level(),
+                        risk.as_str(),
+                        risk.level(),
                         f.confidence.as_str(),
                         d.cwe,
                         d.wasc,
@@ -352,7 +552,22 @@ impl Store {
                 if id > before && created.insert(id) {
                     new += 1;
                     crate::scan::issues::created(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
-                } else if reopen.execute(params![id, crate::provenance::origin(), msg.history_id])? > 0 {
+                    continue;
+                }
+                if let Some(old) = old_risk.as_deref().filter(|old| *old != risk.as_str()) {
+                    crate::scan::issues::record(
+                        &tx,
+                        &crate::scan::issues::Event {
+                            finding: Some(id),
+                            kind: "risk",
+                            old: Some(old),
+                            new: Some(risk.as_str()),
+                            history_id: Some(msg.history_id),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                if reopen.execute(params![id, crate::provenance::origin(), msg.history_id])? > 0 {
                     crate::scan::issues::record(
                         &tx,
                         &crate::scan::issues::Event {
@@ -513,9 +728,11 @@ impl Store {
         let tx = self.write_tx()?;
         // Clearing a note is a decision too: note_origin says someone touched it.
         // So is anything else on its timeline (a retest, a move to another issue, a ticket) or
-        // on its issue's (a title, a rating, a write-up): a record someone made stays.
+        // on its issue's (a title, a rating, a write-up): a record someone made stays. A risk
+        // change is the scanner's own record, not someone's.
         let triaged = "(state != 'open' OR note IS NOT NULL OR state_origin IS NOT NULL OR note_origin IS NOT NULL
-            OR EXISTS (SELECT 1 FROM finding_events e WHERE e.finding_id = findings.id AND e.kind != 'created')
+            OR EXISTS (SELECT 1 FROM finding_events e WHERE e.finding_id = findings.id
+                AND e.kind NOT IN ('created', 'risk'))
             OR EXISTS (SELECT 1 FROM finding_events e WHERE e.finding_id IS NULL AND e.issue_id = findings.issue_id))";
         // A finding that goes takes its timeline and scan observations with it.
         let gone = format!("SELECT id FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}");
@@ -608,7 +825,8 @@ impl Store {
             tx.query_row("SELECT id FROM findings WHERE dedupe = ?1", [&dedupe], |r| r.get::<_, i64>(0)).optional()?
         {
             return Err(Error::Conflict(format!(
-                "finding {id} is already this issue (same title, method, URL without its query, and parameter)"
+                "finding {id} is already this issue (same title, method, URL without its query or path parameters, \
+                 and parameter)"
             )));
         }
         let replaced = texts_replaced(&tx, &alert_ref, f)?;
@@ -786,9 +1004,6 @@ impl Store {
 
     /// The history entries a finding added by hand links to, in the order given.
     pub fn finding_history_ids(&self, id: i64) -> Result<Vec<i64>> {
-        if let Some(list) = self.meta_get(&history_key(id))? {
-            return Ok(serde_json::from_str(&list).unwrap_or_default());
-        }
         let (first, last): (Option<i64>, Option<i64>) = self
             .conn
             .query_row("SELECT history_id, last_history_id FROM findings WHERE id = ?1", [id], |r| {
@@ -796,9 +1011,7 @@ impl Store {
             })
             .optional()?
             .unwrap_or_default();
-        let mut ids: Vec<i64> = first.into_iter().collect();
-        ids.extend(last.filter(|l| Some(*l) != first));
-        Ok(ids)
+        history_ids(&self.conn, id, first, last)
     }
 }
 
@@ -1440,5 +1653,232 @@ mod tests {
         assert_eq!(s.findings_rescan_finish("passive").unwrap(), (ids.len() - 1, 1));
         let v = s.finding_get(ids[0]).unwrap();
         assert!(v["note"].is_null() && v["hits"] == 0, "{v}");
+    }
+
+    /// Records a GET of `path` on app.test with an X-Powered-By header (rule 10037, low) and
+    /// runs the passive scan; returns the history id.
+    fn seen_at(s: &mut Store, path: &str) -> i64 {
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        let req = format!("GET {path} HTTP/1.1\r\nHost: app.test\r\n\r\n");
+        let h = s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp), None, None)).unwrap();
+        crate::scan::passive::scan_pending(s).unwrap();
+        h
+    }
+
+    fn xpb(s: &Store) -> Vec<Value> {
+        let all = FindingFilter { alert_ref: Some("10037".into()), state: Some("all".into()), ..Default::default() };
+        s.findings_list(&all, 100).unwrap()
+    }
+
+    #[test]
+    fn the_key_drops_path_parameters() {
+        let key = |url| dedupe_key("1", "GET", url, "p");
+        assert_eq!(key("http://a.test/login;jsessionid=ABC"), "1|GET|http://a.test/login|p");
+        assert_eq!(key("http://a.test/app;JSESSIONID=1;PHPSESSID=2/page?x=1"), "1|GET|http://a.test/app/page|p");
+        assert_eq!(key("http://a.test/;sid=1"), "1|GET|http://a.test/|p");
+        // Matrix parameters too: like a query, they hold values, not the resource.
+        assert_eq!(key("http://a.test/cars;color=red/x"), "1|GET|http://a.test/cars/x|p");
+        // A `;` that isn't a name=value parameter is part of the path.
+        assert_eq!(key("http://a.test/a;b/c;d=1;e"), "1|GET|http://a.test/a;b/c;e|p");
+        // Only the path: a query keeps going whole, and the authority is left alone.
+        assert_eq!(key("http://a.test/x?a=1;b=2"), "1|GET|http://a.test/x|p");
+        assert_eq!(key("http://u;x=1@a.test/x"), "1|GET|http://u;x=1@a.test/x|p");
+        assert_eq!(key("http://a.test"), "1|GET|http://a.test|p");
+        // A URL without path parameters keys as before, so its fingerprint doesn't change.
+        use sha2::{Digest, Sha256};
+        let v2 = hex::encode(&Sha256::digest(b"10037|GET|http://a.test/a|")[..16]);
+        assert_eq!(fingerprint("10037", "GET", "http://a.test/a?q=1", ""), v2);
+        assert_eq!(
+            fingerprint("10037", "GET", "http://a.test/a;jsessionid=1", ""),
+            fingerprint("10037", "GET", "http://a.test/a;jsessionid=2", "")
+        );
+    }
+
+    #[test]
+    fn a_session_id_in_the_path_is_the_same_finding() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/login;jsessionid=AAA");
+        let h = seen_at(&mut s, "/login;jsessionid=BBB?next=/");
+        let f = xpb(&s);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(
+            (f[0]["hits"].as_i64(), f[0]["url"].as_str()),
+            (Some(2), Some("http://app.test/login;jsessionid=AAA"))
+        );
+        assert_eq!(s.finding_get(f[0]["id"].as_i64().unwrap()).unwrap()["last_history_id"], h);
+    }
+
+    #[test]
+    fn findings_stored_once_per_session_are_merged() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (h1, _, h3) = (seen_at(&mut s, "/a"), seen_at(&mut s, "/b"), seen_at(&mut s, "/c"));
+        let ids: Vec<i64> = xpb(&s).iter().map(|f| f["id"].as_i64().unwrap()).collect();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        // As schema v17 stored them: one finding per session id, each with its own v2 key.
+        for (id, sid) in [(a, "A"), (b, "B"), (c, "C")] {
+            s.conn
+                .execute(
+                    "UPDATE findings SET url = ?1, dedupe = alert_ref || '|GET|' || ?1 || '|' || param WHERE id = ?2",
+                    params![format!("http://app.test/login;jsessionid={sid}"), id],
+                )
+                .unwrap();
+        }
+        // b was marked false positive, then a fixed later: the later decision wins. c has the
+        // note and the highest risk; a, the first, is kept.
+        s.finding_mark(b, Some("false_positive"), None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.finding_mark(a, Some("fixed"), None).unwrap();
+        s.finding_mark(c, None, Some("seen on login")).unwrap();
+        s.conn.execute("UPDATE findings SET risk = 'medium', risk_level = 2 WHERE id = ?1", [c]).unwrap();
+        s.conn
+            .execute_batch(&format!(
+                "INSERT INTO scan_observations (job_id, finding_id, seen) VALUES (1, {a}, 'gone'), (1, {b}, 'still'),
+                    (2, {c}, 'new');"
+            ))
+            .unwrap();
+        let removed = s.finding_add(&manual("Login IDOR", Some("http://app.test/login;jsessionid=A"), vec![])).unwrap();
+        s.findings_remove(&[removed]).unwrap();
+        let tombstone: String =
+            s.conn.query_row("SELECT dedupe FROM findings WHERE id = ?1", [removed], |r| r.get(0)).unwrap();
+
+        rekey_v18(&s.conn).unwrap();
+        let left = xpb(&s);
+        assert_eq!(left.len(), 1, "{left:?}");
+        let f = s.finding_get(a).unwrap();
+        assert_eq!(
+            (f["hits"].as_i64(), f["history_id"].as_i64(), f["last_history_id"].as_i64()),
+            (Some(3), Some(h1), Some(h3))
+        );
+        assert_eq!(
+            (f["state"].as_str(), f["note"].as_str(), f["risk"].as_str()),
+            (Some("fixed"), Some("seen on login"), Some("medium"))
+        );
+        assert!(f["state_changed_at"].is_string() && f["note_changed_at"].is_string(), "{f}");
+        let key: String = s.conn.query_row("SELECT dedupe FROM findings WHERE id = ?1", [a], |r| r.get(0)).unwrap();
+        assert_eq!(key, "10037|GET|http://app.test/login|");
+        // Every timeline moved to it; one scan's view keeps the sighting over the "gone".
+        let kinds: Vec<String> =
+            s.finding_events(a).unwrap().iter().map(|e| e["kind"].as_str().unwrap().into()).collect();
+        assert_eq!(kinds.iter().filter(|k| *k == "created").count(), 3, "{kinds:?}");
+        assert!(kinds.contains(&"note".to_string()) && kinds.iter().filter(|k| *k == "state").count() == 2);
+        let seen: Vec<(i64, i64, String)> = s
+            .conn
+            .prepare("SELECT job_id, finding_id, seen FROM scan_observations ORDER BY job_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(seen, [(1, a, "still".to_string()), (2, a, "new".to_string())]);
+        // A tombstone keeps its key, and running it again changes nothing.
+        let after: String =
+            s.conn.query_row("SELECT dedupe FROM findings WHERE id = ?1", [removed], |r| r.get(0)).unwrap();
+        assert_eq!(after, tombstone);
+        rekey_v18(&s.conn).unwrap();
+        assert_eq!(s.finding_get(a).unwrap()["hits"], 3);
+    }
+
+    #[test]
+    fn findings_added_by_hand_merge_their_links() {
+        let (mut s, h1) = store();
+        let target = Target { scheme: "https".into(), host: "app.test".into(), port: 443 };
+        let mut hs = vec![h1];
+        for _ in 0..3 {
+            hs.push(s.record(&Capture::new("send", &target, b"GET / HTTP/1.1\r\n\r\n", None, None, None)).unwrap());
+        }
+        // As v17 stored them: each with the key it had then, which kept the path parameter
+        // (this build refuses the second as the same finding, so the first's key goes back).
+        let add = |s: &mut Store, sid: &str, links: Vec<i64>| {
+            let url = format!("https://app.test/x;jsessionid={sid}");
+            let id = s
+                .finding_add(&ManualFinding {
+                    method: Some("GET".into()),
+                    ..manual("Session fixation", Some(&url), links)
+                })
+                .unwrap();
+            s.conn.execute("UPDATE findings SET dedupe = 'v17-' || id WHERE id = ?1", [id]).unwrap();
+            id
+        };
+        let a = add(&mut s, "A", vec![hs[0], hs[1], hs[2]]);
+        let b = add(&mut s, "B", vec![hs[3], hs[1]]);
+        rekey_v18(&s.conn).unwrap();
+        assert_eq!(s.finding_history_ids(a).unwrap(), [hs[0], hs[1], hs[2], hs[3]]);
+        assert!(matches!(s.finding_get(b), Err(Error::NotFound(_))));
+        assert!(s.meta_get(&history_key(b)).unwrap().is_none());
+        let f = s.finding_get(a).unwrap();
+        assert_eq!((f["history_id"].as_i64(), f["last_history_id"].as_i64()), (Some(hs[0]), Some(hs[3])));
+        // Added again by hand, it is the same finding.
+        let again = ManualFinding {
+            method: Some("GET".into()),
+            ..manual("Session fixation", Some("https://app.test/x;jsessionid=C"), vec![])
+        };
+        assert!(matches!(s.finding_add(&again), Err(Error::Conflict(_))));
+    }
+
+    #[test]
+    fn marking_the_state_a_finding_has_changes_nothing() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        let id = xpb(&s)[0]["id"].as_i64().unwrap();
+        // Open already: no one changed it, and nothing goes on the timeline.
+        s.finding_mark(id, Some("open"), None).unwrap();
+        let f = s.finding_get(id).unwrap();
+        assert!(f["state_changed_at"].is_null() && f["state_origin"].is_null(), "{f}");
+        s.finding_mark(id, Some("fixed"), None).unwrap();
+        let marked = s.finding_get(id).unwrap()["state_changed_at"].clone();
+        // Seen again after the first mark: a second "fixed" must not move the time it is
+        // compared with, or this sighting wouldn't count as a regression.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let resp = b"HTTP/1.1 200 OK\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        let h = s
+            .record(&Capture::new(
+                "send",
+                &target,
+                b"GET /x HTTP/1.1\r\nHost: app.test\r\n\r\n",
+                Some(resp),
+                None,
+                None,
+            ))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.findings_mark(&[id], Some("fixed"), Some("checked")).unwrap();
+        let f = s.finding_get(id).unwrap();
+        assert_eq!((f["state_changed_at"].clone(), f["note"].as_str()), (marked, Some("checked")));
+        crate::scan::passive::scan_pending(&mut s).unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["state"], "open");
+        assert_eq!(s.finding_events(id).unwrap().last().unwrap()["history_id"], h);
+        let kinds: Vec<String> =
+            s.finding_events(id).unwrap().iter().map(|e| e["kind"].as_str().unwrap().into()).collect();
+        assert_eq!(kinds, ["created", "state", "note", "regressed"]);
+    }
+
+    #[test]
+    fn a_sighting_sets_the_risk_either_way_and_says_so() {
+        let mut s = Store::open_in_memory().unwrap();
+        let h = seen_at(&mut s, "/x");
+        let id = xpb(&s)[0]["id"].as_i64().unwrap();
+        let msg = s.scan_messages_after(h - 1, &["send".to_string()], 1).unwrap().remove(0);
+        let def = crate::scan::passive::scan_message(&msg, &Default::default())
+            .into_iter()
+            .find(|f| f.def.alert_ref == "10037")
+            .unwrap();
+        // A rule rating it higher raises it; one rating it lower (a fixed rule) lowers it again.
+        // Two ratings in one response are one sighting, at the higher.
+        let rated = |risk| Finding { risk, ..def.clone() };
+        s.record_findings("passive", &msg, &[rated(Risk::Low), rated(Risk::High)]).unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["risk"], "high");
+        s.record_findings("passive", &msg, &[rated(Risk::Low)]).unwrap();
+        assert_eq!(s.finding_get(id).unwrap()["risk_level"], 1);
+        s.record_findings("passive", &msg, &[rated(Risk::Low)]).unwrap();
+        let risk: Vec<(String, String)> = s
+            .finding_events(id)
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "risk")
+            .map(|e| (e["old"].as_str().unwrap().into(), e["new"].as_str().unwrap().into()))
+            .collect();
+        assert_eq!(risk, [("low".into(), "high".into()), ("high".into(), "low".into())]);
     }
 }

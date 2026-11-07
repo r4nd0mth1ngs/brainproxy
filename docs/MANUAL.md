@@ -1088,14 +1088,18 @@ them. Reports carry them in every format:
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
 
-In SARIF, each result's `partialFingerprints["brainproxy/v2"]` is a hash of the key the
-project uses to tell findings apart (alert, method, URL without its query, parameter), so
-code scanning sees a finding found again with another query string as the same result, and
-no secret in the URL travels with it. `report json` gives the same hash as each instance's
-`fingerprint`; `findings compare --baseline` matches by it, so a redacted report still
-compares with the project as it was. (It was
-`brainproxy/v1`, which kept the query, so the first upload after updating may show existing
-alerts as closed and opened again.)
+In SARIF, each result's `partialFingerprints["brainproxy/v3"]` is a hash of the key the
+project uses to tell findings apart (alert, method, URL without its query or its path's
+`;name=value` parameters, parameter), so code scanning sees a finding found again with
+another query string, or another session id in its path (`/login;jsessionid=...`), as the
+same result, and no secret in the URL travels with it. `report json` gives the same hash as
+each instance's `fingerprint`; `findings compare --baseline` matches by it, so a redacted
+report still compares with the project as it was. (It was `brainproxy/v1`, which kept the
+query, then `brainproxy/v2`, which kept path parameters: the first upload after updating may
+show existing alerts as closed and opened again. A URL without path parameters has the same
+hash as under v2, so only those findings change in `report json`, `report defectdojo` and
+baselines; a project opened by this version merges the findings it stored once per session
+id, keeping the latest state and note, the summed hits and the highest risk.)
 A result marked false positive or accepted risk (in a report written with `--state all`)
 carries `suppressions` (`kind` external, `status` accepted, the note as `justification`), so
 code scanning shows it as dismissed rather than open.
@@ -1491,7 +1495,7 @@ brainproxy findings remove 17
   same apart from case and punctuation share a type.
 - Each finding keeps its own `--cwe`. Reports show the first one given for the type, and an
   instance's own when it differs.
-- The same title, method, URL without its query, and parameter as an existing finding is refused
+- The same title, method, URL without its query or path parameters, and parameter as an existing finding is refused
   with `conflict`.
 - `findings mark` triages them like any other. `findings remove ID...` removes findings added by
   hand; scanner findings are refused (mark them false positive instead), and then nothing is
@@ -1589,21 +1593,29 @@ Findings are records with a history, not just rows:
   `findings list`. Grouping by rule and host can merge two bugs or split one:
   `findings issue split ID... --title T` moves findings into a new issue, `findings issue
   merge INTO FROM...` moves every finding of the others into the first, and `findings issue
-  title ID T` names an issue ("" goes back to the alert's name). New findings join the first
-  issue for their alert and host; a finding found again stays in its issue.
+  title ID T` names an issue ("" goes back to the alert's name). An issue's `host` names the
+  hosts of its findings (`a.test, b.test` after merging issues from two hosts; `hosts` lists
+  them), and so does its write-up's heading in reports. New findings join the first issue for
+  their alert and host; a finding found again stays in its issue.
 - **States:** `open`, `confirmed`, `false_positive`, `accepted_risk`, `retest_pending` and
-  `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). `findings
-  list` and `report` show work still to do by default: open, confirmed and retest pending.
+  `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). Marking
+  a finding with the state it already has changes nothing: who changed it and when stay as
+  they were. `findings list` and `report` show work still to do by default: open, confirmed
+  and retest pending.
   A fixed finding a scanner sees again goes back to open, with a `regressed` event.
 - **Timeline** (`findings timeline ID`): created, state and note changes, retests, moves
-  between issues, regressions and removals, each with who did it (`gui`, `cli`, `mcp`) and
+  between issues, regressions, risk changes (a sighting rated it higher or lower: the
+  latest sighting's rating is the finding's) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets
   a timeline built from what its findings already recorded.
 - **Retest** (`findings retest ID [--auth PROFILE]`): a passive finding's latest request is
   sent again, recorded with source `retest` (which the background passive scan leaves alone),
   and the finding's own rule or passive check reads that one response. Not reproduced marks it
   `fixed`; a `fixed` or `retest_pending` finding still there is `open` again; false positives
-  and accepted risks keep their state; `--no-mark` records the outcome only. A rule that is
+  and accepted risks keep their state. A retest that still sees it counts as a sighting (a
+  hit, and its reply as the latest); `--no-mark` records the outcome only, leaving the
+  finding as it was. The passive scan never reads retest traffic, even from a source list
+  saved before `scan sources` refused it, so a retest is counted once. A rule that is
   switched off (or no longer loaded) can't tell, so the retest is refused (kind conflict), and
   so is one whose reply has another kind of status than the finding's request had (a redirect
   to a login page, an error) and doesn't show the finding: nothing is marked. A "not
@@ -1721,7 +1733,7 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
 `--fail-on` turns that into an exit code for CI. The baseline can be:
 
 - **A file** (`--baseline FILE`): `report json` output, to compare runs in different project files.
-  Findings match by alert, method, URL without its query, and parameter, so the URL's
+  Findings match by alert, method, URL without its query or path parameters, and parameter, so the URL's
   scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
   doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
   coverage. A finding added by hand and removed since (`findings remove`) is listed under
@@ -1787,7 +1799,7 @@ brainproxy --project run.bpdb findings compare --scan 1 --baseline known.json --
 
 A fresh project starts with every finding open, so its reports would show what earlier runs marked
 as false positives. `findings mark --from FILE` copies the marks first: each of the project's
-findings that matches one of FILE's (alert, method, URL without its query, and parameter, as
+findings that matches one of FILE's (alert, method, URL without its query or path parameters, and parameter, as
 `compare` matches them; a report's `fingerprint` where it has one, so a redacted report still
 matches) gets that finding's mark where it is `confirmed`, `false_positive` or `accepted_risk`,
 or `--state` for every match. FILE is a `report json`, or a list a team keeps of the findings it has

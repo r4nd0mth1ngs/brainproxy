@@ -75,7 +75,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
+    ("kind", "TEXT", "created, state, note, retest, regressed, risk (a sighting rated it otherwise), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
     ("old", "TEXT", "Value before (a state, a note, an issue id)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
@@ -233,7 +233,7 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.alert_ref, i.host, COALESCE(i.title, 
         sum(f.hits) AS hits, min(f.time) AS first_seen,
         max(COALESCE((SELECT h.time FROM history h WHERE h.id = f.last_history_id), f.time)) AS last_seen,
         json_group_object(f.state, 1) AS states, group_concat(DISTINCT f.source) AS sources,
-        i.cvss_vector, i.cvss_score
+        json_group_object(f.host, 1) AS hosts, i.cvss_vector, i.cvss_score
     FROM issues i JOIN findings f ON f.issue_id = i.id";
 
 fn risk_name(level: i64) -> &'static str {
@@ -247,10 +247,20 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         serde_json::from_str::<Map<String, Value>>(&states).map(|m| m.keys().cloned().collect()).unwrap_or_default();
     states.sort();
     let sources: Option<String> = r.get("sources")?;
+    // Its findings' hosts, not the issue's own: a merge can bring findings of other hosts, and
+    // labelling them all with the first host would be wrong. One host is the usual case.
+    let hosts: String = r.get("hosts")?;
+    let mut hosts: Vec<String> =
+        serde_json::from_str::<Map<String, Value>>(&hosts).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    hosts.sort();
+    if hosts.is_empty() {
+        hosts.push(r.get("host")?);
+    }
     Ok(json!({
         "id": r.get::<_, i64>("id")?,
         "alert_ref": r.get::<_, String>("alert_ref")?,
-        "host": r.get::<_, String>("host")?,
+        "host": hosts.join(", "),
+        "hosts": hosts,
         "title": r.get::<_, String>("title")?,
         "titled": r.get::<_, bool>("titled")?,
         "risk": risk_name(level),
@@ -414,10 +424,11 @@ impl Store {
         Ok(())
     }
 
-    /// Records a retest of a finding: an event with its outcome and the request it sent, a
-    /// sighting when it is still there (hits and last seen), and (with `mark`) the state that
+    /// Records a retest of a finding: an event with its outcome and the request it sent and,
+    /// with `mark`, a sighting when it is still there (hits and last seen) and the state that
     /// follows: fixed when not reproduced, open again when a fixed finding is still there.
-    /// Returns the finding's state after.
+    /// Without `mark` only the event is recorded, so the finding is left as it was. Returns the
+    /// finding's state after.
     pub fn finding_retested(
         &mut self,
         id: i64,
@@ -448,7 +459,9 @@ impl Store {
                 ..Default::default()
             },
         )?;
-        if let (Retest::StillPresent, Some(h)) = (outcome, history_id) {
+        // The retest's reply is read only here (the passive scan never reads retest traffic),
+        // so it is counted once.
+        if let (Retest::StillPresent, Some(h), true) = (outcome, history_id, mark) {
             tx.execute("UPDATE findings SET hits = hits + 1, last_history_id = ?1 WHERE id = ?2", params![h, id])?;
         }
         let after = match after_retest(&state, outcome).filter(|_| mark && !outdated) {
@@ -800,5 +813,65 @@ mod tests {
             p["scans"],
             json!([{"job": 7, "started": null, "finished": null, "state": null, "new": 1, "still": 0, "gone": 1}])
         );
+    }
+
+    #[test]
+    fn a_retest_without_mark_records_only_its_outcome_and_counts_once() {
+        let mut s = store();
+        let list = s
+            .findings_list(
+                &FindingFilter { alert_ref: Some("10037".into()), host: Some("a.test".into()), ..Default::default() },
+                10,
+            )
+            .unwrap();
+        let f = list.iter().find(|f| f["url"] == "http://a.test/x").unwrap()["id"].as_i64().unwrap();
+        let before = s.finding_get(f).unwrap();
+        let target = Target { scheme: "http".into(), host: "a.test".into(), port: 80 };
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        let h = s
+            .record(&Capture::new(
+                "retest",
+                &target,
+                b"GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                Some(resp),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(s.finding_retested(f, Retest::StillPresent, Some(h), "GET /x", false).unwrap(), "open");
+        let after = s.finding_get(f).unwrap();
+        assert_eq!((&after["hits"], &after["last_history_id"]), (&before["hits"], &before["last_history_id"]));
+        assert_eq!(s.finding_events(f).unwrap().last().unwrap()["kind"], "retest");
+        // A source list saved before `scan sources` refused retest: the background scan still
+        // leaves the retest's reply alone, so a marking retest is the one sighting of it.
+        let settings = passive::PassiveSettings { sources: vec!["send".into(), "retest".into()], ..Default::default() };
+        s.set_setting(passive::SETTINGS_KEY, &settings).unwrap();
+        passive::scan_pending(&mut s).unwrap();
+        assert_eq!(s.finding_get(f).unwrap()["hits"], before["hits"]);
+        s.finding_retested(f, Retest::StillPresent, Some(h), "GET /x", true).unwrap();
+        let after = s.finding_get(f).unwrap();
+        assert_eq!(after["hits"].as_i64(), before["hits"].as_i64().map(|n| n + 1));
+        assert_eq!(after["last_history_id"], h);
+    }
+
+    #[test]
+    fn a_merged_issue_names_every_host_it_holds() {
+        let mut s = store();
+        let issues = xpb(&s);
+        let a = issues.iter().find(|i| i["host"] == "a.test").unwrap()["id"].as_i64().unwrap();
+        let b = issues.iter().find(|i| i["host"] == "b.test").unwrap()["id"].as_i64().unwrap();
+        assert_eq!(issues[0]["hosts"].as_array().unwrap().len(), 1);
+        s.issues_merge(a, &[b]).unwrap();
+        let merged = xpb(&s);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(
+            (merged[0]["host"].as_str(), &merged[0]["hosts"]),
+            (Some("a.test, b.test"), &json!(["a.test", "b.test"]))
+        );
+        assert_eq!(s.issue_get(a).unwrap()["host"], "a.test, b.test");
+        // Listed for one host, it names the host its matching findings are on.
+        let on_b = FindingFilter { host: Some("b.test".into()), alert_ref: Some("10037".into()), ..Default::default() };
+        let listed = s.issues_list(&on_b, 10).unwrap();
+        assert_eq!((listed[0]["id"].as_i64(), listed[0]["host"].as_str()), (Some(a), Some("b.test")));
     }
 }
