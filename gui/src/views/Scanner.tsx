@@ -810,7 +810,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
               <span className="label">Check min severity</span>
               <select className="input" value={f.checkSeverity} onChange={(e) => set({ checkSeverity: e.target.value })}>
                 <option value="">any</option>
-                {["info", "low", "medium", "high"].map((s) => (
+                {["info", "low", "medium", "high", "critical"].map((s) => (
                   <option key={s}>{s}</option>
                 ))}
               </select>

@@ -400,6 +400,15 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
             narrowed.join(", ")
         ));
     }
+    // Reports leave fixed and accepted findings out unless --state all: their marks can't
+    // carry over from a file that doesn't have them.
+    if report.filters["state"].as_str() != Some("all") {
+        warnings.push(format!(
+            "{} wasn't written with --state all, so it has no false positives, accepted risks or fixed \
+             findings to carry marks from",
+            path.display()
+        ));
+    }
     let items = report
         .alerts
         .into_iter()

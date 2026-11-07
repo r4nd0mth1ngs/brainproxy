@@ -28,7 +28,12 @@ fn serve(leak: Arc<AtomicBool>, down: Arc<AtomicBool>) -> u16 {
                 req.extend_from_slice(&buf[..k]);
             }
             let body = "<html><body><a href=\"/a\">a</a></body></html>";
-            let powered = if leak.load(Ordering::SeqCst) { "X-Powered-By: Express\r\n" } else { "" };
+            let mut powered = if leak.load(Ordering::SeqCst) { "X-Powered-By: Express\r\n" } else { "" }.to_string();
+            // /c sets a session cookie, without its flags, only for a request that has none.
+            let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+            if text.starts_with("get /c ") && !text.contains("\r\ncookie:") {
+                powered.push_str("Set-Cookie: sid=abc123; Path=/\r\n");
+            }
             let status = if down.load(Ordering::SeqCst) { "503 Service Unavailable" } else { "200 OK" };
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{powered}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -148,6 +153,32 @@ fn issues_retests_and_the_timeline() {
     let (code, v) = run(&project, &["findings", "retest", &post]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("--allow-unsafe"), "{v}");
+    // So is a GET that a method-override header turns into a DELETE.
+    ok(&project, &["send", "--url", &format!("{base}/del"), "-H", "X-HTTP-Method-Override: DELETE"]);
+    let del = ok(&project, &["findings", "list", "--all"])["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["url"].as_str().unwrap().ends_with("/del") && f["alert_ref"] == "10037")
+        .unwrap()["id"]
+        .to_string();
+    let (code, v) = run(&project, &["findings", "retest", &del]);
+    assert!(code == 2 && v["error"]["message"].as_str().unwrap().contains("DELETE"), "{v}");
+
+    // A cookie the server sets only for a request without one: retested with a session, the
+    // reply sets no cookie at all, which isn't "fixed".
+    ok(&project, &["send", "--url", &format!("{base}/c")]);
+    let cookie = ok(&project, &["findings", "list", "--all"])["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["url"].as_str().unwrap().ends_with("/c") && f["alert_ref"] == "10010")
+        .expect("a cookie without HttpOnly")["id"]
+        .to_string();
+    ok(&project, &["auth", "add", "u", "--header", "Cookie: sid=valid"]);
+    let (code, v) = run(&project, &["findings", "retest", &cookie, "--auth", "u"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    assert_eq!(ok(&project, &["findings", "show", &cookie])["state"], "open");
 
     // Split one finding off, name it, then merge it back.
     let split = ok(&project, &["findings", "issue", "split", &ids[1].to_string(), "--title", "Second app"]);

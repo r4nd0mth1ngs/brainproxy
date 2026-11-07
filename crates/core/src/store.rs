@@ -522,7 +522,7 @@ impl Store {
             Ok(version)
         };
         if schema_version()? == SCHEMA_VERSION {
-            return Ok(());
+            return self.ensure_indexes();
         }
         // One process migrates. Another opening the project at the same time waits for the
         // write lock (IMMEDIATE takes it under the busy timeout), then finds it done: some
@@ -585,6 +585,25 @@ impl Store {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
+        self.ensure_indexes()
+    }
+
+    /// Indexes added after the schema version that needs them, so a project of that version
+    /// gets them without a new version an older build would refuse. Checked first, so an open
+    /// that has them writes nothing.
+    fn ensure_indexes(&self) -> Result<()> {
+        // A new finding looks up the issue holding its alert on its host.
+        const INDEXES: &[(&str, &str)] = &[("findings_alert_host_issue", "findings(alert_ref, host, issue_id)")];
+        for (name, on) in INDEXES {
+            let there: bool = self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                [name],
+                |r| r.get(0),
+            )?;
+            if !there {
+                self.conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS {name} ON {on};"))?;
+            }
+        }
         Ok(())
     }
 

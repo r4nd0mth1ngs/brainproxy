@@ -620,6 +620,13 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
             let mut settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
             // No arguments shows the current list; it used to clear it.
             if !sources.is_empty() {
+                // A retest's reply is read by the finding's own rule only: a background scan of
+                // it would reopen a finding a retest recorded without marking.
+                if sources.iter().any(|s| s == "retest") {
+                    return Err(Error::InvalidInput(
+                        "retest traffic can't be a passive source: a retest reads its own reply".into(),
+                    ));
+                }
                 settings.sources = sources;
                 store.set_setting(SETTINGS_KEY, &settings)?;
             }

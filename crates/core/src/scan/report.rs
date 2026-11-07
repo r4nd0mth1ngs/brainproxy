@@ -2063,7 +2063,11 @@ pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
             "The {s} rule {} raises \"{}\" when it sees this{}.",
             g.alert_ref,
             g.name,
-            if i.evidence.is_empty() { String::new() } else { format!(": the response contains {}", md_code(&i.evidence)) }
+            if i.evidence.is_empty() {
+                String::new()
+            } else {
+                format!(": the response contains {}", md_code(&i.evidence))
+            }
         ),
     };
     Ok(json!({

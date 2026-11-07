@@ -57,7 +57,9 @@ pub struct RetestArgs {
 }
 
 pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
+    // Traffic recorded but not scanned yet may hold a newer sighting of the finding.
+    passive::scan_pending(&mut store)?;
     let f = store.finding_get(a.id)?;
     let source = f["source"].as_str().unwrap_or_default().to_string();
     let history_id = f["last_history_id"].as_i64().or(f["history_id"].as_i64());
@@ -112,7 +114,11 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         )));
     }
     let item = store.get(history_id)?;
-    let method = item.entry.method.to_ascii_uppercase();
+    // A method-override header names the method the application acts on.
+    let overridden = request_headers(&item.request).into_iter().find_map(|(k, v)| {
+        METHOD_OVERRIDES.iter().any(|h| k.eq_ignore_ascii_case(h)).then(|| v.trim().to_ascii_uppercase())
+    });
+    let method = overridden.unwrap_or_else(|| item.entry.method.to_ascii_uppercase());
     if !a.allow_unsafe && !SAFE_METHODS.contains(&method.as_str()) {
         return Err(Error::InvalidInput(format!(
             "finding {}'s request is a {method}, which may change data when sent again; \
@@ -139,10 +145,9 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
     let found = passive::scan_message(&msg, &settings)
         .iter()
         .any(|x| identity(x.def.alert_ref, &msg.method, &msg.url, &x.param) == want);
-    // A reply of another kind (a redirect to a login page, an error) can't show the finding:
-    // that isn't "fixed".
-    let (was, now) = (item.entry.status.map(|s| s / 100), msg.status / 100);
-    if !found && was.is_some_and(|w| w != now) {
+    // A reply of another kind (a redirect to a login page, an error, a 304 or a 206) can't show
+    // the finding: that isn't "fixed".
+    if !found && item.entry.status.is_some_and(|w| w != msg.status) {
         return Err(Error::Conflict(format!(
             "finding {}: the retest got status {} where its request had {} (history {row}), so it can't tell \
              whether the finding is still there; nothing was marked (an expired session? try --auth PROFILE)",
@@ -150,6 +155,20 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
             msg.status,
             item.entry.status.unwrap_or(0)
         )));
+    }
+    // Nor can a reply that sets no cookie, for a finding about one: a server that sets a cookie
+    // only for a request without one sends no Set-Cookie to a retest that carries one.
+    if !found {
+        let evidence = f["evidence"].as_str().unwrap_or_default();
+        if let Some(name) = evidence_header(&item.response, evidence)
+            .filter(|n| !msg.resp_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)))
+        {
+            return Err(Error::Conflict(format!(
+                "finding {}: it was seen in a {name} header, and the retest's reply (history {row}) sets no \
+                 cookie, so it can't tell whether the finding is still there; nothing was marked",
+                a.id
+            )));
+        }
     }
     let outcome = if found { Retest::StillPresent } else { Retest::NotReproduced };
     let state = store.finding_retested(a.id, outcome, Some(row), &detail, !a.no_mark)?;
@@ -169,6 +188,34 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         format!("finding {}: {said} (now {})", a.id, state.replace('_', " "))
     });
     Ok(())
+}
+
+/// Headers that tell a server to act as if the request had another method.
+const METHOD_OVERRIDES: &[&str] = &["x-http-method-override", "x-http-method", "x-method-override"];
+
+/// A raw message's header lines, as (name, value).
+fn request_headers(raw: &[u8]) -> Vec<(String, String)> {
+    let head = raw.split(|&b| b == b'\n').skip(1).take_while(|l| !l.iter().all(|b| b.is_ascii_whitespace()));
+    head.filter_map(|l| {
+        let l = String::from_utf8_lossy(l);
+        let (k, v) = l.split_once(':')?;
+        Some((k.trim().to_string(), v.trim().to_string()))
+    })
+    .collect()
+}
+
+/// Set-Cookie, when the evidence was quoted from one: a server sends it only when it sets a
+/// cookie (often only to a request without one), so a reply without any can't show the
+/// finding. Other headers going away is how they are fixed.
+fn evidence_header(response: &[u8], evidence: &str) -> Option<String> {
+    let evidence = evidence.trim().to_ascii_lowercase();
+    if evidence.is_empty() {
+        return None;
+    }
+    request_headers(response).into_iter().find_map(|(k, v)| {
+        let quoted = format!("{k}: {v}").to_ascii_lowercase().contains(&evidence);
+        (quoted && k.eq_ignore_ascii_case("set-cookie")).then_some(k)
+    })
 }
 
 /// How to retest an active finding: run its rule or check again, as a scan.
