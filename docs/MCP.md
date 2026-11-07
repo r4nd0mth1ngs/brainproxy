@@ -68,6 +68,8 @@ joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy
 `project save`, since copying the project elsewhere is for the person running the server; and
 `findings remove`, since an agent can't tell a finding a person added from its own (it marks
 one `false_positive` with a note instead; the command refuses a tool call too).
+`findings_mark` takes one finding at a time: `from` (marking every finding that matches a
+file's) is refused, so an agent can't hide a set of findings in one call.
 
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it

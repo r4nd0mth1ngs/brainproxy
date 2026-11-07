@@ -540,6 +540,61 @@ fn a_scan_against_a_baseline_file() {
     assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
 }
 
+/// `findings mark --from`: an earlier run's marks, or a list of false positives, onto a fresh
+/// project's findings, so its reports and gate agree with what was triaged before.
+#[test]
+fn marks_from_a_file() {
+    let first = Env::new("mark-from");
+    first.send("/fp");
+    first.send("/ok");
+    for id in first.ids_on("/fp") {
+        ok(&first.project, &["findings", "mark", &id.to_string(), "--state", "false_positive"]);
+    }
+    let known = first.save_baseline("known.json");
+
+    let next = Env::on("mark-from-run", first.port);
+    next.send("/fp");
+    next.send("/ok");
+    next.send("/listed");
+    let v = ok(&next.project, &["findings", "mark", "--from", &known]);
+    let mut fp = next.ids_on("/fp");
+    fp.sort();
+    let marked: Vec<i64> = v["data"]["marked"].as_array().unwrap().iter().map(|c| c["id"].as_i64().unwrap()).collect();
+    assert_eq!(marked, fp, "{v}");
+    assert!(v["data"]["marked"].as_array().unwrap().iter().all(|c| c["from"] == "open" && c["to"] == "false_positive"));
+    // Open findings in the file carry no mark; marking again changes nothing.
+    assert_eq!(ok(&next.project, &["findings", "mark", "--from", &known])["data"]["marked"], serde_json::json!([]));
+
+    // A list: the same identity (alert, method, URL without its query, parameter).
+    let listed = next.ids_on("/listed");
+    let f = ok(&next.project, &["findings", "show", &listed[0].to_string()])["data"].clone();
+    let list = serde_json::json!([
+        {"alert_ref": f["alert_ref"], "url": format!("{}?x=1", f["url"].as_str().unwrap()), "param": f["param"],
+         "note": "accepted by the team"},
+        {"alert_ref": "10020", "url": "http://127.0.0.1:1/nowhere"},
+    ]);
+    let path = next.path("suppress.json");
+    std::fs::write(&path, list.to_string()).unwrap();
+    let v = ok(&next.project, &["findings", "mark", "--from", &path]);
+    assert_eq!(v["data"]["marked"][0]["id"], listed[0], "{v}");
+    assert_eq!(v["data"]["unmatched"], 1, "{v}");
+    let after = ok(&next.project, &["findings", "show", &listed[0].to_string()]);
+    assert_eq!(after["data"]["state"], "false_positive");
+
+    // --state applies to every match, open ones of a report included.
+    let v = ok(&next.project, &["findings", "mark", "--from", &known, "--state", "confirmed"]);
+    assert!(v["data"]["marked"].as_array().unwrap().iter().all(|c| c["to"] == "confirmed"), "{v}");
+    assert!(!v["data"]["marked"].as_array().unwrap().is_empty());
+
+    // A bad state, an id with --from, neither, and a project file are refused.
+    std::fs::write(&path, r#"[{"alert_ref": "1", "url": "http://a.test/", "state": "removed"}]"#).unwrap();
+    assert_eq!(run(&next.project, &["findings", "mark", "--from", &path]).0, 2);
+    assert_ne!(run(&next.project, &["findings", "mark", "1", "--from", &known]).0, 0);
+    assert_ne!(run(&next.project, &["findings", "mark"]).0, 0);
+    let (code, v) = run(&next.project, &["findings", "mark", "--from", next.project.to_str().unwrap()]);
+    assert_eq!(code, 2, "{v}");
+}
+
 /// A report of one scan leaves out what the project knew before and the scan didn't see again.
 #[test]
 fn report_of_a_scan_lists_what_it_found() {

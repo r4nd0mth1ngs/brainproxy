@@ -1,7 +1,8 @@
 //! CLI for the passive scanner and findings.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use brainproxy_core::scan::compare;
 use brainproxy_core::scan::findings_db::{FindingFilter, ManualFinding};
 use brainproxy_core::scan::passive::{self, PassiveSettings, SETTINGS_KEY};
 use brainproxy_core::store::Store;
@@ -116,13 +117,25 @@ pub enum FindingsCmd {
     Compare(crate::compare_cmd::CompareArgs),
     /// One finding with description, solution, references, and evidence.
     Show { id: i64 },
-    /// Triage a finding.
+    /// Triage a finding, or the findings that match those of a file (--from).
+    #[command(after_help = "--from takes a `report json` (such as the findings an earlier run kept) or a \
+        list of findings: [{\"alert_ref\": \"40018\", \"url\": \"https://a.test/item\", \"method\": \"GET\", \
+        \"param\": \"id\", \"state\": \"false_positive\", \"note\": \"why\"}] (method GET, param empty \
+        and state false_positive when left out; the note is for the list's readers). Findings match as \
+        `findings compare` matches them: alert, method, URL without its query, and parameter. Each \
+        match gets --state when given, else the file's mark where it is confirmed or false_positive. \
+        Removed findings are left as they are. Refused through MCP: an agent marks findings one at a \
+        time, with a note.")]
     Mark {
-        id: i64,
+        #[arg(required_unless_present = "from", conflicts_with = "from")]
+        id: Option<i64>,
         #[arg(long, value_enum)]
         state: Option<StateArg>,
         #[arg(long)]
         note: Option<String>,
+        /// Mark the findings that match those of FILE (see below).
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
     },
     /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
@@ -305,6 +318,29 @@ pub enum StateArg {
     Confirmed,
     #[value(alias = "false_positive")]
     FalsePositive,
+}
+
+/// `findings mark --from FILE`: the marks of FILE's findings onto the project's that match them.
+fn mark_from(store: &Store, path: &Path, state: Option<&str>, note: Option<&str>, out: &Out) -> Result<(), Error> {
+    if crate::mcp::in_tool_call() {
+        return Err(Error::InvalidInput(
+            "findings mark --from is refused through MCP: mark findings one at a time, with a note".into(),
+        ));
+    }
+    let set = compare::load_marks(path)?;
+    let (changes, unmatched) = compare::plan_marks(store, &set.items, state)?;
+    for c in &changes {
+        store.finding_mark(c.id, Some(&c.to), note)?;
+    }
+    let data = json!({"marked": changes, "unmatched": unmatched, "warnings": set.warnings});
+    out.ok(data, || {
+        let mut lines: Vec<String> =
+            changes.iter().map(|c| format!("{:<6} {} -> {}  {} {}", c.id, c.from, c.to, c.alert_ref, c.url)).collect();
+        lines.push(format!("marked {} finding(s); {unmatched} in the file matched none", changes.len()));
+        lines.extend(set.warnings.iter().map(|w| format!("warning: {w}")));
+        lines.join("\n")
+    });
+    Ok(())
 }
 
 pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), Error> {
@@ -523,15 +559,19 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let f = store.finding_get(id)?;
             out.ok(f.clone(), || serde_json::to_string_pretty(&f).unwrap_or_default());
         }
-        FindingsCmd::Mark { id, state, note } => {
-            if state.is_none() && note.is_none() {
-                return Err(Error::InvalidInput("give --state and/or --note".into()));
-            }
+        FindingsCmd::Mark { id, state, note, from } => {
             let state = state.map(|s| match s {
                 StateArg::Open => "open",
                 StateArg::Confirmed => "confirmed",
                 StateArg::FalsePositive => "false_positive",
             });
+            if let Some(path) = from {
+                return mark_from(&store, &path, state, note.as_deref(), out);
+            }
+            let id = id.expect("clap requires an id without --from");
+            if state.is_none() && note.is_none() {
+                return Err(Error::InvalidInput("give --state and/or --note".into()));
+            }
             store.finding_mark(id, state, note.as_deref())?;
             out.ok(json!({"id": id, "state": state, "note": note}), || format!("updated finding {id}"));
         }

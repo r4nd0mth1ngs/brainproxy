@@ -42,7 +42,8 @@ pub struct Item {
 }
 
 impl Item {
-    fn key(&self) -> String {
+    /// The identity findings match by: alert, method, URL without its query, and parameter.
+    pub fn key(&self) -> String {
         dedupe_key(&self.alert_ref, &self.method, &self.url, &self.param)
     }
 
@@ -397,6 +398,124 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
         .collect();
     let tombstones = report.filters["state"].as_str() == Some("all");
     Ok(LoadedSet { items, warnings, tombstones })
+}
+
+/// Findings to copy marks from (`findings mark --from`): a `report json`, as [`load_set`] reads it,
+/// or a list of `{"alert_ref", "url", "method", "param", "state"}` (method GET, param empty and
+/// state false_positive when left out), such as a team's list of known false positives.
+pub fn load_marks(path: &Path) -> Result<LoadedSet> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::NotFound(format!("findings file {}", path.display())));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !bytes.trim_ascii_start().starts_with(b"[") {
+        return load_set(path);
+    }
+    let list: Vec<Mark> = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::InvalidInput(format!("{}: not a list of findings ({{alert_ref, url, ...}}): {e}", path.display()))
+    })?;
+    let mut items = Vec::with_capacity(list.len());
+    for m in list {
+        if !matches!(m.state.as_str(), "open" | "confirmed" | FALSE_POSITIVE) {
+            return Err(Error::InvalidInput(format!(
+                "{}: state {:?} for {} {}: give open, confirmed, or false_positive",
+                path.display(),
+                m.state,
+                m.alert_ref,
+                m.url
+            )));
+        }
+        items.push(Item {
+            id: None,
+            name: m.alert_ref.clone(),
+            alert_ref: m.alert_ref,
+            risk: String::new(),
+            confidence: String::new(),
+            source: String::new(),
+            method: m.method.to_ascii_uppercase(),
+            url: m.url,
+            param: m.param,
+            state: m.state,
+            origin: None,
+            rule_id: None,
+        });
+    }
+    Ok(LoadedSet { items, warnings: vec![], tombstones: false })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Mark {
+    alert_ref: String,
+    url: String,
+    #[serde(default = "default_method")]
+    method: String,
+    #[serde(default)]
+    param: String,
+    #[serde(default = "default_mark")]
+    state: String,
+    /// Why, for whoever keeps the list; not copied onto the finding.
+    #[serde(default, rename = "note")]
+    _note: Option<String>,
+}
+
+fn default_method() -> String {
+    "GET".into()
+}
+
+fn default_mark() -> String {
+    FALSE_POSITIVE.into()
+}
+
+/// A mark to give one of the project's findings.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MarkChange {
+    pub id: i64,
+    pub alert_ref: String,
+    pub url: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// The marks `marks` gives the project's findings with the same key: `state` for every match when
+/// given, else each one's own state where it is confirmed or false_positive (an open finding in a
+/// report carries no mark). Removed findings, and those that already have the state, are left as
+/// they are. Also returns how many of `marks` matched none of the project's findings.
+pub fn plan_marks(store: &Store, marks: &[Item], state: Option<&str>) -> Result<(Vec<MarkChange>, usize)> {
+    let mut want: HashMap<String, &str> = HashMap::new();
+    for m in marks.iter().filter(|m| !m.removed()) {
+        let to = match state {
+            Some(s) => s,
+            None if m.false_positive() || m.state == "confirmed" => m.state.as_str(),
+            None => continue,
+        };
+        // The same finding twice with different marks: a false positive wins, as in `rekey_findings`.
+        let e = want.entry(m.key()).or_insert(to);
+        if to == FALSE_POSITIVE {
+            *e = to;
+        }
+    }
+    let mut changes = Vec::new();
+    let mut matched = HashSet::new();
+    for f in project_items(store)?.into_iter().filter(|f| !f.removed()) {
+        let key = f.key();
+        let Some(&to) = want.get(&key) else { continue };
+        matched.insert(key);
+        if f.state != to {
+            changes.push(MarkChange {
+                id: f.id.unwrap_or_default(),
+                alert_ref: f.alert_ref,
+                url: f.url,
+                from: f.state,
+                to: to.into(),
+            });
+        }
+    }
+    changes.sort_by_key(|c| c.id);
+    Ok((changes, want.len() - matched.len()))
 }
 
 /// The parts of a `report json` that identify its findings.

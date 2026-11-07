@@ -1597,6 +1597,28 @@ in `summary.other`, not as fixed. `data.baseline` is the scan, with `report` nam
 brainproxy --project run.bpdb findings compare --scan 1 --baseline known.json --fail-on high --new-only
 ```
 
+A fresh project starts with every finding open, so its reports would show what earlier runs marked
+as false positives. `findings mark --from FILE` copies the marks first: each of the project's
+findings that matches one of FILE's (alert, method, URL without its query, and parameter, as
+`compare` matches them) gets that finding's mark where it is `confirmed` or `false_positive`, or
+`--state` for every match. FILE is a `report json`, or a list a team keeps of the findings it has
+accepted:
+
+```json
+[{"alert_ref": "10038-1", "url": "https://shop.test/", "note": "CSP set by the CDN"},
+ {"alert_ref": "40018", "method": "POST", "url": "https://shop.test/search", "param": "q", "state": "false_positive"}]
+```
+
+`method` defaults to GET, `param` to empty and `state` to `false_positive`; `note` is for the
+list's readers and isn't copied. Removed findings are left as they are. The output lists each
+change (`marked`: id, from, to) and how many of the file's findings matched none (`unmatched`).
+Refused through MCP: an agent marks findings one at a time, with a note.
+
+```bash
+brainproxy --project run.bpdb findings mark --from known.json
+brainproxy --project run.bpdb findings mark --from accepted.json
+```
+
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Compared, and the gate (if any) passed |
