@@ -1100,7 +1100,9 @@ show existing alerts as closed and opened again. A URL without path parameters h
 hash as under v2, so only those findings change in `report json`, `report defectdojo` and
 baselines: write a baseline again after updating, or they show as new and fixed once. A
 project opened by this version merges the findings it stored once per session id, keeping
-the latest state and note, the summed hits and the highest risk.)
+the latest state and note, the summed hits and the highest risk; a merged finding goes to the
+issue that holds a title, rating or write-up and would otherwise be left with no findings. A
+URL fragment's parameters (`#/view;id=1`, a client-side route) stay part of the identity.)
 A result marked false positive or accepted risk (in a report written with `--state all`)
 carries `suppressions` (`kind` external, `status` accepted, the note as `justification`), so
 code scanning shows it as dismissed rather than open.

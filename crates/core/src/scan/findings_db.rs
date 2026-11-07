@@ -177,16 +177,33 @@ pub(crate) fn mark_with(
 /// each session, and would make the same finding a new one every time. A URL with neither
 /// keys as it did before, so its fingerprint stays the same.
 pub(crate) fn dedupe_key(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
+    format!("{alert_ref}|{method}|{}|{param}", identity_url(url))
+}
+
+/// A finding's URL as its identity sees it ([`dedupe_key`]): without the query or the path's
+/// `;name=value` parameters. What a request has to go to, to be one to the finding's address.
+pub(crate) fn identity_url(url: &str) -> std::borrow::Cow<'_, str> {
+    without_path_params(url.split('?').next().unwrap_or(url))
+}
+
+/// The key before schema v18, which kept path parameters. The v10 migration re-keys with it,
+/// so its plainer merge (no notes, provenance or risk kept) only joins what v2 joined; v18
+/// then merges the rest with everything kept.
+fn dedupe_key_v2(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
     let base = url.split('?').next().unwrap_or(url);
-    format!("{alert_ref}|{method}|{}|{param}", without_path_params(base))
+    format!("{alert_ref}|{method}|{base}|{param}")
 }
 
 /// `url` without the `;name=value` parameters of its path segments: `/a;jsessionid=1/b` is
 /// `/a/b`. A `;` piece with no `=` stays, since it isn't a parameter and may be part of a name.
+/// A fragment is left as it is: a client-side route (`#/view;id=1`) never reaches the server,
+/// and its parameters tell routes apart.
 fn without_path_params(url: &str) -> std::borrow::Cow<'_, str> {
-    if !url.contains(';') {
+    let cut = url.find('#').unwrap_or(url.len());
+    if !url[..cut].contains(';') {
         return url.into();
     }
+    let (url, fragment) = url.split_at(cut);
     // The authority (which could hold a `;` in a user name) is left as it is.
     let path_at = url.find("://").map_or(0, |i| url[i + 3..].find('/').map_or(url.len(), |j| i + 3 + j));
     let (origin, path) = url.split_at(path_at);
@@ -202,7 +219,7 @@ fn without_path_params(url: &str) -> std::borrow::Cow<'_, str> {
             kept
         })
         .collect();
-    format!("{origin}{}", path.join("/")).into()
+    format!("{origin}{}{fragment}", path.join("/")).into()
 }
 
 /// A finding's identity ([`dedupe_key`]) as a hash: what reports export (SARIF's
@@ -232,7 +249,7 @@ pub(crate) fn rekey_findings(conn: &rusqlite::Connection) -> Result<()> {
         )?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            let key = dedupe_key(
+            let key = dedupe_key_v2(
                 &r.get::<_, String>(1)?,
                 &r.get::<_, String>(2)?,
                 &r.get::<_, String>(3)?,
@@ -288,13 +305,14 @@ pub(crate) fn rekey_v18(conn: &rusqlite::Connection) -> Result<()> {
         risk_level: i64,
         state: (String, Option<String>, Option<String>),
         note: (Option<String>, Option<String>, Option<String>),
+        issue: Option<i64>,
     }
     let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
     {
         let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut stmt = conn.prepare(
             "SELECT id, dedupe, source, alert_ref, method, url, param, hits, history_id, last_history_id, risk,
-                risk_level, state, state_origin, state_changed_at, note, note_origin, note_changed_at
+                risk_level, state, state_origin, state_changed_at, note, note_origin, note_changed_at, issue_id
              FROM findings WHERE state != 'removed' ORDER BY id",
         )?;
         let mut rows = stmt.query([])?;
@@ -316,6 +334,7 @@ pub(crate) fn rekey_v18(conn: &rusqlite::Connection) -> Result<()> {
                 risk_level: r.get(11)?,
                 state: (r.get(12)?, r.get(13)?, r.get(14)?),
                 note: (r.get(15)?, r.get(16)?, r.get(17)?),
+                issue: r.get(18)?,
             };
             let at = *index.entry(key.clone()).or_insert_with(|| {
                 groups.push((key, Vec::new()));
@@ -350,6 +369,7 @@ pub(crate) fn rekey_v18(conn: &rusqlite::Connection) -> Result<()> {
         let riskiest = rows.iter().max_by_key(|r| r.risk_level).unwrap_or(&rows[0]);
         let hits: i64 = rows.iter().map(|r| r.hits).sum();
         let (mut first, mut last) = (rows.iter().find_map(|r| r.history_id), rows.iter().filter_map(|r| r.last).max());
+        let issue = merged_issue(conn, &rows.iter().map(|r| (r.id, r.issue)).collect::<Vec<_>>())?;
         for d in &dropped {
             conn.execute("UPDATE finding_events SET finding_id = ?1 WHERE finding_id = ?2", [kept.id, d.id])?;
             // One scan's view of the merged finding: found (new, then still) beats not found.
@@ -386,10 +406,25 @@ pub(crate) fn rekey_v18(conn: &rusqlite::Connection) -> Result<()> {
                 )?;
             }
         }
+        if issue != kept.issue {
+            // Recorded with no origin, like the events v15 built: no one made this move.
+            let ids = rows[1..].iter().map(|r| r.id.to_string()).collect::<Vec<_>>().join(", ");
+            conn.execute(
+                "INSERT INTO finding_events (finding_id, issue_id, kind, old, new, text)
+                 VALUES (?1, ?2, 'moved', ?3, ?4, ?5)",
+                params![
+                    kept.id,
+                    issue,
+                    kept.issue.map(|i| i.to_string()),
+                    issue.map(|i| i.to_string()),
+                    format!("merged with finding {ids}: the same finding with another session id in its path")
+                ],
+            )?;
+        }
         conn.execute(
             "UPDATE findings SET dedupe = ?1, hits = ?2, history_id = ?3, last_history_id = ?4, risk = ?5,
                 risk_level = ?6, state = ?7, state_origin = ?8, state_changed_at = ?9, note = ?10, note_origin = ?11,
-                note_changed_at = ?12
+                note_changed_at = ?12, issue_id = ?14
              WHERE id = ?13",
             params![
                 key,
@@ -404,11 +439,41 @@ pub(crate) fn rekey_v18(conn: &rusqlite::Connection) -> Result<()> {
                 note.0,
                 note.1,
                 note.2,
-                kept.id
+                kept.id,
+                issue
             ],
         )?;
     }
     Ok(())
+}
+
+/// The issue a merged finding goes in, given its rows (id, issue) first row first: its first
+/// row's, unless merging would leave another of their issues with no findings while that issue
+/// holds a person's records (a title, a CVSS rating, a write-up or its own events). Then that
+/// one, so its records still belong to an issue with findings, as `issue show` and reports need.
+fn merged_issue(conn: &rusqlite::Connection, rows: &[(i64, Option<i64>)]) -> Result<Option<i64>> {
+    let first = rows[0].1;
+    let ids = serde_json::to_string(&rows.iter().map(|r| r.0).collect::<Vec<_>>()).unwrap_or_default();
+    let mut seen = Vec::new();
+    for issue in rows.iter().filter_map(|r| r.1).filter(|&i| Some(i) != first) {
+        if seen.contains(&issue) {
+            continue;
+        }
+        seen.push(issue);
+        let stranded: bool = conn.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM findings WHERE issue_id = ?1 AND state != 'removed'
+                    AND id NOT IN (SELECT value FROM json_each(?2)))
+                AND EXISTS (SELECT 1 FROM issues WHERE id = ?1 AND (title IS NOT NULL OR cvss_vector IS NOT NULL
+                    OR narrative IS NOT NULL OR EXISTS (SELECT 1 FROM finding_events e
+                        WHERE e.issue_id = ?1 AND e.finding_id IS NULL)))",
+            params![issue, ids],
+            |r| r.get(0),
+        )?;
+        if stranded {
+            return Ok(Some(issue));
+        }
+    }
+    Ok(first)
 }
 
 /// The history entries a finding links: a finding added by hand keeps the whole list in meta
@@ -1691,6 +1756,9 @@ mod tests {
         assert_eq!(key("http://a.test/x?a=1;b=2"), "1|GET|http://a.test/x|p");
         assert_eq!(key("http://u;x=1@a.test/x"), "1|GET|http://u;x=1@a.test/x|p");
         assert_eq!(key("http://a.test"), "1|GET|http://a.test|p");
+        // A fragment is a client-side route: its parameters stay, the path's before it go.
+        assert_eq!(key("http://a.test/#/view;id=1"), "1|GET|http://a.test/#/view;id=1|p");
+        assert_eq!(key("http://a.test/x;s=1#/v;id=2"), "1|GET|http://a.test/x#/v;id=2|p");
         // A URL without path parameters keys as before, so its fingerprint doesn't change.
         use sha2::{Digest, Sha256};
         let v2 = hex::encode(&Sha256::digest(b"10037|GET|http://a.test/a|")[..16]);
@@ -1783,6 +1851,65 @@ mod tests {
         assert_eq!(after, tombstone);
         rekey_v18(&s.conn).unwrap();
         assert_eq!(s.finding_get(a).unwrap()["hits"], 3);
+    }
+
+    #[test]
+    fn an_older_project_s_v10_step_leaves_session_ids_to_v18() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/a");
+        seen_at(&mut s, "/b");
+        let ids: Vec<i64> = xpb(&s).iter().map(|f| f["id"].as_i64().unwrap()).collect();
+        for (id, sid, risk, level) in [(ids[0], "A", "low", 1), (ids[1], "B", "high", 3)] {
+            s.conn
+                .execute(
+                    "UPDATE findings SET url = ?1, dedupe = 'old-' || id, risk = ?2, risk_level = ?3 WHERE id = ?4",
+                    params![format!("http://app.test/login;jsessionid={sid}"), risk, level, id],
+                )
+                .unwrap();
+        }
+        s.finding_mark(ids[1], None, Some("seen on login")).unwrap();
+        // v10's merge keeps neither notes nor the higher risk, so it only joins what v2 joined
+        // (the query): the session ids are v18's to merge, with both kept.
+        rekey_findings(&s.conn).unwrap();
+        assert_eq!(xpb(&s).len(), 2);
+        rekey_v18(&s.conn).unwrap();
+        let f = s.finding_get(ids[0]).unwrap();
+        assert_eq!(
+            (f["risk"].as_str(), f["note"].as_str(), f["hits"].as_i64()),
+            (Some("high"), Some("seen on login"), Some(2))
+        );
+    }
+
+    #[test]
+    fn a_merge_keeps_an_issue_s_records_with_its_finding() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/a");
+        seen_at(&mut s, "/b");
+        seen_at(&mut s, "/c");
+        let ids: Vec<i64> = xpb(&s).iter().map(|f| f["id"].as_i64().unwrap()).collect();
+        // b was split into an issue of its own with a write-up; a stays with c. As v17 keyed
+        // them, a and b are two findings; now they are one.
+        let split = s.issue_split(&[ids[1]], Some("Login page")).unwrap();
+        s.issue_set_narrative(split, "Shown on the login page.").unwrap();
+        for (id, sid) in [(ids[0], "A"), (ids[1], "B")] {
+            s.conn
+                .execute(
+                    "UPDATE findings SET url = ?1, dedupe = 'old-' || id WHERE id = ?2",
+                    params![format!("http://app.test/login;jsessionid={sid}"), id],
+                )
+                .unwrap();
+        }
+        let first = s.finding_get(ids[0]).unwrap()["issue_id"].as_i64().unwrap();
+        rekey_v18(&s.conn).unwrap();
+        // Moved to the split issue, which would otherwise have no findings and hide its
+        // write-up; the move says why.
+        let got = s.issue_get(split).unwrap();
+        assert_eq!(got["findings"][0]["id"], ids[0]);
+        assert_eq!(s.issue_narrative(split).unwrap().unwrap().text, "Shown on the login page.");
+        let last = s.finding_events(ids[0]).unwrap().pop().unwrap();
+        assert_eq!((last["kind"].as_str(), last["old"].as_str()), (Some("moved"), Some(first.to_string().as_str())));
+        assert!(last["origin"].is_null() && last["text"].as_str().unwrap().contains("session id"), "{last}");
+        assert_eq!(s.issue_finding_ids(first).unwrap(), [ids[2]]);
     }
 
     #[test]
