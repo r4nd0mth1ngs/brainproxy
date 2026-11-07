@@ -75,7 +75,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, cvss, narrative, reviewed, ticket, removed"),
+    ("kind", "TEXT", "created, state, note, retest, regressed, moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
     ("old", "TEXT", "Value before (a state, a note, an issue id)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),

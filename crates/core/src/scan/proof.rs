@@ -224,10 +224,13 @@ impl Store {
         Ok(row)
     }
 
-    /// Sets the executive summary ("" clears it); a new text is a draft until reviewed.
+    /// Sets the executive summary ("" clears it); a new text is a draft until reviewed. Each
+    /// change is an event with no finding or issue (kind `summary`), so it has a timeline too.
     pub fn summary_set(&self, text: &str) -> Result<()> {
         check_text(text)?;
-        match Some(text.trim()).filter(|t| !t.is_empty()) {
+        let text = Some(text.trim()).filter(|t| !t.is_empty());
+        record(&self.conn, &Event { kind: "summary", text, ..Default::default() })?;
+        match text {
             None => self.meta_set(SUMMARY_KEY, None),
             Some(t) => {
                 let at: String =
@@ -264,6 +267,7 @@ impl Store {
             "UPDATE meta SET value = ?1 WHERE key = ?2",
             params![serde_json::to_string(&n).unwrap_or_default(), SUMMARY_KEY],
         )?;
+        record(&tx, &Event { kind: "summary_reviewed", ..Default::default() })?;
         tx.commit()?;
         Ok(())
     }
@@ -272,19 +276,35 @@ impl Store {
     /// request counts when it went to the finding's own method and URL (any query): history
     /// keeps every one, where the finding keeps only its latest sighting.
     pub fn agent_touched(&self, ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
+        use std::collections::HashSet;
         let list = serde_json::to_string(ids).unwrap_or_default();
-        let mut stmt = self.conn.prepare(
-            "SELECT f.id FROM (SELECT id, origin, source, issue_id, host, method,
-                    CASE WHEN instr(url, '?') > 0 THEN substr(url, 1, instr(url, '?') - 1) ELSE url END AS base
-                 FROM findings WHERE id IN (SELECT value FROM json_each(?1))) f
-             WHERE (f.origin = 'mcp' AND f.source = 'manual')
+        let base = |col: &str| {
+            format!("CASE WHEN instr({col}, '?') > 0 THEN substr({col}, 1, instr({col}, '?') - 1) ELSE {col} END")
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.id, f.host, f.method, {}, (f.origin = 'mcp' AND f.source = 'manual')
                 OR EXISTS (SELECT 1 FROM finding_events e WHERE e.origin = 'mcp' AND e.kind NOT IN ('created', 'regressed')
                     AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id)))
-                OR EXISTS (SELECT 1 FROM history h WHERE h.origin = 'mcp' AND h.host = f.host AND h.method = f.method
-                    AND (h.url = f.base OR substr(h.url, 1, length(f.base) + 1) = f.base || '?'))",
-        )?;
-        let rows = stmt.query_map([list], |r| r.get(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+             FROM findings f WHERE f.id IN (SELECT value FROM json_each(?1))",
+            base("f.url")
+        ))?;
+        type Row = (i64, String, String, String, bool);
+        let found: Vec<Row> = stmt
+            .query_map([list], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut touched: HashSet<i64> = found.iter().filter(|f| f.4).map(|f| f.0).collect();
+        if found.iter().all(|f| f.4) {
+            return Ok(touched);
+        }
+        // The addresses the agent sent requests to, read once rather than once per finding.
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT DISTINCT host, method, {} FROM history WHERE origin = 'mcp'", base("url")))?;
+        let sent: HashSet<(String, String, String)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+        touched
+            .extend(found.into_iter().filter(|f| sent.contains(&(f.1.clone(), f.2.clone(), f.3.clone()))).map(|f| f.0));
+        Ok(touched)
     }
 
     /// What an agent did for finding `id` (see [`AgentTrail`]): its changes to the finding and
@@ -495,6 +515,17 @@ mod tests {
         assert!(s.summary().unwrap().unwrap().reviewed());
         s.summary_set("").unwrap();
         assert!(s.summary().unwrap().is_none());
+        // Each change and the review are on record.
+        let kinds: Vec<String> = s
+            .conn
+            .prepare("SELECT kind FROM finding_events WHERE kind LIKE 'summary%' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(kinds.last().map(String::as_str), Some("summary"));
+        assert!(kinds.iter().any(|k| k == "summary_reviewed"), "{kinds:?}");
     }
 
     #[test]

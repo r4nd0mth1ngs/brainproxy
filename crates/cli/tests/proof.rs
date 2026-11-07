@@ -154,7 +154,12 @@ fn narratives_trails_repro_tickets_and_exports() {
     ok(&project, &["findings", "ticket", &f, "--record", "https://tracker.test/i/1?token=TICKETSECRET77"]);
     assert!(!html(&[]).contains("TICKETSECRET77"));
     let t = ok(&project, &["findings", "ticket", &f, "--to", "github", "--repo", "acme/web"]);
-    assert!(t["command"].as_str().unwrap().starts_with("gh issue create --repo 'acme/web' --title '[Low] "), "{t}");
+    let command = t["command"].as_str().unwrap();
+    assert!(command.starts_with(&format!("brainproxy findings ticket {f} --to github --repo 'acme/web' --format json")));
+    assert!(
+        command.contains("| gh issue create --repo 'acme/web' --title '[Low] ") && !command.contains("--label"),
+        "{t}"
+    );
     assert!(t["body"].as_str().unwrap().contains("fingerprint `"));
     assert!(t["body"].as_str().unwrap().contains("**Where:** `GET http://127.0.0.1:"), "{t}");
     let j = ok(&project, &["findings", "ticket", &f, "--to", "jira", "--key", "SEC"]);

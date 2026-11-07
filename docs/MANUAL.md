@@ -1642,7 +1642,7 @@ finding, with masked secrets still masked), `retest` (fixed, still there, back a
 and awaiting a retest since `--since DAY`, default the last 30 days, each with the retest
 request as proof), `about`. `evidence` and `reproduce` sit in the issue sections, so
 either brings `issues` with it. The curl lines send the request as recorded
-(`--globoff --path-as-is`, the recorded `Host`), masked secrets still masked.
+(`--globoff --path-as-is`, the URL after `--url`, the recorded `Host`), masked secrets still masked.
 
 Branding: `--company NAME` on the cover, `--accent #rrggbb` for the cover and headings,
 `--logo FILE` (PNG, JPEG, GIF or WebP, at most 256 KiB, embedded; SVG is refused because it
@@ -1693,9 +1693,11 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   has to start from the original request: the command says which history id to give it).
 - **Tickets** (`findings ticket ID --to github --repo OWNER/NAME` or `--to jira --key KEY`):
   a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
-  reproduce it, its fingerprint) and the command that files it (`gh issue create`, or Jira's
-  REST call; its description is a `{noformat}` block, so nothing the target sent is read as
-  Jira markup). Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
+  reproduce it, its fingerprint) and the command that files it: this command again, piped
+  through `jq` into `gh issue create` or Jira's REST call (run it where the project is open).
+  The Jira description is a `{noformat}` block, so nothing the target sent is read as Jira
+  markup. The GitHub command adds no labels, since `gh` refuses one the repository lacks;
+  `labels` lists the suggested ones. Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
   timeline and in reports; it is refused through MCP, since the link would reach reports
   without a person reading it. *Copy ticket* in the app copies the GitHub version.
 - **Exports**: `report csv` (a row per finding; cells starting `=`, `+`, `-` or `@` are
@@ -1703,9 +1705,11 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   finding still to fix, skipped once closed) and `report defectdojo` (DefectDojo's Generic
   Findings Import JSON with its own name and type, `brainproxy`, and the fingerprint as
   `unique_id_from_tool`). DefectDojo deduplicates Generic Findings Import by a hash that
-  includes the description by default, so a changed write-up or note would look new: set
-  `DD_DEDUPLICATION_ALGORITHM_PER_PARSER` to use `unique_id_from_tool` for this scan type to
-  have a re-import update its findings. Every export names a finding by the same fingerprint
+  includes the description by default, so a changed write-up or note would look new. The
+  setting is per scan type, and the scan type is Generic Findings Import whatever tool wrote
+  the file, so choose one that still works for your other generic imports:
+  `DD_DEDUPLICATION_ALGORITHM_PER_PARSER='{"Generic Findings Import": "unique_id_from_tool_or_hash_code"}'`
+  matches brainproxy's findings by fingerprint and the others by hash as before. Every export names a finding by the same fingerprint
   as `report json`, SARIF and tickets.
 
 ### Comparing findings and failing a build (`findings compare`)

@@ -196,8 +196,8 @@ impl Layout {
                 && b[4] == b'-'
                 && b[7] == b'-'
                 && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
-                && (1..=12).contains(&num(5..7))
-                && (1..=31).contains(&num(8..10));
+                && time::Month::try_from(num(5..7) as u8)
+                    .is_ok_and(|m| (1..=m.length(num(0..4) as i32) as u32).contains(&num(8..10)));
             if !shaped {
                 return Err(Error::InvalidInput(format!("since {d:?}: give a day as YYYY-MM-DD")));
             }
@@ -272,6 +272,10 @@ impl Store {
         let name = name.trim();
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidInput("a profile name has 1 to 64 characters".into()));
+        }
+        // A leading "-" would be read as a flag wherever the name is passed on its own.
+        if name.starts_with('-') || name.chars().any(char::is_control) {
+            return Err(Error::InvalidInput("a profile name can't start with - or hold control characters".into()));
         }
         layout.validate()?;
         let json = serde_json::to_string(layout).map_err(|e| Error::InvalidInput(e.to_string()))?;
@@ -378,6 +382,8 @@ mod tests {
         assert!(bad(Layout { since: Some("last week".into()), ..Default::default() }));
         assert!(bad(Layout { since: Some("2026-11-01<script>".into()), ..Default::default() }));
         assert!(bad(Layout { since: Some("2026-13-01".into()), ..Default::default() }));
+        assert!(bad(Layout { since: Some("2026-02-31".into()), ..Default::default() }));
+        assert!(Layout { since: Some("2028-02-29".into()), ..Default::default() }.validate().is_ok());
         assert!(Layout { since: Some("2026-11-01".into()), ..Default::default() }.validate().is_ok());
         assert!(logo_data_uri(b"<svg onload=alert(1)>").is_err());
         let png = logo_data_uri(b"\x89PNG\r\n\x1a\nrest").unwrap();
@@ -393,6 +399,7 @@ mod tests {
         assert_eq!(s.report_profile("board").unwrap(), l);
         assert_eq!(s.report_profiles().unwrap().len(), 1);
         assert!(s.report_profile_save("bad", &Layout { accent: Some("x".into()), ..Default::default() }).is_err());
+        assert!(s.report_profile_save("-x", &Layout::default()).is_err());
         s.report_profile_remove("board").unwrap();
         assert!(matches!(s.report_profile("board"), Err(Error::NotFound(_))));
         s.conn.execute("INSERT INTO issues (alert_ref, host) VALUES ('x', 'a.test')", []).unwrap();

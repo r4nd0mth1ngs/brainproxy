@@ -569,7 +569,9 @@ impl Cvss4 {
         }
         let mean = if n == 0 { 0.0 } else { total / f64::from(n) };
         let score = (value - mean).clamp(0.0, 10.0);
-        (score * 10.0).round() / 10.0
+        // As FIRST's calculator rounds: half up, after adding 1e-6, so a score that floating
+        // point puts just under x.x5 still rounds up.
+        ((score + 1e-6) * 10.0).round() / 10.0
     }
 }
 

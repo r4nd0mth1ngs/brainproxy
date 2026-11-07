@@ -118,6 +118,8 @@ pub struct RetestLetter {
     pub since: String,
     pub fixed: Vec<RetestRow>,
     pub still_present: Vec<RetestRow>,
+    /// Retested and not reproduced, but not marked fixed (`retest --no-mark`).
+    pub not_reproduced: Vec<RetestRow>,
     pub regressed: Vec<RetestRow>,
     pub pending: Vec<RetestRow>,
 }
@@ -641,7 +643,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         let mut ids: Vec<i64> = agent_false_positives.iter().map(|h| h.id).collect();
         let mut sightings = Vec::new();
         if let Some(l) = &retest {
-            for row in [&l.fixed, &l.still_present, &l.regressed, &l.pending].into_iter().flatten() {
+            for row in [&l.fixed, &l.still_present, &l.not_reproduced, &l.regressed, &l.pending].into_iter().flatten() {
                 ids.push(row.id);
                 sightings.extend(row.history_id);
             }
@@ -741,6 +743,8 @@ fn retest_letter(store: &Store, layout: &Layout, scope: &FindingFilter) -> Resul
             letter.fixed.push(item);
         } else if kind == "regressed" {
             letter.regressed.push(item);
+        } else if kind == "retest" {
+            letter.not_reproduced.push(item);
         }
     }
     drop(rows);
@@ -793,7 +797,7 @@ fn redact_findings(
     };
     let mut letter_fields = |red: &mut Redactor, pass: fn(&mut Redactor, &mut String)| {
         if let Some(l) = letter.as_deref_mut() {
-            for list in [&mut l.fixed, &mut l.still_present, &mut l.regressed, &mut l.pending] {
+            for list in [&mut l.fixed, &mut l.still_present, &mut l.not_reproduced, &mut l.regressed, &mut l.pending] {
                 for row in list.iter_mut() {
                     pass(red, &mut row.url);
                     pass(red, &mut row.param);
@@ -1126,6 +1130,11 @@ fn md_escape(s: &str) -> String {
 }
 
 /// Text from our own rule definitions; only table pipes and line breaks need care.
+/// Text someone typed, for one line or a table cell: escaped, its line breaks made spaces.
+fn md_line(s: &str) -> String {
+    md_escape(&s.replace(['\r', '\n'], " "))
+}
+
 fn md_text(s: &str) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
@@ -1144,7 +1153,7 @@ fn markdown(r: &Report) -> String {
     let layout = &r.layout;
     let _ = writeln!(s, "# {}\n", md_text(&r.title));
     if let Some(c) = &layout.company {
-        let _ = writeln!(s, "Security assessment by {}.\n", md_escape(c));
+        let _ = writeln!(s, "Security assessment by {}.\n", md_line(c));
     }
     let _ = writeln!(s, "Generated {} by {} {}.\n", r.generated, r.tool.name, r.tool.version);
     if let Some(scope) = &r.scope {
@@ -1217,7 +1226,7 @@ fn markdown(r: &Report) -> String {
         md_agent_false_positives(&mut s, r);
         return s;
     }
-    if layout.has(Section::List) || layout.has(Section::Summary) {
+    if layout.has(Section::List) {
         // A CVSS column only when a tester rated something.
         let rated = r.alerts.iter().any(|g| g.cvss.is_some());
         s.push_str(if rated {
@@ -1404,6 +1413,7 @@ fn md_retest(s: &mut String, l: &RetestLetter) {
     for (title, rows) in [
         ("Fixed", &l.fixed),
         ("Still there", &l.still_present),
+        ("Not reproduced, not marked fixed", &l.not_reproduced),
         ("Came back after a fix", &l.regressed),
         ("Awaiting a retest", &l.pending),
     ] {
@@ -1421,11 +1431,12 @@ fn md_retest(s: &mut String, l: &RetestLetter) {
             };
             let _ = writeln!(
                 s,
-                "| {} | {} | {} | {} | {what} | {} |",
+                "| {} | {} | {} | {} | {} | {} |",
                 row.id,
-                md_escape(&row.name),
+                md_line(&row.name),
                 risk_title(&row.risk),
                 md_code(&format!("{} {}", row.method, row.url)),
+                md_line(&what),
                 row.history_id.map(|h| format!("history #{h}")).unwrap_or_default()
             );
         }
@@ -2052,7 +2063,7 @@ pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
             "The {s} rule {} raises \"{}\" when it sees this{}.",
             g.alert_ref,
             g.name,
-            if i.evidence.is_empty() { String::new() } else { format!(": the response contains `{}`", i.evidence) }
+            if i.evidence.is_empty() { String::new() } else { format!(": the response contains {}", md_code(&i.evidence)) }
         ),
     };
     Ok(json!({
@@ -2123,30 +2134,47 @@ pub fn ticket(store: &Store, id: i64, tracker: &str, target: Option<&str>) -> Re
     let labels = vec!["security".to_string(), format!("risk:{}", i.risk)];
     Ok(match tracker {
         "github" => {
-            let repo = sh_quote(target.unwrap_or("OWNER/REPO"));
-            let label_args: String = labels.iter().map(|l| format!(" --label {}", sh_quote(l))).collect();
+            let repo = target.unwrap_or("OWNER/REPO");
+            // The body comes from this command again, piped in. No --label: gh refuses a label
+            // the repository doesn't have; `labels` lists them for whoever adds them.
+            let command = format!(
+                "brainproxy findings ticket {} --to github --repo {repo} --format json | jq -r .data.body \\\n  \
+                 | gh issue create --repo {repo} --title {} --body-file -",
+                i.id,
+                sh_quote(&title),
+                repo = sh_quote(repo)
+            );
             json!({
                 "tracker": "github",
                 "title": title,
                 "body": body,
                 "labels": labels,
-                "command": format!("gh issue create --repo {repo} --title {}{label_args} --body-file -", sh_quote(&title)),
+                "command": command,
             })
         }
-        "jira" => json!({
-            "tracker": "jira",
-            "title": title,
-            "body": body,
-            "payload": {"fields": {
-                "project": {"key": target.unwrap_or("KEY")},
-                "summary": title,
-                "description": jira_noformat(&body),
-                "issuetype": {"name": "Bug"},
-                "labels": labels.iter().map(|l| l.replace(':', "-")).collect::<Vec<_>>(),
-            }},
-            "command": "curl -sS -u \"$JIRA_USER:$JIRA_TOKEN\" -H 'Content-Type: application/json' \
-                        -X POST \"$JIRA_URL/rest/api/2/issue\" --data @ticket.json",
-        }),
+        "jira" => {
+            // The payload comes from this command again, piped in.
+            let command = format!(
+                "brainproxy findings ticket {} --to jira --key {} --format json | jq .data.payload \\\n  \
+                 | curl -sS -u \"$JIRA_USER:$JIRA_TOKEN\" -H 'Content-Type: application/json' \\\n  \
+                 -X POST \"$JIRA_URL/rest/api/2/issue\" --data @-",
+                i.id,
+                sh_quote(target.unwrap_or("KEY"))
+            );
+            json!({
+                "tracker": "jira",
+                "title": title,
+                "body": body,
+                "payload": {"fields": {
+                    "project": {"key": target.unwrap_or("KEY")},
+                    "summary": title,
+                    "description": jira_noformat(&body),
+                    "issuetype": {"name": "Bug"},
+                    "labels": labels.iter().map(|l| l.replace(':', "-")).collect::<Vec<_>>(),
+                }},
+                "command": command,
+            })
+        }
         other => return Err(crate::error::Error::InvalidInput(format!("unknown tracker {other:?}: github or jira"))),
     })
 }
@@ -2210,11 +2238,16 @@ fn curl(req: &HttpRequest) -> String {
     // A method token may hold | & $ and backquotes: it is quoted like everything else.
     // --globoff: [ ] { } in the URL (a masked "[redacted]") are text, not curl patterns;
     // --path-as-is: /a/../b is sent as recorded.
-    let mut out = format!("curl -sS --globoff --path-as-is -X {} {}", sh_quote(&req.method), sh_quote(&req.url));
+    // HEAD is -I: with -X HEAD curl waits for a body that never comes. --url: a URL is never
+    // read as an option.
+    let method = if req.method == "HEAD" { "-I".to_string() } else { format!("-X {}", sh_quote(&req.method)) };
+    let mut out = format!("curl -sS --globoff --path-as-is {method} --url {}", sh_quote(&req.url));
     // Host goes as recorded, so a virtual host or Host header test reproduces.
     for (k, v) in &req.headers {
         if !k.eq_ignore_ascii_case("content-length") {
-            out.push_str(&format!(" \\\n  -H {}", sh_quote(&format!("{k}: {v}"))));
+            // "X:" would make curl drop the header; "X;" sends it empty.
+            let h = if v.is_empty() { format!("{k};") } else { format!("{k}: {v}") };
+            out.push_str(&format!(" \\\n  -H {}", sh_quote(&h)));
         }
     }
     if req.body.binary {
@@ -2293,6 +2326,7 @@ fn html_retest(s: &mut String, l: &RetestLetter) {
     for (title, rows) in [
         ("Fixed", &l.fixed),
         ("Still there", &l.still_present),
+        ("Not reproduced, not marked fixed", &l.not_reproduced),
         ("Came back after a fix", &l.regressed),
         ("Awaiting a retest", &l.pending),
     ] {
@@ -2754,8 +2788,16 @@ mod tests {
         };
         assert_eq!(
             curl(&req),
-            "curl -sS --globoff --path-as-is -X 'GET|id' 'http://a.test/it'\\''s' \\\n  -H 'X-A: $(id)' \\\n  -H 'Host: a.test' \\\n  --data-raw 'a'\\''b'"
+            "curl -sS --globoff --path-as-is -X 'GET|id' --url 'http://a.test/it'\\''s' \\\n  -H 'X-A: $(id)' \\\n  -H 'Host: a.test' \\\n  --data-raw 'a'\\''b'"
         );
+        // HEAD is -I, and an empty header is sent empty rather than dropped.
+        let head = HttpRequest {
+            method: "HEAD".into(),
+            url: "http://a.test/".into(),
+            headers: vec![("X-Empty".into(), String::new())],
+            body: Body { text: String::new(), length: 0, truncated: false, binary: false },
+        };
+        assert_eq!(curl(&head), "curl -sS --globoff --path-as-is -I --url 'http://a.test/' \\\n  -H 'X-Empty;'");
         let md = render(&with(&s, Layout { preset: Preset::Developer, ..Default::default() }), ReportKind::Markdown);
         assert!(md.contains("### How to reproduce") && !md.contains("## Summary"));
 
@@ -2783,6 +2825,11 @@ mod tests {
         let letter = r.retest.as_ref().unwrap();
         assert_eq!((letter.fixed.len(), letter.still_present.len()), (0, 1));
         assert_eq!(letter.still_present[0].state, "fixed");
+        // One not reproduced, recorded without marking, has its own list instead of none.
+        s.finding_retested(other, crate::scan::issues::Retest::NotReproduced, Some(1), "GET /", false).unwrap();
+        let r = with(&s, Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() });
+        assert_eq!(r.retest.as_ref().unwrap().not_reproduced.len(), 1);
+        assert!(render(&r, ReportKind::Markdown).contains("### Not reproduced, not marked fixed"));
         // The extra sections keep to the report's filters.
         let other_host = ReportOptions {
             filter: FindingFilter { host: Some("b.test".into()), ..Default::default() },

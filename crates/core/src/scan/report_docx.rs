@@ -220,6 +220,7 @@ pub fn render(r: &Report) -> Vec<u8> {
         for (title, rows) in [
             ("Fixed", &l.fixed),
             ("Still there", &l.still_present),
+            ("Not reproduced, not marked fixed", &l.not_reproduced),
             ("Came back after a fix", &l.regressed),
             ("Awaiting a retest", &l.pending),
         ] {
