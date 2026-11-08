@@ -1050,9 +1050,9 @@ dropped it itself; `edited` says whether it was forwarded with a different messa
 row names the intercept in `edited_by`. A response edited at intercept, or changed by a
 response rule, is recorded in history as the server sent it; the intercept row has the
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
-enabled it. So do auth profiles (`auth show`: `profile.origin`, who saved it last), their
-session rules and macros (`origin`, who added one or last changed it; saving them unchanged
-keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
+enabled it. So do auth profiles (`auth show`: `profile.origin`, who last changed it), their
+session rules and macros (`origin`, who added one or last changed it; saving any of them
+unchanged, as the app's edit form does, keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
 it (logged in, got an OAuth token, or the proxy or a scan that learnt its cookies). A rule id,
 match-and-replace or session rule (of any profile), is never handed out again once its rule is
 removed (or all are cleared), so an old row's `edited_by` can't come to name another rule;

@@ -325,10 +325,17 @@ fn is_zero(n: &u64) -> bool {
 }
 
 impl Store {
-    /// Adds or replaces a profile (keeping no old session state), saved by this process's origin.
+    /// Adds or replaces a profile (keeping no old session state), saved by this process's
+    /// origin; one saved as it was (the app's edit form re-saves it) keeps its own.
     pub fn auth_save_profile(&self, p: &AuthProfile) -> Result<()> {
         p.validate_with(&self.auth_handling(&p.name)?)?;
-        let p = AuthProfile { origin: Some(crate::provenance::origin().to_string()), ..p.clone() };
+        let kept = self
+            .auth_profile(&p.name)
+            .ok()
+            .filter(|(old, _)| *old == AuthProfile { origin: old.origin.clone(), ..p.clone() })
+            .map(|(old, _)| old.origin);
+        let origin = kept.unwrap_or_else(|| Some(crate::provenance::origin().to_string()));
+        let p = AuthProfile { origin, ..p.clone() };
         let json = serde_json::to_string(&p).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO auth_profiles (name, profile, state) VALUES (?1, ?2, '{}')

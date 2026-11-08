@@ -945,6 +945,22 @@ fn the_session_a_proxy_puts_on_requests_says_who_set_it_up() {
 }
 
 #[test]
+fn a_profile_saved_unchanged_keeps_who_saved_it() {
+    let env = Env::new("profile-resave");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    let origin = || env.ok(&[], &["auth", "show", "app"])["profile"]["origin"].clone();
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: k"]);
+    // Re-saved as `auth show` gives it (header values masked), as the app's edit form does.
+    env.ok(&agent, &["auth", "add", "app", "-H", "X-Api-Key: ********"]);
+    assert_eq!(origin(), "gui");
+    env.ok(&agent, &["auth", "add", "app", "-H", "X-Api-Key: other"]);
+    assert_eq!(origin(), "mcp");
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: ********"]);
+    assert_eq!(origin(), "mcp");
+}
+
+#[test]
 fn a_titles_text_filled_in_later_says_who_wrote_it() {
     let env = Env::new("texts");
     let add = |vars: &[(&str, &str)], path: &str, more: &[&str]| {
