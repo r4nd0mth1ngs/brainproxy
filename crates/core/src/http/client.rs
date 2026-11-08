@@ -68,6 +68,56 @@ impl SendOptions {
         }
         Ok(())
     }
+
+    /// The first host `request` names in place of `target`'s that the scope doesn't list by
+    /// name: in a Host header (HTTP/2 sends it as `:authority`) or an absolute request target.
+    /// Nothing refuses one here: a Host-header test needs it, so a command decides (see `send`).
+    pub fn foreign_host(&self, request: &[u8], target: &Target) -> Option<String> {
+        // Like the server name, the Host picks the site on a shared front end, but the
+        // connection still goes to the target, so the scope's own check never sees it.
+        let (head, _) = crate::http::request::split_head_body(request);
+        let head = String::from_utf8_lossy(head);
+        let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+        let request_target = lines.next().and_then(|l| l.split(' ').nth(1)).filter(|t| t.contains("://"));
+        let hosts = lines
+            .take_while(|l| !l.is_empty())
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.trim());
+        let absolute = request_target.and_then(|t| Target::from_url(t).ok()).map(|t| t.host);
+        let named = hosts.filter(|v| !v.is_empty()).map(|v| named_host(v).0);
+        let listed = |name: &str| self.guard.as_ref().is_some_and(|g| g.confirms(name, target.port));
+        absolute.into_iter().chain(named).find(|name| !name.eq_ignore_ascii_case(&target.host) && !listed(name))
+    }
+}
+
+/// The host a Host header's value names, and its port when it gives one. A value that isn't
+/// plainly a `host[:port]` (a placeholder, a regex group reference) is given as it is, and is
+/// never in scope.
+fn named_host(value: &str) -> (String, Option<u16>) {
+    let plain = value.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:[]".contains(c));
+    let parsed = plain.then(|| url::Url::parse(&format!("http://{value}")).ok()).flatten();
+    match parsed.as_ref().and_then(|u| u.host_str().map(|h| (h, u.port()))) {
+        Some((host, port)) => (host.trim_start_matches('[').trim_end_matches(']').to_string(), port),
+        None => (value.to_string(), None),
+    }
+}
+
+/// The host `value` names when the scope doesn't list it by name, for a setting that puts it
+/// in the Host header of requests still to come (an auth profile's header, a signer's, a proxy
+/// rule's), whatever their target. Without a port it is looked up on 443 and 80.
+pub fn unlisted_host(guard: Option<&Guard>, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (name, port) = named_host(value);
+    let listed = |p: u16| guard.is_some_and(|g| g.confirms(&name, p));
+    let ok = match port {
+        Some(p) => listed(p),
+        None => listed(443) || listed(80),
+    };
+    (!ok).then_some(name)
 }
 
 /// A completed round trip.
@@ -875,6 +925,41 @@ mod tests {
         assert!(!ok(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn a_host_the_scope_does_not_list_is_foreign() {
+        let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into(), "app.test".into()], exclude: vec![] };
+        let opts = SendOptions { guard: Some(Guard::from_specs(vec![scope]).unwrap()), ..Default::default() };
+        let target = Target { scheme: "https".into(), host: "127.0.0.1".into(), port: 8443 };
+        let foreign = |req: &str| opts.foreign_host(req.as_bytes(), &target);
+        // The target's own host, with or without a port, and a name the scope lists aren't.
+        assert_eq!(foreign("GET / HTTP/1.1\r\nHost: 127.0.0.1:8443\r\n\r\n"), None);
+        assert_eq!(foreign("GET / HTTP/1.1\r\nHost: APP.test\r\n\r\nHost: body.test"), None);
+        assert_eq!(foreign("GET / HTTP/1.1\r\n\r\n"), None);
+        // Any other is, a second Host or an absolute request target too.
+        assert_eq!(
+            foreign("GET / HTTP/1.1\r\nhost: other-tenant.test:443\r\n\r\n").as_deref(),
+            Some("other-tenant.test")
+        );
+        assert_eq!(foreign("GET / HTTP/1.1\nHost: app.test\nHost: b.test\n\n").as_deref(), Some("b.test"));
+        assert_eq!(foreign("GET http://c.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some("c.test"));
+        // A value that isn't plainly a host is shown as it is.
+        assert_eq!(foreign("GET / HTTP/1.1\r\nHost: app.test/@d.test\r\n\r\n").as_deref(), Some("app.test/@d.test"));
+        // A value a setting puts in requests to come, whatever their target.
+        let guard = opts.guard.as_deref();
+        assert_eq!(unlisted_host(guard, " app.TEST:8443 "), None);
+        assert_eq!(unlisted_host(guard, "127.0.0.1"), None);
+        assert_eq!(unlisted_host(guard, ""), None);
+        assert_eq!(unlisted_host(guard, "other-tenant.test").as_deref(), Some("other-tenant.test"));
+        assert_eq!(unlisted_host(guard, "{{host}}").as_deref(), Some("{{host}}"));
+        assert_eq!(unlisted_host(None, "app.test").as_deref(), Some("app.test"));
+        // Without a scope nothing is listed.
+        let none = SendOptions::default();
+        assert_eq!(
+            none.foreign_host(b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", &target).as_deref(),
+            Some("app.test")
+        );
     }
 
     /// A keep-alive server; with `drop_idle` it closes each connection after one

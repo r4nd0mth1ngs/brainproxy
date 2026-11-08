@@ -642,6 +642,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let send_opts = args.req.send_options(guard);
     // So is a server name the scope doesn't list, before a row could say it was sent.
     send_opts.check_sni(&target)?;
+    // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test.
+    let host_warning = mcp::check_host_header(&send_opts, req.as_bytes(), &target, args.req.host_header_test, out)?;
     let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
         // Its logins, checks and macros keep no content either.
@@ -658,7 +660,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             }
             None => req,
         };
-        return race(project, &args, req, target, client, n, h2, out);
+        return race(project, &args, req, target, client, n, h2, host_warning, out);
     }
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
@@ -735,6 +737,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Err(e) = saved {
         data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
     }
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
+    }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
 }
@@ -774,6 +779,7 @@ fn race(
     client: Client,
     n: usize,
     h2: bool,
+    host_warning: Option<String>,
     out: &Out,
 ) -> Result<(), Error> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
@@ -872,6 +878,9 @@ fn race(
     });
     if new_findings > 0 {
         data["new_findings"] = json!(new_findings);
+    }
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
     }
     out.ok(data.clone(), || {
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();

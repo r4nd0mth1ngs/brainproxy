@@ -157,6 +157,29 @@ changed**. brainproxy refuses every request outside it, including redirects, lin
 by the crawler, and requests from a browser using the proxy. For a different scope, start
 a new engagement.
 
+The scope decides where a connection goes: the target's address and, over TLS, a server name
+set with `--sni` (one other than the target's must be listed by name). It does not refuse a
+`Host` header (HTTP/2 sends it as `:authority`) or an absolute URL in the request line that names
+another host, as Host-header injection tests need one. On a shared front end (a CDN or load
+balancer) such a request to an in-scope address can still reach a site outside the scope, so
+`send` (races too), `fuzz run`, `ws send` and an edited request forwarded with `intercept
+forward` warn when the host they name isn't the target's and isn't listed by name: in the
+output's `host_warning`, and on stderr in text mode. A payload position in the Host header
+counts as such a host. Settings that put a Host on requests still to come are checked the same
+way when they are saved: an auth profile's `--header` or `--token-header`, its login request and
+`--login-header` (the login URL's own host is fine), a macro's steps (`auth macro add`), and a
+proxy rule (`rules add`, or `rules enable` of a disabled one) whose replacement writes a Host line
+or an absolute URL, or that rewrites the Host of a request to a host the engagement lists. A rule
+can match anything, so that last check isn't proof. Session rules and signers can't set the Host
+at all. Saving a setting again with the Host it already had isn't checked again. Through MCP all
+of these are refused unless `--host-header-test` says the test is meant, so the intent is on
+record (see [Agents and MCP](#agents-and-mcp)).
+
+Not checked: active scan rules and check templates that put a host of their own in the Host
+header (Cloud Metadata names the metadata service, for one; `scan active --inject-header Host`
+puts payloads there), which are Host-header tests by nature and connect to the scanned in-scope
+host; and requests sent again as they were recorded (`findings retest`, a scan of history rows).
+
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
 recorded and intercepted. It is empty by default, which means everything the engagement
 allows. Traffic outside it still goes out and leaves a row in history, with only its request
@@ -1997,7 +2020,9 @@ scope and the TLS pass-through list, but traffic left out still leaves rows, and
 that narrows recording is flagged until a person changes that setting or the agent puts it
 back as it was, and stays in the log either way (see [Who recorded what](#who-recorded-what)).
 An agent that also runs `brainproxy` in a shell counts as `cli` there, as a person would, so
-it can clear the flag that way; the change is still logged. `browser open` isn't offered (the
+it can clear the flag that way; the change is still logged. A request whose Host header names a
+host the scope doesn't list is refused without `host_header_test` (see
+[Concepts](#concepts)). `browser open` isn't offered (the
 project's browser profile keeps the person's sign-ins), and other options that need a person are
 refused too; docs/MCP.md lists them.
 

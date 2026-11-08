@@ -393,12 +393,19 @@ pub enum RulesCmd {
         /// Add the rule disabled.
         #[arg(long)]
         disabled: bool,
+        /// The rule deliberately puts a host the scope doesn't list in the Host header, for a
+        /// Host-header test. Through MCP such a rule is refused without it.
+        #[arg(long)]
+        host_header_test: bool,
     },
     Remove {
         id: u32,
     },
     Enable {
         id: u32,
+        /// As for `rules add`: the rule puts a host the scope doesn't list in the Host header.
+        #[arg(long)]
+        host_header_test: bool,
     },
     Disable {
         id: u32,
@@ -469,6 +476,10 @@ pub enum InterceptCmd {
         file: Option<String>,
         #[arg(long)]
         verbatim: bool,
+        /// The replacement's Host header deliberately names a host the scope doesn't list (and the
+        /// held request didn't), for a Host-header test. Through MCP such an edit is refused without it.
+        #[arg(long)]
+        host_header_test: bool,
     },
     /// Drop a held message; the client receives a 502 (a dropped WebSocket message is just not delivered).
     Drop { id: i64 },
@@ -2134,12 +2145,13 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     let find = |rules: &mut Vec<Rule>, id: u32| -> Result<usize, Error> {
         rules.iter().position(|r| r.id == id).ok_or_else(|| Error::NotFound(format!("rule {id}")))
     };
+    let mut host_warning = None;
     match cmd {
         RulesCmd::List => {
             out.ok(json!({"rules": rules}), || serde_json::to_string_pretty(&rules).unwrap_or_default());
             return Ok(());
         }
-        RulesCmd::Add { location, pattern, replace, comment, disabled } => {
+        RulesCmd::Add { location, pattern, replace, comment, disabled, host_header_test } => {
             let mut rule = Rule {
                 id: 0,
                 location: RuleLocation::parse(&location)?,
@@ -2152,17 +2164,22 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             brainproxy_core::proxy::config::validate_rule(&rule)?;
             // Never one a removed rule had: an old history row's `edited_by` names it.
             rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
+            // A disabled rule changes nothing; enabling it is checked.
+            if rule.enabled {
+                host_warning = check_rule_host(&store, &rule, host_header_test, out)?;
+            }
             rules.push(rule);
         }
         RulesCmd::Remove { id } => {
             let i = find(&mut rules, id)?;
             rules.remove(i);
         }
-        RulesCmd::Enable { id } => {
+        RulesCmd::Enable { id, host_header_test } => {
             let i = find(&mut rules, id)?;
             brainproxy_core::proxy::config::validate_rule(&rules[i])?;
             // Whoever turns a rule on answers for what it changes from then on.
             if !rules[i].enabled {
+                host_warning = check_rule_host(&store, &rules[i], host_header_test, out)?;
                 rules[i].origin = Some(brainproxy_core::provenance::origin().to_string());
             }
             rules[i].enabled = true;
@@ -2174,8 +2191,65 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Clear => rules.clear(),
     }
     store.set_setting(RULES_KEY, &rules)?;
-    out.ok(json!({"rules": rules}), || serde_json::to_string_pretty(&rules).unwrap_or_default());
+    let mut data = json!({"rules": rules});
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
+    }
+    out.ok(data, || serde_json::to_string_pretty(&rules).unwrap_or_default());
     Ok(())
+}
+
+/// Checks a request rule about to take effect for a Host the scope doesn't list that it would put
+/// on proxied requests (see [`rule_host`]), as `send` checks a request's.
+fn check_rule_host(store: &Store, rule: &Rule, test: bool, out: &Out) -> Result<Option<String>, Error> {
+    let guard = store.guard()?;
+    // Names the engagement lists, for requests the rule may rewrite: a wildcard as one of its hosts.
+    let names: Vec<String> = store
+        .engagement()?
+        .map(|s| s.include)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| !e.contains('/'))
+        .filter_map(|e| Target::from_url(&e.replacen("*.", "www.", 1)).ok())
+        .map(|t| t.host)
+        .collect();
+    crate::mcp::check_host_setting(&format!("rule {}", rule.id), rule_host(&guard, &names, rule), test, out)
+}
+
+/// The Host the scope doesn't list that a request rule would put on proxied requests: one its
+/// replacement writes (a Host header line, or an absolute URL in the request line), or one it
+/// makes of the Host of a request to one of `names`. A rule can match anything, so this is no
+/// proof: a rule that rewrites only requests these don't look like isn't caught.
+fn rule_host(guard: &std::sync::Arc<brainproxy_core::guard::Guard>, names: &[String], rule: &Rule) -> Option<String> {
+    use brainproxy_core::http::client::unlisted_host;
+    let replace = rule.replace.trim();
+    let written = match rule.location {
+        RuleLocation::RequestHeader => replace
+            .split_once(':')
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+            .and_then(|(_, v)| unlisted_host(Some(guard), v)),
+        RuleLocation::RequestLine => replace.find("://").and_then(|at| {
+            let start = replace[..at].rfind(' ').map_or(0, |i| i + 1);
+            let url = replace[start..].split(' ').next().unwrap_or_default();
+            match Target::from_url(url) {
+                Ok(t) => unlisted_host(Some(guard), &t.host),
+                Err(_) => Some(url.to_string()),
+            }
+        }),
+        _ => return None,
+    };
+    if written.is_some() {
+        return written;
+    }
+    let compiled = brainproxy_core::proxy::config::compile_rules(&[Rule { enabled: true, ..rule.clone() }]).ok()?;
+    let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };
+    names.iter().find_map(|name| {
+        let host = if name.contains(':') { format!("[{name}]") } else { name.clone() };
+        let probe = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
+        let target = Target { scheme: "https".into(), host: name.clone(), port: 443 };
+        let ruled = brainproxy_core::proxy::config::apply_request_rules(&compiled, probe);
+        opts.foreign_host(&ruled, &target)
+    })
 }
 
 pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Error> {
@@ -2264,8 +2338,9 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             });
             out.ok(data, || String::from_utf8_lossy(&original).into_owned());
         }
-        InterceptCmd::Forward { id, file, verbatim } => {
-            let websocket = store.intercept_get(id)?.0.direction.starts_with("ws-");
+        InterceptCmd::Forward { id, file, verbatim, host_header_test } => {
+            let (entry, original, _) = store.intercept_get(id)?;
+            let websocket = entry.direction.starts_with("ws-");
             let edited = match file.as_deref() {
                 None => None,
                 Some(path) => {
@@ -2281,11 +2356,23 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     )
                 }
             };
+            // The proxy sends an edited request where the held one was going, so a Host the edit
+            // brings in is checked as `send` checks one; a Host the client sent stays as it was.
+            let mut host_warning = None;
+            if let (Some(e), "request") = (&edited, entry.direction.as_str()) {
+                let target = Target::from_url(&entry.url)?;
+                let opts = SendOptions { guard: Some(store.guard()?), ..Default::default() };
+                if opts.foreign_host(e, &target) != opts.foreign_host(&original, &target) {
+                    host_warning = crate::mcp::check_host_header(&opts, e, &target, host_header_test, out)?;
+                }
+            }
             let by = brainproxy_core::provenance::origin();
             store.intercept_resolve(id, "forwarded", edited.as_deref(), Some(by))?;
-            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by}), || {
-                format!("forwarded #{id}")
-            });
+            let mut data = json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by});
+            if let Some(w) = host_warning {
+                data["host_warning"] = json!(w);
+            }
+            out.ok(data, || format!("forwarded #{id}"));
         }
         InterceptCmd::Drop { id } => {
             let by = brainproxy_core::provenance::origin();

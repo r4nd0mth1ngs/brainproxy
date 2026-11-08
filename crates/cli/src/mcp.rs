@@ -103,6 +103,59 @@ pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error
     Ok(())
 }
 
+/// Checks the host `request` names in its Host header (or absolute request target) against the
+/// scope (see [`SendOptions::foreign_host`]). Under a tool call one the scope doesn't list is
+/// refused unless `--host-header-test` says the test is meant, so the intent is on record; a
+/// person is never refused. Returns the warning a command shows when one is sent, which in
+/// text mode goes to stderr at once, so it shows even when the send then fails.
+///
+/// [`SendOptions::foreign_host`]: brainproxy_core::http::SendOptions::foreign_host
+pub(crate) fn check_host_header(
+    opts: &brainproxy_core::http::SendOptions,
+    request: &[u8],
+    target: &brainproxy_core::http::Target,
+    test: bool,
+    out: &crate::output::Out,
+) -> Result<Option<String>, brainproxy_core::Error> {
+    let Some(host) = opts.foreign_host(request, target) else { return Ok(None) };
+    host_verdict(&format!("Host {host}"), &format!("the Host names {host}"), test, out)
+}
+
+/// [`check_host_header`] for a setting that puts `host` (when the scope doesn't list it; see
+/// [`unlisted_host`]) in the Host header of requests still to come: `what` names the setting,
+/// e.g. "auth profile app: header". It is refused, or warned about, when it is saved.
+///
+/// [`unlisted_host`]: brainproxy_core::http::client::unlisted_host
+pub(crate) fn check_host_setting(
+    what: &str,
+    host: Option<String>,
+    test: bool,
+    out: &crate::output::Out,
+) -> Result<Option<String>, brainproxy_core::Error> {
+    let Some(host) = host else { return Ok(None) };
+    host_verdict(&format!("{what} sets Host {host}"), &format!("{what} sets the Host to {host}"), test, out)
+}
+
+fn host_verdict(
+    refused: &str,
+    warned: &str,
+    test: bool,
+    out: &crate::output::Out,
+) -> Result<Option<String>, brainproxy_core::Error> {
+    if in_tool_call() && !test {
+        return Err(brainproxy_core::Error::OutOfScope(format!(
+            "{refused}: a host other than the target's must be listed by name in the scope, as a shared front \
+             end may send the request to that site; for a Host-header test pass --host-header-test"
+        )));
+    }
+    let warning =
+        format!("{warned}, which the scope doesn't list: a shared front end may send the request to that site");
+    if !out.json() {
+        eprintln!("warning: {}", crate::output::escape_controls(&warning));
+    }
+    Ok(Some(warning))
+}
+
 /// How long a cancelled or timed-out call may take to exit after SIGTERM (recording what it
 /// sent) before it is killed.
 const CANCEL_GRACE: Duration = Duration::from_secs(3);

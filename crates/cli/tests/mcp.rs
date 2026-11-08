@@ -705,3 +705,112 @@ fn an_agent_cannot_replace_a_persons_layouts_or_files() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("refused through MCP"));
     cli(&["report-profile", "show", "board"]);
 }
+
+#[test]
+fn an_agent_sends_a_foreign_host_only_as_a_stated_host_header_test() {
+    let port = serve(2);
+    let mut m = Mcp::start(&tmp_project("host"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let foreign = ["Host: other-tenant.test"];
+    let raw = "GET / HTTP/1.1\r\nHost: other-tenant.test\r\n\r\n";
+    // An in-scope front end could send these to a site the scope doesn't list.
+    for (tool, args) in [
+        ("send", json!({"url": url, "headers": foreign})),
+        ("send", json!({"url": url, "headers": foreign, "race": 2})),
+        ("send", json!({"url": url, "headers": foreign, "http2": true})),
+        ("send", json!({"file": "-", "target": url, "stdin": raw})),
+        ("ws_send", json!({"url": format!("ws://127.0.0.1:{port}/"), "headers": foreign})),
+        ("fuzz_run", json!({"url": format!("{url}?q=§x§"), "headers": foreign, "payloads": ["list:1"]})),
+    ] {
+        let (err, e) = m.call(tool, args);
+        assert!(err, "{tool}: {e}");
+        assert_eq!(e["error"]["kind"], "out_of_scope", "{tool}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{tool}: {e}");
+    }
+    let (_, e) = m.call("history_list", json!({}));
+    assert_eq!(e["data"]["count"], 0, "{e}");
+    // Saying it is a Host-header test puts the intent on record; the output warns.
+    let (err, e) = m.call("send", json!({"url": url, "headers": foreign, "host_header_test": true}));
+    assert!(!err, "{e}");
+    assert!(e["data"]["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{e}");
+    // A name the scope lists needs no flag.
+    let (err, e) = m.call("send", json!({"url": url, "headers": ["Host: app.test"]}));
+    assert!(!err, "{e}");
+    assert!(e["data"].get("host_warning").is_none(), "{e}");
+}
+
+#[test]
+fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header_test() {
+    let project = tmp_project("host-settings");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let step = project.with_extension("step.http");
+    std::fs::write(&step, "GET / HTTP/1.1\r\nHost: other-tenant.test\r\n\r\n").unwrap();
+    let step = format!("http://127.0.0.1:9={}", step.display());
+    let foreign = ["Host: other-tenant.test"];
+    // Each would put the host on requests an in-scope front end could send to another site.
+    let settings = [
+        ("auth_add", json!({"name": "p", "headers": foreign})),
+        (
+            "auth_add",
+            json!({"name": "p", "login_url": "http://127.0.0.1:9/", "token_regex": "t=(\\w+)", "token_header": "Host: {{token}}"}),
+        ),
+        ("auth_add", json!({"name": "p", "login_url": "http://127.0.0.1:9/login", "login_header": foreign})),
+        ("auth_macro_add", json!({"profile": "p", "name": "m", "steps": [step]})),
+        ("rules_add", json!({"location": "request-header", "replace": "Host: other-tenant.test"})),
+        (
+            "rules_add",
+            json!({"location": "request-header", "pattern": "127\\.0\\.0\\.1", "replace": "other-tenant.test"}),
+        ),
+        (
+            "rules_add",
+            json!({"location": "request-line", "pattern": "^GET /", "replace": "GET http://other-tenant.test/"}),
+        ),
+    ];
+    for (tool, args) in &settings {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(err, "{tool} {args}: {e}");
+        assert_eq!(e["error"]["kind"], "out_of_scope", "{tool} {args}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{tool}: {e}");
+    }
+    let (_, e) = m.call("rules_list", json!({}));
+    assert_eq!(e["data"]["rules"], json!([]), "{e}");
+    // Saying it is a Host-header test puts the intent on record; the output warns.
+    for (tool, args) in &settings {
+        let mut args = args.clone();
+        args["host_header_test"] = json!(true);
+        let (err, e) = m.call(tool, args.clone());
+        assert!(!err, "{tool} {args}: {e}");
+        let warning = e["data"]["host_warning"].as_str().unwrap();
+        assert!(warning.contains("other-tenant.test") || warning.contains("{{token}}"), "{tool}: {e}");
+    }
+    // Saving it again unchanged sets no new Host: no flag is needed.
+    let (err, e) = m.call("auth_add", json!({"name": "q", "headers": foreign, "host_header_test": true}));
+    assert!(!err, "{e}");
+    let (err, e) = m.call("auth_add", json!({"name": "q", "headers": foreign}));
+    assert!(!err, "{e}");
+    // Hosts the scope lists, the login URL's own host, and other headers need none either.
+    for (tool, args) in [
+        ("auth_add", json!({"name": "r", "headers": ["Host: app.test", "X-Api-Key: 1"]})),
+        ("auth_add", json!({"name": "r", "login_url": "http://127.0.0.1:9/", "login_header": ["Host: 127.0.0.1:9"]})),
+        ("rules_add", json!({"location": "request-header", "pattern": "^X-Role: user$", "replace": "X-Role: admin"})),
+    ] {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(!err, "{tool} {args}: {e}");
+        assert!(e["data"].get("host_warning").is_none(), "{tool}: {e}");
+    }
+    // A disabled rule changes nothing until it is enabled, which is checked.
+    let (err, e) =
+        m.call("rules_add", json!({"location": "request-header", "replace": "Host: b.test", "disabled": true}));
+    assert!(!err, "{e}");
+    let id = e["data"]["rules"].as_array().unwrap().last().unwrap()["id"].clone();
+    let (err, e) = m.call("rules_enable", json!({"id": id}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("Host b.test"), "{e}");
+    let (err, e) = m.call("rules_enable", json!({"id": id, "host_header_test": true}));
+    assert!(!err, "{e}");
+}
