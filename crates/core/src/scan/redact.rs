@@ -299,9 +299,11 @@ impl Redactor {
         if v.is_empty() || v == MASK {
             return;
         }
-        // A signed cookie's session id is the secret, and a page may quote it on its own.
+        // A signed cookie's session id is the secret, and a page may quote it on its own. One
+        // learnt from traffic must be distinctive like any other (`s:session.abc` is no reason
+        // to mask the word "session" everywhere).
         if let Some(id) = unsigned_half(v) {
-            self.remember_forms(&id, true);
+            self.remember_forms(&id, known);
         }
         self.remember_forms(v, known);
     }
@@ -813,6 +815,15 @@ mod tests {
         let mut s = "session shortID9 and PROFSID7, signed s:PROFSID7.sigsigsig".to_string();
         r.scrub(&mut s);
         assert_eq!(s, "session [redacted] and [redacted], signed [redacted]");
+        // One learnt from traffic that is a plain word is masked where it stands, not everywhere;
+        // a profile's is known to be a secret, word or not.
+        let mut r = Redactor::default();
+        let mut h = vec![("Cookie".to_string(), "connect.sid=s%3Asession.abcdef".to_string())];
+        r.headers(&mut h);
+        r.know(["s:account.sigsigsig".to_string()]);
+        let mut s = "the session of an account".to_string();
+        r.scrub(&mut s);
+        assert_eq!(s, "the session of an [redacted]");
         // Any other value with a dot in it is not split.
         assert_eq!(unsigned_half("abc.def"), None);
         assert_eq!(unsigned_half("s%3AID12345.sig").as_deref(), Some("ID12345"));
