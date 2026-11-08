@@ -11,6 +11,7 @@ mod compare_cmd;
 mod connection_cmd;
 mod crawl_cmd;
 mod engagement_cmd;
+mod filters_cmd;
 mod fuzz_cmd;
 mod import_cmd;
 mod jobs_cmd;
@@ -295,6 +296,7 @@ enum Shape {
 #[derive(Subcommand)]
 enum HistoryCmd {
     /// List history entries (metadata only).
+    #[command(after_help = filter_notes())]
     List {
         #[arg(long)]
         host: Option<String>,
@@ -317,6 +319,13 @@ enum HistoryCmd {
         /// are searched as they appear.
         #[arg(long)]
         contains: Option<String>,
+        /// A query in the filter language, e.g. 'status:5xx AND resp.body:"stack trace"' or
+        /// 'host:api.test method=POST NOT path:/health'. FIELD:VALUE contains (case-insensitive),
+        /// = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times,
+        /// FIELD:* is present; a bare word searches the URL and title. Terms side by side must
+        /// all match; AND, OR, NOT and parentheses combine them. Fields: see the notes.
+        #[arg(long)]
+        filter: Option<String>,
         /// Only entries with an id greater than this (for incremental polling).
         #[arg(long)]
         after: Option<i64>,
@@ -348,6 +357,9 @@ enum HistoryCmd {
         #[arg(long)]
         remove: Vec<String>,
     },
+    /// Saved Traffic filters, kept in the project (the app offers them in Traffic).
+    #[command(subcommand)]
+    Filters(filters_cmd::FiltersCmd),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -423,6 +435,8 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
         Cmd::History(HistoryCmd::Note { .. }) => "history note",
         Cmd::History(HistoryCmd::Tag { .. }) => "history tag",
+        Cmd::History(HistoryCmd::Filters(filters_cmd::FiltersCmd::List)) => "history filters list",
+        Cmd::History(HistoryCmd::Filters(filters_cmd::FiltersCmd::Save { .. })) => "history filters save",
         Cmd::Proxy(c) => match c {
             proxy_cmd::ProxyCmd::Start(_) => "proxy start",
             proxy_cmd::ProxyCmd::Run(_) => "proxy run",
@@ -1010,10 +1024,26 @@ fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
     format!("{id}{status} ({} bytes, {ms} ms)\n\n{}", response.len(), String::from_utf8_lossy(response))
 }
 
+/// The `history list` notes: the filter language's fields, from the parser's own list.
+fn filter_notes() -> String {
+    let fields: Vec<String> =
+        brainproxy_core::filter::FIELDS.iter().map(|(name, about)| format!("{name} ({about})")).collect();
+    format!(
+        "--filter fields: {}. Status classes: status:5xx. Values with spaces or ( ) go in double quotes \
+         (\\\" and \\\\ inside); a quoted word is searched as text, so \"status:500\" finds that text. \
+         Regexes are Rust syntax, case-sensitive unless they start with (?i). NOT status:500 keeps requests \
+         with no response. --filter combines with the other options, all of which must match.",
+        fields.join("; ")
+    )
+}
+
 fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
+    if let HistoryCmd::Filters(cmd) = cmd {
+        return filters_cmd::filters(project, cmd, out);
+    }
     let store = Store::open(project)?;
     match cmd {
-        HistoryCmd::List { host, method, status, source, tag, origin, contains, after, limit } => {
+        HistoryCmd::List { host, method, status, source, tag, origin, contains, filter, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,
                 method,
@@ -1022,6 +1052,7 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                 tag,
                 origin,
                 contains,
+                filter,
                 after_id: after,
                 limit: Some(limit),
             })?;
@@ -1095,6 +1126,7 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
             let tags = store.update_tags(id, &add, &remove)?;
             out.ok(json!({"id": id, "tags": tags}), || format!("#{id} tags: {}", tags.join(", ")));
         }
+        HistoryCmd::Filters(_) => unreachable!("handled above"),
     }
     Ok(())
 }

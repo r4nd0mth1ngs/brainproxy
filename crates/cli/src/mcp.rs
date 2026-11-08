@@ -388,6 +388,9 @@ const HINTS: &[(&str, Hints)] = &[
     ("history show", READ),
     ("history note", SET),
     ("history tag", SET),
+    ("history filters list", READ),
+    // Through MCP only adds to the saved set (--append), never under a name already saved.
+    ("history filters save", ADD),
     ("ws list", READ),
     ("ws show", READ),
     ("ws messages", READ),

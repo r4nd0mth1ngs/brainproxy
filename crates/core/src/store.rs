@@ -444,6 +444,8 @@ pub struct HistoryFilter {
     /// Substring searched in the raw request and response, and in their decoded bodies
     /// (so a gzip or chunked body matches too). Case-sensitive.
     pub contains: Option<String>,
+    /// A query in the history filter language ([`crate::filter`]).
+    pub filter: Option<String>,
     pub after_id: Option<i64>,
     pub limit: Option<u32>,
 }
@@ -1239,6 +1241,15 @@ impl Store {
                  OR instr(req_body, ?{n}) > 0 OR instr(resp_body, ?{n}) > 0)"
             ));
         }
+        if let Some(q) = &f.filter {
+            let mut values = Vec::new();
+            let cond = crate::filter::Query::parse(q)?.to_sql(&mut values);
+            // The condition numbers its placeholders from 1; move them past the ones above.
+            let base = args.len();
+            let cond = renumber(&cond, base);
+            args.extend(values.into_iter().map(|v| Box::new(v) as Box<dyn rusqlite::ToSql>));
+            sql.push_str(&format!(" AND {cond}"));
+        }
         sql.push_str(" ORDER BY id");
         if let Some(l) = f.limit {
             sql.push_str(&format!(" LIMIT {l}"));
@@ -1556,6 +1567,15 @@ fn clip_text(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
+}
+
+/// `cond` with every `?N` placeholder moved up by `base`.
+fn renumber(cond: &str, base: usize) -> String {
+    if base == 0 {
+        return cond.to_string();
+    }
+    let re = Regex::new(r"\?([0-9]+)").expect("valid regex");
+    re.replace_all(cond, |c: &regex::Captures| format!("?{}", c[1].parse::<usize>().unwrap() + base)).into_owned()
 }
 
 fn register_functions(conn: &Connection) -> Result<()> {
@@ -2105,6 +2125,44 @@ mod tests {
         let hits = s.list(&HistoryFilter { tag: Some("sqli".into()), ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(s.get(99), Err(Error::NotFound(_))));
+
+        // The filter language, run against the same rows: the sample (500 from nginx), the
+        // failed POST (no response) and the gzip one (proxy, 200).
+        let fail_id = all[1].id;
+        let ids = |q: &str| -> Vec<i64> {
+            s.list(&HistoryFilter { filter: Some(q.into()), ..Default::default() })
+                .unwrap_or_else(|e| panic!("{q}: {e}"))
+                .iter()
+                .map(|h| h.id)
+                .collect()
+        };
+        assert_eq!(ids("status:5xx"), [id]);
+        assert_eq!(ids("NOT status:5xx"), [fail_id, gz_id], "a request with no response isn't a 5xx");
+        assert_eq!(ids("status!=500"), [fail_id, gz_id]);
+        assert_eq!(ids("resp.header.server=NGINX"), [id]);
+        assert_eq!(ids("resp.header.server~\"^ngi\""), [id]);
+        assert_eq!(ids("resp.body:\"sql SYNTAX\""), [id], "case-insensitive");
+        assert_eq!(ids("resp.body:HIDDEN-IN-GZIP"), [gz_id], "decoded bodies");
+        assert_eq!(ids("body:user=bob"), [gz_id]);
+        assert_eq!(ids("method=post error:boom"), [fail_id]);
+        assert_eq!(ids("source=proxy OR source=send"), [id, fail_id, gz_id]);
+        assert_eq!(ids("source=proxy OR status=500"), [id, gz_id]);
+        assert_eq!(ids("tag=sqli"), [id]);
+        assert_eq!(ids("NOT tag:sql"), [fail_id, gz_id]);
+        assert_eq!(ids("req.header.host:*"), [id]);
+        assert_eq!(ids("(status:5xx OR error:*) length>10"), [id]);
+        assert_eq!(ids("time:20"), [id, fail_id, gz_id]);
+        assert_eq!(ids("x?id"), [id], "a bare word searches the URL");
+        // Combined with the other filters, whose placeholders come first.
+        let f = HistoryFilter {
+            host: Some("a.test".into()),
+            source: Some("send".into()),
+            filter: Some("status:5xx resp.header.server:nginx".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>(), [id]);
+        let bad = s.list(&HistoryFilter { filter: Some("stauts:500".into()), ..Default::default() }).unwrap_err();
+        assert_eq!(bad.kind(), "invalid_input");
     }
 
     #[test]

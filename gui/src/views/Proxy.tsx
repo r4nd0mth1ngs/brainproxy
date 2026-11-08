@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bodyText, cancelCli, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
+import { bodyText, CliError, cancelCli, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
 import { originOf, useApp, type Handoff } from "../store";
 import { ask, confirm } from "../ui/Confirm";
 import { copyAsCurl } from "../ui/CurlDialog";
@@ -10,24 +10,31 @@ import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import {
   appliedSaved,
+  clearLocalSaved,
   DEFAULT_FILTER,
   failPage,
+  FILTERS_LIST_ARGS,
+  filtersSaveArgs,
   isCurrent,
   isRefused,
   loadSaved,
+  modeOf,
   mergePage,
   needsSearch,
   newSearch,
   refilter,
+  savedBody,
+  savedFrom,
   searchArgs,
   searchFor,
   searchNote,
-  storeSaved,
   visibleRows,
+  withMode,
   withSaved,
   withoutSaved,
   type ContentSearch,
   type SavedFilter,
+  type SearchMode,
   type SearchQuery,
   type TrafficFilter,
 } from "./trafficFilter";
@@ -119,13 +126,65 @@ const COLUMNS: Column<HistoryItem>[] = [
 
 const SOURCES = ["proxy", "send", "crawl", "crawl-browser", "fuzz", "scan", "import", "auth", "race", "ws"];
 
+const PLACEHOLDER: Record<SearchMode, string> = {
+  text: "Filter: URL, title, or method",
+  contents: "Search requests and responses",
+  query: 'Query, e.g. status:5xx resp.body:"stack trace"',
+};
+
+const QUERY_HELP =
+  "FIELD:VALUE contains (any case), = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times, FIELD:* is present. " +
+  "Fields include method, host, path, url, query, status (also 5xx), length, duration, time, source, origin, tag, note, title, type, " +
+  "req, resp, req.body, resp.body, body, req.header.NAME and resp.header.NAME. A bare word searches the URL and title. " +
+  "Terms side by side must all match; AND, OR, NOT and ( ) combine them; quote values with spaces. Runs history list --filter.";
+
+const MODE_HELP: Record<SearchMode, string> = {
+  text: "The text filters the URL, title and method of the rows shown",
+  contents:
+    "Search inside requests and responses: headers and bodies, compressed bodies included. Case-sensitive and literal: the text must appear as stored (URL-encoded or JSON-escaped text included). Runs history list --contains.",
+  query: QUERY_HELP,
+};
+
 function History() {
   const app = useApp();
   const [rows, setRows] = useState<HistoryItem[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const [filter, setFilter] = useState<TrafficFilter>(DEFAULT_FILTER);
-  const [saved, setSaved] = useState<SavedFilter[]>(() => loadSaved(app.project));
+  const [saved, setSaved] = useState<SavedFilter[]>([]);
+  // The saved set's revision in the project, for the next save (0: none saved yet).
+  const savedRev = useRef(0);
+  const loadFilters = async () => {
+    const d = await run<{ rev: number; filters: unknown }>(FILTERS_LIST_ARGS);
+    savedRev.current = d.rev;
+    setSaved(savedFrom(d.filters));
+    return d;
+  };
+  // Saved filters live in the project. An older build kept them in this app's storage: they
+  // move into the project the first time it has none.
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      const d = await loadFilters();
+      const local = loadSaved(app.project);
+      if (!live || d.rev !== 0 || !local.length) return;
+      try {
+        const r = await run<{ rev: number }>(filtersSaveArgs(0), { stdin: savedBody(local) });
+        savedRev.current = r.rev;
+        clearLocalSaved(app.project);
+        if (live) setSaved(local);
+      } catch (e: any) {
+        // Still shown, and kept where they were: the next save tries the project again.
+        if (live) {
+          setSaved(local);
+          app.toast(`Saved filters stay in this app until they can be saved in the project: ${e.message}`, "error");
+        }
+      }
+    })().catch((e) => live && app.toast(`Saved filters: ${e.message}`, "error"));
+    return () => {
+      live = false;
+    };
+  }, [app.project]);
   // The saved filter last chosen or saved, so two with the same state stay apart.
   const [picked, setPicked] = useState<string | null>(null);
   const lastId = useRef(0);
@@ -160,7 +219,8 @@ function History() {
         try {
           next = mergePage(s, (await run<{ items: HistoryItem[] }>(searchArgs(s), { call })).items, upTo, current.current);
         } catch (e: any) {
-          next = failPage(s, e.message);
+          // A query that doesn't parse fails the same way every time: stop until it changes.
+          next = failPage(s, e.message, Date.now(), e instanceof CliError && e.kind === "invalid_input" && s.query.kind === "filter");
         } finally {
           searchCall.current = null;
         }
@@ -311,11 +371,19 @@ function History() {
   const toggleSource = (s: string) =>
     setFilter((f) => ({ ...f, sources: f.sources.includes(s) ? f.sources.filter((x) => x !== s) : [...f.sources, s] }));
 
-  // Saved filters are kept per project in this app (localStorage).
+  // Saved filters are kept in the project (`history filters`), so they travel with it.
   const applied = appliedSaved(saved, filter, picked);
-  const keepSaved = (list: SavedFilter[]) => {
-    setSaved(list);
-    if (!storeSaved(app.project, list)) app.toast("Saved filters can't be stored here; they last until the app closes.", "error");
+  const keepSaved = async (list: SavedFilter[]) => {
+    try {
+      const r = await run<{ rev: number }>(filtersSaveArgs(savedRev.current), { stdin: savedBody(list) });
+      savedRev.current = r.rev;
+      setSaved(list);
+    } catch (e: any) {
+      if (e instanceof CliError && e.kind === "conflict") {
+        await loadFilters().catch(() => {});
+        app.toast("The saved filters were changed elsewhere and have been reloaded; try again.", "error");
+      } else app.toast(`Saved filters: ${e.message}`, "error");
+    }
   };
   const saveFilter = async () => {
     const name = (await ask("Save the current filter", "Name it to apply it again later.", "Save", "Cancel", applied ?? ""))?.trim();
@@ -335,13 +403,23 @@ function History() {
         <input
           className="input"
           style={{ width: 260 }}
-          placeholder={filter.contents ? "Search requests and responses" : "Filter: URL, title, or method"}
+          placeholder={PLACEHOLDER[modeOf(filter)]}
+          title={modeOf(filter) === "query" ? QUERY_HELP : undefined}
+          spellCheck={false}
           value={filter.text}
           onChange={(e) => setFilter({ ...filter, text: e.target.value })}
         />
-        <label className="check" title="Search inside requests and responses: headers and bodies, compressed bodies included. Case-sensitive and literal: the text must appear as stored (URL-encoded or JSON-escaped text included). Runs history list --contains.">
-          <input type="checkbox" checked={filter.contents} onChange={(e) => setFilter({ ...filter, contents: e.target.checked })} /> Contents
-        </label>
+        <select
+          className="input"
+          aria-label="What the text searches"
+          value={modeOf(filter)}
+          title={MODE_HELP[modeOf(filter)]}
+          onChange={(e) => setFilter(withMode(filter, e.target.value as SearchMode))}
+        >
+          <option value="text">URL</option>
+          <option value="contents">Contents</option>
+          <option value="query">Query</option>
+        </select>
         <div className="seg">
           {SOURCES.map((s) => (
             <button key={s} className={filter.sources.includes(s) ? "on" : ""} onClick={() => toggleSource(s)}>

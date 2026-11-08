@@ -14,11 +14,16 @@ import {
   loadSaved,
   matchesFilter,
   mergePage,
+  modeOf,
   needsSearch,
   newSearch,
   parseFilter,
   parseSaved,
   refilter,
+  clearLocalSaved,
+  filtersSaveArgs,
+  savedBody,
+  savedFrom,
   savedKey,
   savedMatching,
   searchArgs,
@@ -27,6 +32,7 @@ import {
   shownMatches,
   storeSaved,
   visibleRows,
+  withMode,
   withSaved,
   withoutSaved,
   type ContentSearch,
@@ -166,11 +172,71 @@ const ids = (s: ContentSearch) => [...s.matches.keys()];
 test("a contents search needs text and passes a single source to the CLI", () => {
   assert.equal(searchFor(filter({ text: "token" })), null);
   assert.equal(searchFor(filter({ contents: true })), null);
-  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { text: "token", source: null });
+  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { kind: "contains", text: "token", source: null });
   assert.deepEqual(searchArgs(ns("token", { sources: ["send", "proxy"] })), ["history", "list", "--contains=token", "--after=0", `--limit=${SEARCH_PAGE}`]);
   const s = { ...ns("-x y", { sources: ["send"] }), cursor: 41 };
   assert.deepEqual(searchArgs(s), ["history", "list", "--contains=-x y", "--source=send", `--after=41`, `--limit=${SEARCH_PAGE}`]);
   assert.deepEqual(searchArgs(ns("a")), ["history", "list", "--contains=a", "--after=0", `--limit=${SEARCH_PAGE}`]);
+});
+
+// ---------------- Saved filters in the project ----------------
+
+test("saved filters go to the project as history filters save takes them", () => {
+  assert.deepEqual(filtersSaveArgs(3), ["history", "filters", "save", "--if-revision", "3"]);
+  const list = [{ name: "errors", filter: filter({ query: true, text: "status:5xx", sources: ["proxy"] }) }];
+  const body = JSON.parse(savedBody(list));
+  assert.deepEqual(body, { filters: [{ name: "errors", filter: { ...DEFAULT_FILTER, query: true, text: "status:5xx", sources: ["proxy"] } }] });
+  // What `history filters list` returns reads back the same (its mode field is ignored).
+  assert.deepEqual(savedFrom([{ ...body.filters[0], mode: "query" }]), list);
+  assert.deepEqual(savedFrom(null), []);
+});
+
+test("filters kept by an older build are removed once moved", () => {
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => store.set(k, v), removeItem: (k: string) => store.delete(k) };
+  store.set(savedKey("/p.bpdb"), "[]");
+  clearLocalSaved("/p.bpdb");
+  assert.equal(store.has(savedKey("/p.bpdb")), false);
+});
+
+// ---------------- Query search ----------------
+
+/** A query search filter for `text`. */
+const qf = (text: string, patch: Partial<TrafficFilter> = {}) => filter({ query: true, text, ...patch });
+
+test("query mode sends the text as --filter, and is its own search", () => {
+  assert.equal(searchFor(qf("  ")), null);
+  assert.deepEqual(searchFor(qf("status:5xx", { sources: ["send"] })), { kind: "filter", text: "status:5xx", source: "send" });
+  const s = { ...newSearch(searchFor(qf('-x resp.body:"a b"'))!), cursor: 9 };
+  assert.deepEqual(searchArgs(s), ["history", "list", '--filter=-x resp.body:"a b"', "--after=9", `--limit=${SEARCH_PAGE}`]);
+  // The same text as a contents search is another search.
+  assert.ok(isCurrent(s, qf('-x resp.body:"a b"')));
+  assert.ok(!isCurrent(s, cf('-x resp.body:"a b"')));
+  // The text isn't matched here: the CLI did.
+  assert.ok(matchesFilter(row(1), qf("nothing-like-this")));
+});
+
+test("the search mode: one of URL, contents and query", () => {
+  assert.equal(modeOf(DEFAULT_FILTER), "text");
+  assert.deepEqual([withMode(DEFAULT_FILTER, "query").query, withMode(DEFAULT_FILTER, "query").contents], [true, false]);
+  assert.deepEqual([withMode(cf("a"), "query").query, withMode(cf("a"), "query").contents], [true, false]);
+  assert.equal(modeOf(withMode(qf("a"), "contents")), "contents");
+  assert.equal(modeOf(withMode(qf("a"), "text")), "text");
+  // Stored filters: older ones have no query field, and both on reads as a query.
+  assert.equal(parseFilter({ text: "a", contents: true }).query, false);
+  assert.deepEqual([parseFilter({ contents: true, query: true }).contents, parseFilter({ contents: true, query: true }).query], [false, true]);
+});
+
+test("a query the CLI refuses is not tried again until it changes", () => {
+  const s = newSearch(searchFor(qf("stauts:500"))!);
+  const bad = failPage(s, 'filter: unknown field "stauts" at position 1', 1000, true);
+  assert.ok(bad.invalid);
+  assert.ok(!needsSearch(bad, 50, 1e15));
+  assert.equal(searchNote(bad, 50), 'Query: unknown field "stauts" at position 1');
+  // Any other failure is retried, and a good page clears it.
+  const flaky = failPage(s, "busy", 1000);
+  assert.ok(!flaky.invalid && needsSearch(flaky, 50, 1000 + RETRY_BASE));
+  assert.ok(!mergePage(bad, [], 50, qf("stauts:500")).invalid);
 });
 
 test("a short page covers everything up to the polled id", () => {
