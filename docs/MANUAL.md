@@ -1018,12 +1018,14 @@ Each history entry has:
 - `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
-  the rule). A proxy started with `--auth NAME` that puts the profile's session on a request
-  adds `{"by":"gui","auth":"NAME"}` (`by`: who saved the profile last), then
-  `{"by":"mcp","auth":"NAME","session_rule":3}` for each session rule that applied and
-  `{"by":"cli","auth":"NAME","macro":"csrf"}` for each macro those rules ran (`by`: who added
-  the rule or macro, or last changed it). NULL when nothing changed it; an intercept forwarded
-  unchanged isn't an edit.
+  the rule). A proxy started with `--auth NAME` adds `{"by":"gui","auth":"NAME"}` when the
+  profile's session (its cookies, including those its macros got, headers or token) changed
+  the request (`by`: who last changed the profile), then
+  `{"by":"mcp","auth":"NAME","session_rule":3}` for each session rule that changed it (one
+  whose URL matched but that changed nothing isn't named) and
+  `{"by":"cli","auth":"NAME","macro":"csrf"}` for each macro whose values those rules put in
+  (`by`: who added the rule or macro, or last changed it). NULL when nothing changed it; an
+  intercept forwarded unchanged isn't an edit.
 - `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
   a session's own requests in those); NULL when it was the target host, for plain HTTP, and
   when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
