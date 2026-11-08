@@ -250,7 +250,12 @@ fn quoted(s: &str, start: usize) -> Result<(String, usize)> {
             c => out.push(c),
         }
     }
-    Err(invalid(format!("the quote at position {} isn't closed", start + 1)))
+    Err(invalid(format!("the quote at position {} isn't closed", pos(s, start))))
+}
+
+/// Where byte `i` of `s` is, for messages: its character count from 1.
+fn pos(s: &str, i: usize) -> usize {
+    s[..i].chars().count() + 1
 }
 
 /// The end (exclusive) of an unquoted run starting at `start`.
@@ -280,7 +285,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
             }
             '"' => {
                 let (text, next) = quoted(s, i)?;
-                out.push(Token::Word { text, at: i + 1 });
+                out.push(Token::Word { text, at: pos(s, i) });
                 i = next;
                 continue;
             }
@@ -300,7 +305,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
             return Err(invalid(format!(
                 "the header name at position {} may only use letters, digits, '-', '_' and '.' here; use \
                  req.headers or resp.headers to search for others",
-                i + 1
+                pos(s, i)
             )));
         }
         if let (true, Some(&(op_text, op))) = (field_like(name), op) {
@@ -317,7 +322,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
                 if field(name).is_none() {
                     return Err(invalid(format!(
                         "unknown field {name:?} at position {} (fields: {}); put text in quotes to search for it",
-                        i + 1,
+                        pos(s, i),
                         FIELDS.iter().map(|(f, _)| *f).collect::<Vec<_>>().join(", ")
                     )));
                 }
@@ -329,9 +334,9 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
                     (s[after..end].to_string(), false, end)
                 };
                 if value.is_empty() && !quoted_value {
-                    return Err(invalid(format!("{name}{op_text} at position {} needs a value", i + 1)));
+                    return Err(invalid(format!("{name}{op_text} at position {} needs a value", pos(s, i))));
                 }
-                out.push(Token::Term { field: name.to_string(), op, value, quoted: quoted_value, at: i + 1 });
+                out.push(Token::Term { field: name.to_string(), op, value, quoted: quoted_value, at: pos(s, i) });
                 i = next;
                 continue;
             }
@@ -344,7 +349,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
             "AND" => Token::And,
             "OR" => Token::Or,
             "NOT" => Token::Not,
-            _ => Token::Word { text: word.to_string(), at: i + 1 },
+            _ => Token::Word { text: word.to_string(), at: pos(s, i) },
         });
         i = end;
     }
@@ -435,11 +440,25 @@ impl Parser {
 /// optionally a time with seconds and a fraction, optionally `Z` or an offset.
 fn is_time(v: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)?(?:Z|[+-]\d{2}:\d{2})?$")
-            .expect("valid regex")
-    })
-    .is_match(v)
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?)?(?:Z|[+-](\d{2}):(\d{2}))?$",
+        )
+        .expect("valid regex")
+    });
+    let Some(c) = re.captures(v) else { return false };
+    let n = |i: usize| c.get(i).map_or(0, |m| m.as_str().parse::<u32>().unwrap_or(u32::MAX));
+    let (year, month, day) = (n(1), n(2), n(3));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    // A day that exists, and a time and offset that do (SQLite would read anything else as NULL).
+    (1..=days).contains(&day) && n(4) < 24 && n(5) < 60 && n(6) < 60 && n(7) < 24 && n(8) < 60
 }
 
 /// Whether `v` is a status class such as `5xx`.
@@ -497,7 +516,12 @@ fn check_term(name: &str, op: Op, value: &str, quoted: bool, at: usize) -> Resul
             }
         }
     }
-    if matches!(op, Op::Regex | Op::NotRegex) {
+    if matches!(op, Op::Regex | Op::NotRegex) && kind == Kind::Bytes {
+        regex::bytes::RegexBuilder::new(value)
+            .size_limit(REGEX_SIZE)
+            .build()
+            .map_err(|e| bad(&format!("not a valid regex ({e})")))?;
+    } else if matches!(op, Op::Regex | Op::NotRegex) {
         RegexBuilder::new(value)
             .size_limit(REGEX_SIZE)
             .build()
@@ -651,7 +675,7 @@ fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &st
             match op {
                 // A prefix, such as a day; the rest compare as instants, so a stored fraction of a
                 // second or a given offset doesn't throw the order off.
-                Op::Has => format!("substr({expr}, 1, length({v})) = {v}"),
+                Op::Has => format!("substr({expr}, 1, length({v})) = replace({v}, ' ', 'T')"),
                 Op::Eq => format!("julianday({expr}) = julianday({v})"),
                 Op::Ne => format!("NOT coalesce((julianday({expr}) = julianday({v})), 0)"),
                 Op::Lt => format!("julianday({expr}) < julianday({v})"),
@@ -839,8 +863,31 @@ mod tests {
         }
         assert!(err("time>yesterday").contains("expected a time"));
         assert!(err("time<2026-11").contains("expected a time"));
-        // A prefix takes any text.
-        assert!(sql("time:2026-11").0.contains("substr(time, 1, length(?1)) = ?1"));
+        // A day or time that doesn't exist is refused, not matched as NULL.
+        for bad in [
+            "2026-11-31",
+            "2026-02-29",
+            "2026-13-01",
+            "2026-11-08T24:00",
+            "2026-11-08T12:60",
+            "2026-11-08T12:00:00+25:00",
+        ] {
+            assert!(err(&format!("time>=\"{bad}\"")).contains("expected a time"), "{bad}");
+        }
+        assert!(Query::parse("time>=2024-02-29").is_ok(), "a leap day");
+        // A prefix takes any text, a space standing for the stored T.
+        assert!(sql("time:2026-11").0.contains("substr(time, 1, length(?1)) = replace(?1, ' ', 'T')"));
+    }
+
+    #[test]
+    fn byte_fields_take_byte_regexes() {
+        assert!(sql("resp.body~\"(?-u:\\xff)\"").0.contains("regexp_bytes(?1, resp_body)"));
+        assert!(err("url~\"(?-u:\\xff)\"").contains("not a valid regex"), "text fields are text");
+    }
+
+    #[test]
+    fn positions_count_characters() {
+        assert!(err("title:\"über\" stauts:1").contains("at position 14"), "{}", err("title:\"über\" stauts:1"));
     }
 
     #[test]

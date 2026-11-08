@@ -121,9 +121,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
   MCP), so a prepared tab never makes the person's send go unrecorded. `replay_tabs_list` can return a large set; `summary` leaves the requests out and
   `index` returns one tab, so a set over `--max-output` can be read a tab at a time. It
   returns requests as stored, live cookies or tokens typed into a tab included.
-- `history_filters_save` without `append`, or with a name already saved: an agent can add a
-  Traffic filter for a person (a query it found useful, say), but not replace, change or clear
-  the ones they keep. `history_list` takes the same query language as Traffic's Query mode in
+- `history_filters_save` without `append`, with a name already saved, or past 150 filters in
+  all: an agent can add a Traffic filter for a person (a query it found useful, say), but not
+  replace, change or clear the ones they keep, or fill the 200 a project holds. `history_list` takes the same query language as Traffic's Query mode in
   `filter`; its description lists the fields.
 - `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
   would copy any file the server can read into the project for the agent to read back; pass the

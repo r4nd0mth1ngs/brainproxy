@@ -516,8 +516,9 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   older build kept in localStorage are merged into the project's (`mergeLocal`: an equal one is
   already there, a different one under a taken name becomes "NAME (this computer)"), then
   removed from localStorage. A note or highlight changed from Traffic runs a query that uses
-  `tag` or `note` again from the start (`usesEditableFields`), since rows already searched may
-  now match or not; edits made elsewhere aren't seen until the query changes.
+  `tag` or `note` again from the start (`usesEditableFields`, `rerun`: rows it hasn't reached yet
+  keep showing as before, so the table doesn't empty), since rows already searched may now match
+  or not; edits made elsewhere aren't seen until the query changes.
 - Traffic's contents search is case-sensitive and literal, like `history list --contains`
   (no `--ignore-case` yet), and stops at the first 10,000 matches the other filters show
   (oldest first; the toolbar says so). Only a new text or a different single source starts a

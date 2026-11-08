@@ -256,6 +256,11 @@ export interface ContentSearch {
   error: string | null;
   /** The CLI refused the query itself (it doesn't parse): never tried again until it changes. */
   invalid: boolean;
+  /**
+   * The matches of the search this one reruns (`rerun`): rows past `cursor` keep showing as
+   * they did until this one reaches them, so the table doesn't empty meanwhile.
+   */
+  previous?: Map<number, HistoryItem>;
   /** Pages failed in a row, for the backoff. */
   failures: number;
   retryAt: number;
@@ -281,6 +286,9 @@ export const newSearch = (query: SearchQuery): ContentSearch => ({
   failures: 0,
   retryAt: 0,
 });
+
+/** The same search from the start, showing `s`'s matches until it gets to them. */
+export const rerun = (s: ContentSearch): ContentSearch => ({ ...newSearch(s.query), previous: s.matches });
 
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
@@ -331,8 +339,11 @@ export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number, 
     matches.set(i.id, i);
     cursor = Math.max(cursor, i.id);
   }
-  if (!capped && items.length < SEARCH_PAGE) cursor = Math.max(cursor, upTo);
-  return { ...s, matches, cursor, capped, error: null, invalid: false, failures: 0, retryAt: 0 };
+  const done = !capped && items.length < SEARCH_PAGE;
+  if (done) cursor = Math.max(cursor, upTo);
+  // Caught up: what the rerun search replaced isn't needed any more.
+  const previous = done ? undefined : s.previous;
+  return { ...s, matches, cursor, capped, previous, error: null, invalid: false, failures: 0, retryAt: 0 };
 }
 
 /**
@@ -375,7 +386,8 @@ export function refilter(s: ContentSearch, f: TrafficFilter): ContentSearch {
 export function visibleRows(rows: HistoryItem[], f: TrafficFilter, s: ContentSearch | null): HistoryItem[] {
   if (searchFor(f)) {
     if (!isCurrent(s, f)) return [];
-    return rows.filter((r) => s.matches.has(r.id) && matchesFilter(r, f));
+    const was = s.previous;
+    return rows.filter((r) => (s.matches.has(r.id) || (!!was && r.id > s.cursor && was.has(r.id))) && matchesFilter(r, f));
   }
   return rows.filter((r) => matchesFilter(r, f));
 }

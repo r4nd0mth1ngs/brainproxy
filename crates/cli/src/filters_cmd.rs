@@ -20,6 +20,8 @@ const KEY: &str = "traffic.filters";
 const VERSION: u64 = 1;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_FILTERS: usize = 200;
+/// The most an agent can bring the set to through MCP, so a person always has room for theirs.
+const MAX_THROUGH_MCP: usize = 150;
 const MAX_NAME: usize = 100;
 const MAX_SOURCES: usize = 16;
 const MAX_SOURCE: usize = 32;
@@ -38,8 +40,8 @@ pub enum FiltersCmd {
         `history list --filter` query, which must parse), sources (empty: every source), hideErrors (2xx/3xx \
         only), hideAssets, hideRefused (out-of-scope rows; true when left out). contents and query can't both be \
         on. Names are unique, at most 100 characters; at most 200 filters. An empty list leaves none. Through MCP \
-        only --append is allowed, and a name already saved is refused, so an agent can't remove or change a \
-        person's filters.")]
+        only --append is allowed, a name already saved is refused, and the set can't grow past 150, so an agent \
+        can't remove or change a person's filters or leave them no room.")]
     Save {
         /// Add the filters after the saved ones instead of replacing them. A name already saved is refused.
         #[arg(long)]
@@ -151,7 +153,8 @@ pub fn filters(project: &Path, cmd: FiltersCmd, out: &Out) -> Result<(), Error> 
                     )));
                 }
                 let before = if append { before } else { Vec::new() };
-                let (json, count) = build(set, before, rev + 1)?;
+                let cap = if crate::mcp::in_tool_call() { MAX_THROUGH_MCP } else { MAX_FILTERS };
+                let (json, count) = build(set, before, rev + 1, cap)?;
                 Ok((Some(json), (count, rev + 1)))
             })?;
             let mut data = json!({"count": count, "rev": rev});
@@ -258,13 +261,17 @@ fn parse(input: &[u8]) -> Result<Set, Error> {
 }
 
 /// The set to store as compact JSON, with its count: `set` after the filters `before` (kept by
-/// an append), at revision `rev`. An appended name that is already saved is refused.
-fn build(set: Set, before: Vec<Value>, rev: u64) -> Result<(String, usize), Error> {
+/// an append), at revision `rev`, with at most `cap` in all. An appended name that is already
+/// saved is refused.
+fn build(set: Set, before: Vec<Value>, rev: u64, cap: usize) -> Result<(String, usize), Error> {
     let count = before.len() + set.filters.len();
-    if count > MAX_FILTERS {
-        return Err(Error::InvalidInput(format!(
-            "{count} Traffic filters with the saved ones; at most {MAX_FILTERS} can be saved, remove some first"
-        )));
+    if count > cap {
+        let why = if cap < MAX_FILTERS {
+            format!("through MCP the set can grow to {cap}, so a person keeps room for their own")
+        } else {
+            format!("at most {cap} can be saved, remove some first")
+        };
+        return Err(Error::InvalidInput(format!("{count} Traffic filters with the saved ones; {why}")));
     }
     if let Some(s) = set.filters.iter().find(|s| before.iter().any(|b| b["name"].as_str() == Some(s.name.as_str()))) {
         return Err(Error::Conflict(format!(
@@ -303,7 +310,7 @@ mod tests {
                 {"name": "tokens", "filter": {"text": "Bearer ", "contents": true, "hideRefused": false}}]}"#,
         )
         .unwrap();
-        let (json, count) = build(set, Vec::new(), 1).unwrap();
+        let (json, count) = build(set, Vec::new(), 1, MAX_FILTERS).unwrap();
         assert_eq!(count, 2);
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!((v["v"].as_u64(), v["rev"].as_u64()), (Some(1), Some(1)));
@@ -337,10 +344,19 @@ mod tests {
     fn an_append_never_replaces_a_name() {
         let before = vec![json!({"name": "mine", "filter": {}})];
         let set = parse(br#"{"filters": [{"name": "mine", "filter": {"text": "x"}}]}"#).unwrap();
-        let e = build(set, before.clone(), 2).unwrap_err();
+        let e = build(set, before.clone(), 2, MAX_FILTERS).unwrap_err();
         assert_eq!(e.kind(), "conflict");
         let set = parse(br#"{"filters": [{"name": "theirs", "filter": {}}]}"#).unwrap();
-        assert_eq!(build(set, before, 2).unwrap().1, 2);
+        assert_eq!(build(set, before, 2, MAX_FILTERS).unwrap().1, 2);
+    }
+
+    #[test]
+    fn an_agent_leaves_the_person_room() {
+        let before: Vec<Value> = (0..MAX_THROUGH_MCP).map(|i| json!({"name": format!("f{i}"), "filter": {}})).collect();
+        let set = || parse(br#"{"filters": [{"name": "one more", "filter": {}}]}"#).unwrap();
+        let e = build(set(), before.clone(), 2, MAX_THROUGH_MCP).unwrap_err().to_string();
+        assert!(e.contains("through MCP the set can grow to 150"), "{e}");
+        assert_eq!(build(set(), before, 2, MAX_FILTERS).unwrap().1, MAX_THROUGH_MCP + 1);
     }
 
     #[test]

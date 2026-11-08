@@ -20,6 +20,7 @@ import {
   parseFilter,
   parseSaved,
   refilter,
+  rerun,
   mergeLocal,
   usesEditableFields,
   saveChange,
@@ -225,6 +226,22 @@ test("filters kept by an older build are added to the project's without losing e
     mergeLocal([agent, { name: "errors (this computer)", filter: filter() }], [clash]).map((s) => s.name),
     ["errors", "errors (this computer)", "errors (this computer 2)"],
   );
+});
+
+test("a rerun search keeps showing the earlier matches it hasn't reached yet", () => {
+  const f = qf("NOT tag=highlight");
+  const all = rows(1, 6);
+  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(3), row(5)], 6, f);
+  s = rerun(s);
+  // Nothing searched yet: the table shows what it showed.
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 3, 5]);
+  // Searched up to 3 (row 3 was highlighted meanwhile): below the cursor only the new matches count.
+  s = { ...s, matches: new Map([[1, row(1)]]), cursor: 3 };
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 5]);
+  // Caught up: the earlier matches are dropped.
+  s = mergePage(s, [row(6)], 6, f);
+  assert.equal(s.previous, undefined);
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 6]);
 });
 
 test("a query on notes or tags is searched again after an edit", () => {

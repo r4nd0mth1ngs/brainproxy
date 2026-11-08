@@ -22,6 +22,7 @@ import {
   needsSearch,
   newSearch,
   refilter,
+  rerun,
   mergeLocal,
   saveChange,
   savedFrom,
@@ -180,9 +181,9 @@ function History() {
         clearLocalSaved(app.project);
         takeSaved(merged, gen);
       } catch (e: any) {
-        // Still shown, and kept where they were: the next open tries the project again.
+        // Still shown, and kept where they were: the next save (or open) tries the project again.
         if (gen !== savedGen.current) return;
-        setSaved(mergeLocal(savedState.current.list, local));
+        takeSaved({ rev: savedState.current.rev, list: mergeLocal(savedState.current.list, local) }, gen);
         app.toast(`Saved filters stay in this app until they can be saved in the project: ${e.message}`, "error");
       }
     })().catch((e) => gen === savedGen.current && app.toast(`Saved filters: ${e.message}`, "error"));
@@ -343,7 +344,7 @@ function History() {
     const s = search.current;
     if (!s || s.query.kind !== "filter" || !usesEditableFields(s.query.text)) return;
     if (searchCall.current) cancelCli(searchCall.current).catch(() => {});
-    search.current = newSearch(s.query);
+    search.current = rerun(s);
     setFound(search.current);
     searchMore();
   };
