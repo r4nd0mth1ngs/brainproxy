@@ -6,17 +6,18 @@
 //! change only the request's headers and query, on the signer's origins.
 //!
 //! The interpreter can't be interrupted (a regex that backtracks, a loop of `await`s), so
-//! each run is a child process, `brainproxy __sign-script`, killed at the time limit. On
-//! Unix the child also limits its own address space (enforced by Linux; macOS accepts the
-//! limit but doesn't enforce it) and CPU time; on Windows only the time limit bounds it. It
-//! starts with an empty environment, and gets the script, its variables and the request on
-//! stdin.
+//! each run is a child process, `brainproxy __sign-script`, killed at the time limit. Its
+//! memory is bounded on each system its own way: on Linux the child limits its address
+//! space, on Windows it runs in a job object with a memory limit, and on macOS (which
+//! accepts an address-space limit but doesn't enforce it) the parent watches its memory and
+//! kills it over the limit. On Unix it also limits its CPU time. It starts with an empty
+//! environment, and gets the script, its variables and the request on stdin.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -32,9 +33,11 @@ const RECURSION_LIMIT: usize = 200;
 /// The interpreter recurses on the native stack.
 const STACK_BYTES: usize = 16 * 1024 * 1024;
 const TIME_LIMIT: Duration = Duration::from_secs(5);
-/// The child's address space: the interpreter, its stack and the script's data.
-#[cfg(unix)]
+/// The child's memory: the interpreter, its stack and the script's data. On Linux it bounds
+/// the address space, on Windows the committed memory, on macOS the physical footprint.
 const MEMORY_LIMIT: u64 = 1 << 30;
+/// How often the parent looks at the child's memory where the system doesn't bound it.
+const WATCH_INTERVAL: Duration = if cfg!(target_os = "macos") { Duration::from_millis(10) } else { TIME_LIMIT };
 /// A result longer than this is no request's headers.
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 /// Globals a script has no use for: shared memory and blocking waits.
@@ -491,6 +494,8 @@ struct Job {
     script: String,
     vars: Vec<(String, String)>,
     request: ScriptRequest,
+    /// The memory limit, in bytes, for the child to set where it can (Linux).
+    memory: u64,
 }
 
 /// The child's answer: one line of JSON, the last it writes.
@@ -502,16 +507,17 @@ struct Reply {
     error: Option<String>,
 }
 
-/// The child side of a run (`brainproxy __sign-script`): limits itself, reads a [`Job`] on
-/// stdin, runs it on a thread with a large stack (the interpreter recurses on the native
-/// stack) and writes a [`Reply`]. Returns the exit code.
+/// The child side of a run (`brainproxy __sign-script`): reads a [`Job`] on stdin, limits
+/// itself, runs the job on a thread with a large stack (the interpreter recurses on the
+/// native stack) and writes a [`Reply`]. Returns the exit code.
 pub fn child_main() -> i32 {
-    limit_resources();
     let mut input = Vec::new();
     if std::io::stdin().read_to_end(&mut input).is_err() {
         return 2;
     }
     let Ok(job) = serde_json::from_slice::<Job>(&input) else { return 2 };
+    drop(input);
+    limit_resources(job.memory);
     let ran = std::thread::Builder::new()
         .name("postman-script".into())
         .stack_size(STACK_BYTES)
@@ -531,13 +537,15 @@ pub fn child_main() -> i32 {
     0
 }
 
-/// Bounds the child's address space and CPU time and turns off core dumps. A limit the
-/// system refuses is left as it was: the parent's time limit still holds.
+/// Bounds the child's address space to `memory` bytes and its CPU time, and turns off core
+/// dumps. A limit the system refuses is left as it was: the parent's time limit still holds.
+/// macOS accepts the address-space limit without enforcing it, which is why the parent
+/// watches the child there.
 #[cfg(unix)]
-fn limit_resources() {
+fn limit_resources(memory: u64) {
     let cpu = TIME_LIMIT.as_secs() * 2;
     for (resource, soft, hard) in
-        [(libc::RLIMIT_AS, MEMORY_LIMIT, MEMORY_LIMIT), (libc::RLIMIT_CPU, cpu, cpu + 1), (libc::RLIMIT_CORE, 0, 0)]
+        [(libc::RLIMIT_AS, memory, memory), (libc::RLIMIT_CPU, cpu, cpu + 1), (libc::RLIMIT_CORE, 0, 0)]
     {
         let limit = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
         // SAFETY: setrlimit reads the struct it is given and nothing else.
@@ -547,9 +555,79 @@ fn limit_resources() {
     }
 }
 
-/// Windows has no setrlimit; a job object could bound memory, which isn't done.
+/// Windows has no setrlimit: the parent puts the child in a [`MemoryJob`] instead.
 #[cfg(not(unix))]
-fn limit_resources() {}
+fn limit_resources(_memory: u64) {}
+
+/// The physical footprint of process `pid`, in bytes: what it holds in memory, compressed
+/// or not.
+#[cfg(target_os = "macos")]
+fn footprint(pid: u32) -> Option<u64> {
+    // SAFETY: the struct is plain integers, for which zero is a valid value.
+    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    let buffer = (&mut info as *mut libc::rusage_info_v0).cast::<libc::rusage_info_t>();
+    // SAFETY: proc_pid_rusage writes one rusage_info_v0, the flavor asked for, into `info`.
+    let r = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V0, buffer) };
+    (r == 0).then_some(info.ri_phys_footprint)
+}
+
+/// Whether the child is over the memory limit, where the parent has to look for itself.
+#[cfg(target_os = "macos")]
+fn over_memory(child: &std::process::Child, memory: u64) -> bool {
+    footprint(child.id()).is_some_and(|used| used > memory)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn over_memory(_child: &std::process::Child, _memory: u64) -> bool {
+    false
+}
+
+/// A Windows job object holding the child: a process in it can't commit more than its
+/// memory limit, and closing the job (when this is dropped) kills whatever is still in it.
+#[cfg(windows)]
+struct MemoryJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl MemoryJob {
+    fn hold(child: &std::process::Child, memory: u64) -> Option<MemoryJob> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        };
+        // SAFETY: both arguments may be null: no security attributes, no name.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return None;
+        }
+        let job = MemoryJob(handle);
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.ProcessMemoryLimit = usize::try_from(memory).unwrap_or(usize::MAX);
+        // SAFETY: `info` is the struct this information class names, with its size; the
+        // child's handle stays open while `child` lives.
+        let held = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && AssignProcessToJobObject(job.0, child.as_raw_handle()) != 0
+        };
+        held.then_some(job)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MemoryJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle is the job's, and closed only here.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -557,13 +635,30 @@ thread_local! {
     pub(crate) static LAST_CHILD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Runs `script` over `request` in a child process, killed if it passes the time limit,
-/// so nothing of it outlives the call. Messages have the values of `vars` masked, as a
-/// script's own errors can quote them.
+/// Runs `script` over `request` in a child process, killed if it passes the time or memory
+/// limit, so nothing of it outlives the call. Messages have the values of `vars` masked, as
+/// a script's own errors can quote them.
 pub(crate) fn run(
     script: &str,
     vars: Vec<(String, String)>,
     request: ScriptRequest,
+) -> std::result::Result<Outcome, Failure> {
+    run_within(script, vars, request, MEMORY_LIMIT)
+}
+
+/// How a wait for the child ended.
+enum Waited {
+    Answered(Vec<u8>),
+    OverTime,
+    OverMemory,
+}
+
+/// [`run`], with a memory limit of `memory` bytes.
+fn run_within(
+    script: &str,
+    vars: Vec<(String, String)>,
+    request: ScriptRequest,
+    memory: u64,
 ) -> std::result::Result<Outcome, Failure> {
     let secrets: Vec<String> = vars.iter().map(|(_, v)| v.clone()).filter(|v| v.len() >= 4).collect();
     let mask = |mut e: String| {
@@ -574,7 +669,7 @@ pub(crate) fn run(
     };
     let stopped = |e: &str| Failure::Stopped(e.to_string());
     let runner = RUNNER.get().ok_or_else(|| stopped("scripts run only from the brainproxy command"))?;
-    let input = serde_json::to_vec(&Job { script: script.to_string(), vars, request })
+    let input = serde_json::to_vec(&Job { script: script.to_string(), vars, request, memory })
         .map_err(|_| stopped("the script couldn't be handed over"))?;
     let mut cmd = Command::new(&runner.program);
     cmd.args(&runner.args)
@@ -595,6 +690,13 @@ pub(crate) fn run(
         let _ = child.wait();
         return Err(stopped("the script couldn't start"));
     };
+    // Before the child has its job: it runs nothing until it has read it all.
+    #[cfg(windows)]
+    let Some(_job) = MemoryJob::hold(&child, memory) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(stopped("the script's memory couldn't be limited"));
+    };
     let (send, recv) = mpsc::channel();
     // Ends when the child does: killing it closes both pipes.
     let io = std::thread::spawn(move || {
@@ -604,13 +706,25 @@ pub(crate) fn run(
         let _ = stdout.take(OUTPUT_LIMIT).read_to_end(&mut out);
         let _ = send.send(out);
     });
-    let out = recv.recv_timeout(TIME_LIMIT);
+    let deadline = Instant::now() + TIME_LIMIT;
+    let waited = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match recv.recv_timeout(left.min(WATCH_INTERVAL)) {
+            Ok(out) => break Waited::Answered(out),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Waited::Answered(Vec::new()),
+            Err(mpsc::RecvTimeoutError::Timeout) if left <= WATCH_INTERVAL => break Waited::OverTime,
+            Err(mpsc::RecvTimeoutError::Timeout) if over_memory(&child, memory) => break Waited::OverMemory,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
     // Also when it answered: a child that wrote too much may still be waiting to write.
     let _ = child.kill();
     let status = child.wait();
     let _ = io.join();
-    let Ok(out) = out else {
-        return Err(stopped(&format!("it ran past the time limit of {} s", TIME_LIMIT.as_secs())));
+    let out = match waited {
+        Waited::Answered(out) => out,
+        Waited::OverTime => return Err(stopped(&format!("it ran past the time limit of {} s", TIME_LIMIT.as_secs()))),
+        Waited::OverMemory => return Err(stopped(&format!("it went past the memory limit of {} MiB", memory >> 20))),
     };
     let text = String::from_utf8_lossy(&out);
     let reply = text.lines().rev().find(|l| !l.trim().is_empty()).and_then(|l| serde_json::from_str::<Reply>(l).ok());
@@ -784,6 +898,35 @@ pub(crate) mod tests {
     #[test]
     fn an_endless_await_loop_is_stopped_with_its_process() {
         stopped_in_time("async function f() { while (true) { await null; } } f();");
+    }
+
+    /// Each system bounds a run's memory its own way (see the module's notes). Linux keeps
+    /// the full limit: its address space counts reservations, not only what is used.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn a_script_that_takes_too_much_memory_is_stopped_with_its_process() {
+        let memory = if cfg!(target_os = "linux") { MEMORY_LIMIT } else { 256 << 20 };
+        // 64 MiB strings, each a fresh copy, kept until the run is stopped.
+        let script = "let s = 'x'.repeat(1 << 20); while (s.length < 1 << 26) s += s;
+                      const kept = []; for (let i = 0; ; i++) kept.push(s + i);";
+        use_test_runner();
+        let started = std::time::Instant::now();
+        let r = run_within(script, vec![], request(), memory);
+        let took = started.elapsed();
+        assert!(took < TIME_LIMIT, "stopped by the time limit, not memory: {r:?}");
+        let Err(Failure::Stopped(e)) = &r else { panic!("not stopped: {r:?}") };
+        if cfg!(target_os = "macos") {
+            assert_eq!(e, "it went past the memory limit of 256 MiB");
+        } else {
+            assert!(e.contains("out of memory"), "{e}");
+        }
+        #[cfg(unix)]
+        {
+            let pid = LAST_CHILD.get() as libc::pid_t;
+            // SAFETY: signal 0 only asks whether the process exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "its process {pid} is still there");
+        }
     }
 
     #[test]
