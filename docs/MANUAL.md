@@ -165,10 +165,20 @@ balancer) such a request to an in-scope address can still reach a site outside t
 `send` (races too), `fuzz run`, `ws send` and an edited request forwarded with `intercept
 forward` warn when the host they name isn't the target's and isn't listed by name: in the
 output's `host_warning`, and on stderr in text mode. A payload position in the Host header
-counts as such a host. Through MCP these are refused unless `--host-header-test` says the test is
-meant, so the intent is on record (see [Agents and MCP](#agents-and-mcp)). Active scan rules that
-put a host of their own in the Host header (Cloud Metadata names the metadata service, for one)
-send it to the scanned host, as they do outside MCP.
+counts as such a host. Settings that put a Host on requests still to come are checked the same
+way when they are saved: an auth profile's `--header` or `--token-header`, its login request and
+`--login-header` (the login URL's own host is fine), a macro's steps (`auth macro add`), and a
+proxy rule (`rules add`, or `rules enable` of a disabled one) whose replacement writes a Host line
+or an absolute URL, or that rewrites the Host of a request to a host the engagement lists. A rule
+can match anything, so that last check isn't proof. Session rules and signers can't set the Host
+at all. Saving a setting again with the Host it already had isn't checked again. Through MCP all
+of these are refused unless `--host-header-test` says the test is meant, so the intent is on
+record (see [Agents and MCP](#agents-and-mcp)).
+
+Not checked: active scan rules and check templates that put a host of their own in the Host
+header (Cloud Metadata names the metadata service, for one; `scan active --inject-header Host`
+puts payloads there), which are Host-header tests by nature and connect to the scanned in-scope
+host; and requests sent again as they were recorded (`findings retest`, a scan of history rows).
 
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
 recorded and intercepted. It is empty by default, which means everything the engagement

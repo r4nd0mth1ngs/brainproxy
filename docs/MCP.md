@@ -137,7 +137,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
   position: refused (`out_of_scope`) unless `host_header_test` is set. On a shared front end such
   a request to an in-scope address can reach a site outside the scope; a Host-header test needs
   one, so the flag puts the intent on record. The output's `host_warning` names the host either
-  way, as it does outside MCP.
+  way, as it does outside MCP. The same goes for settings that put such a Host on requests still
+  to come: `auth_add` (`headers`, `token_header`, `login_request`, `login_header`),
+  `auth_macro_add` steps, and `rules_add` or `rules_enable` with a rule that writes or rewrites
+  the Host; the MANUAL's Concepts section has the details.
 - `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
   project's profile, with the person's cookies and sign-ins, and the pages it loads would be
   recorded as the proxy's traffic, not the agent's.

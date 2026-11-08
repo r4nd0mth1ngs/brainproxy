@@ -353,6 +353,20 @@ fn a_foreign_host_is_sent_with_a_warning_but_an_agent_must_say_it_is_a_test() {
     let _ = std::fs::remove_file(raw);
 }
 
+#[test]
+fn a_person_sets_a_foreign_host_on_requests_to_come_with_a_warning() {
+    let env = Env::new("host-settings");
+    let profile = env.ok(&[], &["auth", "add", "p", "-H", "Host: other-tenant.test"]);
+    assert!(profile["host_warning"].as_str().unwrap().contains("auth profile p: header sets the Host"), "{profile}");
+    let args = ["rules", "add", "--location", "request-header", "--replace", "Host: other-tenant.test"];
+    let rules = env.ok(&[], &args);
+    assert!(rules["host_warning"].as_str().unwrap().contains("rule 1 sets the Host to other-tenant.test"), "{rules}");
+    // An agent's is refused without saying it is a Host-header test.
+    let (code, v, _) = env.run(&[(MCP, "1")], &args);
+    assert_ne!(code, 0);
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+}
+
 /// Sends one request through the proxy and returns the response.
 fn through(listen: &str, port: u16, path: &str, headers: &str) -> String {
     let mut s = TcpStream::connect(listen).unwrap();
