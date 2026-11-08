@@ -1251,6 +1251,8 @@ fn project_dir(path: &Path) -> &Path {
 /// Makes the project file, its -wal/-shm sidecars and `<project>.browsers/` (browser
 /// profiles with cookies) owner-only, and sets the process umask to 077 so whatever is
 /// created next (the database, sidecars, browser profiles, output files) starts that way.
+/// A sidecar that is a link is left alone: chmod follows links, and what one points to may be
+/// shared and isn't the project's to lock down.
 #[cfg(unix)]
 fn owner_only(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -1261,10 +1263,11 @@ fn owner_only(path: &Path) {
         s.push(suffix);
         std::path::PathBuf::from(s)
     };
-    for (p, mode) in
-        [(path.to_path_buf(), 0o600), (with("-wal"), 0o600), (with("-shm"), 0o600), (with(".browsers"), 0o700)]
-    {
-        if p.exists() {
+    if path.exists() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    for (p, mode) in [(with("-wal"), 0o600), (with("-shm"), 0o600), (with(".browsers"), 0o700)] {
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink()) {
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
         }
     }
@@ -1980,5 +1983,22 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir.join("p.bpdb-wal")), 0o600);
         assert_eq!(mode(&browsers), 0o700);
+    }
+
+    /// A linked sidecar's target, which may be shared, keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn linked_sidecars_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-store-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&shared, dir.join("p.bpdb.browsers")).unwrap();
+        let s = Store::open(&dir.join("p.bpdb")).unwrap();
+        sample(&s);
+        assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
