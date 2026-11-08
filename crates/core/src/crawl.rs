@@ -22,6 +22,7 @@ use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
 use crate::scan::message::SetCookie;
 use crate::scan::passive::util::{decode_entities, now_unix, parse_http_date, tags, Tag};
+use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::store::Store;
 
 #[derive(Debug, Clone)]
@@ -169,26 +170,56 @@ pub(crate) fn parse_seeds(seeds: &[String]) -> Result<Vec<Url>> {
 
 pub(crate) type Writer = std::thread::JoinHandle<Result<(usize, usize)>>;
 
-/// Saving and the passive scan on their own thread, beside the fetches. The thread
-/// ends once every sender is dropped; [`join_writer`] gives (new findings, record errors).
-pub(crate) fn spawn_writer(project: &Path) -> Result<(std::sync::mpsc::Sender<Capture>, Writer)> {
-    let (save, saved) = std::sync::mpsc::channel::<Capture>();
+/// What a crawl's writer thread saves.
+pub(crate) enum Save {
+    /// The row of a request about to go out, or its completion (see [`Rows`]).
+    Row(RowWrite),
+    /// A request that wasn't sent (blocked, or refused before it went out).
+    Unsent(Box<Capture>),
+}
+
+/// The rows of a crawl's requests (source `source`), saved by its writer thread `save`.
+pub(crate) fn rows(source: &'static str, save: &std::sync::mpsc::Sender<Save>) -> Rows {
+    let save = save.clone();
+    Rows::new(source, move |w| drop(save.send(Save::Row(w))))
+}
+
+/// Saving and the passive scan on their own thread, beside the fetches. Everything queued
+/// since the last write is written in one transaction. The thread ends once every sender
+/// (and every [`Rows`] made by [`rows`]) is dropped; [`join_writer`] gives (new findings,
+/// record errors).
+pub(crate) fn spawn_writer(project: &Path) -> Result<(std::sync::mpsc::Sender<Save>, Writer)> {
+    let (save, saved) = std::sync::mpsc::channel::<Save>();
     let mut store = Store::open(project)?;
     let writer = std::thread::spawn(move || -> Result<(usize, usize)> {
         let (mut new_findings, mut record_errors) = (0, 0);
         while let Ok(first) = saved.recv() {
-            let mut captures = vec![first];
-            captures.extend(saved.try_iter().take(255));
-            // One unsavable exchange (e.g. a huge body) must not abort the crawl:
+            let mut rows = RowBatch::default();
+            let mut unsent = Vec::new();
+            for s in std::iter::once(first).chain(saved.try_iter().take(255)) {
+                match s {
+                    Save::Row(w) => rows.push(w),
+                    Save::Unsent(c) => unsent.push(*c),
+                }
+            }
+            // One unsavable exchange (e.g. a huge body) must not abort the crawl: these
             // fall back to saving one by one and count what fails.
-            if let Err(e) = store.record_batch(&captures) {
-                eprintln!("brainproxy: crawl: saving {} exchanges failed ({e}); saving one by one", captures.len());
-                for c in &captures {
-                    if let Err(e) = store.record(c) {
-                        eprintln!("brainproxy: crawl: exchange not saved: {e}");
-                        record_errors += 1;
+            let written = rows.write(&mut store);
+            record_errors += written.failed;
+            if !unsent.is_empty() {
+                if let Err(e) = store.record_batch(&unsent) {
+                    eprintln!("brainproxy: crawl: saving {} rows failed ({e}); saving one by one", unsent.len());
+                    for c in &unsent {
+                        if let Err(e) = store.record(c) {
+                            eprintln!("brainproxy: crawl: row not saved: {e}");
+                            record_errors += 1;
+                        }
                     }
                 }
+            }
+            // A row the passive scan passed while it was pending is scanned now.
+            for id in written.completed {
+                new_findings += crate::scan::passive::scan_late(&mut store, id)?;
             }
             new_findings += crate::scan::passive::scan_pending(&mut store)?.new_findings;
         }
@@ -209,8 +240,9 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     let seeds = parse_seeds(&cfg.seeds)?;
     let scope = Scope::new(&seeds, &cfg);
     let (save, writer) = spawn_writer(project)?;
-
     let client = Arc::new(Client::new(cfg.send.clone()));
+    let rows = rows("crawl", &save).sent_by(&client);
+
     // One limiter for the whole crawl: --rate holds across tasks and depths.
     let limiter = crate::scan::active::Limiter::new(cfg.rate).map(Arc::new);
     let mut summary = CrawlSummary::default();
@@ -266,8 +298,15 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             *n += 1;
             sent += 1;
             summary.depth_reached = summary.depth_reached.max(depth);
-            let (client, headers, ctl, auth, jar, limiter) =
-                (client.clone(), cfg.headers.clone(), ctl.clone(), cfg.auth.clone(), jar.clone(), limiter.clone());
+            let (client, headers, ctl, auth, jar, limiter, rows) = (
+                client.clone(),
+                cfg.headers.clone(),
+                ctl.clone(),
+                cfg.auth.clone(),
+                jar.clone(),
+                limiter.clone(),
+                rows.clone(),
+            );
             running.spawn(async move {
                 if let Some(l) = &limiter {
                     l.wait().await;
@@ -275,20 +314,30 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                 if ctl.stopped() {
                     return None;
                 }
-                let result = fetch(&client, auth.as_deref(), &jar, &req, &headers).await;
+                let result = fetch(&client, &rows, auth.as_deref(), &jar, &req, &headers).await;
                 Some((req, depth, result))
             });
         }
         let Some(done) = running.join_next().await else { break };
-        let Ok(Some((req, depth, (target, raw_req, outcome)))) = done else { continue };
+        let Ok(Some((req, depth, (target, raw_req, recorded, outcome)))) = done else { continue };
         summary.requests += 1;
-        let capture = match outcome {
+        match outcome {
             Err(e) => {
                 summary.errors += 1;
                 *summary.by_status.entry("error".into()).or_default() += 1;
-                Capture::new("crawl", &target, &raw_req, None, None, Some(&e.to_string()))
+                // Its row says how it failed; one refused before it went out gets one now.
+                if !recorded {
+                    let _ = save.send(Save::Unsent(Box::new(Capture::new(
+                        "crawl",
+                        &target,
+                        &raw_req,
+                        None,
+                        None,
+                        Some(&e.to_string()),
+                    ))));
+                }
             }
-            Ok((response, ms)) => {
+            Ok(response) => {
                 let page = Url::parse(&req.url).ok();
                 // The final response, after any interim ones (100 Continue, 103 Early Hints).
                 let last = crate::http::client::final_response(&response);
@@ -326,10 +375,8 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                         );
                     }
                 }
-                Capture::new("crawl", &target, &raw_req, Some(&response), Some(ms as i64), None)
             }
-        };
-        let _ = save.send(capture);
+        }
         if summary.requests % 10 == 0 {
             ctl.set_progress(serde_json::json!({
                 "depth": summary.depth_reached,
@@ -339,7 +386,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             }));
         }
     }
-    drop(save);
+    drop((save, rows));
     let (new_findings, record_errors) = join_writer(writer).await?;
     summary.new_findings = new_findings;
     summary.record_errors = record_errors;
@@ -357,10 +404,13 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     Ok(summary)
 }
 
-type FetchResult = (Target, Vec<u8>, Result<(Vec<u8>, u64)>);
+/// The target, the request (as sent, if it was), whether it has a row, and the response.
+type FetchResult = (Target, Vec<u8>, bool, Result<Vec<u8>>);
 
+/// Sends `req`, each request on record (in `rows`) before it goes out.
 async fn fetch(
     client: &Client,
+    rows: &Rows,
     auth: Option<&AuthSession>,
     jar: &Mutex<CookieJar>,
     req: &Req,
@@ -394,22 +444,18 @@ async fn fetch(
         Err(e) => {
             let target =
                 Target::from_url(&req.url).unwrap_or(Target { scheme: "http".into(), host: String::new(), port: 80 });
-            return (target, Vec::new(), Err(e));
+            return (target, Vec::new(), false, Err(e));
         }
     };
-    let sent = match auth {
-        Some(a) => a.send_as(crate::session::Tool::Crawl, &raw, &target).await,
-        None => client.send(&raw, &target).await,
-    };
+    let (ids, sent) = rows.send_with(client, auth, crate::session::Tool::Crawl, &raw, &target).await;
     match sent {
-        // Record the request actually sent (with the session applied).
         Ok(ex) => {
             if let Some(u) = &url {
                 jar.lock().unwrap().observe(u, &ex.response);
             }
-            (target, ex.request, Ok((ex.response, ex.duration_ms)))
+            (target, ex.request, true, Ok(ex.response))
         }
-        Err(e) => (target, raw.into_bytes(), Err(e)),
+        Err(e) => (target, raw.into_bytes(), !ids.is_empty(), Err(e)),
     }
 }
 

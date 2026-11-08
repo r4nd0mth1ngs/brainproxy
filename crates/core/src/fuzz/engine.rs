@@ -17,6 +17,7 @@ use crate::fuzz::plan::{Plan, Template};
 use crate::http::client::final_response;
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
 
@@ -69,7 +70,23 @@ pub struct FuzzResult {
     pub error: Option<String>,
 }
 
-pub type Row = (Option<Capture>, FuzzResult);
+/// A result and its history row.
+pub type Row = (History, FuzzResult);
+
+/// A fuzz result's history row.
+pub enum History {
+    None,
+    /// Written just before the request went out (`--store all`).
+    Written(i64),
+    /// To write with the result: a match under `--store matches`, known only once answered.
+    Capture(Box<Capture>),
+}
+
+/// What the writer thread writes.
+enum Write {
+    Row(RowWrite),
+    Result(Row),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -105,18 +122,23 @@ pub async fn run(
             .transpose()?,
     });
 
-    let (tx, rx) = mpsc::channel::<Row>();
+    // History rows written before their requests go out, and results, in batches: the rows
+    // first, as a result can point to one.
+    let (tx, rx) = mpsc::channel::<Write>();
     let mut writer_store = Store::open(project)?;
     let writer = std::thread::spawn(move || -> Result<()> {
         while let Ok(first) = rx.recv() {
-            let mut batch = vec![first];
-            while batch.len() < 500 {
-                match rx.try_recv() {
-                    Ok(r) => batch.push(r),
-                    Err(_) => break,
+            let (mut rows, mut batch) = (RowBatch::default(), Vec::new());
+            for w in std::iter::once(first).chain(rx.try_iter().take(499)) {
+                match w {
+                    Write::Row(w) => rows.push(w),
+                    Write::Result(r) => batch.push(r),
                 }
             }
-            writer_store.fuzz_record(run_id, &batch)?;
+            rows.write(&mut writer_store);
+            if !batch.is_empty() {
+                writer_store.fuzz_record(run_id, &batch)?;
+            }
         }
         Ok(())
     });
@@ -128,6 +150,11 @@ pub async fn run(
     let matched_stop = Arc::new(AtomicBool::new(false));
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Arc::new(Limiter::new(r)));
     let client = Arc::new(Client::new(cfg.send.clone()));
+    // With `--store all`, each request's row is written before it goes out.
+    let rows = (cfg.store == StoreMode::All).then(|| {
+        let tx = tx.clone();
+        Rows::new("fuzz", move |w| drop(tx.send(Write::Row(w)))).sent_by(&client)
+    });
     // Cookies and parameters that carry a payload must keep it rather than get the
     // session's value or a session rule's.
     let fuzzed: Arc<(Vec<String>, Vec<String>)> = Arc::new(if cfg.auth.is_some() {
@@ -171,8 +198,15 @@ pub async fn run(
     let url_positions = Arc::new(template.url_positions());
     let mut workers = Vec::new();
     for _ in 0..cfg.concurrency.max(1).min(total.max(1) as usize) {
-        let (next, stop, matched_stop, limiter, client, tx) =
-            (next.clone(), stop.clone(), matched_stop.clone(), limiter.clone(), client.clone(), tx.clone());
+        let (next, stop, matched_stop, limiter, client, tx, rows) = (
+            next.clone(),
+            stop.clone(),
+            matched_stop.clone(),
+            limiter.clone(),
+            client.clone(),
+            tx.clone(),
+            rows.clone(),
+        );
         let url_positions = url_positions.clone();
         let (template, plan, target, cfg, compiled, fuzzed) =
             (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone(), fuzzed.clone());
@@ -212,20 +246,23 @@ pub async fn run(
                 }
 
                 let mut started = Instant::now();
-                let mut result = exchange(&client, &target, &request).await;
-                if let (Some(a), Some(p), Ok(response)) = (&cfg.auth, &prepared, &result) {
+                let (mut row, mut result) = exchange(&client, rows.as_ref(), &target, &request).await;
+                if let (Some(a), Some(p), Ok((response, _))) = (&cfg.auth, &prepared, &result) {
                     // Session lost or stale session values: log in again or refresh them
-                    // (once across workers) and retry this payload.
+                    // (once across workers) and retry this payload. Both requests have rows.
                     if a.after_response(p, response).await {
                         request = a.prepare(Tool::Fuzz, &target, &rendered, &keep_cookies, &keep_params).await.request;
                         started = Instant::now();
-                        result = exchange(&client, &target, &request).await;
-                        if let Ok(r) = &result {
+                        (row, result) = exchange(&client, rows.as_ref(), &target, &request).await;
+                        if let Ok((r, _)) = &result {
                             a.observe(r);
                         }
                     }
                 }
-                let duration = started.elapsed().as_millis() as i64;
+                let duration = match &result {
+                    Ok((_, ms)) => *ms as i64,
+                    Err(_) => started.elapsed().as_millis() as i64,
+                };
 
                 let mut res = FuzzResult {
                     idx,
@@ -235,33 +272,34 @@ pub async fn run(
                     ..Default::default()
                 };
                 let capture = match result {
-                    Ok(response) => {
+                    Ok((response, _)) => {
                         analyze(&response, &compiled, &cfg.match_status, &mut res);
-                        let keep = match cfg.store {
-                            StoreMode::All => true,
-                            StoreMode::Matches => res.matched,
-                            StoreMode::None => false,
-                        };
-                        keep.then(|| Capture::new("fuzz", &target, &request, Some(&response), Some(duration), None))
+                        (cfg.store == StoreMode::Matches && res.matched)
+                            .then(|| Capture::new("fuzz", &target, &request, Some(&response), Some(duration), None))
                     }
                     Err(e) => {
                         res.error = Some(e.to_string());
-                        (cfg.store == StoreMode::All)
+                        // Refused before it went out (or its row couldn't be written): no row yet.
+                        (cfg.store == StoreMode::All && row.is_none())
                             .then(|| Capture::new("fuzz", &target, &request, None, None, Some(&e.to_string())))
                     }
                 };
-                let capture = capture.map(|c| Capture { sni: client.sni(&target), ..c });
+                let history = match (row, capture) {
+                    (Some(id), _) => History::Written(id),
+                    (None, Some(c)) => History::Capture(Box::new(Capture { sni: client.sni(&target), ..c })),
+                    (None, None) => History::None,
+                };
                 if res.matched && cfg.stop_on_match {
                     matched_stop.store(true, Ordering::Relaxed);
                     stop.store(true, Ordering::Relaxed);
                 }
-                if tx.send((capture, res)).is_err() {
+                if tx.send(Write::Result((history, res))).is_err() {
                     break;
                 }
             }
         }));
     }
-    drop(tx);
+    drop((tx, rows));
     for w in workers {
         let _ = w.await;
     }
@@ -280,9 +318,20 @@ pub async fn run(
     })
 }
 
-/// Sends on the client's kept-alive connections.
-async fn exchange(client: &Client, target: &Target, request: &[u8]) -> Result<Vec<u8>> {
-    Ok(client.send(&RawRequest::from_bytes(request.to_vec()), target).await?.response)
+/// Sends on the client's kept-alive connections, on record in `rows` first if given.
+/// Returns the request's row and the response with how long it took.
+async fn exchange(
+    client: &Client,
+    rows: Option<&Rows>,
+    target: &Target,
+    request: &[u8],
+) -> (Option<i64>, Result<(Vec<u8>, u64)>) {
+    let req = RawRequest::from_bytes(request.to_vec());
+    let (id, sent) = match rows {
+        Some(rows) => rows.send(client, &req, target).await,
+        None => (None, client.send(&req, target).await),
+    };
+    (id, sent.map(|ex| (ex.response, ex.duration_ms)))
 }
 
 fn analyze(response: &[u8], c: &Compiled, match_status: &[u16], res: &mut FuzzResult) {

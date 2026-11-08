@@ -1250,7 +1250,7 @@ Crawl and active-scan scope and safety flags:
 - `scan active --checks`: the same opt-in applies to the requests a template sends, from any
   store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
   without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
-  check does send is recorded in history (source `scan`), finding or not.
+  check or rule does send is recorded in history (source `scan`), finding or not.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
   GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
@@ -1543,11 +1543,26 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   with the error. If no copy got a response, the command fails with the error's kind (exit
   3) and the message lists the rows; with `--format json` the envelope's `data.results`
   has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
-- The requests a `scan active --checks` template sends, and the document fetches of `import`
-  and `scan active --api` (with `--graphql`, the introspection), are recorded the same way: a row
-  just before the request goes out, completed with the response or the failure. A check request
-  cut off by its timeout, or by a stopped scan, keeps `sent; no response recorded (the check
-  timed out or the scan stopped)`.
+- The document fetches of `import` and `scan active --api` (with `--graphql`, the
+  introspection) are recorded the same way: a row just before the request goes out, completed
+  with the response or the failure.
+- So are the requests of `crawl` (source `crawl`), `crawl --browser` (`crawl-browser`),
+  `authz run` and its live mode (`authz`, the baseline's second copy too), `fuzz run` with
+  `--store all`, the default (`fuzz`), and `scan active` (`scan`): the page `--url` fetches,
+  and every request a rule or a `--checks` template sends, finding or not. A killed run leaves
+  the requests it had out with the pending error. A request answered with "logged out" keeps
+  its row and the one sent again after the re-login gets the next, as for `send --auth`.
+  A scan request cut off by a check's timeout, or by a stopped scan, keeps `sent; no response
+  recorded (the check timed out or the scan stopped)`; a browser crawl's request still out
+  when the crawl ends keeps the pending error. An out-of-band finding points to its attack's
+  own row. `fuzz run --store matches` records a matching request with its response, once it
+  is known to match, so a killed run leaves no row for the request it had out; `--store
+  none` records none. A request the engagement scope refuses outright isn't sent and gets no
+  pending row (`crawl` and `fuzz run --store all` record it as failed).
+- These commands write their rows on a thread of their own: everything queued since its last
+  write (rows about to go out, and completions) goes in one transaction, and a request goes
+  out only once its row is committed. With many requests out at once, that is one write for
+  many rows.
 - `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
   for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
   before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent, and

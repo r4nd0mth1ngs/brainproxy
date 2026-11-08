@@ -13,6 +13,7 @@ use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
+use brainproxy_core::sent::Rows;
 use brainproxy_core::session::Tool;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -794,13 +795,13 @@ fn select_targets(
     if !args.urls.is_empty() {
         let client = Client::new(send.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        // Each request is on record before it goes out (as `send` records).
+        let rows = Rows::direct("scan", Store::open(project)?).sent_by(&client);
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
-            let ex = match auth {
-                Some(a) => rt.block_on(a.send_as(Tool::Scan, &req, &target))?,
-                None => rt.block_on(client.send(&req, &target))?,
-            };
-            let id = store.record_exchange("scan", &ex)?;
+            let (ids, sent) = rt.block_on(rows.send_with(&client, auth, Tool::Scan, &req, &target));
+            let ex = sent?;
+            let Some(&id) = ids.last() else { return Err(Error::Protocol("the request wasn't recorded".into())) };
             named.insert(id);
             targets.push(ScanTarget {
                 history_id: Some(id),

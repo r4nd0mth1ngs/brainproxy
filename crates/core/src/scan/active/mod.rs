@@ -3,11 +3,10 @@
 //! file names the ZAP class it came from.
 //!
 //! Every request goes through the HTTP client and therefore the engagement scope
-//! guard. Attack exchanges of the ported rules are recorded in history (source "scan")
-//! only when they back a finding. Every request a declarative check (`--checks`) sends is
-//! recorded, finding or not: a template can hold any request, so its rows show what went
-//! out. A check's request whose method isn't opted in (`ActiveConfig::check_methods`) is
-//! not sent.
+//! guard. Every request a rule or declarative check (`--checks`) sends is recorded in
+//! history (source "scan"), finding or not: its row is written just before it goes out and
+//! completed when it is answered or fails (see `crate::sent::Rows`). A check's request
+//! whose method isn't opted in (`ActiveConfig::check_methods`) is not sent.
 //!
 //! Out-of-band checks register their payloads (`Cx::oob_payload`/`oob_register`);
 //! after the last unit, `run` waits up to `ActiveConfig::oob_wait` while
@@ -36,6 +35,7 @@ use crate::jobs::JobControl;
 use crate::oob::{self, Endpoint, Payload, ScanPayload};
 use crate::scan::active::source_sink::{Sink, SourceSink};
 use crate::scan::{AlertDef, Finding, Message};
+use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
 pub use points::{InsertionPoint, PointKind, PointOptions};
@@ -203,11 +203,8 @@ enum Report {
         response: Vec<u8>,
         duration_ms: i64,
     },
-    /// A declarative check's request about to go out: recorded, and its row id sent back
-    /// (None when it could not be recorded, and then it isn't sent).
-    Pending { capture: Capture, reply: tokio::sync::oneshot::Sender<Option<i64>> },
-    /// The outcome of a `Pending` request.
-    Sent { id: i64, capture: Capture },
+    /// A request's row, written before it goes out and completed after (see [`Rows`]).
+    Row(RowWrite),
     Oob {
         target: Target,
         token: String,
@@ -215,12 +212,16 @@ enum Report {
         request: Vec<u8>,
         response: Option<Vec<u8>>,
         duration_ms: Option<i64>,
+        /// The attack's row.
+        history_id: Option<i64>,
         check: Option<String>,
     },
 }
 
 struct Shared {
     client: Client,
+    /// Every request's row, written by the recorder thread.
+    rows: Rows,
     auth: Option<Arc<AuthSession>>,
     strength: Strength,
     ctl: JobControl,
@@ -259,6 +260,9 @@ pub struct Cx {
     shared: Arc<Shared>,
     /// Which session rules apply: a ported rule's (scan) or a declarative check's (checks).
     tool: Tool,
+    /// The rows of this unit's requests that failed, by the request as the rule gave it: an
+    /// out-of-band attack without a response is registered with its row (`oob_register`).
+    failed: Mutex<HashMap<Vec<u8>, i64>>,
 }
 
 impl Cx {
@@ -367,7 +371,7 @@ impl Cx {
         self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         let Some(auth) = &self.shared.auth else {
-            return self.client_send(request, target).await;
+            return self.client_send(request.clone(), target, &request).await;
         };
         // The attacked cookie or parameter keeps its payload.
         let (cookie, param): (Vec<&str>, Vec<&str>) = match &self.point {
@@ -376,59 +380,46 @@ impl Cx {
             None => (vec![], vec![]),
         };
         let prepared = auth.prepare(self.tool, target, &request, &cookie, &param).await;
-        let mut resp = self.client_send(prepared.request.clone(), target).await?;
+        let mut resp = self.client_send(prepared.request.clone(), target, &request).await?;
         if auth.after_response(&prepared, &resp.raw).await {
             let again = auth.prepare(self.tool, target, &request, &cookie, &param).await;
-            resp = self.client_send(again.request, target).await?;
+            resp = self.client_send(again.request, target, &request).await?;
             auth.observe(&resp.raw);
         }
         Ok(resp)
     }
 
-    /// Sends `request` with the client. A declarative check's request is recorded just
-    /// before it goes out and completed when it is answered or fails (a check that times
-    /// out, or a scan that stops, leaves it saying so); one whose method isn't opted in is
-    /// refused, unsent.
-    async fn client_send(&self, request: Vec<u8>, target: &Target) -> Result<Response> {
+    /// Sends `request` with the client, recorded just before it goes out and completed when
+    /// it is answered or fails (a request that times out, or a scan that stops, leaves it
+    /// saying so). A declarative check's request whose method isn't opted in is refused,
+    /// unsent. `given` is the request as the rule gave it (before the session was applied).
+    async fn client_send(&self, request: Vec<u8>, target: &Target, given: &[u8]) -> Result<Response> {
         let req = RawRequest::from_bytes(request);
         let client = &self.shared.client;
         let out_of_scope = client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port));
-        if self.tool != Tool::Checks || out_of_scope {
-            // Out of scope, the client refuses it before anything is sent.
-            let ex = client.send(&req, target).await?;
-            return Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms));
-        }
-        // As for the targets the ported rules attack.
+        // As for the targets the ported rules attack. Out of scope, the client refuses it
+        // before anything is sent.
         use crate::apiimport::api::{missing_opt_in, DEFAULT_METHODS};
-        if let Some(opt_in) = missing_opt_in(req.as_bytes(), DEFAULT_METHODS, &self.shared.check_methods) {
+        let opt_in = missing_opt_in(req.as_bytes(), DEFAULT_METHODS, &self.shared.check_methods);
+        if let Some(opt_in) = opt_in.filter(|_| self.tool == Tool::Checks && !out_of_scope) {
             self.shared.check_skipped_methods.fetch_add(1, Ordering::Relaxed);
             return Err(Error::InvalidInput(format!(
                 "a check's {opt_in} request isn't sent without --include-methods {opt_in}"
             )));
         }
-        let recorded = client.recorded_request(&req, target)?;
-        let (reply, row) = tokio::sync::oneshot::channel();
-        let capture = Capture::new("scan", target, &recorded, None, None, Some(CHECK_PENDING));
-        let _ = self.shared.reports.lock().unwrap().send(Report::Pending { capture, reply });
-        let Some(id) = row.await.ok().flatten() else {
-            return Err(Error::Protocol(
-                "the check's request could not be recorded in history, so it wasn't sent".into(),
-            ));
-        };
-        let mut row = CheckRow { shared: &self.shared, id, target, request: recorded, done: false };
-        match client.send(&req, target).await {
-            Ok(ex) => {
-                let ms = ex.duration_ms;
-                row.finish(Capture::new("scan", target, &ex.request, Some(&ex.response), Some(ms as i64), None));
-                let mut resp = Response::parse(ex.request, ex.response, Duration::from_millis(ms))?;
-                resp.history_id = Some(id);
-                Ok(resp)
-            }
+        let (id, result) = self.shared.rows.send(client, &req, target).await;
+        let ex = match result {
+            Ok(ex) => ex,
             Err(e) => {
-                row.finish(Capture::new("scan", target, &row.request, None, None, Some(&e.to_string())));
-                Err(e)
+                if let Some(id) = id {
+                    self.failed.lock().unwrap().insert(given.to_vec(), id);
+                }
+                return Err(e);
             }
-        }
+        };
+        let mut resp = Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))?;
+        resp.history_id = id;
+        Ok(resp)
     }
 
     /// Runs `send` once per scan for `key` (with the target added): later callers,
@@ -601,6 +592,12 @@ impl Cx {
         check: Option<String>,
     ) {
         self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
+        // The attack's row: the one its response came from, or the one of the attack that
+        // failed. Correlating then records no second row for it.
+        let history_id = match resp {
+            Some(r) => r.history_id,
+            None => self.failed.lock().unwrap().remove(request),
+        };
         let _ = self.shared.reports.lock().unwrap().send(Report::Oob {
             check,
             target: self.base.target.clone(),
@@ -609,38 +606,49 @@ impl Cx {
             request: resp.map_or_else(|| request.to_vec(), |r| r.request.clone()),
             response: resp.map(|r| r.raw.clone()),
             duration_ms: resp.map(|r| r.duration.as_millis() as i64),
+            history_id,
         });
     }
 }
 
-/// The error a check's history row keeps while its request is out, and after it if the
-/// request never ended (the process was killed).
-const CHECK_PENDING: &str = "sent; no response recorded (cancelled or interrupted)";
+/// The error a scan request's row keeps if it is given up unanswered.
+const ABANDONED: &str = "sent; no response recorded (the check timed out or the scan stopped)";
 
-/// A check's history row while its request is out; completed when dropped unfinished (the
-/// check timed out, or the scan stopped).
-struct CheckRow<'a> {
-    shared: &'a Shared,
-    id: i64,
-    target: &'a Target,
-    request: Vec<u8>,
-    done: bool,
-}
+/// The most reports the recorder takes off its queue before writing the rows among them.
+const ROW_BATCH: usize = 512;
 
-impl CheckRow<'_> {
-    fn finish(&mut self, capture: Capture) {
-        self.done = true;
-        let _ = self.shared.reports.lock().unwrap().send(Report::Sent { id: self.id, capture });
-    }
-}
-
-impl Drop for CheckRow<'_> {
-    fn drop(&mut self) {
-        if !self.done {
-            let error = "sent; no response recorded (the check timed out or the scan stopped)";
-            let capture = Capture::new("scan", self.target, &self.request, None, None, Some(error));
-            self.finish(capture);
+/// Records a finding (with its exchange's row, if it has none yet) or an out-of-band
+/// payload; returns the new findings.
+fn record_report(store: &mut Store, r: Report) -> Result<usize> {
+    match r {
+        Report::Finding { target, finding, history_id, request, response, duration_ms } => {
+            let id = match history_id {
+                Some(id) => id,
+                None => {
+                    store.record(&Capture::new("scan", &target, &request, Some(&response), Some(duration_ms), None))?
+                }
+            };
+            let msg = Message::from_exchange(id, &target, &request, &response);
+            store.record_findings("active", &msg, std::slice::from_ref(&finding))
         }
+        Report::Oob { target, token, finding, request, response, duration_ms, history_id, check } => {
+            store.oob_add_scan_payload(&ScanPayload {
+                token: &token,
+                alert_ref: finding.def.alert_ref,
+                rule_id: finding.def.alert_ref.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                param: &finding.param,
+                attack: &finding.attack,
+                other_info: &finding.other_info,
+                target: &target,
+                request: &request,
+                response: response.as_deref(),
+                duration_ms,
+                history_id,
+                check: check.as_deref(),
+            })?;
+            Ok(0)
+        }
+        Report::Row(_) => unreachable!("rows are written in batches"),
     }
 }
 
@@ -815,57 +823,34 @@ pub async fn run(
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }
 
-    // Recorder: attack exchanges that back findings go to history, then findings; so does
-    // every request a declarative check sends.
+    // Recorder: every request's row (written before the request goes out, completed
+    // after), then the findings they back. The rows queued since the last write are
+    // written together, before any finding or payload that came after them.
     let (tx, rx) = mpsc::channel::<Report>();
     let mut store = Store::open(project)?;
     let writer = std::thread::spawn(move || -> Result<(usize, Store)> {
         let mut new = 0;
-        while let Ok(r) = rx.recv() {
-            match r {
-                Report::Finding { target, finding, history_id, request, response, duration_ms } => {
-                    let id = match history_id {
-                        Some(id) => id,
-                        None => store.record(&Capture::new(
-                            "scan",
-                            &target,
-                            &request,
-                            Some(&response),
-                            Some(duration_ms),
-                            None,
-                        ))?,
-                    };
-                    let msg = Message::from_exchange(id, &target, &request, &response);
-                    new += store.record_findings("active", &msg, std::slice::from_ref(&finding))?;
+        let mut rows = RowBatch::default();
+        while let Ok(first) = rx.recv() {
+            for r in std::iter::once(first).chain(rx.try_iter().take(ROW_BATCH)) {
+                if let Report::Row(w) = r {
+                    rows.push(w);
+                    continue;
                 }
-                Report::Pending { capture, reply } => {
-                    let id = store.record(&capture);
-                    let _ = reply.send(id.as_ref().ok().copied());
-                    id?;
-                }
-                Report::Sent { id, capture } => store.update_capture(id, &capture)?,
-                Report::Oob { target, token, finding, request, response, duration_ms, check } => {
-                    store.oob_add_scan_payload(&ScanPayload {
-                        token: &token,
-                        alert_ref: finding.def.alert_ref,
-                        rule_id: finding.def.alert_ref.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                        param: &finding.param,
-                        attack: &finding.attack,
-                        other_info: &finding.other_info,
-                        target: &target,
-                        request: &request,
-                        response: response.as_deref(),
-                        duration_ms,
-                        check: check.as_deref(),
-                    })?;
-                }
+                rows.write(&mut store);
+                new += record_report(&mut store, r)?;
             }
+            rows.write(&mut store);
         }
         Ok((new, store))
     });
+    let client = Client::new(cfg.send.clone());
+    let tx_rows = tx.clone();
+    let rows = Rows::new("scan", move |w| drop(tx_rows.send(Report::Row(w)))).abandoned_as(ABANDONED).sent_by(&client);
 
     let shared = Arc::new(Shared {
-        client: Client::new(cfg.send.clone()),
+        client,
+        rows,
         auth: cfg.auth.clone(),
         strength: cfg.strength,
         ctl: ctl.clone(),
@@ -948,7 +933,7 @@ pub async fn run(
                 }
             }
             let Ok(_permit) = sem.acquire().await else { return };
-            let cx = Cx { base, point, shared: shared.clone(), tool };
+            let cx = Cx { base, point, shared: shared.clone(), tool, failed: Mutex::default() };
             if !cx.stopped() {
                 rule.scan(&cx).await;
             }

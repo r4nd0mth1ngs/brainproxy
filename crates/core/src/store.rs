@@ -684,8 +684,13 @@ impl Store {
                     words, lines, duration_ms, matched, grep, extract, error)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
-            for (capture, r) in rows {
-                let history_id = capture.as_ref().map(|c| insert_capture(&tx, c)).transpose()?;
+            for (history, r) in rows {
+                use crate::fuzz::engine::History;
+                let history_id = match history {
+                    History::None => None,
+                    History::Written(id) => Some(*id),
+                    History::Capture(c) => Some(insert_capture(&tx, c)?),
+                };
                 matched += r.matched as i64;
                 errors += r.error.is_some() as i64;
                 stmt.execute(params![
@@ -1002,56 +1007,23 @@ impl Store {
     /// Rewrites history row `id` from `c`: a request recorded before it went out, now
     /// answered or failed. Its time, note, and tags stay; the full-text index follows.
     pub fn update_capture(&mut self, id: i64, c: &Capture) -> Result<()> {
-        const FTS: &str = "url, req_headers, req_body_text, resp_headers, resp_body_text";
         let tx = self.write_tx()?;
-        tx.execute(
-            &format!("INSERT INTO history_fts(history_fts, rowid, {FTS}) SELECT 'delete', id, {FTS} FROM history WHERE id = ?1"),
-            [id],
-        )?;
-        let n = tx.execute(
-            "UPDATE history SET source = ?2, scheme = ?3, host = ?4, port = ?5, method = ?6, url = ?7, path = ?8,
-                query = ?9, req_headers = ?10, req_content_type = ?11, req_body = ?12, req_body_text = ?13,
-                status = ?14, reason = ?15, resp_headers = ?16, resp_content_type = ?17, resp_body = ?18,
-                resp_body_text = ?19, resp_body_length = ?20, title = ?21, duration_ms = ?22, error = ?23,
-                request = ?24, response = ?25
-             WHERE id = ?1",
-            params![
-                id,
-                c.source,
-                c.scheme,
-                c.host,
-                c.port,
-                c.method,
-                c.url,
-                c.path,
-                c.query,
-                c.req_headers,
-                c.req_content_type,
-                c.req_body,
-                c.req_body_text,
-                c.status,
-                c.reason,
-                c.resp_headers,
-                c.resp_content_type,
-                c.resp_body,
-                c.resp_body_text,
-                c.resp_body.as_ref().map(|b| b.len() as i64),
-                c.title,
-                c.duration_ms,
-                c.error,
-                c.request,
-                c.response,
-            ],
-        )?;
-        if n == 0 {
-            return Err(Error::NotFound(format!("history item {id}")));
-        }
-        tx.execute(
-            &format!("INSERT INTO history_fts(rowid, {FTS}) SELECT id, {FTS} FROM history WHERE id = ?1"),
-            [id],
-        )?;
+        update_capture(&tx, id, c)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes rows `new` and completes rows `done` (as [`Store::update_capture`]) in one
+    /// transaction; returns the new rows' ids. Senders with many requests out at once write
+    /// their rows this way, one commit for many rows (see [`crate::sent::RowBatch`]).
+    pub fn write_rows(&mut self, new: &[Capture], done: &[(i64, Capture)]) -> Result<Vec<i64>> {
+        let tx = self.write_tx()?;
+        let ids = new.iter().map(|c| insert_capture(&tx, c)).collect::<Result<Vec<_>>>()?;
+        for (id, c) in done {
+            update_capture(&tx, *id, c)?;
+        }
+        tx.commit()?;
+        Ok(ids)
     }
 
     pub fn list(&self, f: &HistoryFilter) -> Result<Vec<HistoryEntry>> {
@@ -1269,6 +1241,57 @@ fn owner_only(path: &Path) {
 
 #[cfg(not(unix))]
 fn owner_only(_: &Path) {}
+
+/// [`Store::update_capture`] within the caller's transaction.
+fn update_capture(tx: &Connection, id: i64, c: &Capture) -> Result<()> {
+    const FTS: &str = "url, req_headers, req_body_text, resp_headers, resp_body_text";
+    tx.execute(
+        &format!(
+            "INSERT INTO history_fts(history_fts, rowid, {FTS}) SELECT 'delete', id, {FTS} FROM history WHERE id = ?1"
+        ),
+        [id],
+    )?;
+    let n = tx.execute(
+        "UPDATE history SET source = ?2, scheme = ?3, host = ?4, port = ?5, method = ?6, url = ?7, path = ?8,
+            query = ?9, req_headers = ?10, req_content_type = ?11, req_body = ?12, req_body_text = ?13,
+            status = ?14, reason = ?15, resp_headers = ?16, resp_content_type = ?17, resp_body = ?18,
+            resp_body_text = ?19, resp_body_length = ?20, title = ?21, duration_ms = ?22, error = ?23,
+            request = ?24, response = ?25
+         WHERE id = ?1",
+        params![
+            id,
+            c.source,
+            c.scheme,
+            c.host,
+            c.port,
+            c.method,
+            c.url,
+            c.path,
+            c.query,
+            c.req_headers,
+            c.req_content_type,
+            c.req_body,
+            c.req_body_text,
+            c.status,
+            c.reason,
+            c.resp_headers,
+            c.resp_content_type,
+            c.resp_body,
+            c.resp_body_text,
+            c.resp_body.as_ref().map(|b| b.len() as i64),
+            c.title,
+            c.duration_ms,
+            c.error,
+            c.request,
+            c.response,
+        ],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("history item {id}")));
+    }
+    tx.execute(&format!("INSERT INTO history_fts(rowid, {FTS}) SELECT id, {FTS} FROM history WHERE id = ?1"), [id])?;
+    Ok(())
+}
 
 pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
     conn.execute(

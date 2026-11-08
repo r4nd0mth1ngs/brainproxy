@@ -378,3 +378,74 @@ fn a_proxy_relogin_records_the_first_exchange() {
     let r = rows(&p, "SELECT path, status FROM history WHERE source = 'proxy' ORDER BY id");
     assert_eq!(r, serde_json::json!([["/api", 401], ["/api", 200]]).as_array().unwrap().clone());
 }
+
+/// A server that answers its first `answered` requests with a page holding a link, hands
+/// over each later one, and never answers those.
+fn answers_then_silent(answered: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for (n, stream) in listener.incoming().enumerate() {
+            let mut s = stream.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let mut len = 0;
+            while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf[len..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => len += k,
+                }
+            }
+            if n < answered {
+                let body = "<html><a href=\"/next?id=1\">next</a></html>";
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                continue;
+            }
+            let _ = tx.send(buf[..len].to_vec());
+            held.push(s);
+        }
+    });
+    (port, rx)
+}
+
+/// The senders with many requests out at once write each row before its request goes out
+/// too: killed while waiting, each leaves the request as sent, pending.
+#[test]
+fn killed_crawls_scans_fuzz_and_authz_runs_leave_their_pending_rows() {
+    let cases: [(&str, usize, &[&str]); 4] = [
+        ("crawl", 0, &["crawl", "{url}/", "-c", "1", "--no-robots", "--no-sitemap", "--timeout", "60"]),
+        ("fuzz", 0, &["fuzz", "run", "--url", "{url}/f?q=§x§", "-p", "list:a", "-c", "1", "--timeout", "60"]),
+        // A request `send` recorded (and got answered) is sent again: the baseline hangs.
+        ("authz", 1, &["authz", "run", "--where", "source = 'send'", "--timeout", "60"]),
+        // The page is fetched (and answered); the first attack on it hangs.
+        ("scan", 1, &["scan", "active", "{url}/page?id=1", "-c", "1", "--timeout", "60"]),
+    ];
+    for (source, answered, args) in cases {
+        let p = project(&format!("many-{source}"));
+        let (port, got) = answers_then_silent(answered);
+        let url = format!("http://127.0.0.1:{port}");
+        if source == "authz" {
+            let (code, v) = run(&p, &["send", "--url", &format!("{url}/api/orders/1"), "-H", "Cookie: sid=abc"]);
+            assert_eq!(code, 0, "{v}");
+        }
+        let args: Vec<String> = args.iter().map(|a| a.replace("{url}", &url)).collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut child = spawn(&p, &args);
+        let received =
+            got.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("{source}: nothing arrived"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let r = rows(&p, &format!("SELECT error, request FROM history WHERE source = '{source}' AND status IS NULL"));
+        assert!(
+            r.iter().any(|row| row[0] == "sent; no response recorded (cancelled or interrupted)"
+                && row[1].as_str().unwrap().as_bytes() == &received[..]),
+            "{source}: {r:?}\n{}",
+            String::from_utf8_lossy(&received)
+        );
+    }
+}
