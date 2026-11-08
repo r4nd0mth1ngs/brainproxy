@@ -32,8 +32,10 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// (copying the project elsewhere is for the person running the server), `browser open`
 /// (the browser profile holds the person's sign-ins; the command refuses a tool call too), and
 /// `findings remove` (an agent can't tell a person's finding from its own; it marks one
-/// false_positive instead; the command refuses a tool call too), and `connection review`
-/// (an agent can't approve its own changes to where traffic goes; it refuses a tool call too).
+/// false_positive instead; the command refuses a tool call too), `report-profile remove` (a
+/// saved layout may be a person's branding; it refuses a tool call too), and `connection
+/// review` (an agent can't approve its own changes to where traffic goes; it refuses a tool
+/// call too).
 const EXCLUDED: &[&str] = &[
     "mcp serve",
     "proxy run",
@@ -43,6 +45,7 @@ const EXCLUDED: &[&str] = &[
     "project save",
     "browser open",
     "findings remove",
+    "report-profile remove",
     "connection review",
     // A person reviews what an agent drafted; an agent can't vouch for itself.
     "findings issue review",
@@ -274,13 +277,14 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings issue cvss", SET),
     ("findings issue narrative", SET),
     ("findings trail", READ),
-    // --output writes a file (refused if it exists unless --force).
-    ("findings repro", REPLACE),
+    // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("findings repro", ADD),
     ("findings ticket", SET),
     ("report-summary show", READ),
     ("report-summary set", SET),
     ("report-profile list", READ),
     ("report-profile show", READ),
+    // Through MCP only under a new name (a saved layout may be a person's).
     ("report-profile save", SET),
     ("report-profile remove", REPLACE),
     ("findings timeline", READ),

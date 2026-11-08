@@ -218,7 +218,12 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    `[redacted]`, wherever the report quotes them, in any case and percent-, JSON-, HTML- or
    base64-encoded (notes, write-ups, ticket links and findings added by hand included), and says how
    many places it masked; `--no-redact` keeps
-   them as recorded. An issue seen in more than one
+   them as recorded. A signed cookie's session id (`s:ID.signature`, as Express writes
+   `connect.sid`) is masked where it is quoted on its own too, and two secrets that overlap
+   are masked together. A secret nothing marks, such as a token typed into a finding's title
+   or a note ("used token ..."), can't be told from other text: name it with `--mask VALUE`
+   (repeatable, at least 6 characters) and it is masked like the project's own secrets,
+   everywhere the report quotes it, in every format. `findings repro` takes `--mask` too. An issue seen in more than one
    request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
    first time or again, and leaves out older findings it didn't see again.
@@ -1653,8 +1658,9 @@ can carry script). Through MCP `--logo` reads no file: save the logo in a profil
 terminal or the app.
 
 `report-profile save NAME [layout flags]` keeps a layout in the project (`report-profile
-list | show | remove`; `--from PROFILE` saves on top of another, keeping its logo), and
-`report --profile NAME` starts from it; flags given with it override it, and an empty one
+list | show | remove`; `--from PROFILE` saves on top of another, keeping its logo). Through
+MCP a profile is saved only under a new name, and `remove` is refused: a saved layout may be
+a person's branding. `report --profile NAME` starts from it; flags given with it override it, and an empty one
 (`--company=`, `--accent=`, `--logo=`, `--since=`) clears what the profile has. The
 retest, posture and list sections keep to the report's filters (`--host`, `--risk`, ...),
 and a note says when the report is cut short by `--limit` whatever its sections.
@@ -1690,10 +1696,11 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   first change a person made to the finding or its issue after them. Reports say it on each
   such finding ("agent's work reviewed" or "not reviewed"), with the request range in the
   technical details.
-- **Repro pack** (`findings repro ID [--output FILE] [--no-redact]`): the request (secrets
-  masked), a curl command, the response around the evidence, what the rule looks for, and the
+- **Repro pack** (`findings repro ID [--output FILE [--force]] [--no-redact | --mask VALUE]`):
+  the request (secrets masked), a curl command, the response around the evidence, what the rule looks for, and the
   command that checks it again (for an active finding on anything but a plain GET, the scan
   has to start from the original request: the command says which history id to give it).
+  An existing `--output` file is kept unless `--force`, which is refused through MCP.
 - **Tickets** (`findings ticket ID --to github --repo OWNER/NAME` or `--to jira --key KEY`):
   a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
   reproduce it, its fingerprint) and the command that files it: this command again, piped
