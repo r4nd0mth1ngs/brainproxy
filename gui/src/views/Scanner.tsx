@@ -6,6 +6,8 @@ import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
+import { ScanPolicies, usePolicies } from "./ScanPolicies";
+import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
 
 export interface Job {
   id: number;
@@ -48,7 +50,7 @@ export function stateClass(state: string): string {
 
 export function ScannerView({ active }: { active: boolean }) {
   const app = useApp();
-  const [sub, setSub] = useState<"tasks" | "new" | "rules">("tasks");
+  const [sub, setSub] = useState<"tasks" | "new" | "rules" | "policies">("tasks");
   const [selected, setSelected] = useState<number | null>(null);
   const [picked, setPicked] = useState(new Set<number>()); // active rules chosen in Rules, used by New scan
   const [finished, setFinished] = useState<Job | null>(null);
@@ -95,6 +97,9 @@ export function ScannerView({ active }: { active: boolean }) {
         <button className={sub === "rules" ? "on" : ""} onClick={() => setSub("rules")}>
           Rules
         </button>
+        <button className={sub === "policies" ? "on" : ""} onClick={() => setSub("policies")} title="Saved choices of active rules, strength and threshold, for New scan">
+          Policies
+        </button>
       </div>
       {finished && (
         <div className="toolbar sc-banner">
@@ -124,6 +129,9 @@ export function ScannerView({ active }: { active: boolean }) {
       </div>
       <div className="fill" hidden={sub !== "rules"}>
         <Rules active={active && sub === "rules"} picked={picked} setPicked={setPicked} />
+      </div>
+      <div className="fill" hidden={sub !== "policies"}>
+        <ScanPolicies active={active && sub === "policies"} />
       </div>
     </div>
   );
@@ -262,6 +270,7 @@ function ResultFacts({ kind, r }: { kind: string; r: Record<string, any> }) {
           ["Targets", `${r.targets} (${r.insertion_points} insertion points, ${r.skipped_out_of_scope} skipped out of scope)`],
           ["Requests", `${r.requests} · ${r.rules} rules`],
           ["New findings", String(r.new_findings)],
+          ...policyFacts(r),
           ...(r.pruned != null ? [["Pruned", `${r.pruned} attack requests that back no finding`] as [string, string]] : []),
           ...(r.prune_error ? [["Pruning stopped", `${r.prune_error} (the rest were kept)`] as [string, string]] : []),
         ]
@@ -303,6 +312,8 @@ const flag = (f: string, on: boolean) => (on ? [f] : []);
 const SCAN_DEFAULTS = {
   urls: "",
   where: "",
+  /** A saved scan policy; with one, an empty strength is the policy's. */
+  policy: "",
   strength: "medium",
   rules: "",
   excludeRules: "",
@@ -536,6 +547,12 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       .catch(() => {});
   }, []);
   const [auth] = usePoll<{ profiles: { name: string }[] }>(() => run(["auth", "list"]), 30000);
+  const [policies] = usePolicies();
+  const chosenPolicy = policies?.policies.find((x) => x.name === f.policy);
+  // A policy removed in the meantime isn't passed.
+  useEffect(() => {
+    if (f.policy && policies && !chosenPolicy) set({ policy: "", strength: f.strength || "medium" });
+  }, [policies, chosenPolicy, f.policy]);
   // The JavaScript crawl needs a Chromium-based browser on this machine.
   const [browsers] = usePoll<BrowserList>(() => run(["browser", "list"]), 60000);
   const canBrowse = hasChromium(browsers);
@@ -584,7 +601,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...(mode === "recorded" ? [] : urls(f.urls)),
           ...(mode === "crawl" ? ["--crawl", ...browserFlag(f.browser, canBrowse)] : []),
           ...opt("--where", f.where),
-          `--strength=${f.strength}`,
+          ...policyScanArgs(kind === "scan" ? f.policy : "", f.strength),
           ...(kind === "targeted"
             ? targetedArgs(picks)
             : [
@@ -806,15 +823,25 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         {kind === "scan" ? (
           <>
             {text("History filter (SQL)", "where", "host = 'app.test' AND path LIKE '/api/%'", "Selects history rows to attack")}
+            <label className="sc-field" title={chosenPolicy ? describePolicy(chosenPolicy) : "Saved in Scans › Policies: which rules run, at what strength and threshold"}>
+              <span className="label">Policy</span>
+              <select className="input" value={f.policy} onChange={(e) => set({ policy: e.target.value, strength: e.target.value ? "" : "medium" })}>
+                <option value="">none (every rule)</option>
+                {policies?.policies.map((x) => (
+                  <option key={x.name}>{x.name}</option>
+                ))}
+              </select>
+            </label>
             <label className="sc-field">
               <span className="label">Strength</span>
               <select className="input" value={f.strength} onChange={(e) => set({ strength: e.target.value })}>
+                {f.policy && <option value="">policy's ({chosenPolicy?.strength ?? "…"})</option>}
                 {["low", "medium", "high", "insane"].map((s) => (
                   <option key={s}>{s}</option>
                 ))}
               </select>
             </label>
-            {text("Only rules", "rules", "40018,40012 (or pick in Rules)")}
+            {text("Only rules", "rules", f.policy ? "instead of the policy's" : "40018,40012 (or pick in Rules)")}
             {text("Skip rules", "excludeRules", "comma-separated ids")}
             {text("Checks", "checks", "nuclei, local, all, or a path", "Declarative checks to run as well")}
             {text("Check tags", "checkTags", "cve,exposure")}
@@ -836,7 +863,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             {text("History filter (SQL)", "where", "host = 'app.test' AND path LIKE '/api/%'", "Selects history rows to attack")}
             <label className="sc-field">
               <span className="label">Strength</span>
-              <select className="input" value={f.strength} onChange={(e) => set({ strength: e.target.value })}>
+              <select className="input" value={f.strength || "medium"} onChange={(e) => set({ strength: e.target.value })}>
                 {["low", "medium", "high", "insane"].map((s) => (
                   <option key={s}>{s}</option>
                 ))}

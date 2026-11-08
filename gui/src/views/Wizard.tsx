@@ -11,6 +11,8 @@ import { apiResultNotes, baselineText, isApiJob } from "./apiScan";
 import { hasChromium, wizardBrowserArgs, type BrowserList } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
 import { attacksPaths, DEPTHS, depthArgs, type Depth } from "./wizardDepths";
+import { usePolicies } from "./ScanPolicies";
+import { describe as describePolicy } from "./scanPolicy";
 
 /** Nuclei templates per depth when installed (none for Quick: thousands of extra requests). */
 const NUCLEI: Record<Depth, string[]> = {
@@ -64,6 +66,11 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const [login, setLogin] = useState<string>(""); // "" = no login, else an auth profile
   const [depth, setDepth] = useState<Depth>("standard");
   const [speed, setSpeed] = useState<Speed>("normal");
+  // A saved scan policy (Scans › Policies): its rules, strength and thresholds; the depth still
+  // sets how far the crawl goes.
+  const [policy, setPolicy] = useState("");
+  const [policies] = usePolicies();
+  const chosenPolicy = policies?.policies.find((x) => x.name === policy);
   const [busy, setBusy] = useState(false);
   const [checks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 30000);
   // brainproxy's feed checks join Standard and Thorough even without the Nuclei templates.
@@ -108,7 +115,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const start = async () => {
     setBusy(true);
     try {
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs(depth), ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs(depth), ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), ...(chosenPolicy ? [`--policy=${policy}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -216,6 +223,22 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
               </button>
             ))}
           </div>
+          {!!policies?.policies.length && (
+            <>
+              <label className="label">Which rules should it use?</label>
+              <div className="row gap">
+                <select className="input" value={policy} onChange={(e) => setPolicy(e.target.value)}>
+                  <option value="">All of them, as the depth says</option>
+                  {policies.policies.map((x) => (
+                    <option key={x.name} value={x.name}>
+                      Saved policy "{x.name}"
+                    </option>
+                  ))}
+                </select>
+                {chosenPolicy && <span className="muted small">{describePolicy(chosenPolicy)}. The depth still sets how far it explores.</span>}
+              </div>
+            </>
+          )}
           <label className="label">How hard may it push the site?</label>
           <div className="wiz-choices three">
             {SPEEDS.map((s) => (
@@ -240,6 +263,14 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             <dd>
               {DEPTHS.find((d) => d.id === depth)!.title} ({DEPTHS.find((d) => d.id === depth)!.time})
             </dd>
+            {chosenPolicy && (
+              <>
+                <dt>Policy</dt>
+                <dd>
+                  "{chosenPolicy.name}": {describePolicy(chosenPolicy)}
+                </dd>
+              </>
+            )}
             <dt>Speed</dt>
             <dd className={speed === "fast" ? "s5" : ""}>{SPEEDS.find((s) => s.id === speed)!.title}</dd>
             {wizardBrowserArgs(depth, canBrowse).length > 0 && (
