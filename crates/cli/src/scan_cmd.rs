@@ -678,12 +678,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     }
     if let FindingsCmd::Repro { id, no_redact, mask, output, force } = &cmd {
         // Any file the server can write: an agent writes new files only.
-        if *force && crate::mcp::in_tool_call() {
-            return Err(Error::InvalidInput(
-                "findings repro --force is refused through MCP: write the pack to a new file, or leave out --output"
-                    .into(),
-            ));
-        }
+        crate::mcp::check_force(*force, "findings repro", "write the pack to a new file, or leave out --output")?;
         crate::report_cmd::check_mask(mask)?;
         let store = Store::open(project)?;
         let pack = brainproxy_core::scan::report::repro(&store, *id, !no_redact, mask)?;

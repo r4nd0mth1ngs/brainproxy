@@ -951,8 +951,10 @@ local settings (scope, engagement, CA, capabilities, ...) have no `_meta`.
 
 Project files (`.bpdb`, its `-wal`/`-shm`, and `<project>.browsers/`) are readable by
 their owner only. `query` cannot read `auth_profiles`, which holds passwords, header
-values, and session tokens; `auth show` redacts them. `report -o` and `ca export --out`
-refuse to overwrite an existing file unless given `--force`.
+values, and session tokens; `auth show` redacts them. `report -o`, `findings repro -o` and
+`ca export --out` refuse to overwrite an existing file unless given `--force`, and through MCP
+`--force` is refused for them and for `ca init`, so an agent writes new files only and keeps
+the CA.
 
 ```sh
 export BRAINPROXY_PROJECT=~/work/acme.bpdb

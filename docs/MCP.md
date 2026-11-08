@@ -88,8 +88,9 @@ file's) is refused, so an agent can't hide a set of findings in one call.
   most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
   goes back to the old proxy if it had stopped it and the new one isn't up: with its old options
   and a new pid, which `proxy_status` shows in `restart_gone`), `*_remove`, `*_clear`,
-  `scope_set`, `ca_init`, `scan_data_reset`. `replay_tabs_save` is local and not
-  destructive: through MCP it only adds Replay tabs (below), and it sends nothing. A command
+  `scope_set`, `scan_data_reset`. `replay_tabs_save` is local and not
+  destructive: through MCP it only adds Replay tabs (below), and it sends nothing; nor are
+  `report`, `findings_repro`, `ca_export` and `ca_init`, whose `force` is refused (below). A command
   missing from the table gets the spec's cautious defaults (not read-only, destructive, not
   idempotent, open world); a test fails until it is classified. These are hints for clients
   deciding what to confirm; the scope is enforced by the commands regardless.
@@ -126,8 +127,12 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.
-- `findings_repro` with `force`: `output` would overwrite any file the server can write. An
-  agent writes the pack to a new file, or leaves out `output` to get it in the reply.
+- `report`, `findings_repro` and `ca_export` with `force`: `output` (`out`) would overwrite any
+  file the server can write. An agent writes to a new file, or leaves out `output` (`out`) to
+  get the report, pack or certificate in the reply.
+- `ca_init` with `force`: a new CA would make every client that trusts the person's stop
+  trusting the proxy. Without it the CA is created only when missing; a person replaces it in a
+  terminal.
 - `findings_add` with `replace_text`: the description and solution findings of the same title
   share may be a person's. A different one is refused (`conflict`) without it, so an agent
   leaves them out or uses another title.
