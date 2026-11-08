@@ -548,11 +548,10 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   }, []);
   const [auth] = usePoll<{ profiles: { name: string }[] }>(() => run(["auth", "list"]), 30000);
   const [policies] = usePolicies();
+  // A policy removed in the meantime stays picked (and passed, so the scan refuses to start)
+  // rather than quietly becoming every rule.
   const chosenPolicy = policies?.policies.find((x) => x.name === f.policy);
-  // A policy removed in the meantime isn't passed.
-  useEffect(() => {
-    if (f.policy && policies && !chosenPolicy) set({ policy: "", strength: f.strength || "medium" });
-  }, [policies, chosenPolicy, f.policy]);
+  const policyGone = !!f.policy && !!policies && !chosenPolicy;
   // The JavaScript crawl needs a Chromium-based browser on this machine.
   const [browsers] = usePoll<BrowserList>(() => run(["browser", "list"]), 60000);
   const canBrowse = hasChromium(browsers);
@@ -827,6 +826,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
               <span className="label">Policy</span>
               <select className="input" value={f.policy} onChange={(e) => set({ policy: e.target.value, strength: e.target.value ? "" : "medium" })}>
                 <option value="">none (every rule)</option>
+                {policyGone && <option value={f.policy}>{f.policy} (no longer saved)</option>}
                 {policies?.policies.map((x) => (
                   <option key={x.name}>{x.name}</option>
                 ))}

@@ -83,7 +83,8 @@ export function enabledCount(p: Policy, ids: (number | string)[]): number {
 export function nameProblem(name: string): string | null {
   const n = name.trim();
   if (!n) return "Give the policy a name.";
-  if ([...n].length > 64) return "A name has at most 64 characters.";
+  // 64 bytes, as `scan policy save` counts them.
+  if (new TextEncoder().encode(n).length > 64) return "A name has at most 64 characters.";
   if (n.startsWith("-")) return "A name can't start with -.";
   return null;
 }

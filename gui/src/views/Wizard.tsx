@@ -71,6 +71,8 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const [policy, setPolicy] = useState("");
   const [policies] = usePolicies();
   const chosenPolicy = policies?.policies.find((x) => x.name === policy);
+  // Removed since it was picked: still passed, so the scan refuses to start instead of running every rule.
+  const policyGone = !!policy && !!policies && !chosenPolicy;
   const [busy, setBusy] = useState(false);
   const [checks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 30000);
   // brainproxy's feed checks join Standard and Thorough even without the Nuclei templates.
@@ -115,7 +117,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const start = async () => {
     setBusy(true);
     try {
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs(depth), ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), ...(chosenPolicy ? [`--policy=${policy}`] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs(depth), ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), ...(policy ? [`--policy=${policy}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -223,13 +225,14 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
               </button>
             ))}
           </div>
-          {!!policies?.policies.length && (
+          {(!!policies?.policies.length || policyGone) && (
             <>
               <label className="label">Which rules should it use?</label>
               <div className="row gap">
                 <select className="input" value={policy} onChange={(e) => setPolicy(e.target.value)}>
                   <option value="">All of them, as the depth says</option>
-                  {policies.policies.map((x) => (
+                  {policyGone && <option value={policy}>Saved policy "{policy}" (no longer saved)</option>}
+                  {policies!.policies.map((x) => (
                     <option key={x.name} value={x.name}>
                       Saved policy "{x.name}"
                     </option>
@@ -263,11 +266,11 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             <dd>
               {DEPTHS.find((d) => d.id === depth)!.title} ({DEPTHS.find((d) => d.id === depth)!.time})
             </dd>
-            {chosenPolicy && (
+            {policy && (
               <>
                 <dt>Policy</dt>
-                <dd>
-                  "{chosenPolicy.name}": {describePolicy(chosenPolicy)}
+                <dd className={policyGone ? "s5" : ""}>
+                  {chosenPolicy ? `"${chosenPolicy.name}": ${describePolicy(chosenPolicy)}` : `"${policy}" is no longer saved: pick another on the Depth step`}
                 </dd>
               </>
             )}

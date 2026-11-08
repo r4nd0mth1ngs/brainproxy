@@ -34,7 +34,7 @@ const RISK_RANK: Record<Risk, number> = { info: 0, low: 1, medium: 2, high: 3, c
 
 /** The saved policies, polled while `enabled`. */
 export function usePolicies(enabled = true) {
-  return usePoll<{ policies: PolicySummary[] }>(() => run(["scan", "policy", "list"]), 15000, enabled);
+  return usePoll<{ policies: PolicySummary[] }>(() => run(["scan", "policy", "list"]), 30000, enabled);
 }
 
 export function ScanPolicies({ active }: { active: boolean }) {
@@ -167,6 +167,8 @@ export function ScanPolicies({ active }: { active: boolean }) {
       <div className="toolbar">
         <select className="input" value={loaded} onChange={(e) => load(e.target.value)} title="Edit a saved policy, or start a new one">
           <option value="">New policy</option>
+          {/* Just saved, before the list is read again. */}
+          {loaded && !saved?.policies.some((p) => p.name === loaded) && <option value={loaded}>{loaded}</option>}
           {saved?.policies.map((p) => (
             <option key={p.name} value={p.name}>
               {p.name}

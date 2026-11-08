@@ -40,6 +40,7 @@ test("a policy is saved as JSON on stdin, under its trimmed name", () => {
   assert.equal(nameProblem(" "), "Give the policy a name.");
   assert.equal(nameProblem("-x"), "A name can't start with -.");
   assert.equal(nameProblem("x".repeat(65)), "A name has at most 64 characters.");
+  assert.equal(nameProblem("é".repeat(33)), "A name has at most 64 characters.");
   assert.equal(nameProblem("api"), null);
 });
 
