@@ -370,6 +370,7 @@ pub const FUNCTIONS: &[(&str, &str)] = &[
     ("header(headers_json, name)", "First value of a header, case-insensitive. NULL if absent."),
     ("regexp(pattern, text) / text REGEXP pattern", "Rust regex match. Prefix pattern with (?i) for case-insensitive."),
     ("regexp_extract(text, pattern[, group])", "First match (or capture group) of a regex, else NULL."),
+    ("regexp_bytes(pattern, blob)", "Rust regex match over raw bytes, so a body that isn't UTF-8 is searched too."),
     ("json_extract / json_each", "SQLite JSON functions; work on *_headers and JSON bodies."),
 ];
 
@@ -1241,12 +1242,10 @@ impl Store {
                  OR instr(req_body, ?{n}) > 0 OR instr(resp_body, ?{n}) > 0)"
             ));
         }
-        if let Some(q) = &f.filter {
+        // An empty query filters nothing, as the app leaves it out.
+        if let Some(q) = f.filter.as_deref().filter(|q| !q.trim().is_empty()) {
             let mut values = Vec::new();
-            let cond = crate::filter::Query::parse(q)?.to_sql(&mut values);
-            // The condition numbers its placeholders from 1; move them past the ones above.
-            let base = args.len();
-            let cond = renumber(&cond, base);
+            let cond = crate::filter::Query::parse(q)?.to_sql(&mut values, args.len());
             args.extend(values.into_iter().map(|v| Box::new(v) as Box<dyn rusqlite::ToSql>));
             sql.push_str(&format!(" AND {cond}"));
         }
@@ -1569,15 +1568,6 @@ fn clip_text(s: &str, max: usize) -> String {
     format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
 }
 
-/// `cond` with every `?N` placeholder moved up by `base`.
-fn renumber(cond: &str, base: usize) -> String {
-    if base == 0 {
-        return cond.to_string();
-    }
-    let re = Regex::new(r"\?([0-9]+)").expect("valid regex");
-    re.replace_all(cond, |c: &regex::Captures| format!("?{}", c[1].parse::<usize>().unwrap() + base)).into_owned()
-}
-
 fn register_functions(conn: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("header", 2, flags, |ctx| {
@@ -1589,6 +1579,22 @@ fn register_functions(conn: &Connection) -> Result<()> {
     conn.create_scalar_function("regexp", 2, flags, |ctx| {
         let re = cached_regex(ctx, 0)?;
         Ok(text_arg(ctx, 1)?.map(|t| re.is_match(&t)).unwrap_or(false))
+    })?;
+    // A regex over raw bytes: a body that isn't UTF-8 is searched too (the filter language's
+    // req, resp and body fields).
+    conn.create_scalar_function("regexp_bytes", 2, flags, |ctx| {
+        let re = ctx.get_or_create_aux(
+            0,
+            |v| -> std::result::Result<regex::bytes::Regex, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(regex::bytes::Regex::new(v.as_str()?)?)
+            },
+        )?;
+        Ok(match ctx.get_raw(1) {
+            ValueRef::Text(t) | ValueRef::Blob(t) => re.is_match(t),
+            ValueRef::Integer(i) => re.is_match(i.to_string().as_bytes()),
+            ValueRef::Real(f) => re.is_match(f.to_string().as_bytes()),
+            ValueRef::Null => false,
+        })
     })?;
     for n_args in [2, 3] {
         conn.create_scalar_function("regexp_extract", n_args, flags, move |ctx| {
@@ -2079,6 +2085,62 @@ mod tests {
     }
 
     #[test]
+    fn filter_reads_binary_bodies_past_a_nul() {
+        let s = Store::open_in_memory().unwrap();
+        let ex = Exchange {
+            target: Target::from_url("http://a.test").unwrap(),
+            request: b"GET /bin HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(),
+            response: b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n\x00\x01Token-AFTER".to_vec(),
+            duration_ms: 1,
+            sni: None,
+        };
+        let id = s.record_exchange("send", &ex).unwrap();
+        for q in ["resp.body:token-after", "resp:TOKEN-after", "body:after"] {
+            let hits = s.list(&HistoryFilter { filter: Some(q.into()), ..Default::default() }).unwrap();
+            assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [id], "{q}");
+        }
+    }
+
+    #[test]
+    fn filter_headers_times_and_raw_bytes() {
+        let s = Store::open_in_memory().unwrap();
+        let ex = Exchange {
+            target: Target::from_url("http://a.test").unwrap(),
+            request: b"GET /h HTTP/1.1\r\nHost: a.test\r\nX-Empty:\r\n\r\n".to_vec(),
+            response: b"HTTP/1.1 200 OK\r\nSet-Cookie: tracking=1\r\nSet-Cookie: session=abc\r\nContent-Length: 14\r\n\r\n\xffstack trace\x00!".to_vec(),
+            duration_ms: 1,
+            sni: None,
+        };
+        let id = s.record_exchange("send", &ex).unwrap();
+        let ids = |q: &str| -> Vec<i64> {
+            s.list(&HistoryFilter { filter: Some(q.into()), ..Default::default() })
+                .unwrap_or_else(|e| panic!("{q}: {e}"))
+                .iter()
+                .map(|h| h.id)
+                .collect()
+        };
+        // Every value of a repeated header counts; a negation means none matches.
+        assert_eq!(ids("resp.header.set-cookie:session"), [id]);
+        assert_eq!(ids("resp.header.set-cookie=\"tracking=1\""), [id]);
+        assert!(ids("resp.header.set-cookie!=\"tracking=1\"").is_empty());
+        assert_eq!(ids("resp.header.set-cookie!~nothing"), [id]);
+        // An empty header is there.
+        assert_eq!(ids("req.header.x-empty:*"), [id]);
+        assert!(ids("NOT req.header.x-empty:*").is_empty());
+        assert!(ids("req.header.x-missing:*").is_empty());
+        // A regex reads bytes that aren't UTF-8.
+        assert_eq!(ids("resp.body~\"stack trace\""), [id]);
+        assert_eq!(ids("resp~\"^HTTP/1.1 200\""), [id]);
+        assert!(ids("resp.body!~\"stack\"").is_empty());
+        // Times compare as instants: the stored fraction of a second doesn't break the order.
+        let time = s.get(id).unwrap().entry.time;
+        let second = format!("{}Z", &time[..19]);
+        assert_eq!(ids(&format!("time>={second}")), [id], "{time}");
+        assert!(ids(&format!("time<{second}")).is_empty(), "{time}");
+        assert_eq!(ids("time>2000-01-01 time<2999-01-01T00:00:00+01:00"), [id]);
+    }
+
+    #[test]
     fn records_and_filters() {
         let s = Store::open_in_memory().unwrap();
         let id = sample(&s);
@@ -2153,6 +2215,7 @@ mod tests {
         assert_eq!(ids("(status:5xx OR error:*) length>10"), [id]);
         assert_eq!(ids("time:20"), [id, fail_id, gz_id]);
         assert_eq!(ids("x?id"), [id], "a bare word searches the URL");
+        assert_eq!(ids("  "), [id, fail_id, gz_id], "an empty query filters nothing");
         // Combined with the other filters, whose placeholders come first.
         let f = HistoryFilter {
             host: Some("a.test".into()),

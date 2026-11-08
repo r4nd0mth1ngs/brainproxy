@@ -10,7 +10,7 @@
 //!
 //! A term is `FIELD OP VALUE`, or a bare word that searches the URL and title (and matches a
 //! method exactly), as the plain Traffic filter does. Terms next to each other must all match;
-//! `AND`, `OR`, `NOT` and parentheses combine them (`NOT` binds tightest, then `AND`, then
+//! `AND`, `OR`, `NOT` (in any case) and parentheses combine them (`NOT` binds tightest, then `AND`, then
 //! `OR`). Values with spaces or special characters go in double quotes, with `\"` and `\\`.
 //!
 //! Every value is bound as a parameter, and field names map to fixed column expressions, so
@@ -83,7 +83,8 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("resp.header.NAME", "One response header by name, e.g. resp.header.server"),
 ];
 
-/// The column expression and kind of a field, with the header name for `*.header.NAME`.
+/// The column expression and kind of a field. For `*.header.NAME` it is the headers column,
+/// with the header name (lower-case) to look for in it.
 fn field(name: &str) -> Option<(Kind, &'static str, Option<String>)> {
     let lower = name.to_ascii_lowercase();
     for (prefix, cols) in [("req.header.", "req_headers"), ("resp.header.", "resp_headers")] {
@@ -91,8 +92,7 @@ fn field(name: &str) -> Option<(Kind, &'static str, Option<String>)> {
             if h.is_empty() || !h.bytes().all(is_token_byte) {
                 return None;
             }
-            let expr = if cols == "req_headers" { "header(req_headers, {h})" } else { "header(resp_headers, {h})" };
-            return Some((Kind::Text, expr, Some(h.to_string())));
+            return Some((Kind::Text, cols, Some(h.to_string())));
         }
     }
     let (kind, expr) = match lower.as_str() {
@@ -294,6 +294,15 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
             .unwrap_or(s.len());
         let name = &s[i..name_end];
         let op = OPS.iter().find(|(t, _)| s[name_end..].starts_with(t));
+        let lower_name = name.to_ascii_lowercase();
+        let header_like = lower_name.starts_with("req.header.") || lower_name.starts_with("resp.header.");
+        if header_like && op.is_none() && s[name_end..].chars().next().is_some_and(|c| !ends_word(c)) {
+            return Err(invalid(format!(
+                "the header name at position {} may only use letters, digits, '-', '_' and '.' here; use \
+                 req.headers or resp.headers to search for others",
+                i + 1
+            )));
+        }
         if let (true, Some(&(op_text, op))) = (field_like(name), op) {
             let after = name_end + op_text.len();
             // `https://…` and `app.test:8443` are text to search, not fields. A dotted name is a
@@ -329,7 +338,9 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
         }
         let end = run_end(s, i);
         let word = &s[i..end];
-        out.push(match word {
+        // Keywords in any case: `a or b` must not quietly search for the word "or". Quote one to
+        // search for it.
+        out.push(match word.to_ascii_uppercase().as_str() {
             "AND" => Token::And,
             "OR" => Token::Or,
             "NOT" => Token::Not,
@@ -420,6 +431,17 @@ impl Parser {
     }
 }
 
+/// Whether `v` is an ISO-8601 date or date and time SQLite's date functions read: a day,
+/// optionally a time with seconds and a fraction, optionally `Z` or an offset.
+fn is_time(v: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)?(?:Z|[+-]\d{2}:\d{2})?$")
+            .expect("valid regex")
+    })
+    .is_match(v)
+}
+
 /// Whether `v` is a status class such as `5xx`.
 fn status_class(v: &str) -> Option<i64> {
     let b = v.as_bytes();
@@ -468,6 +490,11 @@ fn check_term(name: &str, op: Op, value: &str, quoted: bool, at: usize) -> Resul
             if matches!(op, Op::Regex | Op::NotRegex) {
                 return Err(bad("a time takes :, =, !=, <, <=, > or >="));
             }
+            if op != Op::Has && !is_time(value) {
+                return Err(bad(
+                    "expected a time such as 2026-11-08, 2026-11-08T12:00:00Z or 2026-11-08T12:00:00+01:00",
+                ));
+            }
         }
     }
     if matches!(op, Op::Regex | Op::NotRegex) {
@@ -499,61 +526,92 @@ impl Query {
         }
     }
 
-    /// The query as a SQL condition on `history`, with `?N` placeholders numbered from
-    /// `params.len() + 1`; the values are pushed onto `params`.
-    pub fn to_sql(&self, params: &mut Vec<Value>) -> String {
-        node_sql(&self.0, params)
+    /// The query as a SQL condition on `history`. Its values are pushed onto `params`, and its
+    /// placeholders are numbered after `first` others the statement binds before them (`?N`
+    /// with N from `first + 1`).
+    pub fn to_sql(&self, params: &mut Vec<Value>, first: usize) -> String {
+        let start = params.len();
+        node_sql(&self.0, &mut Binder { params, first, start })
     }
 }
 
-/// A placeholder for `v`, bound as the next parameter.
-fn bind(params: &mut Vec<Value>, v: Value) -> String {
-    params.push(v);
-    format!("?{}", params.len())
+/// Collects a statement's values and numbers their placeholders.
+struct Binder<'a> {
+    params: &'a mut Vec<Value>,
+    first: usize,
+    /// How many values `params` held before this query's.
+    start: usize,
 }
 
-/// `%v%` for LIKE, with the LIKE wildcards in `v` escaped by `\`.
-fn like_pattern(v: &str) -> String {
-    let mut out = String::with_capacity(v.len() + 2);
-    out.push('%');
-    for c in v.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
+impl Binder<'_> {
+    /// A placeholder for `v`, bound as the next parameter.
+    fn bind(&mut self, v: Value) -> String {
+        self.params.push(v);
+        format!("?{}", self.first + self.params.len() - self.start)
     }
-    out.push('%');
-    out
+
+    fn text(&mut self, v: &str) -> String {
+        self.bind(Value::Text(v.to_string()))
+    }
 }
 
-fn node_sql(n: &Node, params: &mut Vec<Value>) -> String {
+/// `expr` contains `p`, ASCII letters in any case. instr reads every byte, where LIKE would stop
+/// at a NUL in a binary body.
+fn contains(expr: &str, p: &str) -> String {
+    format!("instr(lower({expr}), lower({p})) > 0")
+}
+
+fn node_sql(n: &Node, b: &mut Binder) -> String {
     match n {
         Node::And(parts) => {
-            format!("({})", parts.iter().map(|p| node_sql(p, params)).collect::<Vec<_>>().join(" AND "))
+            format!("({})", parts.iter().map(|p| node_sql(p, b)).collect::<Vec<_>>().join(" AND "))
         }
-        Node::Or(parts) => format!("({})", parts.iter().map(|p| node_sql(p, params)).collect::<Vec<_>>().join(" OR ")),
-        Node::Not(inner) => format!("(NOT {})", node_sql(inner, params)),
+        Node::Or(parts) => format!("({})", parts.iter().map(|p| node_sql(p, b)).collect::<Vec<_>>().join(" OR ")),
+        Node::Not(inner) => format!("(NOT {})", node_sql(inner, b)),
         Node::Word(w) => {
-            let p = bind(params, Value::Text(like_pattern(w)));
-            let m = bind(params, Value::Text(w.clone()));
-            format!("coalesce((url LIKE {p} ESCAPE '\\' OR title LIKE {p} ESCAPE '\\' OR method = upper({m})), 0)")
+            let p = b.text(w);
+            format!("coalesce(({} OR {} OR method = upper({p})), 0)", contains("url", &p), contains("title", &p))
         }
         Node::Term { field: name, op, value, quoted } => {
             let (kind, expr, header) = field(name).expect("parse accepts known fields only");
-            let expr = match header {
-                Some(h) => expr.replace("{h}", &bind(params, Value::Text(h))),
-                None => expr.to_string(),
+            let cond = match header {
+                Some(h) => header_sql(expr, &h, *op, value, *quoted, name, b),
+                None => term_sql(kind, expr, *op, value, *quoted, name, b),
             };
-            format!("coalesce(({}), 0)", term_sql(kind, &expr, *op, value, *quoted, name, params))
+            format!("coalesce(({cond}), 0)")
         }
     }
 }
 
-fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &str, params: &mut Vec<Value>) -> String {
+/// A header term over every header of that name in `cols` (a JSON array of [name, value]):
+/// a repeated header such as Set-Cookie matches when any of its values does, a negation when
+/// none does, and `:*` when the header is there, even empty.
+fn header_sql(cols: &str, h: &str, op: Op, value: &str, quoted: bool, name: &str, b: &mut Binder) -> String {
+    let wanted = b.text(h);
+    let named = format!("lower(json_extract(value, '$[0]')) = {wanted}");
+    if is_present(op, value, quoted) {
+        return format!("EXISTS (SELECT 1 FROM json_each({cols}) WHERE {named})");
+    }
+    let v = "json_extract(value, '$[1]')";
+    let (negate, positive) = match op {
+        Op::Ne => (true, Op::Eq),
+        Op::NotRegex => (true, Op::Regex),
+        other => (false, other),
+    };
+    let cond = term_sql(Kind::Text, v, positive, value, quoted, name, b);
+    let exists = format!("EXISTS (SELECT 1 FROM json_each({cols}) WHERE {named} AND coalesce(({cond}), 0))");
+    if negate {
+        format!("NOT {exists}")
+    } else {
+        exists
+    }
+}
+
+fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &str, b: &mut Binder) -> String {
     // `body` is either body: each comparison is made on both and either may match.
     if expr == "body" {
-        let req = term_sql(kind, "req_body", op, value, quoted, name, params);
-        let resp = term_sql(kind, "resp_body", op, value, quoted, name, params);
+        let req = term_sql(kind, "req_body", op, value, quoted, name, b);
+        let resp = term_sql(kind, "resp_body", op, value, quoted, name, b);
         let either = format!("coalesce(({req}), 0) OR coalesce(({resp}), 0)");
         // A negation means neither matches.
         return if matches!(op, Op::NotRegex) {
@@ -572,12 +630,12 @@ fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &st
     match kind {
         Kind::Number => {
             if let Some(class) = status_class(value) {
-                let lo = bind(params, Value::Integer(class * 100));
-                let hi = bind(params, Value::Integer(class * 100 + 99));
+                let lo = b.bind(Value::Integer(class * 100));
+                let hi = b.bind(Value::Integer(class * 100 + 99));
                 let within = format!("{expr} BETWEEN {lo} AND {hi}");
                 return if op == Op::Ne { format!("NOT coalesce(({within}), 0)") } else { within };
             }
-            let n = bind(params, Value::Integer(value.parse().expect("checked when parsed")));
+            let n = b.bind(Value::Integer(value.parse().expect("checked when parsed")));
             match op {
                 Op::Has | Op::Eq => format!("{expr} = {n}"),
                 Op::Ne => format!("NOT coalesce(({expr} = {n}), 0)"),
@@ -589,22 +647,24 @@ fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &st
             }
         }
         Kind::Time => {
-            let v = bind(params, Value::Text(value.to_string()));
+            let v = b.text(value);
             match op {
+                // A prefix, such as a day; the rest compare as instants, so a stored fraction of a
+                // second or a given offset doesn't throw the order off.
                 Op::Has => format!("substr({expr}, 1, length({v})) = {v}"),
-                Op::Eq => format!("{expr} = {v}"),
-                Op::Ne => format!("NOT coalesce(({expr} = {v}), 0)"),
-                Op::Lt => format!("{expr} < {v}"),
-                Op::Le => format!("{expr} <= {v}"),
-                Op::Gt => format!("{expr} > {v}"),
-                Op::Ge => format!("{expr} >= {v}"),
+                Op::Eq => format!("julianday({expr}) = julianday({v})"),
+                Op::Ne => format!("NOT coalesce((julianday({expr}) = julianday({v})), 0)"),
+                Op::Lt => format!("julianday({expr}) < julianday({v})"),
+                Op::Le => format!("julianday({expr}) <= julianday({v})"),
+                Op::Gt => format!("julianday({expr}) > julianday({v})"),
+                Op::Ge => format!("julianday({expr}) >= julianday({v})"),
                 Op::Regex | Op::NotRegex => unreachable!("refused when parsed"),
             }
         }
         Kind::Tags => {
             let each = match op {
-                Op::Has => format!("value LIKE {} ESCAPE '\\'", bind(params, Value::Text(like_pattern(value)))),
-                _ => format!("value = {}", bind(params, Value::Text(value.to_string()))),
+                Op::Has => contains("value", &b.text(value)),
+                _ => format!("value = {}", b.text(value)),
             };
             let exists = format!("EXISTS (SELECT 1 FROM json_each({expr}) WHERE {each})");
             if op == Op::Ne {
@@ -613,14 +673,21 @@ fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &st
                 exists
             }
         }
-        Kind::Text | Kind::Bytes => match op {
-            Op::Has => format!("{expr} LIKE {} ESCAPE '\\'", bind(params, Value::Text(like_pattern(value)))),
-            Op::Eq => format!("lower({expr}) = lower({})", bind(params, Value::Text(value.to_string()))),
-            Op::Ne => {
-                format!("NOT coalesce((lower({expr}) = lower({})), 0)", bind(params, Value::Text(value.to_string())))
+        Kind::Bytes if matches!(op, Op::Regex | Op::NotRegex) => {
+            // Over the bytes, so a body that isn't UTF-8 is still searched.
+            let m = format!("regexp_bytes({}, {expr})", b.text(value));
+            if op == Op::NotRegex {
+                format!("NOT {m}")
+            } else {
+                m
             }
-            Op::Regex => format!("regexp({}, {expr})", bind(params, Value::Text(value.to_string()))),
-            Op::NotRegex => format!("NOT regexp({}, {expr})", bind(params, Value::Text(value.to_string()))),
+        }
+        Kind::Text | Kind::Bytes => match op {
+            Op::Has => contains(expr, &b.text(value)),
+            Op::Eq => format!("lower({expr}) = lower({})", b.text(value)),
+            Op::Ne => format!("NOT coalesce((lower({expr}) = lower({})), 0)", b.text(value)),
+            Op::Regex => format!("regexp({}, {expr})", b.text(value)),
+            Op::NotRegex => format!("NOT regexp({}, {expr})", b.text(value)),
             Op::Lt | Op::Le | Op::Gt | Op::Ge => {
                 unreachable!("{name}: refused when parsed")
             }
@@ -634,7 +701,7 @@ mod tests {
 
     fn sql(q: &str) -> (String, Vec<Value>) {
         let mut params = Vec::new();
-        let s = Query::parse(q).unwrap().to_sql(&mut params);
+        let s = Query::parse(q).unwrap().to_sql(&mut params, 0);
         (s, params)
     }
 
@@ -646,12 +713,33 @@ mod tests {
     fn terms_and_words() {
         let (s, p) = sql("status:5xx resp.body:\"stack trace\"");
         assert!(s.starts_with("(coalesce((status BETWEEN ?1 AND ?2), 0) AND "), "{s}");
-        assert!(s.contains("resp_body LIKE ?3 ESCAPE"), "{s}");
-        assert_eq!(p, vec![Value::Integer(500), Value::Integer(599), Value::Text("%stack trace%".into())]);
+        assert!(s.contains("instr(lower(resp_body), lower(?3)) > 0"), "{s}");
+        assert_eq!(p, vec![Value::Integer(500), Value::Integer(599), Value::Text("stack trace".into())]);
 
         let (s, p) = sql("login");
-        assert!(s.contains("url LIKE ?1") && s.contains("method = upper(?2)"), "{s}");
-        assert_eq!(p[0], Value::Text("%login%".into()));
+        assert!(s.contains("instr(lower(url), lower(?1))") && s.contains("method = upper(?1)"), "{s}");
+        assert_eq!(p, vec![Value::Text("login".into())]);
+    }
+
+    #[test]
+    fn keywords_in_any_case() {
+        let q = Query::parse("a or b and not c").unwrap();
+        assert_eq!(
+            q.0,
+            Node::Or(vec![
+                Node::Word("a".into()),
+                Node::And(vec![Node::Word("b".into()), Node::Not(Box::new(Node::Word("c".into())))])
+            ])
+        );
+        assert_eq!(Query::parse("\"or\"").unwrap().0, Node::Word("or".into()));
+    }
+
+    #[test]
+    fn placeholders_follow_the_statements_own() {
+        let mut params = vec![Value::Integer(1)];
+        let s = Query::parse("host:a status:2xx").unwrap().to_sql(&mut params, 3);
+        assert!(s.contains("lower(?4)") && s.contains("BETWEEN ?5 AND ?6"), "{s}");
+        assert_eq!(params.len(), 4, "pushed after what was there");
     }
 
     #[test]
@@ -680,15 +768,16 @@ mod tests {
     fn values_are_parameters_never_sql() {
         let (s, p) = sql("host:\"x' OR 1=1 --\" resp.header.server=\"a)b\"");
         assert!(!s.contains("1=1") && !s.contains("a)b"), "{s}");
-        assert!(p.contains(&Value::Text("%x' OR 1=1 --%".into())));
-        assert!(s.contains("header(resp_headers, ?2)"), "{s}");
+        assert!(p.contains(&Value::Text("x' OR 1=1 --".into())));
+        assert!(s.contains("json_each(resp_headers)") && s.contains("= ?2"), "{s}");
         assert_eq!(p[1], Value::Text("server".into()));
     }
 
     #[test]
-    fn like_wildcards_are_escaped() {
-        let (_, p) = sql("path:\"100%_\\\\x\"");
-        assert_eq!(p[0], Value::Text("%100\\%\\_\\\\x%".into()));
+    fn wildcards_are_plain_text() {
+        let (s, p) = sql("path:\"100%_\\\\x\"");
+        assert!(!s.contains("LIKE"), "{s}");
+        assert_eq!(p[0], Value::Text("100%_\\x".into()));
     }
 
     #[test]
@@ -718,20 +807,40 @@ mod tests {
             "{s}"
         );
         let (s, _) = sql("host:\"\"");
-        assert!(s.contains("host LIKE ?1"), "{s}");
+        assert!(s.contains("instr(lower(host), lower(?1))"), "{s}");
     }
 
     #[test]
     fn presence_and_headers() {
         let (s, p) = sql("req.header.authorization:*");
-        assert!(s.contains("length(header(req_headers, ?1)) > 0"), "{s}");
+        assert!(
+            s.contains("EXISTS (SELECT 1 FROM json_each(req_headers) WHERE lower(json_extract(value, '$[0]')) = ?1)"),
+            "{s}"
+        );
         assert_eq!(p, vec![Value::Text("authorization".into())]);
         let (s, p) = sql("url:\"*\"");
-        assert!(s.contains("url LIKE ?1"), "{s}");
-        assert_eq!(p[0], Value::Text("%*%".into()));
+        assert!(s.contains("instr(lower(url), lower(?1))"), "{s}");
+        assert_eq!(p[0], Value::Text("*".into()));
         assert!(err("req.header.:x").contains("unknown field"));
-        // A name with a character no field has is a bare word.
-        assert_eq!(Query::parse("req.header.a@b:x").unwrap().0, Node::Word("req.header.a@b:x".into()));
+        // A header name the tokenizer can't read is refused, not searched as a word.
+        assert!(err("req.header.a@b:x").contains("may only use letters"));
+        assert!(err("req.header.x!foo:bar").contains("may only use letters"));
+        assert_eq!(
+            Query::parse("req.header.x-a_b.c:*").unwrap().0,
+            Node::Term { field: "req.header.x-a_b.c".into(), op: Op::Has, value: "*".into(), quoted: false }
+        );
+    }
+
+    #[test]
+    fn times_are_checked_and_compared_as_instants() {
+        for ok in ["2026-11-08", "2026-11-08T12:00", "2026-11-08T12:00:00Z", "2026-11-08 12:00:00.5+01:00"] {
+            let (s, _) = sql(&format!("time>=\"{ok}\""));
+            assert!(s.contains("julianday(time) >= julianday(?1)"), "{s}");
+        }
+        assert!(err("time>yesterday").contains("expected a time"));
+        assert!(err("time<2026-11").contains("expected a time"));
+        // A prefix takes any text.
+        assert!(sql("time:2026-11").0.contains("substr(time, 1, length(?1)) = ?1"));
     }
 
     #[test]

@@ -320,10 +320,10 @@ enum HistoryCmd {
         #[arg(long)]
         contains: Option<String>,
         /// A query in the filter language, e.g. 'status:5xx AND resp.body:"stack trace"' or
-        /// 'host:api.test method=POST NOT path:/health'. FIELD:VALUE contains (case-insensitive),
+        /// 'host:api.test method=POST NOT path:/health'. FIELD:VALUE contains (ASCII letters in any case),
         /// = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times,
         /// FIELD:* is present; a bare word searches the URL and title. Terms side by side must
-        /// all match; AND, OR, NOT and parentheses combine them. Fields: see the notes.
+        /// all match; AND, OR, NOT (in any case) and parentheses combine them. Fields: see the notes.
         #[arg(long)]
         filter: Option<String>,
         /// Only entries with an id greater than this (for incremental polling).
@@ -1031,7 +1031,10 @@ fn filter_notes() -> String {
     format!(
         "--filter fields: {}. Status classes: status:5xx. Values with spaces or ( ) go in double quotes \
          (\\\" and \\\\ inside); a quoted word is searched as text, so \"status:500\" finds that text. \
-         Regexes are Rust syntax, case-sensitive unless they start with (?i). NOT status:500 keeps requests \
+         Regexes are Rust syntax, case-sensitive unless they start with (?i); on req, resp and the bodies they \
+         read bytes. A header term matches when any value of a repeated header does (!= and !~ when none \
+         does), and req.header.NAME:* finds an empty header too. Times compare as instants \
+         (time>=2026-11-08T12:00:00Z, or an offset); time:DATE is a prefix. NOT status:500 keeps requests \
          with no response. --filter combines with the other options, all of which must match.",
         fields.join("; ")
     )

@@ -14,7 +14,6 @@ import {
   DEFAULT_FILTER,
   failPage,
   FILTERS_LIST_ARGS,
-  filtersSaveArgs,
   isCurrent,
   isRefused,
   loadSaved,
@@ -23,7 +22,8 @@ import {
   needsSearch,
   newSearch,
   refilter,
-  savedBody,
+  mergeLocal,
+  saveChange,
   savedFrom,
   searchArgs,
   searchFor,
@@ -32,8 +32,11 @@ import {
   withMode,
   withSaved,
   withoutSaved,
+  usesEditableFields,
   type ContentSearch,
+  type Cli,
   type SavedFilter,
+  type SavedState,
   type SearchMode,
   type SearchQuery,
   type TrafficFilter,
@@ -133,10 +136,10 @@ const PLACEHOLDER: Record<SearchMode, string> = {
 };
 
 const QUERY_HELP =
-  "FIELD:VALUE contains (any case), = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times, FIELD:* is present. " +
+  "FIELD:VALUE contains (ASCII letters in any case), = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times, FIELD:* is present. " +
   "Fields include method, host, path, url, query, status (also 5xx), length, duration, time, source, origin, tag, note, title, type, " +
   "req, resp, req.body, resp.body, body, req.header.NAME and resp.header.NAME. A bare word searches the URL and title. " +
-  "Terms side by side must all match; AND, OR, NOT and ( ) combine them; quote values with spaces. Runs history list --filter.";
+  "Terms side by side must all match; AND, OR, NOT (any case) and ( ) combine them; quote values with spaces. Runs history list --filter.";
 
 const MODE_HELP: Record<SearchMode, string> = {
   text: "The text filters the URL, title and method of the rows shown",
@@ -152,37 +155,39 @@ function History() {
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const [filter, setFilter] = useState<TrafficFilter>(DEFAULT_FILTER);
   const [saved, setSaved] = useState<SavedFilter[]>([]);
-  // The saved set's revision in the project, for the next save (0: none saved yet).
-  const savedRev = useRef(0);
-  const loadFilters = async () => {
-    const d = await run<{ rev: number; filters: unknown }>(FILTERS_LIST_ARGS);
-    savedRev.current = d.rev;
-    setSaved(savedFrom(d.filters));
-    return d;
+  // The saved filters and their revision in the project, for the next save (0: none saved yet).
+  const savedState = useRef<SavedState>({ rev: 0, list: [] });
+  // Goes up when the project changes or the view closes: a load or save that answers later is dropped.
+  const savedGen = useRef(0);
+  const takeSaved = (s: SavedState, gen: number) => {
+    if (gen !== savedGen.current) return;
+    savedState.current = s;
+    setSaved(s.list);
   };
+  const cli: Cli = (args, stdin) => run(args, stdin == null ? undefined : { stdin });
+  const isConflict = (e: unknown) => e instanceof CliError && e.kind === "conflict";
   // Saved filters live in the project. An older build kept them in this app's storage: they
-  // move into the project the first time it has none.
+  // are added to the project's (whatever an agent or the CLI saved there first), then removed.
   useEffect(() => {
-    let live = true;
+    const gen = ++savedGen.current;
     (async () => {
-      const d = await loadFilters();
+      const d = await cli(FILTERS_LIST_ARGS);
+      takeSaved({ rev: d.rev, list: savedFrom(d.filters) }, gen);
       const local = loadSaved(app.project);
-      if (!live || d.rev !== 0 || !local.length) return;
+      if (gen !== savedGen.current || !local.length) return;
       try {
-        const r = await run<{ rev: number }>(filtersSaveArgs(0), { stdin: savedBody(local) });
-        savedRev.current = r.rev;
+        const merged = await saveChange(cli, savedState.current, (list) => mergeLocal(list, local), isConflict);
         clearLocalSaved(app.project);
-        if (live) setSaved(local);
+        takeSaved(merged, gen);
       } catch (e: any) {
-        // Still shown, and kept where they were: the next save tries the project again.
-        if (live) {
-          setSaved(local);
-          app.toast(`Saved filters stay in this app until they can be saved in the project: ${e.message}`, "error");
-        }
+        // Still shown, and kept where they were: the next open tries the project again.
+        if (gen !== savedGen.current) return;
+        setSaved(mergeLocal(savedState.current.list, local));
+        app.toast(`Saved filters stay in this app until they can be saved in the project: ${e.message}`, "error");
       }
-    })().catch((e) => live && app.toast(`Saved filters: ${e.message}`, "error"));
+    })().catch((e) => gen === savedGen.current && app.toast(`Saved filters: ${e.message}`, "error"));
     return () => {
-      live = false;
+      savedGen.current++;
     };
   }, [app.project]);
   // The saved filter last chosen or saved, so two with the same state stay apart.
@@ -332,9 +337,21 @@ function History() {
     }
   };
 
+  // A note or tag edit can change which rows a query on notes or tags matches, also for rows
+  // searched already: search again from the start. (Edits made elsewhere show on the next query.)
+  const rerunQuery = () => {
+    const s = search.current;
+    if (!s || s.query.kind !== "filter" || !usesEditableFields(s.query.text)) return;
+    if (searchCall.current) cancelCli(searchCall.current).catch(() => {});
+    search.current = newSearch(s.query);
+    setFound(search.current);
+    searchMore();
+  };
+
   const highlight = (r: HistoryItem, on: boolean) =>
     run(highlightArgs(r.id, on))
       .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, tags: withHighlight(x.tags, on) } : x))))
+      .then(rerunQuery)
       .catch((e) => app.toast(e.message, "error"));
 
   const rowMenu = (r: HistoryItem, ev: React.MouseEvent) => {
@@ -361,6 +378,7 @@ function History() {
           if (text == null) return;
           run(["history", "note", String(r.id), ...(text ? ["--", text] : [])])
             .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, note: text || null } : x))))
+            .then(rerunQuery)
             .catch((e) => app.toast(e.message, "error"));
         },
       },
@@ -373,28 +391,29 @@ function History() {
 
   // Saved filters are kept in the project (`history filters`), so they travel with it.
   const applied = appliedSaved(saved, filter, picked);
-  const keepSaved = async (list: SavedFilter[]) => {
-    try {
-      const r = await run<{ rev: number }>(filtersSaveArgs(savedRev.current), { stdin: savedBody(list) });
-      savedRev.current = r.rev;
-      setSaved(list);
-    } catch (e: any) {
-      if (e instanceof CliError && e.kind === "conflict") {
-        await loadFilters().catch(() => {});
-        app.toast("The saved filters were changed elsewhere and have been reloaded; try again.", "error");
-      } else app.toast(`Saved filters: ${e.message}`, "error");
-    }
+  // Saves run one after another, each on the state the one before left, so two quick saves
+  // don't send the same revision.
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const keepSaved = (change: (list: SavedFilter[]) => SavedFilter[]) => {
+    const gen = savedGen.current;
+    saveQueue.current = saveQueue.current.then(async () => {
+      try {
+        takeSaved(await saveChange(cli, savedState.current, change, isConflict), gen);
+      } catch (e: any) {
+        if (gen === savedGen.current) app.toast(`Saved filters: ${e.message}`, "error");
+      }
+    });
   };
   const saveFilter = async () => {
     const name = (await ask("Save the current filter", "Name it to apply it again later.", "Save", "Cancel", applied ?? ""))?.trim();
     if (!name) return;
     if (name !== applied && saved.some((s) => s.name === name) && !(await confirm(`Replace the filter ${name}?`, "A saved filter already has that name.", "Replace", "Cancel"))) return;
-    keepSaved(withSaved(saved, name, filter));
+    keepSaved((list) => withSaved(list, name, filter));
     setPicked(name);
   };
   const deleteFilter = async () => {
     if (!applied || !(await confirm(`Delete the filter ${applied}?`, "Only the saved filter is deleted, not any traffic.", "Delete", "Cancel"))) return;
-    keepSaved(withoutSaved(saved, applied));
+    keepSaved((list) => withoutSaved(list, applied));
   };
 
   return (

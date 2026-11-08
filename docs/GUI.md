@@ -511,9 +511,13 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   search. A query the CLI refuses as invalid input isn't tried again until the text changes
   (`failPage(..., invalid)`); the toolbar shows the parser's message. Saved filters are loaded
   with `history filters list` when the project opens and saved whole with `history filters
-  save --if-revision REV`; a conflict reloads them and asks the user to try again. Filters an
-  older build kept in localStorage are saved into a project that has none (revision 0), then
-  removed from localStorage.
+  save --if-revision REV`, one save at a time (`saveChange`); a conflict (an agent added one, or
+  another window saved) reads them again and applies the same change to what is saved now, once. Filters an
+  older build kept in localStorage are merged into the project's (`mergeLocal`: an equal one is
+  already there, a different one under a taken name becomes "NAME (this computer)"), then
+  removed from localStorage. A note or highlight changed from Traffic runs a query that uses
+  `tag` or `note` again from the start (`usesEditableFields`), since rows already searched may
+  now match or not; edits made elsewhere aren't seen until the query changes.
 - Traffic's contents search is case-sensitive and literal, like `history list --contains`
   (no `--ignore-case` yet), and stops at the first 10,000 matches the other filters show
   (oldest first; the toolbar says so). Only a new text or a different single source starts a

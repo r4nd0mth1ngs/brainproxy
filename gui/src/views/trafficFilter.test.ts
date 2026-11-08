@@ -20,6 +20,9 @@ import {
   parseFilter,
   parseSaved,
   refilter,
+  mergeLocal,
+  usesEditableFields,
+  saveChange,
   clearLocalSaved,
   filtersSaveArgs,
   savedBody,
@@ -189,6 +192,44 @@ test("saved filters go to the project as history filters save takes them", () =>
   // What `history filters list` returns reads back the same (its mode field is ignored).
   assert.deepEqual(savedFrom([{ ...body.filters[0], mode: "query" }]), list);
   assert.deepEqual(savedFrom(null), []);
+});
+
+test("a save that meets a newer saved set applies the change to it, once", async () => {
+  const conflict = new Error("conflict");
+  const isConflict = (e: unknown) => e === conflict;
+  const mine = { name: "mine", filter: filter({ text: "a" }) };
+  const theirs = { name: "agent", filter: filter({ query: true, text: "status:5xx" }) };
+  const calls: string[][] = [];
+  // The project is at revision 2, with a filter an agent added after the app read revision 1.
+  const cli = async (args: string[], stdin?: string) => {
+    calls.push(args);
+    if (args[2] === "list") return { rev: 2, filters: JSON.parse(savedBody([mine, theirs])).filters };
+    if (args.at(-1) !== "2") throw conflict;
+    return { rev: 3, filters: JSON.parse(stdin!).filters };
+  };
+  const added = { name: "new", filter: filter({ text: "b" }) };
+  const out = await saveChange(cli, { rev: 1, list: [mine] }, (l) => withSaved(l, added.name, added.filter), isConflict);
+  assert.deepEqual(out, { rev: 3, list: [mine, theirs, added] });
+  assert.deepEqual(calls.map((c) => c.join(" ")), ["history filters save --if-revision 1", "history filters list", "history filters save --if-revision 2"]);
+  // Another error isn't retried.
+  await assert.rejects(saveChange(async () => Promise.reject(new Error("io")), { rev: 1, list: [] }, (l) => l, isConflict), /io/);
+});
+
+test("filters kept by an older build are added to the project's without losing either", () => {
+  const agent = { name: "errors", filter: filter({ query: true, text: "status:5xx" }) };
+  const sameAsSaved = { name: "errors", filter: filter({ query: true, text: "status:5xx" }) };
+  const clash = { name: "errors", filter: filter({ text: "boom" }) };
+  const fresh = { name: "tokens", filter: filter({ contents: true, text: "Bearer" }) };
+  assert.deepEqual(mergeLocal([agent], [sameAsSaved, fresh]), [agent, fresh]);
+  assert.deepEqual(
+    mergeLocal([agent, { name: "errors (this computer)", filter: filter() }], [clash]).map((s) => s.name),
+    ["errors", "errors (this computer)", "errors (this computer 2)"],
+  );
+});
+
+test("a query on notes or tags is searched again after an edit", () => {
+  for (const q of ["tag=highlight", "NOT tag:x", "(note:todo)", "a NOTE~x"]) assert.ok(usesEditableFields(q), q);
+  for (const q of ["status:5xx", "path:/tag:x", '"tag:x"', "notes"]) assert.ok(!usesEditableFields(q), q);
 });
 
 test("filters kept by an older build are removed once moved", () => {

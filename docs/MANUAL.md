@@ -369,7 +369,7 @@ The sidebar groups the tools by what you are doing.
     --filter`) like a contents search, with the same live updates and 10,000-match stop. For
     example `status:5xx resp.body:"stack trace"`, `host:api.acme.test method=POST NOT
     path:/health` or `resp.header.server~"(?i)nginx" OR req.header.authorization:*`:
-    - `FIELD:VALUE` contains the value, in any case; `=` equals (any case), `!=` differs, `~`
+    - `FIELD:VALUE` contains the value, ASCII letters in any case; `=` equals (the same way), `!=` differs, `~`
       and `!~` match a Rust regex (case-sensitive unless it starts with `(?i)`), `<`, `<=`,
       `>`, `>=` compare numbers and times, and `FIELD:*` is present.
     - Fields: `id`, `method`, `scheme`, `host`, `port`, `path`, `query`, `url`, `status` (also
@@ -378,21 +378,31 @@ The sidebar groups the tools by what you are doing.
       `note`, `tag` (`tag=race:ID` is exact), `sni`, `client`, `req` and `resp` (the raw
       messages), `req.body`, `resp.body`, `body` (either), `req.type`, `req.length`,
       `req.headers`, `resp.headers`, and one header by name: `req.header.NAME`,
-      `resp.header.NAME`.
+      `resp.header.NAME` (letters, digits, `-`, `_` and `.` in the name). A repeated header such
+      as `Set-Cookie` matches when any of its values does (`!=` and `!~` when none does), and
+      `:*` finds a header that is there even when it is empty.
+    - Times compare as instants (`time>=2026-11-08T12:00:00Z`, or with an offset such as
+      `+01:00`), so a stored fraction of a second doesn't throw the order off; `time:` is a
+      prefix. A regex on `req`, `resp` or a body reads the bytes, so a body that isn't UTF-8 is
+      searched too.
     - A bare word searches the URL and title, as the URL filter does; a quoted one is searched
       as text, so `"status:500"` finds that text. Terms side by side must all match; `AND`,
-      `OR`, `NOT` and parentheses combine them (`NOT` first, then `AND`, then `OR`). Values with
+      `OR`, `NOT` (in any case, so quote `"or"` to search for the word) and parentheses combine
+      them (`NOT` first, then `AND`, then `OR`). Values with
       spaces go in double quotes, with `\"` and `\\` inside. `NOT status:500` keeps requests
       that got no response.
     - A query that doesn't parse says why and where in the toolbar, and isn't run until you
       change it. Values are always passed to the database as values, never as SQL.
+    - A query on notes or tags is run again when you change a note or a highlight in Traffic;
+      a change made elsewhere (the CLI, an agent) shows once you change the query.
   - **Saved filters:** *Save…* names the current filters (text and what it searches, sources
     and the checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept
     in the project file (`history filters list` and `history filters save`), so they travel
     with it and an agent can read them, or add one under a new name; an agent can't change or
     remove yours. A saved search for a token or password stays in the project until you delete
     it. Filters an older version kept in the app's own storage move into the project the first
-    time it is opened.
+    time it is opened, next to any already there; one whose name is taken by a different filter
+    is added as "NAME (this computer)".
   - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). For a proxy entry
     that is who started the proxy, not who sent the request: hover it to see the address of
     the client that sent it.

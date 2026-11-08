@@ -129,6 +129,55 @@ export const filtersSaveArgs = (rev: number) => ["history", "filters", "save", "
 /** A save's stdin: the whole list, each filter in its stored form. */
 export const savedBody = (list: SavedFilter[]) => JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: parseFilter(s.filter) })) });
 
+/**
+ * `list` (saved in the project) with the filters an older build kept in localStorage added.
+ * One equal to a saved filter of the same name is already there; one that differs from it is
+ * added as "NAME (this computer)", so neither is lost.
+ */
+export function mergeLocal(list: SavedFilter[], local: SavedFilter[]): SavedFilter[] {
+  const out = [...list];
+  for (const s of local) {
+    const same = out.find((o) => o.name === s.name);
+    if (same && JSON.stringify(normal(same.filter)) === JSON.stringify(normal(s.filter))) continue;
+    let name = s.name;
+    for (let n = 1; out.some((o) => o.name === name); n++) name = `${s.name} (this computer${n > 1 ? ` ${n}` : ""})`;
+    out.push({ name, filter: parseFilter(s.filter) });
+  }
+  return out;
+}
+
+/** Whether a query uses a field a person can change after a row is recorded (a note or a tag). */
+export const usesEditableFields = (query: string) => /(^|[\s(])(tag|note)(:|=|!=|~|!~)/i.test(query);
+
+/** The saved filters as the app last read or saved them, with their revision in the project. */
+export interface SavedState {
+  rev: number;
+  list: SavedFilter[];
+}
+
+/** A CLI call with optional stdin, returning the data (`run` in the app). */
+export type Cli = (args: string[], stdin?: string) => Promise<any>;
+
+/**
+ * Saves `change` applied to `cur`. When the saved set changed meanwhile (an agent added a
+ * filter, or another window saved), it reads what is saved now and applies the same change to
+ * that, once, so the person's save isn't lost. Returns the state saved.
+ */
+export async function saveChange(cli: Cli, cur: SavedState, change: (list: SavedFilter[]) => SavedFilter[], isConflict: (e: unknown) => boolean): Promise<SavedState> {
+  const attempt = async (s: SavedState): Promise<SavedState> => {
+    const list = change(s.list);
+    const r = await cli(filtersSaveArgs(s.rev), savedBody(list));
+    return { rev: r.rev, list };
+  };
+  try {
+    return await attempt(cur);
+  } catch (e) {
+    if (!isConflict(e)) throw e;
+    const d = await cli(FILTERS_LIST_ARGS);
+    return attempt({ rev: d.rev, list: savedFrom(d.filters) });
+  }
+}
+
 /** The list with `filter` saved as `name`: a filter with that name is replaced in place, a new one goes last. */
 export function withSaved(list: SavedFilter[], name: string, filter: TrafficFilter): SavedFilter[] {
   const n = name.trim();
