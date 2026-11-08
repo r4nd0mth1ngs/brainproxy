@@ -158,27 +158,51 @@ by the crawler, and requests from a browser using the proxy. For a different sco
 a new engagement.
 
 The scope decides where a connection goes: the target's address and, over TLS, a server name
-set with `--sni` (one other than the target's must be listed by name). It does not refuse a
-`Host` header (HTTP/2 sends it as `:authority`) or an absolute URL in the request line that names
-another host, as Host-header injection tests need one. On a shared front end (a CDN or load
-balancer) such a request to an in-scope address can still reach a site outside the scope, so
-`send` (races too), `fuzz run`, `ws send` and an edited request forwarded with `intercept
-forward` warn when the host they name isn't the target's and isn't listed by name: in the
-output's `host_warning`, and on stderr in text mode. A payload position in the Host header
-counts as such a host. Settings that put a Host on requests still to come are checked the same
-way when they are saved: an auth profile's `--header` or `--token-header`, its login request and
-`--login-header` (the login URL's own host is fine), a macro's steps (`auth macro add`), and a
-proxy rule (`rules add`, or `rules enable` of a disabled one) whose replacement writes a Host line
-or an absolute URL, or that rewrites the Host of a request to a host the engagement lists. A rule
-can match anything, so that last check isn't proof. Session rules and signers can't set the Host
-at all. Saving a setting again with the Host it already had isn't checked again. Through MCP all
-of these are refused unless `--host-header-test` says the test is meant, so the intent is on
-record (see [Agents and MCP](#agents-and-mcp)).
+set with `--sni` (one other than the target's must be listed by name). With an IP address or a
+CIDR range in scope, any host name that resolves to it, by DNS or through a `connection hosts`
+override, is in scope as a target too. On a shared front end (a CDN or load balancer), list the
+sites' names in the scope rather than its addresses.
+
+A `Host` header (HTTP/2 sends it as `:authority`) doesn't pick where the connection goes, but on
+a shared front end it can pick the site, so a request to an in-scope address can reach a site
+outside the scope. Host-header injection tests need such a request, so it isn't simply refused.
+Every request is checked as it goes on the wire, after an auth profile's session, its values
+and signers have been applied: a host it names that isn't the target's and isn't listed by name
+in the engagement scope (on the target's port, or with no port) is foreign. So is a request
+target other than a path, `*` or a URL naming a listed host, a request line that isn't three
+tokens separated by single spaces, and a bare CR in the head. `send` (races too), `ws send` and
+`fuzz run` warn about a foreign host in the output's `host_warning`, and on stderr in text mode.
+A payload position in the Host header or in a header's name counts as one.
+
+Through MCP a request with a foreign host is refused (`out_of_scope`) unless the command says
+the test is meant with `--host-header-test` (`send`, `fuzz run`, `ws send`, and `auth login`,
+`auth status` and `auth macro run` for a profile's own requests), so the intent is on record. One
+refused before it is written to history leaves no row; one refused on the wire, after a session
+added the Host, keeps its row, with the refusal as its error. A crawl's or an import's `-H Host`
+or a collection's Host header is refused the same way, request by request. Settings that put a
+Host on requests still to come are checked when they are saved too: an auth profile's `--header`
+or `--token-header`, its login request and `--login-header` (the login URL's own host is fine), a
+macro's steps (`auth macro add`), and a proxy rule (`rules add`, or `rules enable` of a disabled
+one) whose replacement writes a Host line or an absolute URL, rewrites the Host of a request to a
+host the engagement lists, or copies a header's name or the request target from the request
+(`$1`). A rule can match anything, so that check is best effort; the proxy sends what a rule makes
+of a request unchecked. Session rules and signers can't set the Host at all. Saving a setting
+again with the Host it already had isn't checked again; an edited request forwarded with
+`intercept forward` is checked for hosts the edit brings in. A person on the command line or in
+the app is warned, never refused.
+
+For everyone: a header name or value given as input (`-H`, an auth profile's headers, a
+collection's) can't hold a CR, LF or NUL, which would start another header; a `-H Host` takes the
+place of the target's Host rather than adding a second; a fuzz payload with a raw line break is
+refused where it would go into the head unencoded; and a request sent over HTTP/2 must have a
+path, `*` or a URL as its target, and a Host with no user part, so nothing runs into the
+`:authority`.
 
 Not checked: active scan rules and check templates that put a host of their own in the Host
 header (Cloud Metadata names the metadata service, for one; `scan active --inject-header Host`
 puts payloads there), which are Host-header tests by nature and connect to the scanned in-scope
-host; and requests sent again as they were recorded (`findings retest`, a scan of history rows).
+host; requests sent again as they were recorded (`findings retest`); and a proxied client's own
+requests.
 
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
 recorded and intercepted. It is empty by default, which means everything the engagement

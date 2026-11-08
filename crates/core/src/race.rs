@@ -34,9 +34,16 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
     // What goes on the wire has auth placeholders filled; `requests` stays as recorded.
     let mut wire: Vec<Vec<u8>> = Vec::with_capacity(requests.len());
     for r in &requests {
-        match client.fill_auth(r, target).await {
+        match client.fill_auth(r, target).await.and_then(|w| client.check_host(&w, target).map(|_| w)) {
             Ok(w) => wire.push(w.into_owned()),
-            Err(e) => return requests.iter().map(|_| Err(Error::InvalidInput(e.to_string()))).collect(),
+            Err(e) => {
+                // Every copy fails the same way; a refused Host stays out_of_scope.
+                let again = || match &e {
+                    Error::OutOfScope(m) => Error::OutOfScope(m.clone()),
+                    e => Error::InvalidInput(e.to_string()),
+                };
+                return requests.iter().map(|_| Err(again())).collect();
+            }
         }
     }
     // 1. Connect everything up front.
@@ -122,7 +129,9 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
     }
     let mut converted: Vec<H2Request> = Vec::with_capacity(requests.len());
     for r in &requests {
-        converted.push(H2Request::from_raw(&client.fill_auth(r, target).await?, target)?);
+        let filled = client.fill_auth(r, target).await?;
+        client.check_host(&filled, target)?;
+        converted.push(H2Request::from_raw(&filled, target)?);
     }
     // Recorded with the auth placeholders, not the values sent.
     let recorded: Vec<Vec<u8>> =

@@ -1842,6 +1842,9 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         sni: None,
         guard: Some(guard),
         http2: false,
+        // A proxied client's request goes out with its own Host; an agent's edits and rules
+        // are checked when they are made.
+        host: brainproxy_core::http::client::HostPolicy::Allow,
     };
     let live = args.live_authz()?;
     let stored: LiveAuthz = store.setting(AUTHZ_KEY)?;
@@ -2245,6 +2248,20 @@ fn rule_host(guard: &std::sync::Arc<brainproxy_core::guard::Guard>, names: &[Str
     if written.is_some() {
         return written;
     }
+    // A name or request target the rule takes from the request (`$1`) can be anything, a Host
+    // too ("^X-Zz: (.*)$" to "Hos$1"); so can a name that is the start of "Host".
+    let capture = regex::Regex::new(r"\$(\d|\{|[A-Za-z_])").expect("valid");
+    let copied = match rule.location {
+        RuleLocation::RequestHeader => {
+            let name = replace.split_once(':').map_or(replace, |(k, _)| k).trim();
+            let host_start = !name.is_empty() && "host".starts_with(&name.to_ascii_lowercase());
+            capture.is_match(name) || host_start
+        }
+        _ => capture.find_iter(replace).any(|m| m.start() == 0 || replace[..m.start()].ends_with(' ')),
+    };
+    if copied {
+        return Some(format!("(what the rule makes of the request: {replace:?})"));
+    }
     let compiled = brainproxy_core::proxy::config::compile_rules(&[Rule { enabled: true, ..rule.clone() }]).ok()?;
     let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };
     names.iter().find_map(|name| {
@@ -2366,8 +2383,9 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             if let (Some(e), "request") = (&edited, entry.direction.as_str()) {
                 let target = Target::from_url(&entry.url)?;
                 let opts = SendOptions { guard: Some(store.guard()?), ..Default::default() };
-                if opts.foreign_host(e, &target) != opts.foreign_host(&original, &target) {
-                    host_warning = crate::mcp::check_host_header(&opts, e, &target, host_header_test, out)?;
+                let before = opts.foreign_hosts(&original, &target);
+                if let Some(new) = opts.foreign_hosts(e, &target).into_iter().find(|h| !before.contains(h)) {
+                    host_warning = crate::mcp::check_host_setting("the edit", Some(new), host_header_test, out)?;
                 }
             }
             let by = brainproxy_core::provenance::origin();

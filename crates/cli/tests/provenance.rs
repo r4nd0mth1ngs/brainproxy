@@ -356,6 +356,27 @@ fn a_foreign_host_is_sent_with_a_warning_but_an_agent_must_say_it_is_a_test() {
 }
 
 #[test]
+fn a_request_target_that_isnt_a_path_is_never_sent_over_http2_and_a_listed_port_is_enough() {
+    let port = serve();
+    let env = Env::with_scope("h2-target", &["--target", "127.0.0.1", "--target", "app.test:8443"]);
+    let raw = env.project.with_extension("h2.http");
+    let target = format!("http://127.0.0.1:{port}");
+    // `.evil.test/` would run into the authority (app.test.evil.test), for anyone.
+    for t in [".evil.test/", "@evil.test/"] {
+        std::fs::write(&raw, format!("GET {t} HTTP/2\r\nHost: app.test\r\n\r\n")).unwrap();
+        let (code, v, _) = env.run(&[], &["send", raw.to_str().unwrap(), "--target", &target]);
+        assert_ne!(code, 0, "{t}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("isn't a path"), "{v}");
+    }
+    // A name the scope lists on another port is listed, with that port or without one.
+    for host in ["Host: app.test", "Host: app.test:8443"] {
+        let saved = env.ok(&[(MCP, "1")], &["auth", "add", "p", "-H", host]);
+        assert!(saved.get("host_warning").is_none(), "{host}: {saved}");
+    }
+    assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], 0);
+}
+
+#[test]
 fn a_person_sets_a_foreign_host_on_requests_to_come_with_a_warning() {
     let env = Env::new("host-settings");
     let profile = env.ok(&[], &["auth", "add", "p", "-H", "Host: other-tenant.test"]);
@@ -440,13 +461,14 @@ fn an_agents_intercept_edit_and_rule_in_a_proxy_the_app_started_say_so() {
 
     // An edit that brings in a Host the scope doesn't list must say it is a Host-header test.
     let l = listen.clone();
-    let person = std::thread::spawn(move || through(&l, port, "/tenant", ""));
+    // The person's request names a foreign host of its own, which the edit keeps: the one it adds
+    // is still checked.
+    let person = std::thread::spawn(move || through(&l, port, "/tenant", "Host: first-tenant.test\r\n"));
     let listed = env.ok(&agent, &["intercept", "list", "--wait", "10"]);
     let id3 = listed["items"][0]["id"].as_i64().unwrap().to_string();
     let held = env.ok(&agent, &["intercept", "show", &id3]);
-    let lines = held["message"]["content"].as_str().unwrap().lines().filter(|l| !l.is_empty());
-    let host = |l: &str| l.to_ascii_lowercase().starts_with("host:");
-    let lines: Vec<&str> = lines.map(|l| if host(l) { "Host: other-tenant.test" } else { l }).collect();
+    let mut lines: Vec<&str> = held["message"]["content"].as_str().unwrap().lines().filter(|l| !l.is_empty()).collect();
+    lines.push("Host: other-tenant.test");
     std::fs::write(&edited, format!("{}\r\n\r\n", lines.join("\r\n"))).unwrap();
     let forward = ["intercept", "forward", &id3, "--file", edited.to_str().unwrap()];
     let (code, v, _) = env.run(&agent, &forward);

@@ -813,6 +813,99 @@ fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header
     assert!(err && e["error"]["message"].as_str().unwrap().contains("Host b.test"), "{e}");
     let (err, e) = m.call("rules_enable", json!({"id": id, "host_header_test": true}));
     assert!(!err, "{e}");
+    // A rule that copies a header's name from the request could make it a Host.
+    let copied = json!({"location": "request-header", "pattern": "^X-Zz: (.*)$", "replace": "Hos$1"});
+    let (err, e) = m.call("rules_add", copied);
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+}
+
+#[test]
+fn every_request_is_checked_as_it_goes_out() {
+    let port = serve(2);
+    let project = tmp_project("host-wire");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let person = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .env_remove("BRAINPROXY_MCP_CALL")
+            .args(["--format", "json", "--project"])
+            .arg(&project)
+            .args(args)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    // A person's profile sets a Host; an agent's send with it is refused as it goes out, after
+    // the session applied it, unless the send says it is a Host-header test.
+    let saved = person(&["auth", "add", "p", "-H", "Host: other-tenant.test"]);
+    assert!(saved["data"]["host_warning"].is_string(), "{saved}");
+    let (err, e) = m.call("send", json!({"url": url, "auth": "p"}));
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("Host other-tenant.test"), "{e}");
+    let (err, e) = m.call("send", json!({"url": url, "auth": "p", "host_header_test": true}));
+    assert!(!err, "{e}");
+    assert!(e["data"]["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{e}");
+    // A line break can't start another header from a profile or -H, for anyone.
+    for (tool, args) in [
+        ("auth_add", json!({"name": "q", "headers": ["X-A: v\r\nHost: e.test"]})),
+        ("auth_add", json!({"name": "q", "headers": ["X-B\r\nHost: e.test"]})),
+        ("auth_add", json!({"name": "q", "login_url": url, "login_header": ["X-L: a\r\nHost: e.test"]})),
+        (
+            "auth_add",
+            json!({"name": "q", "login_url": url, "token_regex": "(t)", "token_header": "A: {{token}}\r\nHost: e.test"}),
+        ),
+        ("send", json!({"url": url, "headers": ["X-A: v\r\nHost: e.test"]})),
+    ] {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(err && e["error"]["kind"] == "invalid_input", "{tool} {args}: {e}");
+    }
+    let o = person(&["auth", "add", "q", "-H", "X-A: v\r\nHost: e.test"]);
+    assert_eq!(o["error"]["kind"], "invalid_input", "{o}");
+    // Request lines and heads a lenient server may read otherwise, or a target that isn't a path.
+    for raw in [
+        "GET .evil.test/ HTTP/2\r\nHost: app.test\r\n\r\n",
+        "GET @evil.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET  http://e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET\thttp://e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET / HTTP/1.1\r\nX: a\rHost: e.test\r\nHost: app.test\r\n\r\n",
+        "GET ws://e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+    ] {
+        let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "verbatim": true}));
+        assert!(err && e["error"]["kind"] == "out_of_scope", "{raw:?}: {e}");
+    }
+    // Fuzz payloads that could make a Host: a header name, or a line break into the head.
+    let (err, e) = m.call(
+        "fuzz_run",
+        json!({"file": "-", "target": url, "stdin": "GET / HTTP/1.1\r\n§x§: e.test\r\n\r\n", "payloads": ["list:Host"]}),
+    );
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    let crlf = "GET / HTTP/1.1\r\nHost: app.test\r\nX-Z: §x§\r\n\r\n";
+    let (err, e) =
+        m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": crlf, "payloads": ["list:a\r\nHost: e.test"]}));
+    assert!(err && e["error"]["kind"] == "invalid_input", "{e}");
+    // A crawl's and an import's -H are checked as they go out too.
+    let (_, e) = m.call("crawl", json!({"urls": [url], "headers": ["Host: e.test"], "max_pages": 1}));
+    assert_eq!((&e["data"]["requests"], &e["data"]["errors"]), (&json!(1), &json!(1)), "{e}");
+    let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [{"name": "r", "request": {"method": "GET", "header": [{"key": "Host", "value": "e.test"}], "url": url}}]});
+    let (_, e) = m.call("import_postman", json!({"source": "-", "stdin": coll.to_string()}));
+    assert_eq!(e["data"]["out_of_scope_hosts"], json!(["e.test"]), "{e}");
+    // A Host given with -H takes the place of the target's rather than adding a second.
+    let (err, e) = m.call("send", json!({"url": url, "headers": ["Host: app.test"]}));
+    assert!(!err, "{e}");
+    let id = e["data"]["id"].to_string();
+    let (_, e) = m.call("query", json!({"sql": format!("SELECT req_headers FROM history WHERE id = {id}")}));
+    let head = e["data"]["rows"][0][0].as_str().unwrap().to_ascii_lowercase();
+    assert_eq!(head.matches("[\"host\",").count(), 1, "{head}");
+    let (_, e) = m.call("history_list", json!({}));
+    // Only requests that got as far as the wire have rows (two sends, one refused, and the
+    // crawl's refused one): a refused one says so.
+    assert_eq!(e["data"]["count"], 4, "{e}");
+    let refused = e["data"]["items"][0]["error"].as_str().unwrap();
+    assert!(refused.contains("out of scope: Host other-tenant.test"), "{refused}");
 }
 
 #[test]

@@ -722,6 +722,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let (id, ex) = outcome?;
     let new_findings = log.scan(&rows)?;
     let id = Some(id);
+    let host_warning =
+        mcp::sent_host_warning([&client].into_iter().chain(session.as_deref().map(|s| s.client())), host_warning, out);
 
     if args.raw {
         out.raw(&ex.response);
@@ -866,6 +868,7 @@ fn race(
         std::process::exit(e.exit_code());
     }
     let new_findings = log.scan(&ids)?;
+    let host_warning = mcp::sent_host_warning([&client], host_warning, out);
     let mut data = json!({
         "race": n,
         "race_id": race_id,

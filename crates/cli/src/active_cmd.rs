@@ -406,6 +406,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         sni: None,
         guard: Some(guard.clone()),
         http2: args.http2,
+        // Rules put hosts of their own in the Host header (Cloud Metadata): they are
+        // Host-header tests, sent to the scanned host.
+        host: brainproxy_core::http::client::HostPolicy::Allow,
     };
     let point_opts = PointOptions {
         query: !args.no_query,

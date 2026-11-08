@@ -32,6 +32,30 @@ use crate::http::response::parse_response_head;
 use crate::http::target::Target;
 use crate::http::wire::WireReader;
 
+/// What a client does with a request whose Host header (or request target) names a host the
+/// scope doesn't list by name, which a shared front end may send to a site outside the scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPolicy {
+    /// Refuse it: an agent's request that doesn't say it is a Host-header test.
+    Refuse,
+    /// Send it, and note the host (see [`Client::foreign_hosts`]) for the command to warn about.
+    Warn,
+    /// Send it unremarked: a scan rule's Host-header probe, a proxied client's own request.
+    Allow,
+}
+
+impl HostPolicy {
+    /// Refuse under an MCP tool call unless `test` (`--host-header-test`) says it is meant;
+    /// warn otherwise.
+    pub fn for_process(test: bool) -> Self {
+        if crate::provenance::origin() == "mcp" && !test {
+            Self::Refuse
+        } else {
+            Self::Warn
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SendOptions {
     pub timeout: Duration,
@@ -44,11 +68,21 @@ pub struct SendOptions {
     pub guard: Option<Arc<Guard>>,
     /// Send over HTTP/2 (ALPN `h2` for https, prior knowledge for http).
     pub http2: bool,
+    /// What to do with a foreign Host, checked on every request as it goes on the wire
+    /// (sessions, auth values and signers applied). Defaults to [`HostPolicy::for_process`].
+    pub host: HostPolicy,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(30), verify_tls: false, sni: None, guard: None, http2: false }
+        Self {
+            timeout: Duration::from_secs(30),
+            verify_tls: false,
+            sni: None,
+            guard: None,
+            http2: false,
+            host: HostPolicy::for_process(false),
+        }
     }
 }
 
@@ -70,24 +104,53 @@ impl SendOptions {
     }
 
     /// The first host `request` names in place of `target`'s that the scope doesn't list by
-    /// name: in a Host header (HTTP/2 sends it as `:authority`) or an absolute request target.
-    /// Nothing refuses one here: a Host-header test needs it, so a command decides (see `send`).
+    /// name (see [`SendOptions::foreign_hosts`]).
     pub fn foreign_host(&self, request: &[u8], target: &Target) -> Option<String> {
+        self.foreign_hosts(request, target).into_iter().next()
+    }
+
+    /// The hosts `request` names in place of `target`'s that the scope doesn't list by name: in
+    /// a Host header (HTTP/2 sends it as `:authority`) or a request target that isn't a path.
+    /// A head servers may read differently counts too, shown as what it is: a request line
+    /// that isn't three tokens with single spaces, or a bare CR.
+    pub fn foreign_hosts(&self, request: &[u8], target: &Target) -> Vec<String> {
         // Like the server name, the Host picks the site on a shared front end, but the
         // connection still goes to the target, so the scope's own check never sees it.
         let (head, _) = crate::http::request::split_head_body(request);
         let head = String::from_utf8_lossy(head);
+        let mut odd = Vec::new();
+        if head.split("\r\n").any(|l| l.contains('\r')) {
+            odd.push("(a bare CR in the head)".to_string());
+        }
         let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
-        let request_target = lines.next().and_then(|l| l.split(' ').nth(1)).filter(|t| t.contains("://"));
+        let line = lines.next().unwrap_or_default();
+        let parts: Vec<&str> = line.split(' ').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || p.contains('\t')) {
+            odd.push(format!("(a request line that isn't METHOD TARGET VERSION: {line:?})"));
+        }
+        let named_target = match parts.get(1).copied().unwrap_or_default() {
+            "" | "*" => None,
+            t if t.starts_with('/') => None,
+            // Absolute form: its host, or the target as written when it can't be read as a URL.
+            t if t.contains("://") => Some(Target::from_url(t).map_or_else(|_| t.to_string(), |t| t.host)),
+            // Authority form (CONNECT), or anything else: the host it names, if it names one.
+            t => Some(named_host(t).0),
+        };
         let hosts = lines
             .take_while(|l| !l.is_empty())
             .filter_map(|l| l.split_once(':'))
             .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
-            .map(|(_, v)| v.trim());
-        let absolute = request_target.and_then(|t| Target::from_url(t).ok()).map(|t| t.host);
-        let named = hosts.filter(|v| !v.is_empty()).map(|v| named_host(v).0);
-        let listed = |name: &str| self.guard.as_ref().is_some_and(|g| g.confirms(name, target.port));
-        absolute.into_iter().chain(named).find(|name| !name.eq_ignore_ascii_case(&target.host) && !listed(name))
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| named_host(v).0);
+        let listed = |name: &str| self.guard.as_ref().is_some_and(|g| g.lists_name(name, Some(target.port)));
+        let mut out = odd;
+        for name in named_target.into_iter().chain(hosts) {
+            if !name.eq_ignore_ascii_case(&target.host) && !listed(&name) && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
     }
 }
 
@@ -104,20 +167,17 @@ fn named_host(value: &str) -> (String, Option<u16>) {
 }
 
 /// The host `value` names when the scope doesn't list it by name, for a setting that puts it
-/// in the Host header of requests still to come (an auth profile's header, a signer's, a proxy
-/// rule's), whatever their target. Without a port it is looked up on 443 and 80.
+/// in the Host header of requests still to come (an auth profile's header, a proxy rule's),
+/// whatever their target. Without a port, a name listed on any port will do.
 pub fn unlisted_host(guard: Option<&Guard>, value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
     let (name, port) = named_host(value);
-    let listed = |p: u16| guard.is_some_and(|g| g.confirms(&name, p));
-    let ok = match port {
-        Some(p) => listed(p),
-        None => listed(443) || listed(80),
-    };
-    (!ok).then_some(name)
+    // The URL parser drops a scheme's default port; it still counts as the one given.
+    let given = port.or_else(|| value.rsplit_once(':').and_then(|(_, p)| p.parse().ok()));
+    (!guard.is_some_and(|g| g.lists_name(&name, given))).then_some(name)
 }
 
 /// A completed round trip.
@@ -179,6 +239,8 @@ struct Pool {
     learned: Mutex<HashMap<(u64, String), Learned>>,
     /// The latest generation seen; entries of older ones are dropped when it changes.
     generation: std::sync::atomic::AtomicU64,
+    /// Foreign hosts sent under [`HostPolicy::Warn`], in the order first sent.
+    foreign: Mutex<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -258,6 +320,36 @@ impl Client {
         sent_sni(self.opts.sni.as_deref(), target)
     }
 
+    /// The hosts outside the scope this client (and its clones) has put in a Host header or
+    /// request target so far (see [`SendOptions::foreign_hosts`]), for a command to warn about.
+    pub fn foreign_hosts(&self) -> Vec<String> {
+        self.pool.foreign.lock().unwrap().clone()
+    }
+
+    /// Applies the Host policy to `bytes` as they go on the wire to `target`: every request
+    /// passes here, after sessions, auth values and signers changed it, so none brings in a
+    /// Host the check didn't see.
+    pub fn check_host(&self, bytes: &[u8], target: &Target) -> Result<()> {
+        if self.opts.host == HostPolicy::Allow {
+            return Ok(());
+        }
+        let hosts = self.opts.foreign_hosts(bytes, target);
+        let Some(first) = hosts.first() else { return Ok(()) };
+        if self.opts.host == HostPolicy::Refuse {
+            return Err(Error::OutOfScope(format!(
+                "Host {first}: a host other than the target's must be listed by name in the scope, as a shared \
+                 front end may send the request to that site; for a Host-header test pass --host-header-test"
+            )));
+        }
+        let mut seen = self.pool.foreign.lock().unwrap();
+        for h in hosts {
+            if !seen.contains(&h) {
+                seen.push(h);
+            }
+        }
+        Ok(())
+    }
+
     /// Connections opened so far (pooled reuse doesn't count).
     pub fn connections_opened(&self) -> u64 {
         self.pool.opened.load(std::sync::atomic::Ordering::Relaxed)
@@ -331,6 +423,7 @@ impl Client {
         let started = Instant::now();
         if self.sends_h2(req) {
             let filled = self.fill_auth(req.as_bytes(), target).await?;
+            self.check_host(&filled, target)?;
             let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
                 .await
                 .map_err(|_| Error::Timeout(self.opts.timeout))??;
@@ -376,6 +469,7 @@ impl Client {
     /// same connection; the response returned is the last one.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
         let bytes = &*self.fill_auth(bytes, target).await?;
+        self.check_host(bytes, target)?;
         match self.platform_cred(target, bytes) {
             Some(cred) => self.exchange_platform(&cred, bytes, target, method).await,
             None => self.exchange_once(bytes, target, method).await,
@@ -946,6 +1040,27 @@ mod tests {
         assert_eq!(foreign("GET http://c.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some("c.test"));
         // A value that isn't plainly a host is shown as it is.
         assert_eq!(foreign("GET / HTTP/1.1\r\nHost: app.test/@d.test\r\n\r\n").as_deref(), Some("app.test/@d.test"));
+        // So is a request target that isn't a path or `*`, or one the URL parser can't read.
+        assert_eq!(foreign("GET .evil.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some(".evil.test/"));
+        assert_eq!(foreign("CONNECT e.test:443 HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some("e.test"));
+        assert_eq!(foreign("GET ws://w.test/ HTTP/1.1\r\n\r\n").as_deref(), Some("ws://w.test/"));
+        assert_eq!(foreign("OPTIONS * HTTP/1.1\r\nHost: app.test\r\n\r\n"), None);
+        // And a head a lenient server may read otherwise: odd spacing, a tab, a bare CR.
+        for odd in
+            ["GET  http://e.test/ HTTP/1.1\r\n\r\n", "GET\thttp://e.test/ HTTP/1.1\r\n\r\n", "GET / HTTP/1.1 x\r\n\r\n"]
+        {
+            assert!(foreign(odd).is_some_and(|h| h.contains("request line")), "{odd:?}");
+        }
+        let cr = foreign("GET / HTTP/1.1\r\nX: a\rHost: e.test\r\nHost: app.test\r\n\r\n");
+        assert_eq!(cr.as_deref(), Some("(a bare CR in the head)"));
+        // The client applies the policy to what goes on the wire, and notes what it warned about.
+        let refuse = Client::new(SendOptions { host: HostPolicy::Refuse, ..opts.clone() });
+        let warn = Client::new(SendOptions { host: HostPolicy::Warn, ..opts.clone() });
+        let allow = Client::new(SendOptions { host: HostPolicy::Allow, ..opts.clone() });
+        let wire = b"GET / HTTP/1.1\r\nHost: e.test\r\n\r\n";
+        assert!(matches!(refuse.check_host(wire, &target), Err(Error::OutOfScope(m)) if m.contains("Host e.test")));
+        assert!(warn.check_host(wire, &target).is_ok() && warn.clone().foreign_hosts() == ["e.test"]);
+        assert!(allow.check_host(wire, &target).is_ok() && allow.foreign_hosts().is_empty());
         // A value a setting puts in requests to come, whatever their target.
         let guard = opts.guard.as_deref();
         assert_eq!(unlisted_host(guard, " app.TEST:8443 "), None);
