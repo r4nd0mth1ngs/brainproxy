@@ -238,7 +238,8 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    fragments, forms, multipart, JSON (arrays and JSON inside strings too), XML and script
    bodies, hidden form fields and secret-named attributes, passwords in URLs, JWTs, and every
    password, token, cookie and credential header the project's auth profiles hold) as
-   `[redacted]`, wherever the report quotes them, in any case and percent-, JSON-, HTML- or
+   `[redacted]`, wherever the report quotes them, in any ASCII case (an accented or other
+   non-ASCII letter must match as written) and percent-, JSON-, HTML- or
    base64-encoded (notes, write-ups, ticket links and findings added by hand included), and says how
    many places it masked; `--no-redact` keeps
    them as recorded. A signed cookie's session id (`s:ID.signature`, as Express writes
@@ -246,7 +247,11 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    are masked together. A secret nothing marks, such as a token typed into a finding's title
    or a note ("used token ..."), can't be told from other text: name it with `--mask VALUE`
    (repeatable, at least 6 characters) and it is masked like the project's own secrets,
-   everywhere the report quotes it, in every format. `findings repro` takes `--mask` too. An issue seen in more than one
+   everywhere the report quotes it, in every format: the title, the layout's company, the
+   engagement scope and filters it shows, hosts and states included. A body is cut to its
+   evidence limit only once its secrets are masked, so none is left half shown at the cut.
+   `findings repro` takes `--mask` too; `findings ticket` doesn't, since the command it
+   prints runs it again to file the ticket (see *Tickets* below). An issue seen in more than one
    request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
    first time or again, and leaves out older findings it didn't see again.
@@ -1777,6 +1782,9 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
   reproduce it, its fingerprint) and the command that files it: this command again, piped
   through `jq` into `gh issue create` or Jira's REST call (run it where the project is open).
+  The project's secrets are masked, but there is no `--mask`: the printed command runs this
+  one again, so a value nothing marks (a token typed into a title) is masked by editing the
+  ticket before it is filed.
   The Jira description is a `{noformat}` block, so nothing the target sent is read as Jira
   markup. The GitHub command adds no labels, since `gh` refuses one the repository lacks;
   `labels` lists the suggested ones. Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's

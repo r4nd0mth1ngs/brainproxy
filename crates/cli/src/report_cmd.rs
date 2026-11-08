@@ -68,9 +68,9 @@ pub struct ReportArgs {
     /// [redacted], here and in the evidence, URLs and bodies the report quotes.
     #[arg(long)]
     no_redact: bool,
-    /// Mask VALUE too, wherever the report quotes it and in any encoding, like a session
-    /// cookie: for a secret nothing marks, such as a token typed into a title or a note (at
-    /// least 6 characters; repeatable).
+    /// Mask VALUE too, wherever the report quotes it, in any encoding and ASCII case, like a
+    /// session cookie: for a secret nothing marks, such as a token typed into a title or a
+    /// note (at least 6 characters; repeatable).
     #[arg(long, value_name = "VALUE", conflicts_with = "no_redact")]
     mask: Vec<String>,
     #[command(flatten)]

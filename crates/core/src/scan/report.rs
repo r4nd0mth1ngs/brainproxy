@@ -359,23 +359,42 @@ pub struct Body {
     pub binary: bool,
 }
 
+/// How far past `max_evidence` a body is read before it is cut, so a secret the cut falls
+/// inside is masked whole first (of a longer one, the part before the cut is left).
+const PAST_THE_CUT: usize = 64 * 1024;
+
 impl Body {
-    fn new(bytes: &[u8], max: usize) -> Self {
+    /// A body whose first `max` bytes are text, read [`PAST_THE_CUT`] beyond them, for
+    /// [`Body::cut`] once its secrets are masked; or a placeholder for binary data.
+    fn read(bytes: &[u8], max: usize) -> Self {
         let length = bytes.len();
-        let slice = &bytes[..length.min(max)];
-        let truncated = length > max;
-        let text = match std::str::from_utf8(slice) {
-            Ok(s) => Some(s.to_string()),
-            // The cut may split a multi-byte character; keep the valid prefix.
-            Err(e) if truncated && e.error_len().is_none() => {
-                Some(String::from_utf8_lossy(&slice[..e.valid_up_to()]).into())
-            }
-            Err(_) => None,
+        let head = &bytes[..length.min(max)];
+        let text = match std::str::from_utf8(head) {
+            Ok(_) => true,
+            // The cut may split a multi-byte character.
+            Err(e) => length > max && e.error_len().is_none(),
         };
-        match text {
-            Some(text) => Body { text, length, truncated, binary: false },
-            None => Body { text: format!("[{length} bytes of binary data]"), length, truncated: false, binary: true },
+        if !text {
+            return Body { text: format!("[{length} bytes of binary data]"), length, truncated: false, binary: true };
         }
+        // Up to the window's end, or to the first bytes that aren't text.
+        let window = &bytes[..length.min(max.saturating_add(PAST_THE_CUT))];
+        let valid = std::str::from_utf8(window).map_or_else(|e| e.valid_up_to(), |s| s.len());
+        let text = String::from_utf8_lossy(&window[..valid]).into_owned();
+        Body { truncated: text.len() < length, text, length, binary: false }
+    }
+
+    /// Cuts the text to at most `max` bytes, on a character boundary.
+    fn cut(&mut self, max: usize) {
+        if self.binary || self.text.len() <= max {
+            return;
+        }
+        let mut at = max;
+        while !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.text.truncate(at);
+        self.truncated = true;
     }
 }
 
@@ -686,7 +705,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     if let Some(job) = opts.scan {
         filters["scan"] = json!(job);
     }
-    Ok(Report {
+    let mut report = Report {
         title: opts.title.clone().unwrap_or_else(|| "brainproxy security report".into()),
         generated,
         tool: Tool { name: "brainproxy", version: env!("CARGO_PKG_VERSION") },
@@ -699,7 +718,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             alert_types: groups.len(),
             by_risk,
             false_positives_left_out,
-            redacted: redactor.map(|r| r.masked),
+            redacted: None,
         },
         alerts: groups,
         agent_false_positives,
@@ -707,7 +726,60 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         retest,
         summary_narrative,
         layout: opts.layout.clone(),
-    })
+    };
+    if let Some(mut red) = redactor {
+        scrub_the_rest(&mut red, &mut report);
+        report.summary.redacted = Some(red.masked);
+    }
+    // Bodies were read past the cut so the secrets the cut falls inside were masked whole.
+    for inst in report.alerts.iter_mut().flat_map(|g| g.instances.iter_mut()) {
+        let mut bodies: Vec<&mut Body> = Vec::new();
+        bodies.extend(inst.request.as_mut().map(|r| &mut r.body));
+        bodies.extend(inst.response.as_mut().map(|r| &mut r.body));
+        if let Some(e) = inst.latest.as_mut() {
+            bodies.push(&mut e.request.body);
+            bodies.extend(e.response.as_mut().map(|r| &mut r.body));
+        }
+        bodies.into_iter().for_each(|b| b.cut(opts.max_evidence));
+    }
+    Ok(report)
+}
+
+/// Masks the values known so far in the rest of what a report shows that may quote one: its
+/// title, the layout's company, the engagement scope, the filters, the posture section, and
+/// each finding's host and state in words (only known values: none of these is masked by
+/// its place).
+fn scrub_the_rest(red: &mut Redactor, r: &mut Report) {
+    fn strings(red: &mut Redactor, v: &mut Value) {
+        match v {
+            Value::String(s) => red.scrub(s),
+            Value::Array(a) => a.iter_mut().for_each(|v| strings(red, v)),
+            Value::Object(o) => o.values_mut().for_each(|v| strings(red, v)),
+            _ => {}
+        }
+    }
+    red.scrub(&mut r.title);
+    if let Some(c) = r.layout.company.as_mut() {
+        red.scrub(c);
+    }
+    if let Some(scope) = r.scope.as_mut() {
+        for s in scope.name.iter_mut().chain(scope.include.iter_mut()).chain(scope.exclude.iter_mut()) {
+            red.scrub(s);
+        }
+    }
+    strings(red, &mut r.filters);
+    if let Some(p) = r.posture.as_mut() {
+        strings(red, p);
+    }
+    for g in r.alerts.iter_mut() {
+        for n in g.narratives.iter_mut() {
+            red.scrub(&mut n.host);
+        }
+        for i in g.instances.iter_mut() {
+            red.scrub(&mut i.host);
+            red.scrub(&mut i.state_text);
+        }
+    }
 }
 
 /// The retest section: the latest retest, regression or fix of each finding `scope` selects
@@ -902,7 +974,7 @@ fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, O
                     method: r.get(0)?,
                     url: r.get(1)?,
                     headers: headers(r.get(2)?),
-                    body: Body::new(&r.get::<_, Vec<u8>>(3)?, max),
+                    body: Body::read(&r.get::<_, Vec<u8>>(3)?, max),
                 };
                 let status: Option<i64> = r.get(4)?;
                 let resp = status.map(|_| -> rusqlite::Result<HttpResponse> {
@@ -910,7 +982,7 @@ fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, O
                         status,
                         reason: r.get(5)?,
                         headers: headers(r.get(6)?),
-                        body: Body::new(&r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(), max),
+                        body: Body::read(&r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(), max),
                     })
                 });
                 Ok((req, resp.transpose()?))
@@ -2742,6 +2814,53 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_value_is_masked_outside_the_findings_and_across_the_cut() {
+        let mut s = Store::open_in_memory().unwrap();
+        // The value in a host name, and another one where the body is cut.
+        let host = "typed7token.app.test";
+        let target = Target { scheme: "http".into(), host: host.into(), port: 80 };
+        let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let body = format!("{}STRADDLE77VALUE and more", "a".repeat(100));
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp.as_bytes()), None, None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
+        let filter = FindingFilter { alert_ref: Some("10037".into()), host: Some(host.into()), ..Default::default() };
+        let issue = s.issues_list(&filter, 10).unwrap()[0]["id"].as_i64().unwrap();
+        s.issue_set_narrative(issue, "PHP's version is in every reply.").unwrap();
+        let spec = crate::guard::ScopeSpec {
+            name: Some("Typed7Token engagement".into()),
+            include: vec![host.into()],
+            exclude: vec![],
+        };
+        s.engagement_start(&spec).unwrap();
+        let opts = |mask: Vec<String>| ReportOptions {
+            filter: filter.clone(),
+            title: Some("Report on TYPED7TOKEN".into()),
+            layout: Layout { company: Some("typed7token Ltd".into()), ..Default::default() },
+            max_evidence: 108,
+            drafts: true,
+            mask,
+            ..Default::default()
+        };
+        let plain = render(&build(&s, &opts(vec![])).unwrap(), ReportKind::Json);
+        assert!(plain.contains("STRADDLE") && plain.to_ascii_lowercase().contains("typed7token"));
+
+        let r = build(&s, &opts(vec!["TYPED7TOKEN".into(), "STRADDLE77VALUE".into()])).unwrap();
+        assert_eq!(r.alerts[0].narratives[0].host, "[redacted].app.test");
+        let body = &r.alerts[0].instances[0].response.as_ref().unwrap().body;
+        assert!(body.truncated && body.text.len() <= 108, "{body:?}");
+        for kind in [ReportKind::Json, ReportKind::Markdown, ReportKind::Html] {
+            let out = render(&r, kind);
+            // ASCII case is ignored.
+            assert!(!out.to_ascii_lowercase().contains("typed7token"), "{}: {out}", kind.as_str());
+            assert!(!out.contains("STRADDLE"), "{}", kind.as_str());
+        }
+    }
+
+    #[test]
     fn known_secrets_baselines_and_hidden_findings() {
         let mut s = Store::open_in_memory().unwrap();
         let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
@@ -3050,10 +3169,19 @@ mod tests {
 
     #[test]
     fn body_truncation_and_binary() {
-        let b = Body::new("héllo".as_bytes(), 2);
+        // Read past the cut, then cut (once its secrets are masked).
+        let mut b = Body::read("héllo".as_bytes(), 2);
+        assert_eq!((b.text.as_str(), b.truncated), ("héllo", false));
+        b.cut(2);
         assert_eq!((b.text.as_str(), b.truncated, b.binary), ("h", true, false));
-        let b = Body::new(&[0xff, 0xfe, 0x00], 10);
+        let b = Body::read(&[0xff, 0xfe, 0x00], 10);
         assert!(b.binary && b.text.contains("3 bytes"));
+        // Bytes that aren't text after the cut end what is read, as before.
+        let mut b = Body::read(b"abc\xffdef", 2);
+        b.cut(2);
+        assert_eq!((b.text.as_str(), b.truncated, b.binary), ("ab", true, false));
+        let b = Body::read(b"abc\xffdef", 3);
+        assert_eq!((b.text.as_str(), b.truncated), ("abc", true));
     }
 
     #[test]
