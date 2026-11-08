@@ -1104,3 +1104,37 @@ fn a_titles_text_filled_in_later_says_who_wrote_it() {
     let shown = env.ok(&[], &["findings", "show", &id.to_string()]);
     assert_eq!((&shown["description_origin"], &shown["solution_origin"]), (&"mcp".into(), &"gui".into()));
 }
+
+/// Pruning a scan's attack rows is a project setting the app and the CLI share; an agent can
+/// turn it off, not on, and its own scans keep every request.
+#[test]
+fn an_agent_can_turn_pruning_off_not_on_and_its_scans_keep_every_request() {
+    let env = Env::new("prune");
+    let port = serve();
+    let (gui, agent) = ([(CLIENT, "gui")], [(MCP, "1")]);
+    assert_eq!(env.ok(&[], &["scan", "prune"])["prune"], false);
+    assert_eq!(env.ok(&gui, &["scan", "prune", "on"])["prune"], true);
+    let (code, _, text) = env.run(&agent, &["scan", "prune", "on"]);
+    assert_ne!(code, 0, "{text}");
+    env.ok(&agent, &["scan", "prune", "off"]);
+    env.ok(&gui, &["scan", "prune", "on"]);
+    let logged = env.rows("SELECT origin FROM setting_changes WHERE key = 'active' ORDER BY id");
+    assert_eq!(logged, ["gui", "mcp", "gui"].map(|o| serde_json::json!([o])).to_vec());
+
+    let url = format!("http://127.0.0.1:{port}/?q=1");
+    let scan = ["scan", "active", &url, "--rules", "30001", "--strength", "low", "--no-oob"];
+    let (code, _, text) = env.run(&agent, &[&scan[..], &["--prune"]].concat());
+    assert_ne!(code, 0, "{text}");
+    let scan_rows = || env.rows("SELECT count(*) FROM history WHERE source = 'scan'")[0][0].as_i64().unwrap();
+    // A person's scan follows the setting: the static page backs no finding, so only the
+    // request the scan started from (fetched for the URL) is kept.
+    let mine = env.ok(&[], &scan);
+    assert!(mine["pruned"].as_u64().unwrap() > 0 && scan_rows() == 1, "{mine}");
+    // An agent's keeps everything, and says so.
+    let theirs = env.ok(&agent, &scan);
+    assert!(theirs["pruned"].is_null() && theirs["prune_hint"].is_string() && scan_rows() > 2, "{theirs}");
+    // --no-prune keeps a person's too.
+    let before = scan_rows();
+    assert!(env.ok(&[], &[&scan[..], &["--no-prune"]].concat())["pruned"].is_null());
+    assert!(scan_rows() > before);
+}

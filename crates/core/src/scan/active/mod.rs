@@ -727,6 +727,20 @@ pub struct ActiveConfig {
     /// Methods a declarative check may send besides GET, HEAD, OPTIONS and POST (upper
     /// case; MUTATION for a GraphQL mutation, ALL for anything): `--include-methods`.
     pub check_methods: Vec<String>,
+    /// When the scan ends (also stopped or timed out), delete the attack rows it wrote that
+    /// back nothing (see [`Store::prune_unreferenced`]). Base requests are never its rows.
+    pub prune: bool,
+}
+
+/// The project's active scan setting, `setting.active`: shared by the app and the CLI.
+pub const SETTINGS_KEY: &str = "active";
+
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ActiveSettings {
+    /// Scans keep only the attack requests that back a finding (or anything else that refers
+    /// to them): see [`ActiveConfig::prune`]. Off by default: every request is kept.
+    pub prune: bool,
 }
 
 /// Out-of-band part of a scan.
@@ -772,6 +786,10 @@ pub struct ActiveSummary {
     pub refused_hosts: Vec<String>,
     /// None when no OOB listener was running (out-of-band checks skipped).
     pub oob: Option<OobSummary>,
+    /// Attack rows deleted at the end because nothing referred to them; None when the scan
+    /// kept every request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pruned: Option<usize>,
     pub stopped: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
@@ -833,8 +851,10 @@ pub async fn run(
     // written together, before any finding or payload that came after them.
     let (tx, rx) = mpsc::channel::<Report>();
     let mut store = Store::open(project)?;
-    let writer = std::thread::spawn(move || -> Result<(usize, Store)> {
+    // It also keeps the ids of the rows it wrote, the ones pruning may delete.
+    let writer = std::thread::spawn(move || -> Result<(usize, Store, Vec<i64>)> {
         let mut new = 0;
+        let mut created = Vec::new();
         let mut rows = RowBatch::default();
         while let Ok(first) = rx.recv() {
             for r in std::iter::once(first).chain(rx.try_iter().take(ROW_BATCH)) {
@@ -842,12 +862,12 @@ pub async fn run(
                     rows.push(w);
                     continue;
                 }
-                rows.write(&mut store);
+                created.extend(rows.write(&mut store).created);
                 new += record_report(&mut store, r)?;
             }
-            rows.write(&mut store);
+            created.extend(rows.write(&mut store).created);
         }
-        Ok((new, store))
+        Ok((new, store, created))
     });
     // A rule's own change to the Host is its test (Cloud Metadata names the metadata service),
     // so the rules' client lets those go; base requests are checked below.
@@ -989,7 +1009,7 @@ pub async fn run(
     // Close the channel so the writer finishes.
     *shared.reports.lock().unwrap() = mpsc::channel().0;
     drop(shared);
-    let (mut new_findings, mut store) = tokio::task::spawn_blocking(move || writer.join())
+    let (mut new_findings, mut store, created) = tokio::task::spawn_blocking(move || writer.join())
         .await
         .map_err(|e| Error::Protocol(e.to_string()))?
         .map_err(|_| Error::Protocol("active scan writer panicked".into()))??;
@@ -1018,6 +1038,8 @@ pub async fn run(
     } else {
         None
     };
+    // After the out-of-band wait, so a late callback's finding keeps its attack.
+    let pruned = if cfg.prune { Some(store.prune_unreferenced(&created)?) } else { None };
 
     Ok(ActiveSummary {
         targets: targets.len(),
@@ -1032,6 +1054,7 @@ pub async fn run(
         check_skipped_methods,
         refused_hosts,
         oob,
+        pruned,
         stopped: ctl.stopped(),
         timed_out,
         elapsed_ms: started.elapsed().as_millis() as u64,
@@ -1109,9 +1132,144 @@ mod tests {
             oob: None,
             oob_wait: Duration::ZERO,
             check_methods: vec![],
+            prune: false,
         };
         let s = run(&project, vec![target], cfg, JobControl::default()).await.unwrap();
         let _ = std::fs::remove_file(&project);
         assert_eq!((s.units, s.units_done, s.errors), (1, 0, 1), "{s:?}");
+    }
+
+    static PRUNE_ALERT: AlertDef = AlertDef {
+        alert_ref: "999998",
+        name: "prune test",
+        risk: crate::scan::Risk::Low,
+        confidence: crate::scan::Confidence::Low,
+        cwe: 0,
+        wasc: 0,
+        description: "",
+        solution: "",
+        references: &[],
+        tags: &[],
+    };
+
+    /// Sends three attacks; the second one backs a finding.
+    struct ThreeAttacks;
+
+    impl ActiveRule for ThreeAttacks {
+        fn id(&self) -> u32 {
+            999_998
+        }
+        fn name(&self) -> &'static str {
+            "three attacks"
+        }
+        fn alerts(&self) -> &'static [&'static AlertDef] {
+            static ALERTS: &[&AlertDef] = &[&PRUNE_ALERT];
+            ALERTS
+        }
+        fn scope(&self) -> RuleScope {
+            RuleScope::Page
+        }
+        fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
+            Box::pin(async move {
+                let host = format!("{}:{}", cx.base.target.host, cx.base.target.port);
+                for path in ["/a", "/b", "/c"] {
+                    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
+                    if let Ok(resp) = cx.send(req).await {
+                        if path == "/b" {
+                            cx.report(PRUNE_ALERT.raise("", ""), &resp);
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    /// A server that answers every request with an empty 200.
+    async fn answering_server() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut got = Vec::new();
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        port
+    }
+
+    /// Runs [`ThreeAttacks`] on a base request recorded in history; returns the base row's id,
+    /// the summary, and the history rows left as (id, path).
+    async fn scan_three(name: &str, prune: bool) -> (i64, ActiveSummary, Vec<(i64, String)>) {
+        use url::Url;
+        static RULE: ThreeAttacks = ThreeAttacks;
+        let port = answering_server().await;
+        let project = std::env::temp_dir().join(format!("bp-active-{name}-{}.bpdb", std::process::id()));
+        let _ = std::fs::remove_file(&project);
+        let target = Target::from_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let base = Store::create(&project)
+            .unwrap()
+            .record(&Capture::new("proxy", &target, &request, Some(&response), Some(1), None))
+            .unwrap();
+        let t = ScanTarget { history_id: Some(base), target, request, response, duration_ms: Some(1) };
+        let scope = crate::guard::ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
+        let guard = crate::guard::Guard::from_specs(vec![scope]).unwrap();
+        let cfg = ActiveConfig {
+            strength: Strength::Medium,
+            concurrency: 1,
+            rate: None,
+            send: SendOptions { guard: Some(guard), ..Default::default() },
+            points: PointOptions::default(),
+            rules: None,
+            exclude_rules: vec![],
+            no_rules: true,
+            checks: vec![&RULE],
+            max_duration: None,
+            auth: None,
+            oob: None,
+            oob_wait: Duration::ZERO,
+            check_methods: vec![],
+            prune,
+        };
+        let s = run(&project, vec![t], cfg, JobControl::default()).await.unwrap();
+        let store = Store::open(&project).unwrap();
+        let rows = store
+            .list(&Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.id, Url::parse(&e.url).unwrap().path().to_string()))
+            .collect();
+        drop(store);
+        let _ = std::fs::remove_file(&project);
+        (base, s, rows)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pruning_keeps_the_base_request_and_the_attack_behind_a_finding() {
+        let (base, s, rows) = scan_three("prune", true).await;
+        assert_eq!((s.new_findings, s.pruned), (1, Some(2)), "{s:?}");
+        let mut paths: Vec<&str> = rows.iter().map(|(_, p)| p.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["/", "/b"], "{rows:?}");
+        assert!(rows.iter().any(|(id, p)| *id == base && p == "/"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn by_default_a_scan_keeps_every_request() {
+        let (_, s, rows) = scan_three("keep", false).await;
+        assert_eq!((s.new_findings, s.pruned), (1, None), "{s:?}");
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(!serde_json::to_value(&s).unwrap().as_object().unwrap().contains_key("pruned"));
     }
 }

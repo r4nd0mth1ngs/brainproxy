@@ -622,6 +622,11 @@ attack type, and pick payloads:
   - **Audit specific URLs:** only the requests you list.
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
     templates* (on when installed, high severity and above by default).
+  - **Keep only attack requests that back a finding:** off by default, so every attack request
+    stays in history. On, a scan deletes at its end (also when stopped or out of time) the
+    attack requests it sent that nothing refers to. It is saved for the project and shared with
+    the CLI (`scan prune`), and applies to every kind of active scan. See
+    [Pruning a scan's attack requests](#pruning-a-scans-attack-requests).
 - **New scan › Targeted:** search the ZAP scan rules and the installed checks (Nuclei,
   brainproxy, local) by name, id, CVE, or tag, pick some, and run only those, on crawled,
   recorded, or listed requests. Checks tagged dos, fuzz, or intrusive, which other scans
@@ -1677,6 +1682,10 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   is known to match, so a killed run leaves no row for the request it had out; `--store
   none` records none. A request the engagement scope refuses outright isn't sent and gets no
   pending row (`crawl` and `fuzz run --store all` record it as failed).
+- `scan active` keeps every one of these rows by default; with pruning on it deletes, once
+  the scan ends, the ones nothing refers to (see
+  [Pruning a scan's attack requests](#pruning-a-scans-attack-requests)). The rows are still
+  written before each request goes out, so a killed scan keeps them all.
 - These commands write their rows on a thread of their own: everything queued since its last
   write (rows about to go out, and completions) goes in one transaction, and a request goes
   out only once its row is committed. With many requests out at once, that is one write for
@@ -1712,6 +1721,30 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   Narrowing the scope hides what went out, never that it did. A
   request outside both scopes is refused by the engagement before it goes out and gets no
   row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.
+
+### Pruning a scan's attack requests
+
+An active scan records every attack request it sends, so a scan of a few pages can add
+hundreds of rows to history. To keep only the ones that matter, turn pruning on for the
+project (*Keep only attack requests that back a finding* under *New scan*, or `brainproxy scan
+prune on`; `scan prune` shows it, `scan prune off` turns it off), or pass `scan active --prune`
+for one scan. `--no-prune` keeps everything for one scan whatever the setting. Changing the
+setting is logged in `setting_changes` (key `active`).
+
+With pruning on, when the scan ends (finished, stopped, or out of time) it deletes the history
+rows of its own attack requests that nothing refers to. A row is kept if it is a finding's
+first or last sighting or one of a hand-added finding's linked entries, a finding event's
+request (a retest's, say), a fuzz or `authz` result or its baseline, a WebSocket connection's
+upgrade, or an out-of-band payload's attack (a callback can still arrive and raise a finding),
+or if it has a note or tags. The requests the scan starts from (history rows, the pages a URL
+or `--api` scan fetches first, a `--crawl`'s requests) and a login's requests are never its
+attack rows and are always kept. The scan's result gives the number deleted as `pruned` (left
+out when the scan kept everything). The rows are written before each request goes out as always, so
+a scan that is killed, or that crashes, deletes nothing.
+
+Through MCP, `--prune` and `scan prune on` are refused, and an agent's scan keeps every request
+even with the setting on (its result says so in `prune_hint`), so a person can see everything
+sent on their behalf.
 
 ### Issues, timelines, retests and posture
 
@@ -2089,7 +2122,8 @@ origin `mcp`, including what a proxy or job it started records; see
 [Who recorded what](#who-recorded-what).
 
 A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
-and `fuzz run --store none` or `--store matches` are refused. An agent can change the proxy
+and `fuzz run --store none` or `--store matches` are refused, and so are `scan active --prune`
+and `scan prune on`; an agent's scans keep every request whatever the project's prune setting. An agent can change the proxy
 scope and the TLS pass-through list, but traffic left out still leaves rows, and a change
 that narrows recording is flagged until a person changes that setting or the agent puts it
 back as it was, and stays in the log either way (see [Who recorded what](#who-recorded-what)).

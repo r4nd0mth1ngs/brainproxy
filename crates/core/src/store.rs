@@ -1149,6 +1149,37 @@ impl Store {
         Ok(ids)
     }
 
+    /// Deletes those of history rows `ids` that nothing refers to: no finding (first or last
+    /// sighting, or a hand-added finding's list in meta), finding event, fuzz or authz
+    /// result, WebSocket connection or out-of-band payload, and no note or tags. One
+    /// transaction, so a reference added meanwhile either keeps its row or comes after the
+    /// delete. Returns how many were deleted. An active scan with pruning on calls this
+    /// with the rows it wrote itself.
+    pub fn prune_unreferenced(&mut self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let list = serde_json::to_string(ids).unwrap_or_default();
+        let tx = self.write_tx()?;
+        let n = tx.execute(
+            "DELETE FROM history WHERE id IN (SELECT value FROM json_each(?1))
+                AND COALESCE(note, '') = '' AND tags = '[]'
+                AND id NOT IN (SELECT history_id FROM findings WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT last_history_id FROM findings WHERE last_history_id IS NOT NULL)
+                AND id NOT IN (SELECT j.value FROM meta, json_each(meta.value) j
+                               WHERE meta.key LIKE 'finding.%.history' AND json_valid(meta.value))
+                AND id NOT IN (SELECT history_id FROM finding_events WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM fuzz_results WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM authz_results WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT baseline_history_id FROM authz_results WHERE baseline_history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM ws_connections WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM oob_payloads WHERE history_id IS NOT NULL)",
+            [list],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     pub fn list(&self, f: &HistoryFilter) -> Result<Vec<HistoryEntry>> {
         let mut sql = format!("SELECT {ENTRY_COLS} FROM history WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -2144,6 +2175,46 @@ mod tests {
         assert_eq!(q("SELECT regexp_extract(resp_body_text, '\"token\":\"(\\w+)\"', 1) FROM history")[0][0], "abc");
         assert_eq!(q("SELECT json_extract(resp_body_text, '$.token') FROM history")[0][0], "abc");
         assert_eq!(q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'syntax'").len(), 1);
+    }
+
+    /// Pruning deletes only the given rows nothing refers to.
+    #[test]
+    fn pruning_keeps_every_row_something_refers_to() {
+        let mut s = Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..11).map(|_| sample(&s)).collect();
+        let other = sample(&s);
+        s.set_note(ids[1], Some("look")).unwrap();
+        let exec = |sql: &str, id: i64| s.conn.execute(sql, [id]).unwrap();
+        exec("UPDATE history SET tags = '[\"x\"]' WHERE id = ?1", ids[2]);
+        exec(
+            "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method, url,
+                history_id, last_history_id, dedupe)
+             VALUES ('active', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET', 'http://a.test/x', ?1, NULL, 'd1')",
+            ids[3],
+        );
+        exec(
+            "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method, url,
+                history_id, last_history_id, dedupe)
+             VALUES ('active', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET', 'http://a.test/x', NULL, ?1, 'd2')",
+            ids[4],
+        );
+        exec("INSERT INTO meta (key, value) VALUES ('finding.9.history', json_array(?1, ?1 + 1000))", ids[5]);
+        exec("INSERT INTO finding_events (kind, history_id) VALUES ('retested', ?1)", ids[6]);
+        exec("INSERT INTO fuzz_results (run_id, idx, payloads, history_id) VALUES (1, 0, '[]', ?1)", ids[7]);
+        exec(
+            "INSERT INTO authz_results (run_id, idx, method, url, owner, identity, verdict, baseline_history_id)
+             VALUES (1, 0, 'GET', 'u', 'a', 'b', 'same', ?1)",
+            ids[8],
+        );
+        exec("INSERT INTO oob_payloads (token, source, history_id) VALUES ('t', 'scan', ?1)", ids[9]);
+        // A meta value that isn't JSON doesn't stop the rest.
+        s.meta_set("finding.8.history", Some("{")).unwrap();
+        assert_eq!(s.prune_unreferenced(&ids).unwrap(), 2);
+        let mut left: Vec<i64> = s.list(&Default::default()).unwrap().into_iter().map(|e| e.id).collect();
+        left.sort_unstable();
+        let kept = [&ids[1..10], &[other]].concat();
+        assert_eq!(left, kept, "rows 0 and 10 go; the one not given stays");
+        assert_eq!(s.prune_unreferenced(&[]).unwrap(), 0);
     }
 
     #[test]

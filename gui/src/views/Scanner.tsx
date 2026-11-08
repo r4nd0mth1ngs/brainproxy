@@ -262,6 +262,7 @@ function ResultFacts({ kind, r }: { kind: string; r: Record<string, any> }) {
           ["Targets", `${r.targets} (${r.insertion_points} insertion points, ${r.skipped_out_of_scope} skipped out of scope)`],
           ["Requests", `${r.requests} · ${r.rules} rules`],
           ["New findings", String(r.new_findings)],
+          ...(r.pruned != null ? [["Pruned", `${r.pruned} attack requests that back no finding`] as [string, string]] : []),
         ]
       : kind === "crawl"
         ? [
@@ -514,6 +515,16 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   // Active scan: crawl the listed sites then attack what's found, attack everything already
   // recorded, or attack only the listed URLs.
   const [mode, setMode] = useState<"crawl" | "recorded" | "urls">("crawl");
+  // A project setting shared with the CLI (`scan prune`), so it isn't a flag of this scan.
+  const [prune, refreshPrune] = usePoll<{ prune: boolean }>(() => run(["scan", "prune"]), 30000);
+  const setPrune = async (on: boolean) => {
+    try {
+      await run(["scan", "prune", on ? "on" : "off"]);
+      refreshPrune();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
 
   useEffect(() => {
     loadSuggestions()
@@ -883,6 +894,16 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         {check("HTTP/2", "http2")}
         {check("Verify TLS", "verifyTls")}
       </div>
+      {kind !== "crawl" && (
+        <div className="row gap sc-checks">
+          <label
+            className="check"
+            title="Saved for this project, for every active scan (also from the terminal: brainproxy scan prune). When a scan ends or is stopped, its attack requests that no finding, note or tag refers to are deleted from history. The requests a scan starts from are always kept. Off: every request is kept."
+          >
+            <input type="checkbox" checked={!!prune?.prune} disabled={!prune} onChange={(e) => setPrune(e.target.checked)} /> Keep only attack requests that back a finding
+          </label>
+        </div>
+      )}
       <div className="row gap">
         <button className="btn primary" onClick={launch}>
           Start {kind === "crawl" ? "crawl" : kind === "php2shell" || kind === "quick" ? "check" : "scan"}

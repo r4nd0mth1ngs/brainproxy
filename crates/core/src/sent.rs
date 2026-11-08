@@ -207,6 +207,8 @@ pub struct RowBatch {
 /// What [`RowBatch::write`] did.
 #[derive(Debug, Default)]
 pub struct Written {
+    /// The rows written (pending), in the order queued.
+    pub created: Vec<i64>,
     /// The rows completed: a passive scan may have passed them while they were pending
     /// (see [`crate::scan::passive::scan_late`]).
     pub completed: Vec<i64>,
@@ -241,6 +243,7 @@ impl RowBatch {
             Ok(ids) => {
                 for ((_, reply), id) in pending.into_iter().zip(ids) {
                     let _ = reply.send(Some(id));
+                    out.created.push(id);
                 }
                 out.completed = done.into_iter().map(|(id, _)| id).collect();
             }
@@ -252,6 +255,7 @@ impl RowBatch {
                 for (c, reply) in pending {
                     let id = store.record(&c).inspect_err(|e| eprintln!("brainproxy: history row not written: {e}"));
                     out.failed += id.is_err() as usize;
+                    out.created.extend(id.as_ref().ok());
                     let _ = reply.send(id.ok());
                 }
                 for (id, c) in done {
@@ -587,6 +591,7 @@ mod tests {
         let written = batch.write(&mut store);
         let id = id.blocking_recv().unwrap().unwrap();
         assert!(written.completed.is_empty() && written.failed == 0);
+        assert_eq!(written.created, vec![id]);
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let done = rows.capture(&target, b"GET /a HTTP/1.1\r\n\r\n", Some(resp), Some(3), None);
         batch.push(RowWrite::Complete { id, capture: Box::new(done) });
