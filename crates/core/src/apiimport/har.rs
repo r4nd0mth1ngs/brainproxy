@@ -43,11 +43,22 @@ struct Har {
     log: Log,
 }
 
+/// A field written as `null` (`"cookies": null`, `"response": null` for an aborted request)
+/// reads as its default, so one odd entry doesn't fail the whole file.
+fn or_default<'de, D: serde::Deserializer<'de>, T: Deserialize<'de> + Default>(
+    d: D,
+) -> std::result::Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Log {
+    #[serde(deserialize_with = "or_default")]
     creator: Named,
+    #[serde(deserialize_with = "or_default")]
     browser: Named,
+    #[serde(deserialize_with = "or_default")]
     entries: Vec<Entry>,
 }
 
@@ -61,7 +72,9 @@ struct Named {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Entry {
+    #[serde(deserialize_with = "or_default")]
     request: Request,
+    #[serde(deserialize_with = "or_default")]
     response: Response,
     /// Chrome's: document, xhr, fetch, script, stylesheet, image, font, websocket, ...
     #[serde(rename = "_resourceType")]
@@ -73,9 +86,11 @@ struct Entry {
 struct Request {
     method: Value,
     url: Value,
+    #[serde(deserialize_with = "or_default")]
     headers: Vec<Pair>,
+    #[serde(deserialize_with = "or_default")]
     cookies: Vec<Pair>,
-    #[serde(rename = "queryString")]
+    #[serde(rename = "queryString", deserialize_with = "or_default")]
     query: Vec<Pair>,
     #[serde(rename = "postData")]
     post: Option<PostData>,
@@ -94,7 +109,11 @@ struct PostData {
     #[serde(rename = "mimeType")]
     mime: Value,
     text: Value,
+    #[serde(deserialize_with = "or_default")]
     params: Vec<Param>,
+    /// Not in HAR 1.2: how a binary body's `text` is written, as `history export` writes it.
+    #[serde(rename = "_encoding")]
+    encoding: Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -109,6 +128,7 @@ struct Param {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Response {
+    #[serde(deserialize_with = "or_default")]
     content: Content,
 }
 
@@ -121,8 +141,8 @@ struct Content {
 
 /// Request headers not taken from the file: the URL gives the host, the length is worked
 /// out again, a connection's own headers belong to the browser's connection, an encoding the
-/// client may not decode (zstd) or a conditional request (answered 304, with no body) would
-/// only get in the way of a scan, and HTTP/2's pseudo-headers (`:path`) are dropped too.
+/// client may not decode (zstd) would only get in the way of a scan, the body is the decoded
+/// one (as HAR files record it), and HTTP/2's pseudo-headers (`:path`) are dropped too.
 const NOT_REPLAYED: &[&str] = &[
     "host",
     "content-length",
@@ -133,12 +153,14 @@ const NOT_REPLAYED: &[&str] = &[
     "te",
     "upgrade",
     "accept-encoding",
-    "if-none-match",
-    "if-modified-since",
-    "if-match",
-    "if-unmodified-since",
-    "if-range",
+    "content-encoding",
 ];
+
+/// A read's cache validators, which would get a 304 with no body. A write's preconditions
+/// (`If-Match`, `If-Unmodified-Since`, `If-None-Match: *`) are kept: without them a stale
+/// recording could overwrite newer data instead of failing with 412.
+const READ_CONDITIONALS: &[&str] =
+    &["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range"];
 
 /// Chrome's resource types for what a page loads to show itself.
 const STATIC_TYPES: &[&str] = &["stylesheet", "script", "image", "font", "media", "manifest", "texttrack"];
@@ -152,9 +174,24 @@ fn text(v: &Value) -> String {
     values::scalar(v)
 }
 
-/// Whether `text` is a HAR file. A cheap look first, so other documents aren't parsed twice.
+/// Just the shape of a HAR file, every entry skipped unread.
+#[derive(Deserialize)]
+#[allow(dead_code)] // Only its shape is checked.
+struct Probe {
+    log: ProbeLog,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ProbeLog {
+    entries: Vec<serde::de::IgnoredAny>,
+}
+
+/// Whether `text` is a HAR file: `{"log": {"entries": [...]}}`, its entries skipped rather than
+/// read, as [`build`] reads them next.
 pub fn is_har(text: &str) -> bool {
-    text.contains("\"entries\"") && parse(text).is_ok()
+    let t = text.trim_start_matches('\u{feff}').trim_start();
+    text.len() <= MAX_HAR && text.contains("\"entries\"") && serde_json::from_str::<Probe>(t).is_ok()
 }
 
 fn parse(text: &str) -> Result<Har> {
@@ -196,25 +233,28 @@ pub fn build(document: &str, opts: &Options) -> Result<(Built, Creator)> {
             not_http += 1;
             continue;
         }
-        let label = format!("entry {i}: {method} {}", shown_url(&raw_url));
+        let name = format!("{method} {}", shown_url(&raw_url));
+        let label = format!("entry {i}: {name}");
         if !opts.keep_static && is_static(&method, &raw_url, &text(&e.resource_type), &text(&e.response.content.mime)) {
             static_assets += 1;
             continue;
         }
-        let req = match request(&label, &method, &raw_url, r, opts) {
+        let req = match request(name, &method, &raw_url, r, opts) {
             Ok(req) => req,
             Err(err) => {
                 out.fail(true, label, &err);
                 continue;
             }
         };
-        let content_type = req
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        let key = (req.method.clone(), req.url.clone(), content_type, crate::fetch::sha256_hex(&req.body));
+        // Accept too: the same URL may answer a page and its API (`Accept: application/json`).
+        let header = |n: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
+        let key = (
+            req.method.clone(),
+            req.url.clone(),
+            header("content-type").unwrap_or_default(),
+            header("accept").unwrap_or_default(),
+            crate::fetch::sha256_hex(&req.body),
+        );
         if !seen.insert(key) {
             repeats += 1;
             continue;
@@ -230,7 +270,9 @@ pub fn build(document: &str, opts: &Options) -> Result<(Built, Creator)> {
         ));
     }
     if repeats > 0 {
-        out.warn(format!("left out {repeats} repeated request(s): the same method, URL and body as an earlier entry"));
+        out.warn(format!(
+            "left out {repeats} repeated request(s): the same method, URL, Accept and body as an earlier entry"
+        ));
     }
     if websockets > 0 {
         out.warn(format!("left out {websockets} WebSocket handshake(s); `ws send --from` replays a connection"));
@@ -266,7 +308,7 @@ fn is_static(method: &str, url: &str, resource_type: &str, mime: &str) -> bool {
     last.rsplit_once('.').is_some_and(|(_, ext)| STATIC_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-fn request(label: &str, method: &str, raw_url: &str, r: &Request, opts: &Options) -> Result<ApiRequest> {
+fn request(name: String, method: &str, raw_url: &str, r: &Request, opts: &Options) -> Result<ApiRequest> {
     let mut url = raw_url.to_string();
     // Some tools give the query only as `queryString`.
     let query: Vec<(String, String)> = r.query.iter().map(|q| (text(&q.name), text(&q.value))).collect();
@@ -283,6 +325,9 @@ fn request(label: &str, method: &str, raw_url: &str, r: &Request, opts: &Options
         .map(|h| (text(&h.name).trim().to_string(), text(&h.value)))
         .filter(|(k, _)| !k.is_empty() && !k.starts_with(':'))
         .filter(|(k, _)| !NOT_REPLAYED.contains(&k.to_ascii_lowercase().as_str()))
+        .filter(|(k, _)| {
+            !matches!(method, "GET" | "HEAD") || !READ_CONDITIONALS.contains(&k.to_ascii_lowercase().as_str())
+        })
         .collect();
     let has = |hs: &[(String, String)], n: &str| hs.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
     // A sanitized or hand-made HAR may list the cookies without the header.
@@ -294,7 +339,12 @@ fn request(label: &str, method: &str, raw_url: &str, r: &Request, opts: &Options
     if let Some(p) = &r.post {
         let mime = text(&p.mime);
         let given = text(&p.text);
-        if !given.is_empty() {
+        if !given.is_empty() && text(&p.encoding).eq_ignore_ascii_case("base64") {
+            use base64::Engine;
+            body = base64::engine::general_purpose::STANDARD
+                .decode(given.trim())
+                .map_err(|_| Error::InvalidInput("its base64 body doesn't decode".into()))?;
+        } else if !given.is_empty() {
             body = given.into_bytes();
         } else if !p.params.is_empty() {
             if mime.to_ascii_lowercase().contains("multipart/") {
@@ -313,20 +363,18 @@ fn request(label: &str, method: &str, raw_url: &str, r: &Request, opts: &Options
             } else {
                 let fields: Vec<(String, String)> = p.params.iter().map(|q| (text(&q.name), text(&q.value))).collect();
                 body = values::form(&fields);
+                // Fields alone are a form, whatever type the file gives (or none).
+                if !has(&headers, "content-type") && !mime.to_ascii_lowercase().contains("form") {
+                    headers.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
+                }
             }
         }
-        if !body.is_empty() && !has(&headers, "content-type") {
-            let ct = if mime.is_empty() { "application/x-www-form-urlencoded".to_string() } else { mime };
-            headers.push(("Content-Type".into(), ct));
+        // A text body the file gives no type for goes without one, rather than a guessed one.
+        if !body.is_empty() && !has(&headers, "content-type") && !mime.is_empty() {
+            headers.push(("Content-Type".into(), mime));
         }
     }
-    Ok(ApiRequest {
-        name: label.split_once(": ").map_or(label, |(_, n)| n).to_string(),
-        method: method.into(),
-        url,
-        headers,
-        body,
-    })
+    Ok(ApiRequest { name, method: method.into(), url, headers, body })
 }
 
 #[cfg(test)]
@@ -486,6 +534,58 @@ mod tests {
         let r = &b.requests[0];
         assert_eq!((r.method.as_str(), r.url.as_str()), ("GET", "https://a.test/x?k=v+w"));
         assert_eq!(r.headers, vec![("Cookie".to_string(), "a=1; b=2".to_string())]);
+    }
+
+    #[test]
+    fn null_fields_read_as_empty() {
+        let doc = json!({"log": {"creator": null, "entries": [
+            {"request": {"method": "POST", "url": "https://a.test/x", "headers": null, "cookies": null,
+                "queryString": null, "postData": {"mimeType": null, "text": "{\"a\":1}", "params": null}},
+             "response": null},
+            {"request": {"method": "GET", "url": "https://a.test/y"}, "response": {"content": null}}]}})
+        .to_string();
+        assert!(is_har(&doc));
+        let (b, _) = build(&doc, &Options::default()).unwrap();
+        assert_eq!(b.requests.len(), 2, "{:?}", b.skipped);
+        // A text body without a type goes without one, not as a guessed form.
+        assert_eq!((b.requests[0].body.as_slice(), b.requests[0].headers.len()), (&b"{\"a\":1}"[..], 0));
+    }
+
+    #[test]
+    fn fields_alone_are_a_form_and_accept_tells_requests_apart() {
+        let doc = json!({"log": {"entries": [
+            {"request": {"method": "POST", "url": "https://a.test/f", "postData": {"params": [{"name": "a", "value": "1"}]}}},
+            {"request": {"method": "GET", "url": "https://a.test/orders", "headers": [{"name": "Accept", "value": "text/html"}]}},
+            {"request": {"method": "GET", "url": "https://a.test/orders", "headers": [{"name": "Accept", "value": "application/json"}]}},
+            {"request": {"method": "GET", "url": "https://a.test/orders", "headers": [{"name": "Accept", "value": "application/json"}, {"name": "X-Trace", "value": "2"}]}}]}})
+        .to_string();
+        let (b, _) = build(&doc, &Options::default()).unwrap();
+        let form = &b.requests[0];
+        assert_eq!(form.body, b"a=1");
+        assert_eq!(form.headers, vec![("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())]);
+        assert_eq!(b.requests.len(), 3, "the page and its JSON are both kept, the repeat isn't");
+        assert!(b.warnings.iter().any(|w| w.contains("1 repeated request")), "{:?}", b.warnings);
+    }
+
+    #[test]
+    fn writes_keep_their_preconditions_and_base64_bodies_are_decoded() {
+        let doc = json!({"log": {"entries": [
+            {"request": {"method": "PUT", "url": "https://a.test/doc/1", "headers": [
+                {"name": "If-Match", "value": "\"v3\""}, {"name": "If-None-Match", "value": "*"},
+                {"name": "Content-Encoding", "value": "gzip"}, {"name": "Content-Type", "value": "application/octet-stream"}],
+                "postData": {"mimeType": "application/octet-stream", "text": "//4=", "_encoding": "base64"}}},
+            {"request": {"method": "GET", "url": "https://a.test/doc/1", "headers": [{"name": "If-Match", "value": "\"v3\""}]}},
+            {"request": {"method": "POST", "url": "https://a.test/bad", "postData": {"text": "!!", "_encoding": "base64"}}}]}})
+        .to_string();
+        let (b, _) = build(&doc, &Options::default()).unwrap();
+        let put = &b.requests[0];
+        let names: Vec<&str> = put.headers.iter().map(|(k, _)| k.as_str()).collect();
+        // The body is the decoded one, so its encoding header would lie about it.
+        assert_eq!(names, ["If-Match", "If-None-Match", "Content-Type"]);
+        assert_eq!(put.body, [0xff, 0xfe]);
+        assert!(b.requests[1].headers.is_empty(), "{:?}", b.requests[1].headers);
+        assert_eq!(b.skipped.len(), 1, "{:?}", b.skipped);
+        assert!(b.skipped[0].reason.contains("base64"), "{:?}", b.skipped);
     }
 
     #[test]

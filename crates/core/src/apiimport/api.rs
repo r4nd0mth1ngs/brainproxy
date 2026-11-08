@@ -594,6 +594,7 @@ fn security_schemes(doc: &Value) -> Vec<Credential> {
 /// file's `--keep-credentials`) leaves credential headers in place, still reported; those in
 /// the URL and the body are taken out all the same, as URLs are shown and logged.
 fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_headers: bool) {
+    let secret = secret_test(format);
     let is_declared = |place: &str, name: &str| {
         declared.iter().any(|c| {
             c.location.as_deref() == Some(place)
@@ -650,7 +651,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_heade
             let mut kept = Vec::new();
             for part in q.split('&') {
                 let names = part.split(';').map(|p| form_decoded(p.split('=').next().unwrap_or_default()));
-                match names.into_iter().find(|n| looks_secret(n) || is_declared("query", n)) {
+                match names.into_iter().find(|n| secret(n) || is_declared("query", n)) {
                     Some(name) => {
                         let value = part.split_once('=').map_or("", |(_, v)| v);
                         built.credential(Credential {
@@ -667,7 +668,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_heade
             u.set_query((!kept.is_empty()).then(|| kept.join("&")).as_deref());
         }
         for (k, v) in std::mem::take(&mut r.headers) {
-            if !looks_secret(&k) && !is_declared("header", &k) {
+            if !secret(&k) && !is_declared("header", &k) {
                 r.headers.push((k, v));
                 continue;
             }
@@ -705,7 +706,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_heade
             });
             r.headers.extend(kept);
         }
-        let (body, fields) = without_credentials(&r.headers, &r.body);
+        let (body, fields) = without_credentials(&r.headers, &r.body, secret);
         r.body = body;
         for name in fields {
             built.credential(Credential {
@@ -722,6 +723,20 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_heade
             continue;
         }
         built.requests.push(r);
+    }
+}
+
+/// How a build tells a credential by its name. A HAR file's values were recorded from a live
+/// session, so its names are judged as reports judge them too (`X-Session-Id`, `sid`, `jwt`,
+/// `signature`, ...); a description's examples only by [`looks_secret`].
+fn secret_test(format: Format) -> fn(&str) -> bool {
+    fn recorded(name: &str) -> bool {
+        looks_secret(name) || crate::scan::redact::secret_header(name)
+    }
+    if format == Format::Har {
+        recorded
+    } else {
+        looks_secret
     }
 }
 
@@ -1027,6 +1042,7 @@ impl PreviewRequest {
     fn new(i: &Planned, format: Format) -> Self {
         let r = &i.request;
         let opt_in = opt_in_name(format, r);
+        let secret = secret_test(format);
         PreviewRequest {
             index: i.index,
             name: r.name.clone(),
@@ -1036,7 +1052,7 @@ impl PreviewRequest {
             headers: r
                 .headers
                 .iter()
-                .map(|(k, v)| if looks_secret(k) { format!("{k}: {MASK}") } else { format!("{k}: {v}") })
+                .map(|(k, v)| if secret(k) { format!("{k}: {MASK}") } else { format!("{k}: {v}") })
                 .collect(),
             body: masked_body(&r.headers, &r.body),
             state_changing: opt_in.is_some()
@@ -1080,7 +1096,7 @@ pub struct Preview {
 
 /// `body` with the values of secret-named JSON, form, and multipart fields masked.
 pub fn masked_body(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
-    replace_fields(headers, body, &mut |_, _| Some(MASK.to_string()))
+    replace_fields(headers, body, looks_secret, &mut |_, _| Some(MASK.to_string()))
 }
 
 /// Values the builders make up, and nothing a document could leak.
@@ -1089,9 +1105,9 @@ fn is_stand_in(value: &str) -> bool {
 }
 
 /// `body` with what the document gives for secret-named fields replaced by a test value, and those fields' names.
-fn without_credentials(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, Vec<String>) {
+fn without_credentials(headers: &[(String, String)], body: &[u8], secret: Secret) -> (Vec<u8>, Vec<String>) {
     let mut found = Vec::new();
-    let out = replace_fields(headers, body, &mut |name, value| {
+    let out = replace_fields(headers, body, secret, &mut |name, value| {
         (!is_stand_in(value)).then(|| {
             found.push(name.to_string());
             "test".to_string()
@@ -1100,9 +1116,9 @@ fn without_credentials(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, V
     (out, found)
 }
 
-/// `body` with secret-named JSON, form, and multipart fields set to what `with` returns for
-/// their name and value, where it returns one.
-fn replace_fields(headers: &[(String, String)], body: &[u8], with: &mut Replace<'_>) -> Vec<u8> {
+/// `body` with JSON, form, and multipart fields whose names `secret` calls secret set to what
+/// `with` returns for their name and value, where it returns one.
+fn replace_fields(headers: &[(String, String)], body: &[u8], secret: Secret, with: &mut Replace<'_>) -> Vec<u8> {
     let ct = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
@@ -1112,25 +1128,25 @@ fn replace_fields(headers: &[(String, String)], body: &[u8], with: &mut Replace<
     if text.trim_start().starts_with(['{', '[']) {
         return match serde_json::from_slice::<Value>(body) {
             Ok(mut v) => {
-                if replace_json(&mut v, with) {
+                if replace_json(&mut v, secret, with) {
                     serde_json::to_vec(&v).unwrap_or_default()
                 } else {
                     body.to_vec()
                 }
             }
             // {{variables}} can leave a raw body that doesn't parse.
-            Err(_) => replace_pairs(&text, with).into_bytes(),
+            Err(_) => replace_pairs(&text, secret, with).into_bytes(),
         };
     }
     if ct.contains("xml") {
-        return replace_xml(&text, with).into_bytes();
+        return replace_xml(&text, secret, with).into_bytes();
     }
     if ct.contains("x-www-form-urlencoded") {
         let mut changed = false;
         let pairs: Vec<(String, String)> = url::form_urlencoded::parse(body)
             .into_owned()
             .map(|(k, v)| {
-                let new = if looks_secret(&k) { with(&k, &v) } else { None };
+                let new = if secret(&k) { with(&k, &v) } else { None };
                 changed |= new.is_some();
                 let v = new.unwrap_or(v);
                 (k, v)
@@ -1143,21 +1159,24 @@ fn replace_fields(headers: &[(String, String)], body: &[u8], with: &mut Replace<
         };
     }
     if ct.contains("multipart/form-data") {
-        return replace_parts(&text, with).into_bytes();
+        return replace_parts(&text, secret, with).into_bytes();
     }
     body.to_vec()
 }
 
 type Replace<'a> = dyn FnMut(&str, &str) -> Option<String> + 'a;
 
-fn replace_json(v: &mut Value, with: &mut Replace<'_>) -> bool {
+/// Whether a field's name says it holds a credential.
+type Secret = fn(&str) -> bool;
+
+fn replace_json(v: &mut Value, secret: Secret, with: &mut Replace<'_>) -> bool {
     let mut changed = false;
     match v {
-        Value::Array(a) => a.iter_mut().for_each(|x| changed |= replace_json(x, with)),
+        Value::Array(a) => a.iter_mut().for_each(|x| changed |= replace_json(x, secret, with)),
         Value::Object(m) => {
             for (k, x) in m.iter_mut() {
-                if !looks_secret(k) {
-                    changed |= replace_json(x, with);
+                if !secret(k) {
+                    changed |= replace_json(x, secret, with);
                 } else if !x.is_null() {
                     let text = x.as_str().map_or_else(|| x.to_string(), str::to_string);
                     if let Some(new) = with(k, &text) {
@@ -1173,11 +1192,11 @@ fn replace_json(v: &mut Value, with: &mut Replace<'_>) -> bool {
 }
 
 /// `"key": "value"` pairs of text that is almost JSON.
-fn replace_pairs(text: &str, with: &mut Replace<'_>) -> String {
+fn replace_pairs(text: &str, secret: Secret, with: &mut Replace<'_>) -> String {
     static PAIR: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#""([^"\\]*)"\s*:\s*("(?:[^"\\]|\\.)*"|[^\s,}\]]+)"#).expect("valid regex"));
     PAIR.replace_all(text, |c: &regex::Captures| {
-        let new = if looks_secret(&c[1]) { with(&c[1], c[2].trim_matches('"')) } else { None };
+        let new = if secret(&c[1]) { with(&c[1], c[2].trim_matches('"')) } else { None };
         match new {
             Some(new) => format!("\"{}\": \"{new}\"", &c[1]),
             None => c[0].to_string(),
@@ -1187,13 +1206,13 @@ fn replace_pairs(text: &str, with: &mut Replace<'_>) -> String {
 }
 
 /// `<name attrs>value</name>` elements of an XML body.
-fn replace_xml(text: &str, with: &mut Replace<'_>) -> String {
+fn replace_xml(text: &str, secret: Secret, with: &mut Replace<'_>) -> String {
     static ELEMENT: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"<([\w.:-]+)([^<>]*)>([^<]*)</([\w.:-]+)>").expect("valid regex"));
     ELEMENT
         .replace_all(text, |c: &regex::Captures| {
             let local = c[1].rsplit(':').next().unwrap_or_default();
-            let new = if c[1] == c[4] && looks_secret(local) { with(local, &c[3]) } else { None };
+            let new = if c[1] == c[4] && secret(local) { with(local, &c[3]) } else { None };
             match new {
                 Some(new) => format!("<{}{}>{new}</{}>", &c[1], &c[2], &c[4]),
                 None => c[0].to_string(),
@@ -1202,13 +1221,17 @@ fn replace_xml(text: &str, with: &mut Replace<'_>) -> String {
         .into_owned()
 }
 
-fn replace_parts(text: &str, with: &mut Replace<'_>) -> String {
-    static PART: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(?s)name="([^"]*)"\r\n\r\n(.*?)\r\n--"#).expect("valid regex"));
+/// The parts of a multipart body, by the `name` in their Content-Disposition (not a
+/// `filename`), whatever follows it on that line and whatever headers (a part's own
+/// Content-Type, say) come before the value.
+fn replace_parts(text: &str, secret: Secret, with: &mut Replace<'_>) -> String {
+    static PART: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)\bname="([^"]*)"([^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n)(.*?)\r\n--"#).expect("valid regex")
+    });
     PART.replace_all(text, |c: &regex::Captures| {
-        let new = if looks_secret(&c[1]) { with(&c[1], &c[2]) } else { None };
+        let new = if secret(&c[1]) { with(&c[1], &c[3]) } else { None };
         match new {
-            Some(new) => format!("name=\"{}\"\r\n\r\n{new}\r\n--", &c[1]),
+            Some(new) => format!("name=\"{}\"{}{new}\r\n--", &c[1], &c[2]),
             None => c[0].to_string(),
         }
     })
@@ -1447,6 +1470,58 @@ mod tests {
         let shown = serde_json::to_string(&p).unwrap();
         assert!(!shown.contains("SECRET") && shown.contains("\"credentials_kept\":true"), "{shown}");
         assert!(p.credentials.iter().any(|c| c.name.as_deref() == Some("Authorization")));
+    }
+
+    #[test]
+    fn a_har_file_s_session_names_count_as_credentials() {
+        // Recorded values are live ones: names a report masks are credentials here too, though
+        // `looks_secret` alone would let them through.
+        let doc = json!({"log": {"entries": [{"request": {"method": "POST",
+            "url": "https://api.test/cart?sid=RECORDEDSID1&page=2&jwt=RECORDEDJWT1",
+            "headers": [{"name": "X-Session-Id", "value": "RECORDEDHDR1"}, {"name": "Accept", "value": "*/*"},
+                {"name": "Content-Type", "value": "application/json"}],
+            "postData": {"mimeType": "application/json", "text": "{\"session\": \"RECORDEDBODY1\", \"qty\": 2}"}}}]}});
+        let l = load(&doc.to_string(), &opts()).unwrap();
+        let p = l.preview(&l.plan(&Selection::default(), &guard()).unwrap(), 100);
+        let shown = format!("{}{}", serde_json::to_string(&p).unwrap(), String::from_utf8_lossy(&l.requests[0].body));
+        assert!(!shown.contains("RECORDED"), "{shown}");
+        assert_eq!(p.requests[0].url, "https://api.test/cart?page=2");
+        assert_eq!(String::from_utf8_lossy(&l.requests[0].body), r#"{"session":"test","qty":2}"#);
+        for (at, name) in
+            [(Some("query"), "sid"), (Some("query"), "jwt"), (Some("header"), "X-Session-Id"), (None, "session")]
+        {
+            assert!(
+                p.credentials.iter().any(|c| c.location.as_deref() == at && c.name.as_deref() == Some(name)),
+                "{name}: {:?}",
+                p.credentials
+            );
+        }
+        // Kept, such a header is masked in the preview like any other.
+        let o = Options { har: HarOptions { keep_credentials: true, ..Default::default() }, ..opts() };
+        let l = load(&doc.to_string(), &o).unwrap();
+        let p = l.preview(&l.plan(&Selection::default(), &guard()).unwrap(), 100);
+        assert!(p.requests[0].headers.contains(&"X-Session-Id: ********".to_string()), "{:?}", p.requests[0].headers);
+        assert!(l.requests[0].headers.iter().any(|(k, v)| k == "X-Session-Id" && v == "RECORDEDHDR1"));
+        // Descriptions keep their narrower rule: an OpenAPI `sid` parameter is no credential.
+        let spec = r#"{"openapi": "3.0.0", "servers": [{"url": "https://api.test"}], "paths": {"/a": {"get": {
+            "parameters": [{"name": "sid", "in": "query", "example": "7"}]}}}}"#;
+        assert_eq!(load(spec, &opts()).unwrap().requests[0].url, "https://api.test/a?sid=7");
+    }
+
+    #[test]
+    fn multipart_parts_with_their_own_headers_are_cleaned_too() {
+        let body = "--b\r\nContent-Disposition: form-data; name=\"password\"\r\nContent-Type: text/plain\r\n\r\nPARTSECRET1\r\n\
+            --b\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"secret.txt\"\r\nContent-Type: text/plain\r\n\r\nfile body\r\n\
+            --b\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\nPARTSECRET2\r\n--b--\r\n";
+        let headers = [("Content-Type".to_string(), "multipart/form-data; boundary=b".to_string())];
+        let (out, found) = without_credentials(&headers, body.as_bytes(), looks_secret);
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("PARTSECRET"), "{out}");
+        assert!(out.contains("name=\"password\"\r\nContent-Type: text/plain\r\n\r\ntest\r\n"), "{out}");
+        // A file named like a secret isn't a secret field.
+        assert!(out.contains("file body"), "{out}");
+        assert_eq!(found, ["password", "token"]);
+        assert!(!String::from_utf8_lossy(&masked_body(&headers, body.as_bytes())).contains("PARTSECRET"));
     }
 
     #[test]

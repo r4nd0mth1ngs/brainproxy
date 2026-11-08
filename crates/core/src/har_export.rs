@@ -70,8 +70,9 @@ pub fn export(store: &Store, ids: &[i64], opts: &Options) -> Result<Exported> {
         let mut row = read(store, id)?;
         if let Some(r) = red.as_mut() {
             r.exchange(&mut row.request, row.response.as_mut());
-            if let Some(e) = row.error.as_mut() {
-                r.text(e);
+            // A reason phrase is the server's text too, and may quote a value.
+            for t in row.error.iter_mut().chain(row.response.as_mut().and_then(|x| x.reason.as_mut())) {
+                r.text(t);
             }
         }
         rows.push(row);
@@ -80,8 +81,8 @@ pub fn export(store: &Store, ids: &[i64], opts: &Options) -> Result<Exported> {
     if let Some(r) = red.as_mut() {
         for row in &mut rows {
             r.scrub_exchange(&mut row.request, row.response.as_mut());
-            if let Some(e) = row.error.as_mut() {
-                r.scrub(e);
+            for t in row.error.iter_mut().chain(row.response.as_mut().and_then(|x| x.reason.as_mut())) {
+                r.scrub(t);
             }
         }
     }
@@ -181,23 +182,11 @@ fn cookies(headers: &[(String, String)], name: &str) -> Value {
     Value::Array(out)
 }
 
-fn decoded(s: &str) -> String {
-    let s = s.replace('+', " ");
-    percent_encoding::percent_decode_str(&s).decode_utf8_lossy().into_owned()
-}
-
+/// A URL's query (or, given `?BODY`, a form body) as HAR `{name, value}` pairs, decoded.
 fn query(url: &str) -> Value {
     let q = url.split_once('?').map(|(_, q)| q).unwrap_or_default();
     let q = q.split('#').next().unwrap_or_default();
-    Value::Array(
-        q.split('&')
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                let (k, v) = p.split_once('=').unwrap_or((p, ""));
-                json!({"name": decoded(k), "value": decoded(v)})
-            })
-            .collect(),
-    )
+    Value::Array(url::form_urlencoded::parse(q.as_bytes()).map(|(k, v)| json!({"name": k, "value": v})).collect())
 }
 
 /// A body's text for HAR, or None (and why, in `comment`) when it is left out.
@@ -389,7 +378,20 @@ mod tests {
     fn known_values_are_masked_anywhere() {
         let mut s = store();
         let a = record(&mut s, "GET /a?q=hello-MYTOKEN-77 HTTP/1.1\r\nHost: app.test\r\n\r\n", None);
-        let x = export(&s, &[a], &Options { redact: true, mask: vec!["MYTOKEN-77".into()] }).unwrap();
-        assert!(!x.har.to_string().contains("MYTOKEN-77"), "{}", x.har);
+        // A cookie set first, then quoted in a later reply's reason phrase.
+        let b = record(
+            &mut s,
+            "GET /b HTTP/1.1\r\nHost: app.test\r\nCookie: sid=SESSIONVALUE9\r\n\r\n",
+            Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+        );
+        let c = record(
+            &mut s,
+            "GET /c HTTP/1.1\r\nHost: app.test\r\n\r\n",
+            Some(b"HTTP/1.1 403 Denied SESSIONVALUE9 MYTOKEN-77\r\nContent-Length: 0\r\n\r\n"),
+        );
+        let x = export(&s, &[a, b, c], &Options { redact: true, mask: vec!["MYTOKEN-77".into()] }).unwrap();
+        let text = x.har.to_string();
+        assert!(!text.contains("MYTOKEN-77") && !text.contains("SESSIONVALUE9"), "{text}");
+        assert!(x.har["log"]["entries"][2]["response"]["statusText"].as_str().unwrap().starts_with("Denied"));
     }
 }

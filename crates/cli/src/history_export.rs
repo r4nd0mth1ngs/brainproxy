@@ -80,7 +80,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
     let truncated = rows.len() > a.limit as usize;
     let ids: Vec<i64> = rows.iter().take(a.limit as usize).map(|e| e.id).collect();
     let x = har_export::export(&store, &ids, &har_export::Options { redact: !a.no_redact, mask: a.mask })?;
-    let text = serde_json::to_string_pretty(&x.har).map_err(|e| Error::Io(e.into()))?;
+    let pretty = |har: &serde_json::Value| serde_json::to_string_pretty(har).map_err(|e| Error::Io(e.into()));
     let mut summary = json!({
         "kind": "har",
         "entries": x.entries,
@@ -89,6 +89,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
         "binary_bodies_left_out": x.binary_bodies_left_out,
     });
     if let Some(path) = a.output {
+        let text = pretty(&x.har)?;
         crate::output::write_file(&path, text.as_bytes(), a.force)?;
         summary["path"] = json!(path.display().to_string());
         summary["bytes"] = json!(text.len());
@@ -100,7 +101,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
         summary["har"] = x.har;
         out.ok(summary, String::new);
     } else {
-        out.raw(text.as_bytes());
+        out.raw(pretty(&x.har)?.as_bytes());
     }
     Ok(())
 }

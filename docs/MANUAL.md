@@ -1408,18 +1408,24 @@ Crawl and active-scan scope and safety flags:
   headers, cookies, query, and body: its text, or its form or multipart `params`, a file part's
   content standing in as `test`) becomes one operation, named `METHOD URL` without the query.
   Not taken from the file: `Host` (the URL gives it, so `--base-url` can move a recording to
-  another server), `Content-Length`, the connection's own headers, `Accept-Encoding`, the
-  conditional headers (`If-None-Match`, `If-Modified-Since`, ...) and HTTP/2's pseudo-headers.
+  another server), `Content-Length`, the connection's own headers, `Accept-Encoding`,
+  `Content-Encoding` (a HAR records the decoded body), HTTP/2's pseudo-headers, and a GET's or
+  HEAD's cache validators (`If-None-Match`, `If-Modified-Since`, ...). A write keeps its
+  preconditions (`If-Match`, `If-Unmodified-Since`), so a stale recording fails with 412 rather
+  than overwriting newer data. A body `history export` wrote as base64 (`_encoding`) is decoded.
   Left out and counted in `warnings`: static assets (scripts, styles, images, fonts and media, by
   Chrome's resource type, the response's content type or the file's extension; `--keep-static`
-  keeps them), an entry with the same method, URL and body as an earlier one (the first is kept),
+  keeps them), an entry with the same method, URL, `Accept` header and body as an earlier one
+  (the first is kept),
   WebSocket handshakes (`ws send --from` replays a connection), and URLs that aren't http(s).
   Entries outside the engagement scope are listed with `excluded_reason: "scope"`, never sent,
   and counted in `skipped_out_of_scope`. The method opt-ins are those of any document: DELETE,
   PUT, PATCH and GraphQL mutations need `--include-methods`. The recorded `Cookie` and
-  `Authorization` headers, other credential headers (`X-CSRF-Token`, `X-Api-Key`, ...), and
-  credentials in URLs and bodies are left out and listed under `credentials` by name, as for a
-  Postman collection's saved keys; use an auth profile. `--keep-credentials` sends the recorded
+  `Authorization` headers, other credential headers (`X-CSRF-Token`, `X-Api-Key`,
+  `X-Session-Id`, ...), and credentials in URLs and bodies (form, JSON, XML and multipart fields)
+  are left out and listed under `credentials` by name, as for a Postman collection's saved keys;
+  use an auth profile. As a HAR holds live values, its names are judged as reports judge them
+  (`session`, `sid`, `jwt`, `signature`, `key` and the like count too). `--keep-credentials` sends the recorded
   credential headers as they were (a recorded session is often stale by now); those in the URL
   and body are still left out, as URLs are shown and logged, and the preview shows the kept ones
   as `********` and says `credentials_kept`. The HAR's responses are not read (only their content
@@ -1432,7 +1438,8 @@ Crawl and active-scan scope and safety flags:
   and password parameters, JWTs, the project's auth profile secrets, and each value wherever else
   it appears); a body that isn't text can't be searched, so it is left out with a `comment` and
   counted in `binary_bodies_left_out`. `--mask VALUE` masks more; `--no-redact` keeps everything
-  as recorded, binary bodies as base64. Each entry's `_brainproxy` holds its history id and
+  as recorded, binary bodies as base64 (a request's with `_encoding: "base64"`, which `import
+  har` reads back). Reason phrases are masked too. Each entry's `_brainproxy` holds its history id and
   source, and `_error` why it failed. `-o FILE` writes the file (an existing one is kept unless
   `--force`, which MCP refuses); without it the HAR is printed, under `data.har` in JSON mode.
   The app has no export button yet.
