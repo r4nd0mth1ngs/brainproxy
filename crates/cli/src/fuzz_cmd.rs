@@ -345,18 +345,9 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let marked = String::from_utf8_lossy(req.as_bytes()).replace(&args.marker, fuzz::DEFAULT_MARKER);
     let mut host_warning =
         crate::mcp::check_host_header(&opts, marked.as_bytes(), &target, args.req.host_header_test, out)?;
-    // A payload in a header's name can make it a Host: the same, before anything is sent. (Every
-    // request is checked again as it goes out, payloads in.)
+    // Every request is checked again as it goes out, payloads in: one that names another host
+    // (a payload in a header's name that makes it a Host, say) is refused there through MCP.
     let head = String::from_utf8_lossy(brainproxy_core::http::request::split_head_body(marked.as_bytes()).0);
-    let mut names = head.split('\n').skip(1).map(|l| l.split_once(':').map_or(l, |(k, _)| k));
-    if host_warning.is_none() && names.any(|k| k.contains(fuzz::DEFAULT_MARKER)) {
-        host_warning = crate::mcp::check_host_setting(
-            "fuzz run",
-            Some("(a payload in a header name)".into()),
-            args.req.host_header_test,
-            out,
-        )?;
-    }
     let template = Template::parse(req.as_bytes(), &args.marker)?;
     // How many positions are in the head (they come first), and whether payloads there are
     // URL-encoded: a raw CR or LF there would start another header line (a Host, say).
@@ -386,12 +377,12 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             return Err(Error::InvalidInput(format!("--process {n}=...: there is no payload set {n}")));
         }
     }
-    if raw_in_head && sets.iter().flatten().any(|p| p.contains(&b'\r') || p.contains(&b'\n')) {
-        return Err(Error::InvalidInput(
-            "a payload holds a line break, and goes into the request's head as it is: it would start another \
-             header line; encode it (%0d%0a) or put the position in the body"
-                .into(),
-        ));
+    // A raw line break in the head is a CRLF-injection test a person may run; it can also start a
+    // Host header, so through MCP it needs --host-header-test as a foreign Host does.
+    if raw_in_head && sets.iter().flatten().any(|p| p.contains(&b'\r') || p.contains(&b'\n')) && host_warning.is_none()
+    {
+        let what = "(a payload with a line break, unencoded in the head)".to_string();
+        host_warning = crate::mcp::check_host_setting("fuzz run", Some(what), args.req.host_header_test, out)?;
     }
     let plan = Plan::new(mode, &template, sets)?;
     let total = args.max_requests.map_or(plan.total(), |m| m.min(plan.total()));

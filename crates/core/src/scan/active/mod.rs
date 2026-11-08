@@ -30,6 +30,7 @@ use serde::Serialize;
 use crate::auth::AuthSession;
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
+use crate::http::client::HostPolicy;
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
@@ -757,6 +758,10 @@ pub struct ActiveSummary {
     pub errors: usize,
     /// Check requests not sent because their method wasn't opted in (`check_methods`).
     pub check_skipped_methods: u64,
+    /// Hosts the scope doesn't list that base requests named in their Host header, refused
+    /// (through MCP without `--host-header-test`): those requests weren't attacked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused_hosts: Vec<String>,
     /// None when no OOB listener was running (out-of-band checks skipped).
     pub oob: Option<OobSummary>,
     pub stopped: bool,
@@ -864,8 +869,25 @@ pub async fn run(
         Ok((new, store))
     });
 
+    // A base request is checked as any request is: one whose Host the scope doesn't list is
+    // refused (an agent's that isn't a stated test) or attacked as it is. A rule's own change to
+    // the Host is its test (Cloud Metadata names the metadata service), so the rules' client
+    // lets those go.
+    let mut refused_hosts: Vec<String> = Vec::new();
+    let targets: Vec<ScanTarget> = targets
+        .into_iter()
+        .filter(|t| match cfg.send.foreign_host(&t.request, &t.target) {
+            Some(h) if cfg.send.host == HostPolicy::Refuse => {
+                if !refused_hosts.contains(&h) {
+                    refused_hosts.push(h);
+                }
+                false
+            }
+            _ => true,
+        })
+        .collect();
     let shared = Arc::new(Shared {
-        client: Client::new(cfg.send.clone()),
+        client: Client::new(SendOptions { host: HostPolicy::Allow, ..cfg.send.clone() }),
         auth: cfg.auth.clone(),
         strength: cfg.strength,
         ctl: ctl.clone(),
@@ -1021,6 +1043,7 @@ pub async fn run(
         new_findings,
         errors,
         check_skipped_methods,
+        refused_hosts,
         oob,
         stopped: ctl.stopped(),
         timed_out,

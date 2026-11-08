@@ -915,7 +915,26 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // Who changed the request on its way: the row's origin is the proxy's, not theirs.
     let mut edited_by = Vec::new();
     if in_scope {
+        let before = request.clone();
         let (ruled, changed_by) = apply_request_rules_traced(&live.rules, request);
+        // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
+        // Host-header test, isn't sent: a shared front end may route the request to another site.
+        // A person's rule was warned about when it was saved.
+        if changed_by.iter().any(|r| r.origin.as_deref() == Some("mcp") && !r.host_header_test) {
+            let opts = ctx.client.options();
+            let had = opts.foreign_hosts(&before, target);
+            if let Some(host) = opts.foreign_hosts(&ruled, target).into_iter().find(|h| !had.contains(h)) {
+                let msg = format!(
+                    "out of scope: Host {host}: an agent's rule put a host the scope doesn't list in the request; \
+                     add the rule with --host-header-test for a Host-header test"
+                );
+                let edits =
+                    changed_by.iter().map(|r| Edit { by: r.origin.clone(), rule: Some(r.id), ..Default::default() });
+                let c = row(target, &ruled, None, None, Some(&msg));
+                send_capture(ctx, Capture { edited_by: edits.collect(), ..c }, None).await;
+                return Ok(Reply::Error(error_response(502, "out_of_scope", &msg), false));
+            }
+        }
         request = ruled;
         edited_by.extend(changed_by.iter().map(|r| Edit {
             by: r.origin.clone(),

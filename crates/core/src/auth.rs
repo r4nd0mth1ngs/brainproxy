@@ -612,9 +612,9 @@ impl Vault {
             let allowed = |e: &VaultEntry| {
                 anywhere(e) || (e.header.is_some() && e.header == name) || (i == 0 && e.request_line && to_origin(e))
             };
-            out.extend(fill(&inner.entries, &inner.sign_marks, line, allowed)?);
+            out.extend(fill(&inner.entries, &inner.sign_marks, line, true, allowed)?);
         }
-        let new_body = fill(&inner.entries, &Default::default(), body, anywhere)?;
+        let new_body = fill(&inner.entries, &Default::default(), body, false, anywhere)?;
         let body_changed = new_body != body;
         out.extend(new_body);
         if body_changed {
@@ -644,11 +644,14 @@ impl Vault {
 
 /// `text` with each placeholder replaced by its value, where `allowed` lets it go.
 /// A per-run macro placeholder no longer kept falls back to the variable's latest value.
-/// Placeholders in `later` stay for the signers.
+/// Placeholders in `later` stay for the signers. In the head (`head`), a value holding a CR, LF
+/// or NUL is refused: a token or cookie learned from a reply, or a macro's value, would otherwise
+/// start another header (a Host, say) on every request it goes into.
 fn fill(
     entries: &HashMap<String, VaultEntry>,
     later: &std::collections::HashSet<String>,
     text: &[u8],
+    head: bool,
     allowed: impl Fn(&VaultEntry) -> bool,
 ) -> Result<Vec<u8>> {
     const END: &[u8] = "»".as_bytes();
@@ -670,6 +673,13 @@ fn fill(
             .as_deref()
             .and_then(|ph| entries.get(ph).or_else(|| entries.get(&crate::session::latest_placeholder(ph)?)));
         match (entry.filter(|e| allowed(e)), end) {
+            (Some(e), Some(j)) if head && e.value.contains(['\r', '\n', '\0']) => {
+                let ph = String::from_utf8_lossy(&rest[..j]).into_owned();
+                return Err(Error::InvalidInput(format!(
+                    "the value for {ph} holds a line break or NUL, which would start another header: not \
+                     sent (log in again, or check what the profile learns its values from)"
+                )));
+            }
             (Some(e), Some(j)) => {
                 out.extend_from_slice(e.value.as_bytes());
                 rest = &rest[j..];
@@ -1617,6 +1627,21 @@ mod tests {
         let raw = "GET /?k=«auth:t:query:k» HTTP/1.1\r\n\r\n";
         let filled = vault.resolve(raw.as_bytes(), &Target::from_url("https://a.test").unwrap()).unwrap();
         assert!(String::from_utf8_lossy(&filled).starts_with("GET /?k=v1 "));
+    }
+
+    #[test]
+    fn a_learned_value_with_a_line_break_is_never_filled_into_the_head() {
+        let p = AuthProfile {
+            name: "t".into(),
+            token_header: Some("Authorization: Bearer {{token}}".into()),
+            ..Default::default()
+        };
+        let vault = Vault::default();
+        let st = SessionState { token: Some("abc\r\nHost: e.test".into()), ..Default::default() };
+        vault.put_session(&p, &st);
+        let raw = "GET / HTTP/1.1\r\nAuthorization: Bearer «auth:t:token»\r\n\r\n";
+        let e = vault.resolve(raw.as_bytes(), &Target::from_url("https://a.test").unwrap()).unwrap_err();
+        assert!(e.to_string().contains("line break"), "{e}");
     }
 
     #[test]

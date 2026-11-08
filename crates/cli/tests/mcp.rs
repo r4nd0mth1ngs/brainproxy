@@ -821,7 +821,7 @@ fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header
 
 #[test]
 fn every_request_is_checked_as_it_goes_out() {
-    let port = serve(2);
+    let port = serve(3);
     let project = tmp_project("host-wire");
     let mut m = Mcp::start(&project, &[]);
     m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
@@ -876,19 +876,25 @@ fn every_request_is_checked_as_it_goes_out() {
         let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "verbatim": true}));
         assert!(err && e["error"]["kind"] == "out_of_scope", "{raw:?}: {e}");
     }
-    // Fuzz payloads that could make a Host: a header name, or a line break into the head.
-    let (err, e) = m.call(
-        "fuzz_run",
-        json!({"file": "-", "target": url, "stdin": "GET / HTTP/1.1\r\n§x§: e.test\r\n\r\n", "payloads": ["list:Host"]}),
-    );
-    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    // A payload in a header's name: discovering header names works, and the one that makes the
+    // header a Host is refused as it goes out.
+    let names = "GET / HTTP/1.1\r\nHost: app.test\r\nX-§x§: e.test\r\n\r\n";
+    let (err, e) =
+        m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": names, "payloads": ["list:Forwarded-Host"]}));
+    assert!(!err && e["data"]["run"]["errors"] == 0, "{e}");
+    let named = "GET / HTTP/1.1\r\nHost: app.test\r\n§x§: e.test\r\n\r\n";
+    let (err, e) = m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": named, "payloads": ["list:Host"]}));
+    assert!(!err && e["data"]["run"]["errors"] == 1, "{e}");
+    // A raw line break into the head needs the flag through MCP.
     let crlf = "GET / HTTP/1.1\r\nHost: app.test\r\nX-Z: §x§\r\n\r\n";
     let (err, e) =
         m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": crlf, "payloads": ["list:a\r\nHost: e.test"]}));
-    assert!(err && e["error"]["kind"] == "invalid_input", "{e}");
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("line break"), "{e}");
     // A crawl's and an import's -H are checked as they go out too.
     let (_, e) = m.call("crawl", json!({"urls": [url], "headers": ["Host: e.test"], "max_pages": 1}));
     assert_eq!((&e["data"]["requests"], &e["data"]["errors"]), (&json!(1), &json!(1)), "{e}");
+    assert_eq!(e["data"]["out_of_scope_hosts"], json!(["e.test"]), "{e}");
     let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
         "item": [{"name": "r", "request": {"method": "GET", "header": [{"key": "Host", "value": "e.test"}], "url": url}}]});
     let (_, e) = m.call("import_postman", json!({"source": "-", "stdin": coll.to_string()}));
@@ -901,9 +907,9 @@ fn every_request_is_checked_as_it_goes_out() {
     let head = e["data"]["rows"][0][0].as_str().unwrap().to_ascii_lowercase();
     assert_eq!(head.matches("[\"host\",").count(), 1, "{head}");
     let (_, e) = m.call("history_list", json!({}));
-    // Only requests that got as far as the wire have rows (two sends, one refused, and the
-    // crawl's refused one): a refused one says so.
-    assert_eq!(e["data"]["count"], 4, "{e}");
+    // Only requests that got as far as the wire have rows (two sends, one refused, two fuzz
+    // requests, one refused, and the crawl's refused one): a refused one says so.
+    assert_eq!(e["data"]["count"], 6, "{e}");
     let refused = e["data"]["items"][0]["error"].as_str().unwrap();
     assert!(refused.contains("out of scope: Host other-tenant.test"), "{refused}");
 }
@@ -954,4 +960,57 @@ fn an_agent_overwrites_no_file_and_keeps_the_ca() {
     let (err, e) = m.call("report", json!({"kind": "markdown", "output": fresh.to_str().unwrap()}));
     assert!(!err && fresh.exists(), "{e}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn scans_check_their_base_requests_and_heads_are_read_strictly() {
+    let port = serve(4);
+    let project = tmp_project("host-scan");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let person = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .env_remove("BRAINPROXY_MCP_CALL")
+            .args(["--format", "json", "--project"])
+            .arg(&project)
+            .args(args)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    // A pipelined second request, a `\` in an absolute target, a bare LF: refused.
+    for raw in [
+        "GET /a HTTP/1.1\r\nHost: app.test\r\nConnection: keep-alive\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
+        "GET http://app.test\\@e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: app.test\r\nX: a\n\r\nHost: e.test\r\n\r\n",
+    ] {
+        let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "verbatim": true}));
+        assert!(err && e["error"]["kind"] == "out_of_scope", "{raw:?}: {e}");
+    }
+    // An API item's Host is checked before it is attacked (its baseline is refused).
+    let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [{"name": "r", "request": {"method": "GET", "header": [{"key": "Host", "value": "e.test"}], "url": format!("{url}api?q=1")}}]});
+    let file = project.with_extension("coll.json");
+    std::fs::write(&file, coll.to_string()).unwrap();
+    let (err, e) = m.call("scan_active", json!({"api": file.to_str().unwrap(), "rules": ["40012"]}));
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    // A person's row with a foreign Host isn't attacked by an agent's scan.
+    let sent = person(&["send", "--url", &url, "-H", "Host: e.test"]);
+    let id = sent["data"]["id"].as_i64().unwrap();
+    let (err, e) = m.call("scan_active", json!({"history_ids": [id], "rules": ["40012"]}));
+    assert!(!err && e["data"]["refused_hosts"] == json!(["e.test"]), "{e}");
+    assert_eq!(e["data"]["targets"], 0, "{e}");
+    // Nor is one refused as it went out, which a scan can't name either.
+    person(&["auth", "add", "p", "-H", "Host: e.test"]);
+    let (err, _) = m.call("send", json!({"url": url, "auth": "p"}));
+    assert!(err);
+    let (_, e) = m.call("query", json!({"sql": "SELECT max(id) FROM history"}));
+    let refused = e["data"]["rows"][0][0].as_i64().unwrap();
+    let (err, e) = m.call("scan_active", json!({"history_ids": [refused], "rules": ["40012"]}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("refused for the scope"), "{e}");
+    let o = person(&["scan", "active", "--history-id", &refused.to_string(), "--rules", "40012"]);
+    assert_eq!(o["error"]["kind"], "out_of_scope", "{o}");
 }

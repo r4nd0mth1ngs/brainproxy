@@ -377,6 +377,68 @@ fn a_request_target_that_isnt_a_path_is_never_sent_over_http2_and_a_listed_port_
 }
 
 #[test]
+fn an_agents_rule_that_makes_a_host_is_refused_in_the_proxy() {
+    let port = serve();
+    let env = Env::new("rule-host");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    // A line break in a head replacement is refused for anyone.
+    let crlf = [
+        "rules",
+        "add",
+        "--location",
+        "request-header",
+        "--match",
+        "^X-Trig: 1$",
+        "--replace",
+        "X-A: a\r\nHost: e.test",
+    ];
+    for vars in [&gui[..], &agent[..]] {
+        let (code, v, _) = env.run(vars, &crlf);
+        assert_ne!(code, 0);
+        assert!(v["error"]["message"].as_str().unwrap().contains("line break"), "{v}");
+    }
+    // `Zz` to `st` passes the check when it is saved (it names no host), and turns `HoZz:` into
+    // `Host:`: the proxy refuses what the agent's rule makes of the request.
+    env.ok(&agent, &["rules", "add", "--location", "request-header", "--match", "Zz", "--replace", "st"]);
+    let started = env.ok(&gui, &["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    wait_for_settings();
+    let resp = through(&listen, port, "/frag", "HoZz: e.test\r\n");
+    assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
+    wait_for(&env, "SELECT count(*) FROM history WHERE path = '/frag'", 1);
+    let error = env.rows("SELECT error FROM history WHERE path = '/frag'")[0][0].clone();
+    assert!(error.as_str().unwrap().starts_with("out of scope: Host e.test"), "{error}");
+    // Saved as a Host-header test, it is sent; so is a person's rule.
+    env.ok(&gui, &["rules", "clear"]);
+    env.ok(
+        &agent,
+        &["rules", "add", "--location", "request-header", "--match", "Zz", "--replace", "st", "--host-header-test"],
+    );
+    wait_for_settings();
+    assert!(through(&listen, port, "/flagged", "HoZz: e.test\r\n").starts_with("HTTP/1.1 200"));
+    env.ok(&gui, &["rules", "clear"]);
+    env.ok(&gui, &["rules", "add", "--location", "request-header", "--match", "Zz", "--replace", "st"]);
+    wait_for_settings();
+    assert!(through(&listen, port, "/person", "HoZz: e.test\r\n").starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn a_person_runs_a_crlf_injection_fuzz_with_a_warning() {
+    let port = serve();
+    let env = Env::new("fuzz-crlf");
+    let raw = env.project.with_extension("crlf.http");
+    std::fs::write(&raw, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-A: §x§\r\n\r\n").unwrap();
+    let target = format!("http://127.0.0.1:{port}");
+    let args = ["fuzz", "run", raw.to_str().unwrap(), "--target", &target, "-p", "list:a\r\nX-Injected: 1", "-c", "1"];
+    let data = env.ok(&[], &args);
+    assert!(data["host_warning"].as_str().unwrap().contains("line break"), "{data}");
+    let (code, v, _) = env.run(&[(MCP, "1")], &args);
+    assert_ne!(code, 0);
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+}
+
+#[test]
 fn a_person_sets_a_foreign_host_on_requests_to_come_with_a_warning() {
     let env = Env::new("host-settings");
     let profile = env.ok(&[], &["auth", "add", "p", "-H", "Host: other-tenant.test"]);
