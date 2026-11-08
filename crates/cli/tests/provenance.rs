@@ -424,6 +424,53 @@ fn an_agents_rule_that_makes_a_host_is_refused_in_the_proxy() {
 }
 
 #[test]
+fn a_row_refused_for_its_scope_is_never_evidence_nor_sent_again() {
+    let env = Env::new("refused-row");
+    // A row as a refusal on the wire leaves it: the request it refused, and here a response the
+    // passive scan finds something in.
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    let target = brainproxy_core::http::Target::from_url("http://127.0.0.1:9").unwrap();
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhello";
+    let capture = brainproxy_core::capture::Capture::new(
+        "send",
+        &target,
+        b"GET /r HTTP/1.1\r\nHost: e.test\r\n\r\n",
+        Some(resp),
+        Some(1),
+        Some("out of scope: Host e.test: refused"),
+    );
+    let id = store.record(&capture).unwrap().to_string();
+    drop(store);
+    for vars in [&[][..], &[(MCP, "1")][..]] {
+        let (code, v, _) = env.run(vars, &["findings", "add", "--title", "x", "--risk", "low", "--history-id", &id]);
+        assert_ne!(code, 0);
+        assert!(v["error"]["message"].as_str().unwrap().contains("refused for the scope"), "{v}");
+    }
+    env.ok(&[], &["findings", "list"]);
+    let finding = env.rows("SELECT id FROM findings WHERE source = 'passive' LIMIT 1")[0][0].to_string();
+    for vars in [&[][..], &[(MCP, "1")][..]] {
+        let (code, v, _) = env.run(vars, &["findings", "retest", &finding]);
+        assert_ne!(code, 0);
+        assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+    }
+    assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], 1, "nothing was sent again");
+}
+
+#[test]
+fn a_rule_saved_with_a_line_break_is_skipped_when_rules_load() {
+    let env = Env::new("rule-skip");
+    let rule = |id: u32, replace: &str| serde_json::json!({"id": id, "location": "request-header", "pattern": "^X", "replace": replace, "enabled": true});
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    store.set_setting("rules", &serde_json::json!([rule(1, "X-A: a\r\nHost: e.test"), rule(2, "Y")])).unwrap();
+    drop(store);
+    let list = env.ok(&[], &["rules", "list"]);
+    assert_eq!(list["skipped"][0]["id"], 1, "{list}");
+    assert_eq!(list["skipped"].as_array().unwrap().len(), 1, "{list}");
+    let status = env.ok(&[], &["proxy", "status"]);
+    assert_eq!((&status["rules_enabled"], &status["rules_skipped"][0]["id"]), (&1.into(), &1.into()), "{status}");
+}
+
+#[test]
 fn a_person_runs_a_crlf_injection_fuzz_with_a_warning() {
     let port = serve();
     let env = Env::new("fuzz-crlf");

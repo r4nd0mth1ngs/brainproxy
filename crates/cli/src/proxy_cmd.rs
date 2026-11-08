@@ -9,6 +9,7 @@ use brainproxy_core::authz::live::{Live, LiveOptions};
 use brainproxy_core::authz::{AuthzConfig, ANONYMOUS, DEFAULT_EXCLUDE};
 use brainproxy_core::http::{RawRequest, SendOptions, Target};
 use brainproxy_core::jobs::{is_finished, JobControl};
+use brainproxy_core::proxy::config::breaks_head;
 use brainproxy_core::proxy::config::{
     InterceptSettings, LiveAuthz, Rule, RuleLocation, Scope, TimeoutAction, AUTHZ_KEY, INTERCEPT_KEY, RULES_KEY,
     RULE_IDS, SCOPE_KEY,
@@ -1058,7 +1059,9 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "proxy_captures": captures,
                 "pending_intercepts": pending,
                 "intercept_enabled": intercept.enabled,
-                "rules_enabled": rules.iter().filter(|r| r.enabled).count(),
+                "rules_enabled": rules.iter().filter(|r| r.enabled && !breaks_head(r)).count(),
+                // Saved before line breaks in a head replacement were refused: left out.
+                "rules_skipped": skipped_rules(&rules),
                 "scope": scope,
                 "recording_last_change": changes.recent(1).first(),
                 "recording_narrowed_by_agent": narrowed,
@@ -2155,7 +2158,19 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     let mut host_warning = None;
     match cmd {
         RulesCmd::List => {
-            out.ok(json!({"rules": rules}), || serde_json::to_string_pretty(&rules).unwrap_or_default());
+            let skipped = skipped_rules(&rules);
+            let data = json!({"rules": rules, "skipped": skipped});
+            out.ok(data, || {
+                let mut text = serde_json::to_string_pretty(&rules).unwrap_or_default();
+                for s in skipped.as_array().into_iter().flatten() {
+                    text.push_str(&format!(
+                        "\nwarning: rule {} is skipped: {}",
+                        s["id"],
+                        s["reason"].as_str().unwrap_or("")
+                    ));
+                }
+                text
+            });
             return Ok(());
         }
         RulesCmd::Add { location, pattern, replace, comment, disabled, host_header_test } => {
@@ -2206,6 +2221,14 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     }
     out.ok(data, || serde_json::to_string_pretty(&rules).unwrap_or_default());
     Ok(())
+}
+
+/// The rules the proxy leaves out when it loads them (see [`breaks_head`]), with why.
+fn skipped_rules(rules: &[Rule]) -> Value {
+    let skipped = rules.iter().filter(|r| breaks_head(r)).map(|r| {
+        json!({"id": r.id, "reason": "its replacement holds a line break or NUL, which would start another header"})
+    });
+    Value::Array(skipped.collect())
 }
 
 /// Checks a request rule about to take effect for a Host the scope doesn't list that it would put

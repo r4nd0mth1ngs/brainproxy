@@ -112,6 +112,15 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         )));
     }
     let item = store.get(history_id)?;
+    // A request refused for its scope (its Host, say) is never sent again: as `scan active
+    // --history-id` refuses it.
+    if item.entry.error.as_deref().is_some_and(|e| e.starts_with("out of scope")) {
+        return Err(Error::OutOfScope(format!(
+            "finding {}'s request (history {history_id}) was refused for the scope when it was sent, so it isn't \
+             sent again",
+            a.id
+        )));
+    }
     // A method-override header names the method the application acts on.
     let overridden = request_headers(&item.request).into_iter().find_map(|(k, v)| {
         METHOD_OVERRIDES.iter().any(|h| k.eq_ignore_ascii_case(h)).then(|| v.trim().to_ascii_uppercase())
