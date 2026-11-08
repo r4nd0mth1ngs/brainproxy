@@ -1295,8 +1295,9 @@ fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
             tools.dedup();
             let actions = actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?;
             // Never one a removed rule had, of this profile or another: an old history row's
-            // `edited_by` names it.
-            let id = store.next_id(SESSION_RULE_IDS, h.rules.iter().map(|r| r.id).max().unwrap_or(0))?;
+            // `edited_by` names it. The profiles share the counter, so the floor is theirs all.
+            let floor = store.session_rule_ids_in_use()?;
+            let id = store.next_id(SESSION_RULE_IDS, floor)?;
             let rule = SessionRule {
                 id,
                 description: description.unwrap_or_default(),

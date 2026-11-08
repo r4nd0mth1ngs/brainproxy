@@ -134,6 +134,46 @@ pub(crate) fn log_setting_change(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The highest `id` of the rules in `rules`, a JSON array of them (0 for none or bad JSON).
+fn highest_id(rules: Option<&Value>) -> u32 {
+    let ids = rules.and_then(Value::as_array).into_iter().flatten().filter_map(|r| r["id"].as_u64());
+    ids.max().unwrap_or(0).min(u32::MAX as u64) as u32
+}
+
+/// The highest session rule id in use across every profile's handling.
+fn highest_session_rule_id(conn: &Connection) -> Result<u32> {
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key LIKE 'auth.handling.%'")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut max = 0;
+    for json in rows {
+        let h: Value = serde_json::from_str(&json?).unwrap_or_default();
+        max = max.max(highest_id(h.get("rules")));
+    }
+    Ok(max)
+}
+
+/// v19: starts the rule id counters at the highest ids in use (match-and-replace rules, and
+/// session rules of every profile), so a rule removed after the upgrade can't lend its id to
+/// the next one added. A counter already higher is kept.
+fn seed_rule_ids(conn: &Connection) -> Result<()> {
+    let key = format!("setting.{}", crate::proxy::config::RULES_KEY);
+    let rules: Option<String> =
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?;
+    let rules: Value = rules.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let seeds = [
+        (crate::proxy::config::RULE_IDS, highest_id(Some(&rules))),
+        (crate::session::SESSION_RULE_IDS, highest_session_rule_id(conn)?),
+    ];
+    for (key, max) in seeds.into_iter().filter(|(_, max)| *max > 0) {
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE
+             SET value = MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
+            params![key, max.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether `table` has `column`.
 pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?;
@@ -630,6 +670,7 @@ impl Store {
         }
         if version < 19 {
             add_missing_columns(&self.conn, SCHEMA_V19)?;
+            seed_rule_ids(&self.conn)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -952,6 +993,12 @@ impl Store {
             let next = last.checked_add(1).ok_or_else(|| Error::InvalidInput(format!("{key}: out of ids")))?;
             Ok((Some(next.to_string()), next))
         })
+    }
+
+    /// The highest session rule id in use, of any profile: the floor for
+    /// [`crate::session::SESSION_RULE_IDS`], which all profiles share.
+    pub fn session_rule_ids_in_use(&self) -> Result<u32> {
+        highest_session_rule_id(&self.conn)
     }
 
     /// Makes running proxies reload their settings.
@@ -1679,15 +1726,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn a_project_on_v18_gets_the_rest_of_the_provenance_columns() {
-        let dir = std::env::temp_dir().join(format!("bp-store-v18-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A project in `dir` taken back to v18, with `before` run on it first.
+    fn v18_project(dir: &Path, before: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("p.bpdb");
         let _ = std::fs::remove_file(&path);
         drop(Store::open(&path).unwrap());
-        // A v18 project, with a job and a setting from before.
         let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(before).unwrap();
         let undo: String = SCHEMA_V19
             .lines()
             .filter_map(|l| {
@@ -1698,13 +1744,20 @@ mod tests {
                 }
             })
             .collect();
+        // Nothing had a rule id counter before v19.
         conn.execute_batch(&format!(
-            "{undo} DROP TABLE setting_changes;
-             INSERT INTO jobs (kind, state) VALUES ('crawl', 'completed');
+            "{undo} DROP TABLE setting_changes; DELETE FROM meta WHERE key LIKE '%rule_ids';
              PRAGMA user_version = 18;"
         ))
         .unwrap();
-        drop(conn);
+        path
+    }
+
+    #[test]
+    fn a_project_on_v18_gets_the_rest_of_the_provenance_columns() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v18-{}", std::process::id()));
+        // A v18 project, with a job from before.
+        let path = v18_project(&dir, "INSERT INTO jobs (kind, state) VALUES ('crawl', 'completed');");
 
         let mut store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
@@ -1740,6 +1793,48 @@ mod tests {
         assert_eq!(store.next_id("test_ids", 3).unwrap(), 4);
         assert_eq!(store.next_id("test_ids", 0).unwrap(), 5);
         assert_eq!(store.next_id("test_ids", 9).unwrap(), 10);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rule_ids_from_before_v19_are_not_handed_out_again() {
+        use crate::proxy::config::{RULES_KEY, RULE_IDS};
+        use crate::session::SESSION_RULE_IDS;
+        let dir = std::env::temp_dir().join(format!("bp-store-v18-ids-{}", std::process::id()));
+        // Match-and-replace rules 1 to 3; session rules 1 and 2 of profile a, 7 of profile b.
+        let path = v18_project(
+            &dir,
+            r#"INSERT INTO meta (key, value) VALUES ('setting.rules', '[{"id":1},{"id":2},{"id":3}]'),
+                 ('auth.handling.a', '{"rules":[{"id":1},{"id":2}]}'), ('auth.handling.b', '{"rules":[{"id":7}]}');"#,
+        );
+        let mut store = Store::open(&path).unwrap();
+        // What `rules add` takes as its floor: the highest id left.
+        let floor = |s: &Store| {
+            let rules: Vec<Value> = s.setting(RULES_KEY).unwrap();
+            highest_id(Some(&Value::Array(rules)))
+        };
+        // `rules remove 3`, then add: not 3 again.
+        store.set_setting(RULES_KEY, &json!([{"id": 1}, {"id": 2}])).unwrap();
+        assert_eq!(store.next_id(RULE_IDS, floor(&store)).unwrap(), 4);
+        // `rules clear`, then add: not 1.
+        store.set_setting(RULES_KEY, &json!([])).unwrap();
+        assert_eq!(store.next_id(RULE_IDS, floor(&store)).unwrap(), 5);
+
+        // A rule added to profile a comes after b's 7, and after it once b's is removed too.
+        assert_eq!(store.session_rule_ids_in_use().unwrap(), 7);
+        assert_eq!(store.next_id(SESSION_RULE_IDS, store.session_rule_ids_in_use().unwrap()).unwrap(), 8);
+        store.meta_set("auth.handling.b", None).unwrap();
+        store.meta_set("auth.handling.a", Some(r#"{"rules":[{"id":1}]}"#)).unwrap();
+        assert_eq!(store.next_id(SESSION_RULE_IDS, store.session_rule_ids_in_use().unwrap()).unwrap(), 9);
+        drop(store);
+
+        // Seeding again keeps a counter that is already higher.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 18;").unwrap();
+        drop(conn);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.next_id(SESSION_RULE_IDS, 0).unwrap(), 10);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

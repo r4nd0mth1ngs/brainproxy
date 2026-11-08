@@ -814,3 +814,51 @@ fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header
     let (err, e) = m.call("rules_enable", json!({"id": id, "host_header_test": true}));
     assert!(!err, "{e}");
 }
+
+#[test]
+fn an_agent_overwrites_no_file_and_keeps_the_ca() {
+    let p = tmp_project("force");
+    let dir = p.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&home);
+    let home_s = home.to_str().unwrap().to_string();
+    let kept = dir.join("kept.txt");
+    std::fs::write(&kept, "A PERSON'S FILE").unwrap();
+    let mut m = Mcp::start_env(&p, &[], &[("BRAINPROXY_HOME", &home_s)]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for name in ["report", "ca_export", "ca_init", "findings_repro"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(t["annotations"]["destructiveHint"], false, "{name}");
+    }
+
+    // The CA is made when missing, and kept: a new one is refused.
+    let (err, e) = m.call("ca_init", json!({}));
+    assert!(!err, "{e}");
+    let sha = e["data"]["sha256"].clone();
+    let (err, e) = m.call("ca_init", json!({"force": true}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--force is refused through MCP"), "{e}");
+    let (_, e) = m.call("ca_init", json!({}));
+    assert_eq!(e["data"]["sha256"], sha);
+
+    // Nothing is written over a file, with --force or without it; a new file is written.
+    let path = kept.to_str().unwrap();
+    for (tool, args) in [
+        ("report", json!({"output": path, "force": true})),
+        ("ca_export", json!({"out": path, "force": true})),
+        ("report", json!({"output": path})),
+        ("ca_export", json!({"out": path})),
+    ] {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(err, "{tool} {args}: {e}");
+        if args["force"] == true {
+            assert!(e["error"]["message"].as_str().unwrap().contains("--force is refused through MCP"), "{e}");
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "A PERSON'S FILE");
+    let fresh = dir.join("fresh.md");
+    let _ = std::fs::remove_file(&fresh);
+    let (err, e) = m.call("report", json!({"kind": "markdown", "output": fresh.to_str().unwrap()}));
+    assert!(!err && fresh.exists(), "{e}");
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -238,7 +238,8 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    fragments, forms, multipart, JSON (arrays and JSON inside strings too), XML and script
    bodies, hidden form fields and secret-named attributes, passwords in URLs, JWTs, and every
    password, token, cookie and credential header the project's auth profiles hold) as
-   `[redacted]`, wherever the report quotes them, in any case and percent-, JSON-, HTML- or
+   `[redacted]`, wherever the report quotes them, in any ASCII case (an accented or other
+   non-ASCII letter must match as written) and percent-, JSON-, HTML- or
    base64-encoded (notes, write-ups, ticket links and findings added by hand included), and says how
    many places it masked; `--no-redact` keeps
    them as recorded. A signed cookie's session id (`s:ID.signature`, as Express writes
@@ -246,7 +247,11 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    are masked together. A secret nothing marks, such as a token typed into a finding's title
    or a note ("used token ..."), can't be told from other text: name it with `--mask VALUE`
    (repeatable, at least 6 characters) and it is masked like the project's own secrets,
-   everywhere the report quotes it, in every format. `findings repro` takes `--mask` too. An issue seen in more than one
+   everywhere the report quotes it, in every format: the title, the layout's company, the
+   engagement scope and filters it shows, hosts and states included. A body is cut to its
+   evidence limit only once its secrets are masked, so none is left half shown at the cut.
+   `findings repro` takes `--mask` too; `findings ticket` doesn't, since the command it
+   prints runs it again to file the ticket (see *Tickets* below). An issue seen in more than one
    request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
    first time or again, and leaves out older findings it didn't see again.
@@ -951,8 +956,10 @@ local settings (scope, engagement, CA, capabilities, ...) have no `_meta`.
 
 Project files (`.bpdb`, its `-wal`/`-shm`, and `<project>.browsers/`) are readable by
 their owner only. `query` cannot read `auth_profiles`, which holds passwords, header
-values, and session tokens; `auth show` redacts them. `report -o` and `ca export --out`
-refuse to overwrite an existing file unless given `--force`.
+values, and session tokens; `auth show` redacts them. `report -o`, `findings repro -o` and
+`ca export --out` refuse to overwrite an existing file unless given `--force`, and through MCP
+`--force` is refused for them and for `ca init`, so an agent writes new files only and keeps
+the CA.
 
 ```sh
 export BRAINPROXY_PROJECT=~/work/acme.bpdb
@@ -1011,12 +1018,14 @@ Each history entry has:
 - `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
-  the rule). A proxy started with `--auth NAME` that puts the profile's session on a request
-  adds `{"by":"gui","auth":"NAME"}` (`by`: who saved the profile last), then
-  `{"by":"mcp","auth":"NAME","session_rule":3}` for each session rule that applied and
-  `{"by":"cli","auth":"NAME","macro":"csrf"}` for each macro those rules ran (`by`: who added
-  the rule or macro, or last changed it). NULL when nothing changed it; an intercept forwarded
-  unchanged isn't an edit.
+  the rule). A proxy started with `--auth NAME` adds `{"by":"gui","auth":"NAME"}` when the
+  profile's session (its cookies, including those its macros got, headers or token) changed
+  the request (`by`: who last changed the profile), then
+  `{"by":"mcp","auth":"NAME","session_rule":3}` for each session rule that changed it (one
+  whose URL matched but that changed nothing isn't named) and
+  `{"by":"cli","auth":"NAME","macro":"csrf"}` for each macro whose values those rules put in
+  (`by`: who added the rule or macro, or last changed it). NULL when nothing changed it; an
+  intercept forwarded unchanged isn't an edit.
 - `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
   a session's own requests in those); NULL when it was the target host, for plain HTTP, and
   when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
@@ -1048,12 +1057,13 @@ dropped it itself; `edited` says whether it was forwarded with a different messa
 row names the intercept in `edited_by`. A response edited at intercept, or changed by a
 response rule, is recorded in history as the server sent it; the intercept row has the
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
-enabled it. So do auth profiles (`auth show`: `profile.origin`, who saved it last), their
-session rules and macros (`origin`, who added one or last changed it; saving them unchanged
-keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
+enabled it. So do auth profiles (`auth show`: `profile.origin`, who last changed it), their
+session rules and macros (`origin`, who added one or last changed it; saving any of them
+unchanged, as the app's edit form does, keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
 it (logged in, got an OAuth token, or the proxy or a scan that learnt its cookies). A rule id,
 match-and-replace or session rule (of any profile), is never handed out again once its rule is
-removed, so an old row's `edited_by` can't come to name another rule.
+removed (or all are cleared), so an old row's `edited_by` can't come to name another rule;
+a project from before this starts counting after the highest ids it has.
 
 The other tables say who started what wrote them, as `origin` (NULL for rows from before
 brainproxy kept it): `jobs`, `fuzz_runs`, `authz_results` (who started the run, or the proxy
@@ -1774,6 +1784,9 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
   reproduce it, its fingerprint) and the command that files it: this command again, piped
   through `jq` into `gh issue create` or Jira's REST call (run it where the project is open).
+  The project's secrets are masked, but there is no `--mask`: the printed command runs this
+  one again, so a value nothing marks (a token typed into a title) is masked by editing the
+  ticket before it is filed.
   The Jira description is a `{noformat}` block, so nothing the target sent is read as Jira
   markup. The GitHub command adds no labels, since `gh` refuses one the repository lacks;
   `labels` lists the suggested ones. Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's

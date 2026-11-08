@@ -13,7 +13,9 @@
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::automaton::Automaton;
+use aho_corasick::nfa::contiguous;
+use aho_corasick::{Anchored, Input, MatchKind};
 use regex::{Captures, Regex};
 
 use crate::scan::report::{HttpRequest, HttpResponse};
@@ -197,11 +199,84 @@ static JWT: LazyLock<Regex> =
 pub struct Redactor {
     /// Values masked so far, to find again elsewhere.
     secrets: BTreeSet<String>,
-    /// A matcher for `secrets` that reports overlapping matches, so [`Redactor::scrub`] can
-    /// merge them (ASCII case ignored); rebuilt when a secret is added.
-    matcher: Option<AhoCorasick>,
+    /// A matcher for `secrets` (ASCII case ignored); rebuilt when a secret is added.
+    matcher: Option<Matcher>,
     /// How many places a value was masked in.
     pub masked: usize,
+}
+
+/// An automaton that knows, at each place in a text, every value that ends there. Only the
+/// longest one matters to [`Redactor::scrub`]: the others lie inside it.
+#[derive(Debug)]
+struct Matcher {
+    nfa: contiguous::NFA,
+    /// The length of the longest value a match state ends, by state id (0: not worked out
+    /// yet), worked out once per state.
+    longest: Vec<usize>,
+}
+
+impl Matcher {
+    fn new(secrets: &BTreeSet<String>) -> Option<Matcher> {
+        // Standard semantics: each match state holds every value that ends there.
+        let nfa = contiguous::Builder::new()
+            .match_kind(MatchKind::Standard)
+            .ascii_case_insensitive(true)
+            .build(secrets)
+            .ok()?;
+        Some(Matcher { nfa, longest: Vec::new() })
+    }
+
+    /// The spans of `s` the values cover, those that overlap or touch merged, in order. One
+    /// pass over `s`, whatever the number of values that match at a place, skipping text no
+    /// value can start in.
+    fn spans(&mut self, s: &str) -> Vec<(usize, usize)> {
+        let nfa = &self.nfa;
+        let Ok(start) = nfa.start_state(Anchored::No) else { return Vec::new() };
+        let bytes = s.as_bytes();
+        let longest_value = nfa.max_pattern_len();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        let (mut sid, mut i, mut next_find) = (start, 0, 0);
+        while i < bytes.len() {
+            // Outside any value: the next match to end (found by the automaton's prefilter, fast)
+            // ends first of all those to come, so none starts before its end less the longest
+            // value's length.
+            if sid == start && i >= next_find {
+                match nfa.try_find(&Input::new(s).span(i..bytes.len())) {
+                    Ok(Some(m)) => {
+                        i = i.max(m.end().saturating_sub(longest_value));
+                        next_find = m.end();
+                    }
+                    Ok(None) => break,
+                    Err(_) => next_find = usize::MAX,
+                }
+            }
+            sid = nfa.next_state(Anchored::No, sid, bytes[i]);
+            i += 1;
+            if !nfa.is_match(sid) {
+                continue;
+            }
+            let at = sid.as_usize();
+            if self.longest.len() <= at {
+                self.longest.resize(at + 1, 0);
+            }
+            if self.longest[at] == 0 {
+                let lens = (0..nfa.match_len(sid)).map(|k| nfa.pattern_len(nfa.match_pattern(sid, k)));
+                self.longest[at] = lens.max().unwrap_or(0);
+            }
+            let len = self.longest[at];
+            let (mut from, end) = (i - len, i);
+            // Matches come by where they end; a longer one may start before spans already found.
+            while let Some(&(s0, e0)) = merged.last() {
+                if from > e0 {
+                    break;
+                }
+                from = from.min(s0);
+                merged.pop();
+            }
+            merged.push((from, end));
+        }
+        merged
+    }
 }
 
 fn secret_name(name: &str) -> bool {
@@ -299,9 +374,11 @@ impl Redactor {
         if v.is_empty() || v == MASK {
             return;
         }
-        // A signed cookie's session id is the secret, and a page may quote it on its own.
+        // A signed cookie's session id is the secret, and a page may quote it on its own. One
+        // learnt from traffic must be distinctive like any other (`s:session.abc` is no reason
+        // to mask the word "session" everywhere).
         if let Some(id) = unsigned_half(v) {
-            self.remember_forms(&id, true);
+            self.remember_forms(&id, known);
         }
         self.remember_forms(v, known);
     }
@@ -564,27 +641,12 @@ impl Redactor {
             return;
         }
         if self.matcher.is_none() {
-            self.matcher = AhoCorasick::builder()
-                .match_kind(MatchKind::Standard)
-                .ascii_case_insensitive(true)
-                .build(&self.secrets)
-                .ok();
+            self.matcher = Matcher::new(&self.secrets);
         }
-        let Some(m) = &self.matcher else { return };
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for found in m.find_overlapping_iter(s.as_str()) {
-            spans.push((found.start(), found.end()));
-        }
-        if spans.is_empty() {
+        let Some(m) = &mut self.matcher else { return };
+        let merged = m.spans(s);
+        if merged.is_empty() {
             return;
-        }
-        spans.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-        for (start, end) in spans {
-            match merged.last_mut() {
-                Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                _ => merged.push((start, end)),
-            }
         }
         let mut out = String::with_capacity(s.len());
         let mut at = 0;
@@ -800,6 +862,39 @@ mod tests {
         let mut s = "x Zq81kd0aa1 y 81kd0aa z".to_string();
         r.scrub(&mut s);
         assert_eq!(s, "x [redacted] y [redacted] z");
+        // A longer value that starts before spans already found takes them in.
+        let mut r = Redactor::default();
+        r.know(["bbbbbb".to_string(), "dddddd".to_string(), "abbbbbbcddddddd".to_string()]);
+        let mut s = "bbbbbb abbbbbbcddddddd".to_string();
+        r.scrub(&mut s);
+        assert_eq!((s.as_str(), r.masked), ("[redacted] [redacted]", 2));
+    }
+
+    #[test]
+    fn many_nested_values_over_long_text_are_scrubbed_in_one_pass() {
+        // 500 values each inside the next, and 64 KB that every one of them matches all over:
+        // millions of overlapping matches, of which one span is left.
+        let token: String = (0..600).map(|i| (b'a' + (i % 3) as u8) as char).collect();
+        let mut r = Redactor::default();
+        r.know((0..500).map(|n| token[..6 + n].to_string()));
+        let text = token.repeat(64 * 1024 / token.len() + 1);
+        let mut s = format!("start {text} end");
+        let started = std::time::Instant::now();
+        r.scrub(&mut s);
+        let took = started.elapsed();
+        assert_eq!(s, "start [redacted] end");
+        // Generous for a debug build on a slow machine; collecting every overlapping match took
+        // seconds.
+        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
+
+        // Text the values are seldom in is skipped, but each one in it is found.
+        let mut s = format!("{} {} {}", "xyz abd ".repeat(4096), &token[..40], "ab ".repeat(8192));
+        let started = std::time::Instant::now();
+        r.scrub(&mut s);
+        let took = started.elapsed();
+        assert_eq!(s.matches(MASK).count(), 1);
+        assert!(!s.contains("abcabc"));
+        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
     }
 
     #[test]
@@ -813,6 +908,15 @@ mod tests {
         let mut s = "session shortID9 and PROFSID7, signed s:PROFSID7.sigsigsig".to_string();
         r.scrub(&mut s);
         assert_eq!(s, "session [redacted] and [redacted], signed [redacted]");
+        // One learnt from traffic that is a plain word is masked where it stands, not everywhere;
+        // a profile's is known to be a secret, word or not.
+        let mut r = Redactor::default();
+        let mut h = vec![("Cookie".to_string(), "connect.sid=s%3Asession.abcdef".to_string())];
+        r.headers(&mut h);
+        r.know(["s:account.sigsigsig".to_string()]);
+        let mut s = "the session of an account".to_string();
+        r.scrub(&mut s);
+        assert_eq!(s, "the session of an [redacted]");
         // Any other value with a dot in it is not split.
         assert_eq!(unsigned_half("abc.def"), None);
         assert_eq!(unsigned_half("s%3AID12345.sig").as_deref(), Some("ID12345"));

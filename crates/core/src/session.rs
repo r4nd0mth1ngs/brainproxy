@@ -469,6 +469,11 @@ pub struct Prepared {
     macro_generation: u64,
     /// The rules that applied (indexes).
     rules: Vec<usize>,
+    /// Those of them that changed the request, each with the variables it put in (a signing
+    /// rule puts in none), for [`AuthSession::edits`].
+    changed_by: Vec<(usize, Vec<String>)>,
+    /// Whether the profile's own session (cookies, headers, token) changed the request.
+    session_changed: bool,
 }
 
 /// One macro step as run.
@@ -642,15 +647,20 @@ impl AuthSession {
         let macro_generation = self.handling.generation.load(Ordering::SeqCst);
         let mut request = raw.to_vec();
         let mut rules = Vec::new();
+        let mut changed_by: Vec<(usize, Vec<String>)> = Vec::new();
         if self.handling.active() {
             let url = request_url(raw, target);
             for (i, (rule, c)) in self.handling.cfg.rules.iter().zip(&self.handling.compiled).enumerate() {
                 let tool_ok = rule.tools.is_empty() || rule.tools.contains(&tool);
                 if tool_ok && c.url.as_ref().is_none_or(|u| u.matches(target, &url)) {
                     rules.push(i);
-                    request = self
-                        .run_rule(i, target, request, keep_params, keep_cookies, generation, macro_generation)
+                    let (ruled, placed) = self
+                        .run_rule(i, target, request.clone(), keep_params, keep_cookies, generation, macro_generation)
                         .await;
+                    if ruled != request {
+                        changed_by.push((i, placed));
+                    }
+                    request = ruled;
                 }
             }
         }
@@ -669,34 +679,65 @@ impl AuthSession {
             .collect();
         let mut keep: Vec<&str> = keep_cookies.to_vec();
         keep.extend(set.iter().map(String::as_str));
-        let mut request = self.apply_to(&request, &keep, target);
+        let ruled = request;
+        let mut request = self.apply_to(&ruled, &keep, target);
         for (k, v) in &headers {
             request = RawRequest::from_bytes(request).set_header(k, v).into_bytes();
         }
+        let session_changed = request != ruled;
         // Last, so nothing above moves them; the vault signs when the request is sent.
-        let signers = rules.iter().flat_map(|&i| &self.handling.cfg.rules[i].actions).filter_map(|a| match a {
-            Action::Sign { signer } => self.handling.cfg.signers.iter().find(|s| &s.name == signer),
-            _ => None,
-        });
-        for s in signers.filter(|s| s.origins.iter().any(|o| crate::sign::same_origin(o, target))) {
-            request = s.place(&request, &self.profile.name, keep_params);
+        for &i in &rules {
+            let signers = self.handling.cfg.rules[i].actions.iter().filter_map(|a| match a {
+                Action::Sign { signer } => self.handling.cfg.signers.iter().find(|s| &s.name == signer),
+                _ => None,
+            });
+            for s in signers.filter(|s| s.origins.iter().any(|o| crate::sign::same_origin(o, target))) {
+                let signed = s.place(&request, &self.profile.name, keep_params);
+                if signed != request && !changed_by.iter().any(|(r, _)| *r == i) {
+                    changed_by.push((i, Vec::new()));
+                }
+                request = signed;
+            }
         }
-        Prepared { request, generation, macro_generation, rules }
+        Prepared { request, generation, macro_generation, rules, changed_by, session_changed }
     }
 
-    /// Who answers for what [`AuthSession::prepare`] did to a request: the profile (its
-    /// cookies, headers and token), each session rule that applied, and each macro those rules
-    /// ran, with who added or last changed it. For a history row's `edited_by`.
+    /// Who answers for what [`AuthSession::prepare`] did to a request: the profile when its
+    /// cookies, headers or token changed it, each session rule that changed it, and each
+    /// macro whose values those rules put in, with who added or last changed it. A rule whose
+    /// URL matched but that changed nothing isn't named. For a history row's `edited_by`.
     pub fn edits(&self, prepared: &Prepared) -> Vec<crate::provenance::Edit> {
         use crate::provenance::Edit;
         let auth = Some(self.profile.name.clone());
-        let mut out = vec![Edit { by: self.profile.origin.clone(), auth: auth.clone(), ..Default::default() }];
-        for rule in prepared.rules.iter().filter_map(|&i| self.handling.cfg.rules.get(i)) {
+        let mut out = Vec::new();
+        if prepared.session_changed {
+            out.push(Edit { by: self.profile.origin.clone(), auth: auth.clone(), ..Default::default() });
+        }
+        for (rule, placed) in
+            prepared.changed_by.iter().filter_map(|(i, p)| Some((self.handling.cfg.rules.get(*i)?, p)))
+        {
             let session_rule = Some(rule.id);
             out.push(Edit { by: rule.origin.clone(), auth: auth.clone(), session_rule, ..Default::default() });
-            for a in &rule.actions {
-                let Action::RunMacro { name, .. } = a else { continue };
-                let Some(m) = self.handling.cfg.macros.iter().find(|m| &m.name == name) else { continue };
+            // The macro a value came from: of those the rule ran, else any that extracts it.
+            let ran: Vec<&str> = rule
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::RunMacro { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for var in placed {
+                let extracts = |m: &&Macro| m.vars().contains(&var.as_str());
+                let macros = &self.handling.cfg.macros;
+                let Some(m) = macros
+                    .iter()
+                    .filter(|m| ran.contains(&m.name.as_str()))
+                    .find(extracts)
+                    .or_else(|| macros.iter().find(extracts))
+                else {
+                    continue;
+                };
                 let e = Edit {
                     by: m.origin.clone(),
                     auth: auth.clone(),
@@ -751,8 +792,10 @@ impl AuthSession {
         keep_cookies: &[&str],
         generation: u64,
         macro_generation: u64,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, Vec<String>) {
         let rule = &self.handling.cfg.rules[i];
+        // The variables its updates put in the request.
+        let mut placed: Vec<String> = Vec::new();
         let scoped = rule.url.is_some();
         let counters = &self.handling.compiled[i].counters;
         // Variables of the macros this rule ran, with their runs.
@@ -794,7 +837,10 @@ impl AuthSession {
                     }
                 }
                 Action::Update { params } => {
-                    request = self.update_request(&request, target, params, &local, keep_params, keep_cookies, scoped);
+                    let (updated, vars) =
+                        self.update_request(&request, target, params, &local, keep_params, keep_cookies, scoped);
+                    request = updated;
+                    placed.extend(vars.into_iter().filter(|v| !placed.contains(v)).collect::<Vec<_>>());
                 }
                 Action::Login => {
                     if check_failed || !self.state.lock().unwrap().logged_in {
@@ -805,7 +851,7 @@ impl AuthSession {
                 Action::Sign { .. } => {}
             }
         }
-        request
+        (request, placed)
     }
 
     /// The macro's cached run, running it first when there is none or it went stale
@@ -891,7 +937,7 @@ impl AuthSession {
             // Parameters named like an earlier step's variable get its value too.
             let derived: Vec<(String, String)> = found.iter().map(|v| (v.clone(), v.clone())).collect();
             let runs: HashMap<String, u64> = found.iter().map(|v| (v.clone(), run)).collect();
-            raw = self.update_request(&raw, &target, &derived, &runs, &[], &[], false);
+            raw = self.update_request(&raw, &target, &derived, &runs, &[], &[], false).0;
             let head = RawRequest::from_bytes(raw.clone()).head().ok();
             let mut sr = StepRun {
                 step: i + 1,
@@ -955,6 +1001,7 @@ impl AuthSession {
     /// `scoped` says the caller's URL pattern chose this request, which lets a value go to
     /// this origin from now on; otherwise it only goes to its macro's own origins. Parameters
     /// and headers named in `keep_params`, and cookies in `keep_cookies`, stay as they are.
+    /// Also gives the variables it put in, the request changed by each.
     #[allow(clippy::too_many_arguments)]
     fn update_request(
         &self,
@@ -965,7 +1012,7 @@ impl AuthSession {
         keep_params: &[&str],
         keep_cookies: &[&str],
         scoped: bool,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, Vec<String>) {
         let vars: HashMap<String, (u64, Vec<String>)> =
             self.state.lock().unwrap().vars.iter().map(|v| (v.name.clone(), (v.run, v.home.clone()))).collect();
         let mapping: Vec<(String, String)> = if params.is_empty() {
@@ -978,6 +1025,7 @@ impl AuthSession {
         let vault = self.client.options().guard.as_ref().map(|g| &g.vault);
         let origin = target.origin();
         let mut out = raw.to_vec();
+        let mut placed = Vec::new();
         for (param, var) in mapping {
             if keep_params.iter().any(|k| k == &param) {
                 continue;
@@ -994,6 +1042,9 @@ impl AuthSession {
                 continue;
             }
             out = updated;
+            if !placed.contains(&var) {
+                placed.push(var.clone());
+            }
             if scoped {
                 if let Some(v) = vault {
                     for enc in [Enc::Raw, Enc::Form, Enc::Json] {
@@ -1009,7 +1060,7 @@ impl AuthSession {
                 }
             }
         }
-        out
+        (out, placed)
     }
 }
 
@@ -1338,6 +1389,81 @@ mod tests {
         // Another tool: no rule, the profile's header.
         let p = rt.block_on(s.prepare(Tool::Fuzz, &target, raw, &[], &[]));
         assert!(String::from_utf8(p.request).unwrap().contains("X-Csrf: «auth:t:header:X-Csrf»\r\n"));
+    }
+
+    #[test]
+    fn only_what_changed_a_request_answers_for_it() {
+        use crate::provenance::Edit;
+        let dir = std::env::temp_dir().join(format!("bp-session-edits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = crate::guard::ScopeSpec { name: None, include: vec!["a.test".into()], exclude: vec![] };
+        let opts = crate::http::SendOptions {
+            guard: Some(crate::guard::Guard::from_specs(vec![scope]).unwrap()),
+            ..Default::default()
+        };
+        let var = |name: &str| SessionVar {
+            name: name.into(),
+            value: "v1".into(),
+            run: 1,
+            origins: vec!["https://a.test".into()],
+            home: vec!["https://a.test".into()],
+        };
+        let state = crate::auth::SessionState { vars: vec![var("csrf"), var("other")], ..Default::default() };
+        let step = |var: &str| MacroStep {
+            target: "https://a.test".into(),
+            request: "GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".into(),
+            history_id: None,
+            extract: vec![Extractor { var: var.into(), from: ExtractFrom::Input, expr: var.into() }],
+        };
+        let macros = vec![
+            Macro { name: "token".into(), steps: vec![step("csrf")], origin: Some("gui".into()) },
+            Macro { name: "unused".into(), steps: vec![step("other")], origin: Some("gui".into()) },
+        ];
+        let rule = |id: u32, param: &str, var: &str, by: &str| SessionRule {
+            id,
+            description: String::new(),
+            tools: vec![],
+            url: Some("a.test".into()),
+            actions: vec![Action::Update { params: vec![(param.into(), var.into())] }],
+            invalid: None,
+            origin: Some(by.into()),
+        };
+        // Rule 1 sets the request's csrf from macro token; rule 2's URL matches, but the request
+        // has no parameter of its value's name.
+        let rules = vec![rule(1, "csrf", "csrf", "mcp"), rule(2, "absent", "other", "cli")];
+        let session = |profile: AuthProfile| {
+            AuthSession::new(&dir.join("p.bpdb"), profile, state.clone(), crate::http::Client::new(opts.clone()))
+                .unwrap()
+                .with_handling(Handling { rules: rules.clone(), macros: macros.clone(), ..Default::default() })
+                .unwrap()
+        };
+        let target = Target::from_url("https://a.test").unwrap();
+        let raw = b"GET /?csrf=old HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let auth = Some("t".to_string());
+        let rule_edit =
+            Edit { by: Some("mcp".into()), auth: auth.clone(), session_rule: Some(1), ..Default::default() };
+        let macro_edit =
+            Edit { by: Some("gui".into()), auth: auth.clone(), macro_name: Some("token".into()), ..Default::default() };
+
+        // A profile with nothing to put on: only the rule that changed it, and its macro.
+        let s = session(AuthProfile { name: "t".into(), origin: Some("cli".into()), ..Default::default() });
+        let p = rt.block_on(s.prepare(Tool::Proxy, &target, raw, &[], &[]));
+        assert_eq!(s.edits(&p), [rule_edit.clone(), macro_edit.clone()]);
+        // One that puts a header on is named first.
+        let s = session(AuthProfile {
+            name: "t".into(),
+            headers: vec![("X-Api-Key".into(), "k".into())],
+            origin: Some("cli".into()),
+            ..Default::default()
+        });
+        let p = rt.block_on(s.prepare(Tool::Proxy, &target, raw, &[], &[]));
+        let profile_edit = Edit { by: Some("cli".into()), auth, ..Default::default() };
+        assert_eq!(s.edits(&p), [profile_edit, rule_edit, macro_edit]);
+        // Nothing changed: nobody answers.
+        let s = session(AuthProfile { name: "t".into(), ..Default::default() });
+        let p = rt.block_on(s.prepare(Tool::Proxy, &target, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", &[], &[]));
+        assert_eq!(s.edits(&p), []);
     }
 
     #[test]

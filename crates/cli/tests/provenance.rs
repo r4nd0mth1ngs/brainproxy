@@ -898,8 +898,9 @@ fn the_session_a_proxy_puts_on_requests_says_who_set_it_up() {
     assert_eq!((&shown["profile"]["origin"], &shown["rules"][0]["origin"]), (&"gui".into(), &"mcp".into()));
     assert!(shown["session_origin"].is_null(), "{shown}");
 
-    // The person's proxy puts the profile's header on: the row names the profile and the agent's
-    // rule that applied, with who added each.
+    // The person's proxy puts the profile's header on: the row names the profile, with who
+    // added it. The agent's rule applied, but the request has no x to update: it isn't named.
+    // (Rules and macros that change a request are named too; see the session module's tests.)
     let started = env.ok(&gui, &["proxy", "start", "--listen", "127.0.0.1:0", "--auth", "app"]);
     let listen = started["listen"].as_str().unwrap().to_string();
     assert!(started["schema"].is_i64(), "{started}");
@@ -908,19 +909,10 @@ fn the_session_a_proxy_puts_on_requests_says_who_set_it_up() {
     let rows = env.rows("SELECT id, origin, edited_by FROM history WHERE path = '/with-session'");
     assert_eq!(rows[0][1], "gui");
     let edits: Value = serde_json::from_str(rows[0][2].as_str().unwrap()).unwrap();
-    assert_eq!(
-        edits,
-        serde_json::json!([{"by": "gui", "auth": "app"}, {"by": "mcp", "auth": "app", "session_rule": 1}])
-    );
+    assert_eq!(edits, serde_json::json!([{"by": "gui", "auth": "app"}]));
     let about = env.text(&["history", "show", &rows[0][0].to_string()]);
-    assert!(
-        about
-            .lines()
-            .next()
-            .unwrap()
-            .contains("changed by session rule 1 of auth profile app added via MCP (an agent)"),
-        "{about}"
-    );
+    let first = about.lines().next().unwrap();
+    assert!(first.contains("given the session of auth profile app") && !first.contains("session rule"), "{about}");
     // A proxy this build started is up to date.
     assert!(env.ok(&[], &["proxy", "status"])["proxy_outdated"].is_null());
     env.ok(&[], &["proxy", "stop"]);
@@ -942,6 +934,22 @@ fn the_session_a_proxy_puts_on_requests_says_who_set_it_up() {
     // Who saved which setting is logged, without its value.
     let logged = env.rows("SELECT origin FROM setting_changes WHERE key = 'rules' ORDER BY id");
     assert_eq!(logged, ["gui", "gui", "mcp"].map(|o| serde_json::json!([o])).to_vec());
+}
+
+#[test]
+fn a_profile_saved_unchanged_keeps_who_saved_it() {
+    let env = Env::new("profile-resave");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    let origin = || env.ok(&[], &["auth", "show", "app"])["profile"]["origin"].clone();
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: k"]);
+    // Re-saved as `auth show` gives it (header values masked), as the app's edit form does.
+    env.ok(&agent, &["auth", "add", "app", "-H", "X-Api-Key: ********"]);
+    assert_eq!(origin(), "gui");
+    env.ok(&agent, &["auth", "add", "app", "-H", "X-Api-Key: other"]);
+    assert_eq!(origin(), "mcp");
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: ********"]);
+    assert_eq!(origin(), "mcp");
 }
 
 #[test]

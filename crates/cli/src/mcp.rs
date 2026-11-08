@@ -78,6 +78,17 @@ pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_c
     Ok(())
 }
 
+/// Under a tool call, refuses `--force` on `command`: it would overwrite any file the server
+/// can write (for `ca init`, the person's CA). `instead` says what an agent does instead.
+pub(crate) fn check_force(force: bool, command: &str, instead: &str) -> Result<(), brainproxy_core::Error> {
+    if force && in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{command} --force is refused through MCP: {instead}"
+        )));
+    }
+    Ok(())
+}
+
 /// Under a tool call, refuses `--no-store`: whatever an agent sends goes into the project's
 /// history, so a person can see what was sent on their behalf.
 pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Error> {
@@ -242,9 +253,10 @@ const HINTS: &[(&str, Hints)] = &[
     ("proxy status", READ),
     ("proxy setup show", READ),
     ("proxy setup set", SET),
-    ("ca init", REPLACE),
-    // --out writes a file (refused if it exists unless --force).
-    ("ca export", REPLACE),
+    // Creates the CA if missing: through MCP --force (a new CA) is refused.
+    ("ca init", SET),
+    // --out writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("ca export", ADD),
     ("browser list", READ),
     // Starts a GUI browser on the machine running the server.
     ("browser open", ADD),
@@ -346,8 +358,8 @@ const HINTS: &[(&str, Hints)] = &[
     // Through MCP it can't replace the write-up findings of the same title share (--replace-text).
     ("findings add", ADD),
     ("findings remove", REPLACE),
-    // --output writes a file (refused if it exists unless --force).
-    ("report", REPLACE),
+    // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("report", ADD),
     ("diff", READ),
     ("history list", READ),
     ("history show", READ),

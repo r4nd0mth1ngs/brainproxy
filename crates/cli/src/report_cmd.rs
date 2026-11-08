@@ -26,7 +26,7 @@ pub struct ReportArgs {
     /// An existing file is kept unless --force.
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
-    /// Overwrite an existing --output file.
+    /// Overwrite an existing --output file (not through MCP).
     #[arg(long)]
     force: bool,
     /// Report title.
@@ -68,9 +68,9 @@ pub struct ReportArgs {
     /// [redacted], here and in the evidence, URLs and bodies the report quotes.
     #[arg(long)]
     no_redact: bool,
-    /// Mask VALUE too, wherever the report quotes it and in any encoding, like a session
-    /// cookie: for a secret nothing marks, such as a token typed into a title or a note (at
-    /// least 6 characters; repeatable).
+    /// Mask VALUE too, wherever the report quotes it, in any encoding and ASCII case, like a
+    /// session cookie: for a secret nothing marks, such as a token typed into a title or a
+    /// note (at least 6 characters; repeatable).
     #[arg(long, value_name = "VALUE", conflicts_with = "no_redact")]
     mask: Vec<String>,
     #[command(flatten)]
@@ -359,6 +359,8 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         KindArg::DefectDojo => ReportKind::DefectDojo,
     };
     check_mask(&a.mask)?;
+    // Any file the server can write: an agent writes new files only.
+    crate::mcp::check_force(a.force, "report", "write the report to a new file, or leave out --output")?;
     let binary = matches!(a.kind, KindArg::Pdf | KindArg::Docx);
     if binary && a.output.is_none() {
         return Err(Error::InvalidInput("a PDF or DOCX report needs --output FILE".into()));

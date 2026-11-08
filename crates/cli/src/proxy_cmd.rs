@@ -92,7 +92,7 @@ const MAX_RESTART_WAIT: f64 = 60.0;
 
 #[derive(Subcommand)]
 pub enum CaCmd {
-    /// Create the interception CA if missing (use --force to replace it).
+    /// Create the interception CA if missing (use --force to replace it; not through MCP).
     Init {
         #[arg(long)]
         force: bool,
@@ -108,7 +108,7 @@ pub enum CaCmd {
         /// Print the certificate itself rather than the JSON envelope.
         #[arg(long)]
         raw: bool,
-        /// Overwrite an existing --out file.
+        /// Overwrite an existing --out file (not through MCP).
         #[arg(long)]
         force: bool,
     },
@@ -525,6 +525,8 @@ fn fingerprint(der: &[u8]) -> String {
 pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         CaCmd::Init { force } => {
+            // Every client that trusts the person's CA would stop trusting the proxy.
+            crate::mcp::check_force(force, "ca init", "the CA is kept; a person replaces it in a terminal")?;
             if force {
                 CertAuthority::generate(&ca_dir(home))?;
             }
@@ -538,6 +540,8 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
             out.ok(data, || format!("CA: {}", info.cert_path.display()));
         }
         CaCmd::Export { der, out: path, raw, force } => {
+            // Any file the server can write: an agent writes new files only.
+            crate::mcp::check_force(force, "ca export", "write the certificate to a new file, or leave out --out")?;
             let (ca, info) = load_ca(home)?;
             let bytes = if der { ca.cert_der().to_vec() } else { ca.cert_pem().as_bytes().to_vec() };
             if let Some(path) = path {
