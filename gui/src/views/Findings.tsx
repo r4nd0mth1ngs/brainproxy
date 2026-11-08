@@ -396,7 +396,7 @@ export function FindingsView({ active }: { active: boolean }) {
                   <input
                     type="checkbox"
                     className="tree-check"
-                    aria-label={`Select every ${g.name} finding on ${g.host}`}
+                    aria-label={`Select every ${g.name} finding on ${hostsOf(g.items).join(", ")}`}
                     checked={n === ids.length}
                     ref={(el) => {
                       if (el) el.indeterminate = n > 0 && n < ids.length;
@@ -412,7 +412,7 @@ export function FindingsView({ active }: { active: boolean }) {
                     <span className={`dot-risk risk-${g.risk}`} />
                     <span className="grow ellipsis">
                       {g.name}
-                      {hosts.length > 1 && <span className="muted"> · {g.host}</span>}
+                      {hosts.length > 1 && <span className="muted"> · {hostsOf(g.items).join(", ")}</span>}
                     </span>
                     {g.alert.startsWith("manual:") &&
                       [...new Set(g.items.map((f) => addedBy(f.origin).tag))].map((t) => (

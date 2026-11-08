@@ -101,6 +101,8 @@ export function eventText(e: FindingEvent): string {
       return `Seen again after it was fixed${e.history_id != null ? ` (history #${e.history_id})` : ""}: open again`;
     case "moved":
       return `Moved from issue #${e.old} to #${e.new}`;
+    case "risk":
+      return `Risk ${said(e.old)} → ${said(e.new)}${e.history_id != null ? ` (history #${e.history_id})` : ""}`;
     case "title":
       return e.new ? `Issue renamed "${e.new}"` : "Issue title reset";
     case "removed":

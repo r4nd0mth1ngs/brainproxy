@@ -66,8 +66,8 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   so the GUI, the proxy, background jobs, and an agent share it safely.
 - The app's proxy: every place that starts the proxy (opening a project, the pill, Open
   browser, Settings, Record a login, Access's live restart) goes through `views/proxyPort.ts`,
-  which records the pid `proxy start` returned in the store's `proxy` control. With *Start the
-  proxy when a project opens* on, closing the project or the window stops the proxy with
+  which records the pid `proxy start` returned in the store's `proxy` control. Closing the
+  project or the window stops the proxy with
   `proxy stop --pid`, which stops it only if that pid is still the one running here, so one a
   shell, an agent or another container started is left alone, even if it started a moment ago. Settings moves the proxy to another port, and Access's
   live restart adds live testing to it, with one `proxy restart`, which holds the project's

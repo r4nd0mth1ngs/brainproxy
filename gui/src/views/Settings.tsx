@@ -1759,8 +1759,8 @@ function Project() {
               }
             }}
           />{" "}
-          Start the proxy when a project opens (on the port set in Settings › Proxy), and stop a proxy the app started when the
-          project closes
+          Start the proxy when a project opens (on the port set in Settings › Proxy). A proxy the app started stops when the
+          project closes either way
         </label>
       </div>
       <dl className="facts">
