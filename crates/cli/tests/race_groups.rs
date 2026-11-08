@@ -229,6 +229,72 @@ fn auth_is_applied_to_every_distinct_request() {
     }
 }
 
+#[test]
+fn auth_profile_host_header_is_not_re_checked_against_scope_under_mcp() {
+    // An MCP race with --auth and an in-scope Host succeeds: the session's prepared request (which
+    // may carry provenance markers) is not re-checked against the scope as if its Host were foreign.
+    let p = project("auth-host");
+    let (port, hits, _) = server();
+    let host = format!("127.0.0.1:{port}");
+    let a = raw(&p, "coupon", &host);
+    let b = raw(&p, "checkout", &host);
+    let (code, v) = run(&p, &["auth", "add", "app", "--header", &format!("Host: {host}")], None, false);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&p, &["send", &a, "--also", &b, "--auth=app", "--scheme=http", "--race=2"], None, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn an_http2_request_line_does_not_force_the_auth_login_onto_http2() {
+    // The race honours an HTTP/2 request line itself (single_packet opens its own connection); the
+    // --auth login still goes out over HTTP/1.1, not as an HTTP/2 preface to a login endpoint.
+    let login = TcpListener::bind("127.0.0.1:0").unwrap();
+    let login_port = login.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in login.incoming() {
+            let mut stream = stream.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let first = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            let _ = tx.send(first);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: s=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    let p = project("http2-login");
+    let (port, _, _) = server();
+    let login_url = format!("http://127.0.0.1:{login_port}/login");
+    let (code, v) = run(
+        &p,
+        &[
+            "auth",
+            "add",
+            "app",
+            "--login-url",
+            &login_url,
+            "--login-body",
+            "user={{username}}&pass={{password}}",
+            "--username",
+            "a",
+            "--password",
+            "b",
+        ],
+        None,
+        false,
+    );
+    assert_eq!(code, 0, "{v}");
+    // Primary request line says HTTP/2; the login must still go out over HTTP/1.1.
+    let primary = p.with_extension("coupon-h2.http");
+    std::fs::write(&primary, format!("GET /coupon HTTP/2\r\nHost: 127.0.0.1:{port}\r\n\r\n")).unwrap();
+    let also = raw(&p, "checkout", &format!("127.0.0.1:{port}"));
+    // The race itself (single-packet to a plain server) may fail; we only check the login request.
+    let _ = run(&p, &["send", primary.to_str().unwrap(), "--also", &also, "--auth=app", "--race=2"], None, false);
+    let login_line = rx.recv_timeout(Duration::from_secs(5)).expect("login request never arrived");
+    assert!(login_line.contains("HTTP/1.1") && login_line.contains("/login"), "login went out as {login_line:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn fd_budget_applies_to_the_total_not_the_copy_count() {

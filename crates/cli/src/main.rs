@@ -656,10 +656,10 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         check_race_count(n, group.len(), h2)?;
     }
     let guard = project_guard(project)?;
-    let mut send_opts = args.req.send_options(guard.clone());
-    if count.is_some() && h2 {
-        send_opts.http2 = true;
-    }
+    // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
+    // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
+    // non-race send) would be pushed onto HTTP/2 too.
+    let send_opts = args.req.send_options(guard.clone());
     let mut host_warning = None;
     for (req, target) in &group {
         require_in_scope(&guard, target)?;
@@ -693,10 +693,6 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
                 ),
                 None => req,
             };
-            // Session headers are checked for the whole group before the race starts too.
-            let warning =
-                mcp::check_host_header(client.options(), req.as_bytes(), &target, args.req.host_header_test, out)?;
-            host_warning = host_warning.or(warning);
             requests.push(req);
         }
         if let Some(session) = &session {

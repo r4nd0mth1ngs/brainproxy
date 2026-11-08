@@ -314,6 +314,8 @@ async fn project_delete(project: String, force: Option<bool>) -> Result<Value, S
 }
 
 fn main() {
+    // Clear any race-request staging directory a previous hard exit left behind.
+    race_files::sweep_orphans();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
