@@ -1568,8 +1568,9 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   many rows.
 - `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
   for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
-  before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent, and
-  neither is a re-login retry. The proxy then writes out every capture still queued
+  before the response arrived`; one answered "logged out" whose re-login is still running
+  keeps that answer. Requests arriving meanwhile get a 503 and aren't sent, and neither is a
+  re-login retry. The proxy then writes out every capture still queued
   (passive checks of the last ones wait for the next scan); `proxy stop` waits up to 30
   seconds for it to exit before killing it.
 - `--no-store` (`send`, `send --race`, `ws send`) keeps no content, but still writes a row:

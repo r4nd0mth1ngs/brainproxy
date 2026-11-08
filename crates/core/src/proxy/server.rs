@@ -215,6 +215,14 @@ impl Flight {
     fn claim(&self) -> bool {
         self.set.0.lock().unwrap().open.get_mut(&self.id).map(|v| v.1 = true).is_some()
     }
+
+    /// The request is answered, but its exchange is recorded later (after a re-login): should
+    /// stopping record it first, `answered` is its row, not the unanswered one.
+    fn answered(&self, answered: Capture) {
+        if let Some(v) = self.set.0.lock().unwrap().open.get_mut(&self.id) {
+            v.0 = answered;
+        }
+    }
 }
 
 impl Drop for Flight {
@@ -945,6 +953,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let mut started = Instant::now();
     let mut upstream = forward(ctx, target, &request, &method, h2).await;
     if let (Some(a), Some(p), Ok(Upstream { sent, response, .. })) = (auth, &prepared, &upstream) {
+        // A re-login can outlast stopping's wait: stopping then records this answer.
+        let ms = Some(started.elapsed().as_millis() as i64);
+        flight.answered(Capture { edited_by: edited_by.clone(), ..row(target, sent, Some(response), ms, None) });
         // Session lost or stale session values: log in again or refresh them, and
         // replay the request with the new session.
         if a.after_response(p, response).await {

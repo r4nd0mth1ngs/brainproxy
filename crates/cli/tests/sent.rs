@@ -379,6 +379,31 @@ fn a_proxy_relogin_records_the_first_exchange() {
     assert_eq!(r, serde_json::json!([["/api", 401], ["/api", 200]]).as_array().unwrap().clone());
 }
 
+/// A proxy stopped while a re-login outlasts its 3-second wait records the answer that
+/// started the re-login, not "stopped".
+#[test]
+fn a_proxy_stopped_during_a_long_relogin_keeps_the_answer() {
+    let (port, lines) = login_site(Duration::from_secs(60));
+    let p = logged_in("proxy-relogin-stop", port);
+    let home = p.parent().unwrap().join("home");
+    let home = home.to_str().unwrap();
+    let (code, v) = run(&p, &["--home", home, "proxy", "start", "--listen", "127.0.0.1:0", "--auth", "app"]);
+    assert_eq!(code, 0, "{v}");
+    let listen = v["data"]["listen"].as_str().unwrap().to_string();
+    let mut s = std::net::TcpStream::connect(&listen).unwrap();
+    write!(s, "GET http://127.0.0.1:{port}/api HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut logins = 0;
+    while logins < 2 {
+        let line = lines.recv_timeout(Duration::from_secs(20)).expect("no re-login");
+        logins += usize::from(line.starts_with("POST /login"));
+    }
+    let (code, v) = run(&p, &["--home", home, "proxy", "stop"]);
+    assert_eq!(code, 0, "{v}");
+    let r = rows(&p, "SELECT path, status, error FROM history WHERE source = 'proxy' ORDER BY id");
+    assert_eq!(r, serde_json::json!([["/api", 401, null]]).as_array().unwrap().clone());
+}
+
 /// A server that answers its first `answered` requests with a page holding a link, hands
 /// over each later one, and never answers those.
 fn answers_then_silent(answered: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
