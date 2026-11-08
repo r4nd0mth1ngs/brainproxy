@@ -69,7 +69,8 @@ joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy
 `findings remove`, since an agent can't tell a finding a person added from its own (it marks
 one `false_positive` with a note instead; the command refuses a tool call too); and
 `report-profile remove`, since a saved report layout may be a person's branding (the command
-refuses a tool call too).
+refuses a tool call too); and `scan policy remove`, since a saved scan policy may be a
+person's (the command refuses a tool call too).
 `findings_mark` takes one finding at a time: `from` (marking every finding that matches a
 file's) is refused, so an agent can't hide a set of findings in one call.
 
@@ -127,6 +128,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.
+- `scan_policy_save` under a name that is already saved (`conflict`), for the same reason: an
+  agent saves a new policy and runs `scan_active` with `policy`.
 - `report`, `findings_repro` and `ca_export` with `force`: `output` (`out`) would overwrite any
   file the server can write. An agent writes to a new file, or leaves out `output` (`out`) to
   get the report, pack or certificate in the reply.

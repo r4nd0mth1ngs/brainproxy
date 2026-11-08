@@ -114,9 +114,13 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 
 ## Differences from ZAP
 
-- **Threshold and strength:** behaviour follows ZAP's default MEDIUM alert threshold;
-  `--strength low|medium|high|insane` maps to ZAP's attack strength and keeps ZAP's
-  per-strength request budgets.
+- **Threshold and strength:** each rule's checks follow ZAP's default MEDIUM alert
+  threshold; `--strength low|medium|high|insane` maps to ZAP's attack strength and keeps
+  ZAP's per-strength request budgets. A scan policy (`scan policy save`, `scan active
+  --policy`) gives each rule its own strength, and its own threshold; that threshold is
+  applied to the confidence of the findings a rule raises (low: all, medium: medium and high,
+  high: high only) rather than changing which checks it runs. See
+  [Scan policies](MANUAL.md#scan-policies).
 - **No technology filtering:** ZAP can skip checks for technologies a site doesn't use;
   brainproxy runs every check (ZAP's default with all technologies in scope).
 - **Out-of-band checks** use brainproxy's own listener (`brainproxy oob start`, see

@@ -33,7 +33,8 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// (the browser profile holds the person's sign-ins; the command refuses a tool call too), and
 /// `findings remove` (an agent can't tell a person's finding from its own; it marks one
 /// false_positive instead; the command refuses a tool call too), `report-profile remove` (a
-/// saved layout may be a person's branding; it refuses a tool call too), and `connection
+/// saved layout may be a person's branding; it refuses a tool call too), `scan policy remove`
+/// (likewise a person's saved policy; it refuses a tool call too), and `connection
 /// review` (an agent can't approve its own changes to where traffic goes; it refuses a tool
 /// call too).
 const EXCLUDED: &[&str] = &[
@@ -46,6 +47,7 @@ const EXCLUDED: &[&str] = &[
     "browser open",
     "findings remove",
     "report-profile remove",
+    "scan policy remove",
     "connection review",
     // A person reviews what an agent drafted; an agent can't vouch for itself.
     "findings issue review",
@@ -353,6 +355,11 @@ const HINTS: &[(&str, Hints)] = &[
     ("scan sources", SET),
     // Through MCP it can only be turned off.
     ("scan prune", SET),
+    ("scan policy list", READ),
+    ("scan policy show", READ),
+    // Through MCP only under a new name (a saved policy may be a person's).
+    ("scan policy save", SET),
+    ("scan policy remove", REPLACE),
     ("findings list", READ),
     ("findings compare", READ),
     ("findings show", READ),

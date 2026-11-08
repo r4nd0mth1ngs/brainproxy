@@ -289,6 +289,7 @@ async fn scan_points(
         Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }]).unwrap();
     let cfg = ActiveConfig {
         strength,
+        tuning: Default::default(),
         concurrency: 4,
         rate: None,
         send: SendOptions { timeout: Duration::from_secs(20), guard: Some(guard), ..Default::default() },

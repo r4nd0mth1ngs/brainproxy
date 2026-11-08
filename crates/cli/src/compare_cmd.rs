@@ -233,7 +233,13 @@ pub(crate) fn scan_baseline(
     }
     let args: Vec<String> = serde_json::from_value(job["args"].clone()).unwrap_or_default();
     let mut scope = match crate::Cli::try_parse_from(std::iter::once("brainproxy".to_string()).chain(args)) {
-        Ok(crate::Cli { command: crate::Cmd::Scan(crate::scan_cmd::ScanCmd::Active(a)), .. }) => a.scope(),
+        Ok(crate::Cli { command: crate::Cmd::Scan(crate::scan_cmd::ScanCmd::Active(a)), .. }) => {
+            let mut scope = a.scope();
+            if a.policy_name().is_some() {
+                with_policy(&mut scope, &job["result"]["policy"], id, warnings);
+            }
+            scope
+        }
         // Written by another version, say: nothing is known to be covered, so nothing is "fixed".
         _ => {
             warnings.push(format!("job {id}'s arguments can't be read: nothing counts as fixed"));
@@ -244,6 +250,34 @@ pub(crate) fn scan_baseline(
     scope.end = job["finished_time"].as_str().map(str::to_string);
     let shown = json!({"kind": "scan", "job": id, "state": state, "scope": scope});
     Ok((scope, shown))
+}
+
+/// A --policy scan covered the rules and thresholds its result says it ran with (the policy may
+/// have changed since). A result without them (a scan that didn't finish) covers no ported rule.
+fn with_policy(scope: &mut ScanScope, applied: &Value, id: i64, warnings: &mut Vec<String>) {
+    let ids = |v: &Value| -> Vec<i64> { v.as_array().into_iter().flatten().filter_map(Value::as_i64).collect() };
+    let Some(threshold) = applied["threshold"].as_str().and_then(|t| serde_json::from_value(json!(t)).ok()) else {
+        warnings.push(format!(
+            "job {id}'s result doesn't say what its policy ran: no ported rule's finding counts as fixed"
+        ));
+        scope.ported_rules = false;
+        return;
+    };
+    scope.threshold = threshold;
+    scope.rule_thresholds = applied["rule_thresholds"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.parse().ok()?, serde_json::from_value(v.clone()).ok()?)))
+        .collect();
+    if !applied["rules"].is_null() {
+        scope.rules = Some(ids(&applied["rules"]));
+    }
+    for r in ids(&applied["exclude_rules"]) {
+        if !scope.exclude_rules.contains(&r) {
+            scope.exclude_rules.push(r);
+        }
+    }
 }
 
 /// An active scan job.

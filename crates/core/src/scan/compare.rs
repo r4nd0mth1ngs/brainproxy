@@ -7,15 +7,16 @@
 //!   run, matched by the identity findings are de-duplicated by (alert, method, URL without
 //!   its query, parameter).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::scan::active::Threshold;
 use crate::scan::findings_db::{fingerprint, MANUAL_SOURCE, REMOVED};
-use crate::scan::Risk;
+use crate::scan::{Confidence, Risk};
 use crate::store::Store;
 
 const FALSE_POSITIVE: &str = "false_positive";
@@ -201,6 +202,17 @@ pub struct ScanScope {
     pub ported_rules: bool,
     pub check_ids: Vec<String>,
     pub crawled: bool,
+    /// The threshold the ported rules raised findings at (a scan policy's, or `--threshold`):
+    /// a finding of lower confidence wouldn't have been raised, so it isn't covered.
+    /// `rule_thresholds` holds the rules' own.
+    #[serde(skip_serializing_if = "is_low")]
+    pub threshold: Threshold,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub rule_thresholds: BTreeMap<i64, Threshold>,
+}
+
+fn is_low(t: &Threshold) -> bool {
+    *t == Threshold::Low
 }
 
 /// How one finding relates to a scan.
@@ -222,6 +234,7 @@ pub struct Sighting<'a> {
     pub rule_id: i64,
     pub alert_ref: &'a str,
     pub url: &'a str,
+    pub confidence: &'a str,
 }
 
 impl ScanScope {
@@ -237,9 +250,11 @@ impl ScanScope {
             "active" => match f.alert_ref.strip_prefix("check:") {
                 Some(id) => self.check_ids.iter().any(|c| c == id),
                 None => {
+                    let threshold = self.rule_thresholds.get(&f.rule_id).copied().unwrap_or(self.threshold);
                     self.ported_rules
                         && self.rules.as_ref().is_none_or(|r| r.contains(&f.rule_id))
                         && !self.exclude_rules.contains(&f.rule_id)
+                        && threshold.passes(Confidence::parse(f.confidence).unwrap_or(Confidence::Low))
                 }
             },
             "passive" => self.crawled && self.rules.is_none(),
@@ -256,7 +271,15 @@ impl ScanScope {
             None if f.source == "active" && !f.alert_ref.starts_with("check:") => return false,
             None => 0,
         };
-        self.covers(&Sighting { time: "", last: "", source: &f.source, rule_id, alert_ref: &f.alert_ref, url: &f.url })
+        self.covers(&Sighting {
+            time: "",
+            last: "",
+            source: &f.source,
+            rule_id,
+            alert_ref: &f.alert_ref,
+            url: &f.url,
+            confidence: &f.confidence,
+        })
     }
 
     /// Timestamps are all the same UTC format, so they compare as text. A finding added by
@@ -299,6 +322,7 @@ pub fn compare_scan(store: &Store, scope: &ScanScope) -> Result<Comparison> {
             rule_id: r.get(12)?,
             alert_ref: &f.alert_ref,
             url: &f.url,
+            confidence: &f.confidence,
         };
         match scope.classify(&sighting) {
             Seen::New => out.new.push(f),
@@ -708,8 +732,12 @@ mod tests {
     ];
 
     fn seen(s: &ScanScope, id: i64) -> Seen {
+        seen_at(s, id, "medium")
+    }
+
+    fn seen_at(s: &ScanScope, id: i64, confidence: &str) -> Seen {
         let r = ROWS.iter().find(|r| r.0 == id).unwrap();
-        s.classify(&Sighting { time: r.1, last: r.2, source: r.3, rule_id: r.4, alert_ref: r.5, url: r.6 })
+        s.classify(&Sighting { time: r.1, last: r.2, source: r.3, rule_id: r.4, alert_ref: r.5, url: r.6, confidence })
     }
 
     fn all(s: &ScanScope) -> Vec<Seen> {
@@ -758,6 +786,13 @@ mod tests {
         assert_eq!(seen(&ScanScope { origins: None, ..scope() }, 4), Gone);
         // While a scan runs nothing is after its end.
         assert_eq!(seen(&ScanScope { end: None, ..scope() }, 7), New);
+        // A finding below the threshold its rule ran at wasn't looked for.
+        let high = ScanScope { threshold: Threshold::High, ..scope() };
+        assert_eq!([seen_at(&high, 3, "medium"), seen_at(&high, 3, "high")], [Other, Gone]);
+        let own = ScanScope { rule_thresholds: [(40018, Threshold::Medium)].into(), ..high };
+        assert_eq!([seen_at(&own, 3, "low"), seen_at(&own, 3, "medium")], [Other, Gone]);
+        // Found again, it is still seen whatever its confidence.
+        assert_eq!(seen_at(&own, 2, "low"), Still);
     }
 
     #[test]

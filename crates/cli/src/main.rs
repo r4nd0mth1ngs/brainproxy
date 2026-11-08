@@ -17,6 +17,7 @@ mod jobs_cmd;
 mod mcp;
 mod oob_cmd;
 mod output;
+mod policy_cmd;
 mod process;
 mod project_cmd;
 mod proxy_cmd;

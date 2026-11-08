@@ -10,7 +10,8 @@ use brainproxy_core::apiimport::{self, graphql, RunConfig};
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
-use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
+use brainproxy_core::scan::active::policy::Policy;
+use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget};
 use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
 use brainproxy_core::sent::Rows;
@@ -63,7 +64,8 @@ pub struct ActiveArgs {
     /// A scan depth, as the app's guided scan offers them: `quick` (--strength medium
     /// --crawl-depth 3 --crawl-max-pages 150), `standard` (--strength high --crawl-depth 5
     /// --crawl-max-pages 500 --cookies --url-path), or `thorough` (--strength insane
-    /// --crawl-depth 8 --crawl-max-pages 1500 --cookies --url-path). Flags given as well win.
+    /// --crawl-depth 8 --crawl-max-pages 1500 --cookies --url-path). Flags given as well win,
+    /// and so does --policy's strength.
     #[arg(long, value_enum, value_name = "DEPTH")]
     preset: Option<PresetArg>,
     /// Link depth for --crawl [default: 5].
@@ -97,13 +99,23 @@ pub struct ActiveArgs {
     /// SQL condition selecting history rows to attack, e.g. "host = 'app.test' AND path LIKE '/api/%'".
     #[arg(long = "where")]
     where_sql: Option<String>,
-    /// Attack strength [default: medium].
+    /// Attack strength [default: medium, or --policy's]. With --policy it applies to every rule,
+    /// those with a strength of their own too.
     #[arg(long, value_enum)]
     strength: Option<StrengthArg>,
-    /// Only these rule ids (comma-separated).
+    /// Run the active rules as this saved policy says (`scan policy save`): which run, at what
+    /// strength and threshold. --strength, --threshold, --rules and --exclude-rules win over it;
+    /// the result's `policy` says what applied.
+    #[arg(long, value_name = "NAME")]
+    policy: Option<String>,
+    /// Raise only findings of at least this confidence [default: low, every finding, or
+    /// --policy's]. With --policy it applies to every rule, those with a threshold of their own too.
+    #[arg(long, value_enum)]
+    threshold: Option<crate::policy_cmd::ThresholdArg>,
+    /// Only these rule ids (comma-separated); with --policy, these and not the policy's.
     #[arg(long, value_delimiter = ',')]
     rules: Vec<u32>,
-    /// Skip these rule ids (comma-separated).
+    /// Skip these rule ids (comma-separated); with --policy, as well as those it turns off.
     #[arg(long, value_delimiter = ',')]
     exclude_rules: Vec<u32>,
     /// Run only the declarative checks from --checks, not the ported ZAP rules.
@@ -235,6 +247,8 @@ impl ActiveArgs {
             ported_rules: !self.no_rules,
             check_ids: if !self.checks.is_empty() && by_id_only { self.check_ids.clone() } else { vec![] },
             crawled: self.crawl,
+            // With --policy, the job's result says which rules ran and at what thresholds.
+            threshold: self.threshold.map_or(Default::default(), |t| t.get()),
             ..Default::default()
         }
     }
@@ -278,8 +292,14 @@ impl ActiveArgs {
         self.preset.map(PresetArg::get)
     }
 
-    fn strength(&self) -> StrengthArg {
-        self.strength.or(self.preset().map(|p| p.strength)).unwrap_or(StrengthArg::Medium)
+    /// The saved policy named by --policy, with its name.
+    fn policy(&self, project: &Path) -> Result<Option<(String, Policy)>, Error> {
+        self.policy.as_ref().map(|n| Ok((n.clone(), Store::open(project)?.scan_policy(n)?))).transpose()
+    }
+
+    /// The policy's name: whether the scan's rules and thresholds are in its result's `policy`.
+    pub fn policy_name(&self) -> Option<&str> {
+        self.policy.as_deref()
     }
 
     fn crawl_depth(&self) -> usize {
@@ -365,6 +385,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     {
         return Err(Error::NotFound(format!("active rule {bad}")));
     }
+    // Read now, so a missing one fails before anything runs (a background job reads it again).
+    let policy = args.policy(project)?;
     for u in &args.urls {
         crate::require_in_scope(&guard, &Target::from_url(u)?)?;
     }
@@ -462,19 +484,24 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     } else {
         Some(select_targets(project, &Selection::from_args(&args), &send, &point_opts, auth.as_deref())?)
     };
+    let applied = crate::policy_cmd::apply(
+        policy.as_ref().map(|(n, p)| (n.as_str(), p)),
+        args.strength,
+        args.preset().map(|p| p.strength),
+        args.threshold,
+        &args.rules,
+        &args.exclude_rules,
+    );
+    let policy_shown = applied.shown.clone();
     let cfg = ActiveConfig {
-        strength: match args.strength() {
-            StrengthArg::Low => Strength::Low,
-            StrengthArg::Medium => Strength::Medium,
-            StrengthArg::High => Strength::High,
-            StrengthArg::Insane => Strength::Insane,
-        },
+        strength: applied.strength,
+        tuning: applied.tuning,
         concurrency: args.concurrency.clamp(1, 200),
         rate: args.rate,
         send,
         points: point_opts,
-        rules: (!args.rules.is_empty()).then(|| args.rules.clone()),
-        exclude_rules: args.exclude_rules.clone(),
+        rules: applied.rules,
+        exclude_rules: applied.exclude_rules,
         no_rules: args.no_rules,
         checks: brainproxy_core::checks::into_rules(
             checks,
@@ -627,6 +654,14 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             ..Default::default()
         })?;
         let mut v = json!(summary);
+        if let Some(p) = &policy_shown {
+            v["policy"] = p.clone();
+        }
+        if !summary.below_threshold.is_empty() {
+            v["threshold_hint"] = json!(
+                "below_threshold counts findings the rules' thresholds kept from being raised; a lower --threshold raises them."
+            );
+        }
         v["skipped_out_of_scope"] = json!(skipped);
         if skipped_methods > 0 {
             v["skipped_methods"] = json!(skipped_methods);
@@ -670,6 +705,22 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             "active scan: {} targets, {} units, {} requests, {} new findings",
             result["targets"], result["units"], result["requests"], result["new_findings"]
         )];
+        if let Some(p) = result.get("policy") {
+            let flags = p["flags_over_policy"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "));
+            lines.push(format!(
+                "  policy {}: strength {}, threshold {}{}",
+                p["name"].as_str().unwrap_or(""),
+                p["strength"].as_str().unwrap_or(""),
+                p["threshold"].as_str().unwrap_or(""),
+                flags.filter(|f| !f.is_empty()).map(|f| format!(" ({f} given as well)")).unwrap_or_default()
+            ));
+        }
+        if let Some(below) = result["below_threshold"].as_object() {
+            let n: u64 = below.values().filter_map(|v| v.as_u64()).sum();
+            lines.push(format!("  {n} findings below their rule's threshold not raised"));
+        }
         if let Some(n) = result["pruned"].as_u64() {
             lines.push(format!("  {n} attack requests that back no finding deleted from history"));
         }
@@ -964,8 +1015,10 @@ mod tests {
         }
     }
 
-    fn settings(a: &ActiveArgs) -> (StrengthArg, usize, usize, bool, bool) {
-        (a.strength(), a.crawl_depth(), a.crawl_max_pages(), a.cookies(), a.url_path())
+    fn settings(a: &ActiveArgs) -> (brainproxy_core::scan::active::Strength, usize, usize, bool, bool) {
+        let strength =
+            crate::policy_cmd::apply(None, a.strength, a.preset().map(|p| p.strength), None, &[], &[]).strength;
+        (strength, a.crawl_depth(), a.crawl_max_pages(), a.cookies(), a.url_path())
     }
 
     /// Each preset is exactly the flags the app's guided scan passed before it had presets.
@@ -986,7 +1039,7 @@ mod tests {
             assert_eq!(settings(&parse(&["--preset", preset])), settings(&parse(flags)), "{preset}");
         }
         // Without a preset, the defaults.
-        assert_eq!(settings(&parse(&[])), (StrengthArg::Medium, 5, 500, false, false));
+        assert_eq!(settings(&parse(&[])), (brainproxy_core::scan::active::Strength::Medium, 5, 500, false, false));
     }
 
     #[test]
@@ -1041,8 +1094,8 @@ mod tests {
     #[test]
     fn explicit_flags_override_the_preset() {
         let a = parse(&["--preset", "thorough", "--strength", "low", "--crawl-max-pages", "20"]);
-        assert_eq!(settings(&a), (StrengthArg::Low, 8, 20, true, true));
+        assert_eq!(settings(&a), (brainproxy_core::scan::active::Strength::Low, 8, 20, true, true));
         let a = parse(&["--crawl-depth", "1", "--preset=quick", "--cookies"]);
-        assert_eq!(settings(&a), (StrengthArg::Medium, 1, 150, true, false));
+        assert_eq!(settings(&a), (brainproxy_core::scan::active::Strength::Medium, 1, 150, true, false));
     }
 }

@@ -13,6 +13,7 @@
 //! correlating interactions the OOB listener received (see `crate::oob`).
 
 pub mod points;
+pub mod policy;
 pub mod rules;
 pub mod source_sink;
 
@@ -40,9 +41,10 @@ use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
 pub use points::{InsertionPoint, PointKind, PointOptions};
+pub use policy::{Threshold, Tuning};
 
 /// How many attacks a rule tries (ZAP attack strength).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Strength {
     Low,
@@ -225,12 +227,15 @@ struct Shared {
     rows: Rows,
     auth: Option<Arc<AuthSession>>,
     strength: Strength,
+    tuning: Tuning,
     ctl: JobControl,
     deadline: Option<Instant>,
     limiter: Option<Limiter>,
     requests: AtomicU64,
     reports: Mutex<mpsc::Sender<Report>>,
     raised: Mutex<BTreeMap<&'static str, usize>>,
+    /// Findings not raised because their confidence was below their rule's threshold.
+    below_threshold: Mutex<BTreeMap<&'static str, usize>>,
     /// Keys rules mark as done for the whole run (ZAP's knowledge base).
     once: Mutex<HashSet<String>>,
     /// Soft-404 signatures per origin: (status, body length bucket, body start).
@@ -259,6 +264,9 @@ pub struct Cx {
     base: Arc<Base>,
     point: Option<InsertionPoint>,
     shared: Arc<Shared>,
+    /// The rule's strength and threshold in this scan.
+    strength: Strength,
+    threshold: Threshold,
     /// Which session rules apply: a ported rule's (scan) or a declarative check's (checks).
     tool: Tool,
     /// The rows of this unit's requests that failed, by the request as the rule gave it: an
@@ -289,7 +297,17 @@ impl Cx {
     }
 
     pub fn strength(&self) -> Strength {
-        self.shared.strength
+        self.strength
+    }
+
+    /// Whether a finding of this confidence passes the rule's threshold; one that doesn't is
+    /// counted, not raised.
+    fn passes(&self, finding: &Finding, confidence: crate::scan::Confidence) -> bool {
+        let ok = self.threshold.passes(confidence);
+        if !ok {
+            *self.shared.below_threshold.lock().unwrap().entry(finding.def.alert_ref).or_default() += 1;
+        }
+        ok
     }
 
     /// True once the scan was asked to stop or ran out of time; rules should return.
@@ -522,6 +540,9 @@ impl Cx {
 
     /// Records a finding with the exchange that proves it.
     pub fn report(&self, finding: Finding, resp: &Response) {
+        if !self.passes(&finding, finding.confidence) {
+            return;
+        }
         *self.shared.raised.lock().unwrap().entry(finding.def.alert_ref).or_default() += 1;
         let _ = self.shared.reports.lock().unwrap().send(Report::Finding {
             target: self.base.target.clone(),
@@ -592,6 +613,10 @@ impl Cx {
         resp: Option<&Response>,
         check: Option<String>,
     ) {
+        // A callback raises the alert at its own confidence.
+        if !self.passes(&finding, finding.def.confidence) {
+            return;
+        }
         self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
         // The attack's row: the one its response came from, or the one of the attack that
         // failed. Correlating then records no second row for it.
@@ -705,7 +730,10 @@ pub fn all_rules() -> &'static [Box<dyn ActiveRule>] {
 
 #[derive(Debug, Clone)]
 pub struct ActiveConfig {
+    /// For every rule `tuning` gives no strength of its own.
     pub strength: Strength,
+    /// Thresholds, and rules' own strengths (a scan policy's; see [`policy`]).
+    pub tuning: Tuning,
     pub concurrency: usize,
     pub rate: Option<f64>,
     pub send: SendOptions,
@@ -775,6 +803,10 @@ pub struct ActiveSummary {
     pub requests: u64,
     /// Findings raised in this run, per alert ref.
     pub raised: BTreeMap<String, usize>,
+    /// Findings not raised, per alert ref, because their confidence was below their rule's
+    /// threshold (see [`policy`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub below_threshold: BTreeMap<String, usize>,
     pub new_findings: usize,
     /// Rule units that crashed (panicked) instead of finishing.
     pub errors: usize,
@@ -900,12 +932,14 @@ pub async fn run(
         rows,
         auth: cfg.auth.clone(),
         strength: cfg.strength,
+        tuning: cfg.tuning.clone(),
         ctl: ctl.clone(),
         deadline: cfg.max_duration.map(|d| started + d),
         limiter: Limiter::new(cfg.rate),
         requests: AtomicU64::new(0),
         reports: Mutex::new(tx),
         raised: Mutex::new(BTreeMap::new()),
+        below_threshold: Mutex::new(BTreeMap::new()),
         once: Mutex::new(HashSet::new()),
         not_found: tokio::sync::Mutex::new(HashMap::new()),
         oob: cfg.oob.clone(),
@@ -980,7 +1014,9 @@ pub async fn run(
                 }
             }
             let Ok(_permit) = sem.acquire().await else { return };
-            let cx = Cx { base, point, shared: shared.clone(), tool, failed: Mutex::default() };
+            let strength = shared.tuning.strength(rule.id(), shared.strength);
+            let threshold = shared.tuning.threshold(rule.id());
+            let cx = Cx { base, point, shared: shared.clone(), strength, threshold, tool, failed: Mutex::default() };
             if !cx.stopped() {
                 rule.scan(&cx).await;
             }
@@ -1004,6 +1040,8 @@ pub async fn run(
 
     let mut summary_raised: BTreeMap<String, usize> =
         shared.raised.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let below_threshold: BTreeMap<String, usize> =
+        shared.below_threshold.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let requests = shared.requests.load(Ordering::Relaxed);
     let timed_out = shared.deadline.is_some_and(|d| Instant::now() >= d);
     let oob_payloads = shared.oob_payloads.load(Ordering::Relaxed);
@@ -1058,6 +1096,7 @@ pub async fn run(
         units_done: done.load(Ordering::Relaxed) as usize,
         requests,
         raised: summary_raised,
+        below_threshold,
         new_findings,
         errors,
         check_skipped_methods,
@@ -1129,6 +1168,7 @@ mod tests {
         };
         let cfg = ActiveConfig {
             strength: Strength::Medium,
+            tuning: Default::default(),
             concurrency: 1,
             rate: None,
             send: SendOptions::default(),
@@ -1162,7 +1202,7 @@ mod tests {
         tags: &[],
     };
 
-    /// Sends three attacks; the second one backs a finding.
+    /// Sends three attacks (a fourth at insane strength); the second one backs a finding.
     struct ThreeAttacks;
 
     impl ActiveRule for ThreeAttacks {
@@ -1182,7 +1222,8 @@ mod tests {
         fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
             Box::pin(async move {
                 let host = format!("{}:{}", cx.base.target.host, cx.base.target.port);
-                for path in ["/a", "/b", "/c"] {
+                let insane = cx.strength() == Strength::Insane;
+                for path in ["/a", "/b", "/c", "/d"].into_iter().take(if insane { 4 } else { 3 }) {
                     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
                     if let Ok(resp) = cx.send(req).await {
                         if path == "/b" {
@@ -1220,6 +1261,10 @@ mod tests {
     /// Runs [`ThreeAttacks`] on a base request recorded in history; returns the base row's id,
     /// the summary, and the history rows left as (id, path).
     async fn scan_three(name: &str, prune: bool) -> (i64, ActiveSummary, Vec<(i64, String)>) {
+        scan_three_tuned(name, prune, Tuning::default()).await
+    }
+
+    async fn scan_three_tuned(name: &str, prune: bool, tuning: Tuning) -> (i64, ActiveSummary, Vec<(i64, String)>) {
         use url::Url;
         static RULE: ThreeAttacks = ThreeAttacks;
         let port = answering_server().await;
@@ -1237,6 +1282,7 @@ mod tests {
         let guard = crate::guard::Guard::from_specs(vec![scope]).unwrap();
         let cfg = ActiveConfig {
             strength: Strength::Medium,
+            tuning,
             concurrency: 1,
             rate: None,
             send: SendOptions { guard: Some(guard), ..Default::default() },
@@ -1281,5 +1327,21 @@ mod tests {
         assert_eq!((s.new_findings, s.pruned), (1, None), "{s:?}");
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(!serde_json::to_value(&s).unwrap().as_object().unwrap().contains_key("pruned"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_runs_at_its_own_strength_and_raises_only_what_passes_its_threshold() {
+        use policy::RuleTuning;
+        let own = RuleTuning { strength: Some(Strength::Insane), threshold: Some(Threshold::Medium) };
+        let tuning = Tuning { threshold: Threshold::Low, rules: [(999_998, own)].into() };
+        let (_, s, rows) = scan_three_tuned("tuned", false, tuning).await;
+        assert_eq!((s.requests, rows.len()), (4, 5), "{s:?}");
+        // Its finding is of low confidence: counted, not raised.
+        assert_eq!((s.new_findings, s.raised.len()), (0, 0), "{s:?}");
+        assert_eq!(s.below_threshold, [("999998".to_string(), 1)].into());
+        // The scan's threshold applies to a rule without its own.
+        let (_, s, _) =
+            scan_three_tuned("tuned-scan", false, Tuning { threshold: Threshold::High, ..Default::default() }).await;
+        assert_eq!((s.requests, s.new_findings, s.below_threshold["999998"]), (3, 0, 1), "{s:?}");
     }
 }
