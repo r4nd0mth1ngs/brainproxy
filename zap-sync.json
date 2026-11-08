@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/zaproxy/zap-extensions.git",
   "branch": "main",
-  "commit": "859c5151da3f671d151d1909dfcbfa538f5d9e36",
+  "commit": "f200855df5526e74c5105cf780e3e8424dec5032",
   "data_files": [
     {
       "upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml",
