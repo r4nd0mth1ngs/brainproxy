@@ -67,7 +67,9 @@ joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy
 `oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
 `project save`, since copying the project elsewhere is for the person running the server; and
 `findings remove`, since an agent can't tell a finding a person added from its own (it marks
-one `false_positive` with a note instead; the command refuses a tool call too).
+one `false_positive` with a note instead; the command refuses a tool call too); and
+`report-profile remove`, since a saved report layout may be a person's branding (the command
+refuses a tool call too).
 `findings_mark` takes one finding at a time: `from` (marking every finding that matches a
 file's) is refused, so an agent can't hide a set of findings in one call.
 
@@ -121,6 +123,11 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
   would copy any file the server can read into the project for the agent to read back; pass the
   text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
+  its company, logo and sections, may be a person's. An agent saves a new name; a person
+  replaces or removes one in the app or a terminal.
+- `findings_repro` with `force`: `output` would overwrite any file the server can write. An
+  agent writes the pack to a new file, or leaves out `output` to get it in the reply.
 - `findings_add` with `replace_text`: the description and solution findings of the same title
   share may be a person's. A different one is refused (`conflict`) without it, so an agent
   leaves them out or uses another title.

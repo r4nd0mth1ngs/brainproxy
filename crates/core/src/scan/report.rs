@@ -63,6 +63,9 @@ pub struct ReportOptions {
     pub baseline: Option<std::collections::HashMap<i64, bool>>,
     /// Mask session secrets (cookies, credentials, tokens) in everything taken from traffic.
     pub redact: bool,
+    /// With `redact`: more values to mask wherever the report quotes them, like the project's
+    /// known secrets, for a secret nothing marks (a token typed into a title or a note).
+    pub mask: Vec<String>,
     /// Which sections the report has, and its branding.
     pub layout: Layout,
     /// Print narratives nobody has reviewed yet, marked as drafts.
@@ -80,6 +83,7 @@ impl Default for ReportOptions {
             scan: None,
             baseline: None,
             redact: true,
+            mask: Vec::new(),
             layout: Layout::default(),
             drafts: false,
         }
@@ -585,6 +589,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         for (profile, state) in store.auth_list()? {
             red.know(profile.secret_values(&state));
         }
+        red.know(opts.mask.iter().cloned());
     }
     if opts.evidence {
         for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
@@ -2031,11 +2036,13 @@ fn html(r: &Report) -> String {
     s
 }
 
-/// One finding as the report shows it: its texts, redacted evidence and fingerprint.
-fn one_finding(store: &Store, id: i64, redact: bool) -> Result<(AlertGroup, Instance)> {
+/// One finding as the report shows it: its texts, redacted evidence (and the values in
+/// `mask` masked too) and fingerprint.
+fn one_finding(store: &Store, id: i64, redact: bool, mask: &[String]) -> Result<(AlertGroup, Instance)> {
     let opts = ReportOptions {
         filter: FindingFilter { ids: Some(vec![id]), state: Some("all".into()), ..Default::default() },
         redact,
+        mask: mask.to_vec(),
         max_evidence: 16 * 1024,
         drafts: false,
         ..Default::default()
@@ -2061,8 +2068,8 @@ fn excerpt(resp: &HttpResponse, evidence: &str) -> Option<String> {
 
 /// A repro pack: everything needed to see a finding again by hand or in CI, secrets masked
 /// unless `redact` is off.
-pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
-    let (g, i) = one_finding(store, id, redact)?;
+pub fn repro(store: &Store, id: i64, redact: bool, mask: &[String]) -> Result<Value> {
+    let (g, i) = one_finding(store, id, redact, mask)?;
     // An active check starts from a GET of the URL; another method or a body needs the scan
     // to start from the original request, which the pack's (attack) exchange isn't.
     let plain_get = i.method.eq_ignore_ascii_case("GET") && i.request.as_ref().is_none_or(|r| r.body.length == 0);
@@ -2116,7 +2123,7 @@ pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
 /// A finding written up for an issue tracker (github or jira): a title, a Markdown body with
 /// what it is, where, how to fix and reproduce it, and its fingerprint; secrets masked.
 pub fn ticket(store: &Store, id: i64, tracker: &str, target: Option<&str>) -> Result<Value> {
-    let (g, i) = one_finding(store, id, true)?;
+    let (g, i) = one_finding(store, id, true, &[])?;
     let title = format!("[{}] {} on {}", risk_title(&i.risk), g.name, i.host);
     let mut body = String::new();
     let _ = writeln!(
@@ -2706,6 +2713,32 @@ mod tests {
         let out = render(&bare, ReportKind::Json);
         assert!(bare.alerts.iter().flat_map(|g| &g.instances).all(|i| i.request.is_none() && i.latest.is_none()));
         assert!(secrets.iter().all(|x| !out.contains(x)));
+    }
+
+    #[test]
+    fn values_a_person_names_are_masked_everywhere() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET /a HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\nhello TYPED7TOKEN";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        // A token typed into a manual finding's title and evidence, with nothing to mark it.
+        let mut f = by_hand("IDOR with TYPED7TOKEN", vec![1]);
+        f.evidence = "used TYPED7TOKEN from the mobile app".into();
+        let id = s.finding_add(&f).unwrap();
+        let plain = build(&s, &ReportOptions::default()).unwrap();
+        assert!(render(&plain, ReportKind::Json).contains("TYPED7TOKEN"));
+
+        let mask = vec!["TYPED7TOKEN".to_string()];
+        let r = build(&s, &ReportOptions { mask: mask.clone(), ..Default::default() }).unwrap();
+        for kind in [ReportKind::Json, ReportKind::Markdown, ReportKind::Html, ReportKind::Sarif, ReportKind::Csv] {
+            assert!(!render(&r, kind).contains("TYPED7TOKEN"), "{}", kind.as_str());
+        }
+        // A PDF prints this page, and a DOCX is written from the same masked report.
+        assert!(!render_print_html(&r).contains("TYPED7TOKEN"));
+        // The repro pack takes the same list.
+        assert!(!repro(&s, id, true, &mask).unwrap().to_string().contains("TYPED7TOKEN"));
+        assert!(repro(&s, id, true, &[]).unwrap().to_string().contains("TYPED7TOKEN"));
     }
 
     #[test]

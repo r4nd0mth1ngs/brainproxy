@@ -197,8 +197,8 @@ static JWT: LazyLock<Regex> =
 pub struct Redactor {
     /// Values masked so far, to find again elsewhere.
     secrets: BTreeSet<String>,
-    /// A matcher for `secrets` (leftmost-longest, so a value that contains another is masked
-    /// whole; ASCII case ignored); rebuilt when a secret is added.
+    /// A matcher for `secrets` that reports overlapping matches, so [`Redactor::scrub`] can
+    /// merge them (ASCII case ignored); rebuilt when a secret is added.
     matcher: Option<AhoCorasick>,
     /// How many places a value was masked in.
     pub masked: usize,
@@ -276,6 +276,15 @@ fn forms(v: &str) -> Vec<String> {
     out
 }
 
+/// The value a signed cookie signs (`s:VALUE.signature`, as Express's connect.sid writes
+/// it, also percent-encoded as `s%3AVALUE.signature`), or None for any other value.
+fn unsigned_half(v: &str) -> Option<String> {
+    let decoded = percent_encoding::percent_decode_str(v.trim_matches('"')).decode_utf8_lossy().into_owned();
+    let rest = decoded.strip_prefix("s:")?;
+    let (id, sig) = rest.rsplit_once('.')?;
+    (!id.is_empty() && !sig.is_empty()).then(|| id.to_string())
+}
+
 impl Redactor {
     /// Remembers values the project already knows are secrets, such as its auth profiles'
     /// passwords and session tokens, so they are masked wherever a report quotes them.
@@ -290,6 +299,14 @@ impl Redactor {
         if v.is_empty() || v == MASK {
             return;
         }
+        // A signed cookie's session id is the secret, and a page may quote it on its own.
+        if let Some(id) = unsigned_half(v) {
+            self.remember_forms(&id, true);
+        }
+        self.remember_forms(v, known);
+    }
+
+    fn remember_forms(&mut self, v: &str, known: bool) {
         for f in forms(v) {
             let keep = if known { f.len() >= MIN_SCRUB } else { distinctive(&f) };
             // A value the mask itself holds ("redacted") would mask the masks.
@@ -539,30 +556,46 @@ impl Redactor {
         }
     }
 
-    /// Replaces every value known so far wherever it appears in `s`, in one pass.
+    /// Replaces every value known so far wherever it appears in `s`. Every match is found,
+    /// overlapping ones too, and the spans that overlap or touch are masked as one, so no
+    /// part of a second value that shares characters with the first is left in the text.
     pub fn scrub(&mut self, s: &mut String) {
         if self.secrets.is_empty() {
             return;
         }
         if self.matcher.is_none() {
             self.matcher = AhoCorasick::builder()
-                .match_kind(MatchKind::LeftmostLongest)
+                .match_kind(MatchKind::Standard)
                 .ascii_case_insensitive(true)
                 .build(&self.secrets)
                 .ok();
         }
         let Some(m) = &self.matcher else { return };
-        let mut n = 0;
-        let mut out = String::with_capacity(s.len());
-        m.replace_all_with(s, &mut out, |_, _, dst| {
-            n += 1;
-            dst.push_str(MASK);
-            true
-        });
-        if n > 0 {
-            *s = out;
-            self.masked += n;
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for found in m.find_overlapping_iter(s.as_str()) {
+            spans.push((found.start(), found.end()));
         }
+        if spans.is_empty() {
+            return;
+        }
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut at = 0;
+        for &(start, end) in &merged {
+            out.push_str(&s[at..start]);
+            out.push_str(MASK);
+            at = end;
+        }
+        out.push_str(&s[at..]);
+        *s = out;
+        self.masked += merged.len();
     }
 
     /// Scrubs a request and response the same way as [`Redactor::scrub`].
@@ -757,12 +790,32 @@ mod tests {
         for leak in ["BASICPASS1", "cookiesecret01", "PROF"] {
             assert!(!body.to_ascii_lowercase().contains(&leak.to_ascii_lowercase()), "{leak}: {body}");
         }
-        // A value inside a longer known one is masked once, whole.
+        // Two known values that overlap are masked together, and one inside another once, whole.
         let mut r = Redactor::default();
         r.know(["abcdef12".to_string(), "ef12XYZW".to_string(), "redacted".to_string()]);
         let mut s = "abcdef12XYZW and [redacted]".to_string();
         r.scrub(&mut s);
-        assert_eq!(s, "[redacted]XYZW and [redacted]");
+        assert_eq!((s.as_str(), r.masked), ("[redacted] and [redacted]", 1));
+        r.know(["Zq81kd0aa1".to_string(), "81kd0aa".to_string()]);
+        let mut s = "x Zq81kd0aa1 y 81kd0aa z".to_string();
+        r.scrub(&mut s);
+        assert_eq!(s, "x [redacted] y [redacted] z");
+    }
+
+    #[test]
+    fn a_signed_cookies_session_id_is_found_alone() {
+        // Shorter than the parts a cookie's value is split into, raw and percent-encoded, and
+        // from a profile's known cookie as well as from traffic.
+        let mut r = Redactor::default();
+        let mut h = vec![("Cookie".to_string(), "connect.sid=s%3AshortID9.c2lnbmF0dXJl".to_string())];
+        r.headers(&mut h);
+        r.know(["s:PROFSID7.sigsigsig".to_string()]);
+        let mut s = "session shortID9 and PROFSID7, signed s:PROFSID7.sigsigsig".to_string();
+        r.scrub(&mut s);
+        assert_eq!(s, "session [redacted] and [redacted], signed [redacted]");
+        // Any other value with a dot in it is not split.
+        assert_eq!(unsigned_half("abc.def"), None);
+        assert_eq!(unsigned_half("s%3AID12345.sig").as_deref(), Some("ID12345"));
     }
 
     #[test]

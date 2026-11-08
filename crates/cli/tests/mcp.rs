@@ -644,3 +644,64 @@ fn an_agent_cannot_pass_its_records_off_as_the_apps() {
         }
     }
 }
+
+#[test]
+fn an_agent_cannot_replace_a_persons_layouts_or_files() {
+    let p = tmp_project("layouts");
+    let dir = p.parent().unwrap().to_path_buf();
+    let cli = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .args(["--format", "json", "--project"])
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stdout));
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    // A person's branding, and a finding to make a repro pack of.
+    cli(&["report-profile", "save", "board", "--company", "Acme"]);
+    let added = cli(&["findings", "add", "--title", "Order IDOR", "--risk", "high", "--url", "https://app.test/o/7"]);
+    let id = added["data"]["id"].as_i64().unwrap();
+    let kept = dir.join("kept.json");
+    std::fs::write(&kept, "A PERSON'S FILE").unwrap();
+
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}")).clone();
+    assert!(tools.iter().all(|t| t["name"] != "report_profile_remove"));
+    assert_eq!(tool("findings_repro")["annotations"]["destructiveHint"], false);
+    assert_eq!(tool("report_profile_save")["annotations"]["destructiveHint"], false);
+
+    // A saved name is kept; a new one is saved.
+    let (err, e) = m.call("report_profile_save", json!({"name": "board", "company": "Evil"}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("new name"), "{e}");
+    let (err, e) = m.call("report_profile_save", json!({"name": "agent-draft", "company": "Draft"}));
+    assert!(!err, "{e}");
+    let shown = cli(&["report-profile", "show", "board"]);
+    assert_eq!(shown["data"]["layout"]["company"], "Acme", "{shown}");
+
+    // A repro pack goes to a new file, never over one.
+    let (err, e) = m.call("findings_repro", json!({"id": id, "output": kept.to_str().unwrap(), "force": true}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--force"), "{e}");
+    let (err, e) = m.call("findings_repro", json!({"id": id, "output": kept.to_str().unwrap()}));
+    assert!(err, "{e}");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "A PERSON'S FILE");
+    let fresh = dir.join("fresh.json");
+    let _ = std::fs::remove_file(&fresh);
+    let (err, e) = m.call("findings_repro", json!({"id": id, "output": fresh.to_str().unwrap()}));
+    assert!(!err && fresh.exists(), "{e}");
+
+    // `report-profile remove` isn't a tool, and a tool call's command refuses it too.
+    let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["report-profile", "remove", "board"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("refused through MCP"));
+    cli(&["report-profile", "show", "board"]);
+}

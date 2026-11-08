@@ -167,9 +167,13 @@ pub enum FindingsCmd {
         /// Quote cookies, credentials and tokens as recorded.
         #[arg(long)]
         no_redact: bool,
+        /// Mask VALUE too, as `report --mask` does (repeatable).
+        #[arg(long, value_name = "VALUE", conflicts_with = "no_redact")]
+        mask: Vec<String>,
         /// Write the pack to FILE (JSON).
         #[arg(short, long, value_name = "FILE")]
         output: Option<std::path::PathBuf>,
+        /// Overwrite an existing --output file (not through MCP).
         #[arg(long)]
         force: bool,
     },
@@ -672,9 +676,17 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     if let FindingsCmd::Retest(args) = cmd {
         return crate::retest_cmd::retest(project, args, out);
     }
-    if let FindingsCmd::Repro { id, no_redact, output, force } = &cmd {
+    if let FindingsCmd::Repro { id, no_redact, mask, output, force } = &cmd {
+        // Any file the server can write: an agent writes new files only.
+        if *force && crate::mcp::in_tool_call() {
+            return Err(Error::InvalidInput(
+                "findings repro --force is refused through MCP: write the pack to a new file, or leave out --output"
+                    .into(),
+            ));
+        }
+        crate::report_cmd::check_mask(mask)?;
         let store = Store::open(project)?;
-        let pack = brainproxy_core::scan::report::repro(&store, *id, !no_redact)?;
+        let pack = brainproxy_core::scan::report::repro(&store, *id, !no_redact, mask)?;
         match output {
             Some(path) => {
                 let text = serde_json::to_string_pretty(&pack).unwrap_or_default() + "\n";

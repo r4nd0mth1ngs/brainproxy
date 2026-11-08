@@ -68,6 +68,11 @@ pub struct ReportArgs {
     /// [redacted], here and in the evidence, URLs and bodies the report quotes.
     #[arg(long)]
     no_redact: bool,
+    /// Mask VALUE too, wherever the report quotes it and in any encoding, like a session
+    /// cookie: for a secret nothing marks, such as a token typed into a title or a note (at
+    /// least 6 characters; repeatable).
+    #[arg(long, value_name = "VALUE", conflicts_with = "no_redact")]
+    mask: Vec<String>,
     #[command(flatten)]
     layout: LayoutFlags,
     /// Start from this saved layout (`report-profile save`); the flags above override it.
@@ -226,11 +231,10 @@ pub enum ProfileCmd {
     /// Every saved layout.
     List,
     /// One saved layout.
-    Show {
-        name: String,
-    },
-    /// Save a layout under NAME (replacing one of that name), from these flags, on top of
-    /// --from's when given (a saved logo is kept unless --logo replaces or clears it).
+    Show { name: String },
+    /// Save a layout under NAME (replacing one of that name; through MCP only a new name),
+    /// from these flags, on top of --from's when given (a saved logo is kept unless --logo
+    /// replaces or clears it).
     Save {
         name: String,
         #[arg(long, value_name = "PROFILE")]
@@ -238,9 +242,8 @@ pub enum ProfileCmd {
         #[command(flatten)]
         layout: LayoutFlags,
     },
-    Remove {
-        name: String,
-    },
+    /// Remove a saved layout; a person does this, not through MCP.
+    Remove { name: String },
 }
 
 /// `report-profile`: saved report layouts.
@@ -279,10 +282,25 @@ pub fn profile(project: &Path, cmd: ProfileCmd, out: &Out) -> Result<(), Error> 
                 None => Layout::default(),
             };
             let l = base.overlay(&layout.args()?);
-            store.report_profile_save(&name, &l)?;
+            // A saved layout may be a person's branding: an agent adds new ones only.
+            let replace = !crate::mcp::in_tool_call();
+            store.report_profile_save(&name, &l, replace).map_err(|e| match e {
+                Error::Conflict(_) if !replace => Error::Conflict(format!(
+                    "report profile {name:?} exists; through MCP a profile is saved under a new name, and a person \
+                     replaces or removes one in the app or a terminal"
+                )),
+                e => e,
+            })?;
             out.ok(json!({"name": name, "layout": shown(&l)}), || format!("saved report profile {name}"));
         }
         ProfileCmd::Remove { name } => {
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "report-profile remove is refused through MCP: a saved layout may be a person's; save a new \
+                     name instead"
+                        .into(),
+                ));
+            }
             store.report_profile_remove(&name)?;
             out.ok(json!({"name": name, "removed": true}), || format!("removed report profile {name}"));
         }
@@ -319,6 +337,14 @@ impl RiskArg {
     }
 }
 
+/// Refuses a `--mask` value too short to look for: it would mask that text in every word.
+pub(crate) fn check_mask(mask: &[String]) -> Result<(), Error> {
+    match mask.iter().find(|v| v.trim().chars().count() < 6) {
+        Some(v) => Err(Error::InvalidInput(format!("--mask {v:?}: a value to mask has at least 6 characters"))),
+        None => Ok(()),
+    }
+}
+
 pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
     // Like `findings`, reflect everything captured so far.
@@ -332,6 +358,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         KindArg::Junit => ReportKind::Junit,
         KindArg::DefectDojo => ReportKind::DefectDojo,
     };
+    check_mask(&a.mask)?;
     let binary = matches!(a.kind, KindArg::Pdf | KindArg::Docx);
     if binary && a.output.is_none() {
         return Err(Error::InvalidInput("a PDF or DOCX report needs --output FILE".into()));
@@ -383,6 +410,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         scan: a.scan,
         baseline,
         redact: !a.no_redact,
+        mask: a.mask,
         layout,
         drafts: a.drafts,
     };

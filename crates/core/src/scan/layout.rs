@@ -268,7 +268,9 @@ pub fn logo_data_uri(bytes: &[u8]) -> Result<String> {
 }
 
 impl Store {
-    pub fn report_profile_save(&self, name: &str, layout: &Layout) -> Result<()> {
+    /// Saves a layout under `name`; one of that name is replaced when `replace`, and is
+    /// otherwise a conflict.
+    pub fn report_profile_save(&self, name: &str, layout: &Layout, replace: bool) -> Result<()> {
         let name = name.trim();
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidInput("a profile name has 1 to 64 characters".into()));
@@ -279,6 +281,16 @@ impl Store {
         }
         layout.validate()?;
         let json = serde_json::to_string(layout).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        if !replace {
+            let added = self.conn.execute(
+                "INSERT INTO report_profiles (name, layout) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
+                params![name, json],
+            )?;
+            if added == 0 {
+                return Err(Error::Conflict(format!("report profile {name:?} exists")));
+            }
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO report_profiles (name, layout) VALUES (?1, ?2)
              ON CONFLICT(name) DO UPDATE SET layout = excluded.layout,
@@ -395,11 +407,18 @@ mod tests {
     fn profiles_and_cvss_are_kept() {
         let mut s = Store::open_in_memory().unwrap();
         let l = Layout { preset: Preset::Executive, company: Some("Acme".into()), ..Default::default() };
-        s.report_profile_save("board", &l).unwrap();
+        s.report_profile_save("board", &l, true).unwrap();
+        // Without replace, a new name is saved and an existing one is kept.
+        let other = Layout { company: Some("Other".into()), ..Default::default() };
+        assert!(matches!(s.report_profile_save("board", &other, false), Err(Error::Conflict(_))));
         assert_eq!(s.report_profile("board").unwrap(), l);
-        assert_eq!(s.report_profiles().unwrap().len(), 1);
-        assert!(s.report_profile_save("bad", &Layout { accent: Some("x".into()), ..Default::default() }).is_err());
-        assert!(s.report_profile_save("-x", &Layout::default()).is_err());
+        s.report_profile_save("board2", &other, false).unwrap();
+        assert_eq!(s.report_profile("board").unwrap(), l);
+        assert_eq!(s.report_profiles().unwrap().len(), 2);
+        assert!(s
+            .report_profile_save("bad", &Layout { accent: Some("x".into()), ..Default::default() }, true)
+            .is_err());
+        assert!(s.report_profile_save("-x", &Layout::default(), true).is_err());
         s.report_profile_remove("board").unwrap();
         assert!(matches!(s.report_profile("board"), Err(Error::NotFound(_))));
         s.conn.execute("INSERT INTO issues (alert_ref, host) VALUES ('x', 'a.test')", []).unwrap();
