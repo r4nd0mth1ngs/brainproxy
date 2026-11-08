@@ -1055,7 +1055,8 @@ session rules and macros (`origin`, who added one or last changed it; saving the
 keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
 it (logged in, got an OAuth token, or the proxy or a scan that learnt its cookies). A rule id,
 match-and-replace or session rule (of any profile), is never handed out again once its rule is
-removed, so an old row's `edited_by` can't come to name another rule.
+removed (or all are cleared), so an old row's `edited_by` can't come to name another rule;
+a project from before this starts counting after the highest ids it has.
 
 The other tables say who started what wrote them, as `origin` (NULL for rows from before
 brainproxy kept it): `jobs`, `fuzz_runs`, `authz_results` (who started the run, or the proxy
