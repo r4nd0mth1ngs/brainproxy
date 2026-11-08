@@ -369,25 +369,7 @@ struct CodecArgs {
     raw: bool,
 }
 
-/// The stack every command runs on. A main thread's is 1 MiB on Windows (8 MiB on Linux and
-/// macOS), and a debug build's clap parsing of a stored scan's arguments (`findings compare
-/// --scan`, a finished scan's observations) deep in a command overflowed it there.
-const STACK: usize = 8 << 20;
-
 fn main() {
-    let cli = std::thread::Builder::new().name("main".into()).stack_size(STACK).spawn(cli_main);
-    match cli.map(|t| t.join()) {
-        Ok(Ok(())) => {}
-        // A panic has printed its message already.
-        Ok(Err(_)) => std::process::exit(101),
-        Err(e) => {
-            eprintln!("brainproxy: can't start: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn cli_main() {
     let argv: Vec<String> = std::env::args().collect();
     // A Postman script signer's run, in a process of its own (see sign_script). Not a
     // command: nothing lists it, and it speaks JSON on stdin and stdout only.
@@ -399,6 +381,25 @@ fn cli_main() {
     }
     // A last-byte race opens a connection per request; don't stop at a low default soft limit.
     brainproxy_core::race::raise_fd_limit();
+    // The command runs on a thread of a known stack size, not the main thread's, which the
+    // platform sets: 1 MiB on Windows, too little for clap's parser of every command once a
+    // command parses the command line again (`findings compare --scan` reads a scan's).
+    let ran = std::thread::Builder::new().name("main".into()).stack_size(STACK).spawn(move || cli_main(argv));
+    match ran.map(|t| t.join()) {
+        Ok(Ok(())) => {}
+        // The panic was printed already; exit as Rust does for one on the main thread.
+        Ok(Err(_)) => std::process::exit(101),
+        Err(e) => {
+            eprintln!("brainproxy: can't start: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The stack the command runs with: as much as Linux gives a main thread.
+const STACK: usize = 8 << 20;
+
+fn cli_main(argv: Vec<String>) {
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(e) => {
