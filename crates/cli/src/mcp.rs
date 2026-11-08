@@ -158,7 +158,7 @@ pub(crate) fn sent_host_warning<'a>(
     if early.is_some() {
         return early;
     }
-    let host = clients.into_iter().find_map(|c| c.foreign_hosts().into_iter().next())?;
+    let host = clients.into_iter().find_map(|c| c.first_foreign_host())?;
     let warning = format!(
         "the Host names {host}, which the scope doesn't list: a shared front end may send the request to that site"
     );

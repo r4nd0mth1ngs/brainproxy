@@ -156,6 +156,10 @@ pub struct Rule {
     /// request it changes records this in its history row's `edited_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Added (or last enabled) with `--host-header-test`: a Host it puts in a request is meant,
+    /// so the proxy sends it even when an agent added the rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_header_test: bool,
 }
 
 fn yes() -> bool {
@@ -166,6 +170,8 @@ fn yes() -> bool {
 pub struct CompiledRule {
     pub id: u32,
     pub origin: Option<String>,
+    /// See [`Rule::host_header_test`].
+    pub host_header_test: bool,
     location: RuleLocation,
     text: Option<Regex>,
     bytes: Option<BytesRegex>,
@@ -175,6 +181,13 @@ pub struct CompiledRule {
 /// Checks a rule's pattern whether or not it is enabled: a bad one saved disabled would
 /// stop the proxy loading any settings once enabled.
 pub fn validate_rule(rule: &Rule) -> Result<()> {
+    // A line break in a request line or header would start another header (a Host, say).
+    let head = matches!(rule.location, RuleLocation::RequestLine | RuleLocation::RequestHeader);
+    if head && rule.replace.contains(['\r', '\n', '\0']) {
+        return Err(Error::InvalidInput(
+            "a request-line or request-header replacement can't hold a line break or NUL".into(),
+        ));
+    }
     compile_rules(std::slice::from_ref(&Rule { enabled: true, ..rule.clone() })).map(|_| ())
 }
 
@@ -188,6 +201,7 @@ pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
             Ok(CompiledRule {
                 id: r.id,
                 origin: r.origin.clone(),
+                host_header_test: r.host_header_test,
                 location: r.location,
                 text: if body || r.pattern.is_empty() { None } else { Some(Regex::new(&r.pattern).map_err(bad)?) },
                 bytes: if body && !r.pattern.is_empty() {
@@ -485,7 +499,19 @@ mod tests {
             enabled: true,
             comment: None,
             origin: None,
+            host_header_test: false,
         }
+    }
+
+    #[test]
+    fn a_head_replacement_cant_hold_a_line_break() {
+        for loc in [RuleLocation::RequestLine, RuleLocation::RequestHeader] {
+            for bad in ["X-A: a\r\nHost: e.test", "a\nb", "a\0b"] {
+                assert!(validate_rule(&rule(1, loc, "^X", bad)).is_err(), "{bad:?}");
+            }
+        }
+        // A body can hold one.
+        validate_rule(&rule(1, RuleLocation::RequestBody, "x", "a\r\nb")).unwrap();
     }
 
     #[test]

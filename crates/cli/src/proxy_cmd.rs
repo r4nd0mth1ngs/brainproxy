@@ -2167,6 +2167,7 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
                 enabled: !disabled,
                 comment,
                 origin: Some(brainproxy_core::provenance::origin().to_string()),
+                host_header_test,
             };
             brainproxy_core::proxy::config::validate_rule(&rule)?;
             // Never one a removed rule had: an old history row's `edited_by` names it.
@@ -2188,6 +2189,7 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             if !rules[i].enabled {
                 host_warning = check_rule_host(&store, &rules[i], host_header_test, out)?;
                 rules[i].origin = Some(brainproxy_core::provenance::origin().to_string());
+                rules[i].host_header_test = host_header_test;
             }
             rules[i].enabled = true;
         }

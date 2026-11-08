@@ -169,39 +169,51 @@ outside the scope. Host-header injection tests need such a request, so it isn't 
 Every request is checked as it goes on the wire, after an auth profile's session, its values
 and signers have been applied: a host it names that isn't the target's and isn't listed by name
 in the engagement scope (on the target's port, or with no port) is foreign. So is a request
-target other than a path, `*` or a URL naming a listed host, a request line that isn't three
-tokens separated by single spaces, and a bare CR in the head. `send` (races too), `ws send` and
-`fuzz run` warn about a foreign host in the output's `host_warning`, and on stderr in text mode.
-A payload position in the Host header or in a header's name counts as one.
+target other than a path, `*` or a URL naming a listed host (a URL holding a `\` counts, since
+servers read it differently), a request line that isn't three tokens separated by single
+spaces (a space in the path or an HTTP/0.9 line counts too), a bare CR or LF in the head, and a
+second request after the body its framing (Content-Length or chunked) says. `send` (races too)
+and `ws send` warn about a foreign host in the output's `host_warning`, and on stderr in text
+mode; so does `fuzz run` for its template.
 
 Through MCP a request with a foreign host is refused (`out_of_scope`) unless the command says
-the test is meant with `--host-header-test` (`send`, `fuzz run`, `ws send`, and `auth login`,
-`auth status` and `auth macro run` for a profile's own requests), so the intent is on record. One
-refused before it is written to history leaves no row; one refused on the wire, after a session
-added the Host, keeps its row, with the refusal as its error. A crawl's or an import's `-H Host`
-or a collection's Host header is refused the same way, request by request. Settings that put a
-Host on requests still to come are checked when they are saved too: an auth profile's `--header`
-or `--token-header`, its login request and `--login-header` (the login URL's own host is fine), a
-macro's steps (`auth macro add`), and a proxy rule (`rules add`, or `rules enable` of a disabled
-one) whose replacement writes a Host line or an absolute URL, rewrites the Host of a request to a
-host the engagement lists, or copies a header's name or the request target from the request
-(`$1`). A rule can match anything, so that check is best effort; the proxy sends what a rule makes
-of a request unchecked. Session rules and signers can't set the Host at all. Saving a setting
+the test is meant with `--host-header-test` (`send`, `fuzz run`, `ws send`, `scan active` for its
+base requests, and `auth login`, `auth status` and `auth macro run` for a profile's own
+requests), so the intent is on record. One refused before it is written to history leaves no
+row; one refused on the wire (a fuzz payload that makes a header a Host, a Host a session added)
+keeps its row, with the refusal as its error, and a scan never picks such a row or takes it as
+`--history-id`. A crawl's or an import's `-H Host` or a collection's Host header is refused the
+same way, request by request, and their summaries list the host in `out_of_scope_hosts`.
+`scan active` checks its base requests (URLs, API items, recorded rows, a session's) the same
+way and lists the hosts of those it doesn't attack in `refused_hosts`; a rule's own Host is its
+test (below). A fuzz payload with a raw line break that goes into the head unencoded (a
+CRLF-injection test) needs `--host-header-test` through MCP, as it can start a Host header.
+
+Settings that put a Host on requests still to come are checked when they are saved too: an auth
+profile's `--header` or `--token-header`, its login request and `--login-header` (the login
+URL's own host is fine), a macro's steps (`auth macro add`), and a proxy rule (`rules add`, or
+`rules enable` of a disabled one) whose replacement writes a Host line or an absolute URL,
+rewrites the Host of a request to a host the engagement lists, or copies a header's name or the
+request target from the request (`$1`). A rule can match anything, so that check is best effort;
+the proxy also compares each request's foreign hosts before and after the rules, and refuses one
+an agent's rule brought in (a 502, and a row saying so) unless the rule was added or enabled
+with `--host-header-test`. Session rules and signers can't set the Host at all. Saving a setting
 again with the Host it already had isn't checked again; an edited request forwarded with
 `intercept forward` is checked for hosts the edit brings in. A person on the command line or in
 the app is warned, never refused.
 
 For everyone: a header name or value given as input (`-H`, an auth profile's headers, a
-collection's) can't hold a CR, LF or NUL, which would start another header; a `-H Host` takes the
-place of the target's Host rather than adding a second; a fuzz payload with a raw line break is
-refused where it would go into the head unencoded; and a request sent over HTTP/2 must have a
-path, `*` or a URL as its target, and a Host with no user part, so nothing runs into the
-`:authority`.
+collection's) can't hold a CR, LF or NUL, which would start another header, and neither can a
+proxy rule's request-line or request-header replacement, or a value a session fills into a
+request's head (a token or cookie learned from a reply, a macro's value): such a request isn't
+sent. A `-H Host` takes the place of the target's Host rather than adding a second, and a request
+sent over HTTP/2 must have a path, `*` or a URL as its target, and a Host with no user part, so
+nothing runs into the `:authority`.
 
-Not checked: active scan rules and check templates that put a host of their own in the Host
-header (Cloud Metadata names the metadata service, for one; `scan active --inject-header Host`
-puts payloads there), which are Host-header tests by nature and connect to the scanned in-scope
-host; requests sent again as they were recorded (`findings retest`); and a proxied client's own
+Not checked: what active scan rules and check templates put in the Host header themselves
+(Cloud Metadata names the metadata service, for one; `scan active --inject-header Host` puts
+payloads there), which are Host-header tests by nature and connect to the scanned in-scope host;
+requests sent again as they were recorded (`findings retest`); and a proxied client's own
 requests.
 
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
