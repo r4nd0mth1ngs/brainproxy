@@ -388,7 +388,9 @@ fn main() {
                 e.exit();
             }
             let out = Out::new(Format::sniff(&argv), argv.get(1).cloned().unwrap_or_default());
-            if out.json() {
+            // `mcp serve` owns stdout for JSON-RPC, so its usage errors go to stderr too.
+            let mcp_serve = argv.windows(2).any(|w| w[0] == "mcp" && w[1] == "serve");
+            if out.json() && !mcp_serve {
                 out.error("usage", e.render().to_string().trim());
             } else {
                 let _ = e.print();
@@ -396,7 +398,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let out = Out::new(cli.format.resolve(), command_name(&cli.command));
+    // `mcp serve` owns stdout for JSON-RPC: its own error goes to stderr, never as an envelope.
+    let format = if matches!(cli.command, Cmd::Mcp(_)) { Format::Text } else { cli.format.resolve() };
+    let out = Out::new(format, command_name(&cli.command));
     if let Err(e) = run(cli, &out) {
         out.error(e.kind(), &e.to_string());
         std::process::exit(e.exit_code());

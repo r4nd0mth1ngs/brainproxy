@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 
 struct Mcp {
     child: Child,
-    stdin: ChildStdin,
+    /// None once [`Mcp::hang_up`] closed it.
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
 }
@@ -30,14 +31,30 @@ impl Mcp {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let stdin = child.stdin.take().unwrap();
+        let stdin = child.stdin.take();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Mcp { child, stdin, stdout, next_id: 0 }
     }
 
     fn send_line(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").unwrap();
-        self.stdin.flush().unwrap();
+        self.send_bytes(format!("{line}\n").as_bytes());
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) {
+        let stdin = self.stdin.as_mut().expect("stdin is closed");
+        stdin.write_all(bytes).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Closes the server's stdin and returns every line it writes before exiting, with its
+    /// exit status.
+    fn hang_up(&mut self) -> (Vec<Value>, std::process::ExitStatus) {
+        drop(self.stdin.take());
+        let mut rest = String::new();
+        self.stdout.read_to_string(&mut rest).unwrap();
+        let lines =
+            rest.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSON ({e}): {l:?}"))).collect();
+        (lines, self.child.wait().unwrap())
     }
 
     fn read(&mut self) -> Value {
@@ -54,6 +71,16 @@ impl Mcp {
         assert_eq!(reply["id"], id, "{reply}");
         assert_eq!(reply["jsonrpc"], "2.0");
         reply
+    }
+
+    /// A 2026-07-28 request: `params` plus the `_meta` every one carries.
+    fn modern(&mut self, method: &str, mut params: Value) -> Value {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "0"},
+        });
+        self.request(method, params)
     }
 
     /// Calls a tool and returns (isError, envelope parsed from the text content).
@@ -1047,4 +1074,222 @@ fn an_api_scans_baselines_are_checked_with_the_agents_policy() {
     let id = e["data"]["id"].clone();
     let (err, e) = m.call("scan_active", json!({"history_ids": [id], "rules": ["40012"]}));
     assert!(!err && e["data"]["refused_hosts"] == json!(["e.test"]), "{e}");
+}
+
+/// The fields every 2026-07-28 result carries, and the caching hints where they belong.
+fn assert_modern(result: &Value, cacheable: bool) {
+    assert_eq!(result["resultType"], "complete", "{result}");
+    assert_eq!(result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "brainproxy", "{result}");
+    if cacheable {
+        assert!(result["ttlMs"].as_u64().is_some_and(|t| t > 0), "{result}");
+        assert_eq!(result["cacheScope"], "public", "{result}");
+    } else {
+        assert!(result.get("ttlMs").is_none(), "{result}");
+    }
+}
+
+#[test]
+fn a_modern_client_discovers_and_lists_without_a_handshake() {
+    let mut m = Mcp::start(&tmp_project("modern-list"), &[]);
+    let r = m.modern("server/discover", json!({}));
+    let d = &r["result"];
+    assert_modern(d, true);
+    assert_eq!(d["supportedVersions"][0], "2026-07-28");
+    assert!(d["supportedVersions"].as_array().unwrap().contains(&json!("2025-06-18")));
+    assert!(d["capabilities"]["tools"].is_object() && d["capabilities"]["resources"].is_object());
+    assert!(d["instructions"].as_str().unwrap().contains("engagement_start"));
+
+    let modern = m.modern("tools/list", json!({}));
+    assert_modern(&modern["result"], true);
+    // The same tools, in the same order, as a handshake client sees.
+    let legacy = m.request("tools/list", json!({}));
+    assert_eq!(modern["result"]["tools"], legacy["result"]["tools"]);
+    assert!(legacy["result"].get("resultType").is_none());
+
+    for method in ["resources/list", "resources/templates/list"] {
+        assert_modern(&m.modern(method, json!({}))["result"], true);
+    }
+    let r = m.modern("resources/read", json!({"uri": "brainproxy://schema"}));
+    assert_modern(&r["result"], true);
+    assert_eq!(r["result"]["contents"][0]["uri"], "brainproxy://schema");
+    // An unknown resource is Invalid Params now; the handshake era keeps -32002.
+    assert_eq!(m.modern("resources/read", json!({"uri": "brainproxy://nope"}))["error"]["code"], -32602);
+    assert_eq!(m.request("resources/read", json!({"uri": "brainproxy://nope"}))["error"]["code"], -32002);
+    // ping is gone from 2026-07-28; handshake clients still have it.
+    assert_eq!(m.modern("ping", json!({}))["error"]["code"], -32601);
+    assert_eq!(m.request("ping", Value::Null)["result"], json!({}));
+}
+
+#[test]
+fn each_request_names_a_version_the_server_serves() {
+    let mut m = Mcp::start(&tmp_project("modern-version"), &[]);
+    let meta = |version: &str| json!({"_meta": {"io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientCapabilities": {}}});
+    let e = &m.request("tools/list", meta("1900-01-01"))["error"];
+    assert_eq!(e["code"], -32022, "{e}");
+    assert_eq!(e["data"]["requested"], "1900-01-01");
+    let supported = e["data"]["supported"].as_array().unwrap().clone();
+    assert_eq!(supported[0], "2026-07-28");
+    // Every version the error lists is served: a handshake one named in _meta gets that era
+    // (where a method only 2026-07-28 has is unknown), not the same error again.
+    for version in &supported[1..] {
+        let r = m.request("tools/list", meta(version.as_str().unwrap()));
+        assert!(r["result"]["tools"].is_array() && r["result"].get("resultType").is_none(), "{r}");
+        assert_eq!(m.request("server/discover", meta(version.as_str().unwrap()))["error"]["code"], -32601);
+    }
+    // A version that isn't a string is malformed, not an unsupported version.
+    for version in [json!(42), json!(null), json!(["2026-07-28"])] {
+        let params = json!({"_meta": {"io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientCapabilities": {}}});
+        assert_eq!(m.request("tools/list", params)["error"]["code"], -32602, "{version}");
+    }
+    // A modern request without the client's capabilities is malformed, and so is one with them
+    // (or the client's name) but no version.
+    let r = m.request("tools/list", json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    for key in ["io.modelcontextprotocol/clientCapabilities", "io.modelcontextprotocol/clientInfo"] {
+        let r = m.request("tools/list", json!({"_meta": {key: {}}}));
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    // A method only 2026-07-28 has needs the version, too.
+    assert_eq!(m.request("server/discover", json!({}))["error"]["code"], -32602);
+    assert_eq!(m.request("subscriptions/listen", Value::Null)["error"]["code"], -32602);
+    // Eras mix on one process: nothing carries over from one request to the next.
+    let r = m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+    assert_modern(&m.modern("tools/list", json!({}))["result"], true);
+    assert!(m.request("tools/list", json!({}))["result"].get("resultType").is_none());
+}
+
+#[test]
+fn a_modern_tool_call_reports_bad_arguments_as_a_tool_error() {
+    let mut m = Mcp::start(&tmp_project("modern-call"), &[]);
+    let r = m.modern("tools/call", json!({"name": "encode", "arguments": {"kind": "hex", "input": "A"}}));
+    let result = &r["result"];
+    assert_modern(result, false);
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"]["data"]["output"]["content"], "41");
+    // The provenance mark stays beside the server's name.
+    assert_eq!(result["_meta"]["provenance"]["untrusted_content"], true, "{result}");
+
+    // An argument that doesn't fit the schema is something a model can fix: a tool error.
+    let r = m.modern("tools/call", json!({"name": "encode", "arguments": {"kind": "hex", "input": "A", "nope": 1}}));
+    let result = &r["result"];
+    assert_modern(result, false);
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["error"]["kind"], "usage", "{result}");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("unknown argument: nope"));
+    let r = m.modern("tools/call", json!({"name": "schema", "arguments": {"stdin": "A"}}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("does not read stdin"), "{r}");
+    // The handshake era keeps them protocol errors; an unknown tool is one in both.
+    let r = m.request("tools/call", json!({"name": "encode", "arguments": {"kind": "hex", "input": "A", "nope": 1}}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert_eq!(m.modern("tools/call", json!({"name": "no_such_tool"}))["error"]["code"], -32602);
+}
+
+#[test]
+fn a_subscription_is_acknowledged_and_ends_when_the_client_leaves() {
+    let mut m = Mcp::start(&tmp_project("modern-listen"), &[]);
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}});
+    let listen = |id: &str| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "subscriptions/listen",
+        "params": {"_meta": meta, "notifications": {"toolsListChanged": true, "resourceSubscriptions": ["brainproxy://schema"]}}}).to_string()
+    };
+    m.send_line(&listen("a"));
+    let ack = m.read();
+    assert_eq!(ack["method"], "notifications/subscriptions/acknowledged", "{ack}");
+    assert!(ack.get("id").is_none());
+    assert_eq!(ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], "a");
+    // Nothing here ever changes, so it agrees to no notification type.
+    assert_eq!(ack["params"]["notifications"], json!({}));
+    // Its id is taken while it is open.
+    m.send_line(&listen("a"));
+    assert_eq!(m.read()["error"]["code"], -32600);
+    // The filter is required, and its fields have types.
+    for filter in [Value::Null, json!(false), json!({"toolsListChanged": "yes"}), json!({"resourceSubscriptions": [1]})]
+    {
+        let mut params = json!({"_meta": meta});
+        if !filter.is_null() {
+            params["notifications"] = filter.clone();
+        }
+        let r = m.request("subscriptions/listen", params);
+        assert_eq!(r["error"]["code"], -32602, "{filter}: {r}");
+    }
+
+    // A cancelled subscription ends with no further message: the next line answers the next request.
+    m.send_line(&listen("b"));
+    assert_eq!(m.read()["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], "b");
+    m.send_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"b"}}"#);
+    assert_modern(&m.modern("tools/list", json!({}))["result"], true);
+
+    // Open ones are capped, like tool calls.
+    for i in 0..15 {
+        m.send_line(&listen(&format!("cap{i}")));
+        assert_eq!(m.read()["method"], "notifications/subscriptions/acknowledged");
+    }
+    m.send_line(&listen("one-too-many"));
+    assert_eq!(m.read()["error"]["code"], -32000);
+    for i in 0..15 {
+        m.send_line(&format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":"cap{i}"}}}}"#
+        ));
+    }
+
+    // When the client hangs up, the open one gets its graceful end, and the server exits.
+    let (lines, status) = m.hang_up();
+    assert!(status.success(), "{status}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["id"], "a");
+    assert_modern(&lines[0]["result"], false);
+    assert_eq!(lines[0]["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"], "a");
+}
+
+#[test]
+fn bad_input_is_answered_on_the_protocol_and_the_server_keeps_going() {
+    let mut m = Mcp::start(&tmp_project("bad-input"), &[]);
+    // A request id is never null, nor a fraction; an error for an id that can't be used leaves
+    // the id out, since MCP doesn't allow a null one either.
+    for id in ["null", "1.5", "true"] {
+        m.send_line(&format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#));
+        let r = m.read();
+        assert_eq!(r["error"]["code"], -32600, "{r}");
+        assert!(r.get("id").is_none(), "{r}");
+    }
+    // An integer may be written as a float.
+    for id in ["1.0", "1e2"] {
+        m.send_line(&format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#));
+        let r = m.read();
+        assert_eq!(r["result"], json!({}), "{id}: {r}");
+    }
+    // A line that isn't UTF-8 is a parse error, not the end of the server (which used to print
+    // a CLI envelope on stdout as it quit).
+    m.send_bytes(b"\xff\xfe\n");
+    let r = m.read();
+    assert_eq!(r["error"]["code"], -32700, "{r}");
+    assert!(r.get("id").is_none(), "{r}");
+    m.send_line("{not json");
+    assert!(m.read().get("id").is_none());
+    assert_eq!(m.request("ping", Value::Null)["result"], json!({}));
+    let (lines, status) = m.hang_up();
+    assert!(lines.is_empty() && status.success(), "{lines:?} {status}");
+}
+
+#[test]
+fn a_bad_mcp_serve_command_line_writes_nothing_to_stdout() {
+    let project = tmp_project("bad-args");
+    for format in [None, Some("json")] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_brainproxy"));
+        if let Some(f) = format {
+            cmd.args(["--format", f]);
+        }
+        let out = cmd
+            .arg("--project")
+            .arg(&project)
+            .args(["mcp", "serve", "--timeout", "bad"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{format:?}");
+        assert!(out.stdout.is_empty(), "{format:?}: {}", String::from_utf8_lossy(&out.stdout));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--timeout"), "{format:?}");
+    }
 }
