@@ -36,15 +36,28 @@ impl H2Request {
         let head = req.head()?;
         let unfit = |what: &str| Error::InvalidInput(format!("can't be sent over HTTP/2: {what}"));
         let method = http::Method::from_bytes(head.method.as_bytes()).map_err(|_| unfit("method"))?;
+        // Origin form (/...), absolute form, or `*`: anything else would run into the authority
+        // (`.evil.test/` after `app.test`), so the request would go to another site than it says.
         let path = match head.target.split_once("://") {
             Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]).to_string(),
-            None => head.target.clone(),
+            None if head.target.starts_with('/') || head.target == "*" => head.target.clone(),
+            None => return Err(unfit(&format!("request target {:?} isn't a path, a URL or *", head.target))),
         };
         let header = |n: &str| head.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim());
         let authority = header("host").map(str::to_string).unwrap_or_else(|| target.host_header());
+        // :authority has no user part (RFC 9113 8.3.1), so an `@` never moves the host.
+        let parsed: http::uri::Authority = authority
+            .parse()
+            .ok()
+            .filter(|_| !authority.contains('@'))
+            .ok_or_else(|| unfit(&format!("authority {authority:?}")))?;
         let scheme = if target.is_tls() { "https" } else { "http" };
-        let uri: http::Uri =
-            format!("{scheme}://{authority}{path}").parse().map_err(|e| unfit(&format!("{authority}{path}: {e}")))?;
+        let uri = http::Uri::builder()
+            .scheme(scheme)
+            .authority(parsed)
+            .path_and_query(path.as_str())
+            .build()
+            .map_err(|e| unfit(&format!("{authority} {path}: {e}")))?;
 
         let mut headers = http::HeaderMap::new();
         let mut recorded = format!("{method} {path} HTTP/2\r\nhost: {authority}\r\n");
@@ -261,6 +274,14 @@ pub(crate) mod tests {
         assert_eq!(r.recorded, b"POST /x?y=1 HTTP/2\r\nhost: a.test:8443\r\nx-a: 1\r\n\r\nabc");
         // Line breaks can't be smuggled into an HTTP/2 header value.
         assert!(H2Request::from_raw(b"GET / HTTP/1.1\r\nHost: a\r\nX: a\x01b\r\n\r\n", &t).is_err());
+        // A request target that isn't a path, a URL or * can't run into the authority.
+        for target in [".evil.test/", "@evil.test/", "evil.test", ""] {
+            let raw = format!("GET {target} HTTP/2\r\nHost: a.test\r\n\r\n");
+            assert!(H2Request::from_raw(raw.as_bytes(), &t).is_err(), "{target:?}");
+        }
+        assert!(H2Request::from_raw(b"GET / HTTP/2\r\nHost: a.test@evil.test\r\n\r\n", &t).is_err());
+        let star = H2Request::from_raw(b"OPTIONS * HTTP/2\r\nHost: a.test\r\n\r\n", &t).unwrap();
+        assert_eq!((star.uri.host(), star.uri.path()), (Some("a.test"), "*"));
     }
 
     #[test]

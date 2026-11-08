@@ -223,6 +223,12 @@ impl AuthProfile {
         if self.oauth.is_none() && self.token_regex.is_some() != self.token_header.is_some() {
             return Err(Error::InvalidInput("--token-regex and --token-header go together".into()));
         }
+        // A line break would start another header (a Host, say) on every request.
+        let token = self.token_header.as_deref().map(|h| h.split_once(':').unwrap_or((h, "")));
+        let headers = self.headers.iter().chain(&self.login_headers).map(|(k, v)| (k.as_str(), v.as_str()));
+        for (k, v) in headers.chain(token) {
+            crate::http::request::check_header(k, v)?;
+        }
         Ok(())
     }
 
@@ -772,6 +778,11 @@ impl std::fmt::Debug for AuthSession {
 }
 
 impl AuthSession {
+    /// The client its requests go out with (logins, checks, macros, and what it sends for a tool).
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn load(project: &Path, name: &str, client: Client) -> Result<Self> {
         let store = Store::open(project)?;
         let (profile, state) = store.auth_profile(name)?;

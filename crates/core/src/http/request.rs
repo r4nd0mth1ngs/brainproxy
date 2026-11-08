@@ -52,9 +52,17 @@ impl RawRequest {
             path.push('?');
             path.push_str(q);
         }
-        let mut out = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n", target.host_header());
-        let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
         for (k, v) in headers {
+            check_header(k, v)?;
+        }
+        let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+        // A Host header given takes the place of the target's, first, rather than adding a second.
+        let host = |(k, _): &&(String, String)| k.eq_ignore_ascii_case("host");
+        let mut out = format!("{method} {path} HTTP/1.1\r\n");
+        if !has("host") {
+            out.push_str(&format!("Host: {}\r\n", target.host_header()));
+        }
+        for (k, v) in headers.iter().filter(host).chain(headers.iter().filter(|h| !host(h))) {
             out.push_str(&format!("{k}: {v}\r\n"));
         }
         if !has("user-agent") {
@@ -181,6 +189,20 @@ impl RawRequest {
             .ok_or_else(|| Error::InvalidInput("request has no Host header; pass --target".into()))?;
         Target::from_url(&format!("{default_scheme}://{host}"))
     }
+}
+
+/// Refuses a header name or value given as input (`-H`, a profile's, a collection's) that holds
+/// a CR, LF or NUL: written into a request, a line break would start another header (a Host,
+/// say). A name must also be non-empty and hold no colon or space.
+pub fn check_header(name: &str, value: &str) -> Result<()> {
+    let breaks = |s: &str| s.contains(['\r', '\n', '\0']);
+    if breaks(name) || breaks(value) {
+        return Err(Error::InvalidInput(format!("header {name:?}: a name or value can't hold a line break or NUL")));
+    }
+    if name.trim().is_empty() || name.contains([':', ' ', '\t']) {
+        return Err(Error::InvalidInput(format!("bad header name {name:?}")));
+    }
+    Ok(())
 }
 
 /// Splits a message at the first `\r\n\r\n`. Without one, the whole input is head.

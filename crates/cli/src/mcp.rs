@@ -136,6 +136,27 @@ pub(crate) fn check_host_setting(
     host_verdict(&format!("{what} sets Host {host}"), &format!("{what} sets the Host to {host}"), test, out)
 }
 
+/// The warning a command shows for a foreign Host: `early`, its own check's, or else the first
+/// host `client` noted as it sent (one a session or a signer brought in), which in text mode
+/// goes to stderr too.
+pub(crate) fn sent_host_warning<'a>(
+    clients: impl IntoIterator<Item = &'a brainproxy_core::http::Client>,
+    early: Option<String>,
+    out: &crate::output::Out,
+) -> Option<String> {
+    if early.is_some() {
+        return early;
+    }
+    let host = clients.into_iter().find_map(|c| c.foreign_hosts().into_iter().next())?;
+    let warning = format!(
+        "the Host names {host}, which the scope doesn't list: a shared front end may send the request to that site"
+    );
+    if !out.json() {
+        eprintln!("warning: {}", crate::output::escape_controls(&warning));
+    }
+    Some(warning)
+}
+
 fn host_verdict(
     refused: &str,
     warned: &str,

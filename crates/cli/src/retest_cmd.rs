@@ -252,6 +252,8 @@ fn send_again(
         verify_tls: false,
         sni: None,
         http2: false,
+        // Sent again as it was recorded, with whatever Host it had then.
+        host: brainproxy_core::http::client::HostPolicy::Allow,
     };
     let session = auth_cmd::maybe_session(project, a.auth.as_deref(), &opts)?;
     let client = Client::new(opts);

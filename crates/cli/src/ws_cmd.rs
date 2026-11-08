@@ -385,6 +385,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         verify_tls: args.verify_tls,
         sni: args.sni.clone(),
         http2: false,
+        host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
     };
     // So is a server name the scope doesn't list, before a row could say it was sent.
     send_opts.check_sni(&target)?;
@@ -494,7 +495,11 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             if let Err(e) = saved {
                 data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
             }
-            if let Some(w) = &host_warning {
+            if let Some(w) = crate::mcp::sent_host_warning(
+                [&client].into_iter().chain(session.as_deref().map(|s| s.client())),
+                host_warning.clone(),
+                out,
+            ) {
                 data["host_warning"] = json!(w);
             }
             out.ok(data, || format!("not upgraded\n\n{}", String::from_utf8_lossy(&response)));
@@ -596,7 +601,11 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Err(e) = saved {
         data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
     }
-    if let Some(w) = host_warning {
+    if let Some(w) = crate::mcp::sent_host_warning(
+        [&client].into_iter().chain(session.as_deref().map(|s| s.client())),
+        host_warning,
+        out,
+    ) {
         data["host_warning"] = json!(w);
     }
     out.ok(data, || {

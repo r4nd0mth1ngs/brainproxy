@@ -489,6 +489,10 @@ pub struct NetArgs {
     timeout: f64,
     #[arg(long)]
     verify_tls: bool,
+    /// The profile's login or macro requests deliberately name a host the scope doesn't list in
+    /// their Host header, for a Host-header test. Through MCP such a request is refused without it.
+    #[arg(long)]
+    host_header_test: bool,
 }
 
 impl NetArgs {
@@ -499,6 +503,7 @@ impl NetArgs {
             sni: None,
             guard: Some(crate::project_guard(project)?),
             http2: false,
+            host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
         })
     }
 }
