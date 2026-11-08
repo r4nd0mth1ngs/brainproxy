@@ -369,7 +369,25 @@ struct CodecArgs {
     raw: bool,
 }
 
+/// The stack every command runs on. A main thread's is 1 MiB on Windows (8 MiB on Linux and
+/// macOS), and a debug build's clap parsing of a stored scan's arguments (`findings compare
+/// --scan`, a finished scan's observations) deep in a command overflowed it there.
+const STACK: usize = 8 << 20;
+
 fn main() {
+    let cli = std::thread::Builder::new().name("main".into()).stack_size(STACK).spawn(cli_main);
+    match cli.map(|t| t.join()) {
+        Ok(Ok(())) => {}
+        // A panic has printed its message already.
+        Ok(Err(_)) => std::process::exit(101),
+        Err(e) => {
+            eprintln!("brainproxy: can't start: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cli_main() {
     let argv: Vec<String> = std::env::args().collect();
     // A Postman script signer's run, in a process of its own (see sign_script). Not a
     // command: nothing lists it, and it speaks JSON on stdin and stdout only.
