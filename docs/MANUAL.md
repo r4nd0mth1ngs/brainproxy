@@ -381,8 +381,8 @@ The sidebar groups the tools by what you are doing.
       `resp.header.NAME` (letters, digits, `-`, `_` and `.` in the name). A repeated header such
       as `Set-Cookie` matches when any of its values does (`!=` and `!~` when none does), and
       `:*` finds a header that is there even when it is empty.
-    - Times compare as instants (`time>=2026-11-08T12:00:00Z`, or with an offset such as
-      `+01:00`), so a stored fraction of a second doesn't throw the order off; `time:` is a
+    - Times compare as instants (`time>=2026-11-08T12:00:00Z`, to the millisecond, or with an
+      offset such as `+01:00`), so a stored fraction of a second doesn't throw the order off; `time:` is a
       prefix. A regex on `req`, `resp` or a body reads the bytes, so a body that isn't UTF-8 is
       searched too.
     - A bare word searches the URL and title, as the URL filter does; a quoted one is searched

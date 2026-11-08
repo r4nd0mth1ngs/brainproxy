@@ -139,15 +139,22 @@ export function mergeLocal(list: SavedFilter[], local: SavedFilter[]): SavedFilt
   for (const s of local) {
     const same = out.find((o) => o.name === s.name);
     if (same && JSON.stringify(normal(same.filter)) === JSON.stringify(normal(s.filter))) continue;
-    let name = s.name;
-    for (let n = 1; out.some((o) => o.name === name); n++) name = `${s.name} (this computer${n > 1 ? ` ${n}` : ""})`;
+    // Within the 100 characters the project keeps, suffix included.
+    const named = (suffix: string) => [...s.name].slice(0, MAX_NAME - [...suffix].length).join("") + suffix;
+    let name = named("");
+    for (let n = 1; out.some((o) => o.name === name); n++) name = named(` (this computer${n > 1 ? ` ${n}` : ""})`);
     out.push({ name, filter: parseFilter(s.filter) });
   }
   return out;
 }
 
+/** The longest name `history filters save` keeps, in characters. */
+export const MAX_NAME = 100;
+
 /** Whether a query uses a field a person can change after a row is recorded (a note or a tag). */
-export const usesEditableFields = (query: string) => /(^|[\s(])(tag|note)(:|=|!=|~|!~)/i.test(query);
+// Matches more than the parser would (inside a quoted value too): an extra search costs time,
+// a missed one leaves stale rows.
+export const usesEditableFields = (query: string) => /\b(tag|note)(:|=|!=|~|!~)/i.test(query);
 
 /** The saved filters as the app last read or saved them, with their revision in the project. */
 export interface SavedState {
@@ -159,23 +166,68 @@ export interface SavedState {
 export type Cli = (args: string[], stdin?: string) => Promise<any>;
 
 /**
+ * A change to the saved filters. On a retry `before` is the list the person made it on, so it
+ * can refuse to touch a filter that was saved differently elsewhere meanwhile.
+ */
+export type SavedChange = (list: SavedFilter[], before?: SavedFilter[]) => SavedFilter[];
+
+/** The saved set changed where a change meant to work; carries what is saved now. */
+export class SavedMoved extends Error {
+  constructor(
+    message: string,
+    readonly now: SavedState,
+  ) {
+    super(message);
+  }
+}
+
+/** Whether the filter named `name` differs between `a` and `b` (one of them lacking it counts). */
+export function changedSince(a: SavedFilter[], b: SavedFilter[], name: string): boolean {
+  const f = (l: SavedFilter[]) => {
+    const s = l.find((x) => x.name === name);
+    return s ? JSON.stringify(normal(s.filter)) : null;
+  };
+  return f(a) !== f(b);
+}
+
+/** Saving `filter` as `name`; on a retry, refused when that name was saved differently elsewhere. */
+export const saveAs =
+  (name: string, filter: TrafficFilter): SavedChange =>
+  (list, before) => {
+    if (before && changedSince(before, list, name)) throw new Error(`A filter named ${name} was saved elsewhere meanwhile; save again to replace it.`);
+    return withSaved(list, name, filter);
+  };
+
+/** Deleting `name`; on a retry, refused when it was changed elsewhere meanwhile. */
+export const deleteNamed =
+  (name: string): SavedChange =>
+  (list, before) => {
+    if (before && changedSince(before, list, name)) throw new Error(`The filter ${name} was changed elsewhere meanwhile; it is shown as saved now.`);
+    return withoutSaved(list, name);
+  };
+
+/**
  * Saves `change` applied to `cur`. When the saved set changed meanwhile (an agent added a
  * filter, or another window saved), it reads what is saved now and applies the same change to
- * that, once, so the person's save isn't lost. Returns the state saved.
+ * that, once, so the person's save isn't lost. A change that refuses the newer set throws
+ * SavedMoved with it. Returns the state saved.
  */
-export async function saveChange(cli: Cli, cur: SavedState, change: (list: SavedFilter[]) => SavedFilter[], isConflict: (e: unknown) => boolean): Promise<SavedState> {
-  const attempt = async (s: SavedState): Promise<SavedState> => {
-    const list = change(s.list);
-    const r = await cli(filtersSaveArgs(s.rev), savedBody(list));
-    return { rev: r.rev, list };
-  };
+export async function saveChange(cli: Cli, cur: SavedState, change: SavedChange, isConflict: (e: unknown) => boolean): Promise<SavedState> {
+  const save = async (s: SavedState, list: SavedFilter[]): Promise<SavedState> => ({ rev: (await cli(filtersSaveArgs(s.rev), savedBody(list))).rev, list });
   try {
-    return await attempt(cur);
+    return await save(cur, change(cur.list));
   } catch (e) {
     if (!isConflict(e)) throw e;
-    const d = await cli(FILTERS_LIST_ARGS);
-    return attempt({ rev: d.rev, list: savedFrom(d.filters) });
   }
+  const d = await cli(FILTERS_LIST_ARGS);
+  const now: SavedState = { rev: d.rev, list: savedFrom(d.filters) };
+  let list: SavedFilter[];
+  try {
+    list = change(now.list, cur.list);
+  } catch (e: any) {
+    throw new SavedMoved(e.message, now);
+  }
+  return save(now, list);
 }
 
 /** The list with `filter` saved as `name`: a filter with that name is replaced in place, a new one goes last. */

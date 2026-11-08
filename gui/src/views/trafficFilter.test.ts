@@ -21,6 +21,9 @@ import {
   parseSaved,
   refilter,
   rerun,
+  deleteNamed,
+  saveAs,
+  SavedMoved,
   mergeLocal,
   usesEditableFields,
   saveChange,
@@ -245,8 +248,38 @@ test("a rerun search keeps showing the earlier matches it hasn't reached yet", (
 });
 
 test("a query on notes or tags is searched again after an edit", () => {
-  for (const q of ["tag=highlight", "NOT tag:x", "(note:todo)", "a NOTE~x"]) assert.ok(usesEditableFields(q), q);
-  for (const q of ["status:5xx", "path:/tag:x", '"tag:x"', "notes"]) assert.ok(!usesEditableFields(q), q);
+  // More than the parser would count is fine (an extra search); fewer would leave stale rows.
+  for (const q of ["tag=highlight", "NOT tag:x", "(note:todo)", "a NOTE~x", "(status:200)note:todo", "path:/tag:x"]) assert.ok(usesEditableFields(q), q);
+  for (const q of ["status:5xx", "notes:x", "hashtag"]) assert.ok(!usesEditableFields(q), q);
+});
+
+test("a retried save doesn't replace or delete a filter saved differently elsewhere", async () => {
+  const conflict = new Error("conflict");
+  const isConflict = (e: unknown) => e === conflict;
+  const theirs = { name: "errors", filter: filter({ query: true, text: "status:5xx" }) };
+  // Another window saved "errors" after this one read the (empty) set.
+  const cli = async (args: string[], stdin?: string) => {
+    if (args[2] === "list") return { rev: 2, filters: JSON.parse(savedBody([theirs])).filters };
+    if (args.at(-1) !== "2") throw conflict;
+    return { rev: 3, filters: JSON.parse(stdin!).filters };
+  };
+  const moved = await saveChange(cli, { rev: 1, list: [] }, saveAs("errors", filter({ text: "mine" })), isConflict).catch((e) => e);
+  assert.ok(moved instanceof SavedMoved);
+  assert.match(moved.message, /saved elsewhere meanwhile/);
+  assert.deepEqual(moved.now, { rev: 2, list: [theirs] });
+  // A save under another name still goes through.
+  const ok = await saveChange(cli, { rev: 1, list: [] }, saveAs("mine", filter({ text: "m" })), isConflict);
+  assert.deepEqual(ok.list.map((s) => s.name), ["errors", "mine"]);
+  // Deleting what this window saw as "errors" (not there) leaves theirs alone.
+  const del = await saveChange(cli, { rev: 1, list: [{ name: "errors", filter: filter() }] }, deleteNamed("errors"), isConflict).catch((e) => e);
+  assert.ok(del instanceof SavedMoved);
+});
+
+test("names stay within what the project keeps", () => {
+  const long = "n".repeat(100);
+  const merged = mergeLocal([{ name: long, filter: filter({ text: "a" }) }], [{ name: long, filter: filter({ text: "b" }) }, { name: "x".repeat(150), filter: filter() }]);
+  assert.deepEqual(merged.map((s) => [...s.name].length), [100, 100, 100]);
+  assert.ok(merged[1].name.endsWith(" (this computer)"));
 });
 
 test("filters kept by an older build are removed once moved", () => {

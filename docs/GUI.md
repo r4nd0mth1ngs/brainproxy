@@ -511,10 +511,15 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   search. A query the CLI refuses as invalid input isn't tried again until the text changes
   (`failPage(..., invalid)`); the toolbar shows the parser's message. Saved filters are loaded
   with `history filters list` when the project opens and saved whole with `history filters
-  save --if-revision REV`, one save at a time (`saveChange`); a conflict (an agent added one, or
-  another window saved) reads them again and applies the same change to what is saved now, once. Filters an
+  save --if-revision REV`. Loading, the move from localStorage and saves run one at a time in a
+  queue, each call naming the project it was made for, and an answer older than the revision
+  shown is dropped. A conflict (an agent added one, or another window saved) reads them again
+  and applies the same change to what is saved now, once (`saveChange`), unless that change would
+  replace or delete a filter of that name saved differently meanwhile: then the newer set is
+  shown and the user is told to save again. Filters an
   older build kept in localStorage are merged into the project's (`mergeLocal`: an equal one is
-  already there, a different one under a taken name becomes "NAME (this computer)"), then
+  already there, a different one under a taken name becomes "NAME (this computer)", names cut to
+  the 100 characters the project keeps), then
   removed from localStorage. A note or highlight changed from Traffic runs a query that uses
   `tag` or `note` again from the start (`usesEditableFields`, `rerun`: rows it hasn't reached yet
   keep showing as before, so the table doesn't empty), since rows already searched may now match

@@ -437,12 +437,13 @@ impl Parser {
 }
 
 /// Whether `v` is an ISO-8601 date or date and time SQLite's date functions read: a day,
-/// optionally a time with seconds and a fraction, optionally `Z` or an offset.
+/// optionally a time with seconds and up to milliseconds (what is stored, and what julianday
+/// keeps), optionally `Z` or an offset.
 fn is_time(v: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(
-            r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?)?(?:Z|[+-](\d{2}):(\d{2}))?$",
+            r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?)?(?:Z|[+-](\d{2}):(\d{2}))?$",
         )
         .expect("valid regex")
     });
@@ -875,6 +876,8 @@ mod tests {
             assert!(err(&format!("time>=\"{bad}\"")).contains("expected a time"), "{bad}");
         }
         assert!(Query::parse("time>=2024-02-29").is_ok(), "a leap day");
+        assert!(err("time<2026-11-08T12:00:00.1234Z").contains("expected a time"), "finer than milliseconds");
+        assert!(Query::parse("time<2026-11-08T12:00:00.123Z").is_ok());
         // A prefix takes any text, a space standing for the stored T.
         assert!(sql("time:2026-11").0.contains("substr(time, 1, length(?1)) = replace(?1, ' ', 'T')"));
     }

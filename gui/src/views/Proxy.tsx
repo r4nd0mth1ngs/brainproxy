@@ -24,19 +24,21 @@ import {
   refilter,
   rerun,
   mergeLocal,
+  deleteNamed,
+  saveAs,
   saveChange,
+  SavedMoved,
   savedFrom,
   searchArgs,
   searchFor,
   searchNote,
   visibleRows,
   withMode,
-  withSaved,
-  withoutSaved,
   usesEditableFields,
   type ContentSearch,
   type Cli,
   type SavedFilter,
+  type SavedChange,
   type SavedState,
   type SearchMode,
   type SearchQuery,
@@ -161,32 +163,52 @@ function History() {
   // Goes up when the project changes or the view closes: a load or save that answers later is dropped.
   const savedGen = useRef(0);
   const takeSaved = (s: SavedState, gen: number) => {
-    if (gen !== savedGen.current) return;
+    // Another project's answer, or an older revision than one already shown (a slow answer).
+    if (gen !== savedGen.current || s.rev < savedState.current.rev) return;
     savedState.current = s;
     setSaved(s.list);
   };
-  const cli: Cli = (args, stdin) => run(args, stdin == null ? undefined : { stdin });
+  // Every call names the project it was made for, so one still queued when another project
+  // opens can't write there.
+  const cliFor =
+    (project: string): Cli =>
+    (args, stdin) =>
+      run(args, { stdin, project });
   const isConflict = (e: unknown) => e instanceof CliError && e.kind === "conflict";
+  // Loads, saves and the move from local storage run one after another (`saveQueue`), each on
+  // the state the one before left, so two quick saves don't send the same revision.
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const enqueue = (gen: number, work: () => Promise<void>) => {
+    saveQueue.current = saveQueue.current.then(() => (gen === savedGen.current ? work() : undefined));
+  };
   // Saved filters live in the project. An older build kept them in this app's storage: they
   // are added to the project's (whatever an agent or the CLI saved there first), then removed.
   useEffect(() => {
     const gen = ++savedGen.current;
-    (async () => {
-      const d = await cli(FILTERS_LIST_ARGS);
-      takeSaved({ rev: d.rev, list: savedFrom(d.filters) }, gen);
-      const local = loadSaved(app.project);
-      if (gen !== savedGen.current || !local.length) return;
+    const project = app.project;
+    const cli = cliFor(project);
+    savedState.current = { rev: 0, list: [] };
+    setSaved([]);
+    enqueue(gen, async () => {
       try {
-        const merged = await saveChange(cli, savedState.current, (list) => mergeLocal(list, local), isConflict);
-        clearLocalSaved(app.project);
-        takeSaved(merged, gen);
+        const d = await cli(FILTERS_LIST_ARGS);
+        takeSaved({ rev: d.rev, list: savedFrom(d.filters) }, gen);
+        const local = loadSaved(project);
+        if (gen !== savedGen.current || !local.length) return;
+        try {
+          const merged = await saveChange(cli, savedState.current, (list) => mergeLocal(list, local), isConflict);
+          clearLocalSaved(project);
+          takeSaved(merged, gen);
+        } catch (e: any) {
+          // Still shown, and kept where they were: the next save (or open) tries the project again.
+          if (gen !== savedGen.current) return;
+          takeSaved({ rev: savedState.current.rev, list: mergeLocal(savedState.current.list, local) }, gen);
+          app.toast(`Saved filters stay in this app until they can be saved in the project: ${e.message}`, "error");
+        }
       } catch (e: any) {
-        // Still shown, and kept where they were: the next save (or open) tries the project again.
-        if (gen !== savedGen.current) return;
-        takeSaved({ rev: savedState.current.rev, list: mergeLocal(savedState.current.list, local) }, gen);
-        app.toast(`Saved filters stay in this app until they can be saved in the project: ${e.message}`, "error");
+        if (gen === savedGen.current) app.toast(`Saved filters: ${e.message}`, "error");
       }
-    })().catch((e) => gen === savedGen.current && app.toast(`Saved filters: ${e.message}`, "error"));
+    });
     return () => {
       savedGen.current++;
     };
@@ -392,16 +414,16 @@ function History() {
 
   // Saved filters are kept in the project (`history filters`), so they travel with it.
   const applied = appliedSaved(saved, filter, picked);
-  // Saves run one after another, each on the state the one before left, so two quick saves
-  // don't send the same revision.
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
-  const keepSaved = (change: (list: SavedFilter[]) => SavedFilter[]) => {
+  const keepSaved = (change: SavedChange) => {
     const gen = savedGen.current;
-    saveQueue.current = saveQueue.current.then(async () => {
+    const cli = cliFor(app.project);
+    enqueue(gen, async () => {
       try {
         takeSaved(await saveChange(cli, savedState.current, change, isConflict), gen);
       } catch (e: any) {
-        if (gen === savedGen.current) app.toast(`Saved filters: ${e.message}`, "error");
+        if (gen !== savedGen.current) return;
+        if (e instanceof SavedMoved) takeSaved(e.now, gen);
+        app.toast(e instanceof SavedMoved ? e.message : `Saved filters: ${e.message}`, "error");
       }
     });
   };
@@ -409,12 +431,12 @@ function History() {
     const name = (await ask("Save the current filter", "Name it to apply it again later.", "Save", "Cancel", applied ?? ""))?.trim();
     if (!name) return;
     if (name !== applied && saved.some((s) => s.name === name) && !(await confirm(`Replace the filter ${name}?`, "A saved filter already has that name.", "Replace", "Cancel"))) return;
-    keepSaved((list) => withSaved(list, name, filter));
+    keepSaved(saveAs(name, filter));
     setPicked(name);
   };
   const deleteFilter = async () => {
     if (!applied || !(await confirm(`Delete the filter ${applied}?`, "Only the saved filter is deleted, not any traffic.", "Delete", "Cancel"))) return;
-    keepSaved((list) => withoutSaved(list, applied));
+    keepSaved(deleteNamed(applied));
   };
 
   return (
