@@ -157,6 +157,69 @@ changed**. brainproxy refuses every request outside it, including redirects, lin
 by the crawler, and requests from a browser using the proxy. For a different scope, start
 a new engagement.
 
+The scope decides where a connection goes: the target's address and, over TLS, a server name
+set with `--sni` (one other than the target's must be listed by name). With an IP address or a
+CIDR range in scope, any host name that resolves to it, by DNS or through a `connection hosts`
+override, is in scope as a target too. On a shared front end (a CDN or load balancer), list the
+sites' names in the scope rather than its addresses.
+
+A `Host` header (HTTP/2 sends it as `:authority`) doesn't pick where the connection goes, but on
+a shared front end it can pick the site, so a request to an in-scope address can reach a site
+outside the scope. Host-header injection tests need such a request, so it isn't simply refused.
+Every request is checked as it goes on the wire, after an auth profile's session, its values
+and signers have been applied: a host it names that isn't the target's and isn't listed by name
+in the engagement scope (on the target's port, or with no port) is foreign. So is a request
+target other than a path, `*` or a URL naming a listed host (a URL holding a `\` counts, since
+servers read it differently), a request line that isn't three tokens separated by single
+spaces (a space in the path or an HTTP/0.9 line counts too), a bare CR or LF in the head, and a
+second request after the body its framing (Content-Length or chunked) says (with no framing, a
+`--verbatim` body that starts with a request line is one, in any case), and framing servers may
+read differently: Content-Length headers that differ, or Content-Length with Transfer-Encoding.
+So request smuggling tests (CL.TE, TE.CL, a request after the body) are Host-header tests here:
+through MCP they need `--host-header-test`. `send` (races too) and `ws send` warn about a
+foreign host in the output's `host_warning`, and on stderr in text mode; so does `fuzz run` for
+its template.
+
+Through MCP a request with a foreign host is refused (`out_of_scope`) unless the command says
+the test is meant with `--host-header-test` (`send`, `fuzz run`, `ws send`, `scan active` for its
+base requests, and `auth login`, `auth status` and `auth macro run` for a profile's own
+requests), so the intent is on record. One refused before it is written to history leaves no
+row; one refused on the wire (a fuzz payload that makes a header a Host, a Host a session added)
+keeps its row, with the refusal as its error, and a scan never picks such a row or takes it as
+`--history-id`. A crawl's or an import's `-H Host` or a collection's Host header is refused the
+same way, request by request, and their summaries list the host in `out_of_scope_hosts`.
+`scan active` checks its base requests (URLs, API items, recorded rows, a session's) the same
+way and lists the hosts of those it doesn't attack in `refused_hosts`; a rule's own Host is its
+test (below). A fuzz payload with a raw line break that goes into the head unencoded (a
+CRLF-injection test) needs `--host-header-test` through MCP, as it can start a Host header.
+
+Settings that put a Host on requests still to come are checked when they are saved too: an auth
+profile's `--header` or `--token-header`, its login request and `--login-header` (the login
+URL's own host is fine), a macro's steps (`auth macro add`), and a proxy rule (`rules add`, or
+`rules enable` of a disabled one) whose replacement writes a Host line or an absolute URL,
+rewrites the Host of a request to a host the engagement lists, or copies a header's name or the
+request target from the request (`$1`). A rule can match anything, so that check is best effort;
+the proxy also compares each request's foreign hosts before and after the rules, and refuses one
+an agent's rule brought in (a 502, and a row saying so) unless the rule was added or enabled
+with `--host-header-test`. Session rules and signers can't set the Host at all. Saving a setting
+again with the Host it already had isn't checked again; an edited request forwarded with
+`intercept forward` is checked for hosts the edit brings in. A person on the command line or in
+the app is warned, never refused.
+
+For everyone: a header name or value given as input (`-H`, an auth profile's headers, a
+collection's) can't hold a CR, LF or NUL, which would start another header, and neither can a
+proxy rule's request-line or request-header replacement, or a value a session fills into a
+request's head (a token or cookie learned from a reply, a macro's value): such a request isn't
+sent. A `-H Host` takes the place of the target's Host rather than adding a second, and a request
+sent over HTTP/2 must have a path, `*` or a URL as its target, and a Host with no user part, so
+nothing runs into the `:authority`.
+
+Not checked: what active scan rules and check templates put in the Host header themselves
+(Cloud Metadata names the metadata service, for one; `scan active --inject-header Host` puts
+payloads there), which are Host-header tests by nature and connect to the scanned in-scope host;
+requests sent again as they were recorded (`findings retest`); and a proxied client's own
+requests.
+
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
 recorded and intercepted. It is empty by default, which means everything the engagement
 allows. Traffic outside it still goes out and leaves a row in history, with only its request
@@ -215,10 +278,20 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    fragments, forms, multipart, JSON (arrays and JSON inside strings too), XML and script
    bodies, hidden form fields and secret-named attributes, passwords in URLs, JWTs, and every
    password, token, cookie and credential header the project's auth profiles hold) as
-   `[redacted]`, wherever the report quotes them, in any case and percent-, JSON-, HTML- or
+   `[redacted]`, wherever the report quotes them, in any ASCII case (an accented or other
+   non-ASCII letter must match as written) and percent-, JSON-, HTML- or
    base64-encoded (notes, write-ups, ticket links and findings added by hand included), and says how
    many places it masked; `--no-redact` keeps
-   them as recorded. An issue seen in more than one
+   them as recorded. A signed cookie's session id (`s:ID.signature`, as Express writes
+   `connect.sid`) is masked where it is quoted on its own too, and two secrets that overlap
+   are masked together. A secret nothing marks, such as a token typed into a finding's title
+   or a note ("used token ..."), can't be told from other text: name it with `--mask VALUE`
+   (repeatable, at least 6 characters) and it is masked like the project's own secrets,
+   everywhere the report quotes it, in every format: the title, the layout's company, the
+   engagement scope and filters it shows, hosts and states included. A body is cut to its
+   evidence limit only once its secrets are masked, so none is left half shown at the cut.
+   `findings repro` takes `--mask` too; `findings ticket` doesn't, since the command it
+   prints runs it again to file the ticket (see *Tickets* below). An issue seen in more than one
    request also carries its latest sighting next to the first. A project collects findings across
    scans; `report html --scan JOB` lists only what that background scan found, for the
    first time or again, and leaves out older findings it didn't see again.
@@ -923,8 +996,10 @@ local settings (scope, engagement, CA, capabilities, ...) have no `_meta`.
 
 Project files (`.bpdb`, its `-wal`/`-shm`, and `<project>.browsers/`) are readable by
 their owner only. `query` cannot read `auth_profiles`, which holds passwords, header
-values, and session tokens; `auth show` redacts them. `report -o` and `ca export --out`
-refuse to overwrite an existing file unless given `--force`.
+values, and session tokens; `auth show` redacts them. `report -o`, `findings repro -o` and
+`ca export --out` refuse to overwrite an existing file unless given `--force`, and through MCP
+`--force` is refused for them and for `ca init`, so an agent writes new files only and keeps
+the CA.
 
 ```sh
 export BRAINPROXY_PROJECT=~/work/acme.bpdb
@@ -983,7 +1058,14 @@ Each history entry has:
 - `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
-  the rule). NULL when nothing changed it; an intercept forwarded unchanged isn't an edit.
+  the rule). A proxy started with `--auth NAME` adds `{"by":"gui","auth":"NAME"}` when the
+  profile's session (its cookies, including those its macros got, headers or token) changed
+  the request (`by`: who last changed the profile), then
+  `{"by":"mcp","auth":"NAME","session_rule":3}` for each session rule that changed it (one
+  whose URL matched but that changed nothing isn't named) and
+  `{"by":"cli","auth":"NAME","macro":"csrf"}` for each macro whose values those rules put in
+  (`by`: who added the rule or macro, or last changed it). NULL when nothing changed it; an
+  intercept forwarded unchanged isn't an edit.
 - `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
   a session's own requests in those); NULL when it was the target host, for plain HTTP, and
   when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
@@ -1015,7 +1097,29 @@ dropped it itself; `edited` says whether it was forwarded with a different messa
 row names the intercept in `edited_by`. A response edited at intercept, or changed by a
 response rule, is recorded in history as the server sent it; the intercept row has the
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
-enabled it.
+enabled it. A request-line or request-header rule whose replacement holds a line break or NUL
+(saved by a build that didn't refuse one) is left out when the proxy loads its rules, and
+`rules list` (`skipped`) and `proxy status` (`rules_skipped`) say so. So do auth profiles (`auth show`: `profile.origin`, who last changed it), their
+session rules and macros (`origin`, who added one or last changed it; saving any of them
+unchanged, as the app's edit form does, keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
+it (logged in, got an OAuth token, or the proxy or a scan that learnt its cookies). A rule id,
+match-and-replace or session rule (of any profile), is never handed out again once its rule is
+removed (or all are cleared), so an old row's `edited_by` can't come to name another rule;
+a project from before this starts counting after the highest ids it has.
+
+The other tables say who started what wrote them, as `origin` (NULL for rows from before
+brainproxy kept it): `jobs`, `fuzz_runs`, `authz_results` (who started the run, or the proxy
+for live testing), `ws_connections` (who started the proxy or `ws send`), and
+`oob_interactions` (who started the listener or poll that stored it). An OOB payload's
+`issued_by` is who started the scan or ran `oob payload` (its `origin` column is the attacked
+site). Every saved setting (scope, rules, intercept, connection settings, live authz, ...) is
+logged in `setting_changes` with its `key`, `time` and `origin`, without its value, which can
+hold credentials.
+
+A proxy records the schema of the build that started it (`proxy.schema` in `proxy status`).
+One started by an older build goes on writing rows the old way, without what came since (who
+changed a request, for one), so `proxy status` warns about it in `proxy_outdated` and a
+`warning:` line, until it is restarted (`proxy restart`).
 
 Narrowing the proxy scope or adding a TLS pass-through host keeps traffic's content out of
 history (only request lines and tunnels' rows remain), so each change to either is logged:
@@ -1077,7 +1181,10 @@ Findings have an `origin` too (who added them: the proxy's passive scan, a scan 
 `findings add`, ...), and `state_origin` and `state_changed_at` say who last changed the state
 with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. `note_origin` and
 `note_changed_at` do the same for the note. `findings list` and `findings show` include
-them. Reports carry them in every format:
+them. The description and solution a title added by hand shares keep who wrote them
+(`description_origin` and `solution_origin` in `findings show` and the `finding_types`
+table): whoever gave the text first, filled it in when it was left blank, or replaced it.
+Reports carry a finding's origins in every format:
 
 - JSON: each instance has `state_origin`, `state_changed_at`, `note_origin`,
   `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
@@ -1088,14 +1195,21 @@ them. Reports carry them in every format:
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
 
-In SARIF, each result's `partialFingerprints["brainproxy/v2"]` is a hash of the key the
-project uses to tell findings apart (alert, method, URL without its query, parameter), so
-code scanning sees a finding found again with another query string as the same result, and
-no secret in the URL travels with it. `report json` gives the same hash as each instance's
-`fingerprint`; `findings compare --baseline` matches by it, so a redacted report still
-compares with the project as it was. (It was
-`brainproxy/v1`, which kept the query, so the first upload after updating may show existing
-alerts as closed and opened again.)
+In SARIF, each result's `partialFingerprints["brainproxy/v3"]` is a hash of the key the
+project uses to tell findings apart (alert, method, URL without its query or its path's
+`;name=value` parameters, parameter), so code scanning sees a finding found again with
+another query string, or another session id in its path (`/login;jsessionid=...`), as the
+same result, and no secret in the URL travels with it. `report json` gives the same hash as
+each instance's `fingerprint`; `findings compare --baseline` matches by it, so a redacted
+report still compares with the project as it was. (It was `brainproxy/v1`, which kept the
+query, then `brainproxy/v2`, which kept path parameters: the first upload after updating may
+show existing alerts as closed and opened again. A URL without path parameters has the same
+hash as under v2, so only those findings change in `report json`, `report defectdojo` and
+baselines: write a baseline again after updating, or they show as new and fixed once. A
+project opened by this version merges the findings it stored once per session id, keeping
+the latest state and note, the summed hits and the highest risk; a merged finding goes to the
+issue that holds a title, rating or write-up and would otherwise be left with no findings. A
+URL fragment's parameters (`#/view;id=1`, a client-side route) stay part of the identity.)
 A result marked false positive or accepted risk (in a report written with `--state all`)
 carries `suppressions` (`kind` external, `status` accepted, the note as `justification`), so
 code scanning shows it as dismissed rather than open.
@@ -1403,9 +1517,10 @@ and targets that want a JWT you choose the claims of:
   context per request, with a loop and recursion limit and without `SharedArrayBuffer`, `Atomics` or
   `Temporal`. Each run is a child process of brainproxy with an empty environment, killed after five
   seconds, so a script that never ends (a regex that backtracks, a loop of `await`s) leaves nothing
-  running. On Linux the child's address space is limited to 1 GiB; macOS doesn't enforce that limit
-  and Windows has none, so there only the time limit bounds a run. A script stopped at a limit
-  stops its signer for the rest of the command: later requests fail at once, without another run;
+  running. Its memory is limited to 1 GiB: on Linux as the child's address space, on Windows by a
+  job object, and on macOS by brainproxy watching the child's memory and killing it over the limit
+  (it looks every 10 ms, so a fast allocation can briefly go a little over). A script stopped at
+  a limit stops its signer for the rest of the command: later requests fail at once, without another run;
   a script that throws fails only that request. One never runs unless chosen. The collection and
   environment stay in their files:
   the signer stores their paths and the script's sha256, and refuses a script that changed. Error
@@ -1491,7 +1606,7 @@ brainproxy findings remove 17
   same apart from case and punctuation share a type.
 - Each finding keeps its own `--cwe`. Reports show the first one given for the type, and an
   instance's own when it differs.
-- The same title, method, URL without its query, and parameter as an existing finding is refused
+- The same title, method, URL without its query or path parameters, and parameter as an existing finding is refused
   with `conflict`.
 - `findings mark` triages them like any other. `findings remove ID...` removes findings added by
   hand; scanner findings are refused (mark them false positive instead), and then nothing is
@@ -1608,21 +1723,29 @@ Findings are records with a history, not just rows:
   `findings list`. Grouping by rule and host can merge two bugs or split one:
   `findings issue split ID... --title T` moves findings into a new issue, `findings issue
   merge INTO FROM...` moves every finding of the others into the first, and `findings issue
-  title ID T` names an issue ("" goes back to the alert's name). New findings join the first
-  issue for their alert and host; a finding found again stays in its issue.
+  title ID T` names an issue ("" goes back to the alert's name). An issue's `host` names the
+  hosts of its findings (`a.test, b.test` after merging issues from two hosts; `hosts` lists
+  them), and so does its write-up's heading in reports. New findings join the first issue for
+  their alert and host; a finding found again stays in its issue.
 - **States:** `open`, `confirmed`, `false_positive`, `accepted_risk`, `retest_pending` and
-  `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). `findings
-  list` and `report` show work still to do by default: open, confirmed and retest pending.
+  `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). Marking
+  a finding with the state it already has changes nothing: who changed it and when stay as
+  they were. `findings list` and `report` show work still to do by default: open, confirmed
+  and retest pending.
   A fixed finding a scanner sees again goes back to open, with a `regressed` event.
 - **Timeline** (`findings timeline ID`): created, state and note changes, retests, moves
-  between issues, regressions and removals, each with who did it (`gui`, `cli`, `mcp`) and
+  between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
+  afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets
   a timeline built from what its findings already recorded.
 - **Retest** (`findings retest ID [--auth PROFILE]`): a passive finding's latest request is
   sent again, recorded with source `retest` (which the background passive scan leaves alone),
   and the finding's own rule or passive check reads that one response. Not reproduced marks it
   `fixed`; a `fixed` or `retest_pending` finding still there is `open` again; false positives
-  and accepted risks keep their state; `--no-mark` records the outcome only. A rule that is
+  and accepted risks keep their state. A retest that still sees it counts as a sighting (a
+  hit, and its reply as the latest); `--no-mark` records the outcome only, leaving the
+  finding as it was. The passive scan never reads retest traffic, even from a source list
+  saved before `scan sources` refused it, so a retest is counted once. A rule that is
   switched off (or no longer loaded) can't tell, so the retest is refused (kind conflict), and
   so is one whose reply has another kind of status than the finding's request had (a redirect
   to a login page, an error) and doesn't show the finding: nothing is marked. A "not
@@ -1642,8 +1765,11 @@ Findings are records with a history, not just rows:
 Risks run `info`, `low`, `medium`, `high` and `critical` (`risk_level` 0 to 4). Checks and
 vulnerable JavaScript libraries rated critical are critical; SARIF gives critical a
 `security-severity` of 9.5. A finding found again at a higher risk than it was stored with
-moves up (never down), so `scan passive --rescan` brings findings recorded as high by older
-builds up to critical.
+moves up, and `scan passive --rescan` rates passive findings afresh: each takes the highest
+risk its sightings give now, so findings recorded as high by older builds go up to critical,
+and one a rule rated too high before it was fixed comes down. Each change is a `risk` event on
+the finding's timeline. Between rescans a lower rating doesn't lower it, since one URL can be
+rated two ways at once (a library file served old and new under two query strings).
 
 ### Report layouts
 
@@ -1672,8 +1798,9 @@ can carry script). Through MCP `--logo` reads no file: save the logo in a profil
 terminal or the app.
 
 `report-profile save NAME [layout flags]` keeps a layout in the project (`report-profile
-list | show | remove`; `--from PROFILE` saves on top of another, keeping its logo), and
-`report --profile NAME` starts from it; flags given with it override it, and an empty one
+list | show | remove`; `--from PROFILE` saves on top of another, keeping its logo). Through
+MCP a profile is saved only under a new name, and `remove` is refused: a saved layout may be
+a person's branding. `report --profile NAME` starts from it; flags given with it override it, and an empty one
 (`--company=`, `--accent=`, `--logo=`, `--since=`) clears what the profile has. The
 retest, posture and list sections keep to the report's filters (`--host`, `--risk`, ...),
 and a note says when the report is cut short by `--limit` whatever its sections.
@@ -1709,14 +1836,18 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   first change a person made to the finding or its issue after them. Reports say it on each
   such finding ("agent's work reviewed" or "not reviewed"), with the request range in the
   technical details.
-- **Repro pack** (`findings repro ID [--output FILE] [--no-redact]`): the request (secrets
-  masked), a curl command, the response around the evidence, what the rule looks for, and the
+- **Repro pack** (`findings repro ID [--output FILE [--force]] [--no-redact | --mask VALUE]`):
+  the request (secrets masked), a curl command, the response around the evidence, what the rule looks for, and the
   command that checks it again (for an active finding on anything but a plain GET, the scan
   has to start from the original request: the command says which history id to give it).
+  An existing `--output` file is kept unless `--force`, which is refused through MCP.
 - **Tickets** (`findings ticket ID --to github --repo OWNER/NAME` or `--to jira --key KEY`):
   a title and Markdown body (what it is, where, CVSS, the reviewed write-up, how to fix and
   reproduce it, its fingerprint) and the command that files it: this command again, piped
   through `jq` into `gh issue create` or Jira's REST call (run it where the project is open).
+  The project's secrets are masked, but there is no `--mask`: the printed command runs this
+  one again, so a value nothing marks (a token typed into a title) is masked by editing the
+  ticket before it is filed.
   The Jira description is a `{noformat}` block, so nothing the target sent is read as Jira
   markup. The GitHub command adds no labels, since `gh` refuses one the repository lacks;
   `labels` lists the suggested ones. Nothing is sent. `--record URL` keeps the filed ticket's link on the finding's
@@ -1740,7 +1871,7 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
 `--fail-on` turns that into an exit code for CI. The baseline can be:
 
 - **A file** (`--baseline FILE`): `report json` output, to compare runs in different project files.
-  Findings match by alert, method, URL without its query, and parameter, so the URL's
+  Findings match by alert, method, URL without its query or path parameters, and parameter, so the URL's
   scheme, host and port must be the same in both runs. `--current FILE` compares two reports and
   doesn't touch `--project`. "Fixed" only means not found this run, so it's as good as the run's
   coverage. A finding added by hand and removed since (`findings remove`) is listed under
@@ -1806,7 +1937,7 @@ brainproxy --project run.bpdb findings compare --scan 1 --baseline known.json --
 
 A fresh project starts with every finding open, so its reports would show what earlier runs marked
 as false positives. `findings mark --from FILE` copies the marks first: each of the project's
-findings that matches one of FILE's (alert, method, URL without its query, and parameter, as
+findings that matches one of FILE's (alert, method, URL without its query or path parameters, and parameter, as
 `compare` matches them; a report's `fingerprint` where it has one, so a redacted report still
 matches) gets that finding's mark where it is `confirmed`, `false_positive` or `accepted_risk`,
 or `--state` for every match. FILE is a `report json`, or a list a team keeps of the findings it has
@@ -1963,7 +2094,9 @@ scope and the TLS pass-through list, but traffic left out still leaves rows, and
 that narrows recording is flagged until a person changes that setting or the agent puts it
 back as it was, and stays in the log either way (see [Who recorded what](#who-recorded-what)).
 An agent that also runs `brainproxy` in a shell counts as `cli` there, as a person would, so
-it can clear the flag that way; the change is still logged. `browser open` isn't offered (the
+it can clear the flag that way; the change is still logged. A request whose Host header names a
+host the scope doesn't list is refused without `host_header_test` (see
+[Concepts](#concepts)). `browser open` isn't offered (the
 project's browser profile keeps the person's sign-ins), and other options that need a person are
 refused too; docs/MCP.md lists them.
 

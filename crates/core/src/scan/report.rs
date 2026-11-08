@@ -63,6 +63,9 @@ pub struct ReportOptions {
     pub baseline: Option<std::collections::HashMap<i64, bool>>,
     /// Mask session secrets (cookies, credentials, tokens) in everything taken from traffic.
     pub redact: bool,
+    /// With `redact`: more values to mask wherever the report quotes them, like the project's
+    /// known secrets, for a secret nothing marks (a token typed into a title or a note).
+    pub mask: Vec<String>,
     /// Which sections the report has, and its branding.
     pub layout: Layout,
     /// Print narratives nobody has reviewed yet, marked as drafts.
@@ -80,6 +83,7 @@ impl Default for ReportOptions {
             scan: None,
             baseline: None,
             redact: true,
+            mask: Vec::new(),
             layout: Layout::default(),
             drafts: false,
         }
@@ -217,7 +221,7 @@ pub struct AlertGroup {
     /// The highest CVSS 4.0 score among its instances' issues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
-    /// Write-ups of its issues (one per host), reviewed or, when asked for, drafts.
+    /// Write-ups of its issues (usually one per host), reviewed or, when asked for, drafts.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub narratives: Vec<IssueNarrative>,
     pub instances: Vec<Instance>,
@@ -227,6 +231,8 @@ pub struct AlertGroup {
 #[derive(Debug, Clone, Serialize)]
 pub struct IssueNarrative {
     pub issue_id: i64,
+    /// The hosts of the issue's findings in the report, joined by ", " (several after issues
+    /// from two hosts were merged).
     pub host: String,
     #[serde(flatten)]
     pub narrative: Narrative,
@@ -296,11 +302,12 @@ pub struct Instance {
     /// With a `--scan`: new (first found by that scan) or unchanged (found before and again).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_state: Option<&'static str>,
-    /// What makes it the same finding in the project (alert, method, URL without its query,
-    /// parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
+    /// What makes it the same finding in the project (alert, method, URL without its query or
+    /// path parameters, parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
     /// matches a saved report by, since redaction may change the URL.
     pub fingerprint: String,
-    /// The issue (alert type and host) it is an instance of, and that issue's CVSS rating.
+    /// The issue (alert type and host, or hosts once merged) it is an instance of, and that
+    /// issue's CVSS rating.
     pub issue_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
@@ -352,23 +359,42 @@ pub struct Body {
     pub binary: bool,
 }
 
+/// How far past `max_evidence` a body is read before it is cut, so a secret the cut falls
+/// inside is masked whole first (of a longer one, the part before the cut is left).
+const PAST_THE_CUT: usize = 64 * 1024;
+
 impl Body {
-    fn new(bytes: &[u8], max: usize) -> Self {
+    /// A body whose first `max` bytes are text, read [`PAST_THE_CUT`] beyond them, for
+    /// [`Body::cut`] once its secrets are masked; or a placeholder for binary data.
+    fn read(bytes: &[u8], max: usize) -> Self {
         let length = bytes.len();
-        let slice = &bytes[..length.min(max)];
-        let truncated = length > max;
-        let text = match std::str::from_utf8(slice) {
-            Ok(s) => Some(s.to_string()),
-            // The cut may split a multi-byte character; keep the valid prefix.
-            Err(e) if truncated && e.error_len().is_none() => {
-                Some(String::from_utf8_lossy(&slice[..e.valid_up_to()]).into())
-            }
-            Err(_) => None,
+        let head = &bytes[..length.min(max)];
+        let text = match std::str::from_utf8(head) {
+            Ok(_) => true,
+            // The cut may split a multi-byte character.
+            Err(e) => length > max && e.error_len().is_none(),
         };
-        match text {
-            Some(text) => Body { text, length, truncated, binary: false },
-            None => Body { text: format!("[{length} bytes of binary data]"), length, truncated: false, binary: true },
+        if !text {
+            return Body { text: format!("[{length} bytes of binary data]"), length, truncated: false, binary: true };
         }
+        // Up to the window's end, or to the first bytes that aren't text.
+        let window = &bytes[..length.min(max.saturating_add(PAST_THE_CUT))];
+        let valid = std::str::from_utf8(window).map_or_else(|e| e.valid_up_to(), |s| s.len());
+        let text = String::from_utf8_lossy(&window[..valid]).into_owned();
+        Body { truncated: text.len() < length, text, length, binary: false }
+    }
+
+    /// Cuts the text to at most `max` bytes, on a character boundary.
+    fn cut(&mut self, max: usize) {
+        if self.binary || self.text.len() <= max {
+            return;
+        }
+        let mut at = max;
+        while !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.text.truncate(at);
+        self.truncated = true;
     }
 }
 
@@ -532,11 +558,24 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     let touched = store.agent_touched(&ids)?;
     let mut tickets = store.findings_tickets(&ids)?;
     for g in &mut groups {
+        // An issue merged from several hosts holds findings of each: its write-up names them
+        // all, not the host of whichever finding comes first.
+        let mut hosts: std::collections::BTreeMap<i64, std::collections::BTreeSet<String>> = Default::default();
+        for inst in &g.instances {
+            if let Some(issue) = inst.issue_id {
+                hosts.entry(issue).or_default().insert(inst.host.clone());
+            }
+        }
         let mut seen = std::collections::BTreeSet::new();
         for inst in &mut g.instances {
             if let Some(issue) = inst.issue_id.filter(|i| seen.insert(*i)) {
                 if let Some(n) = store.issue_narrative(issue)?.filter(|n| n.reviewed() || opts.drafts) {
-                    g.narratives.push(IssueNarrative { issue_id: issue, host: inst.host.clone(), narrative: n });
+                    let host = hosts.get(&issue).map(|h| h.iter().cloned().collect::<Vec<_>>().join(", "));
+                    g.narratives.push(IssueNarrative {
+                        issue_id: issue,
+                        host: host.unwrap_or_else(|| inst.host.clone()),
+                        narrative: n,
+                    });
                 }
             }
             let trail = if touched.contains(&inst.id) { Some(store.agent_trail(inst.id)?) } else { None };
@@ -569,6 +608,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         for (profile, state) in store.auth_list()? {
             red.know(profile.secret_values(&state));
         }
+        red.know(opts.mask.iter().cloned());
     }
     if opts.evidence {
         for inst in groups.iter_mut().flat_map(|g| g.instances.iter_mut()) {
@@ -665,7 +705,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     if let Some(job) = opts.scan {
         filters["scan"] = json!(job);
     }
-    Ok(Report {
+    let mut report = Report {
         title: opts.title.clone().unwrap_or_else(|| "brainproxy security report".into()),
         generated,
         tool: Tool { name: "brainproxy", version: env!("CARGO_PKG_VERSION") },
@@ -678,7 +718,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             alert_types: groups.len(),
             by_risk,
             false_positives_left_out,
-            redacted: redactor.map(|r| r.masked),
+            redacted: None,
         },
         alerts: groups,
         agent_false_positives,
@@ -686,7 +726,60 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         retest,
         summary_narrative,
         layout: opts.layout.clone(),
-    })
+    };
+    if let Some(mut red) = redactor {
+        scrub_the_rest(&mut red, &mut report);
+        report.summary.redacted = Some(red.masked);
+    }
+    // Bodies were read past the cut so the secrets the cut falls inside were masked whole.
+    for inst in report.alerts.iter_mut().flat_map(|g| g.instances.iter_mut()) {
+        let mut bodies: Vec<&mut Body> = Vec::new();
+        bodies.extend(inst.request.as_mut().map(|r| &mut r.body));
+        bodies.extend(inst.response.as_mut().map(|r| &mut r.body));
+        if let Some(e) = inst.latest.as_mut() {
+            bodies.push(&mut e.request.body);
+            bodies.extend(e.response.as_mut().map(|r| &mut r.body));
+        }
+        bodies.into_iter().for_each(|b| b.cut(opts.max_evidence));
+    }
+    Ok(report)
+}
+
+/// Masks the values known so far in the rest of what a report shows that may quote one: its
+/// title, the layout's company, the engagement scope, the filters, the posture section, and
+/// each finding's host and state in words (only known values: none of these is masked by
+/// its place).
+fn scrub_the_rest(red: &mut Redactor, r: &mut Report) {
+    fn strings(red: &mut Redactor, v: &mut Value) {
+        match v {
+            Value::String(s) => red.scrub(s),
+            Value::Array(a) => a.iter_mut().for_each(|v| strings(red, v)),
+            Value::Object(o) => o.values_mut().for_each(|v| strings(red, v)),
+            _ => {}
+        }
+    }
+    red.scrub(&mut r.title);
+    if let Some(c) = r.layout.company.as_mut() {
+        red.scrub(c);
+    }
+    if let Some(scope) = r.scope.as_mut() {
+        for s in scope.name.iter_mut().chain(scope.include.iter_mut()).chain(scope.exclude.iter_mut()) {
+            red.scrub(s);
+        }
+    }
+    strings(red, &mut r.filters);
+    if let Some(p) = r.posture.as_mut() {
+        strings(red, p);
+    }
+    for g in r.alerts.iter_mut() {
+        for n in g.narratives.iter_mut() {
+            red.scrub(&mut n.host);
+        }
+        for i in g.instances.iter_mut() {
+            red.scrub(&mut i.host);
+            red.scrub(&mut i.state_text);
+        }
+    }
 }
 
 /// The retest section: the latest retest, regression or fix of each finding `scope` selects
@@ -881,7 +974,7 @@ fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, O
                     method: r.get(0)?,
                     url: r.get(1)?,
                     headers: headers(r.get(2)?),
-                    body: Body::new(&r.get::<_, Vec<u8>>(3)?, max),
+                    body: Body::read(&r.get::<_, Vec<u8>>(3)?, max),
                 };
                 let status: Option<i64> = r.get(4)?;
                 let resp = status.map(|_| -> rusqlite::Result<HttpResponse> {
@@ -889,7 +982,7 @@ fn evidence(store: &Store, id: i64, max: usize) -> Result<Option<(HttpRequest, O
                         status,
                         reason: r.get(5)?,
                         headers: headers(r.get(6)?),
-                        body: Body::new(&r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(), max),
+                        body: Body::read(&r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(), max),
                     })
                 });
                 Ok((req, resp.transpose()?))
@@ -2015,11 +2108,13 @@ fn html(r: &Report) -> String {
     s
 }
 
-/// One finding as the report shows it: its texts, redacted evidence and fingerprint.
-fn one_finding(store: &Store, id: i64, redact: bool) -> Result<(AlertGroup, Instance)> {
+/// One finding as the report shows it: its texts, redacted evidence (and the values in
+/// `mask` masked too) and fingerprint.
+fn one_finding(store: &Store, id: i64, redact: bool, mask: &[String]) -> Result<(AlertGroup, Instance)> {
     let opts = ReportOptions {
         filter: FindingFilter { ids: Some(vec![id]), state: Some("all".into()), ..Default::default() },
         redact,
+        mask: mask.to_vec(),
         max_evidence: 16 * 1024,
         drafts: false,
         ..Default::default()
@@ -2045,8 +2140,8 @@ fn excerpt(resp: &HttpResponse, evidence: &str) -> Option<String> {
 
 /// A repro pack: everything needed to see a finding again by hand or in CI, secrets masked
 /// unless `redact` is off.
-pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
-    let (g, i) = one_finding(store, id, redact)?;
+pub fn repro(store: &Store, id: i64, redact: bool, mask: &[String]) -> Result<Value> {
+    let (g, i) = one_finding(store, id, redact, mask)?;
     // An active check starts from a GET of the URL; another method or a body needs the scan
     // to start from the original request, which the pack's (attack) exchange isn't.
     let plain_get = i.method.eq_ignore_ascii_case("GET") && i.request.as_ref().is_none_or(|r| r.body.length == 0);
@@ -2100,7 +2195,7 @@ pub fn repro(store: &Store, id: i64, redact: bool) -> Result<Value> {
 /// A finding written up for an issue tracker (github or jira): a title, a Markdown body with
 /// what it is, where, how to fix and reproduce it, and its fingerprint; secrets masked.
 pub fn ticket(store: &Store, id: i64, tracker: &str, target: Option<&str>) -> Result<Value> {
-    let (g, i) = one_finding(store, id, true)?;
+    let (g, i) = one_finding(store, id, true, &[])?;
     let title = format!("[{}] {} on {}", risk_title(&i.risk), g.name, i.host);
     let mut body = String::new();
     let _ = writeln!(
@@ -2486,8 +2581,9 @@ fn sarif(r: &Report) -> Value {
                 "message": {"text": msg},
                 "locations": [{"physicalLocation": {"artifactLocation": {"uri": inst.url.replace(crate::scan::redact::MASK, "%5Bredacted%5D")}}}],
                 // The project's own dedup key, so a finding seen again with another query string
-                // is the same result to code scanning, as it is to brainproxy.
-                "partialFingerprints": {"brainproxy/v2": inst.fingerprint},
+                // or session id in its path is the same result to code scanning, as it is to
+                // brainproxy. v3 since the key dropped path parameters (v2 kept them).
+                "partialFingerprints": {"brainproxy/v3": inst.fingerprint},
                 "properties": {
                     "findingId": inst.id,
                     "source": inst.source,
@@ -2674,8 +2770,8 @@ mod tests {
         // The SARIF fingerprint is the project's dedup key, hashed: no URL, so no secret in it.
         let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
         let res = sarif["runs"][0]["results"].as_array().unwrap().iter().find(|x| x["ruleId"] == "10037").unwrap();
-        assert_eq!(res["partialFingerprints"]["brainproxy/v2"], fingerprint("10037", "GET", "http://app.test/a", ""));
-        assert_eq!(res["partialFingerprints"]["brainproxy/v2"].as_str().unwrap().len(), 32);
+        assert_eq!(res["partialFingerprints"]["brainproxy/v3"], fingerprint("10037", "GET", "http://app.test/a", ""));
+        assert_eq!(res["partialFingerprints"]["brainproxy/v3"].as_str().unwrap().len(), 32);
         assert_eq!(res["properties"]["lastHistoryId"], 2);
         assert!(res.get("baselineState").is_none());
 
@@ -2689,6 +2785,79 @@ mod tests {
         let out = render(&bare, ReportKind::Json);
         assert!(bare.alerts.iter().flat_map(|g| &g.instances).all(|i| i.request.is_none() && i.latest.is_none()));
         assert!(secrets.iter().all(|x| !out.contains(x)));
+    }
+
+    #[test]
+    fn values_a_person_names_are_masked_everywhere() {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let req = b"GET /a HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\nhello TYPED7TOKEN";
+        s.record(&Capture::new("send", &target, req, Some(resp), Some(5), None)).unwrap();
+        // A token typed into a manual finding's title and evidence, with nothing to mark it.
+        let mut f = by_hand("IDOR with TYPED7TOKEN", vec![1]);
+        f.evidence = "used TYPED7TOKEN from the mobile app".into();
+        let id = s.finding_add(&f).unwrap();
+        let plain = build(&s, &ReportOptions::default()).unwrap();
+        assert!(render(&plain, ReportKind::Json).contains("TYPED7TOKEN"));
+
+        let mask = vec!["TYPED7TOKEN".to_string()];
+        let r = build(&s, &ReportOptions { mask: mask.clone(), ..Default::default() }).unwrap();
+        for kind in [ReportKind::Json, ReportKind::Markdown, ReportKind::Html, ReportKind::Sarif, ReportKind::Csv] {
+            assert!(!render(&r, kind).contains("TYPED7TOKEN"), "{}", kind.as_str());
+        }
+        // A PDF prints this page, and a DOCX is written from the same masked report.
+        assert!(!render_print_html(&r).contains("TYPED7TOKEN"));
+        // The repro pack takes the same list.
+        assert!(!repro(&s, id, true, &mask).unwrap().to_string().contains("TYPED7TOKEN"));
+        assert!(repro(&s, id, true, &[]).unwrap().to_string().contains("TYPED7TOKEN"));
+    }
+
+    #[test]
+    fn a_masked_value_is_masked_outside_the_findings_and_across_the_cut() {
+        let mut s = Store::open_in_memory().unwrap();
+        // The value in a host name, and another one where the body is cut.
+        let host = "typed7token.app.test";
+        let target = Target { scheme: "http".into(), host: host.into(), port: 80 };
+        let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let body = format!("{}STRADDLE77VALUE and more", "a".repeat(100));
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp.as_bytes()), None, None)).unwrap();
+        passive::scan_pending(&mut s).unwrap();
+        let filter = FindingFilter { alert_ref: Some("10037".into()), host: Some(host.into()), ..Default::default() };
+        let issue = s.issues_list(&filter, 10).unwrap()[0]["id"].as_i64().unwrap();
+        s.issue_set_narrative(issue, "PHP's version is in every reply.").unwrap();
+        let spec = crate::guard::ScopeSpec {
+            name: Some("Typed7Token engagement".into()),
+            include: vec![host.into()],
+            exclude: vec![],
+        };
+        s.engagement_start(&spec).unwrap();
+        let opts = |mask: Vec<String>| ReportOptions {
+            filter: filter.clone(),
+            title: Some("Report on TYPED7TOKEN".into()),
+            layout: Layout { company: Some("typed7token Ltd".into()), ..Default::default() },
+            max_evidence: 108,
+            drafts: true,
+            mask,
+            ..Default::default()
+        };
+        let plain = render(&build(&s, &opts(vec![])).unwrap(), ReportKind::Json);
+        assert!(plain.contains("STRADDLE") && plain.to_ascii_lowercase().contains("typed7token"));
+
+        let r = build(&s, &opts(vec!["TYPED7TOKEN".into(), "STRADDLE77VALUE".into()])).unwrap();
+        assert_eq!(r.alerts[0].narratives[0].host, "[redacted].app.test");
+        let body = &r.alerts[0].instances[0].response.as_ref().unwrap().body;
+        assert!(body.truncated && body.text.len() <= 108, "{body:?}");
+        for kind in [ReportKind::Json, ReportKind::Markdown, ReportKind::Html] {
+            let out = render(&r, kind);
+            // ASCII case is ignored.
+            assert!(!out.to_ascii_lowercase().contains("typed7token"), "{}: {out}", kind.as_str());
+            assert!(!out.contains("STRADDLE"), "{}", kind.as_str());
+        }
     }
 
     #[test]
@@ -3000,10 +3169,19 @@ mod tests {
 
     #[test]
     fn body_truncation_and_binary() {
-        let b = Body::new("héllo".as_bytes(), 2);
+        // Read past the cut, then cut (once its secrets are masked).
+        let mut b = Body::read("héllo".as_bytes(), 2);
+        assert_eq!((b.text.as_str(), b.truncated), ("héllo", false));
+        b.cut(2);
         assert_eq!((b.text.as_str(), b.truncated, b.binary), ("h", true, false));
-        let b = Body::new(&[0xff, 0xfe, 0x00], 10);
+        let b = Body::read(&[0xff, 0xfe, 0x00], 10);
         assert!(b.binary && b.text.contains("3 bytes"));
+        // Bytes that aren't text after the cut end what is read, as before.
+        let mut b = Body::read(b"abc\xffdef", 2);
+        b.cut(2);
+        assert_eq!((b.text.as_str(), b.truncated, b.binary), ("ab", true, false));
+        let b = Body::read(b"abc\xffdef", 3);
+        assert_eq!((b.text.as_str(), b.truncated), ("abc", true));
     }
 
     #[test]
@@ -3419,5 +3597,27 @@ mod tests {
         let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
         assert_eq!(g.instances[0].state, "removed");
         assert!(render(&r, ReportKind::Html).contains("<span class=\"tag\">removed from the command line</span>"));
+    }
+
+    #[test]
+    fn a_merged_issue_s_write_up_names_every_host() {
+        let mut s = Store::open_in_memory().unwrap();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        for host in ["a.test", "b.test"] {
+            let target = Target { scheme: "http".into(), host: host.into(), port: 80 };
+            let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp), None, None)).unwrap();
+        }
+        passive::scan_pending(&mut s).unwrap();
+        let filter = FindingFilter { alert_ref: Some("10037".into()), ..Default::default() };
+        let issues = s.issues_list(&filter, 10).unwrap();
+        let id = |host: &str| issues.iter().find(|i| i["host"] == host).unwrap()["id"].as_i64().unwrap();
+        let (a, b) = (id("a.test"), id("b.test"));
+        s.issues_merge(a, &[b]).unwrap();
+        s.issue_set_narrative(a, "PHP's version is in every reply.").unwrap();
+        let r = build(&s, &ReportOptions { filter, drafts: true, ..Default::default() }).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "10037").unwrap();
+        assert_eq!(g.narratives.len(), 1);
+        assert_eq!(g.narratives[0].host, "a.test, b.test");
     }
 }

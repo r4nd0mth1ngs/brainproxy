@@ -325,6 +325,10 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             Err(e) => {
                 summary.errors += 1;
                 *summary.by_status.entry("error".into()).or_default() += 1;
+                // A Host the scope doesn't list, refused as the request went out.
+                if let Some(h) = crate::http::client::refused_host(&e).filter(|_| out_of_scope.len() < 50) {
+                    out_of_scope.insert(h);
+                }
                 // Its row says how it failed; one refused before it went out gets one now.
                 if !recorded {
                     let _ = save.send(Save::Unsent(Box::new(Capture::new(

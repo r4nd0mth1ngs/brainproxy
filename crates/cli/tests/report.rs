@@ -180,3 +180,44 @@ fn report_formats_filters_and_files() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn values_named_with_mask_are_masked() {
+    let dir = std::env::temp_dir().join(format!("bp-report-{}-mask", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("p.bpdb");
+    // A token typed into a title and evidence: nothing marks it as a secret.
+    let (code, v) = run(
+        &[
+            "findings",
+            "add",
+            "--title",
+            "IDOR with TYPED7TOKEN",
+            "--risk",
+            "high",
+            "--url",
+            "https://app.test/o/7",
+            "--evidence",
+            "used token TYPED7TOKEN",
+        ],
+        &project,
+    );
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["id"].as_i64().unwrap().to_string();
+    let (_, v) = run(&["report", "markdown"], &project);
+    assert!(v.to_string().contains("TYPED7TOKEN"));
+    let (code, v) = run(&["report", "markdown", "--mask", "TYPED7TOKEN", "--mask", "other-value"], &project);
+    assert_eq!(code, 0, "{v}");
+    assert!(!v.to_string().contains("TYPED7TOKEN"), "{v}");
+    let (code, v) = run(&["findings", "repro", &id, "--mask", "TYPED7TOKEN"], &project);
+    assert_eq!(code, 0, "{v}");
+    assert!(!v.to_string().contains("TYPED7TOKEN"), "{v}");
+    // Too short to look for, or with nothing masked at all.
+    let (code, v) = run(&["report", "--mask", "abc"], &project);
+    assert_ne!(code, 0);
+    assert!(v["error"]["message"].as_str().unwrap().contains("at least 6"), "{v}");
+    let o = bin().arg("--project").arg(&project).args(["report", "--no-redact", "--mask", "TYPED7TOKEN"]).output();
+    assert!(!o.unwrap().status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+}

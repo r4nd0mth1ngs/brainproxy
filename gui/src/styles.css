@@ -1134,6 +1134,28 @@ select {
 .recent .label {
   margin-bottom: 4px;
 }
+.recent-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.recent-row .recent-item {
+  flex: 1;
+  min-width: 0;
+}
+.recent-delete {
+  flex: none;
+  opacity: 0;
+}
+.recent-row:hover .recent-delete,
+.recent-delete:focus-visible,
+.recent-delete:disabled {
+  opacity: 1;
+}
+.recent-delete:hover:not(:disabled) {
+  color: var(--high);
+  border-color: var(--high);
+}
 .recent-item {
   display: flex;
   flex-direction: column;
@@ -1145,7 +1167,7 @@ select {
   cursor: pointer;
   text-align: left;
 }
-.recent-item:hover {
+.recent-item:hover:not(:disabled) {
   background: var(--raised);
 }
 .recent-item .muted {
@@ -1366,8 +1388,13 @@ select {
   cursor: pointer;
   text-align: left;
 }
-.welcome-action:hover {
+.welcome-action:hover:not(:disabled) {
   border-color: var(--accent);
+}
+.welcome-action:disabled,
+.recent-item:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 .welcome-action.primary {
   border-color: var(--accent);

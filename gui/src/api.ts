@@ -120,6 +120,25 @@ export const tempProjects = {
   discard: (project: string) => shell<void>("temp_discard", { project }),
 };
 
+/** What `deleteProject` did. */
+export type ProjectDeleted =
+  /** The file was already gone: nothing was deleted. */
+  | { state: "gone" }
+  /** `project stop` failed (something won't stop, or the project can't be opened); nothing was deleted. */
+  | { state: "not_stopped"; error: string }
+  /** `left`: what couldn't be deleted once the project file was. */
+  | { state: "deleted"; removed: string[]; left: { path: string; error: string }[] };
+
+/**
+ * Deletes a project (desktop app only): stops everything running for it (`project stop`), then
+ * deletes its file and what the CLI keeps beside it (SQLite's files, locks, default logs,
+ * browser profiles). No CLI command can, so a project an agent or script starts stays until a
+ * person deletes it here. If `project stop` fails nothing is deleted unless `force` is set
+ * (how a damaged project goes). Rejects, having deleted nothing, with the shell's message if it
+ * isn't a project file or is a temporary engagement.
+ */
+export const deleteProject = (project: string, force = false) => shell<ProjectDeleted>("project_delete", { project, force });
+
 /** Runs a command and returns its data, throwing CliError when ok is false. */
 export async function run<T = any>(args: string[], input?: string | Uint8Array | CliInput): Promise<T> {
   const env = await cli<T>(args, input);

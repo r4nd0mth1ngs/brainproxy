@@ -37,6 +37,7 @@ pub const JOB_COLUMNS: &[(&str, &str, &str)] = &[
     ("progress", "TEXT", "Latest progress as JSON"),
     ("result", "TEXT", "Final summary as JSON"),
     ("error", "TEXT", "Error message if the job failed"),
+    ("origin", "TEXT", "gui, cli or mcp: who started the job; NULL for jobs from before brainproxy kept it"),
 ];
 
 /// Terminal states.
@@ -47,8 +48,8 @@ pub fn is_finished(state: &str) -> bool {
 impl Store {
     pub fn job_create(&self, kind: &str, state: &str, args: &[String]) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO jobs (kind, state, args) VALUES (?1, ?2, ?3)",
-            params![kind, state, serde_json::to_string(args).unwrap_or_default()],
+            "INSERT INTO jobs (kind, state, args, origin) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, state, serde_json::to_string(args).unwrap_or_default(), crate::provenance::origin()],
         )?;
         Ok(self.conn.last_insert_rowid())
     }

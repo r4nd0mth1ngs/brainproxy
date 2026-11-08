@@ -67,7 +67,9 @@ joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy
 `oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
 `project save`, since copying the project elsewhere is for the person running the server; and
 `findings remove`, since an agent can't tell a finding a person added from its own (it marks
-one `false_positive` with a note instead; the command refuses a tool call too).
+one `false_positive` with a note instead; the command refuses a tool call too); and
+`report-profile remove`, since a saved report layout may be a person's branding (the command
+refuses a tool call too).
 `findings_mark` takes one finding at a time: `from` (marking every finding that matches a
 file's) is refused, so an agent can't hide a set of findings in one call.
 
@@ -86,8 +88,9 @@ file's) is refused, so an agent can't hide a set of findings in one call.
   most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
   goes back to the old proxy if it had stopped it and the new one isn't up: with its old options
   and a new pid, which `proxy_status` shows in `restart_gone`), `*_remove`, `*_clear`,
-  `scope_set`, `ca_init`, `scan_data_reset`. `replay_tabs_save` is local and not
-  destructive: through MCP it only adds Replay tabs (below), and it sends nothing. A command
+  `scope_set`, `scan_data_reset`. `replay_tabs_save` is local and not
+  destructive: through MCP it only adds Replay tabs (below), and it sends nothing; nor are
+  `report`, `findings_repro`, `ca_export` and `ca_init`, whose `force` is refused (below). A command
   missing from the table gets the spec's cautious defaults (not read-only, destructive, not
   idempotent, open world); a test fails until it is classified. These are hints for clients
   deciding what to confirm; the scope is enforced by the commands regardless.
@@ -121,6 +124,15 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
   would copy any file the server can read into the project for the agent to read back; pass the
   text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
+  its company, logo and sections, may be a person's. An agent saves a new name; a person
+  replaces or removes one in the app or a terminal.
+- `report`, `findings_repro` and `ca_export` with `force`: `output` (`out`) would overwrite any
+  file the server can write. An agent writes to a new file, or leaves out `output` (`out`) to
+  get the report, pack or certificate in the reply.
+- `ca_init` with `force`: a new CA would make every client that trusts the person's stop
+  trusting the proxy. Without it the CA is created only when missing; a person replaces it in a
+  terminal.
 - `findings_add` with `replace_text`: the description and solution findings of the same title
   share may be a person's. A different one is refused (`conflict`) without it, so an agent
   leaves them out or uses another title.
@@ -131,6 +143,24 @@ Some arguments need a person, so a command run for a tool call (the server sets
   requests out of history. (Every request a `scan_active` check template sends, and the
   document fetches of `import_api` and `scan_active` with `api`, are recorded whoever runs
   them.)
+- Any request whose Host header (HTTP/2's `:authority`) or request target names a host other
+  than the target's that the engagement scope doesn't list by name, or whose request line or head
+  a lenient server could read otherwise (odd spacing, a bare CR or LF, a second request after the
+  body, including a `verbatim` body with no framing that starts with a request line, or framing
+  servers may read differently: Content-Length twice with different values, or with
+  Transfer-Encoding), is refused (`out_of_scope`) as it goes on the wire, after a session or signer changed it;
+  `send` (races too), `fuzz_run` (also for payloads with raw line breaks into the head),
+  `ws_send`, `scan_active` (for its base requests: a rule's own Host is its test),
+  `auth_login`, `auth_status`, `auth_macro_run` and `intercept_forward` (for hosts an edit
+  brings in) send it when `host_header_test` is set, so request smuggling tests (CL.TE, TE.CL, a
+  request after the body) need it too. A proxy rule an agent added refuses the
+  requests it gives a foreign Host unless `rules_add` (or `rules_enable`) had `host_header_test`. On a shared front end such
+  a request to an in-scope address can reach a site outside the scope; a Host-header test needs
+  one, so the flag puts the intent on record. The output's `host_warning` names the host either
+  way, as it does outside MCP. The same goes for settings that put such a Host on requests still
+  to come: `auth_add` (`headers`, `token_header`, `login_request`, `login_header`),
+  `auth_macro_add` steps, and `rules_add` or `rules_enable` with a rule that writes or rewrites
+  the Host; the MANUAL's Concepts section has the details.
 - `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
   project's profile, with the person's cookies and sign-ins, and the pages it loads would be
   recorded as the proxy's traffic, not the agent's.

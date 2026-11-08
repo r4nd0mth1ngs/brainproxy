@@ -205,15 +205,15 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
     }
   };
 
-  // The proxy starts with the project (unless turned off in Settings). While that setting is on,
-  // a proxy the app started (here, from the pill, Open browser, Settings or Record a login) stops
-  // again when the project closes or the window does, so none are left behind holding the port;
+  // The proxy starts with the project (unless turned off in Settings). A proxy the app started
+  // (here, from the pill, Open browser, Settings or Record a login) stops again when the project
+  // closes or the window does, whatever that setting, so none are left behind holding the port;
   // one a shell or an agent started is left alone.
   const proxyCtl = app.proxy;
   // Pinned to this project: another may be open by the time it runs.
   const project = app.project;
   const inProject = (args: string[]) => run(args, { project });
-  const stopOnClose = () => (autoProxy() ? stopOwned(inProject, proxyCtl).catch(() => {}) : Promise.resolve());
+  const stopOnClose = () => stopOwned(inProject, proxyCtl).catch(() => {});
   // `app` changes with every toast or tab switch; only a project change may restart the proxy.
   const toastRef = useRef(app.toast);
   toastRef.current = app.toast;

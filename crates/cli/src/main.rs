@@ -642,6 +642,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let send_opts = args.req.send_options(guard);
     // So is a server name the scope doesn't list, before a row could say it was sent.
     send_opts.check_sni(&target)?;
+    // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test.
+    let host_warning = mcp::check_host_header(&send_opts, req.as_bytes(), &target, args.req.host_header_test, out)?;
     let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
         // Its logins, checks and macros keep no content either.
@@ -658,7 +660,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             }
             None => req,
         };
-        return race(project, &args, req, target, client, n, h2, out);
+        return race(project, &args, req, target, client, n, h2, host_warning, out);
     }
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
@@ -720,6 +722,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let (id, ex) = outcome?;
     let new_findings = log.scan(&rows)?;
     let id = Some(id);
+    let host_warning =
+        mcp::sent_host_warning([&client].into_iter().chain(session.as_deref().map(|s| s.client())), host_warning, out);
 
     if args.raw {
         out.raw(&ex.response);
@@ -734,6 +738,9 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if let Err(e) = saved {
         data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
+    }
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
@@ -774,6 +781,7 @@ fn race(
     client: Client,
     n: usize,
     h2: bool,
+    host_warning: Option<String>,
     out: &Out,
 ) -> Result<(), Error> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(Error::Io)?;
@@ -860,6 +868,7 @@ fn race(
         std::process::exit(e.exit_code());
     }
     let new_findings = log.scan(&ids)?;
+    let host_warning = mcp::sent_host_warning([&client], host_warning, out);
     let mut data = json!({
         "race": n,
         "race_id": race_id,
@@ -872,6 +881,9 @@ fn race(
     });
     if new_findings > 0 {
         data["new_findings"] = json!(new_findings);
+    }
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
     }
     out.ok(data.clone(), || {
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
@@ -933,8 +945,9 @@ fn schema_json() -> Value {
             {"name": "finding_events", "description": "Each finding's timeline: created, state and note changes, retests, regressions, moves between issues, removals, with who and when.", "columns": cols(brainproxy_core::scan::issues::EVENT_COLUMNS)},
             {"name": "scan_observations", "description": "What each completed active scan saw of the findings it covered: new, still or gone. Join jobs ON jobs.id = job_id.", "columns": cols(brainproxy_core::scan::issues::OBSERVATION_COLUMNS)},
             {"name": "report_profiles", "description": "Saved report layouts (`report-profile save`), used with `report --profile NAME`.", "columns": cols(brainproxy_core::scan::layout::PROFILE_COLUMNS)},
-            {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
-            {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Not readable with query (it holds secrets); use auth list / auth show (redacted)."},
+            {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref, and who wrote the text of a title added by hand.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_TYPE_COLUMNS)},
+            {"name": "setting_changes", "description": "Who saved which setting (scope, rules, intercept, connection, ...) and when; the values themselves are not logged.", "columns": cols(store::SETTING_CHANGE_COLUMNS)},
+            {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Not readable with query (it holds secrets); use auth list / auth show (redacted), which also say who saved the profile (profile.origin), its rules and macros (origin), and its session (session_origin)."},
             {"name": "authz_results", "description": "Access-control test results: one row per request and identity (authz run). Join history ON history.id = authz_results.history_id (or baseline_history_id).", "columns": cols(brainproxy_core::authz::AUTHZ_RESULT_COLUMNS)},
             {"name": "jobs", "description": "Background jobs (crawl, active scan, authz run).", "columns": cols(brainproxy_core::jobs::JOB_COLUMNS)},
             {"name": "oob_payloads", "description": "Out-of-band payload tokens: from active rules (source scan) or `oob payload` (manual).", "columns": cols(brainproxy_core::oob::PAYLOAD_COLUMNS)},

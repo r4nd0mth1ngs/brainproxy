@@ -403,9 +403,10 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
     for task in tasks {
         let Ok(Some((req, raw, target, sent))) = task.await else { continue };
         // Host names pass may_allow; the resolved address can still be out of scope.
-        if let Err(Error::OutOfScope(_)) = &sent {
+        if let Err(e @ Error::OutOfScope(_)) = &sent {
             summary.skipped_out_of_scope += 1;
-            oos.insert(target.host.clone());
+            // A refused Host header is listed by the host it named, not the target's.
+            oos.insert(crate::http::client::refused_host(e).unwrap_or_else(|| target.host.clone()));
             total -= 1;
             continue;
         }

@@ -32,6 +32,30 @@ use crate::http::response::parse_response_head;
 use crate::http::target::Target;
 use crate::http::wire::WireReader;
 
+/// What a client does with a request whose Host header (or request target) names a host the
+/// scope doesn't list by name, which a shared front end may send to a site outside the scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPolicy {
+    /// Refuse it: an agent's request that doesn't say it is a Host-header test.
+    Refuse,
+    /// Send it, and note the host (see [`Client::first_foreign_host`]) for the command to warn about.
+    Warn,
+    /// Send it unremarked: a scan rule's Host-header probe, a proxied client's own request.
+    Allow,
+}
+
+impl HostPolicy {
+    /// Refuse under an MCP tool call unless `test` (`--host-header-test`) says it is meant;
+    /// warn otherwise.
+    pub fn for_process(test: bool) -> Self {
+        if crate::provenance::origin() == "mcp" && !test {
+            Self::Refuse
+        } else {
+            Self::Warn
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SendOptions {
     pub timeout: Duration,
@@ -44,11 +68,21 @@ pub struct SendOptions {
     pub guard: Option<Arc<Guard>>,
     /// Send over HTTP/2 (ALPN `h2` for https, prior knowledge for http).
     pub http2: bool,
+    /// What to do with a foreign Host, checked on every request as it goes on the wire
+    /// (sessions, auth values and signers applied). Defaults to [`HostPolicy::for_process`].
+    pub host: HostPolicy,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(30), verify_tls: false, sni: None, guard: None, http2: false }
+        Self {
+            timeout: Duration::from_secs(30),
+            verify_tls: false,
+            sni: None,
+            guard: None,
+            http2: false,
+            host: HostPolicy::for_process(false),
+        }
     }
 }
 
@@ -68,6 +102,152 @@ impl SendOptions {
         }
         Ok(())
     }
+
+    /// The first host `request` names in place of `target`'s that the scope doesn't list by
+    /// name (see [`SendOptions::foreign_hosts`]).
+    pub fn foreign_host(&self, request: &[u8], target: &Target) -> Option<String> {
+        self.foreign_hosts(request, target).into_iter().next()
+    }
+
+    /// The hosts `request` names in place of `target`'s that the scope doesn't list by name: in
+    /// a Host header (HTTP/2 sends it as `:authority`) or a request target that isn't a path.
+    /// A head servers may read differently counts too, shown as what it is: a request line
+    /// that isn't three tokens with single spaces (a space in the path, an HTTP/0.9 line), a
+    /// bare CR or LF, and a second request after the body its framing says.
+    pub fn foreign_hosts(&self, request: &[u8], target: &Target) -> Vec<String> {
+        // Like the server name, the Host picks the site on a shared front end, but the
+        // connection still goes to the target, so the scope's own check never sees it.
+        let (head_bytes, body) = crate::http::request::split_head_body(request);
+        let head = String::from_utf8_lossy(head_bytes);
+        let mut odd = Vec::new();
+        if head.split("\r\n").any(|l| l.contains('\r')) {
+            odd.push("(a bare CR in the head)".to_string());
+        }
+        // A lone LF ends a line for some servers and not others ("X: a\n\r\nHost: ...").
+        if head_bytes.iter().enumerate().any(|(i, &b)| b == b'\n' && (i == 0 || head_bytes[i - 1] != b'\r')) {
+            odd.push("(a bare LF in the head)".to_string());
+        }
+        if pipelined(&head, body) {
+            odd.push("(a second request after the body)".to_string());
+        }
+        if ambiguous_framing(&head) {
+            odd.push(
+                "(a body servers may frame differently: Content-Length twice, or with Transfer-Encoding)".to_string(),
+            );
+        }
+        let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+        let line = lines.next().unwrap_or_default();
+        let parts: Vec<&str> = line.split(' ').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || p.contains('\t')) {
+            odd.push(format!("(a request line that isn't METHOD TARGET VERSION: {line:?})"));
+        }
+        let named_target = match parts.get(1).copied().unwrap_or_default() {
+            "" | "*" => None,
+            t if t.starts_with('/') => None,
+            // Absolute form: its host, or the target as written when it can't be read as a URL
+            // or holds a `\` (which the URL parser reads as `/`, and a server may not).
+            t if t.contains("://") && !t.contains('\\') => {
+                Some(Target::from_url(t).map_or_else(|_| t.to_string(), |t| t.host))
+            }
+            t if t.contains("://") => Some(t.to_string()),
+            // Authority form (CONNECT), or anything else: the host it names, if it names one.
+            t => Some(named_host(t).0),
+        };
+        let hosts = lines
+            .take_while(|l| !l.is_empty())
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| named_host(v).0);
+        let listed = |name: &str| self.guard.as_ref().is_some_and(|g| g.lists_name(name, Some(target.port)));
+        let mut out = odd;
+        for name in named_target.into_iter().chain(hosts) {
+            if !name.eq_ignore_ascii_case(&target.host) && !listed(&name) && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+}
+
+/// What follows `Host NAME` in the error of a request [`Client::check_host`] refused.
+const REFUSED_HOST: &str = ": a host other than the target's must be listed by name in the scope, as a shared \
+     front end may send the request to that site; for a Host-header test pass --host-header-test";
+
+/// The host a request was refused for by [`Client::check_host`], from its error, so a summary can
+/// list it among the hosts outside the scope.
+pub fn refused_host(e: &Error) -> Option<String> {
+    let Error::OutOfScope(m) = e else { return None };
+    m.strip_prefix("Host ")?.strip_suffix(REFUSED_HOST).map(str::to_string)
+}
+
+/// Whether bytes follow the body `head`'s framing says, starting with what reads as a request
+/// line: a server keeping the connection open answers it as a request of its own.
+fn pipelined(head: &str, body: &[u8]) -> bool {
+    let header = |n: &str| {
+        head.split('\n')
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.trim().to_ascii_lowercase())
+    };
+    let framed = match (header("transfer-encoding"), header("content-length")) {
+        (Some(te), _) if te.ends_with("chunked") => chunked_len(body),
+        (_, Some(cl)) => cl.parse::<usize>().ok().map(|n| n.min(body.len())),
+        _ => Some(0),
+    };
+    let Some(rest) = framed.and_then(|n| body.get(n..)) else { return false };
+    let rest = String::from_utf8_lossy(rest);
+    let line = rest.trim_start_matches(['\r', '\n']).split('\n').next().unwrap_or_default();
+    let parts: Vec<&str> = line.trim_end_matches('\r').split_whitespace().collect();
+    // Servers match methods and versions case-insensitively often enough (`Get`, `http/1.1`).
+    parts.len() >= 2
+        && parts[0].bytes().all(|b| b.is_ascii_alphabetic())
+        && parts.last().is_some_and(|v| v.to_ascii_uppercase().starts_with("HTTP/"))
+}
+
+/// Whether servers may disagree on where `head`'s body ends: Content-Length headers that
+/// differ, or Content-Length with Transfer-Encoding. Either can hide a second request in the
+/// body (request smuggling) that [`pipelined`] can't see.
+fn ambiguous_framing(head: &str) -> bool {
+    let values = |n: &str| -> Vec<String> {
+        head.split('\n')
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.trim().to_string())
+            .collect()
+    };
+    let lengths = values("content-length");
+    let differ = lengths.iter().any(|l| l != &lengths[0]);
+    differ || (!lengths.is_empty() && !values("transfer-encoding").is_empty())
+}
+
+/// The host a Host header's value names, and its port when it gives one. A value that isn't
+/// plainly a `host[:port]` (a placeholder, a regex group reference) is given as it is, and is
+/// never in scope.
+fn named_host(value: &str) -> (String, Option<u16>) {
+    let plain = value.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:[]".contains(c));
+    let parsed = plain.then(|| url::Url::parse(&format!("http://{value}")).ok()).flatten();
+    match parsed.as_ref().and_then(|u| u.host_str().map(|h| (h, u.port()))) {
+        Some((host, port)) => (host.trim_start_matches('[').trim_end_matches(']').to_string(), port),
+        None => (value.to_string(), None),
+    }
+}
+
+/// The host `value` names when the scope doesn't list it by name, for a setting that puts it
+/// in the Host header of requests still to come (an auth profile's header, a proxy rule's),
+/// whatever their target. Without a port, a name listed on any port will do.
+pub fn unlisted_host(guard: Option<&Guard>, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (name, port) = named_host(value);
+    // The URL parser drops a scheme's default port; it still counts as the one given.
+    let given = port.or_else(|| value.rsplit_once(':').and_then(|(_, p)| p.parse().ok()));
+    (!guard.is_some_and(|g| g.lists_name(&name, given))).then_some(name)
 }
 
 /// A completed round trip.
@@ -129,6 +309,8 @@ struct Pool {
     learned: Mutex<HashMap<(u64, String), Learned>>,
     /// The latest generation seen; entries of older ones are dropped when it changes.
     generation: std::sync::atomic::AtomicU64,
+    /// The first foreign host sent under [`HostPolicy::Warn`]: only it is reported.
+    foreign: std::sync::OnceLock<String>,
 }
 
 #[derive(Clone)]
@@ -208,6 +390,28 @@ impl Client {
         sent_sni(self.opts.sni.as_deref(), target)
     }
 
+    /// The first host outside the scope this client (and its clones) has put in a Host header
+    /// or request target (see [`SendOptions::foreign_hosts`]), for a command to warn about.
+    pub fn first_foreign_host(&self) -> Option<String> {
+        self.pool.foreign.get().cloned()
+    }
+
+    /// Applies the Host policy to `bytes` as they go on the wire to `target`: every request
+    /// passes here, after sessions, auth values and signers changed it, so none brings in a
+    /// Host the check didn't see.
+    pub fn check_host(&self, bytes: &[u8], target: &Target) -> Result<()> {
+        if self.opts.host == HostPolicy::Allow {
+            return Ok(());
+        }
+        let hosts = self.opts.foreign_hosts(bytes, target);
+        let Some(first) = hosts.first() else { return Ok(()) };
+        if self.opts.host == HostPolicy::Refuse {
+            return Err(Error::OutOfScope(format!("Host {first}{REFUSED_HOST}")));
+        }
+        let _ = self.pool.foreign.set(first.clone());
+        Ok(())
+    }
+
     /// Connections opened so far (pooled reuse doesn't count).
     pub fn connections_opened(&self) -> u64 {
         self.pool.opened.load(std::sync::atomic::Ordering::Relaxed)
@@ -281,6 +485,7 @@ impl Client {
         let started = Instant::now();
         if self.sends_h2(req) {
             let filled = self.fill_auth(req.as_bytes(), target).await?;
+            self.check_host(&filled, target)?;
             let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
                 .await
                 .map_err(|_| Error::Timeout(self.opts.timeout))??;
@@ -326,6 +531,7 @@ impl Client {
     /// same connection; the response returned is the last one.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
         let bytes = &*self.fill_auth(bytes, target).await?;
+        self.check_host(bytes, target)?;
         match self.platform_cred(target, bytes) {
             Some(cred) => self.exchange_platform(&cred, bytes, target, method).await,
             None => self.exchange_once(bytes, target, method).await,
@@ -875,6 +1081,92 @@ mod tests {
         assert!(!ok(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn a_host_the_scope_does_not_list_is_foreign() {
+        let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into(), "app.test".into()], exclude: vec![] };
+        let opts = SendOptions { guard: Some(Guard::from_specs(vec![scope]).unwrap()), ..Default::default() };
+        let target = Target { scheme: "https".into(), host: "127.0.0.1".into(), port: 8443 };
+        let foreign = |req: &str| opts.foreign_host(req.as_bytes(), &target);
+        // The target's own host, with or without a port, and a name the scope lists aren't.
+        assert_eq!(foreign("GET / HTTP/1.1\r\nHost: 127.0.0.1:8443\r\n\r\n"), None);
+        assert_eq!(foreign("GET / HTTP/1.1\r\nHost: APP.test\r\n\r\nHost: body.test"), None);
+        assert_eq!(foreign("GET / HTTP/1.1\r\n\r\n"), None);
+        // Any other is, a second Host or an absolute request target too.
+        assert_eq!(
+            foreign("GET / HTTP/1.1\r\nhost: other-tenant.test:443\r\n\r\n").as_deref(),
+            Some("other-tenant.test")
+        );
+        let lf = opts.foreign_hosts(b"GET / HTTP/1.1\nHost: app.test\nHost: b.test\n\n", &target);
+        assert_eq!(lf, ["(a bare LF in the head)", "b.test"]);
+        assert_eq!(foreign("GET http://c.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some("c.test"));
+        // A value that isn't plainly a host is shown as it is.
+        assert_eq!(foreign("GET / HTTP/1.1\r\nHost: app.test/@d.test\r\n\r\n").as_deref(), Some("app.test/@d.test"));
+        // So is a request target that isn't a path or `*`, or one the URL parser can't read.
+        assert_eq!(foreign("GET .evil.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some(".evil.test/"));
+        assert_eq!(foreign("CONNECT e.test:443 HTTP/1.1\r\nHost: app.test\r\n\r\n").as_deref(), Some("e.test"));
+        assert_eq!(foreign("GET ws://w.test/ HTTP/1.1\r\n\r\n").as_deref(), Some("ws://w.test/"));
+        assert_eq!(foreign("OPTIONS * HTTP/1.1\r\nHost: app.test\r\n\r\n"), None);
+        // And a head a lenient server may read otherwise: odd spacing, a tab, a bare CR.
+        for odd in
+            ["GET  http://e.test/ HTTP/1.1\r\n\r\n", "GET\thttp://e.test/ HTTP/1.1\r\n\r\n", "GET / HTTP/1.1 x\r\n\r\n"]
+        {
+            assert!(foreign(odd).is_some_and(|h| h.contains("request line")), "{odd:?}");
+        }
+        let cr = foreign("GET / HTTP/1.1\r\nX: a\rHost: e.test\r\nHost: app.test\r\n\r\n");
+        assert_eq!(cr.as_deref(), Some("(a bare CR in the head)"));
+        // The client applies the policy to what goes on the wire, and notes what it warned about.
+        let refuse = Client::new(SendOptions { host: HostPolicy::Refuse, ..opts.clone() });
+        let warn = Client::new(SendOptions { host: HostPolicy::Warn, ..opts.clone() });
+        let allow = Client::new(SendOptions { host: HostPolicy::Allow, ..opts.clone() });
+        let wire = b"GET / HTTP/1.1\r\nHost: e.test\r\n\r\n";
+        assert!(matches!(refuse.check_host(wire, &target), Err(Error::OutOfScope(m)) if m.contains("Host e.test")));
+        assert!(
+            warn.check_host(wire, &target).is_ok() && warn.clone().first_foreign_host().as_deref() == Some("e.test")
+        );
+        assert!(allow.check_host(wire, &target).is_ok() && allow.first_foreign_host().is_none());
+        // A `\` in an absolute target, which the URL parser reads as `/`.
+        let slash = foreign("GET http://app.test\\@e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n");
+        assert_eq!(slash.as_deref(), Some("http://app.test\\@e.test/"));
+        // A second request after the body its framing says, but not a body that is just data.
+        let second = "GET /b HTTP/1.1\r\nHost: e.test\r\n\r\n";
+        for first in [
+            "GET /a HTTP/1.1\r\nHost: app.test\r\n\r\n".to_string(),
+            "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 2\r\n\r\nab".to_string(),
+            "POST /a HTTP/1.1\r\nHost: app.test\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n".to_string(),
+        ] {
+            let both = foreign(&format!("{first}{second}"));
+            assert_eq!(both.as_deref(), Some("(a second request after the body)"), "{first:?}");
+        }
+        let data =
+            "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 34\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n";
+        assert_eq!(foreign(data), None);
+        // A method in mixed case still reads as a request.
+        let lower =
+            "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 0\r\n\r\nGet /b http/1.1\r\nHost: e.test\r\n\r\n";
+        assert_eq!(foreign(lower).as_deref(), Some("(a second request after the body)"));
+        // Framing servers may read differently hides one from that check: it counts by itself.
+        for framing in ["Content-Length: 47\r\nContent-Length: 0", "Content-Length: 4\r\nTransfer-Encoding: chunked"] {
+            let raw = format!("POST /a HTTP/1.1\r\nHost: app.test\r\n{framing}\r\n\r\n0\r\n\r\n");
+            assert!(foreign(&raw).is_some_and(|h| h.contains("frame differently")), "{framing}");
+        }
+        let same = "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab";
+        assert_eq!(foreign(same), None);
+        // A value a setting puts in requests to come, whatever their target.
+        let guard = opts.guard.as_deref();
+        assert_eq!(unlisted_host(guard, " app.TEST:8443 "), None);
+        assert_eq!(unlisted_host(guard, "127.0.0.1"), None);
+        assert_eq!(unlisted_host(guard, ""), None);
+        assert_eq!(unlisted_host(guard, "other-tenant.test").as_deref(), Some("other-tenant.test"));
+        assert_eq!(unlisted_host(guard, "{{host}}").as_deref(), Some("{{host}}"));
+        assert_eq!(unlisted_host(None, "app.test").as_deref(), Some("app.test"));
+        // Without a scope nothing is listed.
+        let none = SendOptions::default();
+        assert_eq!(
+            none.foreign_host(b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", &target).as_deref(),
+            Some("app.test")
+        );
     }
 
     /// A keep-alive server; with `drop_idle` it closes each connection after one

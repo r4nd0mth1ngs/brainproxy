@@ -1,13 +1,16 @@
 // Welcome screen: start a new engagement (project file + write-once scope), a temporary one
 // (desktop app only: no file to pick; deleted when discarded), or open an existing project.
 // Temporary ones a closed or crashed app left behind are offered here, never deleted unasked.
+// In the desktop app a Recent project can be deleted here, after asking.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { inTauri, run, setProject, tempProjects, type TempLeftover } from "../api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { deleteProject, inTauri, run, setProject, tempProjects, type TempLeftover } from "../api";
 import type { TempInfo } from "../store";
 import { confirm } from "../ui/Confirm";
+import { Icon } from "../ui/Icons";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
+import { baseName, deletedNotice, forgetProject } from "./deleteProject";
 import { copySaved } from "./trafficFilter";
 
 const RECENT = "recent-projects";
@@ -17,6 +20,16 @@ export function recent(): string[] {
     return JSON.parse(localStorage.getItem(RECENT) ?? "[]");
   } catch {
     return [];
+  }
+}
+
+/** Takes the project off Recent and drops what the app kept about it (saved filters, ...). */
+function forget(path: string) {
+  try {
+    localStorage.setItem(RECENT, JSON.stringify(recent().filter((p) => p !== path)));
+    forgetProject(localStorage, path);
+  } catch {
+    /* storage unavailable */
   }
 }
 
@@ -92,8 +105,60 @@ export function Welcome({ open, notice }: { open: Open; notice?: string }) {
   useEffect(() => {
     if (inTauri) tempProjects.location().then((d) => setRamBacked(d.ram_backed), () => {});
   }, []);
+  // Re-read after a delete changes the list.
+  const [recents, setRecents] = useState(recent);
+  const [deleting, setDeletingState] = useState<string | null>(null);
+  // Also read by callbacks that started before the delete (a file dialog still open).
+  const deletingRef = useRef<string | null>(null);
+  const setDeleting = (p: string | null) => {
+    deletingRef.current = p;
+    setDeletingState(p);
+  };
+  const [info, setInfo] = useState("");
+  const remove = async (p: string) => {
+    const name = baseName(p);
+    const yes = await confirm(
+      `Delete ${name}?`,
+      `${p} is deleted for good, with its traffic, findings, settings, logs and browser profiles. Its proxy, OOB listener, scans and fuzz runs are stopped first. Close any browser opened for it, and close it wherever else it is open (another window, the CLI, an agent): their next step would make a new, empty project here. Reports and copies saved elsewhere are kept. This can't be undone.`,
+      "Delete",
+      "Keep",
+    );
+    if (!yes) return;
+    setError("");
+    setInfo("");
+    setDeleting(p);
+    try {
+      let done = await deleteProject(p);
+      // A damaged project, or one from a newer brainproxy, can't be opened to stop what runs for it.
+      if (
+        done.state === "not_stopped" &&
+        (await confirm(
+          `Delete ${name} anyway?`,
+          `What runs for it couldn't be stopped, or it couldn't be opened: ${done.error}. Deleting it anyway may leave its proxy, OOB listener or scans running, and files still in use may not be deleted.`,
+          "Delete anyway",
+          "Keep",
+        ))
+      )
+        done = await deleteProject(p, true);
+      if (done.state !== "not_stopped") {
+        forget(p);
+        setRecents(recent());
+      }
+      const { text, problem } = deletedNotice(p, done);
+      (problem ? setError : setInfo)(text);
+    } catch (e: any) {
+      setError(`${baseName(p)} wasn't deleted: ${String(e?.message ?? e)}`);
+    } finally {
+      setDeleting(null);
+    }
+  };
+  // Nothing opens or starts while a delete runs: it could be the project being deleted.
   const tryOpen = (p: string) =>
-    isAbsolute(p) ? open(p).catch((e) => setError(String(e.message ?? e))) : setError(`${FULL_PATH}/project.bpdb.`);
+    deletingRef.current != null
+      ? undefined
+      : isAbsolute(p)
+        ? open(p).catch((e) => setError(String(e.message ?? e)))
+        : setError(`${FULL_PATH}/project.bpdb.`);
 
   const browse = async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
@@ -120,12 +185,12 @@ export function Welcome({ open, notice }: { open: Open; notice?: string }) {
           <>
             {inTauri && <Leftovers open={open} />}
             <div className="welcome-actions">
-              <button className="welcome-action primary" onClick={() => setMode("new")}>
+              <button className="welcome-action primary" onClick={() => setMode("new")} disabled={deleting != null}>
                 <span className="welcome-action-title">New engagement</span>
                 <span className="welcome-action-sub">Create a project and set the targets you're allowed to test</span>
               </button>
               {inTauri && (
-                <button className="welcome-action" onClick={() => setMode("temp")}>
+                <button className="welcome-action" onClick={() => setMode("temp")} disabled={deleting != null}>
                   <span className="welcome-action-title">Temporary engagement</span>
                   <span className="welcome-action-sub">
                     No file: {ramBacked == null ? "" : ramBacked ? "kept in memory and " : "kept in the temp folder and "}deleted
@@ -134,7 +199,7 @@ export function Welcome({ open, notice }: { open: Open; notice?: string }) {
                 </button>
               )}
               {inTauri && (
-                <button className="welcome-action" onClick={browse}>
+                <button className="welcome-action" onClick={browse} disabled={deleting != null}>
                   <span className="welcome-action-title">Open project…</span>
                   <span className="welcome-action-sub">Continue an existing .bpdb file</span>
                 </button>
@@ -149,19 +214,35 @@ export function Welcome({ open, notice }: { open: Open; notice?: string }) {
                 }}
               >
                 <input className="input grow" placeholder="Open an existing project: /path/to/engagement.bpdb" value={path} onChange={(e) => setPath(e.target.value)} />
-                <button className="btn">Open</button>
+                <button className="btn" disabled={deleting != null}>
+                  Open
+                </button>
               </form>
             )}
             {error && <div className="error">{error}</div>}
+            {info && <div className="hint">{info}</div>}
             {notice && <div className="error">{notice}</div>}
-            {recent().length > 0 && (
+            {recents.length > 0 && (
               <div className="recent">
                 <div className="label">Recent</div>
-                {recent().map((p) => (
-                  <button key={p} className="recent-item" onClick={() => tryOpen(p)} title={p}>
-                    <span>{p.split("/").pop()}</span>
-                    <span className="muted">{p}</span>
-                  </button>
+                {recents.map((p) => (
+                  <div key={p} className="recent-row">
+                    <button className="recent-item" onClick={() => tryOpen(p)} title={p} disabled={deleting != null}>
+                      <span>{baseName(p)}</span>
+                      <span className="muted">{deleting === p ? "Deleting…" : p}</span>
+                    </button>
+                    {inTauri && (
+                      <button
+                        className="icon-btn recent-delete"
+                        onClick={() => remove(p)}
+                        disabled={deleting != null}
+                        title={`Delete ${p}`}
+                        aria-label={`Delete ${baseName(p)}`}
+                      >
+                        <Icon name="trash" />
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
             )}

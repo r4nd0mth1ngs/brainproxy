@@ -144,6 +144,11 @@ pub struct ActiveArgs {
     /// Also inject into this request header (e.g. User-Agent). Repeatable.
     #[arg(long = "inject-header")]
     inject_headers: Vec<String>,
+    /// A base request (a URL's, an API item's, a recorded one) deliberately names a host the
+    /// scope doesn't list in its Host header, for a Host-header test. Through MCP such a request
+    /// isn't attacked without it. Rules that set a Host of their own need no flag.
+    #[arg(long)]
+    host_header_test: bool,
     #[arg(long)]
     no_query: bool,
     #[arg(long)]
@@ -407,6 +412,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         sni: None,
         guard: Some(guard.clone()),
         http2: args.http2,
+        // Base requests (baselines, API items, a session's) are checked as any are; the rules'
+        // own Host changes are allowed by the scan itself.
+        host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
     };
     let point_opts = PointOptions {
         query: !args.no_query,
@@ -826,6 +834,15 @@ fn select_targets(
     let mut skipped = 0;
     for id in ids {
         let item = store.get(id)?;
+        // A request refused for its scope (its Host, say) went nowhere: nothing to attack.
+        if item.entry.error.as_deref().is_some_and(|e| e.starts_with("out of scope")) {
+            if named.contains(&id) {
+                return Err(Error::OutOfScope(format!(
+                    "--history-id {id} was refused for the scope when it was sent, so there is nothing to scan"
+                )));
+            }
+            continue;
+        }
         if item.response.is_empty() {
             continue;
         }

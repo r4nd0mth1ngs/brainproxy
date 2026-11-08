@@ -165,6 +165,10 @@ pub struct SendArgs {
     /// Override the TLS SNI host name.
     #[arg(long)]
     sni: Option<String>,
+    /// The handshake's Host header deliberately names a host the scope doesn't list, for a
+    /// Host-header test. Through MCP such a handshake is refused without it.
+    #[arg(long)]
+    host_header_test: bool,
 }
 
 pub fn ws(project: &Path, cmd: WsCmd, out: &Out) -> Result<(), Error> {
@@ -384,9 +388,13 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         verify_tls: args.verify_tls,
         sni: args.sni.clone(),
         http2: false,
+        host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
     };
     // So is a server name the scope doesn't list, before a row could say it was sent.
     send_opts.check_sni(&target)?;
+    // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test.
+    let host_warning =
+        crate::mcp::check_host_header(&send_opts, handshake.as_bytes(), &target, args.host_header_test, out)?;
     let session = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     let client = Client::new(send_opts);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
@@ -490,6 +498,13 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
             if let Err(e) = saved {
                 data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
             }
+            if let Some(w) = crate::mcp::sent_host_warning(
+                [&client].into_iter().chain(session.as_deref().map(|s| s.client())),
+                host_warning.clone(),
+                out,
+            ) {
+                data["host_warning"] = json!(w);
+            }
             out.ok(data, || format!("not upgraded\n\n{}", String::from_utf8_lossy(&response)));
             return Ok(());
         }
@@ -590,6 +605,13 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     });
     if let Err(e) = saved {
         data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
+    }
+    if let Some(w) = crate::mcp::sent_host_warning(
+        [&client].into_iter().chain(session.as_deref().map(|s| s.client())),
+        host_warning,
+        out,
+    ) {
+        data["host_warning"] = json!(w);
     }
     out.ok(data, || {
         let mut lines = vec![format!(

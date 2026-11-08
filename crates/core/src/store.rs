@@ -16,7 +16,9 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 17;
+/// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
+/// one started by an older build.
+pub const SCHEMA_VERSION: i64 = 19;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -90,6 +92,87 @@ ALTER TABLE findings ADD COLUMN note_origin TEXT;
 ALTER TABLE findings ADD COLUMN note_changed_at TEXT;
 ALTER TABLE intercepts ADD COLUMN resolved_by TEXT;
 ";
+
+/// Provenance, the rest: who started the job, fuzz run, authz run, WebSocket recording and OOB
+/// listener behind a row, who issued an OOB payload, who last stored a profile's session (a
+/// login, an OAuth token), who wrote a finding type's description and solution, and a log of
+/// who saved which setting.
+const SCHEMA_V19: &str = "
+ALTER TABLE jobs ADD COLUMN origin TEXT;
+ALTER TABLE fuzz_runs ADD COLUMN origin TEXT;
+ALTER TABLE authz_results ADD COLUMN origin TEXT;
+ALTER TABLE ws_connections ADD COLUMN origin TEXT;
+ALTER TABLE oob_payloads ADD COLUMN issued_by TEXT;
+ALTER TABLE oob_interactions ADD COLUMN origin TEXT;
+ALTER TABLE auth_profiles ADD COLUMN state_origin TEXT;
+ALTER TABLE auth_profiles ADD COLUMN state_changed_at TEXT;
+ALTER TABLE finding_types ADD COLUMN description_origin TEXT;
+ALTER TABLE finding_types ADD COLUMN solution_origin TEXT;
+CREATE TABLE IF NOT EXISTS setting_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), key TEXT NOT NULL, origin TEXT NOT NULL);
+";
+
+/// Column documentation for the log of setting changes.
+pub const SETTING_CHANGE_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Change id, increasing"),
+    ("time", "TEXT", "UTC time the setting was saved"),
+    (
+        "key",
+        "TEXT",
+        "The setting saved: scope, rules, intercept, connection, authz, ... (not its value, which can hold \
+         credentials)",
+    ),
+    ("origin", "TEXT", "gui, cli or mcp: who saved it"),
+];
+
+/// Logs that setting `key` was saved by this process's origin, on `conn` (inside the caller's
+/// transaction when it has one).
+pub(crate) fn log_setting_change(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting_changes (key, origin) VALUES (?1, ?2)",
+        params![key, crate::provenance::origin()],
+    )?;
+    Ok(())
+}
+
+/// The highest `id` of the rules in `rules`, a JSON array of them (0 for none or bad JSON).
+fn highest_id(rules: Option<&Value>) -> u32 {
+    let ids = rules.and_then(Value::as_array).into_iter().flatten().filter_map(|r| r["id"].as_u64());
+    ids.max().unwrap_or(0).min(u32::MAX as u64) as u32
+}
+
+/// The highest session rule id in use across every profile's handling.
+fn highest_session_rule_id(conn: &Connection) -> Result<u32> {
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key LIKE 'auth.handling.%'")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut max = 0;
+    for json in rows {
+        let h: Value = serde_json::from_str(&json?).unwrap_or_default();
+        max = max.max(highest_id(h.get("rules")));
+    }
+    Ok(max)
+}
+
+/// v19: starts the rule id counters at the highest ids in use (match-and-replace rules, and
+/// session rules of every profile), so a rule removed after the upgrade can't lend its id to
+/// the next one added. A counter already higher is kept.
+fn seed_rule_ids(conn: &Connection) -> Result<()> {
+    let key = format!("setting.{}", crate::proxy::config::RULES_KEY);
+    let rules: Option<String> =
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?;
+    let rules: Value = rules.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let seeds = [
+        (crate::proxy::config::RULE_IDS, highest_id(Some(&rules))),
+        (crate::session::SESSION_RULE_IDS, highest_session_rule_id(conn)?),
+    ];
+    for (key, max) in seeds.into_iter().filter(|(_, max)| *max > 0) {
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE
+             SET value = MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
+            params![key, max.to_string()],
+        )?;
+    }
+    Ok(())
+}
 
 /// Whether `table` has `column`.
 pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -179,6 +262,7 @@ pub const FUZZ_RUN_COLUMNS: &[(&str, &str, &str)] = &[
     ("errors", "INTEGER", "Requests that got no response"),
     ("config", "TEXT", "Run settings as JSON"),
     ("template", "BLOB", "Request template with payload markers"),
+    ("origin", "TEXT", "gui, cli or mcp: who started the run; NULL for runs from before brainproxy kept it"),
 ];
 
 pub const FUZZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -581,6 +665,13 @@ impl Store {
         if version < 17 {
             crate::scan::proof::migrate_v17(&self.conn)?;
         }
+        if version < 18 {
+            crate::scan::findings_db::rekey_v18(&self.conn)?;
+        }
+        if version < 19 {
+            add_missing_columns(&self.conn, SCHEMA_V19)?;
+            seed_rule_ids(&self.conn)?;
+        }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -639,9 +730,18 @@ impl Store {
         template: &[u8],
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO fuzz_runs (state, mode, target, positions, total, config, template)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![state, mode, target, positions as i64, total as i64, config.to_string(), template],
+            "INSERT INTO fuzz_runs (state, mode, target, positions, total, config, template, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                state,
+                mode,
+                target,
+                positions as i64,
+                total as i64,
+                config.to_string(),
+                template,
+                crate::provenance::origin()
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -876,11 +976,34 @@ impl Store {
         }
     }
 
-    /// Writes a JSON setting and bumps the settings version so running proxies reload.
+    /// Writes a JSON setting, logs who saved it, and bumps the settings version so running
+    /// proxies reload.
     pub fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.meta_set(&format!("setting.{key}"), Some(&json))?;
+        log_setting_change(&self.conn, key)?;
         self.bump_settings_version()
+    }
+
+    /// The project's schema version: the one the newest build to open it migrated it to.
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
+    /// The next id from the counter in meta `key`, above `floor` (the highest id in use), so an
+    /// id is never handed out twice, even once what held it has been removed.
+    pub fn next_id(&mut self, key: &str, floor: u32) -> Result<u32> {
+        self.meta_update(key, |old| {
+            let last = old.and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).max(floor);
+            let next = last.checked_add(1).ok_or_else(|| Error::InvalidInput(format!("{key}: out of ids")))?;
+            Ok((Some(next.to_string()), next))
+        })
+    }
+
+    /// The highest session rule id in use, of any profile: the floor for
+    /// [`crate::session::SESSION_RULE_IDS`], which all profiles share.
+    pub fn session_rule_ids_in_use(&self) -> Result<u32> {
+        highest_session_rule_id(&self.conn)
     }
 
     /// Makes running proxies reload their settings.
@@ -1220,6 +1343,8 @@ fn project_dir(path: &Path) -> &Path {
 /// Makes the project file, its -wal/-shm sidecars and `<project>.browsers/` (browser
 /// profiles with cookies) owner-only, and sets the process umask to 077 so whatever is
 /// created next (the database, sidecars, browser profiles, output files) starts that way.
+/// A sidecar that is a link is left alone: chmod follows links, and what one points to may be
+/// shared and isn't the project's to lock down.
 #[cfg(unix)]
 fn owner_only(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -1230,10 +1355,11 @@ fn owner_only(path: &Path) {
         s.push(suffix);
         std::path::PathBuf::from(s)
     };
-    for (p, mode) in
-        [(path.to_path_buf(), 0o600), (with("-wal"), 0o600), (with("-shm"), 0o600), (with(".browsers"), 0o700)]
-    {
-        if p.exists() {
+    if path.exists() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    for (p, mode) in [(with("-wal"), 0o600), (with("-shm"), 0o600), (with(".browsers"), 0o700)] {
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink()) {
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
         }
     }
@@ -1623,6 +1749,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A project in `dir` taken back to v18, with `before` run on it first.
+    fn v18_project(dir: &Path, before: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(before).unwrap();
+        let undo: String = SCHEMA_V19
+            .lines()
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                match w[..] {
+                    ["ALTER", "TABLE", t, "ADD", "COLUMN", c, ..] => Some(format!("ALTER TABLE {t} DROP COLUMN {c};")),
+                    _ => None,
+                }
+            })
+            .collect();
+        // Nothing had a rule id counter before v19.
+        conn.execute_batch(&format!(
+            "{undo} DROP TABLE setting_changes; DELETE FROM meta WHERE key LIKE '%rule_ids';
+             PRAGMA user_version = 18;"
+        ))
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_project_on_v18_gets_the_rest_of_the_provenance_columns() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v18-{}", std::process::id()));
+        // A v18 project, with a job from before.
+        let path = v18_project(&dir, "INSERT INTO jobs (kind, state) VALUES ('crawl', 'completed');");
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        for line in SCHEMA_V19.lines() {
+            if let ["ALTER", "TABLE", table, "ADD", "COLUMN", column, ..] =
+                line.split_whitespace().collect::<Vec<_>>()[..]
+            {
+                assert!(has_column(&store.conn, table, column).unwrap(), "{table}.{column}");
+            }
+        }
+        // The old job's origin is unknown; a new one's is this process's.
+        let new = store.job_create("crawl", "queued", &[]).unwrap();
+        let origins: Vec<Option<String>> = store
+            .conn
+            .prepare("SELECT origin FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(origins, [None, Some(crate::provenance::origin().to_string())]);
+        assert_eq!(new, 2);
+
+        // Saving a setting logs who did, not what it holds.
+        store.set_setting("rules", &json!([])).unwrap();
+        let logged: (String, String) = store
+            .conn
+            .query_row("SELECT key, origin FROM setting_changes", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(logged, ("rules".to_string(), crate::provenance::origin().to_string()));
+
+        // Ids from a counter are never handed out twice, even when the highest is gone.
+        assert_eq!(store.next_id("test_ids", 3).unwrap(), 4);
+        assert_eq!(store.next_id("test_ids", 0).unwrap(), 5);
+        assert_eq!(store.next_id("test_ids", 9).unwrap(), 10);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rule_ids_from_before_v19_are_not_handed_out_again() {
+        use crate::proxy::config::{RULES_KEY, RULE_IDS};
+        use crate::session::SESSION_RULE_IDS;
+        let dir = std::env::temp_dir().join(format!("bp-store-v18-ids-{}", std::process::id()));
+        // Match-and-replace rules 1 to 3; session rules 1 and 2 of profile a, 7 of profile b.
+        let path = v18_project(
+            &dir,
+            r#"INSERT INTO meta (key, value) VALUES ('setting.rules', '[{"id":1},{"id":2},{"id":3}]'),
+                 ('auth.handling.a', '{"rules":[{"id":1},{"id":2}]}'), ('auth.handling.b', '{"rules":[{"id":7}]}');"#,
+        );
+        let mut store = Store::open(&path).unwrap();
+        // What `rules add` takes as its floor: the highest id left.
+        let floor = |s: &Store| {
+            let rules: Vec<Value> = s.setting(RULES_KEY).unwrap();
+            highest_id(Some(&Value::Array(rules)))
+        };
+        // `rules remove 3`, then add: not 3 again.
+        store.set_setting(RULES_KEY, &json!([{"id": 1}, {"id": 2}])).unwrap();
+        assert_eq!(store.next_id(RULE_IDS, floor(&store)).unwrap(), 4);
+        // `rules clear`, then add: not 1.
+        store.set_setting(RULES_KEY, &json!([])).unwrap();
+        assert_eq!(store.next_id(RULE_IDS, floor(&store)).unwrap(), 5);
+
+        // A rule added to profile a comes after b's 7, and after it once b's is removed too.
+        assert_eq!(store.session_rule_ids_in_use().unwrap(), 7);
+        assert_eq!(store.next_id(SESSION_RULE_IDS, store.session_rule_ids_in_use().unwrap()).unwrap(), 8);
+        store.meta_set("auth.handling.b", None).unwrap();
+        store.meta_set("auth.handling.a", Some(r#"{"rules":[{"id":1}]}"#)).unwrap();
+        assert_eq!(store.next_id(SESSION_RULE_IDS, store.session_rule_ids_in_use().unwrap()).unwrap(), 9);
+        drop(store);
+
+        // Seeding again keeps a counter that is already higher.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 18;").unwrap();
+        drop(conn);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.next_id(SESSION_RULE_IDS, 0).unwrap(), 10);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_on_v17_merges_findings_stored_once_per_session_id() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v17-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        // Two sightings v17 kept apart, each keyed with its session id.
+        let conn = Connection::open(&path).unwrap();
+        for sid in ["A", "B"] {
+            let url = format!("http://a.test/login;jsessionid={sid}");
+            conn.execute(
+                "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method,
+                    url, dedupe) VALUES ('passive', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET', ?1, '1|GET|' || ?1 || '|')",
+                [&url],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 17).unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (n, hits, key): (i64, i64, String) = store
+            .conn
+            .query_row("SELECT count(*), sum(hits), min(dedupe) FROM findings", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((n, hits, key.as_str()), (1, 2, "1|GET|http://a.test/login|"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_new_project_opened_by_many_at_once_is_migrated_once() {
         // Each step ran unlocked: two openers both ran `ALTER TABLE ... ADD COLUMN`
@@ -1966,5 +2239,22 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir.join("p.bpdb-wal")), 0o600);
         assert_eq!(mode(&browsers), 0o700);
+    }
+
+    /// A linked sidecar's target, which may be shared, keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn linked_sidecars_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-store-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&shared, dir.join("p.bpdb.browsers")).unwrap();
+        let s = Store::open(&dir.join("p.bpdb")).unwrap();
+        sample(&s);
+        assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -515,6 +515,27 @@ impl Guard {
         }
     }
 
+    /// Whether a Host header (or another name a request carries besides its target) may name
+    /// `host`: an address every scope allows, or a name the engagement scope lists by name (on
+    /// `port`, or on any port without one) that no scope refuses. A system scope of addresses
+    /// only doesn't list names, so it doesn't refuse one the engagement lists.
+    pub fn lists_name(&self, host: &str, port: Option<u16>) -> bool {
+        let bare = &norm_host(host);
+        // Without a port, an entry's own port (or none) is taken as the one asked about.
+        let named = |e: &Entry| e.matches_name(bare, port.or(e.port).unwrap_or(0));
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            let ports = port.map_or(vec![443, 80], |p| vec![p]);
+            return ports.iter().any(|&p| self.scopes.iter().all(|s| s.allowed_addrs(bare, p, &[ip]).is_ok()));
+        }
+        let engagement: Vec<&Scope> = self.scopes.iter().filter(|s| s.origin == "engagement scope").collect();
+        let listing = if engagement.is_empty() { self.scopes.iter().collect() } else { engagement };
+        listing.iter().all(|s| s.include.iter().any(named))
+            && self.scopes.iter().all(|s| {
+                !s.exclude.iter().any(named)
+                    && (s.include.iter().any(|e| matches!(e.pattern, Pattern::Net(..))) || s.include.iter().any(named))
+            })
+    }
+
     /// Whether `may_allow` is already certain: an address, or a name every scope lists.
     pub fn confirms(&self, host: &str, port: u16) -> bool {
         let bare = &norm_host(host);
@@ -618,6 +639,26 @@ mod tests {
         assert!(s.allowed_addrs("v1.api.test", 443, &any).is_err());
         assert!(s.allowed_addrs("api.test", 8443, &any).is_err());
         assert!(s.allowed_addrs("admin.api.test", 8443, &any).is_err());
+    }
+
+    #[test]
+    fn a_host_header_may_name_what_the_engagement_lists_by_name() {
+        let system = Scope::compile(spec(&["10.0.0.0/8", "127.0.0.1"], &["bad.test"]), "system scope").unwrap();
+        let engagement = Scope::compile(spec(&["app.test:8443", "*.api.test", "bad.test"], &[]), "engagement scope");
+        let g = Guard { scopes: vec![system, engagement.unwrap()], ..Default::default() };
+        // A system scope of addresses doesn't refuse a name the engagement lists.
+        assert!(g.lists_name("APP.test.", None) && g.lists_name("app.test", Some(8443)));
+        assert!(!g.lists_name("app.test", Some(443)));
+        assert!(g.lists_name("v1.api.test", Some(443)) && !g.lists_name("api.test", None));
+        // An exclusion in any scope does, and so does a name only an address entry covers.
+        assert!(!g.lists_name("bad.test", None) && !g.lists_name("other.test", None));
+        // An address must be allowed by every scope.
+        assert!(!g.lists_name("10.1.2.3", Some(443)) && !g.lists_name("192.0.2.1", None));
+        let only = Guard {
+            scopes: vec![Scope::compile(spec(&["127.0.0.1"], &[]), "engagement scope").unwrap()],
+            ..Default::default()
+        };
+        assert!(only.lists_name("127.0.0.1", None));
     }
 
     #[test]

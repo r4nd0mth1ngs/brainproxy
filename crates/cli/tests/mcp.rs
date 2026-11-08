@@ -644,3 +644,407 @@ fn an_agent_cannot_pass_its_records_off_as_the_apps() {
         }
     }
 }
+
+#[test]
+fn an_agent_cannot_replace_a_persons_layouts_or_files() {
+    let p = tmp_project("layouts");
+    let dir = p.parent().unwrap().to_path_buf();
+    let cli = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .args(["--format", "json", "--project"])
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stdout));
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    // A person's branding, and a finding to make a repro pack of.
+    cli(&["report-profile", "save", "board", "--company", "Acme"]);
+    let added = cli(&["findings", "add", "--title", "Order IDOR", "--risk", "high", "--url", "https://app.test/o/7"]);
+    let id = added["data"]["id"].as_i64().unwrap();
+    let kept = dir.join("kept.json");
+    std::fs::write(&kept, "A PERSON'S FILE").unwrap();
+
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}")).clone();
+    assert!(tools.iter().all(|t| t["name"] != "report_profile_remove"));
+    assert_eq!(tool("findings_repro")["annotations"]["destructiveHint"], false);
+    assert_eq!(tool("report_profile_save")["annotations"]["destructiveHint"], false);
+
+    // A saved name is kept; a new one is saved.
+    let (err, e) = m.call("report_profile_save", json!({"name": "board", "company": "Evil"}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("new name"), "{e}");
+    let (err, e) = m.call("report_profile_save", json!({"name": "agent-draft", "company": "Draft"}));
+    assert!(!err, "{e}");
+    let shown = cli(&["report-profile", "show", "board"]);
+    assert_eq!(shown["data"]["layout"]["company"], "Acme", "{shown}");
+
+    // A repro pack goes to a new file, never over one.
+    let (err, e) = m.call("findings_repro", json!({"id": id, "output": kept.to_str().unwrap(), "force": true}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--force"), "{e}");
+    let (err, e) = m.call("findings_repro", json!({"id": id, "output": kept.to_str().unwrap()}));
+    assert!(err, "{e}");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "A PERSON'S FILE");
+    let fresh = dir.join("fresh.json");
+    let _ = std::fs::remove_file(&fresh);
+    let (err, e) = m.call("findings_repro", json!({"id": id, "output": fresh.to_str().unwrap()}));
+    assert!(!err && fresh.exists(), "{e}");
+
+    // `report-profile remove` isn't a tool, and a tool call's command refuses it too.
+    let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["report-profile", "remove", "board"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("refused through MCP"));
+    cli(&["report-profile", "show", "board"]);
+}
+
+#[test]
+fn an_agent_sends_a_foreign_host_only_as_a_stated_host_header_test() {
+    let port = serve(2);
+    let mut m = Mcp::start(&tmp_project("host"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let foreign = ["Host: other-tenant.test"];
+    let raw = "GET / HTTP/1.1\r\nHost: other-tenant.test\r\n\r\n";
+    // An in-scope front end could send these to a site the scope doesn't list.
+    for (tool, args) in [
+        ("send", json!({"url": url, "headers": foreign})),
+        ("send", json!({"url": url, "headers": foreign, "race": 2})),
+        ("send", json!({"url": url, "headers": foreign, "http2": true})),
+        ("send", json!({"file": "-", "target": url, "stdin": raw})),
+        ("ws_send", json!({"url": format!("ws://127.0.0.1:{port}/"), "headers": foreign})),
+        ("fuzz_run", json!({"url": format!("{url}?q=§x§"), "headers": foreign, "payloads": ["list:1"]})),
+    ] {
+        let (err, e) = m.call(tool, args);
+        assert!(err, "{tool}: {e}");
+        assert_eq!(e["error"]["kind"], "out_of_scope", "{tool}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{tool}: {e}");
+    }
+    let (_, e) = m.call("history_list", json!({}));
+    assert_eq!(e["data"]["count"], 0, "{e}");
+    // Saying it is a Host-header test puts the intent on record; the output warns.
+    let (err, e) = m.call("send", json!({"url": url, "headers": foreign, "host_header_test": true}));
+    assert!(!err, "{e}");
+    assert!(e["data"]["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{e}");
+    // A name the scope lists needs no flag.
+    let (err, e) = m.call("send", json!({"url": url, "headers": ["Host: app.test"]}));
+    assert!(!err, "{e}");
+    assert!(e["data"].get("host_warning").is_none(), "{e}");
+}
+
+#[test]
+fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header_test() {
+    let project = tmp_project("host-settings");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let step = project.with_extension("step.http");
+    std::fs::write(&step, "GET / HTTP/1.1\r\nHost: other-tenant.test\r\n\r\n").unwrap();
+    let step = format!("http://127.0.0.1:9={}", step.display());
+    let foreign = ["Host: other-tenant.test"];
+    // Each would put the host on requests an in-scope front end could send to another site.
+    let settings = [
+        ("auth_add", json!({"name": "p", "headers": foreign})),
+        (
+            "auth_add",
+            json!({"name": "p", "login_url": "http://127.0.0.1:9/", "token_regex": "t=(\\w+)", "token_header": "Host: {{token}}"}),
+        ),
+        ("auth_add", json!({"name": "p", "login_url": "http://127.0.0.1:9/login", "login_header": foreign})),
+        ("auth_macro_add", json!({"profile": "p", "name": "m", "steps": [step]})),
+        ("rules_add", json!({"location": "request-header", "replace": "Host: other-tenant.test"})),
+        (
+            "rules_add",
+            json!({"location": "request-header", "pattern": "127\\.0\\.0\\.1", "replace": "other-tenant.test"}),
+        ),
+        (
+            "rules_add",
+            json!({"location": "request-line", "pattern": "^GET /", "replace": "GET http://other-tenant.test/"}),
+        ),
+    ];
+    for (tool, args) in &settings {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(err, "{tool} {args}: {e}");
+        assert_eq!(e["error"]["kind"], "out_of_scope", "{tool} {args}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{tool}: {e}");
+    }
+    let (_, e) = m.call("rules_list", json!({}));
+    assert_eq!(e["data"]["rules"], json!([]), "{e}");
+    // Saying it is a Host-header test puts the intent on record; the output warns.
+    for (tool, args) in &settings {
+        let mut args = args.clone();
+        args["host_header_test"] = json!(true);
+        let (err, e) = m.call(tool, args.clone());
+        assert!(!err, "{tool} {args}: {e}");
+        let warning = e["data"]["host_warning"].as_str().unwrap();
+        assert!(warning.contains("other-tenant.test") || warning.contains("{{token}}"), "{tool}: {e}");
+    }
+    // Saving it again unchanged sets no new Host: no flag is needed.
+    let (err, e) = m.call("auth_add", json!({"name": "q", "headers": foreign, "host_header_test": true}));
+    assert!(!err, "{e}");
+    let (err, e) = m.call("auth_add", json!({"name": "q", "headers": foreign}));
+    assert!(!err, "{e}");
+    // Hosts the scope lists, the login URL's own host, and other headers need none either.
+    for (tool, args) in [
+        ("auth_add", json!({"name": "r", "headers": ["Host: app.test", "X-Api-Key: 1"]})),
+        ("auth_add", json!({"name": "r", "login_url": "http://127.0.0.1:9/", "login_header": ["Host: 127.0.0.1:9"]})),
+        ("rules_add", json!({"location": "request-header", "pattern": "^X-Role: user$", "replace": "X-Role: admin"})),
+    ] {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(!err, "{tool} {args}: {e}");
+        assert!(e["data"].get("host_warning").is_none(), "{tool}: {e}");
+    }
+    // A disabled rule changes nothing until it is enabled, which is checked.
+    let (err, e) =
+        m.call("rules_add", json!({"location": "request-header", "replace": "Host: b.test", "disabled": true}));
+    assert!(!err, "{e}");
+    let id = e["data"]["rules"].as_array().unwrap().last().unwrap()["id"].clone();
+    let (err, e) = m.call("rules_enable", json!({"id": id}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("Host b.test"), "{e}");
+    let (err, e) = m.call("rules_enable", json!({"id": id, "host_header_test": true}));
+    assert!(!err, "{e}");
+    // A rule that copies a header's name from the request could make it a Host.
+    let copied = json!({"location": "request-header", "pattern": "^X-Zz: (.*)$", "replace": "Hos$1"});
+    let (err, e) = m.call("rules_add", copied);
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+}
+
+#[test]
+fn every_request_is_checked_as_it_goes_out() {
+    let port = serve(3);
+    let project = tmp_project("host-wire");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let person = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .env_remove("BRAINPROXY_MCP_CALL")
+            .args(["--format", "json", "--project"])
+            .arg(&project)
+            .args(args)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    // A person's profile sets a Host; an agent's send with it is refused as it goes out, after
+    // the session applied it, unless the send says it is a Host-header test.
+    let saved = person(&["auth", "add", "p", "-H", "Host: other-tenant.test"]);
+    assert!(saved["data"]["host_warning"].is_string(), "{saved}");
+    let (err, e) = m.call("send", json!({"url": url, "auth": "p"}));
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("Host other-tenant.test"), "{e}");
+    let (err, e) = m.call("send", json!({"url": url, "auth": "p", "host_header_test": true}));
+    assert!(!err, "{e}");
+    assert!(e["data"]["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{e}");
+    // A line break can't start another header from a profile or -H, for anyone.
+    for (tool, args) in [
+        ("auth_add", json!({"name": "q", "headers": ["X-A: v\r\nHost: e.test"]})),
+        ("auth_add", json!({"name": "q", "headers": ["X-B\r\nHost: e.test"]})),
+        ("auth_add", json!({"name": "q", "login_url": url, "login_header": ["X-L: a\r\nHost: e.test"]})),
+        (
+            "auth_add",
+            json!({"name": "q", "login_url": url, "token_regex": "(t)", "token_header": "A: {{token}}\r\nHost: e.test"}),
+        ),
+        ("send", json!({"url": url, "headers": ["X-A: v\r\nHost: e.test"]})),
+    ] {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(err && e["error"]["kind"] == "invalid_input", "{tool} {args}: {e}");
+    }
+    let o = person(&["auth", "add", "q", "-H", "X-A: v\r\nHost: e.test"]);
+    assert_eq!(o["error"]["kind"], "invalid_input", "{o}");
+    // Request lines and heads a lenient server may read otherwise, or a target that isn't a path.
+    for raw in [
+        "GET .evil.test/ HTTP/2\r\nHost: app.test\r\n\r\n",
+        "GET @evil.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET  http://e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET\thttp://e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET / HTTP/1.1\r\nX: a\rHost: e.test\r\nHost: app.test\r\n\r\n",
+        "GET ws://e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+    ] {
+        let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "verbatim": true}));
+        assert!(err && e["error"]["kind"] == "out_of_scope", "{raw:?}: {e}");
+    }
+    // A payload in a header's name: discovering header names works, and the one that makes the
+    // header a Host is refused as it goes out.
+    let names = "GET / HTTP/1.1\r\nHost: app.test\r\nX-§x§: e.test\r\n\r\n";
+    let (err, e) =
+        m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": names, "payloads": ["list:Forwarded-Host"]}));
+    assert!(!err && e["data"]["run"]["errors"] == 0, "{e}");
+    let named = "GET / HTTP/1.1\r\nHost: app.test\r\n§x§: e.test\r\n\r\n";
+    let (err, e) = m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": named, "payloads": ["list:Host"]}));
+    assert!(!err && e["data"]["run"]["errors"] == 1, "{e}");
+    // A raw line break into the head needs the flag through MCP.
+    let crlf = "GET / HTTP/1.1\r\nHost: app.test\r\nX-Z: §x§\r\n\r\n";
+    let (err, e) =
+        m.call("fuzz_run", json!({"file": "-", "target": url, "stdin": crlf, "payloads": ["list:a\r\nHost: e.test"]}));
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("line break"), "{e}");
+    // A crawl's and an import's -H are checked as they go out too.
+    let (_, e) = m.call("crawl", json!({"urls": [url], "headers": ["Host: e.test"], "max_pages": 1}));
+    assert_eq!((&e["data"]["requests"], &e["data"]["errors"]), (&json!(1), &json!(1)), "{e}");
+    assert_eq!(e["data"]["out_of_scope_hosts"], json!(["e.test"]), "{e}");
+    let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [{"name": "r", "request": {"method": "GET", "header": [{"key": "Host", "value": "e.test"}], "url": url}}]});
+    let (_, e) = m.call("import_postman", json!({"source": "-", "stdin": coll.to_string()}));
+    assert_eq!(e["data"]["out_of_scope_hosts"], json!(["e.test"]), "{e}");
+    // A Host given with -H takes the place of the target's rather than adding a second.
+    let (err, e) = m.call("send", json!({"url": url, "headers": ["Host: app.test"]}));
+    assert!(!err, "{e}");
+    let id = e["data"]["id"].to_string();
+    let (_, e) = m.call("query", json!({"sql": format!("SELECT req_headers FROM history WHERE id = {id}")}));
+    let head = e["data"]["rows"][0][0].as_str().unwrap().to_ascii_lowercase();
+    assert_eq!(head.matches("[\"host\",").count(), 1, "{head}");
+    let (_, e) = m.call("history_list", json!({}));
+    // Only requests that got as far as the wire have rows (two sends, one refused, two fuzz
+    // requests, one refused, and the crawl's refused one): a refused one says so.
+    assert_eq!(e["data"]["count"], 6, "{e}");
+    let refused = e["data"]["items"][0]["error"].as_str().unwrap();
+    assert!(refused.contains("out of scope: Host other-tenant.test"), "{refused}");
+}
+
+#[test]
+fn an_agent_overwrites_no_file_and_keeps_the_ca() {
+    let p = tmp_project("force");
+    let dir = p.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&home);
+    let home_s = home.to_str().unwrap().to_string();
+    let kept = dir.join("kept.txt");
+    std::fs::write(&kept, "A PERSON'S FILE").unwrap();
+    let mut m = Mcp::start_env(&p, &[], &[("BRAINPROXY_HOME", &home_s)]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for name in ["report", "ca_export", "ca_init", "findings_repro"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(t["annotations"]["destructiveHint"], false, "{name}");
+    }
+
+    // The CA is made when missing, and kept: a new one is refused.
+    let (err, e) = m.call("ca_init", json!({}));
+    assert!(!err, "{e}");
+    let sha = e["data"]["sha256"].clone();
+    let (err, e) = m.call("ca_init", json!({"force": true}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("--force is refused through MCP"), "{e}");
+    let (_, e) = m.call("ca_init", json!({}));
+    assert_eq!(e["data"]["sha256"], sha);
+
+    // Nothing is written over a file, with --force or without it; a new file is written.
+    let path = kept.to_str().unwrap();
+    for (tool, args) in [
+        ("report", json!({"output": path, "force": true})),
+        ("ca_export", json!({"out": path, "force": true})),
+        ("report", json!({"output": path})),
+        ("ca_export", json!({"out": path})),
+    ] {
+        let (err, e) = m.call(tool, args.clone());
+        assert!(err, "{tool} {args}: {e}");
+        if args["force"] == true {
+            assert!(e["error"]["message"].as_str().unwrap().contains("--force is refused through MCP"), "{e}");
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "A PERSON'S FILE");
+    let fresh = dir.join("fresh.md");
+    let _ = std::fs::remove_file(&fresh);
+    let (err, e) = m.call("report", json!({"kind": "markdown", "output": fresh.to_str().unwrap()}));
+    assert!(!err && fresh.exists(), "{e}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn scans_check_their_base_requests_and_heads_are_read_strictly() {
+    let port = serve(4);
+    let project = tmp_project("host-scan");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let person = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .env_remove("BRAINPROXY_MCP_CALL")
+            .args(["--format", "json", "--project"])
+            .arg(&project)
+            .args(args)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    // A pipelined second request, a `\` in an absolute target, a bare LF: refused.
+    for raw in [
+        "GET /a HTTP/1.1\r\nHost: app.test\r\nConnection: keep-alive\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
+        "GET http://app.test\\@e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: app.test\r\nX: a\n\r\nHost: e.test\r\n\r\n",
+        // Framing servers read differently, and a second request whose method isn't upper case.
+        "POST /d HTTP/1.1\r\nHost: app.test\r\nContent-Length: 47\r\nContent-Length: 0\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
+        "POST /d HTTP/1.1\r\nHost: app.test\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nG",
+        "POST /l HTTP/1.1\r\nHost: app.test\r\nContent-Length: 0\r\n\r\nGet /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
+    ] {
+        let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "verbatim": true}));
+        assert!(err && e["error"]["kind"] == "out_of_scope", "{raw:?}: {e}");
+    }
+    // An API item's Host is checked before it is attacked (its baseline is refused).
+    let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [{"name": "r", "request": {"method": "GET", "header": [{"key": "Host", "value": "e.test"}], "url": format!("{url}api?q=1")}}]});
+    let file = project.with_extension("coll.json");
+    std::fs::write(&file, coll.to_string()).unwrap();
+    let (err, e) = m.call("scan_active", json!({"api": file.to_str().unwrap(), "rules": ["40012"]}));
+    assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    // A person's row with a foreign Host isn't attacked by an agent's scan.
+    let sent = person(&["send", "--url", &url, "-H", "Host: e.test"]);
+    let id = sent["data"]["id"].as_i64().unwrap();
+    let (err, e) = m.call("scan_active", json!({"history_ids": [id], "rules": ["40012"]}));
+    assert!(!err && e["data"]["refused_hosts"] == json!(["e.test"]), "{e}");
+    assert_eq!(e["data"]["targets"], 0, "{e}");
+    // Nor is one refused as it went out, which a scan can't name either.
+    person(&["auth", "add", "p", "-H", "Host: e.test"]);
+    let (err, _) = m.call("send", json!({"url": url, "auth": "p"}));
+    assert!(err);
+    let (_, e) = m.call("query", json!({"sql": "SELECT max(id) FROM history"}));
+    let refused = e["data"]["rows"][0][0].as_i64().unwrap();
+    let (err, e) = m.call("scan_active", json!({"history_ids": [refused], "rules": ["40012"]}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("refused for the scope"), "{e}");
+    let o = person(&["scan", "active", "--history-id", &refused.to_string(), "--rules", "40012"]);
+    assert_eq!(o["error"]["kind"], "out_of_scope", "{o}");
+}
+
+#[test]
+fn an_api_scans_baselines_are_checked_with_the_agents_policy() {
+    let port = serve(500);
+    let project = tmp_project("host-api-scan");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let item = |name: &str, headers: Value| json!({"name": name, "request": {"method": "GET", "header": headers, "url": format!("{url}{name}?q=1")}});
+    let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [item("plain", json!([])), item("tenant", json!([{"key": "Host", "value": "e.test"}]))]});
+    let file = project.with_extension("coll.json");
+    std::fs::write(&file, coll.to_string()).unwrap();
+    // The item with the foreign Host isn't sent as a baseline (so isn't attacked); the other is.
+    let (err, e) = m.call("scan_active", json!({"api": file.to_str().unwrap(), "rules": ["40012"]}));
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["import"]["out_of_scope_hosts"], json!(["e.test"]), "{e}");
+    assert_eq!(e["data"]["import"]["sent"], 1, "{e}");
+    let (_, e) = m.call("query", json!({"sql": "SELECT count(*) FROM history WHERE url LIKE '%/tenant%'"}));
+    assert_eq!(e["data"]["rows"][0][0], 0, "{e}");
+    // A recorded row with a foreign Host shows in the scan's refused_hosts.
+    let raw = "GET /r HTTP/1.1\r\nHost: e.test\r\n\r\n";
+    let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "host_header_test": true}));
+    assert!(!err, "{e}");
+    let id = e["data"]["id"].clone();
+    let (err, e) = m.call("scan_active", json!({"history_ids": [id], "rules": ["40012"]}));
+    assert!(!err && e["data"]["refused_hosts"] == json!(["e.test"]), "{e}");
+}

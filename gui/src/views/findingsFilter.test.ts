@@ -69,6 +69,7 @@ test("timeline events read as sentences", () => {
   const e = (over: object) => ({ id: 1, time: "", kind: "state", old: null, new: null, text: null, by: "", history_id: null, ...over });
   assert.equal(eventText(e({ old: "open", new: "false_positive" })), "Marked false positive (was open)");
   assert.equal(eventText(e({ kind: "created", history_id: 3 })), "Found in history #3");
+  assert.equal(eventText(e({ kind: "risk", old: "high", new: "low", history_id: 9 })), "Risk high → low (history #9)");
   assert.equal(eventText(e({ kind: "note", text: "" })), "Note cleared");
   assert.equal(eventText(e({ kind: "retest", new: "not_reproduced", text: "GET /a" })), "Retest: not reproduced (GET /a)");
   assert.equal(eventText(e({ kind: "ticket", new: "github", text: "https://github.com/o/r/issues/3" })), "GitHub ticket filed: https://github.com/o/r/issues/3");

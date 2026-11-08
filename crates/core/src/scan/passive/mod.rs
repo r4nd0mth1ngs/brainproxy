@@ -41,6 +41,19 @@ impl Default for PassiveSettings {
     }
 }
 
+/// The history source of a retest's request (`findings retest`).
+pub const RETEST_SOURCE: &str = "retest";
+
+impl PassiveSettings {
+    /// The sources a background scan reads: `sources` less retest traffic, whatever the list
+    /// says. A retest reads its own reply and counts it as a sighting, so a scan reading it too
+    /// would count one retest twice (and could reopen a finding the retest left as it was). A
+    /// list saved before `scan sources` refused `retest` may still name it.
+    fn scanned_sources(&self) -> Vec<String> {
+        self.sources.iter().filter(|s| *s != RETEST_SOURCE).cloned().collect()
+    }
+}
+
 pub fn all_rules() -> &'static [Box<dyn PassiveRule>] {
     static RULES: OnceLock<Vec<Box<dyn PassiveRule>>> = OnceLock::new();
     RULES.get_or_init(rules::all)
@@ -118,13 +131,14 @@ pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
     let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let mut last: i64 = store.meta_get(WATERMARK_KEY)?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut stats = ScanStats { last_id: last, ..Default::default() };
+    let sources = settings.scanned_sources();
     // Rows recorded while we scan are left for the next call.
     let max_at_start = store.max_history_id()?;
     if max_at_start <= last {
         return Ok(stats);
     }
     loop {
-        let batch = store.scan_messages_after(last, &settings.sources, BATCH)?;
+        let batch = store.scan_messages_after(last, &sources, BATCH)?;
         // Rows from unscanned sources are skipped by the query; jump the watermark past them.
         let Some(batch_last) = batch.last().map(|m| m.history_id) else { break };
         for msg in &batch {
@@ -153,7 +167,8 @@ pub fn scan_late(store: &mut Store, id: i64) -> Result<usize> {
     }
     let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let mut new = 0;
-    for msg in store.scan_messages_after(id - 1, &settings.sources, 1)?.iter().filter(|m| m.history_id == id) {
+    for msg in store.scan_messages_after(id - 1, &settings.scanned_sources(), 1)?.iter().filter(|m| m.history_id == id)
+    {
         new += store.record_findings("passive", msg, &scan_message(msg, &settings))?;
     }
     Ok(new)

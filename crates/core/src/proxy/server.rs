@@ -923,11 +923,38 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // Who changed the request on its way: the row's origin is the proxy's, not theirs.
     let mut edited_by = Vec::new();
     if in_scope {
+        let before = request.clone();
         let (ruled, changed_by) = apply_request_rules_traced(&live.rules, request);
+        // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
+        // Host-header test, isn't sent: a shared front end may route the request to another site.
+        // A person's rule was warned about when it was saved.
+        if changed_by.iter().any(|r| r.origin.as_deref() == Some("mcp") && !r.host_header_test) {
+            let opts = ctx.client.options();
+            let had = opts.foreign_hosts(&before, target);
+            if let Some(host) = opts.foreign_hosts(&ruled, target).into_iter().find(|h| !had.contains(h)) {
+                let msg = format!(
+                    "out of scope: Host {host}: an agent's rule put a host the scope doesn't list in the request; \
+                     add the rule with --host-header-test for a Host-header test"
+                );
+                let edits =
+                    changed_by.iter().map(|r| Edit { by: r.origin.clone(), rule: Some(r.id), ..Default::default() });
+                let c = row(target, &ruled, None, None, Some(&msg));
+                send_capture(ctx, Capture { edited_by: edits.collect(), ..c }, None).await;
+                return Ok(Reply::Error(error_response(502, "out_of_scope", &msg), false));
+            }
+        }
         request = ruled;
-        edited_by.extend(changed_by.iter().map(|r| Edit { by: r.origin.clone(), intercept: None, rule: Some(r.id) }));
+        edited_by.extend(changed_by.iter().map(|r| Edit {
+            by: r.origin.clone(),
+            rule: Some(r.id),
+            ..Default::default()
+        }));
         if let Some(a) = auth {
             let p = a.prepare(Tool::Proxy, target, &request, &[], &[]).await;
+            // The profile and its session rules and macros answer for what they changed.
+            if p.request != request {
+                edited_by.extend(a.edits(&p));
+            }
             request = p.request.clone();
             prepared = Some(p);
         }
@@ -959,7 +986,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         // Session lost or stale session values: log in again or refresh them, and
         // replay the request with the new session.
         if a.after_response(p, response).await {
-            let retry = a.prepare(Tool::Proxy, target, &request, &[], &[]).await.request;
+            let again = a.prepare(Tool::Proxy, target, &request, &[], &[]).await;
+            let edits = if again.request != request { a.edits(&again) } else { Vec::new() };
+            let retry = again.request;
             // Not once the proxy is stopping: then the first answer stands.
             if let Some(next) = ctx.in_flight.start(row(target, &retry, None, None, Some(STOPPED))) {
                 // The first exchange went out and was answered: it has its own row.
@@ -970,6 +999,11 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
                 }
                 flight = next;
                 request = retry;
+                for e in edits {
+                    if !edited_by.contains(&e) {
+                        edited_by.push(e);
+                    }
+                }
                 started = Instant::now();
                 upstream = forward(ctx, target, &request, &method, h2).await;
                 if let Ok(up) = &upstream {
@@ -1315,7 +1349,7 @@ async fn hold(
                 let edit = held.edited.as_ref().filter(|e| **e != message).map(|_| Edit {
                     by: held.resolved_by.clone(),
                     intercept: Some(id),
-                    rule: None,
+                    ..Default::default()
                 });
                 return Ok(Some(Released { message: held.edited.unwrap_or(message), edit }));
             }

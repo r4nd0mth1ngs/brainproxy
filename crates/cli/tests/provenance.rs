@@ -165,6 +165,7 @@ fn a_background_job_records_the_origin_that_started_it() {
     assert_eq!(done["state"], "completed", "{done}");
     let rows = env.rows("SELECT DISTINCT origin FROM history WHERE source = 'crawl'");
     assert_eq!(rows, vec![serde_json::json!(["gui"])]);
+    assert_eq!(env.rows("SELECT origin FROM jobs"), vec![serde_json::json!(["gui"])]);
 }
 
 #[test]
@@ -197,6 +198,7 @@ fn a_proxy_started_by_an_agent_records_mcp_and_each_client() {
     assert_eq!(&head, b"HTTP/1.1 101");
 
     wait_for(&env, "SELECT count(*) FROM history WHERE source = 'proxy'", 2);
+    wait_for(&env, "SELECT count(*) FROM ws_connections WHERE origin = 'mcp'", 1);
     let rows = env.rows("SELECT path, origin, client_addr FROM history WHERE source = 'proxy' ORDER BY path");
     assert_eq!(rows[0], serde_json::json!(["/page", "mcp", local]));
     assert_eq!(rows[1], serde_json::json!(["/ws", "mcp", ws_local]));
@@ -292,6 +294,211 @@ fn an_overridden_server_name_is_recorded() {
     assert!(env.text(&["history", "show", "1"]).lines().next().unwrap().ends_with("TLS server name (SNI) app.test"));
 }
 
+#[test]
+fn a_foreign_host_is_sent_with_a_warning_but_an_agent_must_say_it_is_a_test() {
+    let port = serve();
+    // The scope lists app.test by name, so a Host naming it is not another site's.
+    let env = Env::with_scope("host", &["--target", "127.0.0.1", "--target", "app.test"]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let ws = format!("ws://127.0.0.1:{port}/");
+    let fuzz = format!("{url}?q=§x§");
+    let senders: [&[&str]; 4] = [
+        &["send", "--url", &url],
+        &["send", "--url", &url, "--race", "2"],
+        &["ws", "send", "--url", &ws, "--wait", "0"],
+        &["fuzz", "run", "--url", &fuzz, "-p", "list:a", "-c", "1"],
+    ];
+    let agent = [(MCP, "1")];
+    let count = || env.rows("SELECT count(*) FROM history")[0][0].as_i64().unwrap();
+    for sender in senders {
+        let args = [sender, &["-H", "Host: other-tenant.test"]].concat();
+        // Refused to an agent before a row could say it was sent.
+        let before = count();
+        let (code, v, _) = env.run(&agent, &args);
+        assert_ne!(code, 0, "{args:?}");
+        assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Host other-tenant.test") && message.contains("--host-header-test"), "{v}");
+        assert_eq!(count(), before, "{args:?}");
+        // Sent with a warning for a person, and for an agent that says it is a Host-header test.
+        for (vars, test) in [(&[][..], &[][..]), (&agent[..], &["--host-header-test"][..])] {
+            let data = env.ok(vars, &[&args[..], test].concat());
+            assert!(data["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{args:?}: {data}");
+        }
+        // The target's own host and a name the scope lists are no one else's.
+        for host in [format!("Host: 127.0.0.1:{port}"), "Host: APP.test".into()] {
+            let data = env.ok(&agent, &[sender, &["-H", &host]].concat());
+            assert!(data.get("host_warning").is_none(), "{args:?}: {data}");
+        }
+    }
+    // A payload position in the Host header is a Host-header test too.
+    let (code, v, _) = env.run(&agent, &["fuzz", "run", "--url", &url, "-p", "list:a", "-H", "Host: §x§.app.test"]);
+    assert_ne!(code, 0);
+    assert!(v["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{v}");
+    // So is an absolute request target naming another host, sent to an in-scope one.
+    let raw = std::env::temp_dir().join(format!("bp-prov-{}-host.http", std::process::id()));
+    std::fs::write(&raw, "GET http://other-tenant.test/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    let raw_send = ["send", raw.to_str().unwrap(), "--target", &url];
+    let (code, v, _) = env.run(&agent, &raw_send);
+    assert_eq!((code != 0, &v["error"]["kind"]), (true, &"out_of_scope".into()), "{v}");
+    // In text mode the warning goes to stderr, before anything is sent.
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env_remove(MCP)
+        .args(["--format", "text", "--project"])
+        .arg(&env.project)
+        .args(raw_send)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("warning: the Host names other-tenant.test"), "{stderr}");
+    let _ = std::fs::remove_file(raw);
+}
+
+#[test]
+fn a_request_target_that_isnt_a_path_is_never_sent_over_http2_and_a_listed_port_is_enough() {
+    let port = serve();
+    let env = Env::with_scope("h2-target", &["--target", "127.0.0.1", "--target", "app.test:8443"]);
+    let raw = env.project.with_extension("h2.http");
+    let target = format!("http://127.0.0.1:{port}");
+    // `.evil.test/` would run into the authority (app.test.evil.test), for anyone.
+    for t in [".evil.test/", "@evil.test/"] {
+        std::fs::write(&raw, format!("GET {t} HTTP/2\r\nHost: app.test\r\n\r\n")).unwrap();
+        let (code, v, _) = env.run(&[], &["send", raw.to_str().unwrap(), "--target", &target]);
+        assert_ne!(code, 0, "{t}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("isn't a path"), "{v}");
+    }
+    // A name the scope lists on another port is listed, with that port or without one.
+    for host in ["Host: app.test", "Host: app.test:8443"] {
+        let saved = env.ok(&[(MCP, "1")], &["auth", "add", "p", "-H", host]);
+        assert!(saved.get("host_warning").is_none(), "{host}: {saved}");
+    }
+    assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], 0);
+}
+
+#[test]
+fn an_agents_rule_that_makes_a_host_is_refused_in_the_proxy() {
+    let port = serve();
+    let env = Env::new("rule-host");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    // A line break in a head replacement is refused for anyone.
+    let crlf = [
+        "rules",
+        "add",
+        "--location",
+        "request-header",
+        "--match",
+        "^X-Trig: 1$",
+        "--replace",
+        "X-A: a\r\nHost: e.test",
+    ];
+    for vars in [&gui[..], &agent[..]] {
+        let (code, v, _) = env.run(vars, &crlf);
+        assert_ne!(code, 0);
+        assert!(v["error"]["message"].as_str().unwrap().contains("line break"), "{v}");
+    }
+    // `Zz` to `st` passes the check when it is saved (it names no host), and turns `HoZz:` into
+    // `Host:`: the proxy refuses what the agent's rule makes of the request.
+    env.ok(&agent, &["rules", "add", "--location", "request-header", "--match", "Zz", "--replace", "st"]);
+    let started = env.ok(&gui, &["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    wait_for_settings();
+    let resp = through(&listen, port, "/frag", "HoZz: e.test\r\n");
+    assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
+    wait_for(&env, "SELECT count(*) FROM history WHERE path = '/frag'", 1);
+    let error = env.rows("SELECT error FROM history WHERE path = '/frag'")[0][0].clone();
+    assert!(error.as_str().unwrap().starts_with("out of scope: Host e.test"), "{error}");
+    // Saved as a Host-header test, it is sent; so is a person's rule.
+    env.ok(&gui, &["rules", "clear"]);
+    env.ok(
+        &agent,
+        &["rules", "add", "--location", "request-header", "--match", "Zz", "--replace", "st", "--host-header-test"],
+    );
+    wait_for_settings();
+    assert!(through(&listen, port, "/flagged", "HoZz: e.test\r\n").starts_with("HTTP/1.1 200"));
+    env.ok(&gui, &["rules", "clear"]);
+    env.ok(&gui, &["rules", "add", "--location", "request-header", "--match", "Zz", "--replace", "st"]);
+    wait_for_settings();
+    assert!(through(&listen, port, "/person", "HoZz: e.test\r\n").starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn a_row_refused_for_its_scope_is_never_evidence_nor_sent_again() {
+    let env = Env::new("refused-row");
+    // A row as a refusal on the wire leaves it: the request it refused, and here a response the
+    // passive scan finds something in.
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    let target = brainproxy_core::http::Target::from_url("http://127.0.0.1:9").unwrap();
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhello";
+    let capture = brainproxy_core::capture::Capture::new(
+        "send",
+        &target,
+        b"GET /r HTTP/1.1\r\nHost: e.test\r\n\r\n",
+        Some(resp),
+        Some(1),
+        Some("out of scope: Host e.test: refused"),
+    );
+    let id = store.record(&capture).unwrap().to_string();
+    drop(store);
+    for vars in [&[][..], &[(MCP, "1")][..]] {
+        let (code, v, _) = env.run(vars, &["findings", "add", "--title", "x", "--risk", "low", "--history-id", &id]);
+        assert_ne!(code, 0);
+        assert!(v["error"]["message"].as_str().unwrap().contains("refused for the scope"), "{v}");
+    }
+    env.ok(&[], &["findings", "list"]);
+    let finding = env.rows("SELECT id FROM findings WHERE source = 'passive' LIMIT 1")[0][0].to_string();
+    for vars in [&[][..], &[(MCP, "1")][..]] {
+        let (code, v, _) = env.run(vars, &["findings", "retest", &finding]);
+        assert_ne!(code, 0);
+        assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+    }
+    assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], 1, "nothing was sent again");
+}
+
+#[test]
+fn a_rule_saved_with_a_line_break_is_skipped_when_rules_load() {
+    let env = Env::new("rule-skip");
+    let rule = |id: u32, replace: &str| serde_json::json!({"id": id, "location": "request-header", "pattern": "^X", "replace": replace, "enabled": true});
+    let store = brainproxy_core::store::Store::open(&env.project).unwrap();
+    store.set_setting("rules", &serde_json::json!([rule(1, "X-A: a\r\nHost: e.test"), rule(2, "Y")])).unwrap();
+    drop(store);
+    let list = env.ok(&[], &["rules", "list"]);
+    assert_eq!(list["skipped"][0]["id"], 1, "{list}");
+    assert_eq!(list["skipped"].as_array().unwrap().len(), 1, "{list}");
+    let status = env.ok(&[], &["proxy", "status"]);
+    assert_eq!((&status["rules_enabled"], &status["rules_skipped"][0]["id"]), (&1.into(), &1.into()), "{status}");
+}
+
+#[test]
+fn a_person_runs_a_crlf_injection_fuzz_with_a_warning() {
+    let port = serve();
+    let env = Env::new("fuzz-crlf");
+    let raw = env.project.with_extension("crlf.http");
+    std::fs::write(&raw, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-A: §x§\r\n\r\n").unwrap();
+    let target = format!("http://127.0.0.1:{port}");
+    let args = ["fuzz", "run", raw.to_str().unwrap(), "--target", &target, "-p", "list:a\r\nX-Injected: 1", "-c", "1"];
+    let data = env.ok(&[], &args);
+    assert!(data["host_warning"].as_str().unwrap().contains("line break"), "{data}");
+    let (code, v, _) = env.run(&[(MCP, "1")], &args);
+    assert_ne!(code, 0);
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+}
+
+#[test]
+fn a_person_sets_a_foreign_host_on_requests_to_come_with_a_warning() {
+    let env = Env::new("host-settings");
+    let profile = env.ok(&[], &["auth", "add", "p", "-H", "Host: other-tenant.test"]);
+    assert!(profile["host_warning"].as_str().unwrap().contains("auth profile p: header sets the Host"), "{profile}");
+    let args = ["rules", "add", "--location", "request-header", "--replace", "Host: other-tenant.test"];
+    let rules = env.ok(&[], &args);
+    assert!(rules["host_warning"].as_str().unwrap().contains("rule 1 sets the Host to other-tenant.test"), "{rules}");
+    // An agent's is refused without saying it is a Host-header test.
+    let (code, v, _) = env.run(&[(MCP, "1")], &args);
+    assert_ne!(code, 0);
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+}
+
 /// Sends one request through the proxy and returns the response.
 fn through(listen: &str, port: u16, path: &str, headers: &str) -> String {
     let mut s = TcpStream::connect(listen).unwrap();
@@ -361,6 +568,26 @@ fn an_agents_intercept_edit_and_rule_in_a_proxy_the_app_started_say_so() {
         .lines()
         .any(|l| l.contains("/agent-edited") && l.ends_with("gui  edited by mcp")));
 
+    // An edit that brings in a Host the scope doesn't list must say it is a Host-header test.
+    let l = listen.clone();
+    // The person's request names a foreign host of its own, which the edit keeps: the one it adds
+    // is still checked.
+    let person = std::thread::spawn(move || through(&l, port, "/tenant", "Host: first-tenant.test\r\n"));
+    let listed = env.ok(&agent, &["intercept", "list", "--wait", "10"]);
+    let id3 = listed["items"][0]["id"].as_i64().unwrap().to_string();
+    let held = env.ok(&agent, &["intercept", "show", &id3]);
+    let mut lines: Vec<&str> = held["message"]["content"].as_str().unwrap().lines().filter(|l| !l.is_empty()).collect();
+    lines.push("Host: other-tenant.test");
+    std::fs::write(&edited, format!("{}\r\n\r\n", lines.join("\r\n"))).unwrap();
+    let forward = ["intercept", "forward", &id3, "--file", edited.to_str().unwrap()];
+    let (code, v, _) = env.run(&agent, &forward);
+    assert_ne!(code, 0);
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{v}");
+    let fwd = env.ok(&agent, &[&forward[..], &["--host-header-test"]].concat());
+    assert!(fwd["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{fwd}");
+    assert!(person.join().unwrap().starts_with("HTTP/1.1 200"));
+
     // Forwarded unchanged: no edit on either record.
     let l = listen.clone();
     let person = std::thread::spawn(move || through(&l, port, "/as-is", ""));
@@ -372,7 +599,7 @@ fn an_agents_intercept_edit_and_rule_in_a_proxy_the_app_started_say_so() {
     wait_for(&env, "SELECT count(*) FROM history WHERE path = '/as-is'", 1);
     assert_eq!(env.rows("SELECT edited_by FROM history WHERE path = '/as-is'")[0][0], Value::Null);
     let all = env.ok(&[], &["intercept", "list", "--state", "all"]);
-    assert_eq!((&all["items"][1]["resolved_by"], &all["items"][1]["edited"]), (&"gui".into(), &false.into()));
+    assert_eq!((&all["items"][2]["resolved_by"], &all["items"][2]["edited"]), (&"gui".into(), &false.into()));
 
     // A rule the agent added changes the person's request: the row names the rule and the agent.
     let rules = env.ok(
@@ -787,4 +1014,93 @@ fn a_change_log_that_doesnt_parse_is_reported_and_kept() {
     let (code, _, _) = env.run(&[], &["connection", "passthrough", "add", "a.test"]);
     assert_ne!(code, 0);
     assert_eq!(store.meta_get("proxy.recording_changes").unwrap().as_deref(), Some("{not json"));
+}
+
+#[test]
+fn the_session_a_proxy_puts_on_requests_says_who_set_it_up() {
+    let port = serve();
+    let env = Env::new("session");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: k"]);
+    let rule = env.ok(&agent, &["auth", "rule", "add", "app", "--action", "update:x=y"]);
+    assert_eq!((&rule["rule"]["id"], &rule["rule"]["origin"]), (&1.into(), &"mcp".into()), "{rule}");
+    let shown = env.ok(&[], &["auth", "show", "app"]);
+    assert_eq!((&shown["profile"]["origin"], &shown["rules"][0]["origin"]), (&"gui".into(), &"mcp".into()));
+    assert!(shown["session_origin"].is_null(), "{shown}");
+
+    // The person's proxy puts the profile's header on: the row names the profile, with who
+    // added it. The agent's rule applied, but the request has no x to update: it isn't named.
+    // (Rules and macros that change a request are named too; see the session module's tests.)
+    let started = env.ok(&gui, &["proxy", "start", "--listen", "127.0.0.1:0", "--auth", "app"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    assert!(started["schema"].is_i64(), "{started}");
+    assert!(through(&listen, port, "/with-session", "").starts_with("HTTP/1.1 200"));
+    wait_for(&env, "SELECT count(*) FROM history WHERE path = '/with-session'", 1);
+    let rows = env.rows("SELECT id, origin, edited_by FROM history WHERE path = '/with-session'");
+    assert_eq!(rows[0][1], "gui");
+    let edits: Value = serde_json::from_str(rows[0][2].as_str().unwrap()).unwrap();
+    assert_eq!(edits, serde_json::json!([{"by": "gui", "auth": "app"}]));
+    let about = env.text(&["history", "show", &rows[0][0].to_string()]);
+    let first = about.lines().next().unwrap();
+    assert!(first.contains("given the session of auth profile app") && !first.contains("session rule"), "{about}");
+    // A proxy this build started is up to date.
+    assert!(env.ok(&[], &["proxy", "status"])["proxy_outdated"].is_null());
+    env.ok(&[], &["proxy", "stop"]);
+
+    // Saving the rules again unchanged keeps who added each.
+    env.ok(&gui, &["auth", "rule", "add", "app", "--action", "update:a=b"]);
+    let rules = env.ok(&[], &["auth", "rule", "list", "app"])["rules"].clone();
+    assert_eq!((&rules[0]["origin"], &rules[1]["origin"]), (&"mcp".into(), &"gui".into()), "{rules}");
+
+    // A removed rule's id is never handed out again, of a session rule or a proxy rule.
+    env.ok(&gui, &["auth", "rule", "remove", "app", "2"]);
+    let again = env.ok(&gui, &["auth", "rule", "add", "app", "--action", "update:a=b"]);
+    assert_eq!(again["rule"]["id"], 3);
+    let add = ["rules", "add", "--location", "request-header", "--match", "^A: 1$", "--replace", "A: 2"];
+    env.ok(&gui, &add);
+    env.ok(&gui, &["rules", "remove", "1"]);
+    assert_eq!(env.ok(&agent, &add)["rules"][0]["id"], 2);
+
+    // Who saved which setting is logged, without its value.
+    let logged = env.rows("SELECT origin FROM setting_changes WHERE key = 'rules' ORDER BY id");
+    assert_eq!(logged, ["gui", "gui", "mcp"].map(|o| serde_json::json!([o])).to_vec());
+}
+
+#[test]
+fn a_profile_saved_unchanged_keeps_who_saved_it() {
+    let env = Env::new("profile-resave");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    let origin = || env.ok(&[], &["auth", "show", "app"])["profile"]["origin"].clone();
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: k"]);
+    // Re-saved as `auth show` gives it (header values masked), as the app's edit form does.
+    env.ok(&agent, &["auth", "add", "app", "-H", "X-Api-Key: ********"]);
+    assert_eq!(origin(), "gui");
+    env.ok(&agent, &["auth", "add", "app", "-H", "X-Api-Key: other"]);
+    assert_eq!(origin(), "mcp");
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: ********"]);
+    assert_eq!(origin(), "mcp");
+}
+
+#[test]
+fn a_titles_text_filled_in_later_says_who_wrote_it() {
+    let env = Env::new("texts");
+    let add = |vars: &[(&str, &str)], path: &str, more: &[&str]| {
+        let url = format!("http://127.0.0.1:9/{path}");
+        let mut args = vec!["findings", "add", "--title", "Open redirect", "--risk", "low", "--url", &url];
+        args.extend_from_slice(more);
+        env.ok(vars, &args)["finding"]["id"].as_i64().unwrap()
+    };
+    add(&[(CLIENT, "gui")], "a", &["--solution", "check the target"]);
+    // The person left the description blank: the agent's fills it in, and says so.
+    let id = add(&[(MCP, "1")], "b", &["--description", "agent text"]);
+    let sql = "SELECT description, description_origin, solution, solution_origin FROM finding_types \
+               WHERE name = 'Open redirect'";
+    assert_eq!(env.rows(sql)[0], serde_json::json!(["agent text", "mcp", "check the target", "gui"]));
+    // The same text given again isn't written by anyone new.
+    add(&[(CLIENT, "gui")], "c", &["--description", "agent text"]);
+    assert_eq!(env.rows(sql)[0][1], "mcp");
+    let shown = env.ok(&[], &["findings", "show", &id.to_string()]);
+    assert_eq!((&shown["description_origin"], &shown["solution_origin"]), (&"mcp".into(), &"gui".into()));
 }

@@ -86,6 +86,7 @@ fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> Act
             sni: None,
             guard: Some(guard),
             http2: false,
+            host: brainproxy_core::http::client::HostPolicy::Allow,
         },
         points: PointOptions::default(),
         rules: Some(rules.to_vec()),

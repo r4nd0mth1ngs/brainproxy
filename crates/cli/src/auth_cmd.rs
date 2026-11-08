@@ -9,7 +9,7 @@ use brainproxy_core::auth::{AuthProfile, AuthSession, QueryKey, Secret, SessionS
 use brainproxy_core::auth_record::{Mode, Recorded};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::oauth::{Flow, OAuth};
-use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool};
+use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool, SESSION_RULE_IDS};
 use brainproxy_core::sign::{HmacAlg, JwtAlg, KeySource, Place, SignKind, Signer};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -137,6 +137,10 @@ pub enum MacroCmd {
         /// Scheme for FILE steps whose request line has no absolute URL.
         #[arg(long, default_value = "https")]
         scheme: String,
+        /// A step's Host header deliberately names a host the scope doesn't list, for a
+        /// Host-header test. Through MCP such a macro is refused without it.
+        #[arg(long)]
+        host_header_test: bool,
     },
     /// The profile's macros.
     List { profile: String },
@@ -454,6 +458,11 @@ pub struct AddArgs {
     /// When replacing a profile, keep its OAuth setup. For an edit that can't see it.
     #[arg(long, conflicts_with = "oauth_flow")]
     keep_oauth: bool,
+    /// A Host header the profile sets (with --header or in the login request) deliberately
+    /// names a host the scope doesn't list, for a Host-header test. Through MCP such a profile
+    /// is refused without it.
+    #[arg(long)]
+    host_header_test: bool,
     /// Minimum seconds between automatic re-logins.
     #[arg(long, default_value_t = 5)]
     relogin_interval: u64,
@@ -480,6 +489,10 @@ pub struct NetArgs {
     timeout: f64,
     #[arg(long)]
     verify_tls: bool,
+    /// The profile's login or macro requests deliberately name a host the scope doesn't list in
+    /// their Host header, for a Host-header test. Through MCP such a request is refused without it.
+    #[arg(long)]
+    host_header_test: bool,
 }
 
 impl NetArgs {
@@ -490,6 +503,7 @@ impl NetArgs {
             sni: None,
             guard: Some(crate::project_guard(project)?),
             http2: false,
+            host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
         })
     }
 }
@@ -766,6 +780,8 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                         })
                     })
                     .transpose()?,
+                // Set when it is saved.
+                origin: None,
             };
             let store = Store::open(project)?;
             // `auth show` redacts header values; re-saving one unchanged (the GUI's edit form does)
@@ -787,24 +803,41 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 if a.keep_oauth && old.oauth.is_some() {
                     profile.oauth = old.oauth;
                     profile.token_header = old.token_header;
-                    kept_tokens = Some(SessionState {
-                        token: old_state.token,
-                        refresh_token: old_state.refresh_token,
-                        token_expires: old_state.token_expires,
-                        logged_in: old_state.logged_in,
-                        last_login: old_state.last_login,
-                        ..Default::default()
-                    });
+                    let by = store.auth_state_origin(&profile.name)?;
+                    kept_tokens = Some((
+                        SessionState {
+                            token: old_state.token,
+                            refresh_token: old_state.refresh_token,
+                            token_expires: old_state.token_expires,
+                            logged_in: old_state.logged_in,
+                            last_login: old_state.last_login,
+                            ..Default::default()
+                        },
+                        by,
+                    ));
                 }
             }
+            // A Host the profile puts on its requests, unless it put the same one there already.
+            let guard = store.guard()?;
+            let old = store.auth_profile(&profile.name).ok().and_then(|(old, _)| profile_host(&guard, &old));
+            let host = profile_host(&guard, &profile).filter(|h| old.as_ref() != Some(h));
+            let host_warning = match host {
+                Some((place, host)) => {
+                    let what = format!("auth profile {}: {place}", profile.name);
+                    crate::mcp::check_host_setting(&what, Some(host), a.host_header_test, out)?
+                }
+                None => None,
+            };
             store.auth_save_profile(&profile)?;
-            if let Some(state) = kept_tokens {
-                store.auth_save_state(&profile.name, &state)?;
+            if let Some((state, by)) = kept_tokens {
+                store.auth_keep_state(&profile.name, &state, by)?;
             }
             let shown = profile.redacted();
-            out.ok(json!({"profile": shown, "next": format!("brainproxy auth login {}", shown.name)}), || {
-                format!("profile {:?} saved; run: brainproxy auth login {}", shown.name, shown.name)
-            });
+            let mut data = json!({"profile": shown, "next": format!("brainproxy auth login {}", shown.name)});
+            if let Some(w) = host_warning {
+                data["host_warning"] = json!(w);
+            }
+            out.ok(data, || format!("profile {:?} saved; run: brainproxy auth login {}", shown.name, shown.name));
         }
         AuthCmd::Login { name, net } => {
             let session = AuthSession::load(project, &name, Client::new(net.send_options(project)?))?;
@@ -893,9 +926,12 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                     *v = "********".into();
                 }
             }
+            let (session_origin, session_changed_at) = store.auth_state_origin(&name)?;
             let data = json!({
                 "profile": profile,
                 "session": state_json(&state),
+                "session_origin": session_origin,
+                "session_changed_at": session_changed_at,
                 "macros": handling.macros.iter().map(macro_summary).collect::<Vec<_>>(),
                 "rules": handling.rules,
                 "signers": handling.signers,
@@ -1000,6 +1036,7 @@ fn macro_summary(m: &Macro) -> serde_json::Value {
         "steps": m.steps.len(),
         "vars": m.vars(),
         "requests": m.steps.iter().map(step_line).collect::<Vec<_>>(),
+        "origin": m.origin,
     })
 }
 
@@ -1016,6 +1053,42 @@ fn step_line(s: &MacroStep) -> String {
 }
 
 /// A macro step from `--step`: a history id, FILE, or ORIGIN=FILE.
+/// The values of the Host headers among `headers`.
+fn host_values<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> impl Iterator<Item = &'a str> {
+    headers.into_iter().filter(|(k, _)| k.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v)
+}
+
+/// Where a profile puts a Host the scope doesn't list on its requests, and that host: its
+/// headers (the token header too) go to every target, so any such host counts; its login
+/// request and login headers go to the login URL, whose own host is fine.
+fn profile_host(guard: &Arc<brainproxy_core::guard::Guard>, p: &AuthProfile) -> Option<(&'static str, String)> {
+    let token = p.token_header.as_deref().and_then(|h| h.split_once(':'));
+    let headers = p.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).chain(token);
+    let unlisted = |v: &str| brainproxy_core::http::client::unlisted_host(Some(guard), v);
+    if let Some(host) = host_values(headers).find_map(unlisted) {
+        return Some(("header", host));
+    }
+    let login = p.login_url.as_deref().and_then(|u| Target::from_url(u).ok())?;
+    let own = |h: &String| h.eq_ignore_ascii_case(&login.host);
+    let login_headers = p.login_headers.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    if let Some(host) = host_values(login_headers).filter_map(unlisted).find(|h| !own(h)) {
+        return Some(("login header", host));
+    }
+    let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };
+    let request = p.login_request.as_deref()?;
+    opts.foreign_host(request.as_bytes(), &login).map(|host| ("login request", host))
+}
+
+/// The first macro step whose request names a Host the scope doesn't list in place of its
+/// own target's, and that host.
+fn macro_host(guard: &Arc<brainproxy_core::guard::Guard>, m: &Macro) -> Option<(usize, String)> {
+    let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };
+    m.steps.iter().enumerate().find_map(|(i, s)| {
+        let target = Target::from_url(&s.target).ok()?;
+        opts.foreign_host(s.request.as_bytes(), &target).map(|host| (i + 1, host))
+    })
+}
+
 fn read_step(store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error> {
     if let Ok(id) = spec.trim().parse::<i64>() {
         let h = store.get(id)?;
@@ -1054,11 +1127,12 @@ fn parse_extract(spec: &str) -> Result<(usize, Extractor), Error> {
 fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        MacroCmd::Add { profile, name, steps, extract, scheme } => {
+        MacroCmd::Add { profile, name, steps, extract, scheme, host_header_test } => {
             let mut h = store.auth_handling(&profile)?;
             let mut m = Macro {
                 name: name.clone(),
                 steps: steps.iter().map(|s| read_step(&store, s, &scheme)).collect::<Result<_, _>>()?,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             for spec in &extract {
                 let (step, x) = parse_extract(spec)?;
@@ -1069,6 +1143,17 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                     .ok_or_else(|| Error::InvalidInput(format!("--extract {spec:?}: the macro has steps 1 to {n}")))?;
                 s.extract.push(x);
             }
+            // Its steps go out as a session rule's, so a Host the scope doesn't list is checked as
+            // `send` checks one, unless the macro it replaces sent the same one.
+            let guard = store.guard()?;
+            let old = h.macros.iter().find(|o| o.name == name).and_then(|o| macro_host(&guard, o));
+            let host_warning = match macro_host(&guard, &m).filter(|(_, h)| old.as_ref().map(|o| &o.1) != Some(h)) {
+                Some((step, host)) => {
+                    let what = format!("macro {name} step {step}");
+                    crate::mcp::check_host_setting(&what, Some(host), host_header_test, out)?
+                }
+                None => None,
+            };
             let replaced = h.macros.iter().any(|o| o.name == name);
             h.macros.retain(|o| o.name != name);
             h.macros.push(m.clone());
@@ -1080,17 +1165,19 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                 store.auth_save_handling(&profile, &h)?;
             }
             let summary = macro_summary(&m);
-            out.ok(
-                json!({"profile": profile, "profile_created": created, "macro": summary, "replaced": replaced}),
-                || {
-                    format!(
+            let mut data =
+                json!({"profile": profile, "profile_created": created, "macro": summary, "replaced": replaced});
+            if let Some(w) = host_warning {
+                data["host_warning"] = json!(w);
+            }
+            out.ok(data, || {
+                format!(
                     "macro {name:?} {} for {}{profile} ({} steps); try it: brainproxy auth macro run {profile} {name}",
                     if replaced { "replaced" } else { "saved" },
                     if created { "new profile " } else { "" },
                     m.steps.len()
                 )
-                },
-            );
+            });
         }
         MacroCmd::List { profile } => {
             store.auth_profile(&profile)?;
@@ -1205,19 +1292,25 @@ fn rule_line(r: &SessionRule) -> String {
 }
 
 fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
     match cmd {
         RuleCmd::Add { profile, actions, tools, url, invalid, description } => {
             let mut h = store.auth_handling(&profile)?;
             let mut tools = tools.iter().map(|t| Tool::parse(t)).collect::<Result<Vec<_>, _>>()?;
             tools.dedup();
+            let actions = actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?;
+            // Never one a removed rule had, of this profile or another: an old history row's
+            // `edited_by` names it. The profiles share the counter, so the floor is theirs all.
+            let floor = store.session_rule_ids_in_use()?;
+            let id = store.next_id(SESSION_RULE_IDS, floor)?;
             let rule = SessionRule {
-                id: h.rules.iter().map(|r| r.id).max().unwrap_or(0) + 1,
+                id,
                 description: description.unwrap_or_default(),
                 tools,
                 url,
-                actions: actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?,
+                actions,
                 invalid,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             h.rules.push(rule.clone());
             store.auth_save_handling(&profile, &h)?;

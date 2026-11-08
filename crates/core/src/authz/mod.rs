@@ -97,6 +97,7 @@ pub const AUTHZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
     ("baseline_history_id", "INTEGER", "history.id of the baseline response"),
     ("reason", "TEXT", "Why the verdict was given"),
     ("evidence", "TEXT", "What showed the bypass"),
+    ("origin", "TEXT", "gui, cli or mcp: who started the run; NULL for rows from before brainproxy kept it"),
 ];
 
 /// Methods replayed unless asked otherwise. Replaying a request that changes state as
@@ -950,8 +951,9 @@ impl Store {
             }
             self.conn.execute(
                 "INSERT INTO authz_results (run_id, idx, source_id, method, url, owner, identity, verdict, confidence,
-                    status, similarity, private_total, private_hits, history_id, baseline_history_id, reason, evidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    status, similarity, private_total, private_hits, history_id, baseline_history_id, reason, evidence,
+                    origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     run_id,
                     *idx,
@@ -970,6 +972,7 @@ impl Store {
                     baseline_id,
                     r.reason,
                     r.evidence,
+                    crate::provenance::origin(),
                 ],
             )?;
             *idx += 1;

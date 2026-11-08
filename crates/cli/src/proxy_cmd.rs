@@ -9,9 +9,10 @@ use brainproxy_core::authz::live::{Live, LiveOptions};
 use brainproxy_core::authz::{AuthzConfig, ANONYMOUS, DEFAULT_EXCLUDE};
 use brainproxy_core::http::{RawRequest, SendOptions, Target};
 use brainproxy_core::jobs::{is_finished, JobControl};
+use brainproxy_core::proxy::config::breaks_head;
 use brainproxy_core::proxy::config::{
     InterceptSettings, LiveAuthz, Rule, RuleLocation, Scope, TimeoutAction, AUTHZ_KEY, INTERCEPT_KEY, RULES_KEY,
-    SCOPE_KEY,
+    RULE_IDS, SCOPE_KEY,
 };
 use brainproxy_core::proxy::{CertAuthority, ProxyOptions, ProxyState, STATE_KEY};
 use brainproxy_core::store::{HistoryFilter, Store};
@@ -92,7 +93,7 @@ const MAX_RESTART_WAIT: f64 = 60.0;
 
 #[derive(Subcommand)]
 pub enum CaCmd {
-    /// Create the interception CA if missing (use --force to replace it).
+    /// Create the interception CA if missing (use --force to replace it; not through MCP).
     Init {
         #[arg(long)]
         force: bool,
@@ -108,7 +109,7 @@ pub enum CaCmd {
         /// Print the certificate itself rather than the JSON envelope.
         #[arg(long)]
         raw: bool,
-        /// Overwrite an existing --out file.
+        /// Overwrite an existing --out file (not through MCP).
         #[arg(long)]
         force: bool,
     },
@@ -393,12 +394,19 @@ pub enum RulesCmd {
         /// Add the rule disabled.
         #[arg(long)]
         disabled: bool,
+        /// The rule deliberately puts a host the scope doesn't list in the Host header, for a
+        /// Host-header test. Through MCP such a rule is refused without it.
+        #[arg(long)]
+        host_header_test: bool,
     },
     Remove {
         id: u32,
     },
     Enable {
         id: u32,
+        /// As for `rules add`: the rule puts a host the scope doesn't list in the Host header.
+        #[arg(long)]
+        host_header_test: bool,
     },
     Disable {
         id: u32,
@@ -469,6 +477,10 @@ pub enum InterceptCmd {
         file: Option<String>,
         #[arg(long)]
         verbatim: bool,
+        /// The replacement's Host header deliberately names a host the scope doesn't list (and the
+        /// held request didn't), for a Host-header test. Through MCP such an edit is refused without it.
+        #[arg(long)]
+        host_header_test: bool,
     },
     /// Drop a held message; the client receives a 502 (a dropped WebSocket message is just not delivered).
     Drop { id: i64 },
@@ -514,6 +526,8 @@ fn fingerprint(der: &[u8]) -> String {
 pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         CaCmd::Init { force } => {
+            // Every client that trusts the person's CA would stop trusting the proxy.
+            crate::mcp::check_force(force, "ca init", "the CA is kept; a person replaces it in a terminal")?;
             if force {
                 CertAuthority::generate(&ca_dir(home))?;
             }
@@ -527,6 +541,8 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
             out.ok(data, || format!("CA: {}", info.cert_path.display()));
         }
         CaCmd::Export { der, out: path, raw, force } => {
+            // Any file the server can write: an agent writes new files only.
+            crate::mcp::check_force(force, "ca export", "write the certificate to a new file, or leave out --out")?;
             let (ca, info) = load_ca(home)?;
             let bytes = if der { ca.cert_der().to_vec() } else { ca.cert_pem().as_bytes().to_vec() };
             if let Some(path) = path {
@@ -941,6 +957,21 @@ fn usage_hints(state: &ProxyState) -> Value {
     })
 }
 
+/// A warning when the running proxy was started by a build older than the project's schema
+/// (`started`: the schema it records, None from before it did): it goes on writing rows as
+/// that build did, without what came since (who changed a request, for one).
+fn outdated_text(started: Option<i64>, project: i64) -> Option<String> {
+    let by = match started {
+        Some(v) if v >= project => return None,
+        Some(v) => format!("a brainproxy build for schema v{v}"),
+        None => "an older brainproxy build".to_string(),
+    };
+    Some(format!(
+        "the running proxy was started by {by}, and the project is at schema v{project}: it records less than \
+         this version does (who changed a request, for one); restart it with brainproxy proxy restart"
+    ))
+}
+
 fn state_json(state: &ProxyState) -> Value {
     let mut v = json!(state);
     v["usage"] = usage_hints(state);
@@ -1017,6 +1048,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 }
                 None => Value::Null,
             };
+            let schema = store.schema_version()?;
+            let outdated = state.as_ref().and_then(|s| outdated_text(s.schema, schema));
             let data = json!({
                 "running": state.is_some(),
                 "restarting": held,
@@ -1026,7 +1059,9 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "proxy_captures": captures,
                 "pending_intercepts": pending,
                 "intercept_enabled": intercept.enabled,
-                "rules_enabled": rules.iter().filter(|r| r.enabled).count(),
+                "rules_enabled": rules.iter().filter(|r| r.enabled && !breaks_head(r)).count(),
+                // Saved before line breaks in a head replacement were refused: left out.
+                "rules_skipped": skipped_rules(&rules),
                 "scope": scope,
                 "recording_last_change": changes.recent(1).first(),
                 "recording_narrowed_by_agent": narrowed,
@@ -1038,11 +1073,15 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "recording_changes_problem": problem,
                 "authz": authz,
                 "restart_gone": gone,
+                "proxy_outdated": outdated,
             });
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             let gone_note = gone.as_ref().map(|g| format!("\n{}", gone_text(g, now))).unwrap_or_default();
             let mut notes: String =
                 narrowed.iter().chain(&rerouted).map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
+            if let Some(o) = &outdated {
+                notes.push_str(&format!("\nwarning: {o}"));
+            }
             if let Some(p) = &problem {
                 notes.push_str(&format!("\nwarning: {p}"));
             }
@@ -1806,6 +1845,9 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         sni: None,
         guard: Some(guard),
         http2: false,
+        // A proxied client's request goes out with its own Host; an agent's edits and rules
+        // are checked when they are made.
+        host: brainproxy_core::http::client::HostPolicy::Allow,
     };
     let live = args.live_authz()?;
     let stored: LiveAuthz = store.setting(AUTHZ_KEY)?;
@@ -1978,6 +2020,7 @@ fn serve(
             log: args.log.clone(),
             authz_run: authz.as_ref().map(|l| l.run_id()),
             args: crate::jobs_cmd::child_args(),
+            schema: Some(brainproxy_core::store::SCHEMA_VERSION),
         };
         let lock = process::RunLock::acquire(&store, LOCK_NAME)?;
         let saved = Saved {
@@ -2107,40 +2150,61 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
 }
 
 pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
     let mut rules: Vec<Rule> = store.setting(RULES_KEY)?;
     let find = |rules: &mut Vec<Rule>, id: u32| -> Result<usize, Error> {
         rules.iter().position(|r| r.id == id).ok_or_else(|| Error::NotFound(format!("rule {id}")))
     };
+    let mut host_warning = None;
     match cmd {
         RulesCmd::List => {
-            out.ok(json!({"rules": rules}), || serde_json::to_string_pretty(&rules).unwrap_or_default());
+            let skipped = skipped_rules(&rules);
+            let data = json!({"rules": rules, "skipped": skipped});
+            out.ok(data, || {
+                let mut text = serde_json::to_string_pretty(&rules).unwrap_or_default();
+                for s in skipped.as_array().into_iter().flatten() {
+                    text.push_str(&format!(
+                        "\nwarning: rule {} is skipped: {}",
+                        s["id"],
+                        s["reason"].as_str().unwrap_or("")
+                    ));
+                }
+                text
+            });
             return Ok(());
         }
-        RulesCmd::Add { location, pattern, replace, comment, disabled } => {
-            let id = rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-            let rule = Rule {
-                id,
+        RulesCmd::Add { location, pattern, replace, comment, disabled, host_header_test } => {
+            let mut rule = Rule {
+                id: 0,
                 location: RuleLocation::parse(&location)?,
                 pattern,
                 replace,
                 enabled: !disabled,
                 comment,
                 origin: Some(brainproxy_core::provenance::origin().to_string()),
+                host_header_test,
             };
             brainproxy_core::proxy::config::validate_rule(&rule)?;
+            // Never one a removed rule had: an old history row's `edited_by` names it.
+            rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
+            // A disabled rule changes nothing; enabling it is checked.
+            if rule.enabled {
+                host_warning = check_rule_host(&store, &rule, host_header_test, out)?;
+            }
             rules.push(rule);
         }
         RulesCmd::Remove { id } => {
             let i = find(&mut rules, id)?;
             rules.remove(i);
         }
-        RulesCmd::Enable { id } => {
+        RulesCmd::Enable { id, host_header_test } => {
             let i = find(&mut rules, id)?;
             brainproxy_core::proxy::config::validate_rule(&rules[i])?;
             // Whoever turns a rule on answers for what it changes from then on.
             if !rules[i].enabled {
+                host_warning = check_rule_host(&store, &rules[i], host_header_test, out)?;
                 rules[i].origin = Some(brainproxy_core::provenance::origin().to_string());
+                rules[i].host_header_test = host_header_test;
             }
             rules[i].enabled = true;
         }
@@ -2151,8 +2215,87 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Clear => rules.clear(),
     }
     store.set_setting(RULES_KEY, &rules)?;
-    out.ok(json!({"rules": rules}), || serde_json::to_string_pretty(&rules).unwrap_or_default());
+    let mut data = json!({"rules": rules});
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
+    }
+    out.ok(data, || serde_json::to_string_pretty(&rules).unwrap_or_default());
     Ok(())
+}
+
+/// The rules the proxy leaves out when it loads them (see [`breaks_head`]), with why.
+fn skipped_rules(rules: &[Rule]) -> Value {
+    let skipped = rules.iter().filter(|r| breaks_head(r)).map(|r| {
+        json!({"id": r.id, "reason": "its replacement holds a line break or NUL, which would start another header"})
+    });
+    Value::Array(skipped.collect())
+}
+
+/// Checks a request rule about to take effect for a Host the scope doesn't list that it would put
+/// on proxied requests (see [`rule_host`]), as `send` checks a request's.
+fn check_rule_host(store: &Store, rule: &Rule, test: bool, out: &Out) -> Result<Option<String>, Error> {
+    let guard = store.guard()?;
+    // Names the engagement lists, for requests the rule may rewrite: a wildcard as one of its hosts.
+    let names: Vec<String> = store
+        .engagement()?
+        .map(|s| s.include)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| !e.contains('/'))
+        .filter_map(|e| Target::from_url(&e.replacen("*.", "www.", 1)).ok())
+        .map(|t| t.host)
+        .collect();
+    crate::mcp::check_host_setting(&format!("rule {}", rule.id), rule_host(&guard, &names, rule), test, out)
+}
+
+/// The Host the scope doesn't list that a request rule would put on proxied requests: one its
+/// replacement writes (a Host header line, or an absolute URL in the request line), or one it
+/// makes of the Host of a request to one of `names`. A rule can match anything, so this is no
+/// proof: a rule that rewrites only requests these don't look like isn't caught.
+fn rule_host(guard: &std::sync::Arc<brainproxy_core::guard::Guard>, names: &[String], rule: &Rule) -> Option<String> {
+    use brainproxy_core::http::client::unlisted_host;
+    let replace = rule.replace.trim();
+    let written = match rule.location {
+        RuleLocation::RequestHeader => replace
+            .split_once(':')
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+            .and_then(|(_, v)| unlisted_host(Some(guard), v)),
+        RuleLocation::RequestLine => replace.find("://").and_then(|at| {
+            let start = replace[..at].rfind(' ').map_or(0, |i| i + 1);
+            let url = replace[start..].split(' ').next().unwrap_or_default();
+            match Target::from_url(url) {
+                Ok(t) => unlisted_host(Some(guard), &t.host),
+                Err(_) => Some(url.to_string()),
+            }
+        }),
+        _ => return None,
+    };
+    if written.is_some() {
+        return written;
+    }
+    // A name or request target the rule takes from the request (`$1`) can be anything, a Host
+    // too ("^X-Zz: (.*)$" to "Hos$1"); so can a name that is the start of "Host".
+    let capture = regex::Regex::new(r"\$(\d|\{|[A-Za-z_])").expect("valid");
+    let copied = match rule.location {
+        RuleLocation::RequestHeader => {
+            let name = replace.split_once(':').map_or(replace, |(k, _)| k).trim();
+            let host_start = !name.is_empty() && "host".starts_with(&name.to_ascii_lowercase());
+            capture.is_match(name) || host_start
+        }
+        _ => capture.find_iter(replace).any(|m| m.start() == 0 || replace[..m.start()].ends_with(' ')),
+    };
+    if copied {
+        return Some(format!("(what the rule makes of the request: {replace:?})"));
+    }
+    let compiled = brainproxy_core::proxy::config::compile_rules(&[Rule { enabled: true, ..rule.clone() }]).ok()?;
+    let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };
+    names.iter().find_map(|name| {
+        let host = if name.contains(':') { format!("[{name}]") } else { name.clone() };
+        let probe = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
+        let target = Target { scheme: "https".into(), host: name.clone(), port: 443 };
+        let ruled = brainproxy_core::proxy::config::apply_request_rules(&compiled, probe);
+        opts.foreign_host(&ruled, &target)
+    })
 }
 
 pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Error> {
@@ -2241,8 +2384,9 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             });
             out.ok(data, || String::from_utf8_lossy(&original).into_owned());
         }
-        InterceptCmd::Forward { id, file, verbatim } => {
-            let websocket = store.intercept_get(id)?.0.direction.starts_with("ws-");
+        InterceptCmd::Forward { id, file, verbatim, host_header_test } => {
+            let (entry, original, _) = store.intercept_get(id)?;
+            let websocket = entry.direction.starts_with("ws-");
             let edited = match file.as_deref() {
                 None => None,
                 Some(path) => {
@@ -2258,11 +2402,24 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     )
                 }
             };
+            // The proxy sends an edited request where the held one was going, so a Host the edit
+            // brings in is checked as `send` checks one; a Host the client sent stays as it was.
+            let mut host_warning = None;
+            if let (Some(e), "request") = (&edited, entry.direction.as_str()) {
+                let target = Target::from_url(&entry.url)?;
+                let opts = SendOptions { guard: Some(store.guard()?), ..Default::default() };
+                let before = opts.foreign_hosts(&original, &target);
+                if let Some(new) = opts.foreign_hosts(e, &target).into_iter().find(|h| !before.contains(h)) {
+                    host_warning = crate::mcp::check_host_setting("the edit", Some(new), host_header_test, out)?;
+                }
+            }
             let by = brainproxy_core::provenance::origin();
             store.intercept_resolve(id, "forwarded", edited.as_deref(), Some(by))?;
-            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by}), || {
-                format!("forwarded #{id}")
-            });
+            let mut data = json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by});
+            if let Some(w) = host_warning {
+                data["host_warning"] = json!(w);
+            }
+            out.ok(data, || format!("forwarded #{id}"));
         }
         InterceptCmd::Drop { id } => {
             let by = brainproxy_core::provenance::origin();
@@ -2307,6 +2464,7 @@ mod tests {
             log: None,
             authz_run: None,
             args: args.iter().map(|a| a.to_string()).collect(),
+            schema: Some(brainproxy_core::store::SCHEMA_VERSION),
         }
     }
 
@@ -2639,6 +2797,23 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_older_than_the_project_schema_is_warned_about() {
+        assert_eq!(outdated_text(Some(19), 19), None);
+        assert_eq!(outdated_text(Some(20), 19), None);
+        let older = outdated_text(Some(18), 19).unwrap();
+        assert!(older.starts_with("the running proxy was started by a brainproxy build for schema v18"), "{older}");
+        assert!(older.ends_with("brainproxy proxy restart"), "{older}");
+        // One from before the proxy kept it says nothing of its schema.
+        assert!(outdated_text(None, 19)
+            .unwrap()
+            .contains("by an older brainproxy build, and the project is at schema v19"));
+        // What an older build wrote still reads.
+        let old: ProxyState =
+            serde_json::from_str(r#"{"pid":1,"listen":"127.0.0.1:1","started":"0","ca_cert":"c","log":null}"#).unwrap();
+        assert_eq!(old.schema, None);
+    }
+
+    #[test]
     fn usage_hints_point_at_loopback_for_a_wildcard_listen_address() {
         let state = |listen: &str| ProxyState {
             pid: 1,
@@ -2648,6 +2823,7 @@ mod tests {
             log: None,
             authz_run: None,
             args: vec![],
+            schema: None,
         };
         for (listen, url) in [
             ("127.0.0.1:8080", "http://127.0.0.1:8080"),

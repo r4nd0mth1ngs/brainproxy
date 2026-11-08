@@ -32,8 +32,10 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// (copying the project elsewhere is for the person running the server), `browser open`
 /// (the browser profile holds the person's sign-ins; the command refuses a tool call too), and
 /// `findings remove` (an agent can't tell a person's finding from its own; it marks one
-/// false_positive instead; the command refuses a tool call too), and `connection review`
-/// (an agent can't approve its own changes to where traffic goes; it refuses a tool call too).
+/// false_positive instead; the command refuses a tool call too), `report-profile remove` (a
+/// saved layout may be a person's branding; it refuses a tool call too), and `connection
+/// review` (an agent can't approve its own changes to where traffic goes; it refuses a tool
+/// call too).
 const EXCLUDED: &[&str] = &[
     "mcp serve",
     "proxy run",
@@ -43,6 +45,7 @@ const EXCLUDED: &[&str] = &[
     "project save",
     "browser open",
     "findings remove",
+    "report-profile remove",
     "connection review",
     // A person reviews what an agent drafted; an agent can't vouch for itself.
     "findings issue review",
@@ -75,6 +78,17 @@ pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_c
     Ok(())
 }
 
+/// Under a tool call, refuses `--force` on `command`: it would overwrite any file the server
+/// can write (for `ca init`, the person's CA). `instead` says what an agent does instead.
+pub(crate) fn check_force(force: bool, command: &str, instead: &str) -> Result<(), brainproxy_core::Error> {
+    if force && in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{command} --force is refused through MCP: {instead}"
+        )));
+    }
+    Ok(())
+}
+
 /// Under a tool call, refuses `--no-store`: whatever an agent sends goes into the project's
 /// history, so a person can see what was sent on their behalf.
 pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Error> {
@@ -98,6 +112,80 @@ pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error
         )));
     }
     Ok(())
+}
+
+/// Checks the host `request` names in its Host header (or absolute request target) against the
+/// scope (see [`SendOptions::foreign_host`]). Under a tool call one the scope doesn't list is
+/// refused unless `--host-header-test` says the test is meant, so the intent is on record; a
+/// person is never refused. Returns the warning a command shows when one is sent, which in
+/// text mode goes to stderr at once, so it shows even when the send then fails.
+///
+/// [`SendOptions::foreign_host`]: brainproxy_core::http::SendOptions::foreign_host
+pub(crate) fn check_host_header(
+    opts: &brainproxy_core::http::SendOptions,
+    request: &[u8],
+    target: &brainproxy_core::http::Target,
+    test: bool,
+    out: &crate::output::Out,
+) -> Result<Option<String>, brainproxy_core::Error> {
+    let Some(host) = opts.foreign_host(request, target) else { return Ok(None) };
+    host_verdict(&format!("Host {host}"), &format!("the Host names {host}"), test, out)
+}
+
+/// [`check_host_header`] for a setting that puts `host` (when the scope doesn't list it; see
+/// [`unlisted_host`]) in the Host header of requests still to come: `what` names the setting,
+/// e.g. "auth profile app: header". It is refused, or warned about, when it is saved.
+///
+/// [`unlisted_host`]: brainproxy_core::http::client::unlisted_host
+pub(crate) fn check_host_setting(
+    what: &str,
+    host: Option<String>,
+    test: bool,
+    out: &crate::output::Out,
+) -> Result<Option<String>, brainproxy_core::Error> {
+    let Some(host) = host else { return Ok(None) };
+    host_verdict(&format!("{what} sets Host {host}"), &format!("{what} sets the Host to {host}"), test, out)
+}
+
+/// The warning a command shows for a foreign Host: `early`, its own check's, or else the first
+/// host `client` noted as it sent (one a session or a signer brought in), which in text mode
+/// goes to stderr too.
+pub(crate) fn sent_host_warning<'a>(
+    clients: impl IntoIterator<Item = &'a brainproxy_core::http::Client>,
+    early: Option<String>,
+    out: &crate::output::Out,
+) -> Option<String> {
+    if early.is_some() {
+        return early;
+    }
+    let host = clients.into_iter().find_map(|c| c.first_foreign_host())?;
+    let warning = format!(
+        "the Host names {host}, which the scope doesn't list: a shared front end may send the request to that site"
+    );
+    if !out.json() {
+        eprintln!("warning: {}", crate::output::escape_controls(&warning));
+    }
+    Some(warning)
+}
+
+fn host_verdict(
+    refused: &str,
+    warned: &str,
+    test: bool,
+    out: &crate::output::Out,
+) -> Result<Option<String>, brainproxy_core::Error> {
+    if in_tool_call() && !test {
+        return Err(brainproxy_core::Error::OutOfScope(format!(
+            "{refused}: a host other than the target's must be listed by name in the scope, as a shared front \
+             end may send the request to that site; for a Host-header test pass --host-header-test"
+        )));
+    }
+    let warning =
+        format!("{warned}, which the scope doesn't list: a shared front end may send the request to that site");
+    if !out.json() {
+        eprintln!("warning: {}", crate::output::escape_controls(&warning));
+    }
+    Ok(Some(warning))
 }
 
 /// How long a cancelled or timed-out call may take to exit after SIGTERM (recording what it
@@ -186,9 +274,10 @@ const HINTS: &[(&str, Hints)] = &[
     ("proxy status", READ),
     ("proxy setup show", READ),
     ("proxy setup set", SET),
-    ("ca init", REPLACE),
-    // --out writes a file (refused if it exists unless --force).
-    ("ca export", REPLACE),
+    // Creates the CA if missing: through MCP --force (a new CA) is refused.
+    ("ca init", SET),
+    // --out writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("ca export", ADD),
     ("browser list", READ),
     // Starts a GUI browser on the machine running the server.
     ("browser open", ADD),
@@ -274,13 +363,14 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings issue cvss", SET),
     ("findings issue narrative", SET),
     ("findings trail", READ),
-    // --output writes a file (refused if it exists unless --force).
-    ("findings repro", REPLACE),
+    // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("findings repro", ADD),
     ("findings ticket", SET),
     ("report-summary show", READ),
     ("report-summary set", SET),
     ("report-profile list", READ),
     ("report-profile show", READ),
+    // Through MCP only under a new name (a saved layout may be a person's).
     ("report-profile save", SET),
     ("report-profile remove", REPLACE),
     ("findings timeline", READ),
@@ -289,8 +379,8 @@ const HINTS: &[(&str, Hints)] = &[
     // Through MCP it can't replace the write-up findings of the same title share (--replace-text).
     ("findings add", ADD),
     ("findings remove", REPLACE),
-    // --output writes a file (refused if it exists unless --force).
-    ("report", REPLACE),
+    // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("report", ADD),
     ("diff", READ),
     ("history list", READ),
     ("history show", READ),

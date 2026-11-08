@@ -121,6 +121,7 @@ fn run_with(
             sni: None,
             guard: Some(guard),
             http2: false,
+            host: brainproxy_core::http::client::HostPolicy::Allow,
         },
         points: PointOptions::default(),
         rules: None,

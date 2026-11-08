@@ -27,4 +27,9 @@ pub struct ProxyState {
     /// The `proxy run` arguments it was started with, so it can be started again alike.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// The project schema of the build that started it ([`crate::store::SCHEMA_VERSION`]); None
+    /// for a proxy started by a build from before it was kept. `proxy status` warns about one
+    /// older than the project: it may record less than the project holds (provenance, for one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<i64>,
 }

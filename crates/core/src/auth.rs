@@ -123,6 +123,10 @@ pub struct AuthProfile {
     /// OAuth 2.0 token requests in place of a login (see [`crate::oauth`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<crate::oauth::OAuth>,
+    /// Who saved it last: gui, cli or mcp (None: before brainproxy kept it), set when it is
+    /// saved. A proxied request its session goes on records this in `edited_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 fn post() -> String {
@@ -218,6 +222,12 @@ impl AuthProfile {
         }
         if self.oauth.is_none() && self.token_regex.is_some() != self.token_header.is_some() {
             return Err(Error::InvalidInput("--token-regex and --token-header go together".into()));
+        }
+        // A line break would start another header (a Host, say) on every request.
+        let token = self.token_header.as_deref().map(|h| h.split_once(':').unwrap_or((h, "")));
+        let headers = self.headers.iter().chain(&self.login_headers).map(|(k, v)| (k.as_str(), v.as_str()));
+        for (k, v) in headers.chain(token) {
+            crate::http::request::check_header(k, v)?;
         }
         Ok(())
     }
@@ -321,14 +331,22 @@ fn is_zero(n: &u64) -> bool {
 }
 
 impl Store {
-    /// Adds or replaces a profile (keeping no old session state).
+    /// Adds or replaces a profile (keeping no old session state), saved by this process's
+    /// origin; one saved as it was (the app's edit form re-saves it) keeps its own.
     pub fn auth_save_profile(&self, p: &AuthProfile) -> Result<()> {
         p.validate_with(&self.auth_handling(&p.name)?)?;
-        let json = serde_json::to_string(p).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let kept = self
+            .auth_profile(&p.name)
+            .ok()
+            .filter(|(old, _)| *old == AuthProfile { origin: old.origin.clone(), ..p.clone() })
+            .map(|(old, _)| old.origin);
+        let origin = kept.unwrap_or_else(|| Some(crate::provenance::origin().to_string()));
+        let p = AuthProfile { origin, ..p.clone() };
+        let json = serde_json::to_string(&p).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO auth_profiles (name, profile, state) VALUES (?1, ?2, '{}')
-             ON CONFLICT(name) DO UPDATE SET profile = excluded.profile, state = '{}',
-                updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+             ON CONFLICT(name) DO UPDATE SET profile = excluded.profile, state = '{}', state_origin = NULL,
+                state_changed_at = NULL, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             params![p.name, json],
         )?;
         // Running proxies reload platform credentials with the settings.
@@ -348,13 +366,39 @@ impl Store {
         Ok((profile, state))
     }
 
+    /// Stores a profile's session (cookies, token, macro values) with who stored it: the
+    /// process that logged in, got the OAuth token or learnt the cookies.
     pub fn auth_save_state(&self, name: &str, state: &SessionState) -> Result<()> {
+        self.auth_keep_state(name, state, (Some(crate::provenance::origin().to_string()), None))
+    }
+
+    /// Stores a profile's session as stored earlier by `by` (who, and when: now when None), for
+    /// tokens kept across a change to the profile.
+    pub fn auth_keep_state(
+        &self,
+        name: &str,
+        state: &SessionState,
+        by: (Option<String>, Option<String>),
+    ) -> Result<()> {
         let json = serde_json::to_string(state).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
-            "UPDATE auth_profiles SET state = ?1, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE name = ?2",
-            params![json, name],
+            "UPDATE auth_profiles SET state = ?1, state_origin = ?3, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                state_changed_at = COALESCE(?4, strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE name = ?2",
+            params![json, name, by.0, by.1],
         )?;
         Ok(())
+    }
+
+    /// Who stored a profile's session last (gui, cli or mcp), and when; None until a session is
+    /// stored, and for one stored before brainproxy kept it.
+    pub fn auth_state_origin(&self, name: &str) -> Result<(Option<String>, Option<String>)> {
+        let row = self
+            .conn
+            .query_row("SELECT state_origin, state_changed_at FROM auth_profiles WHERE name = ?1", [name], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        row.ok_or_else(|| Error::NotFound(format!("auth profile {name:?}")))
     }
 
     pub fn auth_list(&self) -> Result<Vec<(AuthProfile, SessionState)>> {
@@ -568,9 +612,9 @@ impl Vault {
             let allowed = |e: &VaultEntry| {
                 anywhere(e) || (e.header.is_some() && e.header == name) || (i == 0 && e.request_line && to_origin(e))
             };
-            out.extend(fill(&inner.entries, &inner.sign_marks, line, allowed)?);
+            out.extend(fill(&inner.entries, &inner.sign_marks, line, true, allowed)?);
         }
-        let new_body = fill(&inner.entries, &Default::default(), body, anywhere)?;
+        let new_body = fill(&inner.entries, &Default::default(), body, false, anywhere)?;
         let body_changed = new_body != body;
         out.extend(new_body);
         if body_changed {
@@ -600,11 +644,14 @@ impl Vault {
 
 /// `text` with each placeholder replaced by its value, where `allowed` lets it go.
 /// A per-run macro placeholder no longer kept falls back to the variable's latest value.
-/// Placeholders in `later` stay for the signers.
+/// Placeholders in `later` stay for the signers. In the head (`head`), a value holding a CR, LF
+/// or NUL is refused: a token or cookie learned from a reply, or a macro's value, would otherwise
+/// start another header (a Host, say) on every request it goes into.
 fn fill(
     entries: &HashMap<String, VaultEntry>,
     later: &std::collections::HashSet<String>,
     text: &[u8],
+    head: bool,
     allowed: impl Fn(&VaultEntry) -> bool,
 ) -> Result<Vec<u8>> {
     const END: &[u8] = "»".as_bytes();
@@ -626,6 +673,13 @@ fn fill(
             .as_deref()
             .and_then(|ph| entries.get(ph).or_else(|| entries.get(&crate::session::latest_placeholder(ph)?)));
         match (entry.filter(|e| allowed(e)), end) {
+            (Some(e), Some(j)) if head && e.value.contains(['\r', '\n', '\0']) => {
+                let ph = String::from_utf8_lossy(&rest[..j]).into_owned();
+                return Err(Error::InvalidInput(format!(
+                    "the value for {ph} holds a line break or NUL, which would start another header: not \
+                     sent (log in again, or check what the profile learns its values from)"
+                )));
+            }
             (Some(e), Some(j)) => {
                 out.extend_from_slice(e.value.as_bytes());
                 rest = &rest[j..];
@@ -741,6 +795,11 @@ impl std::fmt::Debug for AuthSession {
 }
 
 impl AuthSession {
+    /// The client its requests go out with (logins, checks, macros, and what it sends for a tool).
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn load(project: &Path, name: &str, client: Client) -> Result<Self> {
         let store = Store::open(project)?;
         let (profile, state) = store.auth_profile(name)?;
@@ -1571,6 +1630,21 @@ mod tests {
     }
 
     #[test]
+    fn a_learned_value_with_a_line_break_is_never_filled_into_the_head() {
+        let p = AuthProfile {
+            name: "t".into(),
+            token_header: Some("Authorization: Bearer {{token}}".into()),
+            ..Default::default()
+        };
+        let vault = Vault::default();
+        let st = SessionState { token: Some("abc\r\nHost: e.test".into()), ..Default::default() };
+        vault.put_session(&p, &st);
+        let raw = "GET / HTTP/1.1\r\nAuthorization: Bearer «auth:t:token»\r\n\r\n";
+        let e = vault.resolve(raw.as_bytes(), &Target::from_url("https://a.test").unwrap()).unwrap_err();
+        assert!(e.to_string().contains("line break"), "{e}");
+    }
+
+    #[test]
     fn detects_logout() {
         let s = session(AuthProfile {
             name: "t".into(),
@@ -1667,6 +1741,7 @@ mod tests {
             url: None,
             actions: vec![crate::session::Action::Login],
             invalid: None,
+            origin: None,
         };
         assert!(bare.validate_with(&crate::session::Handling { rules: vec![rule], ..Default::default() }).is_ok());
         let p = AuthProfile {

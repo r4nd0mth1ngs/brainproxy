@@ -337,9 +337,23 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let (req, target) = prepared?;
     let guard = crate::project_guard(project)?;
     crate::require_in_scope(&guard, &target)?;
+    let opts = args.req.send_options(guard.clone());
     // So is a server name the scope doesn't list, before a row could say it was sent.
-    args.req.send_options(guard.clone()).check_sni(&target)?;
+    opts.check_sni(&target)?;
+    // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test. A
+    // payload position in the Host is one: its marker, shown as the default's, is never a host.
+    let marked = String::from_utf8_lossy(req.as_bytes()).replace(&args.marker, fuzz::DEFAULT_MARKER);
+    let mut host_warning =
+        crate::mcp::check_host_header(&opts, marked.as_bytes(), &target, args.req.host_header_test, out)?;
+    // Every request is checked again as it goes out, payloads in: one that names another host
+    // (a payload in a header's name that makes it a Host, say) is refused there through MCP.
+    let head = String::from_utf8_lossy(brainproxy_core::http::request::split_head_body(marked.as_bytes()).0);
     let template = Template::parse(req.as_bytes(), &args.marker)?;
+    // How many positions are in the head (they come first), and whether payloads there are
+    // URL-encoded: a raw CR or LF there would start another header line (a Host, say).
+    let head_positions = head.matches(fuzz::DEFAULT_MARKER).count() / 2;
+    let encode = !args.no_encode && !args.req.verbatim;
+    let raw_in_head = template.url_positions().iter().take(head_positions).any(|url| !(encode && *url));
 
     let mut stdin = || crate::read_input(None);
     let mut sets = Vec::new();
@@ -362,6 +376,13 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         if let Some(n) = which.filter(|n| *n == 0 || *n > args.payloads.len()) {
             return Err(Error::InvalidInput(format!("--process {n}=...: there is no payload set {n}")));
         }
+    }
+    // A raw line break in the head is a CRLF-injection test a person may run; it can also start a
+    // Host header, so through MCP it needs --host-header-test as a foreign Host does.
+    if raw_in_head && sets.iter().flatten().any(|p| p.contains(&b'\r') || p.contains(&b'\n')) && host_warning.is_none()
+    {
+        let what = "(a payload with a line break, unencoded in the head)".to_string();
+        host_warning = crate::mcp::check_host_setting("fuzz run", Some(what), args.req.host_header_test, out)?;
     }
     let plan = Plan::new(mode, &template, sets)?;
     let total = args.max_requests.map_or(plan.total(), |m| m.min(plan.total()));
@@ -391,7 +412,8 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             &config,
             req.as_bytes(),
         )?;
-        return spawn_background(project, home, run_id, stdin_request.then(|| req.as_bytes()), &store, out);
+        let request = stdin_request.then(|| req.as_bytes());
+        return spawn_background(project, home, run_id, request, &store, host_warning, out);
     }
 
     let run_id = match args.attach_run {
@@ -454,6 +476,9 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             let mut summary = store.fuzz_summary(run_id, args.top)?;
             summary["outcome"] = json!(outcome);
             summary["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            if let Some(w) = host_warning {
+                summary["host_warning"] = json!(w);
+            }
             out.ok(summary.clone(), || text_summary(&summary));
             Ok(())
         }
@@ -470,6 +495,7 @@ fn spawn_background(
     run_id: i64,
     request: Option<&[u8]>,
     store: &Store,
+    host_warning: Option<String>,
     out: &Out,
 ) -> Result<(), Error> {
     let project = std::fs::canonicalize(project)?;
@@ -509,11 +535,14 @@ fn spawn_background(
         std::thread::sleep(Duration::from_millis(50));
     }
     let info = store.fuzz_run(run_id)?;
-    let data = json!({
+    let mut data = json!({
         "run": info,
         "log": log,
         "next": format!("brainproxy fuzz status {run_id}   (or: fuzz stop {run_id})"),
     });
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
+    }
     out.ok(data, || format!("fuzz run {run_id} started in the background"));
     Ok(())
 }

@@ -20,7 +20,9 @@ use brainproxy_core::auth::Attempt;
 use brainproxy_core::http::{Client, RawRequest, SendOptions};
 use brainproxy_core::scan::findings_db::fingerprint;
 use brainproxy_core::scan::issues::Retest;
-use brainproxy_core::scan::passive::{self, PassiveSettings};
+// A retest's request is recorded with source RETEST_SOURCE, which the background passive scan
+// never reads, so only the retest judges it.
+use brainproxy_core::scan::passive::{self, PassiveSettings, RETEST_SOURCE};
 
 use brainproxy_core::store::Store;
 use serde_json::{json, Value};
@@ -29,10 +31,6 @@ use brainproxy_core::Error;
 
 use crate::output::Out;
 use crate::{auth_cmd, process, sent};
-
-/// The history source of a retest's request: not one the background passive scan reads, so
-/// only the retest judges it.
-const RETEST_SOURCE: &str = "retest";
 
 /// Methods a retest sends without being told it may: they shouldn't change anything.
 const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
@@ -114,6 +112,15 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         )));
     }
     let item = store.get(history_id)?;
+    // A request refused for its scope (its Host, say) is never sent again: as `scan active
+    // --history-id` refuses it.
+    if item.entry.error.as_deref().is_some_and(|e| e.starts_with("out of scope")) {
+        return Err(Error::OutOfScope(format!(
+            "finding {}'s request (history {history_id}) was refused for the scope when it was sent, so it isn't \
+             sent again",
+            a.id
+        )));
+    }
     // A method-override header names the method the application acts on.
     let overridden = request_headers(&item.request).into_iter().find_map(|(k, v)| {
         METHOD_OVERRIDES.iter().any(|h| k.eq_ignore_ascii_case(h)).then(|| v.trim().to_ascii_uppercase())
@@ -254,6 +261,8 @@ fn send_again(
         verify_tls: false,
         sni: None,
         http2: false,
+        // Sent again as it was recorded, with whatever Host it had then.
+        host: brainproxy_core::http::client::HostPolicy::Allow,
     };
     let session = auth_cmd::maybe_session(project, a.auth.as_deref(), &opts)?;
     let client = Client::new(opts);

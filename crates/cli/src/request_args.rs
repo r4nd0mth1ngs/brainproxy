@@ -58,6 +58,10 @@ pub struct RequestArgs {
     /// request whose request line says HTTP/2 is sent over HTTP/2 anyway.
     #[arg(long)]
     pub http2: bool,
+    /// The request's Host header (or absolute URL) deliberately names a host the scope doesn't
+    /// list, for a Host-header test. Through MCP such a request is refused without it.
+    #[arg(long)]
+    pub host_header_test: bool,
 }
 
 impl RequestArgs {
@@ -72,6 +76,7 @@ impl RequestArgs {
             verify_tls: self.verify_tls,
             sni: self.sni.clone(),
             http2: self.http2,
+            host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
         }
     }
 
@@ -134,9 +139,15 @@ impl RequestArgs {
     }
 }
 
+/// `Name: value`, refused with a line break or NUL in it (see [`check_header`]).
+///
+/// [`check_header`]: brainproxy_core::http::request::check_header
 pub fn parse_header(h: &str) -> Result<(String, String), Error> {
-    h.split_once(':')
+    let (k, v) = h
+        .split_once(':')
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
-        .ok_or_else(|| Error::InvalidInput(format!("header {h:?} must look like 'Name: value'")))
+        .ok_or_else(|| Error::InvalidInput(format!("header {h:?} must look like 'Name: value'")))?;
+    brainproxy_core::http::request::check_header(&k, &v)?;
+    Ok((k, v))
 }

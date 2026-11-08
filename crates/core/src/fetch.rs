@@ -57,7 +57,7 @@ impl GitHub {
                 verify_tls: true,
                 sni: None,
                 guard: Some(guard),
-                http2: false,
+                ..Default::default()
             }),
         })
     }

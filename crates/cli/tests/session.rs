@@ -571,8 +571,9 @@ fn update_stays_within_the_rules_macros_and_their_origins() {
     assert_eq!(code, 0);
     assert!(last_body(&a).contains("amount=csrf-tok-"), "{}", last_body(&a));
 
+    // Rule ids are never reused: the one added above is 2.
     // A URL on the rule says where else the value goes: there, and only there.
-    ok(&p, &["auth", "rule", "remove", "app", "1"]);
+    ok(&p, &["auth", "rule", "remove", "app", "2"]);
     ok(&p, &["auth", "rule", "add", "app", "--url", &b.origin(), "--action", "update:csrf"]);
     let (code, _) = post(&b, true, "amount=5&csrf=stale");
     assert_eq!(code, 0);
