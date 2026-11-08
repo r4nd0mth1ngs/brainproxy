@@ -44,9 +44,12 @@ impl CertAuthority {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let cert_path = dir.join(CA_CERT);
         let key_path = dir.join(CA_KEY);
+        // Held while the pair is created and read, so a process starting at the same time
+        // never reads a half-written file, or a cert and a key from two different creations.
+        let _lock = lock(dir);
         let created = !cert_path.exists() || !key_path.exists();
         if created {
-            Self::generate(dir)?;
+            Self::write_new(dir)?;
         }
         warn_if_loose(&key_path);
         let ca_pem = std::fs::read_to_string(&cert_path)?;
@@ -68,6 +71,12 @@ impl CertAuthority {
 
     /// Writes a fresh CA to `dir`, replacing any existing one.
     pub fn generate(dir: &Path) -> Result<()> {
+        let _lock = lock(dir);
+        Self::write_new(dir)
+    }
+
+    /// [`CertAuthority::generate`], for a caller holding the lock.
+    fn write_new(dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let key = KeyPair::generate().map_err(ca_err)?;
         let mut params = CertificateParams::default();
@@ -163,6 +172,16 @@ fn rand_serial() -> Vec<u8> {
     v
 }
 
+/// An exclusive lock on `<dir>/.lock` for creating or reading the CA, released when dropped.
+/// Best effort: without it (a read-only directory holding an existing CA, a filesystem with
+/// no locks) the CA still loads, as it did before there was a lock.
+fn lock(dir: &Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".lock")).ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     #[cfg(unix)]
@@ -227,6 +246,30 @@ mod tests {
         let a = ca2.server_config("Example.test").unwrap();
         let b = ca2.server_config("example.test").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    /// Processes starting at once on a new home all get the same, whole CA.
+    #[test]
+    fn concurrent_first_loads_share_one_ca() {
+        let dir = std::env::temp_dir().join(format!("bp-ca-race-{}", std::process::id()));
+        for _ in 0..5 {
+            let _ = std::fs::remove_dir_all(&dir);
+            let barrier = std::sync::Barrier::new(8);
+            let pems: Vec<String> = std::thread::scope(|s| {
+                let loads: Vec<_> = (0..8)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            CertAuthority::load_or_create(&dir).unwrap().0.cert_pem().to_string()
+                        })
+                    })
+                    .collect();
+                loads.into_iter().map(|l| l.join().unwrap()).collect()
+            });
+            assert!(pems.iter().all(|p| *p == pems[0]));
+            assert_eq!(std::fs::read_to_string(dir.join(CA_CERT)).unwrap(), pems[0]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
