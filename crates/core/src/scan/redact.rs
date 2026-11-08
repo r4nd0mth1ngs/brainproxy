@@ -883,9 +883,9 @@ mod tests {
         r.scrub(&mut s);
         let took = started.elapsed();
         assert_eq!(s, "start [redacted] end");
-        // Generous for a debug build on a slow machine; collecting every overlapping match took
-        // seconds.
-        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
+        // Generous for a debug build on a slow CI runner (Windows took 246 ms); collecting every
+        // overlapping match took seconds.
+        assert!(took < std::time::Duration::from_millis(750), "{took:?}");
 
         // Text the values are seldom in is skipped, but each one in it is found.
         let mut s = format!("{} {} {}", "xyz abd ".repeat(4096), &token[..40], "ab ".repeat(8192));
@@ -894,7 +894,7 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(s.matches(MASK).count(), 1);
         assert!(!s.contains("abcabc"));
-        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
+        assert!(took < std::time::Duration::from_millis(750), "{took:?}");
     }
 
     #[test]
