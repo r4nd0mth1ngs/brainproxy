@@ -82,7 +82,9 @@ pub(crate) fn check_secret_env(flag: &str, var: &str) -> Result<(), brainproxy_c
 /// can write (for `ca init`, the person's CA). `instead` says what an agent does instead.
 pub(crate) fn check_force(force: bool, command: &str, instead: &str) -> Result<(), brainproxy_core::Error> {
     if force && in_tool_call() {
-        return Err(brainproxy_core::Error::InvalidInput(format!("{command} --force is refused through MCP: {instead}")));
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{command} --force is refused through MCP: {instead}"
+        )));
     }
     Ok(())
 }

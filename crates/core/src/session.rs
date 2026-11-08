@@ -713,7 +713,9 @@ impl AuthSession {
         if prepared.session_changed {
             out.push(Edit { by: self.profile.origin.clone(), auth: auth.clone(), ..Default::default() });
         }
-        for (rule, placed) in prepared.changed_by.iter().filter_map(|(i, p)| Some((self.handling.cfg.rules.get(*i)?, p))) {
+        for (rule, placed) in
+            prepared.changed_by.iter().filter_map(|(i, p)| Some((self.handling.cfg.rules.get(*i)?, p)))
+        {
             let session_rule = Some(rule.id);
             out.push(Edit { by: rule.origin.clone(), auth: auth.clone(), session_rule, ..Default::default() });
             // The macro a value came from: of those the rule ran, else any that extracts it.
@@ -1439,7 +1441,8 @@ mod tests {
         let raw = b"GET /?csrf=old HTTP/1.1\r\nHost: a.test\r\n\r\n";
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let auth = Some("t".to_string());
-        let rule_edit = Edit { by: Some("mcp".into()), auth: auth.clone(), session_rule: Some(1), ..Default::default() };
+        let rule_edit =
+            Edit { by: Some("mcp".into()), auth: auth.clone(), session_rule: Some(1), ..Default::default() };
         let macro_edit =
             Edit { by: Some("gui".into()), auth: auth.clone(), macro_name: Some("token".into()), ..Default::default() };
 

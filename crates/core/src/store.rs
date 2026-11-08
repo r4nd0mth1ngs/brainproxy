@@ -157,7 +157,8 @@ fn highest_session_rule_id(conn: &Connection) -> Result<u32> {
 /// the next one added. A counter already higher is kept.
 fn seed_rule_ids(conn: &Connection) -> Result<()> {
     let key = format!("setting.{}", crate::proxy::config::RULES_KEY);
-    let rules: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?;
+    let rules: Option<String> =
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?;
     let rules: Value = rules.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let seeds = [
         (crate::proxy::config::RULE_IDS, highest_id(Some(&rules))),
