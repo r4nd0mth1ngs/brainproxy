@@ -644,3 +644,39 @@ fn an_agent_cannot_pass_its_records_off_as_the_apps() {
         }
     }
 }
+
+#[test]
+fn an_agent_sends_a_foreign_host_only_as_a_stated_host_header_test() {
+    let port = serve(2);
+    let mut m = Mcp::start(&tmp_project("host"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let foreign = ["Host: other-tenant.test"];
+    let raw = "GET / HTTP/1.1\r\nHost: other-tenant.test\r\n\r\n";
+    // An in-scope front end could send these to a site the scope doesn't list.
+    for (tool, args) in [
+        ("send", json!({"url": url, "headers": foreign})),
+        ("send", json!({"url": url, "headers": foreign, "race": 2})),
+        ("send", json!({"url": url, "headers": foreign, "http2": true})),
+        ("send", json!({"file": "-", "target": url, "stdin": raw})),
+        ("ws_send", json!({"url": format!("ws://127.0.0.1:{port}/"), "headers": foreign})),
+        ("fuzz_run", json!({"url": format!("{url}?q=§x§"), "headers": foreign, "payloads": ["list:1"]})),
+    ] {
+        let (err, e) = m.call(tool, args);
+        assert!(err, "{tool}: {e}");
+        assert_eq!(e["error"]["kind"], "out_of_scope", "{tool}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{tool}: {e}");
+    }
+    let (_, e) = m.call("history_list", json!({}));
+    assert_eq!(e["data"]["count"], 0, "{e}");
+    // Saying it is a Host-header test puts the intent on record; the output warns.
+    let (err, e) = m.call("send", json!({"url": url, "headers": foreign, "host_header_test": true}));
+    assert!(!err, "{e}");
+    assert!(e["data"]["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{e}");
+    // A name the scope lists needs no flag.
+    let (err, e) = m.call("send", json!({"url": url, "headers": ["Host: app.test"]}));
+    assert!(!err, "{e}");
+    assert!(e["data"].get("host_warning").is_none(), "{e}");
+}

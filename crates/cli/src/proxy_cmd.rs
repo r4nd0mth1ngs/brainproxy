@@ -469,6 +469,10 @@ pub enum InterceptCmd {
         file: Option<String>,
         #[arg(long)]
         verbatim: bool,
+        /// The replacement's Host header deliberately names a host the scope doesn't list (and the
+        /// held request didn't), for a Host-header test. Through MCP such an edit is refused without it.
+        #[arg(long)]
+        host_header_test: bool,
     },
     /// Drop a held message; the client receives a 502 (a dropped WebSocket message is just not delivered).
     Drop { id: i64 },
@@ -2241,8 +2245,9 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             });
             out.ok(data, || String::from_utf8_lossy(&original).into_owned());
         }
-        InterceptCmd::Forward { id, file, verbatim } => {
-            let websocket = store.intercept_get(id)?.0.direction.starts_with("ws-");
+        InterceptCmd::Forward { id, file, verbatim, host_header_test } => {
+            let (entry, original, _) = store.intercept_get(id)?;
+            let websocket = entry.direction.starts_with("ws-");
             let edited = match file.as_deref() {
                 None => None,
                 Some(path) => {
@@ -2258,11 +2263,23 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     )
                 }
             };
+            // The proxy sends an edited request where the held one was going, so a Host the edit
+            // brings in is checked as `send` checks one; a Host the client sent stays as it was.
+            let mut host_warning = None;
+            if let (Some(e), "request") = (&edited, entry.direction.as_str()) {
+                let target = Target::from_url(&entry.url)?;
+                let opts = SendOptions { guard: Some(store.guard()?), ..Default::default() };
+                if opts.foreign_host(e, &target) != opts.foreign_host(&original, &target) {
+                    host_warning = crate::mcp::check_host_header(&opts, e, &target, host_header_test, out)?;
+                }
+            }
             let by = brainproxy_core::provenance::origin();
             store.intercept_resolve(id, "forwarded", edited.as_deref(), Some(by))?;
-            out.ok(json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by}), || {
-                format!("forwarded #{id}")
-            });
+            let mut data = json!({"id": id, "state": "forwarded", "edited": edited.is_some(), "resolved_by": by});
+            if let Some(w) = host_warning {
+                data["host_warning"] = json!(w);
+            }
+            out.ok(data, || format!("forwarded #{id}"));
         }
         InterceptCmd::Drop { id } => {
             let by = brainproxy_core::provenance::origin();

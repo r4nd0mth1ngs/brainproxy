@@ -337,8 +337,14 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let (req, target) = prepared?;
     let guard = crate::project_guard(project)?;
     crate::require_in_scope(&guard, &target)?;
+    let opts = args.req.send_options(guard.clone());
     // So is a server name the scope doesn't list, before a row could say it was sent.
-    args.req.send_options(guard.clone()).check_sni(&target)?;
+    opts.check_sni(&target)?;
+    // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test. A
+    // payload position in the Host is one: its marker, shown as the default's, is never a host.
+    let marked = String::from_utf8_lossy(req.as_bytes()).replace(&args.marker, fuzz::DEFAULT_MARKER);
+    let host_warning =
+        crate::mcp::check_host_header(&opts, marked.as_bytes(), &target, args.req.host_header_test, out)?;
     let template = Template::parse(req.as_bytes(), &args.marker)?;
 
     let mut stdin = || crate::read_input(None);
@@ -391,7 +397,8 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             &config,
             req.as_bytes(),
         )?;
-        return spawn_background(project, home, run_id, stdin_request.then(|| req.as_bytes()), &store, out);
+        let request = stdin_request.then(|| req.as_bytes());
+        return spawn_background(project, home, run_id, request, &store, host_warning, out);
     }
 
     let run_id = match args.attach_run {
@@ -454,6 +461,9 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             let mut summary = store.fuzz_summary(run_id, args.top)?;
             summary["outcome"] = json!(outcome);
             summary["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            if let Some(w) = host_warning {
+                summary["host_warning"] = json!(w);
+            }
             out.ok(summary.clone(), || text_summary(&summary));
             Ok(())
         }
@@ -470,6 +480,7 @@ fn spawn_background(
     run_id: i64,
     request: Option<&[u8]>,
     store: &Store,
+    host_warning: Option<String>,
     out: &Out,
 ) -> Result<(), Error> {
     let project = std::fs::canonicalize(project)?;
@@ -509,11 +520,14 @@ fn spawn_background(
         std::thread::sleep(Duration::from_millis(50));
     }
     let info = store.fuzz_run(run_id)?;
-    let data = json!({
+    let mut data = json!({
         "run": info,
         "log": log,
         "next": format!("brainproxy fuzz status {run_id}   (or: fuzz stop {run_id})"),
     });
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
+    }
     out.ok(data, || format!("fuzz run {run_id} started in the background"));
     Ok(())
 }

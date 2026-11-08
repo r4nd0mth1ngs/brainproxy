@@ -58,6 +58,10 @@ pub struct RequestArgs {
     /// request whose request line says HTTP/2 is sent over HTTP/2 anyway.
     #[arg(long)]
     pub http2: bool,
+    /// The request's Host header (or absolute URL) deliberately names a host the scope doesn't
+    /// list, for a Host-header test. Through MCP such a request is refused without it.
+    #[arg(long)]
+    pub host_header_test: bool,
 }
 
 impl RequestArgs {

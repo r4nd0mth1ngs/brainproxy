@@ -131,6 +131,13 @@ Some arguments need a person, so a command run for a tool call (the server sets
   requests out of history. (Every request a `scan_active` check template sends, and the
   document fetches of `import_api` and `scan_active` with `api`, are recorded whoever runs
   them.)
+- `send` (races too), `fuzz_run`, `ws_send` and `intercept_forward` with an edited request,
+  when the Host header (HTTP/2's `:authority`) or an absolute URL in the request line names a
+  host other than the target's that the scope doesn't list by name, or the Host holds a payload
+  position: refused (`out_of_scope`) unless `host_header_test` is set. On a shared front end such
+  a request to an in-scope address can reach a site outside the scope; a Host-header test needs
+  one, so the flag puts the intent on record. The output's `host_warning` names the host either
+  way, as it does outside MCP.
 - `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
   project's profile, with the person's cookies and sign-ins, and the pages it loads would be
   recorded as the proxy's traffic, not the agent's.

@@ -292,6 +292,67 @@ fn an_overridden_server_name_is_recorded() {
     assert!(env.text(&["history", "show", "1"]).lines().next().unwrap().ends_with("TLS server name (SNI) app.test"));
 }
 
+#[test]
+fn a_foreign_host_is_sent_with_a_warning_but_an_agent_must_say_it_is_a_test() {
+    let port = serve();
+    // The scope lists app.test by name, so a Host naming it is not another site's.
+    let env = Env::with_scope("host", &["--target", "127.0.0.1", "--target", "app.test"]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let ws = format!("ws://127.0.0.1:{port}/");
+    let fuzz = format!("{url}?q=§x§");
+    let senders: [&[&str]; 4] = [
+        &["send", "--url", &url],
+        &["send", "--url", &url, "--race", "2"],
+        &["ws", "send", "--url", &ws, "--wait", "0"],
+        &["fuzz", "run", "--url", &fuzz, "-p", "list:a", "-c", "1"],
+    ];
+    let agent = [(MCP, "1")];
+    let count = || env.rows("SELECT count(*) FROM history")[0][0].as_i64().unwrap();
+    for sender in senders {
+        let args = [sender, &["-H", "Host: other-tenant.test"]].concat();
+        // Refused to an agent before a row could say it was sent.
+        let before = count();
+        let (code, v, _) = env.run(&agent, &args);
+        assert_ne!(code, 0, "{args:?}");
+        assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Host other-tenant.test") && message.contains("--host-header-test"), "{v}");
+        assert_eq!(count(), before, "{args:?}");
+        // Sent with a warning for a person, and for an agent that says it is a Host-header test.
+        for (vars, test) in [(&[][..], &[][..]), (&agent[..], &["--host-header-test"][..])] {
+            let data = env.ok(vars, &[&args[..], test].concat());
+            assert!(data["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{args:?}: {data}");
+        }
+        // The target's own host and a name the scope lists are no one else's.
+        for host in [format!("Host: 127.0.0.1:{port}"), "Host: APP.test".into()] {
+            let data = env.ok(&agent, &[sender, &["-H", &host]].concat());
+            assert!(data.get("host_warning").is_none(), "{args:?}: {data}");
+        }
+    }
+    // A payload position in the Host header is a Host-header test too.
+    let (code, v, _) = env.run(&agent, &["fuzz", "run", "--url", &url, "-p", "list:a", "-H", "Host: §x§.app.test"]);
+    assert_ne!(code, 0);
+    assert!(v["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{v}");
+    // So is an absolute request target naming another host, sent to an in-scope one.
+    let raw = std::env::temp_dir().join(format!("bp-prov-{}-host.http", std::process::id()));
+    std::fs::write(&raw, "GET http://other-tenant.test/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    let raw_send = ["send", raw.to_str().unwrap(), "--target", &url];
+    let (code, v, _) = env.run(&agent, &raw_send);
+    assert_eq!((code != 0, &v["error"]["kind"]), (true, &"out_of_scope".into()), "{v}");
+    // In text mode the warning goes to stderr, before anything is sent.
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env_remove(MCP)
+        .args(["--format", "text", "--project"])
+        .arg(&env.project)
+        .args(raw_send)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("warning: the Host names other-tenant.test"), "{stderr}");
+    let _ = std::fs::remove_file(raw);
+}
+
 /// Sends one request through the proxy and returns the response.
 fn through(listen: &str, port: u16, path: &str, headers: &str) -> String {
     let mut s = TcpStream::connect(listen).unwrap();
@@ -361,6 +422,25 @@ fn an_agents_intercept_edit_and_rule_in_a_proxy_the_app_started_say_so() {
         .lines()
         .any(|l| l.contains("/agent-edited") && l.ends_with("gui  edited by mcp")));
 
+    // An edit that brings in a Host the scope doesn't list must say it is a Host-header test.
+    let l = listen.clone();
+    let person = std::thread::spawn(move || through(&l, port, "/tenant", ""));
+    let listed = env.ok(&agent, &["intercept", "list", "--wait", "10"]);
+    let id3 = listed["items"][0]["id"].as_i64().unwrap().to_string();
+    let held = env.ok(&agent, &["intercept", "show", &id3]);
+    let lines = held["message"]["content"].as_str().unwrap().lines().filter(|l| !l.is_empty());
+    let host = |l: &str| l.to_ascii_lowercase().starts_with("host:");
+    let lines: Vec<&str> = lines.map(|l| if host(l) { "Host: other-tenant.test" } else { l }).collect();
+    std::fs::write(&edited, format!("{}\r\n\r\n", lines.join("\r\n"))).unwrap();
+    let forward = ["intercept", "forward", &id3, "--file", edited.to_str().unwrap()];
+    let (code, v, _) = env.run(&agent, &forward);
+    assert_ne!(code, 0);
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{v}");
+    let fwd = env.ok(&agent, &[&forward[..], &["--host-header-test"]].concat());
+    assert!(fwd["host_warning"].as_str().unwrap().contains("other-tenant.test"), "{fwd}");
+    assert!(person.join().unwrap().starts_with("HTTP/1.1 200"));
+
     // Forwarded unchanged: no edit on either record.
     let l = listen.clone();
     let person = std::thread::spawn(move || through(&l, port, "/as-is", ""));
@@ -372,7 +452,7 @@ fn an_agents_intercept_edit_and_rule_in_a_proxy_the_app_started_say_so() {
     wait_for(&env, "SELECT count(*) FROM history WHERE path = '/as-is'", 1);
     assert_eq!(env.rows("SELECT edited_by FROM history WHERE path = '/as-is'")[0][0], Value::Null);
     let all = env.ok(&[], &["intercept", "list", "--state", "all"]);
-    assert_eq!((&all["items"][1]["resolved_by"], &all["items"][1]["edited"]), (&"gui".into(), &false.into()));
+    assert_eq!((&all["items"][2]["resolved_by"], &all["items"][2]["edited"]), (&"gui".into(), &false.into()));
 
     // A rule the agent added changes the person's request: the row names the rule and the agent.
     let rules = env.ok(
