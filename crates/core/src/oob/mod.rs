@@ -90,6 +90,11 @@ pub const PAYLOAD_COLUMNS: &[(&str, &str, &str)] = &[
     ("history_id", "INTEGER", "History row of the attack once an interaction raised a finding"),
     ("note", "TEXT", "Note given to `oob payload`"),
     ("check_json", "TEXT", "Declarative check payloads: alert and interactsh matchers an interaction must pass"),
+    (
+        "issued_by",
+        "TEXT",
+        "gui, cli or mcp: who started the scan or ran `oob payload`; NULL for payloads from before brainproxy kept it",
+    ),
 ];
 
 pub const INTERACTION_COLUMNS: &[(&str, &str, &str)] = &[
@@ -101,6 +106,12 @@ pub const INTERACTION_COLUMNS: &[(&str, &str, &str)] = &[
     ("summary", "TEXT", "One line: DNS question, HTTP request line, ..."),
     ("raw", "BLOB", "Received bytes (at most 16 KiB)"),
     ("processed", "INTEGER", "1 once correlation has looked at it"),
+    (
+        "origin",
+        "TEXT",
+        "gui, cli or mcp: who started the listener (or the poll) that stored it; NULL for interactions from \
+         before brainproxy kept it",
+    ),
 ];
 
 /// Where targets reach the listener (the public side, which may differ from the
@@ -259,8 +270,8 @@ impl Store {
         self.conn.execute(
             "INSERT OR IGNORE INTO oob_payloads
                 (token, source, rule_id, alert_ref, param, attack, other_info, origin, request, response, duration_ms,
-                 check_json)
-             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 check_json, issued_by)
+             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 p.token,
                 p.rule_id,
@@ -272,7 +283,8 @@ impl Store {
                 p.request,
                 p.response,
                 p.duration_ms,
-                p.check
+                p.check,
+                crate::provenance::origin()
             ],
         )?;
         Ok(())
@@ -280,8 +292,8 @@ impl Store {
 
     pub fn oob_add_manual_payload(&self, token: &str, note: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO oob_payloads (token, source, note) VALUES (?1, 'manual', ?2)",
-            params![token, note],
+            "INSERT INTO oob_payloads (token, source, note, issued_by) VALUES (?1, 'manual', ?2, ?3)",
+            params![token, note, crate::provenance::origin()],
         )?;
         Ok(())
     }
@@ -325,8 +337,9 @@ impl Store {
             return Ok(Recorded::Dropped);
         }
         self.conn.execute(
-            "INSERT INTO oob_interactions (protocol, remote, token, summary, raw) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![protocol, remote, token, summary, raw],
+            "INSERT INTO oob_interactions (protocol, remote, token, summary, raw, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![protocol, remote, token, summary, raw, crate::provenance::origin()],
         )?;
         Ok(Recorded::Stored(self.conn.last_insert_rowid()))
     }
@@ -639,6 +652,15 @@ mod tests {
         assert_eq!(all[2]["payload"]["note"], "by hand");
         assert_eq!(store.oob_interactions(2, Some(&tok), 10, 100).unwrap().len(), 0);
         assert_eq!(store.oob_counts().unwrap(), (2, 3, 1, 0));
+        // Each payload says who issued it, each interaction who ran the listener that stored it.
+        let by = crate::provenance::origin();
+        let issued: i64 =
+            store.conn.query_row("SELECT count(*) FROM oob_payloads WHERE issued_by = ?1", [by], |r| r.get(0)).unwrap();
+        let stored: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM oob_interactions WHERE origin = ?1", [by], |r| r.get(0))
+            .unwrap();
+        assert_eq!((issued, stored), (2, 3));
 
         let ro = store
             .query("SELECT param, evidence, other_info FROM findings WHERE alert_ref = '40043-1'", &[], 10, 1000)

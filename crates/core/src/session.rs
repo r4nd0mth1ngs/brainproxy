@@ -84,6 +84,10 @@ pub struct Handling {
 pub struct Macro {
     pub name: String,
     pub steps: Vec<MacroStep>,
+    /// Who added it or last changed it: gui, cli or mcp (None: before brainproxy kept it), set
+    /// when it is saved. A proxied request it gives values to records this in `edited_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -155,6 +159,10 @@ pub struct SessionRule {
     /// CSRF token"): the rule's macros run again and the request is sent once more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid: Option<String>,
+    /// Who added it or last changed it: gui, cli or mcp (None: before brainproxy kept it), set
+    /// when it is saved. A proxied request it applies to records this in `edited_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -547,14 +555,33 @@ impl Store {
         self.auth_write_handling(profile, h)
     }
 
+    /// Writes them with who changed them: a rule or macro saved as it was keeps its origin, a
+    /// new or changed one gets this process's, whatever the caller put there.
     fn auth_write_handling(&self, profile: &str, h: &Handling) -> Result<()> {
         if *h == Handling::default() {
             return self.auth_clear_handling(profile);
         }
-        let json = serde_json::to_string(h).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let old = self.auth_handling(profile).unwrap_or_default();
+        let by = Some(crate::provenance::origin().to_string());
+        let mut h = h.clone();
+        for r in &mut h.rules {
+            let kept =
+                old.rules.iter().find(|o| o.id == r.id && **o == SessionRule { origin: o.origin.clone(), ..r.clone() });
+            r.origin = kept.map_or(by.clone(), |o| o.origin.clone());
+        }
+        for m in &mut h.macros {
+            let kept =
+                old.macros.iter().find(|o| o.name == m.name && **o == Macro { origin: o.origin.clone(), ..m.clone() });
+            m.origin = kept.map_or(by.clone(), |o| o.origin.clone());
+        }
+        let json = serde_json::to_string(&h).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.meta_set(&handling_key(profile), Some(&json))
     }
 }
+
+/// The meta key of the last session rule id handed out, for all profiles: an id is never used
+/// twice, so the `edited_by` of an old history row can't come to name another rule.
+pub const SESSION_RULE_IDS: &str = "auth.session_rule_ids";
 
 fn handling_key(profile: &str) -> String {
     format!("auth.handling.{profile}")
@@ -655,6 +682,33 @@ impl AuthSession {
             request = s.place(&request, &self.profile.name, keep_params);
         }
         Prepared { request, generation, macro_generation, rules }
+    }
+
+    /// Who answers for what [`AuthSession::prepare`] did to a request: the profile (its
+    /// cookies, headers and token), each session rule that applied, and each macro those rules
+    /// ran, with who added or last changed it. For a history row's `edited_by`.
+    pub fn edits(&self, prepared: &Prepared) -> Vec<crate::provenance::Edit> {
+        use crate::provenance::Edit;
+        let auth = Some(self.profile.name.clone());
+        let mut out = vec![Edit { by: self.profile.origin.clone(), auth: auth.clone(), ..Default::default() }];
+        for rule in prepared.rules.iter().filter_map(|&i| self.handling.cfg.rules.get(i)) {
+            let session_rule = Some(rule.id);
+            out.push(Edit { by: rule.origin.clone(), auth: auth.clone(), session_rule, ..Default::default() });
+            for a in &rule.actions {
+                let Action::RunMacro { name, .. } = a else { continue };
+                let Some(m) = self.handling.cfg.macros.iter().find(|m| &m.name == name) else { continue };
+                let e = Edit {
+                    by: m.origin.clone(),
+                    auth: auth.clone(),
+                    macro_name: Some(m.name.clone()),
+                    ..Default::default()
+                };
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+        }
+        out
     }
 
     /// Learns cookies from the response to a prepared request, and handles a lost
@@ -1267,6 +1321,7 @@ mod tests {
             url: None,
             actions: vec![update],
             invalid: None,
+            origin: None,
         };
         let s = AuthSession::new(&dir.join("p.bpdb"), profile, state, crate::http::Client::new(opts))
             .unwrap()

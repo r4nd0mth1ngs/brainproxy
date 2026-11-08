@@ -104,6 +104,24 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("issue_id", "INTEGER", "The issue (root cause: alert type and host) it is an instance of; join issues"),
 ];
 
+/// Column documentation for the alert types.
+pub const FINDING_TYPE_COLUMNS: &[(&str, &str, &str)] = &[
+    ("alert_ref", "TEXT", "Alert type id (findings.alert_ref)"),
+    ("rule_id", "INTEGER", "Rule id; 0 for a title added by hand"),
+    ("name", "TEXT", "Alert name, or the title of findings added by hand"),
+    ("description", "TEXT", "What the issue is"),
+    ("solution", "TEXT", "How to fix it"),
+    ("refs", "TEXT", "JSON array of reference URLs"),
+    ("tags", "TEXT", "JSON array of tags (manual for a title added by hand)"),
+    (
+        "description_origin",
+        "TEXT",
+        "gui, cli or mcp: who wrote the description of a title added by hand (gave it first, filled it in \
+         when blank, or replaced it); NULL for a scanner's own text, and from before brainproxy kept it",
+    ),
+    ("solution_origin", "TEXT", "gui, cli or mcp: who wrote the solution, as description_origin"),
+];
+
 /// Triage states a finding can be marked with. `removed` is set only by `findings remove`.
 pub const STATES: &[&str] = &["open", "confirmed", "false_positive", "fixed", "accepted_risk", "retest_pending"];
 
@@ -730,7 +748,8 @@ impl Store {
     /// One finding with its alert type's description, solution, and references.
     pub fn finding_get(&self, id: i64) -> Result<Value> {
         let r = self.query(
-            "SELECT f.*, t.description, t.solution, json(t.refs) AS refs, json(t.tags) AS tags
+            "SELECT f.*, t.description, t.solution, json(t.refs) AS refs, json(t.tags) AS tags, t.description_origin,
+                t.solution_origin
              FROM findings f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref WHERE f.id = ?1",
             &[id.to_string()],
             1,
@@ -932,13 +951,21 @@ impl Store {
                 params![key, Value::Array(list).to_string()],
             )?;
         }
+        // Each text says who wrote it: whoever gave it first, filled it in when it was blank, or
+        // replaced it. Giving the same text again changes neither.
         tx.execute(
-            "INSERT INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
-             VALUES (?1, 0, ?2, ?3, ?4, '[]', '[\"manual\"]')
+            "INSERT INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags,
+                description_origin, solution_origin)
+             VALUES (?1, 0, ?2, ?3, ?4, '[]', '[\"manual\"]',
+                CASE WHEN ?3 != '' THEN ?5 END, CASE WHEN ?4 != '' THEN ?5 END)
              ON CONFLICT(alert_ref) DO UPDATE SET
                 description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END,
-                solution = CASE WHEN excluded.solution != '' THEN excluded.solution ELSE solution END",
-            params![alert_ref, title, f.description.trim(), f.solution.trim()],
+                solution = CASE WHEN excluded.solution != '' THEN excluded.solution ELSE solution END,
+                description_origin = CASE WHEN excluded.description NOT IN ('', description)
+                    THEN excluded.description_origin ELSE description_origin END,
+                solution_origin = CASE WHEN excluded.solution NOT IN ('', solution)
+                    THEN excluded.solution_origin ELSE solution_origin END",
+            params![alert_ref, title, f.description.trim(), f.solution.trim(), crate::provenance::origin()],
         )?;
         tx.execute(
             "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, host,

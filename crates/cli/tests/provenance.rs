@@ -165,6 +165,7 @@ fn a_background_job_records_the_origin_that_started_it() {
     assert_eq!(done["state"], "completed", "{done}");
     let rows = env.rows("SELECT DISTINCT origin FROM history WHERE source = 'crawl'");
     assert_eq!(rows, vec![serde_json::json!(["gui"])]);
+    assert_eq!(env.rows("SELECT origin FROM jobs"), vec![serde_json::json!(["gui"])]);
 }
 
 #[test]
@@ -197,6 +198,7 @@ fn a_proxy_started_by_an_agent_records_mcp_and_each_client() {
     assert_eq!(&head, b"HTTP/1.1 101");
 
     wait_for(&env, "SELECT count(*) FROM history WHERE source = 'proxy'", 2);
+    wait_for(&env, "SELECT count(*) FROM ws_connections WHERE origin = 'mcp'", 1);
     let rows = env.rows("SELECT path, origin, client_addr FROM history WHERE source = 'proxy' ORDER BY path");
     assert_eq!(rows[0], serde_json::json!(["/page", "mcp", local]));
     assert_eq!(rows[1], serde_json::json!(["/ws", "mcp", ws_local]));
@@ -787,4 +789,85 @@ fn a_change_log_that_doesnt_parse_is_reported_and_kept() {
     let (code, _, _) = env.run(&[], &["connection", "passthrough", "add", "a.test"]);
     assert_ne!(code, 0);
     assert_eq!(store.meta_get("proxy.recording_changes").unwrap().as_deref(), Some("{not json"));
+}
+
+#[test]
+fn the_session_a_proxy_puts_on_requests_says_who_set_it_up() {
+    let port = serve();
+    let env = Env::new("session");
+    let gui = [(CLIENT, "gui")];
+    let agent = [(MCP, "1")];
+    env.ok(&gui, &["auth", "add", "app", "-H", "X-Api-Key: k"]);
+    let rule = env.ok(&agent, &["auth", "rule", "add", "app", "--action", "update:x=y"]);
+    assert_eq!((&rule["rule"]["id"], &rule["rule"]["origin"]), (&1.into(), &"mcp".into()), "{rule}");
+    let shown = env.ok(&[], &["auth", "show", "app"]);
+    assert_eq!((&shown["profile"]["origin"], &shown["rules"][0]["origin"]), (&"gui".into(), &"mcp".into()));
+    assert!(shown["session_origin"].is_null(), "{shown}");
+
+    // The person's proxy puts the profile's header on: the row names the profile and the agent's
+    // rule that applied, with who added each.
+    let started = env.ok(&gui, &["proxy", "start", "--listen", "127.0.0.1:0", "--auth", "app"]);
+    let listen = started["listen"].as_str().unwrap().to_string();
+    assert!(started["schema"].is_i64(), "{started}");
+    assert!(through(&listen, port, "/with-session", "").starts_with("HTTP/1.1 200"));
+    wait_for(&env, "SELECT count(*) FROM history WHERE path = '/with-session'", 1);
+    let rows = env.rows("SELECT id, origin, edited_by FROM history WHERE path = '/with-session'");
+    assert_eq!(rows[0][1], "gui");
+    let edits: Value = serde_json::from_str(rows[0][2].as_str().unwrap()).unwrap();
+    assert_eq!(
+        edits,
+        serde_json::json!([{"by": "gui", "auth": "app"}, {"by": "mcp", "auth": "app", "session_rule": 1}])
+    );
+    let about = env.text(&["history", "show", &rows[0][0].to_string()]);
+    assert!(
+        about
+            .lines()
+            .next()
+            .unwrap()
+            .contains("changed by session rule 1 of auth profile app added via MCP (an agent)"),
+        "{about}"
+    );
+    // A proxy this build started is up to date.
+    assert!(env.ok(&[], &["proxy", "status"])["proxy_outdated"].is_null());
+    env.ok(&[], &["proxy", "stop"]);
+
+    // Saving the rules again unchanged keeps who added each.
+    env.ok(&gui, &["auth", "rule", "add", "app", "--action", "update:a=b"]);
+    let rules = env.ok(&[], &["auth", "rule", "list", "app"])["rules"].clone();
+    assert_eq!((&rules[0]["origin"], &rules[1]["origin"]), (&"mcp".into(), &"gui".into()), "{rules}");
+
+    // A removed rule's id is never handed out again, of a session rule or a proxy rule.
+    env.ok(&gui, &["auth", "rule", "remove", "app", "2"]);
+    let again = env.ok(&gui, &["auth", "rule", "add", "app", "--action", "update:a=b"]);
+    assert_eq!(again["rule"]["id"], 3);
+    let add = ["rules", "add", "--location", "request-header", "--match", "^A: 1$", "--replace", "A: 2"];
+    env.ok(&gui, &add);
+    env.ok(&gui, &["rules", "remove", "1"]);
+    assert_eq!(env.ok(&agent, &add)["rules"][0]["id"], 2);
+
+    // Who saved which setting is logged, without its value.
+    let logged = env.rows("SELECT origin FROM setting_changes WHERE key = 'rules' ORDER BY id");
+    assert_eq!(logged, ["gui", "gui", "mcp"].map(|o| serde_json::json!([o])).to_vec());
+}
+
+#[test]
+fn a_titles_text_filled_in_later_says_who_wrote_it() {
+    let env = Env::new("texts");
+    let add = |vars: &[(&str, &str)], path: &str, more: &[&str]| {
+        let url = format!("http://127.0.0.1:9/{path}");
+        let mut args = vec!["findings", "add", "--title", "Open redirect", "--risk", "low", "--url", &url];
+        args.extend_from_slice(more);
+        env.ok(vars, &args)["finding"]["id"].as_i64().unwrap()
+    };
+    add(&[(CLIENT, "gui")], "a", &["--solution", "check the target"]);
+    // The person left the description blank: the agent's fills it in, and says so.
+    let id = add(&[(MCP, "1")], "b", &["--description", "agent text"]);
+    let sql = "SELECT description, description_origin, solution, solution_origin FROM finding_types \
+               WHERE name = 'Open redirect'";
+    assert_eq!(env.rows(sql)[0], serde_json::json!(["agent text", "mcp", "check the target", "gui"]));
+    // The same text given again isn't written by anyone new.
+    add(&[(CLIENT, "gui")], "c", &["--description", "agent text"]);
+    assert_eq!(env.rows(sql)[0][1], "mcp");
+    let shown = env.ok(&[], &["findings", "show", &id.to_string()]);
+    assert_eq!((&shown["description_origin"], &shown["solution_origin"]), (&"mcp".into(), &"gui".into()));
 }

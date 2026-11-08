@@ -11,7 +11,7 @@ use brainproxy_core::http::{RawRequest, SendOptions, Target};
 use brainproxy_core::jobs::{is_finished, JobControl};
 use brainproxy_core::proxy::config::{
     InterceptSettings, LiveAuthz, Rule, RuleLocation, Scope, TimeoutAction, AUTHZ_KEY, INTERCEPT_KEY, RULES_KEY,
-    SCOPE_KEY,
+    RULE_IDS, SCOPE_KEY,
 };
 use brainproxy_core::proxy::{CertAuthority, ProxyOptions, ProxyState, STATE_KEY};
 use brainproxy_core::store::{HistoryFilter, Store};
@@ -941,6 +941,21 @@ fn usage_hints(state: &ProxyState) -> Value {
     })
 }
 
+/// A warning when the running proxy was started by a build older than the project's schema
+/// (`started`: the schema it records, None from before it did): it goes on writing rows as
+/// that build did, without what came since (who changed a request, for one).
+fn outdated_text(started: Option<i64>, project: i64) -> Option<String> {
+    let by = match started {
+        Some(v) if v >= project => return None,
+        Some(v) => format!("a brainproxy build for schema v{v}"),
+        None => "an older brainproxy build".to_string(),
+    };
+    Some(format!(
+        "the running proxy was started by {by}, and the project is at schema v{project}: it records less than \
+         this version does (who changed a request, for one); restart it with brainproxy proxy restart"
+    ))
+}
+
 fn state_json(state: &ProxyState) -> Value {
     let mut v = json!(state);
     v["usage"] = usage_hints(state);
@@ -1017,6 +1032,8 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 }
                 None => Value::Null,
             };
+            let schema = store.schema_version()?;
+            let outdated = state.as_ref().and_then(|s| outdated_text(s.schema, schema));
             let data = json!({
                 "running": state.is_some(),
                 "restarting": held,
@@ -1038,11 +1055,15 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "recording_changes_problem": problem,
                 "authz": authz,
                 "restart_gone": gone,
+                "proxy_outdated": outdated,
             });
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             let gone_note = gone.as_ref().map(|g| format!("\n{}", gone_text(g, now))).unwrap_or_default();
             let mut notes: String =
                 narrowed.iter().chain(&rerouted).map(|c| format!("\nnot reviewed: {}", c.describe())).collect();
+            if let Some(o) = &outdated {
+                notes.push_str(&format!("\nwarning: {o}"));
+            }
             if let Some(p) = &problem {
                 notes.push_str(&format!("\nwarning: {p}"));
             }
@@ -1978,6 +1999,7 @@ fn serve(
             log: args.log.clone(),
             authz_run: authz.as_ref().map(|l| l.run_id()),
             args: crate::jobs_cmd::child_args(),
+            schema: Some(brainproxy_core::store::SCHEMA_VERSION),
         };
         let lock = process::RunLock::acquire(&store, LOCK_NAME)?;
         let saved = Saved {
@@ -2107,7 +2129,7 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
 }
 
 pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
     let mut rules: Vec<Rule> = store.setting(RULES_KEY)?;
     let find = |rules: &mut Vec<Rule>, id: u32| -> Result<usize, Error> {
         rules.iter().position(|r| r.id == id).ok_or_else(|| Error::NotFound(format!("rule {id}")))
@@ -2118,9 +2140,8 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             return Ok(());
         }
         RulesCmd::Add { location, pattern, replace, comment, disabled } => {
-            let id = rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-            let rule = Rule {
-                id,
+            let mut rule = Rule {
+                id: 0,
                 location: RuleLocation::parse(&location)?,
                 pattern,
                 replace,
@@ -2129,6 +2150,8 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
                 origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             brainproxy_core::proxy::config::validate_rule(&rule)?;
+            // Never one a removed rule had: an old history row's `edited_by` names it.
+            rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
             rules.push(rule);
         }
         RulesCmd::Remove { id } => {
@@ -2307,6 +2330,7 @@ mod tests {
             log: None,
             authz_run: None,
             args: args.iter().map(|a| a.to_string()).collect(),
+            schema: Some(brainproxy_core::store::SCHEMA_VERSION),
         }
     }
 
@@ -2639,6 +2663,23 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_older_than_the_project_schema_is_warned_about() {
+        assert_eq!(outdated_text(Some(19), 19), None);
+        assert_eq!(outdated_text(Some(20), 19), None);
+        let older = outdated_text(Some(18), 19).unwrap();
+        assert!(older.starts_with("the running proxy was started by a brainproxy build for schema v18"), "{older}");
+        assert!(older.ends_with("brainproxy proxy restart"), "{older}");
+        // One from before the proxy kept it says nothing of its schema.
+        assert!(outdated_text(None, 19)
+            .unwrap()
+            .contains("by an older brainproxy build, and the project is at schema v19"));
+        // What an older build wrote still reads.
+        let old: ProxyState =
+            serde_json::from_str(r#"{"pid":1,"listen":"127.0.0.1:1","started":"0","ca_cert":"c","log":null}"#).unwrap();
+        assert_eq!(old.schema, None);
+    }
+
+    #[test]
     fn usage_hints_point_at_loopback_for_a_wildcard_listen_address() {
         let state = |listen: &str| ProxyState {
             pid: 1,
@@ -2648,6 +2689,7 @@ mod tests {
             log: None,
             authz_run: None,
             args: vec![],
+            schema: None,
         };
         for (listen, url) in [
             ("127.0.0.1:8080", "http://127.0.0.1:8080"),

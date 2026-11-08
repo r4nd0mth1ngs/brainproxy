@@ -9,7 +9,7 @@ use brainproxy_core::auth::{AuthProfile, AuthSession, QueryKey, Secret, SessionS
 use brainproxy_core::auth_record::{Mode, Recorded};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::oauth::{Flow, OAuth};
-use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool};
+use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool, SESSION_RULE_IDS};
 use brainproxy_core::sign::{HmacAlg, JwtAlg, KeySource, Place, SignKind, Signer};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -766,6 +766,8 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                         })
                     })
                     .transpose()?,
+                // Set when it is saved.
+                origin: None,
             };
             let store = Store::open(project)?;
             // `auth show` redacts header values; re-saving one unchanged (the GUI's edit form does)
@@ -787,19 +789,23 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 if a.keep_oauth && old.oauth.is_some() {
                     profile.oauth = old.oauth;
                     profile.token_header = old.token_header;
-                    kept_tokens = Some(SessionState {
-                        token: old_state.token,
-                        refresh_token: old_state.refresh_token,
-                        token_expires: old_state.token_expires,
-                        logged_in: old_state.logged_in,
-                        last_login: old_state.last_login,
-                        ..Default::default()
-                    });
+                    let by = store.auth_state_origin(&profile.name)?;
+                    kept_tokens = Some((
+                        SessionState {
+                            token: old_state.token,
+                            refresh_token: old_state.refresh_token,
+                            token_expires: old_state.token_expires,
+                            logged_in: old_state.logged_in,
+                            last_login: old_state.last_login,
+                            ..Default::default()
+                        },
+                        by,
+                    ));
                 }
             }
             store.auth_save_profile(&profile)?;
-            if let Some(state) = kept_tokens {
-                store.auth_save_state(&profile.name, &state)?;
+            if let Some((state, by)) = kept_tokens {
+                store.auth_keep_state(&profile.name, &state, by)?;
             }
             let shown = profile.redacted();
             out.ok(json!({"profile": shown, "next": format!("brainproxy auth login {}", shown.name)}), || {
@@ -893,9 +899,12 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                     *v = "********".into();
                 }
             }
+            let (session_origin, session_changed_at) = store.auth_state_origin(&name)?;
             let data = json!({
                 "profile": profile,
                 "session": state_json(&state),
+                "session_origin": session_origin,
+                "session_changed_at": session_changed_at,
                 "macros": handling.macros.iter().map(macro_summary).collect::<Vec<_>>(),
                 "rules": handling.rules,
                 "signers": handling.signers,
@@ -1000,6 +1009,7 @@ fn macro_summary(m: &Macro) -> serde_json::Value {
         "steps": m.steps.len(),
         "vars": m.vars(),
         "requests": m.steps.iter().map(step_line).collect::<Vec<_>>(),
+        "origin": m.origin,
     })
 }
 
@@ -1059,6 +1069,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             let mut m = Macro {
                 name: name.clone(),
                 steps: steps.iter().map(|s| read_step(&store, s, &scheme)).collect::<Result<_, _>>()?,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             for spec in &extract {
                 let (step, x) = parse_extract(spec)?;
@@ -1205,19 +1216,24 @@ fn rule_line(r: &SessionRule) -> String {
 }
 
 fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    let mut store = Store::open(project)?;
     match cmd {
         RuleCmd::Add { profile, actions, tools, url, invalid, description } => {
             let mut h = store.auth_handling(&profile)?;
             let mut tools = tools.iter().map(|t| Tool::parse(t)).collect::<Result<Vec<_>, _>>()?;
             tools.dedup();
+            let actions = actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?;
+            // Never one a removed rule had, of this profile or another: an old history row's
+            // `edited_by` names it.
+            let id = store.next_id(SESSION_RULE_IDS, h.rules.iter().map(|r| r.id).max().unwrap_or(0))?;
             let rule = SessionRule {
-                id: h.rules.iter().map(|r| r.id).max().unwrap_or(0) + 1,
+                id,
                 description: description.unwrap_or_default(),
                 tools,
                 url,
-                actions: actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?,
+                actions,
                 invalid,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             h.rules.push(rule.clone());
             store.auth_save_handling(&profile, &h)?;

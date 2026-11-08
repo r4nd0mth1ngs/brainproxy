@@ -983,7 +983,12 @@ Each history entry has:
 - `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
-  the rule). NULL when nothing changed it; an intercept forwarded unchanged isn't an edit.
+  the rule). A proxy started with `--auth NAME` that puts the profile's session on a request
+  adds `{"by":"gui","auth":"NAME"}` (`by`: who saved the profile last), then
+  `{"by":"mcp","auth":"NAME","session_rule":3}` for each session rule that applied and
+  `{"by":"cli","auth":"NAME","macro":"csrf"}` for each macro those rules ran (`by`: who added
+  the rule or macro, or last changed it). NULL when nothing changed it; an intercept forwarded
+  unchanged isn't an edit.
 - `sni`: the TLS server name sent when `--sni` overrode it (`send`, `fuzz`, `ws send`, and
   a session's own requests in those); NULL when it was the target host, for plain HTTP, and
   when `--sni` was an IP address, which can't be a server name, so none is sent. A `--sni`
@@ -1015,7 +1020,26 @@ dropped it itself; `edited` says whether it was forwarded with a different messa
 row names the intercept in `edited_by`. A response edited at intercept, or changed by a
 response rule, is recorded in history as the server sent it; the intercept row has the
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
-enabled it.
+enabled it. So do auth profiles (`auth show`: `profile.origin`, who saved it last), their
+session rules and macros (`origin`, who added one or last changed it; saving them unchanged
+keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
+it (logged in, got an OAuth token, or the proxy or a scan that learnt its cookies). A rule id,
+match-and-replace or session rule (of any profile), is never handed out again once its rule is
+removed, so an old row's `edited_by` can't come to name another rule.
+
+The other tables say who started what wrote them, as `origin` (NULL for rows from before
+brainproxy kept it): `jobs`, `fuzz_runs`, `authz_results` (who started the run, or the proxy
+for live testing), `ws_connections` (who started the proxy or `ws send`), and
+`oob_interactions` (who started the listener or poll that stored it). An OOB payload's
+`issued_by` is who started the scan or ran `oob payload` (its `origin` column is the attacked
+site). Every saved setting (scope, rules, intercept, connection settings, live authz, ...) is
+logged in `setting_changes` with its `key`, `time` and `origin`, without its value, which can
+hold credentials.
+
+A proxy records the schema of the build that started it (`proxy.schema` in `proxy status`).
+One started by an older build goes on writing rows the old way, without what came since (who
+changed a request, for one), so `proxy status` warns about it in `proxy_outdated` and a
+`warning:` line, until it is restarted (`proxy restart`).
 
 Narrowing the proxy scope or adding a TLS pass-through host keeps traffic's content out of
 history (only request lines and tunnels' rows remain), so each change to either is logged:
@@ -1077,7 +1101,10 @@ Findings have an `origin` too (who added them: the proxy's passive scan, a scan 
 `findings add`, ...), and `state_origin` and `state_changed_at` say who last changed the state
 with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. `note_origin` and
 `note_changed_at` do the same for the note. `findings list` and `findings show` include
-them. Reports carry them in every format:
+them. The description and solution a title added by hand shares keep who wrote them
+(`description_origin` and `solution_origin` in `findings show` and the `finding_types`
+table): whoever gave the text first, filled it in when it was left blank, or replaced it.
+Reports carry a finding's origins in every format:
 
 - JSON: each instance has `state_origin`, `state_changed_at`, `note_origin`,
   `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
