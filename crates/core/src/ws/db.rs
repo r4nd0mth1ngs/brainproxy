@@ -309,6 +309,23 @@ impl Store {
         )?)
     }
 
+    /// Marks connection `id` closed with `error` as the reason, if it is still open (one whose
+    /// `ws send` was killed). Returns whether it was.
+    pub fn ws_close_open(&self, id: i64, error: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE ws_connections SET state = 'closed', closed_time = ?1, error = COALESCE(error, ?2)
+             WHERE id = ?3 AND state = 'open'",
+            params![crate::ws::now_iso(), error, id],
+        )? > 0)
+    }
+
+    /// Ids of the open connections of `source`.
+    pub fn ws_open_ids(&self, source: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM ws_connections WHERE state = 'open' AND source = ?1")?;
+        let ids = stmt.query_map([source], |r| r.get(0))?;
+        Ok(ids.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn ws_connections(&self, f: &ConnectionFilter) -> Result<Vec<WsConnection>> {
         let order = if f.newest { "DESC" } else { "" };
         let mut stmt = self.conn.prepare(&format!(

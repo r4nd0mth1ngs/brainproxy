@@ -1537,8 +1537,11 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   the command is killed at once, and its row keeps the pending error.
 - `ws send` records the connection and each message as they happen, not at the end (a
   message to the server when it is queued, so one queued just before the connection dropped
-  may not have gone out). Killed while listening, the connection stays `open` with every
-  message up to then; stopped with Ctrl-C or SIGTERM, it is closed with that error.
+  may not have gone out). Killed while listening, the connection is left `open` with every
+  message up to then, and the next `ws send`, `ws list` or `ws show` closes it with the error
+  `ws send ended without closing it (killed)`: while it runs, `ws send` holds
+  `<project>-ws-ID.lock`, which the system lets go of when the process dies. Stopped with
+  Ctrl-C or SIGTERM, it is closed with that error.
 - An HTTP/2 race (`send --race N --http2`) that fails after connecting records each copy
   with the error. If no copy got a response, the command fails with the error's kind (exit
   3) and the message lists the rows; with `--format json` the envelope's `data.results`
