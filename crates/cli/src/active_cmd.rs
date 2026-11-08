@@ -13,6 +13,7 @@ use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
+use brainproxy_core::sent::Rows;
 use brainproxy_core::session::Tool;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -197,6 +198,14 @@ pub struct ActiveArgs {
     /// Skip out-of-band checks even when an OOB listener is running.
     #[arg(long)]
     no_oob: bool,
+    /// Keep only the attack requests that back a finding: when the scan ends (finished, `job
+    /// stop`, or --max-minutes; not if the process dies or the scan fails), delete its own attacks' history rows that nothing refers to. Overrides the
+    /// project's setting (`scan prune`). Refused through MCP.
+    #[arg(long, conflicts_with = "no_prune")]
+    prune: bool,
+    /// Keep every request, whatever the project's setting.
+    #[arg(long)]
+    no_prune: bool,
     /// Run detached; returns a job id for `job wait|status|stop`.
     #[arg(long)]
     background: bool,
@@ -375,6 +384,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         return Err(Error::InvalidInput("--no-rules needs --checks".into()));
     }
     let oob = if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) };
+    let (prune, prune_hint) = prune(project, &args)?;
     let (checks, check_summary) = load_checks(home, &args, band, oob.is_some())?;
     let browser = args.browser.then(|| crate::browser_cmd::chromium(args.browser_id.as_deref())).transpose()?;
     if args.background {
@@ -475,6 +485,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         oob,
         oob_wait: Duration::from_secs_f64(args.oob_wait.clamp(0.0, 3600.0)),
         check_methods: args.include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(),
+        prune,
     };
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -644,6 +655,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         v["hint"] = json!(
             "Details: brainproxy findings show ID; all active findings: brainproxy findings list --source active"
         );
+        if let Some(hint) = prune_hint {
+            v["prune_hint"] = json!(hint);
+        }
         if v["oob"].is_null() && !args.no_oob {
             v["oob_hint"] = json!("Out-of-band checks were skipped: no OOB listener (brainproxy oob start).");
         } else if !v["oob"].is_null() {
@@ -656,6 +670,12 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             "active scan: {} targets, {} units, {} requests, {} new findings",
             result["targets"], result["units"], result["requests"], result["new_findings"]
         )];
+        if let Some(n) = result["pruned"].as_u64() {
+            lines.push(format!("  {n} attack requests that back no finding deleted from history"));
+        }
+        if let Some(e) = result["prune_error"].as_str() {
+            lines.push(format!("  pruning stopped, the rest of its attack requests kept: {e}"));
+        }
         for g in result["active_findings"].as_array().into_iter().flatten() {
             lines.push(format!(
                 "  {:<6} {:<8} {} ({} instance(s))",
@@ -668,6 +688,27 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         lines.join("\n")
     });
     Ok(())
+}
+
+/// Whether this scan prunes its attack rows: --prune or --no-prune, else the project's
+/// setting. Through MCP --prune is refused and the setting doesn't apply (everything an agent
+/// sends is recorded); the hint then says so.
+fn prune(project: &Path, args: &ActiveArgs) -> Result<(bool, Option<&'static str>), Error> {
+    if args.prune {
+        crate::mcp::check_records_all("--prune")?;
+        return Ok((true, None));
+    }
+    if args.no_prune {
+        return Ok((false, None));
+    }
+    let on = Store::open(project)?.setting::<active::ActiveSettings>(active::SETTINGS_KEY)?.prune;
+    if on && crate::mcp::in_tool_call() {
+        return Ok((
+            false,
+            Some("The project prunes active scans' attack requests, but through MCP every request is kept."),
+        ));
+    }
+    Ok((on, None))
 }
 
 /// Loads and filters the --checks templates; returns them with a summary for the output.
@@ -802,13 +843,13 @@ fn select_targets(
     if !args.urls.is_empty() {
         let client = Client::new(send.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        // Each request is on record before it goes out (as `send` records).
+        let rows = Rows::direct("scan", Store::open(project)?).sent_by(&client);
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
-            let ex = match auth {
-                Some(a) => rt.block_on(a.send_as(Tool::Scan, &req, &target))?,
-                None => rt.block_on(client.send(&req, &target))?,
-            };
-            let id = store.record_exchange("scan", &ex)?;
+            let (ids, sent) = rt.block_on(rows.send_with(&client, auth, Tool::Scan, &req, &target));
+            let ex = sent?;
+            let Some(&id) = ids.last() else { return Err(Error::Protocol("the request wasn't recorded".into())) };
             named.insert(id);
             targets.push(ScanTarget {
                 history_id: Some(id),

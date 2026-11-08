@@ -143,6 +143,11 @@ Some arguments need a person, so a command run for a tool call (the server sets
   requests out of history. (Every request a `scan_active` check template sends, and the
   document fetches of `import_api` and `scan_active` with `api`, are recorded whoever runs
   them.)
+- `scan_active` with `prune`, and `scan_prune` with `on`: pruning deletes a scan's attack
+  requests that back no finding once it ends, so an agent can't have its own scans, or a
+  person's, drop what they sent. `scan_prune` `off` is allowed. With the project's setting on
+  (a person turned it on), an agent's scan still keeps every request, and its result says so in
+  `prune_hint`.
 - Any request whose Host header (HTTP/2's `:authority`) or request target names a host other
   than the target's that the engagement scope doesn't list by name, or whose request line or head
   a lenient server could read otherwise (odd spacing, a bare CR or LF, a second request after the

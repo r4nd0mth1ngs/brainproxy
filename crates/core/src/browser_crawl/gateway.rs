@@ -22,13 +22,14 @@ use url::Url;
 
 use crate::auth::AuthSession;
 use crate::capture::{decode_body, Capture};
-use crate::crawl::{is_static, Endpoint, Scope};
+use crate::crawl::{is_static, Endpoint, Save, Scope};
 use crate::error::{Error, Result};
 use crate::http::client::{close_after, final_response};
 use crate::http::{parse_response_head, Client, RawRequest, Target, WireReader};
 use crate::proxy::ca::CertAuthority;
 use crate::proxy::server::{error_response, resolve_target, wants_close, Prefixed};
 use crate::scan::active::Limiter;
+use crate::sent::Rows;
 
 /// Requests blocked or refused that are listed in the summary.
 const MAX_LISTED: usize = 50;
@@ -61,7 +62,10 @@ pub(crate) struct Stats {
 struct Shared {
     opts: Options,
     limiter: Option<Limiter>,
-    save: Mutex<mpsc::Sender<Capture>>,
+    /// The writer thread's queue; let go of when the gateway stops (see [`Gateway::stop`]).
+    save: Arc<Mutex<mpsc::Sender<Save>>>,
+    /// The rows of the requests sent, queued to `save`.
+    rows: Rows,
     in_flight: AtomicUsize,
     last_done: Mutex<Instant>,
     stats: Mutex<Stats>,
@@ -75,13 +79,17 @@ pub(crate) struct Gateway {
 }
 
 impl Gateway {
-    pub async fn start(opts: Options, save: mpsc::Sender<Capture>) -> Result<Gateway> {
+    pub async fn start(opts: Options, save: mpsc::Sender<Save>) -> Result<Gateway> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
+        let save = Arc::new(Mutex::new(save));
+        let queue = save.clone();
+        let rows = Rows::new("crawl-browser", move |w| drop(queue.lock().unwrap().send(Save::Row(w))));
         let shared = Arc::new(Shared {
             limiter: Limiter::new(opts.rate),
+            rows: rows.sent_by(&opts.client),
             opts,
-            save: Mutex::new(save),
+            save,
             in_flight: AtomicUsize::new(0),
             last_done: Mutex::new(Instant::now()),
             stats: Mutex::default(),
@@ -132,6 +140,7 @@ impl Gateway {
         }
         let _ = (&mut self.task).await;
         // Connection tasks that are still being torn down must not keep the writer alive.
+        // (Their rows' writes go through the same queue, so they are let go of too.)
         drop(std::mem::replace(&mut *self.shared.save.lock().unwrap(), mpsc::channel().0));
         std::mem::take(&mut *self.shared.stats.lock().unwrap())
     }
@@ -300,20 +309,18 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         l.wait().await;
     }
     let generation = auth.map(|a| a.generation()).unwrap_or(0);
-    let started = Instant::now();
-    let mut sent = forward(s, target, &request, &method).await;
+    let (mut recorded, mut sent) = forward_recorded(s, target, &request, &method).await;
     if let (Some(a), Ok((_, response))) = (auth, &sent) {
         a.observe(response);
         // Session lost: log in again and replay with the new session.
         if a.is_logged_out(response) && a.relogin(generation).await {
             request = a.apply_to(&request, &[], target);
-            sent = forward(s, target, &request, &method).await;
+            (recorded, sent) = forward_recorded(s, target, &request, &method).await;
             if let Ok((_, response)) = &sent {
                 a.observe(response);
             }
         }
     }
-    let duration = started.elapsed().as_millis() as i64;
     let (conn, response) = match sent {
         Ok(v) => v,
         Err(e) => {
@@ -321,7 +328,10 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
                 refused(s, &target.host);
                 return (error_response(403, e.kind(), &e.to_string()), None);
             }
-            send_capture(s, Capture::new("crawl-browser", target, &request, None, None, Some(&e.to_string())));
+            // Its row says how it failed; one that couldn't go out gets one now.
+            if !recorded {
+                send_capture(s, Capture::new("crawl-browser", target, &request, None, None, Some(&e.to_string())));
+            }
             let mut st = s.stats.lock().unwrap();
             st.requests += 1;
             st.errors += 1;
@@ -330,7 +340,6 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         }
     };
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
-    send_capture(s, Capture::new("crawl-browser", target, &request, Some(&response), Some(duration), None));
     {
         let mut st = s.stats.lock().unwrap();
         st.requests += 1;
@@ -350,6 +359,31 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         s.opts.client.checkin(target, conn);
     }
     (response, None)
+}
+
+/// [`forward`] with the request's row written before it goes out and completed with the
+/// outcome; returns whether it has a row. A target the engagement scope refuses outright
+/// gets none: the client refuses it unsent.
+async fn forward_recorded(
+    s: &Shared,
+    target: &Target,
+    request: &[u8],
+    method: &str,
+) -> (bool, Result<(crate::http::client::Conn, Vec<u8>)>) {
+    if s.opts.client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port)) {
+        return (false, forward(s, target, request, method).await);
+    }
+    let mut row = match s.rows.open(target, request.to_vec()).await {
+        Ok(row) => row,
+        Err(e) => return (false, Err(e)),
+    };
+    let started = Instant::now();
+    let sent = forward(s, target, request, method).await;
+    match &sent {
+        Ok((_, response)) => row.answered_with(response, started.elapsed().as_millis() as u64),
+        Err(e) => row.failed(&e.to_string()),
+    }
+    (true, sent)
 }
 
 async fn forward(
@@ -409,8 +443,9 @@ fn accept_starts_with(headers: &[(String, String)], types: &[&str]) -> bool {
     types.iter().any(|t| accept.starts_with(t))
 }
 
+/// Saves the row of a request that wasn't sent.
 fn send_capture(s: &Shared, c: Capture) {
-    let _ = s.save.lock().unwrap().send(c);
+    let _ = s.save.lock().unwrap().send(Save::Unsent(Box::new(c)));
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
