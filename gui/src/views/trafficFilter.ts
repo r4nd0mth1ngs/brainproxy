@@ -173,11 +173,12 @@ export type SavedChange = (list: SavedFilter[], before?: SavedFilter[]) => Saved
 
 /** The saved set changed where a change meant to work; carries what is saved now. */
 export class SavedMoved extends Error {
-  constructor(
-    message: string,
-    readonly now: SavedState,
-  ) {
+  // A plain field, not a constructor parameter property: Node runs these files by stripping
+  // types, which can't turn a parameter property into an assignment.
+  readonly now: SavedState;
+  constructor(message: string, now: SavedState) {
     super(message);
+    this.now = now;
   }
 }
 
