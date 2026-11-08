@@ -195,7 +195,9 @@ and ends with counts per risk level explained in plain words and a link to Findi
 set it up myself" hides it for that project.
 
 The first step also links to the API flow (`views/ApiWizard.tsx`, with its logic in
-`views/apiScan.ts`), which shares the slot and `WizardProgress`. It previews with `import api
+`views/apiScan.ts`), which shares the slot and `WizardProgress`. Its file picker takes a `.har`
+too (format `har`, "HAR file"); the wizard has no controls for `--keep-static` or
+`--keep-credentials`, so a HAR goes in with its static assets and recorded credentials left out. It previews with `import api
 SOURCE --dry-run` (with `--graphql` for a GraphQL endpoint, and `--environment FILE` once a
 Postman environment is chosen), then asks for the server (the endpoint, for a GraphQL schema file)
 and Postman variables, optional authentication (API key or bearer token via `auth add

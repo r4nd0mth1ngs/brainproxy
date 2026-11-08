@@ -13,8 +13,8 @@ use serde_json::Value;
 use super::postman::Variable;
 use super::values::{resolve, scalar};
 use super::{
-    build_raw, graphql, looks_secret, merge_credential, openapi, parse_base, parse_document, postman, shown_url,
-    ApiRequest, Built, Credential, Skipped,
+    build_raw, graphql, har, looks_secret, merge_credential, openapi, parse_base, parse_document, postman, shown_url,
+    ApiRequest, Built, Credential, Skipped, MAX_DOCUMENT,
 };
 use crate::auth::MARK;
 use crate::error::{Error, Result};
@@ -30,7 +30,7 @@ pub const DEFAULT_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST"];
 const MASK: &str = "********";
 
 const ACCEPTED: &str = "accepted formats: OpenAPI 3.x, Swagger 2.0, and Postman collection v2.0/v2.1, as JSON or \
-     YAML; a GraphQL schema or introspection result";
+     YAML; a GraphQL schema or introspection result; a HAR file";
 
 /// What `--include-methods` calls GraphQL mutations, which all travel as POST.
 pub const MUTATION: &str = "MUTATION";
@@ -58,6 +58,30 @@ pub enum Format {
     Swagger2,
     Postman,
     Graphql,
+    Har,
+}
+
+impl Format {
+    fn describe(self) -> &'static str {
+        match self {
+            Format::Openapi3 => "an OpenAPI 3 document",
+            Format::Swagger2 => "a Swagger 2.0 document",
+            Format::Postman => "a Postman collection",
+            Format::Graphql => "a GraphQL schema",
+            Format::Har => "a HAR file",
+        }
+    }
+}
+
+/// What only a HAR file's import takes.
+#[derive(Debug, Default, Clone)]
+pub struct HarOptions {
+    /// Keep scripts, styles, images, fonts and media.
+    pub keep_static: bool,
+    /// Send the recorded `Cookie`, `Authorization` and other credential headers as they were
+    /// recorded, instead of leaving them out. They are still listed in `credentials`, and
+    /// masked in the preview.
+    pub keep_credentials: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -71,6 +95,9 @@ pub struct Options {
     pub expect_environment_sha256: Option<String>,
     /// Where the document was fetched from.
     pub spec_url: Option<String>,
+    pub har: HarOptions,
+    /// Refuse anything but a HAR file (`import har`).
+    pub require_har: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +127,8 @@ pub struct Loaded {
     pub scripts: Vec<ScriptInfo>,
     pub oauth: Vec<OAuthHint>,
     pub aws: Vec<AwsHint>,
+    /// A HAR file's recorded credential headers are sent (`--keep-credentials`).
+    pub credentials_kept: bool,
 }
 
 /// An OAuth setup a document declares: never a client secret, only where to get tokens.
@@ -315,7 +344,17 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
         scripts: vec![],
         oauth: vec![],
         aws: vec![],
+        credentials_kept: false,
     };
+    if opts.require_har && format != Format::Har {
+        return Err(Error::InvalidInput(format!(
+            "this is {}, not a HAR file: use `import api` for it",
+            format.describe()
+        )));
+    }
+    if format != Format::Har && (opts.har.keep_static || opts.har.keep_credentials) {
+        return Err(Error::InvalidInput("--keep-static and --keep-credentials are for HAR files".into()));
+    }
     let environment = match &opts.environment {
         Some(text) => {
             if format != Format::Postman {
@@ -378,6 +417,19 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
                 },
             )?
         }
+        Format::Har => {
+            if opts.server.is_some() {
+                return Err(Error::InvalidInput("--server: a HAR file has no servers".into()));
+            }
+            if !opts.vars.is_empty() {
+                loaded.warnings.push("--var only applies to Postman collections; it was ignored".into());
+            }
+            let o = har::Options { base_url: opts.base_url.clone(), keep_static: opts.har.keep_static };
+            let (built, creator) = har::build(text, &o)?;
+            (loaded.title, loaded.version) = (creator.name, creator.version);
+            loaded.credentials_kept = opts.har.keep_credentials;
+            built
+        }
         Format::Openapi3 | Format::Swagger2 => {
             if !doc.get("paths").is_none_or(Value::is_object) {
                 return Err(Error::InvalidInput("the document's \"paths\" must be an object".into()));
@@ -408,7 +460,7 @@ pub fn load(text: &str, opts: &Options) -> Result<Loaded> {
             openapi::build(&doc, &o)?
         }
     };
-    harden(&mut built, format, &loaded.credentials);
+    harden(&mut built, format, &loaded.credentials, loaded.credentials_kept);
     built.credentials.drain(..).for_each(|c| merge_credential(&mut loaded.credentials, c));
     loaded.warnings.append(&mut built.warnings);
     loaded.base_url_required = built.base_url_required;
@@ -422,6 +474,17 @@ fn detect(text: &str) -> Result<(Format, Value)> {
     let unknown = |what: &str| Error::InvalidInput(format!("{what}; {ACCEPTED}"));
     if t.is_empty() {
         return Err(unknown("the document is empty"));
+    }
+    // Only a HAR file may be larger: it often holds every response, which isn't read.
+    if t.len() > MAX_DOCUMENT {
+        if t.starts_with('{') && har::is_har(t) {
+            return Ok((Format::Har, Value::Null));
+        }
+        return Err(Error::InvalidInput(format!(
+            "the document is larger than {} MiB (a HAR file may be up to {} MiB)",
+            MAX_DOCUMENT >> 20,
+            har::MAX_HAR >> 20
+        )));
     }
     if graphql::looks_like_sdl(t) {
         return Ok((Format::Graphql, graphql::parse_sdl(t)?));
@@ -470,8 +533,8 @@ fn detect(text: &str) -> Result<(Format, Value)> {
     if doc.get("errors").is_some() {
         return Err(unknown("this is a GraphQL error, not a schema: introspection may be turned off"));
     }
-    if doc.pointer("/log/entries").is_some() {
-        return Err(unknown("this looks like a HAR file"));
+    if doc.pointer("/log/entries").is_some_and(Value::is_array) {
+        return Ok((Format::Har, doc));
     }
     Err(unknown("the document's format wasn't recognised (no \"openapi\", \"swagger\", or Postman \"item\" field)"))
 }
@@ -527,8 +590,10 @@ fn security_schemes(doc: &Value) -> Vec<Credential> {
 
 /// Removes every credential from the built requests, reporting each, and skips those
 /// holding the auth placeholder marker or that can't be sent. `declared` adds the names the
-/// document itself says are credentials, whatever they look like.
-fn harden(built: &mut Built, format: Format, declared: &[Credential]) {
+/// document itself says are credentials, whatever they look like. `keep_headers` (a HAR
+/// file's `--keep-credentials`) leaves credential headers in place, still reported; those in
+/// the URL and the body are taken out all the same, as URLs are shown and logged.
+fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_headers: bool) {
     let is_declared = |place: &str, name: &str| {
         declared.iter().any(|c| {
             c.location.as_deref() == Some(place)
@@ -607,6 +672,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential]) {
                 continue;
             }
             let embedded = !is_stand_in(&v);
+            let kept = keep_headers.then(|| (k.clone(), v.clone()));
             if k.eq_ignore_ascii_case("cookie") {
                 for name in v.split(';').filter_map(|c| c.split('=').next()).map(str::trim).filter(|n| !n.is_empty()) {
                     built.credential(Credential {
@@ -617,6 +683,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential]) {
                         embedded,
                     });
                 }
+                r.headers.extend(kept);
                 continue;
             }
             let lower = v.trim_start().to_ascii_lowercase();
@@ -636,6 +703,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential]) {
                 source: source.clone(),
                 embedded,
             });
+            r.headers.extend(kept);
         }
         let (body, fields) = without_credentials(&r.headers, &r.body);
         r.body = body;
@@ -861,6 +929,7 @@ impl Loaded {
             scripts: self.scripts.clone(),
             oauth: self.oauth.clone(),
             aws: self.aws.clone(),
+            credentials_kept: self.credentials_kept,
             built: self.requests.len(),
             selected: plan.selected(),
             skipped: self.skipped.clone(),
@@ -963,7 +1032,12 @@ impl PreviewRequest {
             name: r.name.clone(),
             method: r.method.clone(),
             url: r.url.clone(),
-            headers: r.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect(),
+            // Only a HAR file's --keep-credentials leaves any; never shown.
+            headers: r
+                .headers
+                .iter()
+                .map(|(k, v)| if looks_secret(k) { format!("{k}: {MASK}") } else { format!("{k}: {v}") })
+                .collect(),
             body: masked_body(&r.headers, &r.body),
             state_changing: opt_in.is_some()
                 || matches!(r.method.to_ascii_uppercase().as_str(), "PUT" | "PATCH" | "DELETE"),
@@ -993,6 +1067,8 @@ pub struct Preview {
     pub scripts: Vec<ScriptInfo>,
     pub oauth: Vec<OAuthHint>,
     pub aws: Vec<AwsHint>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub credentials_kept: bool,
     pub built: usize,
     pub selected: usize,
     pub skipped: Vec<Skipped>,
@@ -1182,6 +1258,7 @@ mod tests {
         assert_eq!(f("type Query {\n  a: Int\n}\n"), Format::Graphql);
         assert!(err("type Other {\n  a: Int\n}\n").contains("no Query type"));
         assert_eq!(f(r#"{"data": {"__schema": {"queryType": {"name": "Query"}, "types": []}}}"#), Format::Graphql);
+        assert_eq!(f(r#"{"log": {"version": "1.2", "entries": []}}"#), Format::Har);
         for (text, says) in [
             ("openapi: 4.0.0\npaths: {}", "OpenAPI version \"4.0.0\" isn't supported"),
             ("swagger: 1.2\npaths: {}", "Swagger version \"1.2\" isn't supported"),
@@ -1189,7 +1266,6 @@ mod tests {
             (r#"{"errors": [{"message": "off"}]}"#, "introspection"),
             (r#"{"values": [], "_postman_variable_scope": "environment"}"#, "--environment"),
             (r#"{"requests": [], "order": []}"#, "Postman collection v1"),
-            (r#"{"log": {"entries": []}}"#, "HAR"),
             ("<html></html>", "HTML"),
             ("", "empty"),
             ("[1, 2]", "not a JSON or YAML object"),
@@ -1302,6 +1378,102 @@ mod tests {
         let l = load(spec, &opts()).unwrap();
         assert_eq!(String::from_utf8_lossy(&l.requests[0].body), r#"{"password":"Passw0rd!","token":"test"}"#);
         assert!(l.credentials.is_empty(), "{:?}", l.credentials);
+    }
+
+    fn har() -> String {
+        json!({"log": {"version": "1.2", "creator": {"name": "WebInspector", "version": "537.36"}, "entries": [
+            {"request": {"method": "GET", "url": "https://api.test/me?access_token=QUERYSECRET&x=1",
+                "headers": [{"name": "Cookie", "value": "sid=COOKIESECRET; theme=dark"},
+                    {"name": "Authorization", "value": "Bearer HEADERSECRET"},
+                    {"name": "X-CSRF-Token", "value": "CSRFSECRET"},
+                    {"name": "Accept", "value": "application/json"}]},
+             "response": {"status": 200, "content": {"mimeType": "application/json", "text": "{\"me\": 1}"}}},
+            {"request": {"method": "POST", "url": "https://api.test/login",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "postData": {"mimeType": "application/json", "text": "{\"user\": \"a\", \"password\": \"BODYSECRET\"}"}},
+             "response": {"status": 200, "content": {}}},
+            {"request": {"method": "DELETE", "url": "https://api.test/items/1"}, "response": {"content": {}}},
+            {"request": {"method": "GET", "url": "https://tracker.example/collect?id=1"}, "response": {"content": {}}}
+        ]}})
+        .to_string()
+    }
+
+    #[test]
+    fn a_har_file_is_imported_without_its_credentials() {
+        let l = load(&har(), &opts()).unwrap();
+        assert_eq!(
+            (l.format, l.title.as_deref(), l.version.as_deref()),
+            (Format::Har, Some("WebInspector"), Some("537.36"))
+        );
+        let g = guard();
+        let plan = l.plan(&Selection::default(), &g).unwrap();
+        let reasons: Vec<_> = plan.items.iter().map(|i| i.excluded_reason).collect();
+        // The DELETE needs opting in to, as for any format; the tracker is out of scope.
+        assert_eq!(reasons, [None, None, Some("method"), Some("scope")]);
+        let p = l.preview(&plan, 100);
+        assert_eq!(p.requests[0].url, "https://api.test/me?x=1");
+        assert_eq!(p.requests[0].headers, ["Accept: application/json"]);
+        let shown = format!("{}{}", serde_json::to_string(&p).unwrap(), String::from_utf8_lossy(&p.requests[1].body));
+        for s in ["COOKIESECRET", "HEADERSECRET", "CSRFSECRET", "QUERYSECRET", "BODYSECRET"] {
+            assert!(!shown.contains(s), "{s} in {shown}");
+        }
+        assert!(!shown.contains("credentials_kept"), "{shown}");
+        let has = |at: &str, n: &str| {
+            p.credentials
+                .iter()
+                .any(|c| c.location.as_deref() == Some(at) && c.name.as_deref() == Some(n) && c.embedded)
+        };
+        assert!(has("cookie", "sid") && has("cookie", "theme") && has("header", "Authorization"));
+        assert!(has("header", "X-CSRF-Token") && has("query", "access_token"), "{:?}", p.credentials);
+        assert!(l.requests.iter().all(|r| !String::from_utf8_lossy(&r.body).contains("BODYSECRET")));
+        let e = l.check_runnable(&l.plan(&Selection { only: Some(vec![3]), ..Default::default() }, &g).unwrap());
+        assert!(e.unwrap_err().to_string().contains("tracker.example"));
+    }
+
+    #[test]
+    fn a_har_file_keeps_its_credential_headers_only_when_asked() {
+        let o = Options { har: HarOptions { keep_credentials: true, ..Default::default() }, ..opts() };
+        let l = load(&har(), &o).unwrap();
+        assert!(l.credentials_kept);
+        let sent = &l.requests[0];
+        let header = |n: &str| sent.headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        assert_eq!(header("Cookie"), Some("sid=COOKIESECRET; theme=dark"));
+        assert_eq!(header("Authorization"), Some("Bearer HEADERSECRET"));
+        // The URL and body are shown and logged: their credentials go all the same.
+        assert_eq!(sent.url, "https://api.test/me?x=1");
+        assert!(!String::from_utf8_lossy(&l.requests[1].body).contains("BODYSECRET"));
+        let p = l.preview(&l.plan(&Selection::default(), &guard()).unwrap(), 100);
+        assert!(p.requests[0].headers.contains(&"Cookie: ********".to_string()), "{:?}", p.requests[0].headers);
+        let shown = serde_json::to_string(&p).unwrap();
+        assert!(!shown.contains("SECRET") && shown.contains("\"credentials_kept\":true"), "{shown}");
+        assert!(p.credentials.iter().any(|c| c.name.as_deref() == Some("Authorization")));
+    }
+
+    #[test]
+    fn har_options_and_import_har_are_checked() {
+        let spec = r#"{"openapi": "3.0.0", "paths": {}}"#;
+        let only_har = Options { require_har: true, ..opts() };
+        assert!(load(&har(), &only_har).is_ok());
+        let e = load(spec, &only_har).unwrap_err().to_string();
+        assert!(e.contains("an OpenAPI 3 document, not a HAR file") && e.contains("import api"), "{e}");
+        let keep = Options { har: HarOptions { keep_static: true, ..Default::default() }, ..opts() };
+        assert!(load(spec, &keep).unwrap_err().to_string().contains("for HAR files"));
+        let server = Options { server: Some(0), ..opts() };
+        assert!(load(&har(), &server).unwrap_err().to_string().contains("no servers"));
+        let rebased = load(&har(), &Options { base_url: Some("http://127.0.0.1:9".into()), ..opts() }).unwrap();
+        assert!(rebased.requests.iter().all(|r| r.url.starts_with("http://127.0.0.1:9/")));
+    }
+
+    #[test]
+    fn a_har_file_may_be_larger_than_other_documents() {
+        // Response bodies take up most of a HAR file, and aren't read.
+        let big = "x".repeat(MAX_DOCUMENT);
+        let doc = json!({"log": {"entries": [{"request": {"method": "GET", "url": "https://api.test/a"},
+            "response": {"content": {"mimeType": "text/plain", "text": big}}}]}});
+        let l = load(&doc.to_string(), &opts()).unwrap();
+        assert_eq!((l.format, l.requests.len()), (Format::Har, 1));
+        let e = err(&format!("{{\"openapi\": \"3.0.0\", \"x\": \"{big}\"}}"));
+        assert!(e.contains("larger than 32 MiB"), "{e}");
     }
 
     #[test]

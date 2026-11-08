@@ -27,8 +27,8 @@ pub struct ActiveArgs {
     /// URLs to attack (fetched first as the baseline). Without URLs, --history-id or
     /// --where, every crawled/proxied/sent/imported request in history is a target.
     urls: Vec<String>,
-    /// Scan an API from its description (OpenAPI 3.x, Swagger 2.0, or Postman v2.0/v2.1; a file or
-    /// an http(s) URL): build requests as `import api` does, send each selected in-scope
+    /// Scan an API from its description (OpenAPI 3.x, Swagger 2.0, Postman v2.0/v2.1, a GraphQL schema,
+    /// or a HAR file; a file or an http(s) URL): build requests as `import api` does, send each selected in-scope
     /// operation once as a baseline, then attack exactly those.
     #[arg(long, value_name = "SOURCE", conflicts_with_all = ["urls", "crawl", "history_ids", "where_sql"])]
     api: Option<String>,
@@ -56,6 +56,9 @@ pub struct ActiveArgs {
     /// With --api: the source is a GraphQL endpoint to introspect.
     #[arg(long, requires = "api")]
     graphql: bool,
+    /// With --api, a HAR file: keep its static assets, and (--keep-credentials) its credential headers.
+    #[command(flatten)]
+    har: crate::import_cmd::HarFlags,
     /// Crawl and audit: crawl from each URL first (in scope, forms submitted, same auth and
     /// limits), then attack every recorded request on those sites, not only the URLs.
     #[arg(long)]
@@ -250,6 +253,8 @@ impl ActiveArgs {
             environment: self.environment.as_deref().map(crate::import_cmd::read_environment).transpose()?,
             expect_environment_sha256: self.expect_environment_sha256.clone(),
             spec_url: None,
+            har: self.har.options(),
+            require_har: false,
         })
     }
 
@@ -261,10 +266,14 @@ impl ActiveArgs {
             || self.only.is_some()
             || self.expect_sha256.is_some()
             || self.environment.is_some()
-            || self.graphql;
+            || self.graphql
+            || self.har.keep_static
+            || self.har.keep_credentials;
         if given && self.api.is_none() {
             return Err(Error::InvalidInput(
-                "--base-url, --server, --var, --only, --expect-sha256, --environment and --graphql need --api".into(),
+                "--base-url, --server, --var, --only, --expect-sha256, --environment, --graphql, --keep-static and \
+                 --keep-credentials need --api"
+                    .into(),
             ));
         }
         Ok(())

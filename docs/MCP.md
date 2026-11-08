@@ -127,9 +127,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.
-- `report`, `findings_repro` and `ca_export` with `force`: `output` (`out`) would overwrite any
-  file the server can write. An agent writes to a new file, or leaves out `output` (`out`) to
-  get the report, pack or certificate in the reply.
+- `report`, `findings_repro`, `history_export` and `ca_export` with `force`: `output` (`out`)
+  would overwrite any file the server can write. An agent writes to a new file, or leaves out
+  `output` (`out`) to get the report, pack, HAR or certificate in the reply.
 - `ca_init` with `force`: a new CA would make every client that trusts the person's stop
   trusting the proxy. Without it the CA is created only when missing; a person replaces it in a
   terminal.

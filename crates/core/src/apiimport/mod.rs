@@ -1,10 +1,11 @@
-//! API import: turns OpenAPI/Swagger documents, Postman collections, and
-//! GraphQL schemas into concrete requests (example or typed default values for
+//! API import: turns OpenAPI/Swagger documents, Postman collections, GraphQL
+//! schemas, and HAR files into concrete requests (example or typed default values for
 //! every parameter), sends them through the guarded client, and records them in
 //! history (source "import") so `scan active` and `fuzz` can work from them.
 
 pub mod api;
 pub mod graphql;
+pub mod har;
 pub mod openapi;
 pub mod postman;
 mod values;

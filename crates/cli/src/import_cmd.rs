@@ -1,11 +1,11 @@
-//! `import api|openapi|postman|graphql`: build requests from an API description,
-//! send them (in scope only) and record them as history source "import".
+//! `import api|openapi|postman|graphql|har`: build requests from an API description or a
+//! HAR file, send them (in scope only) and record them as history source "import".
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brainproxy_core::apiimport::{self, api, graphql, openapi, postman, ApiRequest, Built, RunConfig};
+use brainproxy_core::apiimport::{self, api, graphql, har, openapi, postman, ApiRequest, Built, RunConfig};
 use brainproxy_core::auth::{Attempt, AuthSession};
 use brainproxy_core::capture::decode_body;
 use brainproxy_core::guard::Guard;
@@ -20,14 +20,15 @@ use crate::output::{body_value, Out};
 
 #[derive(Subcommand)]
 pub enum ImportCmd {
-    /// An API description, its format detected: OpenAPI 3.x, Swagger 2.0, Postman v2.0/v2.1, or a GraphQL
-    /// schema file or introspection result (--graphql introspects a URL).
+    /// An API description, its format detected: OpenAPI 3.x, Swagger 2.0, Postman v2.0/v2.1, a GraphQL
+    /// schema file or introspection result (--graphql introspects a URL), or a HAR file.
     /// `--dry-run` is the preview: every request built, and which would go out.
     #[command(after_help = "Sends GET, HEAD, OPTIONS, and POST; --include-methods opts in to others, and to GraphQL \
         mutations as MUTATION. A GraphQL schema file needs --base-url, the endpoint. Credentials \
         in the document are never sent or stored, only listed under `credentials`: use `auth add` and --auth \
         for them. Indexes for --only count the built requests in document order, so they hold for one document \
-        and one set of options; --expect-sha256 proves the document is the one previewed.")]
+        and one set of options; --expect-sha256 proves the document is the one previewed. A HAR file: see \
+        `import har`.")]
     Api(ApiArgs),
     /// OpenAPI 3.x or Swagger 2.0 document (JSON or YAML): one request per operation.
     #[command(after_help = "Parameters get their example, default, or first enum value, else a typed default \
@@ -45,6 +46,18 @@ pub enum ImportCmd {
         ID \"1\", first enum value, input objects filled in), so `scan active` injects into them as JSON values. \
         Mutations are only sent with --include-destructive.")]
     Graphql(GraphqlArgs),
+    /// HAR 1.2 file (a browser's or proxy's recording): one request per entry, as recorded,
+    /// under `import api`'s rules. `--dry-run` is the preview.
+    #[command(after_help = "Each entry's method, URL, headers, cookies, query and body (text, form or multipart \
+        params) is sent again, and the live response recorded; the HAR's responses are not read or stored. Left \
+        out, and counted in `warnings`: static assets (scripts, styles, images, fonts, media; --keep-static keeps \
+        them), repeats of an earlier entry's method, URL and body, WebSocket handshakes, and URLs that aren't \
+        http(s). Entries out of scope are listed with excluded_reason \"scope\" and never sent. The recorded \
+        Cookie, Authorization and other credential headers, and credentials in URLs and bodies, are left out \
+        and listed under `credentials` by name; --keep-credentials sends the headers as recorded (never shown). \
+        Sends GET, HEAD, OPTIONS and POST; --include-methods opts in to others and to GraphQL mutations (MUTATION). \
+        `import api` and `scan active --api` take a HAR file too. Up to 256 MiB.")]
+    Har(HarArgs),
 }
 
 #[derive(clap::Args)]
@@ -91,6 +104,69 @@ pub struct ApiArgs {
     /// List the text of each Postman pre-request script in the preview.
     #[arg(long)]
     show_scripts: bool,
+    #[command(flatten)]
+    har: HarFlags,
+    /// `import har`: refuse any other format.
+    #[arg(skip)]
+    require_har: bool,
+}
+
+/// What only a HAR file takes.
+#[derive(clap::Args)]
+pub struct HarFlags {
+    /// HAR files: keep scripts, styles, images, fonts and media, which are left out by default.
+    #[arg(long)]
+    pub(crate) keep_static: bool,
+    /// HAR files: send the recorded Cookie, Authorization and other credential headers as recorded,
+    /// instead of leaving them out. They are still listed under `credentials`, and never shown.
+    #[arg(long)]
+    pub(crate) keep_credentials: bool,
+}
+
+impl HarFlags {
+    pub(crate) fn options(&self) -> api::HarOptions {
+        api::HarOptions { keep_static: self.keep_static, keep_credentials: self.keep_credentials }
+    }
+}
+
+#[derive(clap::Args)]
+pub struct HarArgs {
+    /// HAR file, '-' for stdin, or an http(s) URL (fetched in scope; the file itself isn't recorded).
+    source: String,
+    /// Send to this server instead: scheme://host[:port] replaces the origin; with a path, the whole base.
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Also send these methods (comma-separated, or `all`). By default GET, HEAD, OPTIONS, and POST.
+    #[arg(long, value_delimiter = ',', value_name = "METHODS")]
+    include_methods: Vec<String>,
+    /// Only the requests at these indexes (comma-separated), as the preview numbers them.
+    #[arg(long, value_delimiter = ',', value_name = "INDEXES")]
+    only: Option<Vec<usize>>,
+    /// Refuse a file whose sha256 isn't this: it proves the file is the one previewed.
+    #[arg(long, value_name = "HEX")]
+    expect_sha256: Option<String>,
+    #[command(flatten)]
+    har: HarFlags,
+    #[command(flatten)]
+    common: Common,
+}
+
+impl From<HarArgs> for ApiArgs {
+    fn from(h: HarArgs) -> Self {
+        ApiArgs {
+            doc: DocArgs { source: h.source, base_url: h.base_url, vars: vec![], common: h.common },
+            include_methods: h.include_methods,
+            only: h.only,
+            server: None,
+            expect_sha256: h.expect_sha256,
+            environment: None,
+            expect_environment_sha256: None,
+            graphql: false,
+            show_scripts: false,
+            har: h.har,
+            require_har: true,
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -145,11 +221,17 @@ pub struct Common {
 }
 
 pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<(), Error> {
+    // `import har` is `import api` for a HAR file only.
+    let cmd = match cmd {
+        ImportCmd::Har(h) => ImportCmd::Api(h.into()),
+        other => other,
+    };
     let (kind, c, stdin) = match &cmd {
         ImportCmd::Api(a) => ("api", &a.doc.common, a.doc.source == "-"),
         ImportCmd::Openapi(a) => ("openapi", &a.common, a.source == "-"),
         ImportCmd::Postman(a) => ("postman", &a.common, a.source == "-"),
         ImportCmd::Graphql(a) => ("graphql", &a.common, a.schema.as_deref() == Some("-")),
+        ImportCmd::Har(_) => unreachable!("made an `import api` above"),
     };
     if let ImportCmd::Api(a) = &cmd {
         api::check_source(&a.doc.source)?;
@@ -159,6 +241,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         ImportCmd::Api(a) => is_url(&a.doc.source).then_some(a.doc.source.as_str()),
         ImportCmd::Openapi(a) | ImportCmd::Postman(a) => is_url(&a.source).then_some(a.source.as_str()),
         ImportCmd::Graphql(a) => Some(a.url.as_str()),
+        ImportCmd::Har(_) => unreachable!("made an `import api` above"),
     };
     if let Some(u) = remote {
         crate::require_in_scope(&guard, &Target::from_url(u)?)?;
@@ -212,7 +295,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
     }
 
     let built = match &cmd {
-        ImportCmd::Api(_) => unreachable!("handled above"),
+        ImportCmd::Api(_) | ImportCmd::Har(_) => unreachable!("handled above"),
         ImportCmd::Openapi(a) => {
             let (text, spec_url) = fetch.document(&a.source)?;
             let doc = apiimport::parse_document(&text)?;
@@ -311,6 +394,8 @@ impl ApiArgs {
             environment: self.environment.as_deref().map(read_environment).transpose()?,
             expect_environment_sha256: self.expect_environment_sha256.clone(),
             spec_url: None,
+            har: self.har.options(),
+            require_har: self.require_har,
         })
     }
 
@@ -570,11 +655,9 @@ pub(crate) fn read_local(source: &str) -> Result<String, Error> {
     } else {
         let meta =
             std::fs::metadata(source).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?;
-        if meta.len() as usize > apiimport::MAX_DOCUMENT {
-            return Err(Error::InvalidInput(format!(
-                "{source:?} is larger than {} MiB",
-                apiimport::MAX_DOCUMENT >> 20
-            )));
+        // A HAR file may be larger than other documents; `api::load` holds those to their limit.
+        if meta.len() as usize > har::MAX_HAR {
+            return Err(Error::InvalidInput(format!("{source:?} is larger than {} MiB", har::MAX_HAR >> 20)));
         }
         std::fs::read(source).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?
     };
@@ -660,8 +743,8 @@ impl Fetcher<'_> {
         };
         let head = parse_response_head(&ex.response)?;
         let body = decode_body(&head.headers, split_head_body(&ex.response).1);
-        if body.len() > apiimport::MAX_DOCUMENT {
-            return Err(Error::InvalidInput(format!("{url} returned more than {} MiB", apiimport::MAX_DOCUMENT >> 20)));
+        if body.len() > har::MAX_HAR {
+            return Err(Error::InvalidInput(format!("{url} returned more than {} MiB", har::MAX_HAR >> 20)));
         }
         let text = String::from_utf8_lossy(&body).into_owned();
         // GraphQL servers often answer errors with 200 or 400 + a JSON body; let the parser report those.

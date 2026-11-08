@@ -566,9 +566,11 @@ fn malformed_documents_are_refused_without_quoting_them() {
     let o = run(&p, &["scan", "active", &arg]);
     assert_eq!(o.code, 2, "{}", o.all);
     assert!(!o.all.contains("FAKE"), "{}", o.all);
+    // A HAR file is taken now (tests/har.rs); one with nothing in it builds nothing, and says so.
     let other = write_doc(&dir, "other.json", r#"{"log": {"entries": []}}"#);
-    let e = refused(&p, &["import", "api", "--dry-run", "--", &other], 2, "invalid_input");
-    assert!(e.contains("HAR"), "{e}");
+    let d = preview(&p, &other, &[]);
+    assert_eq!((d["format"].as_str(), d["built"].as_u64()), (Some("har"), Some(0)), "{d}");
+    assert!(d["warnings"].to_string().contains("no entries"), "{d}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

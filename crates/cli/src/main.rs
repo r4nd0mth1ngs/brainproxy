@@ -12,6 +12,7 @@ mod connection_cmd;
 mod crawl_cmd;
 mod engagement_cmd;
 mod fuzz_cmd;
+mod history_export;
 mod import_cmd;
 mod jobs_cmd;
 mod mcp;
@@ -336,6 +337,15 @@ enum HistoryCmd {
         #[arg(long, default_value_t = 65536)]
         max_body: usize,
     },
+    /// Export entries as a file another tool reads: HAR 1.2. Chosen as `history list` chooses
+    /// them (oldest first, up to --limit), with session secrets masked as in reports.
+    #[command(after_help = "Masked by default, as `report` masks them: cookie values, Authorization \
+        credentials, API-key headers, token and password parameters in URLs and bodies, JWTs, the project's \
+        auth profile secrets, and each such value wherever else it appears; bodies that aren't text are left \
+        out (they can't be searched). --no-redact keeps everything as recorded, binary bodies as base64. Each \
+        entry's `_brainproxy` holds its history id and source. Without --output the HAR is printed (in JSON \
+        mode, under `data.har`). `import har` reads the file back, in this project or another.")]
+    Export(history_export::ExportArgs),
     /// Attach a note to an entry; omit TEXT to clear it.
     Note { id: i64, text: Option<String> },
     /// Add or remove tags on an entry.
@@ -421,6 +431,7 @@ fn command_name(cmd: &Cmd) -> String {
         },
         Cmd::History(HistoryCmd::List { .. }) => "history list",
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
+        Cmd::History(HistoryCmd::Export(_)) => "history export",
         Cmd::History(HistoryCmd::Note { .. }) => "history note",
         Cmd::History(HistoryCmd::Tag { .. }) => "history tag",
         Cmd::Proxy(c) => match c {
@@ -456,6 +467,7 @@ fn command_name(cmd: &Cmd) -> String {
             import_cmd::ImportCmd::Openapi(_) => "import openapi",
             import_cmd::ImportCmd::Postman(_) => "import postman",
             import_cmd::ImportCmd::Graphql(_) => "import graphql",
+            import_cmd::ImportCmd::Har(_) => "import har",
         },
         Cmd::Engagement(_) => "engagement",
         Cmd::Auth(c) => match c {
@@ -1011,8 +1023,12 @@ fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
 }
 
 fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
+    if let HistoryCmd::Export(a) = cmd {
+        return history_export::export(project, a, out);
+    }
     let store = Store::open(project)?;
     match cmd {
+        HistoryCmd::Export(_) => unreachable!("handled above"),
         HistoryCmd::List { host, method, status, source, tag, origin, contains, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,

@@ -17,6 +17,7 @@ pub mod error;
 pub mod fetch;
 pub mod fuzz;
 pub mod guard;
+pub mod har_export;
 pub mod http;
 pub mod jobs;
 pub mod oauth;

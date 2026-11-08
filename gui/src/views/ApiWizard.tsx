@@ -95,7 +95,7 @@ import {
 import { signerAddArgs, signerLabel, signerProblems, type SessionRule, type Signer, type SignerForm } from "./sessionRules";
 import { DEPTHS, attacksPaths, type Depth } from "./wizardDepths";
 
-const FILTERS = [{ name: "API definition", extensions: ["json", "yaml", "yml", "graphql", "graphqls", "gql"] }];
+const FILTERS = [{ name: "API definition", extensions: ["json", "yaml", "yml", "graphql", "graphqls", "gql", "har"] }];
 const ENVIRONMENT_FILTERS = [{ name: "Postman environment", extensions: ["json"] }];
 
 /** A file's path; null if cancelled. */
