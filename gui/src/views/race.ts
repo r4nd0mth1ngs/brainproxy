@@ -1,4 +1,4 @@
-// Replay's Race: `send --race N` with the tab's request, and its results. No DOM, so it can be
+// Replay's Race: `send --race N [--also FILE]` with the tabs' requests and results. No DOM, so it can be
 // tested on its own (race.test.ts).
 
 import { autoEncodeRequest } from "../ui/urlencode.ts";
@@ -8,12 +8,15 @@ import { optionArgs, type ReplayOptions } from "./replayOptions.ts";
  * One request of a race, as `send --race` returns it: a response, or why it failed. `id` is the
  * history row that records either (null with --no-store).
  */
-export type RaceItem =
+export type RaceItem = { request?: number; request_line?: string } & (
   | { id: number | null; status: number | null; length: number | null; duration_ms: number }
-  | { id?: number | null; error: string; kind: string };
+  | { id?: number | null; error: string; kind: string }
+);
 
 export interface RaceResult {
   race: number;
+  total?: number;
+  requests?: { index: number; request_line: string }[];
   /** Every row the race recorded is tagged `race:<race_id>`. */
   race_id?: string;
   /** The technique: "last-byte" (HTTP/1.1) or "single-packet" (HTTP/2). */
@@ -176,8 +179,8 @@ export function raceSummary(r: RaceResult): RaceSummary {
 
 /** A note when a single-packet race couldn't put every final frame in the one packet. */
 export function syncNote(r: RaceResult): string | null {
-  if (r.sync !== "single-packet" || r.synced == null || r.synced >= r.results.length) return null;
-  return `${r.synced} of ${r.results.length} final frames went in the single packet; the rest were sent separately`;
+  if (r.sync !== "single-packet" || r.synced == null || r.synced >= (r.total ?? r.results.length)) return null;
+  return `${r.synced} of ${r.total ?? r.results.length} final frames went in the single packet; the rest were sent separately`;
 }
 
 /** Whether a row has a recorded response to open with `history show` (a failure has only its error). */
@@ -200,4 +203,34 @@ export interface Raced {
  */
 export function patchOpen<T extends { race?: Raced }>(list: T[], result: RaceResult, idx: number, patch: Partial<T>): T[] {
   return list.map((e) => (e.race?.result === result && e.race.open === idx ? { ...e, ...patch } : e));
+}
+
+/** Additional requests are staged privately by the shell; only file paths enter argv. */
+export function raceGroupArgs(target: string, n: number, additional: number, options?: Partial<ReplayOptions>): string[] {
+  const args = raceArgs(target, n, options);
+  args.splice(args.length - 1, 0, ...Array.from({ length: additional }, (_, i) => `--also=@request:${i}`));
+  return args;
+}
+
+/** Counts are per member; HTTP/2 on any member puts the entire group on one connection. */
+export function groupRaceMax(raw: string[], http2 = false): number {
+  const limit = raw.some((r) => racesHttp2(r, http2)) ? RACE_MAX_HTTP2 : RACE_MAX;
+  return Math.floor(limit / Math.max(1, raw.length));
+}
+
+export function parseGroupRaceCount(text: string, raw: string[], http2 = false): number | null {
+  if (!/^\s*\d+\s*$/.test(text)) return null;
+  const n = Number(text);
+  return n >= (raw.length > 1 ? 1 : RACE_MIN) && n <= groupRaceMax(raw, http2) ? n : null;
+}
+
+/** One tab's results, so comparisons and response selection stay within that request. */
+export function raceResultForRequest(result: RaceResult, request: number): RaceResult {
+  const results = result.results.filter((r) => (r.request ?? 0) === request);
+  const distinct: Record<string, number> = {};
+  for (const item of results) {
+    const key = isRaceError(item) ? `error: ${item.kind}` : `${item.status ?? 0} ${item.length ?? 0}B`;
+    distinct[key] = (distinct[key] ?? 0) + 1;
+  }
+  return { ...result, results, distinct_responses: distinct };
 }

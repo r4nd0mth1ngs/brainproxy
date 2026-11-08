@@ -11,13 +11,15 @@ import { activeLabels, curlOptions, optionsProblem, requestToSend, sendArgs, sen
 import {
   firstOpenable,
   openable,
-  parseRaceCount,
   patchOpen,
   plannedTechnique,
   RACE_MAX_HTTP2,
   RACE_MIN,
-  raceArgs,
-  raceMax,
+  raceGroupArgs,
+  raceResultForRequest,
+  parseGroupRaceCount,
+  groupRaceMax,
+  racesHttp2,
   raceRows,
   raceSummary,
   sentRequestLine,
@@ -67,8 +69,10 @@ export function RepeaterView() {
   const app = useApp();
   const tabs = app.repeater;
   const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
+  const [raceSelected, setRaceSelected] = useState<number[]>([]);
   const [pasting, setPasting] = useState(false);
   const curlButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => setRaceSelected([]), [app.project]);
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
@@ -77,6 +81,7 @@ export function RepeaterView() {
     const q = closeQuestion(key);
     if (q && !(await confirm(q.title, q.message, "Stop and close", "Keep open"))) return;
     forgetTab(key, cancelCli);
+    setRaceSelected((keys) => keys.filter((k) => k !== key));
     app.setRepeater((ts) => ts.filter((t) => t.key !== key));
     if (key === active?.key) {
       const rest = tabs.filter((t) => t.key !== key);
@@ -88,25 +93,35 @@ export function RepeaterView() {
     <div className="col fill">
       <div className="subtabs">
         {tabs.map((t) => (
-          <button
-            key={t.key}
-            className={t.key === active?.key ? "on" : ""}
-            title={activeLabels(t.options, t.ws ? "ws" : "http").join(", ") || undefined}
-            onClick={() => app.setRepeaterActive(t.key)}
-            onAuxClick={(e) => e.button === 1 && closeTab(t.key)}
-          >
-            {t.title}
-            <span
-              className="x"
-              title="Close"
-              onClick={(e) => {
-                e.stopPropagation();
-                closeTab(t.key);
-              }}
+          <span key={t.key} style={{ display: "inline-flex", alignItems: "center" }}>
+            {!t.ws && (
+              <input
+                type="checkbox"
+                aria-label={`Include ${t.title} in race`}
+                title="Race this tab with the active tab, using the active tab's options"
+                checked={raceSelected.includes(t.key)}
+                onChange={(e) => setRaceSelected((keys) => e.target.checked ? [...keys, t.key] : keys.filter((k) => k !== t.key))}
+              />
+            )}
+            <button
+              className={t.key === active?.key ? "on" : ""}
+              title={activeLabels(t.options, t.ws ? "ws" : "http").join(", ") || undefined}
+              onClick={() => app.setRepeaterActive(t.key)}
+              onAuxClick={(e) => e.button === 1 && closeTab(t.key)}
             >
-              ×
-            </span>
-          </button>
+              {t.title}
+              <span
+                className="x"
+                title="Close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeTab(t.key);
+                }}
+              >
+                ×
+              </span>
+            </button>
+          </span>
         ))}
         <button onClick={newTab} title="New tab">
           +
@@ -120,7 +135,7 @@ export function RepeaterView() {
       </div>
       {active ? (
         // key: each tab has its own editor state and send history.
-        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} />
+        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} raceSelected={raceSelected} />
       ) : (
         <div className="blank">
           <p>Send a request here from Traffic (right-click → Send to Replay, or double-click), or</p>
@@ -165,7 +180,7 @@ function storedAutoEncode(): boolean {
 // can run for a while: coming back to its tab shows it still running.
 const sentByTab = tabSlot<{ list: Sent[]; at: number }>({ list: [], at: -1 });
 
-function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
+function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected: number[] }) {
   const app = useApp();
   // Pinned to this project: another may be open by the time a send or race ends.
   const { project } = app;
@@ -244,14 +259,33 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     copyAsCurl(requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, withScheme(guessTarget(raw, target)), tab.binary, app.toast, curlOptions(options));
   };
 
+  // The active tab is primary; checked HTTP tabs follow it in tab order.
+  const raceTabs = [tab, ...app.repeater.filter((t) => t.key !== tab.key && !t.ws && raceSelected.includes(t.key))];
+  const groupLines = raceTabs.map((t) => sentRequestLine(t.key === tab.key ? raw : t.raw, autoEncode && !sendsAsTyped(options)));
+  const groupMax = groupRaceMax(groupLines, options.http2);
+  const groupHttp2 = groupLines.some((line) => racesHttp2(line, options.http2));
   const race = async () => {
-    // The limit depends on HTTP/2 (the option, or the request line as sent, after auto
-    // URL-encoding), which makes it a single-packet race.
-    const { text: sent, encoded } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
-    const n = parseRaceCount(raceCount, sent, options.http2);
-    if (n == null) return app.toast(`Race takes ${RACE_MIN} to ${raceMax(sent, options.http2)} requests (${plannedTechnique(sent, options.http2)})`, "error");
-    const to = withScheme(guessTarget(raw, target));
-    if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
+    const members = raceTabs.map((t) => {
+      const source = t.key === tab.key ? raw : t.raw;
+      return {
+        tab: t,
+        raw: source,
+        to: withScheme(guessTarget(source, t.key === tab.key ? target : t.target)),
+        ...requestToSend(source, { binary: t.binary, autoEncode, options }),
+      };
+    });
+    const n = parseGroupRaceCount(raceCount, members.map((m) => m.text), options.http2);
+    if (n == null) return app.toast(`Race takes ${members.length > 1 ? 1 : RACE_MIN} to ${groupMax} copies per tab`, "error");
+    const to = members[0].to;
+    if (!to || members.some((m) => !m.to)) return app.toast("Set a target (scheme://host[:port]) or a Host header for every tab", "error");
+    try {
+      const origin = new URL(to).origin;
+      const other = members.find((m) => new URL(m.to).origin !== origin);
+      if (other) return app.toast(`Race tabs must have the same origin: ${origin} and ${new URL(other.to).origin}`, "error");
+    } catch {
+      return app.toast("Set a valid target for every tab", "error");
+    }
+    if (members.some((m) => replayCalls.get(m.tab.key) != null)) return app.toast("A selected tab already has a send running", "error");
     const problem = optionsProblem(options);
     if (problem) return app.toast(problem, "error");
     setTarget(to);
@@ -261,22 +295,35 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
       /* storage unavailable */
     }
     const labels = activeLabels(options, "http");
-    const key = tab.key;
-    const id = beginCall(key, "replay-race");
-    let entry: Sent;
+    const id = beginCall(tab.key, "replay-race");
+    for (const member of members.slice(1)) replayCalls.update(member.tab.key, () => id);
+    let result: RaceResult | null = null;
+    let error: string | null = null;
     try {
-      const result = await run<RaceResult>(raceArgs(to, n, options), { stdin: textBytes(sent, tab.binary), call: id, project });
-      entry = { raw, sent, encoded, labels, result: null, error: null, race: { result, open: null } };
+      result = await run<RaceResult>(raceGroupArgs(to, n, members.length - 1, options), {
+        stdin: textBytes(members[0].text, tab.binary),
+        requestFiles: members.slice(1).map((m) => textBytes(m.text, m.tab.binary)),
+        call: id,
+        project,
+      });
     } catch (e: any) {
-      entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "race") };
+      error = failureText(e, "race");
+      // A failed HTTP/2 connection still reports every member's recorded failure.
+      if (Array.isArray(e.data?.results)) result = e.data as RaceResult;
     }
-    // The tab or the project closed while it ran: nothing to show the response in.
-    if (!endCall(key, id)) return;
-    sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
-    if (entry.race) {
-      const first = firstOpenable(raceRows(entry.race.result));
-      if (first != null) openRaced(first, entry.race.result);
-    }
+    members.forEach((member, index) => {
+      if (!endCall(member.tab.key, id)) return;
+      const perTab = result ? raceResultForRequest(result, index) : null;
+      const entry: Sent = {
+        raw: member.raw, sent: member.text, encoded: member.encoded, labels,
+        result: null, error, ...(perTab ? { race: { result: perTab, open: null } } : {}),
+      };
+      sentByTab.update(member.tab.key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
+      if (member.tab.key === tab.key && perTab) {
+        const first = firstOpenable(raceRows(perTab));
+        if (first != null) openRaced(first, perTab);
+      }
+    });
   };
 
   // Opens one raced response in the response pane (`history show`). The race's entry is found by
@@ -360,13 +407,13 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         )}
         <div
           className="race-ctl"
-          title={`Send the request ${raceCount || "N"} times at once, with the tab's options, to look for race conditions: ${plannedTechnique(line, options.http2)}. HTTP/2 (the option, or a request line ending in HTTP/2) uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}
+          title={`Send each of ${raceTabs.length} tabs ${raceCount || "N"} times at once, with the active tab's options, to look for race conditions: ${plannedTechnique(line, groupHttp2)}. HTTP/2 (the option, or a request line ending in HTTP/2) uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}
         >
           <button className="btn" disabled={busy} onClick={race}>
-            {racing ? "Racing…" : "Race"}
+            {racing ? "Racing…" : raceTabs.length > 1 ? `Race ${raceTabs.length} tabs` : "Race"}
           </button>
           <span className="label">×</span>
-          <input className="input mono" type="number" aria-label="Race count" min={RACE_MIN} max={raceMax(line, options.http2)} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+          <input className="input mono" type="number" aria-label="Race count" min={raceTabs.length > 1 ? 1 : RACE_MIN} max={groupMax} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
         </div>
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">

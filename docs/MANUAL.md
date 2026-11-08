@@ -477,7 +477,16 @@ Edit a raw request and send it as often as you like, in separate tabs.
     and path, without the query string, headers, bodies or response. Agents can't use it
     through MCP.
 - **Race:** set how many copies to send (2 to 1000) and click **Race** to send the request
-  that many times at once, to look for race conditions such as a coupon redeemed twice. Over
+  that many times at once, to look for race conditions such as a coupon redeemed twice.
+  To race different requests together (for example apply coupon and checkout), tick the
+  checkboxes beside other HTTP tab titles, then click **Race G tabs** in the active tab.
+  The active tab is always the primary, followed by the checked tabs in tab order. All must
+  have the same origin (scheme, host and port); a mismatch is refused before sending.
+  The active tab's send options apply to every member. The count is copies **per tab**:
+  G tabs × N copies produces G*N requests, with all copies of the primary first, then each
+  other tab. Groups allow N=1; the total is at most 1000 (100 for HTTP/2), and the file
+  descriptor budget also applies to the total. Results appear separately in each tab and
+  compare copies of that tab's request. **Stop** in any participating tab stops the group. Over
   HTTP/1.1 each copy gets its own connection and the last byte of every copy is released
   together (last-byte sync). With **HTTP/2** on in the tab's Options, or a request line ending
   in `HTTP/2`, all copies go on one connection and their final frames leave in a single packet
@@ -495,7 +504,8 @@ Edit a raw request and send it as often as you like, in separate tabs.
   (or closing the tab) leaves them all in history as one race, marked cancelled (on Windows,
   with `sent; no response recorded`). You can switch tabs while a race runs; its results show
   up in its tab when it ends (not if you close the project first). The same as
-  `brainproxy send req.http --race 20` with the tab's options as flags (`--http2`, `--sni`,
+  `brainproxy send req.http --also checkout.http --race 20` for a two-tab group (omit
+  `--also` for one tab), with the active tab's options as flags (`--http2`, `--sni`,
   `--timeout`, `--verify-tls`, `--no-store`).
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
@@ -1014,6 +1024,8 @@ brainproxy proxy start                       # 127.0.0.1:8080, prints how to tru
 brainproxy browser open --browser chrome https://app.acme.test/
 
 brainproxy send --url https://app.acme.test/search?q=test
+brainproxy send coupon.http --also checkout.http          # race each request once
+brainproxy send coupon.http --also checkout.http --race 5 # 2*5 = 10 requests
 brainproxy crawl https://app.acme.test/ --background
 brainproxy scan active https://app.acme.test/ --crawl --checks nuclei --check-severity high \
     --check-include-tags eol --background     # plus the end-of-life checks (rated info)
@@ -1050,6 +1062,35 @@ brainproxy scan active https://app.acme.test/account --auth app
 brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe while in use; never overwrites
 brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
 ```
+
+### Racing different requests (`send --also`)
+
+`send PRIMARY --also FILE [--also FILE ...] --race N` races a group of different raw HTTP
+requests. The primary can also be stdin (`-`, or no file) or `--url`. `--also` is repeatable;
+`--also -` reads stdin, but only one group member may read stdin. With `--also`, `--race`
+defaults to 1. N is copies per member: G members produce G*N results, in blocking order
+(all N copies of the primary, then all N copies of the first `--also`, and so on).
+
+Every member uses the same send options, header edits, SNI and auth profile. Additional raw
+requests inherit the primary target's scheme and infer their host/port from their Host header;
+an explicit `--target` overrides the destination for every member. All resolved targets must
+have the same origin (scheme + host + port). Scope, SNI and MCP Host-header opt-in checks run
+for the entire group before session preparation or sending. A request whose Host deliberately
+names an unlisted host still needs `--host-header-test` through MCP, even with `--target`.
+
+HTTP/1.1 uses one connection per copy and last-byte sync; if `--http2` is set or **any**
+member's request line says `HTTP/2`, the whole group uses the single HTTP/2 connection and
+single-packet sync. The total must be at most 1000, at most 100 for single-packet sync,
+and fit the open-file budget for last-byte sync. Counts and the whole group are checked
+before sending, including any auth login.
+
+JSON keeps `race` as the per-member count, `race_id`, `sync`, `synced`, `target`,
+`distinct_responses`, `results` and `hint`. Each result adds a zero-based `request` index
+and `request_line`, including failures. For multiple members, `requests` lists
+`{index, request_line}` and `total` is G*N. `race-pos:I/N` tags count positions across that
+full list. The text summary lists each member and its history rows. Different members may
+normally return different statuses or lengths: compare copies within one request index.
+The flag is also available on the MCP `send` tool and in `capabilities send`.
 
 ### Who recorded what
 
