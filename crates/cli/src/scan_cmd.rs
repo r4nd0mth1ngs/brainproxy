@@ -109,7 +109,7 @@ pub enum FindingsCmd {
     /// Compare findings with a baseline (new, unchanged, fixed) and optionally fail on a risk (exit code 5).
     #[command(
         after_help = "The baseline is a file (`report json --state all --no-evidence`), a background active scan of this project (--scan), or nothing, when every finding is new. Findings \
-        match by alert, method, URL without its query, and parameter. A false-positive or accepted-risk mark on either side stays \
+        match by alert, method, URL without its query or path parameters, and parameter. A false-positive or accepted-risk mark on either side stays \
         with the finding. Findings added by hand are outside every --scan (no scan looks for them); against a \
         file they compare like any other. Exit codes: 5 when --fail-on finds something; 4 when the baseline, project, or job \
         doesn't exist (--allow-missing-baseline treats a missing baseline file as empty); 2 for a baseline that \
@@ -200,7 +200,7 @@ pub enum FindingsCmd {
         list of findings: [{\"alert_ref\": \"40018\", \"url\": \"https://a.test/item\", \"method\": \"GET\", \
         \"param\": \"id\", \"state\": \"false_positive\", \"note\": \"why\"}] (method GET, param empty \
         and state false_positive when left out; the note is for the list's readers). Findings match as \
-        `findings compare` matches them: alert, method, URL without its query, and parameter (a \
+        `findings compare` matches them: alert, method, URL without its query or path parameters, and parameter (a \
         report's fingerprint when it has one, so a redacted report still matches). Each match gets \
         --state when given, else the file's mark where it is confirmed, false_positive or \
         accepted_risk. Removed findings are left as they are. Refused through MCP: an agent marks \
@@ -226,7 +226,7 @@ pub enum FindingsCmd {
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
         description and solution: leaving one out keeps the type's, and one that differs from it is refused \
         (kind conflict) unless --replace-text, which keeps the earlier text (findings show lists it in \
-        replaced_texts). The same title, method, URL without its query, and parameter as an existing finding \
+        replaced_texts). The same title, method, URL without its query or path parameters, and parameter as an existing finding \
         is refused (kind conflict). Without --url, the URL and method are the first --history-id entry's; a \
         linked entry on another host or port is warned about. The first linked entry is the report's \
         evidence. Through MCP, the *-file flags only take '-' (the call's stdin) and --replace-text is \
@@ -622,7 +622,7 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
             if !sources.is_empty() {
                 // A retest's reply is read by the finding's own rule only: a background scan of
                 // it would reopen a finding a retest recorded without marking.
-                if sources.iter().any(|s| s == "retest") {
+                if sources.iter().any(|s| s == passive::RETEST_SOURCE) {
                     return Err(Error::InvalidInput(
                         "retest traffic can't be a passive source: a retest reads its own reply".into(),
                     ));

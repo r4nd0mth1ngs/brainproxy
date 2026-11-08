@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::scan::findings_db::MANUAL_SOURCE;
+use crate::scan::findings_db::{identity_url, MANUAL_SOURCE};
 use crate::scan::issues::{record, Event};
 use crate::store::Store;
 
@@ -273,21 +273,18 @@ impl Store {
     }
 
     /// Whether an agent added, changed or sent a request to any of `ids`: those it did. A
-    /// request counts when it went to the finding's own method and URL (any query): history
-    /// keeps every one, where the finding keeps only its latest sighting.
+    /// request counts when it went to the finding's own method and address (its URL as the
+    /// finding's identity sees it: any query, any session id in the path): history keeps every
+    /// one, where the finding keeps only its latest sighting.
     pub fn agent_touched(&self, ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
         use std::collections::HashSet;
         let list = serde_json::to_string(ids).unwrap_or_default();
-        let base = |col: &str| {
-            format!("CASE WHEN instr({col}, '?') > 0 THEN substr({col}, 1, instr({col}, '?') - 1) ELSE {col} END")
-        };
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT f.id, f.host, f.method, {}, (f.origin = 'mcp' AND f.source = 'manual')
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.host, f.method, f.url, (f.origin = 'mcp' AND f.source = 'manual')
                 OR EXISTS (SELECT 1 FROM finding_events e WHERE e.origin = 'mcp' AND e.kind NOT IN ('created', 'regressed')
                     AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id)))
              FROM findings f WHERE f.id IN (SELECT value FROM json_each(?1))",
-            base("f.url")
-        ))?;
+        )?;
         type Row = (i64, String, String, String, bool);
         let found: Vec<Row> = stmt
             .query_map([list], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
@@ -297,13 +294,20 @@ impl Store {
             return Ok(touched);
         }
         // The addresses the agent sent requests to, read once rather than once per finding.
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT DISTINCT host, method, {} FROM history WHERE origin = 'mcp'", base("url")))?;
-        let sent: HashSet<(String, String, String)> =
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
-        touched
-            .extend(found.into_iter().filter(|f| sent.contains(&(f.1.clone(), f.2.clone(), f.3.clone()))).map(|f| f.0));
+        let mut stmt = self.conn.prepare("SELECT DISTINCT host, method, url FROM history WHERE origin = 'mcp'")?;
+        let mut sent: HashSet<(String, String, String)> = HashSet::new();
+        for row in
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        {
+            let (host, method, url) = row?;
+            sent.insert((host, method, identity_url(&url).into_owned()));
+        }
+        touched.extend(
+            found
+                .into_iter()
+                .filter(|f| sent.contains(&(f.1.clone(), f.2.clone(), identity_url(&f.3).into_owned())))
+                .map(|f| f.0),
+        );
         Ok(touched)
     }
 
@@ -322,22 +326,24 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
-        // The agent's first and latest requests to the finding's own method and URL (any query).
-        let base = url.split('?').next().unwrap_or(&url).to_string();
-        let seen = |order: &str| -> Result<Option<String>> {
-            Ok(self
-                .conn
-                .query_row(
-                    &format!(
-                        "SELECT time FROM history WHERE origin = 'mcp' AND host = ?1 AND method = ?2
-                        AND (url = ?3 OR substr(url, 1, length(?3) + 1) = ?3 || '?') ORDER BY id {order} LIMIT 1"
-                    ),
-                    params![host, method, base],
-                    |r| r.get(0),
-                )
-                .optional()?)
-        };
-        let (first_seen, last_seen) = (seen("ASC")?, seen("DESC")?);
+        // The agent's first and latest requests to the finding's own method and address (any
+        // query, any session id in the path), in id order.
+        let address = identity_url(&url).into_owned();
+        let (mut first_seen, mut last_seen): (Option<String>, Option<String>) = (None, None);
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT time, url FROM history WHERE origin = 'mcp' AND host = ?1 AND method = ?2 ORDER BY id",
+            )?;
+            for row in
+                stmt.query_map(params![host, method], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (time, sent) = row?;
+                if identity_url(&sent) == address {
+                    first_seen.get_or_insert_with(|| time.clone());
+                    last_seen = Some(time);
+                }
+            }
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, time, kind, old, new, text, history_id, finding_id IS NULL FROM finding_events
              WHERE origin = 'mcp' AND kind NOT IN ('created', 'regressed')
@@ -551,6 +557,36 @@ mod tests {
         send(&mut s);
         passive::scan_pending(&mut s).unwrap();
         assert_ne!(s.finding_get(f).unwrap()["last_history_id"].as_i64(), Some(agent));
+        assert!(s.agent_touched(&[f]).unwrap().contains(&f));
+        let t = s.agent_trail(f).unwrap();
+        assert!(t.agent_involved && t.requests.iter().any(|r| r.history_id == agent), "{t:?}");
+    }
+
+    #[test]
+    fn an_agents_request_with_another_session_id_is_on_the_trail() {
+        let (mut s, _, _) = store();
+        let target = Target { scheme: "http".into(), host: "a.test".into(), port: 80 };
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        let send = |s: &mut Store, path: &str| {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: a.test\r\n\r\n");
+            let id = s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp), None, None)).unwrap();
+            passive::scan_pending(s).unwrap();
+            id
+        };
+        // A person's request finds it; the agent's, in another session, is the same finding.
+        send(&mut s, "/login;jsessionid=A");
+        let agent = send(&mut s, "/login;jsessionid=B?next=1");
+        s.conn.execute("UPDATE history SET origin = 'mcp' WHERE id = ?1", [agent]).unwrap();
+        let filter = crate::scan::findings_db::FindingFilter { alert_ref: Some("10037".into()), ..Default::default() };
+        let f = s
+            .findings_list(&filter, 100)
+            .unwrap()
+            .into_iter()
+            .find(|f| f["url"] == "http://a.test/login;jsessionid=A")
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(s.finding_get(f).unwrap()["hits"], 2);
         assert!(s.agent_touched(&[f]).unwrap().contains(&f));
         let t = s.agent_trail(f).unwrap();
         assert!(t.agent_involved && t.requests.iter().any(|r| r.history_id == agent), "{t:?}");

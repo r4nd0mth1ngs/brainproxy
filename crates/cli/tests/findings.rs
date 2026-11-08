@@ -93,6 +93,7 @@ fn issues_retests_and_the_timeline() {
     let issues = ok(&project, &["findings", "issues"]);
     let issue = issues["issues"].as_array().unwrap().iter().find(|i| i["alert_ref"] == "10037").unwrap().clone();
     assert_eq!((issue["instances"].as_i64(), issue["host"].as_str()), (Some(2), Some("127.0.0.1")), "{issue}");
+    assert_eq!(issue["hosts"][0], "127.0.0.1", "{issue}");
     let issue_id = issue["id"].as_i64().unwrap().to_string();
     let shown = ok(&project, &["findings", "issue", "show", &issue_id]);
     let ids: Vec<i64> = shown["findings"].as_array().unwrap().iter().map(|f| f["id"].as_i64().unwrap()).collect();
@@ -123,9 +124,15 @@ fn issues_retests_and_the_timeline() {
     let open = ok(&project, &["findings", "list", "--all"]);
     assert!(open["items"].as_array().unwrap().iter().all(|f| f["id"] != ids[0]));
     leak.store(true, Ordering::SeqCst);
+    // Nor is it a sighting: the finding is left exactly as it was.
+    let before = ok(&project, &["findings", "show", &a]);
     let r = ok(&project, &["findings", "retest", &a, "--no-mark"]);
     assert_eq!((r["outcome"].as_str(), r["state"].as_str()), (Some("still_present"), Some("fixed")), "{r}");
-    assert_eq!(ok(&project, &["findings", "show", &a])["state"], "fixed");
+    let after = ok(&project, &["findings", "show", &a]);
+    assert_eq!(
+        (after["state"].as_str(), &after["hits"], &after["last_history_id"]),
+        (Some("fixed"), &before["hits"], &before["last_history_id"])
+    );
     // A rule switched off can't tell, so the retest is refused rather than calling it fixed.
     ok(&project, &["scan", "disable", "10037"]);
     let (code, v) = run(&project, &["findings", "retest", &a]);

@@ -217,7 +217,7 @@ pub struct AlertGroup {
     /// The highest CVSS 4.0 score among its instances' issues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
-    /// Write-ups of its issues (one per host), reviewed or, when asked for, drafts.
+    /// Write-ups of its issues (usually one per host), reviewed or, when asked for, drafts.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub narratives: Vec<IssueNarrative>,
     pub instances: Vec<Instance>,
@@ -227,6 +227,8 @@ pub struct AlertGroup {
 #[derive(Debug, Clone, Serialize)]
 pub struct IssueNarrative {
     pub issue_id: i64,
+    /// The hosts of the issue's findings in the report, joined by ", " (several after issues
+    /// from two hosts were merged).
     pub host: String,
     #[serde(flatten)]
     pub narrative: Narrative,
@@ -296,11 +298,12 @@ pub struct Instance {
     /// With a `--scan`: new (first found by that scan) or unchanged (found before and again).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_state: Option<&'static str>,
-    /// What makes it the same finding in the project (alert, method, URL without its query,
-    /// parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
+    /// What makes it the same finding in the project (alert, method, URL without its query or
+    /// path parameters, parameter), hashed before redaction: SARIF's fingerprint, and what `findings compare`
     /// matches a saved report by, since redaction may change the URL.
     pub fingerprint: String,
-    /// The issue (alert type and host) it is an instance of, and that issue's CVSS rating.
+    /// The issue (alert type and host, or hosts once merged) it is an instance of, and that
+    /// issue's CVSS rating.
     pub issue_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
@@ -532,11 +535,24 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     let touched = store.agent_touched(&ids)?;
     let mut tickets = store.findings_tickets(&ids)?;
     for g in &mut groups {
+        // An issue merged from several hosts holds findings of each: its write-up names them
+        // all, not the host of whichever finding comes first.
+        let mut hosts: std::collections::BTreeMap<i64, std::collections::BTreeSet<String>> = Default::default();
+        for inst in &g.instances {
+            if let Some(issue) = inst.issue_id {
+                hosts.entry(issue).or_default().insert(inst.host.clone());
+            }
+        }
         let mut seen = std::collections::BTreeSet::new();
         for inst in &mut g.instances {
             if let Some(issue) = inst.issue_id.filter(|i| seen.insert(*i)) {
                 if let Some(n) = store.issue_narrative(issue)?.filter(|n| n.reviewed() || opts.drafts) {
-                    g.narratives.push(IssueNarrative { issue_id: issue, host: inst.host.clone(), narrative: n });
+                    let host = hosts.get(&issue).map(|h| h.iter().cloned().collect::<Vec<_>>().join(", "));
+                    g.narratives.push(IssueNarrative {
+                        issue_id: issue,
+                        host: host.unwrap_or_else(|| inst.host.clone()),
+                        narrative: n,
+                    });
                 }
             }
             let trail = if touched.contains(&inst.id) { Some(store.agent_trail(inst.id)?) } else { None };
@@ -2486,8 +2502,9 @@ fn sarif(r: &Report) -> Value {
                 "message": {"text": msg},
                 "locations": [{"physicalLocation": {"artifactLocation": {"uri": inst.url.replace(crate::scan::redact::MASK, "%5Bredacted%5D")}}}],
                 // The project's own dedup key, so a finding seen again with another query string
-                // is the same result to code scanning, as it is to brainproxy.
-                "partialFingerprints": {"brainproxy/v2": inst.fingerprint},
+                // or session id in its path is the same result to code scanning, as it is to
+                // brainproxy. v3 since the key dropped path parameters (v2 kept them).
+                "partialFingerprints": {"brainproxy/v3": inst.fingerprint},
                 "properties": {
                     "findingId": inst.id,
                     "source": inst.source,
@@ -2674,8 +2691,8 @@ mod tests {
         // The SARIF fingerprint is the project's dedup key, hashed: no URL, so no secret in it.
         let sarif: Value = serde_json::from_str(&render(&r, ReportKind::Sarif)).unwrap();
         let res = sarif["runs"][0]["results"].as_array().unwrap().iter().find(|x| x["ruleId"] == "10037").unwrap();
-        assert_eq!(res["partialFingerprints"]["brainproxy/v2"], fingerprint("10037", "GET", "http://app.test/a", ""));
-        assert_eq!(res["partialFingerprints"]["brainproxy/v2"].as_str().unwrap().len(), 32);
+        assert_eq!(res["partialFingerprints"]["brainproxy/v3"], fingerprint("10037", "GET", "http://app.test/a", ""));
+        assert_eq!(res["partialFingerprints"]["brainproxy/v3"].as_str().unwrap().len(), 32);
         assert_eq!(res["properties"]["lastHistoryId"], 2);
         assert!(res.get("baselineState").is_none());
 
@@ -3419,5 +3436,27 @@ mod tests {
         let g = r.alerts.iter().find(|g| g.alert_ref == "manual:order-idor").unwrap();
         assert_eq!(g.instances[0].state, "removed");
         assert!(render(&r, ReportKind::Html).contains("<span class=\"tag\">removed from the command line</span>"));
+    }
+
+    #[test]
+    fn a_merged_issue_s_write_up_names_every_host() {
+        let mut s = Store::open_in_memory().unwrap();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        for host in ["a.test", "b.test"] {
+            let target = Target { scheme: "http".into(), host: host.into(), port: 80 };
+            let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp), None, None)).unwrap();
+        }
+        passive::scan_pending(&mut s).unwrap();
+        let filter = FindingFilter { alert_ref: Some("10037".into()), ..Default::default() };
+        let issues = s.issues_list(&filter, 10).unwrap();
+        let id = |host: &str| issues.iter().find(|i| i["host"] == host).unwrap()["id"].as_i64().unwrap();
+        let (a, b) = (id("a.test"), id("b.test"));
+        s.issues_merge(a, &[b]).unwrap();
+        s.issue_set_narrative(a, "PHP's version is in every reply.").unwrap();
+        let r = build(&s, &ReportOptions { filter, drafts: true, ..Default::default() }).unwrap();
+        let g = r.alerts.iter().find(|g| g.alert_ref == "10037").unwrap();
+        assert_eq!(g.narratives.len(), 1);
+        assert_eq!(g.narratives[0].host, "a.test, b.test");
     }
 }
