@@ -172,9 +172,13 @@ in the engagement scope (on the target's port, or with no port) is foreign. So i
 target other than a path, `*` or a URL naming a listed host (a URL holding a `\` counts, since
 servers read it differently), a request line that isn't three tokens separated by single
 spaces (a space in the path or an HTTP/0.9 line counts too), a bare CR or LF in the head, and a
-second request after the body its framing (Content-Length or chunked) says. `send` (races too)
-and `ws send` warn about a foreign host in the output's `host_warning`, and on stderr in text
-mode; so does `fuzz run` for its template.
+second request after the body its framing (Content-Length or chunked) says (with no framing, a
+`--verbatim` body that starts with a request line is one, in any case), and framing servers may
+read differently: Content-Length headers that differ, or Content-Length with Transfer-Encoding.
+So request smuggling tests (CL.TE, TE.CL, a request after the body) are Host-header tests here:
+through MCP they need `--host-header-test`. `send` (races too) and `ws send` warn about a
+foreign host in the output's `host_warning`, and on stderr in text mode; so does `fuzz run` for
+its template.
 
 Through MCP a request with a foreign host is refused (`out_of_scope`) unless the command says
 the test is meant with `--host-header-test` (`send`, `fuzz run`, `ws send`, `scan active` for its
@@ -1093,7 +1097,9 @@ dropped it itself; `edited` says whether it was forwarded with a different messa
 row names the intercept in `edited_by`. A response edited at intercept, or changed by a
 response rule, is recorded in history as the server sent it; the intercept row has the
 edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
-enabled it. So do auth profiles (`auth show`: `profile.origin`, who last changed it), their
+enabled it. A request-line or request-header rule whose replacement holds a line break or NUL
+(saved by a build that didn't refuse one) is left out when the proxy loads its rules, and
+`rules list` (`skipped`) and `proxy status` (`rules_skipped`) say so. So do auth profiles (`auth show`: `profile.origin`, who last changed it), their
 session rules and macros (`origin`, who added one or last changed it; saving any of them
 unchanged, as the app's edit form does, keeps it), and their session: `session_origin` and `session_changed_at` say who last stored
 it (logged in, got an OAuth token, or the proxy or a scan that learnt its cookies). A rule id,

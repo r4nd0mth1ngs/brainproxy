@@ -130,6 +130,11 @@ impl SendOptions {
         if pipelined(&head, body) {
             odd.push("(a second request after the body)".to_string());
         }
+        if ambiguous_framing(&head) {
+            odd.push(
+                "(a body servers may frame differently: Content-Length twice, or with Transfer-Encoding)".to_string(),
+            );
+        }
         let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
         let line = lines.next().unwrap_or_default();
         let parts: Vec<&str> = line.split(' ').collect();
@@ -196,9 +201,27 @@ fn pipelined(head: &str, body: &[u8]) -> bool {
     let rest = String::from_utf8_lossy(rest);
     let line = rest.trim_start_matches(['\r', '\n']).split('\n').next().unwrap_or_default();
     let parts: Vec<&str> = line.trim_end_matches('\r').split_whitespace().collect();
+    // Servers match methods and versions case-insensitively often enough (`Get`, `http/1.1`).
     parts.len() >= 2
-        && parts[0].bytes().all(|b| b.is_ascii_uppercase())
-        && parts.last().is_some_and(|v| v.starts_with("HTTP/"))
+        && parts[0].bytes().all(|b| b.is_ascii_alphabetic())
+        && parts.last().is_some_and(|v| v.to_ascii_uppercase().starts_with("HTTP/"))
+}
+
+/// Whether servers may disagree on where `head`'s body ends: Content-Length headers that
+/// differ, or Content-Length with Transfer-Encoding. Either can hide a second request in the
+/// body (request smuggling) that [`pipelined`] can't see.
+fn ambiguous_framing(head: &str) -> bool {
+    let values = |n: &str| -> Vec<String> {
+        head.split('\n')
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.trim().to_string())
+            .collect()
+    };
+    let lengths = values("content-length");
+    let differ = lengths.iter().any(|l| l != &lengths[0]);
+    differ || (!lengths.is_empty() && !values("transfer-encoding").is_empty())
 }
 
 /// The host a Host header's value names, and its port when it gives one. A value that isn't
@@ -1119,6 +1142,17 @@ mod tests {
         let data =
             "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 34\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n";
         assert_eq!(foreign(data), None);
+        // A method in mixed case still reads as a request.
+        let lower =
+            "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 0\r\n\r\nGet /b http/1.1\r\nHost: e.test\r\n\r\n";
+        assert_eq!(foreign(lower).as_deref(), Some("(a second request after the body)"));
+        // Framing servers may read differently hides one from that check: it counts by itself.
+        for framing in ["Content-Length: 47\r\nContent-Length: 0", "Content-Length: 4\r\nTransfer-Encoding: chunked"] {
+            let raw = format!("POST /a HTTP/1.1\r\nHost: app.test\r\n{framing}\r\n\r\n0\r\n\r\n");
+            assert!(foreign(&raw).is_some_and(|h| h.contains("frame differently")), "{framing}");
+        }
+        let same = "POST /a HTTP/1.1\r\nHost: app.test\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab";
+        assert_eq!(foreign(same), None);
         // A value a setting puts in requests to come, whatever their target.
         let guard = opts.guard.as_deref();
         assert_eq!(unlisted_host(guard, " app.TEST:8443 "), None);

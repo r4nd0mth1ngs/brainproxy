@@ -181,9 +181,7 @@ pub struct CompiledRule {
 /// Checks a rule's pattern whether or not it is enabled: a bad one saved disabled would
 /// stop the proxy loading any settings once enabled.
 pub fn validate_rule(rule: &Rule) -> Result<()> {
-    // A line break in a request line or header would start another header (a Host, say).
-    let head = matches!(rule.location, RuleLocation::RequestLine | RuleLocation::RequestHeader);
-    if head && rule.replace.contains(['\r', '\n', '\0']) {
+    if breaks_head(rule) {
         return Err(Error::InvalidInput(
             "a request-line or request-header replacement can't hold a line break or NUL".into(),
         ));
@@ -191,10 +189,20 @@ pub fn validate_rule(rule: &Rule) -> Result<()> {
     compile_rules(std::slice::from_ref(&Rule { enabled: true, ..rule.clone() })).map(|_| ())
 }
 
+/// Whether `rule` would write a line break or NUL into a request line or header, which would start
+/// another header (a Host, say). Saving one is refused; one saved before that was checked is
+/// skipped when rules load (see [`compile_rules`]) and listed as skipped.
+pub fn breaks_head(rule: &Rule) -> bool {
+    let head = matches!(rule.location, RuleLocation::RequestLine | RuleLocation::RequestHeader);
+    head && rule.replace.contains(['\r', '\n', '\0'])
+}
+
+/// The enabled rules, compiled. One that [`breaks_head`] is left out rather than failing the
+/// load, so the proxy keeps the rest.
 pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
     rules
         .iter()
-        .filter(|r| r.enabled)
+        .filter(|r| r.enabled && !breaks_head(r))
         .map(|r| {
             let body = matches!(r.location, RuleLocation::RequestBody | RuleLocation::ResponseBody);
             let bad = |e: regex::Error| Error::InvalidInput(format!("rule {} pattern: {e}", r.id));
@@ -512,6 +520,13 @@ mod tests {
         }
         // A body can hold one.
         validate_rule(&rule(1, RuleLocation::RequestBody, "x", "a\r\nb")).unwrap();
+        // One saved before this was checked is left out when rules load; the others stay.
+        let saved = [
+            rule(1, RuleLocation::RequestHeader, "^X", "X-A: a\r\nHost: e"),
+            rule(2, RuleLocation::RequestHeader, "^X", "Y"),
+        ];
+        let compiled = compile_rules(&saved).unwrap();
+        assert_eq!(compiled.iter().map(|r| r.id).collect::<Vec<_>>(), [2]);
     }
 
     #[test]

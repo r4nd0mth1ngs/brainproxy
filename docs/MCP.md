@@ -146,11 +146,14 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - Any request whose Host header (HTTP/2's `:authority`) or request target names a host other
   than the target's that the engagement scope doesn't list by name, or whose request line or head
   a lenient server could read otherwise (odd spacing, a bare CR or LF, a second request after the
-  body), is refused (`out_of_scope`) as it goes on the wire, after a session or signer changed it;
+  body, including a `verbatim` body with no framing that starts with a request line, or framing
+  servers may read differently: Content-Length twice with different values, or with
+  Transfer-Encoding), is refused (`out_of_scope`) as it goes on the wire, after a session or signer changed it;
   `send` (races too), `fuzz_run` (also for payloads with raw line breaks into the head),
   `ws_send`, `scan_active` (for its base requests: a rule's own Host is its test),
   `auth_login`, `auth_status`, `auth_macro_run` and `intercept_forward` (for hosts an edit
-  brings in) send it when `host_header_test` is set. A proxy rule an agent added refuses the
+  brings in) send it when `host_header_test` is set, so request smuggling tests (CL.TE, TE.CL, a
+  request after the body) need it too. A proxy rule an agent added refuses the
   requests it gives a foreign Host unless `rules_add` (or `rules_enable`) had `host_header_test`. On a shared front end such
   a request to an in-scope address can reach a site outside the scope; a Host-header test needs
   one, so the flag puts the intent on record. The output's `host_warning` names the host either

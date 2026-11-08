@@ -882,12 +882,21 @@ impl Store {
         // The linked entries must exist; the first gives the URL and method when none are given.
         let mut first: Option<(String, String)> = None;
         for &id in &history {
-            let row: Option<(String, String)> = tx
-                .query_row("SELECT method, url FROM history WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            let row: Option<(String, String, Option<String>)> = tx
+                .query_row("SELECT method, url, error FROM history WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
                 .optional()?;
             match row {
-                Some(r) => {
-                    first.get_or_insert(r);
+                // A request refused for its scope (its Host, say) went nowhere, so it shows
+                // nothing, and a retest would send what was refused.
+                Some((_, _, Some(e))) if e.starts_with("out of scope") => {
+                    return Err(Error::OutOfScope(format!(
+                        "history entry {id} was refused for the scope when it was sent, so it can't be evidence"
+                    )))
+                }
+                Some((method, url, _)) => {
+                    first.get_or_insert((method, url));
                 }
                 None => return Err(Error::NotFound(format!("history entry {id}"))),
             }

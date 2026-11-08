@@ -986,6 +986,10 @@ fn scans_check_their_base_requests_and_heads_are_read_strictly() {
         "GET /a HTTP/1.1\r\nHost: app.test\r\nConnection: keep-alive\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
         "GET http://app.test\\@e.test/ HTTP/1.1\r\nHost: app.test\r\n\r\n",
         "GET / HTTP/1.1\r\nHost: app.test\r\nX: a\n\r\nHost: e.test\r\n\r\n",
+        // Framing servers read differently, and a second request whose method isn't upper case.
+        "POST /d HTTP/1.1\r\nHost: app.test\r\nContent-Length: 47\r\nContent-Length: 0\r\n\r\nGET /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
+        "POST /d HTTP/1.1\r\nHost: app.test\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nG",
+        "POST /l HTTP/1.1\r\nHost: app.test\r\nContent-Length: 0\r\n\r\nGet /b HTTP/1.1\r\nHost: e.test\r\n\r\n",
     ] {
         let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "verbatim": true}));
         assert!(err && e["error"]["kind"] == "out_of_scope", "{raw:?}: {e}");
@@ -1013,4 +1017,34 @@ fn scans_check_their_base_requests_and_heads_are_read_strictly() {
     assert!(err && e["error"]["message"].as_str().unwrap().contains("refused for the scope"), "{e}");
     let o = person(&["scan", "active", "--history-id", &refused.to_string(), "--rules", "40012"]);
     assert_eq!(o["error"]["kind"], "out_of_scope", "{o}");
+}
+
+#[test]
+fn an_api_scans_baselines_are_checked_with_the_agents_policy() {
+    let port = serve(500);
+    let project = tmp_project("host-api-scan");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1", "app.test"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let item = |name: &str, headers: Value| json!({"name": name, "request": {"method": "GET", "header": headers, "url": format!("{url}{name}?q=1")}});
+    let coll = json!({"info": {"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "item": [item("plain", json!([])), item("tenant", json!([{"key": "Host", "value": "e.test"}]))]});
+    let file = project.with_extension("coll.json");
+    std::fs::write(&file, coll.to_string()).unwrap();
+    // The item with the foreign Host isn't sent as a baseline (so isn't attacked); the other is.
+    let (err, e) = m.call("scan_active", json!({"api": file.to_str().unwrap(), "rules": ["40012"]}));
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["import"]["out_of_scope_hosts"], json!(["e.test"]), "{e}");
+    assert_eq!(e["data"]["import"]["sent"], 1, "{e}");
+    let (_, e) = m.call("query", json!({"sql": "SELECT count(*) FROM history WHERE url LIKE '%/tenant%'"}));
+    assert_eq!(e["data"]["rows"][0][0], 0, "{e}");
+    // A recorded row with a foreign Host shows in the scan's refused_hosts.
+    let raw = "GET /r HTTP/1.1\r\nHost: e.test\r\n\r\n";
+    let (err, e) = m.call("send", json!({"file": "-", "target": url, "stdin": raw, "host_header_test": true}));
+    assert!(!err, "{e}");
+    let id = e["data"]["id"].clone();
+    let (err, e) = m.call("scan_active", json!({"history_ids": [id], "rules": ["40012"]}));
+    assert!(!err && e["data"]["refused_hosts"] == json!(["e.test"]), "{e}");
 }
