@@ -487,6 +487,7 @@ impl Store {
         change: impl FnOnce(&T, &T) -> Vec<Part>,
     ) -> Result<T> {
         let by = crate::provenance::origin();
+        let name = key;
         let key = format!("setting.{key}");
         let tx = self.write_tx()?;
         let get = |k: &str| tx.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0));
@@ -506,6 +507,7 @@ impl Store {
         let set = "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
         tx.execute(set, params![key, json])?;
         tx.execute(set, params![CHANGES_KEY, log])?;
+        crate::store::log_setting_change(&tx, name)?;
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('settings_version', '1')
              ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",

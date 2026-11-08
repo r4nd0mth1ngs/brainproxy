@@ -14,6 +14,9 @@ use crate::http::{parse_response_head, RawRequest};
 
 pub const SCOPE_KEY: &str = "scope";
 pub const RULES_KEY: &str = "rules";
+/// The meta key of the last match-and-replace rule id handed out: an id is never used twice,
+/// so the `edited_by` of an old history row can't come to name another rule.
+pub const RULE_IDS: &str = "rule_ids";
 pub const INTERCEPT_KEY: &str = "intercept";
 pub const AUTHZ_KEY: &str = "authz";
 

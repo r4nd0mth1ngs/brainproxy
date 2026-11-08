@@ -75,6 +75,12 @@ pub const CONNECTION_COLUMNS: &[(&str, &str, &str)] = &[
         "TEXT",
         "Why recording stopped or missed messages (bad frame, over the size limit, recorder behind, proxy stopped)",
     ),
+    (
+        "origin",
+        "TEXT",
+        "gui, cli or mcp: who started the proxy or ws send that recorded it (as history.origin); NULL for \
+         connections from before brainproxy kept it",
+    ),
 ];
 
 pub const MESSAGE_COLUMNS: &[(&str, &str, &str)] = &[
@@ -222,8 +228,8 @@ fn insert_connection(
     let resp = crate::http::parse_response_head(crate::http::client::final_response(&capture.response)).ok();
     let header = |n: &str| resp.as_ref().and_then(|h| h.header(n)).map(str::to_string);
     conn.execute(
-        "INSERT INTO ws_connections (time, source, history_id, url, host, extensions, protocol)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO ws_connections (time, source, history_id, url, host, extensions, protocol, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             time,
             source,
@@ -231,7 +237,8 @@ fn insert_connection(
             url,
             capture.host,
             header("sec-websocket-extensions"),
-            header("sec-websocket-protocol")
+            header("sec-websocket-protocol"),
+            capture.origin.as_deref().unwrap_or(crate::provenance::origin())
         ],
     )?;
     Ok(conn.last_insert_rowid())

@@ -123,6 +123,10 @@ pub struct AuthProfile {
     /// OAuth 2.0 token requests in place of a login (see [`crate::oauth`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<crate::oauth::OAuth>,
+    /// Who saved it last: gui, cli or mcp (None: before brainproxy kept it), set when it is
+    /// saved. A proxied request its session goes on records this in `edited_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 fn post() -> String {
@@ -321,14 +325,15 @@ fn is_zero(n: &u64) -> bool {
 }
 
 impl Store {
-    /// Adds or replaces a profile (keeping no old session state).
+    /// Adds or replaces a profile (keeping no old session state), saved by this process's origin.
     pub fn auth_save_profile(&self, p: &AuthProfile) -> Result<()> {
         p.validate_with(&self.auth_handling(&p.name)?)?;
-        let json = serde_json::to_string(p).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let p = AuthProfile { origin: Some(crate::provenance::origin().to_string()), ..p.clone() };
+        let json = serde_json::to_string(&p).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO auth_profiles (name, profile, state) VALUES (?1, ?2, '{}')
-             ON CONFLICT(name) DO UPDATE SET profile = excluded.profile, state = '{}',
-                updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+             ON CONFLICT(name) DO UPDATE SET profile = excluded.profile, state = '{}', state_origin = NULL,
+                state_changed_at = NULL, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             params![p.name, json],
         )?;
         // Running proxies reload platform credentials with the settings.
@@ -348,13 +353,39 @@ impl Store {
         Ok((profile, state))
     }
 
+    /// Stores a profile's session (cookies, token, macro values) with who stored it: the
+    /// process that logged in, got the OAuth token or learnt the cookies.
     pub fn auth_save_state(&self, name: &str, state: &SessionState) -> Result<()> {
+        self.auth_keep_state(name, state, (Some(crate::provenance::origin().to_string()), None))
+    }
+
+    /// Stores a profile's session as stored earlier by `by` (who, and when: now when None), for
+    /// tokens kept across a change to the profile.
+    pub fn auth_keep_state(
+        &self,
+        name: &str,
+        state: &SessionState,
+        by: (Option<String>, Option<String>),
+    ) -> Result<()> {
         let json = serde_json::to_string(state).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
-            "UPDATE auth_profiles SET state = ?1, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE name = ?2",
-            params![json, name],
+            "UPDATE auth_profiles SET state = ?1, state_origin = ?3, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                state_changed_at = COALESCE(?4, strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE name = ?2",
+            params![json, name, by.0, by.1],
         )?;
         Ok(())
+    }
+
+    /// Who stored a profile's session last (gui, cli or mcp), and when; None until a session is
+    /// stored, and for one stored before brainproxy kept it.
+    pub fn auth_state_origin(&self, name: &str) -> Result<(Option<String>, Option<String>)> {
+        let row = self
+            .conn
+            .query_row("SELECT state_origin, state_changed_at FROM auth_profiles WHERE name = ?1", [name], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        row.ok_or_else(|| Error::NotFound(format!("auth profile {name:?}")))
     }
 
     pub fn auth_list(&self) -> Result<Vec<(AuthProfile, SessionState)>> {
@@ -1667,6 +1698,7 @@ mod tests {
             url: None,
             actions: vec![crate::session::Action::Login],
             invalid: None,
+            origin: None,
         };
         assert!(bare.validate_with(&crate::session::Handling { rules: vec![rule], ..Default::default() }).is_ok());
         let p = AuthProfile {

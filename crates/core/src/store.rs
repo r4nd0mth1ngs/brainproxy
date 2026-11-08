@@ -16,7 +16,9 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 18;
+/// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
+/// one started by an older build.
+pub const SCHEMA_VERSION: i64 = 19;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -90,6 +92,47 @@ ALTER TABLE findings ADD COLUMN note_origin TEXT;
 ALTER TABLE findings ADD COLUMN note_changed_at TEXT;
 ALTER TABLE intercepts ADD COLUMN resolved_by TEXT;
 ";
+
+/// Provenance, the rest: who started the job, fuzz run, authz run, WebSocket recording and OOB
+/// listener behind a row, who issued an OOB payload, who last stored a profile's session (a
+/// login, an OAuth token), who wrote a finding type's description and solution, and a log of
+/// who saved which setting.
+const SCHEMA_V19: &str = "
+ALTER TABLE jobs ADD COLUMN origin TEXT;
+ALTER TABLE fuzz_runs ADD COLUMN origin TEXT;
+ALTER TABLE authz_results ADD COLUMN origin TEXT;
+ALTER TABLE ws_connections ADD COLUMN origin TEXT;
+ALTER TABLE oob_payloads ADD COLUMN issued_by TEXT;
+ALTER TABLE oob_interactions ADD COLUMN origin TEXT;
+ALTER TABLE auth_profiles ADD COLUMN state_origin TEXT;
+ALTER TABLE auth_profiles ADD COLUMN state_changed_at TEXT;
+ALTER TABLE finding_types ADD COLUMN description_origin TEXT;
+ALTER TABLE finding_types ADD COLUMN solution_origin TEXT;
+CREATE TABLE IF NOT EXISTS setting_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), key TEXT NOT NULL, origin TEXT NOT NULL);
+";
+
+/// Column documentation for the log of setting changes.
+pub const SETTING_CHANGE_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Change id, increasing"),
+    ("time", "TEXT", "UTC time the setting was saved"),
+    (
+        "key",
+        "TEXT",
+        "The setting saved: scope, rules, intercept, connection, authz, ... (not its value, which can hold \
+         credentials)",
+    ),
+    ("origin", "TEXT", "gui, cli or mcp: who saved it"),
+];
+
+/// Logs that setting `key` was saved by this process's origin, on `conn` (inside the caller's
+/// transaction when it has one).
+pub(crate) fn log_setting_change(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting_changes (key, origin) VALUES (?1, ?2)",
+        params![key, crate::provenance::origin()],
+    )?;
+    Ok(())
+}
 
 /// Whether `table` has `column`.
 pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -179,6 +222,7 @@ pub const FUZZ_RUN_COLUMNS: &[(&str, &str, &str)] = &[
     ("errors", "INTEGER", "Requests that got no response"),
     ("config", "TEXT", "Run settings as JSON"),
     ("template", "BLOB", "Request template with payload markers"),
+    ("origin", "TEXT", "gui, cli or mcp: who started the run; NULL for runs from before brainproxy kept it"),
 ];
 
 pub const FUZZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -584,6 +628,9 @@ impl Store {
         if version < 18 {
             crate::scan::findings_db::rekey_v18(&self.conn)?;
         }
+        if version < 19 {
+            add_missing_columns(&self.conn, SCHEMA_V19)?;
+        }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -642,9 +689,18 @@ impl Store {
         template: &[u8],
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO fuzz_runs (state, mode, target, positions, total, config, template)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![state, mode, target, positions as i64, total as i64, config.to_string(), template],
+            "INSERT INTO fuzz_runs (state, mode, target, positions, total, config, template, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                state,
+                mode,
+                target,
+                positions as i64,
+                total as i64,
+                config.to_string(),
+                template,
+                crate::provenance::origin()
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -874,11 +930,28 @@ impl Store {
         }
     }
 
-    /// Writes a JSON setting and bumps the settings version so running proxies reload.
+    /// Writes a JSON setting, logs who saved it, and bumps the settings version so running
+    /// proxies reload.
     pub fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.meta_set(&format!("setting.{key}"), Some(&json))?;
+        log_setting_change(&self.conn, key)?;
         self.bump_settings_version()
+    }
+
+    /// The project's schema version: the one the newest build to open it migrated it to.
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
+    /// The next id from the counter in meta `key`, above `floor` (the highest id in use), so an
+    /// id is never handed out twice, even once what held it has been removed.
+    pub fn next_id(&mut self, key: &str, floor: u32) -> Result<u32> {
+        self.meta_update(key, |old| {
+            let last = old.and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).max(floor);
+            let next = last.checked_add(1).ok_or_else(|| Error::InvalidInput(format!("{key}: out of ids")))?;
+            Ok((Some(next.to_string()), next))
+        })
     }
 
     /// Makes running proxies reload their settings.
@@ -1602,6 +1675,71 @@ mod tests {
                 .unwrap();
             assert!(has, "{table}.{column}");
         }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_on_v18_gets_the_rest_of_the_provenance_columns() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v18-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        // A v18 project, with a job and a setting from before.
+        let conn = Connection::open(&path).unwrap();
+        let undo: String = SCHEMA_V19
+            .lines()
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                match w[..] {
+                    ["ALTER", "TABLE", t, "ADD", "COLUMN", c, ..] => Some(format!("ALTER TABLE {t} DROP COLUMN {c};")),
+                    _ => None,
+                }
+            })
+            .collect();
+        conn.execute_batch(&format!(
+            "{undo} DROP TABLE setting_changes;
+             INSERT INTO jobs (kind, state) VALUES ('crawl', 'completed');
+             PRAGMA user_version = 18;"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        for line in SCHEMA_V19.lines() {
+            if let ["ALTER", "TABLE", table, "ADD", "COLUMN", column, ..] =
+                line.split_whitespace().collect::<Vec<_>>()[..]
+            {
+                assert!(has_column(&store.conn, table, column).unwrap(), "{table}.{column}");
+            }
+        }
+        // The old job's origin is unknown; a new one's is this process's.
+        let new = store.job_create("crawl", "queued", &[]).unwrap();
+        let origins: Vec<Option<String>> = store
+            .conn
+            .prepare("SELECT origin FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(origins, [None, Some(crate::provenance::origin().to_string())]);
+        assert_eq!(new, 2);
+
+        // Saving a setting logs who did, not what it holds.
+        store.set_setting("rules", &json!([])).unwrap();
+        let logged: (String, String) = store
+            .conn
+            .query_row("SELECT key, origin FROM setting_changes", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(logged, ("rules".to_string(), crate::provenance::origin().to_string()));
+
+        // Ids from a counter are never handed out twice, even when the highest is gone.
+        assert_eq!(store.next_id("test_ids", 3).unwrap(), 4);
+        assert_eq!(store.next_id("test_ids", 0).unwrap(), 5);
+        assert_eq!(store.next_id("test_ids", 9).unwrap(), 10);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
