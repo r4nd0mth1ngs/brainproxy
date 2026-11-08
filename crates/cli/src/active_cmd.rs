@@ -240,10 +240,22 @@ impl ActiveArgs {
         let by_id_only =
             self.check_severity.is_none() && self.check_severity_max.is_none() && self.check_tags.is_empty();
         let numbers = |ids: &[u32]| ids.iter().map(|&id| i64::from(id)).collect::<Vec<_>>();
+        // The rules that ran, as the scan resolves their dependencies: a rule left without one
+        // (excluded) didn't run.
+        let ran =
+            || active::selected_rule_ids((!self.rules.is_empty()).then_some(&self.rules[..]), &self.exclude_rules);
+        let skipped = || {
+            let ran = ran();
+            active::all_rules().iter().map(|r| r.id()).filter(|id| !ran.contains(id)).collect::<Vec<u32>>()
+        };
         ScanScope {
             origins,
-            rules: (!self.rules.is_empty()).then(|| numbers(&self.rules)),
-            exclude_rules: numbers(&self.exclude_rules),
+            rules: (!self.rules.is_empty()).then(|| numbers(&ran())),
+            exclude_rules: if self.rules.is_empty() && !self.exclude_rules.is_empty() {
+                numbers(&skipped())
+            } else {
+                numbers(&self.exclude_rules)
+            },
             ported_rules: !self.no_rules,
             check_ids: if !self.checks.is_empty() && by_id_only { self.check_ids.clone() } else { vec![] },
             crawled: self.crawl,

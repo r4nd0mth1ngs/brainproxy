@@ -246,15 +246,18 @@ impl ScanScope {
         let site = self.origins.as_ref().is_none_or(|origins| {
             origins.iter().any(|o| f.url.strip_prefix(o.as_str()).is_some_and(|rest| rest.starts_with('/')))
         });
+        // A finding of lower confidence than the threshold it would have been raised at wasn't
+        // looked for. Checks have the scan's threshold only.
+        let confidence = Confidence::parse(f.confidence).unwrap_or(Confidence::Low);
         site && match f.source {
             "active" => match f.alert_ref.strip_prefix("check:") {
-                Some(id) => self.check_ids.iter().any(|c| c == id),
+                Some(id) => self.check_ids.iter().any(|c| c == id) && self.threshold.passes(confidence),
                 None => {
                     let threshold = self.rule_thresholds.get(&f.rule_id).copied().unwrap_or(self.threshold);
                     self.ported_rules
                         && self.rules.as_ref().is_none_or(|r| r.contains(&f.rule_id))
                         && !self.exclude_rules.contains(&f.rule_id)
-                        && threshold.passes(Confidence::parse(f.confidence).unwrap_or(Confidence::Low))
+                        && threshold.passes(confidence)
                 }
             },
             "passive" => self.crawled && self.rules.is_none(),
@@ -793,6 +796,13 @@ mod tests {
         assert_eq!([seen_at(&own, 3, "low"), seen_at(&own, 3, "medium")], [Other, Gone]);
         // Found again, it is still seen whatever its confidence.
         assert_eq!(seen_at(&own, 2, "low"), Still);
+        // A check named by id has the scan's threshold.
+        let checks = ScanScope { rules: None, ported_rules: false, check_ids: vec!["cve-1".into()], ..scope() };
+        let strict = ScanScope { threshold: Threshold::High, ..checks.clone() };
+        assert_eq!(
+            [seen_at(&checks, 8, "medium"), seen_at(&strict, 8, "medium"), seen_at(&strict, 8, "high")],
+            [Gone, Other, Gone]
+        );
     }
 
     #[test]

@@ -1772,7 +1772,11 @@ brainproxy scan active https://app.acme.test/ --crawl --policy api
 - `save` builds on `--from POLICY` or `--json` (inline, or `-` for stdin), then applies the
   flags: `--strength`, `--threshold`, `--others`, `--reset IDS` (the rules take the policy's
   settings again), `--enable`, `--disable`, `--rule-strength ID=S`, `--rule-threshold ID=T`.
-  Saving a name that exists replaces it.
+  Saving a name that exists replaces it. `--json` refuses a field it doesn't know.
+- A policy saved by a newer brainproxy that this one can't read is listed under `unreadable`
+  and kept as it is; the others still work.
+- Policies tune the ported rules only: `--checks` templates run at the scan's strength and
+  threshold (the policy's own, or `--strength`/`--threshold`), never at a rule's own.
 
 `scan active --policy NAME` runs the rules as the policy says. Flags given as well win:
 `--strength` and `--threshold` apply to every rule, those with settings of their own too;
@@ -1780,8 +1784,10 @@ brainproxy scan active https://app.acme.test/ --crawl --policy api
 as those the policy turns off. With `--preset`, the policy's strength wins over the preset's;
 the preset still sets the crawl. `--threshold` also works without a policy. The result's
 `policy` says what applied: `name`, `strength`, `threshold`, `rule_strengths`,
-`rule_thresholds`, `rules` (when the scan ran only some), `exclude_rules`, and
-`flags_over_policy` (the flags given as well).
+`rule_thresholds`, `rules` (the ported rules that ran, once the rules they depend on are
+resolved), `exclude_rules`, and `flags_over_policy` (the flags given as well). A policy picked
+in the app that was removed since stays picked, and the scan refuses to start rather than run
+every rule.
 
 `findings compare --scan` reads the rules and thresholds a policy scan ran with from its result,
 not from the policy as it is now: a finding of a rule the policy turned off, or of lower

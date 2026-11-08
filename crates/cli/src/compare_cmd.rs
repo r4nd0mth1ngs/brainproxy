@@ -410,6 +410,11 @@ mod tests {
             (t.ported_rules, t.check_ids, t.exclude_rules),
             (false, vec!["x".to_string(), "y".to_string()], vec![40018])
         );
+        // A rule left without a rule it depends on didn't run.
+        assert_eq!(scope(&["--rules=40014,40034", "--exclude-rules=40017"]).rules.unwrap(), [40034]);
+        let mut x = scope(&["--exclude-rules=40016"]).exclude_rules;
+        x.sort_unstable();
+        assert_eq!((scope(&["--exclude-rules=40016"]).rules, x), (None, vec![40014, 40016, 40017]));
         // Checks picked by severity or tags: which ran isn't known.
         assert!(scope(&["a.test", "--checks", "nuclei", "--check-severity", "high"]).check_ids.is_empty());
         assert!(scope(&["a.test", "--checks", "nuclei", "--check-ids", "x", "--check-tags", "cve"])

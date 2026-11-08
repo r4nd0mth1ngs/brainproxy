@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::scan::active::{all_rules, Strength};
@@ -54,7 +55,7 @@ impl Threshold {
 
 /// One rule's own settings in a policy; what it leaves out comes from the policy.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RuleSetting {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -72,7 +73,7 @@ impl RuleSetting {
 
 /// A saved scan policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Policy {
     /// Whether rules the policy doesn't turn on or off run.
     pub enabled: bool,
@@ -168,55 +169,66 @@ impl Tuning {
     }
 }
 
-/// Checks a policy name: 1 to 64 characters, not starting with `-`, no control characters.
-pub fn check_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.chars().count() > 64 {
-        return Err(Error::InvalidInput("a policy name has 1 to 64 characters".into()));
-    }
-    if name.starts_with('-') || name.chars().any(char::is_control) {
-        return Err(Error::InvalidInput("a policy name can't start with - or hold control characters".into()));
-    }
-    Ok(())
-}
-
 const META_KEY: &str = "setting.scan_policies";
 
-fn parse(v: Option<String>) -> Result<BTreeMap<String, Policy>> {
+/// The stored policies, each as saved: one this build can't read (saved by a newer one, say)
+/// is kept as it is when another is saved or removed.
+fn stored(v: Option<String>) -> Result<BTreeMap<String, Value>> {
     match v {
         Some(v) => serde_json::from_str(&v).map_err(|e| Error::InvalidInput(format!("setting {SETTINGS_KEY}: {e}"))),
         None => Ok(BTreeMap::new()),
     }
 }
 
+fn read(name: &str, v: &Value) -> Result<Policy> {
+    serde_json::from_value(v.clone()).map_err(|e| {
+        Error::InvalidInput(format!("scan policy {name:?} can't be read (saved by a newer brainproxy?): {e}"))
+    })
+}
+
 impl Store {
-    /// Every saved policy, by name.
+    /// Every saved policy this build can read, by name.
     pub fn scan_policies(&self) -> Result<BTreeMap<String, Policy>> {
-        parse(self.meta_get(META_KEY)?)
+        Ok(stored(self.meta_get(META_KEY)?)?.iter().filter_map(|(n, v)| Some((n.clone(), read(n, v).ok()?))).collect())
+    }
+
+    /// The names of saved policies this build can't read.
+    pub fn scan_policies_unreadable(&self) -> Result<Vec<String>> {
+        Ok(stored(self.meta_get(META_KEY)?)?
+            .iter()
+            .filter(|(n, v)| read(n, v).is_err())
+            .map(|(n, _)| n.clone())
+            .collect())
     }
 
     pub fn scan_policy(&self, name: &str) -> Result<Policy> {
-        self.scan_policies()?.remove(name).ok_or_else(|| Error::NotFound(format!("scan policy {name:?}")))
+        match stored(self.meta_get(META_KEY)?)?.get(name) {
+            Some(v) => read(name, v),
+            None => Err(Error::NotFound(format!("scan policy {name:?}"))),
+        }
     }
 
-    /// Saves `policy` as `name`; one of that name is replaced only with `replace`
-    /// (otherwise `Conflict`).
-    pub fn scan_policy_save(&mut self, name: &str, policy: &Policy, replace: bool) -> Result<()> {
-        check_name(name)?;
-        let policy = policy.clone().validate()?;
+    /// Saves `policy` as `name` (trimmed); one of that name is replaced only with `replace`
+    /// (otherwise `Conflict`). Returns the name it was saved as.
+    pub fn scan_policy_save(&mut self, name: &str, policy: &Policy, replace: bool) -> Result<String> {
+        let name = crate::store::saved_name("policy", name)?.to_string();
+        let policy =
+            serde_json::to_value(policy.clone().validate()?).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.meta_update(META_KEY, |old| {
-            let mut all = parse(old)?;
-            if !replace && all.contains_key(name) {
+            let mut all = stored(old)?;
+            if !replace && all.contains_key(&name) {
                 return Err(Error::Conflict(format!("scan policy {name:?} exists")));
             }
-            all.insert(name.to_string(), policy);
+            all.insert(name.clone(), policy);
             Ok((Some(serde_json::to_string(&all).map_err(|e| Error::InvalidInput(e.to_string()))?), ()))
         })?;
-        self.setting_saved(SETTINGS_KEY)
+        self.setting_saved(SETTINGS_KEY)?;
+        Ok(name)
     }
 
     pub fn scan_policy_remove(&mut self, name: &str) -> Result<()> {
         self.meta_update(META_KEY, |old| {
-            let mut all = parse(old)?;
+            let mut all = stored(old)?;
             if all.remove(name).is_none() {
                 return Err(Error::NotFound(format!("scan policy {name:?}")));
             }
@@ -301,7 +313,9 @@ mod tests {
         };
         assert!(matches!(s.scan_policy_save("bad", &bad, true), Err(Error::NotFound(_))));
         assert!(s.scan_policy_save("-x", &Policy::default(), true).is_err());
-        assert!(s.scan_policy_save("", &Policy::default(), true).is_err());
+        assert!(s.scan_policy_save(" ", &Policy::default(), true).is_err());
+        assert_eq!(s.scan_policy_save(" spaced ", &Policy::default(), true).unwrap(), "spaced");
+        s.scan_policy_remove("spaced").unwrap();
 
         s.scan_policy_remove("deep").unwrap();
         assert!(matches!(s.scan_policy("deep"), Err(Error::NotFound(_))));
@@ -310,7 +324,7 @@ mod tests {
             .conn
             .query_row("SELECT count(*) FROM setting_changes WHERE key = 'scan_policies'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(logged, 3);
+        assert_eq!(logged, 5);
     }
 
     #[test]
@@ -319,7 +333,25 @@ mod tests {
             serde_json::from_str(r#"{"strength": "high", "rules": {"40018": {"threshold": "high"}}}"#).unwrap();
         assert!(p.enabled && p.strength == Strength::High && p.threshold == Threshold::Low);
         assert_eq!(p.rules[&40018].threshold, Some(Threshold::High));
-        assert!(serde_json::from_str::<Policy>(r#"{"strenght": "high"}"#).is_err());
         assert!(serde_json::from_str::<Policy>(r#"{"threshold": "off"}"#).is_err());
+    }
+
+    /// A policy this build can't read doesn't stop the others being used, saved or removed,
+    /// and is kept as it was.
+    #[test]
+    fn a_policy_from_a_newer_build_is_kept_and_doesnt_block_the_rest() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.scan_policy_save("mine", &Policy::default(), true).unwrap();
+        let newer = r#"{"mine": {"strength": "low"}, "future": {"threshold": "paranoid"}, "extra": {"strength": "high", "new_field": 1}}"#;
+        s.meta_set(META_KEY, Some(newer)).unwrap();
+        assert_eq!(s.scan_policies().unwrap().keys().collect::<Vec<_>>(), ["extra", "mine"]);
+        assert_eq!(s.scan_policies_unreadable().unwrap(), ["future"]);
+        assert!(s.scan_policy("future").unwrap_err().to_string().contains("newer brainproxy"));
+        assert_eq!(s.scan_policy("extra").unwrap().strength, Strength::High);
+        s.scan_policy_save("other", &Policy::default(), true).unwrap();
+        s.scan_policy_remove("mine").unwrap();
+        let kept: Value = serde_json::from_str(&s.meta_get(META_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(kept["future"], serde_json::json!({"threshold": "paranoid"}));
+        assert_eq!(kept["extra"]["new_field"], 1);
     }
 }

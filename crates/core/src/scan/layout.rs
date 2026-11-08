@@ -271,14 +271,7 @@ impl Store {
     /// Saves a layout under `name`; one of that name is replaced when `replace`, and is
     /// otherwise a conflict.
     pub fn report_profile_save(&self, name: &str, layout: &Layout, replace: bool) -> Result<()> {
-        let name = name.trim();
-        if name.is_empty() || name.len() > 64 {
-            return Err(Error::InvalidInput("a profile name has 1 to 64 characters".into()));
-        }
-        // A leading "-" would be read as a flag wherever the name is passed on its own.
-        if name.starts_with('-') || name.chars().any(char::is_control) {
-            return Err(Error::InvalidInput("a profile name can't start with - or hold control characters".into()));
-        }
+        let name = crate::store::saved_name("profile", name)?;
         layout.validate()?;
         let json = serde_json::to_string(layout).map_err(|e| Error::InvalidInput(e.to_string()))?;
         if !replace {

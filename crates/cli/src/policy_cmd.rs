@@ -157,7 +157,20 @@ fn read_json(given: &str) -> Result<Policy, Error> {
     } else {
         given.to_string()
     };
-    serde_json::from_str(&text).map_err(|e| Error::InvalidInput(format!("--json: {e}")))
+    let v: Value = serde_json::from_str(&text).map_err(|e| Error::InvalidInput(format!("--json: {e}")))?;
+    // A misspelt field would otherwise be dropped without a word (stored policies are read
+    // leniently, so one saved by a newer build still loads).
+    let unknown = |v: &Value, known: &[&str]| -> Option<String> {
+        v.as_object()?.keys().find(|k| !known.contains(&k.as_str())).cloned()
+    };
+    let mut bad = unknown(&v, &["enabled", "strength", "threshold", "rules"]);
+    for r in v["rules"].as_object().into_iter().flat_map(|m| m.values()) {
+        bad = bad.or_else(|| unknown(r, &["enabled", "strength", "threshold"]));
+    }
+    if let Some(k) = bad {
+        return Err(Error::InvalidInput(format!("--json: unknown field {k:?}")));
+    }
+    serde_json::from_value(v).map_err(|e| Error::InvalidInput(format!("--json: {e}")))
 }
 
 /// A policy as shown: its settings, and how many rules it turns off.
@@ -207,12 +220,19 @@ pub fn policy(project: &Path, cmd: PolicyCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         PolicyCmd::List => {
             let list: Vec<Value> = store.scan_policies()?.iter().map(|(n, p)| summary(n, p)).collect();
-            out.ok(json!({"policies": list}), || {
-                if list.is_empty() {
-                    "no saved scan policies (scan policy save NAME)".into()
-                } else {
-                    list.iter().map(text_line).collect::<Vec<_>>().join("\n")
+            let unreadable = store.scan_policies_unreadable()?;
+            let mut v = json!({"policies": list});
+            if !unreadable.is_empty() {
+                v["unreadable"] = json!(unreadable);
+                v["unreadable_hint"] = json!("Saved by a newer brainproxy, or edited by hand: this build can't use them, and keeps them as they are.");
+            }
+            out.ok(v, || {
+                let mut lines: Vec<String> = list.iter().map(text_line).collect();
+                if lines.is_empty() {
+                    lines.push("no saved scan policies (scan policy save NAME)".into());
                 }
+                lines.extend(unreadable.iter().map(|n| format!("{n}  (can't be read by this build)")));
+                lines.join("\n")
             });
         }
         PolicyCmd::Show { name } => {
@@ -244,7 +264,7 @@ pub fn policy(project: &Path, cmd: PolicyCmd, out: &Out) -> Result<(), Error> {
             let p = flags.apply(base)?;
             // A saved policy may be a person's: an agent adds new ones only.
             let replace = !crate::mcp::in_tool_call();
-            store.scan_policy_save(&name, &p, replace).map_err(|e| match e {
+            let name = store.scan_policy_save(&name, &p, replace).map_err(|e| match e {
                 Error::Conflict(_) if !replace => Error::Conflict(format!(
                     "scan policy {name:?} exists; through MCP a policy is saved under a new name, and a person \
                      replaces or removes one in the app or a terminal"
@@ -350,9 +370,8 @@ pub fn apply(
         "rule_thresholds": rule_thresholds,
         "flags_over_policy": overridden,
     });
-    if let Some(r) = &sel {
-        shown["rules"] = json!(r);
-    }
+    // The ported rules that run, once dependencies are resolved: what a comparison covers.
+    shown["rules"] = json!(active::selected_rule_ids(sel.as_deref(), &exclude));
     shown["exclude_rules"] = json!(exclude);
     Applied { strength, tuning, rules: sel, exclude_rules: exclude, shown: Some(shown) }
 }
@@ -398,6 +417,25 @@ mod tests {
         assert_eq!(a.exclude_rules, [40014]);
         let shown = a.shown.unwrap();
         assert_eq!(shown["flags_over_policy"], json!(["--strength", "--threshold", "--rules", "--exclude-rules"]));
+    }
+
+    /// The result names the rules that ran: a rule whose dependency the policy turns off doesn't.
+    #[test]
+    fn the_result_names_the_rules_that_run() {
+        let p = Policy {
+            enabled: false,
+            rules: [
+                (40014, RuleSetting { enabled: Some(true), ..Default::default() }),
+                (40034, RuleSetting { enabled: Some(true), ..Default::default() }),
+                (40017, RuleSetting { enabled: Some(false), ..Default::default() }),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let shown = apply(Some(("p", &p)), None, None, None, &[], &[]).shown.unwrap();
+        assert_eq!(shown["rules"], json!([40034]));
+        let all = apply(Some(("all", &Policy::default())), None, None, None, &[], &[]).shown.unwrap();
+        assert_eq!(all["rules"].as_array().unwrap().len(), active::all_rules().len());
     }
 
     #[test]

@@ -140,6 +140,11 @@ fn policies_are_saved_shown_listed_and_removed() {
     assert_eq!(run(&p, &["scan", "policy", "save", "x", "--disable", "1"]).0, 4, "no rule 1");
     assert_eq!(run(&p, &["scan", "policy", "save", "x", "--rule-strength", "40018"]).0, 2);
     assert_eq!(run(&p, &["scan", "policy", "save", "x", "--json", r#"{"threshold": "off"}"#]).0, 2);
+    // A misspelt field is refused, not dropped.
+    let (code, v) =
+        run(&p, &["scan", "policy", "save", "x", "--json", r#"{"rules": {"40018": {"treshold": "high"}}}"#]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("treshold"), "{v}");
     assert_eq!(run(&p, &["scan", "policy", "show", "nope"]).0, 4);
 
     ok(&p, &["scan", "policy", "remove", "api2"]);
