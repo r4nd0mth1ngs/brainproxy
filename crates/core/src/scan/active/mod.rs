@@ -727,7 +727,7 @@ pub struct ActiveConfig {
     /// Methods a declarative check may send besides GET, HEAD, OPTIONS and POST (upper
     /// case; MUTATION for a GraphQL mutation, ALL for anything): `--include-methods`.
     pub check_methods: Vec<String>,
-    /// When the scan ends (also stopped or timed out), delete the attack rows it wrote that
+    /// When the scan ends (also stopped with `job stop`, or timed out), delete the attack rows it wrote that
     /// back nothing (see [`Store::prune_unreferenced`]). Base requests are never its rows.
     pub prune: bool,
 }
@@ -790,6 +790,9 @@ pub struct ActiveSummary {
     /// kept every request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pruned: Option<usize>,
+    /// Why pruning stopped before it was done; the rows it hadn't reached are kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prune_error: Option<String>,
     pub stopped: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
@@ -1039,7 +1042,13 @@ pub async fn run(
         None
     };
     // After the out-of-band wait, so a late callback's finding keeps its attack.
-    let pruned = if cfg.prune { Some(store.prune_unreferenced(&created)?) } else { None };
+    // A failure here doesn't fail the scan: what was deleted stays deleted, the rest is kept.
+    let (pruned, prune_error) = if cfg.prune {
+        let (n, e) = store.prune_unreferenced(&created);
+        (Some(n), e.map(|e| e.to_string()))
+    } else {
+        (None, None)
+    };
 
     Ok(ActiveSummary {
         targets: targets.len(),
@@ -1055,6 +1064,7 @@ pub async fn run(
         refused_hosts,
         oob,
         pruned,
+        prune_error,
         stopped: ctl.stopped(),
         timed_out,
         elapsed_ms: started.elapsed().as_millis() as u64,

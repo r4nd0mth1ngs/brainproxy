@@ -198,8 +198,8 @@ pub struct ActiveArgs {
     /// Skip out-of-band checks even when an OOB listener is running.
     #[arg(long)]
     no_oob: bool,
-    /// Keep only the attack requests that back a finding: when the scan ends (also when
-    /// stopped), delete its own attacks' history rows that nothing refers to. Overrides the
+    /// Keep only the attack requests that back a finding: when the scan ends (finished, `job
+    /// stop`, or --max-minutes; not if the process dies or the scan fails), delete its own attacks' history rows that nothing refers to. Overrides the
     /// project's setting (`scan prune`). Refused through MCP.
     #[arg(long, conflicts_with = "no_prune")]
     prune: bool,
@@ -672,6 +672,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         )];
         if let Some(n) = result["pruned"].as_u64() {
             lines.push(format!("  {n} attack requests that back no finding deleted from history"));
+        }
+        if let Some(e) = result["prune_error"].as_str() {
+            lines.push(format!("  pruning stopped, the rest of its attack requests kept: {e}"));
         }
         for g in result["active_findings"].as_array().into_iter().flatten() {
             lines.push(format!(

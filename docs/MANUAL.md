@@ -623,8 +623,8 @@ attack type, and pick payloads:
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
     templates* (on when installed, high severity and above by default).
   - **Keep only attack requests that back a finding:** off by default, so every attack request
-    stays in history. On, a scan deletes at its end (also when stopped or out of time) the
-    attack requests it sent that nothing refers to. It is saved for the project and shared with
+    stays in history. On, a scan deletes when it ends (finished, stopped with *Stop*, or out
+    of time) the attack requests it sent that nothing refers to. It is saved for the project and shared with
     the CLI (`scan prune`), and applies to every kind of active scan. See
     [Pruning a scan's attack requests](#pruning-a-scans-attack-requests).
 - **New scan › Targeted:** search the ZAP scan rules and the installed checks (Nuclei,
@@ -1731,16 +1731,32 @@ prune on`; `scan prune` shows it, `scan prune off` turns it off), or pass `scan 
 for one scan. `--no-prune` keeps everything for one scan whatever the setting. Changing the
 setting is logged in `setting_changes` (key `active`).
 
-With pruning on, when the scan ends (finished, stopped, or out of time) it deletes the history
-rows of its own attack requests that nothing refers to. A row is kept if it is a finding's
-first or last sighting or one of a hand-added finding's linked entries, a finding event's
-request (a retest's, say), a fuzz or `authz` result or its baseline, a WebSocket connection's
-upgrade, or an out-of-band payload's attack (a callback can still arrive and raise a finding),
-or if it has a note or tags. The requests the scan starts from (history rows, the pages a URL
-or `--api` scan fetches first, a `--crawl`'s requests) and a login's requests are never its
-attack rows and are always kept. The scan's result gives the number deleted as `pruned` (left
-out when the scan kept everything). The rows are written before each request goes out as always, so
-a scan that is killed, or that crashes, deletes nothing.
+With pruning on, when the scan ends it deletes the history rows of its own attack requests
+that nothing refers to. It ends that way when it finishes, when it is stopped with `job stop`
+(the app's *Stop* on a task), and when `--max-minutes` runs out. If the process dies first
+(killed, Ctrl-C on a scan run in the foreground, a crash) or the scan fails with an error,
+nothing is deleted: the rows were written before each request went out, as always, and stay.
+
+A row is kept if it is a finding's first or last sighting or one of a hand-added finding's
+linked entries, a finding event's request (a retest's, say), an `authz` result's request
+tested, response or baseline, a fuzz result, a WebSocket connection's upgrade, an auth macro
+step's source, or an out-of-band payload's attack (a callback can still arrive and raise a
+finding), or if it has a note or tags. The requests the scan starts from (history rows, the
+pages a URL or `--api` scan fetches first, a `--crawl`'s requests) and a login's requests are
+never its attack rows and are always kept.
+
+Rows are deleted 500 at a time, each batch checked and deleted in a transaction of its own, so
+a running proxy or another scan can keep writing meanwhile. The scan's result gives the number
+deleted as `pruned` (left out when the scan kept everything). If deleting fails part way, the
+scan still completes: `pruned` counts what was deleted, `prune_error` says why it stopped, and
+the rest of the rows stay.
+
+What it doesn't see:
+- A reference made by another process after its batch was deleted points at a row that is
+  gone: for example a passive scan of source `scan` (`scan sources`), or a second scan started
+  meanwhile from the first one's attack rows (`--where "source = 'scan'"`).
+- History ids in a job's arguments (`jobs.args`, such as `--history-id`) don't keep a row.
+- History ids are never reused, so a deleted id never points at another request.
 
 Through MCP, `--prune` and `scan prune on` are refused, and an agent's scan keeps every request
 even with the setting on (its result says so in `prune_hint`), so a person can see everything

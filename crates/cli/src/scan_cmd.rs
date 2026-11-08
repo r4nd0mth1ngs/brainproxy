@@ -54,10 +54,12 @@ pub enum ScanCmd {
     /// Show, or with on|off set, whether active scans keep only the attack requests that back
     /// a finding (default off: every request is kept). `scan active --prune|--no-prune`
     /// overrides it for one scan.
-    #[command(after_help = "With it on, a scan deletes at its end (also when stopped) the history rows of its own \
-        attacks that nothing refers to: no finding, finding event, note, tag, fuzz, authz, WebSocket or \
-        out-of-band record. The requests a scan starts from are never deleted. Through MCP it can be turned \
-        off, not on, and an agent's scans keep every request.")]
+    #[command(
+        after_help = "With it on, a scan deletes when it ends (finished, `job stop`, or --max-minutes; not if the process dies \
+        or the scan fails) the history rows of its own attacks that nothing refers to: no finding, finding \
+        event, note, tag, fuzz, authz, WebSocket, auth macro or out-of-band record. The requests a scan starts from are never deleted. Through MCP it can be turned \
+        off, not on, and an agent's scans keep every request."
+    )]
     Prune {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,

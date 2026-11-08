@@ -20,6 +20,9 @@ use crate::http::{Exchange, Target};
 /// one started by an older build.
 pub const SCHEMA_VERSION: i64 = 19;
 
+/// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
+pub const PRUNE_CHUNK: usize = 500;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1150,15 +1153,29 @@ impl Store {
     }
 
     /// Deletes those of history rows `ids` that nothing refers to: no finding (first or last
-    /// sighting, or a hand-added finding's list in meta), finding event, fuzz or authz
-    /// result, WebSocket connection or out-of-band payload, and no note or tags. One
-    /// transaction, so a reference added meanwhile either keeps its row or comes after the
-    /// delete. Returns how many were deleted. An active scan with pruning on calls this
-    /// with the rows it wrote itself.
-    pub fn prune_unreferenced(&mut self, ids: &[i64]) -> Result<usize> {
-        if ids.is_empty() {
-            return Ok(0);
+    /// sighting, or a hand-added finding's list in meta), finding event, fuzz or authz result
+    /// (the request tested, its response or the baseline), WebSocket connection, out-of-band
+    /// payload or auth macro step, and no note or tags. An active scan with pruning on calls
+    /// this with the rows it wrote itself.
+    ///
+    /// The ids go [`PRUNE_CHUNK`] at a time, each chunk checked and deleted in a transaction of
+    /// its own: the full-text index's delete trigger makes a large delete slow, and one long
+    /// write transaction would make a running proxy, or another sender's row writer, wait past
+    /// the busy timeout and fail. A reference added between chunks keeps its row if its chunk
+    /// comes later. Returns how many were deleted, and the error that stopped it, if any (the
+    /// rows of that chunk and after are left in place).
+    pub fn prune_unreferenced(&mut self, ids: &[i64]) -> (usize, Option<Error>) {
+        let mut deleted = 0;
+        for chunk in ids.chunks(PRUNE_CHUNK) {
+            match self.prune_chunk(chunk) {
+                Ok(n) => deleted += n,
+                Err(e) => return (deleted, Some(e)),
+            }
         }
+        (deleted, None)
+    }
+
+    fn prune_chunk(&mut self, ids: &[i64]) -> Result<usize> {
         let list = serde_json::to_string(ids).unwrap_or_default();
         let tx = self.write_tx()?;
         let n = tx.execute(
@@ -1170,10 +1187,15 @@ impl Store {
                                WHERE meta.key LIKE 'finding.%.history' AND json_valid(meta.value))
                 AND id NOT IN (SELECT history_id FROM finding_events WHERE history_id IS NOT NULL)
                 AND id NOT IN (SELECT history_id FROM fuzz_results WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT source_id FROM authz_results WHERE source_id IS NOT NULL)
                 AND id NOT IN (SELECT history_id FROM authz_results WHERE history_id IS NOT NULL)
                 AND id NOT IN (SELECT baseline_history_id FROM authz_results WHERE baseline_history_id IS NOT NULL)
                 AND id NOT IN (SELECT history_id FROM ws_connections WHERE history_id IS NOT NULL)
-                AND id NOT IN (SELECT history_id FROM oob_payloads WHERE history_id IS NOT NULL)",
+                AND id NOT IN (SELECT history_id FROM oob_payloads WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT json_extract(step.value, '$.history_id')
+                               FROM meta, json_each(meta.value, '$.macros') m, json_each(m.value, '$.steps') step
+                               WHERE meta.key LIKE 'auth.handling.%' AND json_valid(meta.value)
+                                 AND json_extract(step.value, '$.history_id') IS NOT NULL)",
             [list],
         )?;
         tx.commit()?;
@@ -2181,7 +2203,7 @@ mod tests {
     #[test]
     fn pruning_keeps_every_row_something_refers_to() {
         let mut s = Store::open_in_memory().unwrap();
-        let ids: Vec<i64> = (0..11).map(|_| sample(&s)).collect();
+        let ids: Vec<i64> = (0..13).map(|_| sample(&s)).collect();
         let other = sample(&s);
         s.set_note(ids[1], Some("look")).unwrap();
         let exec = |sql: &str, id: i64| s.conn.execute(sql, [id]).unwrap();
@@ -2207,14 +2229,40 @@ mod tests {
             ids[8],
         );
         exec("INSERT INTO oob_payloads (token, source, history_id) VALUES ('t', 'scan', ?1)", ids[9]);
+        exec(
+            "INSERT INTO authz_results (run_id, idx, source_id, method, url, owner, identity, verdict)
+             VALUES (2, 0, ?1, 'GET', 'u', 'a', 'b', 'same')",
+            ids[10],
+        );
+        let macros = serde_json::json!({"macros": [{"name": "m", "steps": [
+            {"target": "http://a.test", "request": "GET / HTTP/1.1\r\n\r\n"},
+            {"target": "http://a.test", "request": "GET / HTTP/1.1\r\n\r\n", "history_id": ids[11]},
+        ]}]});
+        s.meta_set("auth.handling.app", Some(&macros.to_string())).unwrap();
         // A meta value that isn't JSON doesn't stop the rest.
         s.meta_set("finding.8.history", Some("{")).unwrap();
-        assert_eq!(s.prune_unreferenced(&ids).unwrap(), 2);
+        let (n, e) = s.prune_unreferenced(&ids);
+        assert_eq!((n, e.map(|e| e.to_string())), (2, None));
         let mut left: Vec<i64> = s.list(&Default::default()).unwrap().into_iter().map(|e| e.id).collect();
         left.sort_unstable();
-        let kept = [&ids[1..10], &[other]].concat();
-        assert_eq!(left, kept, "rows 0 and 10 go; the one not given stays");
-        assert_eq!(s.prune_unreferenced(&[]).unwrap(), 0);
+        let kept = [&ids[1..12], &[other]].concat();
+        assert_eq!(left, kept, "rows 0 and 12 go; the one not given stays");
+        assert_eq!(s.prune_unreferenced(&[]).0, 0);
+    }
+
+    /// Many rows are pruned a chunk per transaction; an error stops it with the count so far,
+    /// leaving the rest.
+    #[test]
+    fn pruning_goes_a_chunk_at_a_time_and_an_error_keeps_the_rest() {
+        let mut s = Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..PRUNE_CHUNK * 2 + 3).map(|_| sample(&s)).collect();
+        let (first, rest) = ids.split_at(PRUNE_CHUNK + 1);
+        assert_eq!(s.prune_unreferenced(first).0, PRUNE_CHUNK + 1);
+        s.conn.execute_batch("DROP TABLE ws_connections").unwrap();
+        let (n, e) = s.prune_unreferenced(rest);
+        assert_eq!(n, 0);
+        assert!(e.is_some());
+        assert_eq!(s.count().unwrap(), rest.len() as i64);
     }
 
     #[test]

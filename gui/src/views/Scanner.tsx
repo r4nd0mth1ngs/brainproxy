@@ -263,6 +263,7 @@ function ResultFacts({ kind, r }: { kind: string; r: Record<string, any> }) {
           ["Requests", `${r.requests} · ${r.rules} rules`],
           ["New findings", String(r.new_findings)],
           ...(r.pruned != null ? [["Pruned", `${r.pruned} attack requests that back no finding`] as [string, string]] : []),
+          ...(r.prune_error ? [["Pruning stopped", `${r.prune_error} (the rest were kept)`] as [string, string]] : []),
         ]
       : kind === "crawl"
         ? [
