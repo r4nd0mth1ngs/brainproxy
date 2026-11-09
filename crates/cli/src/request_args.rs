@@ -77,6 +77,7 @@ impl RequestArgs {
             sni: self.sni.clone(),
             http2: self.http2,
             host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
+            stream: Default::default(),
         }
     }
 

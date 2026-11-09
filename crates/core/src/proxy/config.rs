@@ -340,6 +340,14 @@ pub fn apply_response_rules(rules: &[CompiledRule], resp: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// [`apply_response_rules`] for the head of a response whose body is relayed as it arrives
+/// (an event stream): the header rules only. A body rule needs the whole body.
+pub fn apply_response_head_rules(rules: &[CompiledRule], head: Vec<u8>) -> Vec<u8> {
+    let header_rules: Vec<CompiledRule> =
+        rules.iter().filter(|r| r.location == RuleLocation::ResponseHeader).cloned().collect();
+    apply_response_rules(&header_rules, head)
+}
+
 fn apply_header_rule(rule: &CompiledRule, headers: &mut Vec<String>) {
     match &rule.text {
         None => {

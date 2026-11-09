@@ -233,6 +233,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
         guard: Some(guard.clone()),
         http2: args.http2,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
+        stream: Default::default(),
     };
     let (targets, skipped) = select(project, &args, &exclude, &guard)?;
     if targets.is_empty() {

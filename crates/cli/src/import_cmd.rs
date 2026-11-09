@@ -287,6 +287,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         guard: Some(guard),
         http2: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
+        stream: Default::default(),
     };
     let auth = crate::auth_cmd::maybe_session(project, c.auth.as_deref(), &send)?;
     let fetch = Fetcher { project, send: &send, auth: auth.as_deref(), headers: &headers, tool: Tool::Crawl };
@@ -591,6 +592,7 @@ pub(crate) fn check_remote_vars(
         guard: Some(guard.clone()),
         http2: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
+        stream: Default::default(),
     };
     let auth = crate::auth_cmd::maybe_session(project, from.auth, &send)?;
     let fetch = Fetcher { project, send: &send, auth: auth.as_deref(), headers: from.headers, tool: from.tool };

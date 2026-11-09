@@ -123,6 +123,7 @@ fn run_with(
             guard: Some(guard),
             http2: false,
             host: brainproxy_core::http::client::HostPolicy::Allow,
+            stream: Default::default(),
         },
         points: PointOptions::default(),
         rules: None,

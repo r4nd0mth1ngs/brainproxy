@@ -29,6 +29,7 @@ mod request_args;
 mod retest_cmd;
 mod scan_cmd;
 mod sent;
+mod sse_cmd;
 mod update_cmd;
 mod ws_cmd;
 
@@ -149,6 +150,17 @@ enum Cmd {
         `query` (tables ws_connections, ws_messages, ws_messages_fts)."
     )]
     Ws(ws_cmd::WsCmd),
+
+    /// Server-sent events: the event streams the proxy relayed or `send` read, and their events.
+    #[command(
+        subcommand,
+        after_help = "A response with Content-Type text/event-stream is a stream of events that may never end. The \
+        proxy relays one to the client as it arrives and records it (the request and response are a history entry, \
+        which gets the body when the stream ends); `send` reads one for --stream-wait seconds or --max-events \
+        events. A stream stores up to 4 MiB of body and 10000 events: one that goes over is marked truncated at once. \
+        Search events with `query` (tables sse_streams, sse_events, sse_events_fts)."
+    )]
+    Sse(sse_cmd::SseCmd),
 
     /// Intruder-style fuzzing: payload positions, four attack modes, grep/extract, outlier summary.
     #[command(subcommand)]
@@ -274,6 +286,16 @@ struct SendArgs {
     /// Print the raw response bytes instead of structured output.
     #[arg(long)]
     raw: bool,
+    /// Seconds to read an event stream (a text/event-stream response, which may never end)
+    /// before stopping, from its head (at most 86400, a day). What arrived is the response.
+    /// Not with a race, which reads whole responses.
+    #[arg(long, default_value_t = 5.0, value_name = "SECONDS", conflicts_with_all = ["race", "also"])]
+    stream_wait: f64,
+    /// Stop reading an event stream once this many events have arrived (events that arrive
+    /// together with the last one are read too). Not with a race.
+    #[arg(long, default_value_t = 100, value_name = "N", value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with_all = ["race", "also"])]
+    max_events: u32,
 }
 
 #[derive(clap::Args)]
@@ -503,6 +525,12 @@ fn command_name(cmd: &Cmd) -> String {
             ws_cmd::WsCmd::Messages { .. } => "ws messages",
             ws_cmd::WsCmd::Send(_) => "ws send",
         },
+        Cmd::Sse(c) => match c {
+            sse_cmd::SseCmd::List { .. } => "sse list",
+            sse_cmd::SseCmd::Show { .. } => "sse show",
+            sse_cmd::SseCmd::Events { .. } => "sse events",
+            sse_cmd::SseCmd::Event { .. } => "sse event",
+        },
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
         Cmd::Import(c) => match c {
@@ -627,6 +655,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
         Cmd::Ws(cmd) => ws_cmd::ws(&cli.project, cmd, out)?,
+        Cmd::Sse(cmd) => sse_cmd::sse(&cli.project, cmd, out)?,
         Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Import(cmd) => import_cmd::import(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
@@ -710,7 +739,14 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
     // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
     // non-race send) would be pushed onto HTTP/2 too.
-    let send_opts = args.req.send_options(guard.clone());
+    if !(0.0..=ws_cmd::MAX_WAIT_SECS).contains(&args.stream_wait) {
+        return Err(Error::InvalidInput(format!("--stream-wait: 0 to {} seconds", ws_cmd::MAX_WAIT_SECS)));
+    }
+    let mut send_opts = args.req.send_options(guard.clone());
+    send_opts.stream = brainproxy_core::sse::StreamLimits {
+        wait: std::time::Duration::from_secs_f64(args.stream_wait),
+        max_events: args.max_events as usize,
+    };
     let mut host_warning = None;
     for (req, target) in &group {
         require_in_scope(&guard, target)?;
@@ -810,6 +846,15 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     };
     let saved = session.as_ref().map(|s| s.save()).transpose();
     let (id, ex) = outcome?;
+    // An event stream's events are listed with its row (`sse events`); without the row's
+    // content there is nothing to list them with.
+    let stream_id = match &ex.stream {
+        Some(read) if !args.no_store => {
+            let url = exchange_url(&target, &ex.request);
+            Some(log.store.sse_record_read(id, "send", &url, &target.host, read)?)
+        }
+        _ => None,
+    };
     let new_findings = log.scan(&rows)?;
     let id = Some(id);
     let host_warning =
@@ -832,7 +877,16 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
     }
-    out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
+    if let Some(read) = &ex.stream {
+        data["stream"] = sse_cmd::read_json(read, stream_id, args.max_body);
+    }
+    out.ok(data, || {
+        let text = text_exchange(id, &ex.response, ex.duration_ms);
+        match &ex.stream {
+            Some(read) => format!("{}\n\n{}", text.trim_end(), sse_cmd::read_text(read, args.max_body)),
+            None => text,
+        }
+    });
     Ok(())
 }
 
@@ -1066,6 +1120,8 @@ fn schema_json() -> Value {
             {"name": "history", "description": "One row per request: source is send, race, proxy, fuzz, crawl, crawl-browser, import, scan, or ws (ws send handshakes).", "columns": cols(store::HISTORY_COLUMNS)},
             {"name": "ws_connections", "description": "WebSocket connections the proxy relayed (source proxy) or ws send opened (source replay). Join history ON history.id = history_id for the upgrade request.", "columns": cols(brainproxy_core::ws::db::CONNECTION_COLUMNS)},
             {"name": "ws_messages", "description": "One row per WebSocket message (control frames included), payload decompressed. Join ws_connections ON ws_connections.id = connection_id.", "columns": cols(brainproxy_core::ws::db::MESSAGE_COLUMNS)},
+            {"name": "sse_streams", "description": "Event streams (text/event-stream responses) the proxy relayed (source proxy) or send read (source send). Join history ON history.id = history_id for the request and response.", "columns": cols(brainproxy_core::sse::db::STREAM_COLUMNS)},
+            {"name": "sse_events", "description": "One row per server-sent event. Join sse_streams ON sse_streams.id = stream_id.", "columns": cols(brainproxy_core::sse::db::EVENT_COLUMNS)},
             {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
             {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
@@ -1083,6 +1139,7 @@ fn schema_json() -> Value {
             {"name": "oob_interactions", "description": "Interactions received by the OOB listener. Join oob_payloads ON token.", "columns": cols(brainproxy_core::oob::INTERACTION_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
             {"name": "ws_messages_fts", "description": "FTS5 full-text index over ws_messages.payload_text. rowid = ws_messages.id. Query with: WHERE ws_messages_fts MATCH 'term'."},
+            {"name": "sse_events_fts", "description": "FTS5 full-text index over sse_events.data. rowid = sse_events.id. Query with: WHERE sse_events_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),
         "examples": store::EXAMPLES.iter().map(|(t, q)| json!({"title": t, "sql": q})).collect::<Vec<_>>(),
@@ -1120,16 +1177,30 @@ fn exchange_json(
     duration_ms: Option<u64>,
     max_body: usize,
 ) -> Value {
-    let url = RawRequest::from_bytes(request.to_vec())
-        .head()
-        .map(|h| if h.target.contains("://") { h.target } else { format!("{}{}", target.origin(), h.target) })
-        .unwrap_or_else(|_| target.origin());
     json!({
         "id": id,
-        "url": url,
+        "url": exchange_url(target, request),
         "duration_ms": duration_ms,
         "response": response_json(response, max_body),
     })
+}
+
+/// History row `id` as [`exchange_json`] with its request, for a command that shows what a
+/// row opened (a WebSocket connection, an event stream); null when there is no such row.
+pub(crate) fn recorded_exchange_json(store: &Store, id: Option<i64>, max_body: usize) -> Value {
+    let Some(Ok(item)) = id.map(|id| store.get(id)) else { return Value::Null };
+    let ms = item.entry.duration_ms.map(|d| d as u64);
+    let mut v = exchange_json(Some(item.entry.id), &item.target, &item.request, &item.response, ms, max_body);
+    v["request"] = body_value(&item.request, max_body);
+    v
+}
+
+/// The URL `request` asks `target` for.
+fn exchange_url(target: &Target, request: &[u8]) -> String {
+    RawRequest::from_bytes(request.to_vec())
+        .head()
+        .map(|h| if h.target.contains("://") { h.target } else { format!("{}{}", target.origin(), h.target) })
+        .unwrap_or_else(|_| target.origin())
 }
 
 fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
@@ -1219,6 +1290,11 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
             data["request"] = body_value(&item.request, max_body);
             data["entry"] = json!(item.entry);
             data["origin_text"] = json!(recorded_text(&item.entry));
+            // An event stream's events are listed by its stream id (`sse events`).
+            let stream = store.sse_stream_of(id)?;
+            if let Some(s) = &stream {
+                data["stream"] = json!(s);
+            }
             out.ok(data, || {
                 let e = &item.entry;
                 let mut about = vec![format!("#{id} {} {}", e.source, recorded_text(e))];
@@ -1231,6 +1307,10 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                 }
                 if e.note.is_some() || e.note_origin.is_some() {
                     about.push(format!("note set {}", brainproxy_core::provenance::describe(e.note_origin.as_deref())));
+                }
+                if let Some(s) = &stream {
+                    let cut = if s.truncated { ", truncated" } else { "" };
+                    about.push(format!("event stream #{} ({}, {} events{cut})", s.id, s.state, s.events));
                 }
                 format!(
                     "{}\n\n{}\n\n{}",

@@ -100,7 +100,14 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
             let response = tokio::time::timeout(timeout, WireReader::new().read_response(&mut s, &method))
                 .await
                 .map_err(|_| Error::Timeout(timeout))??;
-            Ok(Exchange { target, request: req, response, duration_ms: released.elapsed().as_millis() as u64, sni })
+            Ok(Exchange {
+                target,
+                request: req,
+                response,
+                duration_ms: released.elapsed().as_millis() as u64,
+                sni,
+                stream: None,
+            })
         }));
     }
     let mut out = Vec::new();
@@ -180,7 +187,14 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
         reads.push(tokio::spawn(async move {
             let response =
                 tokio::time::timeout(timeout, read_response(fut)).await.map_err(|_| Error::Timeout(timeout))??;
-            Ok(Exchange { target, request, response, duration_ms: released.elapsed().as_millis() as u64, sni })
+            Ok(Exchange {
+                target,
+                request,
+                response,
+                duration_ms: released.elapsed().as_millis() as u64,
+                sni,
+                stream: None,
+            })
         }));
     }
     let mut out = Vec::new();

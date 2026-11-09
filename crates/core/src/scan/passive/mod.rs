@@ -126,11 +126,41 @@ pub struct ScanStats {
     pub kept_not_found: Option<usize>,
 }
 
-/// Scans every capture recorded since the last call.
+/// History rows completed after the scanner passed them and not scanned again yet (a JSON
+/// list of ids): see [`scan_later`].
+const LATE_KEY: &str = "passive.late";
+
+/// Leaves rows `ids` for the next [`scan_pending`] to scan again, whether or not it has passed
+/// them: rows completed (an event stream's, which got its body) by a process that has no time
+/// to scan them itself, such as a proxy that is stopping.
+pub fn scan_later(store: &Store, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut late: Vec<i64> = store.meta_get(LATE_KEY)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+    for id in ids {
+        if !late.contains(id) {
+            late.push(*id);
+        }
+    }
+    store.meta_set(LATE_KEY, Some(&serde_json::to_string(&late).unwrap_or_default()))
+}
+
+/// Scans every capture recorded since the last call, and the rows left by [`scan_later`].
 pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
     let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let mut last: i64 = store.meta_get(WATERMARK_KEY)?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut stats = ScanStats { last_id: last, ..Default::default() };
+    let late: Vec<i64> = store.meta_get(LATE_KEY)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+    if !late.is_empty() {
+        // Taken off the list first: a row that fails to scan mustn't fail every scan after.
+        store.meta_set(LATE_KEY, None)?;
+        // One the scanner hasn't reached yet is scanned below, whole.
+        for id in late.into_iter().filter(|id| *id <= last) {
+            stats.new_findings += scan_late(store, id)?;
+            stats.scanned += 1;
+        }
+    }
     let sources = settings.scanned_sources();
     // Rows recorded while we scan are left for the next call.
     let max_at_start = store.max_history_id()?;
@@ -186,4 +216,42 @@ pub fn rescan(store: &mut Store) -> Result<ScanStats> {
     stats.removed = Some(removed);
     stats.kept_not_found = Some(kept);
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::Capture;
+    use crate::http::Target;
+
+    /// A row completed after the scanner passed it, by a process with no time to scan it (an
+    /// event stream's row as the proxy stops), is scanned by the next scan.
+    #[test]
+    fn a_row_left_for_later_is_scanned_by_the_next_scan() {
+        let mut store = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let request = b"GET /events HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+        let id = store.record(&Capture::new("proxy", &target, request, Some(head.as_bytes()), Some(1), None)).unwrap();
+        let opened = scan_pending(&mut store).unwrap();
+        assert_eq!((opened.scanned, opened.last_id), (1, id));
+        let findings =
+            |s: &Store| s.query("SELECT count(*) FROM findings", &[], 1, 100).unwrap().rows[0][0].as_i64().unwrap();
+        let before = findings(&store);
+
+        // The body arrives with something in it to find; nobody scans the row.
+        let body = format!("{head}data: {{\"internal\": \"http://10.11.12.13:8080/admin\"}}\n\n");
+        store
+            .update_capture(id, &Capture::new("proxy", &target, request, Some(body.as_bytes()), Some(9), None))
+            .unwrap();
+        assert_eq!(scan_pending(&mut store).unwrap().scanned, 0, "the scanner has passed the row");
+        assert_eq!(findings(&store), before);
+
+        scan_later(&store, &[id, id]).unwrap();
+        let next = scan_pending(&mut store).unwrap();
+        assert_eq!(next.scanned, 1);
+        assert!(next.new_findings > 0 && findings(&store) > before, "{next:?}");
+        // Once: the list is empty again.
+        assert_eq!(scan_pending(&mut store).unwrap().scanned, 0);
+    }
 }

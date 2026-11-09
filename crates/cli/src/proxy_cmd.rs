@@ -1848,6 +1848,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         // A proxied client's request goes out with its own Host; an agent's edits and rules
         // are checked when they are made.
         host: brainproxy_core::http::client::HostPolicy::Allow,
+        stream: Default::default(),
     };
     let live = args.live_authz()?;
     let stored: LiveAuthz = store.setting(AUTHZ_KEY)?;

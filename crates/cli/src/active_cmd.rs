@@ -471,6 +471,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         // Base requests (baselines, API items, a session's) are checked as any are; the rules'
         // own Host changes are allowed by the scan itself.
         host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
+        stream: Default::default(),
     };
     let point_opts = PointOptions {
         query: !args.no_query,
