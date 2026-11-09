@@ -20,6 +20,9 @@ use crate::http::{Exchange, Target};
 /// one started by an older build.
 pub const SCHEMA_VERSION: i64 = 19;
 
+/// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
+pub const PRUNE_CHUNK: usize = 500;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -784,8 +787,13 @@ impl Store {
                     words, lines, duration_ms, matched, grep, extract, error)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
-            for (capture, r) in rows {
-                let history_id = capture.as_ref().map(|c| insert_capture(&tx, c)).transpose()?;
+            for (history, r) in rows {
+                use crate::fuzz::engine::History;
+                let history_id = match history {
+                    History::None => None,
+                    History::Written(id) => Some(*id),
+                    History::Capture(c) => Some(insert_capture(&tx, c)?),
+                };
                 matched += r.matched as i64;
                 errors += r.error.is_some() as i64;
                 stmt.execute(params![
@@ -1125,56 +1133,73 @@ impl Store {
     /// Rewrites history row `id` from `c`: a request recorded before it went out, now
     /// answered or failed. Its time, note, and tags stay; the full-text index follows.
     pub fn update_capture(&mut self, id: i64, c: &Capture) -> Result<()> {
-        const FTS: &str = "url, req_headers, req_body_text, resp_headers, resp_body_text";
         let tx = self.write_tx()?;
-        tx.execute(
-            &format!("INSERT INTO history_fts(history_fts, rowid, {FTS}) SELECT 'delete', id, {FTS} FROM history WHERE id = ?1"),
-            [id],
-        )?;
-        let n = tx.execute(
-            "UPDATE history SET source = ?2, scheme = ?3, host = ?4, port = ?5, method = ?6, url = ?7, path = ?8,
-                query = ?9, req_headers = ?10, req_content_type = ?11, req_body = ?12, req_body_text = ?13,
-                status = ?14, reason = ?15, resp_headers = ?16, resp_content_type = ?17, resp_body = ?18,
-                resp_body_text = ?19, resp_body_length = ?20, title = ?21, duration_ms = ?22, error = ?23,
-                request = ?24, response = ?25
-             WHERE id = ?1",
-            params![
-                id,
-                c.source,
-                c.scheme,
-                c.host,
-                c.port,
-                c.method,
-                c.url,
-                c.path,
-                c.query,
-                c.req_headers,
-                c.req_content_type,
-                c.req_body,
-                c.req_body_text,
-                c.status,
-                c.reason,
-                c.resp_headers,
-                c.resp_content_type,
-                c.resp_body,
-                c.resp_body_text,
-                c.resp_body.as_ref().map(|b| b.len() as i64),
-                c.title,
-                c.duration_ms,
-                c.error,
-                c.request,
-                c.response,
-            ],
-        )?;
-        if n == 0 {
-            return Err(Error::NotFound(format!("history item {id}")));
-        }
-        tx.execute(
-            &format!("INSERT INTO history_fts(rowid, {FTS}) SELECT id, {FTS} FROM history WHERE id = ?1"),
-            [id],
-        )?;
+        update_capture(&tx, id, c)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes rows `new` and completes rows `done` (as [`Store::update_capture`]) in one
+    /// transaction; returns the new rows' ids. Senders with many requests out at once write
+    /// their rows this way, one commit for many rows (see [`crate::sent::RowBatch`]).
+    pub fn write_rows(&mut self, new: &[Capture], done: &[(i64, Capture)]) -> Result<Vec<i64>> {
+        let tx = self.write_tx()?;
+        let ids = new.iter().map(|c| insert_capture(&tx, c)).collect::<Result<Vec<_>>>()?;
+        for (id, c) in done {
+            update_capture(&tx, *id, c)?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Deletes those of history rows `ids` that nothing refers to: no finding (first or last
+    /// sighting, or a hand-added finding's list in meta), finding event, fuzz or authz result
+    /// (the request tested, its response or the baseline), WebSocket connection, out-of-band
+    /// payload or auth macro step, and no note or tags. An active scan with pruning on calls
+    /// this with the rows it wrote itself.
+    ///
+    /// The ids go [`PRUNE_CHUNK`] at a time, each chunk checked and deleted in a transaction of
+    /// its own: the full-text index's delete trigger makes a large delete slow, and one long
+    /// write transaction would make a running proxy, or another sender's row writer, wait past
+    /// the busy timeout and fail. A reference added between chunks keeps its row if its chunk
+    /// comes later. Returns how many were deleted, and the error that stopped it, if any (the
+    /// rows of that chunk and after are left in place).
+    pub fn prune_unreferenced(&mut self, ids: &[i64]) -> (usize, Option<Error>) {
+        let mut deleted = 0;
+        for chunk in ids.chunks(PRUNE_CHUNK) {
+            match self.prune_chunk(chunk) {
+                Ok(n) => deleted += n,
+                Err(e) => return (deleted, Some(e)),
+            }
+        }
+        (deleted, None)
+    }
+
+    fn prune_chunk(&mut self, ids: &[i64]) -> Result<usize> {
+        let list = serde_json::to_string(ids).unwrap_or_default();
+        let tx = self.write_tx()?;
+        let n = tx.execute(
+            "DELETE FROM history WHERE id IN (SELECT value FROM json_each(?1))
+                AND COALESCE(note, '') = '' AND tags = '[]'
+                AND id NOT IN (SELECT history_id FROM findings WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT last_history_id FROM findings WHERE last_history_id IS NOT NULL)
+                AND id NOT IN (SELECT j.value FROM meta, json_each(meta.value) j
+                               WHERE meta.key LIKE 'finding.%.history' AND json_valid(meta.value))
+                AND id NOT IN (SELECT history_id FROM finding_events WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM fuzz_results WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT source_id FROM authz_results WHERE source_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM authz_results WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT baseline_history_id FROM authz_results WHERE baseline_history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM ws_connections WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM oob_payloads WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT json_extract(step.value, '$.history_id')
+                               FROM meta, json_each(meta.value, '$.macros') m, json_each(m.value, '$.steps') step
+                               WHERE meta.key LIKE 'auth.handling.%' AND json_valid(meta.value)
+                                 AND json_extract(step.value, '$.history_id') IS NOT NULL)",
+            [list],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     pub fn list(&self, f: &HistoryFilter) -> Result<Vec<HistoryEntry>> {
@@ -1395,6 +1420,57 @@ fn owner_only(path: &Path) {
 
 #[cfg(not(unix))]
 fn owner_only(_: &Path) {}
+
+/// [`Store::update_capture`] within the caller's transaction.
+fn update_capture(tx: &Connection, id: i64, c: &Capture) -> Result<()> {
+    const FTS: &str = "url, req_headers, req_body_text, resp_headers, resp_body_text";
+    tx.execute(
+        &format!(
+            "INSERT INTO history_fts(history_fts, rowid, {FTS}) SELECT 'delete', id, {FTS} FROM history WHERE id = ?1"
+        ),
+        [id],
+    )?;
+    let n = tx.execute(
+        "UPDATE history SET source = ?2, scheme = ?3, host = ?4, port = ?5, method = ?6, url = ?7, path = ?8,
+            query = ?9, req_headers = ?10, req_content_type = ?11, req_body = ?12, req_body_text = ?13,
+            status = ?14, reason = ?15, resp_headers = ?16, resp_content_type = ?17, resp_body = ?18,
+            resp_body_text = ?19, resp_body_length = ?20, title = ?21, duration_ms = ?22, error = ?23,
+            request = ?24, response = ?25
+         WHERE id = ?1",
+        params![
+            id,
+            c.source,
+            c.scheme,
+            c.host,
+            c.port,
+            c.method,
+            c.url,
+            c.path,
+            c.query,
+            c.req_headers,
+            c.req_content_type,
+            c.req_body,
+            c.req_body_text,
+            c.status,
+            c.reason,
+            c.resp_headers,
+            c.resp_content_type,
+            c.resp_body,
+            c.resp_body_text,
+            c.resp_body.as_ref().map(|b| b.len() as i64),
+            c.title,
+            c.duration_ms,
+            c.error,
+            c.request,
+            c.response,
+        ],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("history item {id}")));
+    }
+    tx.execute(&format!("INSERT INTO history_fts(rowid, {FTS}) SELECT id, {FTS} FROM history WHERE id = ?1"), [id])?;
+    Ok(())
+}
 
 pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
     conn.execute(
@@ -2121,6 +2197,72 @@ mod tests {
         assert_eq!(q("SELECT regexp_extract(resp_body_text, '\"token\":\"(\\w+)\"', 1) FROM history")[0][0], "abc");
         assert_eq!(q("SELECT json_extract(resp_body_text, '$.token') FROM history")[0][0], "abc");
         assert_eq!(q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'syntax'").len(), 1);
+    }
+
+    /// Pruning deletes only the given rows nothing refers to.
+    #[test]
+    fn pruning_keeps_every_row_something_refers_to() {
+        let mut s = Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..13).map(|_| sample(&s)).collect();
+        let other = sample(&s);
+        s.set_note(ids[1], Some("look")).unwrap();
+        let exec = |sql: &str, id: i64| s.conn.execute(sql, [id]).unwrap();
+        exec("UPDATE history SET tags = '[\"x\"]' WHERE id = ?1", ids[2]);
+        exec(
+            "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method, url,
+                history_id, last_history_id, dedupe)
+             VALUES ('active', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET', 'http://a.test/x', ?1, NULL, 'd1')",
+            ids[3],
+        );
+        exec(
+            "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host, method, url,
+                history_id, last_history_id, dedupe)
+             VALUES ('active', 1, '1', 'n', 'low', 1, 'low', 'a.test', 'GET', 'http://a.test/x', NULL, ?1, 'd2')",
+            ids[4],
+        );
+        exec("INSERT INTO meta (key, value) VALUES ('finding.9.history', json_array(?1, ?1 + 1000))", ids[5]);
+        exec("INSERT INTO finding_events (kind, history_id) VALUES ('retested', ?1)", ids[6]);
+        exec("INSERT INTO fuzz_results (run_id, idx, payloads, history_id) VALUES (1, 0, '[]', ?1)", ids[7]);
+        exec(
+            "INSERT INTO authz_results (run_id, idx, method, url, owner, identity, verdict, baseline_history_id)
+             VALUES (1, 0, 'GET', 'u', 'a', 'b', 'same', ?1)",
+            ids[8],
+        );
+        exec("INSERT INTO oob_payloads (token, source, history_id) VALUES ('t', 'scan', ?1)", ids[9]);
+        exec(
+            "INSERT INTO authz_results (run_id, idx, source_id, method, url, owner, identity, verdict)
+             VALUES (2, 0, ?1, 'GET', 'u', 'a', 'b', 'same')",
+            ids[10],
+        );
+        let macros = serde_json::json!({"macros": [{"name": "m", "steps": [
+            {"target": "http://a.test", "request": "GET / HTTP/1.1\r\n\r\n"},
+            {"target": "http://a.test", "request": "GET / HTTP/1.1\r\n\r\n", "history_id": ids[11]},
+        ]}]});
+        s.meta_set("auth.handling.app", Some(&macros.to_string())).unwrap();
+        // A meta value that isn't JSON doesn't stop the rest.
+        s.meta_set("finding.8.history", Some("{")).unwrap();
+        let (n, e) = s.prune_unreferenced(&ids);
+        assert_eq!((n, e.map(|e| e.to_string())), (2, None));
+        let mut left: Vec<i64> = s.list(&Default::default()).unwrap().into_iter().map(|e| e.id).collect();
+        left.sort_unstable();
+        let kept = [&ids[1..12], &[other]].concat();
+        assert_eq!(left, kept, "rows 0 and 12 go; the one not given stays");
+        assert_eq!(s.prune_unreferenced(&[]).0, 0);
+    }
+
+    /// Many rows are pruned a chunk per transaction; an error stops it with the count so far,
+    /// leaving the rest.
+    #[test]
+    fn pruning_goes_a_chunk_at_a_time_and_an_error_keeps_the_rest() {
+        let mut s = Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..PRUNE_CHUNK * 2 + 3).map(|_| sample(&s)).collect();
+        let (first, rest) = ids.split_at(PRUNE_CHUNK + 1);
+        assert_eq!(s.prune_unreferenced(first).0, PRUNE_CHUNK + 1);
+        s.conn.execute_batch("DROP TABLE ws_connections").unwrap();
+        let (n, e) = s.prune_unreferenced(rest);
+        assert_eq!(n, 0);
+        assert!(e.is_some());
+        assert_eq!(s.count().unwrap(), rest.len() as i64);
     }
 
     #[test]

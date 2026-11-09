@@ -13,14 +13,21 @@
 //! An API document's fetch keeps its request as sent and the response's head, but not the
 //! document: it can hold the credentials `import` reports by name and withholds. The error
 //! says so ([`DOCUMENT_OMITTED`]), with the body's length and sha256.
+//!
+//! Senders with many requests out at once (crawls, active scans, `authz`, `fuzz`) write
+//! their rows the same way, through a writer thread of their own: see [`Rows`] and
+//! [`RowBatch`]. The thread writes every row queued since its last write in one
+//! transaction, and a request goes out only once its row is committed.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::auth::AuthSession;
 use crate::capture::Capture;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::http::client::{final_response, sent_sni};
 use crate::http::request::split_head_body;
-use crate::http::{parse_response_head, Client, Exchange, Target};
+use crate::http::{parse_response_head, Client, Exchange, RawRequest, Target};
 use crate::store::Store;
 
 /// The error of a row whose request went out and whose outcome was never recorded.
@@ -177,6 +184,280 @@ impl SentLog {
     }
 }
 
+/// The error of a [`Rows`] row whose request was given up unanswered: it timed out, or the
+/// command stopped waiting for it.
+pub const ABANDONED: &str = "sent; no response recorded (timed out or stopped while waiting)";
+
+/// A row write for a sender's writer thread: see [`Rows`].
+pub enum RowWrite {
+    /// A request about to go out. Its row is written and the id sent back once committed;
+    /// None if it couldn't be written, and then the request isn't sent.
+    Pending { capture: Box<Capture>, reply: tokio::sync::oneshot::Sender<Option<i64>> },
+    /// How a pending row's request ended.
+    Complete { id: i64, capture: Box<Capture> },
+}
+
+/// The row writes a writer thread has taken off its queue, written in one transaction.
+#[derive(Default)]
+pub struct RowBatch {
+    pending: Vec<(Capture, tokio::sync::oneshot::Sender<Option<i64>>)>,
+    done: Vec<(i64, Capture)>,
+}
+
+/// What [`RowBatch::write`] did.
+#[derive(Debug, Default)]
+pub struct Written {
+    /// The rows written (pending), in the order queued.
+    pub created: Vec<i64>,
+    /// The rows completed: a passive scan may have passed them while they were pending
+    /// (see [`crate::scan::passive::scan_late`]).
+    pub completed: Vec<i64>,
+    /// Writes that failed (each also printed to stderr).
+    pub failed: usize,
+}
+
+impl RowBatch {
+    pub fn push(&mut self, w: RowWrite) {
+        match w {
+            RowWrite::Pending { capture, reply } => self.pending.push((*capture, reply)),
+            RowWrite::Complete { id, capture } => self.done.push((id, *capture)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.done.is_empty()
+    }
+
+    /// Writes the batch in one transaction, then sends the new rows' ids back. If that
+    /// fails (one row too large, say), writes them one by one, so only the bad ones fail:
+    /// a pending row that couldn't be written gets None, and its request isn't sent.
+    pub fn write(&mut self, store: &mut Store) -> Written {
+        let pending = std::mem::take(&mut self.pending);
+        let done = std::mem::take(&mut self.done);
+        let mut out = Written::default();
+        if pending.is_empty() && done.is_empty() {
+            return out;
+        }
+        let new: Vec<Capture> = pending.iter().map(|(c, _)| c.clone()).collect();
+        match store.write_rows(&new, &done) {
+            Ok(ids) => {
+                for ((_, reply), id) in pending.into_iter().zip(ids) {
+                    let _ = reply.send(Some(id));
+                    out.created.push(id);
+                }
+                out.completed = done.into_iter().map(|(id, _)| id).collect();
+            }
+            Err(e) => {
+                eprintln!(
+                    "brainproxy: writing {} history rows failed ({e}); writing them one by one",
+                    new.len() + done.len()
+                );
+                for (c, reply) in pending {
+                    let id = store.record(&c).inspect_err(|e| eprintln!("brainproxy: history row not written: {e}"));
+                    out.failed += id.is_err() as usize;
+                    out.created.extend(id.as_ref().ok());
+                    let _ = reply.send(id.ok());
+                }
+                for (id, c) in done {
+                    match store.update_capture(id, &c) {
+                        Ok(()) => out.completed.push(id),
+                        Err(e) => {
+                            eprintln!("brainproxy: history #{id} not completed: {e}");
+                            out.failed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Records the requests of one source as they go out, for a sender with many in flight:
+/// each row is queued to the sender's writer thread (which writes it with others in a
+/// [`RowBatch`]), and the request waits until it is committed. Cheap to clone.
+#[derive(Clone)]
+pub struct Rows {
+    write: Arc<dyn Fn(RowWrite) + Send + Sync>,
+    source: &'static str,
+    /// See [`SentLog::sent_by`].
+    sni: Option<String>,
+    /// The error of a row whose request was given up unanswered.
+    abandoned: &'static str,
+}
+
+impl Rows {
+    /// Rows of `source`, handed to `write` (which queues them for the writer thread).
+    pub fn new(source: &'static str, write: impl Fn(RowWrite) + Send + Sync + 'static) -> Self {
+        Self { write: Arc::new(write), source, sni: None, abandoned: ABANDONED }
+    }
+
+    /// Rows of `source` written to `store` at once, on the sending thread: for a sender with
+    /// one request out at a time, which needs no writer thread.
+    pub fn direct(source: &'static str, store: Store) -> Self {
+        let store = std::sync::Mutex::new(store);
+        Self::new(source, move |w| {
+            let mut batch = RowBatch::default();
+            batch.push(w);
+            batch.write(&mut store.lock().unwrap());
+        })
+    }
+
+    /// Rows record the TLS server name `client` sends in place of a target's host (`--sni`).
+    pub fn sent_by(mut self, client: &Client) -> Self {
+        self.sni = client.options().sni.clone();
+        self
+    }
+
+    /// A row whose request is given up unanswered keeps `error` (default [`ABANDONED`]).
+    pub fn abandoned_as(mut self, error: &'static str) -> Self {
+        self.abandoned = error;
+        self
+    }
+
+    pub fn source(&self) -> &'static str {
+        self.source
+    }
+
+    /// The row for `request` and how it ended.
+    pub fn capture(
+        &self,
+        target: &Target,
+        request: &[u8],
+        response: Option<&[u8]>,
+        duration_ms: Option<u64>,
+        error: Option<&str>,
+    ) -> Capture {
+        let c = Capture::new(self.source, target, request, response, duration_ms.map(|d| d as i64), error);
+        Capture { sni: sent_sni(self.sni.as_deref(), target), ..c }
+    }
+
+    /// Writes the row of `request` (as recorded) as about to go out, and waits until it is
+    /// committed. The returned row completes itself as given up if dropped open.
+    pub async fn open(&self, target: &Target, request: Vec<u8>) -> Result<OpenRow> {
+        let (reply, id) = tokio::sync::oneshot::channel();
+        let capture = self.capture(target, &request, None, None, Some(PENDING));
+        (self.write)(RowWrite::Pending { capture: Box::new(capture), reply });
+        let Some(id) = id.await.ok().flatten() else {
+            return Err(Error::Protocol("the request could not be recorded in history, so it wasn't sent".into()));
+        };
+        Ok(OpenRow { rows: self.clone(), id, target: target.clone(), request, open: true })
+    }
+
+    /// Sends `req` with `client`, its row written first and completed with the outcome.
+    /// Returns the row (None when nothing was recorded or sent) and the result. A target the
+    /// engagement scope refuses outright gets no row: the client refuses it unsent.
+    pub async fn send(&self, client: &Client, req: &RawRequest, target: &Target) -> (Option<i64>, Result<Exchange>) {
+        if client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port)) {
+            return (None, client.send(req, target).await);
+        }
+        let row = match client.recorded_request(req, target) {
+            Ok(recorded) => self.open(target, recorded).await,
+            Err(e) => Err(e),
+        };
+        let mut row = match row {
+            Ok(row) => row,
+            Err(e) => return (None, Err(e)),
+        };
+        let result = client.send(req, target).await;
+        match &result {
+            Ok(ex) => row.answered(ex),
+            Err(e) => row.failed(&e.to_string()),
+        }
+        (Some(row.id), result)
+    }
+
+    /// [`Rows::send_as`] with `session` if there is one, else [`Rows::send`] with `client`.
+    pub async fn send_with(
+        &self,
+        client: &Client,
+        session: Option<&AuthSession>,
+        tool: crate::session::Tool,
+        req: &RawRequest,
+        target: &Target,
+    ) -> (Vec<i64>, Result<Exchange>) {
+        match session {
+            Some(s) => self.send_as(s, tool, req, target).await,
+            None => {
+                let (id, result) = self.send(client, req, target).await;
+                (id.into_iter().collect(), result)
+            }
+        }
+    }
+
+    /// [`Rows::send`] with `session` applied for `tool`, as [`AuthSession::send_as`] sends:
+    /// the request, and the request sent again after a re-login, each get a row (in the
+    /// order sent).
+    pub async fn send_as(
+        &self,
+        session: &AuthSession,
+        tool: crate::session::Tool,
+        req: &RawRequest,
+        target: &Target,
+    ) -> (Vec<i64>, Result<Exchange>) {
+        let mut ids = Vec::new();
+        let prepared = session.prepare(tool, target, req.as_bytes(), &[], &[]).await;
+        let (id, result) = self.send(&session.client, &RawRequest::from_bytes(prepared.request.clone()), target).await;
+        ids.extend(id);
+        let ex = match result {
+            Ok(ex) => ex,
+            Err(e) => return (ids, Err(e)),
+        };
+        if !session.after_response(&prepared, &ex.response).await {
+            return (ids, Ok(ex));
+        }
+        let again = RawRequest::from_bytes(session.prepare(tool, target, req.as_bytes(), &[], &[]).await.request);
+        let (id, result) = self.send(&session.client, &again, target).await;
+        ids.extend(id);
+        if let Ok(ex) = &result {
+            session.observe(&ex.response);
+        }
+        (ids, result)
+    }
+}
+
+/// A [`Rows`] row whose request is out. Completed by [`OpenRow::answered`] or
+/// [`OpenRow::failed`]; dropped open (the request timed out, or the sender stopped waiting),
+/// it completes itself with the [`Rows`]' given-up error.
+pub struct OpenRow {
+    rows: Rows,
+    pub id: i64,
+    target: Target,
+    request: Vec<u8>,
+    open: bool,
+}
+
+impl OpenRow {
+    pub fn answered(&mut self, ex: &Exchange) {
+        let c = self.rows.capture(&ex.target, &ex.request, Some(&ex.response), Some(ex.duration_ms), None);
+        self.finish(c);
+    }
+
+    /// Answered with `response` to the request as recorded.
+    pub fn answered_with(&mut self, response: &[u8], duration_ms: u64) {
+        let c = self.rows.capture(&self.target, &self.request, Some(response), Some(duration_ms), None);
+        self.finish(c);
+    }
+
+    pub fn failed(&mut self, error: &str) {
+        let c = self.rows.capture(&self.target, &self.request, None, None, Some(error));
+        self.finish(c);
+    }
+
+    fn finish(&mut self, capture: Capture) {
+        self.open = false;
+        (self.rows.write)(RowWrite::Complete { id: self.id, capture: Box::new(capture) });
+    }
+}
+
+impl Drop for OpenRow {
+    fn drop(&mut self) {
+        if self.open {
+            self.failed(self.rows.abandoned);
+        }
+    }
+}
+
 /// A row that keeps no content: the request line without its query string, the time, source
 /// and target. The response is left out (no status, so passive checks skip it); the error
 /// starts with `reason`, then says whether a query string was left out and how the request
@@ -246,6 +527,80 @@ mod tests {
         );
         assert_eq!(item.entry.duration_ms, Some(12));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request's row is committed before it goes out; one given up unanswered says so,
+    /// and a target the scope refuses outright gets none.
+    #[tokio::test]
+    async fn rows_are_written_before_the_request_goes_out() {
+        let dir = std::env::temp_dir().join(format!("bp-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&project);
+        drop(Store::create(&project).unwrap());
+        // A server that takes the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (got_tx, got) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let _ = got_tx.send(());
+            std::future::pending::<()>().await;
+            drop(s);
+        });
+        let rows = Rows::direct("crawl", Store::open(&project).unwrap());
+        let in_scope = |host: &str| {
+            let scope = crate::guard::ScopeSpec { name: None, include: vec![host.into()], exclude: vec![] };
+            let guard = crate::guard::Guard::from_specs(vec![scope]).unwrap();
+            Client::new(crate::http::SendOptions { guard: Some(guard), ..Default::default() })
+        };
+        let client = in_scope("127.0.0.1");
+        let target = Target::from_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        let req = RawRequest::from_bytes(b"GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec());
+        let sending = rows.send(&client, &req, &target);
+        let waited = tokio::select! {
+            r = sending => panic!("the server never answers: {:?}", r.1.err()),
+            r = async { got.await.unwrap(); Store::open(&project).unwrap().list(&Default::default()).unwrap() } => r,
+        };
+        // On record while out, then given up (the future dropped).
+        assert_eq!(waited.len(), 1);
+        assert_eq!(waited[0].error.as_deref(), Some(PENDING));
+        let store = Store::open(&project).unwrap();
+        let item = store.get(waited[0].id).unwrap();
+        assert_eq!(item.entry.error.as_deref(), Some(ABANDONED));
+        assert_eq!(item.request, req.as_bytes());
+
+        // Outside the engagement: refused unsent, and no row.
+        let (id, sent) = rows.send(&in_scope("b.test"), &req, &target).await;
+        assert!(id.is_none() && sent.is_err());
+        assert_eq!(store.list(&Default::default()).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_batch_writes_rows_and_completions_together() {
+        let mut store = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let rows = Rows::new("scan", |_| {});
+        let mut batch = RowBatch::default();
+        let (reply, id) = tokio::sync::oneshot::channel();
+        batch.push(RowWrite::Pending {
+            capture: Box::new(rows.capture(&target, b"GET /a HTTP/1.1\r\n\r\n", None, None, Some(PENDING))),
+            reply,
+        });
+        let written = batch.write(&mut store);
+        let id = id.blocking_recv().unwrap().unwrap();
+        assert!(written.completed.is_empty() && written.failed == 0);
+        assert_eq!(written.created, vec![id]);
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let done = rows.capture(&target, b"GET /a HTTP/1.1\r\n\r\n", Some(resp), Some(3), None);
+        batch.push(RowWrite::Complete { id, capture: Box::new(done) });
+        // A completion of a row that doesn't exist fails alone.
+        batch.push(RowWrite::Complete { id: 99, capture: Box::default() });
+        let written = batch.write(&mut store);
+        assert_eq!((written.completed, written.failed), (vec![id], 1));
+        let item = store.get(id).unwrap();
+        assert_eq!((item.entry.status, item.entry.error), (Some(200), None));
     }
 
     #[test]

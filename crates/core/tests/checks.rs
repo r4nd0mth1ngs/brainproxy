@@ -133,6 +133,7 @@ fn run_with(
         oob: None,
         oob_wait: Duration::ZERO,
         check_methods: vec![],
+        prune: false,
     };
     tweak(&mut cfg);
     let targets = vec![ScanTarget {

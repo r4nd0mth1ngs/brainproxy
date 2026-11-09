@@ -175,6 +175,7 @@ pub fn ws(project: &Path, cmd: WsCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         WsCmd::List { host, source, state, after, limit, newest } => {
             let store = Store::open(project)?;
+            close_abandoned(&store, project)?;
             let state = state.map(|s| match s {
                 ConnState::Open => "open".to_string(),
                 ConnState::Closed => "closed".to_string(),
@@ -192,6 +193,7 @@ pub fn ws(project: &Path, cmd: WsCmd, out: &Out) -> Result<(), Error> {
         }
         WsCmd::Show { id, max_body } => {
             let store = Store::open(project)?;
+            close_abandoned(&store, project)?;
             let c = store.ws_connection(id)?;
             let handshake = match c.history_id.map(|h| store.get(h)) {
                 Some(Ok(item)) => {
@@ -358,6 +360,7 @@ fn outgoing(store: &Store, args: &SendArgs, input: &Input) -> Result<Vec<(u8, Ve
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     crate::mcp::check_no_store(args.no_store)?;
     let store = Store::open(project)?;
+    close_abandoned(&store, project)?;
     let input = if args.input_json {
         serde_json::from_slice(&crate::read_input(None)?)
             .map_err(|e| Error::InvalidInput(format!("--input-json: {e}")))?
@@ -523,6 +526,8 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         keys.insert(0, id);
         Some(id)
     };
+    // Held until the connection's close is recorded (dropped at the end of this function).
+    let _held = connection_id.and_then(|id| ConnLock::take(project, id));
     let (events, queued) = std::sync::mpsc::channel::<WsEvent>();
     let writer = connection_id.map(|_| {
         let (project, mut keys) = (project.to_path_buf(), keys.clone());
@@ -620,6 +625,66 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         }));
         lines.join("\n")
     });
+    Ok(())
+}
+
+/// The error of a replay connection whose `ws send` ended without closing it (it was killed).
+pub(crate) const ABANDONED: &str = "ws send ended without closing it (killed)";
+
+/// `<project>-ws-<id>.lock`, held by the `ws send` of replay connection `id` while it runs.
+fn conn_lock_path(project: &Path, id: i64) -> std::path::PathBuf {
+    let mut path = project.as_os_str().to_owned();
+    path.push(format!("-ws-{id}.lock"));
+    path.into()
+}
+
+/// A `ws send`'s hold on its connection's lock file, for as long as the connection is open.
+/// The kernel lets go of it the moment the process dies, however that happens, so a later
+/// look ([`close_abandoned`]) can tell a connection left open by a killed `ws send`.
+struct ConnLock {
+    path: std::path::PathBuf,
+    _file: std::fs::File,
+}
+
+impl ConnLock {
+    /// None where the lock can't be taken (a filesystem without locks, say): that connection
+    /// is then never closed by a look, as before.
+    fn take(project: &Path, id: i64) -> Option<Self> {
+        let path = conn_lock_path(project, id);
+        // Locked under another name first, then renamed: a look never finds it unlocked
+        // while this command runs.
+        let mut taking = path.clone().into_os_string();
+        taking.push(format!(".{}", std::process::id()));
+        let taking = std::path::PathBuf::from(taking);
+        let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&taking).ok()?;
+        if file.try_lock().is_err() || std::fs::rename(&taking, &path).is_err() {
+            let _ = std::fs::remove_file(&taking);
+            return None;
+        }
+        Some(Self { path, _file: file })
+    }
+}
+
+impl Drop for ConnLock {
+    fn drop(&mut self) {
+        // Removed while still held, so a look never takes it for a killed command's.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Closes replay connections left open by a `ws send` that was killed: their lock file is
+/// there, and nothing holds it. Ones without a lock file (from an older build, or one that
+/// couldn't take it) are left as they are.
+fn close_abandoned(store: &Store, project: &Path) -> Result<(), Error> {
+    for id in store.ws_open_ids("replay")? {
+        let path = conn_lock_path(project, id);
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        if file.try_lock_shared().is_ok() {
+            store.ws_close_open(id, ABANDONED)?;
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     Ok(())
 }
 

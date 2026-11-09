@@ -33,6 +33,7 @@ use crate::http::{Client, Exchange, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
 use crate::scan::active::Limiter;
 use crate::scan::{AlertDef, Confidence, Message, Risk};
+use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::store::Store;
 use compare::{
     mentions, private_hits, private_values, privileged_path, references_object, says_denied, similarity, Body, Noise,
@@ -334,6 +335,8 @@ struct Row {
     similarity: Option<f64>,
     private: Option<(usize, usize)>,
     exchange: Option<Exchange>,
+    /// The request's history row (written as it went out), answered or failed.
+    history_id: Option<i64>,
     reason: String,
     evidence: String,
 }
@@ -348,6 +351,7 @@ impl Row {
             similarity: None,
             private: None,
             exchange: None,
+            history_id: None,
             reason: reason.into(),
             evidence: String::new(),
         }
@@ -504,6 +508,8 @@ enum As {
 /// live mode (each request as it is recorded). Stops sending once `ctl` is stopped.
 pub struct Tester {
     client: Client,
+    /// Every request's row (source `authz`), written before it goes out.
+    rows: Rows,
     cfg: AuthzConfig,
     limiter: Option<Limiter>,
     sent: AtomicU64,
@@ -511,8 +517,12 @@ pub struct Tester {
     identities: Vec<String>,
 }
 
+/// A request sent by a [`Tester`]: its history row (None if it got none) and the result.
+type Sent = (Option<i64>, Result<Exchange>);
+
 impl Tester {
-    pub fn new(cfg: AuthzConfig, ctl: JobControl) -> Result<Tester> {
+    /// Records the requests it sends with `rows` (see [`writer`]).
+    pub fn new(cfg: AuthzConfig, ctl: JobControl, rows: Rows) -> Result<Tester> {
         if !cfg.anonymous && cfg.identities.is_empty() {
             return Err(Error::InvalidInput(
                 "nothing to compare: pass --as NAME or leave the anonymous control on".into(),
@@ -523,8 +533,10 @@ impl Tester {
             identities.push(ANONYMOUS.to_string());
         }
         identities.extend(cfg.identities.iter().map(|s| s.profile.name.clone()));
+        let client = Client::new(cfg.send.clone());
         Ok(Tester {
-            client: Client::new(cfg.send.clone()),
+            rows: rows.sent_by(&client),
+            client,
             limiter: Limiter::new(cfg.rate),
             cfg,
             sent: AtomicU64::new(0),
@@ -550,7 +562,7 @@ impl Tester {
 
     /// Sends unless the run is stopped, before or while waiting for the rate limit
     /// (then None).
-    async fn send(&self, who: &As, request: &[u8], target: &Target) -> Option<Result<Exchange>> {
+    async fn send(&self, who: &As, request: &[u8], target: &Target) -> Option<Sent> {
         if let Some(l) = &self.limiter {
             tokio::select! {
                 _ = l.wait() => {}
@@ -569,13 +581,18 @@ impl Tester {
         }
     }
 
-    async fn send_now(&self, who: &As, request: &[u8], target: &Target) -> Result<Exchange> {
+    /// Sends `request` as `who`, each request on record before it goes out. With a session
+    /// that logs in again, the row is the one of the request sent again.
+    async fn send_now(&self, who: &As, request: &[u8], target: &Target) -> Sent {
         self.sent.fetch_add(1, Ordering::Relaxed);
         let strip = || RawRequest::from_bytes(strip_auth(request, &self.cfg.known, &self.cfg.keep_cookies));
         match who {
-            As::Recorded => self.client.send(&RawRequest::from_bytes(request.to_vec()), target).await,
-            As::Anonymous => self.client.send(&strip(), target).await,
-            As::Owner(s) | As::Session(s) => s.send(&strip(), target).await,
+            As::Recorded => self.rows.send(&self.client, &RawRequest::from_bytes(request.to_vec()), target).await,
+            As::Anonymous => self.rows.send(&self.client, &strip(), target).await,
+            As::Owner(s) | As::Session(s) => {
+                let (ids, result) = self.rows.send_as(s, crate::session::Tool::Send, &strip(), target).await;
+                (ids.last().copied(), result)
+            }
         }
     }
 
@@ -607,17 +624,20 @@ impl Tester {
             rows: vec![],
         };
 
-        let first = match self.send(&owner_as, &request, &t.target).await {
+        let (first_id, first) = match self.send(&owner_as, &request, &t.target).await {
             None => return out,
-            Some(Ok(ex)) => ex,
-            Some(Err(e)) => {
-                out.rows.push(Row::new(&owner_name, Verdict::Error, format!("baseline failed: {e}")));
+            Some((id, Ok(ex))) => (id, ex),
+            Some((id, Err(e))) => {
+                let mut row = Row::new(&owner_name, Verdict::Error, format!("baseline failed: {e}"));
+                row.history_id = id;
+                out.rows.push(row);
                 return out;
             }
         };
         let body = Body::parse(&first.response);
         let mut base_row = Row::new(&owner_name, Verdict::Baseline, "");
         base_row.status = body.status;
+        base_row.history_id = first_id;
         let unusable = if !body.success() {
             Some(format!(
                 "baseline status {}",
@@ -638,10 +658,11 @@ impl Tester {
         out.rows.push(base_row);
         // The baseline again: whatever differs between the two is noise. A second
         // response that isn't a like one (rate limited, an error, logged out) would
-        // mask real differences, so then nothing is left out.
+        // mask real differences, so then nothing is left out. (It has a history row, but
+        // no result row.)
         let noise = match self.send(&owner_as, &request, &t.target).await {
             None => return out,
-            Some(Ok(ex)) => {
+            Some((_, Ok(ex))) => {
                 let again = Body::parse(&ex.response);
                 let alike = again.success()
                     && again.json.is_some() == body.json.is_some()
@@ -652,7 +673,7 @@ impl Tester {
                     Noise::default()
                 }
             }
-            Some(Err(_)) => Noise::default(),
+            Some((_, Err(_))) => Noise::default(),
         };
         if self.cfg.owner.is_none()
             && owner.is_none()
@@ -686,11 +707,13 @@ impl Tester {
         let nothing_private = Vec::new();
         for (name, who, user) in sends {
             let anonymous = matches!(who, As::Anonymous);
-            let ex = match self.send(&who, &request, &t.target).await {
+            let (id, ex) = match self.send(&who, &request, &t.target).await {
                 None => break,
-                Some(Ok(ex)) => ex,
-                Some(Err(e)) => {
-                    out.rows.push(Row::new(&name, Verdict::Error, e.to_string()));
+                Some((id, Ok(ex))) => (id, ex),
+                Some((id, Err(e))) => {
+                    let mut row = Row::new(&name, Verdict::Error, e.to_string());
+                    row.history_id = id;
+                    out.rows.push(row);
                     continue;
                 }
             };
@@ -734,6 +757,7 @@ impl Tester {
             }
             row.identity = name;
             row.exchange = Some(ex);
+            row.history_id = id;
             out.rows.push(row);
         }
         out
@@ -768,8 +792,8 @@ fn credential_headers<'a>(profiles: impl IntoIterator<Item = &'a AuthProfile>) -
     names
 }
 
-/// Writes outcomes under one run: the result rows, the exchanges (history, source
-/// `authz`) and the findings.
+/// Writes outcomes under one run: the result rows (with the history rows their requests
+/// got as they went out, source `authz`) and the findings.
 pub struct Recorder {
     store: Store,
     run_id: i64,
@@ -805,6 +829,61 @@ impl Recorder {
     }
 }
 
+/// What a run's writer thread writes.
+pub(crate) enum Write {
+    /// A request's history row, written before it goes out (see [`Rows`]).
+    Row(RowWrite),
+    Outcome(Outcome),
+}
+
+pub(crate) type Writer = std::thread::JoinHandle<Result<Recorder>>;
+
+/// A run writer's queue, shared by its tester's rows; [`join_writer`] lets go of it.
+#[derive(Clone)]
+pub(crate) struct Queue(Arc<std::sync::Mutex<mpsc::Sender<Write>>>);
+
+impl Queue {
+    pub(crate) fn outcome(&self, o: Outcome) {
+        let _ = self.0.lock().unwrap().send(Write::Outcome(o));
+    }
+}
+
+/// Starts the thread that writes a run's history rows and outcomes with `recorder`. Returns
+/// its queue, the rows for a [`Tester`] to record its requests with, and the thread. Rows
+/// queued since its last write are written together, before any outcome after them.
+pub(crate) fn writer(mut recorder: Recorder) -> (Queue, Rows, Writer) {
+    let (tx, rx) = mpsc::channel::<Write>();
+    let tx = Queue(Arc::new(std::sync::Mutex::new(tx)));
+    let queue = tx.clone();
+    let rows = Rows::new("authz", move |w| drop(queue.0.lock().unwrap().send(Write::Row(w))));
+    let writer = std::thread::spawn(move || -> Result<Recorder> {
+        let mut rows = RowBatch::default();
+        while let Ok(first) = rx.recv() {
+            for w in std::iter::once(first).chain(rx.try_iter().take(512)) {
+                match w {
+                    Write::Row(w) => rows.push(w),
+                    Write::Outcome(o) => {
+                        rows.write(&mut recorder.store);
+                        recorder.record(&o)?;
+                    }
+                }
+            }
+            rows.write(&mut recorder.store);
+        }
+        Ok(recorder)
+    });
+    (tx, rows, writer)
+}
+
+/// Lets go of `queue` (requests still out keep their rows pending) and waits for the writer.
+pub(crate) async fn join_writer(queue: Queue, writer: Writer) -> Result<Recorder> {
+    drop(std::mem::replace(&mut *queue.0.lock().unwrap(), mpsc::channel().0));
+    tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .map_err(|e| Error::Protocol(e.to_string()))?
+        .map_err(|_| Error::Protocol("authz writer panicked".into()))?
+}
+
 /// Runs the comparison for every target and records the results under `run_id`.
 pub async fn run(
     project: &Path,
@@ -814,16 +893,8 @@ pub async fn run(
     ctl: JobControl,
 ) -> Result<AuthzSummary> {
     let concurrency = cfg.concurrency.max(1);
-    let tester = Arc::new(Tester::new(cfg, ctl.clone())?);
-
-    let (tx, rx) = mpsc::channel::<Outcome>();
-    let mut recorder = Recorder::open(project, run_id)?;
-    let writer = std::thread::spawn(move || -> Result<Recorder> {
-        while let Ok(o) = rx.recv() {
-            recorder.record(&o)?;
-        }
-        Ok(recorder)
-    });
+    let (tx, rows, writer) = writer(Recorder::open(project, run_id)?);
+    let tester = Arc::new(Tester::new(cfg, ctl.clone(), rows)?);
 
     let total = targets.len();
     let done = Arc::new(AtomicU64::new(0));
@@ -837,19 +908,15 @@ pub async fn run(
                 return;
             }
             let outcome = tester.test(&t).await;
-            let _ = tx.send(outcome);
+            tx.outcome(outcome);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             ctl.set_progress(json!({"requests_done": n, "requests": total, "sent": tester.sent()}));
         }));
     }
-    drop(tx);
     for t in tasks {
         let _ = t.await;
     }
-    let recorder = tokio::task::spawn_blocking(move || writer.join())
-        .await
-        .map_err(|e| Error::Protocol(e.to_string()))?
-        .map_err(|_| Error::Protocol("authz writer panicked".into()))??;
+    let recorder = join_writer(tx, writer).await?;
     Ok(AuthzSummary {
         run_id,
         requests: total,
@@ -870,17 +937,15 @@ impl Store {
         )?)
     }
 
-    /// Records one request's exchanges, result rows and findings. Returns the number of
+    /// Records one request's result rows and findings. Returns the number of
     /// new findings and the rows per verdict.
     fn authz_record(&mut self, run_id: i64, idx: &mut i64, o: &Outcome) -> Result<(usize, BTreeMap<String, usize>)> {
         let mut new = 0;
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut baseline_id = None;
         for (i, r) in o.rows.iter().enumerate() {
-            let history_id = match &r.exchange {
-                Some(ex) => Some(self.record_exchange("authz", ex)?),
-                None => None,
-            };
+            // Written as the request went out.
+            let history_id = r.history_id;
             if i == 0 {
                 baseline_id = history_id;
             }

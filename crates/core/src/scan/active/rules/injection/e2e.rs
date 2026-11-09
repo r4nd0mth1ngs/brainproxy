@@ -302,6 +302,7 @@ async fn scan_points(
         oob: None,
         oob_wait: std::time::Duration::ZERO,
         check_methods: vec![],
+        prune: false,
     };
     let path = project(name);
     let summary = run(&path, targets, cfg, JobControl::default()).await.unwrap();

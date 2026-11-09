@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use brainproxy_core::scan::active::{self, ActiveSettings};
 use brainproxy_core::scan::compare;
 use brainproxy_core::scan::findings_db::{FindingFilter, ManualFinding};
 use brainproxy_core::scan::passive::{self, PassiveSettings, SETTINGS_KEY};
@@ -49,6 +50,19 @@ pub enum ScanCmd {
     Sources {
         #[arg(value_delimiter = ',')]
         sources: Vec<String>,
+    },
+    /// Show, or with on|off set, whether active scans keep only the attack requests that back
+    /// a finding (default off: every request is kept). `scan active --prune|--no-prune`
+    /// overrides it for one scan.
+    #[command(
+        after_help = "With it on, a scan deletes when it ends (finished, `job stop`, or --max-minutes; not if the process dies \
+        or the scan fails) the history rows of its own attacks that nothing refers to: no finding, finding \
+        event, note, tag, fuzz, authz, WebSocket, auth macro or out-of-band record. The requests a scan starts from are never deleted. Through MCP it can be turned \
+        off, not on, and an agent's scans keep every request."
+    )]
+    Prune {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
     },
 }
 
@@ -635,6 +649,28 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                 store.set_setting(SETTINGS_KEY, &settings)?;
             }
             out.ok(json!(settings), || format!("passive sources: {}", settings.sources.join(",")));
+        }
+        ScanCmd::Prune { state } => {
+            let mut settings: ActiveSettings = store.setting(active::SETTINGS_KEY)?;
+            if let Some(state) = state {
+                let on = state == "on";
+                // Through MCP everything sent is recorded: an agent can't have a person's scans
+                // delete what they sent.
+                if on {
+                    crate::mcp::check_records_all("scan prune on")?;
+                }
+                if settings.prune != on {
+                    settings.prune = on;
+                    store.set_setting(active::SETTINGS_KEY, &settings)?;
+                }
+            }
+            out.ok(json!(settings), || {
+                if settings.prune {
+                    "active scans keep only the attack requests that back a finding".into()
+                } else {
+                    "active scans keep every request".into()
+                }
+            });
         }
     }
     Ok(())
