@@ -2,7 +2,8 @@
 //! client, and in-process HTTP/HTTPS echo servers as upstreams.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use brainproxy_core::http::WireReader;
@@ -10,6 +11,9 @@ use brainproxy_core::proxy::CertAuthority;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// Held while [`Env::run_env`] starts a command.
+static SPAWN: Mutex<()> = Mutex::new(());
 
 struct Env {
     dir: PathBuf,
@@ -33,15 +37,25 @@ impl Env {
 
     /// [`Env::run`] with these environment variables set.
     fn run_env(&self, args: &[&str], vars: &[(&str, &str)]) -> (i32, Value) {
-        let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
-            .envs(vars.iter().copied())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_brainproxy"));
+        cmd.envs(vars.iter().copied())
             .args(["--format", "json", "--project"])
             .arg(&self.project)
             .arg("--home")
             .arg(&self.home)
             .args(args)
-            .output()
-            .unwrap();
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // One spawn at a time. macOS has no pipe2, so a pipe exists for a moment before it
+        // is marked close-on-exec: a command another thread starts in that moment inherits
+        // it, and passes it on to the proxy it starts. The proxy then holds this command's
+        // stdout open, and reading it to the end never returns.
+        let child = {
+            let _one_at_a_time = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+            cmd.spawn().unwrap()
+        };
+        let out = child.wait_with_output().unwrap();
         let v = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
         (out.status.code().unwrap(), v)
