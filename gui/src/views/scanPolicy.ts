@@ -86,6 +86,7 @@ export function nameProblem(name: string): string | null {
   // 64 bytes, as `scan policy save` counts them.
   if (new TextEncoder().encode(n).length > 64) return "A name has at most 64 characters.";
   if (n.startsWith("-")) return "A name can't start with -.";
+  if (/\p{Cc}/u.test(n)) return "A name can't hold control characters.";
   return null;
 }
 
