@@ -173,15 +173,18 @@ pub fn escape_lines(s: &str) -> String {
 
 /// Writes an output file named by the caller (`--out`, `-o`). An existing file is
 /// refused unless `force`, so a stray path can't clobber something like ~/.bashrc. On Unix
-/// the file is readable by its owner only (0600), also when `force` overwrites one: an
+/// a regular file is readable by its owner only (0600), also when `force` overwrites one: an
 /// export, report or repro may hold what a target answered, and with `--no-redact` secrets.
+/// What isn't a regular file (`/dev/null`, `/dev/stdout` on a pipe) is written as it is.
 pub fn write_file(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<(), brainproxy_core::Error> {
     let mut f = std::fs::OpenOptions::new();
     f.write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
+    // An existing file is opened without truncating it: it is emptied only once it is ours
+    // alone (see `make_private`).
     if force {
-        f.create(true).truncate(true);
+        f.create(true);
     } else {
         f.create_new(true);
     }
@@ -191,10 +194,44 @@ pub fn write_file(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<(
         }
         _ => e.into(),
     })?;
-    // `mode` applies only to a file it creates; one overwritten keeps its own until now.
-    #[cfg(unix)]
-    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    if force {
+        overwrite(&f, path, make_private)?;
+    }
     Ok(f.write_all(bytes)?)
+}
+
+/// Empties a regular file opened for overwriting once `private` has made it the owner's
+/// only; a file `private` fails on is left as it was. Anything else (a device, a pipe) is
+/// left to be written as it is.
+fn overwrite(
+    f: &std::fs::File,
+    path: &std::path::Path,
+    private: fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), brainproxy_core::Error> {
+    if !f.metadata()?.is_file() {
+        return Ok(());
+    }
+    private(f).map_err(|e| {
+        brainproxy_core::Error::InvalidInput(format!(
+            "{} can't be made readable by its owner only ({e}); it was left as it was: write somewhere else",
+            path.display()
+        ))
+    })?;
+    Ok(f.set_len(0)?)
+}
+
+/// Sets a file to 0600 (`mode` applies only to a file `open` creates), unless it is already.
+fn make_private(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if f.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = f;
+    Ok(())
 }
 
 /// Renders bytes for JSON: UTF-8 text when valid, base64 otherwise, truncated to `max`.
@@ -237,6 +274,45 @@ mod tests {
         assert_eq!((std::fs::read_to_string(&old).unwrap().as_str(), mode(&old)), ("a person's", 0o644));
         write_file(&old, b"two", true).unwrap();
         assert_eq!((std::fs::read_to_string(&old).unwrap().as_str(), mode(&old)), ("two", 0o600));
+        // Shorter content replaces a longer file whole.
+        write_file(&old, b"3", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "3");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_writes_to_what_is_not_a_regular_file() {
+        // No chmod on a device: --output /dev/null --force works for anyone.
+        write_file(std::path::Path::new("/dev/null"), b"x", true).unwrap();
+        assert!(matches!(
+            write_file(std::path::Path::new("/dev/null"), b"x", false),
+            Err(brainproxy_core::Error::Conflict(_))
+        ));
+        // Nor on a pipe (`--output /dev/stdout --force | cat`).
+        let (r, w) = std::io::pipe().unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&w);
+        write_file(std::path::Path::new(&format!("/dev/fd/{fd}")), b"piped", true).unwrap();
+        drop(w);
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut { r }, &mut got).unwrap();
+        assert_eq!(got, "piped");
+    }
+
+    #[test]
+    fn a_file_that_cant_be_made_private_is_left_whole() {
+        let dir = std::env::temp_dir().join(format!("bp-write-file-chmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("someone-elses.json");
+        std::fs::write(&path, "theirs").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let denied = |_: &std::fs::File| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let e = overwrite(&f, &path, denied).unwrap_err().to_string();
+        assert!(e.contains("left as it was"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+        overwrite(&f, &path, |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         let _ = std::fs::remove_dir_all(dir);
     }
 
