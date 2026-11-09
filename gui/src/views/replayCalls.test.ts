@@ -143,3 +143,18 @@ test("before quitting, every send in flight is cancelled and waited for", async 
   await stopAllCalls(async (call) => void again.push(call));
   assert.deepEqual(again, []);
 });
+
+test("group tabs share one process and either tab can stop it", () => {
+  clearReplayTabs(async () => {});
+  const call = beginCall(1, "replay-race");
+  replayCalls.update(2, () => call);
+  const { stopped, cancel } = canceller();
+  stopCall(2, cancel);
+  assert.deepEqual(stopped, [call]);
+  // Switching tabs leaves both attached; closing a member cancels and forgets only that tab.
+  assert.equal(replayCalls.get(1), call);
+  forgetTab(2, cancel);
+  assert.equal(endCall(2, call), false);
+  assert.equal(endCall(1, call), true);
+  assert.equal(sendsInFlight(), 0);
+});

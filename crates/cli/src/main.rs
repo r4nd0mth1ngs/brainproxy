@@ -96,7 +96,7 @@ enum Cmd {
     #[command(subcommand)]
     Project(project_cmd::ProjectCmd),
 
-    /// Send one HTTP request and record it in history (Repeater).
+    /// Send an HTTP request or race a group, recording it in history (Repeater).
     #[command(after_help = "Request sources, in order: --url (build a request like curl), FILE, or stdin. \
         Raw requests are sent byte-for-byte after optional line-ending normalization and Content-Length update.")]
     Send(SendArgs),
@@ -244,9 +244,14 @@ struct SendArgs {
     #[command(flatten)]
     req: request_args::RequestArgs,
 
-    /// Race mode: send the request N times at once. HTTP/1.1: N connections, releasing
+    /// Additional raw request file in the race group. Repeatable; '-' reads stdin once.
+    /// Defaults --race to 1. All requests must resolve to the same origin.
+    #[arg(long, value_name = "FILE")]
+    also: Vec<String>,
+
+    /// Race mode: send each group member N times at once (G*N total), in blocking order. HTTP/1.1: one connection per copy, releasing
     /// the last byte of every request together (last-byte sync). With --http2: one
-    /// connection, final frames released in one packet (single-packet attack, N <= 100).
+    /// connection, final frames released in one packet (single-packet attack, total <= 100).
     /// Rows are tagged race:ID, race-sync:..., race-pos:I/N (and race-partial).
     #[arg(long, value_name = "N")]
     race: Option<usize>,
@@ -633,39 +638,74 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     mcp::check_no_store(args.no_store)?;
-    let (req, target) = args.req.prepare(None)?;
-    // HTTP/2 (the flag, or a request line saying so) races single-packet.
-    let h2 = args.req.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"));
-    if let Some(n) = args.race {
+    mcp::check_request_files(&args.also)?;
+    let stdin_count = usize::from(args.req.reads_stdin()) + args.also.iter().filter(|f| *f == "-").count();
+    if stdin_count > 1 {
+        return Err(Error::InvalidInput("stdin may be read only once across the primary request and --also".into()));
+    }
+    let primary = args.req.prepare(None)?;
+    let mut group = vec![primary];
+    for file in &args.also {
+        let mut input = args.req.clone();
+        input.url = None;
+        input.file = Some(file.clone());
+        // A URL primary also supplies the default scheme for raw group members.
+        input.scheme = group[0].1.scheme.clone();
+        group.push(input.prepare(None)?);
+    }
+    let h2 =
+        args.req.http2 || group.iter().any(|(r, _)| r.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")));
+    let count = args.race.or_else(|| (!args.also.is_empty()).then_some(1));
+    if let Some(n) = count {
         // Refused before anything is sent, a login included.
-        check_race_count(n, h2)?;
+        check_race_count(n, group.len(), h2)?;
     }
     let guard = project_guard(project)?;
-    // Refuse out-of-scope targets up front, before any connection is attempted.
-    require_in_scope(&guard, &target)?;
-    let send_opts = args.req.send_options(guard);
-    // So is a server name the scope doesn't list, before a row could say it was sent.
-    send_opts.check_sni(&target)?;
-    // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test.
-    let host_warning = mcp::check_host_header(&send_opts, req.as_bytes(), &target, args.req.host_header_test, out)?;
+    // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
+    // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
+    // non-race send) would be pushed onto HTTP/2 too.
+    let send_opts = args.req.send_options(guard.clone());
+    let mut host_warning = None;
+    for (req, target) in &group {
+        require_in_scope(&guard, target)?;
+        send_opts.check_sni(target)?;
+        let warning = mcp::check_host_header(&send_opts, req.as_bytes(), target, args.req.host_header_test, out)?;
+        host_warning = host_warning.or(warning);
+    }
+    let target = group[0].1.clone();
+    for (i, (_, other)) in group.iter().enumerate().skip(1) {
+        if other != &target {
+            return Err(Error::InvalidInput(format!(
+                "race group requires the same origin: request 0 is {}, request {i} is {}",
+                target.origin(),
+                other.origin()
+            )));
+        }
+    }
     let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
-        // Its logins, checks and macros keep no content either.
         s.keep_no_content();
     }
     let client = Client::new(send_opts);
-    if let Some(n) = args.race {
-        // Every racing request carries the same session, applied once.
-        let req = match &session {
-            Some(s) => {
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-                let tool = brainproxy_core::session::Tool::Send;
-                RawRequest::from_bytes(rt.block_on(s.prepare(tool, &target, req.as_bytes(), &[], &[])).request)
-            }
-            None => req,
-        };
-        return race(project, &args, req, target, client, n, h2, host_warning, out);
+    if let Some(n) = count {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
+        let mut requests = Vec::with_capacity(group.len());
+        for (req, target) in group {
+            let req = match &session {
+                Some(s) => RawRequest::from_bytes(
+                    rt.block_on(s.prepare(brainproxy_core::session::Tool::Send, &target, req.as_bytes(), &[], &[]))
+                        .request,
+                ),
+                None => req,
+            };
+            requests.push(req);
+        }
+        if let Some(session) = &session {
+            session.save()?;
+        }
+        return race(project, &args, requests, target, client, n, h2, host_warning, out);
     }
+    let req = group.remove(0).0;
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request is on record (its row and the bytes recorded) before it goes out. `open`
@@ -754,11 +794,15 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
 /// name lookups and TLS roots.
 const RACE_FD_RESERVE: usize = 64;
 
-/// Refuses race counts the CLI can't run: 1 to 1000, at most 100 single-packet, and for
+/// Refuses race totals the CLI can't run: 1 to 1000, at most 100 single-packet, and for
 /// last-byte sync (a connection each) no more than the open-file limit leaves room for.
-fn check_race_count(n: usize, h2: bool) -> Result<(), Error> {
-    if !(1..=1000).contains(&n) {
+fn check_race_count(copies: usize, group: usize, h2: bool) -> Result<(), Error> {
+    if !(1..=1000).contains(&copies) {
         return Err(Error::InvalidInput("--race must be between 1 and 1000".into()));
+    }
+    let n = copies.checked_mul(group).ok_or_else(|| Error::InvalidInput("race group total overflows".into()))?;
+    if n > 1000 {
+        return Err(Error::InvalidInput("race group total (requests * --race) must be at most 1000".into()));
     }
     let max = brainproxy_core::race::SINGLE_PACKET_MAX;
     if h2 && n > max {
@@ -768,7 +812,7 @@ fn check_race_count(n: usize, h2: bool) -> Result<(), Error> {
         let room = limit.saturating_sub(open + RACE_FD_RESERVE);
         if n > room {
             return Err(Error::InvalidInput(format!(
-                "--race {n} needs {n} connections, but the open-file limit ({limit}) leaves room for {room}; \
+                "race total {n} ({group} requests x {copies}) needs {n} connections, but the open-file limit ({limit}) leaves room for {room}; \
                  lower --race or raise the limit (ulimit -n)"
             )));
         }
@@ -780,10 +824,10 @@ fn check_race_count(n: usize, h2: bool) -> Result<(), Error> {
 fn race(
     project: &Path,
     args: &SendArgs,
-    req: RawRequest,
+    group: Vec<RawRequest>,
     target: Target,
     client: Client,
-    n: usize,
+    copies: usize,
     h2: bool,
     host_warning: Option<String>,
     out: &Out,
@@ -793,11 +837,24 @@ fn race(
     // and where: see race::row_tags.
     let race_id = brainproxy_core::race::new_race_id()?;
     let sync = if h2 { "single-packet" } else { "last-byte" };
-    let recorded = client.recorded_request(&req, &target)?;
+    let n = group.len() * copies;
+    let recorded = group.iter().map(|req| client.recorded_request(req, &target)).collect::<Result<Vec<_>, _>>()?;
+    let descriptions: Vec<Value> = group
+        .iter()
+        .enumerate()
+        .map(|(i, req)| {
+            let line = String::from_utf8_lossy(req.as_bytes()).lines().next().unwrap_or("").to_string();
+            json!({"index": i, "request_line": line})
+        })
+        .collect();
     let mut log = sent::SentLog::open(project, "race", args.no_store)?.sent_by(&client);
-    let ids =
-        log.pending_many(&target, &recorded, n, |i| brainproxy_core::race::row_tags(&race_id, sync, false, i, n))?;
-    let requests = vec![req.as_bytes().to_vec(); n];
+    let mut ids = Vec::with_capacity(n);
+    for (member, bytes) in recorded.iter().enumerate() {
+        ids.extend(log.pending_many(&target, bytes, copies, |i| {
+            brainproxy_core::race::row_tags(&race_id, sync, false, member * copies + i, n)
+        })?);
+    }
+    let requests = group.iter().flat_map(|req| std::iter::repeat_n(req.as_bytes().to_vec(), copies)).collect();
     let racing = async {
         if h2 {
             brainproxy_core::race::single_packet(&client, &target, requests)
@@ -823,14 +880,14 @@ fn race(
     let (results, sync, synced) = match outcome {
         Some(Ok(v)) => v,
         Some(Err(e)) => {
-            for id in &ids {
-                done(log.failed(*id, &target, &recorded, &e.to_string()));
+            for (i, id) in ids.iter().enumerate() {
+                done(log.failed(*id, &target, &recorded[i / copies], &e.to_string()));
             }
             return Err(store_error.unwrap_or(e));
         }
         None => {
-            for id in &ids {
-                done(log.failed(*id, &target, &recorded, sent::CANCELLED));
+            for (i, id) in ids.iter().enumerate() {
+                done(log.failed(*id, &target, &recorded[i / copies], sent::CANCELLED));
             }
             return Err(store_error.unwrap_or_else(|| sent::cancelled(&ids)));
         }
@@ -842,7 +899,7 @@ fn race(
     }
     let mut items = Vec::new();
     let mut shapes: std::collections::BTreeMap<String, usize> = Default::default();
-    for (r, &id) in results.iter().zip(&ids) {
+    for (i, (r, &id)) in results.iter().zip(&ids).enumerate() {
         match r {
             Ok(ex) => {
                 done(log.answered(id, ex));
@@ -854,27 +911,22 @@ fn race(
                 items.push(json!({"id": id, "status": status, "length": length, "duration_ms": ex.duration_ms}));
             }
             Err(e) => {
-                done(log.failed(id, &target, &recorded, &e.to_string()));
+                done(log.failed(id, &target, &recorded[i / copies], &e.to_string()));
                 *shapes.entry(format!("error: {}", e.kind())).or_default() += 1;
                 items.push(json!({"id": id, "error": e.to_string(), "kind": e.kind()}));
             }
         }
+        let item = items.last_mut().expect("one item per result");
+        item["request"] = json!(i / copies);
+        item["request_line"] = descriptions[i / copies]["request_line"].clone();
     }
     if let Some(e) = store_error {
         return Err(e);
     }
-    // A single-packet race that got no response at all failed as a whole (its connection),
-    // as before; the rows of the copies are still in the output.
-    if let (true, Some(Err(e))) = (h2 && results.iter().all(|r| r.is_err()), results.first()) {
-        let rows = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
-        let data = json!({"race": n, "race_id": race_id, "sync": sync, "target": target.origin(), "results": items});
-        out.error_with(e.kind(), &format!("{e} (every copy failed; history {rows})"), data);
-        std::process::exit(e.exit_code());
-    }
     let new_findings = log.scan(&ids)?;
     let host_warning = mcp::sent_host_warning([&client], host_warning, out);
     let mut data = json!({
-        "race": n,
+        "race": copies,
         "race_id": race_id,
         "sync": sync,
         "synced": synced,
@@ -883,6 +935,17 @@ fn race(
         "results": items,
         "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2. duration_ms counts from the release of the final bytes. Every recorded row is tagged race:RACE_ID.",
     });
+    if group.len() > 1 {
+        data["requests"] = json!(descriptions);
+        data["total"] = json!(n);
+        data["hint"] = json!("Compare responses within each request index; different group members may normally return different responses. Inspect history show ID or diff ID1 ID2. duration_ms counts from the release of the final bytes; rows are tagged race:RACE_ID.");
+    }
+    // Keep the full group output even when the one HTTP/2 connection fails.
+    if let (true, Some(Err(e))) = (h2 && results.iter().all(|r| r.is_err()), results.first()) {
+        let rows = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        out.error_with(e.kind(), &format!("{e} (every copy failed; history {rows})"), data);
+        std::process::exit(e.exit_code());
+    }
     if new_findings > 0 {
         data["new_findings"] = json!(new_findings);
     }
@@ -893,6 +956,22 @@ fn race(
         let mut lines: Vec<String> = shapes.iter().map(|(k, v)| format!("{v:>5}  {k}")).collect();
         let note = if partial { ", partial" } else { "" };
         lines.insert(0, format!("race x{n} ({sync}{note}) -> {}  [tag race:{race_id}]", target.origin()));
+        if group.len() > 1 {
+            for (i, description) in descriptions.iter().enumerate() {
+                lines.push(format!("request {i} x{copies}: {}", description["request_line"].as_str().unwrap_or("")));
+                for item in &items[i * copies..(i + 1) * copies] {
+                    lines.push(format!(
+                        "  #{}  {}",
+                        item["id"],
+                        if item["error"].is_string() {
+                            item["error"].as_str().unwrap().to_string()
+                        } else {
+                            format!("{} {}B", item["status"], item["length"])
+                        }
+                    ));
+                }
+            }
+        }
         lines.join("\n")
     });
     Ok(())

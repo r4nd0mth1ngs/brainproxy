@@ -474,3 +474,62 @@ fn killed_crawls_scans_fuzz_and_authz_runs_leave_their_pending_rows() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_stopped_group_keeps_each_members_request_and_full_position() {
+    let p = project("race-group-term");
+    let (port, got) = silent();
+    let url = format!("http://127.0.0.1:{port}/coupon");
+    let file = p.with_extension("checkout.http");
+    std::fs::write(&file, format!("POST /checkout HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\norder=1")).unwrap();
+    let child = spawn(&p, &["send", "--url", &url, "--also", file.to_str().unwrap(), "--race=2", "--timeout=60"]);
+    for _ in 0..4 {
+        got.recv_timeout(Duration::from_secs(20)).expect("a group member never arrived");
+    }
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let recorded = rows(&p, "SELECT CAST(request AS TEXT), tags, error FROM history WHERE source = 'race' ORDER BY id");
+    assert_eq!(recorded.len(), 4);
+    for (i, row) in recorded.iter().enumerate() {
+        let request = row[0].as_str().unwrap();
+        assert!(request.starts_with(if i < 2 { "GET /coupon " } else { "POST /checkout " }), "{row}");
+        if i >= 2 {
+            assert!(request.ends_with("order=1"), "{row}");
+        }
+        let tags: Vec<String> = serde_json::from_str(row[1].as_str().unwrap()).unwrap();
+        assert_eq!(tags[2], format!("race-pos:{}/4", i + 1));
+        assert_eq!(row[2], "cancelled by user before a response was recorded");
+    }
+}
+
+#[test]
+fn a_failed_http2_group_reports_and_records_each_members_request() {
+    let p = project("h2-group-failure");
+    let port = answering();
+    let url = format!("http://127.0.0.1:{port}/coupon");
+    let file = p.with_extension("checkout.http");
+    std::fs::write(&file, format!("POST /checkout HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\norder=1")).unwrap();
+    let (code, v) = run(&p, &["send", "--url", &url, "--http2", "--also", file.to_str().unwrap(), "--race=2"]);
+    assert_eq!(code, 3, "{v}");
+    let data = &v["data"];
+    assert_eq!(data["race"], 2);
+    assert_eq!(data["total"], 4);
+    assert_eq!(data["requests"].as_array().unwrap().len(), 2);
+    assert!(data["distinct_responses"].is_object() && data["hint"].is_string());
+    for (i, item) in data["results"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(item["request"], i / 2);
+        assert!(item["error"].is_string() && item["kind"] == "protocol", "{item}");
+    }
+    let recorded = rows(&p, "SELECT CAST(request AS TEXT), tags FROM history WHERE source = 'race' ORDER BY id");
+    assert_eq!(recorded.len(), 4);
+    for (i, row) in recorded.iter().enumerate() {
+        assert!(
+            row[0].as_str().unwrap().starts_with(if i < 2 { "GET /coupon HTTP/2" } else { "POST /checkout HTTP/2" }),
+            "{row}"
+        );
+        let tags: Vec<String> = serde_json::from_str(row[1].as_str().unwrap()).unwrap();
+        assert_eq!(tags[2], format!("race-pos:{}/4", i + 1));
+    }
+}

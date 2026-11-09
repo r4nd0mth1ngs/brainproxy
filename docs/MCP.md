@@ -150,6 +150,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
   would copy any file the server can read into the project for the agent to read back; pass the
   text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `send` with an `also` file other than `-`: a race group member is sent and recorded as it is
+  (and a request line that doesn't parse is quoted in the error), so it could send any file the
+  server can read to a target and have it read back from history. An agent races a group of two
+  with the primary as `url` and the other request as the call's `stdin` (`also: ["-"]`).
 - `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.

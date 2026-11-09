@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod delete;
+mod race_files;
 mod temp;
 
 use std::collections::HashMap;
@@ -71,8 +72,9 @@ const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 async fn cli(
     app: tauri::AppHandle,
     project: String,
-    args: Vec<String>,
+    mut args: Vec<String>,
     stdin: Option<Vec<u8>>,
+    request_files: Option<Vec<Vec<u8>>>,
     env: Option<HashMap<String, String>>,
     call: Option<String>,
 ) -> Value {
@@ -80,6 +82,10 @@ async fn cli(
     if let Some(bad) = env.keys().find(|k| !k.starts_with(SECRET_ENV_PREFIX)) {
         return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
     }
+    let _requests = match race_files::RaceFiles::stage(&mut args, request_files.unwrap_or_default()) {
+        Ok(files) => files,
+        Err(e) => return failure(format!("cannot stage race requests: {e}")),
+    };
     let Some(call) = call else { return run(&project, &args, stdin, &env).await };
     let mut child = match spawn(&project, &args, stdin, &env) {
         Ok(c) => c,
@@ -308,6 +314,8 @@ async fn project_delete(project: String, force: Option<bool>) -> Result<Value, S
 }
 
 fn main() {
+    // Clear any race-request staging directory a previous hard exit left behind.
+    race_files::sweep_orphans();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

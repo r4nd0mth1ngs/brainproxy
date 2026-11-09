@@ -9,6 +9,10 @@ import {
   patchOpen,
   plannedTechnique,
   raceArgs,
+  raceGroupArgs,
+  raceResultForRequest,
+  parseGroupRaceCount,
+  groupRaceMax,
   raceMax,
   raceRows,
   raceSummary,
@@ -317,4 +321,46 @@ test("a raced response only lands if its row is still open", () => {
     patchOpen(list, b, 0, { name: "b filled" }).map((e) => e.name),
     ["send", "a", "b"],
   );
+});
+
+test("group commands use private staged files after the primary stdin", () => {
+  assert.deepEqual(raceGroupArgs("https://shop.test", 2, 2, { timeout: "5", http2: true }), [
+    "send", "--target=https://shop.test", "--race=2", "--http2", "--timeout=5",
+    "--also=@request:0", "--also=@request:1", "-",
+  ]);
+  assert.deepEqual(raceGroupArgs("https://shop.test", 20, 0), raceArgs("https://shop.test", 20));
+});
+
+test("group limits apply to the total and a group can send each member once", () => {
+  assert.equal(parseGroupRaceCount("1", [H1, H1]), 1);
+  assert.equal(parseGroupRaceCount("1", [H1]), null);
+  assert.equal(groupRaceMax([H1, H1]), 500);
+  assert.equal(groupRaceMax([H1, H2]), 50);
+  assert.equal(groupRaceMax([H1, H1], true), 50);
+  assert.equal(parseGroupRaceCount("51", [H1, H2]), null);
+  assert.equal(parseGroupRaceCount("50", [H1, H2]), 50);
+  for (const bad of ["0", "-1", "2.5", "1e2", "", "501"]) assert.equal(parseGroupRaceCount(bad, [H1, H1]), null);
+});
+
+test("results map to their originating tabs and use a separate baseline per tab", () => {
+  const r: RaceResult = { ...result([
+    { request: 0, id: 1, status: 200, length: 12, duration_ms: 4 },
+    { request: 0, id: 2, status: 200, length: 12, duration_ms: 5 },
+    { request: 1, id: 3, status: 201, length: 24, duration_ms: 4 },
+    { request: 1, id: 4, error: "reset", kind: "io" },
+  ], "single-packet", 3), race: 2, total: 4, race_id: "group" };
+  const a = raceResultForRequest(r, 0);
+  const b = raceResultForRequest(r, 1);
+  assert.deepEqual(a.results.map((r) => r.id), [1, 2]);
+  assert.deepEqual(b.results.map((r) => r.id), [3, 4]);
+  assert.deepEqual(a.distinct_responses, { "200 12B": 2 });
+  assert.deepEqual(b.distinct_responses, { "201 24B": 1, "error: io": 1 });
+  assert.equal(a.race_id, "group");
+  assert.deepEqual(raceRows(a).map((r) => r.differs), [false, false]);
+  assert.deepEqual(raceRows(b).map((r) => r.differs), [false, true]);
+  assert.equal(syncNote(b), "3 of 4 final frames went in the single packet; the rest were sent separately");
+  assert.deepEqual(raceResultForRequest(r, 2).results, []);
+  // Older CLI responses with no discriminator still belong to the primary tab.
+  const old = result([{ id: 5, status: 200, length: 1, duration_ms: 1 }]);
+  assert.deepEqual(raceResultForRequest(old, 0).results, old.results);
 });

@@ -267,8 +267,26 @@ for. A race is one step in ‹ › like a send. Send history and the running sen
 per tab outside the tab's view (`views/replayCalls.ts`), so a race that ends after the user
 switched tabs still lands in its tab. The send, race and `history show` run against the project
 they started in: closing the project stops a race still running and drops its result, and the
-next project's tabs start empty. It races copies of
-one request; racing different requests against each other isn't offered.
+next project's tabs start empty.
+
+To race different requests, tick the checkboxes beside other HTTP tab titles and click
+**Race G tabs** in the active tab. The active tab is always primary; checked tabs follow in
+tab order. WebSocket tabs cannot join. All targets must have the same origin (scheme, host,
+port); mismatches are refused before sending. The active tab's options and request preparation
+settings apply to all members, including auto URL-encode, CRLF bodies and binary handling.
+N is copies per tab, so G tabs produce G*N requests; N=1 is allowed for a group. All copies
+of the primary precede copies of the next tab. The total limit is 1000 (100 when HTTP/2 is
+selected or any member has an HTTP/2 request line), also subject to the file descriptor budget.
+
+The primary request remains on stdin; `raceGroupArgs` adds repeatable `--also` inputs for
+the others. The Tauri shell and Vite bridge stage byte-preserving files in a private temporary
+directory and remove them when the CLI exits, including cancellation or spawn failure. Raw
+requests stay out of argv. The whole group runs as one existing cancellable CLI call, shared
+by participating tabs: **Stop** in any of them stops it. Closing a participating tab also
+stops it. `results[].request` maps responses back to the originating tab; each receives its
+own race step and compares its own copies, while all rows retain the shared race ID and
+full-group `race-pos:I/N` tags. Switching tabs preserves the call and results as for a
+single-tab race.
 
 Cross-tool actions go through `store.tsx`: `sendToRepeater`, `sendToFuzzer`,
 `sendToComparer` (right-click a history row, or buttons in Intercept and Findings),

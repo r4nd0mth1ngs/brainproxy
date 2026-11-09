@@ -4,7 +4,7 @@
 
 export type Envelope<T = any> =
   | { ok: true; command: string; data: T }
-  | { ok: false; command?: string; error: { kind: string; message: string; data?: unknown } };
+  | { ok: false; command?: string; data?: unknown; error: { kind: string; message: string; data?: unknown } };
 
 export class CliError extends Error {
   kind: string;
@@ -48,6 +48,8 @@ export const getProject = () => project;
  */
 export interface CliInput {
   stdin?: string | Uint8Array;
+  /** Private staged files referenced by --also=@request:I; removed when the CLI exits. */
+  requestFiles?: Uint8Array[];
   env?: Record<string, string>;
   /** Run against this project instead of the open one. */
   project?: string;
@@ -59,19 +61,20 @@ export interface CliInput {
 }
 
 export async function cli<T = any>(args: string[], input: string | Uint8Array | CliInput = {}): Promise<Envelope<T>> {
-  const { stdin, env, project: target, call } =
-    typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined, project: undefined, call: undefined } : input;
+  const { stdin, env, project: target, call, requestFiles } =
+    typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined, project: undefined, call: undefined, requestFiles: undefined } : input;
   const proj = target ?? project;
   // Bytes go as a number array (Vec<u8> in Tauri, a Buffer in the dev bridge), so nothing is re-encoded.
   const bytes = stdin == null ? null : Array.from(typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin);
+  const files = requestFiles?.map((bytes) => Array.from(bytes)) ?? null;
   if (inTauri) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<Envelope<T>>("cli", { project: proj, args, stdin: bytes, env: env ?? null, call: call ?? null });
+    return invoke<Envelope<T>>("cli", { project: proj, args, stdin: bytes, env: env ?? null, call: call ?? null, requestFiles: files });
   }
   const res = await fetch("/api/cli", {
     method: "POST",
     headers: { "content-type": "application/json", "x-brainproxy": bridgeToken },
-    body: JSON.stringify({ project: proj, args, stdin: bytes, env, call }),
+    body: JSON.stringify({ project: proj, args, stdin: bytes, env, call, requestFiles: files }),
   });
   return res.json();
 }
@@ -142,7 +145,7 @@ export const deleteProject = (project: string, force = false) => shell<ProjectDe
 /** Runs a command and returns its data, throwing CliError when ok is false. */
 export async function run<T = any>(args: string[], input?: string | Uint8Array | CliInput): Promise<T> {
   const env = await cli<T>(args, input);
-  if (!env.ok) throw new CliError(env.error.kind, env.error.message, env.error.data);
+  if (!env.ok) throw new CliError(env.error.kind, env.error.message, env.error.data ?? env.data);
   return env.data;
 }
 

@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -72,15 +74,35 @@ function cliBridge(): Plugin {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
-          const { project, args, stdin, env, call } = JSON.parse(body) as {
+          const { project, args, stdin, env, call, requestFiles } = JSON.parse(body) as {
             project: string;
             args: string[];
             stdin?: number[] | null;
+            requestFiles?: number[][] | null;
             env?: Record<string, string> | null;
             call?: string | null;
           };
           // Same rule as the Tauri command: only BRAINPROXY_SECRET_* variables may be set.
           const extra = Object.fromEntries(Object.entries(env ?? {}).filter(([k]) => k.startsWith("BRAINPROXY_SECRET_")));
+          let requestDir: string | null = null;
+          const cleanup = () => { if (requestDir) rmSync(requestDir, { recursive: true, force: true }); };
+          try {
+            if (requestFiles?.length) {
+              requestDir = mkdtempSync(join(tmpdir(), "brainproxy-race-"));
+              requestFiles.forEach((bytes, i) => {
+                const at = args.indexOf(`--also=@request:${i}`);
+                if (at < 0) throw new Error("missing race request argument");
+                const path = join(requestDir!, `${i}.http`);
+                writeFileSync(path, Buffer.from(bytes), { flag: "wx", mode: 0o600 });
+                args[at] = `--also=${path}`;
+              });
+            }
+          } catch (e) {
+            cleanup();
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ ok: false, error: { kind: "gui", message: String(e) } }));
+            return;
+          }
           const child = spawn(bin, ["--format", "json", "--project", project, ...args], {
             stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"],
             // What the CLI records is marked as the app's (origin `gui`), as with the Tauri command.
@@ -97,6 +119,7 @@ function cliBridge(): Plugin {
           child.stdout!.on("data", (c) => (out += c));
           child.stderr!.on("data", (c) => (err += c));
           child.on("error", (e: NodeJS.ErrnoException) => {
+            cleanup();
             const fix = process.env.BRAINPROXY_BIN ? "check BRAINPROXY_BIN" : "run `cargo build` in the repository root, or set BRAINPROXY_BIN";
             const message = e.code === "ENOENT" ? `No brainproxy CLI at ${bin}: ${fix}.` : String(e);
             res.setHeader("content-type", "application/json");
@@ -104,6 +127,7 @@ function cliBridge(): Plugin {
           });
           // Also emitted after a failed spawn, once "error" has already answered.
           child.on("close", () => {
+            cleanup();
             if (call) running.delete(call);
             const stopped = cancelled.delete(child);
             if (res.writableEnded) return;

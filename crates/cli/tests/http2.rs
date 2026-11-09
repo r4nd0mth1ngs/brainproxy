@@ -102,12 +102,51 @@ fn send_race_and_fuzz_over_http2() {
     // Its rows say how it was run (all three final frames went out together: not partial).
     let id = d["results"][2]["id"].to_string();
     let tags = &run(&["history", "show", &id], &p, None)["entry"]["tags"];
-    let want =
-        [format!("race:{}", d["race_id"].as_str().unwrap()), "race-sync:single-packet".into(), "race-pos:3/3".into()];
+    let want = [
+        format!("race:{}", d["race_id"].as_str().unwrap()),
+        "race-sync:single-packet".to_string(),
+        "race-pos:3/3".into(),
+    ];
     assert_eq!(tags, &serde_json::json!(want), "{tags}");
 
     let d = run(&["fuzz", "run", "--http2", "--url", &format!("{base}/f?q=§x§"), "-p", "list:a,b,c,d"], &p, None);
     assert_eq!(d["run"]["done"], 4, "{d}");
     // send, send, race, race, and fuzz: one connection each.
     assert_eq!(accepted.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn different_requests_share_one_single_packet_connection() {
+    let (port, accepted) = serve();
+    let dir = std::env::temp_dir().join(format!("bp-test-{}-http2-group", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("p.bpdb");
+    let _ = std::fs::remove_file(&p);
+    run(&["engagement", "start", "--target", "127.0.0.1"], &p, None);
+    let base = format!("http://127.0.0.1:{port}");
+    let also = dir.join("checkout.http");
+    // An HTTP/2 line on the additional member makes the whole group HTTP/2.
+    std::fs::write(&also, format!("POST /checkout HTTP/2\r\nhost: 127.0.0.1:{port}\r\n\r\norder=1")).unwrap();
+    let d = run(&["send", "--url", &format!("{base}/coupon"), "--also", also.to_str().unwrap(), "--race=2"], &p, None);
+    assert_eq!((d["sync"].as_str(), d["synced"].as_u64()), (Some("single-packet"), Some(4)), "{d}");
+    assert_eq!(d["race"], 2);
+    assert_eq!(d["total"], 4);
+    let results = d["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4);
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r["request"], i / 2);
+        assert_eq!(r["status"], 200, "{r}");
+        let h = run(&["history", "show", &r["id"].to_string()], &p, None);
+        let response = h.to_string();
+        assert!(response.contains(if i < 2 { "GET /coupon " } else { "POST /checkout order=1" }), "{h}");
+        assert_eq!(
+            h["entry"]["tags"],
+            serde_json::json!([
+                format!("race:{}", d["race_id"].as_str().unwrap()),
+                "race-sync:single-packet".to_string(),
+                format!("race-pos:{}/4", i + 1)
+            ])
+        );
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
 }

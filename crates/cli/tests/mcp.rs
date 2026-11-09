@@ -157,6 +157,8 @@ fn protocol_and_tool_list() {
     let props = &send["inputSchema"]["properties"];
     assert_eq!(props["stdin"]["type"], "string");
     assert_eq!(props["headers"]["type"], "array");
+    assert_eq!(props["also"]["type"], "array");
+    assert_eq!(props["also"]["items"]["type"], "string");
     assert_eq!(props["max_body"]["type"], "integer");
     assert_eq!(props["no_store"]["type"], "boolean");
     assert!(props.get("project").is_none() && props.get("format").is_none());
