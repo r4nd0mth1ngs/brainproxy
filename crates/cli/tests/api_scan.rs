@@ -622,8 +622,13 @@ fn hosts_out_of_scope_are_reported_not_sent() {
     let src = write_doc(&dir, "mixed.json", &doc.to_string());
     let d = preview(&p, &src, &[]);
     assert_eq!(included(&d), ["in"]);
-    assert_eq!(row(&d, "out")["excluded_reason"], "scope");
-    assert_eq!(row(&d, "out")["in_scope"], false);
+    // Out of scope, it shows only its method and host.
+    let out = &d["requests"][1];
+    assert_eq!((out["excluded_reason"].as_str(), out["in_scope"].as_bool()), (Some("scope"), Some(false)));
+    assert_eq!(
+        (out["name"].as_str(), out["url"].as_str()),
+        (Some("GET http://198.51.100.9:81"), Some("http://198.51.100.9:81"))
+    );
     assert_eq!(
         d["hosts"],
         json!([
@@ -664,7 +669,10 @@ fn a_name_scope_refuses_other_names_up_front() {
         "/out": {"get": {"operationId": "out", "servers": [{"url": "https://elsewhere.example.test"}]}}}});
     let src = write_doc(&dir, "mixed.json", &doc.to_string());
     let d = preview(&p, &src, &[]);
-    assert_eq!((row(&d, "in")["in_scope"].as_bool(), row(&d, "out")["in_scope"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(
+        (row(&d, "in")["in_scope"].as_bool(), d["requests"][1]["in_scope"].as_bool()),
+        (Some(true), Some(false))
+    );
     let d = ok(&p, &["import", "api", "--", &src]);
     assert_eq!((d["sent"].as_u64(), d["skipped_out_of_scope"].as_u64()), (Some(1), Some(1)), "{d}");
     assert_eq!(d["out_of_scope_hosts"], json!(["elsewhere.example.test"]));
