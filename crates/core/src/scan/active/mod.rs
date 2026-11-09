@@ -13,6 +13,7 @@
 //! correlating interactions the OOB listener received (see `crate::oob`).
 
 pub mod points;
+pub mod policy;
 pub mod rules;
 pub mod source_sink;
 
@@ -40,9 +41,10 @@ use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
 pub use points::{InsertionPoint, PointKind, PointOptions};
+pub use policy::{Threshold, Tuning};
 
 /// How many attacks a rule tries (ZAP attack strength).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Strength {
     Low,
@@ -225,12 +227,15 @@ struct Shared {
     rows: Rows,
     auth: Option<Arc<AuthSession>>,
     strength: Strength,
+    tuning: Tuning,
     ctl: JobControl,
     deadline: Option<Instant>,
     limiter: Option<Limiter>,
     requests: AtomicU64,
     reports: Mutex<mpsc::Sender<Report>>,
     raised: Mutex<BTreeMap<&'static str, usize>>,
+    /// Findings not raised because their confidence was below their rule's threshold.
+    below_threshold: Mutex<BTreeMap<&'static str, usize>>,
     /// Keys rules mark as done for the whole run (ZAP's knowledge base).
     once: Mutex<HashSet<String>>,
     /// Soft-404 signatures per origin: (status, body length bucket, body start).
@@ -259,6 +264,9 @@ pub struct Cx {
     base: Arc<Base>,
     point: Option<InsertionPoint>,
     shared: Arc<Shared>,
+    /// The rule's strength and threshold in this scan.
+    strength: Strength,
+    threshold: Threshold,
     /// Which session rules apply: a ported rule's (scan) or a declarative check's (checks).
     tool: Tool,
     /// The rows of this unit's requests that failed, by the request as the rule gave it: an
@@ -289,7 +297,17 @@ impl Cx {
     }
 
     pub fn strength(&self) -> Strength {
-        self.shared.strength
+        self.strength
+    }
+
+    /// Whether a finding of this confidence passes the rule's threshold; one that doesn't is
+    /// counted, not raised.
+    fn passes(&self, finding: &Finding, confidence: crate::scan::Confidence) -> bool {
+        let ok = self.threshold.passes(confidence);
+        if !ok {
+            *self.shared.below_threshold.lock().unwrap().entry(finding.def.alert_ref).or_default() += 1;
+        }
+        ok
     }
 
     /// True once the scan was asked to stop or ran out of time; rules should return.
@@ -522,6 +540,9 @@ impl Cx {
 
     /// Records a finding with the exchange that proves it.
     pub fn report(&self, finding: Finding, resp: &Response) {
+        if !self.passes(&finding, finding.confidence) {
+            return;
+        }
         *self.shared.raised.lock().unwrap().entry(finding.def.alert_ref).or_default() += 1;
         let _ = self.shared.reports.lock().unwrap().send(Report::Finding {
             target: self.base.target.clone(),
@@ -592,6 +613,10 @@ impl Cx {
         resp: Option<&Response>,
         check: Option<String>,
     ) {
+        // A callback raises the alert at its own confidence.
+        if !self.passes(&finding, finding.def.confidence) {
+            return;
+        }
         self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
         // The attack's row: the one its response came from, or the one of the attack that
         // failed. Correlating then records no second row for it.
@@ -705,7 +730,10 @@ pub fn all_rules() -> &'static [Box<dyn ActiveRule>] {
 
 #[derive(Debug, Clone)]
 pub struct ActiveConfig {
+    /// For every rule `tuning` gives no strength of its own.
     pub strength: Strength,
+    /// Thresholds, and rules' own strengths (a scan policy's; see [`policy`]).
+    pub tuning: Tuning,
     pub concurrency: usize,
     pub rate: Option<f64>,
     pub send: SendOptions,
@@ -775,6 +803,10 @@ pub struct ActiveSummary {
     pub requests: u64,
     /// Findings raised in this run, per alert ref.
     pub raised: BTreeMap<String, usize>,
+    /// Findings not raised, per alert ref, because their confidence was below their rule's
+    /// threshold (see [`policy`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub below_threshold: BTreeMap<String, usize>,
     pub new_findings: usize,
     /// Rule units that crashed (panicked) instead of finishing.
     pub errors: usize,
@@ -807,6 +839,46 @@ impl Drop for Finished<'_> {
     }
 }
 
+/// The ported rules a scan runs for `rules` (None: all) less `exclude`: the rules the selected
+/// ones depend on are pulled in unless excluded, and a rule missing one (excluded, or itself
+/// dropped for that reason) is dropped.
+pub fn select_rules(rules: Option<&[u32]>, exclude: &[u32]) -> Vec<&'static dyn ActiveRule> {
+    let mut selected: Vec<&'static dyn ActiveRule> = all_rules()
+        .iter()
+        .map(|r| r.as_ref())
+        .filter(|r| rules.is_none_or(|ids| ids.contains(&r.id())) && !exclude.contains(&r.id()))
+        .collect();
+    loop {
+        let ids: HashSet<u32> = selected.iter().map(|r| r.id()).collect();
+        let missing: Vec<&'static dyn ActiveRule> = all_rules()
+            .iter()
+            .map(|r| r.as_ref())
+            .filter(|r| !ids.contains(&r.id()) && !exclude.contains(&r.id()))
+            .filter(|r| selected.iter().any(|sel| sel.depends_on().contains(&r.id())))
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        selected.extend(missing);
+    }
+    // Until nothing changes: dropping a rule can leave another without what it needs.
+    loop {
+        let ids: HashSet<u32> = selected.iter().map(|r| r.id()).collect();
+        let before = selected.len();
+        selected.retain(|r| r.depends_on().iter().all(|d| ids.contains(d)));
+        if selected.len() == before {
+            return selected;
+        }
+    }
+}
+
+/// The ids of [`select_rules`], in id order.
+pub fn selected_rule_ids(rules: Option<&[u32]>, exclude: &[u32]) -> Vec<u32> {
+    let mut ids: Vec<u32> = select_rules(rules, exclude).iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// One rule run on one target (and insertion point, for Param rules).
 type Unit = (Arc<Base>, &'static dyn ActiveRule, Option<InsertionPoint>);
 
@@ -817,34 +889,13 @@ pub async fn run(
     ctl: JobControl,
 ) -> Result<ActiveSummary> {
     let started = Instant::now();
-    let mut rules: Vec<&'static dyn ActiveRule> = all_rules()
-        .iter()
-        .map(|r| r.as_ref())
-        .filter(|r| {
-            !cfg.no_rules
-                && cfg.rules.as_ref().is_none_or(|ids| ids.contains(&r.id()))
-                && !cfg.exclude_rules.contains(&r.id())
-        })
-        .collect();
-    // Pull in dependencies of selected rules, then drop rules missing one (excluded).
-    loop {
-        let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
-        let missing: Vec<&'static dyn ActiveRule> = all_rules()
-            .iter()
-            .map(|r| r.as_ref())
-            .filter(|r| !ids.contains(&r.id()) && !cfg.exclude_rules.contains(&r.id()))
-            .filter(|r| rules.iter().any(|sel| sel.depends_on().contains(&r.id())))
-            .collect();
-        if missing.is_empty() {
-            break;
-        }
-        rules.extend(missing);
-    }
-    let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
-    rules.retain(|r| r.depends_on().iter().all(|d| ids.contains(d)));
+    let mut rules = if cfg.no_rules { vec![] } else { select_rules(cfg.rules.as_deref(), &cfg.exclude_rules) };
     rules.extend(cfg.checks.iter().copied());
-    // Session rules tell the ported rules (scan) from declarative checks (checks).
-    let check_ids: HashSet<u32> = cfg.checks.iter().map(|c| c.id()).collect();
+    // Session rules tell the ported rules (scan) from declarative checks (checks), and a policy
+    // tunes ported rules only. A check is told by identity: every check's id is 0, as is
+    // Directory Browsing's.
+    let checks = cfg.checks.clone();
+    let is_check = move |r: &'static dyn ActiveRule| checks.iter().any(|c| std::ptr::addr_eq(*c, r));
     if rules.is_empty() {
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }
@@ -900,12 +951,14 @@ pub async fn run(
         rows,
         auth: cfg.auth.clone(),
         strength: cfg.strength,
+        tuning: cfg.tuning.clone(),
         ctl: ctl.clone(),
         deadline: cfg.max_duration.map(|d| started + d),
         limiter: Limiter::new(cfg.rate),
         requests: AtomicU64::new(0),
         reports: Mutex::new(tx),
         raised: Mutex::new(BTreeMap::new()),
+        below_threshold: Mutex::new(BTreeMap::new()),
         once: Mutex::new(HashSet::new()),
         not_found: tokio::sync::Mutex::new(HashMap::new()),
         oob: cfg.oob.clone(),
@@ -970,7 +1023,8 @@ pub async fn run(
     let mut tasks = Vec::with_capacity(units.len());
     for (base, rule, point) in units {
         let (shared, sem, done, ctl, left) = (shared.clone(), sem.clone(), done.clone(), ctl.clone(), left.clone());
-        let tool = if check_ids.contains(&rule.id()) { Tool::Checks } else { Tool::Scan };
+        let check = is_check(rule);
+        let tool = if check { Tool::Checks } else { Tool::Scan };
         tasks.push(tokio::spawn(async move {
             // Counts the unit as finished even when the rule panics.
             let _finished = Finished(&left[&rule.id()]);
@@ -980,7 +1034,12 @@ pub async fn run(
                 }
             }
             let Ok(_permit) = sem.acquire().await else { return };
-            let cx = Cx { base, point, shared: shared.clone(), tool, failed: Mutex::default() };
+            let (strength, threshold) = if check {
+                (shared.strength, shared.tuning.threshold)
+            } else {
+                (shared.tuning.strength(rule.id(), shared.strength), shared.tuning.threshold(rule.id()))
+            };
+            let cx = Cx { base, point, shared: shared.clone(), strength, threshold, tool, failed: Mutex::default() };
             if !cx.stopped() {
                 rule.scan(&cx).await;
             }
@@ -1004,6 +1063,8 @@ pub async fn run(
 
     let mut summary_raised: BTreeMap<String, usize> =
         shared.raised.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let below_threshold: BTreeMap<String, usize> =
+        shared.below_threshold.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let requests = shared.requests.load(Ordering::Relaxed);
     let timed_out = shared.deadline.is_some_and(|d| Instant::now() >= d);
     let oob_payloads = shared.oob_payloads.load(Ordering::Relaxed);
@@ -1058,6 +1119,7 @@ pub async fn run(
         units_done: done.load(Ordering::Relaxed) as usize,
         requests,
         raised: summary_raised,
+        below_threshold,
         new_findings,
         errors,
         check_skipped_methods,
@@ -1129,6 +1191,7 @@ mod tests {
         };
         let cfg = ActiveConfig {
             strength: Strength::Medium,
+            tuning: Default::default(),
             concurrency: 1,
             rate: None,
             send: SendOptions::default(),
@@ -1220,6 +1283,10 @@ mod tests {
     /// Runs [`ThreeAttacks`] on a base request recorded in history; returns the base row's id,
     /// the summary, and the history rows left as (id, path).
     async fn scan_three(name: &str, prune: bool) -> (i64, ActiveSummary, Vec<(i64, String)>) {
+        scan_three_tuned(name, prune, Tuning::default()).await
+    }
+
+    async fn scan_three_tuned(name: &str, prune: bool, tuning: Tuning) -> (i64, ActiveSummary, Vec<(i64, String)>) {
         use url::Url;
         static RULE: ThreeAttacks = ThreeAttacks;
         let port = answering_server().await;
@@ -1237,6 +1304,7 @@ mod tests {
         let guard = crate::guard::Guard::from_specs(vec![scope]).unwrap();
         let cfg = ActiveConfig {
             strength: Strength::Medium,
+            tuning,
             concurrency: 1,
             rate: None,
             send: SendOptions { guard: Some(guard), ..Default::default() },
@@ -1281,5 +1349,34 @@ mod tests {
         assert_eq!((s.new_findings, s.pruned), (1, None), "{s:?}");
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(!serde_json::to_value(&s).unwrap().as_object().unwrap().contains_key("pruned"));
+    }
+
+    /// [`ThreeAttacks`] runs as a declarative check here: a check takes the scan's strength and
+    /// threshold, never a policy's settings for a rule of the same id (every check's id is 0,
+    /// as is Directory Browsing's).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_takes_the_scans_threshold_and_no_rules_own_settings() {
+        use policy::RuleTuning;
+        let own = RuleTuning { strength: Some(Strength::Insane), threshold: Some(Threshold::High) };
+        let tuning = Tuning { threshold: Threshold::Low, rules: [(999_998, own), (0, own)].into() };
+        let (_, s, rows) = scan_three_tuned("tuned", false, tuning).await;
+        assert_eq!((s.requests, rows.len(), s.new_findings), (3, 4, 1), "{s:?}");
+        assert!(s.below_threshold.is_empty(), "{s:?}");
+        // The scan's threshold applies: its low-confidence finding is counted, not raised.
+        let high = Tuning { threshold: Threshold::High, ..Default::default() };
+        let (_, s, _) = scan_three_tuned("tuned-scan", false, high).await;
+        assert_eq!((s.requests, s.new_findings, s.raised.len()), (3, 0, 0), "{s:?}");
+        assert_eq!(s.below_threshold, [("999998".to_string(), 1)].into());
+    }
+
+    /// Selected rules bring the rules they depend on; a rule left without one is dropped, along
+    /// the whole chain (persistent XSS 40014 needs Spider 40017, which needs Prime 40016).
+    #[test]
+    fn rules_are_selected_with_what_they_depend_on() {
+        assert_eq!(selected_rule_ids(Some(&[40014]), &[]), [40014, 40016, 40017]);
+        assert_eq!(selected_rule_ids(Some(&[40014, 40034]), &[40017]), [40034]);
+        let all = selected_rule_ids(None, &[40016]);
+        assert!(!all.contains(&40017) && !all.contains(&40014) && all.contains(&40012), "{all:?}");
+        assert_eq!(all.len(), all_rules().len() - 3);
     }
 }

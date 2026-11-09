@@ -127,6 +127,20 @@ pub const SETTING_CHANGE_COLUMNS: &[(&str, &str, &str)] = &[
     ("origin", "TEXT", "gui, cli or mcp: who saved it"),
 ];
 
+/// A saved item's name (a report profile's, a scan policy's), trimmed: 1 to 64 bytes, not
+/// starting with "-" (it would be read as a flag wherever the name is passed on its own), no
+/// control characters.
+pub(crate) fn saved_name<'a>(what: &str, name: &'a str) -> Result<&'a str> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(Error::InvalidInput(format!("a {what} name has 1 to 64 characters")));
+    }
+    if name.starts_with('-') || name.chars().any(char::is_control) {
+        return Err(Error::InvalidInput(format!("a {what} name can't start with - or hold control characters")));
+    }
+    Ok(name)
+}
+
 /// Logs that setting `key` was saved by this process's origin, on `conn` (inside the caller's
 /// transaction when it has one).
 pub(crate) fn log_setting_change(conn: &Connection, key: &str) -> Result<()> {

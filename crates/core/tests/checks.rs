@@ -113,6 +113,7 @@ fn run_with(
         Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }]).unwrap();
     let mut cfg = ActiveConfig {
         strength: Strength::Medium,
+        tuning: Default::default(),
         concurrency: 4,
         rate: None,
         send: SendOptions {

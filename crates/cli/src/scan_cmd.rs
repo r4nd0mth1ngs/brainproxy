@@ -43,6 +43,10 @@ pub enum ScanCmd {
     Enable { ids: Vec<String> },
     /// Disable passive rules by id, or passive checks by check id.
     Disable { ids: Vec<String> },
+    /// Saved scan policies: which active rules run, at what strength and threshold, for
+    /// `scan active --policy NAME`.
+    #[command(subcommand)]
+    Policy(crate::policy_cmd::PolicyCmd),
     /// ZAP data files the rules read (error patterns, hidden files, sensitive names): status, update, reset.
     #[command(subcommand)]
     Data(DataCmd),
@@ -535,9 +539,12 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
     if let ScanCmd::Data(cmd) = cmd {
         return data_cmd(home, cmd, out);
     }
+    if let ScanCmd::Policy(cmd) = cmd {
+        return crate::policy_cmd::policy(project, cmd, out);
+    }
     let mut store = Store::open(project)?;
     match cmd {
-        ScanCmd::Active(_) | ScanCmd::Data(_) => unreachable!(),
+        ScanCmd::Active(_) | ScanCmd::Data(_) | ScanCmd::Policy(_) => unreachable!(),
         ScanCmd::Passive { rescan } => {
             let stats = if rescan { passive::rescan(&mut store)? } else { passive::scan_pending(&mut store)? };
             out.ok(json!(stats), || {

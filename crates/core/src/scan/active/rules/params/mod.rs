@@ -209,6 +209,7 @@ mod e2e {
                 .unwrap();
         let cfg = ActiveConfig {
             strength: Strength::Medium,
+            tuning: Default::default(),
             concurrency: 4,
             rate: None,
             send: SendOptions { guard: Some(guard), timeout: Duration::from_secs(10), ..Default::default() },

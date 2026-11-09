@@ -632,8 +632,10 @@ attack type, and pick payloads:
     also covers `https://` on port 443 of the same host, since sites redirect there.
   - **Audit everything recorded:** attacks all traffic already in the project.
   - **Audit specific URLs:** only the requests you list.
-  - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
-    templates* (on when installed, high severity and above by default).
+  - **Options:** a saved scan policy, strength, rules, login profile, speed limits, and
+    *Include Nuclei templates* (on when installed, high severity and above by default). With a
+    policy, *Strength* is the policy's unless you pick one, and a strength, *Only rules* or
+    *Skip rules* given here win over the policy's (see [Scan policies](#scan-policies)).
   - **Keep only attack requests that back a finding:** off by default, so every attack request
     stays in history. On, a scan deletes when it ends (finished, stopped with *Stop*, or out
     of time) the attack requests it sent that nothing refers to. It is saved for the project and shared with
@@ -678,7 +680,15 @@ attack type, and pick payloads:
 - **New scan › CVE quick checks:** one check for a new CVE from the brainproxy checks
   feed, run on the listed sites (for example whether a site decodes Brotli request
   bodies, CVE-2026-111497). New ones arrive with the daily feed update.
-- **Tasks:** running and finished scans and crawls with progress; Stop; View findings.
+- **Policies:** saved scan policies, each a choice of which active rules run, at what strength,
+  and how sure a rule must be to raise a finding (its threshold). Pick a saved one or *New
+  policy*, set the strength and threshold every rule gets, untick *Rules on unless turned off*
+  to run only the rules you tick, and give single rules their own strength or threshold
+  (*reset* puts a rule back on the policy's). *Save* keeps it in the project under its name.
+  *New scan* and the guided scan's *How thorough* step (when a policy is saved) can use one.
+  See [Scan policies](#scan-policies).
+- **Tasks:** running and finished scans and crawls with progress; Stop; View findings. A
+  scan's result shows the policy it ran with and how many findings its thresholds held back.
 - **Rules:** turn passive rules and the feed's passive checks on or off, choose which
   traffic is passively scanned, or run the passive scan again.
 
@@ -1003,7 +1013,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 147 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 151 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1031,6 +1041,9 @@ brainproxy send coupon.http --also checkout.http --race 5 # 2*5 = 10 requests
 brainproxy crawl https://app.acme.test/ --background
 brainproxy scan active https://app.acme.test/ --crawl --checks nuclei --check-severity high \
     --check-include-tags eol --background     # plus the end-of-life checks (rated info)
+brainproxy scan policy save api --strength high --threshold medium --disable 40012,40014 \
+    --rule-strength 40018=insane              # a saved scan policy
+brainproxy scan active https://app.acme.test/api/ --crawl --policy api --background
 brainproxy job wait 1
 
 brainproxy fuzz run --url 'https://app.acme.test/search?q=§x§' -p wordlist:sqli --grep 'SQL syntax'
@@ -1813,6 +1826,68 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   Narrowing the scope hides what went out, never that it did. A
   request outside both scopes is refused by the engagement before it goes out and gets no
   row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.
+
+### Scan policies
+
+A scan policy is a saved, named choice of which active rules run, how hard each attacks
+(strength) and how sure each must be before it raises a finding (threshold), as ZAP's scan
+policies are. Policies are kept in the project (setting `scan_policies`, logged in
+`setting_changes`) and edited in *Scans › Policies* or with `scan policy`:
+
+```sh
+brainproxy scan policy save api --strength high --threshold medium --disable 40012,40014 \
+    --rule-strength 40018=insane --rule-threshold 40018=high
+brainproxy scan policy save sqli --others off --enable 40018,40019   # only these rules
+brainproxy scan policy save api-lite --from api --strength low --reset 40018
+echo '{"strength": "low", "rules": {"40018": {"threshold": "high"}}}' \
+    | brainproxy scan policy save from-json --json -
+brainproxy scan policy list
+brainproxy scan policy show api      # every rule as the policy runs it (* = its own settings)
+brainproxy scan policy remove api-lite
+brainproxy scan active https://app.acme.test/ --crawl --policy api
+```
+
+- **Strength** is ZAP's attack strength (`low`, `medium`, `high`, `insane`): how many attacks a
+  rule tries. A rule's own `--rule-strength` wins over the policy's.
+- **Threshold** is ZAP's alert threshold, read against the confidence a rule gives each
+  finding: `low` raises every finding (what a scan without a policy does), `medium` raises
+  findings of medium or high confidence, `high` only high-confidence ones. A finding below its
+  rule's threshold isn't raised; the scan counts it per alert in `below_threshold`. The attacks
+  sent are the same at every threshold: the rules keep ZAP's checks at its default MEDIUM
+  threshold (see [ACTIVE_RULES.md](ACTIVE_RULES.md#differences-from-zap)). An out-of-band check
+  is held to the confidence its callback raises the alert at, and a check below its threshold
+  isn't registered. ZAP's OFF threshold is a rule turned off (`--disable`).
+- **On and off:** with `--others on` (the default) every rule runs except those the policy turns
+  off; with `--others off` only the rules it turns on run, so a rule added in a later version
+  stays off. Rules the turned-on ones depend on (the persistent XSS rule's Prime and Spider)
+  run with them unless the policy turns them off.
+- `save` builds on `--from POLICY` or `--json` (inline, or `-` for stdin), then applies the
+  flags: `--strength`, `--threshold`, `--others`, `--reset IDS` (the rules take the policy's
+  settings again), `--enable`, `--disable`, `--rule-strength ID=S`, `--rule-threshold ID=T`.
+  Saving a name that exists replaces it. `--json` refuses a field it doesn't know.
+- A policy saved by a newer brainproxy that this one can't read is listed under `unreadable`
+  and kept as it is; the others still work.
+- Policies tune the ported rules only: `--checks` templates run at the scan's strength and
+  threshold (the policy's own, or `--strength`/`--threshold`), never at a rule's own.
+
+`scan active --policy NAME` runs the rules as the policy says. Flags given as well win:
+`--strength` and `--threshold` apply to every rule, those with settings of their own too;
+`--rules` runs the rules it names instead of the policy's; `--exclude-rules` skips rules as well
+as those the policy turns off. With `--preset`, the policy's strength wins over the preset's;
+the preset still sets the crawl. `--threshold` also works without a policy. The result's
+`policy` says what applied: `name`, `strength`, `threshold`, `rule_strengths`,
+`rule_thresholds`, `rules` (the ported rules that ran, once the rules they depend on are
+resolved), `exclude_rules`, and `flags_over_policy` (the flags given as well). A policy picked
+in the app that was removed since stays picked, and the scan refuses to start rather than run
+every rule.
+
+`findings compare --scan` reads the rules and thresholds a policy scan ran with from its result,
+not from the policy as it is now: a finding of a rule the policy turned off, or of lower
+confidence than its rule's threshold, isn't counted as fixed. A `--policy` scan whose result
+doesn't say (one that didn't finish) covers no ported rule.
+
+Through MCP, `scan policy save` saves a new name only (a saved policy may be a person's) and
+`scan policy remove` is refused; an agent can run a scan with any policy.
 
 ### Pruning a scan's attack requests
 
