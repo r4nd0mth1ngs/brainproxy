@@ -1,7 +1,8 @@
 //! Spider: breadth-first crawl from seed URLs. Follows links, redirects, frames,
 //! scripts, meta refreshes, forms (submitted with generated values), robots.txt,
-//! sitemap.xml, and URL paths written in page text or scripts (placeholder values
-//! such as `…` or `{id}` filled in), staying inside a host/path scope. Cookies the
+//! sitemap.xml, URL paths written in page text or scripts (placeholder values
+//! such as `…`, `{id}` or a template literal's `${id}` filled in), and the chunks a
+//! bundle loads by relative path, staying inside a host/path scope. Cookies the
 //! site sets are kept in a per-crawl jar and sent back. Every fetched exchange is
 //! recorded (source "crawl") and passively scanned.
 
@@ -666,6 +667,10 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
         }
     }
     if ct.contains("javascript") || ct.contains("json") {
+        // Template literals, as compiled apps write their API calls (`/api/users/${id}`): each
+        // `${…}` becomes a placeholder, filled in like `{id}`.
+        static INTERPOLATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{[^{}`]{0,100}\}").unwrap());
+        let text = INTERPOLATION.replace_all(&text, "{x}");
         // Quoted absolute paths in scripts, e.g. fetch("/api/items").
         static PATHS: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r#"["'`](/[A-Za-z0-9_\-./{}:~%]{1,150}(?:\?[^"'`\s]{0,200})?)["'`]"#).unwrap());
@@ -674,6 +679,7 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
                 link(page, &c[1], &mut out);
             }
         }
+        chunk_links(page, &text, &mut out);
         return out;
     }
     if !ct.contains("html") {
@@ -716,6 +722,34 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
     static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->|<[^>]*>").unwrap());
     text_links(&base, &decode_entities(&TAG.replace_all(&text, " ")), &mut out);
     out
+}
+
+/// Scripts a bundle loads later by a relative path: the code-split chunks of each route, where
+/// single-page apps keep most of their API calls. `./x.js` and `../x.js` are relative to the
+/// script (dynamic `import()`). A bare `assets/x.js` (Vite's preload list, webpack's chunk
+/// paths) is relative to where the app is served: the script's parent folder when the path starts
+/// with the script's own folder (`/app/assets/index.js` loading `assets/x.js`), else the origin's
+/// root. At most 200 per script.
+fn chunk_links(script: &Url, text: &str, out: &mut Vec<Found>) {
+    static CHUNKS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"["'`]((?:\.\.?/)*[A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)*\.m?js)["'`]"#).unwrap());
+    let folders: Vec<&str> = script.path_segments().map(|s| s.collect()).unwrap_or_default();
+    let dir = folders.len().checked_sub(2).and_then(|i| folders.get(i)).copied().unwrap_or_default();
+    for c in CHUNKS.captures_iter(text).take(200) {
+        let path = &c[1];
+        let joined = if path.starts_with("./") || path.starts_with("../") {
+            script.join(path)
+        } else if let Some((first, _)) = path.split_once('/') {
+            let base = if !dir.is_empty() && first == dir { "../" } else { "/" };
+            script.join(base).and_then(|b| b.join(path))
+        } else {
+            // A bare file name is as likely a word in a message as a chunk.
+            continue;
+        };
+        if let Ok(u) = joined {
+            out.push(Found { method: "GET".into(), url: u.to_string(), body: None, form: false });
+        }
+    }
 }
 
 /// Same-site paths and absolute URLs mentioned in plain text, at most 200 per page.
@@ -878,6 +912,46 @@ mod tests {
         let found = extract(&js, &h, br#"fetch("/api/items?limit=5"); x = '//cdn'"#, false);
         assert_eq!(found[0].url, "https://a.test/api/items?limit=5");
         assert_eq!(found.len(), 1);
+    }
+
+    /// A single-page app's bundle: API calls in template literals, and its routes' chunks.
+    #[test]
+    fn extracts_template_paths_and_chunks_from_bundles() {
+        let h = vec![("Content-Type".to_string(), "text/javascript".to_string())];
+        let urls = |script: &str, body: &str| -> Vec<String> {
+            let mut out: Vec<String> = extract(&Url::parse(script).unwrap(), &h, body.as_bytes(), false)
+                .into_iter()
+                .map(|f| {
+                    let mut u = Url::parse(&f.url).unwrap();
+                    fill_placeholders(&mut u);
+                    u.to_string()
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let bundle = r#"a.get(`/api/users/${e.id}/posts?page=${n}`); fetch(`/api/items`);
+            const r = [{path:"/about",component:()=>t(()=>import("./About-x1.js"),__vite__mapDeps([0,1]))}];
+            const d = ["assets/About-x1.js","assets/About-x1.css","assets/vendor-y2.mjs"];
+            throw Error("see index.js"); x = "https://cdn.test/lib.js"; y = `${a}${b}.js`"#;
+        assert_eq!(
+            urls("https://a.test/assets/index-CM.js", bundle),
+            [
+                "https://a.test/about",
+                "https://a.test/api/items",
+                "https://a.test/api/users/1/posts?page=1",
+                "https://a.test/assets/About-x1.js",
+                "https://a.test/assets/About-x1.js",
+                "https://a.test/assets/vendor-y2.mjs",
+            ]
+        );
+        // Served under a path: chunks stay under it.
+        assert_eq!(
+            urls("https://a.test/app/assets/index.js", r#"["assets/x.js"]; import("../lazy/y.js")"#),
+            ["https://a.test/app/assets/x.js", "https://a.test/app/lazy/y.js"]
+        );
+        // A chunk folder that isn't the script's own: from the origin's root.
+        assert_eq!(urls("https://a.test/static/main.js", r#"["js/chunk-1.js"]"#), ["https://a.test/js/chunk-1.js"]);
     }
 
     #[test]
