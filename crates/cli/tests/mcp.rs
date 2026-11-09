@@ -955,7 +955,7 @@ fn an_agent_overwrites_no_file_and_keeps_the_ca() {
     let mut m = Mcp::start_env(&p, &[], &[("BRAINPROXY_HOME", &home_s)]);
     m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
     let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
-    for name in ["report", "ca_export", "ca_init", "findings_repro"] {
+    for name in ["report", "ca_export", "ca_init", "findings_repro", "history_export"] {
         let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}"));
         assert_eq!(t["annotations"]["destructiveHint"], false, "{name}");
     }
@@ -974,8 +974,10 @@ fn an_agent_overwrites_no_file_and_keeps_the_ca() {
     for (tool, args) in [
         ("report", json!({"output": path, "force": true})),
         ("ca_export", json!({"out": path, "force": true})),
+        ("history_export", json!({"output": path, "force": true})),
         ("report", json!({"output": path})),
         ("ca_export", json!({"out": path})),
+        ("history_export", json!({"output": path})),
     ] {
         let (err, e) = m.call(tool, args.clone());
         assert!(err, "{tool} {args}: {e}");

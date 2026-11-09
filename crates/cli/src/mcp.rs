@@ -394,6 +394,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("import openapi", NET),
     ("import postman", NET),
     ("import graphql", NET),
+    ("import har", NET),
     ("oob start", ADD),
     ("oob stop", REPLACE),
     ("oob status", READ),
@@ -455,6 +456,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("diff", READ),
     ("history list", READ),
     ("history show", READ),
+    // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
+    ("history export", ADD),
     ("history note", SET),
     ("history tag", SET),
     ("ws list", READ),

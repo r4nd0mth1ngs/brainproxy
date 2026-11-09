@@ -12,6 +12,7 @@ mod connection_cmd;
 mod crawl_cmd;
 mod engagement_cmd;
 mod fuzz_cmd;
+mod history_export;
 mod import_cmd;
 mod jobs_cmd;
 mod mcp;
@@ -341,6 +342,15 @@ enum HistoryCmd {
         #[arg(long, default_value_t = 65536)]
         max_body: usize,
     },
+    /// Export entries as a file another tool reads: HAR 1.2. Chosen as `history list` chooses
+    /// them (oldest first, up to --limit), with session secrets masked as in reports.
+    #[command(after_help = "Masked by default, as `report` masks them: cookie values, Authorization \
+        credentials, API-key headers, token and password parameters in URLs and bodies, JWTs, the project's \
+        auth profile secrets, and each such value wherever else it appears; bodies that aren't text are left \
+        out (they can't be searched). --no-redact keeps everything as recorded, binary bodies as base64. Each \
+        entry's `_brainproxy` holds its history id and source. Without --output the HAR is printed (in JSON \
+        mode, under `data.har`). `import har` reads the file back, in this project or another.")]
+    Export(history_export::ExportArgs),
     /// Attach a note to an entry; omit TEXT to clear it.
     Note { id: i64, text: Option<String> },
     /// Add or remove tags on an entry.
@@ -385,6 +395,25 @@ fn main() {
     }
     // A last-byte race opens a connection per request; don't stop at a low default soft limit.
     brainproxy_core::race::raise_fd_limit();
+    // The command runs on a thread of a known stack size, not the main thread's, which the
+    // platform sets: 1 MiB on Windows, too little for clap's parser of every command once a
+    // command parses the command line again (`findings compare --scan` reads a scan's).
+    let ran = std::thread::Builder::new().name("main".into()).stack_size(STACK).spawn(move || cli_main(argv));
+    match ran.map(|t| t.join()) {
+        Ok(Ok(())) => {}
+        // The panic was printed already; exit as Rust does for one on the main thread.
+        Ok(Err(_)) => std::process::exit(101),
+        Err(e) => {
+            eprintln!("brainproxy: can't start: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The stack the command runs with: as much as Linux gives a main thread.
+const STACK: usize = 8 << 20;
+
+fn cli_main(argv: Vec<String>) {
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(e) => {
@@ -430,6 +459,7 @@ fn command_name(cmd: &Cmd) -> String {
         },
         Cmd::History(HistoryCmd::List { .. }) => "history list",
         Cmd::History(HistoryCmd::Show { .. }) => "history show",
+        Cmd::History(HistoryCmd::Export(_)) => "history export",
         Cmd::History(HistoryCmd::Note { .. }) => "history note",
         Cmd::History(HistoryCmd::Tag { .. }) => "history tag",
         Cmd::Proxy(c) => match c {
@@ -465,6 +495,7 @@ fn command_name(cmd: &Cmd) -> String {
             import_cmd::ImportCmd::Openapi(_) => "import openapi",
             import_cmd::ImportCmd::Postman(_) => "import postman",
             import_cmd::ImportCmd::Graphql(_) => "import graphql",
+            import_cmd::ImportCmd::Har(_) => "import har",
         },
         Cmd::Engagement(_) => "engagement",
         Cmd::Auth(c) => match c {
@@ -1094,8 +1125,12 @@ fn text_exchange(id: Option<i64>, response: &[u8], ms: u64) -> String {
 }
 
 fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
+    if let HistoryCmd::Export(a) = cmd {
+        return history_export::export(project, a, out);
+    }
     let store = Store::open(project)?;
     match cmd {
+        HistoryCmd::Export(_) => unreachable!("handled above"),
         HistoryCmd::List { host, method, status, source, tag, origin, contains, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,

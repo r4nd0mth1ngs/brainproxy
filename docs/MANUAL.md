@@ -332,6 +332,8 @@ The sidebar groups the tools by what you are doing.
   Site map and **Proxy › Traffic**, which opens showing only the source `import`; right-click one to
   send it to Replay. A definition read from a URL shows there too, as its fetch: each fetch (the
   preview's and the import's) keeps the response's head only, not the document. One import runs at a time. The guided API scan's first step links here too.
+  A HAR file (a browser's or another proxy's recording) can be picked as the definition too: each
+  of its requests is one operation, as below under `import har`.
 - **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
   the proxy scope. Below it, the latest changes to the proxy scope and the TLS pass-through
   list, with who made each and whether it narrowed recording. While an agent's narrowing
@@ -1001,7 +1003,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 145 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 147 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1412,8 +1414,8 @@ Crawl and active-scan scope and safety flags:
   store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
   without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
   check or rule does send is recorded in history (source `scan`), finding or not.
-- `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
-  GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
+- `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, a
+  GraphQL schema (SDL file or introspection result), or a HAR file (see `import har`), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
   and which operations were skipped and why. `--server N` picks a listed server, `--base-url`
   overrides them, `--var NAME=VALUE` sets a Postman variable, `--only 0,3,7` picks operations by
@@ -1442,6 +1444,54 @@ Crawl and active-scan scope and safety flags:
 - The preview also lists what the document declares about OAuth (`oauth`: flow, token and sign-in
   URLs, scopes, an OpenID Connect discovery URL) and a Postman collection's AWS Signature settings
   (`aws`: region and service), to fill in a profile or signer. Client ids and secrets are never shown.
+- `import har FILE`: a HAR 1.2 file (Chrome's or Firefox's *Save all as HAR*, or another proxy's
+  export) under the same rules; `import api` and `scan active --api` take one too, detected from
+  its contents, up to 256 MiB (other documents: 32 MiB). Each entry's request (method, URL,
+  headers, cookies, query, and body: its text, or its form or multipart `params`, a file part's
+  content standing in as `test`) becomes one operation, named `METHOD URL` without the query.
+  Not taken from the file: `Host` (the URL gives it, so `--base-url` can move a recording to
+  another server), `Content-Length`, the connection's own headers, `Accept-Encoding`,
+  `Content-Encoding` (a HAR records the decoded body), HTTP/2's pseudo-headers, and a GET's or
+  HEAD's cache validators (`If-None-Match`, `If-Modified-Since`, ...). A write keeps its
+  preconditions (`If-Match`, `If-Unmodified-Since`), so a stale recording fails with 412 rather
+  than overwriting newer data. A body `history export` wrote as base64 (`_encoding`) is decoded.
+  Left out and counted in `warnings`: static assets (scripts, styles, images, fonts and media, by
+  Chrome's resource type, the response's content type or the file's extension; `--keep-static`
+  keeps them), an entry with the same method, URL, `Accept` header and body as an earlier one
+  (the first is kept),
+  WebSocket handshakes (`ws send --from` replays a connection), and URLs that aren't http(s).
+  Entries outside the engagement scope are listed with `excluded_reason: "scope"`, never sent,
+  and counted in `skipped_out_of_scope`. The method opt-ins are those of any document: DELETE,
+  PUT, PATCH and GraphQL mutations need `--include-methods`. The recorded `Cookie` and
+  `Authorization` headers, other credential headers (`X-CSRF-Token`, `X-Api-Key`,
+  `X-Session-Id`, ...), and credentials in URLs and bodies (form, JSON, XML and multipart fields)
+  are left out and listed under `credentials` by name, as for a Postman collection's saved keys;
+  use an auth profile. As a HAR holds live values, its names are judged as reports judge them
+  (`session`, `sid`, `jwt`, `signature`, `key` and the like count too). `--keep-credentials` sends the recorded
+  credential headers as they were (a recorded session is often stale by now); those in the URL
+  and body are still left out, as URLs are shown and logged, and the preview shows the kept ones
+  as `********` and says `credentials_kept`. The HAR's responses are not read (only their content
+  type, to tell a static asset) or stored: each request is sent again, and the live answer is
+  recorded. A HAR fetched from a URL is recorded like any document, its body omitted.
+- `history export har`: history rows as a HAR 1.2 file, chosen with `history list`'s filters
+  (`--host`, `--method`, `--status`, `--source`, `--tag`, `--origin`, `--contains`, `--after`),
+  oldest first, up to `--limit` (1000; `truncated` says when more matched). Session secrets are
+  masked as reports mask them (cookie values, `Authorization` credentials, API-key headers, token
+  and password parameters, JWTs, the project's auth profile secrets, and each value wherever else
+  it appears); a body that isn't text can't be searched, so it is left out with a `comment` and
+  counted in `binary_bodies_left_out`. `--mask VALUE` masks more; `--no-redact` keeps everything
+  as recorded, binary bodies as base64 (a request's with `_encoding: "base64"`, which `import
+  har` reads back). Reason phrases are masked too. Each entry's `_brainproxy` holds its history id and
+  source, and `_error` why it failed. `-o FILE` writes the file (an existing one is kept unless
+  `--force`, which MCP refuses); without it the HAR is printed, under `data.har` in JSON mode.
+  The app has no export button yet.
+
+  ```sh
+  brainproxy import har recording.har --dry-run                 # what would go out, and what was left out
+  brainproxy import har recording.har --expect-sha256 HEX --auth app
+  brainproxy scan active --api recording.har --only 0,2 --auth app
+  brainproxy history export har --source proxy --host app.acme.test -o acme.har
+  ```
 - `scan active --api SOURCE`: the same document flags in one job: send each chosen in-scope
   operation once as a baseline (history source `import`), then attack exactly those. Baselines
   count as the `scan` tool for session rules. A scan with nothing in scope exits 6 and sends

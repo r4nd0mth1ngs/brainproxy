@@ -84,7 +84,7 @@ export interface ApiAwsHint {
 
 export interface ApiPreview {
   kind: "api";
-  format: "openapi3" | "swagger2" | "postman" | "graphql";
+  format: "openapi3" | "swagger2" | "postman" | "graphql" | "har";
   title: string | null;
   version: string | null;
   document_sha256: string;
@@ -97,6 +97,8 @@ export interface ApiPreview {
   scripts?: ApiScript[];
   oauth?: ApiOAuthHint[];
   aws?: ApiAwsHint[];
+  /** A HAR file's recorded credential headers are sent (`--keep-credentials`); absent otherwise. */
+  credentials_kept?: boolean;
   built: number;
   selected: number;
   skipped: { operation: string; reason: string }[];
@@ -125,7 +127,7 @@ export const EMPTY_TARGET: ApiTarget = { server: null, baseUrl: "", vars: {}, en
 /** Requests listed by the preview: every operation, up to this many. */
 export const PREVIEW_LIMIT = 1000;
 
-const FORMATS: Record<ApiPreview["format"], string> = { openapi3: "OpenAPI 3", swagger2: "Swagger 2", postman: "Postman collection", graphql: "GraphQL schema" };
+const FORMATS: Record<ApiPreview["format"], string> = { openapi3: "OpenAPI 3", swagger2: "Swagger 2", postman: "Postman collection", graphql: "GraphQL schema", har: "HAR file" };
 
 export const formatLabel = (f: ApiPreview["format"]): string => FORMATS[f] ?? f;
 
