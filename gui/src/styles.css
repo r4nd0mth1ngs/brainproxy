@@ -275,12 +275,62 @@ select {
   background: var(--panel);
   flex-shrink: 0;
   min-height: 38px;
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 .toolbar.flat {
   background: none;
   border: 0;
   padding: 0;
   margin: 8px 0;
+}
+/* Toolbars and the other bars of controls wrap: on a narrow window their controls go onto more
+   lines instead of running off the edge. Nothing in them is wider than the bar. A select without
+   a set width is as wide as its longest option, so a long host name or scan is cut off rather
+   than pushing everything else down. Text cut off with an ellipsis starts small, so it shrinks
+   before anything wraps. After a `.grow` spacer, controls that wrap stay at the right; use
+   `.toolbar-end` to keep a group of them together. */
+.toolbar > *,
+.msg-bar > *,
+.msg-foot > *,
+.detail-head > *,
+.dec-head > *,
+.toolbar-end > * {
+  max-width: 100%;
+}
+.toolbar > select:not([style*="width"]) {
+  max-width: min(100%, 280px);
+}
+.toolbar > .ellipsis,
+.msg-bar > .ellipsis {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+.toolbar > .grow + *,
+.msg-bar > .grow + *,
+.detail-head > .grow + *,
+.dec-head > .grow + *,
+.row > .grow + * {
+  margin-left: auto;
+}
+.msg-bar,
+.msg-foot,
+.detail-head,
+.dec-head,
+.set-actions,
+.oob-actions,
+.finding-dialog-actions {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.toolbar-end {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px 8px;
+  margin-left: auto;
+  min-width: 0;
 }
 .toolbar .sep {
   width: 1px;
@@ -2772,11 +2822,6 @@ button.chip {
   margin-right: 4px;
 }
 /* Six triage states and the actions beside them wrap in a narrow detail pane. */
-.detail .toolbar.flat {
-  flex-wrap: wrap;
-  row-gap: 6px;
-}
-
 /* The report builder (views/ReportBuilder.tsx): choices on the left, the preview on the right. */
 .report-dialog {
   width: min(1180px, 100%);

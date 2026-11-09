@@ -128,16 +128,17 @@ export function DecoderView() {
                 <option key={k}>{k}</option>
               ))}
             </select>
-            <span className="grow" />
-            <button className="btn small" onClick={() => navigator.clipboard.writeText(outputs[i]?.text ?? "")}>
-              Copy
-            </button>
-            <button className="btn small" onClick={() => changeInput(outputs[i]?.text ?? "")} title="Use this output as the input">
-              Use as input
-            </button>
-            <button className="btn small" onClick={() => editSteps((ss) => ss.filter((_, j) => j !== i))} disabled={steps.length === 1}>
-              Remove
-            </button>
+            <div className="toolbar-end">
+              <button className="btn small" onClick={() => navigator.clipboard.writeText(outputs[i]?.text ?? "")}>
+                Copy
+              </button>
+              <button className="btn small" onClick={() => changeInput(outputs[i]?.text ?? "")} title="Use this output as the input">
+                Use as input
+              </button>
+              <button className="btn small" onClick={() => editSteps((ss) => ss.filter((_, j) => j !== i))} disabled={steps.length === 1}>
+                Remove
+              </button>
+            </div>
           </div>
           {outputs[i]?.error ? <div className="error">{outputs[i].error}</div> : <pre className="code dec-text">{outputs[i]?.text}</pre>}
         </div>

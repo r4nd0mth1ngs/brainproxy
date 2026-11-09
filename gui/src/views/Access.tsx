@@ -112,13 +112,14 @@ export function AccessView({ active }: { active: boolean }) {
             Stop
           </button>
         )}
-        <span className="grow" />
-        <label className="check" title="Rows with a bypass first">
-          <input type="checkbox" checked={worstFirst} onChange={(e) => setWorstFirst(e.target.checked)} /> Worst first
-        </label>
-        <button className={`btn small ${showNew ? "" : "primary"}`} onClick={() => setShowNew((s) => !s)}>
-          {showNew ? "Hide new run" : "New run"}
-        </button>
+        <div className="toolbar-end">
+          <label className="check" title="Rows with a bypass first">
+            <input type="checkbox" checked={worstFirst} onChange={(e) => setWorstFirst(e.target.checked)} /> Worst first
+          </label>
+          <button className={`btn small ${showNew ? "" : "primary"}`} onClick={() => setShowNew((s) => !s)}>
+            {showNew ? "Hide new run" : "New run"}
+          </button>
+        </div>
       </div>
       {/* Kept mounted, so what was picked survives hiding it. */}
       <div className="az-new" hidden={!showNew}>
@@ -253,21 +254,22 @@ function Compare({ runId, picked, onClose }: { runId: number; picked: Picked; on
           <span className="method">{picked.method}</span> {picked.url}
         </span>
         {row && <span className="muted small ellipsis" title={row.evidence || row.reason}>{row.evidence || row.reason}{row.similarity != null ? ` · similarity ${row.similarity.toFixed(2)}` : ""}</span>}
-        <span className="grow" />
-        <div className="seg">
-          <button className={part === "response" ? "on" : ""} onClick={() => setPart("response")}>
-            Responses
+        <div className="toolbar-end">
+          <div className="seg">
+            <button className={part === "response" ? "on" : ""} onClick={() => setPart("response")}>
+              Responses
+            </button>
+            <button className={part === "request" ? "on" : ""} onClick={() => setPart("request")}>
+              Requests
+            </button>
+          </div>
+          <button className="btn small" disabled={!pair} onClick={toDiff} title="Open both in Diff">
+            Diff
           </button>
-          <button className={part === "request" ? "on" : ""} onClick={() => setPart("request")}>
-            Requests
+          <button className="icon-btn" onClick={onClose} title="Close">
+            ×
           </button>
         </div>
-        <button className="btn small" disabled={!pair} onClick={toDiff} title="Open both in Diff">
-          Diff
-        </button>
-        <button className="icon-btn" onClick={onClose} title="Close">
-          ×
-        </button>
       </div>
       {!pair ? (
         <div className="blank">

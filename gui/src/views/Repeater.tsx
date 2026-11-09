@@ -452,42 +452,43 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
           Copy as cURL
         </button>
         <OptionsToggle options={options} kind="http" open={showOptions} onToggle={() => setShowOptions(!showOptions)} controls={optionsId} />
-        <span className="grow" />
-        {note && (
-          <span className="tag" title="This step was sent with other options than the tab has now">
-            {note}
-          </span>
-        )}
-        <button
-          className="btn small"
-          onClick={() => app.newFinding(draftFromRequest(current?.sent ?? raw, withScheme(guessTarget(raw, target)), r?.id, r?.url))}
-          title="Write up a finding for this request, linked to its last send"
-        >
-          Create finding…
-        </button>
-        {!!current?.encoded && (
-          <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>
-            {current.encoded} char{current.encoded === 1 ? "" : "s"} URL-encoded
-          </span>
-        )}
-        {raced && summary && (
-          <span className="tag" title={[partial, raced.result.race_id && `History rows tagged race:${raced.result.race_id}`].filter(Boolean).join("\n") || undefined}>
-            race ×{raced.result.race} · {techniqueLabel(raced.result.sync)}
-            {partial ? " (partial)" : ""}
-          </span>
-        )}
-        {raced && summary && (
-          <span className="muted" title={summary.baseline == null ? undefined : `Compared with the most common result: ${shapeLabel(raced.result.results[summary.baseline])} (first at #${summary.baseline + 1})`}>
-            {summary.spread == null ? "no responses" : `spread ${summary.spread} ms`} · {summary.differing ? `${summary.differing} differ from the most common` : "all alike"}
-            {summary.errors ? ` · ${summary.errors} failed` : ""}
-          </span>
-        )}
-        {r?.response && (
-          <span className="muted">
-            {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms ·{" "}
-            {r.id != null ? `history #${r.id}` : "not recorded"}
-          </span>
-        )}
+        <div className="toolbar-end">
+          {note && (
+            <span className="tag" title="This step was sent with other options than the tab has now">
+              {note}
+            </span>
+          )}
+          <button
+            className="btn small"
+            onClick={() => app.newFinding(draftFromRequest(current?.sent ?? raw, withScheme(guessTarget(raw, target)), r?.id, r?.url))}
+            title="Write up a finding for this request, linked to its last send"
+          >
+            Create finding…
+          </button>
+          {!!current?.encoded && (
+            <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>
+              {current.encoded} char{current.encoded === 1 ? "" : "s"} URL-encoded
+            </span>
+          )}
+          {raced && summary && (
+            <span className="tag" title={[partial, raced.result.race_id && `History rows tagged race:${raced.result.race_id}`].filter(Boolean).join("\n") || undefined}>
+              race ×{raced.result.race} · {techniqueLabel(raced.result.sync)}
+              {partial ? " (partial)" : ""}
+            </span>
+          )}
+          {raced && summary && (
+            <span className="muted" title={summary.baseline == null ? undefined : `Compared with the most common result: ${shapeLabel(raced.result.results[summary.baseline])} (first at #${summary.baseline + 1})`}>
+              {summary.spread == null ? "no responses" : `spread ${summary.spread} ms`} · {summary.differing ? `${summary.differing} differ from the most common` : "all alike"}
+              {summary.errors ? ` · ${summary.errors} failed` : ""}
+            </span>
+          )}
+          {r?.response && (
+            <span className="muted">
+              {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms ·{" "}
+              {r.id != null ? `history #${r.id}` : "not recorded"}
+            </span>
+          )}
+        </div>
       </div>
       {showOptions && <OptionsRow id={optionsId} options={options} set={setOptions} kind="http" binary={tab.binary} />}
       <Split id="repeater" dir="row">

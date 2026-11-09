@@ -211,17 +211,18 @@ function Tasks(p: { jobs: Job[]; selected: number | null; setSelected: (id: numb
               {j.kind} #{j.id}
             </h2>
             <span className={stateClass(j.state)}>{j.state}</span>
-            <span className="grow" />
-            {isLive(j) && (
-              <button className="btn small" onClick={() => stop(j.id)} disabled={j.state === "stopping"}>
-                Stop
-              </button>
-            )}
-            {j.kind === "active-scan" && !isLive(j) && (
-              <button className="btn small primary" onClick={() => app.setTab("findings")}>
-                View findings
-              </button>
-            )}
+            <div className="toolbar-end">
+              {isLive(j) && (
+                <button className="btn small" onClick={() => stop(j.id)} disabled={j.state === "stopping"}>
+                  Stop
+                </button>
+              )}
+              {j.kind === "active-scan" && !isLive(j) && (
+                <button className="btn small primary" onClick={() => app.setTab("findings")}>
+                  View findings
+                </button>
+              )}
+            </div>
           </div>
           {prog?.frac != null && (
             <div className="sc-bar wide">
@@ -1063,23 +1064,25 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
                 </button>
               ))}
             </div>
-            <span className="grow" />
-            <button className="btn" disabled={busy} onClick={() => runPassive(false)}>
-              Run passive scan now
-            </button>
-            <button className="btn" disabled={busy} onClick={() => window.confirm("Rescan all history? Findings found again keep their state and notes; untriaged ones not found again are removed.") && runPassive(true)}>
-              Rescan all
-            </button>
+            <div className="toolbar-end">
+              <button className="btn" disabled={busy} onClick={() => runPassive(false)}>
+                Run passive scan now
+              </button>
+              <button className="btn" disabled={busy} onClick={() => window.confirm("Rescan all history? Findings found again keep their state and notes; untriaged ones not found again are removed.") && runPassive(true)}>
+                Rescan all
+              </button>
+            </div>
           </>
         ) : (
           <>
-            <span className="grow" />
-            <span className="muted">{p.picked.size ? `${p.picked.size} picked for the next scan` : "Tick rules to limit the next scan to them"}</span>
-            {p.picked.size > 0 && (
-              <button className="btn small" onClick={() => p.setPicked(new Set())}>
-                Clear
-              </button>
-            )}
+            <div className="toolbar-end">
+              <span className="muted">{p.picked.size ? `${p.picked.size} picked for the next scan` : "Tick rules to limit the next scan to them"}</span>
+              {p.picked.size > 0 && (
+                <button className="btn small" onClick={() => p.setPicked(new Set())}>
+                  Clear
+                </button>
+              )}
+            </div>
           </>
         )}
       </div>

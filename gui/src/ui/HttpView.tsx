@@ -177,18 +177,19 @@ export function HttpView(p: {
             </button>
           ))}
         </div>
-        <span className="grow" />
-        {editable && (
-          <div className="seg">
-            <button onMouseDown={(e) => e.preventDefault()} onClick={() => transformSelection(encodeAll)} title="URL-encode the selection (⌘/Ctrl+U)">
-              Encode
-            </button>
-            <button onMouseDown={(e) => e.preventDefault()} onClick={() => transformSelection((s) => decode(s, true))} title="URL-decode the selection (⌘/Ctrl+Shift+U)">
-              Decode
-            </button>
-          </div>
-        )}
-        {p.extra}
+        <div className="toolbar-end">
+          {editable && (
+            <div className="seg">
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => transformSelection(encodeAll)} title="URL-encode the selection (⌘/Ctrl+U)">
+                Encode
+              </button>
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => transformSelection((s) => decode(s, true))} title="URL-decode the selection (⌘/Ctrl+Shift+U)">
+                Decode
+              </button>
+            </div>
+          )}
+          {p.extra}
+        </div>
       </div>
       <div className="code-wrap">
         {view === "render" ? (
