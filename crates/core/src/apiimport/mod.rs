@@ -172,6 +172,17 @@ pub(crate) fn shown_url(url: &str) -> String {
 /// strings (e.g. unquoted `200:` response codes) become strings; aliases are
 /// bounded by the parser's budget, so alias bombs fail instead of exhausting memory.
 pub fn parse_document(text: &str) -> Result<Value> {
+    parse(text, true)
+}
+
+/// [`parse_document`] whose error says where the text stops being JSON or YAML (line and
+/// column) but never quotes it, for a caller that must not read the file back through
+/// the error (an agent pointing an import at a file of secrets).
+pub fn parse_document_unquoted(text: &str) -> Result<Value> {
+    parse(text, false)
+}
+
+fn parse(text: &str, quote: bool) -> Result<Value> {
     if text.len() > MAX_DOCUMENT {
         return Err(Error::InvalidInput(format!("document is larger than {} MiB", MAX_DOCUMENT >> 20)));
     }
@@ -181,9 +192,13 @@ pub fn parse_document(text: &str) -> Result<Value> {
             return Ok(v);
         }
     }
-    serde_saphyr::from_str::<AnyKeys>(trimmed)
-        .map(|v| v.0)
-        .map_err(|e| Error::InvalidInput(format!("not valid JSON or YAML: {e}")))
+    serde_saphyr::from_str::<AnyKeys>(trimmed).map(|v| v.0).map_err(|e| {
+        Error::InvalidInput(match e.location() {
+            _ if quote => format!("not valid JSON or YAML: {e}"),
+            Some(at) => format!("not valid JSON or YAML (line {}, column {})", at.line(), at.column()),
+            None => "not valid JSON or YAML".to_string(),
+        })
+    })
 }
 
 /// serde_json::Value that accepts non-string map keys.
@@ -485,6 +500,14 @@ mod tests {
             ));
         }
         assert!(parse_document(&doc).is_err());
+        // Unquoted, an error says only where.
+        let ini = "[default]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = INISECRET456\n";
+        assert!(parse_document(ini).unwrap_err().to_string().contains("INISECRET456"));
+        let e = parse_document_unquoted(ini).unwrap_err().to_string();
+        assert!(
+            e.contains("not valid JSON or YAML (line 2, column 1)") && !e.contains("AKIA") && !e.contains("INISECRET"),
+            "{e}"
+        );
     }
 
     #[test]

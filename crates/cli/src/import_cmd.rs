@@ -298,14 +298,14 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         ImportCmd::Api(_) | ImportCmd::Har(_) => unreachable!("handled above"),
         ImportCmd::Openapi(a) => {
             let (text, spec_url) = fetch.document(&a.source)?;
-            let doc = apiimport::parse_document(&text)?;
+            let doc = parse_doc(&text)?;
             openapi::build(&doc, &openapi::Options { base_url: a.base_url.clone(), spec_url, ..Default::default() })?
         }
         ImportCmd::Postman(a) => {
             let (text, _) = fetch.document(&a.source)?;
             let vars = parse_vars(&a.vars)?;
             postman::build(
-                &apiimport::parse_document(&text)?,
+                &parse_doc(&text)?,
                 &postman::Options { base_url: a.base_url.clone(), vars, ..Default::default() },
             )?
         }
@@ -314,7 +314,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                 Some(s) => read_local(project, s)?,
                 None => fetch.introspect(&a.url)?,
             };
-            graphql::build(&apiimport::parse_document(&text)?, &a.url, c.include_destructive)?
+            graphql::build(&parse_doc(&text)?, &a.url, c.include_destructive)?
         }
     };
     let Built { mut requests, mut warnings, .. } = built;
@@ -649,6 +649,16 @@ fn text(v: &Value) -> String {
 pub(crate) fn is_url(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
     l.starts_with("http://") || l.starts_with("https://")
+}
+
+/// Parses a document. Through MCP a parse error says only where (line and column), never
+/// quoting the text: an agent could otherwise read a file of secrets back line by line.
+fn parse_doc(text: &str) -> Result<serde_json::Value, Error> {
+    if crate::mcp::in_tool_call() {
+        apiimport::parse_document_unquoted(text)
+    } else {
+        apiimport::parse_document(text)
+    }
 }
 
 /// Reads a local document, or stdin for `-`. Through MCP only a file in the project's folder

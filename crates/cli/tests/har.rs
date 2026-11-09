@@ -301,8 +301,13 @@ fn a_scan_takes_a_har_file() {
 
 /// `args` run as an MCP tool call's command, with `stdin` on stdin.
 fn run_mcp(project: &Path, args: &[&str], stdin: &[u8]) -> Output {
+    run_mcp_env(project, args, stdin, &[])
+}
+
+fn run_mcp_env(project: &Path, args: &[&str], stdin: &[u8], env: &[(&str, &Path)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
         .env("BRAINPROXY_MCP_CALL", "1")
+        .envs(env.iter().copied())
         .args(["--format", "json", "--project"])
         .arg(project)
         .args(args)
@@ -372,6 +377,40 @@ fn an_agent_imports_only_files_in_the_projects_folder() {
     // A person may import from anywhere.
     assert_eq!(ok(&p, &["import", "har", "--dry-run", "--", &outside])["format"], "har");
     let _ = std::fs::remove_dir_all(elsewhere);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_agent_s_import_errors_never_quote_the_file() {
+    let (dir, p) = setup("mcp-quote");
+    let ini = dir.join("credentials");
+    std::fs::write(&ini, "[default]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = INISECRET456\n").unwrap();
+    let ini = ini.to_str().unwrap();
+    for args in [
+        vec!["import", "openapi", "--dry-run", "--", ini],
+        vec!["import", "postman", "--dry-run", "--", ini],
+        vec!["import", "api", "--dry-run", "--", ini],
+        vec!["import", "har", "--dry-run", "--", ini],
+        vec!["import", "graphql", "--dry-run", "--schema", ini, "http://127.0.0.1:1/graphql"],
+    ] {
+        let o = run_mcp(&p, &args, b"");
+        assert_eq!(o.code, 2, "{args:?}: {}", o.all);
+        assert!(o.all.contains("not valid JSON or YAML"), "{args:?}: {}", o.all);
+        assert!(!o.all.contains("AKIA") && !o.all.contains("INISECRET"), "{args:?}: {}", o.all);
+    }
+    // A person sees where and what.
+    let o = run(&p, &["import", "openapi", "--dry-run", "--", ini]);
+    assert!(o.all.contains("aws_access_key_id"), "{}", o.all);
+
+    // A project kept in the home folder opens no file to an agent: put it in its own folder.
+    let o = run_mcp_env(&p, &["import", "openapi", "--dry-run", "--", ini], b"", &[("HOME", &dir)]);
+    assert_eq!(o.code, 2, "{}", o.all);
+    assert!(o.all.contains("home folder") && o.all.contains("folder of its own"), "{}", o.all);
+    assert!(!o.all.contains("AKIA"), "{}", o.all);
+    // Stdin is still read.
+    let spec = br#"{"openapi": "3.0.0", "servers": [{"url": "http://127.0.0.1:1"}], "paths": {}}"#;
+    let o = run_mcp_env(&p, &["import", "openapi", "--dry-run", "--", "-"], spec, &[("HOME", &dir)]);
+    assert_eq!(o.code, 0, "{}", o.all);
     let _ = std::fs::remove_dir_all(dir);
 }
 

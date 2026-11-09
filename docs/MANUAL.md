@@ -1475,8 +1475,9 @@ Crawl and active-scan scope and safety flags:
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, a
   GraphQL schema (SDL file or introspection result), or a HAR file (see `import har`), detected from its contents. Through MCP a local
   file (this, `import har`'s, `--schema`, `--environment` and `scan active --api`'s too) is read
-  only from the project file's folder, symlinks followed; `-` (stdin) and URLs are not limited
-  (see MCP.md). `--dry-run` previews and sends nothing for a local file: servers,
+  only from the project file's folder, symlinks followed (not when that folder is the home
+  folder or `/`), and its parse errors give only a line and column; `-` (stdin) and URLs are
+  not limited (see MCP.md). `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
   and which operations were skipped and why. `--server N` picks a listed server, `--base-url`
   overrides them, `--var NAME=VALUE` sets a Postman variable, `--only 0,3,7` picks operations by
