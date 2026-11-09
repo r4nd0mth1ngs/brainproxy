@@ -292,7 +292,10 @@ select {
    `.toolbar-end` to keep a group of them together. */
 .toolbar > *,
 .msg-bar > *,
-.msg-foot > * {
+.msg-foot > *,
+.detail-head > *,
+.dec-head > *,
+.toolbar-end > * {
   max-width: 100%;
 }
 .toolbar > select:not([style*="width"]) {
@@ -305,11 +308,15 @@ select {
 }
 .toolbar > .grow + *,
 .msg-bar > .grow + *,
+.detail-head > .grow + *,
+.dec-head > .grow + *,
 .row > .grow + * {
   margin-left: auto;
 }
 .msg-bar,
 .msg-foot,
+.detail-head,
+.dec-head,
 .set-actions,
 .oob-actions,
 .finding-dialog-actions {
@@ -318,9 +325,12 @@ select {
 }
 .toolbar-end {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
   margin-left: auto;
+  min-width: 0;
 }
 .toolbar .sep {
   width: 1px;

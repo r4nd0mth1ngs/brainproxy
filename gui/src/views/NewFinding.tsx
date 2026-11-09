@@ -139,13 +139,14 @@ export function NewFinding({ draft, onClose, onAdded }: { draft: FindingDraft; o
           </div>
         )}
         <div className="row gap finding-dialog-actions">
-          <span className="grow" />
-          <button className="btn" disabled={busy} onClick={onClose}>
-            Cancel
-          </button>
-          <button className="btn primary" disabled={busy || !!problem} title={problem ?? undefined} onClick={save}>
-            {busy ? "Adding…" : "Add finding"}
-          </button>
+          <div className="toolbar-end">
+            <button className="btn" disabled={busy} onClick={onClose}>
+              Cancel
+            </button>
+            <button className="btn primary" disabled={busy || !!problem} title={problem ?? undefined} onClick={save}>
+              {busy ? "Adding…" : "Add finding"}
+            </button>
+          </div>
         </div>
       </div>
     </div>

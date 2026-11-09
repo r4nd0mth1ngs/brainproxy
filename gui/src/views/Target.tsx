@@ -389,26 +389,27 @@ function SiteMap({ active }: { active: boolean }) {
         <label className="check" title="Hide hosts and requests the proxy refused because they're outside the engagement scope">
           <input type="checkbox" checked={inScope} onChange={(e) => setInScope(e.target.checked)} /> In scope only
         </label>
-        <span className="grow" />
-        <span className="muted">
-          {tree.length} host{tree.length === 1 ? "" : "s"} · right-click a node to crawl or scan it
-        </span>
-        {importJob != null && !jobShown && (
+        <div className="toolbar-end">
           <span className="muted">
-            {importRunning ? "API import running" : "API import finished"} ·{" "}
-            <button className="link" onClick={() => setJobShown(true)}>
-              Show
-            </button>
+            {tree.length} host{tree.length === 1 ? "" : "s"} · right-click a node to crawl or scan it
           </span>
-        )}
-        <button
-          className="btn small"
-          disabled={!!importing || importRunning}
-          onClick={() => openImport({ source: "", graphql: false, key: 0 })}
-          title={importRunning ? "An API import is running" : "Send an API definition's operations once each and record them, without scanning"}
-        >
-          Import API (sends each once)…
-        </button>
+          {importJob != null && !jobShown && (
+            <span className="muted">
+              {importRunning ? "API import running" : "API import finished"} ·{" "}
+              <button className="link" onClick={() => setJobShown(true)}>
+                Show
+              </button>
+            </span>
+          )}
+          <button
+            className="btn small"
+            disabled={!!importing || importRunning}
+            onClick={() => openImport({ source: "", graphql: false, key: 0 })}
+            title={importRunning ? "An API import is running" : "Send an API definition's operations once each and record them, without scanning"}
+          >
+            Import API (sends each once)…
+          </button>
+        </div>
       </div>
       {importing ? (
         <div className="st-import">

@@ -387,17 +387,18 @@ function History() {
         <button className="btn" disabled={!applied} onClick={deleteFilter} title={applied ? `Delete the saved filter ${applied}` : "Pick a saved filter to delete it"}>
           Delete
         </button>
-        <span className="grow" />
-        <span className={found?.error && isCurrent(found, filter) ? "s5" : "muted"} aria-live="polite">
-          {note}
-        </span>
-        <span className="muted">
-          {contents
-            ? `${shown.length} match${shown.length === 1 ? "" : "es"} of ${rows.length} items`
-            : shown.length === rows.length
-              ? `${rows.length} items`
-              : `${shown.length} of ${rows.length} items`}
-        </span>
+        <div className="toolbar-end">
+          <span className={found?.error && isCurrent(found, filter) ? "s5" : "muted"} aria-live="polite">
+            {note}
+          </span>
+          <span className="muted">
+            {contents
+              ? `${shown.length} match${shown.length === 1 ? "" : "es"} of ${rows.length} items`
+              : shown.length === rows.length
+                ? `${rows.length} items`
+                : `${shown.length} of ${rows.length} items`}
+          </span>
+        </div>
       </div>
       <Split id="history" dir="col" initial={0.5}>
         <DataTable
