@@ -305,6 +305,44 @@ pub fn secret_header(name: &str) -> bool {
     SECRET_HEADERS.contains(&n.as_str()) || secret_name(&n)
 }
 
+/// Headers whose names say "auth" or end in `-key` but whose values are no credential: an
+/// auth challenge (the scheme and realm a server asks for), a WebSocket handshake's nonce,
+/// and a retry's idempotency key.
+const PLAIN_HEADERS: &[&str] = &["www-authenticate", "proxy-authenticate", "sec-websocket-key", "idempotency-key"];
+
+/// The schemes a credential value starts with (`Authorization: Bearer ...`), lowercase.
+const AUTH_SCHEMES: &[&str] = &["bearer", "basic", "token", "digest", "negotiate"];
+
+/// The scheme `value` starts with, when it starts with one followed by whitespace and more.
+fn auth_scheme(value: &str) -> Option<&str> {
+    let v = value.trim_start();
+    let end = v.find(char::is_whitespace)?;
+    let (scheme, rest) = v.split_at(end);
+    (AUTH_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) && !rest.trim().is_empty()).then_some(scheme)
+}
+
+/// Whether a header name, lowercased, reads as a credential's: it says `auth` (X-Api-Auth,
+/// X-Authorization, Authentication, Grpc-Metadata-Authorization, but not `:authority` or
+/// Author) or ends in `-key` (X-Functions-Key, Ocp-Apim-Subscription-Key).
+fn auth_or_key_name(n: &str) -> bool {
+    let auth = n.contains("auth") && !(n.contains("author") && !n.contains("authoriz"));
+    auth || n.ends_with("-key")
+}
+
+/// Whether a header holds a credential, by its name or its value: the one rule a HAR file's
+/// import (which takes credentials out) and every export (which masks them) share. A known
+/// API-key header, a name [`crate::apiimport::looks_secret`] or the report rules call secret,
+/// one that says `auth` or ends in `-key`, or a value that starts with an auth scheme (Bearer,
+/// Basic, Token, Digest, Negotiate) whatever the name, such as a token sent in
+/// `Sec-WebSocket-Protocol`. Auth challenges and nonces ([`PLAIN_HEADERS`]) are not.
+pub fn credential_header(name: &str, value: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    if PLAIN_HEADERS.contains(&n.as_str()) {
+        return false;
+    }
+    secret_header(&n) || crate::apiimport::looks_secret(&n) || auth_or_key_name(&n) || auth_scheme(value).is_some()
+}
+
 /// Whether a value masked because of its name is worth finding elsewhere. A plain word or
 /// a short number (`"token_type":"bearer"`, `sid=deleted`, `"otp":123456`) is masked where
 /// it stands, but masking it everywhere would hide ordinary text.
@@ -423,9 +461,13 @@ impl Redactor {
     }
 
     /// A header's value with its secret parts masked, or None when it isn't a credential
-    /// header (its value may still hold a secret: see [`Redactor::headers`]).
-    fn header_value(&mut self, name: &str, value: &str) -> Option<String> {
+    /// header (its value may still hold a secret: see [`Redactor::headers`]). A recorded
+    /// header (`recorded`) is judged by [`credential_header`]; a `name: value` line found in
+    /// free text, which may be prose (`Author: ...`, `Note: Basic auth is off`), by its name
+    /// alone, and by the wider name rules only when it is hyphenated as headers are.
+    fn header_value(&mut self, name: &str, value: &str, recorded: bool) -> Option<String> {
         let n = name.trim().to_ascii_lowercase();
+        let wide = recorded || n.contains('-');
         Some(match n.as_str() {
             // Cookie names say which session it was; only the values are secret.
             "cookie" => value.split(';').map(|c| self.pair(c.trim())).collect::<Vec<_>>().join("; "),
@@ -441,9 +483,25 @@ impl Redactor {
                 }
                 None => self.secret(value),
             },
-            n if secret_header(n) => self.secret(value),
+            n if PLAIN_HEADERS.contains(&n) => return None,
+            n if recorded && credential_header(n, value) => self.credential(value),
+            n if secret_header(n) || (wide && (crate::apiimport::looks_secret(n) || auth_or_key_name(n))) => {
+                self.credential(value)
+            }
             _ => return None,
         })
+    }
+
+    /// A credential header's value masked, keeping the scheme it starts with, if any.
+    fn credential(&mut self, value: &str) -> String {
+        match auth_scheme(value) {
+            Some(scheme) => {
+                let cred = value.trim_start()[scheme.len()..].trim().to_string();
+                self.credential_parts(scheme, &cred);
+                format!("{scheme} {}", self.secret(&cred))
+            }
+            None => self.secret(value),
+        }
     }
 
     /// Learns what an Authorization value quotes elsewhere: a Basic credential's decoded
@@ -477,7 +535,7 @@ impl Redactor {
     /// `Location` or `Referer` URL, a JWT in a custom header.
     pub fn headers(&mut self, headers: &mut [(String, String)]) {
         for (name, value) in headers.iter_mut() {
-            match self.header_value(name, value) {
+            match self.header_value(name, value, true) {
                 Some(v) => *value = v,
                 None => self.text(value),
             }
@@ -488,7 +546,7 @@ impl Redactor {
     /// `name=value` pairs, multipart fields and form inputs, and JWTs.
     pub fn text(&mut self, s: &mut String) {
         let header = |red: &mut Self, c: &Captures| {
-            let v = red.header_value(&c[2], &c[4]).unwrap_or_else(|| c[4].to_string());
+            let v = red.header_value(&c[2], &c[4], false).unwrap_or_else(|| c[4].to_string());
             format!("{}{}{}{v}", &c[1], &c[2], &c[3])
         };
         let mut out = HEADER_LINE.replace_all(s, |c: &Captures| header(self, c)).into_owned();
@@ -718,6 +776,77 @@ mod tests {
         let mut ev = "Set-Cookie: session=abc123456 sent in en".to_string();
         r.scrub(&mut ev);
         assert_eq!(ev, "Set-Cookie: session=[redacted] sent in en");
+    }
+
+    #[test]
+    fn credential_headers_by_name_or_scheme() {
+        let token = "Bearer OPAQUE7f3k9Qz1";
+        let leaked = [
+            "X-Authorization",
+            "Authentication",
+            "X-Auth-Key",
+            "X-Access-Key",
+            "Ocp-Apim-Subscription-Key",
+            "X-Functions-Key",
+            "X-Client-Key",
+            "X-Consumer-Key",
+            "X-Api-Auth",
+            "X-Upstream-Auth",
+            "Grpc-Metadata-Authorization",
+            "Sec-WebSocket-Protocol",
+            "X-Pin",
+        ];
+        let mut r = Redactor::default();
+        let mut h: Vec<(String, String)> = leaked.iter().map(|n| (n.to_string(), token.to_string())).collect();
+        r.headers(&mut h);
+        for (n, v) in &h {
+            assert_eq!(v, "Bearer [redacted]", "{n}");
+            assert!(credential_header(n, token), "{n}");
+        }
+        // By name alone, the whole value; by scheme whatever the name, case ignored.
+        let mut h = vec![
+            ("X-Functions-Key".to_string(), "fk-9Qz1x7Lm".to_string()),
+            ("X-Custom".to_string(), "basic dXNlcjpwYXNzd29yZA==".to_string()),
+            ("X-Other".to_string(), "Negotiate YIIGhgYGKwYBBQUC".to_string()),
+            ("X-Plain".to_string(), "Token\tabc123def".to_string()),
+        ];
+        r.headers(&mut h);
+        assert_eq!(h[0].1, "[redacted]");
+        assert_eq!(h[1].1, "basic [redacted]");
+        assert_eq!(h[2].1, "Negotiate [redacted]");
+        assert_eq!(h[3].1, "Token [redacted]");
+        // The decoded Basic password is found again.
+        let mut echo = "logged in with password".to_string();
+        r.scrub(&mut echo);
+        assert_eq!(echo, "logged in with [redacted]");
+        // Harmless headers, auth challenges and nonces are kept.
+        let plain = [
+            ("Accept", "*/*"),
+            ("Content-Type", "application/json"),
+            ("Cache-Control", "no-cache"),
+            ("Keep-Alive", "timeout=5"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("Idempotency-Key", "8e03978e-40d5-43e8-bc93-6894a57f9324"),
+            ("WWW-Authenticate", "Bearer realm=\"api\""),
+            ("Proxy-Authenticate", "Basic realm=\"proxy\""),
+            (":authority", "app.test"),
+            ("Author", "Jane Doe"),
+            ("Vary", "Authorization"),
+            ("X-Mode", "Basic"),
+        ];
+        let mut h: Vec<(String, String)> = plain.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        let before = h.clone();
+        let mut r = Redactor::default();
+        r.headers(&mut h);
+        assert_eq!(h, before);
+        assert_eq!(r.masked, 0);
+        for (n, v) in plain {
+            assert!(!credential_header(n, v), "{n}");
+        }
+        // In free text a bare word before a colon may be prose; a hyphenated name is a header.
+        assert_eq!(redacted("Author: Jane\nNote: Basic"), "Author: Jane\nNote: Basic");
+        assert_eq!(redacted("X-Functions-Key: fk-9Qz1x7Lm"), "X-Functions-Key: [redacted]");
+        assert_eq!(redacted(r#"curl -H "X-Api-Auth: s3cr3tvalue1""#), r#"curl -H "X-Api-Auth: [redacted]""#);
     }
 
     #[test]

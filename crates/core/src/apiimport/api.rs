@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::guard::Guard;
 use crate::http::request::find;
 use crate::http::{RawRequest, Target};
+use crate::scan::redact::credential_header;
 
 /// Methods sent and attacked by default. Not all safe: POST can change data or send email,
 /// but a scan without it misses too much, so it stays on with a warning. Replaying the
@@ -668,7 +669,7 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_heade
             u.set_query((!kept.is_empty()).then(|| kept.join("&")).as_deref());
         }
         for (k, v) in std::mem::take(&mut r.headers) {
-            if !secret(&k) && !is_declared("header", &k) {
+            if !secret(&k) && !credential_header(&k, &v) && !is_declared("header", &k) {
                 r.headers.push((k, v));
                 continue;
             }
@@ -726,7 +727,8 @@ fn harden(built: &mut Built, format: Format, declared: &[Credential], keep_heade
     }
 }
 
-/// How a build tells a credential by its name. A HAR file's values were recorded from a live
+/// How a build tells a credential by its name (headers also by their value: see
+/// [`credential_header`]). A HAR file's values were recorded from a live
 /// session, so its names are judged as reports judge them too (`X-Session-Id`, `sid`, `jwt`,
 /// `signature`, ...); a description's examples only by [`looks_secret`].
 fn secret_test(format: Format) -> fn(&str) -> bool {
@@ -1052,7 +1054,15 @@ impl PreviewRequest {
             headers: r
                 .headers
                 .iter()
-                .map(|(k, v)| if secret(k) { format!("{k}: {MASK}") } else { format!("{k}: {v}") })
+                .map(
+                    |(k, v)| {
+                        if secret(k) || credential_header(k, v) {
+                            format!("{k}: {MASK}")
+                        } else {
+                            format!("{k}: {v}")
+                        }
+                    },
+                )
                 .collect(),
             body: masked_body(&r.headers, &r.body),
             state_changing: opt_in.is_some()
@@ -1506,6 +1516,33 @@ mod tests {
         let spec = r#"{"openapi": "3.0.0", "servers": [{"url": "https://api.test"}], "paths": {"/a": {"get": {
             "parameters": [{"name": "sid", "in": "query", "example": "7"}]}}}}"#;
         assert_eq!(load(spec, &opts()).unwrap().requests[0].url, "https://api.test/a?sid=7");
+    }
+
+    #[test]
+    fn a_har_file_s_credential_headers_are_known_by_name_or_scheme() {
+        // The rule exports mask by: a name that says auth or ends in -key, or a value that
+        // starts with an auth scheme, whatever its header.
+        let doc = json!({"log": {"entries": [{"request": {"method": "GET", "url": "https://api.test/a",
+            "headers": [{"name": "X-Functions-Key", "value": "RECORDEDKEY1"},
+                {"name": "X-Api-Auth", "value": "RECORDEDAUTH1"},
+                {"name": "Sec-WebSocket-Protocol", "value": "Bearer RECORDEDWS1"},
+                {"name": "Sec-WebSocket-Key", "value": "dGhlIHNhbXBsZSBub25jZQ=="},
+                {"name": "Accept", "value": "*/*"}]}}]}});
+        let l = load(&doc.to_string(), &opts()).unwrap();
+        let p = l.preview(&l.plan(&Selection::default(), &guard()).unwrap(), 100);
+        let shown = serde_json::to_string(&p).unwrap();
+        assert!(!shown.contains("RECORDED"), "{shown}");
+        let names: Vec<&str> = l.requests[0].headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["Sec-WebSocket-Key", "Accept"]);
+        for name in ["X-Functions-Key", "X-Api-Auth", "Sec-WebSocket-Protocol"] {
+            assert!(p.credentials.iter().any(|c| c.name.as_deref() == Some(name)), "{name}: {:?}", p.credentials);
+        }
+        // Kept, they are masked in the preview.
+        let o = Options { har: HarOptions { keep_credentials: true, ..Default::default() }, ..opts() };
+        let l = load(&doc.to_string(), &o).unwrap();
+        let p = l.preview(&l.plan(&Selection::default(), &guard()).unwrap(), 100);
+        assert!(!serde_json::to_string(&p).unwrap().contains("RECORDED"));
+        assert!(p.requests[0].headers.contains(&"Sec-WebSocket-Protocol: ********".to_string()));
     }
 
     #[test]

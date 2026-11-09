@@ -310,6 +310,10 @@ fn history_exports_as_har_with_secrets_masked() {
             "Cookie: sid=FAKE-CHROME-SESSION",
             "-H",
             "Authorization: Bearer FAKE-CHROME-BEARER",
+            "-H",
+            "X-Functions-Key: FAKE-FUNCTIONS-KEY",
+            "-H",
+            "Sec-WebSocket-Protocol: Bearer FAKE-WS-BEARER",
         ],
     );
     let form = format!("http://127.0.0.1:{}/login", server.port);
@@ -339,6 +343,8 @@ fn history_exports_as_har_with_secrets_masked() {
         "FAKE-FIREFOX-PASSWORD",
         "FAKE-QUERY-TOKEN-1",
         "FAKE-SERVER-SESSION-1",
+        "FAKE-FUNCTIONS-KEY",
+        "FAKE-WS-BEARER",
     ] {
         assert!(!text.contains(s), "{s} in {text}");
     }
