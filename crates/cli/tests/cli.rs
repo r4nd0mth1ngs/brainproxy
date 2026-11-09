@@ -63,7 +63,9 @@ fn run(args: &[&str], project: &std::path::Path, stdin: Option<&[u8]>) -> (i32, 
     {
         let mut stdin_pipe = child.stdin.take().unwrap();
         if let Some(data) = stdin {
-            stdin_pipe.write_all(data).unwrap();
+            // A command that fails on its arguments exits without reading stdin, and may be
+            // gone before this write: that is its answer to check, not a failure here.
+            let _ = stdin_pipe.write_all(data);
         }
     }
     let out = child.wait_with_output().unwrap();
@@ -797,7 +799,7 @@ fn replay_tabs_keep_bytes_and_placeholders_and_send_nothing() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(br#"{"tabs": [{"kind": "ws", "request": ""}]}"#).unwrap();
+    let _ = child.stdin.take().unwrap().write_all(br#"{"tabs": [{"kind": "ws", "request": ""}]}"#);
     let out = child.wait_with_output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "saved 1 Replay tab\n");
     assert_eq!(text(&["replay", "tabs", "list"]), "  0  ws      \n");
@@ -1044,7 +1046,10 @@ fn stop_never_signals_a_process_it_cannot_verify() {
     // SIGTERM: it gets SIGTERM, never SIGKILL, and the user is told.
     #[cfg(unix)]
     {
-        let mut child = Command::new("sh").args(["-c", "trap '' TERM; sleep 30"]).spawn().unwrap();
+        // `exec`, so the pid is the sleep itself (an ignored signal stays ignored across
+        // exec). A shell that forks it instead leaves it running when the shell is killed
+        // below, still holding this test's stderr.
+        let mut child = Command::new("sh").args(["-c", "trap '' TERM; exec sleep 30"]).spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         set("oob.state", &oob(child.id() as u64));
         let (_, v) = run(&["oob", "status"], &project, None);
@@ -1476,7 +1481,8 @@ fn race_beyond_the_open_file_limit_is_refused() {
             });
         }
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
-        child.stdin.take().unwrap().write_all(raw.as_bytes()).unwrap();
+        // A command that fails on its arguments may exit before reading its stdin.
+        let _ = child.stdin.take().unwrap().write_all(raw.as_bytes());
         let out = child.wait_with_output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         (out.status.code().unwrap(), v)

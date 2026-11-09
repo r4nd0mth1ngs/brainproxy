@@ -44,7 +44,8 @@ fn run_as(project: &Path, args: &[&str], stdin: Option<&str>, agent: bool) -> (i
         cmd.env_remove("BRAINPROXY_MCP_CALL");
     }
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    child.stdin.take().unwrap().write_all(stdin.unwrap_or("").as_bytes()).unwrap();
+    // A command that fails on its arguments may exit before reading its stdin.
+    let _ = child.stdin.take().unwrap().write_all(stdin.unwrap_or("").as_bytes());
     let out = child.wait_with_output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(

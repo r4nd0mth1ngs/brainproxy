@@ -139,7 +139,8 @@ fn run_with_stdin(project: &Path, args: &[&str], stdin: Option<&[u8]>) -> (i32, 
     c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
     let mut pipe = child.stdin.take().unwrap();
-    pipe.write_all(stdin.unwrap_or_default()).unwrap();
+    // A command that fails on its arguments may exit before reading its stdin.
+    let _ = pipe.write_all(stdin.unwrap_or_default());
     drop(pipe);
     let out: Output = child.wait_with_output().unwrap();
     for text in [&out.stdout, &out.stderr] {

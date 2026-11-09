@@ -52,7 +52,8 @@ fn run_with(project: &Path, args: &[&str], stdin: Option<&str>, mcp: bool) -> (i
     {
         let mut pipe = child.stdin.take().unwrap();
         if let Some(s) = stdin {
-            pipe.write_all(s.as_bytes()).unwrap();
+            // A command that fails on its arguments may exit before reading its stdin.
+            let _ = pipe.write_all(s.as_bytes());
         }
     }
     let out = child.wait_with_output().unwrap();
