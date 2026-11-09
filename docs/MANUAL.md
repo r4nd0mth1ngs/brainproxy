@@ -1090,7 +1090,8 @@ and `request_line`, including failures. For multiple members, `requests` lists
 `{index, request_line}` and `total` is G*N. `race-pos:I/N` tags count positions across that
 full list. The text summary lists each member and its history rows. Different members may
 normally return different statuses or lengths: compare copies within one request index.
-The flag is also available on the MCP `send` tool and in `capabilities send`.
+The flag is also on the MCP `send` tool and in `capabilities send`; through MCP a
+member comes from the call's stdin (`--also -`), not a file (see MCP.md).
 
 ### Who recorded what
 

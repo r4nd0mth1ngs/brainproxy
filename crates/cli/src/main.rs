@@ -634,6 +634,7 @@ fn read_input(arg: Option<&str>) -> Result<Vec<u8>, Error> {
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     mcp::check_no_store(args.no_store)?;
+    mcp::check_request_files(&args.also)?;
     let stdin_count = usize::from(args.req.reads_stdin()) + args.also.iter().filter(|f| *f == "-").count();
     if stdin_count > 1 {
         return Err(Error::InvalidInput("stdin may be read only once across the primary request and --also".into()));

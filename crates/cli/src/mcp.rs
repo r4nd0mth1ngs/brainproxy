@@ -102,6 +102,21 @@ pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Erro
     Ok(())
 }
 
+/// Under a tool call, refuses a `send --also` request file other than `-`: its bytes go on the
+/// wire and into history as they are (and a parse error quotes them), so an agent could send any
+/// file the server can read to the target and read it back. The request goes in the call's stdin.
+pub(crate) fn check_request_files(files: &[String]) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() && files.iter().any(|f| f != "-") {
+        return Err(brainproxy_core::Error::InvalidInput(
+            "--also FILE: through MCP the extra request comes from the call's stdin (--also -), with the \
+             primary from --url: a file is sent and recorded as it is, so any file the server can read could \
+             reach the target and be read back from history"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as
 /// `fuzz run --store none`), for the same reason as [`check_no_store`].
 pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error> {

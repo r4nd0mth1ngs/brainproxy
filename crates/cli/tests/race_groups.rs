@@ -179,12 +179,41 @@ fn additional_scope_and_host_checks_precede_every_send() {
     assert_eq!(code, 6, "{v}");
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     // An explicit target applies to the whole group; through MCP a foreign Host still needs opt-in.
+    // (Through MCP the extra member comes from stdin; see an_agent_cannot_race_a_local_file.)
     let target = format!("http://127.0.0.1:{port}");
-    let (code, v) = run(&p, &["send", &a, "--target", &target, "--also", &b], None, true);
+    let b = std::fs::read_to_string(&b).unwrap();
+    let (code, v) = run(&p, &["send", &a, "--target", &target, "--also=-"], Some(&b), true);
     assert_eq!(code, 6, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{v}");
     assert_eq!(hits.load(Ordering::SeqCst), 0);
-    let (code, v) = run(&p, &["send", &a, "--target", &target, "--also", &b, "--host-header-test"], None, true);
+    let (code, v) = run(&p, &["send", &a, "--target", &target, "--also=-", "--host-header-test"], Some(&b), true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_agent_cannot_race_a_local_file() {
+    // Any readable file would be sent and recorded as it is (a parse error even quotes it), so
+    // through MCP an extra member comes from stdin; a person can still pass files.
+    let p = project("mcp-file");
+    let (port, hits, _) = server();
+    let secret = p.with_extension("secret.txt");
+    std::fs::write(&secret, "AWS_SECRET=hunter2\n").unwrap();
+    let url = format!("http://127.0.0.1:{port}/primary");
+    let (code, v) = run(
+        &p,
+        &["send", "--url", &url, "--also", secret.to_str().unwrap(), "--target", &url, "--host-header-test"],
+        None,
+        true,
+    );
+    assert_eq!(code, 2, "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--also -") && !message.contains("hunter2"), "{v}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let (_, v) = run(&p, &["query", "SELECT count(*) FROM history"], None, false);
+    assert_eq!(v["data"]["rows"][0][0], 0);
+    let member = format!("GET /member HTTP/1.1\nHost: 127.0.0.1:{port}\n\n");
+    let (code, v) = run(&p, &["send", "--url", &url, "--also=-"], Some(&member), true);
     assert_eq!(code, 0, "{v}");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
@@ -240,7 +269,8 @@ fn auth_profile_host_header_is_not_re_checked_against_scope_under_mcp() {
     let b = raw(&p, "checkout", &host);
     let (code, v) = run(&p, &["auth", "add", "app", "--header", &format!("Host: {host}")], None, false);
     assert_eq!(code, 0, "{v}");
-    let (code, v) = run(&p, &["send", &a, "--also", &b, "--auth=app", "--scheme=http", "--race=2"], None, true);
+    let b = std::fs::read_to_string(&b).unwrap();
+    let (code, v) = run(&p, &["send", &a, "--also=-", "--auth=app", "--scheme=http", "--race=2"], Some(&b), true);
     assert_eq!(code, 0, "{v}");
     assert_eq!(hits.load(Ordering::SeqCst), 4);
 }
