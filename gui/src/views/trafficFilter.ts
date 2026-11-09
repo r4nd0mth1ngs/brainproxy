@@ -1,6 +1,7 @@
-// Proxy › Traffic filters: the filter state, saved filters (per project, in localStorage), and
-// the contents search, which asks the CLI (`history list --contains`) and keeps up with the
-// rows the live poll adds.
+// Proxy › Traffic filters: the filter state, saved filters (kept in the project by `history
+// filters`; older builds kept them in localStorage, moved over once), and
+// the CLI searches (`history list --contains`, or `--filter` with a query in the filter
+// language), which keep up with the rows the live poll adds.
 
 import type { HistoryItem } from "../api";
 
@@ -8,6 +9,11 @@ export interface TrafficFilter {
   text: string;
   /** Search `text` inside requests and responses (the CLI) instead of URL, title and method. */
   contents: boolean;
+  /**
+   * `text` is a query in the filter language (`history list --filter`), run by the CLI. Wins
+   * over `contents`: at most one of them is on.
+   */
+  query: boolean;
   /** Empty: every source. */
   sources: string[];
   hideErrors: boolean;
@@ -16,16 +22,23 @@ export interface TrafficFilter {
 }
 
 // Refused requests (outside the engagement scope) are mostly browser background noise.
-export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, sources: [], hideErrors: false, hideAssets: false, hideRefused: true };
+export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, query: false, sources: [], hideErrors: false, hideAssets: false, hideRefused: true };
+
+/** Which search the text box does: the URL, title and method here, or a CLI search. */
+export type SearchMode = "text" | "contents" | "query";
+
+export const modeOf = (f: TrafficFilter): SearchMode => (f.query ? "query" : f.contents ? "contents" : "text");
+
+export const withMode = (f: TrafficFilter, mode: SearchMode): TrafficFilter => ({ ...f, contents: mode === "contents", query: mode === "query" });
 
 const ASSET = /\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\?|$)/i;
 
 /** The proxy refused it (outside the engagement scope). */
 export const isRefused = (r: { error?: string | null }) => !!r.error?.startsWith("out of scope");
 
-/** Whether a row passes the filters checked here. The text counts only outside contents mode. */
+/** Whether a row passes the filters checked here. The text counts only outside the CLI searches. */
 export function matchesFilter(r: HistoryItem, f: TrafficFilter): boolean {
-  const t = f.contents ? "" : f.text.toLowerCase();
+  const t = f.contents || f.query ? "" : f.text.toLowerCase();
   return (
     (!t || r.url.toLowerCase().includes(t) || (r.title ?? "").toLowerCase().includes(t) || r.method.toLowerCase() === t) &&
     (f.sources.length === 0 || f.sources.includes(r.source)) &&
@@ -48,9 +61,11 @@ export const savedKey = (project: string) => `traffic-filters:${project}`;
 export function parseFilter(v: unknown): TrafficFilter {
   const o = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
   const bool = (k: keyof TrafficFilter) => (typeof o[k] === "boolean" ? (o[k] as boolean) : (DEFAULT_FILTER[k] as boolean));
+  const query = bool("query");
   return {
     text: typeof o.text === "string" ? o.text : "",
-    contents: bool("contents"),
+    contents: query ? false : bool("contents"),
+    query,
     sources: Array.isArray(o.sources) ? [...new Set(o.sources.filter((s): s is string => typeof s === "string"))] : [],
     hideErrors: bool("hideErrors"),
     hideAssets: bool("hideAssets"),
@@ -66,6 +81,11 @@ export function parseSaved(text: string | null): SavedFilter[] {
   } catch {
     return [];
   }
+  return savedFrom(v);
+}
+
+/** Saved filters from a parsed list (stored text, or `history filters list`'s `filters`). */
+export function savedFrom(v: unknown): SavedFilter[] {
   if (!Array.isArray(v)) return [];
   const out: SavedFilter[] = [];
   for (const s of v) {
@@ -91,6 +111,124 @@ export function storeSaved(project: string, list: SavedFilter[]): boolean {
   } catch {
     return false;
   }
+}
+
+/** Removes the filters an older build kept in localStorage, once they are in the project. */
+export function clearLocalSaved(project: string): void {
+  try {
+    localStorage.removeItem(savedKey(project));
+  } catch {
+    // Storage unavailable: nothing was kept there either.
+  }
+}
+
+/** `history filters` arguments: the saved set, and a save over revision `rev`. */
+export const FILTERS_LIST_ARGS = ["history", "filters", "list"];
+export const filtersSaveArgs = (rev: number) => ["history", "filters", "save", "--if-revision", String(rev)];
+
+/** A save's stdin: the whole list, each filter in its stored form. */
+export const savedBody = (list: SavedFilter[]) => JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: parseFilter(s.filter) })) });
+
+/**
+ * `list` (saved in the project) with the filters an older build kept in localStorage added.
+ * One equal to a saved filter of the same name is already there; one that differs from it is
+ * added as "NAME (this computer)", so neither is lost.
+ */
+export function mergeLocal(list: SavedFilter[], local: SavedFilter[]): SavedFilter[] {
+  const out = [...list];
+  for (const s of local) {
+    const same = out.find((o) => o.name === s.name);
+    if (same && JSON.stringify(normal(same.filter)) === JSON.stringify(normal(s.filter))) continue;
+    // Within the 100 characters the project keeps, suffix included.
+    const named = (suffix: string) => [...s.name].slice(0, MAX_NAME - [...suffix].length).join("") + suffix;
+    let name = named("");
+    for (let n = 1; out.some((o) => o.name === name); n++) name = named(` (this computer${n > 1 ? ` ${n}` : ""})`);
+    out.push({ name, filter: parseFilter(s.filter) });
+  }
+  return out;
+}
+
+/** The longest name `history filters save` keeps, in characters. */
+export const MAX_NAME = 100;
+
+/** Whether a query uses a field a person can change after a row is recorded (a note or a tag). */
+// Matches more than the parser would (inside a quoted value too): an extra search costs time,
+// a missed one leaves stale rows.
+export const usesEditableFields = (query: string) => /\b(tag|note)(:|=|!=|~|!~)/i.test(query);
+
+/** The saved filters as the app last read or saved them, with their revision in the project. */
+export interface SavedState {
+  rev: number;
+  list: SavedFilter[];
+}
+
+/** A CLI call with optional stdin, returning the data (`run` in the app). */
+export type Cli = (args: string[], stdin?: string) => Promise<any>;
+
+/**
+ * A change to the saved filters. On a retry `before` is the list the person made it on, so it
+ * can refuse to touch a filter that was saved differently elsewhere meanwhile.
+ */
+export type SavedChange = (list: SavedFilter[], before?: SavedFilter[]) => SavedFilter[];
+
+/** The saved set changed where a change meant to work; carries what is saved now. */
+export class SavedMoved extends Error {
+  // A plain field, not a constructor parameter property: Node runs these files by stripping
+  // types, which can't turn a parameter property into an assignment.
+  readonly now: SavedState;
+  constructor(message: string, now: SavedState) {
+    super(message);
+    this.now = now;
+  }
+}
+
+/** Whether the filter named `name` differs between `a` and `b` (one of them lacking it counts). */
+export function changedSince(a: SavedFilter[], b: SavedFilter[], name: string): boolean {
+  const f = (l: SavedFilter[]) => {
+    const s = l.find((x) => x.name === name);
+    return s ? JSON.stringify(normal(s.filter)) : null;
+  };
+  return f(a) !== f(b);
+}
+
+/** Saving `filter` as `name`; on a retry, refused when that name was saved differently elsewhere. */
+export const saveAs =
+  (name: string, filter: TrafficFilter): SavedChange =>
+  (list, before) => {
+    if (before && changedSince(before, list, name)) throw new Error(`A filter named ${name} was saved elsewhere meanwhile; save again to replace it.`);
+    return withSaved(list, name, filter);
+  };
+
+/** Deleting `name`; on a retry, refused when it was changed elsewhere meanwhile. */
+export const deleteNamed =
+  (name: string): SavedChange =>
+  (list, before) => {
+    if (before && changedSince(before, list, name)) throw new Error(`The filter ${name} was changed elsewhere meanwhile; it is shown as saved now.`);
+    return withoutSaved(list, name);
+  };
+
+/**
+ * Saves `change` applied to `cur`. When the saved set changed meanwhile (an agent added a
+ * filter, or another window saved), it reads what is saved now and applies the same change to
+ * that, once, so the person's save isn't lost. A change that refuses the newer set throws
+ * SavedMoved with it. Returns the state saved.
+ */
+export async function saveChange(cli: Cli, cur: SavedState, change: SavedChange, isConflict: (e: unknown) => boolean): Promise<SavedState> {
+  const save = async (s: SavedState, list: SavedFilter[]): Promise<SavedState> => ({ rev: (await cli(filtersSaveArgs(s.rev), savedBody(list))).rev, list });
+  try {
+    return await save(cur, change(cur.list));
+  } catch (e) {
+    if (!isConflict(e)) throw e;
+  }
+  const d = await cli(FILTERS_LIST_ARGS);
+  const now: SavedState = { rev: d.rev, list: savedFrom(d.filters) };
+  let list: SavedFilter[];
+  try {
+    list = change(now.list, cur.list);
+  } catch (e: any) {
+    throw new SavedMoved(e.message, now);
+  }
+  return save(now, list);
 }
 
 /** The list with `filter` saved as `name`: a filter with that name is replaced in place, a new one goes last. */
@@ -146,8 +284,12 @@ export const MAX_MATCHES = 10000;
 export const RETRY_BASE = 2000;
 export const RETRY_MAX = 60000;
 
-/** What the CLI is asked: the text for --contains and the one source for --source (null: all). */
+/**
+ * What the CLI is asked: the text for --contains (kind "contains") or the query for --filter
+ * (kind "filter"), and the one source for --source (null: all).
+ */
 export interface SearchQuery {
+  kind: "contains" | "filter";
   text: string;
   source: string | null;
 }
@@ -165,6 +307,13 @@ export interface ContentSearch {
   capped: boolean;
   /** The last page failed; it is tried again from `retryAt` (ms, Date.now). */
   error: string | null;
+  /** The CLI refused the query itself (it doesn't parse): never tried again until it changes. */
+  invalid: boolean;
+  /**
+   * The matches of the search this one reruns (`rerun`): rows past `cursor` keep showing as
+   * they did until this one reaches them, so the table doesn't empty meanwhile.
+   */
+  previous?: Map<number, HistoryItem>;
   /** Pages failed in a row, for the backoff. */
   failures: number;
   retryAt: number;
@@ -176,8 +325,8 @@ export interface ContentSearch {
  * the CLI, so only they make a new search; the checkboxes are applied here (see refilter).
  */
 export function searchFor(f: TrafficFilter): SearchQuery | null {
-  if (!f.contents || !f.text.trim()) return null;
-  return { text: f.text, source: f.sources.length === 1 ? f.sources[0] : null };
+  if (!(f.contents || f.query) || !f.text.trim()) return null;
+  return { kind: f.query ? "filter" : "contains", text: f.text, source: f.sources.length === 1 ? f.sources[0] : null };
 }
 
 export const newSearch = (query: SearchQuery): ContentSearch => ({
@@ -186,20 +335,25 @@ export const newSearch = (query: SearchQuery): ContentSearch => ({
   cursor: 0,
   capped: false,
   error: null,
+  invalid: false,
   failures: 0,
   retryAt: 0,
 });
 
+/** The same search from the start, showing `s`'s matches until it gets to them. */
+export const rerun = (s: ContentSearch): ContentSearch => ({ ...newSearch(s.query), previous: s.matches });
+
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
   const want = searchFor(f);
-  return !!s && !!want && s.query.text === want.text && s.query.source === want.source;
+  return !!s && !!want && s.query.kind === want.kind && s.query.text === want.text && s.query.source === want.source;
 };
 
 /** `history list` arguments for the next page of a search. */
 export function searchArgs(s: ContentSearch): string[] {
-  const { text, source } = s.query;
-  return ["history", "list", `--contains=${text}`, ...(source ? [`--source=${source}`] : []), `--after=${s.cursor}`, `--limit=${SEARCH_PAGE}`];
+  const { kind, text, source } = s.query;
+  const what = kind === "filter" ? `--filter=${text}` : `--contains=${text}`;
+  return ["history", "list", what, ...(source ? [`--source=${source}`] : []), `--after=${s.cursor}`, `--limit=${SEARCH_PAGE}`];
 }
 
 /**
@@ -238,14 +392,22 @@ export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number, 
     matches.set(i.id, i);
     cursor = Math.max(cursor, i.id);
   }
-  if (!capped && items.length < SEARCH_PAGE) cursor = Math.max(cursor, upTo);
-  return { ...s, matches, cursor, capped, error: null, failures: 0, retryAt: 0 };
+  const done = !capped && items.length < SEARCH_PAGE;
+  if (done) cursor = Math.max(cursor, upTo);
+  // Caught up: what the rerun search replaced isn't needed any more.
+  const previous = done ? undefined : s.previous;
+  return { ...s, matches, cursor, capped, previous, error: null, invalid: false, failures: 0, retryAt: 0 };
 }
 
-/** The search after a failed page: it keeps its matches and waits longer after each failure. */
-export function failPage(s: ContentSearch, error: string, now = Date.now()): ContentSearch {
+/**
+ * The search after a failed page: it keeps its matches and waits longer after each failure.
+ * `invalid` (the CLI refused the query as invalid input) stops it for good: the same query
+ * would fail the same way, so it waits for the text to change.
+ */
+export function failPage(s: ContentSearch, error: string, now = Date.now(), invalid = false): ContentSearch {
   const failures = s.failures + 1;
-  return { ...s, error, failures, retryAt: now + Math.min(RETRY_MAX, RETRY_BASE * 2 ** (failures - 1)) };
+  const retryAt = invalid ? Infinity : now + Math.min(RETRY_MAX, RETRY_BASE * 2 ** (failures - 1));
+  return { ...s, error, invalid, failures, retryAt };
 }
 
 /**
@@ -277,14 +439,16 @@ export function refilter(s: ContentSearch, f: TrafficFilter): ContentSearch {
 export function visibleRows(rows: HistoryItem[], f: TrafficFilter, s: ContentSearch | null): HistoryItem[] {
   if (searchFor(f)) {
     if (!isCurrent(s, f)) return [];
-    return rows.filter((r) => s.matches.has(r.id) && matchesFilter(r, f));
+    const was = s.previous;
+    return rows.filter((r) => (s.matches.has(r.id) || (!!was && r.id > s.cursor && was.has(r.id))) && matchesFilter(r, f));
   }
   return rows.filter((r) => matchesFilter(r, f));
 }
 
-/** A short status for the toolbar while contents search is on. */
+/** A short status for the toolbar while a CLI search is on. */
 export function searchNote(s: ContentSearch | null, upTo: number): string {
   if (!s) return "Searching…";
+  if (s.invalid) return `Query: ${(s.error ?? "").replace(/^filter: /, "")}`;
   if (s.error) return `Search failed (trying again): ${s.error}`;
   if (s.capped) return `Stopped at the first ${MAX_MATCHES.toLocaleString("en-US")} matches (up to #${s.cursor}); narrow the search or filters to see later ones`;
   if (needsSearch(s, upTo)) return "Searching…";

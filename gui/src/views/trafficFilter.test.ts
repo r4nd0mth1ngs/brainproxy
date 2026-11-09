@@ -14,11 +14,23 @@ import {
   loadSaved,
   matchesFilter,
   mergePage,
+  modeOf,
   needsSearch,
   newSearch,
   parseFilter,
   parseSaved,
   refilter,
+  rerun,
+  deleteNamed,
+  saveAs,
+  SavedMoved,
+  mergeLocal,
+  usesEditableFields,
+  saveChange,
+  clearLocalSaved,
+  filtersSaveArgs,
+  savedBody,
+  savedFrom,
   savedKey,
   savedMatching,
   searchArgs,
@@ -27,6 +39,7 @@ import {
   shownMatches,
   storeSaved,
   visibleRows,
+  withMode,
   withSaved,
   withoutSaved,
   type ContentSearch,
@@ -166,11 +179,155 @@ const ids = (s: ContentSearch) => [...s.matches.keys()];
 test("a contents search needs text and passes a single source to the CLI", () => {
   assert.equal(searchFor(filter({ text: "token" })), null);
   assert.equal(searchFor(filter({ contents: true })), null);
-  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { text: "token", source: null });
+  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { kind: "contains", text: "token", source: null });
   assert.deepEqual(searchArgs(ns("token", { sources: ["send", "proxy"] })), ["history", "list", "--contains=token", "--after=0", `--limit=${SEARCH_PAGE}`]);
   const s = { ...ns("-x y", { sources: ["send"] }), cursor: 41 };
   assert.deepEqual(searchArgs(s), ["history", "list", "--contains=-x y", "--source=send", `--after=41`, `--limit=${SEARCH_PAGE}`]);
   assert.deepEqual(searchArgs(ns("a")), ["history", "list", "--contains=a", "--after=0", `--limit=${SEARCH_PAGE}`]);
+});
+
+// ---------------- Saved filters in the project ----------------
+
+test("saved filters go to the project as history filters save takes them", () => {
+  assert.deepEqual(filtersSaveArgs(3), ["history", "filters", "save", "--if-revision", "3"]);
+  const list = [{ name: "errors", filter: filter({ query: true, text: "status:5xx", sources: ["proxy"] }) }];
+  const body = JSON.parse(savedBody(list));
+  assert.deepEqual(body, { filters: [{ name: "errors", filter: { ...DEFAULT_FILTER, query: true, text: "status:5xx", sources: ["proxy"] } }] });
+  // What `history filters list` returns reads back the same (its mode field is ignored).
+  assert.deepEqual(savedFrom([{ ...body.filters[0], mode: "query" }]), list);
+  assert.deepEqual(savedFrom(null), []);
+});
+
+test("a save that meets a newer saved set applies the change to it, once", async () => {
+  const conflict = new Error("conflict");
+  const isConflict = (e: unknown) => e === conflict;
+  const mine = { name: "mine", filter: filter({ text: "a" }) };
+  const theirs = { name: "agent", filter: filter({ query: true, text: "status:5xx" }) };
+  const calls: string[][] = [];
+  // The project is at revision 2, with a filter an agent added after the app read revision 1.
+  const cli = async (args: string[], stdin?: string) => {
+    calls.push(args);
+    if (args[2] === "list") return { rev: 2, filters: JSON.parse(savedBody([mine, theirs])).filters };
+    if (args.at(-1) !== "2") throw conflict;
+    return { rev: 3, filters: JSON.parse(stdin!).filters };
+  };
+  const added = { name: "new", filter: filter({ text: "b" }) };
+  const out = await saveChange(cli, { rev: 1, list: [mine] }, (l) => withSaved(l, added.name, added.filter), isConflict);
+  assert.deepEqual(out, { rev: 3, list: [mine, theirs, added] });
+  assert.deepEqual(calls.map((c) => c.join(" ")), ["history filters save --if-revision 1", "history filters list", "history filters save --if-revision 2"]);
+  // Another error isn't retried.
+  await assert.rejects(saveChange(async () => Promise.reject(new Error("io")), { rev: 1, list: [] }, (l) => l, isConflict), /io/);
+});
+
+test("filters kept by an older build are added to the project's without losing either", () => {
+  const agent = { name: "errors", filter: filter({ query: true, text: "status:5xx" }) };
+  const sameAsSaved = { name: "errors", filter: filter({ query: true, text: "status:5xx" }) };
+  const clash = { name: "errors", filter: filter({ text: "boom" }) };
+  const fresh = { name: "tokens", filter: filter({ contents: true, text: "Bearer" }) };
+  assert.deepEqual(mergeLocal([agent], [sameAsSaved, fresh]), [agent, fresh]);
+  assert.deepEqual(
+    mergeLocal([agent, { name: "errors (this computer)", filter: filter() }], [clash]).map((s) => s.name),
+    ["errors", "errors (this computer)", "errors (this computer 2)"],
+  );
+});
+
+test("a rerun search keeps showing the earlier matches it hasn't reached yet", () => {
+  const f = qf("NOT tag=highlight");
+  const all = rows(1, 6);
+  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(3), row(5)], 6, f);
+  s = rerun(s);
+  // Nothing searched yet: the table shows what it showed.
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 3, 5]);
+  // Searched up to 3 (row 3 was highlighted meanwhile): below the cursor only the new matches count.
+  s = { ...s, matches: new Map([[1, row(1)]]), cursor: 3 };
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 5]);
+  // Caught up: the earlier matches are dropped.
+  s = mergePage(s, [row(6)], 6, f);
+  assert.equal(s.previous, undefined);
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 6]);
+});
+
+test("a query on notes or tags is searched again after an edit", () => {
+  // More than the parser would count is fine (an extra search); fewer would leave stale rows.
+  for (const q of ["tag=highlight", "NOT tag:x", "(note:todo)", "a NOTE~x", "(status:200)note:todo", "path:/tag:x"]) assert.ok(usesEditableFields(q), q);
+  for (const q of ["status:5xx", "notes:x", "hashtag"]) assert.ok(!usesEditableFields(q), q);
+});
+
+test("a retried save doesn't replace or delete a filter saved differently elsewhere", async () => {
+  const conflict = new Error("conflict");
+  const isConflict = (e: unknown) => e === conflict;
+  const theirs = { name: "errors", filter: filter({ query: true, text: "status:5xx" }) };
+  // Another window saved "errors" after this one read the (empty) set.
+  const cli = async (args: string[], stdin?: string) => {
+    if (args[2] === "list") return { rev: 2, filters: JSON.parse(savedBody([theirs])).filters };
+    if (args.at(-1) !== "2") throw conflict;
+    return { rev: 3, filters: JSON.parse(stdin!).filters };
+  };
+  const moved = await saveChange(cli, { rev: 1, list: [] }, saveAs("errors", filter({ text: "mine" })), isConflict).catch((e) => e);
+  assert.ok(moved instanceof SavedMoved);
+  assert.match(moved.message, /saved elsewhere meanwhile/);
+  assert.deepEqual(moved.now, { rev: 2, list: [theirs] });
+  // A save under another name still goes through.
+  const ok = await saveChange(cli, { rev: 1, list: [] }, saveAs("mine", filter({ text: "m" })), isConflict);
+  assert.deepEqual(ok.list.map((s) => s.name), ["errors", "mine"]);
+  // Deleting what this window saw as "errors" (not there) leaves theirs alone.
+  const del = await saveChange(cli, { rev: 1, list: [{ name: "errors", filter: filter() }] }, deleteNamed("errors"), isConflict).catch((e) => e);
+  assert.ok(del instanceof SavedMoved);
+});
+
+test("names stay within what the project keeps", () => {
+  const long = "n".repeat(100);
+  const merged = mergeLocal([{ name: long, filter: filter({ text: "a" }) }], [{ name: long, filter: filter({ text: "b" }) }, { name: "x".repeat(150), filter: filter() }]);
+  assert.deepEqual(merged.map((s) => [...s.name].length), [100, 100, 100]);
+  assert.ok(merged[1].name.endsWith(" (this computer)"));
+});
+
+test("filters kept by an older build are removed once moved", () => {
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => store.set(k, v), removeItem: (k: string) => store.delete(k) };
+  store.set(savedKey("/p.bpdb"), "[]");
+  clearLocalSaved("/p.bpdb");
+  assert.equal(store.has(savedKey("/p.bpdb")), false);
+});
+
+// ---------------- Query search ----------------
+
+/** A query search filter for `text`. */
+const qf = (text: string, patch: Partial<TrafficFilter> = {}) => filter({ query: true, text, ...patch });
+
+test("query mode sends the text as --filter, and is its own search", () => {
+  assert.equal(searchFor(qf("  ")), null);
+  assert.deepEqual(searchFor(qf("status:5xx", { sources: ["send"] })), { kind: "filter", text: "status:5xx", source: "send" });
+  const s = { ...newSearch(searchFor(qf('-x resp.body:"a b"'))!), cursor: 9 };
+  assert.deepEqual(searchArgs(s), ["history", "list", '--filter=-x resp.body:"a b"', "--after=9", `--limit=${SEARCH_PAGE}`]);
+  // The same text as a contents search is another search.
+  assert.ok(isCurrent(s, qf('-x resp.body:"a b"')));
+  assert.ok(!isCurrent(s, cf('-x resp.body:"a b"')));
+  // The text isn't matched here: the CLI did.
+  assert.ok(matchesFilter(row(1), qf("nothing-like-this")));
+});
+
+test("the search mode: one of URL, contents and query", () => {
+  assert.equal(modeOf(DEFAULT_FILTER), "text");
+  assert.deepEqual([withMode(DEFAULT_FILTER, "query").query, withMode(DEFAULT_FILTER, "query").contents], [true, false]);
+  assert.deepEqual([withMode(cf("a"), "query").query, withMode(cf("a"), "query").contents], [true, false]);
+  assert.equal(modeOf(withMode(qf("a"), "contents")), "contents");
+  assert.equal(modeOf(withMode(qf("a"), "text")), "text");
+  // Stored filters: older ones have no query field, and both on reads as a query.
+  assert.equal(parseFilter({ text: "a", contents: true }).query, false);
+  assert.deepEqual([parseFilter({ contents: true, query: true }).contents, parseFilter({ contents: true, query: true }).query], [false, true]);
+});
+
+test("a query the CLI refuses is not tried again until it changes", () => {
+  const s = newSearch(searchFor(qf("stauts:500"))!);
+  const bad = failPage(s, 'filter: unknown field "stauts" at position 1', 1000, true);
+  assert.ok(bad.invalid);
+  assert.ok(!needsSearch(bad, 50, 1e15));
+  assert.equal(searchNote(bad, 50), 'Query: unknown field "stauts" at position 1');
+  // Any other failure is retried, and a good page clears it.
+  const flaky = failPage(s, "busy", 1000);
+  assert.ok(!flaky.invalid && needsSearch(flaky, 50, 1000 + RETRY_BASE));
+  assert.ok(!mergePage(bad, [], 50, qf("stauts:500")).invalid);
 });
 
 test("a short page covers everything up to the polled id", () => {

@@ -57,8 +57,8 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
     holds the token, so an agent that can reach the port through `send` can't learn it.
   - Requests with brainproxy's own `User-Agent` (`brainproxy/...`) are refused as well.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
-  1.5 s with `history list --after <last id>` (with a contents search on, the rows each poll
-  adds are then searched with `history list --contains TEXT --after <searched up to>`, so a
+  1.5 s with `history list --after <last id>` (with a contents search or a query on, the rows each poll
+  adds are then searched with `history list --contains TEXT` or `--filter QUERY` `--after <searched up to>`, so a
   new row shows only once it is known to match; `views/trafficFilter.ts`), proxy status every 2 s, the intercept queue
   every second while its tab is open. Polls can overlap; an older one that answers after a
   newer one's answer is dropped, so a slow poll never puts back a stale state (a failed poll
@@ -165,7 +165,7 @@ Replay tabs are also kept in the project file (below).
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node, copy a request as cURL), *Import API (sends each once)…* (an API definition's operations sent live once each and recorded, below), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `import api` (`--dry-run`, then `--background`), `job status/stop`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, saved filters per project, request/response, copy as cURL; right-click to scan a request after a confirmation, test it in Access, highlight it and remove the highlight, or *Create finding…*), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `scan active --history-id [--include-methods] --background`, `checks status`, `ws list/messages`, `findings add` |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, a contents search inside requests and responses, a query in the filter language, saved filters kept in the project, request/response, copy as cURL; right-click to scan a request after a confirmation, test it in Access, highlight it and remove the highlight, or *Create finding…*), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `history list --contains`, `history list --filter`, `history filters list/save --if-revision`, `scan active --history-id [--include-methods] --background`, `checks status`, `ws list/messages`, `findings add` |
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor; **+ cURL** opens a pasted curl command as a tab and *Copy as cURL* copies the request with the tab's options (both below); Race (below); per-tab Options (`views/replayOptions.ts`): HTTP/2, send as typed (`--verbatim`, HTTP/1 only so greyed out with HTTP/2: no Content-Length update, no auto URL-encode, the head's line breaks sent as CRLF and the body as the editor holds it), CRLF body (the GUI writes a text body's line breaks as CRLF; no CLI flag), SNI, timeout, verify TLS, don't record, with the ones that aren't the default as chips on the toolbar; a step sent with other options than the tab now has says which; Stop cancels a send still waiting (`cancelCli`) and says it may have reached the server (history has its row marked cancelled, or on Windows with the pending error, and the rows the CLI names when it answered in time); a send in flight and its result stay with its tab across tab switches (`views/replayCalls.ts`), and closing the tab or the project (or quitting) stops it, after asking. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the same options except HTTP/2, as typed and CRLF body, Stop, the conversation with a payload viewer. *Create finding…* for the request and its last send. Tabs are kept in the project (below) | `send --target T [--http2 \| --verbatim] [--sni] [--timeout] [--verify-tls] [--no-store] -` (with `--race N` for Race), `history show` (a raced response), `ws send --target T --input-json [--sni] [--timeout] [--verify-tls] [--no-store]` (handshake and messages on stdin), `replay tabs list/save`, `findings add` |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable; *Keep only attack requests that back a finding*, a project setting) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules, saved scan policies (per-rule on/off, strength and threshold; picked in new scan) | `job *`, `scan active/passive/rules/enable/disable/sources/prune`, `scan policy list/show/save/remove`, `scan active --policy`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
@@ -528,6 +528,23 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   `auth macro add` on the command line. A macro or rule is replaced or removed, not edited
   in place. *New macro profile* starts a profile with no login from its first macro, since
   `auth add` refuses a profile with nothing to do.
+- Traffic's Query mode runs `history list --filter` through the same paging as the contents
+  search. A query the CLI refuses as invalid input isn't tried again until the text changes
+  (`failPage(..., invalid)`); the toolbar shows the parser's message. Saved filters are loaded
+  with `history filters list` when the project opens and saved whole with `history filters
+  save --if-revision REV`. Loading, the move from localStorage and saves run one at a time in a
+  queue, each call naming the project it was made for, and an answer older than the revision
+  shown is dropped. A conflict (an agent added one, or another window saved) reads them again
+  and applies the same change to what is saved now, once (`saveChange`), unless that change would
+  replace or delete a filter of that name saved differently meanwhile: then the newer set is
+  shown and the user is told to save again. Filters an
+  older build kept in localStorage are merged into the project's (`mergeLocal`: an equal one is
+  already there, a different one under a taken name becomes "NAME (this computer)", names cut to
+  the 100 characters the project keeps), then
+  removed from localStorage. A note or highlight changed from Traffic runs a query that uses
+  `tag` or `note` again from the start (`usesEditableFields`, `rerun`: rows it hasn't reached yet
+  keep showing as before, so the table doesn't empty), since rows already searched may now match
+  or not; edits made elsewhere aren't seen until the query changes.
 - Traffic's contents search is case-sensitive and literal, like `history list --contains`
   (no `--ignore-case` yet), and stops at the first 10,000 matches the other filters show
   (oldest first; the toolbar says so). Only a new text or a different single source starts a

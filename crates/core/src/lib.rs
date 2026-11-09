@@ -15,6 +15,7 @@ pub mod data;
 pub mod diff;
 pub mod error;
 pub mod fetch;
+pub mod filter;
 pub mod fuzz;
 pub mod guard;
 pub mod har_export;

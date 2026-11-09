@@ -357,7 +357,9 @@ The sidebar groups the tools by what you are doing.
   imports.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
     default).
-  - **Contents:** tick it to search the text inside requests and responses instead: headers
+  - **URL, Contents, Query:** the list beside the text box says what the text does. **URL**
+    (the default) filters the URL, title and method of the rows shown.
+  - **Contents:** search the text inside requests and responses instead: headers
     and bodies, compressed and chunked bodies included. Unlike the plain filter, the search is
     case-sensitive and literal: it matches the bytes as stored, so `a@b.com` doesn't find
     `a%40b.com`, a JSON-escaped value has to be typed escaped, and HTTP/2 header names are
@@ -365,11 +367,45 @@ The sidebar groups the tools by what you are doing.
     changing one doesn't search again. New traffic that matches shows up as it arrives. A
     search stops at the first 10,000 matches the other filters show and says so; narrow it to
     see later ones.
-  - **Saved filters:** *Save…* names the current filters (text, Contents, sources and the
-    checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept per
-    project on this computer, in the app's own storage in plain text, not in the owner-only
-    project file: a saved search for a token or password stays there until you delete it.
-    *Save as…* on a temporary engagement takes them along.
+  - **Query:** the text is a query in the filter language, run by the CLI (`history list
+    --filter`) like a contents search, with the same live updates and 10,000-match stop. For
+    example `status:5xx resp.body:"stack trace"`, `host:api.acme.test method=POST NOT
+    path:/health` or `resp.header.server~"(?i)nginx" OR req.header.authorization:*`:
+    - `FIELD:VALUE` contains the value, ASCII letters in any case; `=` equals (the same way), `!=` differs, `~`
+      and `!~` match a Rust regex (case-sensitive unless it starts with `(?i)`), `<`, `<=`,
+      `>`, `>=` compare numbers and times, and `FIELD:*` is present.
+    - Fields: `id`, `method`, `scheme`, `host`, `port`, `path`, `query`, `url`, `status` (also
+      `status:5xx`), `length` (response body bytes), `duration` (ms), `time` (`time:2026-11-08`
+      is that day), `source`, `origin`, `title`, `type` (response Content-Type), `error`,
+      `note`, `tag` (`tag=race:ID` is exact), `sni`, `client`, `req` and `resp` (the raw
+      messages), `req.body`, `resp.body`, `body` (either), `req.type`, `req.length`,
+      `req.headers`, `resp.headers`, and one header by name: `req.header.NAME`,
+      `resp.header.NAME` (letters, digits, `-`, `_` and `.` in the name). A repeated header such
+      as `Set-Cookie` matches when any of its values does (`!=` and `!~` when none does), and
+      `:*` finds a header that is there even when it is empty.
+    - Times compare as instants (`time>=2026-11-08T12:00:00Z`, to the millisecond, or with an
+      offset such as `+01:00`), so a stored fraction of a second doesn't throw the order off; `time:` is a
+      prefix. A regex on `req`, `resp` or a body reads the bytes, so a body that isn't UTF-8 is
+      searched too.
+    - A bare word searches the URL and title, as the URL filter does; a quoted one is searched
+      as text, so `"status:500"` finds that text. Terms side by side must all match; `AND`,
+      `OR`, `NOT` (in any case, so quote `"or"` to search for the word) and parentheses combine
+      them (`NOT` first, then `AND`, then `OR`). Values with
+      spaces go in double quotes, with `\"` and `\\` inside. `NOT status:500` keeps requests
+      that got no response.
+    - A query that doesn't parse says why and where in the toolbar, and isn't run until you
+      change it. Values are always passed to the database as values, never as SQL.
+    - A query on notes or tags is run again when you change a note or a highlight in Traffic;
+      a change made elsewhere (the CLI, an agent) shows once you change the query.
+  - **Saved filters:** *Save…* names the current filters (text and what it searches, sources
+    and the checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept
+    in the project file (`history filters list` and `history filters save`), so they travel
+    with it and an agent can read them, or add one under a new name; an agent can't change or
+    remove yours. Each records who saved it (`origin`: gui, cli or mcp; `history filters list`
+    marks an agent's). A saved search for a token or password stays in the project until you delete
+    it. Filters an older version kept in the app's own storage move into the project the first
+    time it is opened, next to any already there; one whose name is taken by a different filter
+    is added as "NAME (this computer)".
   - **By:** who recorded the entry: the app, the CLI, or an agent (MCP). For a proxy entry
     that is who started the proxy, not who sent the request: hover it to see the address of
     the client that sent it.
@@ -1013,7 +1049,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 151 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 153 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1065,6 +1101,10 @@ brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param
     --description-file idor.md                # an issue found by hand; nothing is sent
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
+brainproxy history list --filter 'status:5xx resp.body:"stack trace" NOT path:/health'   # the filter language (Traffic's Query)
+brainproxy history filters list                           # the app's saved Traffic filters, kept in the project
+echo '{"filters":[{"name":"errors","filter":{"text":"status:5xx","query":true}}]}' \
+    | brainproxy history filters save --append            # adds one (replaces them without --append)
 brainproxy report html -o acme-report.html
 
 # Session handling: a macro that fetches a fresh CSRF token (history #42 is the form page),

@@ -74,6 +74,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
         tag: a.tag,
         origin: a.origin,
         contains: a.contains,
+        filter: None,
         after_id: a.after,
         limit: Some(a.limit.saturating_add(1)),
     })?;

@@ -1241,6 +1241,86 @@ fn history_contains_takes_the_gui_arguments_and_finds_no_secrets() {
 }
 
 #[test]
+fn history_filter_takes_the_gui_arguments() {
+    let (port, _) = serve_recording();
+    let project = tmp_project("filter");
+    let mut sent = Vec::new();
+    for (method, path, body) in
+        [("POST", "/api/login", "user=alice"), ("GET", "/health", ""), ("PUT", "/api/items/7", "{\"n\":1}")]
+    {
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Trace: t-{path}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+        sent.push(v["data"]["id"].as_i64().unwrap());
+    }
+    let ids = |args: &[&str]| {
+        let (code, v) = run(&[&["history", "list"], args].concat(), &project, None);
+        assert_eq!(code, 0, "{v}");
+        v["data"]["items"].as_array().unwrap().iter().map(|i| i["id"].as_i64().unwrap()).collect::<Vec<_>>()
+    };
+
+    // The GUI passes the query as --filter=QUERY with --after and --limit, as it does --contains.
+    assert_eq!(ids(&["--filter=path:/api/ NOT method=put", "--after=0", "--limit=2000"]), [sent[0]]);
+    assert_eq!(ids(&["--filter=req.body:ALICE OR req.header.x-trace~\"items\"", "--after=0"]), [sent[0], sent[2]]);
+    assert_eq!(
+        ids(&["--filter=status:2xx resp.header.set-cookie:*", &format!("--after={}", sent[0])]),
+        [sent[1], sent[2]]
+    );
+    assert_eq!(ids(&["--filter=-x", "--source=send"]), Vec::<i64>::new(), "a leading dash is part of the query");
+    assert_eq!(ids(&["--filter=health", "--source=send", "--limit=1"]), [sent[1]]);
+
+    // A query that doesn't parse is invalid input, and says where.
+    let (code, v) = run(&["history", "list", "--filter=stauts:200"], &project, None);
+    assert_eq!(code, 2, "{v}");
+    assert_eq!(v["error"]["kind"], "invalid_input");
+    assert!(v["error"]["message"].as_str().unwrap().contains("unknown field \"stauts\" at position 1"), "{v}");
+
+    // Saved Traffic filters live in the project, guarded by a revision.
+    let save = |args: &[&str], body: &str| {
+        run(&[&["history", "filters", "save"], args].concat(), &project, Some(body.as_bytes()))
+    };
+    let (code, v) = save(
+        &["--if-revision", "0"],
+        r#"{"filters": [{"name": "api", "filter": {"text": "path:/api/", "query": true}}]}"#,
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["data"]["count"].as_u64(), v["data"]["rev"].as_u64()), (Some(1), Some(1)));
+    let (code, v) = save(&["--if-revision", "0"], r#"{"filters": []}"#);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    let (code, v) = save(&["--append"], r#"{"filters": [{"name": "api", "filter": {}}]}"#);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    let (code, v) =
+        save(&["--append"], r#"{"filters": [{"name": "bad", "filter": {"query": true, "text": "stauts:1"}}]}"#);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let (code, v) = save(&["--append"], r#"{"filters": [{"name": "health", "filter": {"text": "health"}}]}"#);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["history", "filters", "list"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["rev"], 2);
+    let listed: Vec<(&str, &str)> = v["data"]["filters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["name"].as_str().unwrap(), f["mode"].as_str().unwrap()))
+        .collect();
+    assert_eq!(listed, [("api", "query"), ("health", "url")]);
+    // A saved query is the text --filter takes.
+    let query = v["data"]["filters"][0]["filter"]["text"].as_str().unwrap().to_string();
+    assert_eq!(ids(&[&format!("--filter={query}")]), [sent[0], sent[2]]);
+
+    // The notes (and the history_list MCP tool, built from them) list the fields.
+    let (code, v) = run(&["capabilities", "history", "list"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let notes = v["data"]["notes"].as_str().unwrap();
+    for words in ["resp.header.NAME", "status:5xx", "(?i)", "NOT status:500 keeps requests"] {
+        assert!(notes.contains(words), "{notes}");
+    }
+}
+
+#[test]
 fn auth_add_reads_a_literal_password_from_the_environment() {
     let project = tmp_project("pwenv");
     let out = bin()
