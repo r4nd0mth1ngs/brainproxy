@@ -2084,6 +2084,92 @@ mod tests {
         assert_eq!(s.meta_get("k").unwrap(), None);
     }
 
+    /// Random queries from the language's own pieces and odd input: parsing never panics,
+    /// and every query that parses runs as SQL.
+    #[test]
+    fn filter_fuzz_parses_or_refuses_and_runs() {
+        let s = Store::open_in_memory().unwrap();
+        let ex = Exchange {
+            target: Target::from_url("http://a.test").unwrap(),
+            request: b"POST /a?x=1 HTTP/1.1\r\nHost: a.test\r\nContent-Length: 3\r\n\r\nabc".to_vec(),
+            response: b"HTTP/1.1 500 Oops\r\nServer: nginx\r\nContent-Length: 4\r\n\r\n\xff\x00ok".to_vec(),
+            duration_ms: 5,
+            sni: None,
+        };
+        s.record_exchange("send", &ex).unwrap();
+        let pieces: Vec<&str> = [
+            "(",
+            ")",
+            "\"",
+            "\\",
+            " ",
+            "AND",
+            "or",
+            "NOT",
+            "not",
+            ":",
+            "=",
+            "!=",
+            "~",
+            "!~",
+            "<",
+            ">=",
+            "*",
+            "5xx",
+            "12",
+            "-3",
+            "99999999999999999999",
+            "2026-11-08",
+            "2026-11-08T12:00:00Z",
+            "(?i)a",
+            "[",
+            "a{1000}",
+            "x",
+            "é",
+            "\u{0}",
+            "https://a.test",
+            "req.header.",
+            "resp.header.server",
+            "req.header.x-y",
+        ]
+        .into_iter()
+        .chain(crate::filter::FIELDS.iter().map(|(f, _)| *f))
+        .collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut ok, mut refused) = (0, 0);
+        for _ in 0..20_000 {
+            let n = (next() % 12) as usize + 1;
+            let q: String = (0..n)
+                .map(|_| {
+                    let p = pieces[(next() % pieces.len() as u64) as usize];
+                    if next() % 3 == 0 {
+                        format!("{p} ")
+                    } else {
+                        p.to_string()
+                    }
+                })
+                .collect();
+            match s.list(&HistoryFilter { filter: Some(q.clone()), ..Default::default() }) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    assert_eq!(e.kind(), "invalid_input", "{q:?}: {e}");
+                    refused += 1;
+                }
+            }
+        }
+        assert!(ok > 1000 && refused > 1000, "{ok} ran, {refused} refused");
+        // Nesting and length at and past the limits: refused, never a stack overflow.
+        for q in ["(".repeat(5000), "NOT ".repeat(1000) + "a", "\"".repeat(4096), "a:".repeat(2048)] {
+            let _ = crate::filter::Query::parse(&q);
+        }
+    }
+
     #[test]
     fn filter_reads_binary_bodies_past_a_nul() {
         let s = Store::open_in_memory().unwrap();
