@@ -1,0 +1,9 @@
+# cargo-nextest, which CI runs the tests with: `cargo nextest run --profile ci`.
+# Plain `cargo test` works as before.
+
+[profile.ci]
+# Report every failure, as `cargo test --no-fail-fast` did.
+fail-fast = false
+# The slowest test takes about a minute. One still running after five has hung: it is stopped
+# and fails, instead of the job's timeout cancelling the whole run with no report.
+slow-timeout = { period = "60s", terminate-after = 5 }

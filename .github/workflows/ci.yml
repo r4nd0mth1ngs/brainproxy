@@ -23,6 +23,10 @@ env:
 jobs:
   check:
     runs-on: ${{ matrix.os }}
+    # Line tables are enough for a test's backtrace, and much less to build, link and cache than
+    # full debug info. At job level so rust-cache keys on it.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -51,7 +55,14 @@ jobs:
           fi
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --no-fail-fast
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-nextest@0.9.148
+      # cargo test runs the test binaries one after another, each waiting on its slowest test;
+      # nextest runs every test as its own process, all binaries at once.
+      - run: cargo nextest run --profile ci
+      # nextest doesn't run doctests.
+      - run: cargo test --doc
       - run: python3 scripts/test_zap_drift.py
         if: runner.os == 'Linux'
 
@@ -133,9 +144,9 @@ jobs:
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
 
-  # The container image: built and smoke-tested here, not pushed anywhere.
+  # The container image: built and smoke-tested here, not pushed anywhere. Nothing is
+  # published from it, so it builds alongside the checks instead of after them.
   image:
-    needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
