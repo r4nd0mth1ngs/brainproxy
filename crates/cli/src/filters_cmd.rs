@@ -31,7 +31,8 @@ pub enum FiltersCmd {
     /// List the saved Traffic filters: name, what the text searches, the text, sources and checkboxes.
     #[command(after_help = "mode is url (the text filters URL, title and method in the app), contents \
         (`history list --contains`) or query (`history list --filter`). rev goes up with every save; \
-        `save --if-revision` checks it.")]
+        `save --if-revision` checks it. origin is who saved a filter (gui, cli or mcp; unknown when an older \
+        build did); a replace keeps it for a filter saved back unchanged.")]
     List,
     /// Replace the saved Traffic filters with the JSON on stdin (or add to them with --append).
     #[command(after_help = "Reads JSON from stdin: {\"filters\": [{\"name\": \"server errors\", \"filter\": \
@@ -125,7 +126,11 @@ pub fn filters(project: &Path, cmd: FiltersCmd, out: &Out) -> Result<(), Error> 
                         let f = &s["filter"];
                         let name = escape_controls(s["name"].as_str().unwrap_or_default());
                         let text = escape_controls(f["text"].as_str().unwrap_or_default());
-                        format!("{name}  [{}]  {text}", mode(f))
+                        let by = match s["origin"].as_str() {
+                            Some("mcp") => "  (saved by an agent)",
+                            _ => "",
+                        };
+                        format!("{name}  [{}]  {text}{by}", mode(f))
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -152,9 +157,10 @@ pub fn filters(project: &Path, cmd: FiltersCmd, out: &Out) -> Result<(), Error> 
                          meanwhile; list them again"
                     )));
                 }
-                let before = if append { before } else { Vec::new() };
+                let kept = if append { before.clone() } else { Vec::new() };
                 let cap = if crate::mcp::in_tool_call() { MAX_THROUGH_MCP } else { MAX_FILTERS };
-                let (json, count) = build(set, before, rev + 1, cap)?;
+                let by = brainproxy_core::provenance::origin();
+                let (json, count) = build(set, kept, &before, by, rev + 1, cap)?;
                 Ok((Some(json), (count, rev + 1)))
             })?;
             let mut data = json!({"count": count, "rev": rev});
@@ -262,8 +268,16 @@ fn parse(input: &[u8]) -> Result<Set, Error> {
 
 /// The set to store as compact JSON, with its count: `set` after the filters `before` (kept by
 /// an append), at revision `rev`, with at most `cap` in all. An appended name that is already
-/// saved is refused.
-fn build(set: Set, before: Vec<Value>, rev: u64, cap: usize) -> Result<(String, usize), Error> {
+/// saved is refused. Each filter records the `origin` that saved it (`by`, or the one it had in
+/// `stored` when a replace saves it unchanged, as the app does with every filter it keeps).
+fn build(
+    set: Set,
+    before: Vec<Value>,
+    stored: &[Value],
+    by: &str,
+    rev: u64,
+    cap: usize,
+) -> Result<(String, usize), Error> {
     let count = before.len() + set.filters.len();
     if count > cap {
         let why = if cap < MAX_FILTERS {
@@ -281,7 +295,14 @@ fn build(set: Set, before: Vec<Value>, rev: u64, cap: usize) -> Result<(String, 
     }
     let mut filters = before;
     for s in set.filters {
-        filters.push(serde_json::to_value(s).map_err(|e| Error::InvalidInput(e.to_string()))?);
+        let mut v = serde_json::to_value(s).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let unchanged = stored.iter().find(|o| o["name"] == v["name"] && o["filter"] == v["filter"]);
+        v["origin"] = match unchanged.and_then(|o| o["origin"].as_str()) {
+            Some(o) => json!(o),
+            None if unchanged.is_some() => json!("unknown"),
+            None => json!(by),
+        };
+        filters.push(v);
     }
     let json = serde_json::to_string(&json!({"v": VERSION, "rev": rev, "filters": filters}))
         .map_err(|e| Error::InvalidInput(e.to_string()))?;
@@ -310,14 +331,14 @@ mod tests {
                 {"name": "tokens", "filter": {"text": "Bearer ", "contents": true, "hideRefused": false}}]}"#,
         )
         .unwrap();
-        let (json, count) = build(set, Vec::new(), 1, MAX_FILTERS).unwrap();
+        let (json, count) = build(set, Vec::new(), &[], "cli", 1, MAX_FILTERS).unwrap();
         assert_eq!(count, 2);
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!((v["v"].as_u64(), v["rev"].as_u64()), (Some(1), Some(1)));
         assert_eq!(
             v["filters"][0],
             json!({"name": "errors", "filter": {"text": "status:5xx", "contents": false, "query": true,
-                "sources": ["proxy"], "hideErrors": false, "hideAssets": false, "hideRefused": true}})
+                "sources": ["proxy"], "hideErrors": false, "hideAssets": false, "hideRefused": true}, "origin": "cli"})
         );
         assert_eq!(v["filters"][1]["filter"]["hideRefused"], false);
         assert_eq!(mode(&v["filters"][0]["filter"]), "query");
@@ -344,19 +365,42 @@ mod tests {
     fn an_append_never_replaces_a_name() {
         let before = vec![json!({"name": "mine", "filter": {}})];
         let set = parse(br#"{"filters": [{"name": "mine", "filter": {"text": "x"}}]}"#).unwrap();
-        let e = build(set, before.clone(), 2, MAX_FILTERS).unwrap_err();
+        let e = build(set, before.clone(), &before, "cli", 2, MAX_FILTERS).unwrap_err();
         assert_eq!(e.kind(), "conflict");
         let set = parse(br#"{"filters": [{"name": "theirs", "filter": {}}]}"#).unwrap();
-        assert_eq!(build(set, before, 2, MAX_FILTERS).unwrap().1, 2);
+        assert_eq!(build(set, before.clone(), &before, "cli", 2, MAX_FILTERS).unwrap().1, 2);
     }
 
     #[test]
     fn an_agent_leaves_the_person_room() {
         let before: Vec<Value> = (0..MAX_THROUGH_MCP).map(|i| json!({"name": format!("f{i}"), "filter": {}})).collect();
         let set = || parse(br#"{"filters": [{"name": "one more", "filter": {}}]}"#).unwrap();
-        let e = build(set(), before.clone(), 2, MAX_THROUGH_MCP).unwrap_err().to_string();
+        let e = build(set(), before.clone(), &before, "mcp", 2, MAX_THROUGH_MCP).unwrap_err().to_string();
         assert!(e.contains("through MCP the set can grow to 150"), "{e}");
-        assert_eq!(build(set(), before, 2, MAX_FILTERS).unwrap().1, MAX_THROUGH_MCP + 1);
+        assert_eq!(build(set(), before.clone(), &before, "cli", 2, MAX_FILTERS).unwrap().1, MAX_THROUGH_MCP + 1);
+    }
+
+    #[test]
+    fn a_replace_keeps_who_saved_an_unchanged_filter() {
+        let set = parse(br#"{"filters": [{"name": "theirs", "filter": {"text": "x"}}]}"#).unwrap();
+        let (json, _) = build(set, Vec::new(), &[], "mcp", 1, MAX_FILTERS).unwrap();
+        let stored: Value = serde_json::from_str(&json).unwrap();
+        let stored = stored["filters"].as_array().unwrap().clone();
+        assert_eq!(stored[0]["origin"], "mcp");
+        // The app saves the whole list back: the agent's filter stays the agent's, a changed or new one is the app's.
+        let set = parse(
+            br#"{"filters": [{"name": "theirs", "filter": {"text": "x"}}, {"name": "mine", "filter": {"text": "y"}}]}"#,
+        )
+        .unwrap();
+        let (json, _) = build(set, Vec::new(), &stored, "gui", 2, MAX_FILTERS).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (v["filters"][0]["origin"].as_str(), v["filters"][1]["origin"].as_str()),
+            (Some("mcp"), Some("gui"))
+        );
+        let set = parse(br#"{"filters": [{"name": "theirs", "filter": {"text": "changed"}}]}"#).unwrap();
+        let (json, _) = build(set, Vec::new(), &stored, "gui", 2, MAX_FILTERS).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["filters"][0]["origin"], "gui");
     }
 
     #[test]

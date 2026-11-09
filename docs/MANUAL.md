@@ -399,7 +399,8 @@ The sidebar groups the tools by what you are doing.
     and the checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept
     in the project file (`history filters list` and `history filters save`), so they travel
     with it and an agent can read them, or add one under a new name; an agent can't change or
-    remove yours. A saved search for a token or password stays in the project until you delete
+    remove yours. Each records who saved it (`origin`: gui, cli or mcp; `history filters list`
+    marks an agent's). A saved search for a token or password stays in the project until you delete
     it. Filters an older version kept in the app's own storage move into the project the first
     time it is opened, next to any already there; one whose name is taken by a different filter
     is added as "NAME (this computer)".
