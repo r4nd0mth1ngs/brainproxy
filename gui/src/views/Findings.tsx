@@ -289,7 +289,7 @@ export function FindingsView({ active }: { active: boolean }) {
 
   return (
     <div className="col fill">
-      <div className="toolbar">
+      <div className="toolbar wrap">
         <div className="seg">
           {RISKS.map((r) => (
             <button key={r} className={risks.has(r) ? "on" : ""} onClick={() => setRisks(toggle(risks, r))}>
@@ -342,16 +342,17 @@ export function FindingsView({ active }: { active: boolean }) {
             ))}
           </select>
         )}
-        <span className="grow" />
-        <span className="muted">
-          {groups.length} issue{groups.length === 1 ? "" : "s"}
-        </span>
-        <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
-          New finding…
-        </button>
-        <button className="btn small" onClick={() => setReporting(true)} title="Build a report: who it is for, its sections and branding; HTML, PDF, Word or Markdown">
-          Report…
-        </button>
+        <div className="toolbar-end">
+          <span className="muted">
+            {groups.length} issue{groups.length === 1 ? "" : "s"}
+          </span>
+          <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
+            New finding…
+          </button>
+          <button className="btn small" onClick={() => setReporting(true)} title="Build a report: who it is for, its sections and branding; HTML, PDF, Word or Markdown">
+            Report…
+          </button>
+        </div>
       </div>
       {picked.length > 0 && (
         <div className="toolbar bulk-bar">

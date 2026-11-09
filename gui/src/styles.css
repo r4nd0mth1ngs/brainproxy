@@ -282,6 +282,25 @@ select {
   padding: 0;
   margin: 8px 0;
 }
+/* A toolbar with more controls than a narrow window fits: they go onto more lines instead of
+   running off the edge. A select is as wide as its longest option, so a long host name or scan
+   is cut off rather than pushing everything else down. `.toolbar-end` keeps the last controls
+   together at the right of whichever line they land on. */
+.toolbar.wrap {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.toolbar.wrap > select,
+.toolbar.wrap > .input {
+  max-width: min(100%, 280px);
+  min-width: 0;
+}
+.toolbar-end {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
 .toolbar .sep {
   width: 1px;
   height: 18px;
