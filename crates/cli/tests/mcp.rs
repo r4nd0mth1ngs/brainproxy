@@ -1293,3 +1293,161 @@ fn a_bad_mcp_serve_command_line_writes_nothing_to_stdout() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("--timeout"), "{format:?}");
     }
 }
+
+impl Mcp {
+    /// A 2026-07-28 tool call;
+    /// returns (isError, envelope), checking the result is a modern one.
+    fn call_modern(&mut self, name: &str, arguments: Value) -> (bool, Value) {
+        let r = self.modern("tools/call", json!({"name": name, "arguments": arguments}));
+        let result = &r["result"];
+        assert_modern(result, false);
+        let text = result["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no text: {r}"));
+        let env: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("bad envelope ({e}): {text}"));
+        assert_eq!(result["structuredContent"], env);
+        (result["isError"].as_bool().unwrap(), env)
+    }
+}
+
+/// Nothing an agent is refused through a handshake session is allowed to a 2026-07-28 request:
+/// the same tools are withheld, the same options refused with the same message, and what it
+/// records is marked as an agent's, on one process serving both eras.
+#[test]
+fn a_modern_request_is_refused_what_a_handshake_one_is() {
+    let p = tmp_project("modern-refusals");
+    let dir = p.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&home);
+    let home_s = home.to_str().unwrap().to_string();
+    let kept = dir.join("kept.txt");
+    std::fs::write(&kept, "A PERSON'S FILE").unwrap();
+    let kept_s = kept.to_str().unwrap().to_string();
+    let env = [("BRAINPROXY_HOME", home_s.as_str()), ("BRAINPROXY_CLIENT", "gui"), ("OTHER_TOKEN", "FAKE-OTHER")];
+    let mut m = Mcp::start_env(&p, &[], &env);
+    let port = serve(1);
+
+    // Withheld tools: neither listed nor callable, in either era.
+    let modern_tools = m.modern("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = modern_tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for name in [
+        "mcp_serve",
+        "proxy_run",
+        "oob_run",
+        "checks_feed_keygen",
+        "checks_feed_sign",
+        "project_save",
+        "browser_open",
+        "findings_remove",
+        "report_profile_remove",
+        "connection_review",
+        "findings_issue_review",
+        "report_summary_review",
+    ] {
+        assert!(!names.contains(&name), "{name} is listed to a modern client");
+        let modern = m.modern("tools/call", json!({"name": name, "arguments": {}}));
+        assert_eq!(modern["error"]["code"], -32602, "{name}: {modern}");
+        let legacy = m.request("tools/call", json!({"name": name, "arguments": {}}));
+        assert_eq!(legacy["error"]["code"], -32602, "{name}: {legacy}");
+    }
+
+    let (err, e) = m.call_modern("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let fuzz_url = format!("http://127.0.0.1:{port}/?q=§x§");
+    // Every one of these is refused by the command itself, so both eras get the same envelope.
+    for (tool, args, says) in [
+        ("ca_init", json!({}), ""),
+        ("ca_init", json!({"force": true}), "--force is refused through MCP"),
+        ("report", json!({"output": kept_s, "force": true}), "--force is refused through MCP"),
+        ("ca_export", json!({"out": kept_s, "force": true}), "--force is refused through MCP"),
+        ("send", json!({"url": url, "no_store": true}), "--no-store"),
+        ("fuzz_run", json!({"url": fuzz_url, "payloads": ["list:1,2"], "store": "none"}), "--store none"),
+        ("scan_prune", json!({"state": "on"}), "scan prune on"),
+        ("scan_active", json!({"history_ids": [1], "prune": true}), "--prune"),
+        ("auth_add", json!({"name": "k", "header_env": ["X-Key=OTHER_TOKEN"]}), "BRAINPROXY_SECRET_"),
+        ("proxy_start", json!({"listen": "0.0.0.0:0"}), "loopback"),
+    ] {
+        let (modern_err, modern) = m.call_modern(tool, args.clone());
+        if says.is_empty() {
+            assert!(!modern_err, "{tool}: {modern}");
+            continue;
+        }
+        let (legacy_err, legacy) = m.call(tool, args.clone());
+        assert!(modern_err && legacy_err, "{tool} {args}: {modern} / {legacy}");
+        assert_eq!(modern["error"], legacy["error"], "{tool} {args}");
+        let message = modern["error"]["message"].as_str().unwrap();
+        assert!(message.contains(says), "{tool} {args}: {message}");
+    }
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "A PERSON'S FILE");
+    // Nothing reached the target, and the scans' prune setting stayed off.
+    let (_, e) = m.call_modern("history_list", json!({}));
+    assert_eq!(e["data"]["count"], 0, "{e}");
+
+    // What a modern call records is an agent's, even from a server started by the app.
+    let (err, e) = m.call_modern("send", json!({"url": url}));
+    assert!(!err, "{e}");
+    let (_, e) = m.call_modern("history_list", json!({}));
+    assert_eq!(e["data"]["items"][0]["origin"], "mcp", "{e}");
+    let (_, e) = m.call("history_list", json!({"origin": "gui"}));
+    assert_eq!(e["data"]["count"], 0, "{e}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Cancelling a 2026-07-28 call kills its command and sends nothing for it, and a progress
+/// token in its `_meta` gets progress notifications, as in the handshake era.
+#[test]
+fn a_modern_call_reports_progress_and_can_be_cancelled() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (closed_tx, closed) = std::sync::mpsc::channel();
+    let (connected_tx, connected) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = connected_tx.send(());
+        let mut buf = [0u8; 4096];
+        while s.read(&mut buf).is_ok_and(|n| n > 0) {}
+        let _ = closed_tx.send(());
+    });
+    let mut m = Mcp::start(&tmp_project("modern-cancel"), &[]);
+    let (err, e) = m.call_modern("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{e}");
+    let params = json!({
+        "name": "send",
+        "arguments": {"url": format!("http://127.0.0.1:{port}/"), "timeout": 20},
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "progressToken": "p1",
+        },
+    });
+    m.send_line(&json!({"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": params}).to_string());
+    connected.recv_timeout(std::time::Duration::from_secs(20)).expect("send never connected");
+    // Progress for the running call, tagged with its token.
+    let msg = m.read();
+    assert_eq!(msg["method"], "notifications/progress", "{msg}");
+    assert_eq!(msg["params"]["progressToken"], "p1");
+    // A request id still running is taken in this era too.
+    m.send_line(&json!({"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": params}).to_string());
+    let r = loop {
+        let msg = m.read();
+        if msg["method"] != "notifications/progress" {
+            break msg;
+        }
+    };
+    assert_eq!(r["error"]["code"], -32600, "{r}");
+
+    m.send_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"slow"}}"#);
+    closed.recv_timeout(std::time::Duration::from_secs(5)).expect("cancelled send still connected");
+    // No answer for the cancelled call: the next non-progress line answers the next request.
+    m.next_id += 1;
+    let id = m.next_id;
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}});
+    m.send_line(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {"_meta": meta}}).to_string());
+    let r = loop {
+        let msg = m.read();
+        if msg["method"] != "notifications/progress" {
+            break msg;
+        }
+    };
+    assert_eq!(r["id"], id, "{r}");
+    assert_modern(&r["result"], true);
+}
