@@ -331,7 +331,7 @@ function History() {
 
   return (
     <div className="col fill">
-      <div className="toolbar" style={{ flexWrap: "wrap" }}>
+      <div className="toolbar">
         <input
           className="input"
           style={{ width: 260 }}

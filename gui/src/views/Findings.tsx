@@ -289,7 +289,7 @@ export function FindingsView({ active }: { active: boolean }) {
 
   return (
     <div className="col fill">
-      <div className="toolbar wrap">
+      <div className="toolbar">
         <div className="seg">
           {RISKS.map((r) => (
             <button key={r} className={risks.has(r) ? "on" : ""} onClick={() => setRisks(toggle(risks, r))}>
