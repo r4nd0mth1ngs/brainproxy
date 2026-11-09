@@ -195,13 +195,14 @@ CRLF-injection test) needs `--host-header-test` through MCP, as it can start a H
 
 Settings that put a Host on requests still to come are checked when they are saved too: an auth
 profile's `--header` or `--token-header`, its login request and `--login-header` (the login
-URL's own host is fine), a macro's steps (`auth macro add`), and a proxy rule (`rules add`, or
-`rules enable` of a disabled one) whose replacement writes a Host line or an absolute URL,
-rewrites the Host of a request to a host the engagement lists, or copies a header's name or the
-request target from the request (`$1`). A rule can match anything, so that check is best effort;
-the proxy also compares each request's foreign hosts before and after the rules, and refuses one
-an agent's rule brought in (a 502, and a row saying so) unless the rule was added or enabled
-with `--host-header-test`. Session rules and signers can't set the Host at all. Saving a setting
+URL's own host is fine), a macro's steps (`auth macro add`), and a match-and-replace rule (`rules
+add`, `rules import`, or `rules enable` of a disabled one) whose replacement writes a Host line
+or an absolute URL, sets the header named `Host`, rewrites the Host of a request to a host the
+engagement lists, or copies a header's name or the request target from the request (`$1`). A rule
+can match anything, so that check is best effort; the proxy also compares each request's foreign
+hosts before and after the rules, and refuses one an agent's rule brought in (a 502, and a row
+saying so) unless the rule was added or enabled with `--host-header-test`. So do `send`, a fuzz
+run and a scan for the rules that apply to them (the request fails as out of scope, unsent). Session rules and signers can't set the Host at all. Saving a setting
 again with the Host it already had isn't checked again; an edited request forwarded with
 `intercept forward` is checked for hosts the edit brings in. A person on the command line or in
 the app is warned, never refused.
@@ -965,7 +966,19 @@ byte, side by side or unified.
     it by name; *Run last* moves it after the others, for one that covers another's signature; a
     signer a rule uses can't be removed until the rule is. A session rule's *Sign request*
     action turns a signer on.
-- **Match & replace:** rewrite requests and responses passing through the proxy.
+- **Match & replace:** rules that rewrite requests and responses on their way. A rule says
+  *where* it works: the method, the path, a query parameter or a header by name (set it, add
+  another, or remove it), the status code, a body, a WebSocket message, or, as before, each raw
+  header line or the request line. It says *what to match* there (a regex, plain text, or the
+  whole value; nothing means the whole value) and what to write instead. **Applies to** is whose
+  traffic it changes: the proxy unless you tick Replay, the Fuzzer or Scans too (a WebSocket rule:
+  messages to the server, to the client, or both), and a host regex limits it to some targets.
+  Below the list, **Test** tries the rule you are writing, the selected rule, or all enabled
+  rules on a message you paste or on a history row, and shows the message after the rules and
+  which rules changed it; nothing is sent. *Copy as JSON* and *Import* move rules between
+  projects through the clipboard. In Traffic, an exchange a rule changed has both versions:
+  *Before rules* and *Sent* on the request, *Received* and *After rules* on the response. See
+  [Match-and-replace rules](#match-and-replace-rules-rules).
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
   Chromium, curl, or a shell at it. *Port* sets the port the app's proxy listens on, for every
@@ -1057,7 +1070,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 175 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 177 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1157,6 +1170,92 @@ normally return different statuses or lengths: compare copies within one request
 The flag is also on the MCP `send` tool and in `capabilities send`; through MCP a
 member comes from the call's stdin (`--also -`), not a file (see MCP.md).
 
+### Match-and-replace rules (`rules`)
+
+A rule rewrites one place in a message. `--location` names the place, `--match` what to find
+there and `--replace` what to write instead:
+
+| `--location` | Works on |
+|---|---|
+| `method`, `path` | The request's method; its path, without the query string |
+| `query-param --name N` | The value of query parameter `N`, as written in the request line (not decoded). `N` is the parameter's decoded name: it matches `a+b` and `a%20b` alike, and is written encoded where the rule adds the parameter |
+| `request-header --name N`, `response-header --name N` | The value of header `N` |
+| `status` | The response's status code; the replacement is a code from 200 up, with a reason if you like (`404` or `404 Not Found`). To or from 204 and 304, which have no body, the body and its framing follow |
+| `request-body`, `response-body` | The body (a compressed response body is decoded first and sent on decoded) |
+| `ws-message` | The payload of a WebSocket text or binary message the proxy relays |
+| `request-line`, `request-header`, `response-header` (no `--name`) | The raw request line, or each header line (`Name: value`) on its own; with an empty `--match`, a header location adds `--replace` as a new header line |
+
+`--match-kind` says how `--match` is read: `regex` (the default; the replacement may use `$1`),
+`literal` (plain text, each occurrence replaced with `--replace` as written) or `whole` (the
+whole value, when it equals `--match`). An empty `--match` stands for the whole value, whatever
+it is; only a regex on `request-line` or a body matches nothing when empty, as it always did. A
+regex replaces what it matched, not the whole value: to turn every 4xx into 200, match `^4..$`.
+
+With `--name`, `--action` says what to do with the header or parameter: `set` (the default)
+rewrites its value where `--match` matches, and with no `--match` sets it, adding the header or
+parameter when the message has none; `add` adds another one whatever is there; `remove` removes
+it (with `--match`, only where the value matches).
+
+`--applies-to` lists whose traffic the rule changes: `proxy` (the default: in-scope requests and
+responses the proxy relays), `send` (and so the app's Replay, a race included), `fuzz`, `scan`
+(the attack requests of active scans and checks), and for a `ws-message` rule `ws-to-server` and
+`ws-to-client` (default: both). `--host REGEX` limits it to targets whose host matches. `send`,
+a fuzz run and a scan read the rules when they start and apply them before the session of
+`--auth`, as the proxy does. A rule applies to every request an engine sends, so `add` on a
+request recorded with the same rule adds a second copy; `set` doesn't. A response rule changes
+what the engine reads: `send` shows the response after it, the fuzzer greps and counts it, and
+a scan's rules look for their evidence in it (and read the baseline they compare with through the
+same rules), so a finding raised from a rewritten response
+points at a row whose response, as received, may not hold the evidence (`history show` has the
+rewritten one as `modified_response`).
+
+```sh
+brainproxy rules add --location query-param --name role --replace admin
+brainproxy rules add --location request-header --name X-Forwarded-For --action add --replace 127.0.0.1 \
+    --applies-to proxy,send,fuzz,scan --host '(^|\.)app\.test$'
+brainproxy rules add --location status --match '^403$' --replace 200
+brainproxy rules add --location response-header --name Content-Security-Policy --action remove
+brainproxy rules add --location ws-message --match-kind literal --match '"admin":false' --replace '"admin":true' \
+    --applies-to ws-to-client
+```
+
+`rules test` tries rules on a message and sends nothing: the message is a raw request or
+response in a file or on stdin (a response is told by its `HTTP/` start; `--message` says
+otherwise, and `ws-to-server` or `ws-to-client` reads it as a WebSocket payload), or a history
+row's request and response (`--history ID`). It prints the message after the rules and the ids
+of the rules that changed it. By default the enabled rules apply as the proxy would apply them
+(`--as send`, `fuzz` or `scan` for another engine); `--rule 3,5` tries those saved rules,
+enabled or not; and `--location` with the other `rules add` flags tries a rule that isn't saved
+(it shows as rule 0). `--target-host` gives the host for `--host` conditions when the message
+has no Host header.
+
+```sh
+brainproxy rules test request.http                       # the enabled rules, as the proxy applies them
+brainproxy rules test --history 42 --rule 3              # rule 3 on a recorded exchange
+printf 'GET /a?role=user HTTP/1.1\nHost: app.test\n\n' | \
+    brainproxy rules test --location query-param --name role --replace admin
+```
+
+When a rule changes an exchange, its history row still holds the request that went out and the
+response that came back, and `history show` adds the other two: `original_request` (the request
+before the rules) and `modified_response` (the response after them, which is what the proxy's
+client or `send` was given) with `response_edits`, the rules that changed it; the request's
+rules are in `entry.edited_by`. `history show ID --raw --part original-request` and `--part
+modified-response` print them, and the `rule_edits` table holds them for `query`. Rows that
+keep no content (`--no-store`) keep neither. A WebSocket message a rule rewrote is recorded as
+forwarded, marked `rule` in `ws messages` (its `intercept` column); the original payload isn't
+kept.
+
+`rules list` prints the rules as JSON, and `rules import` reads that JSON back (a file, or
+stdin) into this or another project: each rule gets a new id and the importer's origin, and is
+checked as `rules add` checks it; `--replace` removes the rules there are first, `--disabled`
+adds them all disabled.
+
+A rule that puts a host the scope doesn't list in the Host header (or makes the request
+target an absolute URL) is checked as before, structured or not: saving it warns a person and
+is refused through MCP without `--host-header-test`, and a request an agent's rule did that to
+isn't sent by the proxy, `send`, a fuzz run or a scan.
+
 ### Who recorded what
 
 Each history entry has:
@@ -1166,7 +1265,8 @@ Each history entry has:
   jobs, fuzz runs and the proxy record the origin of the command that started them.
 - `client_addr`: for proxy entries, the address (`ip:port`) of the client that sent the
   request, whether intercepted, passed through, a WebSocket upgrade, or invisible.
-- `edited_by`: for proxy entries, who changed the request before it went out, as a JSON
+- `edited_by`: who changed the request before it went out (for proxy entries, and for a
+  `send`, fuzz or scan request a match-and-replace rule changed), as a JSON
   list: `[{"by":"mcp","intercept":4}]` for an edit forwarded from the intercept queue,
   `[{"by":"gui","rule":2}]` for a match-and-replace rule (`by` is who added or last enabled
   the rule). A proxy started with `--auth NAME` adds `{"by":"gui","auth":"NAME"}` when the
@@ -1207,7 +1307,7 @@ dropped it itself; `edited` says whether it was forwarded with a different messa
 (`intercept list`, `intercept show`, the `intercepts` table). An edited request's history
 row names the intercept in `edited_by`. A response edited at intercept, or changed by a
 response rule, is recorded in history as the server sent it; the intercept row has the
-edit. Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
+edit, and `history show` has what a rule made of it (`modified_response`). Match-and-replace rules keep an `origin` (`rules list`): who added the rule, or last
 enabled it. A request-line or request-header rule whose replacement holds a line break or NUL
 (saved by a build that didn't refuse one) is left out when the proxy loads its rules, and
 `rules list` (`skipped`) and `proxy status` (`rules_skipped`) say so. So do auth profiles (`auth show`: `profile.origin`, who last changed it), their

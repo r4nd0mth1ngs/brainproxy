@@ -94,7 +94,12 @@ pub const MESSAGE_COLUMNS: &[(&str, &str, &str)] = &[
     ("length", "INTEGER", "Payload length"),
     ("compressed", "INTEGER", "1 if sent with permessage-deflate"),
     ("fragments", "INTEGER", "Frames the message came in"),
-    ("intercept", "TEXT", "edited (payload is what was forwarded) or dropped, if held in intercept"),
+    (
+        "intercept",
+        "TEXT",
+        "edited (payload is what was forwarded) or dropped, if held in intercept; rule, if a match-and-replace \
+         rule rewrote the payload",
+    ),
 ];
 
 /// What the proxy (or `ws send`) records, in order. `key` names a connection within one

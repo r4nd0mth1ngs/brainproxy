@@ -45,6 +45,7 @@ import {
   type TrafficFilter,
 } from "./trafficFilter";
 import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
+import { ruleEditNote } from "./matchReplace";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
@@ -313,6 +314,15 @@ function History() {
     searchMore();
   }, [filter]);
 
+  // A rule-changed exchange has two of each: the request before the rules and as sent, the
+  // response as received and after the rules. The row's own (sent, received) show first.
+  const [beforeRules, setBeforeRules] = useState(false);
+  const [afterRules, setAfterRules] = useState(false);
+  useEffect(() => {
+    setBeforeRules(false);
+    setAfterRules(false);
+  }, [selected]);
+
   useEffect(() => {
     if (selected == null) return setEntry(null);
     let live = true;
@@ -540,13 +550,44 @@ function History() {
           }
         />
         <Split id="history-msg" dir="row">
-          <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
+          <HttpView
+            title="Request"
+            value={entry ? bodyText(beforeRules && entry.original_request ? entry.original_request : entry.request) : ""}
+            binary={isBinary(beforeRules && entry?.original_request ? entry.original_request : entry?.request)}
+            placeholder="Select a request"
+            extra={
+              entry?.original_request && (
+                <div className="seg" title={ruleEditNote(entry.entry.edited_by)}>
+                  <button className={beforeRules ? "on" : ""} onClick={() => setBeforeRules(true)}>
+                    Before rules
+                  </button>
+                  <button className={beforeRules ? "" : "on"} onClick={() => setBeforeRules(false)}>
+                    Sent
+                  </button>
+                </div>
+              )
+            }
+          />
           <HttpView
             title="Response"
-            value={entry ? rawResponse(entry) : ""}
-            binary={isBinary(entry?.response?.body)}
+            value={entry ? (afterRules && entry.modified_response ? bodyText(entry.modified_response) : rawResponse(entry)) : ""}
+            binary={isBinary(afterRules && entry?.modified_response ? entry.modified_response : entry?.response?.body)}
             placeholder={entry?.entry.error ?? ""}
-            extra={entry?.duration_ms != null && <span className="muted">{entry.duration_ms} ms</span>}
+            extra={
+              <>
+                {entry?.modified_response && (
+                  <div className="seg" title={ruleEditNote(entry.response_edits)}>
+                    <button className={afterRules ? "" : "on"} onClick={() => setAfterRules(false)}>
+                      Received
+                    </button>
+                    <button className={afterRules ? "on" : ""} onClick={() => setAfterRules(true)}>
+                      After rules
+                    </button>
+                  </div>
+                )}
+                {entry?.duration_ms != null && <span className="muted">{entry.duration_ms} ms</span>}
+              </>
+            }
           />
         </Split>
       </Split>

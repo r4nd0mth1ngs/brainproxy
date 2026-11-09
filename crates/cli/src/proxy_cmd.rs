@@ -15,6 +15,7 @@ use brainproxy_core::proxy::config::{
     RULE_IDS, SCOPE_KEY,
 };
 use brainproxy_core::proxy::{CertAuthority, ProxyOptions, ProxyState, STATE_KEY};
+use brainproxy_core::rules::{Engine, MatchKind, RuleAction};
 use brainproxy_core::store::{HistoryFilter, Store};
 use brainproxy_core::{codec, Error};
 use clap::{Subcommand, ValueEnum};
@@ -375,20 +376,63 @@ pub enum ScopeCmd {
     Check { host: String },
 }
 
+/// What a rule works on beyond its location, match and replacement: `rules add` saves it,
+/// `rules test` tries it unsaved.
+#[derive(clap::Args, Clone, Default)]
+pub struct RuleOptions {
+    /// How --match is read: a regex (the replacement may use $1), literal text (each occurrence
+    /// is replaced with --replace as written), or whole (the whole value, when it equals --match).
+    #[arg(long, value_parser = MatchKind::ALL.to_vec(), default_value = "regex")]
+    pub match_kind: String,
+    /// The header (with request-header or response-header) or query parameter (query-param) the
+    /// rule works on: --match and --replace then act on its value, and --action says what to do.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// With --name: set (rewrite the value where --match matches; with no --match, set it, adding
+    /// the header or parameter if there is none), add (another one, whatever is there), or
+    /// remove (with --match: only where the value matches). Default set.
+    #[arg(long, value_parser = RuleAction::ALL.to_vec())]
+    pub action: Option<String>,
+    /// Whose traffic the rule applies to, comma-separated: proxy, send (the app's Replay too),
+    /// fuzz, scan (active scans and checks); a ws-message rule: ws-to-server, ws-to-client.
+    /// Default: proxy (a ws-message rule: both directions).
+    #[arg(long, value_delimiter = ',', value_parser = Engine::ALL.to_vec())]
+    pub applies_to: Vec<String>,
+    /// Only for targets whose host matches this regex (case-insensitive).
+    #[arg(long)]
+    pub host: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum MessageArg {
+    Request,
+    Response,
+    WsToServer,
+    WsToClient,
+}
+
 #[derive(Subcommand)]
 pub enum RulesCmd {
-    /// List match-and-replace rules.
+    /// List match-and-replace rules. Its JSON is what `rules import` reads.
     List,
-    /// Add a rule. Header rules match each header line; an empty --match adds --replace as a new header.
+    /// Add a rule. Locations: request-line, request-header, request-body, response-header and
+    /// response-body match in the raw text (header rules match each header line; an empty --match
+    /// adds --replace as a new header); method, path, query-param (--name), status and, with
+    /// --name, request-header and response-header work on that one value; ws-message on the
+    /// payload of WebSocket messages the proxy relays.
     Add {
         #[arg(long, value_parser = RuleLocation::ALL.to_vec())]
         location: String,
-        /// Regex to match (Rust syntax). Empty with a header location means "add header".
+        /// What to match: a regex (Rust syntax) unless --match-kind says otherwise. Empty: with a
+        /// header location and no --name, "add header"; with a regex on request-line or a body,
+        /// nothing; otherwise the whole value.
         #[arg(long = "match", default_value = "")]
         pattern: String,
-        /// Replacement; $1-style group references allowed. Empty removes the match.
+        /// Replacement; $1-style group references allowed with a regex. Empty removes the match.
         #[arg(long, default_value = "")]
         replace: String,
+        #[command(flatten)]
+        options: RuleOptions,
         #[arg(long)]
         comment: Option<String>,
         /// Add the rule disabled.
@@ -413,6 +457,65 @@ pub enum RulesCmd {
     },
     /// Remove all rules.
     Clear,
+    /// Try rules on a message without sending anything: prints the message after the rules and
+    /// which rules changed it. The message is a raw request or response from FILE or stdin, or
+    /// a history row's (--history: its request and its response). By default the enabled rules
+    /// apply as --as would apply them; --rule picks saved rules (enabled or not, whatever they
+    /// apply to), and --location with --match, --replace and the other `rules add` flags tries
+    /// a rule that isn't saved.
+    Test {
+        /// File holding the message; '-' or omitted reads stdin (unless --history is given).
+        /// Through MCP the message comes from stdin or --history.
+        file: Option<String>,
+        /// Test on this history row's request and response.
+        #[arg(long)]
+        history: Option<i64>,
+        /// What FILE holds. Default: a response if it starts with "HTTP/", else a request.
+        #[arg(long, value_enum)]
+        message: Option<MessageArg>,
+        /// The engine whose rules apply to a request or response.
+        #[arg(long = "as", value_parser = ["proxy", "send", "fuzz", "scan"], default_value = "proxy")]
+        engine: String,
+        /// Only these saved rules (ids, comma-separated).
+        #[arg(long = "rule", value_delimiter = ',')]
+        rules: Vec<u32>,
+        /// Try an unsaved rule with this location (after any --rule).
+        #[arg(long, value_parser = RuleLocation::ALL.to_vec())]
+        location: Option<String>,
+        /// The unsaved rule's --match, as for `rules add`.
+        #[arg(long = "match", default_value = "")]
+        pattern: String,
+        /// The unsaved rule's --replace, as for `rules add`.
+        #[arg(long, default_value = "")]
+        replace: String,
+        #[command(flatten)]
+        options: RuleOptions,
+        /// The host the message is for, for rules with a --host condition. Default: the history
+        /// row's, else the request's Host header.
+        #[arg(long)]
+        target_host: Option<String>,
+        /// Print only the message after the rules (with --history: the request, or with
+        /// --message response the response).
+        #[arg(long)]
+        raw: bool,
+        #[arg(long, default_value_t = 65536)]
+        max_body: usize,
+    },
+    /// Add rules from JSON, as `rules list` prints them. Each gets a new id and the importer's
+    /// origin, and is checked as `rules add` checks it.
+    Import {
+        /// File holding the JSON; '-' or omitted reads stdin. Through MCP the rules come from stdin.
+        file: Option<String>,
+        /// Remove the rules there are first.
+        #[arg(long)]
+        replace: bool,
+        /// Add them all disabled.
+        #[arg(long)]
+        disabled: bool,
+        /// As for `rules add`, for every rule imported.
+        #[arg(long)]
+        host_header_test: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2149,6 +2252,33 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
     Ok(())
 }
 
+/// A rule from `rules add`'s flags (or `rules test`'s), not yet checked or given an id.
+fn rule_from(
+    location: &str,
+    pattern: String,
+    replace: String,
+    options: RuleOptions,
+    host_header_test: bool,
+) -> Result<Rule, Error> {
+    let mut applies_to = Vec::new();
+    for e in &options.applies_to {
+        let e = Engine::parse(e)?;
+        if !applies_to.contains(&e) {
+            applies_to.push(e);
+        }
+    }
+    Ok(Rule {
+        matcher: MatchKind::parse(&options.match_kind)?,
+        name: options.name,
+        action: options.action.as_deref().map(RuleAction::parse).transpose()?,
+        applies_to,
+        host: options.host.filter(|h| !h.is_empty()),
+        origin: Some(brainproxy_core::provenance::origin().to_string()),
+        host_header_test,
+        ..Rule::new(0, RuleLocation::parse(location)?, &pattern, &replace)
+    })
+}
+
 pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
     let mut rules: Vec<Rule> = store.setting(RULES_KEY)?;
@@ -2173,17 +2303,28 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             });
             return Ok(());
         }
-        RulesCmd::Add { location, pattern, replace, comment, disabled, host_header_test } => {
-            let mut rule = Rule {
-                id: 0,
-                location: RuleLocation::parse(&location)?,
-                pattern,
-                replace,
-                enabled: !disabled,
-                comment,
-                origin: Some(brainproxy_core::provenance::origin().to_string()),
-                host_header_test,
-            };
+        RulesCmd::Test {
+            file,
+            history,
+            message,
+            engine,
+            rules: picked,
+            location,
+            pattern,
+            replace,
+            options,
+            target_host,
+            raw,
+            max_body,
+        } => {
+            let draft = location.map(|l| rule_from(&l, pattern, replace, options, false)).transpose()?;
+            let test = RuleTest { file, history, message, engine: Engine::parse(&engine)?, picked, draft, target_host };
+            return test_rules(&store, &rules, test, raw, max_body, out);
+        }
+        RulesCmd::Add { location, pattern, replace, options, comment, disabled, host_header_test } => {
+            let mut rule = rule_from(&location, pattern, replace, options, host_header_test)?;
+            rule.enabled = !disabled;
+            rule.comment = comment;
             brainproxy_core::proxy::config::validate_rule(&rule)?;
             // Never one a removed rule had: an old history row's `edited_by` names it.
             rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
@@ -2192,6 +2333,32 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
                 host_warning = check_rule_host(&store, &rule, host_header_test, out)?;
             }
             rules.push(rule);
+        }
+        RulesCmd::Import { file, replace, disabled, host_header_test } => {
+            let imported = read_rules(file.as_deref())?;
+            if replace {
+                rules.clear();
+            }
+            // Checked before any is given an id, so a bad one leaves the rules as they were.
+            for rule in &imported {
+                brainproxy_core::proxy::config::validate_rule(rule)
+                    .map_err(|e| Error::InvalidInput(format!("rule {} of the import: {e}", rule.id)))?;
+            }
+            for mut rule in imported {
+                let listed = rule.id;
+                rule.enabled &= !disabled;
+                // Whoever imports a rule answers for it, as whoever adds one does; and only the
+                // command can say a Host it sets is meant, not the file.
+                rule.origin = Some(brainproxy_core::provenance::origin().to_string());
+                rule.host_header_test = host_header_test;
+                rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
+                if rule.enabled {
+                    let checked = Rule { id: listed, ..rule.clone() };
+                    let warning = check_rule_host(&store, &checked, host_header_test, out)?;
+                    host_warning = host_warning.or(warning);
+                }
+                rules.push(rule);
+            }
         }
         RulesCmd::Remove { id } => {
             let i = find(&mut rules, id)?;
@@ -2223,6 +2390,199 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     Ok(())
 }
 
+/// The rules in an import: a JSON list of rules, or what `rules list` prints (`{"rules": [...]}`,
+/// alone or as a command's `data`). Through MCP it comes from the call's stdin: a file an agent
+/// names could be any the server can read, and a refusal would quote it.
+fn read_rules(file: Option<&str>) -> Result<Vec<Rule>, Error> {
+    let bytes = match file {
+        Some(path) if path != "-" => {
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "rules import FILE: through MCP the rules come from the call's stdin".into(),
+                ));
+            }
+            std::fs::read(path).map_err(|e| Error::InvalidInput(format!("cannot read rules file {path:?}: {e}")))?
+        }
+        _ => crate::read_input(None)?,
+    };
+    let bad = |e: serde_json::Error| Error::InvalidInput(format!("the import isn't a list of rules: {e}"));
+    let value: Value = serde_json::from_slice(&bytes).map_err(bad)?;
+    let list = match &value {
+        Value::Array(_) => &value,
+        v if v["rules"].is_array() => &v["rules"],
+        v if v["data"]["rules"].is_array() => &v["data"]["rules"],
+        _ => return Err(Error::InvalidInput("the import isn't a list of rules, nor what `rules list` prints".into())),
+    };
+    // A rule from another project has an id there; one written by hand may have none.
+    let mut rules = Vec::new();
+    for (i, item) in list.as_array().into_iter().flatten().enumerate() {
+        let mut item = item.clone();
+        if item.is_object() && item.get("id").is_none() {
+            item["id"] = json!(i + 1);
+        }
+        rules.push(
+            serde_json::from_value::<Rule>(item)
+                .map_err(|e| Error::InvalidInput(format!("rule {} of the import: {e}", i + 1)))?,
+        );
+    }
+    Ok(rules)
+}
+
+/// What `rules test` was asked to try, and on what.
+struct RuleTest {
+    file: Option<String>,
+    history: Option<i64>,
+    message: Option<MessageArg>,
+    engine: Engine,
+    picked: Vec<u32>,
+    draft: Option<Rule>,
+    target_host: Option<String>,
+}
+
+/// `rules test`: applies rules to a message and shows what they made of it. Nothing is sent
+/// and nothing is saved.
+fn test_rules(
+    store: &Store,
+    saved: &[Rule],
+    test: RuleTest,
+    raw: bool,
+    max_body: usize,
+    out: &Out,
+) -> Result<(), Error> {
+    use brainproxy_core::rules::{RuleSet, Ruled};
+    if test.history.is_some() && test.file.is_some() {
+        return Err(Error::InvalidInput("give FILE or --history, not both".into()));
+    }
+    if crate::mcp::in_tool_call() && test.file.as_deref().is_some_and(|f| f != "-") {
+        return Err(Error::InvalidInput(
+            "rules test FILE: through MCP the message comes from the call's stdin or from --history: the result \
+             shows the file, so any file the server can read could be read back"
+                .into(),
+        ));
+    }
+    // The messages to try: (what it is, its bytes).
+    let mut host = test.target_host.clone();
+    let mut messages: Vec<(MessageArg, Vec<u8>)> = Vec::new();
+    match test.history {
+        Some(id) => {
+            let item = store.get(id)?;
+            host.get_or_insert(item.target.host.clone());
+            // The request as it was before the rules of its day, if they changed it.
+            let request = item.rule_edit.and_then(|e| e.original_request).unwrap_or(item.request);
+            match test.message {
+                Some(MessageArg::WsToServer | MessageArg::WsToClient) => {
+                    return Err(Error::InvalidInput(
+                        "--history tests a request and its response; a WebSocket message comes from FILE or stdin"
+                            .into(),
+                    ))
+                }
+                Some(MessageArg::Request) => messages.push((MessageArg::Request, request)),
+                Some(MessageArg::Response) => messages.push((MessageArg::Response, item.response)),
+                None => {
+                    messages.push((MessageArg::Request, request));
+                    if !item.response.is_empty() {
+                        messages.push((MessageArg::Response, item.response));
+                    }
+                }
+            }
+        }
+        None => {
+            let bytes = match test.file.as_deref() {
+                Some(path) if path != "-" => std::fs::read(path)
+                    .map_err(|e| Error::InvalidInput(format!("cannot read message file {path:?}: {e}")))?,
+                _ => crate::read_input(None)?,
+            };
+            let kind = test.message.unwrap_or(if bytes.starts_with(b"HTTP/") {
+                MessageArg::Response
+            } else {
+                MessageArg::Request
+            });
+            // A head typed with bare line feeds is read as `send` reads a request's.
+            let bytes = match kind {
+                MessageArg::Request | MessageArg::Response => {
+                    RawRequest::from_bytes(bytes).normalize_line_endings().into_bytes()
+                }
+                _ => bytes,
+            };
+            if kind == MessageArg::Request && host.is_none() {
+                host = RawRequest::from_bytes(bytes.clone()).infer_target("https").ok().map(|t| t.host);
+            }
+            messages.push((kind, bytes));
+        }
+    }
+    let host = host.unwrap_or_default();
+    let engine_for = |kind: MessageArg| match kind {
+        MessageArg::Request | MessageArg::Response => test.engine,
+        MessageArg::WsToServer => Engine::WsToServer,
+        MessageArg::WsToClient => Engine::WsToClient,
+    };
+    // The rules to try. Picked ones and an unsaved one are tried whatever they apply to and
+    // whether or not they are enabled: they are what is being tested. Otherwise the engine's own.
+    let chosen = !test.picked.is_empty() || test.draft.is_some();
+    let mut tried: Vec<Rule> = Vec::new();
+    for id in &test.picked {
+        tried.push(saved.iter().find(|r| r.id == *id).cloned().ok_or_else(|| Error::NotFound(format!("rule {id}")))?);
+    }
+    if let Some(draft) = test.draft {
+        brainproxy_core::proxy::config::validate_rule(&draft)?;
+        tried.push(draft);
+    }
+    if !chosen {
+        // The engine's own: the enabled rules that list it (or, for a message, its direction).
+        let engines: Vec<Engine> = messages.iter().map(|(kind, _)| engine_for(*kind)).collect();
+        let applies = |r: &&Rule| r.enabled && r.engines().iter().any(|e| engines.contains(e));
+        tried = saved.iter().filter(applies).cloned().collect();
+    }
+    let mut results = serde_json::Map::new();
+    let mut texts = Vec::new();
+    let mut first_bytes = None;
+    for (kind, bytes) in messages {
+        let engine = engine_for(kind);
+        let rules: Vec<Rule> = tried
+            .iter()
+            .cloned()
+            .map(|r| if chosen { Rule { enabled: true, applies_to: vec![engine], ..r } } else { r })
+            // A chosen rule for the other kind of traffic (a WebSocket rule on a request) can't apply.
+            .filter(|r| !chosen || (r.location == RuleLocation::WsMessage) == engine.is_ws())
+            .collect();
+        let set = RuleSet::compile(&rules)?;
+        let ruled: Ruled = match kind {
+            MessageArg::Request => set.request(engine, &host, bytes),
+            MessageArg::Response => set.response(engine, &host, bytes),
+            MessageArg::WsToServer | MessageArg::WsToClient => set.ws_message(engine, &host, &bytes),
+        };
+        let name = match kind {
+            MessageArg::Request => "request",
+            MessageArg::Response => "response",
+            MessageArg::WsToServer | MessageArg::WsToClient => "message",
+        };
+        let mut result = json!({
+            "changed": ruled.changed(),
+            "rules": ruled.ids(),
+            "result": body_value(&ruled.bytes, max_body),
+        });
+        if let Some(original) = &ruled.original {
+            result["original"] = body_value(original, max_body);
+        }
+        results.insert(name.to_string(), result);
+        let by = match ruled.ids().as_slice() {
+            [] => "unchanged".to_string(),
+            ids => format!("changed by rule {}", ids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),
+        };
+        texts.push(format!("{name}: {by}\n{}", crate::output::escape_lines(&String::from_utf8_lossy(&ruled.bytes))));
+        first_bytes.get_or_insert(ruled.bytes);
+    }
+    if raw {
+        out.raw(&first_bytes.unwrap_or_default());
+        return Ok(());
+    }
+    let mut data = Value::Object(results);
+    data["host"] = json!(host);
+    data["tried"] = json!(tried.iter().map(|r| r.id).collect::<Vec<_>>());
+    out.ok(data, || texts.join("\n\n"));
+    Ok(())
+}
+
 /// The rules the proxy leaves out when it loads them (see [`breaks_head`]), with why.
 fn skipped_rules(rules: &[Rule]) -> Value {
     let skipped = rules.iter().filter(|r| breaks_head(r)).map(|r| {
@@ -2232,7 +2592,7 @@ fn skipped_rules(rules: &[Rule]) -> Value {
 }
 
 /// Checks a request rule about to take effect for a Host the scope doesn't list that it would put
-/// on proxied requests (see [`rule_host`]), as `send` checks a request's.
+/// on requests (see [`rule_host`]), as `send` checks a request's.
 fn check_rule_host(store: &Store, rule: &Rule, test: bool, out: &Out) -> Result<Option<String>, Error> {
     let guard = store.guard()?;
     // Names the engagement lists, for requests the rule may rewrite: a wildcard as one of its hosts.
@@ -2248,26 +2608,47 @@ fn check_rule_host(store: &Store, rule: &Rule, test: bool, out: &Out) -> Result<
     crate::mcp::check_host_setting(&format!("rule {}", rule.id), rule_host(&guard, &names, rule), test, out)
 }
 
-/// The Host the scope doesn't list that a request rule would put on proxied requests: one its
-/// replacement writes (a Host header line, or an absolute URL in the request line), or one it
-/// makes of the Host of a request to one of `names`. A rule can match anything, so this is no
-/// proof: a rule that rewrites only requests these don't look like isn't caught.
+/// The Host the scope doesn't list that a request rule would put on requests: one its
+/// replacement writes (a Host header's line or value, or an absolute URL in the request line or
+/// path), or one it makes of the Host of a request to one of `names`. A rule can match anything,
+/// so this is no proof: a rule that rewrites only requests these don't look like isn't caught.
 fn rule_host(guard: &std::sync::Arc<brainproxy_core::guard::Guard>, names: &[String], rule: &Rule) -> Option<String> {
     use brainproxy_core::http::client::unlisted_host;
     let replace = rule.replace.trim();
-    let written = match rule.location {
-        RuleLocation::RequestHeader => replace
-            .split_once(':')
-            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
-            .and_then(|(_, v)| unlisted_host(Some(guard), v)),
-        RuleLocation::RequestLine => replace.find("://").and_then(|at| {
+    // A URL in what is written into the request line.
+    let url_host = || {
+        replace.find("://").and_then(|at| {
             let start = replace[..at].rfind(' ').map_or(0, |i| i + 1);
             let url = replace[start..].split(' ').next().unwrap_or_default();
             match Target::from_url(url) {
                 Ok(t) => unlisted_host(Some(guard), &t.host),
                 Err(_) => Some(url.to_string()),
             }
-        }),
+        })
+    };
+    // What the rule makes of the request, for a part of the request line that would no longer be one part.
+    let made = || Some(format!("(what the rule makes of the request: {replace:?})"));
+    let removes = rule.action == Some(RuleAction::Remove);
+    let written = match (rule.location, rule.name.as_deref()) {
+        // A named header's value: only the Host header's can name a host. The replacement is
+        // the whole value when nothing is matched (or the whole value is); what a match in the
+        // value leaves of it is seen below, on requests to the hosts the engagement lists.
+        (RuleLocation::RequestHeader, Some(name)) => {
+            if !name.eq_ignore_ascii_case("host") || removes {
+                return None;
+            }
+            let whole = rule.pattern.is_empty() || rule.matcher == MatchKind::Whole;
+            whole.then(|| unlisted_host(Some(guard), replace)).flatten()
+        }
+        (RuleLocation::RequestHeader, None) => replace
+            .split_once(':')
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+            .and_then(|(_, v)| unlisted_host(Some(guard), v)),
+        (RuleLocation::RequestLine | RuleLocation::Path, _) => url_host(),
+        // A space would make the method or a parameter the start of another target.
+        (RuleLocation::Method | RuleLocation::QueryParam, _) if !removes => {
+            url_host().or_else(|| replace.contains(' ').then(made).flatten())
+        }
         _ => return None,
     };
     if written.is_some() {
@@ -2277,15 +2658,22 @@ fn rule_host(guard: &std::sync::Arc<brainproxy_core::guard::Guard>, names: &[Str
     // too ("^X-Zz: (.*)$" to "Hos$1"); so can a name that is the start of "Host".
     let capture = regex::Regex::new(r"\$(\d|\{|[A-Za-z_])").expect("valid");
     let copied = match rule.location {
+        _ if rule.matcher != MatchKind::Regex && rule.location != RuleLocation::RequestHeader => false,
+        // A part of the Host's value the rule takes from the request can be any host.
+        RuleLocation::RequestHeader if rule.name.is_some() => {
+            rule.matcher == MatchKind::Regex && capture.is_match(replace)
+        }
         RuleLocation::RequestHeader => {
             let name = replace.split_once(':').map_or(replace, |(k, _)| k).trim();
             let host_start = !name.is_empty() && "host".starts_with(&name.to_ascii_lowercase());
-            capture.is_match(name) || host_start
+            (rule.matcher == MatchKind::Regex && capture.is_match(name)) || host_start
         }
+        // A parameter's value is never where the target starts.
+        RuleLocation::QueryParam => false,
         _ => capture.find_iter(replace).any(|m| m.start() == 0 || replace[..m.start()].ends_with(' ')),
     };
     if copied {
-        return Some(format!("(what the rule makes of the request: {replace:?})"));
+        return made();
     }
     let compiled = brainproxy_core::proxy::config::compile_rules(&[Rule { enabled: true, ..rule.clone() }]).ok()?;
     let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };

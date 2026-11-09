@@ -45,6 +45,14 @@ pub struct Capture {
     pub sni: Option<String>,
     /// Who changed the request before it went out (intercept edits, rules), for the proxy.
     pub edited_by: Vec<crate::provenance::Edit>,
+    /// The request as it was before a match-and-replace rule changed it; the row's request is
+    /// the one that went out. Kept beside the row (see [`crate::store::RuleEdit`]).
+    pub original_request: Option<Vec<u8>>,
+    /// The response as a match-and-replace rule left it, which is what the proxy's client (or
+    /// the tool that sent the request) was given; the row's response is the one received.
+    pub modified_response: Option<Vec<u8>>,
+    /// The rules that changed the response.
+    pub response_edits: Vec<crate::provenance::Edit>,
 }
 
 impl Capture {

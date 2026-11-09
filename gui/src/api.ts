@@ -178,6 +178,8 @@ export interface HistoryItem {
   client_addr?: string | null;
   /** The TLS server name sent, when overridden with --sni. */
   sni?: string | null;
+  /** Who changed the request before it went out: an intercept edit, a session, or a match-and-replace `rule`. */
+  edited_by?: { by: string | null; rule?: number }[];
 }
 
 export interface HistoryEntry {
@@ -187,6 +189,12 @@ export interface HistoryEntry {
   request: Body;
   response: { status: number; reason: string; headers: string[]; body: Body; http_version?: string } | null;
   entry: HistoryItem;
+  /** The request before match-and-replace rules changed it (`request` is the one sent). */
+  original_request?: Body;
+  /** The response after match-and-replace rules changed it (`response` is the one received). */
+  modified_response?: Body;
+  /** The rules that changed the response. */
+  response_edits?: { by: string | null; rule?: number }[];
 }
 
 export type Risk = "critical" | "high" | "medium" | "low" | "info";

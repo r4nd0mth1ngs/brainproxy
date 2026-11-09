@@ -445,7 +445,55 @@ pub struct HistoryItem {
     pub request: Vec<u8>,
     pub response: Vec<u8>,
     pub resp_body: Option<Vec<u8>>,
+    /// What match-and-replace rules changed in the exchange, if they changed it.
+    pub rule_edit: Option<RuleEdit>,
 }
+
+/// The other side of an exchange a match-and-replace rule changed: a history row keeps the
+/// request that went out and the response that came back, and this keeps the request before the
+/// rules and the response after them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RuleEdit {
+    /// The request before the rules, when one changed it.
+    pub original_request: Option<Vec<u8>>,
+    /// The response after the rules, when one changed it.
+    pub modified_response: Option<Vec<u8>>,
+    /// The rules that changed the response (the row's `edited_by` has the request's).
+    pub response_edits: Vec<crate::provenance::Edit>,
+}
+
+/// What a match-and-replace rule changed in a history row's exchange. Not part of a schema
+/// version: [`Store::ensure_extras`] adds it to a project that lacks it, so an older build of
+/// the same schema still opens the project (and leaves the table alone). The trigger takes a
+/// row's entry with it whichever build deletes the row.
+const RULE_EDITS: &str = "
+CREATE TABLE IF NOT EXISTS rule_edits (
+    history_id INTEGER PRIMARY KEY,
+    original_request BLOB,
+    modified_response BLOB,
+    response_edits TEXT
+);
+CREATE TRIGGER IF NOT EXISTS rule_edits_history_ad AFTER DELETE ON history BEGIN
+    DELETE FROM rule_edits WHERE history_id = old.id;
+END;
+";
+
+/// Column documentation for `rule_edits`.
+pub const RULE_EDIT_COLUMNS: &[(&str, &str, &str)] = &[
+    ("history_id", "INTEGER", "The history row of the exchange a match-and-replace rule changed"),
+    (
+        "original_request",
+        "BLOB",
+        "The request before the rules (history.request is the one sent); NULL when no rule changed the request",
+    ),
+    (
+        "modified_response",
+        "BLOB",
+        "The response after the rules, as the proxy's client or the sending tool was given it (history.response \
+         is the one received); NULL when no rule changed the response",
+    ),
+    ("response_edits", "TEXT", "JSON list of the rules that changed the response: {by, rule}"),
+];
 
 #[derive(Debug, Default, Clone)]
 pub struct HistoryFilter {
@@ -626,7 +674,7 @@ impl Store {
             Ok(version)
         };
         if schema_version()? == SCHEMA_VERSION {
-            return self.ensure_indexes();
+            return self.ensure_extras();
         }
         // One process migrates. Another opening the project at the same time waits for the
         // write lock (IMMEDIATE takes it under the busy timeout), then finds it done: some
@@ -696,13 +744,21 @@ impl Store {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
-        self.ensure_indexes()
+        self.ensure_extras()
     }
 
-    /// Indexes added after the schema version that needs them, so a project of that version
-    /// gets them without a new version an older build would refuse. Checked first, so an open
-    /// that has them writes nothing.
-    fn ensure_indexes(&self) -> Result<()> {
+    /// Indexes and tables added after the schema version that needs them, so a project of that
+    /// version gets them without a new version an older build would refuse. Checked first, so
+    /// an open that has them writes nothing.
+    fn ensure_extras(&self) -> Result<()> {
+        let has_rule_edits: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'rule_edits_history_ad')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_rule_edits {
+            self.conn.execute_batch(RULE_EDITS)?;
+        }
         // A new finding looks up the issue holding its alert on its host.
         const INDEXES: &[(&str, &str)] = &[("findings_alert_host_issue", "findings(alert_ref, host, issue_id)")];
         for (name, on) in INDEXES {
@@ -1156,6 +1212,17 @@ impl Store {
         Ok(())
     }
 
+    /// Keeps the response a match-and-replace rule made of row `id`'s (see [`RuleEdit`]), for a
+    /// sender that applies its response rules once the row is complete.
+    pub fn set_modified_response(&self, id: i64, response: &[u8], edits: &[crate::provenance::Edit]) -> Result<()> {
+        let c = Capture {
+            modified_response: Some(response.to_vec()),
+            response_edits: edits.to_vec(),
+            ..Default::default()
+        };
+        write_rule_edit(&self.conn, id, &c)
+    }
+
     /// Writes rows `new` and completes rows `done` (as [`Store::update_capture`]) in one
     /// transaction; returns the new rows' ids. Senders with many requests out at once write
     /// their rows this way, one commit for many rows (see [`crate::sent::RowBatch`]).
@@ -1281,16 +1348,30 @@ impl Store {
         self.conn
             .query_row(
                 &format!(
-                    "SELECT {ENTRY_COLS}, scheme, host, port, request, response, resp_body FROM history WHERE id = ?1"
+                    "SELECT {ENTRY_COLS}, scheme, host, port, request, response, resp_body,
+                        e.history_id AS ruled, e.original_request, e.modified_response, e.response_edits
+                     FROM history LEFT JOIN rule_edits e ON e.history_id = history.id WHERE id = ?1"
                 ),
                 [id],
                 |r| {
+                    let rule_edit = match r.get::<_, Option<i64>>("ruled")? {
+                        Some(_) => Some(RuleEdit {
+                            original_request: r.get("original_request")?,
+                            modified_response: r.get("modified_response")?,
+                            response_edits: r
+                                .get::<_, Option<String>>("response_edits")?
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
+                        }),
+                        None => None,
+                    };
                     Ok(HistoryItem {
                         entry: row_to_entry(r)?,
                         target: Target { scheme: r.get("scheme")?, host: r.get("host")?, port: r.get("port")? },
                         request: r.get("request")?,
                         response: r.get("response")?,
                         resp_body: r.get("resp_body")?,
+                        rule_edit,
                     })
                 },
             )
@@ -1493,6 +1574,29 @@ fn update_capture(tx: &Connection, id: i64, c: &Capture) -> Result<()> {
         return Err(Error::NotFound(format!("history item {id}")));
     }
     tx.execute(&format!("INSERT INTO history_fts(rowid, {FTS}) SELECT id, {FTS} FROM history WHERE id = ?1"), [id])?;
+    write_rule_edit(tx, id, c)
+}
+
+/// Keeps what match-and-replace rules changed in row `id`'s exchange, if `c` says they changed
+/// it. A row completed later (its request recorded before it went out) adds to what is there.
+fn write_rule_edit(conn: &Connection, id: i64, c: &Capture) -> Result<()> {
+    if c.original_request.is_none() && c.modified_response.is_none() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO rule_edits (history_id, original_request, modified_response, response_edits)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(history_id) DO UPDATE SET
+            original_request = COALESCE(excluded.original_request, original_request),
+            modified_response = COALESCE(excluded.modified_response, modified_response),
+            response_edits = COALESCE(excluded.response_edits, response_edits)",
+        params![
+            id,
+            c.original_request,
+            c.modified_response,
+            (!c.response_edits.is_empty()).then(|| serde_json::to_string(&c.response_edits).unwrap_or_default()),
+        ],
+    )?;
     Ok(())
 }
 
@@ -1536,7 +1640,9 @@ pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
             serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    write_rule_edit(conn, id, c)?;
+    Ok(id)
 }
 
 /// Binds parameters that are canonical integers ("42", "-7"; not "007" or "+5")
@@ -1681,6 +1787,67 @@ mod tests {
             sni: None,
         };
         store.record_exchange("send", &ex).unwrap()
+    }
+
+    #[test]
+    fn a_rule_changed_exchange_keeps_both_versions_beside_its_row() {
+        use crate::provenance::Edit;
+        let dir = std::env::temp_dir().join(format!("bp-store-rule-edits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let mut store = Store::open(&path).unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let sent = b"GET /b HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let original = b"GET /a HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec();
+        // Written before the request goes out, with the request as it was before the rules.
+        let pending = Capture {
+            original_request: Some(original.clone()),
+            ..Capture::new("send", &target, sent, None, None, Some("pending"))
+        };
+        let id = store.record(&pending).unwrap();
+        assert_eq!(
+            store.get(id).unwrap().rule_edit,
+            Some(RuleEdit { original_request: Some(original.clone()), ..Default::default() })
+        );
+        // Completed with the answer: what the rules made of it is added, and the original stays.
+        let received = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+        let modified = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let edits = vec![Edit { by: Some("cli".into()), rule: Some(4), ..Default::default() }];
+        let done = Capture {
+            modified_response: Some(modified.clone()),
+            response_edits: edits.clone(),
+            ..Capture::new("send", &target, sent, Some(received), Some(3), None)
+        };
+        store.update_capture(id, &done).unwrap();
+        let item = store.get(id).unwrap();
+        assert_eq!((item.request.as_slice(), item.response.as_slice()), (&sent[..], &received[..]));
+        let both = RuleEdit {
+            original_request: Some(original),
+            modified_response: Some(modified.clone()),
+            response_edits: edits.clone(),
+        };
+        assert_eq!(item.rule_edit, Some(both));
+        // A sender that applies its response rules once the row is complete adds it then.
+        let plain = sample(&store);
+        assert_eq!(store.get(plain).unwrap().rule_edit, None);
+        store.set_modified_response(plain, &modified, &edits).unwrap();
+        let later = RuleEdit { modified_response: Some(modified), response_edits: edits, ..Default::default() };
+        assert_eq!(store.get(plain).unwrap().rule_edit, Some(later));
+        // A row that is deleted takes its entry with it, whichever build deletes it.
+        store.conn.execute("DELETE FROM history WHERE id = ?1", [id]).unwrap();
+        let left: i64 = store.conn.query_row("SELECT count(*) FROM rule_edits", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 1);
+        // A project of this schema version from before the table gets it when it is opened, and
+        // is still the same version: an older build opens it as before.
+        store.conn.execute_batch("DROP TRIGGER rule_edits_history_ad; DROP TABLE rule_edits;").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.get(plain).unwrap().rule_edit, None);
+        store.set_modified_response(plain, b"x", &[]).unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Takes a project back to before schema v13.

@@ -160,6 +160,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
   (and a request line that doesn't parse is quoted in the error), so it could send any file the
   server can read to a target and have it read back from history. An agent races a group of two
   with the primary as `url` and the other request as the call's `stdin` (`also: ["-"]`).
+- `rules_test` and `rules_import` with a `file` other than `-`: the tester shows the message it
+  was given, so a file could be read back, and an import's rules come from the agent anyway. The
+  message, or the rules' JSON, is the call's `stdin`; `rules_test` also takes `history`. Neither
+  sends anything. `rules_import` takes `host_header_test` from the call, never from the JSON.
 - A local file for `import_api`, `import_har`, `import_openapi`, `import_postman`,
   `import_graphql`'s `schema`, `scan_active`'s `api`, or any `environment`, outside the project
   file's folder (symlinks are followed before the check, and the resolved file is what is
@@ -210,13 +214,15 @@ Some arguments need a person, so a command run for a tool call (the server sets
   `ws_send`, `scan_active` (for its base requests: a rule's own Host is its test),
   `auth_login`, `auth_status`, `auth_macro_run` and `intercept_forward` (for hosts an edit
   brings in) send it when `host_header_test` is set, so request smuggling tests (CL.TE, TE.CL, a
-  request after the body) need it too. A proxy rule an agent added refuses the
-  requests it gives a foreign Host unless `rules_add` (or `rules_enable`) had `host_header_test`. On a shared front end such
+  request after the body) need it too. A match-and-replace rule an agent added (raw or structured: a
+  `request-header` rule named `Host`, a `path` rule that makes the target an absolute URL) refuses the
+  requests it gives a foreign Host unless `rules_add`, `rules_enable` or `rules_import` had `host_header_test`,
+  in the proxy and in the `send`, fuzz and scan requests of rules that apply there. On a shared front end such
   a request to an in-scope address can reach a site outside the scope; a Host-header test needs
   one, so the flag puts the intent on record. The output's `host_warning` names the host either
   way, as it does outside MCP. The same goes for settings that put such a Host on requests still
   to come: `auth_add` (`headers`, `token_header`, `login_request`, `login_header`),
-  `auth_macro_add` steps, and `rules_add` or `rules_enable` with a rule that writes or rewrites
+  `auth_macro_add` steps, and `rules_add`, `rules_enable` or `rules_import` with a rule that writes or rewrites
   the Host; the MANUAL's Concepts section has the details.
 - `browser open` isn't a tool, and the command refuses a tool call: the browser uses the
   project's profile, with the person's cookies and sign-ins, and the pages it loads would be

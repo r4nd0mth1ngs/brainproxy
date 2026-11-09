@@ -28,6 +28,7 @@ use crate::error::{Error, Result};
 use crate::http::client::{final_response, sent_sni};
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, Exchange, RawRequest, Target};
+use crate::rules::{EngineRules, Ruled};
 use crate::store::Store;
 
 /// The error of a row whose request went out and whose outcome was never recorded.
@@ -53,6 +54,9 @@ pub struct SentLog {
     omit_body: Option<&'static str>,
     /// The sending client's `--sni`, recorded on the rows of TLS targets (see [`sent_sni`]).
     sni: Option<String>,
+    /// What match-and-replace rules did to the request the rows are for: the request before
+    /// them and who changed it (see [`SentLog::ruled`]).
+    ruled: Option<(Vec<u8>, Vec<crate::provenance::Edit>)>,
 }
 
 impl SentLog {
@@ -62,7 +66,7 @@ impl SentLog {
     }
 
     pub fn new(store: Store, source: &'static str, no_store: bool) -> Self {
-        Self { store, source, omit: no_store.then_some(NOT_STORED), omit_body: None, sni: None }
+        Self { store, source, omit: no_store.then_some(NOT_STORED), omit_body: None, sni: None, ruled: None }
     }
 
     /// Rows keep no content, marked with `reason`.
@@ -82,6 +86,22 @@ impl SentLog {
         self.omit.is_some()
     }
 
+    /// The rows written from now on are for a request match-and-replace rules changed: they say
+    /// which rules (`edited_by`) and keep the request as it was before them. Rows that keep no
+    /// content keep neither.
+    pub fn ruled(&mut self, request: &crate::rules::Ruled) {
+        self.ruled = request.original.clone().map(|original| (original, request.edits()));
+    }
+
+    /// Keeps what the rules made of row `id`'s response, when they changed it and the row keeps
+    /// its content.
+    pub fn ruled_response(&self, id: i64, response: &crate::rules::Ruled) -> Result<()> {
+        if !response.changed() || self.omit.is_some() || self.omit_body.is_some() {
+            return Ok(());
+        }
+        self.store.set_modified_response(id, &response.bytes, &response.edits())
+    }
+
     /// Rows record the TLS server name `client` sends in place of a target's host (`--sni`).
     pub fn sent_by(mut self, client: &Client) -> Self {
         self.sni = client.options().sni.clone();
@@ -97,7 +117,11 @@ impl SentLog {
         duration_ms: Option<u64>,
         error: Option<&str>,
     ) -> Capture {
-        let c = self.content(target, request, response, duration_ms, error);
+        let mut c = self.content(target, request, response, duration_ms, error);
+        if let Some((original, edits)) = self.ruled.as_ref().filter(|_| self.omit.is_none()) {
+            c.original_request = Some(original.clone());
+            c.edited_by = edits.clone();
+        }
         Capture { sni: sent_sni(self.sni.as_deref(), target), ..c }
     }
 
@@ -335,8 +359,18 @@ impl Rows {
     /// Writes the row of `request` (as recorded) as about to go out, and waits until it is
     /// committed. The returned row completes itself as given up if dropped open.
     pub async fn open(&self, target: &Target, request: Vec<u8>) -> Result<OpenRow> {
+        self.open_ruled(target, request, None).await
+    }
+
+    /// [`Rows::open`] for a request match-and-replace rules changed (`ruled`, the request after
+    /// them): the row says which rules and keeps the request as it was before them.
+    async fn open_ruled(&self, target: &Target, request: Vec<u8>, ruled: Option<&Ruled>) -> Result<OpenRow> {
         let (reply, id) = tokio::sync::oneshot::channel();
-        let capture = self.capture(target, &request, None, None, Some(PENDING));
+        let mut capture = self.capture(target, &request, None, None, Some(PENDING));
+        if let Some(ruled) = ruled.filter(|r| r.changed()) {
+            capture.original_request = ruled.original.clone();
+            capture.edited_by = ruled.edits();
+        }
         (self.write)(RowWrite::Pending { capture: Box::new(capture), reply });
         let Some(id) = id.await.ok().flatten() else {
             return Err(Error::Protocol("the request could not be recorded in history, so it wasn't sent".into()));
@@ -348,23 +382,55 @@ impl Rows {
     /// Returns the row (None when nothing was recorded or sent) and the result. A target the
     /// engagement scope refuses outright gets no row: the client refuses it unsent.
     pub async fn send(&self, client: &Client, req: &RawRequest, target: &Target) -> (Option<i64>, Result<Exchange>) {
+        let (id, result, _) = self.send_ruled(client, req, target, None).await;
+        (id, result)
+    }
+
+    /// [`Rows::send`] for an engine that applies match-and-replace rules. `by` is the engine's
+    /// rules and what they made of the request (`req` is that, with the session applied): the
+    /// row says which rules changed it and keeps the request as it was before them. The
+    /// response rules apply to the answer: the row keeps the response as received, which is
+    /// also the exchange's, and beside it what the rules made of it, which is returned third
+    /// for the sender to read (None without response rules or without an answer: the sender
+    /// then reads the exchange's).
+    pub async fn send_ruled(
+        &self,
+        client: &Client,
+        req: &RawRequest,
+        target: &Target,
+        by: Option<(&EngineRules, &Ruled)>,
+    ) -> (Option<i64>, Result<Exchange>, Option<Ruled>) {
         if client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port)) {
-            return (None, client.send(req, target).await);
+            return (None, client.send(req, target).await, None);
         }
         let row = match client.recorded_request(req, target) {
-            Ok(recorded) => self.open(target, recorded).await,
+            Ok(recorded) => self.open_ruled(target, recorded, by.map(|(_, ruled)| ruled)).await,
             Err(e) => Err(e),
         };
         let mut row = match row {
             Ok(row) => row,
-            Err(e) => return (None, Err(e)),
+            Err(e) => return (None, Err(e), None),
         };
         let result = client.send(req, target).await;
+        let mut ruled = None;
         match &result {
-            Ok(ex) => row.answered(ex),
+            Ok(ex) => {
+                let mut c = self.capture(&ex.target, &ex.request, Some(&ex.response), Some(ex.duration_ms), None);
+                // The exchange keeps the response as received, so the rules get a copy; only
+                // when there are rules for it.
+                if let Some((rules, _)) = by.filter(|(rules, _)| rules.rewrites_responses(target)) {
+                    let response = rules.response(target, ex.response.clone());
+                    if response.changed() {
+                        c.response_edits = response.edits();
+                        c.modified_response = Some(response.bytes.clone());
+                    }
+                    ruled = Some(response);
+                }
+                row.finish(c);
+            }
             Err(e) => row.failed(&e.to_string()),
         }
-        (Some(row.id), result)
+        (Some(row.id), result, ruled)
     }
 
     /// [`Rows::send_as`] with `session` if there is one, else [`Rows::send`] with `client`.
