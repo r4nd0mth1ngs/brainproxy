@@ -356,6 +356,10 @@ fn history_exports_as_har_with_secrets_masked() {
     let d = ok(&p, &["history", "export", "--limit", "1"]);
     assert_eq!((d["entries"].as_u64(), d["truncated"].as_bool()), (Some(1), Some(true)), "{d}");
     assert_eq!(d["har"]["log"]["entries"].as_array().unwrap().len(), 1);
+    // The filter language chooses rows as it does for history list.
+    let d = ok(&p, &["history", "export", "--filter", "method=POST path:/login"]);
+    assert_eq!(d["entries"].as_u64(), Some(1), "{d}");
+    assert_eq!(d["har"]["log"]["entries"][0]["request"]["method"], "POST");
     // Unmasked on request; text mode prints the file itself.
     let o = run_as(&p, &["history", "export", "har", "--no-redact", "--source", "send"], "text");
     assert_eq!(o.code, 0, "{}", o.all);

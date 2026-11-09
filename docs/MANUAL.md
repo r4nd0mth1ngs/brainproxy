@@ -1527,7 +1527,8 @@ Crawl and active-scan scope and safety flags:
   type, to tell a static asset) or stored: each request is sent again, and the live answer is
   recorded. A HAR fetched from a URL is recorded like any document, its body omitted.
 - `history export har`: history rows as a HAR 1.2 file, chosen with `history list`'s filters
-  (`--host`, `--method`, `--status`, `--source`, `--tag`, `--origin`, `--contains`, `--after`),
+  (`--host`, `--method`, `--status`, `--source`, `--tag`, `--origin`, `--contains`, `--filter`,
+  `--after`),
   oldest first, up to `--limit` (1000; `truncated` says when more matched). Session secrets are
   masked as reports mask them (cookie values, `Authorization` credentials, API-key headers, token
   and password parameters, JWTs, the project's auth profile secrets, and each value wherever else

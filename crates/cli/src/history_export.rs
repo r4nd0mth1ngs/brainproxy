@@ -39,6 +39,9 @@ pub struct ExportArgs {
     /// Text the raw request or response, or a decoded body, contains (case-sensitive, literal).
     #[arg(long)]
     contains: Option<String>,
+    /// A query in the filter language, as `history list --filter` takes it.
+    #[arg(long)]
+    filter: Option<String>,
     /// Only entries with an id greater than this.
     #[arg(long)]
     after: Option<i64>,
@@ -74,7 +77,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
         tag: a.tag,
         origin: a.origin,
         contains: a.contains,
-        filter: None,
+        filter: a.filter,
         after_id: a.after,
         limit: Some(a.limit.saturating_add(1)),
     })?;
