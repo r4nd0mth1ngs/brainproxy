@@ -602,9 +602,58 @@ mod sys {
     }
 }
 
+/// Opens a file a background run keeps next to the project (a job's or fuzz run's log, a fuzz
+/// run's request template), readable by its owner only on Unix: a log quotes what the run
+/// saw and a template the request's credentials. Appended to, or else replaced; a file
+/// already there is made the owner's only before it is emptied.
+pub(crate) fn private_file(path: &std::path::Path, append: bool) -> std::io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.create(true);
+    if append {
+        o.append(true);
+    } else {
+        o.write(true);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let f = o.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = f.metadata()?;
+        if meta.is_file() && meta.permissions().mode() & 0o7777 != 0o600 {
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    if !append {
+        f.set_len(0)?;
+    }
+    Ok(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runs_files_are_the_owners_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-private-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let log = dir.join("p.job-1.log");
+        private_file(&log, true).unwrap().write_all(b"one\n").unwrap();
+        private_file(&log, true).unwrap().write_all(b"two\n").unwrap();
+        assert_eq!((std::fs::read_to_string(&log).unwrap().as_str(), mode(&log)), ("one\ntwo\n", 0o600));
+        let req = dir.join("p.fuzz-1.req");
+        std::fs::write(&req, "an older, longer template").unwrap();
+        std::fs::set_permissions(&req, std::fs::Permissions::from_mode(0o644)).unwrap();
+        private_file(&req, false).unwrap().write_all(b"GET / HTTP/1.1").unwrap();
+        assert_eq!((std::fs::read_to_string(&req).unwrap().as_str(), mode(&req)), ("GET / HTTP/1.1", 0o600));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn process_identity() {

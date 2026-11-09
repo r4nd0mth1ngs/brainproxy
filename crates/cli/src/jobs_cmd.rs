@@ -209,7 +209,7 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     let child_argv = with_options(argv, ["--job-id".into(), id.to_string()]);
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("job-{id}.log"));
-    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+    let log_file = process::private_file(&log, true)?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&child_argv);
     brainproxy_core::provenance::pass_on(&mut cmd);

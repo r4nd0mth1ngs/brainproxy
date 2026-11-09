@@ -500,11 +500,11 @@ fn spawn_background(
 ) -> Result<(), Error> {
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("fuzz-{run_id}.log"));
-    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+    let log_file = process::private_file(&log, true)?;
     let mut options = vec!["--attach-run".to_string(), run_id.to_string()];
     if let Some(bytes) = request {
         let path = project.with_extension(format!("fuzz-{run_id}.req"));
-        std::fs::write(&path, bytes)?;
+        std::io::Write::write_all(&mut process::private_file(&path, false)?, bytes)?;
         options.push(format!("--attach-request={}", path.display()));
     }
     let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
