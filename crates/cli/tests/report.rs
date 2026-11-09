@@ -199,7 +199,7 @@ fn values_named_with_mask_are_masked() {
             "--url",
             "https://app.test/o/7",
             "--evidence",
-            "used token TYPED7TOKEN",
+            "used value TYPED7TOKEN",
         ],
         &project,
     );
