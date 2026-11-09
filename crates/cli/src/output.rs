@@ -172,10 +172,14 @@ pub fn escape_lines(s: &str) -> String {
 }
 
 /// Writes an output file named by the caller (`--out`, `-o`). An existing file is
-/// refused unless `force`, so a stray path can't clobber something like ~/.bashrc.
+/// refused unless `force`, so a stray path can't clobber something like ~/.bashrc. On Unix
+/// the file is readable by its owner only (0600), also when `force` overwrites one: an
+/// export, report or repro may hold what a target answered, and with `--no-redact` secrets.
 pub fn write_file(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<(), brainproxy_core::Error> {
     let mut f = std::fs::OpenOptions::new();
     f.write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
     if force {
         f.create(true).truncate(true);
     } else {
@@ -187,6 +191,9 @@ pub fn write_file(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<(
         }
         _ => e.into(),
     })?;
+    // `mode` applies only to a file it creates; one overwritten keeps its own until now.
+    #[cfg(unix)]
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     Ok(f.write_all(bytes)?)
 }
 
@@ -211,6 +218,27 @@ pub fn body_value(bytes: &[u8], max: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn output_files_are_the_owners_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-write-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let new = dir.join("new.json");
+        write_file(&new, b"one", false).unwrap();
+        assert_eq!(mode(&new), 0o600);
+        let old = dir.join("old.json");
+        std::fs::write(&old, "a person's").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(write_file(&old, b"two", false), Err(brainproxy_core::Error::Conflict(_))));
+        assert_eq!((std::fs::read_to_string(&old).unwrap().as_str(), mode(&old)), ("a person's", 0o644));
+        write_file(&old, b"two", true).unwrap();
+        assert_eq!((std::fs::read_to_string(&old).unwrap().as_str(), mode(&old)), ("two", 0o600));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn escape_controls_shows_bidi_overrides() {

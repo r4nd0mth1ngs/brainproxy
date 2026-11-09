@@ -1065,7 +1065,8 @@ their owner only. `query` cannot read `auth_profiles`, which holds passwords, he
 values, and session tokens; `auth show` redacts them. `report -o`, `findings repro -o` and
 `ca export --out` refuse to overwrite an existing file unless given `--force`, and through MCP
 `--force` is refused for them and for `ca init`, so an agent writes new files only and keeps
-the CA.
+the CA. On Unix the files these and other `--out`/`-o` options write are readable by their
+owner only (0600), also one `--force` overwrites.
 
 ```sh
 export BRAINPROXY_PROJECT=~/work/acme.bpdb
