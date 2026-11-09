@@ -76,7 +76,6 @@ const SECRET_NAMES: &[&str] = &[
     "authorization",
     "otp",
     "otp_code",
-    "refresh",
     "sig",
     "key",
     "credential",
@@ -320,12 +319,22 @@ fn secret_name(name: &str) -> bool {
     SECRET_NAMES.contains(&n) || SECRET_NAME_PARTS.iter().any(|p| n.contains(p))
 }
 
-/// Whether `name = value` holds a secret: a secret name, or a code name with a long value.
+/// Whether `name = value` holds a secret: a secret name, a code name with a long value, or
+/// `refresh` with a value shaped like a token (not `?refresh=60`, `"refresh": true` or a
+/// `Refresh: 5; url=/x` header; `refresh_token` and the like are secret by name).
 fn secret_pair(name: &str, value: &str) -> bool {
     let code = value.len() >= CODE_MIN
         && value.chars().any(|c| c.is_ascii_digit())
         && value.chars().any(|c| c.is_ascii_alphabetic());
-    secret_name(name) || (code && CODE_NAMES.contains(&name.to_ascii_lowercase().as_str()))
+    let n = name.to_ascii_lowercase();
+    let refresh = n == "refresh" && refresh_token(value.trim().trim_matches('"'));
+    secret_name(name) || refresh || (code && CODE_NAMES.contains(&n.as_str()))
+}
+
+/// Whether a value named `refresh` reads as a token rather than a period, a flag or a
+/// redirect.
+fn refresh_token(v: &str) -> bool {
+    v.len() >= 8 && !v.contains(['=', ';', ' ']) && credential_shaped(v)
 }
 
 /// Whether a header's whole value is a credential (beyond Cookie, Set-Cookie and
@@ -422,19 +431,85 @@ fn auth_scheme(value: &str) -> Option<&str> {
     (AUTH_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) && !rest.trim().is_empty()).then_some(scheme)
 }
 
+/// The word before `-key` in a header name that says the key is a credential
+/// (Ocp-Apim-Subscription-Key, Api-Key, Client-Key, ...).
+const SECRET_KEY_KINDS: &[&str] = &[
+    "api",
+    "access",
+    "auth",
+    "secret",
+    "client",
+    "consumer",
+    "subscription",
+    "functions",
+    "function",
+    "private",
+    "master",
+    "app",
+    "application",
+    "license",
+    "licence",
+    "signing",
+    "encryption",
+    "session",
+    "service",
+    "developer",
+    "partner",
+    "account",
+];
+
+/// The word before `-key` in a header name whose key is data, not a credential: a cache's,
+/// a table's or a retry's (X-Cache-Key, Sort-Key, Primary-Key, X-Idempotency-Key), or a
+/// public one.
+const PLAIN_KEY_KINDS: &[&str] = &[
+    "cache",
+    "sort",
+    "primary",
+    "partition",
+    "range",
+    "hash",
+    "row",
+    "routing",
+    "idempotency",
+    "dedup",
+    "deduplication",
+    "correlation",
+    "foreign",
+    "lookup",
+    "object",
+    "shard",
+    "group",
+    "public",
+    "websocket",
+];
+
 /// Whether a header name, lowercased, reads as a credential's: it says `auth` (X-Api-Auth,
-/// X-Authorization, Authentication, Grpc-Metadata-Authorization, but not `:authority` or
-/// Author) or ends in `-key` (X-Functions-Key, Ocp-Apim-Subscription-Key).
+/// X-Authorization, Authentication, Grpc-Metadata-Authorization, but not `:authority`,
+/// Author or X-Authority), or it names a key that is a credential: `<kind>-key` for a kind
+/// in [`SECRET_KEY_KINDS`] (X-Functions-Key, Ocp-Apim-Subscription-Key), or any `X-...-Key`
+/// whose kind isn't one of [`PLAIN_KEY_KINDS`] (X-Cache-Key and Sort-Key are data).
 fn auth_or_key_name(n: &str) -> bool {
     let auth = n.contains("auth") && !(n.contains("author") && !n.contains("authoriz"));
-    auth || n.ends_with("-key")
+    let Some(rest) = n.strip_suffix("-key") else { return auth };
+    let kind = rest.rsplit('-').next().unwrap_or_default();
+    auth || (!PLAIN_KEY_KINDS.contains(&kind) && (SECRET_KEY_KINDS.contains(&kind) || n.starts_with("x-")))
+}
+
+/// Whether a value starts with an auth scheme followed by something credential-shaped
+/// (`Token abc123def`, not `Token based` or `Basic is required`).
+fn scheme_credential(value: &str) -> bool {
+    auth_scheme(value).is_some_and(|scheme| {
+        let rest = value.trim_start()[scheme.len()..].trim_start();
+        rest.split(|c: char| c.is_whitespace() || c == ',').next().is_some_and(credential_shaped)
+    })
 }
 
 /// Whether a header holds a credential, by its name or its value: the one rule a HAR file's
 /// import (which takes credentials out) and every export (which masks them) share. A known
 /// API-key header, a name [`crate::apiimport::looks_secret`] or the report rules call secret,
-/// one that says `auth` or ends in `-key`, or a value that starts with an auth scheme (Bearer,
-/// Basic, Token, Digest, Negotiate) whatever the name, and a `Sec-WebSocket-Protocol` list
+/// one that says `auth` or names a credential key (see [`auth_or_key_name`]), or a value that
+/// starts with an auth scheme (Bearer, Basic, Token, Digest, Negotiate) and a credential-shaped
+/// word whatever the name, and a `Sec-WebSocket-Protocol` list
 /// with any item but a plain subprotocol name (a token sent as one). Auth challenges and
 /// nonces ([`PLAIN_HEADERS`]) are not.
 pub fn credential_header(name: &str, value: &str) -> bool {
@@ -445,7 +520,7 @@ pub fn credential_header(name: &str, value: &str) -> bool {
     if n == "sec-websocket-protocol" {
         return subprotocol_credential(value);
     }
-    secret_header(&n) || crate::apiimport::looks_secret(&n) || auth_or_key_name(&n) || auth_scheme(value).is_some()
+    secret_header(&n) || crate::apiimport::looks_secret(&n) || auth_or_key_name(&n) || scheme_credential(value)
 }
 
 /// Whether a value masked because of its name is worth finding elsewhere. A plain word or
@@ -719,7 +794,7 @@ impl Redactor {
             .into_owned();
         out = MULTIPART_FIELD
             .replace_all(&out, |c: &Captures| {
-                if secret_name(&c[2]) {
+                if secret_pair(&c[2], &c[3]) {
                     format!("{}{}", &c[1], self.secret(&c[3]))
                 } else {
                     c[0].to_string()
@@ -767,7 +842,7 @@ impl Redactor {
         }
         out = XML_ELEMENT
             .replace_all(&out, |c: &Captures| {
-                if secret_name(&c[2]) {
+                if secret_pair(&c[2], &c[4]) {
                     format!("<{}{}>{}</", &c[1], c.get(3).map_or("", |m| m.as_str()), self.secret(&c[4]))
                 } else {
                     c[0].to_string()
@@ -778,7 +853,7 @@ impl Redactor {
             .replace_all(&out, |c: &Captures| {
                 // name, id, value and content are read with the tag they are in.
                 let plain = matches!(c[2].to_ascii_lowercase().as_str(), "name" | "id" | "value" | "content" | "type");
-                if !plain && secret_name(&c[2]) {
+                if !plain && secret_pair(&c[2], &c[4]) {
                     format!("{}{}{}{}\"", &c[1], &c[2], &c[3], self.secret(&c[4]))
                 } else {
                     c[0].to_string()
@@ -998,6 +1073,56 @@ mod tests {
         assert_eq!(redacted("Author: Jane\nNote: Basic"), "Author: Jane\nNote: Basic");
         assert_eq!(redacted("X-Functions-Key: fk-9Qz1x7Lm"), "X-Functions-Key: [redacted]");
         assert_eq!(redacted(r#"curl -H "X-Api-Auth: s3cr3tvalue1""#), r#"curl -H "X-Api-Auth: [redacted]""#);
+    }
+
+    #[test]
+    fn plain_headers_and_params_the_wider_rules_left_alone() {
+        // Keys that are data, scheme words in prose, a Refresh period, author names.
+        let plain = [
+            ("Sort-Key", "createdAt"),
+            ("Primary-Key", "id"),
+            ("X-Cache-Key", "GET:/api/items:v2"),
+            ("X-Idempotency-Key", "8e03978e-40d5-43e8-bc93-6894a57f9324"),
+            ("X-Mode", "Token based"),
+            ("X-Help", "Basic is required"),
+            ("Accept-Language", "token en"),
+            ("Refresh", "5; url=/x"),
+            ("X-Author", "Jane Doe"),
+            ("X-Authority", "registry.test"),
+        ];
+        let mut h: Vec<(String, String)> = plain.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        let before = h.clone();
+        let mut r = Redactor::default();
+        r.headers(&mut h);
+        assert_eq!((h, r.masked), (before, 0));
+        for (n, v) in plain {
+            assert!(!credential_header(n, v), "{n}");
+        }
+        for s in ["/feed?refresh=60&x=1", "/feed?refresh=true", r#"{"refresh": 30, "auto": "refresh"}"#] {
+            assert_eq!(redacted(s), s);
+        }
+        // Credential keys, a scheme with a credential after it, and Authorization whatever it holds.
+        for (n, v) in [
+            ("X-Api-Key", "k"),
+            ("Api-Key", "k"),
+            ("X-Partner-Key", "k"),
+            ("Ocp-Apim-Subscription-Key", "k"),
+            ("X-Custom-Key", "k"),
+            ("X-Mode", "Token abc123def"),
+            ("Authorization", "Token based"),
+            ("X-Auth-Token", "k"),
+        ] {
+            let mut h = vec![(n.to_string(), v.to_string())];
+            let mut r = Redactor::default();
+            r.headers(&mut h);
+            assert!(h[0].1.contains(MASK), "{n}: {}", h[0].1);
+        }
+        assert!(crate::apiimport::looks_secret("X-Authorization") && crate::apiimport::looks_secret("X-Auth-Token"));
+        assert!(!crate::apiimport::looks_secret("X-Author") && !crate::apiimport::looks_secret("X-Authority"));
+        // refresh_token is secret whatever its value; `refresh` when it holds a token.
+        assert_eq!(redacted("refresh_token=60"), "refresh_token=[redacted]");
+        assert_eq!(redacted("Refresh: rt-91kd0aZ"), "Refresh: rt-91kd0aZ");
+        assert_eq!(redacted("x?refresh=rt-91kd0aZ"), "x?refresh=[redacted]");
     }
 
     #[test]

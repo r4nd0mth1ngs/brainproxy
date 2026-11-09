@@ -274,9 +274,11 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    your branding and the format: HTML, PDF, Word (DOCX) or Markdown. On the command line:
    `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`, `pdf`, `docx`). Every format masks session secrets
    (cookie values, `Authorization` credentials and a Basic credential's decoded password,
-   API-key and other secret-named headers (any name that says `auth` or ends in `-key`, and
-   any header whose value starts with an auth scheme such as `Bearer` or `Basic`, keeping the
-   scheme; tokens sent as WebSocket subprotocols in `Sec-WebSocket-Protocol`, keeping plain
+   API-key and other secret-named headers (any name that says `auth`, but not `Author` or
+   `Authority`; a credential key such as `Api-Key`, `X-Functions-Key`, `Ocp-Apim-Subscription-Key`
+   or any other `X-...-Key`, but not a key that is data such as `Sort-Key`, `Primary-Key` or
+   `X-Cache-Key`; and any header whose value starts with an auth scheme such as `Bearer` or
+   `Basic` followed by a credential rather than a word, keeping the scheme; tokens sent as WebSocket subprotocols in `Sec-WebSocket-Protocol`, keeping plain
    subprotocol names such as `graphql-transport-ws`; not `WWW-Authenticate` challenges, `Sec-WebSocket-Key` or `Idempotency-Key`, which
    hold no credential), token and password parameters in URLs and their
    fragments, forms, multipart, JSON (arrays and JSON inside strings too), XML and script
@@ -1527,8 +1529,8 @@ Crawl and active-scan scope and safety flags:
   and counted in `skipped_out_of_scope`. The method opt-ins are those of any document: DELETE,
   PUT, PATCH and GraphQL mutations need `--include-methods`. The recorded `Cookie` and
   `Authorization` headers, other credential headers (`X-CSRF-Token`, `X-Api-Key`,
-  `X-Session-Id`, any name that says `auth` or ends in `-key`, and any header whose value
-  starts with an auth scheme, and a `Sec-WebSocket-Protocol` that carries more than plain
+  `X-Session-Id`, any name that says `auth` or names a credential key, and any header whose
+  value starts with an auth scheme and a credential, and a `Sec-WebSocket-Protocol` that carries more than plain
   subprotocol names: the rule exports mask by), and credentials in URLs and bodies (form, JSON, XML and multipart fields)
   are left out and listed under `credentials` by name, as for a Postman collection's saved keys;
   use an auth profile. As a HAR holds live values, its names are judged as reports judge them

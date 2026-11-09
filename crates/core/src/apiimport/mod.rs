@@ -149,7 +149,9 @@ fn merge_credential(list: &mut Vec<Credential>, c: Credential) {
 /// Whether a header, parameter, or variable name looks like it holds a credential.
 pub fn looks_secret(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase().replace('_', "-");
-    n.starts_with("x-auth")
+    // X-Auth-Token and X-Authorization, not X-Author or X-Authority.
+    let x_auth = n.starts_with("x-auth") && !(n.starts_with("x-author") && !n.starts_with("x-authoriz"));
+    x_auth
         || ["authorization", "cookie", "token", "secret", "api-key", "apikey", "password", "passwd"]
             .iter()
             .any(|s| n.contains(s))
