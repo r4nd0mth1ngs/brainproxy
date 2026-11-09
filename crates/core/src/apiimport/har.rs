@@ -1,4 +1,4 @@
-//! HAR 1.2 files (as Chrome, Firefox, Burp, ZAP and others export them) to requests: one per
+//! HAR 1.2 files (as browsers, ZAP and other proxies export them) to requests: one per
 //! entry, as it was recorded, for `import api` and `scan active --api`.
 //!
 //! Only the requests are read. Responses are ignored apart from their content type, which
