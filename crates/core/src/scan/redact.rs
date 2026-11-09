@@ -27,6 +27,9 @@ pub const MASK: &str = "[redacted]";
 /// cookie such as `lang=en` would otherwise mask every "en" in the report.
 const MIN_SCRUB: usize = 6;
 
+/// How long a cookie item without `=` must be to be masked as a bare session value.
+const BARE_COOKIE_MIN: usize = 8;
+
 /// Headers whose whole value is a credential.
 const SECRET_HEADERS: &[&str] = &[
     "x-api-key",
@@ -73,6 +76,7 @@ const SECRET_NAMES: &[&str] = &[
     "authorization",
     "otp",
     "otp_code",
+    "refresh",
     "sig",
     "key",
     "credential",
@@ -112,11 +116,22 @@ static HEADER_INLINE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// A JSON string member; a body cut short may end before the closing quote.
 static JSON_MEMBER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""([A-Za-z0-9_.\-]{1,64})"(\s*:\s*)"((?:[^"\\]|\\.)*)("|$)"#).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r#""({JSON_NAME})"(\s*:\s*)"((?:[^"\\]|\\.)*)("|$)"#)).unwrap());
+
+/// A JSON member's name, which may spell its letters as `\u` escapes (`"\u0070assword"`).
+const JSON_NAME: &str = r"(?:[A-Za-z0-9_.\-]|\\u[0-9A-Fa-f]{4}){1,64}";
+
+/// A JSON member's name with its `\u` escapes undone, to judge it by.
+fn json_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.contains("\\u") {
+        return name.into();
+    }
+    serde_json::from_str::<String>(&format!("\"{name}\"")).map_or(name.into(), Into::into)
+}
 
 /// A JSON member whose value is an array, such as a list of tokens.
 static JSON_ARRAY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""([A-Za-z0-9_.\-]{1,64})"(\s*:\s*)\[([^\]]{0,8192})\]"#).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r#""({JSON_NAME})"(\s*:\s*)\[([^\]]{{0,8192}})\]"#)).unwrap());
 static JSON_STRING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""((?:[^"\\]|\\.)*)""#).unwrap());
 
 /// A JSON member inside a JSON-encoded string (`"payload":"{\"secret\":\"x\"}"`).
@@ -166,7 +181,23 @@ static QUOTED_PASSWORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\band p
 
 /// A JSON member whose value is a number, such as a one-time code.
 static JSON_NUMBER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""([A-Za-z0-9_.\-]{1,64})"(\s*:\s*)(-?[0-9][0-9.eE+\-]*)"#).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r#""({JSON_NAME})"(\s*:\s*)(-?[0-9][0-9.eE+\-]*)"#)).unwrap());
+
+/// A credential after an auth scheme in text (`Bearer abc123`, `token: Basic dXNl...`), as
+/// a body or a log line may quote one: a token68 value of at least 8 characters.
+static SCHEME_CREDENTIAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(bearer|basic|token|negotiate)([ \t]+)([A-Za-z0-9\-._~+/]{8,}=*)").unwrap());
+
+/// Whether a word after an auth scheme reads as a credential rather than prose: not a plain
+/// lowercase or capitalised word (`Bearer tokens`, `Basic Authentication`).
+fn credential_shaped(v: &str) -> bool {
+    let letters = v.trim_end_matches('=');
+    let mut chars = letters.chars();
+    let first_upper = chars.next().is_some_and(|c| c.is_ascii_uppercase());
+    let rest_lower = chars.all(|c| c.is_ascii_lowercase());
+    let word = letters.chars().all(|c| c.is_ascii_lowercase()) || (first_upper && rest_lower);
+    !word
+}
 
 /// A `name=value` pair in a query string, fragment, form body or link; the name may be
 /// percent-encoded. A value ends at a backslash, which in quoted text starts an escape such
@@ -442,7 +473,8 @@ impl Redactor {
         MASK.to_string()
     }
 
-    /// A cookie's `name=value` with the value masked; anything without `=` is kept. The
+    /// A cookie's `name=value` with the value masked; an item without `=` is a bare value
+    /// (some servers set one), masked when it is long enough to be a session id. The
     /// parts of a signed value (`s:ID.signature`) are learned too, since a page may quote the
     /// session id alone.
     fn pair(&mut self, item: &str) -> String {
@@ -456,6 +488,7 @@ impl Redactor {
                 }
                 format!("{k}={}", self.secret(v))
             }
+            None if item.len() >= BARE_COOKIE_MIN => self.secret(item),
             None => item.to_string(),
         }
     }
@@ -551,6 +584,15 @@ impl Redactor {
         };
         let mut out = HEADER_LINE.replace_all(s, |c: &Captures| header(self, c)).into_owned();
         out = HEADER_INLINE.replace_all(&out, |c: &Captures| header(self, c)).into_owned();
+        out = SCHEME_CREDENTIAL
+            .replace_all(&out, |c: &Captures| {
+                if !credential_shaped(&c[3]) {
+                    return c[0].to_string();
+                }
+                self.credential_parts(&c[1], &c[3]);
+                format!("{}{}{}", &c[1], &c[2], self.secret(&c[3]))
+            })
+            .into_owned();
         out = USERINFO.replace_all(&out, |c: &Captures| format!("{}{}@", &c[1], self.secret(&c[2]))).into_owned();
         if out.to_ascii_lowercase().contains("digest") {
             out =
@@ -576,7 +618,7 @@ impl Redactor {
             .into_owned();
         out = JSON_MEMBER
             .replace_all(&out, |c: &Captures| {
-                if secret_pair(&c[1], &c[3]) {
+                if secret_pair(&json_name(&c[1]), &c[3]) {
                     format!("\"{}\"{}\"{}{}", &c[1], &c[2], self.secret(&c[3]), &c[4])
                 } else {
                     c[0].to_string()
@@ -594,7 +636,7 @@ impl Redactor {
             .into_owned();
         out = JSON_ARRAY
             .replace_all(&out, |c: &Captures| {
-                if !secret_name(&c[1]) {
+                if !secret_name(&json_name(&c[1])) {
                     return c[0].to_string();
                 }
                 let items = JSON_STRING.replace_all(&c[3], |v: &Captures| format!("\"{}\"", self.secret(&v[1])));
@@ -635,7 +677,7 @@ impl Redactor {
             .into_owned();
         out = JSON_NUMBER
             .replace_all(&out, |c: &Captures| {
-                if secret_name(&c[1]) {
+                if secret_name(&json_name(&c[1])) {
                     format!("\"{}\"{}\"{}\"", &c[1], &c[2], self.secret(&c[3]))
                 } else {
                     c[0].to_string()
@@ -847,6 +889,32 @@ mod tests {
         assert_eq!(redacted("Author: Jane\nNote: Basic"), "Author: Jane\nNote: Basic");
         assert_eq!(redacted("X-Functions-Key: fk-9Qz1x7Lm"), "X-Functions-Key: [redacted]");
         assert_eq!(redacted(r#"curl -H "X-Api-Auth: s3cr3tvalue1""#), r#"curl -H "X-Api-Auth: [redacted]""#);
+    }
+
+    #[test]
+    fn the_gaps_the_export_review_found() {
+        // A cookie item without `=`, long enough to be a session; a short one is kept.
+        let mut r = Redactor::default();
+        let mut h = vec![("Cookie".to_string(), "BARECOOKIESECRET42; lang=en; ab".to_string())];
+        r.headers(&mut h);
+        assert_eq!(h[0].1, "[redacted]; lang=[redacted]; ab");
+        // A JSON name spelt with \u escapes is judged by what it spells.
+        assert_eq!(
+            redacted(r#"{"\u0070assword": "hunter22", "name": "bob", "\u006ftp": 123456}"#),
+            r#"{"\u0070assword": "[redacted]", "name": "bob", "\u006ftp": "[redacted]"}"#
+        );
+        assert_eq!(redacted(r#"{"\u0074okens": ["Zq81kd0aa"]}"#), r#"{"\u0074okens": ["[redacted]"]}"#);
+        // A credential after an auth scheme in a body; prose after one is kept.
+        assert_eq!(redacted("log: sent Bearer OPAQUE7f3k9Qz1 to the API"), "log: sent Bearer [redacted] to the API");
+        assert_eq!(redacted(r#"{"h": "Basic dXNlcjpodW50ZXIy"}"#), r#"{"h": "Basic [redacted]"}"#);
+        let prose = "Bearer tokens and Basic Authentication are both accepted";
+        assert_eq!(masked(prose), (prose.to_string(), 0));
+        // `refresh` names a refresh token.
+        assert_eq!(redacted(r#"{"refresh": "rt-91kd0aZ"}"#), r#"{"refresh": "[redacted]"}"#);
+        assert_eq!(
+            redacted("grant_type=refresh_token&refresh=rt-91kd0aZ"),
+            "grant_type=refresh_token&refresh=[redacted]"
+        );
     }
 
     #[test]
