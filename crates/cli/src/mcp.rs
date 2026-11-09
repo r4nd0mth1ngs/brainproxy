@@ -170,6 +170,35 @@ pub(crate) fn check_request_files(files: &[String]) -> Result<(), brainproxy_cor
     Ok(())
 }
 
+/// The path to read a local document `source` from (an import's spec, collection, HAR file,
+/// schema or environment). Under a tool call it must be inside the project file's folder once
+/// symlinks are followed, and the resolved path is what is read, so a link can't be swapped
+/// in between: an agent could otherwise point an import at any file the server can read and
+/// read parts of it back from the preview or an error. The refusal never quotes the file.
+/// `-` (stdin) is the caller's own text and is not checked.
+pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result<PathBuf, brainproxy_core::Error> {
+    if !in_tool_call() || source == "-" {
+        return Ok(PathBuf::from(source));
+    }
+    let refuse = || {
+        brainproxy_core::Error::InvalidInput(format!(
+            "{flag} {source:?}: through MCP a local file is read only from the project's folder (symlinks \
+             followed); put it there, pass its text on stdin (-), or give an http(s) URL"
+        ))
+    };
+    let folder = match project.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let folder = folder.canonicalize().map_err(|_| refuse())?;
+    let file = Path::new(source).canonicalize().map_err(|_| refuse())?;
+    if file.starts_with(&folder) && file != folder {
+        Ok(file)
+    } else {
+        Err(refuse())
+    }
+}
+
 /// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as
 /// `fuzz run --store none`), for the same reason as [`check_no_store`].
 pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error> {

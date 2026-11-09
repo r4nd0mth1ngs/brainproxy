@@ -270,13 +270,17 @@ impl ActiveArgs {
 }
 
 impl ActiveArgs {
-    fn api_options(&self) -> Result<api::Options, Error> {
+    fn api_options(&self, project: &Path) -> Result<api::Options, Error> {
         Ok(api::Options {
             base_url: self.base_url.clone(),
             server: self.server,
             vars: crate::import_cmd::parse_vars(&self.vars)?,
             expect_sha256: self.expect_sha256.clone(),
-            environment: self.environment.as_deref().map(crate::import_cmd::read_environment).transpose()?,
+            environment: self
+                .environment
+                .as_deref()
+                .map(|e| crate::import_cmd::read_environment(project, e))
+                .transpose()?,
             expect_environment_sha256: self.expect_environment_sha256.clone(),
             spec_url: None,
             har: self.har.options(),
@@ -441,7 +445,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 if args.graphql {
                     return Err(Error::InvalidInput("--graphql needs the endpoint's http(s) URL".into()));
                 }
-                let loaded = api::load(&crate::import_cmd::read_local(source)?, &args.api_options()?)?;
+                let loaded = api::load(&crate::import_cmd::read_local(project, source)?, &args.api_options(project)?)?;
                 crate::import_cmd::check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&args.api_selection(), &guard)?)?;
             } else {
@@ -453,7 +457,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     verify_tls: args.verify_tls,
                     graphql: args.graphql,
                 };
-                crate::import_cmd::check_remote_vars(project, &guard, source, args.api_options()?, from)?;
+                crate::import_cmd::check_remote_vars(project, &guard, source, args.api_options(project)?, from)?;
             }
         }
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
@@ -489,9 +493,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 tool: Tool::Scan,
             };
             let loaded = if args.graphql {
-                crate::import_cmd::load_graphql_endpoint(&fetch, source, args.api_options()?)?
+                crate::import_cmd::load_graphql_endpoint(&fetch, source, args.api_options(project)?)?
             } else {
-                crate::import_cmd::load_api(&fetch, source, args.api_options()?)?
+                crate::import_cmd::load_api(&fetch, source, args.api_options(project)?)?
             };
             let plan = loaded.plan(&args.api_selection(), &guard)?;
             loaded.check_runnable(&plan)?;

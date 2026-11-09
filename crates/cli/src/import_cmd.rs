@@ -260,7 +260,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                 if a.graphql {
                     return Err(Error::InvalidInput("--graphql needs the endpoint's http(s) URL".into()));
                 }
-                let loaded = api::load(&read_local(&a.doc.source)?, &a.options()?)?;
+                let loaded = api::load(&read_local(project, &a.doc.source)?, &a.options(project)?)?;
                 check_background_doc(&loaded)?;
                 loaded.check_runnable(&loaded.plan(&a.selection(), &guard)?)?;
             } else {
@@ -274,7 +274,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                     verify_tls: c.verify_tls,
                     graphql: a.graphql,
                 };
-                check_remote_vars(project, &guard, &a.doc.source, a.options()?, from)?;
+                check_remote_vars(project, &guard, &a.doc.source, a.options(project)?, from)?;
             }
         }
         return crate::jobs_cmd::spawn_background("import", project, home, out);
@@ -311,7 +311,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         }
         ImportCmd::Graphql(a) => {
             let text = match &a.schema {
-                Some(s) => read_local(s)?,
+                Some(s) => read_local(project, s)?,
                 None => fetch.introspect(&a.url)?,
             };
             graphql::build(&apiimport::parse_document(&text)?, &a.url, c.include_destructive)?
@@ -385,13 +385,13 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
 }
 
 impl ApiArgs {
-    fn options(&self) -> Result<api::Options, Error> {
+    fn options(&self, project: &Path) -> Result<api::Options, Error> {
         Ok(api::Options {
             base_url: self.doc.base_url.clone(),
             server: self.server,
             vars: parse_vars(&self.doc.vars)?,
             expect_sha256: self.expect_sha256.clone(),
-            environment: self.environment.as_deref().map(read_environment).transpose()?,
+            environment: self.environment.as_deref().map(|e| read_environment(project, e)).transpose()?,
             expect_environment_sha256: self.expect_environment_sha256.clone(),
             spec_url: None,
             har: self.har.options(),
@@ -420,11 +420,11 @@ fn import_api(
     let c = &a.doc.common;
     let guard = fetch.send.guard.clone().ok_or_else(|| Error::OutOfScope("no scope set".into()))?;
     let loaded = if a.graphql {
-        load_graphql_endpoint(fetch, &a.doc.source, a.options()?)?
+        load_graphql_endpoint(fetch, &a.doc.source, a.options(project)?)?
     } else {
         // Read once: the script text must come from the document the preview is of.
         let (text, spec_url) = fetch.document(&a.doc.source)?;
-        let mut loaded = api::load(&text, &api::Options { spec_url, ..a.options()? })?;
+        let mut loaded = api::load(&text, &api::Options { spec_url, ..a.options(project)? })?;
         if a.show_scripts {
             api::add_script_text(&mut loaded, &text);
         }
@@ -506,12 +506,14 @@ pub(crate) fn load_graphql_endpoint(
     api::load(&text, &opts)
 }
 
-/// Reads an environment file. A path, never a URL: it holds secrets.
-pub(crate) fn read_environment(path: &str) -> Result<String, Error> {
+/// Reads an environment file. A path, never a URL: it holds secrets. Through MCP only a file
+/// in the project's folder (see [`crate::mcp::local_document`]).
+pub(crate) fn read_environment(project: &Path, path: &str) -> Result<String, Error> {
     if is_url(path) || path == "-" {
         return Err(Error::InvalidInput("--environment must be a local file".into()));
     }
-    std::fs::read_to_string(path).map_err(|_| Error::InvalidInput(format!("can't read the environment file {path:?}")))
+    let file = crate::mcp::local_document(project, "--environment", path)?;
+    std::fs::read_to_string(file).map_err(|_| Error::InvalidInput(format!("can't read the environment file {path:?}")))
 }
 
 pub(crate) fn selection(include_methods: &[String], only: Option<Vec<usize>>) -> api::Selection {
@@ -649,17 +651,19 @@ pub(crate) fn is_url(s: &str) -> bool {
     l.starts_with("http://") || l.starts_with("https://")
 }
 
-pub(crate) fn read_local(source: &str) -> Result<String, Error> {
+/// Reads a local document, or stdin for `-`. Through MCP only a file in the project's folder
+/// (see [`crate::mcp::local_document`]).
+pub(crate) fn read_local(project: &Path, source: &str) -> Result<String, Error> {
     let bytes = if source == "-" {
         crate::read_input(None)?
     } else {
-        let meta =
-            std::fs::metadata(source).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?;
+        let path = crate::mcp::local_document(project, "the document", source)?;
+        let meta = std::fs::metadata(&path).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?;
         // A HAR file may be larger than other documents; `api::load` holds those to their limit.
         if meta.len() as usize > har::MAX_HAR {
             return Err(Error::InvalidInput(format!("{source:?} is larger than {} MiB", har::MAX_HAR >> 20)));
         }
-        std::fs::read(source).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?
+        std::fs::read(&path).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?
     };
     String::from_utf8(bytes).map_err(|_| Error::InvalidInput(format!("{source:?} is not UTF-8 text")))
 }
@@ -680,7 +684,7 @@ impl Fetcher<'_> {
     /// Returns the document text and, for URLs, the URL it came from.
     fn document(&self, source: &str) -> Result<(String, Option<String>), Error> {
         if !is_url(source) {
-            return Ok((read_local(source)?, None));
+            return Ok((read_local(self.project, source)?, None));
         }
         let body = self.fetch("GET", source, &[], b"")?;
         Ok((body, Some(source.to_string())))

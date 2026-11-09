@@ -160,6 +160,12 @@ Some arguments need a person, so a command run for a tool call (the server sets
   (and a request line that doesn't parse is quoted in the error), so it could send any file the
   server can read to a target and have it read back from history. An agent races a group of two
   with the primary as `url` and the other request as the call's `stdin` (`also: ["-"]`).
+- A local file for `import_api`, `import_har`, `import_openapi`, `import_postman`,
+  `import_graphql`'s `schema`, `scan_active`'s `api`, or any `environment`, outside the project
+  file's folder (symlinks are followed before the check, and the resolved file is what is
+  read): its text could reach the agent through the preview or an error. The refusal names the
+  path, never the file's content. An agent passes a document as the call's `stdin` (`-`), puts
+  the file in the project's folder, or gives an http(s) URL (checked against the scope as usual).
 - `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.

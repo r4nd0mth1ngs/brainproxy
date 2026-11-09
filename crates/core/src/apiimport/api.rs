@@ -1043,6 +1043,9 @@ pub struct PreviewRequest {
 impl PreviewRequest {
     fn new(i: &Planned, format: Format) -> Self {
         let r = &i.request;
+        if !i.in_scope {
+            return Self::out_of_scope(i);
+        }
         let opt_in = opt_in_name(format, r);
         let secret = secret_test(format);
         PreviewRequest {
@@ -1071,6 +1074,32 @@ impl PreviewRequest {
             in_scope: i.in_scope,
             scope_confirmed: i.scope_confirmed,
             included: i.excluded_reason.is_none(),
+            excluded_reason: i.excluded_reason,
+        }
+    }
+
+    /// A request to a host outside the scope shows only its method and host: it is never
+    /// sent, and its path, query, headers and body may hold what the document's author didn't
+    /// mean to share (a HAR file records every site the browser visited).
+    fn out_of_scope(i: &Planned) -> Self {
+        let r = &i.request;
+        let origin = url::Url::parse(&r.url)
+            .ok()
+            .map(|u| u.origin().ascii_serialization())
+            .filter(|o| o != "null")
+            .unwrap_or_else(|| format!("{}:{}", i.host, i.port));
+        PreviewRequest {
+            index: i.index,
+            name: format!("{} {origin}", r.method),
+            method: r.method.clone(),
+            url: origin,
+            headers: Vec::new(),
+            body: Vec::new(),
+            state_changing: false,
+            opt_in: None,
+            in_scope: i.in_scope,
+            scope_confirmed: i.scope_confirmed,
+            included: false,
             excluded_reason: i.excluded_reason,
         }
     }

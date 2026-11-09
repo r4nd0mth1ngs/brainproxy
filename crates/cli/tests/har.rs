@@ -199,13 +199,17 @@ fn a_chrome_har_is_previewed_without_its_secrets() {
         (d["format"].as_str(), d["title"].as_str(), d["version"].as_str()),
         (Some("har"), Some("WebInspector"), Some("537.36"))
     );
-    assert_eq!(
-        names(d),
-        ["GET /account?tab=orders", "POST /api/orders", "DELETE /api/orders/7", "GET /collect?id=1"],
-        "{d}"
-    );
+    assert_eq!(names(d), ["GET /account?tab=orders", "POST /api/orders", "DELETE /api/orders/7", "GET "], "{d}");
     let reasons: Vec<&Value> = d["requests"].as_array().unwrap().iter().map(|r| &r["excluded_reason"]).collect();
     assert_eq!(reasons, [&Value::Null, &Value::Null, &json!("method"), &json!("scope")]);
+    // One the scope leaves out shows its method and host only.
+    let other = &d["requests"][3];
+    assert_eq!(
+        (other["name"].as_str(), other["url"].as_str(), other["headers"].as_array().map(Vec::len)),
+        (Some("GET http://198.51.100.9:81"), Some("http://198.51.100.9:81"), Some(0)),
+        "{other}"
+    );
+    assert!(!o.all.contains("/collect") && !o.all.contains("id=1"), "{}", o.all);
     let w = d["warnings"].to_string();
     assert!(w.contains("1 static asset") && w.contains("1 repeated request"), "{w}");
     let creds: Vec<String> =
@@ -292,6 +296,82 @@ fn a_scan_takes_a_har_file() {
     assert!(hits.len() > 1 && hits.iter().all(|h| h.target.starts_with("/search")), "{hits:?}");
     let e = refused(&p, &["scan", "active", "http://127.0.0.1:1/", "--keep-static"], 2);
     assert!(e.contains("need --api"), "{e}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `args` run as an MCP tool call's command, with `stdin` on stdin.
+fn run_mcp(project: &Path, args: &[&str], stdin: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(project)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Output {
+        code: out.status.code().unwrap_or(-1),
+        json: serde_json::from_str(&stdout).unwrap_or(Value::Null),
+        all: format!("{stdout}\n{stderr}"),
+    }
+}
+
+#[test]
+fn an_agent_imports_only_files_in_the_projects_folder() {
+    let (dir, p) = setup("mcp-files");
+    let server = Server::start();
+    let inside = fixture(&dir, "chrome.har", server.port);
+    let elsewhere = std::env::temp_dir().join(format!("bp-har-{}-mcp-elsewhere", std::process::id()));
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let outside = fixture(&elsewhere, "chrome.har", server.port);
+    let private = elsewhere.join("private.txt");
+    std::fs::write(&private, "PRIVATE-FILE-CONTENT").unwrap();
+    let private = private.to_str().unwrap();
+
+    // A file in the project's folder, and stdin, are read.
+    let o = run_mcp(&p, &["import", "har", "--dry-run", "--", &inside], b"");
+    assert_eq!((o.code, o.json["data"]["format"].as_str()), (0, Some("har")), "{}", o.all);
+    let o = run_mcp(&p, &["import", "har", "--dry-run", "--", "-"], std::fs::read(&inside).unwrap().as_slice());
+    assert_eq!((o.code, o.json["data"]["format"].as_str()), (0, Some("har")), "{}", o.all);
+
+    // A file elsewhere, or a link from inside to one, is refused without quoting it.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(private, dir.join("link.har")).unwrap();
+    let link = dir.join("link.har");
+    let mut refused_docs = vec![
+        vec!["import", "har", "--dry-run", "--", &outside],
+        vec!["import", "api", "--dry-run", "--", private],
+        vec!["import", "openapi", "--dry-run", "--", private],
+        vec!["import", "postman", "--dry-run", "--", private],
+        vec!["import", "graphql", "--dry-run", "--schema", private, "http://127.0.0.1:1/graphql"],
+        vec!["scan", "active", "--api", private, "--rules", "40012"],
+    ];
+    if cfg!(unix) {
+        refused_docs.push(vec!["import", "har", "--dry-run", "--", link.to_str().unwrap()]);
+    }
+    for args in &refused_docs {
+        let o = run_mcp(&p, args, b"");
+        assert_eq!(o.code, 2, "{args:?}: {}", o.all);
+        assert!(o.json["error"]["message"].as_str().unwrap().contains("project's folder"), "{args:?}: {}", o.all);
+        assert!(!o.all.contains("PRIVATE-FILE-CONTENT"), "{args:?}: {}", o.all);
+    }
+    // An environment file elsewhere is refused too.
+    let env_arg = format!("--environment={private}");
+    let o = run_mcp(&p, &["import", "api", "--dry-run", &env_arg, "--", &inside], b"");
+    assert_eq!(o.code, 2, "{}", o.all);
+    assert!(o.all.contains("--environment") && o.all.contains("project's folder"), "{}", o.all);
+    assert!(!o.all.contains("PRIVATE-FILE-CONTENT"), "{}", o.all);
+
+    // A person may import from anywhere.
+    assert_eq!(ok(&p, &["import", "har", "--dry-run", "--", &outside])["format"], "har");
+    let _ = std::fs::remove_dir_all(elsewhere);
     let _ = std::fs::remove_dir_all(dir);
 }
 

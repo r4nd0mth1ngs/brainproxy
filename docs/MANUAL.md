@@ -1471,7 +1471,10 @@ Crawl and active-scan scope and safety flags:
   without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
   check or rule does send is recorded in history (source `scan`), finding or not.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, a
-  GraphQL schema (SDL file or introspection result), or a HAR file (see `import har`), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
+  GraphQL schema (SDL file or introspection result), or a HAR file (see `import har`), detected from its contents. Through MCP a local
+  file (this, `import har`'s, `--schema`, `--environment` and `scan active --api`'s too) is read
+  only from the project file's folder, symlinks followed; `-` (stdin) and URLs are not limited
+  (see MCP.md). `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
   and which operations were skipped and why. `--server N` picks a listed server, `--base-url`
   overrides them, `--var NAME=VALUE` sets a Postman variable, `--only 0,3,7` picks operations by
@@ -1516,7 +1519,8 @@ Crawl and active-scan scope and safety flags:
   keeps them), an entry with the same method, URL, `Accept` header and body as an earlier one
   (the first is kept),
   WebSocket handshakes (`ws send --from` replays a connection), and URLs that aren't http(s).
-  Entries outside the engagement scope are listed with `excluded_reason: "scope"`, never sent,
+  Entries outside the engagement scope are listed with `excluded_reason: "scope"` and only
+  their method and host (no path, query, headers or body), never sent,
   and counted in `skipped_out_of_scope`. The method opt-ins are those of any document: DELETE,
   PUT, PATCH and GraphQL mutations need `--include-methods`. The recorded `Cookie` and
   `Authorization` headers, other credential headers (`X-CSRF-Token`, `X-Api-Key`,
