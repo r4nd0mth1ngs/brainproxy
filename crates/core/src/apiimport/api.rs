@@ -1554,7 +1554,7 @@ mod tests {
         let doc = json!({"log": {"entries": [{"request": {"method": "GET", "url": "https://api.test/a",
             "headers": [{"name": "X-Functions-Key", "value": "RECORDEDKEY1"},
                 {"name": "X-Api-Auth", "value": "RECORDEDAUTH1"},
-                {"name": "Sec-WebSocket-Protocol", "value": "Bearer RECORDEDWS1"},
+                {"name": "Sec-WebSocket-Protocol", "value": "graphql-transport-ws, RECORDEDWS1"},
                 {"name": "Sec-WebSocket-Key", "value": "dGhlIHNhbXBsZSBub25jZQ=="},
                 {"name": "Accept", "value": "*/*"}]}}]}});
         let l = load(&doc.to_string(), &opts()).unwrap();
@@ -1572,6 +1572,17 @@ mod tests {
         let p = l.preview(&l.plan(&Selection::default(), &guard()).unwrap(), 100);
         assert!(!serde_json::to_string(&p).unwrap().contains("RECORDED"));
         assert!(p.requests[0].headers.contains(&"Sec-WebSocket-Protocol: ********".to_string()));
+        // A Kubernetes bearer subprotocol, or `Bearer, <token>`, goes too; plain names stay.
+        for (value, kept) in [
+            ("base64url.bearer.authorization.k8s.io.UkVDT1JERURLOFM, v4.channel.k8s.io", false),
+            ("Bearer, RECORDEDWS2", false),
+            ("graphql-ws", true),
+        ] {
+            let doc = json!({"log": {"entries": [{"request": {"method": "GET", "url": "https://api.test/ws",
+                "headers": [{"name": "Sec-WebSocket-Protocol", "value": value}]}}]}});
+            let l = load(&doc.to_string(), &opts()).unwrap();
+            assert_eq!(!l.requests[0].headers.is_empty(), kept, "{value}");
+        }
     }
 
     #[test]

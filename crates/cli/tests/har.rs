@@ -393,7 +393,7 @@ fn history_exports_as_har_with_secrets_masked() {
             "-H",
             "X-Functions-Key: FAKE-FUNCTIONS-KEY",
             "-H",
-            "Sec-WebSocket-Protocol: Bearer FAKE-WS-BEARER",
+            "Sec-WebSocket-Protocol: graphql-transport-ws, FAKE-WS-TOKEN-7f3k9Qz1",
         ],
     );
     let form = format!("http://127.0.0.1:{}/login", server.port);
@@ -424,10 +424,12 @@ fn history_exports_as_har_with_secrets_masked() {
         "FAKE-QUERY-TOKEN-1",
         "FAKE-SERVER-SESSION-1",
         "FAKE-FUNCTIONS-KEY",
-        "FAKE-WS-BEARER",
+        "FAKE-WS-TOKEN",
     ] {
         assert!(!text.contains(s), "{s} in {text}");
     }
+    // A subprotocol token is masked, the subprotocol's name kept.
+    assert!(text.contains("graphql-transport-ws, [redacted]"), "{text}");
     let har: Value = serde_json::from_str(&text).unwrap();
     let e = &har["log"]["entries"];
     assert_eq!(har["log"]["version"], "1.2");

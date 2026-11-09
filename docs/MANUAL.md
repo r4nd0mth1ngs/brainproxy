@@ -276,7 +276,8 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    (cookie values, `Authorization` credentials and a Basic credential's decoded password,
    API-key and other secret-named headers (any name that says `auth` or ends in `-key`, and
    any header whose value starts with an auth scheme such as `Bearer` or `Basic`, keeping the
-   scheme; not `WWW-Authenticate` challenges, `Sec-WebSocket-Key` or `Idempotency-Key`, which
+   scheme; tokens sent as WebSocket subprotocols in `Sec-WebSocket-Protocol`, keeping plain
+   subprotocol names such as `graphql-transport-ws`; not `WWW-Authenticate` challenges, `Sec-WebSocket-Key` or `Idempotency-Key`, which
    hold no credential), token and password parameters in URLs and their
    fragments, forms, multipart, JSON (arrays and JSON inside strings too), XML and script
    bodies, hidden form fields and secret-named attributes, passwords in URLs, JWTs, and every
@@ -1526,7 +1527,8 @@ Crawl and active-scan scope and safety flags:
   PUT, PATCH and GraphQL mutations need `--include-methods`. The recorded `Cookie` and
   `Authorization` headers, other credential headers (`X-CSRF-Token`, `X-Api-Key`,
   `X-Session-Id`, any name that says `auth` or ends in `-key`, and any header whose value
-  starts with an auth scheme: the rule exports mask by), and credentials in URLs and bodies (form, JSON, XML and multipart fields)
+  starts with an auth scheme, and a `Sec-WebSocket-Protocol` that carries more than plain
+  subprotocol names: the rule exports mask by), and credentials in URLs and bodies (form, JSON, XML and multipart fields)
   are left out and listed under `credentials` by name, as for a Postman collection's saved keys;
   use an auth profile. As a HAR holds live values, its names are judged as reports judge them
   (`session`, `sid`, `jwt`, `signature`, `key` and the like count too). `--keep-credentials` sends the recorded

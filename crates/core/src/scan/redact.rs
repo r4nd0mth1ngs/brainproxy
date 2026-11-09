@@ -341,6 +341,76 @@ pub fn secret_header(name: &str) -> bool {
 /// and a retry's idempotency key.
 const PLAIN_HEADERS: &[&str] = &["www-authenticate", "proxy-authenticate", "sec-websocket-key", "idempotency-key"];
 
+/// WebSocket subprotocol names that are no credential, lowercase. Browsers can't set
+/// headers on a WebSocket, so apps send a token as a subprotocol instead (`Bearer, <token>`,
+/// `access_token, <token>`, `graphql-transport-ws, <token>`, Kubernetes'
+/// `base64url.bearer.authorization.k8s.io.<token>`): every other item is masked.
+const PLAIN_SUBPROTOCOLS: &[&str] = &[
+    "graphql-ws",
+    "graphql-transport-ws",
+    "subscriptions-transport-ws",
+    "wamp",
+    "wamp.2.json",
+    "wamp.2.msgpack",
+    "wamp.2.cbor",
+    "wamp.2.ubjson",
+    "mqtt",
+    "mqttv3.1",
+    "mqttv3.1.1",
+    "mqttv5",
+    "soap",
+    "stomp",
+    "xmpp",
+    "sip",
+    "msrp",
+    "chat",
+    "superchat",
+    "json",
+    "msgpack",
+    "cbor",
+    "binary",
+    "base64",
+    "text",
+    "jsonrpc",
+    "json-rpc",
+    "jsonrpc2",
+    "echo-protocol",
+    "actioncable-v1-json",
+    "actioncable-v1-msgpack",
+    "actioncable-v1-ext-json",
+    "actioncable-unsupported",
+    "ocpp1.2",
+    "ocpp1.5",
+    "ocpp1.6",
+    "ocpp2.0",
+    "ocpp2.0.1",
+    "ocpp2.1",
+    "channel.k8s.io",
+    "base64.channel.k8s.io",
+    "binary.k8s.io",
+    "base64.binary.k8s.io",
+];
+
+/// A versioned subprotocol name (`v1`, `v10.stomp`, `v4.channel.k8s.io`, `v2.json`): short
+/// lowercase words after a version, nothing a token looks like.
+static VERSIONED_SUBPROTOCOL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^v[0-9]{1,3}(?:\.[0-9]{1,3}){0,2}(?:[.\-][a-z][a-z0-9]{0,11}){0,4}$").unwrap());
+
+/// Where Kubernetes puts a bearer token in `Sec-WebSocket-Protocol`.
+const K8S_BEARER: &str = "base64url.bearer.authorization.k8s.io.";
+
+/// Whether a `Sec-WebSocket-Protocol` item names a subprotocol rather than carries a token.
+fn plain_subprotocol(item: &str) -> bool {
+    let i = item.trim().to_ascii_lowercase();
+    !i.starts_with(K8S_BEARER)
+        && (PLAIN_SUBPROTOCOLS.contains(&i.as_str()) || (i.len() <= 40 && VERSIONED_SUBPROTOCOL.is_match(&i)))
+}
+
+/// Whether a `Sec-WebSocket-Protocol` value carries anything but plain subprotocol names.
+fn subprotocol_credential(value: &str) -> bool {
+    value.split(',').map(str::trim).any(|i| !i.is_empty() && !plain_subprotocol(i))
+}
+
 /// The schemes a credential value starts with (`Authorization: Bearer ...`), lowercase.
 const AUTH_SCHEMES: &[&str] = &["bearer", "basic", "token", "digest", "negotiate"];
 
@@ -364,12 +434,16 @@ fn auth_or_key_name(n: &str) -> bool {
 /// import (which takes credentials out) and every export (which masks them) share. A known
 /// API-key header, a name [`crate::apiimport::looks_secret`] or the report rules call secret,
 /// one that says `auth` or ends in `-key`, or a value that starts with an auth scheme (Bearer,
-/// Basic, Token, Digest, Negotiate) whatever the name, such as a token sent in
-/// `Sec-WebSocket-Protocol`. Auth challenges and nonces ([`PLAIN_HEADERS`]) are not.
+/// Basic, Token, Digest, Negotiate) whatever the name, and a `Sec-WebSocket-Protocol` list
+/// with any item but a plain subprotocol name (a token sent as one). Auth challenges and
+/// nonces ([`PLAIN_HEADERS`]) are not.
 pub fn credential_header(name: &str, value: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
     if PLAIN_HEADERS.contains(&n.as_str()) {
         return false;
+    }
+    if n == "sec-websocket-protocol" {
+        return subprotocol_credential(value);
     }
     secret_header(&n) || crate::apiimport::looks_secret(&n) || auth_or_key_name(&n) || auth_scheme(value).is_some()
 }
@@ -517,12 +591,48 @@ impl Redactor {
                 None => self.secret(value),
             },
             n if PLAIN_HEADERS.contains(&n) => return None,
+            // A list of subprotocols, which may carry a token: the plain names are kept.
+            "sec-websocket-protocol" if subprotocol_credential(value) => self.subprotocols(value),
+            "sec-websocket-protocol" => return None,
             n if recorded && credential_header(n, value) => self.credential(value),
             n if secret_header(n) || (wide && (crate::apiimport::looks_secret(n) || auth_or_key_name(n))) => {
                 self.credential(value)
             }
             _ => return None,
         })
+    }
+
+    /// A `Sec-WebSocket-Protocol` list with every item but a plain subprotocol name masked:
+    /// a token, the word that marks one (`Bearer`, `access_token`), and a Kubernetes bearer
+    /// item whole (its token, base64url-decoded, is learned too).
+    fn subprotocols(&mut self, value: &str) -> String {
+        use base64::Engine;
+        let items: Vec<String> = value
+            .split(',')
+            .map(|item| {
+                let i = item.trim();
+                if i.is_empty() || plain_subprotocol(i) {
+                    return i.to_string();
+                }
+                if i.len() > K8S_BEARER.len() && i[..K8S_BEARER.len()].eq_ignore_ascii_case(K8S_BEARER) {
+                    let token = &i[K8S_BEARER.len()..];
+                    if let Ok(b) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token.trim_end_matches('='))
+                    {
+                        self.remember(&String::from_utf8_lossy(&b), true);
+                    }
+                    self.remember(token, true);
+                }
+                // A token has digits or is long; a marker word (`Bearer`, `access_token`) is
+                // masked where it stands, not looked for elsewhere.
+                let token = i.len() >= 20 || i.chars().any(|c| c.is_ascii_digit());
+                if token && distinctive(i) {
+                    return self.secret(i);
+                }
+                self.masked += 1;
+                MASK.to_string()
+            })
+            .collect();
+        items.join(", ")
     }
 
     /// A credential header's value masked, keeping the scheme it starts with, if any.
@@ -835,7 +945,6 @@ mod tests {
             "X-Api-Auth",
             "X-Upstream-Auth",
             "Grpc-Metadata-Authorization",
-            "Sec-WebSocket-Protocol",
             "X-Pin",
         ];
         let mut r = Redactor::default();
@@ -889,6 +998,78 @@ mod tests {
         assert_eq!(redacted("Author: Jane\nNote: Basic"), "Author: Jane\nNote: Basic");
         assert_eq!(redacted("X-Functions-Key: fk-9Qz1x7Lm"), "X-Functions-Key: [redacted]");
         assert_eq!(redacted(r#"curl -H "X-Api-Auth: s3cr3tvalue1""#), r#"curl -H "X-Api-Auth: [redacted]""#);
+    }
+
+    #[test]
+    fn websocket_subprotocols_that_carry_a_token() {
+        // A token as browsers must send one, in Sec-WebSocket-Protocol's comma-separated list.
+        let k8s_token = "eyJhbGciOiJSUzI1NiJ9-K8STOKEN42";
+        let k8s = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(k8s_token)
+        };
+        let cases = [
+            ("Bearer, OPAQUE7f3k9Qz1", "[redacted], [redacted]"),
+            ("access_token, OPAQUE7f3k9Qz1", "[redacted], [redacted]"),
+            ("graphql-transport-ws, OPAQUE7f3k9Qz1", "graphql-transport-ws, [redacted]"),
+            (
+                &*format!("v4.channel.k8s.io, base64url.bearer.authorization.k8s.io.{k8s}"),
+                "v4.channel.k8s.io, [redacted]",
+            ),
+        ];
+        for (value, masked) in cases {
+            assert!(credential_header("Sec-WebSocket-Protocol", value), "{value}");
+            let mut r = Redactor::default();
+            let mut h = vec![("Sec-WebSocket-Protocol".to_string(), value.to_string())];
+            r.headers(&mut h);
+            assert_eq!(h[0].1, masked, "{value}");
+            // In text too: a header line, and one quoted in a curl command.
+            assert_eq!(
+                redacted(&format!("Sec-WebSocket-Protocol: {value}")),
+                format!("Sec-WebSocket-Protocol: {masked}")
+            );
+            assert_eq!(
+                redacted(&format!(r#"curl -H "Sec-WebSocket-Protocol: {value}" ws://x"#)),
+                format!(r#"curl -H "Sec-WebSocket-Protocol: {masked}" ws://x"#)
+            );
+        }
+        // The token is found again elsewhere, the marker words are not.
+        let mut r = Redactor::default();
+        let mut h = vec![("Sec-WebSocket-Protocol".to_string(), "access_token, OPAQUE7f3k9Qz1".to_string())];
+        r.headers(&mut h);
+        let mut echo = "token OPAQUE7f3k9Qz1 in access_token".to_string();
+        r.scrub(&mut echo);
+        assert_eq!(echo, "token [redacted] in access_token");
+        // A Kubernetes token is learned decoded as well.
+        let mut r = Redactor::default();
+        let mut h = vec![(
+            "Sec-WebSocket-Protocol".to_string(),
+            format!("base64url.bearer.authorization.k8s.io.{k8s}, v4.channel.k8s.io"),
+        )];
+        r.headers(&mut h);
+        assert_eq!(h[0].1, "[redacted], v4.channel.k8s.io");
+        let mut echo = format!("Authorization: Bearer {k8s_token}");
+        r.scrub(&mut echo);
+        assert!(!echo.contains("K8STOKEN42"), "{echo}");
+        // Plain subprotocol lists are kept.
+        for value in [
+            "graphql-ws",
+            "graphql-transport-ws",
+            "wamp.2.json, wamp.2.msgpack",
+            "v10.stomp, v11.stomp",
+            "mqtt",
+            "v4.channel.k8s.io",
+        ] {
+            assert!(!credential_header("Sec-WebSocket-Protocol", value), "{value}");
+            let mut r = Redactor::default();
+            let mut h = vec![("Sec-WebSocket-Protocol".to_string(), value.to_string())];
+            r.headers(&mut h);
+            assert_eq!((h[0].1.as_str(), r.masked), (value, 0));
+            assert_eq!(
+                redacted(&format!("Sec-WebSocket-Protocol: {value}")),
+                format!("Sec-WebSocket-Protocol: {value}")
+            );
+        }
     }
 
     #[test]
