@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use regex::Regex;
@@ -18,9 +18,9 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinSet;
 
-use super::{has_credentials, AuthzConfig, AuthzTarget, Outcome, Recorder, Tester, SAFE_METHODS};
+use super::{has_credentials, AuthzConfig, AuthzTarget, Queue, Recorder, Tester, Writer, SAFE_METHODS};
 use crate::auth::AuthProfile;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::http::{RawRequest, Target};
 use crate::jobs::JobControl;
 
@@ -121,7 +121,8 @@ pub struct LiveWorker {
     live: Arc<Live>,
     task: tokio::task::JoinHandle<()>,
     shutdown: oneshot::Sender<()>,
-    writer: std::thread::JoinHandle<Result<Recorder>>,
+    out: Queue,
+    writer: Writer,
 }
 
 impl Live {
@@ -134,7 +135,8 @@ impl Live {
         opts: LiveOptions,
         ctl: JobControl,
     ) -> Result<(Arc<Live>, LiveWorker)> {
-        let tester = Arc::new(Tester::new(cfg, ctl.clone())?);
+        let (out, rows, writer) = super::writer(Recorder::open(project, run_id)?);
+        let tester = Arc::new(Tester::new(cfg, ctl.clone(), rows)?);
         let (tx, rx) = tokio::sync::mpsc::channel(opts.queue.max(1));
         let live = Arc::new(Live {
             run_id,
@@ -146,18 +148,10 @@ impl Live {
             tester,
             ctl,
         });
-        let (out_tx, out_rx) = mpsc::channel::<Outcome>();
-        let mut recorder = Recorder::open(project, run_id)?;
-        let writer = std::thread::spawn(move || -> Result<Recorder> {
-            while let Ok(o) = out_rx.recv() {
-                recorder.record(&o)?;
-            }
-            Ok(recorder)
-        });
         let (shutdown, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(work(live.clone(), rx, out_tx, opts.concurrency.max(1), stop_rx));
+        let task = tokio::spawn(work(live.clone(), rx, out.clone(), opts.concurrency.max(1), stop_rx));
         live.progress();
-        Ok((live.clone(), LiveWorker { live, task, shutdown, writer }))
+        Ok((live.clone(), LiveWorker { live, task, shutdown, out, writer }))
     }
 
     pub fn run_id(&self) -> i64 {
@@ -259,7 +253,7 @@ impl Live {
 async fn work(
     live: Arc<Live>,
     mut rx: tokio::sync::mpsc::Receiver<AuthzTarget>,
-    out: mpsc::Sender<Outcome>,
+    out: Queue,
     concurrency: usize,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -281,7 +275,7 @@ async fn work(
                 return;
             }
             let outcome = live.tester.test(&t).await;
-            let _ = out.send(outcome);
+            out.outcome(outcome);
             live.counts.tested.fetch_add(1, Ordering::Relaxed);
             live.progress();
         });
@@ -309,11 +303,8 @@ impl LiveWorker {
         let _ = self.task.await;
         let live = self.live;
         let mut v = live.stats();
-        // The tests hold the senders to the writer; with the worker gone, it ends.
-        let recorder = tokio::task::spawn_blocking(move || self.writer.join())
-            .await
-            .map_err(|e| Error::Protocol(e.to_string()))?
-            .map_err(|_| Error::Protocol("authz writer panicked".into()))??;
+        // With the worker gone, nothing writes any more.
+        let recorder = super::join_writer(self.out, self.writer).await?;
         v["run_id"] = json!(live.run_id);
         v["verdicts"] = json!(recorder.verdicts());
         v["new_findings"] = json!(recorder.new_findings());

@@ -454,7 +454,12 @@ fn crawl_with_auth_reaches_protected_pages() {
     );
     let rows = q["rows"].as_array().unwrap();
     assert!(!rows.is_empty(), "{q}");
-    assert!(rows.iter().all(|r| r[1] == 200), "protected pages not reached: {q}");
+    // A request answered with the login redirect keeps its row; the one sent again after the
+    // re-login gets the next.
+    for (i, r) in rows.iter().enumerate() {
+        let retried = rows.get(i + 1).is_some_and(|n| n[0] == r[0] && n[1] == 200);
+        assert!(r[1] == 200 || (r[1] == 302 && retried), "protected pages not reached: {q}");
+    }
     // The logout link is excluded by default, and history holds the session cookie as a placeholder.
     assert!(!srv.log().iter().any(|l| l.starts_with("GET /logout")));
     let q = ok(

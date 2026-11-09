@@ -602,6 +602,19 @@ fn ws_send_records_as_it_goes() {
         "SELECT c.source, c.state, h.status, h.source FROM ws_connections c JOIN history h ON h.id = c.history_id";
     let c = env.ok(&["query", sql]);
     assert_eq!(c["rows"], serde_json::json!([["replay", "open", 101, "ws"]]));
+    // The next look at the connections closes it: its `ws send` no longer holds its lock.
+    let l = env.ok(&["ws", "list"]);
+    assert_eq!(l["items"][0]["state"], "closed", "{l}");
+    assert_eq!(l["items"][0]["error"], "ws send ended without closing it (killed)", "{l}");
+    // One whose `ws send` still runs is left open.
+    let env = Env::new("live-running");
+    let mut child = ws_send_listening(&env, port);
+    let l = env.ok(&["ws", "list"]);
+    assert_eq!(l["items"][0]["state"], "open", "{l}");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let l = env.ok(&["ws", "show", &l["items"][0]["id"].to_string()]);
+    assert_eq!(l["connection"]["state"], "closed", "{l}");
 
     // Stopped with SIGTERM: the close is recorded with why.
     #[cfg(unix)]

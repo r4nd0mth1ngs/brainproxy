@@ -351,6 +351,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("scan data update", FETCH),
     ("scan data reset", REPLACE),
     ("scan sources", SET),
+    // Through MCP it can only be turned off.
+    ("scan prune", SET),
     ("findings list", READ),
     ("findings compare", READ),
     ("findings show", READ),

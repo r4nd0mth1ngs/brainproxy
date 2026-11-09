@@ -622,6 +622,11 @@ attack type, and pick payloads:
   - **Audit specific URLs:** only the requests you list.
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
     templates* (on when installed, high severity and above by default).
+  - **Keep only attack requests that back a finding:** off by default, so every attack request
+    stays in history. On, a scan deletes when it ends (finished, stopped with *Stop*, or out
+    of time) the attack requests it sent that nothing refers to. It is saved for the project and shared with
+    the CLI (`scan prune`), and applies to every kind of active scan. See
+    [Pruning a scan's attack requests](#pruning-a-scans-attack-requests).
 - **New scan › Targeted:** search the ZAP scan rules and the installed checks (Nuclei,
   brainproxy, local) by name, id, CVE, or tag, pick some, and run only those, on crawled,
   recorded, or listed requests. Checks tagged dos, fuzz, or intrusive, which other scans
@@ -1364,7 +1369,7 @@ Crawl and active-scan scope and safety flags:
 - `scan active --checks`: the same opt-in applies to the requests a template sends, from any
   store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
   without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
-  check does send is recorded in history (source `scan`), finding or not.
+  check or rule does send is recorded in history (source `scan`), finding or not.
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, or a
   GraphQL schema (SDL file or introspection result), detected from its contents. `--dry-run` previews and sends nothing for a local file: servers,
   declared credentials, variables, every operation with its index and whether it would be sent,
@@ -1652,21 +1657,44 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   the command is killed at once, and its row keeps the pending error.
 - `ws send` records the connection and each message as they happen, not at the end (a
   message to the server when it is queued, so one queued just before the connection dropped
-  may not have gone out). Killed while listening, the connection stays `open` with every
-  message up to then; stopped with Ctrl-C or SIGTERM, it is closed with that error.
+  may not have gone out). Killed while listening, the connection is left `open` with every
+  message up to then, and the next `ws send`, `ws list` or `ws show` closes it with the error
+  `ws send ended without closing it (killed)`: while it runs, `ws send` holds
+  `<project>-ws-ID.lock`, which the system lets go of when the process dies. Stopped with
+  Ctrl-C or SIGTERM, it is closed with that error.
 - An HTTP/2 race (`send --race N --http2`) that fails after connecting records each copy
   with the error. If no copy got a response, the command fails with the error's kind (exit
   3) and the message lists the rows; with `--format json` the envelope's `data.results`
   has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
-- The requests a `scan active --checks` template sends, and the document fetches of `import`
-  and `scan active --api` (with `--graphql`, the introspection), are recorded the same way: a row
-  just before the request goes out, completed with the response or the failure. A check request
-  cut off by its timeout, or by a stopped scan, keeps `sent; no response recorded (the check
-  timed out or the scan stopped)`.
+- The document fetches of `import` and `scan active --api` (with `--graphql`, the
+  introspection) are recorded the same way: a row just before the request goes out, completed
+  with the response or the failure.
+- So are the requests of `crawl` (source `crawl`), `crawl --browser` (`crawl-browser`),
+  `authz run` and its live mode (`authz`, the baseline's second copy too), `fuzz run` with
+  `--store all`, the default (`fuzz`), and `scan active` (`scan`): the page `--url` fetches,
+  and every request a rule or a `--checks` template sends, finding or not. A killed run leaves
+  the requests it had out with the pending error. A request answered with "logged out" keeps
+  its row and the one sent again after the re-login gets the next, as for `send --auth`.
+  A scan request cut off by a check's timeout, or by a stopped scan, keeps `sent; no response
+  recorded (the check timed out or the scan stopped)`; a browser crawl's request still out
+  when the crawl ends keeps the pending error. An out-of-band finding points to its attack's
+  own row. `fuzz run --store matches` records a matching request with its response, once it
+  is known to match, so a killed run leaves no row for the request it had out; `--store
+  none` records none. A request the engagement scope refuses outright isn't sent and gets no
+  pending row (`crawl` and `fuzz run --store all` record it as failed).
+- `scan active` keeps every one of these rows by default; with pruning on it deletes, once
+  the scan ends, the ones nothing refers to (see
+  [Pruning a scan's attack requests](#pruning-a-scans-attack-requests)). The rows are still
+  written before each request goes out, so a killed scan keeps them all.
+- These commands write their rows on a thread of their own: everything queued since its last
+  write (rows about to go out, and completions) goes in one transaction, and a request goes
+  out only once its row is committed. With many requests out at once, that is one write for
+  many rows.
 - `proxy stop` (and anything that stops the proxy) stops sending, then waits up to 3 seconds
   for requests already forwarded. Ones still unanswered are recorded with `proxy stopped
-  before the response arrived`. Requests arriving meanwhile get a 503 and aren't sent, and
-  neither is a re-login retry. The proxy then writes out every capture still queued
+  before the response arrived`; one answered "logged out" whose re-login is still running
+  keeps that answer. Requests arriving meanwhile get a 503 and aren't sent, and neither is a
+  re-login retry. The proxy then writes out every capture still queued
   (passive checks of the last ones wait for the next scan); `proxy stop` waits up to 30
   seconds for it to exit before killing it.
 - `--no-store` (`send`, `send --race`, `ws send`) keeps no content, but still writes a row:
@@ -1693,6 +1721,46 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   Narrowing the scope hides what went out, never that it did. A
   request outside both scopes is refused by the engagement before it goes out and gets no
   row. Find these rows with `SELECT * FROM history WHERE error LIKE 'outside the recording scope%'`.
+
+### Pruning a scan's attack requests
+
+An active scan records every attack request it sends, so a scan of a few pages can add
+hundreds of rows to history. To keep only the ones that matter, turn pruning on for the
+project (*Keep only attack requests that back a finding* under *New scan*, or `brainproxy scan
+prune on`; `scan prune` shows it, `scan prune off` turns it off), or pass `scan active --prune`
+for one scan. `--no-prune` keeps everything for one scan whatever the setting. Changing the
+setting is logged in `setting_changes` (key `active`).
+
+With pruning on, when the scan ends it deletes the history rows of its own attack requests
+that nothing refers to. It ends that way when it finishes, when it is stopped with `job stop`
+(the app's *Stop* on a task), and when `--max-minutes` runs out. If the process dies first
+(killed, Ctrl-C on a scan run in the foreground, a crash) or the scan fails with an error,
+nothing is deleted: the rows were written before each request went out, as always, and stay.
+
+A row is kept if it is a finding's first or last sighting or one of a hand-added finding's
+linked entries, a finding event's request (a retest's, say), an `authz` result's request
+tested, response or baseline, a fuzz result, a WebSocket connection's upgrade, an auth macro
+step's source, or an out-of-band payload's attack (a callback can still arrive and raise a
+finding), or if it has a note or tags. The requests the scan starts from (history rows, the
+pages a URL or `--api` scan fetches first, a `--crawl`'s requests) and a login's requests are
+never its attack rows and are always kept.
+
+Rows are deleted 500 at a time, each batch checked and deleted in a transaction of its own, so
+a running proxy or another scan can keep writing meanwhile. The scan's result gives the number
+deleted as `pruned` (left out when the scan kept everything). If deleting fails part way, the
+scan still completes: `pruned` counts what was deleted, `prune_error` says why it stopped, and
+the rest of the rows stay.
+
+What it doesn't see:
+- A reference made by another process after its batch was deleted points at a row that is
+  gone: for example a passive scan of source `scan` (`scan sources`), or a second scan started
+  meanwhile from the first one's attack rows (`--where "source = 'scan'"`).
+- History ids in a job's arguments (`jobs.args`, such as `--history-id`) don't keep a row.
+- History ids are never reused, so a deleted id never points at another request.
+
+Through MCP, `--prune` and `scan prune on` are refused, and an agent's scan keeps every request
+even with the setting on (its result says so in `prune_hint`), so a person can see everything
+sent on their behalf.
 
 ### Issues, timelines, retests and posture
 
@@ -2070,7 +2138,8 @@ origin `mcp`, including what a proxy or job it started records; see
 [Who recorded what](#who-recorded-what).
 
 A tool call can't leave what it sends out of history: `send` and `ws send` with `--no-store`
-and `fuzz run --store none` or `--store matches` are refused. An agent can change the proxy
+and `fuzz run --store none` or `--store matches` are refused, and so are `scan active --prune`
+and `scan prune on`; an agent's scans keep every request whatever the project's prune setting. An agent can change the proxy
 scope and the TLS pass-through list, but traffic left out still leaves rows, and a change
 that narrows recording is flagged until a person changes that setting or the agent puts it
 back as it was, and stays in the log either way (see [Who recorded what](#who-recorded-what)).
