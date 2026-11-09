@@ -26,20 +26,46 @@ the server's working directory.
 
 ## Protocol
 
+The server speaks both protocol eras, chosen per request:
+
+- **2026-07-28 (stateless).** A request whose `params._meta` has
+  `io.modelcontextprotocol/protocolVersion: "2026-07-28"` must also have
+  `io.modelcontextprotocol/clientCapabilities` (an object), or it gets `-32602`. So does a
+  request with that object (or `clientInfo`) but no version, a version that isn't a string,
+  and `server/discover` or `subscriptions/listen` without one. A version the server doesn't
+  serve gets `-32022` (`UnsupportedProtocolVersion`) with `data: {supported, requested}`. Every result has `resultType: "complete"` and
+  `_meta["io.modelcontextprotocol/serverInfo"]`; list, read and discover results also have
+  `ttlMs: 3600000` and `cacheScope: "public"` (none of them change while the server runs).
+- **2025-06-18 and earlier (handshake).** `initialize` picks the version: the client's if it
+  is 2025-06-18, 2025-03-26, or 2024-11-05, otherwise 2025-06-18. A request without the
+  version in `_meta` is served this way, whether or not `initialize` came first, and so is
+  one that names one of those versions there.
+
+Eras can mix on one process: nothing carries over from one request to the next.
+
 | Method | Result |
 | --- | --- |
-| `initialize` | protocol version (the client's if it is 2025-06-18, 2025-03-26, or 2024-11-05; otherwise 2025-06-18), `capabilities.tools`, `capabilities.resources`, `serverInfo`, short `instructions` |
-| `ping` | `{}` |
-| `tools/list` | every tool, no pagination |
+| `server/discover` | 2026-07-28 only: `supportedVersions` (`2026-07-28` first, then the handshake versions), `capabilities.tools`, `capabilities.resources`, short `instructions` |
+| `initialize` | handshake only: protocol version, the same `capabilities` and `instructions`, `serverInfo` |
+| `ping` | handshake only: `{}` (2026-07-28 removed it: `-32601`) |
+| `tools/list` | every tool, no pagination, in a fixed order |
 | `tools/call` | the command's output (below) |
 | `resources/list` | `brainproxy://schema` and `brainproxy://capabilities` (below) |
-| `resources/read` | the resource's JSON; `-32002` for an unknown URI |
+| `resources/read` | the resource's JSON; an unknown URI is `-32602` (2026-07-28) or `-32002` (handshake) |
 | `resources/templates/list` | `[]` |
+| `subscriptions/listen` | 2026-07-28 only: `params.notifications` must be a `SubscriptionFilter` object (`-32602` otherwise). Answered with `notifications/subscriptions/acknowledged` and an empty `notifications` filter, since nothing the server lists ever changes. Up to 16 may be open at once (more get `-32000`). The request stays open until `notifications/cancelled` names it (no reply then) or stdin closes (then a `complete` result tagged with `io.modelcontextprotocol/subscriptionId`) |
 
 Notifications (`notifications/initialized`, `notifications/cancelled`, ...) get no reply.
-Errors: `-32700` parse error, `-32600` not a request object, `-32601` unknown method,
-`-32602` unknown tool, unknown argument, or wrongly typed argument, `-32000` too many calls,
-`-32603` a resource's command failed.
+Errors: `-32700` parse error (including a line that isn't UTF-8; the server keeps going),
+`-32600` not a request object, an id that isn't a string or an integer (`1.0` counts as an
+integer), or the id of a request still running; an error for a message whose id can't be read
+or used has no `id`, never `null`; `-32601` unknown method, `-32602` unknown tool or missing `_meta` fields,
+`-32022` unsupported version, `-32000` too many calls, `-32603` a resource's command failed.
+An argument a tool doesn't take, or one of the wrong type, is a `-32602` protocol error for a
+handshake client. Under 2026-07-28 it is a tool execution error instead (`isError: true`,
+envelope `{ok: false, error: {kind: "usage", ...}}`), so a model can see it and correct the call.
+Nothing but JSON-RPC messages is written to stdout; the server's own errors, including a bad
+`mcp serve` command line, go to stderr.
 
 Tool calls run concurrently, each on its own thread and child process, up to 16 at once
 (more are refused with `-32000`; a second call with the id of a running one gets `-32600`),
