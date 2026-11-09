@@ -605,8 +605,10 @@ attack type, and pick payloads:
 - **New scan › Active scan:**
   - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
-    and URL paths mentioned in page text or scripts (error pages included); placeholder
-    values such as `?key=…` or `/users/{id}` are replaced with test values. It keeps the
+    and URL paths mentioned in page text or scripts (error pages included), including template
+    literals such as `` `/api/users/${id}` `` and the code-split chunks a bundle loads later
+    (`import("./About-x.js")`, `"assets/About-x.js"`); placeholder values such as `?key=…`,
+    `/users/{id}` or `${id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them,
     and *Inject into URL paths* to attack each path segment, such as the ID in `/users/42`
     (`scan active --url-path`; it sends many more requests). The guided Standard and Thorough

@@ -303,8 +303,8 @@ brainproxy scan passive --rescan                  # rescan all history
 
 # Crawl, then actively scan (52 rules ported from ZAP); everything stays inside the engagement scope.
 # The crawler follows links, forms, robots.txt, sitemaps, and URL paths written in page text or
-# scripts (also on 4xx pages; placeholders like ?key=… or /users/{id} get test values), and keeps
-# the cookies the site sets. It doesn't run JavaScript; --browser does (single-page apps, below).
+# scripts (also on 4xx pages; placeholders like ?key=…, /users/{id} or `${id}` get test values),
+# the code-split chunks a bundle loads later, and keeps the cookies the site sets. It doesn't run JavaScript; --browser does (single-page apps, below).
 brainproxy crawl https://app.example.com/ --background         # job id; brainproxy job wait ID
 brainproxy crawl https://app.example.com/ --max-minutes 10     # stop after 10 minutes
 brainproxy scan active                                         # all crawled/proxied/sent endpoints
