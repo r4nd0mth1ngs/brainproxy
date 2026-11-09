@@ -127,8 +127,6 @@ pub const SETTING_CHANGE_COLUMNS: &[(&str, &str, &str)] = &[
     ("origin", "TEXT", "gui, cli or mcp: who saved it"),
 ];
 
-/// Logs that setting `key` was saved by this process's origin, on `conn` (inside the caller's
-/// transaction when it has one).
 /// A saved item's name (a report profile's, a scan policy's), trimmed: 1 to 64 bytes, not
 /// starting with "-" (it would be read as a flag wherever the name is passed on its own), no
 /// control characters.
@@ -143,6 +141,8 @@ pub(crate) fn saved_name<'a>(what: &str, name: &'a str) -> Result<&'a str> {
     Ok(name)
 }
 
+/// Logs that setting `key` was saved by this process's origin, on `conn` (inside the caller's
+/// transaction when it has one).
 pub(crate) fn log_setting_change(conn: &Connection, key: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO setting_changes (key, origin) VALUES (?1, ?2)",
