@@ -191,15 +191,15 @@ pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result
         _ => PathBuf::from("."),
     };
     let folder = folder.canonicalize().map_err(|_| refuse())?;
-    // A project kept in the home folder (or at /) would open every file under it.
+    // A project kept in the home folder, above it, or at / would open every file under it.
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|h| !h.is_empty());
     let home = home.and_then(|h| Path::new(&h).canonicalize().ok());
-    if folder.parent().is_none() || home.as_deref() == Some(folder.as_path()) {
+    if folder.parent().is_none() || home.as_deref().is_some_and(|h| h.starts_with(&folder)) {
         return Err(brainproxy_core::Error::InvalidInput(format!(
             "{flag} {source:?}: through MCP a local file is read only from the project's folder, and this \
              project is in {}: put the project in a folder of its own, pass the file's text on stdin (-), \
              or give an http(s) URL",
-            if folder.parent().is_none() { "/" } else { "your home folder" }
+            if folder.parent().is_none() { "/" } else { "your home folder or above it" }
         )));
     }
     let file = Path::new(source).canonicalize().map_err(|_| refuse())?;

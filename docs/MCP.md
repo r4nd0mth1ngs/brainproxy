@@ -166,7 +166,7 @@ Some arguments need a person, so a command run for a tool call (the server sets
   read): its text could reach the agent through the preview or an error. The refusal names the
   path, never the file's content. An agent passes a document as the call's `stdin` (`-`), puts
   the file in the project's folder, or gives an http(s) URL (checked against the scope as usual).
-  A project kept directly in the home folder or at `/` opens no local file to these commands:
+  A project kept in the home folder, in a folder above it, or at `/` opens no local file to these commands:
   a person puts the project in a folder of its own. Through MCP these commands' parse errors
   say only where a document stops being JSON or YAML (line and column), never quoting it.
   This limit is for these import and scan options only. Known gap: `send`'s `file`,

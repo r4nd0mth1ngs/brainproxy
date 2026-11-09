@@ -331,10 +331,11 @@ fn secret_pair(name: &str, value: &str) -> bool {
     secret_name(name) || refresh || (code && CODE_NAMES.contains(&n.as_str()))
 }
 
-/// Whether a value named `refresh` reads as a token rather than a period, a flag or a
-/// redirect.
+/// Whether a value named `refresh` reads as a token rather than a period, a flag, a
+/// timestamp or a redirect (base64 padding at the end is allowed).
 fn refresh_token(v: &str) -> bool {
-    v.len() >= 8 && !v.contains(['=', ';', ' ']) && credential_shaped(v)
+    let core = v.trim_end_matches('=');
+    v.len() >= 8 && !core.contains(['=', ';', ' ']) && !core.bytes().all(|b| b.is_ascii_digit()) && credential_shaped(v)
 }
 
 /// Whether a header's whole value is a credential (beyond Cookie, Set-Cookie and
@@ -410,9 +411,11 @@ const K8S_BEARER: &str = "base64url.bearer.authorization.k8s.io.";
 
 /// Whether a `Sec-WebSocket-Protocol` item names a subprotocol rather than carries a token.
 fn plain_subprotocol(item: &str) -> bool {
-    let i = item.trim().to_ascii_lowercase();
+    let item = item.trim();
+    let i = item.to_ascii_lowercase();
+    // A version name is matched as sent: a token's capitals don't pass as a lowercase name.
     !i.starts_with(K8S_BEARER)
-        && (PLAIN_SUBPROTOCOLS.contains(&i.as_str()) || (i.len() <= 40 && VERSIONED_SUBPROTOCOL.is_match(&i)))
+        && (PLAIN_SUBPROTOCOLS.contains(&i.as_str()) || (item.len() <= 40 && VERSIONED_SUBPROTOCOL.is_match(item)))
 }
 
 /// Whether a `Sec-WebSocket-Protocol` value carries anything but plain subprotocol names.
@@ -430,33 +433,6 @@ fn auth_scheme(value: &str) -> Option<&str> {
     let (scheme, rest) = v.split_at(end);
     (AUTH_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) && !rest.trim().is_empty()).then_some(scheme)
 }
-
-/// The word before `-key` in a header name that says the key is a credential
-/// (Ocp-Apim-Subscription-Key, Api-Key, Client-Key, ...).
-const SECRET_KEY_KINDS: &[&str] = &[
-    "api",
-    "access",
-    "auth",
-    "secret",
-    "client",
-    "consumer",
-    "subscription",
-    "functions",
-    "function",
-    "private",
-    "master",
-    "app",
-    "application",
-    "license",
-    "licence",
-    "signing",
-    "encryption",
-    "session",
-    "service",
-    "developer",
-    "partner",
-    "account",
-];
 
 /// The word before `-key` in a header name whose key is data, not a credential: a cache's,
 /// a table's or a retry's (X-Cache-Key, Sort-Key, Primary-Key, X-Idempotency-Key), or a
@@ -484,15 +460,16 @@ const PLAIN_KEY_KINDS: &[&str] = &[
 ];
 
 /// Whether a header name, lowercased, reads as a credential's: it says `auth` (X-Api-Auth,
-/// X-Authorization, Authentication, Grpc-Metadata-Authorization, but not `:authority`,
-/// Author or X-Authority), or it names a key that is a credential: `<kind>-key` for a kind
-/// in [`SECRET_KEY_KINDS`] (X-Functions-Key, Ocp-Apim-Subscription-Key), or any `X-...-Key`
-/// whose kind isn't one of [`PLAIN_KEY_KINDS`] (X-Cache-Key and Sort-Key are data).
+/// X-Authorization, X-Authorisation, Authentication, Grpc-Metadata-Authorization, but not
+/// `:authority`, Author or X-Authority), or it ends in `-key` and the word before isn't one
+/// of [`PLAIN_KEY_KINDS`] (User-Key and X-Functions-Key are credentials; X-Cache-Key and
+/// Sort-Key are data).
 fn auth_or_key_name(n: &str) -> bool {
-    let auth = n.contains("auth") && !(n.contains("author") && !n.contains("authoriz"));
+    let author = n.contains("author") && !n.contains("authoriz") && !n.contains("authoris");
+    let auth = n.contains("auth") && !author;
     let Some(rest) = n.strip_suffix("-key") else { return auth };
     let kind = rest.rsplit('-').next().unwrap_or_default();
-    auth || (!PLAIN_KEY_KINDS.contains(&kind) && (SECRET_KEY_KINDS.contains(&kind) || n.starts_with("x-")))
+    auth || !PLAIN_KEY_KINDS.contains(&kind)
 }
 
 /// Whether a value starts with an auth scheme followed by something credential-shaped
@@ -1195,6 +1172,25 @@ mod tests {
                 format!("Sec-WebSocket-Protocol: {value}")
             );
         }
+    }
+
+    #[test]
+    fn the_gaps_the_second_review_found() {
+        // Any `-key` header that isn't data, and the British spelling of Authorization.
+        for n in ["User-Key", "Admin-Key", "Hmac-Key", "Write-Key", "Merchant-Key", "Authorisation", "X-Authorisation"]
+        {
+            assert!(credential_header(n, "k"), "{n}");
+        }
+        // A refresh token with base64 padding is one; a timestamp isn't.
+        let padded = "dGhpcyBpcyBhIHJlZnJlc2g=";
+        assert!(!redacted(&format!("/feed?refresh={padded}")).contains(padded));
+        assert!(!redacted(&format!(r#"{{"refresh": "{padded}="}}"#)).contains(padded));
+        assert_eq!(redacted("/feed?refresh=1700000000123"), "/feed?refresh=1700000000123");
+        // A version-style subprotocol is matched as sent, so a token's capitals give it away.
+        for v in ["v1.aB3dE5gH7jK9", "V1.QWERTYUIOPAS"] {
+            assert!(subprotocol_credential(v), "{v}");
+        }
+        assert!(!subprotocol_credential("v10.stomp, v4.channel.k8s.io"));
     }
 
     #[test]

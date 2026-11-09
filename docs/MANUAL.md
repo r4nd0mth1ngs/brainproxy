@@ -275,8 +275,8 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
    `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`, `pdf`, `docx`). Every format masks session secrets
    (cookie values, `Authorization` credentials and a Basic credential's decoded password,
    API-key and other secret-named headers (any name that says `auth`, but not `Author` or
-   `Authority`; a credential key such as `Api-Key`, `X-Functions-Key`, `Ocp-Apim-Subscription-Key`
-   or any other `X-...-Key`, but not a key that is data such as `Sort-Key`, `Primary-Key` or
+   `Authority`; a credential key such as `Api-Key`, `X-Functions-Key`, `Ocp-Apim-Subscription-Key`,
+   `User-Key` or any other `...-Key`, but not a key that is data such as `Sort-Key`, `Primary-Key` or
    `X-Cache-Key`; and any header whose value starts with an auth scheme such as `Bearer` or
    `Basic` followed by a credential rather than a word, keeping the scheme; tokens sent as WebSocket subprotocols in `Sec-WebSocket-Protocol`, keeping plain
    subprotocol names such as `graphql-transport-ws`; not `WWW-Authenticate` challenges, `Sec-WebSocket-Key` or `Idempotency-Key`, which

@@ -407,6 +407,12 @@ fn an_agent_s_import_errors_never_quote_the_file() {
     assert_eq!(o.code, 2, "{}", o.all);
     assert!(o.all.contains("home folder") && o.all.contains("folder of its own"), "{}", o.all);
     assert!(!o.all.contains("AKIA"), "{}", o.all);
+    // So does one kept in a folder above the home folder, which holds it.
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let o = run_mcp_env(&p, &["import", "openapi", "--dry-run", "--", ini], b"", &[("HOME", home.as_path())]);
+    assert_eq!(o.code, 2, "{}", o.all);
+    assert!(o.all.contains("home folder or above it"), "{}", o.all);
     // Stdin is still read.
     let spec = br#"{"openapi": "3.0.0", "servers": [{"url": "http://127.0.0.1:1"}], "paths": {}}"#;
     let o = run_mcp_env(&p, &["import", "openapi", "--dry-run", "--", "-"], spec, &[("HOME", &dir)]);
