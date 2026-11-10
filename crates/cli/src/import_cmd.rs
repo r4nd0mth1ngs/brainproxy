@@ -513,7 +513,12 @@ pub(crate) fn read_environment(project: &Path, path: &str) -> Result<String, Err
     if is_url(path) || path == "-" {
         return Err(Error::InvalidInput("--environment must be a local file".into()));
     }
-    let file = crate::mcp::local_document(project, "--environment", path)?;
+    let file = crate::mcp::local_document(
+        project,
+        "--environment",
+        path,
+        "have a person run the command in the app or a terminal (an environment file is read from disk only)",
+    )?;
     std::fs::read_to_string(file).map_err(|_| Error::InvalidInput(format!("can't read the environment file {path:?}")))
 }
 
@@ -669,7 +674,12 @@ pub(crate) fn read_local(project: &Path, source: &str) -> Result<String, Error> 
     let bytes = if source == "-" {
         crate::read_input(None)?
     } else {
-        let path = crate::mcp::local_document(project, "the document", source)?;
+        let path = crate::mcp::local_document(
+            project,
+            "the document",
+            source,
+            "pass its text on stdin (-), or give an http(s) URL",
+        )?;
         let meta = std::fs::metadata(&path).map_err(|e| Error::InvalidInput(format!("cannot read {source:?}: {e}")))?;
         // A HAR file may be larger than other documents; `api::load` holds those to their limit.
         if meta.len() as usize > har::MAX_HAR {

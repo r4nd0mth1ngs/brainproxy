@@ -2884,7 +2884,9 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     let bytes = if path == "-" {
                         crate::read_input(None)?
                     } else {
-                        std::fs::read(path).map_err(|e| Error::InvalidInput(format!("cannot read {path:?}: {e}")))?
+                        // Forwarded as it is, and recorded: through MCP only a file in the project's folder.
+                        let file = crate::mcp::local_document(project, "FILE", path, "pass the edit on stdin (-)")?;
+                        std::fs::read(file).map_err(|e| Error::InvalidInput(format!("cannot read {path:?}: {e}")))?
                     };
                     let msg = RawRequest::from_bytes(bytes);
                     Some(

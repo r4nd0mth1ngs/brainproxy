@@ -187,20 +187,27 @@ pub(crate) fn check_request_files(files: &[String]) -> Result<(), brainproxy_cor
     Ok(())
 }
 
-/// The path to read a local document `source` from (an import's spec, collection, HAR file,
-/// schema or environment). Under a tool call it must be inside the project file's folder once
-/// symlinks are followed, and the resolved path is what is read, so a link can't be swapped
-/// in between: an agent could otherwise point an import at any file the server can read and
-/// read parts of it back from the preview or an error. The refusal never quotes the file.
-/// `-` (stdin) is the caller's own text and is not checked.
-pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result<PathBuf, brainproxy_core::Error> {
+/// The path to read a caller-given local file `source` from: an import's spec, collection, HAR
+/// file, schema or environment, a request or handshake file, a macro step, a payload file, a
+/// template. Under a tool call it must be inside the project file's folder once symlinks are
+/// followed, and the resolved path is what is read, so a link can't be swapped in between: an
+/// agent could otherwise point a command at any file the server can read and have it sent to
+/// the target, or read parts of it back from history, a preview or an error. The refusal never
+/// quotes the file; `instead` ends it with what an agent does instead ("pass its text on stdin
+/// (-)"). `-` (stdin) is the caller's own text and is not checked.
+pub(crate) fn local_document(
+    project: &Path,
+    flag: &str,
+    source: &str,
+    instead: &str,
+) -> Result<PathBuf, brainproxy_core::Error> {
     if !in_tool_call() || source == "-" {
         return Ok(PathBuf::from(source));
     }
     let refuse = || {
         brainproxy_core::Error::InvalidInput(format!(
             "{flag} {source:?}: through MCP a local file is read only from the project's folder (symlinks \
-             followed); put it there, pass its text on stdin (-), or give an http(s) URL"
+             followed); put it there, or {instead}"
         ))
     };
     let folder = match project.parent() {
@@ -214,8 +221,7 @@ pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result
     if folder.parent().is_none() || home.as_deref().is_some_and(|h| h.starts_with(&folder)) {
         return Err(brainproxy_core::Error::InvalidInput(format!(
             "{flag} {source:?}: through MCP a local file is read only from the project's folder, and this \
-             project is in {}: put the project in a folder of its own, pass the file's text on stdin (-), \
-             or give an http(s) URL",
+             project is in {}: put the project in a folder of its own, or {instead}",
             if folder.parent().is_none() { "/" } else { "your home folder or above it" }
         )));
     }
@@ -225,6 +231,42 @@ pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result
     } else {
         Err(refuse())
     }
+}
+
+/// [`local_document`] for a file argument kept as text (a request file, a macro step, a payload
+/// file): the path to read, as text. A resolved path that isn't UTF-8 is refused rather than
+/// read under another name.
+pub(crate) fn local_file_arg(
+    project: &Path,
+    flag: &str,
+    source: &str,
+    instead: &str,
+) -> Result<String, brainproxy_core::Error> {
+    local_document(project, flag, source, instead)?.into_os_string().into_string().map_err(|_| {
+        brainproxy_core::Error::InvalidInput(format!(
+            "{flag} {source:?}: through MCP a local file is read from its resolved path, and this one isn't UTF-8 \
+             text; {instead}"
+        ))
+    })
+}
+
+/// [`local_document`] for a file argument kept as a path (a report to compare, a template). Through
+/// MCP a path that isn't UTF-8 text is refused, as it can't be checked.
+pub(crate) fn local_path(
+    project: &Path,
+    flag: &str,
+    source: &Path,
+    instead: &str,
+) -> Result<PathBuf, brainproxy_core::Error> {
+    if !in_tool_call() {
+        return Ok(source.to_path_buf());
+    }
+    let text = source.to_str().ok_or_else(|| {
+        brainproxy_core::Error::InvalidInput(format!(
+            "{flag}: through MCP a local file's path must be UTF-8 text; {instead}"
+        ))
+    })?;
+    local_document(project, flag, text, instead)
 }
 
 /// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as

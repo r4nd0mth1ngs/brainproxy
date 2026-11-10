@@ -58,7 +58,16 @@ pub struct CompareArgs {
     limit: usize,
 }
 
-pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
+pub fn compare(project: &Path, mut a: CompareArgs, out: &Out) -> Result<(), Error> {
+    // A report file's findings come back in the reply: through MCP only one in the project's
+    // folder (a missing --baseline is refused there too, --allow-missing-baseline or not).
+    let instead = "compare against a scan with --scan, or save the report there with `report json --output`";
+    if let Some(path) = a.baseline.take() {
+        a.baseline = Some(crate::mcp::local_path(project, "--baseline", &path, instead)?);
+    }
+    if let Some(path) = a.current.take() {
+        a.current = Some(crate::mcp::local_path(project, "--current", &path, instead)?);
+    }
     let mut warnings = Vec::new();
     // A --current file without tombstones, where a removed finding added by hand looks fixed.
     let mut no_tombstones: Option<PathBuf> = None;

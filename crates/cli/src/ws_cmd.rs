@@ -284,7 +284,12 @@ struct Input {
 }
 
 /// The handshake to send and where to, from the first source given.
-fn handshake_source(store: &Store, args: &SendArgs, input: &Input) -> Result<(RawRequest, Target), Error> {
+fn handshake_source(
+    project: &Path,
+    store: &Store,
+    args: &SendArgs,
+    input: &Input,
+) -> Result<(RawRequest, Target), Error> {
     let headers = args.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
     let history =
         match (args.from, args.history) {
@@ -302,8 +307,14 @@ fn handshake_source(store: &Store, args: &SendArgs, input: &Input) -> Result<(Ra
     } else {
         let bytes = match args.file.as_deref() {
             _ if args.input_json => input.handshake.clone().unwrap_or_default().into_bytes(),
-            Some(path) if path != "-" => std::fs::read(path)
-                .map_err(|e| Error::InvalidInput(format!("cannot read handshake file {path:?}: {e}")))?,
+            // Its bytes go on the wire and into history: through MCP only a file in the project's folder.
+            Some(path) if path != "-" => std::fs::read(crate::mcp::local_document(
+                project,
+                "FILE",
+                path,
+                "pass the handshake on stdin (-), or give --url, --from or --history",
+            )?)
+            .map_err(|e| Error::InvalidInput(format!("cannot read handshake file {path:?}: {e}")))?,
             _ => crate::read_input(None)?,
         };
         if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -353,7 +364,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     } else {
         Input::default()
     };
-    let (handshake, target) = handshake_source(&store, &args, &input)?;
+    let (handshake, target) = handshake_source(project, &store, &args, &input)?;
     let messages = outgoing(&store, &args, &input)?;
     let until = args
         .until

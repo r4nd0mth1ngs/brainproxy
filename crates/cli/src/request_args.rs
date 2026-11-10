@@ -81,6 +81,21 @@ impl RequestArgs {
         }
     }
 
+    /// Through MCP, points FILE at the file it resolves to inside the project's folder, and
+    /// refuses one elsewhere (see [`crate::mcp::local_document`]): its bytes go on the wire and
+    /// into history as they are. A FILE beside --url is never read, so it isn't checked.
+    pub fn resolve_file(&mut self, project: &std::path::Path) -> Result<(), Error> {
+        if let (None, Some(file)) = (&self.url, &self.file) {
+            self.file = Some(crate::mcp::local_file_arg(
+                project,
+                "FILE",
+                file,
+                "pass the request on stdin (-), or build it with --url",
+            )?);
+        }
+        Ok(())
+    }
+
     /// Builds the request and works out its target. With `template_marker`
     /// (fuzzing), markers are preserved, Content-Length is left for after payload
     /// substitution, and --url requests use keep-alive.
