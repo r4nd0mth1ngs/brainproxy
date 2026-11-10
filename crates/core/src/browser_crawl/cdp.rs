@@ -216,6 +216,7 @@ impl Chrome {
     }
 
     /// The browser's events from now on (method, params, sessionId), for one listener.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn events(&self) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *self.conn.events.lock().unwrap() = Some(tx);
