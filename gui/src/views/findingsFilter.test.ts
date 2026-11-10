@@ -129,6 +129,7 @@ test("a filed ticket's link is an http(s) URL, recorded as one argument", () => 
   assert.deepEqual(recordTicketCommand(7, "jira", "https://x.test/--force"), ["findings", "ticket", "7", "--to", "jira", "--record=https://x.test/--force"]);
 });
 
-test("a repro pack is written where the save dialog said", () => {
-  assert.deepEqual(reproCommand(9, "/w/finding-9.json"), ["findings", "repro", "9", "--output", "/w/finding-9.json", "--force"]);
+test("a repro pack replaces a file only when the save dialog asked about it", () => {
+  assert.deepEqual(reproCommand(9, "/w/finding-9.json", true), ["findings", "repro", "9", "--output", "/w/finding-9.json", "--force"]);
+  assert.deepEqual(reproCommand(9, "/w/finding-9.json", false), ["findings", "repro", "9", "--output", "/w/finding-9.json"]);
 });

@@ -4,20 +4,11 @@
 import { useRef, useState } from "react";
 import { inTauri, run } from "../api";
 import { useApp } from "../store";
-import { ask, confirm } from "../ui/Confirm";
+import { confirm } from "../ui/Confirm";
 import { useDialogFocus } from "../ui/dialogFocus";
-import { DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, harPath, MIN_MASK, type ExportOptions, type ExportResult } from "./trafficExport.ts";
+import { chooseSave } from "../ui/savePath.ts";
+import { DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, MIN_MASK, type ExportOptions, type ExportResult } from "./trafficExport.ts";
 import type { TrafficFilter } from "./trafficFilter";
-
-/** Where to write the HAR; null if cancelled. In a browser (the dev bridge) the path is typed. */
-async function chooseHar(name: string): Promise<string | null> {
-  if (inTauri) {
-    const dialogs = await import("@tauri-apps/plugin-dialog");
-    const p = await dialogs.save({ defaultPath: `${name}-traffic.har`, filters: [{ name: "HAR", extensions: ["har"] }] });
-    return typeof p === "string" ? p : null;
-  }
-  return (await ask("Save the HAR file as", "Its full path on this computer.", "Save", "Cancel", `${name}-traffic.har`))?.trim() || null;
-}
 
 /** Asks how to export what the filter shows, then writes it. `close` is called once it has started or was cancelled. */
 export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter; shown: number; close: () => void }) {
@@ -42,14 +33,14 @@ export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter;
       ))
     )
       return;
-    let chosen: string | null;
+    let chosen: { path: string; overwrite: boolean } | null;
     try {
-      chosen = await chooseHar(name);
+      chosen = await chooseSave(`${name}-traffic.har`, "HAR", "har");
     } catch (e: any) {
       return app.toast(e.message, "error");
     }
     if (!chosen) return;
-    const { path, overwrite } = harPath(chosen);
+    const { path, overwrite } = chosen;
     try {
       const r = await run<ExportResult>(exportArgs(filter, o, path, overwrite));
       app.toast(exportNote(r));

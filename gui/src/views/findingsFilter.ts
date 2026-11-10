@@ -198,6 +198,6 @@ export function recordTicketCommand(id: number, tracker: Tracker, url: string): 
 
 /** The command that writes a finding's repro pack (request with secrets masked, a curl command,
  * the response around the evidence, what the rule looks for, the command that checks it again). */
-export function reproCommand(id: number, path: string): string[] {
-  return ["findings", "repro", String(id), "--output", path, "--force"];
+export function reproCommand(id: number, path: string, overwrite: boolean): string[] {
+  return ["findings", "repro", String(id), "--output", path, ...(overwrite ? ["--force"] : [])];
 }

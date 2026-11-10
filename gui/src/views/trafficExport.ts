@@ -3,7 +3,7 @@
 // in the CLI (a contents search or a query); the export asks the CLI for all of it at once, as
 // one query in the filter language, so it covers every matching row, not only those loaded.
 
-import type { TrafficFilter } from "./trafficFilter";
+import { ASSET, type TrafficFilter } from "./trafficFilter";
 
 /** Rows per export, oldest first; the CLI says `truncated` when more matched. */
 export const EXPORT_LIMIT = 5000;
@@ -26,8 +26,8 @@ export const quoted = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, 
 /** `s` as literal text inside a regex. */
 const regexLiteral = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** The asset paths Traffic's "Hide static assets" hides; trafficFilter.ts tests the same. */
-const ASSET_REGEX = "(?i)\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\\?|$)";
+/** The asset paths Traffic's "Hide static assets" hides: trafficFilter.ts's own pattern, in any case. */
+export const ASSET_REGEX = `(?i)${ASSET.source}`;
 
 /**
  * Whether a query's parentheses pair up (outside quoted values). One that doesn't would join
@@ -102,13 +102,6 @@ export function exportArgs(f: TrafficFilter, o: ExportOptions, path: string, ove
     `--output=${path}`,
     ...(overwrite ? ["--force"] : []),
   ];
-}
-
-/** The file to write: the dialog's path, with .har added when it has no such extension. */
-export function harPath(chosen: string): { path: string; overwrite: boolean } {
-  if (/\.har$/i.test(chosen)) return { path: chosen, overwrite: true };
-  // The dialog asked about `chosen`, not this name: an existing file here is refused, not replaced.
-  return { path: `${chosen}.har`, overwrite: false };
 }
 
 /** What `history export` answers with --output. */

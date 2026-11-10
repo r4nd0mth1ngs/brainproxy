@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_FILTER } from "./trafficFilter.ts";
-import { balanced, DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, exportQuery, harPath, maskValues, quoted } from "./trafficExport.ts";
+import { balanced, DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, exportQuery, maskValues, quoted } from "./trafficExport.ts";
 
 const NONE = { ...DEFAULT_FILTER, hideRefused: false };
 
@@ -66,10 +66,6 @@ test("mask values go one per --mask; keeping secrets passes --no-redact", () => 
   assert.deepEqual(exportArgs(NONE, { keepSecrets: true, mask: "abcdef" }, "/t.har", false).slice(4), ["--no-redact", "--output=/t.har"]);
 });
 
-test("harPath adds .har and then never overwrites", () => {
-  assert.deepEqual(harPath("/a/t.HAR"), { path: "/a/t.HAR", overwrite: true });
-  assert.deepEqual(harPath("/a/t"), { path: "/a/t.har", overwrite: false });
-});
 
 test("exportNote says what was cut, masked and left out", () => {
   assert.equal(exportNote({ entries: 1, truncated: false, redacted: 0, binary_bodies_left_out: 0, path: "/t.har" }), "Exported 1 request to /t.har.");

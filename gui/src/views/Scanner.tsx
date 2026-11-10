@@ -980,9 +980,8 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
   const call = async (args: string[]) => {
     try {
       await run(args);
-      refreshPassive();
-      // A script check switched on or off: its row in the list above says so too.
-      if (args[1] === "enable" || args[1] === "disable") refreshScripts();
+      // A script check switched on or off: its row in the script list says so too.
+      scriptsChanged();
     } catch (e: any) {
       app.toast(e.message, "error");
     }

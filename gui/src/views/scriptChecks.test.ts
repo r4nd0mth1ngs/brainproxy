@@ -41,6 +41,8 @@ test("historyId takes a positive id, with or without #", () => {
   assert.equal(historyId("1.5"), null);
   assert.equal(historyId("-3"), null);
   assert.equal(historyId(""), null);
+  assert.equal(historyId("999999999999999"), 999999999999999);
+  assert.equal(historyId("9999999999999999"), null);
 });
 
 test("script commands put names and files after --, so a leading dash isn't a flag", () => {

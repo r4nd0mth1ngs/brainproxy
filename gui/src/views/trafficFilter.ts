@@ -31,7 +31,7 @@ export const modeOf = (f: TrafficFilter): SearchMode => (f.query ? "query" : f.c
 
 export const withMode = (f: TrafficFilter, mode: SearchMode): TrafficFilter => ({ ...f, contents: mode === "contents", query: mode === "query" });
 
-const ASSET = /\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\?|$)/i;
+export const ASSET = /\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\?|$)/i;
 
 /** The proxy refused it (outside the engagement scope). */
 export const isRefused = (r: { error?: string | null }) => !!r.error?.startsWith("out of scope");

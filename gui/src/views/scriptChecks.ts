@@ -81,7 +81,8 @@ export function scriptNameProblem(name: string): string | null {
 /** A history id typed in, or null when it isn't one. */
 export function historyId(text: string): number | null {
   const t = text.trim().replace(/^#/, "");
-  return /^[1-9]\d{0,15}$/.test(t) ? Number(t) : null;
+  // At most 15 digits: a longer one is past what a number holds exactly, and would name another row.
+  return /^[1-9]\d{0,14}$/.test(t) ? Number(t) : null;
 }
 
 /**

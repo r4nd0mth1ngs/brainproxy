@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, type Finding, type FindingEvent, type FindingItem, type HistoryEntry, type Risk } from "../api";
+import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, inTauri, type Finding, type FindingEvent, type FindingItem, type HistoryEntry, type Risk } from "../api";
 import { originOf, useApp } from "../store";
 import { ask, confirm } from "../ui/Confirm";
 import { Menu, useMenu } from "../ui/Menu";
+import { chooseSave } from "../ui/savePath.ts";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
@@ -253,14 +254,14 @@ export function FindingsView({ active }: { active: boolean }) {
     if (!finding) return;
     const id = finding.id;
     try {
-      const dialogs = await import("@tauri-apps/plugin-dialog");
-      const path = await dialogs.save({ defaultPath: `finding-${id}-repro.json`, filters: [{ name: "JSON", extensions: ["json"] }] });
-      if (typeof path !== "string") return;
-      const file = path.toLowerCase().endsWith(".json") ? path : `${path}.json`;
-      await run(reproCommand(id, file));
-      app.toast(`Repro pack saved. Secrets are masked.`);
-      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
-      await revealItemInDir(file).catch(() => {});
+      const chosen = await chooseSave(`finding-${id}-repro.json`, "JSON", "json");
+      if (!chosen) return;
+      await run(reproCommand(id, chosen.path, chosen.overwrite));
+      app.toast(`Repro pack saved to ${chosen.path}. Secrets are masked.`);
+      if (inTauri) {
+        const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+        await revealItemInDir(chosen.path).catch(() => {});
+      }
     } catch (e: any) {
       app.toast(e.message, "error");
     }
