@@ -23,16 +23,24 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
+/// The CLI's file name: `brainproxy`, or what `$BRAINPROXY_CLI_NAME` was when this app was
+/// built. A dev package (`make dev-deb`) builds with `brainproxy-dev`, so it runs its own CLI
+/// and keeps its own temp folder, and installs beside a release without touching it.
+const CLI_NAME: &str = match option_env!("BRAINPROXY_CLI_NAME") {
+    Some(name) => name,
+    None => "brainproxy",
+};
+
 /// The CLI to run: $BRAINPROXY_BIN, else the bundled sidecar next to this executable,
-/// else `brainproxy` on PATH.
+/// else `CLI_NAME` on PATH.
 fn binary() -> PathBuf {
     if let Some(bin) = std::env::var_os("BRAINPROXY_BIN") {
         return bin.into();
     }
-    let name = if cfg!(windows) { "brainproxy.exe" } else { "brainproxy" };
+    let name = if cfg!(windows) { format!("{CLI_NAME}.exe") } else { CLI_NAME.to_string() };
     std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.join(name)))
+        .and_then(|exe| Some(exe.parent()?.join(&name)))
         .filter(|p| p.is_file())
         .unwrap_or_else(|| name.into())
 }

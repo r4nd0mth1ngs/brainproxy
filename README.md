@@ -66,6 +66,10 @@ command line alone for Windows is `brainproxy-<version>-windows-x86_64.exe`; the
 (`-setup.exe`). See
 [docs/GUI.md](docs/GUI.md).
 
+To try the current code beside a release, `make dev-deb` (Linux) or `make dev-macos` (macOS)
+builds a **brainproxy-dev** package of the app into `dist/`, with its own name, CLI, app data and
+icon (`make help`; [docs/GUI.md, Dev packages](docs/GUI.md#dev-packages)).
+
 <table>
 <tr><th>Proxy</th><th>Site map</th><th>Replay</th><th>Fuzzer</th></tr>
 <tr><td><a href="docs/screenshots/proxy-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/proxy-light.png"><img src="docs/screenshots/proxy-dark.png" alt="Proxy: recorded traffic with the request and response"></picture></a></td><td><a href="docs/screenshots/sitemap-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/sitemap-light.png"><img src="docs/screenshots/sitemap-dark.png" alt="Site map: recorded requests by host and path"></picture></a></td><td><a href="docs/screenshots/replay-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/replay-light.png"><img src="docs/screenshots/replay-dark.png" alt="Replay: resending a request that returns a SQL error"></picture></a></td><td><a href="docs/screenshots/fuzzer-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/fuzzer-light.png"><img src="docs/screenshots/fuzzer-dark.png" alt="Fuzzer: payload position and the built-in SQL injection list"></picture></a></td></tr>

@@ -4,3 +4,4 @@ target/
 .claude/worktrees/
 HANDOVER.md
 research/
+/dist/
