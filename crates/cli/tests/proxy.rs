@@ -167,6 +167,72 @@ fn wait_for_settings() {
 }
 
 #[test]
+fn intercept_holds_what_its_filter_matches() {
+    let env = Env::new("intercept-filter");
+    let http_port = spawn_echo(false, &env.dir);
+    let https_port = spawn_echo(true, &env.dir);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let proxy = started["usage"]["proxy_url"].as_str().unwrap().to_string();
+    let refused = |args: &[&str]| {
+        let (code, v) = env.run(&[&["intercept", "enable"][..], args].concat());
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+        v["error"]["message"].as_str().unwrap().to_string()
+    };
+
+    // Requests: held when they match, sent at once when they don't.
+    let set = env.ok(&["intercept", "enable", "--filter", "method=POST req.body:secret", "--timeout", "30"]);
+    assert_eq!(set["settings"]["filter"], "method=POST req.body:secret");
+    assert_eq!(env.ok(&["intercept", "status"])["settings"]["filter"], "method=POST req.body:secret");
+    wait_for_settings();
+    let url = format!("https://localhost:{https_port}/form");
+    let (status, body) = curl(&proxy, &env.ca(), &url, &["-d", "a=public"]);
+    assert_eq!(status, 200, "not held: {body}");
+    let (status, _) = curl(&proxy, &env.ca(), &format!("{url}?secret"), &[]);
+    assert_eq!(status, 200, "a GET isn't held");
+    assert_eq!(env.ok(&["intercept", "list", "--state", "all"])["count"], 0);
+    let (p, ca, u) = (proxy.clone(), env.ca(), url.clone());
+    let client = std::thread::spawn(move || curl(&p, &ca, &u, &["-d", "a=secret"]));
+    let listed = env.ok(&["intercept", "list", "--wait", "10"]);
+    assert_eq!((listed["count"].as_i64(), listed["items"][0]["method"].as_str()), (Some(1), Some("POST")), "{listed}");
+    env.ok(&["intercept", "forward", &listed["items"][0]["id"].as_i64().unwrap().to_string()]);
+    let (status, body) = client.join().unwrap();
+    assert!(status == 200 && body.ends_with("a=secret"), "{status} {body}");
+
+    // --host, --path and --method still apply beside it: all must match.
+    env.ok(&["intercept", "enable", "--path", "^/other", "--filter", "method=POST", "--timeout", "30"]);
+    wait_for_settings();
+    assert_eq!(curl(&proxy, &env.ca(), &url, &["-d", "a=1"]).0, 200);
+    assert_eq!(env.ok(&["intercept", "list", "--state", "all"])["count"], 1, "only the one held above");
+
+    // Responses: the filter may ask about the response when only responses are held.
+    env.ok(&["intercept", "enable", "--responses", "--filter", "status:2xx resp.body:/boom"]);
+    wait_for_settings();
+    assert_eq!(curl(&proxy, &env.ca(), &format!("http://127.0.0.1:{http_port}/fine"), &[]).0, 200);
+    let (p, ca, u) = (proxy.clone(), env.ca(), format!("http://127.0.0.1:{http_port}/boom"));
+    let client = std::thread::spawn(move || curl(&p, &ca, &u, &[]));
+    let listed = env.ok(&["intercept", "list", "--wait", "10"]);
+    assert_eq!((listed["count"].as_i64(), listed["items"][0]["direction"].as_str()), (Some(1), Some("response")));
+    assert!(listed["items"][0]["url"].as_str().unwrap().ends_with("/boom"), "{listed}");
+    env.ok(&["intercept", "drop", &listed["items"][0]["id"].as_i64().unwrap().to_string()]);
+    assert_eq!(client.join().unwrap().0, 502);
+
+    // Fields not known when the message is held are refused, and nothing is changed.
+    let before = env.ok(&["intercept", "status"])["settings"].clone();
+    assert!(refused(&["--filter", "status:5xx"]).contains("status isn't known when a request"));
+    assert!(refused(&["--requests", "--responses", "--filter", "resp.header.server:*"]).contains("Hold only responses"));
+    assert!(refused(&["--ws-to-server", "--responses", "--filter", "title:x"]).contains("WebSocket message"));
+    assert!(refused(&["--responses", "--filter", "tag=x"]).contains("added to an entry once it is recorded"));
+    assert!(refused(&["--filter", "stauts:5"]).contains("unknown field"));
+    assert_eq!(env.ok(&["intercept", "status"])["settings"], before);
+
+    // An empty filter is none.
+    let set = env.ok(&["intercept", "enable", "--filter", " "]);
+    assert!(set["settings"].get("filter").is_none(), "{set}");
+    env.ok(&["intercept", "disable"]);
+    env.ok(&["proxy", "stop"]);
+}
+
+#[test]
 fn proxy_end_to_end() {
     let env = Env::new("e2e");
     let http_port = spawn_echo(false, &env.dir);

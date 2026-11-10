@@ -534,6 +534,14 @@ pub enum RulesCmd {
 #[derive(Subcommand)]
 pub enum InterceptCmd {
     /// Start holding matching messages in the queue. With no direction flag, requests are held.
+    #[command(after_help = "--filter takes the query language of `history list --filter` (see `history list \
+        --help`), asked about what is known when the message is held: a request is matched by itself (after \
+        match-and-replace rules), a response by the request sent and the response, a WebSocket message by its \
+        connection's handshake request. Response fields (status, length, duration, title, type, resp, \
+        resp.body, body, resp.headers, resp.header.NAME) are refused unless only --responses is held; id, \
+        error, note and tag are refused always. A bare word searches the URL (and the title of a response) and \
+        matches the method. --host, --path and --method still apply: a message is held when all that are \
+        given match. Enable replaces every setting, so pass the filter again each time (an empty one is none).")]
     Enable {
         #[arg(long)]
         requests: bool,
@@ -554,6 +562,10 @@ pub enum InterceptCmd {
         /// Only hold these methods (regex alternation, e.g. "POST|PUT"). Not applied to WebSocket messages.
         #[arg(long)]
         method: Option<String>,
+        /// Only hold messages whose exchange matches this query in the filter language of `history list
+        /// --filter`, e.g. 'method=POST NOT path:/static'. Combines with --host, --path and --method.
+        #[arg(long, value_name = "QUERY")]
+        filter: Option<String>,
         /// Seconds a held message waits for a decision.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -2800,6 +2812,7 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             host,
             path,
             method,
+            filter,
             timeout,
             timeout_action,
         } => {
@@ -2812,6 +2825,7 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                 host,
                 path,
                 method,
+                filter: filter.filter(|f| !f.trim().is_empty()),
                 timeout_secs: timeout,
                 timeout_action: match timeout_action {
                     TimeoutArg::Forward => TimeoutAction::Forward,
