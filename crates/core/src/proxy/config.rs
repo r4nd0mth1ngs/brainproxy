@@ -2,6 +2,7 @@
 //! the project database so the CLI can change them while a proxy is running; the
 //! proxy picks up changes within a fraction of a second.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use regex::Regex;
@@ -202,9 +203,7 @@ impl InterceptSettings {
             settings: self.clone(),
         })
     }
-}
 
-impl InterceptSettings {
     /// What the filter may ask about: only what a request carries when requests or WebSocket
     /// messages are held (those are matched by their handshake request), the response too when
     /// only responses are.
@@ -220,13 +219,13 @@ impl CompiledIntercept {
     /// Whether a message for this request should be held. `exchange` is the request (and, for a
     /// response, the response) as the filter sees it; it is made only when a filter is set and
     /// everything else matches.
-    pub fn matches(
+    pub fn matches<'c>(
         &self,
         response: bool,
         method: &str,
         host: &str,
         path: &str,
-        exchange: impl FnOnce() -> Capture,
+        exchange: impl FnOnce() -> Cow<'c, Capture>,
     ) -> bool {
         let s = &self.settings;
         s.enabled
@@ -311,6 +310,10 @@ mod tests {
         Capture::new("proxy", &target, request.as_bytes(), response.map(str::as_bytes), Some(5), None)
     }
 
+    fn owned(request: &str, response: Option<&str>) -> Cow<'static, Capture> {
+        Cow::Owned(exchange(request, response))
+    }
+
     #[test]
     fn intercept_filter() {
         let post = "POST /api/login HTTP/1.1\r\nHost: app.test\r\nContent-Length: 6\r\n\r\nuser=a";
@@ -322,8 +325,8 @@ mod tests {
         }
         .compile()
         .unwrap();
-        assert!(i.matches(false, "POST", "app.test", "/api/login", || exchange(post, None)));
-        assert!(!i.matches(false, "GET", "app.test", "/static/app.js", || exchange(get, None)));
+        assert!(i.matches(false, "POST", "app.test", "/api/login", || owned(post, None)));
+        assert!(!i.matches(false, "GET", "app.test", "/static/app.js", || owned(get, None)));
         // The other settings still apply, and the exchange isn't made when they don't match.
         let i = InterceptSettings { method: Some("PUT".into()), ..i.settings.clone() }.compile().unwrap();
         assert!(!i.matches(false, "POST", "app.test", "/api/login", || unreachable!()));
@@ -353,8 +356,8 @@ mod tests {
         let i = held(false, true, false, false).unwrap();
         let boom = "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n";
         let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-        assert!(i.matches(true, "GET", "app.test", "/", || exchange(get, Some(boom))));
-        assert!(!i.matches(true, "GET", "app.test", "/", || exchange(get, Some(ok))));
+        assert!(i.matches(true, "GET", "app.test", "/", || owned(get, Some(boom))));
+        assert!(!i.matches(true, "GET", "app.test", "/", || owned(get, Some(ok))));
 
         // Never known in flight, at any stage; an empty filter is none.
         let e = InterceptSettings { filter: Some("id>3".into()), ..Default::default() }.compile().unwrap_err();

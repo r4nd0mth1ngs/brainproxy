@@ -726,33 +726,54 @@ function Intercept({ active }: { active: boolean }) {
   }, [current]);
 
   const s = settings?.settings;
-  // The filter as typed, until it is applied (null: the saved one is shown).
+  // Changes run one after another, each on the settings as they are then: `enable` replaces
+  // them all, so a checkbox ticked while a filter is being applied mustn't undo it (or the
+  // other way round).
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
+  const change = (make: (cur: InterceptSettings) => string[] | null) => {
+    const work = async () => {
+      try {
+        const cur = (await run<{ settings: InterceptSettings }>(["intercept", "status"])).settings;
+        const args = make(cur);
+        if (args) await run(args);
+        return true;
+      } catch (e: any) {
+        app.toast(e.message, "error");
+        return false;
+      } finally {
+        refreshSettings();
+      }
+    };
+    const done = queue.current.then(work);
+    queue.current = done;
+    return done;
+  };
+
+  // The filter as typed, until it is applied and shows in the settings (null: the saved one is shown).
   const [filterDraft, setFilterDraft] = useState<string | null>(null);
   // The text last applied, so Enter and then leaving the box don't apply (or refuse) it twice.
   const triedFilter = useRef<string | null>(null);
+  // Applied, and kept in the box until the settings polled show it.
+  const appliedFilter = useRef<string | null>(null);
+  useEffect(() => {
+    const text = appliedFilter.current;
+    if (!s || text == null || filterChanged(s, text)) return;
+    appliedFilter.current = null;
+    setFilterDraft((d) => (d === text ? null : d));
+  }, [s]);
   const applyFilter = async (text: string) => {
     if (!s?.enabled || !filterChanged(s, text)) return setFilterDraft(null);
     if (triedFilter.current === text) return;
     triedFilter.current = text;
-    try {
-      await run(interceptEnableArgs(withFilter(s, text)));
-      setFilterDraft(null);
-      refreshSettings();
-    } catch (e: any) {
-      // Kept as typed, to fix.
-      app.toast(e.message, "error");
-    }
+    // Kept as typed when refused, to fix.
+    const ok = await change((cur) => (cur.enabled ? interceptEnableArgs(withFilter(cur, text)) : null));
+    if (ok) appliedFilter.current = text;
   };
-  const toggle = async (patch: Partial<InterceptSettings>) => {
-    const next = { ...s!, ...patch };
-    try {
-      if (!next.enabled) await run(["intercept", "disable"]);
-      else await run(interceptEnableArgs(next));
-      refreshSettings();
-    } catch (e: any) {
-      app.toast(e.message, "error");
-    }
-  };
+  const toggle = (patch: (cur: InterceptSettings) => Partial<InterceptSettings>) =>
+    change((cur) => {
+      const next = { ...cur, ...patch(cur) };
+      return next.enabled ? interceptEnableArgs(next) : ["intercept", "disable"];
+    });
 
   const decide = async (how: "forward" | "drop") => {
     if (current == null || !message) return;
@@ -773,21 +794,33 @@ function Intercept({ active }: { active: boolean }) {
       <div className="toolbar">
         <button
           className={`btn ${s?.enabled ? "primary" : ""}`}
-          onClick={() => s && toggle({ enabled: !s.enabled, requests: s.enabled ? s.requests : s.requests || !(s.responses || s.ws_to_server || s.ws_to_client) })}
+          onClick={() => s && toggle((c) => ({ enabled: !c.enabled, requests: c.enabled ? c.requests : c.requests || !(c.responses || c.ws_to_server || c.ws_to_client) }))}
         >
           Intercept is {s?.enabled ? "on" : "off"}
         </button>
         <label className="check">
-          <input type="checkbox" checked={!!s?.requests} disabled={!s?.enabled} onChange={(e) => toggle({ requests: e.target.checked })} /> Requests
+          <input type="checkbox" checked={!!s?.requests} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ requests: on }));
+            }} /> Requests
         </label>
         <label className="check">
-          <input type="checkbox" checked={!!s?.responses} disabled={!s?.enabled} onChange={(e) => toggle({ responses: e.target.checked })} /> Responses
+          <input type="checkbox" checked={!!s?.responses} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ responses: on }));
+            }} /> Responses
         </label>
         <label className="check" title="WebSocket messages from the browser (text and binary)">
-          <input type="checkbox" checked={!!s?.ws_to_server} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_server: e.target.checked })} /> WS to server
+          <input type="checkbox" checked={!!s?.ws_to_server} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ ws_to_server: on }));
+            }} /> WS to server
         </label>
         <label className="check" title="WebSocket messages from the server (text and binary)">
-          <input type="checkbox" checked={!!s?.ws_to_client} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_client: e.target.checked })} /> WS to client
+          <input type="checkbox" checked={!!s?.ws_to_client} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ ws_to_client: on }));
+            }} /> WS to client
         </label>
         <InterceptFilter
           value={filterDraft ?? s?.filter ?? ""}

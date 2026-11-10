@@ -1259,8 +1259,12 @@ brainproxy intercept enable --method POST --filter 'req.body~"(?i)role"'   # all
   hold only responses.
 - A bare word searches the URL and matches the method, and searches a response's title too.
 - `--host`, `--path` and `--method` still work and combine with `--filter`: a message is held
-  when all that are given match. `--method` is not applied to WebSocket messages; the filter
-  is, through the handshake request (whose method is `GET`).
+  when all that are given match. They read the request as the client sent it, before
+  match-and-replace rules, while the filter reads it as it goes out: with a rule that rewrites
+  the path, `--path` sees the old one and `path:` the new one. `--method` is not applied to
+  WebSocket messages; the filter is, through the handshake request (whose method is `GET`).
+- A proxy started by a build from before `--filter` doesn't know the setting and holds what
+  the other options match, and its `intercept disable` or `enable` drops the filter.
 - `enable` replaces every intercept setting, so pass `--filter` again with each call; an
   empty one is none. `intercept status` shows it as `settings.filter`. A saved Traffic filter
   in Query mode is a query `--filter` takes (`history filters list`, its `filter.text`).

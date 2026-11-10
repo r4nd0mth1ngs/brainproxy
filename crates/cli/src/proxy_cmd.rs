@@ -541,7 +541,7 @@ pub enum InterceptCmd {
         resp.body, body, resp.headers, resp.header.NAME) are refused unless only --responses is held; id, \
         error, note and tag are refused always. A bare word searches the URL (and the title of a response) and \
         matches the method. --host, --path and --method still apply: a message is held when all that are \
-        given match. Enable replaces every setting, so pass the filter again each time (an empty one is none).")]
+        given match. They read the request as the client sent it, the filter the request as it goes out. Enable replaces every setting, so pass the filter again each time (an empty one is none).")]
     Enable {
         #[arg(long)]
         requests: bool,

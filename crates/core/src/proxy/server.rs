@@ -19,6 +19,7 @@
 //! origin-form requests are routed by their Host header and TLS by its SNI. A
 //! `redirect` target sends everything from the listener to one origin.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -1302,7 +1303,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             prepared = Some(p);
         }
         // The filter sees the request as it would go out, after rules and the session.
-        let exchange = || Capture::new("proxy", target, &request, None, None, None);
+        let exchange = || Cow::Owned(Capture::new("proxy", target, &request, None, None, None));
         if live.intercept.matches(false, &method, &target.host, &path, exchange) {
             match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
                 Some(released) => {
@@ -1471,6 +1472,15 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         false => crate::rules::Ruled { bytes: response, ..Default::default() },
     };
     live.rule_failures.note(Engine::Proxy, &ruled.failed);
+    // Whether intercept holds the response. The filter sees the request that went out and the
+    // response the client would get: the row's own exchange when no rule changed the response.
+    let held = in_scope
+        && live.intercept.matches(true, &method, &target.host, &path, || {
+            match capture.as_ref().filter(|_| !ruled.changed()) {
+                Some(c) => Cow::Borrowed(c),
+                None => Cow::Owned(Capture::new("proxy", target, &sent, Some(&ruled.bytes), Some(duration), None)),
+            }
+        });
     if let Some(mut c) = capture {
         if ruled.changed() {
             c.modified_response = Some(ruled.bytes.clone());
@@ -1488,9 +1498,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     }
 
     let mut response = ruled.bytes;
-    // The filter sees the request that went out and the response the client would get.
-    let exchange = || Capture::new("proxy", target, &sent, Some(&response), Some(duration), None);
-    if in_scope && live.intercept.matches(true, &method, &target.host, &path, exchange) {
+    if held {
         match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
             // The exchange is recorded as received; the intercept row says who edited the response.
             Some(released) => response = released.message,

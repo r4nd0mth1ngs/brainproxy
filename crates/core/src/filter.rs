@@ -28,6 +28,7 @@ use regex::RegexBuilder;
 use rusqlite::types::Value;
 use rusqlite::{Connection, ToSql};
 
+use crate::capture::Capture;
 use crate::error::{Error, Result};
 
 /// Longest query accepted, in bytes.
@@ -643,37 +644,59 @@ impl Query {
     }
 }
 
-/// The columns [`Matcher`] gives its one-row `history`, from a [`Capture`] as
-/// [`crate::store`]'s insert would store it. `time` is the time of the match.
-const IN_FLIGHT_COLUMNS: &[&str] = &[
-    "id",
-    "source",
-    "scheme",
-    "host",
-    "port",
-    "method",
-    "url",
-    "path",
-    "query",
-    "req_headers",
-    "req_content_type",
-    "req_body",
-    "status",
-    "resp_headers",
-    "resp_content_type",
-    "resp_body",
-    "resp_body_length",
-    "title",
-    "duration_ms",
-    "error",
-    "note",
-    "tags",
-    "request",
-    "response",
-    "origin",
-    "client_addr",
-    "sni",
-];
+/// Values a [`Capture`] doesn't hold as such but its history row does, as
+/// [`crate::store`]'s insert works them out.
+struct Derived<'a> {
+    resp_body_length: Option<i64>,
+    tags: String,
+    origin: &'a str,
+    none: Option<i64>,
+}
+
+impl<'a> Derived<'a> {
+    fn of(c: &'a Capture) -> Self {
+        Derived {
+            resp_body_length: c.resp_body.as_ref().map(|b| b.len() as i64),
+            tags: serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into()),
+            origin: c.origin.as_deref().unwrap_or(crate::provenance::origin()),
+            none: None,
+        }
+    }
+}
+
+/// The one-row `history` [`Matcher`] asks about: each column the filter language reads, with
+/// its value from `c` as the history row would have it. `time` is the time of the match.
+fn in_flight_row<'a>(c: &'a Capture, d: &'a Derived<'a>) -> [(&'static str, &'a dyn ToSql); 27] {
+    [
+        ("id", &d.none),
+        ("source", &c.source),
+        ("scheme", &c.scheme),
+        ("host", &c.host),
+        ("port", &c.port),
+        ("method", &c.method),
+        ("url", &c.url),
+        ("path", &c.path),
+        ("query", &c.query),
+        ("req_headers", &c.req_headers),
+        ("req_content_type", &c.req_content_type),
+        ("req_body", &c.req_body),
+        ("status", &c.status),
+        ("resp_headers", &c.resp_headers),
+        ("resp_content_type", &c.resp_content_type),
+        ("resp_body", &c.resp_body),
+        ("resp_body_length", &d.resp_body_length),
+        ("title", &c.title),
+        ("duration_ms", &c.duration_ms),
+        ("error", &c.error),
+        ("note", &d.none),
+        ("tags", &d.tags),
+        ("request", &c.request),
+        ("response", &c.response),
+        ("origin", &d.origin),
+        ("client_addr", &c.client_addr),
+        ("sni", &c.sni),
+    ]
+}
 
 /// A query matched against messages in flight (the proxy's intercept), with the same SQL
 /// [`Query::to_sql`] gives `history list --filter`, run on an in-memory connection over a
@@ -682,8 +705,13 @@ const IN_FLIGHT_COLUMNS: &[&str] = &[
 pub struct Matcher {
     sql: String,
     params: Vec<Value>,
-    conn: Mutex<Connection>,
+    /// Connections not in use. Each match takes one (or opens one) and puts it back, so matches
+    /// on different connections of the proxy don't wait for each other.
+    idle: Mutex<Vec<Connection>>,
 }
+
+/// The most idle connections kept; more are opened while matches run side by side.
+const IDLE_CONNECTIONS: usize = 8;
 
 impl std::fmt::Debug for Matcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -693,62 +721,45 @@ impl std::fmt::Debug for Matcher {
 
 impl Matcher {
     pub fn new(query: &Query) -> Result<Matcher> {
-        let conn = Connection::open_in_memory()?;
-        crate::store::register_functions(&conn)?;
+        let names = in_flight_row(&Capture::default(), &Derived::of(&Capture::default())).map(|(name, _)| name);
         let mut params = Vec::new();
-        let cond = query.to_sql(&mut params, IN_FLIGHT_COLUMNS.len());
-        let cols: Vec<String> =
-            IN_FLIGHT_COLUMNS.iter().enumerate().map(|(i, c)| format!("?{} AS {c}", i + 1)).collect();
+        let cond = query.to_sql(&mut params, names.len());
+        let cols: Vec<String> = names.iter().enumerate().map(|(i, c)| format!("?{} AS {c}", i + 1)).collect();
         let sql = format!(
             "SELECT coalesce(({cond}), 0) FROM (SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS time, {}) AS history",
             cols.join(", ")
         );
+        let conn = Self::open()?;
         conn.prepare_cached(&sql)?;
-        Ok(Matcher { sql, params, conn: Mutex::new(conn) })
+        Ok(Matcher { sql, params, idle: Mutex::new(vec![conn]) })
+    }
+
+    fn open() -> Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        crate::store::register_functions(&conn)?;
+        Ok(conn)
     }
 
     /// Whether the exchange `c` matches. A request on its way out has no response yet: its
     /// response fields are NULL, which [`Query::check_known`] keeps a filter from asking about.
-    pub fn matches(&self, c: &crate::capture::Capture) -> Result<bool> {
-        let resp_body_length = c.resp_body.as_ref().map(|b| b.len() as i64);
-        let tags = serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into());
-        let origin = c.origin.as_deref().unwrap_or(crate::provenance::origin());
-        let none: Option<i64> = None;
-        // In the order of IN_FLIGHT_COLUMNS.
-        let row: [&dyn ToSql; 27] = [
-            &none,
-            &c.source,
-            &c.scheme,
-            &c.host,
-            &c.port,
-            &c.method,
-            &c.url,
-            &c.path,
-            &c.query,
-            &c.req_headers,
-            &c.req_content_type,
-            &c.req_body,
-            &c.status,
-            &c.resp_headers,
-            &c.resp_content_type,
-            &c.resp_body,
-            &resp_body_length,
-            &c.title,
-            &c.duration_ms,
-            &c.error,
-            &none,
-            &tags,
-            &c.request,
-            &c.response,
-            &origin,
-            &c.client_addr,
-            &c.sni,
-        ];
+    pub fn matches(&self, c: &Capture) -> Result<bool> {
+        let derived = Derived::of(c);
+        let row = in_flight_row(c, &derived).map(|(_, v)| v);
         let params = row.into_iter().chain(self.params.iter().map(|v| v as &dyn ToSql));
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare_cached(&self.sql)?;
-        let hit: i64 = stmt.query_row(rusqlite::params_from_iter(params), |r| r.get(0))?;
-        Ok(hit != 0)
+        let idle = || self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = idle().pop();
+        let conn = match taken {
+            Some(conn) => conn,
+            None => Self::open()?,
+        };
+        let hit = conn
+            .prepare_cached(&self.sql)
+            .and_then(|mut stmt| stmt.query_row(rusqlite::params_from_iter(params), |r| r.get::<_, i64>(0)));
+        let mut pool = idle();
+        if pool.len() < IDLE_CONNECTIONS {
+            pool.push(conn);
+        }
+        Ok(hit? != 0)
     }
 }
 
@@ -915,7 +926,6 @@ fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::Capture;
     use crate::http::Target;
 
     fn sql(q: &str) -> (String, Vec<Value>) {
