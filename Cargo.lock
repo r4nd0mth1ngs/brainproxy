@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "brainproxy"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "brainproxy-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
