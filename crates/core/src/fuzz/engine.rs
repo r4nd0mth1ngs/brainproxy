@@ -17,6 +17,7 @@ use crate::fuzz::plan::{Plan, Template};
 use crate::http::client::final_response;
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use crate::rules::{Engine, EngineRules, Ruled};
 use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
@@ -126,6 +127,8 @@ pub async fn run(
     // first, as a result can point to one.
     let (tx, rx) = mpsc::channel::<Write>();
     let mut writer_store = Store::open(project)?;
+    // Match-and-replace rules that list the fuzzer, as they are when the run starts.
+    let rules = EngineRules::load(&writer_store, Engine::Fuzz)?;
     let writer = std::thread::spawn(move || -> Result<()> {
         while let Ok(first) = rx.recv() {
             let (mut rows, mut batch) = (RowBatch::default(), Vec::new());
@@ -198,7 +201,7 @@ pub async fn run(
     let url_positions = Arc::new(template.url_positions());
     let mut workers = Vec::new();
     for _ in 0..cfg.concurrency.max(1).min(total.max(1) as usize) {
-        let (next, stop, matched_stop, limiter, client, tx, rows) = (
+        let (next, stop, matched_stop, limiter, client, tx, rows, rules) = (
             next.clone(),
             stop.clone(),
             matched_stop.clone(),
@@ -206,6 +209,7 @@ pub async fn run(
             client.clone(),
             tx.clone(),
             rows.clone(),
+            rules.clone(),
         );
         let url_positions = url_positions.clone();
         let (template, plan, target, cfg, compiled, fuzzed) =
@@ -237,30 +241,47 @@ pub async fn run(
                 }
                 let keep_cookies: Vec<&str> = fuzzed.0.iter().map(String::as_str).collect();
                 let keep_params: Vec<&str> = fuzzed.1.iter().map(String::as_str).collect();
+                // The rules see the request with its payloads in, then the session is applied.
+                let mut refused = None;
+                let ruled = match rules.as_ref().map(|r| r.request(client.options(), &target, request.clone())) {
+                    Some(Ok(ruled)) => {
+                        request = ruled.bytes.clone();
+                        Some(ruled)
+                    }
+                    Some(Err(e)) => {
+                        refused = Some(e);
+                        None
+                    }
+                    None => None,
+                };
+                let by = rules.as_ref().zip(ruled.as_ref());
                 let rendered = request.clone();
                 let mut prepared = None;
-                if let Some(a) = &cfg.auth {
+                if let Some(a) = cfg.auth.as_ref().filter(|_| refused.is_none()) {
                     let p = a.prepare(Tool::Fuzz, &target, &rendered, &keep_cookies, &keep_params).await;
                     request = p.request.clone();
                     prepared = Some(p);
                 }
 
                 let mut started = Instant::now();
-                let (mut row, mut result) = exchange(&client, rows.as_ref(), &target, &request).await;
-                if let (Some(a), Some(p), Ok((response, _))) = (&cfg.auth, &prepared, &result) {
+                let (mut row, mut result) = match refused {
+                    Some(e) => (None, Err(e)),
+                    None => exchange(&client, rows.as_ref(), &target, &request, by).await,
+                };
+                if let (Some(a), Some(p), Ok(answer)) = (&cfg.auth, &prepared, &result) {
                     // Session lost or stale session values: log in again or refresh them
                     // (once across workers) and retry this payload. Both requests have rows.
-                    if a.after_response(p, response).await {
+                    if a.after_response(p, answer.received()).await {
                         request = a.prepare(Tool::Fuzz, &target, &rendered, &keep_cookies, &keep_params).await.request;
                         started = Instant::now();
-                        (row, result) = exchange(&client, rows.as_ref(), &target, &request).await;
-                        if let Ok((r, _)) = &result {
-                            a.observe(r);
+                        (row, result) = exchange(&client, rows.as_ref(), &target, &request, by).await;
+                        if let Ok(answer) = &result {
+                            a.observe(answer.received());
                         }
                     }
                 }
                 let duration = match &result {
-                    Ok((_, ms)) => *ms as i64,
+                    Ok(answer) => answer.ms as i64,
                     Err(_) => started.elapsed().as_millis() as i64,
                 };
 
@@ -272,10 +293,17 @@ pub async fn run(
                     ..Default::default()
                 };
                 let capture = match result {
-                    Ok((response, _)) => {
-                        analyze(&response, &compiled, &cfg.match_status, &mut res);
-                        (cfg.store == StoreMode::Matches && res.matched)
-                            .then(|| Capture::new("fuzz", &target, &request, Some(&response), Some(duration), None))
+                    Ok(answer) => {
+                        analyze(&answer.response.bytes, &compiled, &cfg.match_status, &mut res);
+                        (cfg.store == StoreMode::Matches && res.matched).then(|| {
+                            let mut c =
+                                Capture::new("fuzz", &target, &request, Some(answer.received()), Some(duration), None);
+                            if answer.response.changed() {
+                                c.response_edits = answer.response.edits();
+                                c.modified_response = Some(answer.response.bytes);
+                            }
+                            c
+                        })
                     }
                     Err(e) => {
                         res.error = Some(e.to_string());
@@ -284,6 +312,15 @@ pub async fn run(
                             .then(|| Capture::new("fuzz", &target, &request, None, None, Some(&e.to_string())))
                     }
                 };
+                // A row written here says what the rules did to its request, as one written
+                // before the request went out does.
+                let capture = capture.map(|mut c| {
+                    if let Some(ruled) = ruled.as_ref().filter(|r| r.changed()) {
+                        c.original_request = ruled.original.clone();
+                        c.edited_by = ruled.edits();
+                    }
+                    c
+                });
                 let history = match (row, capture) {
                     (Some(id), _) => History::Written(id),
                     (None, Some(c)) => History::Capture(Box::new(Capture { sni: client.sni(&target), ..c })),
@@ -318,20 +355,46 @@ pub async fn run(
     })
 }
 
-/// Sends on the client's kept-alive connections, on record in `rows` first if given.
-/// Returns the request's row and the response with how long it took.
+/// A fuzz request's answer.
+struct Answer {
+    /// The response after the fuzzer's match-and-replace rules, which is what is analysed.
+    response: Ruled,
+    ms: u64,
+}
+
+impl Answer {
+    /// The response as the server sent it: what a session and a history row go by.
+    fn received(&self) -> &[u8] {
+        self.response.original.as_deref().unwrap_or(&self.response.bytes)
+    }
+}
+
+/// Sends on the client's kept-alive connections, on record in `rows` first if given, and
+/// applies the fuzzer's response rules (`by`: its rules, and what they made of the request).
+/// Returns the request's row and the answer.
 async fn exchange(
     client: &Client,
     rows: Option<&Rows>,
     target: &Target,
     request: &[u8],
-) -> (Option<i64>, Result<(Vec<u8>, u64)>) {
+    by: Option<(&EngineRules, &Ruled)>,
+) -> (Option<i64>, Result<Answer>) {
     let req = RawRequest::from_bytes(request.to_vec());
-    let (id, sent) = match rows {
-        Some(rows) => rows.send(client, &req, target).await,
-        None => (None, client.send(&req, target).await),
+    let (id, sent, ruled) = match rows {
+        Some(rows) => rows.send_ruled(client, &req, target, by).await,
+        None => (None, client.send(&req, target).await, None),
     };
-    (id, sent.map(|ex| (ex.response, ex.duration_ms)))
+    let answer = sent.map(|ex| Answer {
+        ms: ex.duration_ms,
+        // A recorded request's row has what the rules made of the response; a request that
+        // isn't recorded first gets its response ruled here.
+        response: match (ruled, by) {
+            (Some(ruled), _) => ruled,
+            (None, Some((rules, _))) if rows.is_none() => rules.response(target, ex.response),
+            (None, _) => Ruled { bytes: ex.response, ..Default::default() },
+        },
+    });
+    (id, answer)
 }
 
 fn analyze(response: &[u8], c: &Compiled, match_status: &[u16], res: &mut FuzzResult) {

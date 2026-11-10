@@ -35,6 +35,7 @@ use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::jobs::JobControl;
 use crate::oob::{self, Endpoint, Payload, ScanPayload};
+use crate::rules::{Engine, EngineRules, Ruled};
 use crate::scan::active::source_sink::{Sink, SourceSink};
 use crate::scan::{AlertDef, Finding, Message};
 use crate::sent::{RowBatch, RowWrite, Rows};
@@ -111,6 +112,9 @@ pub struct Response {
     pub raw: Vec<u8>,
     /// The history row already holding this exchange (a declarative check's request).
     history_id: Option<i64>,
+    /// The response as the server sent it, when a match-and-replace rule changed what the scan
+    /// rule reads (`raw` and the rest are then the response after it).
+    received: Option<Vec<u8>>,
     text: OnceLock<String>,
 }
 
@@ -138,6 +142,7 @@ impl Response {
             request,
             raw,
             history_id: None,
+            received: None,
             text: OnceLock::new(),
         })
     }
@@ -153,12 +158,18 @@ impl Response {
             request: Vec::new(),
             raw: Vec::new(),
             history_id: None,
+            received: None,
             text: OnceLock::new(),
         }
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    /// The response as the server sent it: what a session goes by.
+    fn received(&self) -> &[u8] {
+        self.received.as_deref().unwrap_or(&self.raw)
     }
 
     pub fn headers_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
@@ -254,6 +265,8 @@ struct Shared {
     check_methods: Vec<String>,
     /// Check requests not sent because their method wasn't opted in.
     check_skipped_methods: AtomicU64,
+    /// Match-and-replace rules that list scans, as they were when the scan started.
+    match_rules: Option<EngineRules>,
 }
 
 /// One response shared by identical requests; an error is kept as its message.
@@ -389,8 +402,16 @@ impl Cx {
     async fn send_to_once(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
         self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
+        // Match-and-replace rules that list scans see the request as the scan rule made it; the
+        // session is applied to what they leave.
+        let given = request;
+        let ruled = match &self.shared.match_rules {
+            Some(rules) => Some(rules.request(self.shared.client.options(), target, given.clone())?),
+            None => None,
+        };
+        let request = ruled.as_ref().map_or(&given, |r| &r.bytes);
         let Some(auth) = &self.shared.auth else {
-            return self.client_send(request.clone(), target, &request).await;
+            return self.client_send(request.clone(), target, &given, ruled.as_ref()).await;
         };
         // The attacked cookie or parameter keeps its payload.
         let (cookie, param): (Vec<&str>, Vec<&str>) = match &self.point {
@@ -398,12 +419,12 @@ impl Cx {
             Some(p) => (vec![], vec![p.session_name()]),
             None => (vec![], vec![]),
         };
-        let prepared = auth.prepare(self.tool, target, &request, &cookie, &param).await;
-        let mut resp = self.client_send(prepared.request.clone(), target, &request).await?;
-        if auth.after_response(&prepared, &resp.raw).await {
-            let again = auth.prepare(self.tool, target, &request, &cookie, &param).await;
-            resp = self.client_send(again.request, target, &request).await?;
-            auth.observe(&resp.raw);
+        let prepared = auth.prepare(self.tool, target, request, &cookie, &param).await;
+        let mut resp = self.client_send(prepared.request.clone(), target, &given, ruled.as_ref()).await?;
+        if auth.after_response(&prepared, resp.received()).await {
+            let again = auth.prepare(self.tool, target, request, &cookie, &param).await;
+            resp = self.client_send(again.request, target, &given, ruled.as_ref()).await?;
+            auth.observe(resp.received());
         }
         Ok(resp)
     }
@@ -411,8 +432,15 @@ impl Cx {
     /// Sends `request` with the client, recorded just before it goes out and completed when
     /// it is answered or fails (a request that times out, or a scan that stops, leaves it
     /// saying so). A declarative check's request whose method isn't opted in is refused,
-    /// unsent. `given` is the request as the rule gave it (before the session was applied).
-    async fn client_send(&self, request: Vec<u8>, target: &Target, given: &[u8]) -> Result<Response> {
+    /// unsent. `given` is the request as the rule gave it (before match-and-replace rules and
+    /// the session were applied), and `ruled` what the match-and-replace rules made of it.
+    async fn client_send(
+        &self,
+        request: Vec<u8>,
+        target: &Target,
+        given: &[u8],
+        ruled: Option<&Ruled>,
+    ) -> Result<Response> {
         let req = RawRequest::from_bytes(request);
         let client = &self.shared.client;
         let out_of_scope = client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port));
@@ -426,7 +454,8 @@ impl Cx {
                 "a check's {opt_in} request isn't sent without --include-methods {opt_in}"
             )));
         }
-        let (id, result) = self.shared.rows.send(client, &req, target).await;
+        let by = self.shared.match_rules.as_ref().zip(ruled);
+        let (id, result, response) = self.shared.rows.send_ruled(client, &req, target, by).await;
         let ex = match result {
             Ok(ex) => ex,
             Err(e) => {
@@ -436,7 +465,17 @@ impl Cx {
                 return Err(e);
             }
         };
-        let mut resp = Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))?;
+        // The scan rule reads the response after the match-and-replace rules; the session goes
+        // by the one received.
+        let duration = Duration::from_millis(ex.duration_ms);
+        let mut resp = match response.filter(Ruled::changed) {
+            Some(ruled) => {
+                let mut resp = Response::parse(ex.request, ruled.bytes, duration)?;
+                resp.received = Some(ex.response);
+                resp
+            }
+            None => Response::parse(ex.request, ex.response, duration)?,
+        };
         resp.history_id = id;
         Ok(resp)
     }
@@ -905,6 +944,7 @@ pub async fn run(
     // written together, before any finding or payload that came after them.
     let (tx, rx) = mpsc::channel::<Report>();
     let mut store = Store::open(project)?;
+    let match_rules = EngineRules::load(&store, Engine::Scan)?;
     // It also keeps the ids of the rows it wrote, the ones pruning may delete.
     let writer = std::thread::spawn(move || -> Result<(usize, Store, Vec<i64>)> {
         let mut new = 0;
@@ -969,6 +1009,7 @@ pub async fn run(
         paused: Mutex::new(HashMap::new()),
         check_methods: cfg.check_methods.clone(),
         check_skipped_methods: AtomicU64::new(0),
+        match_rules,
     });
 
     // Build units of work.
@@ -981,7 +1022,13 @@ pub async fn run(
         // Requests recorded with `Connection: close` (e.g. from `send --url`) are
         // re-sent with keep-alive, so the client can reuse connections.
         let request = keep_alive(&t.request);
-        let Ok(response) = Response::parse(request.clone(), t.response.clone(), duration) else { continue };
+        // The baseline is read as the attack responses will be: after the response rules that
+        // list scans, or a rule's rewrite would look like the attack's doing.
+        let baseline = match &shared.match_rules {
+            Some(rules) => rules.response(&t.target, t.response.clone()).bytes,
+            None => t.response.clone(),
+        };
+        let Ok(response) = Response::parse(request.clone(), baseline, duration) else { continue };
         let msg = Message::from_exchange(t.history_id.unwrap_or(0), &t.target, &request, &t.response);
         let mut pts = points::points(&request, &cfg.points);
         // A fixed URL path segment (`/api`) is attacked once per method and origin, not on

@@ -26,6 +26,7 @@ pub mod oob;
 pub mod provenance;
 pub mod proxy;
 pub mod race;
+pub mod rules;
 pub mod scan;
 pub mod sent;
 pub mod session;

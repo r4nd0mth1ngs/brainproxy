@@ -2,13 +2,13 @@
 // connection options, the CA, rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
 
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { run, type CliInput } from "../api";
+import { run } from "../api";
 import { AUTO_PROXY, autoProxy, useApp } from "../store";
-import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
 import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
+import { useRunner } from "../ui/useRunner";
 import { DEFAULT_PROXY_PORT, lowPortNote, moveProxy, portOf, portProblem, proxyListen, saveProxyPort, savedProxyPort, startProxy } from "./proxyPort";
 import {
   DEFAULT_SETUP,
@@ -27,6 +27,7 @@ import {
   type Refusal,
 } from "./proxyMode";
 import { RecordLogin } from "./RecordLogin";
+import { MatchReplace } from "./MatchReplace";
 import { AppUpdateSettings } from "./AppUpdate";
 import {
   EMPTY_CERT,
@@ -75,7 +76,7 @@ export function SettingsView() {
       </div>
       {/* Only the open sub-tab is mounted, so it reloads fresh data each time it is opened. */}
       {sub === "auth" && <Auth />}
-      {sub === "rules" && <Rules />}
+      {sub === "rules" && <MatchReplace />}
       {sub === "intercept" && <Intercept />}
       {sub === "proxy" && <ProxySetup />}
       {sub === "connections" && <Connections />}
@@ -113,19 +114,6 @@ function ConfirmButton(p: { label: string; question: string; onConfirm: () => vo
       </button>
     </span>
   );
-}
-
-/** Runs a command, toasting its error; returns its data or undefined on failure. */
-function useRunner() {
-  const app = useApp();
-  return async <T,>(args: string[], input?: CliInput): Promise<T | undefined> => {
-    try {
-      return await run<T>(args, input);
-    } catch (e: any) {
-      app.toast(e.message, "error");
-      return undefined;
-    }
-  };
 }
 
 function Field(p: { label: string; children: ReactNode; wide?: boolean }) {
@@ -906,101 +894,6 @@ function Connections() {
       <div className="row gap set-actions">
         <ConfirmButton label="Clear all" question="Remove every connection option?" onConfirm={() => apply(["connection", "clear"])} />
       </div>
-    </div>
-  );
-}
-
-// ---------------- Match & replace ----------------
-
-interface Rule {
-  id: number;
-  location: string;
-  pattern: string;
-  replace: string;
-  enabled: boolean;
-  comment?: string;
-}
-
-const LOCATIONS = ["request-line", "request-header", "request-body", "response-header", "response-body"];
-
-function Rules() {
-  const exec = useRunner();
-  const [rules, setRules] = useState<Rule[]>([]);
-  const [selected, setSelected] = useState<number | null>(null);
-  const [draft, setDraft] = useState({ location: "request-header", match: "", replace: "", comment: "", disabled: false });
-
-  // Every rules command answers with the full list.
-  const apply = async (args: string[]) => {
-    const d = await exec<{ rules: Rule[] }>(args);
-    if (d) setRules(d.rules);
-    return d;
-  };
-  useEffect(() => {
-    apply(["rules", "list"]);
-  }, []);
-
-  const add = async () => {
-    const args = ["rules", "add", `--location=${draft.location}`, `--match=${draft.match}`, `--replace=${draft.replace}`];
-    if (draft.comment) args.push(`--comment=${draft.comment}`);
-    if (draft.disabled) args.push("--disabled");
-    if (await apply(args)) setDraft({ ...draft, match: "", replace: "", comment: "" });
-  };
-
-  const columns: Column<Rule>[] = [
-    {
-      key: "enabled",
-      label: "On",
-      width: 40,
-      value: (r) => (r.enabled ? 1 : 0),
-      render: (r) => (
-        <input
-          type="checkbox"
-          checked={r.enabled}
-          onClick={(e) => e.stopPropagation()}
-          onChange={() => apply(["rules", r.enabled ? "disable" : "enable", String(r.id)])}
-        />
-      ),
-    },
-    { key: "location", label: "Where", width: 120, value: (r) => r.location },
-    { key: "pattern", label: "Match", width: 240, value: (r) => r.pattern, render: (r) => (r.pattern ? <span className="mono">{r.pattern}</span> : <span className="muted">(add header)</span>) },
-    { key: "replace", label: "Replace", width: 240, value: (r) => r.replace, render: (r) => (r.replace ? <span className="mono">{r.replace}</span> : <span className="muted">(remove)</span>) },
-    { key: "comment", label: "Comment", width: 220, value: (r) => r.comment ?? "" },
-  ];
-
-  const header = draft.location.endsWith("-header");
-  return (
-    <div className="col fill">
-      <div className="toolbar">
-        <select className="input" value={draft.location} onChange={(e) => setDraft({ ...draft, location: e.target.value })}>
-          {LOCATIONS.map((l) => (
-            <option key={l}>{l}</option>
-          ))}
-        </select>
-        <input className="input grow mono" placeholder={header ? "match regex (empty: add a header)" : "match regex"} value={draft.match} onChange={(e) => setDraft({ ...draft, match: e.target.value })} />
-        <input className="input grow mono" placeholder="replace ($1 groups; empty removes)" value={draft.replace} onChange={(e) => setDraft({ ...draft, replace: e.target.value })} />
-        <input className="input" placeholder="comment" value={draft.comment} onChange={(e) => setDraft({ ...draft, comment: e.target.value })} />
-        <label className="check">
-          <input type="checkbox" checked={draft.disabled} onChange={(e) => setDraft({ ...draft, disabled: e.target.checked })} /> disabled
-        </label>
-        <button className="btn primary" disabled={!draft.match && !draft.replace} onClick={add}>
-          Add rule
-        </button>
-        <span className="sep" />
-        <button className="btn" disabled={selected == null} onClick={() => selected != null && apply(["rules", "remove", String(selected)]).then(() => setSelected(null))}>
-          Remove
-        </button>
-        <ConfirmButton label="Clear all" question="Remove every rule?" disabled={!rules.length} onConfirm={() => apply(["rules", "clear"])} />
-      </div>
-      <DataTable
-        rows={rules}
-        columns={columns}
-        rowKey={(r) => r.id}
-        selected={selected}
-        onSelect={(r) => setSelected(r.id)}
-        initialSort={{ key: "enabled", desc: false }}
-        rowClass={(r) => (r.enabled ? undefined : "set-off")}
-        empty="No match-and-replace rules. The proxy applies enabled rules to every request and response it relays."
-      />
     </div>
   );
 }

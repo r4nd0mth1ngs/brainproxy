@@ -235,6 +235,11 @@ sudo brainproxy ca install-system                 # or trust the CA system-wide 
 brainproxy scope set --include '(^|\.)target\.test$' # only intercept/record these hosts
 brainproxy rules add --location request-header --replace 'X-Forwarded-For: 127.0.0.1'
 brainproxy rules add --location response-body --match 'disabled' --replace ''
+# Structured rules: a query parameter, a header by name, the method, path or status; for Replay,
+# fuzz and scan requests too (--applies-to), and only some hosts (--host). See the manual.
+brainproxy rules add --location query-param --name role --replace admin --applies-to proxy,send,fuzz
+brainproxy rules add --location status --match '^403$' --replace 200 --host '(^|\.)target\.test$'
+brainproxy rules test --history 42                # what the rules make of a recorded exchange; sends nothing
 brainproxy proxy status
 brainproxy proxy restart --listen 127.0.0.1:9090  # move it: stop and start in one step, back on failure
 brainproxy proxy stop

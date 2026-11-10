@@ -129,7 +129,8 @@ enum Cmd {
     #[command(subcommand)]
     Scope(proxy_cmd::ScopeCmd),
 
-    /// Match-and-replace rules applied to in-scope proxy traffic.
+    /// Match-and-replace rules: applied to in-scope proxy traffic and, where a rule says so, to send, fuzz and scan requests
+    /// and to WebSocket messages; `rules test` tries them without sending anything.
     #[command(subcommand)]
     Rules(proxy_cmd::RulesCmd),
 
@@ -383,6 +384,10 @@ enum Part {
     Request,
     Response,
     ResponseBody,
+    /// The request before match-and-replace rules changed it (empty when none did).
+    OriginalRequest,
+    /// The response after match-and-replace rules changed it (empty when none did).
+    ModifiedResponse,
 }
 
 #[derive(clap::Args)]
@@ -718,6 +723,19 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         let warning = mcp::check_host_header(&send_opts, req.as_bytes(), target, args.req.host_header_test, out)?;
         host_warning = host_warning.or(warning);
     }
+    // Match-and-replace rules that list send apply to each request as given, before a session
+    // is applied to it (the proxy's order). The checks above were of the request as given; the
+    // client checks what goes out.
+    let rules =
+        brainproxy_core::rules::EngineRules::load(&Store::open(project)?, brainproxy_core::rules::Engine::Send)?;
+    let mut ruled = Vec::new();
+    if let Some(rules) = &rules {
+        for (req, target) in group.iter_mut() {
+            let r = rules.request(&send_opts, target, req.as_bytes().to_vec())?;
+            *req = RawRequest::from_bytes(r.bytes.clone());
+            ruled.push(r);
+        }
+    }
     let target = group[0].1.clone();
     for (i, (_, other)) in group.iter().enumerate().skip(1) {
         if other != &target {
@@ -749,10 +767,13 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         if let Some(session) = &session {
             session.save()?;
         }
-        return race(project, &args, requests, target, client, n, h2, host_warning, out);
+        return race(project, &args, requests, (rules.as_ref(), &ruled), target, client, n, h2, host_warning, out);
     }
     let req = group.remove(0).0;
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
+    if let Some(r) = ruled.first() {
+        log.ruled(r);
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request is on record (its row and the bytes recorded) before it goes out. `open`
     // is the one out and unanswered; a row answered already is never rewritten.
@@ -809,7 +830,21 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         (None, None) => Err(sent::cancelled(&rows)),
     };
     let saved = session.as_ref().map(|s| s.save()).transpose();
-    let (id, ex) = outcome?;
+    let (id, mut ex) = outcome?;
+    // The row keeps the response as received and, beside it, what the rules made of it, which
+    // is what is shown.
+    let mut response_rules = Vec::new();
+    let mut unkept = None;
+    if let Some(rules) = &rules {
+        let r = rules.response(&target, std::mem::take(&mut ex.response));
+        // The request went out and its row is complete: failing now would hide the answer.
+        unkept = log.ruled_response(id, &r).err();
+        response_rules = r.ids();
+        ex.response = r.bytes;
+    }
+    let request_rules = ruled.first().map(|r| r.ids()).unwrap_or_default();
+    let unkept =
+        unkept.map(|e| format!("history #{id} keeps the response as received, but not what the rules made of it: {e}"));
     let new_findings = log.scan(&rows)?;
     let id = Some(id);
     let host_warning =
@@ -828,9 +863,14 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if let Err(e) = saved {
         data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
+    } else if let Some(warning) = unkept {
+        data["warning"] = json!(warning);
     }
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
+    }
+    if !request_rules.is_empty() || !response_rules.is_empty() {
+        data["rules"] = json!({"request": request_rules, "response": response_rules});
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
@@ -871,6 +911,7 @@ fn race(
     project: &Path,
     args: &SendArgs,
     group: Vec<RawRequest>,
+    (rules, ruled): (Option<&brainproxy_core::rules::EngineRules>, &[brainproxy_core::rules::Ruled]),
     target: Target,
     client: Client,
     copies: usize,
@@ -896,10 +937,13 @@ fn race(
     let mut log = sent::SentLog::open(project, "race", args.no_store)?.sent_by(&client);
     let mut ids = Vec::with_capacity(n);
     for (member, bytes) in recorded.iter().enumerate() {
+        // A member match-and-replace rules changed says so on its rows.
+        log.ruled(ruled.get(member).unwrap_or(&Default::default()));
         ids.extend(log.pending_many(&target, bytes, copies, |i| {
             brainproxy_core::race::row_tags(&race_id, sync, false, member * copies + i, n)
         })?);
     }
+    log.ruled(&Default::default());
     let requests = group.iter().flat_map(|req| std::iter::repeat_n(req.as_bytes().to_vec(), copies)).collect();
     let racing = async {
         if h2 {
@@ -949,8 +993,18 @@ fn race(
         match r {
             Ok(ex) => {
                 done(log.answered(id, ex));
-                let head = parse_response_head(&ex.response).ok();
-                let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(&ex.response).1));
+                // As for one send: the row keeps the response as received and, beside it, what
+                // the rules made of it, which is what the race's results go by.
+                let after = rules
+                    .filter(|rules| rules.rewrites_responses(&target))
+                    .map(|rules| rules.response(&target, ex.response.clone()))
+                    .filter(|after| after.changed());
+                if let Some(after) = &after {
+                    done(log.ruled_response(id, after));
+                }
+                let response = after.as_ref().map_or(&ex.response, |after| &after.bytes);
+                let head = parse_response_head(response).ok();
+                let body = head.as_ref().map(|h| decode_body(&h.headers, split_head_body(response).1));
                 let status = head.as_ref().map(|h| h.status);
                 let length = body.as_ref().map(|b| b.len());
                 *shapes.entry(format!("{} {}B", status.unwrap_or(0), length.unwrap_or(0))).or_default() += 1;
@@ -1075,6 +1129,7 @@ fn schema_json() -> Value {
             {"name": "scan_observations", "description": "What each completed active scan saw of the findings it covered: new, still or gone. Join jobs ON jobs.id = job_id.", "columns": cols(brainproxy_core::scan::issues::OBSERVATION_COLUMNS)},
             {"name": "report_profiles", "description": "Saved report layouts (`report-profile save`), used with `report --profile NAME`.", "columns": cols(brainproxy_core::scan::layout::PROFILE_COLUMNS)},
             {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref, and who wrote the text of a title added by hand.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_TYPE_COLUMNS)},
+            {"name": "rule_edits", "description": "What match-and-replace rules changed in a history row's exchange: the request before them and the response after (see history show).", "columns": cols(store::RULE_EDIT_COLUMNS)},
             {"name": "setting_changes", "description": "Who saved which setting (scope, rules, intercept, connection, ...) and when; the values themselves are not logged.", "columns": cols(store::SETTING_CHANGE_COLUMNS)},
             {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Not readable with query (it holds secrets); use auth list / auth show (redacted), which also say who saved the profile (profile.origin), its rules and macros (origin), and its session (session_origin)."},
             {"name": "authz_results", "description": "Access-control test results: one row per request and identity (authz run). Join history ON history.id = authz_results.history_id (or baseline_history_id).", "columns": cols(brainproxy_core::authz::AUTHZ_RESULT_COLUMNS)},
@@ -1204,6 +1259,8 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                     Part::Request => item.request,
                     Part::Response => item.response,
                     Part::ResponseBody => item.resp_body.unwrap_or_default(),
+                    Part::OriginalRequest => item.rule_edit.and_then(|e| e.original_request).unwrap_or_default(),
+                    Part::ModifiedResponse => item.rule_edit.and_then(|e| e.modified_response).unwrap_or_default(),
                 };
                 out.raw(&bytes);
                 return Ok(());
@@ -1219,6 +1276,16 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
             data["request"] = body_value(&item.request, max_body);
             data["entry"] = json!(item.entry);
             data["origin_text"] = json!(recorded_text(&item.entry));
+            // What match-and-replace rules changed: the row has the request sent and the
+            // response received; these are the request before them and the response after.
+            let edit = item.rule_edit.clone().unwrap_or_default();
+            if let Some(original) = &edit.original_request {
+                data["original_request"] = body_value(original, max_body);
+            }
+            if let Some(modified) = &edit.modified_response {
+                data["modified_response"] = body_value(modified, max_body);
+                data["response_edits"] = json!(edit.response_edits);
+            }
             out.ok(data, || {
                 let e = &item.entry;
                 let mut about = vec![format!("#{id} {} {}", e.source, recorded_text(e))];
@@ -1232,12 +1299,26 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                 if e.note.is_some() || e.note_origin.is_some() {
                     about.push(format!("note set {}", brainproxy_core::provenance::describe(e.note_origin.as_deref())));
                 }
-                format!(
+                about.extend(edit.response_edits.iter().map(|x| format!("response {}", x.describe())));
+                let mut text = format!(
                     "{}\n\n{}\n\n{}",
                     about.join(" · "),
                     String::from_utf8_lossy(&item.request),
                     String::from_utf8_lossy(&item.response)
-                )
+                );
+                if let Some(original) = &edit.original_request {
+                    text.push_str(&format!(
+                        "\n\n--- request before match-and-replace rules ---\n{}",
+                        String::from_utf8_lossy(original)
+                    ));
+                }
+                if let Some(modified) = &edit.modified_response {
+                    text.push_str(&format!(
+                        "\n\n--- response after match-and-replace rules ---\n{}",
+                        String::from_utf8_lossy(modified)
+                    ));
+                }
+                text
             });
         }
         HistoryCmd::Note { id, text } => {

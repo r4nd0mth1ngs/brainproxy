@@ -3,6 +3,9 @@
 //! handed to [`Hooks::record`]. A data message is forwarded once its last fragment arrives
 //! (control frames at once), so it can be held for an intercept decision first.
 //!
+//! A message a rule rewrites ([`Hooks::rewrite`]) is recorded as `rule` and goes on as an edited
+//! one does.
+//!
 //! An edited message goes out as one uncompressed frame (permessage-deflate lets any message
 //! be sent uncompressed). When the sender keeps its compression window between messages,
 //! its later messages may refer back to the one that was replaced or dropped, which the
@@ -43,6 +46,11 @@ pub trait Hooks: Sync {
     fn should_hold(&self, direction: Direction) -> bool;
     /// Holds a data message until someone decides.
     fn hold(&self, direction: Direction, message: &Message) -> impl Future<Output = Hold> + Send;
+    /// The payload to pass on in place of a data message's, when something rewrites it on its
+    /// way (a match-and-replace rule): it is what is then held, recorded and forwarded.
+    fn rewrite(&self, _direction: Direction, _message: &Message) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// How a relayed connection ended.
@@ -175,6 +183,12 @@ where
                 break;
             }
             let Some(m) = complete else { continue };
+            // A rewritten message goes out as one uncompressed frame, as an edited one does.
+            let was_compressed = m.compressed;
+            let (m, rewritten) = match hooks.rewrite(dir, &m) {
+                Some(payload) => (Message { payload, compressed: false, fragments: 1, ..m }, true),
+                None => (m, false),
+            };
             let decision = if hooks.should_hold(dir) {
                 to.flush().await?;
                 let decided = hooks.hold(dir, &m);
@@ -209,6 +223,11 @@ where
                 Hold::Forward
             };
             match decision {
+                Hold::Forward if rewritten => {
+                    hooks.record(dir, &m, Some("rule"));
+                    to.write_all(&encode_frame(true, 0, m.opcode, &m.payload, mask())).await?;
+                    diverged |= was_compressed && takeover;
+                }
                 Hold::Forward => {
                     hooks.record(dir, &m, None);
                     if diverged && m.compressed {
@@ -221,11 +240,11 @@ where
                     let edited = Message { payload, compressed: false, fragments: 1, ..m.clone() };
                     hooks.record(dir, &edited, Some("edited"));
                     to.write_all(&encode_frame(true, 0, m.opcode, &edited.payload, mask())).await?;
-                    diverged |= m.compressed && takeover;
+                    diverged |= was_compressed && takeover;
                 }
                 Hold::Drop => {
                     hooks.record(dir, &m, Some("dropped"));
-                    diverged |= m.compressed && takeover;
+                    diverged |= was_compressed && takeover;
                 }
             }
             pending.clear();
@@ -268,6 +287,8 @@ mod tests {
         hold_for: Duration,
         /// When set, a held message waits for a permit here.
         gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        /// Rewrites messages to the server: each `user` becomes `admin`.
+        rewrite_to_server: bool,
     }
 
     impl Hooks for Recorder {
@@ -276,6 +297,11 @@ mod tests {
         }
         fn should_hold(&self, d: Direction) -> bool {
             self.hold_to_server && d == Direction::ToServer
+        }
+        fn rewrite(&self, d: Direction, m: &Message) -> Option<Vec<u8>> {
+            let text = String::from_utf8_lossy(&m.payload);
+            (self.rewrite_to_server && d == Direction::ToServer && text.contains("user"))
+                .then(|| text.replace("user", "admin").into_bytes())
         }
         fn hold(&self, _: Direction, _: &Message) -> impl Future<Output = Hold> + Send {
             let d = self.decision.lock().unwrap().remove(0);
@@ -364,6 +390,66 @@ mod tests {
             ]
         );
         assert!(seen.iter().any(|s| s.0 == Direction::ToClient && s.2 == [0, 159, 146, 150]));
+    }
+
+    #[tokio::test]
+    async fn rewritten_messages_go_on_as_edited_ones_do() {
+        use flate2::{Compress, Compression, FlushCompress};
+        let deflate = Deflate { enabled: true, ..Default::default() };
+        let mut c = Compress::new(Compression::default(), false);
+        let mut compressed = |data: &[u8]| {
+            let mut out = Vec::with_capacity(data.len() + 64);
+            c.compress_vec(data, &mut out, FlushCompress::Sync).unwrap();
+            out.truncate(out.len() - 4);
+            out
+        };
+        let (client, proxy_client) = duplex(1 << 20);
+        let (proxy_server, server) = duplex(1 << 20);
+        // The second message is rewritten, then held and forwarded as it then is.
+        let rec = Recorder {
+            rewrite_to_server: true,
+            hold_to_server: true,
+            decision: Mutex::new(vec![Hold::Forward, Hold::Forward, Hold::Edited(b"by hand".to_vec())]),
+            ..Default::default()
+        };
+        let mut sent = Vec::new();
+        for m in [&b"role none"[..], b"role user role", b"role user again"] {
+            sent.extend(encode_frame(true, 4, OP_TEXT, &compressed(m), Some(random_mask())));
+        }
+        // To the client nothing is rewritten.
+        let down = encode_frame(true, 0, OP_TEXT, b"user", None);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        let (_, (_, frames), _, to_client) = tokio::join!(
+            relay(proxy_client, Vec::new(), proxy_server, Vec::new(), deflate, &rec),
+            frames_from(server_r),
+            async move {
+                client_w.write_all(&sent).await.unwrap();
+                client_w.shutdown().await.unwrap();
+            },
+            async move {
+                server_w.write_all(&down).await.unwrap();
+                server_w.shutdown().await.unwrap();
+                let mut got = Vec::new();
+                client_r.read_to_end(&mut got).await.unwrap();
+                got
+            },
+        );
+        // The first goes on byte for byte (still compressed); the rewritten one as one
+        // uncompressed frame; an edit in intercept is of the message after the rewrite.
+        assert_eq!((frames[0].0, frames[0].1), (OP_TEXT, 4));
+        assert_eq!(frames[1..], [(OP_TEXT, 0, b"role admin role".to_vec()), (OP_TEXT, 0, b"by hand".to_vec())]);
+        assert_eq!(to_client, encode_frame(true, 0, OP_TEXT, b"user", None));
+        let seen = rec.seen.lock().unwrap();
+        let marks: Vec<_> = seen.iter().filter(|s| s.0 == Direction::ToServer).map(|s| (s.2.clone(), s.3)).collect();
+        assert_eq!(
+            marks,
+            vec![
+                (b"role none".to_vec(), None),
+                (b"role admin role".to_vec(), Some("rule")),
+                (b"by hand".to_vec(), Some("edited"))
+            ]
+        );
     }
 
     #[tokio::test]

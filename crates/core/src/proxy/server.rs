@@ -36,10 +36,11 @@ use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, 
 use crate::provenance::Edit;
 use crate::proxy::ca::CertAuthority;
 use crate::proxy::config::{
-    apply_request_rules_traced, apply_response_rules, compile_rules, CompiledIntercept, CompiledRule, CompiledScope,
-    InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY, SCOPE_KEY,
+    CompiledIntercept, CompiledScope, InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY,
+    SCOPE_KEY,
 };
 use crate::proxy::h2 as h2p;
+use crate::rules::{Engine, RuleSet};
 use crate::session::Tool;
 use crate::store::Store;
 use crate::ws::db::WsEvent;
@@ -109,7 +110,7 @@ struct Recorded {
 struct Live {
     version: i64,
     scope: CompiledScope,
-    rules: Vec<CompiledRule>,
+    rules: RuleSet,
     intercept: CompiledIntercept,
 }
 
@@ -459,7 +460,7 @@ async fn reload(ctx: &Arc<Ctx>) {
         Ok(Some(Live {
             version,
             scope: scope.compile()?,
-            rules: compile_rules(&rules)?,
+            rules: RuleSet::compile(&rules)?,
             intercept: intercept.compile()?,
         }))
     })
@@ -922,33 +923,22 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let mut prepared = None;
     // Who changed the request on its way: the row's origin is the proxy's, not theirs.
     let mut edited_by = Vec::new();
+    // The request as the client sent it, when a rule changed it.
+    let mut original_request = None;
     if in_scope {
-        let before = request.clone();
-        let (ruled, changed_by) = apply_request_rules_traced(&live.rules, request);
+        let ruled = live.rules.request(Engine::Proxy, &target.host, request);
         // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
         // Host-header test, isn't sent: a shared front end may route the request to another site.
         // A person's rule was warned about when it was saved.
-        if changed_by.iter().any(|r| r.origin.as_deref() == Some("mcp") && !r.host_header_test) {
-            let opts = ctx.client.options();
-            let had = opts.foreign_hosts(&before, target);
-            if let Some(host) = opts.foreign_hosts(&ruled, target).into_iter().find(|h| !had.contains(h)) {
-                let msg = format!(
-                    "out of scope: Host {host}: an agent's rule put a host the scope doesn't list in the request; \
-                     add the rule with --host-header-test for a Host-header test"
-                );
-                let edits =
-                    changed_by.iter().map(|r| Edit { by: r.origin.clone(), rule: Some(r.id), ..Default::default() });
-                let c = row(target, &ruled, None, None, Some(&msg));
-                send_capture(ctx, Capture { edited_by: edits.collect(), ..c }, None).await;
-                return Ok(Reply::Error(error_response(502, "out_of_scope", &msg), false));
-            }
+        if let Some(host) = ruled.agent_host(ctx.client.options(), target) {
+            let msg = format!("out of scope: {}", crate::rules::agent_host_refusal(&host));
+            let c = row(target, &ruled.bytes, None, None, Some(&msg));
+            send_capture(ctx, Capture { edited_by: ruled.edits(), original_request: ruled.original, ..c }, None).await;
+            return Ok(Reply::Error(error_response(502, "out_of_scope", &msg), false));
         }
-        request = ruled;
-        edited_by.extend(changed_by.iter().map(|r| Edit {
-            by: r.origin.clone(),
-            rule: Some(r.id),
-            ..Default::default()
-        }));
+        edited_by.extend(ruled.edits());
+        request = ruled.bytes;
+        original_request = ruled.original;
         if let Some(a) = auth {
             let p = a.prepare(Tool::Proxy, target, &request, &[], &[]).await;
             // The profile and its session rules and macros answer for what they changed.
@@ -974,7 +964,13 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // A rule or an edit may have changed the method (GET to HEAD): the response is framed
     // by the one sent.
     let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or(method);
-    let Some(mut flight) = ctx.in_flight.start(row(target, &request, None, None, Some(STOPPED))) else {
+    // The row stopping leaves for a request still unanswered says who changed it, as any does.
+    let unanswered = |request: &[u8], edited_by: &[Edit], original: &Option<Vec<u8>>| Capture {
+        edited_by: edited_by.to_vec(),
+        original_request: original.clone(),
+        ..row(target, request, None, None, Some(STOPPED))
+    };
+    let Some(mut flight) = ctx.in_flight.start(unanswered(&request, &edited_by, &original_request)) else {
         return Ok(Reply::Error(error_response(503, "stopping", "the proxy is stopping"), true));
     };
     let mut started = Instant::now();
@@ -982,7 +978,11 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     if let (Some(a), Some(p), Ok(Upstream { sent, response, .. })) = (auth, &prepared, &upstream) {
         // A re-login can outlast stopping's wait: stopping then records this answer.
         let ms = Some(started.elapsed().as_millis() as i64);
-        flight.answered(Capture { edited_by: edited_by.clone(), ..row(target, sent, Some(response), ms, None) });
+        flight.answered(Capture {
+            edited_by: edited_by.clone(),
+            original_request: original_request.clone(),
+            ..row(target, sent, Some(response), ms, None)
+        });
         // Session lost or stale session values: log in again or refresh them, and
         // replay the request with the new session.
         if a.after_response(p, response).await {
@@ -990,12 +990,13 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             let edits = if again.request != request { a.edits(&again) } else { Vec::new() };
             let retry = again.request;
             // Not once the proxy is stopping: then the first answer stands.
-            if let Some(next) = ctx.in_flight.start(row(target, &retry, None, None, Some(STOPPED))) {
+            if let Some(next) = ctx.in_flight.start(unanswered(&retry, &edited_by, &original_request)) {
                 // The first exchange went out and was answered: it has its own row.
                 if flight.claim() {
                     let ms = Some(started.elapsed().as_millis() as i64);
                     let c = row(target, sent, Some(response), ms, None);
-                    send_capture(ctx, Capture { edited_by: edited_by.clone(), ..c }, None).await;
+                    let original_request = original_request.clone();
+                    send_capture(ctx, Capture { edited_by: edited_by.clone(), original_request, ..c }, None).await;
                 }
                 flight = next;
                 request = retry;
@@ -1021,6 +1022,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             if !refused && flight.claim() {
                 let mut c = row(target, &request, None, None, Some(&e.to_string()));
                 c.edited_by = edited_by;
+                c.original_request = original_request;
                 send_capture(ctx, c, None).await;
             }
             let status = if matches!(e, Error::OutOfScope(_)) { 403 } else { 502 };
@@ -1030,8 +1032,11 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
     // Not recorded again if stopping has already recorded it as unanswered.
-    let mut capture =
-        flight.claim().then(|| Capture { edited_by, ..row(target, &sent, Some(&response), Some(duration), None) });
+    let mut capture = flight.claim().then(|| Capture {
+        edited_by,
+        original_request,
+        ..row(target, &sent, Some(&response), Some(duration), None)
+    });
     if status == Some(101) {
         // Outside the recording scope the upgrade's row is all that is kept: no messages.
         if omit.is_some() {
@@ -1044,18 +1049,28 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         let upgrade = Upgrade { response, conn, capture, flight, in_scope, host: target.host.clone(), path, url };
         return Ok(Reply::Upgrade(Box::new(upgrade)));
     }
-    if let Some(c) = capture {
+    // The row keeps the response as received, and beside it what the rules made of it.
+    let ruled = match in_scope {
+        true => live.rules.response(Engine::Proxy, &target.host, response),
+        false => crate::rules::Ruled { bytes: response, ..Default::default() },
+    };
+    if let Some(mut c) = capture {
+        if ruled.changed() {
+            c.modified_response = Some(ruled.bytes.clone());
+            c.response_edits = ruled.edits();
+        }
         // Live access-control testing gets the in-scope requests, as sent.
         let authz = (in_scope && ctx.authz.is_some()).then(|| (target.clone(), sent.clone()));
         send_capture(ctx, c, authz).await;
     }
-    // Recorded: stopping needn't wait for the response rules or a response held in intercept.
+    // Recorded: stopping needn't wait for a response held in intercept.
     drop(flight);
-    if let Some(conn) = conn.filter(|_| !close_after(&sent, &response, &method)) {
+    let received = ruled.original.as_deref().unwrap_or(&ruled.bytes);
+    if let Some(conn) = conn.filter(|_| !close_after(&sent, received, &method)) {
         ctx.client.checkin(target, conn);
     }
 
-    let mut response = if in_scope { apply_response_rules(&live.rules, response) } else { response };
+    let mut response = ruled.bytes;
     if in_scope && live.intercept.matches(true, &method, &target.host, &path) {
         match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
             // The exchange is recorded as received; the intercept row says who edited the response.
@@ -1159,6 +1174,22 @@ impl Hooks for WsHooks {
 
     fn should_hold(&self, direction: Direction) -> bool {
         self.in_scope && live(&self.ctx).intercept.matches_ws(direction, &self.host, &self.path)
+    }
+
+    fn rewrite(&self, direction: Direction, message: &Message) -> Option<Vec<u8>> {
+        if !self.in_scope {
+            return None;
+        }
+        let engine = match direction {
+            Direction::ToServer => Engine::WsToServer,
+            Direction::ToClient => Engine::WsToClient,
+        };
+        let live = live(&self.ctx);
+        if !live.rules.rewrites_ws(engine, &self.host) {
+            return None;
+        }
+        let ruled = live.rules.ws_message(engine, &self.host, &message.payload);
+        ruled.changed().then_some(ruled.bytes)
     }
 
     async fn hold(&self, direction: Direction, message: &Message) -> Hold {
@@ -1389,6 +1420,8 @@ fn capture_bytes(c: &Capture) -> usize {
     let text = |t: &Option<String>| t.as_ref().map_or(0, String::len);
     c.request.len()
         + c.response.len()
+        + c.original_request.as_ref().map_or(0, Vec::len)
+        + c.modified_response.as_ref().map_or(0, Vec::len)
         + c.req_body.len()
         + c.resp_body.as_ref().map_or(0, Vec::len)
         + text(&c.req_body_text)

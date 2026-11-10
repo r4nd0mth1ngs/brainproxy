@@ -800,6 +800,12 @@ fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header
             "rules_add",
             json!({"location": "request-line", "pattern": "^GET /", "replace": "GET http://other-tenant.test/"}),
         ),
+        // A structured rule meets the same check: the header named Host, a path made a URL.
+        ("rules_add", json!({"location": "request-header", "name": "host", "replace": "other-tenant.test"})),
+        (
+            "rules_add",
+            json!({"location": "path", "match_kind": "literal", "pattern": "/", "replace": "http://other-tenant.test/"}),
+        ),
     ];
     for (tool, args) in &settings {
         let (err, e) = m.call(tool, args.clone());
@@ -846,6 +852,55 @@ fn an_agent_sets_a_foreign_host_on_requests_to_come_only_as_a_stated_host_header
     let copied = json!({"location": "request-header", "pattern": "^X-Zz: (.*)$", "replace": "Hos$1"});
     let (err, e) = m.call("rules_add", copied);
     assert!(err && e["error"]["kind"] == "out_of_scope", "{e}");
+    // Structured rules that name no host need no flag, whatever they apply to.
+    for args in [
+        json!({"location": "request-header", "name": "X-Role", "replace": "admin", "applies_to": ["proxy", "send", "scan"]}),
+        json!({"location": "query-param", "name": "role", "action": "remove"}),
+        json!({"location": "status", "pattern": "^403$", "replace": "200", "host": "^app\\.test$"}),
+    ] {
+        let (err, e) = m.call("rules_add", args.clone());
+        assert!(!err, "{args}: {e}");
+        assert!(e["data"].get("host_warning").is_none(), "{args}: {e}");
+    }
+}
+
+#[test]
+fn an_agent_tries_rules_on_text_it_passes_and_imports_them_from_stdin() {
+    let project = tmp_project("rules-test");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["app.test"]}));
+    assert!(!err, "{e}");
+    // An unsaved rule on the call's stdin: nothing is saved, nothing is sent.
+    let request = "GET /a?role=user HTTP/1.1\nHost: app.test\n\n";
+    let draft = json!({"stdin": request, "location": "query-param", "name": "role", "replace": "admin"});
+    let (err, e) = m.call("rules_test", draft);
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["request"]["rules"], json!([0]), "{e}");
+    assert!(e["data"]["request"]["result"]["content"].as_str().unwrap().starts_with("GET /a?role=admin "), "{e}");
+    let (_, e) = m.call("rules_list", json!({}));
+    assert_eq!(e["data"]["rules"], json!([]), "{e}");
+    // A file would be read back in the result, so there is none through MCP.
+    let secret = project.with_extension("secret");
+    std::fs::write(&secret, "GET /secret-in-a-file HTTP/1.1\r\nHost: app.test\r\n\r\n").unwrap();
+    for tool in ["rules_test", "rules_import"] {
+        let (err, e) = m.call(tool, json!({"file": secret.to_str().unwrap()}));
+        assert!(err, "{tool}: {e}");
+        let message = e["error"]["message"].as_str().unwrap();
+        assert!(message.contains("through MCP") && !message.contains("secret-in-a-file"), "{tool}: {e}");
+    }
+    // Rules come in on stdin, as the agent's own, and are tried by id.
+    let rules = json!([{"location": "method", "pattern": "", "replace": "POST", "origin": "gui"}]).to_string();
+    let (err, e) = m.call("rules_import", json!({"stdin": rules}));
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["rules"][0]["origin"], "mcp", "{e}");
+    let (err, e) = m.call("rules_test", json!({"stdin": request, "rules": [1], "engine": "fuzz"}));
+    assert!(!err, "{e}");
+    assert!(e["data"]["request"]["result"]["content"].as_str().unwrap().starts_with("POST /a?role=user "), "{e}");
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    let hints = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap()["annotations"].clone();
+    assert_eq!(hints("rules_test")["readOnlyHint"], true);
+    assert_eq!(hints("rules_import")["readOnlyHint"], false);
 }
 
 #[test]

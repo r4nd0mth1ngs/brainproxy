@@ -336,6 +336,62 @@ fn websocket_traffic_through_the_proxy_is_recorded() {
 }
 
 #[test]
+fn websocket_rules_rewrite_messages_each_way() {
+    let env = Env::new("rules");
+    let port = spawn_ws_echo();
+    let proxy = start_proxy(&env);
+    let add = |args: &[&str]| env.ok(&[&["rules", "add", "--location"][..], args].concat());
+    add(&[
+        "ws-message",
+        "--match-kind",
+        "literal",
+        "--match",
+        "user",
+        "--replace",
+        "admin",
+        "--applies-to",
+        "ws-to-server",
+    ]);
+    add(&["ws-message", "--match", "^echo: ", "--replace", "", "--applies-to", "ws-to-client"]);
+    // Neither a rule for HTTP bodies nor one for another host touches these messages.
+    add(&["request-body", "--match", "role", "--replace", "x"]);
+    add(&["ws-message", "--match", "role", "--replace", "x", "--host", "^other\\.test$"]);
+    std::thread::sleep(Duration::from_millis(700));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut c = WsClient::connect(&proxy, &format!("http://127.0.0.1:{port}/rules"), true).await;
+        // The server gets `role admin` and echoes it; the client gets the echo without its prefix.
+        c.send(OP_TEXT, b"role user").await;
+        let (op, payload, compressed) = c.recv(Duration::from_secs(5)).await.unwrap();
+        assert_eq!((op, payload.as_slice(), compressed), (OP_TEXT, &b"role admin"[..], false));
+        // A binary message is ruled too, and a ping is not a message to rule.
+        c.send(OP_BINARY, b"user\x00").await;
+        assert_eq!(c.recv(Duration::from_secs(5)).await.unwrap().1, b"admin\x00");
+        c.send(OP_PING, b"user").await;
+        assert_eq!(c.recv(Duration::from_secs(5)).await.unwrap(), (OP_PONG, b"user".to_vec(), false));
+        c.send(OP_CLOSE, &close_payload(1000, "bye")).await;
+        assert_eq!(c.recv(Duration::from_secs(5)).await.unwrap().0, OP_CLOSE);
+    });
+    // What is recorded is what went on, marked as a rule's doing.
+    let id = env.closed_connection()["id"].as_i64().unwrap().to_string();
+    let msgs = env.ok(&["ws", "messages", &id]);
+    let data: Vec<(&str, &str, &str)> = msgs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["opcode"] == "text")
+        .map(|m| {
+            (
+                m["direction"].as_str().unwrap(),
+                m["payload"]["content"].as_str().unwrap(),
+                m["intercept"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(data, [("to-server", "role admin", "rule"), ("to-client", "role admin", "rule")], "{msgs}");
+}
+
+#[test]
 fn websocket_messages_can_be_intercepted() {
     let env = Env::new("intercept");
     let port = spawn_ws_echo();
