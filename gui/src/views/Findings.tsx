@@ -3,7 +3,7 @@ import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, inTauri
 import { originOf, useApp } from "../store";
 import { ask, confirm } from "../ui/Confirm";
 import { Menu, useMenu } from "../ui/Menu";
-import { chooseSave } from "../ui/savePath.ts";
+import { chooseSave } from "../ui/chooseSave.ts";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";

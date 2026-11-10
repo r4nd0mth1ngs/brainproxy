@@ -3,7 +3,7 @@
 // in the CLI (a contents search or a query); the export asks the CLI for all of it at once, as
 // one query in the filter language, so it covers every matching row, not only those loaded.
 
-import { ASSET, type TrafficFilter } from "./trafficFilter";
+import { ASSET, type TrafficFilter } from "./trafficFilter.ts";
 
 /** Rows per export, oldest first; the CLI says `truncated` when more matched. */
 export const EXPORT_LIMIT = 5000;

@@ -6,7 +6,7 @@ import { inTauri, run } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import { useDialogFocus } from "../ui/dialogFocus";
-import { chooseSave } from "../ui/savePath.ts";
+import { chooseSave } from "../ui/chooseSave.ts";
 import { DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, MIN_MASK, type ExportOptions, type ExportResult } from "./trafficExport.ts";
 import type { TrafficFilter } from "./trafficFilter";
 
