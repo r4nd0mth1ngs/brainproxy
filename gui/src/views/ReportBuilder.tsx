@@ -16,7 +16,7 @@ import {
   PRESETS,
   previewCommand,
   profileSaveCommand,
-  REPORT_HOSTS_SQL,
+  reportHostsCommand,
   REPORT_SOURCES,
   REPORT_STATES,
   reportCommand,
@@ -83,7 +83,7 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
     loadProfiles();
     loadSummary();
     // Every host with a finding, closed ones too: the filter matches a host exactly.
-    run<{ rows: [string][] }>(["query", REPORT_HOSTS_SQL]).then(
+    run<{ rows: [string][] }>(reportHostsCommand()).then(
       (r) => setHosts(r.rows.map((row) => row[0])),
       () => setHosts([]),
     );

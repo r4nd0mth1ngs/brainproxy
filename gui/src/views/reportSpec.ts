@@ -1,7 +1,7 @@
 // The report builder's choices and the commands they become. Kept apart from the dialog so it
 // can be tested without a window. Presets and sections mirror crates/core/src/scan/layout.rs.
 
-import { SOURCES, STATES, type Narrative } from "./findingsFilter";
+import { SOURCES, STATES, type Narrative } from "./findingsFilter.ts";
 
 export type Preset = "technical" | "executive" | "developer" | "retest";
 export type Format = "html" | "pdf" | "docx" | "markdown" | "csv" | "json" | "sarif" | "defectdojo";
@@ -245,7 +245,13 @@ export function summaryCommand(text: string): { args: string[]; stdin: string } 
 }
 
 /** The hosts findings were raised on, for the host filter (which matches a host exactly). */
-export const REPORT_HOSTS_SQL = "SELECT DISTINCT host FROM findings WHERE host <> '' ORDER BY host LIMIT 1000";
+export const REPORT_HOSTS_SQL = "SELECT DISTINCT host FROM findings WHERE host <> '' ORDER BY host";
+
+/** Most hosts offered; `query` stops at 200 rows unless given --limit. */
+export const REPORT_HOSTS_LIMIT = 5000;
+
+/** The `query` that lists them. */
+export const reportHostsCommand = (): string[] => ["query", REPORT_HOSTS_SQL, "--limit", String(REPORT_HOSTS_LIMIT)];
 
 /** The command that marks the summary reviewed: it names the text read, by its hash. */
 export function summaryReviewCommand(hash: string): string[] {

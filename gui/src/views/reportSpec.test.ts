@@ -15,7 +15,7 @@ import {
   savedNote,
   specFromProfile,
   specProblem,
-  REPORT_HOSTS_SQL,
+  reportHostsCommand,
   summaryCommand,
   summaryReviewCommand,
   toggleSection,
@@ -109,6 +109,8 @@ test("the executive summary goes on stdin and is reviewed by its hash", () => {
   assert.deepEqual(summaryCommand("  --state all\nmore  "), { args: ["report-summary", "set", "--file=-"], stdin: "--state all\nmore" });
   assert.deepEqual(summaryCommand("x".repeat(50_000)).args, ["report-summary", "set", "--file=-"]);
   assert.deepEqual(summaryCommand(""), { args: ["report-summary", "set", "--file=-"], stdin: "" });
-  assert.match(REPORT_HOSTS_SQL, /^SELECT DISTINCT host FROM findings/);
+  // Past the 200 rows `query` gives by default.
+  assert.deepEqual(reportHostsCommand().slice(2), ["--limit", "5000"]);
+  assert.match(reportHostsCommand()[1], /^SELECT DISTINCT host FROM findings/);
   assert.deepEqual(summaryReviewCommand("ab12"), ["report-summary", "review", "--hash=ab12"]);
 });
