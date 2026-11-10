@@ -37,6 +37,7 @@ use crate::auth::AuthSession;
 use crate::authz::live::Live as LiveAuthz;
 use crate::capture::Capture;
 use crate::error::{Error, Result};
+use crate::filter::Matcher;
 use crate::http::client::{close_after, cut_short, final_response, Conn, LiveBody};
 use crate::http::h2::h2_error;
 use crate::http::wire::Piece;
@@ -44,8 +45,8 @@ use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, 
 use crate::provenance::Edit;
 use crate::proxy::ca::CertAuthority;
 use crate::proxy::config::{
-    CompiledIntercept, CompiledScope, InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY,
-    SCOPE_KEY,
+    filter_matches, CompiledIntercept, CompiledScope, InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY,
+    RULES_KEY, SCOPE_KEY,
 };
 use crate::proxy::h2 as h2p;
 use crate::rules::{Engine, RuleSet};
@@ -994,6 +995,8 @@ struct Upgrade {
     host: String,
     path: String,
     url: String,
+    /// The upgrade request as sent, which the intercept's filter is asked about.
+    handshake: (Target, Vec<u8>),
 }
 
 /// An event stream on its way to the client.
@@ -1298,7 +1301,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             request = p.request.clone();
             prepared = Some(p);
         }
-        if live.intercept.matches(false, &method, &target.host, &path) {
+        // The filter sees the request as it would go out, after rules and the session.
+        let exchange = || Capture::new("proxy", target, &request, None, None, None);
+        if live.intercept.matches(false, &method, &target.host, &path, exchange) {
             match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
                 Some(released) => {
                     request = released.message;
@@ -1396,7 +1401,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         }
         // In flight until its connection's opening is queued.
         let flight = Some(flight);
-        let upgrade = Upgrade { response, conn, capture, flight, in_scope, host: target.host.clone(), path, url };
+        let handshake = (target.clone(), sent);
+        let upgrade =
+            Upgrade { response, conn, capture, flight, in_scope, host: target.host.clone(), path, url, handshake };
         return Ok(Reply::Upgrade(Box::new(upgrade)));
     }
     if let Some(body) = body {
@@ -1481,7 +1488,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     }
 
     let mut response = ruled.bytes;
-    if in_scope && live.intercept.matches(true, &method, &target.host, &path) {
+    // The filter sees the request that went out and the response the client would get.
+    let exchange = || Capture::new("proxy", target, &sent, Some(&response), Some(duration), None);
+    if in_scope && live.intercept.matches(true, &method, &target.host, &path, exchange) {
         match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
             // The exchange is recorded as received; the intercept row says who edited the response.
             Some(released) => response = released.message,
@@ -1499,7 +1508,7 @@ async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
     from_client: Vec<u8>,
     upgrade: Upgrade,
 ) -> Result<()> {
-    let Upgrade { response, conn, capture, flight, in_scope, host, path, url } = upgrade;
+    let Upgrade { response, conn, capture, flight, in_scope, host, path, url, handshake } = upgrade;
     let Some(mut conn) = conn else {
         if let Some(c) = capture {
             send_capture(ctx, c, None).await;
@@ -1534,7 +1543,18 @@ async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
         ctx.recorder.send(Record::Ws(open), bytes).await;
     }
     drop(flight);
-    let hooks = WsHooks { ctx: ctx.clone(), key, recording, in_scope, host, path, url, unrecorded: AtomicU64::new(0) };
+    let hooks = WsHooks {
+        ctx: ctx.clone(),
+        key,
+        recording,
+        in_scope,
+        host,
+        path,
+        url,
+        handshake,
+        filtered: Mutex::new(None),
+        unrecorded: AtomicU64::new(0),
+    };
     let ended =
         crate::ws::relay::relay(client, from_client, conn.stream, from_server, Deflate::from_response(&head), &hooks)
             .await;
@@ -1568,6 +1588,25 @@ struct WsHooks {
     host: String,
     path: String,
     url: String,
+    /// The upgrade request as sent: the intercept's filter matches messages by it.
+    handshake: (Target, Vec<u8>),
+    /// The filter last asked about the handshake and its answer, until the settings change.
+    filtered: Mutex<Option<(Arc<Matcher>, bool)>>,
+}
+
+impl WsHooks {
+    /// Whether the handshake request matches the intercept's filter `m`, worked out once per
+    /// filter rather than for every message.
+    fn handshake_matches(&self, m: &Arc<Matcher>) -> bool {
+        let mut cached = self.filtered.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, hit)) = cached.as_ref().filter(|(seen, _)| Arc::ptr_eq(seen, m)) {
+            return *hit;
+        }
+        let (target, request) = &self.handshake;
+        let hit = filter_matches(m, &Capture::new("proxy", target, request, None, None, None));
+        *cached = Some((m.clone(), hit));
+        hit
+    }
 }
 
 impl Hooks for WsHooks {
@@ -1583,7 +1622,8 @@ impl Hooks for WsHooks {
     }
 
     fn should_hold(&self, direction: Direction) -> bool {
-        self.in_scope && live(&self.ctx).intercept.matches_ws(direction, &self.host, &self.path)
+        self.in_scope
+            && live(&self.ctx).intercept.matches_ws(direction, &self.host, &self.path, |m| self.handshake_matches(m))
     }
 
     fn rewrite(&self, direction: Direction, message: &Message) -> Option<Vec<u8>> {

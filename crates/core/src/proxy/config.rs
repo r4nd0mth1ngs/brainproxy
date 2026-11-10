@@ -2,10 +2,14 @@
 //! the project database so the CLI can change them while a proxy is running; the
 //! proxy picks up changes within a fraction of a second.
 
+use std::sync::Arc;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::capture::Capture;
 use crate::error::{Error, Result};
+use crate::filter::{Matcher, Query, Stage};
 
 /// Match-and-replace rules: they began as the proxy's and are still named from here.
 pub use crate::rules::{
@@ -118,7 +122,8 @@ pub enum TimeoutAction {
     Drop,
 }
 
-/// Which messages are held for review. Patterns are regexes; unset means "any".
+/// Which messages are held for review. Patterns are regexes; unset means "any". A message is
+/// held when every one that is set matches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InterceptSettings {
     pub enabled: bool,
@@ -136,6 +141,12 @@ pub struct InterceptSettings {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+    /// A query in the history filter language (`history list --filter`) the message's exchange
+    /// must match: the request for a held request, the request sent and the response for a held
+    /// response, the handshake request for a WebSocket message. Fields not known yet when the
+    /// message is held are refused when the settings are compiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
     /// Seconds a message waits for a decision before `timeout_action` applies.
     pub timeout_secs: u64,
     pub timeout_action: TimeoutAction,
@@ -152,6 +163,7 @@ impl Default for InterceptSettings {
             host: None,
             path: None,
             method: None,
+            filter: None,
             timeout_secs: 120,
             timeout_action: TimeoutAction::Forward,
         }
@@ -164,6 +176,7 @@ pub struct CompiledIntercept {
     host: Option<Regex>,
     path: Option<Regex>,
     method: Option<Regex>,
+    filter: Option<Arc<Matcher>>,
 }
 
 impl InterceptSettings {
@@ -173,7 +186,16 @@ impl InterceptSettings {
                 .map(|p| Regex::new(p).map_err(|e| Error::InvalidInput(format!("intercept {what} pattern: {e}"))))
                 .transpose()
         };
+        let filter = match self.filter.as_deref().filter(|f| !f.trim().is_empty()) {
+            Some(text) => {
+                let query = Query::parse(text)?;
+                query.check_known(self.filter_stage())?;
+                Some(Arc::new(Matcher::new(&query)?))
+            }
+            None => None,
+        };
         Ok(CompiledIntercept {
+            filter,
             host: re(&self.host, "host")?,
             path: re(&self.path, "path")?,
             method: re(&self.method.as_ref().map(|m| format!("(?i)^(?:{m})$")), "method")?,
@@ -182,20 +204,50 @@ impl InterceptSettings {
     }
 }
 
+impl InterceptSettings {
+    /// What the filter may ask about: only what a request carries when requests or WebSocket
+    /// messages are held (those are matched by their handshake request), the response too when
+    /// only responses are.
+    fn filter_stage(&self) -> Stage {
+        match self.requests || self.ws_to_server || self.ws_to_client {
+            true => Stage::Request,
+            false => Stage::Response,
+        }
+    }
+}
+
 impl CompiledIntercept {
-    /// Whether a message for this request should be held.
-    pub fn matches(&self, response: bool, method: &str, host: &str, path: &str) -> bool {
+    /// Whether a message for this request should be held. `exchange` is the request (and, for a
+    /// response, the response) as the filter sees it; it is made only when a filter is set and
+    /// everything else matches.
+    pub fn matches(
+        &self,
+        response: bool,
+        method: &str,
+        host: &str,
+        path: &str,
+        exchange: impl FnOnce() -> Capture,
+    ) -> bool {
         let s = &self.settings;
         s.enabled
             && (if response { s.responses } else { s.requests })
             && self.host.as_ref().is_none_or(|r| r.is_match(host))
             && self.path.as_ref().is_none_or(|r| r.is_match(path))
             && self.method.as_ref().is_none_or(|r| r.is_match(method))
+            && self.filter.as_ref().is_none_or(|m| filter_matches(m, &exchange()))
     }
 
     /// Whether a WebSocket data message going `direction` on a connection upgraded from a
-    /// request to `host` and `path` should be held. The method filter doesn't apply.
-    pub fn matches_ws(&self, direction: crate::ws::Direction, host: &str, path: &str) -> bool {
+    /// request to `host` and `path` should be held. The method filter doesn't apply. The filter
+    /// is asked about the handshake request through `handshake`, which may keep the answer for
+    /// the connection while the filter is the same one.
+    pub fn matches_ws(
+        &self,
+        direction: crate::ws::Direction,
+        host: &str,
+        path: &str,
+        handshake: impl FnOnce(&Arc<Matcher>) -> bool,
+    ) -> bool {
         let s = &self.settings;
         s.enabled
             && match direction {
@@ -204,7 +256,18 @@ impl CompiledIntercept {
             }
             && self.host.as_ref().is_none_or(|r| r.is_match(host))
             && self.path.as_ref().is_none_or(|r| r.is_match(path))
+            && self.filter.as_ref().is_none_or(handshake)
     }
+}
+
+/// Whether `exchange` matches the intercept's filter. A filter that can't be evaluated (it
+/// parsed and was checked, so this isn't expected) holds the message: the person asked to see
+/// what they might want to change, and a held message is forwarded on its timeout anyway.
+pub fn filter_matches(m: &Matcher, exchange: &Capture) -> bool {
+    m.matches(exchange).unwrap_or_else(|e| {
+        eprintln!("brainproxy: intercept filter not evaluated, message held: {e}");
+        true
+    })
 }
 
 fn compile_all(patterns: &[String]) -> Result<Vec<Regex>> {
@@ -237,8 +300,92 @@ mod tests {
         let i = InterceptSettings { enabled: true, method: Some("post|put".into()), ..Default::default() }
             .compile()
             .unwrap();
-        assert!(i.matches(false, "POST", "h", "/"));
-        assert!(!i.matches(false, "GET", "h", "/"));
-        assert!(!i.matches(true, "POST", "h", "/"));
+        let none = || unreachable!("no filter, no exchange made");
+        assert!(i.matches(false, "POST", "h", "/", none));
+        assert!(!i.matches(false, "GET", "h", "/", none));
+        assert!(!i.matches(true, "POST", "h", "/", none));
+    }
+
+    fn exchange(request: &str, response: Option<&str>) -> Capture {
+        let target = crate::http::Target { scheme: "https".into(), host: "app.test".into(), port: 443 };
+        Capture::new("proxy", &target, request.as_bytes(), response.map(str::as_bytes), Some(5), None)
+    }
+
+    #[test]
+    fn intercept_filter() {
+        let post = "POST /api/login HTTP/1.1\r\nHost: app.test\r\nContent-Length: 6\r\n\r\nuser=a";
+        let get = "GET /static/app.js HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let i = InterceptSettings {
+            enabled: true,
+            filter: Some("req.body:user NOT path:/static".into()),
+            ..Default::default()
+        }
+        .compile()
+        .unwrap();
+        assert!(i.matches(false, "POST", "app.test", "/api/login", || exchange(post, None)));
+        assert!(!i.matches(false, "GET", "app.test", "/static/app.js", || exchange(get, None)));
+        // The other settings still apply, and the exchange isn't made when they don't match.
+        let i = InterceptSettings { method: Some("PUT".into()), ..i.settings.clone() }.compile().unwrap();
+        assert!(!i.matches(false, "POST", "app.test", "/api/login", || unreachable!()));
+
+        // Response fields: only when only responses are held.
+        let held = |requests, responses, ws_to_server, ws_to_client| {
+            InterceptSettings {
+                enabled: true,
+                requests,
+                responses,
+                ws_to_server,
+                ws_to_client,
+                filter: Some("status:5xx".into()),
+                ..Default::default()
+            }
+            .compile()
+        };
+        for refused in [
+            held(true, false, false, false),
+            held(true, true, false, false),
+            held(false, true, true, false),
+            held(false, true, false, true),
+        ] {
+            let e = refused.unwrap_err().to_string();
+            assert!(e.contains("status isn't known when a request or a WebSocket message is held"), "{e}");
+        }
+        let i = held(false, true, false, false).unwrap();
+        let boom = "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n";
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert!(i.matches(true, "GET", "app.test", "/", || exchange(get, Some(boom))));
+        assert!(!i.matches(true, "GET", "app.test", "/", || exchange(get, Some(ok))));
+
+        // Never known in flight, at any stage; an empty filter is none.
+        let e = InterceptSettings { filter: Some("id>3".into()), ..Default::default() }.compile().unwrap_err();
+        assert!(e.to_string().contains("history id"), "{e}");
+        let e = InterceptSettings { filter: Some("status:".into()), ..Default::default() }.compile().unwrap_err();
+        assert!(e.to_string().contains("needs a value"), "{e}");
+        let i = InterceptSettings { enabled: true, filter: Some("  ".into()), ..Default::default() }.compile().unwrap();
+        assert!(i.matches(false, "GET", "h", "/", || unreachable!()));
+    }
+
+    #[test]
+    fn intercept_filter_on_websocket_messages() {
+        use crate::ws::Direction;
+        let i = InterceptSettings {
+            enabled: true,
+            requests: false,
+            ws_to_server: true,
+            filter: Some("path:/chat".into()),
+            ..Default::default()
+        }
+        .compile()
+        .unwrap();
+        let chat = "GET /chat HTTP/1.1\r\nHost: app.test\r\nUpgrade: websocket\r\n\r\n";
+        let ask = |request: &'static str| move |m: &Arc<Matcher>| filter_matches(m, &exchange(request, None));
+        assert!(i.matches_ws(Direction::ToServer, "app.test", "/chat", ask(chat)));
+        assert!(!i.matches_ws(
+            Direction::ToServer,
+            "app.test",
+            "/feed",
+            ask("GET /feed HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        ));
+        assert!(!i.matches_ws(Direction::ToClient, "app.test", "/chat", |_| unreachable!()));
     }
 }

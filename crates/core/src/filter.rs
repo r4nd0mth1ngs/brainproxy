@@ -16,9 +16,17 @@
 //! Every value is bound as a parameter, and field names map to fixed column expressions, so
 //! nothing typed becomes SQL. Each term is coalesced to 0 or 1, so `NOT status:500` keeps the
 //! requests that got no response at all.
+//!
+//! The proxy's intercept uses the same language to pick the messages it holds
+//! (`intercept enable --filter`): [`Matcher`] runs the same SQL against a one-row table made
+//! from the message in flight, and [`Query::check_known`] refuses fields that aren't known yet
+//! when the message is held (a response's status, for a request).
+
+use std::sync::Mutex;
 
 use regex::RegexBuilder;
 use rusqlite::types::Value;
+use rusqlite::{Connection, ToSql};
 
 use crate::error::{Error, Result};
 
@@ -129,6 +137,50 @@ fn field(name: &str) -> Option<(Kind, &'static str, Option<String>)> {
         _ => return None,
     };
     Some((kind, expr, None))
+}
+
+/// What is known of an exchange when the proxy's intercept holds one of its messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// A request on its way out, before any response. WebSocket messages are matched by their
+    /// connection's handshake request, so they are at this stage too.
+    Request,
+    /// A response on its way back, with the request that was sent.
+    Response,
+}
+
+/// When a field's value is known for a message in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Known {
+    /// From the request on.
+    Request,
+    /// Once the response is in.
+    Response,
+    /// Never while a message is held, for this reason.
+    Never(&'static str),
+}
+
+/// When `name`'s value is known in flight. Every field in [`FIELDS`] is listed here (a test
+/// checks it), so a field added later isn't quietly matched against nothing.
+fn known(name: &str) -> Known {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("req.header.") {
+        return Known::Request;
+    }
+    if lower.starts_with("resp.header.") {
+        return Known::Response;
+    }
+    match lower.as_str() {
+        "method" | "scheme" | "host" | "port" | "path" | "query" | "url" | "time" | "source" | "origin" | "sni"
+        | "client" | "req" | "req.body" | "req.type" | "req.length" | "req.headers" => Known::Request,
+        "status" | "length" | "duration" | "title" | "type" | "resp" | "resp.body" | "body" | "resp.headers" => {
+            Known::Response
+        }
+        "id" => Known::Never("a history id is given when the exchange is recorded"),
+        "error" => Known::Never("a held message has no error: one is recorded when no response came back"),
+        "note" | "tag" => Known::Never("notes and tags are added to an entry once it is recorded"),
+        _ => Known::Never("it isn't known while a message is held"),
+    }
 }
 
 /// A header-name character (RFC 9110 token).
@@ -560,6 +612,146 @@ impl Query {
     }
 }
 
+impl Query {
+    /// Refuses a field whose value isn't known yet when a message is held at `stage` (a
+    /// response's status, for a request), or is never known in flight (a history id), so a
+    /// filter doesn't quietly never match. Bare words are fine at either stage: they search the
+    /// URL and match the method, and the title too once there is a response.
+    pub fn check_known(&self, stage: Stage) -> Result<()> {
+        fn walk(n: &Node, stage: Stage) -> Result<()> {
+            match n {
+                Node::And(parts) | Node::Or(parts) => parts.iter().try_for_each(|p| walk(p, stage)),
+                Node::Not(inner) => walk(inner, stage),
+                Node::Word(_) => Ok(()),
+                Node::Term { field, .. } => match (known(field), stage) {
+                    (Known::Request, _) | (Known::Response, Stage::Response) => Ok(()),
+                    (Known::Never(why), _) => {
+                        Err(invalid(format!("{field} can't pick which messages are held: {why}")))
+                    }
+                    (Known::Response, Stage::Request) => {
+                        let instead = if field.eq_ignore_ascii_case("body") { " (req.body is)" } else { "" };
+                        Err(invalid(format!(
+                            "{field} isn't known when a request or a WebSocket message is held: it comes with \
+                             the response{instead}. Hold only responses (--responses, without --requests, \
+                             --ws-to-server or --ws-to-client) to filter on it"
+                        )))
+                    }
+                },
+            }
+        }
+        walk(&self.0, stage)
+    }
+}
+
+/// The columns [`Matcher`] gives its one-row `history`, from a [`Capture`] as
+/// [`crate::store`]'s insert would store it. `time` is the time of the match.
+const IN_FLIGHT_COLUMNS: &[&str] = &[
+    "id",
+    "source",
+    "scheme",
+    "host",
+    "port",
+    "method",
+    "url",
+    "path",
+    "query",
+    "req_headers",
+    "req_content_type",
+    "req_body",
+    "status",
+    "resp_headers",
+    "resp_content_type",
+    "resp_body",
+    "resp_body_length",
+    "title",
+    "duration_ms",
+    "error",
+    "note",
+    "tags",
+    "request",
+    "response",
+    "origin",
+    "client_addr",
+    "sni",
+];
+
+/// A query matched against messages in flight (the proxy's intercept), with the same SQL
+/// [`Query::to_sql`] gives `history list --filter`, run on an in-memory connection over a
+/// one-row `history` made from the exchange. The same SQL means the same answers: case, NUL
+/// bytes, missing values and regexes behave as they do on recorded rows.
+pub struct Matcher {
+    sql: String,
+    params: Vec<Value>,
+    conn: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for Matcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Matcher").field("sql", &self.sql).finish_non_exhaustive()
+    }
+}
+
+impl Matcher {
+    pub fn new(query: &Query) -> Result<Matcher> {
+        let conn = Connection::open_in_memory()?;
+        crate::store::register_functions(&conn)?;
+        let mut params = Vec::new();
+        let cond = query.to_sql(&mut params, IN_FLIGHT_COLUMNS.len());
+        let cols: Vec<String> =
+            IN_FLIGHT_COLUMNS.iter().enumerate().map(|(i, c)| format!("?{} AS {c}", i + 1)).collect();
+        let sql = format!(
+            "SELECT coalesce(({cond}), 0) FROM (SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS time, {}) AS history",
+            cols.join(", ")
+        );
+        conn.prepare_cached(&sql)?;
+        Ok(Matcher { sql, params, conn: Mutex::new(conn) })
+    }
+
+    /// Whether the exchange `c` matches. A request on its way out has no response yet: its
+    /// response fields are NULL, which [`Query::check_known`] keeps a filter from asking about.
+    pub fn matches(&self, c: &crate::capture::Capture) -> Result<bool> {
+        let resp_body_length = c.resp_body.as_ref().map(|b| b.len() as i64);
+        let tags = serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".into());
+        let origin = c.origin.as_deref().unwrap_or(crate::provenance::origin());
+        let none: Option<i64> = None;
+        // In the order of IN_FLIGHT_COLUMNS.
+        let row: [&dyn ToSql; 27] = [
+            &none,
+            &c.source,
+            &c.scheme,
+            &c.host,
+            &c.port,
+            &c.method,
+            &c.url,
+            &c.path,
+            &c.query,
+            &c.req_headers,
+            &c.req_content_type,
+            &c.req_body,
+            &c.status,
+            &c.resp_headers,
+            &c.resp_content_type,
+            &c.resp_body,
+            &resp_body_length,
+            &c.title,
+            &c.duration_ms,
+            &c.error,
+            &none,
+            &tags,
+            &c.request,
+            &c.response,
+            &origin,
+            &c.client_addr,
+            &c.sni,
+        ];
+        let params = row.into_iter().chain(self.params.iter().map(|v| v as &dyn ToSql));
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare_cached(&self.sql)?;
+        let hit: i64 = stmt.query_row(rusqlite::params_from_iter(params), |r| r.get(0))?;
+        Ok(hit != 0)
+    }
+}
+
 /// Collects a statement's values and numbers their placeholders.
 struct Binder<'a> {
     params: &'a mut Vec<Value>,
@@ -723,6 +915,8 @@ fn term_sql(kind: Kind, expr: &str, op: Op, value: &str, quoted: bool, name: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::Capture;
+    use crate::http::Target;
 
     fn sql(q: &str) -> (String, Vec<Value>) {
         let mut params = Vec::new();
@@ -891,6 +1085,130 @@ mod tests {
     #[test]
     fn positions_count_characters() {
         assert!(err("title:\"über\" stauts:1").contains("at position 14"), "{}", err("title:\"über\" stauts:1"));
+    }
+
+    #[test]
+    fn every_field_has_a_stage() {
+        for (name, _) in FIELDS {
+            let name = name.replace("NAME", "x");
+            assert_ne!(
+                known(&name),
+                Known::Never("it isn't known while a message is held"),
+                "{name} isn't listed in known()"
+            );
+        }
+        assert_eq!(known("REQ.HEADER.Cookie"), Known::Request);
+        assert_eq!(known("resp.header.server"), Known::Response);
+    }
+
+    #[test]
+    fn fields_unknown_at_hold_time_are_refused() {
+        let check = |q: &str, stage| Query::parse(q).unwrap().check_known(stage);
+        for q in ["host:a method=POST req.body:x req.header.cookie:* NOT path:/health", "login", "time:2026 client:127"]
+        {
+            check(q, Stage::Request).unwrap();
+            check(q, Stage::Response).unwrap();
+        }
+        for q in
+            ["status:5xx", "host:a OR (NOT resp.header.server:nginx)", "title:x", "length>1", "duration>1", "type:json"]
+        {
+            let e = check(q, Stage::Request).unwrap_err().to_string();
+            assert!(e.contains("isn't known when a request") && e.contains("Hold only responses"), "{q}: {e}");
+            check(q, Stage::Response).unwrap();
+        }
+        assert!(check("body:x", Stage::Request).unwrap_err().to_string().contains("(req.body is)"));
+        for (q, why) in
+            [("id>3", "history id"), ("note:x", "notes and tags"), ("tag=a", "notes and tags"), ("error:*", "no error")]
+        {
+            for stage in [Stage::Request, Stage::Response] {
+                let e = check(q, stage).unwrap_err().to_string();
+                assert!(e.contains("can't pick which messages are held") && e.contains(why), "{q}: {e}");
+            }
+        }
+    }
+
+    fn exchange(request: &str, response: Option<&str>) -> Capture {
+        let target = Target { scheme: "https".into(), host: "app.test".into(), port: 443 };
+        Capture::new("proxy", &target, request.as_bytes(), response.map(str::as_bytes), Some(12), None)
+    }
+
+    #[test]
+    fn in_flight_matches_as_history_list_does() {
+        let get = "GET /login?next=%2F HTTP/1.1\r\nHost: app.test\r\nCookie: a=1\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        let post = "POST /api/items HTTP/1.1\r\nHost: app.test\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{\"n\":\"\u{0}x\"}";
+        let ok = "HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Type: text/html\r\nContent-Length: 34\r\n\r\n<html><title>Sign in</title></html>";
+        let boom = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 11\r\n\r\nstack trace";
+        let exchanges =
+            [exchange(get, None), exchange(post, None), exchange(get, Some(ok)), exchange(post, Some(boom))];
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = exchanges.iter().map(|c| store.record(c).unwrap()).collect();
+        let queries = [
+            "login",
+            "LOGIN",
+            "post",
+            "\"sign in\"",
+            "host:app.test method=post",
+            "path:/api NOT method=GET",
+            "query:next url~\"^https://app\\\\.test/login\"",
+            "port=443 scheme=https source=proxy",
+            "req.header.cookie:*",
+            "req.header.x-dup=two",
+            "req.header.x-dup!=one",
+            "NOT req.header.cookie:*",
+            "req.body:x req.type:json req.length=10",
+            "req~\"\\\\x00\"",
+            "req.headers:cookie",
+            "status:5xx",
+            "status!=200",
+            "NOT status:200",
+            "resp.body:\"stack trace\" OR title:sign",
+            "resp.header.server~\"(?i)NGINX\"",
+            "type:html length>10 duration<100",
+            "body:x",
+            "resp:nginx",
+            "time:2",
+            "origin:*",
+            "client:*",
+            "sni:*",
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for q in queries {
+            let query = Query::parse(q).unwrap();
+            let listed: Vec<i64> = store
+                .list(&crate::store::HistoryFilter { filter: Some(q.into()), ..Default::default() })
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let m = Matcher::new(&query).unwrap();
+            let matched: Vec<i64> =
+                ids.iter().zip(&exchanges).filter(|(_, c)| m.matches(c).unwrap()).map(|(id, _)| *id).collect();
+            assert_eq!(matched, listed, "{q}");
+            seen.insert(q, matched);
+        }
+        // The cases above pick different rows, not all or none.
+        assert_eq!(seen["status:5xx"], [ids[3]]);
+        assert_eq!(seen["login"], [ids[0], ids[2]]);
+        assert_eq!(seen["\"sign in\""], [ids[2]]);
+        assert_eq!(seen["req.body:x req.type:json req.length=10"], [ids[1], ids[3]]);
+        assert_eq!(seen["NOT status:200"], [ids[0], ids[1], ids[3]], "no response is no status");
+        assert_eq!(seen["req.header.x-dup=two"], [ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn in_flight_matcher_is_shared_across_threads() {
+        let m = std::sync::Arc::new(Matcher::new(&Query::parse("method=POST").unwrap()).unwrap());
+        let post = exchange("POST / HTTP/1.1\r\nHost: app.test\r\n\r\n", None);
+        let get = exchange("GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", None);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..50 {
+                        assert!(m.matches(&post).unwrap() && !m.matches(&get).unwrap());
+                    }
+                });
+            }
+        });
     }
 
     #[test]
