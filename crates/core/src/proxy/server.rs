@@ -1606,12 +1606,17 @@ impl WsHooks {
     /// Whether the handshake request matches the intercept's filter `m`, worked out once per
     /// filter rather than for every message.
     fn handshake_matches(&self, m: &Arc<Matcher>) -> bool {
+        let (target, request) = &self.handshake;
+        let ask = || filter_matches(m, &Capture::new("proxy", target, request, None, None, None));
+        // A query on `time` may answer differently from one message to the next.
+        if !m.is_steady() {
+            return ask();
+        }
         let mut cached = self.filtered.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, hit)) = cached.as_ref().filter(|(seen, _)| Arc::ptr_eq(seen, m)) {
             return *hit;
         }
-        let (target, request) = &self.handshake;
-        let hit = filter_matches(m, &Capture::new("proxy", target, request, None, None, None));
+        let hit = ask();
         *cached = Some((m.clone(), hit));
         hit
     }

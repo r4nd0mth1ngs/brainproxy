@@ -1251,6 +1251,11 @@ brainproxy intercept enable --method POST --filter 'req.body~"(?i)role"'   # all
 - A held request is matched by itself, as it would go out (after match-and-replace rules and
   the auth session); a held response by the request that was sent and the response the client
   would get (after response rules); a WebSocket message by its connection's handshake request.
+  An HTTP/2 request is matched in the form it is held in (its headers as the client sent them),
+  before it is turned into HTTP/1.1 for an origin that doesn't speak HTTP/2, so a header that
+  turning adds (`Content-Length`, for one) is in its history entry but not yet in the held
+  request. A query on `time` is asked again for each WebSocket message; others once per
+  connection, until the settings change.
 - A field that isn't known yet when the message is held is refused with a message, rather
   than never matching: the response fields (`status`, `length`, `duration`, `title`, `type`,
   `resp`, `resp.body`, `body`, `resp.headers`, `resp.header.NAME`) unless only `--responses`

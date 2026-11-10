@@ -494,6 +494,37 @@ fn websocket_messages_are_held_by_their_handshake_request() {
 }
 
 #[test]
+fn a_filter_on_time_is_asked_again_for_each_websocket_message() {
+    let env = Env::new("intercept-time");
+    let port = spawn_ws_echo();
+    let proxy = start_proxy(&env);
+    let cut = env.ok(&["query", "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+3 seconds')"])["rows"][0][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["intercept", "enable", "--ws-to-server", "--filter", &format!("time>={cut}"), "--timeout", "30"]);
+    std::thread::sleep(Duration::from_millis(700));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut c = WsClient::connect(&proxy, &format!("http://127.0.0.1:{port}/clock"), false).await;
+        c.send(OP_TEXT, b"early").await;
+        let got = c.recv(Duration::from_secs(10)).await.map(|m| m.1);
+        assert_eq!(got.as_deref(), Some(&b"echo: early"[..]), "before the cut: not held");
+        // Past the cut, on the same connection and with the same filter: held.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        c.send(OP_TEXT, b"late").await;
+        let listed = env.ok(&["intercept", "list", "--wait", "10"]);
+        assert_eq!(listed["count"], 1, "{listed}");
+        env.ok(&["intercept", "forward", &listed["items"][0]["id"].as_i64().unwrap().to_string()]);
+        let got = c.recv(Duration::from_secs(10)).await.map(|m| m.1);
+        assert_eq!(got.as_deref(), Some(&b"echo: late"[..]));
+        c.send(OP_CLOSE, &close_payload(1000, "")).await;
+        c.recv(Duration::from_secs(5)).await;
+    });
+    env.ok(&["intercept", "disable"]);
+}
+
+#[test]
 fn a_held_message_is_resolved_when_its_connection_ends() {
     let env = Env::new("abandoned");
     let port = spawn_ws_echo();

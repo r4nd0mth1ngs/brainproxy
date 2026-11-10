@@ -52,6 +52,42 @@ export function withFilter(s: InterceptSettings, filter: string): InterceptSetti
 /** Whether `text` would change the filter in `s` (spaces around it don't count). */
 export const filterChanged = (s: InterceptSettings, text: string) => (s.filter ?? "").trim() !== text.trim();
 
+/** The CLI, run against a given project. */
+export type ProjectCli = <T>(args: string[], opts: { project: string }) => Promise<T>;
+
+/**
+ * Changes to the intercept settings, run one after another. `enable` replaces every setting,
+ * so each change reads them when its turn comes (`make` gets them and returns the command, or
+ * null for none): a checkbox ticked while a filter is being applied doesn't undo it, nor the
+ * other way round. Each runs against the project it was made for, so one still queued when
+ * another project opens can't write there. Resolves to whether it went through.
+ */
+export function interceptChanger(cli: ProjectCli, onError: (e: unknown) => void, onDone: () => void) {
+  let queue: Promise<unknown> = Promise.resolve();
+  return (project: string, make: (cur: InterceptSettings) => string[] | null): Promise<boolean> => {
+    const work = async () => {
+      try {
+        const cur = (await cli<{ settings: InterceptSettings }>(["intercept", "status"], { project })).settings;
+        const args = make(cur);
+        if (args) await cli(args, { project });
+        return true;
+      } catch (e) {
+        onError(e);
+        return false;
+      } finally {
+        onDone();
+      }
+    };
+    const done = queue.then(work);
+    queue = done;
+    return done;
+  };
+}
+
+/** The change that makes `text` the filter, while intercept is on and it differs. */
+export const filterChange = (text: string) => (cur: InterceptSettings) =>
+  cur.enabled && filterChanged(cur, text) ? interceptEnableArgs(withFilter(cur, text)) : null;
+
 /**
  * The saved Traffic filters the intercept can take: those in Query mode with a query. Their
  * sources and checkboxes are Traffic's own and don't carry over; a URL or contents search isn't

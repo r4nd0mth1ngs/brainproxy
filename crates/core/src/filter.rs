@@ -642,6 +642,20 @@ impl Query {
         }
         walk(&self.0, stage)
     }
+
+    /// Whether the query reads `time`, which in flight is the time of the match: the same
+    /// message can match at one moment and not the next.
+    fn reads_clock(&self) -> bool {
+        fn walk(n: &Node) -> bool {
+            match n {
+                Node::And(parts) | Node::Or(parts) => parts.iter().any(walk),
+                Node::Not(inner) => walk(inner),
+                Node::Word(_) => false,
+                Node::Term { field, .. } => field.eq_ignore_ascii_case("time"),
+            }
+        }
+        walk(&self.0)
+    }
 }
 
 /// Values a [`Capture`] doesn't hold as such but its history row does, as
@@ -705,6 +719,8 @@ fn in_flight_row<'a>(c: &'a Capture, d: &'a Derived<'a>) -> [(&'static str, &'a 
 pub struct Matcher {
     sql: String,
     params: Vec<Value>,
+    /// The query reads the clock (`time`), so an answer can't be kept for later.
+    reads_clock: bool,
     /// Connections not in use. Each match takes one (or opens one) and puts it back, so matches
     /// on different connections of the proxy don't wait for each other.
     idle: Mutex<Vec<Connection>>,
@@ -731,7 +747,13 @@ impl Matcher {
         );
         let conn = Self::open()?;
         conn.prepare_cached(&sql)?;
-        Ok(Matcher { sql, params, idle: Mutex::new(vec![conn]) })
+        Ok(Matcher { sql, params, reads_clock: query.reads_clock(), idle: Mutex::new(vec![conn]) })
+    }
+
+    /// Whether the same exchange always gets the same answer, so it may be kept: not when the
+    /// query reads `time`, the time of the match.
+    pub fn is_steady(&self) -> bool {
+        !self.reads_clock
     }
 
     fn open() -> Result<Connection> {
@@ -1203,6 +1225,16 @@ mod tests {
         assert_eq!(seen["req.body:x req.type:json req.length=10"], [ids[1], ids[3]]);
         assert_eq!(seen["NOT status:200"], [ids[0], ids[1], ids[3]], "no response is no status");
         assert_eq!(seen["req.header.x-dup=two"], [ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn a_query_on_time_is_not_steady() {
+        let steady = |q: &str| Matcher::new(&Query::parse(q).unwrap()).unwrap().is_steady();
+        assert!(steady("host:a OR path:/b"));
+        assert!(!steady("host:a OR (NOT TIME>=2026-11-10)"));
+        let c = exchange("GET / HTTP/1.1\r\nHost: app.test\r\n\r\n", None);
+        let m = |q: &str| Matcher::new(&Query::parse(q).unwrap()).unwrap().matches(&c).unwrap();
+        assert!(m("time>=2020-01-01") && !m("time<2020-01-01"), "time is the time of the match");
     }
 
     #[test]

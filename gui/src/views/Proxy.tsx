@@ -48,7 +48,7 @@ import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, 
 import { EventStreams } from "./EventStreams";
 import { ruleEditNote } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
-import { filterChanged, INTERCEPT_FILTER_HELP, interceptEnableArgs, savedQueries, savedQueryFor, withFilter, type InterceptSettings } from "./intercept";
+import { filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
 
 export function ProxyView() {
   const app = useApp();
@@ -640,10 +640,11 @@ export function InterceptFilter({
   disabled?: boolean;
   width?: number;
 }) {
+  const { project } = useApp();
   const [saved, setSaved] = useState<{ name: string; text: string }[]>([]);
   // Read again when the list is opened: Traffic may have saved one since.
   const load = () =>
-    run<{ filters: unknown }>(FILTERS_LIST_ARGS)
+    run<{ filters: unknown }>(FILTERS_LIST_ARGS, { project })
       .then((d) => setSaved(savedQueries(savedFrom(d.filters))))
       .catch(() => {});
   useEffect(() => {
@@ -726,28 +727,18 @@ function Intercept({ active }: { active: boolean }) {
   }, [current]);
 
   const s = settings?.settings;
-  // Changes run one after another, each on the settings as they are then: `enable` replaces
-  // them all, so a checkbox ticked while a filter is being applied mustn't undo it (or the
-  // other way round).
-  const queue = useRef<Promise<unknown>>(Promise.resolve());
-  const change = (make: (cur: InterceptSettings) => string[] | null) => {
-    const work = async () => {
-      try {
-        const cur = (await run<{ settings: InterceptSettings }>(["intercept", "status"])).settings;
-        const args = make(cur);
-        if (args) await run(args);
-        return true;
-      } catch (e: any) {
-        app.toast(e.message, "error");
-        return false;
-      } finally {
-        refreshSettings();
-      }
-    };
-    const done = queue.current.then(work);
-    queue.current = done;
-    return done;
-  };
+  // Changes run one after another, each on the settings as they are when its turn comes,
+  // against the project they were made for (`interceptChanger`).
+  const latest = useRef({ toast: app.toast, refresh: refreshSettings });
+  latest.current = { toast: app.toast, refresh: refreshSettings };
+  const [changer] = useState(() =>
+    interceptChanger(
+      (args, opts) => run(args, opts),
+      (e: any) => latest.current.toast(e?.message ?? String(e), "error"),
+      () => latest.current.refresh(),
+    ),
+  );
+  const change = (make: (cur: InterceptSettings) => string[] | null) => changer(app.project, make);
 
   // The filter as typed, until it is applied and shows in the settings (null: the saved one is shown).
   const [filterDraft, setFilterDraft] = useState<string | null>(null);
@@ -762,11 +753,14 @@ function Intercept({ active }: { active: boolean }) {
     setFilterDraft((d) => (d === text ? null : d));
   }, [s]);
   const applyFilter = async (text: string) => {
-    if (!s?.enabled || !filterChanged(s, text)) return setFilterDraft(null);
+    if (!s?.enabled) return setFilterDraft(null);
+    // Nothing typed, and the box left: nothing to do.
+    if (filterDraft === null && !filterChanged(s, text)) return;
     if (triedFilter.current === text) return;
     triedFilter.current = text;
-    // Kept as typed when refused, to fix.
-    const ok = await change((cur) => (cur.enabled ? interceptEnableArgs(withFilter(cur, text)) : null));
+    // Compared with the settings as they are when its turn comes, not as last polled: an apply
+    // still queued may change them. Kept as typed when refused, to fix.
+    const ok = await change(filterChange(text));
     if (ok) appliedFilter.current = text;
   };
   const toggle = (patch: (cur: InterceptSettings) => Partial<InterceptSettings>) => {
