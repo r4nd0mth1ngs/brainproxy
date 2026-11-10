@@ -777,7 +777,8 @@ impl Vault {
     /// stand in a form, in JSON, or as they are) and its current one-time code, in the request
     /// line, the header values and the body. A request the login browser sends is
     /// recorded like one brainproxy builds, with no secret in it; [`Vault::resolve`] puts the
-    /// same bytes back on the wire. Only in a request to an origin the value may go to anyway
+    /// same bytes back on the wire (but for a code whose period has turned over since it was
+    /// typed: the current one goes). Only in a request to an origin the value may go to anyway
     /// (the sites it was typed on): this never widens where a placeholder is filled in, or bytes
     /// that happen to match on some other site would open that site to the password.
     pub(crate) fn conceal(&self, profile: &str, request: &[u8], origin: &str) -> Vec<u8> {
@@ -801,7 +802,16 @@ impl Vault {
             .map(|(ph, e)| (ph.clone(), e.value.clone()))
             .collect();
         if let Some(g) = inner.totp.get(&totp).filter(|_| goes_here(&totp)) {
-            secrets.push((totp.clone(), g.now()));
+            // The code the page was given: the current one, or the one before or the one noted
+            // as typed, whose period may have turned over between the typing and the sending.
+            let now = g.step(crate::totp::unix_now());
+            let typed = inner.totp_sent.get(&totp).map(|u| u.step);
+            for step in [Some(now), now.checked_sub(1), typed].into_iter().flatten() {
+                let code = g.code_for_step(step);
+                if !secrets.iter().any(|(ph, v)| *ph == totp && *v == code) {
+                    secrets.push((totp.clone(), code));
+                }
+            }
         }
         secrets.retain(|(_, v)| v.len() >= 4);
         // (Of two forms that read the same, the plain one's placeholder.)
@@ -2133,6 +2143,12 @@ mod tests {
         let target = Target::from_url(origin).unwrap();
         let sent = String::from_utf8(vault.resolve(kept.as_bytes(), &target).unwrap().into_owned()).unwrap();
         assert!(sent == req || g.now() != code, "{sent}");
+        // A code typed just before its period turned over is still one to hide: the current
+        // one goes out in its place.
+        let before = g.code_for_step(g.step(crate::totp::unix_now()) - 1);
+        let late = format!("POST /login HTTP/1.1\r\nHost: sso.a.test\r\nContent-Length: 12\r\n\r\notp={before}");
+        let kept = String::from_utf8(vault.conceal("b", late.as_bytes(), origin)).unwrap();
+        assert!(kept.ends_with("otp=\u{ab}auth:b:totp\u{bb}"), "{kept}");
         // JSON, and a request with neither: as it was.
         let json = format!("POST /api HTTP/1.1\r\n\r\n{{\"pw\":\"p&ss w0rd\",\"otp\":\"{code}\"}}");
         let kept = String::from_utf8(vault.conceal("b", json.as_bytes(), origin)).unwrap();

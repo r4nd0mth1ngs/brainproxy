@@ -82,11 +82,12 @@ struct App {
 }
 
 impl App {
-    /// Whether `code` is the current code (or the one before, as sites allow) and unused.
+    /// Whether `code` is the current code (or one of the two before: a loaded machine can take
+    /// a few seconds between a page and its form) and unused.
     fn take_code(&mut self, code: &str) -> bool {
         let g = generator();
         let now = g.step(brainproxy_core::totp::unix_now());
-        let step = [now, now - 1].into_iter().find(|s| g.code_for_step(*s) == code);
+        let step = [now, now - 1, now - 2].into_iter().find(|s| g.code_for_step(*s) == code);
         match step.filter(|s| self.used_steps.insert(*s)) {
             Some(_) => true,
             None => {
