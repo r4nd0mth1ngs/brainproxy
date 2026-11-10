@@ -891,7 +891,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         let received = std::mem::take(&mut ex.response);
         let r = match ex.stream {
             Some(_) => rules.response_head(&target, received),
-            None => rules.response(&target, received),
+            None => rules.response(&target, &ex.request, received),
         };
         // The request went out and its row is complete: failing now would hide the answer.
         unkept = log.ruled_response(id, &r).err();
@@ -1076,7 +1076,7 @@ fn race(
                 // the rules made of it, which is what the race's results go by.
                 let after = rules
                     .filter(|rules| rules.rewrites_responses(&target))
-                    .map(|rules| rules.response(&target, ex.response.clone()))
+                    .map(|rules| rules.response(&target, &ex.request, ex.response.clone()))
                     .filter(|after| after.changed());
                 if let Some(after) = &after {
                     done(log.ruled_response(id, after));

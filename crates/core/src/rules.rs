@@ -1041,14 +1041,16 @@ impl RuleSet {
         Ruled::of(request, bytes, by, run.failed())
     }
 
-    /// `response` from `host` after the rules `engine` applies there.
-    pub fn response(&self, engine: Engine, host: &str, response: Vec<u8>) -> Ruled {
+    /// `response` from `host`, the answer to `request`, after the rules `engine` applies there.
+    /// The request is read for its method only: the response to a `HEAD` has no body for a body
+    /// rule to change (see [`response_rules`]). Empty when there is none to go by.
+    pub fn response(&self, engine: Engine, host: &str, request: &[u8], response: Vec<u8>) -> Ruled {
         let active: Vec<&CompiledRule> = self.active(engine, host, RuleLocation::is_response).collect();
         if active.is_empty() {
             return Ruled::unchanged(response);
         }
         let run = Run::new(engine, host);
-        let (bytes, by) = response_rules(&active, &response, &run);
+        let (bytes, by) = response_rules(&active, &response, answers_head(request), &run);
         Ruled::of(response, bytes, by, run.failed())
     }
 
@@ -1063,7 +1065,7 @@ impl RuleSet {
             return Ruled::unchanged(head);
         }
         let run = Run::new(engine, host);
-        let (bytes, by) = response_rules(&active, &head, &run);
+        let (bytes, by) = response_rules(&active, &head, false, &run);
         let bytes = keep_framing(&head, bytes);
         Ruled::of(head, bytes, by, run.failed())
     }
@@ -1130,9 +1132,10 @@ impl EngineRules {
         self.set.rewrites_responses(self.engine, &target.host)
     }
 
-    /// `response` from `target` after the rules: what the engine then reads.
-    pub fn response(&self, target: &Target, response: Vec<u8>) -> Ruled {
-        let ruled = self.set.response(self.engine, &target.host, response);
+    /// `response` from `target`, the answer to `request`, after the rules: what the engine then
+    /// reads.
+    pub fn response(&self, target: &Target, request: &[u8], response: Vec<u8>) -> Ruled {
+        let ruled = self.set.response(self.engine, &target.host, request, response);
         self.failures.note(self.engine, &ruled.failed);
         ruled
     }
@@ -1500,10 +1503,27 @@ fn response_rule(
     }
 }
 
-fn response_rules<'a>(active: &[&'a CompiledRule], resp: &[u8], run: &Run<'_>) -> (Vec<u8>, Vec<&'a CompiledRule>) {
+/// Whether `request` is a `HEAD`, whose response has no body whatever its headers say.
+fn answers_head(request: &[u8]) -> bool {
+    request.split(|b| *b == b' ').next().is_some_and(|m| m.eq_ignore_ascii_case(b"HEAD"))
+}
+
+/// Applies response rules to `resp`. With `to_head` it answers a `HEAD`: like a 1xx, 204 or 304
+/// it has no body, and body rules are skipped. One that matches an empty body (an empty or `^`
+/// pattern) would otherwise give it a body and a Content-Length, and a kept-alive client would
+/// read that body as the start of the next response.
+fn response_rules<'a>(
+    active: &[&'a CompiledRule],
+    resp: &[u8],
+    to_head: bool,
+    run: &Run<'_>,
+) -> (Vec<u8>, Vec<&'a CompiledRule>) {
     let final_start = final_response_offset(resp);
     let (prefix, rest) = resp.split_at(final_start);
     let Ok(parsed) = parse_response_head(rest) else { return (resp.to_vec(), Vec::new()) };
+    let no_body = to_head || (100..200).contains(&parsed.status) || matches!(parsed.status, 204 | 304);
+    let active: Vec<&'a CompiledRule> =
+        active.iter().copied().filter(|r| !(no_body && r.location == RuleLocation::ResponseBody)).collect();
     let (head, raw_body) = split_head_body(rest);
     let (mut first, mut headers) = split_lines(head);
     // Decoded once, when a body rule needs it; None if it can't be decoded (then body rules
@@ -1513,7 +1533,7 @@ fn response_rules<'a>(active: &[&'a CompiledRule], resp: &[u8], run: &Run<'_>) -
     let mut changed_by = Vec::new();
     // The response's body decoded, the first time something needs it.
     let decode = || decode_body_fully(&parsed.headers, raw_body);
-    for &rule in active {
+    for rule in active {
         if !run.wants(rule, |dry| {
             response_rule(rule, &mut first.clone(), &mut headers.clone(), &mut decoded, &decode, dry);
         }) {
@@ -1677,7 +1697,7 @@ mod tests {
     }
 
     fn response(rules: &[Rule], resp: &str) -> (String, Vec<u32>) {
-        let out = RuleSet::compile(rules).unwrap().response(Engine::Proxy, "h.test", resp.as_bytes().to_vec());
+        let out = RuleSet::compile(rules).unwrap().response(Engine::Proxy, "h.test", b"", resp.as_bytes().to_vec());
         (String::from_utf8(out.bytes.clone()).unwrap(), out.ids())
     }
 
@@ -1806,9 +1826,9 @@ mod tests {
     fn response_body_rules_leave_bodies_they_cannot_decode_or_do_not_change() {
         let set = RuleSet::compile(&[rule(1, RuleLocation::ResponseBody, "a", "b")]).unwrap();
         let zstd = b"HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: 4\r\n\r\n(\xb5/\xfd".to_vec();
-        assert_eq!(set.response(Engine::Proxy, "h", zstd.clone()).bytes, zstd);
+        assert_eq!(set.response(Engine::Proxy, "h", b"", zstd.clone()).bytes, zstd);
         let head = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 120\r\n\r\n".to_vec();
-        let out = set.response(Engine::Proxy, "h", head.clone());
+        let out = set.response(Engine::Proxy, "h", b"", head.clone());
         assert_eq!((out.bytes, out.original), (head, None));
     }
 
@@ -2012,6 +2032,58 @@ mod tests {
         // A regex with nothing to match still matches nothing on a body, as it always did.
         let empty = [rule(3, RuleLocation::RequestBody, "", "x")];
         assert_eq!(request(&empty, "POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\na").1, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_body_rule_leaves_responses_that_have_no_body_without_one() {
+        // Each matches an empty body: an empty literal or whole match, and regexes that match "".
+        let rules = [
+            Rule { matcher: MatchKind::Literal, ..rule(1, RuleLocation::ResponseBody, "", "x") },
+            Rule { matcher: MatchKind::Whole, ..rule(2, RuleLocation::ResponseBody, "", "{}") },
+            rule(3, RuleLocation::ResponseBody, "^", "injected"),
+            rule(4, RuleLocation::ResponseBody, "^$", "injected"),
+        ];
+        let get = b"GET / HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        let head = b"HEAD / HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        let no_content = "HTTP/1.1 204 No Content\r\nServer: s\r\n\r\n";
+        let not_modified = "HTTP/1.1 304 Not Modified\r\nETag: \"a\"\r\n\r\n";
+        let to_head = "HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
+        let early = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
+        for r in &rules {
+            let set = RuleSet::compile(std::slice::from_ref(r)).unwrap();
+            for (request, resp) in [(&get[..], no_content), (get, not_modified), (head, to_head), (get, early)] {
+                let out = set.response(Engine::Proxy, "h.test", request, resp.as_bytes().to_vec());
+                assert!(
+                    !out.changed(),
+                    "rule {} gave {resp:?} a body: {:?}",
+                    r.id,
+                    String::from_utf8_lossy(&out.bytes)
+                );
+                assert_eq!(out.bytes, resp.as_bytes());
+            }
+            // A response with a body, even an empty one, still gets the rule.
+            let empty = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            assert!(set.response(Engine::Proxy, "h.test", get, empty.as_bytes().to_vec()).changed(), "rule {}", r.id);
+        }
+        // Header rules still apply to them.
+        let header = named(5, RuleLocation::ResponseHeader, "X-Seen", RuleAction::Add, "", "yes");
+        let out =
+            RuleSet::compile(&[header]).unwrap().response(Engine::Proxy, "h.test", head, to_head.as_bytes().to_vec());
+        assert_eq!(
+            String::from_utf8(out.bytes).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 42\r\nX-Seen: yes\r\n\r\n"
+        );
+
+        // A script's replacement goes the same way: never run for a response with no body.
+        let (r, dir) = scripted(6, RuleLocation::ResponseBody, "^", "function replace(m) { return 'from a script'; }");
+        let set = RuleSet::compile(&[r]).unwrap();
+        let out = set.response(Engine::Proxy, "h.test", get, no_content.as_bytes().to_vec());
+        assert!(!out.changed() && out.failed.is_empty());
+        let out = set.response(Engine::Proxy, "h.test", head, to_head.as_bytes().to_vec());
+        assert!(!out.changed() && out.failed.is_empty());
+        let out = set.response(Engine::Proxy, "h.test", get, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+        assert_eq!(String::from_utf8(out.bytes).unwrap(), "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nfrom a script");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2244,7 +2316,7 @@ mod tests {
         assert_eq!((out.as_str(), ids), ("HTTP/1.1 418 I'm a teapot\r\nContent-Length: 6\r\n\r\nteapot", vec![2]));
         // What a script returns as a status is checked like a rule's text, when it has run.
         let set = RuleSet::compile(&rules).unwrap();
-        let out = set.response(Engine::Proxy, "h", b"HTTP/1.1 500 Oops\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let out = set.response(Engine::Proxy, "h", b"", b"HTTP/1.1 500 Oops\r\nContent-Length: 0\r\n\r\n".to_vec());
         assert!(
             !out.changed() && failed(&out) == [(2, failed(&out)[0].1)] && failed(&out)[0].1.contains("is no status")
         );
@@ -2418,7 +2490,7 @@ mod tests {
         header.name = Some("X-Debug".into());
         let (body, dir_c) = scripted(3, RuleLocation::ResponseBody, "secret", throws);
         let set = RuleSet::compile(&[status, header, body]).unwrap();
-        let respond = |resp: &str| set.response(Engine::Proxy, "h", resp.as_bytes().to_vec());
+        let respond = |resp: &str| set.response(Engine::Proxy, "h", b"", resp.as_bytes().to_vec());
         let out = respond("HTTP/1.1 200 OK\r\nX-Debug: off\r\nContent-Length: 5\r\n\r\nplain");
         assert!(!out.changed() && out.failed.is_empty(), "{out:?}");
         let out = respond("HTTP/1.1 403 No\r\nX-Debug: on\r\nContent-Length: 6\r\n\r\nsecret");
@@ -2483,7 +2555,7 @@ mod tests {
         let (mut cookie, dir_d) = scripted(4, RuleLocation::ResponseHeader, "", script);
         cookie.name = Some("Set-Cookie".into());
         let resp = "HTTP/1.1 200 OK\r\nSet-Cookie: ok\r\nSet-Cookie: bad\r\nContent-Length: 0\r\n\r\n";
-        let out = RuleSet::compile(&[cookie]).unwrap().response(Engine::Proxy, "h", resp.as_bytes().to_vec());
+        let out = RuleSet::compile(&[cookie]).unwrap().response(Engine::Proxy, "h", b"", resp.as_bytes().to_vec());
         assert!(!out.changed() && out.failed.len() == 1, "{out:?}");
         for dir in [dir_a, dir_b, dir_c, dir_d] {
             let _ = std::fs::remove_dir_all(dir);
@@ -2496,7 +2568,7 @@ mod tests {
         let set = RuleSet::compile(&[r]).unwrap();
         let respond = |n: usize| {
             let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n{}", "a".repeat(n));
-            set.response(Engine::Proxy, "h", resp.into_bytes())
+            set.response(Engine::Proxy, "h", b"", resp.into_bytes())
         };
         let out = respond(500);
         assert!(out.failed.is_empty() && !out.changed(), "{out:?}");

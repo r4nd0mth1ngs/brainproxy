@@ -390,7 +390,7 @@ async fn exchange(
         // isn't recorded first gets its response ruled here.
         response: match (ruled, by) {
             (Some(ruled), _) => ruled,
-            (None, Some((rules, _))) if rows.is_none() => rules.response(target, ex.response),
+            (None, Some((rules, _))) if rows.is_none() => rules.response(target, &ex.request, ex.response),
             (None, _) => Ruled { bytes: ex.response, ..Default::default() },
         },
     });

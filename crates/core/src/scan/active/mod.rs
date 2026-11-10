@@ -1025,7 +1025,7 @@ pub async fn run(
         // The baseline is read as the attack responses will be: after the response rules that
         // list scans, or a rule's rewrite would look like the attack's doing.
         let baseline = match &shared.match_rules {
-            Some(rules) => rules.response(&t.target, t.response.clone()).bytes,
+            Some(rules) => rules.response(&t.target, &t.request, t.response.clone()).bytes,
             None => t.response.clone(),
         };
         let Ok(response) = Response::parse(request.clone(), baseline, duration) else { continue };

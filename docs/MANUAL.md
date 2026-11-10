@@ -1224,7 +1224,7 @@ there and `--replace` what to write instead:
 | `query-param --name N` | The value of query parameter `N`, as written in the request line (not decoded). `N` is the parameter's decoded name: it matches `a+b` and `a%20b` alike, and is written encoded where the rule adds the parameter |
 | `request-header --name N`, `response-header --name N` | The value of header `N` |
 | `status` | The response's status code; the replacement is a code from 200 up, with a reason if you like (`404` or `404 Not Found`). To or from 204 and 304, which have no body, the body and its framing follow |
-| `request-body`, `response-body` | The body (a compressed response body is decoded first and sent on decoded) |
+| `request-body`, `response-body` | The body (a compressed response body is decoded first and sent on decoded). A response that has no body (1xx, 204, 304, or the answer to a `HEAD`) is left without one |
 | `ws-message` | The payload of a WebSocket text or binary message the proxy relays |
 | `request-line`, `request-header`, `response-header` (no `--name`) | The raw request line, or each header line (`Name: value`) on its own; with an empty `--match`, a header location adds `--replace` as a new header line |
 

@@ -1460,7 +1460,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     }
     // The row keeps the response as received, and beside it what the rules made of it.
     let ruled = match in_scope {
-        true => live.rules.response(Engine::Proxy, &target.host, response),
+        true => live.rules.response(Engine::Proxy, &target.host, &sent, response),
         false => crate::rules::Ruled { bytes: response, ..Default::default() },
     };
     live.rule_failures.note(Engine::Proxy, &ruled.failed);

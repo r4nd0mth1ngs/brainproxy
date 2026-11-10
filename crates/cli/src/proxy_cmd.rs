@@ -2603,6 +2603,12 @@ fn test_rules(
     let mut results = serde_json::Map::new();
     let mut texts = Vec::new();
     let mut first_bytes = None;
+    // A response tested with its request is read as its answer: a HEAD's has no body to rule.
+    let answered: Vec<u8> = messages
+        .iter()
+        .find(|(kind, _)| matches!(kind, MessageArg::Request))
+        .map(|(_, bytes)| bytes.clone())
+        .unwrap_or_default();
     for (kind, bytes) in messages {
         let engine = engine_for(kind);
         let rules: Vec<Rule> = tried
@@ -2615,7 +2621,7 @@ fn test_rules(
         let set = RuleSet::compile(&rules)?;
         let ruled: Ruled = match kind {
             MessageArg::Request => set.request(engine, &host, bytes),
-            MessageArg::Response => set.response(engine, &host, bytes),
+            MessageArg::Response => set.response(engine, &host, &answered, bytes),
             MessageArg::WsToServer | MessageArg::WsToClient => set.ws_message(engine, &host, &bytes),
         };
         let name = match kind {

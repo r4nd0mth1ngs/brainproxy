@@ -431,7 +431,7 @@ impl Rows {
                 // The exchange keeps the response as received, so the rules get a copy; only
                 // when there are rules for it.
                 if let Some((rules, _)) = by.filter(|(rules, _)| rules.rewrites_responses(target)) {
-                    let response = rules.response(target, ex.response.clone());
+                    let response = rules.response(target, &ex.request, ex.response.clone());
                     if response.changed() {
                         c.response_edits = response.edits();
                         c.modified_response = Some(response.bytes.clone());
