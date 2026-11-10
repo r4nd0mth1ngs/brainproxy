@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use brainproxy_core::apiimport::api;
 use brainproxy_core::auth::{AuthProfile, AuthSession};
+use brainproxy_core::authz::noise::{self, PathSkips, SavedSkips, SKIP_KEY, SKIP_SYNTAX};
 use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS, DEFAULT_EXCLUDE, SAFE_METHODS};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::jobs::is_finished;
@@ -29,8 +30,13 @@ pub enum AuthzCmd {
         (refused), bypass (the owner's data came back), public (also without a session), different (e.g. the \
         identity's own data), inconclusive (nothing to compare: an empty body, or HEAD or OPTIONS). Bypasses of medium or high confidence are also findings (source authz). The \
         owner is found from the auth placeholders or session values in the request; --owner sets it. Only \
-        GET, HEAD and OPTIONS requests that carry credentials are picked from history unless \
-        --include-methods or --history-id says otherwise; a GraphQL mutation needs MUTATION as well as its method.")]
+        GET requests that carry credentials are picked from history unless --include-methods or --history-id \
+        says otherwise (HEAD and OPTIONS have no body to compare); a GraphQL mutation needs MUTATION as well as \
+        its method. Static assets (by the response's Content-Type, the browser's Sec-Fetch-Dest, or the \
+        extension when the response doesn't say) and the project's skip paths (authz skip list: well-known \
+        public files by default) aren't picked either: --include-static and --no-saved-skips bring them back, \
+        and --skip-path leaves out more. The summary's skipped counts and skipped_examples say what was left \
+        out and why.")]
     Run(Box<RunArgs>),
     /// Result rows of a run: one per request and identity.
     Results {
@@ -44,18 +50,52 @@ pub enum AuthzCmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
-    /// A run as a table: one row per request, one cell per identity.
+    /// A run as a table: one row per request, one cell per identity. Requests that are static
+    /// assets or match the project's skip paths are left out and counted (hidden_requests).
     Matrix {
         /// Run id.
         run: i64,
         /// Maximum requests.
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Also show static assets and requests matching the skip paths, each with why it
+        /// would be hidden.
+        #[arg(long)]
+        all: bool,
     },
     /// Recent runs with their verdict counts.
     List {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// The project's skip paths: requests runs and live testing leave out, and `authz matrix`
+    /// hides. Well-known public files (robots.txt, /.well-known/, health checks) until changed.
+    #[command(subcommand)]
+    Skip(SkipCmd),
+}
+
+#[derive(Subcommand)]
+pub enum SkipCmd {
+    /// The saved skip paths.
+    List,
+    /// Add skip paths: each a path (/static/) or URL (https://cdn.example.com/) a request
+    /// starts with; * matches any characters, a trailing $ means it ends there.
+    Add {
+        #[arg(required = true, value_name = "PATTERN")]
+        patterns: Vec<String>,
+    },
+    /// Remove skip paths, written as `authz skip list` shows them.
+    Remove {
+        #[arg(required = true, value_name = "PATTERN")]
+        patterns: Vec<String>,
+    },
+    /// Replace the skip paths with these (none: skip nothing), or with the defaults.
+    Set {
+        #[arg(value_name = "PATTERN")]
+        patterns: Vec<String>,
+        /// Back to the defaults: well-known public files.
+        #[arg(long, conflicts_with = "patterns")]
+        defaults: bool,
     },
 }
 
@@ -119,6 +159,18 @@ pub struct RunArgs {
     /// Regex on the path of requests from history not to replay.
     #[arg(long, default_value = DEFAULT_EXCLUDE)]
     exclude: String,
+    /// Also test static assets from history: stylesheets, scripts, images, fonts, media and
+    /// source maps, which are usually served to everyone.
+    #[arg(long)]
+    include_static: bool,
+    /// Leave out requests from history whose path or URL starts with this (* matches any
+    /// characters, a trailing $ means it ends there), on top of the project's skip paths.
+    /// Repeatable.
+    #[arg(long = "skip-path", value_name = "PATTERN")]
+    skip_paths: Vec<String>,
+    /// Don't apply the project's saved skip paths (authz skip list) to this run.
+    #[arg(long)]
+    no_saved_skips: bool,
     /// Cookie that isn't a credential and stays on the request (e.g. a locale). Repeatable
     /// or comma-separated. Every other cookie is removed before sending as another identity.
     #[arg(long = "keep-cookie", value_delimiter = ',', value_name = "NAME")]
@@ -159,10 +211,10 @@ pub fn authz(project: &Path, home: &Path, cmd: AuthzCmd, out: &Out) -> Result<()
             });
             Ok(())
         }
-        AuthzCmd::Matrix { run, limit } => {
+        AuthzCmd::Matrix { run, limit, all } => {
             let store = Store::open(project)?;
             require_run(&store, run)?;
-            let m = store.authz_matrix(run, limit)?;
+            let m = store.authz_matrix(run, limit, &saved_skips(&store)?, all)?;
             out.ok(m.clone(), || matrix_text(&m));
             Ok(())
         }
@@ -191,7 +243,59 @@ pub fn authz(project: &Path, home: &Path, cmd: AuthzCmd, out: &Out) -> Result<()
             });
             Ok(())
         }
+        AuthzCmd::Skip(cmd) => skip(project, cmd, out),
     }
+}
+
+/// The project's saved skip paths, compiled.
+fn saved_skips(store: &Store) -> Result<PathSkips, Error> {
+    let saved: SavedSkips = store.setting(SKIP_KEY)?;
+    PathSkips::compile(&saved.paths).map_err(|e| Error::InvalidInput(format!("saved {e} (authz skip set)")))
+}
+
+fn skip(project: &Path, cmd: SkipCmd, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    let saved: SavedSkips = store.setting(SKIP_KEY)?;
+    let paths = match cmd {
+        SkipCmd::List => saved.paths,
+        SkipCmd::Add { patterns } => {
+            let added = noise::check_skip_paths(&patterns)?;
+            let mut paths = saved.paths;
+            paths.extend(added.into_iter().filter(|p| !paths.contains(p)).collect::<Vec<_>>());
+            store.set_setting(SKIP_KEY, &SavedSkips { paths: paths.clone() })?;
+            paths
+        }
+        SkipCmd::Remove { patterns } => {
+            let gone: Vec<String> = patterns.iter().map(|p| p.trim().to_string()).collect();
+            if let Some(p) = gone.iter().find(|p| !saved.paths.contains(p)) {
+                return Err(Error::NotFound(format!("skip path {p:?} (see authz skip list)")));
+            }
+            let paths: Vec<String> = saved.paths.into_iter().filter(|p| !gone.contains(p)).collect();
+            store.set_setting(SKIP_KEY, &SavedSkips { paths: paths.clone() })?;
+            paths
+        }
+        SkipCmd::Set { patterns, defaults } => {
+            let paths = if defaults { SavedSkips::default().paths } else { noise::check_skip_paths(&patterns)? };
+            store.set_setting(SKIP_KEY, &SavedSkips { paths: paths.clone() })?;
+            paths
+        }
+    };
+    let defaults = paths == SavedSkips::default().paths;
+    let v = json!({"paths": paths, "defaults": defaults, "syntax": SKIP_SYNTAX});
+    out.ok(v, || {
+        let mut lines: Vec<String> = paths.iter().map(|p| format!("  {p}")).collect();
+        lines.insert(
+            0,
+            format!(
+                "{} skip path{}{}",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" },
+                if defaults { " (the defaults)" } else { "" }
+            ),
+        );
+        lines.join("\n")
+    });
+    Ok(())
 }
 
 fn require_run(store: &Store, run: i64) -> Result<(), Error> {
@@ -205,6 +309,8 @@ fn require_run(store: &Store, run: i64) -> Result<(), Error> {
 fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Error> {
     let guard = crate::project_guard(project)?;
     let exclude = regex::Regex::new(&args.exclude).map_err(|e| Error::InvalidInput(format!("--exclude: {e}")))?;
+    let run_skips = PathSkips::compile(&args.skip_paths).map_err(|e| Error::InvalidInput(format!("--skip-path: {e}")))?;
+    let skips = if args.no_saved_skips { run_skips } else { saved_skips(&Store::open(project)?)?.with(&run_skips) };
     let anonymous = !args.no_anonymous;
     let identities: Vec<String> = {
         let mut seen = HashSet::new();
@@ -235,13 +341,14 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
         stream: Default::default(),
     };
-    let (targets, skipped) = select(project, &args, &exclude, &guard)?;
+    let (targets, skipped, examples) = select(project, &args, &exclude, &skips, &guard)?;
     if targets.is_empty() {
-        return Err(Error::InvalidInput(
-            "no requests to test: pass URLs with --owner, --history-id, --where, or --tag, or browse/send the \
-             target logged in first"
-                .into(),
-        ));
+        let left_out = skipped.as_object().filter(|o| !o.is_empty()).map(|_| format!(" (left out: {skipped})"));
+        return Err(Error::InvalidInput(format!(
+            "no requests to test{}: pass URLs with --owner, --history-id, --where, or --tag, or browse/send the \
+             target logged in first",
+            left_out.unwrap_or_default()
+        )));
     }
 
     // Sessions: the identities and owner log in now if they need to. Other profiles
@@ -285,6 +392,9 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
         let bypasses = store.authz_results(job_id, Some("bypass"), None, 20)?;
         let mut v = json!(summary);
         v["skipped"] = skipped.clone();
+        if !examples.is_empty() {
+            v["skipped_examples"] = json!(examples);
+        }
         v["bypasses"] = json!(bypasses);
         v["hint"] = json!(format!(
             "Table: brainproxy authz matrix {job_id}; bypasses: brainproxy authz results {job_id} --verdict bypass; \
@@ -334,14 +444,19 @@ pub(crate) fn load_sessions(
     Ok(known)
 }
 
+/// Requests from history left out as noise listed in a run's summary, at most, per reason.
+const EXAMPLES_PER_REASON: usize = 10;
+
 /// Picks and de-duplicates the requests to test; returns them with the numbers skipped
-/// and why.
+/// and why, and some of those left out as noise (static assets, skip paths, HEAD and
+/// OPTIONS) with why each was.
 fn select(
     project: &Path,
     args: &RunArgs,
     exclude: &regex::Regex,
+    skips: &PathSkips,
     guard: &brainproxy_core::guard::Guard,
-) -> Result<(Vec<AuthzTarget>, Value), Error> {
+) -> Result<(Vec<AuthzTarget>, Value, Vec<Value>), Error> {
     // Its method, and MUTATION too for a GraphQL mutation, as in a scan.
     let missing = |request: &[u8]| api::missing_opt_in(request, SAFE_METHODS, &args.include_methods);
     let mut targets = Vec::new();
@@ -378,13 +493,21 @@ fn select(
     let store = Store::open(project)?;
     let profiles: Vec<AuthProfile> = store.auth_list()?.into_iter().map(|(p, _)| p).collect();
     let (mut out_of_scope, mut methods, mut excluded, mut no_credentials) = (0, 0, 0, 0);
+    let (mut head_options, mut skip_paths, mut static_assets) = (0, 0, 0);
+    let mut examples: Vec<Value> = Vec::new();
+    let mut example = |reason: &str, n: usize, id: i64, url: &str, why: String| {
+        if n <= EXAMPLES_PER_REASON {
+            examples.push(json!({"reason": reason, "history_id": id, "url": url, "why": why}));
+        }
+    };
     for (id, explicit) in ids {
         let item = store.get(id)?;
         if !guard.may_allow(&item.target.host, item.target.port) {
             out_of_scope += 1;
             continue;
         }
-        let path = Message::from_exchange(id, &item.target, &item.request, b"").path;
+        let msg = Message::from_exchange(id, &item.target, &item.request, b"");
+        let path = msg.path;
         // Naming a request isn't consent to replay what it changes, or to log every identity out:
         // a named one that would be skipped is refused before anything is sent.
         if let Some(method) = missing(&item.request) {
@@ -406,6 +529,26 @@ fn select(
             }
             excluded += 1;
             continue;
+        }
+        // Noise: a request named on its own is tested as it is.
+        if !explicit {
+            if noise::no_body_method(&msg.method, &args.include_methods) {
+                head_options += 1;
+                example("head_options", head_options, id, &msg.url, format!("{} has no body to compare", msg.method));
+                continue;
+            }
+            if let Some(p) = skips.matching(&msg.url) {
+                skip_paths += 1;
+                example("skip_paths", skip_paths, id, &msg.url, format!("matches skip path {p}"));
+                continue;
+            }
+            let content_type = item.entry.resp_content_type.as_deref();
+            let why = noise::static_asset(content_type, &path, noise::fetch_dest(&item.request).as_deref());
+            if let Some(why) = why.filter(|_| !args.include_static) {
+                static_assets += 1;
+                example("static_assets", static_assets, id, &msg.url, format!("static asset: {why}"));
+                continue;
+            }
         }
         if !explicit && !authz::has_credentials(&item.request, &profiles) {
             no_credentials += 1;
@@ -433,6 +576,9 @@ fn select(
         ("out_of_scope", out_of_scope),
         ("methods", methods),
         ("excluded_paths", excluded),
+        ("head_options", head_options),
+        ("skip_paths", skip_paths),
+        ("static_assets", static_assets),
         ("no_credentials", no_credentials),
         ("duplicates", duplicates),
         ("over_max_requests", over),
@@ -447,7 +593,14 @@ fn select(
              and MUTATION adds GraphQL mutations."
         );
     }
-    Ok((targets.into_iter().map(|(_, t)| t).collect(), skipped))
+    if head_options + skip_paths + static_assets > 0 {
+        skipped["noise_hint"] = json!(
+            "Left out as noise: HEAD and OPTIONS (--include-methods HEAD,OPTIONS tests them), the project's skip \
+             paths (authz skip list; --no-saved-skips ignores them) and static assets (--include-static tests \
+             them). skipped_examples lists some with why."
+        );
+    }
+    Ok((targets.into_iter().map(|(_, t)| t).collect(), skipped, examples))
 }
 
 fn result_line(r: &Value) -> String {
@@ -485,12 +638,18 @@ fn matrix_text(m: &Value) -> String {
             })
             .collect();
         let skipped = r["skipped"].as_str().map(|s| format!("  ({s})")).unwrap_or_default();
+        let hidden = r["hidden"].as_str().map(|s| format!("  [{s}]")).unwrap_or_default();
         lines.push(format!(
-            "{:<10} {cells}  {} {}{skipped}",
+            "{:<10} {cells}  {} {}{skipped}{hidden}",
             r["owner"].as_str().unwrap_or(""),
             r["method"].as_str().unwrap_or(""),
             r["url"].as_str().unwrap_or("")
         ));
+    }
+    let h = &m["hidden_requests"];
+    let (statics, paths) = (h["static_assets"].as_u64().unwrap_or(0), h["skip_paths"].as_u64().unwrap_or(0));
+    if statics + paths > 0 {
+        lines.push(format!("hidden: {statics} static assets, {paths} matching skip paths (--all shows them)"));
     }
     lines.join("\n")
 }

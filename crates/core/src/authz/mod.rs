@@ -17,6 +17,7 @@
 
 pub(crate) mod compare;
 pub mod live;
+pub mod noise;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -1053,22 +1054,42 @@ impl Store {
     }
 
     /// One row per request with a cell per identity: verdict, confidence, status, history id.
-    pub fn authz_matrix(&self, run_id: i64, limit: usize) -> Result<Value> {
+    /// Requests that are static assets or match `skips` are left out and counted in
+    /// `hidden_requests`; with `all` they are shown, each with why it would be `hidden`.
+    pub fn authz_matrix(&self, run_id: i64, limit: usize, skips: &noise::PathSkips, all: bool) -> Result<Value> {
         let rows = self.authz_results(run_id, None, None, i64::MAX as usize)?;
         let mut identities: Vec<String> = Vec::new();
         let mut requests: Vec<Value> = Vec::new();
         let mut current = None;
         let mut truncated = false;
+        // The request being left out, until the next one starts.
+        let mut hiding = false;
+        let (mut hidden_static, mut hidden_paths) = (0, 0);
         for r in rows {
             // A request's rows are consecutive and start with its baseline (or why there is none).
             let key = (r["source_id"].clone(), r["method"].clone(), r["url"].clone());
             let verdict = r["verdict"].as_str().unwrap_or("");
             if current.as_ref() != Some(&key) || matches!(verdict, "baseline" | "skipped") {
+                current = Some(key);
+                let url = r["url"].as_str().unwrap_or("");
+                let hidden = match skips.matching(url) {
+                    Some(p) => Some((false, format!("skip path {p}"))),
+                    None => self
+                        .authz_static(r["source_id"].as_i64().or(r["history_id"].as_i64()), url)?
+                        .map(|why| (true, format!("static asset ({why})"))),
+                };
+                hiding = hidden.is_some() && !all;
+                if hiding {
+                    match hidden {
+                        Some((true, _)) => hidden_static += 1,
+                        _ => hidden_paths += 1,
+                    }
+                    continue;
+                }
                 if requests.len() >= limit {
                     truncated = true;
                     break;
                 }
-                current = Some(key);
                 let mut req = json!({
                     "source_id": r["source_id"],
                     "method": r["method"],
@@ -1081,10 +1102,16 @@ impl Store {
                 if verdict != "baseline" {
                     req["skipped"] = json!(format!("{verdict}: {}", r["reason"].as_str().unwrap_or("")));
                 }
+                if let Some((_, why)) = hidden {
+                    req["hidden"] = json!(why);
+                }
                 requests.push(req);
                 if matches!(verdict, "baseline" | "skipped") || r["identity"] == r["owner"] {
                     continue;
                 }
+            }
+            if hiding {
+                continue;
             }
             let identity = r["identity"].as_str().unwrap_or("").to_string();
             if !identities.contains(&identity) {
@@ -1098,7 +1125,30 @@ impl Store {
                 "history_id": r["history_id"],
             });
         }
-        Ok(json!({"run_id": run_id, "identities": identities, "requests": requests, "truncated": truncated}))
+        Ok(json!({
+            "run_id": run_id,
+            "identities": identities,
+            "requests": requests,
+            "truncated": truncated,
+            "hidden_requests": {"static_assets": hidden_static, "skip_paths": hidden_paths},
+        }))
+    }
+
+    /// Why the request of history entry `id` (and its response) is a static asset, if it is one.
+    fn authz_static(&self, id: Option<i64>, url: &str) -> Result<Option<String>> {
+        let Some(id) = id else { return Ok(None) };
+        let row: Option<(Option<String>, Vec<u8>)> = self
+            .conn
+            .query_row("SELECT resp_content_type, request FROM history WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default()))
+            })
+            .optional()?;
+        let Some((content_type, request)) = row else { return Ok(None) };
+        let path = match url.split_once("://") {
+            Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
+            None => url,
+        };
+        Ok(noise::static_asset(content_type.as_deref(), path, noise::fetch_dest(&request).as_deref()))
     }
 
     /// Recent authz runs, newest first, with their rows per verdict.

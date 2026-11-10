@@ -550,6 +550,14 @@ async fn reload(ctx: &Arc<Ctx>) {
         let scope: Scope = store.setting(SCOPE_KEY)?;
         let rules: Vec<Rule> = store.setting(RULES_KEY)?;
         let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
+        // Live access-control testing skips the paths saved now.
+        if let Some(authz) = &c.authz {
+            let saved: crate::authz::noise::SavedSkips = store.setting(crate::authz::noise::SKIP_KEY)?;
+            match crate::authz::noise::PathSkips::compile(&saved.paths) {
+                Ok(skips) => authz.set_saved_skips(skips),
+                Err(e) => eprintln!("brainproxy: live authz skip paths not reloaded: {e}"),
+            }
+        }
         // Connection options and platform credentials go to the guard every client shares.
         if let Some(g) = &c.guard {
             g.net.set(store.connection_compiled()?);

@@ -370,6 +370,10 @@ const HINTS: &[(&str, Hints)] = &[
     ("authz results", READ),
     ("authz matrix", READ),
     ("authz list", READ),
+    ("authz skip list", READ),
+    ("authz skip add", SET),
+    ("authz skip remove", REPLACE),
+    ("authz skip set", REPLACE),
     // Starts a browser on the machine running the server.
     ("auth record start", ADD),
     ("auth record finish", REPLACE),
