@@ -301,9 +301,6 @@ pub(crate) fn run_here(job: &SignJob) -> std::result::Result<Outcome, String> {
     serde_json::from_str(&text).map_err(|_| "its result couldn't be read".to_string())
 }
 
-#[cfg(test)]
-pub(crate) use crate::sandbox::LAST_CHILD;
-
 /// Runs `script` over `request` in a child process, killed if it passes the time or memory
 /// limit, so nothing of it outlives the call. Messages have the values of `vars` masked, as
 /// a script's own errors can quote them.
@@ -493,12 +490,7 @@ pub(crate) mod tests {
         assert!(matches!(&r, Err(Failure::Stopped(e)) if e.contains("time limit")), "{script}: {r:?}");
         assert!(took >= TIME_LIMIT && took < TIME_LIMIT + Duration::from_secs(3), "{script}: {took:?}");
         #[cfg(unix)]
-        {
-            let pid = LAST_CHILD.get() as libc::pid_t;
-            // SAFETY: signal 0 only asks whether the process exists.
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-            assert!(!alive, "{script}: its process {pid} is still there");
-        }
+        assert!(!crate::sandbox::tests::last_child_alive(), "{script}: its process is still there");
     }
 
     #[test]
@@ -532,12 +524,7 @@ pub(crate) mod tests {
             assert!(e.contains("out of memory"), "{e}");
         }
         #[cfg(unix)]
-        {
-            let pid = LAST_CHILD.get() as libc::pid_t;
-            // SAFETY: signal 0 only asks whether the process exists.
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-            assert!(!alive, "its process {pid} is still there");
-        }
+        assert!(!crate::sandbox::tests::last_child_alive(), "its process is still there");
     }
 
     #[test]

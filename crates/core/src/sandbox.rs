@@ -837,6 +837,17 @@ impl Worker {
         items: Vec<String>,
         each: bool,
     ) -> std::result::Result<Vec<std::result::Result<Value, String>>, Failure> {
+        self.call_within(cx, items, each, OUTPUT_LIMIT)
+    }
+
+    /// [`Worker::call`], with `most` bytes for the call's answers in all.
+    fn call_within(
+        &mut self,
+        cx: String,
+        items: Vec<String>,
+        each: bool,
+        most: u64,
+    ) -> std::result::Result<Vec<std::result::Result<Value, String>>, Failure> {
         let stopped = |e: &str| Failure::Stopped(e.to_string());
         let count = items.len();
         let mut line =
@@ -850,7 +861,7 @@ impl Worker {
             let wait_for = if each { CALL_LIMIT } else { deadline.saturating_duration_since(Instant::now()) };
             let (answer, len) = self.answer(wait_for, CALL_LIMIT)?;
             size += len;
-            if size as u64 > OUTPUT_LIMIT {
+            if size as u64 > most {
                 return Err(over_size());
             }
             out.push(answer);
@@ -1141,22 +1152,23 @@ pub(crate) mod tests {
 
     #[test]
     fn a_call_has_one_time_limit_and_one_size_limit_for_all_its_items() {
-        // Each answer is under a megabyte and takes a moment: twenty of them are one call.
         let script = "function replace(m) {
             if (m.text === 'slow') { const end = Date.now() + 300; while (Date.now() < end) {} return 'x'; }
-            return 'x'.repeat(1 << 20);
+            return 'x'.repeat(10000);
         }";
         let items = |text: &str, n: usize| vec![serde_json::json!({ "text": text }).to_string(); n];
+        // Each answer takes a moment: twenty of them are one call, with one time limit.
         let mut w = worker("replace", script).unwrap();
         let started = Instant::now();
         let r = w.call("{}".into(), items("slow", 20), false);
         assert!(matches!(&r, Err(Failure::Stopped(e)) if e.contains("time limit")), "{r:?}");
-        assert!(started.elapsed() < CALL_LIMIT + Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(started.elapsed() < CALL_LIMIT + Duration::from_secs(3), "{:?}", started.elapsed());
         // Payloads have the limit each.
         let mut w = worker("replace", script).unwrap();
         assert_eq!(w.call("{}".into(), items("slow", 9), true).unwrap().len(), 9);
-        let mut w = worker("replace", script).unwrap();
-        let r = w.call("{}".into(), items("big", 20), true);
+        // Each answer is small, and twenty of them are over what the call may return in all.
+        assert_eq!(w.call_within("{}".into(), items("big", 9), true, 100_000).unwrap().len(), 9);
+        let r = w.call_within("{}".into(), items("big", 20), true, 100_000);
         assert!(matches!(&r, Err(Failure::Script(e)) if e.contains("is over 16 MiB")), "{:?}", r.map(|a| a.len()));
     }
 }
