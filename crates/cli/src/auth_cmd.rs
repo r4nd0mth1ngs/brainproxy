@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use brainproxy_core::auth::{AuthProfile, AuthSession, QueryKey, Secret, SessionState};
 use brainproxy_core::auth_record::{Mode, Recorded};
+use brainproxy_core::browser_login::record::{ask, Ask, RecordOptions, Recording};
+use brainproxy_core::browser_login::Passkey;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::oauth::{Flow, OAuth};
 use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool, SESSION_RULE_IDS};
 use brainproxy_core::sign::{HmacAlg, JwtAlg, KeySource, Place, SignKind, Signer};
 use brainproxy_core::store::Store;
+use brainproxy_core::totp::Totp;
 use brainproxy_core::Error;
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -326,17 +329,43 @@ pub struct SignAddArgs {
 
 #[derive(Subcommand)]
 pub enum RecordCmd {
-    /// Open a fresh browser profile at URL through the running proxy and start recording.
+    /// Open a fresh browser profile at URL through the running proxy and start recording. In a
+    /// Chromium-based browser (on Linux and macOS) what you do in the page is recorded too:
+    /// fields filled, buttons clicked, Enter pressed.
+    #[command(after_help = "The steps are for a login plain requests can't repeat (single sign-on on another site, \
+        a page that builds the login in JavaScript, a passkey): `auth record finish` then makes a profile that \
+        replays them in a headless browser. They are recorded in the tab the browser opens with; the browser is \
+        held by a brainproxy process until `auth record finish` or until you close it.\n\
+        Passkeys: --passkey puts a virtual authenticator in the browser. Log in as usual, register a passkey in \
+        the account's security settings (it is made here, and kept with the profile), and finish. To record the \
+        passkey sign-in itself, start again with --passkeys-from PROFILE and sign in with the passkey.")]
     Start {
         /// Login page (or the site's start page).
         url: String,
         /// Browser id from `browser list` (default: the first one found).
         #[arg(long)]
         browser: Option<String>,
+        /// Only record the traffic, as for Firefox: the browser isn't held, and no steps are kept.
+        #[arg(long, conflicts_with_all = ["passkey", "passkeys_from"])]
+        no_steps: bool,
+        /// Put a virtual authenticator in the browser, so a passkey registered while recording
+        /// is kept with the profile. The machine's own authenticators and security keys aren't
+        /// offered in this browser.
+        #[arg(long)]
+        passkey: bool,
+        /// Start the virtual authenticator with this profile's passkeys, to record a sign-in
+        /// with one (implies --passkey).
+        #[arg(long, value_name = "PROFILE")]
+        passkeys_from: Option<String>,
+        /// Hold the browser and record until asked to stop (what `start` runs in the background).
+        #[arg(long, hide = true)]
+        hold: bool,
     },
     /// Turn what the proxy recorded since `start` into a profile: the login request with
     /// placeholders, its CSRF token and where it comes from, a bearer token, and logged-in
-    /// and logged-out checks. Single sign-on and one-time codes give a session profile.
+    /// and logged-out checks. A one-time code is replayed with the TOTP secret; single sign-on
+    /// and other logins plain requests can't repeat replay the recorded browser steps; without
+    /// either, the profile carries the recorded session.
     Finish {
         /// Profile name.
         name: String,
@@ -350,7 +379,58 @@ pub enum RecordCmd {
         /// Analyze history after this id instead of since `record start`.
         #[arg(long)]
         since: Option<i64>,
+        #[command(flatten)]
+        totp: TotpArgs,
+        /// Replay the recorded steps in a headless browser even if plain requests could
+        /// repeat the login (for a login the plain replay gets wrong).
+        #[arg(long)]
+        in_browser: bool,
+        /// Keep the recorded steps from this one on (as numbered in the output): for a
+        /// recording that did more than log in, such as registering a passkey first.
+        #[arg(long, value_name = "N")]
+        steps_from: Option<usize>,
     },
+}
+
+/// A profile's TOTP secret, for the one-time code a login asks for.
+#[derive(clap::Args)]
+pub struct TotpArgs {
+    /// TOTP secret (base32, or the otpauth:// URI a QR code holds), stored in the project file.
+    /// Prefer --totp-secret-env. Also read from BRAINPROXY_SECRET_TOTP, which keeps it off the
+    /// command line (the desktop app uses it).
+    #[arg(long, conflicts_with = "totp_secret_env", env = "BRAINPROXY_SECRET_TOTP", hide_env_values = true)]
+    totp_secret: Option<String>,
+    /// Environment variable holding the TOTP secret, read at each login; never stored.
+    #[arg(long, value_name = "VAR")]
+    totp_secret_env: Option<String>,
+    /// TOTP hash: sha1, sha256 or sha512 (default sha1, or what an otpauth:// URI says).
+    #[arg(long, value_name = "HASH")]
+    totp_algorithm: Option<String>,
+    /// Digits of a code (default 6, or what an otpauth:// URI says).
+    #[arg(long, value_name = "N")]
+    totp_digits: Option<u32>,
+    /// Seconds a code is valid (default 30, or what an otpauth:// URI says).
+    #[arg(long, value_name = "SECONDS")]
+    totp_period: Option<u64>,
+}
+
+impl TotpArgs {
+    /// The setup the flags give, if they give a secret.
+    fn totp(&self) -> Result<Option<Totp>, Error> {
+        let algorithm = self.totp_algorithm.as_deref().map(brainproxy_core::totp::Algorithm::parse).transpose()?;
+        let (digits, period) = (self.totp_digits, self.totp_period);
+        match (&self.totp_secret, &self.totp_secret_env) {
+            (Some(secret), _) => Ok(Some(Totp::from_input(secret, algorithm, digits, period)?)),
+            (None, Some(var)) => {
+                crate::mcp::check_secret_env("--totp-secret-env", var)?;
+                Ok(Some(Totp::from_env(var, algorithm, digits, period)?))
+            }
+            (None, None) if algorithm.is_some() || digits.is_some() || period.is_some() => Err(Error::InvalidInput(
+                "--totp-algorithm, --totp-digits and --totp-period go with --totp-secret-env (or --totp-secret)".into(),
+            )),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -458,6 +538,16 @@ pub struct AddArgs {
     /// When replacing a profile, keep its OAuth setup. For an edit that can't see it.
     #[arg(long, conflicts_with = "oauth_flow")]
     keep_oauth: bool,
+    #[command(flatten)]
+    totp: TotpArgs,
+    /// When replacing a profile, keep its TOTP secret. For an edit that can't see it.
+    #[arg(long, conflicts_with_all = ["totp_secret", "totp_secret_env"])]
+    keep_totp: bool,
+    /// When replacing a profile `auth record` made, keep what only a recording gives: its
+    /// login request (unless --login-request gives one), the requests after it, and its
+    /// browser steps. For an edit that can't see them.
+    #[arg(long)]
+    keep_recorded: bool,
     /// A Host header the profile sets (with --header or in the login request) deliberately
     /// names a host the scope doesn't list, for a Host-header test. Through MCP such a profile
     /// is refused without it.
@@ -781,6 +871,10 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                         })
                     })
                     .transpose()?,
+                totp: a.totp.totp()?,
+                login_steps: vec![],
+                browser: None,
+                passkeys: vec![],
                 // Set when it is saved.
                 origin: None,
             };
@@ -800,6 +894,24 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 }
                 if a.keep_query_keys {
                     profile.query_keys = old.query_keys;
+                }
+                if a.keep_totp {
+                    profile.totp = old.totp;
+                }
+                // No flag gives a passkey: the profile keeps those a recording gave it.
+                profile.passkeys = old.passkeys;
+                if a.keep_recorded {
+                    // The browser steps stand in for a login request: one given now replaces them.
+                    if profile.login_url.is_none() && profile.oauth.is_none() {
+                        profile.browser = old.browser;
+                    }
+                    if profile.login_request.is_none()
+                        && profile.login_body.is_none()
+                        && profile.login_url == old.login_url
+                    {
+                        profile.login_request = old.login_request;
+                        profile.login_steps = old.login_steps;
+                    }
                 }
                 if a.keep_oauth && old.oauth.is_some() {
                     profile.oauth = old.oauth;
@@ -899,7 +1011,13 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 .auth_list()?
                 .into_iter()
                 .map(|(p, s)| {
-                    json!({"name": p.name, "login_url": p.login_url, "username": p.username, "session": state_json(&s)})
+                    json!({
+                        "name": p.name,
+                        "login_url": p.login_url,
+                        "browser_login": p.browser.as_ref().map(|b| &b.start_url),
+                        "username": p.username,
+                        "session": state_json(&s),
+                    })
                 })
                 .collect();
             out.ok(json!({"profiles": items}), || {
@@ -910,7 +1028,11 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                             "{:<20} {:<14} {}",
                             i["name"].as_str().unwrap_or(""),
                             if i["session"]["logged_in"] == true { "logged in" } else { "not logged in" },
-                            i["login_url"].as_str().unwrap_or("(headers only)")
+                            match (i["login_url"].as_str(), i["browser_login"].as_str()) {
+                                (Some(url), _) => url.to_string(),
+                                (None, Some(url)) => format!("{url} (in a browser)"),
+                                (None, None) => "(headers only)".to_string(),
+                            }
                         )
                     })
                     .collect::<Vec<_>>()
@@ -928,7 +1050,11 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 }
             }
             let (session_origin, session_changed_at) = store.auth_state_origin(&name)?;
+            let steps: Vec<String> = profile.browser.iter().flat_map(|b| b.steps.iter().map(|s| s.line())).collect();
             let data = json!({
+                // What a browser login does, a step a line; and its passkeys, never their keys.
+                "browser_steps": steps,
+                "passkeys": profile.passkeys.iter().map(Passkey::summary).collect::<Vec<_>>(),
                 "profile": profile,
                 "session": state_json(&state),
                 "session_origin": session_origin,
@@ -949,25 +1075,203 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
 
 const RECORD_KEY: &str = "auth.record";
 
+/// The recording of the login browser's steps, if there is one: its recorder is asked to stop
+/// recording (the browser closes) and hands it over. It keeps holding it, for a later `auth
+/// record finish --save`. Also whether a recording was lost: its recorder is gone, and what
+/// it held with it.
+fn take_recording(store: &Store) -> Result<(Option<Recording>, bool), Error> {
+    let Some(status) = store.auth_recording_status()? else { return Ok((None, false)) };
+    if !matches!(status.state.as_str(), "recording" | "done") {
+        return Ok((None, false));
+    }
+    if !crate::process::alive(status.pid) {
+        return Ok((None, true));
+    }
+    match ask(&status.socket, Ask::Stop) {
+        Ok(rec) => Ok((rec, false)),
+        Err(Error::NotFound(_)) => Ok((None, true)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Lets go of the recording: its recorder forgets it and exits.
+fn drop_recording(store: &Store) -> Result<(), Error> {
+    if let Some(status) = store.auth_recording_status()? {
+        if crate::process::alive(status.pid) {
+            let _ = ask(&status.socket, Ask::Done);
+        }
+        store.auth_set_recording_status(None)?;
+    }
+    Ok(())
+}
+
+/// What `auth record start --hold` does: opens the login browser with the DevTools protocol
+/// attached and records what is done in it, until `auth record finish` asks it to stop or the
+/// person closes the browser.
+fn hold_recording(
+    project: &Path,
+    home: &Path,
+    url: String,
+    browser: Option<String>,
+    passkey: bool,
+    passkeys_from: Option<String>,
+) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    let state = crate::proxy_cmd::running_here(&store)?.ok_or_else(|| {
+        Error::Conflict("the proxy isn't running for this project; start it with `brainproxy proxy start`".into())
+    })?;
+    let listen = crate::proxy_cmd::connect_addr(&state.listen);
+    let proxy = listen
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("can't record steps through a proxy listening on {listen}")))?;
+    let (ca, _) = crate::proxy_cmd::load_ca(home)?;
+    let passkeys = match &passkeys_from {
+        Some(name) => store.auth_profile(name)?.0.passkeys,
+        None => vec![],
+    };
+    drop(store);
+    let path = crate::browser_cmd::chromium(browser.as_deref())?;
+    let opts = RecordOptions {
+        passkeys_from,
+        browser: &path,
+        proxy,
+        ca_spki: ca.spki_sha256_base64(),
+        url,
+        passkey,
+        passkeys,
+        unattended: std::env::var("BRAINPROXY_RECORD_UNATTENDED").is_ok_and(|v| !v.is_empty() && v != "0"),
+    };
+    runtime()?.block_on(brainproxy_core::browser_login::record::record(project, opts))
+}
+
+/// Seconds since 1970 of a history row's time (`2026-11-09T21:59:03.123Z`).
+fn unix_time(iso: &str) -> Option<u64> {
+    let num = |r: std::ops::Range<usize>| iso.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, min, s) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Days from 1970-01-01 (the civil-from-days arithmetic, the other way round).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + min * 60 + s).ok()
+}
+
 fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        RecordCmd::Start { url, browser } => {
+        RecordCmd::Start { url, browser, no_steps, passkey, passkeys_from, hold } => {
             let guard = crate::project_guard(project)?;
             crate::require_in_scope(&guard, &brainproxy_core::http::Target::from_url(&url)?)?;
-            let since = store.last_history_id()?;
+            crate::browser_cmd::check_url(&url)?;
+            let passkey = passkey || passkeys_from.is_some();
+            if hold {
+                return hold_recording(project, home, url, browser, passkey, passkeys_from);
+            }
+            if let Some(name) = &passkeys_from {
+                if store.auth_profile(name)?.0.passkeys.is_empty() {
+                    return Err(Error::NotFound(format!(
+                        "passkeys of profile {name:?}; register one first: auth record start URL --passkey"
+                    )));
+                }
+            }
             let found = crate::browser_cmd::find();
-            let (browser, _) = crate::browser_cmd::open(project, home, &found, browser, url.clone(), Some("login"))?;
+            let steps = !no_steps && crate::browser_cmd::records_steps(&found, browser.as_deref());
+            if passkey && !steps {
+                return Err(Error::InvalidInput(
+                    "--passkey needs a Chromium-based browser on Linux or macOS: the passkey is made by the browser's \
+                     virtual authenticator (see `brainproxy browser list`)"
+                        .into(),
+                ));
+            }
+            if let Some(id) = browser.as_deref().filter(|id| !crate::browser_cmd::known(&found, id)) {
+                return Err(Error::NotFound(format!("browser {id:?}; see `brainproxy browser list`")));
+            }
+            if crate::proxy_cmd::running_here(&store)?.is_none() {
+                return Err(Error::Conflict(
+                    "the proxy isn't running for this project; start it with `brainproxy proxy start`".into(),
+                ));
+            }
+            // Only now, with nothing left to refuse this one for: an earlier recording's browser
+            // is closed, and what it recorded let go of.
+            drop_recording(&store)?;
+            let since = store.last_history_id()?;
+            let mut data = if steps {
+                // Refused here, with the reason, if it isn't one that can be held.
+                let path = crate::browser_cmd::chromium(browser.as_deref())?;
+                // The browser is held by a process of its own, which outlives this command.
+                let project = std::fs::canonicalize(project)?;
+                let log = project.with_extension("record.log");
+                let log_file = crate::process::private_file(&log, false)?;
+                let mut cmd = std::process::Command::new(std::env::current_exe()?);
+                cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]);
+                cmd.args(["auth", "record", "start", "--hold"]);
+                if let Some(b) = &browser {
+                    cmd.arg(format!("--browser={b}"));
+                }
+                if passkey {
+                    cmd.arg("--passkey");
+                }
+                if let Some(name) = &passkeys_from {
+                    cmd.arg(format!("--passkeys-from={name}"));
+                }
+                cmd.arg("--").arg(&url);
+                brainproxy_core::provenance::pass_on(&mut cmd);
+                crate::process::detach(&mut cmd);
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::from(log_file));
+                let mut child = cmd.spawn()?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(45);
+                loop {
+                    let status = store.auth_recording_status()?.filter(|r| r.pid == child.id());
+                    match status.as_ref().map(|r| r.state.as_str()) {
+                        Some("recording") => break,
+                        Some("failed") => {
+                            let why = status.and_then(|r| r.error).unwrap_or_default();
+                            store.auth_set_recording_status(None)?;
+                            return Err(Error::InvalidInput(format!("the login browser didn't start: {why}")));
+                        }
+                        _ => {}
+                    }
+                    if let Some(status) = child.try_wait()? {
+                        let msg = std::fs::read_to_string(&log).unwrap_or_default();
+                        return Err(crate::jobs_cmd::child_failure("the login browser", status, &msg));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err(Error::InvalidInput("the login browser didn't open the page in 45s".into()));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                json!({
+                    "since": since,
+                    "url": url,
+                    "browser": {"path": path, "pid": null, "held_by": child.id()},
+                    "steps": true,
+                    "passkey": passkey,
+                })
+            } else {
+                let (browser, _) =
+                    crate::browser_cmd::open(project, home, &found, browser, url.clone(), Some("login"))?;
+                json!({"since": since, "url": url, "browser": browser, "steps": false, "passkey": false})
+            };
             store.meta_set(RECORD_KEY, Some(&json!({"since": since, "url": url}).to_string()))?;
-            let data = json!({"since": since, "url": url, "browser": browser});
+            data["next"] = json!("brainproxy auth record finish NAME --save");
             out.ok(data, || {
                 format!(
-                    "Recording from history #{since}. Log in in the browser, open a page only a logged-in user sees, then: \
-                     brainproxy auth record finish NAME --save"
+                    "Recording from history #{since}{}. Log in in the browser, open a page only a logged-in user sees, then: \
+                     brainproxy auth record finish NAME --save",
+                    match (steps, passkey) {
+                        (true, true) => " (with your steps, and a virtual authenticator for passkeys)",
+                        (true, false) => " (with your steps in the page)",
+                        _ => "",
+                    }
                 )
             });
         }
-        RecordCmd::Finish { name, save, password_env, since } => {
+        RecordCmd::Finish { name, save, password_env, since, totp, in_browser, steps_from } => {
             let started: serde_json::Value =
                 store.meta_get(RECORD_KEY)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             let since = since.or_else(|| started["since"].as_i64()).ok_or_else(|| {
@@ -975,6 +1279,18 @@ fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), 
                     "no recording started; run `auth record start URL` first (or pass --since ID)".into(),
                 )
             })?;
+            if let Some(var) = &password_env {
+                crate::mcp::check_secret_env("--password-env", var)?;
+            }
+            // Given now, else the one the profile this replaces has.
+            let old = store.auth_profile(&name).ok().map(|(p, _)| p);
+            let totp = match totp.totp()? {
+                Some(t) => Some(t),
+                None => old.as_ref().and_then(|p| p.totp.clone()),
+            };
+            // The login browser closes here: its steps are complete.
+            let (recording, lost) = take_recording(&store)?;
+            let recording = recording.filter(|r| !r.events.is_empty() || r.passkey);
             let entries = store.list(&brainproxy_core::store::HistoryFilter {
                 after_id: Some(since),
                 source: Some("proxy".into()),
@@ -991,17 +1307,122 @@ fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), 
                 .filter_map(|e| store.get(e.id).ok())
                 .map(|h| Recorded { id: h.entry.id, target: h.target, request: h.request, response: h.response })
                 .collect();
-            let mut p = brainproxy_core::auth_record::analyze(&recorded, &name, started["url"].as_str());
+            let from = steps_from.unwrap_or(1);
+            let derived = recording.as_ref().map(|r| brainproxy_core::browser_login::record::derive(r, from));
+            if steps_from.is_some() && derived.as_ref().is_none_or(|d| d.steps.is_empty()) {
+                return Err(Error::InvalidInput(format!("--steps-from {from}: the recording has no step {from}")));
+            }
+            let opts =
+                brainproxy_core::auth_record::Options { totp: totp.is_some(), steps: derived.as_ref(), in_browser };
+            let mut p = brainproxy_core::auth_record::analyze_with(&recorded, &name, started["url"].as_str(), &opts);
             if let Some(var) = &password_env {
-                crate::mcp::check_secret_env("--password-env", var)?;
                 if p.profile.password.is_some() {
                     p.profile.password = Some(Secret::Env(var.clone()));
+                }
+            }
+            if lost {
+                p.warnings.push(
+                    "The steps recorded in the browser are gone (the process that held them isn't running any more), \
+                     so only the recorded traffic was looked at. Record again to have the steps."
+                        .into(),
+                );
+            }
+            // The code typed while recording, and when: the login's, else the one typed in the page.
+            let typed_code = match (&p.code, p.mode) {
+                (Some((code, id)), Mode::Replay | Mode::Session) => {
+                    entries.iter().find(|e| e.id == *id).and_then(|e| unix_time(&e.time)).map(|at| (code.clone(), at))
+                }
+                _ => derived.as_ref().and_then(|d| d.code.clone()),
+            };
+            let needs_totp = totp.is_none() && typed_code.is_some();
+            // The secret must make the code the person typed, or every login will be refused.
+            let mut code_step = None;
+            if let (Some(t), Some((code, at))) = (&totp, &typed_code) {
+                match t.generator() {
+                    // A history row's time is when the proxy wrote it, which can be a while after.
+                    Ok(g) => match g.step_of(code, *at, (90 / g.period).max(2)) {
+                        Some(step) => {
+                            p.found.push("The TOTP secret makes the code that was typed while recording".into());
+                            code_step = Some(step);
+                        }
+                        None => p.warnings.push(
+                            "The TOTP secret doesn't make the code that was typed while recording: another account's \
+                             secret, or other digits, period or algorithm? The site will refuse the login."
+                                .into(),
+                        ),
+                    },
+                    // A variable that isn't set here (the app's, a job's) is read when it logs in.
+                    Err(e) => p.warnings.push(format!("The TOTP secret couldn't be read to check it: {e}")),
+                }
+            }
+            // Kept though this login sends no code: a macro or a rule of the profile may.
+            p.profile.totp = totp;
+            // The passkeys the browser ended with; without an authenticator in it, those the
+            // profile this replaces has.
+            p.profile.passkeys = match &recording {
+                Some(r) if r.passkey => r.passkeys.clone(),
+                _ => old.map(|p| p.passkeys).unwrap_or_default(),
+            };
+            if let Some(r) = recording.as_ref().filter(|r| r.passkey) {
+                for k in &r.passkeys {
+                    p.found.push(format!(
+                        "Passkey for {} (signed {} times), kept with the profile",
+                        k.rp_id, k.sign_count
+                    ));
+                }
+                if r.passkeys.is_empty() {
+                    p.warnings.push(
+                        "No passkey was registered in the browser: add one in the account's security settings while \
+                         recording (auth record start URL --passkey)."
+                            .into(),
+                    );
+                } else if p.mode == Mode::Browser && !r.passkey_used {
+                    p.warnings.push(
+                        "The passkey was registered but didn't sign in during this recording: the steps replay the \
+                         login as you did it. To record the passkey sign-in: auth record start URL --passkeys-from \
+                         PROFILE, sign in with the passkey, and finish."
+                            .into(),
+                    );
+                } else if p.mode != Mode::Browser {
+                    p.warnings.push(
+                        "The passkey is kept, but this profile doesn't log in with a browser, so it isn't used: record \
+                         the passkey sign-in with auth record start URL --passkeys-from PROFILE."
+                            .into(),
+                    );
+                }
+            }
+            // Where the steps go must be in the engagement scope, or the replay refuses them.
+            let guard = crate::project_guard(project)?;
+            let steps: Vec<String> = p.profile.browser.iter().flat_map(|b| b.steps.iter().map(|s| s.line())).collect();
+            if let Some(b) = &p.profile.browser {
+                let mut refused: Vec<String> = Vec::new();
+                for url in
+                    b.steps.iter().flat_map(|s| [s.page.as_str(), if s.css.is_empty() { s.value.as_str() } else { "" }])
+                {
+                    if let Ok(t) = Target::from_url(url) {
+                        if !guard.may_allow(&t.host, t.port) && !refused.contains(&t.host) {
+                            refused.push(t.host);
+                        }
+                    }
+                }
+                if !refused.is_empty() {
+                    p.warnings.push(format!(
+                        "The login went through {}, outside the engagement scope: the replay refuses steps there. \
+                         Add it to the scope if the login needs it.",
+                        refused.join(", ")
+                    ));
                 }
             }
             if save {
                 p.profile.validate()?;
                 store.auth_save_profile(&p.profile)?;
+                // The site may take a code once: the one typed while recording isn't sent again.
+                if let Some(step) = code_step {
+                    store.auth_note_code_used(&name, step)?;
+                }
                 store.meta_set(RECORD_KEY, None)?;
+                // The recording holds what was typed: let go of once the profile has it.
+                drop_recording(&store)?;
             }
             let data = json!({
                 "saved": save,
@@ -1011,18 +1432,23 @@ fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), 
                 "evidence": p.evidence,
                 "found": p.found,
                 "warnings": p.warnings,
+                "steps": steps,
+                "passkeys": p.profile.passkeys.iter().map(Passkey::summary).collect::<Vec<_>>(),
+                "needs_totp": needs_totp,
             });
             out.ok(data, || {
                 let mut lines = vec![format!(
                     "{} profile {name} from {} recorded requests{}",
                     match p.mode {
                         Mode::Replay => "Login",
+                        Mode::Browser => "Browser login",
                         Mode::Session => "Session-only",
                     },
                     recorded.len(),
                     if save { " (saved)" } else { " (not saved; add --save)" }
                 )];
                 lines.extend(p.found.iter().map(|f| format!("  found: {f}")));
+                lines.extend(steps.iter().enumerate().map(|(i, s)| format!("  step {}: {s}", i + from)));
                 lines.extend(p.warnings.iter().map(|w| format!("  note:  {w}")));
                 lines.join("\n")
             });

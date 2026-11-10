@@ -416,14 +416,17 @@ name = "brainproxy"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "base64",
  "brainproxy-core",
  "bytes",
  "clap",
  "flate2",
  "h2",
+ "hex",
  "http",
  "libc",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

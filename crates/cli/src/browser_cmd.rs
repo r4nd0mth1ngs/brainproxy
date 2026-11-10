@@ -156,6 +156,21 @@ pub(crate) fn chromium(id: Option<&str>) -> Result<PathBuf, Error> {
     }
 }
 
+/// Whether `auth record` can record steps in the browser it would open (`id`, or the first
+/// found): a Chromium-based one, where the DevTools pipe works.
+pub(crate) fn records_steps(found: &[Found], id: Option<&str>) -> bool {
+    let chosen = match id {
+        Some(id) => found.iter().find(|f| f.id == id),
+        None => found.first(),
+    };
+    BROWSER_CRAWL && chosen.is_some_and(|f| f.kind == Kind::Chromium)
+}
+
+/// Whether `id` is one of the browsers found.
+pub(crate) fn known(found: &[Found], id: &str) -> bool {
+    found.iter().any(|f| f.id == id)
+}
+
 fn describe(f: &Found) -> Value {
     json!({"id": f.id, "name": f.name, "kind": if f.kind == Kind::Chromium { "chromium" } else { "firefox" }, "path": f.path})
 }
@@ -282,7 +297,7 @@ pub(crate) fn open(
 
 /// Only http(s) URLs and about:blank: anything else (`--renderer-cmd-prefix=...`,
 /// `-profile`, `file:`, `javascript:`) could be read as a launch switch or open local files.
-fn check_url(url: &str) -> Result<(), Error> {
+pub(crate) fn check_url(url: &str) -> Result<(), Error> {
     let lower = url.to_ascii_lowercase();
     let web = (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() > "https://".len();
     if (web || lower == "about:blank") && !url.starts_with('-') && !url.chars().any(char::is_control) {

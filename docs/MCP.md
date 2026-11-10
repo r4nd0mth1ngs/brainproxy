@@ -144,9 +144,17 @@ Some arguments need a person, so a command run for a tool call (the server sets
   switched off is refused, as the tester would run its script), `rules_disable`, `rules_remove`
   and `scan_disable` work as for any rule.
 - Environment variables named by `auth_add` (`header_env`, `query_keys`, `password_env`,
-  `oauth_client_secret_env`, `oauth_refresh_token_env`) and `auth_sign_add` (`secret_env`,
+  `totp_secret_env`, `oauth_client_secret_env`, `oauth_refresh_token_env`), `auth_record_finish`
+  (`password_env`, `totp_secret_env`) and `auth_sign_add` (`secret_env`,
   `access_key_env`, `session_token_env`) must start with `BRAINPROXY_SECRET_`, so an agent can't
   send the server's other secrets to a target.
+- A login's browser steps come only from a recording a person made in the browser
+  `auth_record_start` opens on the server's machine: no tool takes steps as an argument, so an
+  agent can't have the login browser click through pages of its choosing. Replaying them
+  (`auth_login`, or any re-login) stays inside the engagement scope like every other request.
+  `auth_show` and `auth_record_finish` list the steps with what was typed into password fields
+  masked, a TOTP secret as `********` or its variable's name, and a passkey without its key;
+  `query` can't read the table that holds them.
 - `auth_sign_add` with `access_key_file` or `session_token_file`: their contents go on requests
   as they are, so they could send any readable file to a target; use the `_env` forms.
 - `auth_oauth_authorize` never opens a browser (as `--no-open`); a person signs in from a terminal.

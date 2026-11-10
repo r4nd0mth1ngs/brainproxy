@@ -28,6 +28,7 @@ import {
 } from "./proxyMode";
 import { RecordLogin } from "./RecordLogin";
 import { MatchReplace } from "./MatchReplace";
+import { TOTP_ENV, passkeyLine, type PasskeyInfo } from "./recordLogin";
 import { AppUpdateSettings } from "./AppUpdate";
 import {
   EMPTY_CERT,
@@ -157,11 +158,18 @@ interface Profile {
   relogin_interval_secs: number;
   max_relogins: number;
   platform?: PlatformAuth;
+  /** Where the TOTP secret is; a stored one is redacted. */
+  totp?: { secret: { env: string } | { literal: string }; algorithm: string; digits: number; period: number };
+  /** Requests a recording put after the login request (a one-time code form). */
+  login_steps?: { url: string }[];
+  /** A login replayed in a browser: `auth show` lists its steps as `browser_steps`. */
+  browser?: { start_url: string };
 }
 
 interface ProfileItem {
   name: string;
   login_url: string | null;
+  browser_login?: string | null;
   username: string | null;
   session: Session;
 }
@@ -177,6 +185,12 @@ interface Form {
   passwordMode: "env" | "literal" | "none";
   passwordEnv: string;
   password: string;
+  /** keep: the stored secret, which this form can't see. */
+  totpMode: "none" | "env" | "literal" | "keep";
+  totpEnv: string;
+  /** The variable the stored profile reads its secret from, if it does. */
+  totpKeptEnv: string;
+  totpSecret: string;
   csrfUrl: string;
   csrfRegex: string;
   tokenRegex: string;
@@ -201,6 +215,10 @@ const EMPTY_FORM: Form = {
   passwordMode: "env",
   passwordEnv: "",
   password: "",
+  totpMode: "none",
+  totpEnv: "",
+  totpKeptEnv: "",
+  totpSecret: "",
   csrfUrl: "",
   csrfRegex: "",
   tokenRegex: "",
@@ -216,6 +234,14 @@ const EMPTY_FORM: Form = {
 
 const headerLines = (h: [string, string][]) => h.map(([k, v]) => `${k}: ${v}`).join("\n");
 
+/** Where a profile's TOTP secret is and what codes it makes; never the secret. */
+const totpLine = (t: NonNullable<Profile["totp"]>) =>
+  `${"env" in t.secret ? `$${t.secret.env}` : "stored (redacted)"} · ${t.digits} digits every ${t.period} s (${t.algorithm.toUpperCase()})`;
+
+/** The choices for the TOTP secret: keeping the stored one is offered when there is one. */
+const totpModes = (old?: Profile): Form["totpMode"][] =>
+  old?.totp && "literal" in old.totp.secret ? ["none", "keep", "env", "literal"] : ["none", "env", "literal"];
+
 function formOf(p: Profile): Form {
   const pw = p.password;
   return {
@@ -229,6 +255,9 @@ function formOf(p: Profile): Form {
     // A stored password is redacted by `auth show`, so editing asks for it again.
     passwordMode: !pw ? "none" : "env" in pw ? "env" : "literal",
     passwordEnv: pw && "env" in pw ? pw.env : "",
+    totpMode: !p.totp ? "none" : "env" in p.totp.secret ? "env" : "keep",
+    totpEnv: p.totp && "env" in p.totp.secret ? p.totp.secret.env : "",
+    totpKeptEnv: p.totp && "env" in p.totp.secret ? p.totp.secret.env : "",
     csrfUrl: p.csrf_url ?? "",
     csrfRegex: p.csrf_regex ?? "",
     tokenRegex: p.token_regex ?? "",
@@ -261,6 +290,12 @@ function addArgs(f: Form): string[] {
   lines("--login-header", f.loginHeaders);
   opt("--username", f.username);
   if (f.passwordMode === "env") opt("--password-env", f.passwordEnv);
+  // A typed TOTP secret goes in the environment (see `save`); a stored one this form can't see
+  // is kept, and so is a variable left as it was (with its digits, period and algorithm, which
+  // this form doesn't show).
+  const sameEnv = f.totpMode === "env" && !!f.totpKeptEnv && f.totpEnv.trim() === f.totpKeptEnv;
+  if (f.totpMode === "keep" || sameEnv) args.push("--keep-totp");
+  else if (f.totpMode === "env") opt("--totp-secret-env", f.totpEnv);
   opt("--csrf-url", f.csrfUrl);
   opt("--csrf-regex", f.csrfRegex);
   opt("--token-regex", f.tokenRegex);
@@ -275,6 +310,8 @@ function addArgs(f: Form): string[] {
   // This form doesn't show query keys, so saving it mustn't drop them.
   args.push("--keep-query-keys");
   args.push("--keep-oauth");
+  // Nor what only a recording gives: its raw login request, the requests after it, its browser steps.
+  args.push("--keep-recorded");
   args.push("--", f.name.trim());
   return args;
 }
@@ -289,6 +326,9 @@ function SessionState({ s }: { s: Session }) {
 
 interface Shown {
   profile: Profile;
+  /** A browser login's steps, a step a line, and the profile's passkeys (never their keys). */
+  browser_steps?: string[];
+  passkeys?: PasskeyInfo[];
   session: Session;
   macros: MacroSummary[];
   rules: SessionRule[];
@@ -338,7 +378,9 @@ function Auth() {
     if (!form) return;
     if (!form.name.trim()) return app.toast("A profile needs a name", "error");
     // A literal password goes in the environment, never on the command line (`ps` shows that).
-    const env = form.passwordMode === "literal" && form.password ? { BRAINPROXY_SECRET_PASSWORD: form.password } : undefined;
+    const env: Record<string, string> = {};
+    if (form.passwordMode === "literal" && form.password) env.BRAINPROXY_SECRET_PASSWORD = form.password;
+    if (form.totpMode === "literal" && form.totpSecret.trim()) env[TOTP_ENV] = form.totpSecret.trim();
     const d = await exec(addArgs(form), { env });
     if (!d) return;
     app.toast(`Saved profile ${form.name.trim()}`);
@@ -478,7 +520,7 @@ function Auth() {
           <div className="form">
             <Field label="Login URL">{text("loginUrl", "https://app/login")}</Field>
             <Field label="Method">{text("loginMethod", "POST")}</Field>
-            <Field label="Body ({{username}}, {{password}}, {{csrf}})" wide>
+            <Field label="Body ({{username}}, {{password}}, {{csrf}}, {{totp}})" wide>
               <textarea
                 className="input area mono"
                 value={form.loginBody}
@@ -490,7 +532,16 @@ function Auth() {
               {text("loginRequestFile", "/path/to/login.req")}
             </Field>
             {editing && shown?.profile.login_request && !form.loginRequestFile && (
-              <p className="muted small wide">This profile has a stored raw login request; saving without a file drops it.</p>
+              <p className="muted small wide">
+                This profile has a stored raw login request{shown.profile.login_steps?.length ? " and a one-time code request after it" : ""}
+                ; it is kept unless a body, a file or another login URL replaces it.
+              </p>
+            )}
+            {editing && shown?.profile.browser && (
+              <p className="muted small wide">
+                This profile logs in by replaying {shown.browser_steps?.length ?? 0} recorded steps in a browser; they are kept unless a
+                login URL replaces them. To change them, record the login again.
+              </p>
             )}
             <Field label="Login-only headers (one per line)" wide>
               <textarea className="input area mono" value={form.loginHeaders} onChange={(e) => set({ loginHeaders: e.target.value })} />
@@ -521,6 +572,30 @@ function Auth() {
                   placeholder={editing ? "re-enter: the stored one is redacted" : ""}
                   onChange={(e) => set({ password: e.target.value })}
                 />
+              </Field>
+            )}
+          </div>
+          <h3>One-time codes</h3>
+          <p className="muted small">
+            The secret an authenticator app holds (base32, or the otpauth:// address in the QR code). With it,{" "}
+            <span className="mono">{"{{totp}}"}</span> in the login body, a macro step or a recorded login is the current code, and a
+            session rule can put it in a parameter (<span className="mono">update:PARAM=totp</span>).
+          </p>
+          <div className="form">
+            <div>
+              <span className="label">TOTP secret</span>
+              <div className="seg">
+                {totpModes(editing ? shown?.profile : undefined).map((m) => (
+                  <button key={m} className={form.totpMode === m ? "on" : ""} onClick={(e) => (e.preventDefault(), set({ totpMode: m }))}>
+                    {m === "env" ? "Env variable" : m === "literal" ? "Stored" : m === "keep" ? "Keep stored" : "None"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {form.totpMode === "env" && <Field label="Environment variable (read at each login, never stored)">{text("totpEnv", "APP_TOTP")}</Field>}
+            {form.totpMode === "literal" && (
+              <Field label="Secret (stored in the project file)">
+                <input className="input" type="password" value={form.totpSecret} placeholder="base32 or otpauth://…" onChange={(e) => set({ totpSecret: e.target.value })} />
               </Field>
             )}
           </div>
@@ -589,7 +664,11 @@ function Auth() {
             <SessionState s={shown.session} />
           </div>
           <div className="toolbar flat">
-            <button className="btn primary" disabled={!!busy || !shown.profile.login_url} onClick={() => act("login", ["auth", "login", shown.profile.name])}>
+            <button
+              className="btn primary"
+              disabled={!!busy || !(shown.profile.login_url || shown.profile.browser)}
+              onClick={() => act("login", ["auth", "login", shown.profile.name])}
+            >
               {busy === "login" ? "Logging in…" : "Login now"}
             </button>
             <button
@@ -651,6 +730,10 @@ function Auth() {
                 ["Login", shown.profile.login_url && `${shown.profile.login_method} ${shown.profile.login_url}`],
                 ["Body", shown.profile.login_body],
                 ["Raw request", shown.profile.login_request],
+                ["Then", shown.profile.login_steps?.map((s) => s.url).join("\n")],
+                ["Browser login", shown.profile.browser && [shown.profile.browser.start_url, ...(shown.browser_steps ?? [])].join("\n")],
+                ["Passkeys", shown.passkeys?.map(passkeyLine).join("\n")],
+                ["One-time codes", shown.profile.totp && totpLine(shown.profile.totp)],
                 ["Login headers", headerLines(shown.profile.login_headers)],
                 ["Username", shown.profile.username],
                 ["Password", shown.profile.password && ("env" in shown.profile.password ? `$${shown.profile.password.env}` : "stored (redacted)")],
@@ -680,7 +763,7 @@ function Auth() {
             rules={shown.rules ?? []}
             signers={shown.signers ?? []}
             hasCheckUrl={!!shown.profile.check_url}
-            hasLogin={!!shown.profile.login_url}
+            hasLogin={!!(shown.profile.login_url || shown.profile.browser)}
             onChange={() => show(shown.profile.name)}
           />
           <p className="muted small">

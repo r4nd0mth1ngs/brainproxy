@@ -4,15 +4,20 @@
 //! header it travels in, and a page that tells logged-in from logged-out. Every
 //! extraction pattern is checked against the recorded response it has to work on.
 //!
-//! A login that can't be replayed (single sign-on on another host, a second factor, a
-//! token from a later step) gives a session profile instead: the recorded cookies and
-//! token as static headers, valid until the site expires them.
+//! A one-time code is replayed too when the profile has the TOTP secret: `{{totp}}` in the
+//! login request, or in the request after it that posts the code. A login plain requests
+//! can't repeat (single sign-on on another host, a page that builds the login itself, a
+//! passkey) is replayed in a browser when its steps were recorded (see
+//! [`crate::browser_login`]). Failing both, the profile carries the session instead: the
+//! recorded cookies and token as static headers, valid until the site expires them.
 
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::auth::{AuthProfile, Secret};
+use crate::auth::{AuthProfile, LoginStep, Secret};
+use crate::browser_login::record::Derived;
+use crate::browser_login::{BrowserLogin, Do};
 use crate::capture::decode_body;
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, RawRequest, Target};
@@ -32,6 +37,8 @@ pub struct Recorded {
 pub enum Mode {
     /// brainproxy logs in by itself, and again when the session ends.
     Replay,
+    /// brainproxy logs in by itself by replaying the recorded steps in a headless browser.
+    Browser,
     /// The recorded session only; record again once it expires.
     Session,
 }
@@ -54,6 +61,9 @@ pub struct Proposal {
     /// What was found, in plain words.
     pub found: Vec<String>,
     pub warnings: Vec<String>,
+    /// The one-time code the login sent, and the history row it went in.
+    #[serde(skip)]
+    pub code: Option<(String, i64)>,
 }
 
 struct Ex {
@@ -264,8 +274,120 @@ fn last_segment_raw(key: &str) -> String {
     }
 }
 
+/// What else `auth record finish` knows when it analyzes a recording.
+#[derive(Default)]
+pub struct Options<'a> {
+    /// The profile has a TOTP secret, so a login that sends a one-time code can be replayed.
+    pub totp: bool,
+    /// What the person did in the login browser, when it was recorded.
+    pub steps: Option<&'a Derived>,
+    /// Replay the steps in a browser even if plain requests could repeat the login.
+    pub in_browser: bool,
+}
+
+/// A value a second factor posts: a short number in a field named for one.
+fn is_otp_field(key: &str, value: &str) -> bool {
+    let k = last_segment(key);
+    ["otp", "totp", "mfa", "2fa", "code", "verification"].iter().any(|w| k.contains(w))
+        && (4..=10).contains(&value.len())
+        && value.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A header that carries a token, with its scheme ("Bearer ") and the token.
+fn sent_token(e: &Ex) -> Option<(String, String, String)> {
+    e.headers.iter().find_map(|(k, v)| {
+        let lk = k.to_ascii_lowercase();
+        if lk == "authorization" {
+            let (scheme, tok) =
+                v.split_once(' ').map(|(s, t)| (format!("{s} "), t)).unwrap_or((String::new(), v.as_str()));
+            Some((k.clone(), scheme, tok.trim().to_string()))
+        } else if (lk.contains("token") || lk.contains("api-key") || lk.contains("apikey"))
+            && !lk.contains("csrf")
+            && !lk.contains("xsrf")
+            && v.len() >= 16
+        {
+            Some((k.clone(), String::new(), v.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+/// A recorded request as a template: the body fields named in `by_key` (key, value,
+/// placeholder) and every field or header whose value is in `by_value` get their
+/// placeholders; stale cookies and framing headers go.
+fn template(e: &Ex, by_key: &[(&str, &str, &str)], by_value: &[(&str, &str)]) -> String {
+    let fields = e.fields();
+    let key = |k: &str| by_key.iter().find(|(key, ..)| *key == k).map(|(.., to)| *to);
+    let value = |v: &str| by_value.iter().find(|(val, _)| *val == v).map(|(_, to)| *to);
+    let mut body = e.body.clone();
+    if e.json() {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&e.body) {
+            for (k, val) in &fields {
+                if let Some(to) = key(k).or_else(|| value(val)) {
+                    set_json(&mut v, k, to);
+                }
+            }
+            body = v.to_string();
+        }
+    } else if e.form() || body.contains('=') {
+        body = body
+            .split('&')
+            .map(|pair| {
+                let (rk, _) = pair.split_once('=').unwrap_or((pair, ""));
+                let k = crate::scan::message::url_decode(rk);
+                let v = fields.iter().find(|(fk, _)| *fk == k).map(|(_, v)| v.clone()).unwrap_or_default();
+                match key(&k).or_else(|| value(&v)) {
+                    Some(to) => format!("{rk}={to}"),
+                    None => pair.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+    } else {
+        for (_, v, to) in by_key.iter().filter(|(_, v, _)| !v.is_empty()) {
+            body = body.replace(v, to);
+        }
+    }
+    let skip = [
+        "cookie",
+        "content-length",
+        "connection",
+        "if-none-match",
+        "if-modified-since",
+        "priority",
+        "proxy-connection",
+    ];
+    let mut head = format!("{} {} HTTP/1.1\r\n", e.method, &e.url[url::Position::BeforePath..]);
+    if e.header("host").is_none() {
+        head.push_str(&format!("Host: {}\r\n", e.url.host_str().unwrap_or_default()));
+    }
+    for (k, v) in &e.headers {
+        if skip.contains(&k.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        // The whole value, or the part after a scheme word ("Bearer TOKEN").
+        let filled = match (value(v), v.split_once(' ')) {
+            (Some(to), _) => to.to_string(),
+            (None, Some((scheme, rest))) if value(rest.trim()).is_some() => {
+                format!("{scheme} {}", value(rest.trim()).unwrap_or_default())
+            }
+            _ => v.clone(),
+        };
+        head.push_str(&format!("{k}: {filled}\r\n"));
+    }
+    format!("{head}\r\n{body}")
+}
+
 /// Analyzes a recording. `site` is the address the recording started at, if known.
 pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposal {
+    analyze_with(recorded, name, site, &Options::default())
+}
+
+/// [`analyze`], knowing whether the profile can make one-time codes and what was done in the
+/// login browser. Plain requests are tried first; a login they can't repeat is replayed in a
+/// browser when its steps were recorded; else the profile carries the recorded session.
+pub fn analyze_with(recorded: &[Recorded], name: &str, site: Option<&str>, opts: &Options) -> Proposal {
     let exs: Vec<Ex> = recorded.iter().filter_map(Ex::parse).collect();
     let mut found = Vec::new();
     let mut warnings = Vec::new();
@@ -296,58 +418,153 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
         .or_else(|| login.map(|(i, _)| exs[*i].origin()))
         .or_else(|| exs.first().map(Ex::origin));
 
-    let session = |why: String, warnings: &mut Vec<String>, found: &mut Vec<String>, evidence: &mut Evidence| {
-        warnings.push(why);
-        session_profile(&exs, name, app_origin.as_deref(), found, evidence)
-    };
+    // Why plain requests can't repeat the login, if they can't: the reason, and what to say
+    // when the profile then carries the recorded session.
+    let mut why_not: Option<(String, String)> = None;
+    // A one-time code: the field of the login request it went in, or the request after it.
+    let (mut code_in_login, mut code_step): (Option<String>, Option<usize>) = (None, None);
+    match login {
+        None => {
+            why_not = Some((
+                "No login request with a password was recorded".into(),
+                ", so brainproxy can't log in by itself.".into(),
+            ))
+        }
+        Some(&(li, _)) => {
+            let le = &exs[li];
+            evidence.login = Some(le.id);
+            found.push(format!("Login: {} {} (history #{})", le.method, le.url, le.id));
+            if app_origin.as_deref().is_some_and(|o| o != le.origin()) {
+                let why = format!("The password went to {} (single sign-on on another site)", le.origin());
+                why_not = Some((why, "; the profile uses the recorded session instead.".into()));
+            } else {
+                code_in_login = le.fields().into_iter().find(|(k, v)| is_otp_field(k, v)).map(|(k, _)| k);
+                // A second factor right after the login (the last one sent, if a code was mistyped).
+                code_step = exs
+                    .iter()
+                    .enumerate()
+                    .skip(li + 1)
+                    .rev()
+                    .find(|(_, e)| e.method == "POST" && e.fields().iter().any(|(k, v)| is_otp_field(k, v)))
+                    .map(|(i, _)| i);
+                if !opts.totp {
+                    if let Some(s) = code_step {
+                        let why = format!("A one-time code was entered after the login (history #{})", exs[s].id);
+                        why_not = Some((why, "; the profile uses the recorded session instead.".into()));
+                    } else if code_in_login.is_some() {
+                        let why = format!("A one-time code was sent with the login (history #{})", le.id);
+                        why_not = Some((why, "; the profile uses the recorded session instead.".into()));
+                    }
+                }
+            }
+        }
+    }
 
-    let Some(&(li, ref pass_key)) = login else {
-        let profile = session(
-            "No login request with a password was recorded, so brainproxy can't log in by itself.".into(),
-            &mut warnings,
-            &mut found,
-            &mut evidence,
-        );
-        return Proposal { mode: Mode::Session, profile, evidence, found, warnings };
+    let code = code_step
+        .map(|s| &exs[s])
+        .or(login.filter(|_| code_in_login.is_some()).map(|(i, _)| &exs[*i]))
+        .and_then(|e| e.fields().into_iter().find(|(k, v)| is_otp_field(k, v)).map(|(_, v)| (v, e.id)));
+
+    // The steps recorded in the browser, if they can be replayed.
+    let acts = |d: &&Derived| d.steps.iter().any(|s| matches!(s.action, Do::Fill | Do::Click | Do::Press));
+    let steps = opts.steps.filter(acts);
+    let steps_type_code = steps.is_some_and(|d| d.steps.iter().any(|s| s.value.contains("{{totp")));
+    let browser = steps.filter(|_| !steps_type_code || opts.totp);
+    if opts.in_browser && browser.is_none() {
+        warnings
+            .push("No steps to replay in a browser were recorded, so plain requests are used if they can be.".into());
+    }
+    let plain = login.filter(|_| why_not.is_none() && !(opts.in_browser && browser.is_some()));
+
+    let Some(&(li, ref pass_key)) = plain else {
+        let recorded_password =
+            login.and_then(|(i, k)| exs[*i].fields().into_iter().find(|(fk, _)| fk == k)).map(|(_, v)| v);
+        if let Some(d) = browser {
+            match &why_not {
+                Some((why, _)) => found.push(format!("{why}: the recorded steps are replayed in a browser instead.")),
+                None => found.push("The recorded steps are replayed in a browser, as asked.".into()),
+            }
+            let site = site.map(str::to_string).or_else(|| exs.first().map(|e| e.url.to_string())).unwrap_or_default();
+            let mut profile = AuthProfile {
+                name: name.into(),
+                username: d.username.clone(),
+                password: d.password.clone().or(recorded_password).map(Secret::Literal),
+                browser: Some(BrowserLogin { start_url: site, steps: d.steps.clone() }),
+                relogin_interval_secs: 5,
+                max_relogins: 20,
+                ..Default::default()
+            };
+            found.push(format!("{} browser steps", d.steps.len()));
+            warnings.extend(d.warnings.iter().cloned());
+            // What the proxy recorded after the last step is the logged-in site: after the row
+            // that was the last one then, and after the load of the page the step was taken on
+            // (the proxy may write its rows a moment late).
+            let by_row = exs.iter().rposition(|e| e.id <= d.last_history).map_or(0, |i| i + 1);
+            let by_page =
+                exs.iter().rposition(|e| e.method == "GET" && e.url.as_str() == d.last_page).map_or(0, |i| i + 1);
+            let (before, after) = exs.split_at(by_row.max(by_page));
+            let (before, after): (Vec<&Ex>, Vec<&Ex>) = (before.iter().collect(), after.iter().collect());
+            let on_site = |e: &Ex| app_origin.as_deref().is_none_or(|o| e.origin() == o);
+            let sent = after.iter().copied().filter(|e| on_site(e)).find_map(|e| Some((e, sent_token(e)?)));
+            if let Some((e, (header, scheme, _))) = sent {
+                found.push(format!(
+                    "Token sent as {header} (history #{}), read off the browser's requests at each login",
+                    e.id
+                ));
+                profile.token_header = Some(format!("{header}: {scheme}{{{{token}}}}"));
+                evidence.token = Some(e.id);
+            }
+            let login_page = before.iter().rev().copied().find(|e| e.has_password_input());
+            let pages: Vec<&Ex> = after
+                .iter()
+                .copied()
+                .filter(|e| e.method == "GET" && e.status == 200 && e.is_page() && Some(e.origin()) == app_origin)
+                .collect();
+            let user = d.username.clone();
+            find_checks(
+                &mut profile,
+                login_page,
+                &pages,
+                None,
+                user.as_ref(),
+                &mut found,
+                &mut warnings,
+                &mut evidence,
+            );
+            return Proposal { mode: Mode::Browser, profile, evidence, found, warnings, code };
+        }
+        let (why, then) = why_not.unwrap_or_default();
+        warnings.push(format!("{why}{then}"));
+        if code_in_login.is_some() || code_step.is_some() {
+            warnings.push(
+                "With the TOTP secret (auth record finish --totp-secret-env VAR, or in the app) brainproxy makes \
+                 the code itself and logs in again when the session ends."
+                    .into(),
+            );
+        } else if steps_type_code {
+            warnings.push(
+                "The recorded steps type a one-time code: with the TOTP secret (--totp-secret-env VAR, or in the \
+                 app) they are replayed in a browser."
+                    .into(),
+            );
+        }
+        if let Some(d) = opts.steps {
+            warnings.extend(d.warnings.iter().cloned());
+        }
+        let profile = session_profile(&exs, name, app_origin.as_deref(), &mut found, &mut evidence);
+        return Proposal { mode: Mode::Session, profile, evidence, found, warnings, code };
     };
     let le = &exs[li];
-    evidence.login = Some(le.id);
-    found.push(format!("Login: {} {} (history #{})", le.method, le.url, le.id));
-
-    if app_origin.as_deref().is_some_and(|o| o != le.origin()) {
-        let why = format!(
-            "The password went to {} (single sign-on on another site); the profile uses the recorded session instead.",
-            le.origin()
-        );
-        let profile = session(why, &mut warnings, &mut found, &mut evidence);
-        return Proposal { mode: Mode::Session, profile, evidence, found, warnings };
-    }
-    // A second factor right after the login can't be replayed.
-    let second = exs[li + 1..].iter().find(|e| {
-        e.method == "POST"
-            && e.fields().iter().any(|(k, v)| {
-                let k = last_segment(k);
-                ["otp", "totp", "mfa", "2fa", "code", "verification"].iter().any(|w| k.contains(w))
-                    && v.len() <= 10
-                    && v.chars().all(|c| c.is_ascii_digit())
-            })
-    });
-    if let Some(s) = second {
-        let why = format!(
-            "A one-time code was entered after the login (history #{}); the profile uses the recorded session instead.",
-            s.id
-        );
-        let profile = session(why, &mut warnings, &mut found, &mut evidence);
-        return Proposal { mode: Mode::Session, profile, evidence, found, warnings };
-    }
 
     let fields = le.fields();
     let password = fields.iter().find(|(k, _)| k == pass_key).map(|(_, v)| v.clone()).unwrap_or_default();
+    let typed =
+        |k: &String, v: &String| k != pass_key && Some(k) != code_in_login.as_ref() && !v.is_empty() && !tokenish(v);
     let user = fields
         .iter()
-        .filter(|(k, v)| k != pass_key && !v.is_empty() && !tokenish(v))
+        .filter(|(k, v)| typed(k, v))
         .find(|(k, _)| is_user_key(k))
-        .or_else(|| fields.iter().find(|(k, v)| k != pass_key && !v.is_empty() && !tokenish(v)))
+        .or_else(|| fields.iter().find(|(k, v)| typed(k, v)))
         .cloned();
     if let Some((k, v)) = &user {
         found.push(format!("Username field {k} ({v})"));
@@ -355,6 +572,9 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
         warnings.push("No username field was recognised; the request is replayed as recorded.".into());
     }
     found.push(format!("Password field {pass_key}"));
+    if let Some(k) = &code_in_login {
+        found.push(format!("One-time code field {k}, filled from the TOTP secret"));
+    }
 
     // CSRF: a generated value the login sent that an earlier response handed out.
     let mut csrf: Option<(String, String, String, i64)> = None; // (value, url, pattern, id)
@@ -387,68 +607,16 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
     evidence.csrf = csrf.as_ref().map(|c| c.3);
 
     // The login request as a template: values become placeholders, stale cookies go.
-    let mut body = le.body.clone();
     let user_value = user.as_ref().map(|(_, v)| v.clone());
-    let csrf_value = csrf.as_ref().map(|c| c.0.clone());
-    if le.json() {
-        if let Ok(mut v) = serde_json::from_str::<Value>(&le.body) {
-            for (k, val) in &fields {
-                if k == pass_key {
-                    set_json(&mut v, k, "{{password}}");
-                } else if Some(val) == user_value.as_ref() && user.as_ref().is_some_and(|(uk, _)| uk == k) {
-                    set_json(&mut v, k, "{{username}}");
-                } else if Some(val) == csrf_value.as_ref() {
-                    set_json(&mut v, k, "{{csrf}}");
-                }
-            }
-            body = v.to_string();
-        }
-    } else if le.form() || body.contains('=') {
-        body = body
-            .split('&')
-            .map(|pair| {
-                let (rk, _) = pair.split_once('=').unwrap_or((pair, ""));
-                let k = crate::scan::message::url_decode(rk);
-                let v = fields.iter().find(|(fk, _)| *fk == k).map(|(_, v)| v.clone()).unwrap_or_default();
-                if &k == pass_key {
-                    format!("{rk}={{{{password}}}}")
-                } else if user.as_ref().is_some_and(|(uk, _)| *uk == k) {
-                    format!("{rk}={{{{username}}}}")
-                } else if Some(&v) == csrf_value.as_ref() {
-                    format!("{rk}={{{{csrf}}}}")
-                } else {
-                    pair.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-    } else {
-        body = body.replace(&password, "{{password}}");
-        if let Some(u) = &user_value {
-            body = body.replace(u.as_str(), "{{username}}");
-        }
+    let mut by_key: Vec<(&str, &str, &str)> = vec![(pass_key.as_str(), password.as_str(), "{{password}}")];
+    if let Some((k, v)) = &user {
+        by_key.push((k.as_str(), v.as_str(), "{{username}}"));
     }
-    let skip = [
-        "cookie",
-        "content-length",
-        "connection",
-        "if-none-match",
-        "if-modified-since",
-        "priority",
-        "proxy-connection",
-    ];
-    let mut head = format!("{} {} HTTP/1.1\r\n", le.method, &le.url[url::Position::BeforePath..]);
-    if le.header("host").is_none() {
-        head.push_str(&format!("Host: {}\r\n", le.url.host_str().unwrap_or_default()));
+    if let Some(k) = &code_in_login {
+        by_key.push((k.as_str(), "", "{{totp}}"));
     }
-    for (k, v) in &le.headers {
-        if skip.contains(&k.to_ascii_lowercase().as_str()) {
-            continue;
-        }
-        let v = if csrf_value.as_deref() == Some(v.as_str()) { "{{csrf}}" } else { v.as_str() };
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    let login_request = format!("{head}\r\n{body}");
+    let by_value: Vec<(&str, &str)> = csrf.iter().map(|c| (c.0.as_str(), "{{csrf}}")).collect();
+    let login_request = template(le, &by_key, &by_value);
 
     let mut profile = AuthProfile {
         name: name.to_string(),
@@ -466,38 +634,99 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
         profile.csrf_regex = Some(pattern.clone());
     }
 
-    // A token the browser sent after the login, and where it came from.
-    for e in &exs[li + 1..] {
-        let sent = e.headers.iter().find_map(|(k, v)| {
-            let lk = k.to_ascii_lowercase();
-            if lk == "authorization" {
-                let (scheme, tok) =
-                    v.split_once(' ').map(|(s, t)| (format!("{s} "), t)).unwrap_or((String::new(), v.as_str()));
-                Some((k.clone(), scheme, tok.trim().to_string()))
-            } else if (lk.contains("token") || lk.contains("api-key") || lk.contains("apikey"))
-                && !lk.contains("csrf")
-                && !lk.contains("xsrf")
-                && v.len() >= 16
-            {
-                Some((k.clone(), String::new(), v.clone()))
-            } else {
-                None
+    // The request that posts the one-time code, as a step after the login request. A
+    // generated value it carries comes from a page fetched for it, or from what the login
+    // (or its redirects) answered.
+    if let Some(si) = code_step {
+        let se = &exs[si];
+        let step_fields = se.fields();
+        let code_key = step_fields.iter().find(|(k, v)| is_otp_field(k, v)).map(|(k, _)| k.clone()).unwrap_or_default();
+        let mut token: Option<(String, Option<String>, String)> = None; // (value, page, pattern)
+                                                                        // A token may travel in a header instead (X-CSRF-Token, or Authorization with the
+                                                                        // ticket the login answered with): the value after any scheme word.
+        let in_headers: Vec<(String, String)> = se
+            .headers
+            .iter()
+            .filter_map(|(k, v)| {
+                let lk = k.to_ascii_lowercase();
+                let value = match lk.as_str() {
+                    "authorization" => v.split_once(' ').map_or(v.as_str(), |(_, t)| t).trim(),
+                    _ if lk.contains("csrf") || lk.contains("xsrf") || lk.contains("token") => v.trim(),
+                    _ => return None,
+                };
+                Some((k.clone(), value.to_string()))
+            })
+            .collect();
+        let in_body = step_fields.iter().filter(|(k, v)| *k != code_key && tokenish(v));
+        for (key, value) in in_body.chain(&in_headers) {
+            if token.as_ref().is_some_and(|t| &t.0 == value) {
+                continue;
             }
+            let header = in_headers.iter().any(|(k, _)| k == key);
+            let holds = |e: &&Ex| e.text.contains(value.as_str()) || e.text.contains(&value.replace('&', "&amp;"));
+            // A page that can be fetched again, if one handed it out (the form may also have
+            // come back with a mistyped code); else what the request before answered.
+            let earlier = || exs[li..si].iter().rev();
+            let src = earlier().filter(|e| e.method == "GET").find(holds).or_else(|| earlier().find(holds));
+            let cookie = src.and_then(|s| s.set_cookies.iter().find(|c| &c.value == value)).map(|c| c.name.clone());
+            let field = cookie.as_deref().or((!header).then_some(key.as_str()));
+            let read =
+                src.and_then(|s| Some((s, pattern_for(&s.text, value, extraction_candidates(&s.text, value, field))?)));
+            let Some((src, p)) = read else {
+                // Sent again as it was recorded, which a site that hands out a new one each
+                // time refuses: said, so a failing login has its reason.
+                if header {
+                    warnings.push(format!(
+                        "The one-time code request's {key} header didn't come from an earlier response; it is sent as \
+                         recorded, and the login stops working when it expires."
+                    ));
+                }
+                continue;
+            };
+            if token.is_some() {
+                warnings.push(format!(
+                    "The one-time code request sent more than one token ({key} too); only the first is refreshed."
+                ));
+                continue;
+            }
+            found.push(format!("Token {key} of the one-time code request, from {} (history #{})", src.url, src.id));
+            token = Some((value.clone(), (src.method == "GET").then(|| src.url.to_string()), p));
+        }
+        let by_value: Vec<(&str, &str)> = token.iter().map(|t| (t.0.as_str(), "{{csrf}}")).collect();
+        found.push(format!(
+            "One-time code: {} {} (history #{}), field {code_key} filled from the TOTP secret",
+            se.method, se.url, se.id
+        ));
+        profile.login_steps.push(LoginStep {
+            url: se.url.to_string(),
+            request: template(se, &[(code_key.as_str(), "", "{{totp}}")], &by_value),
+            csrf_url: token.as_ref().and_then(|t| t.1.clone()),
+            csrf_regex: token.map(|t| t.2),
         });
-        let Some((header, scheme, token)) = sent else { continue };
-        let key = serde_json::from_str::<Value>(le.text.split_once("\r\n\r\n").map(|x| x.1).unwrap_or(""))
-            .ok()
-            .and_then(|v| {
-                let mut all = Vec::new();
-                json_strings(&v, "", &mut all);
-                all.into_iter().find(|(_, x)| *x == token).map(|(k, _)| k)
-            });
-        match pattern_for(&le.text, &token, extraction_candidates(&le.text, &token, key.as_deref())) {
-            Some(p) => {
+    }
+    // Everything after the last request of the login is the logged-in site.
+    let last = code_step.unwrap_or(li);
+
+    // A token the browser sent after the login, and where it came from.
+    for e in &exs[last + 1..] {
+        let Some((header, scheme, token)) = sent_token(e) else { continue };
+        // The answer that handed it out: the last request of the login, else the login request.
+        let source = [last, li].into_iter().map(|i| &exs[i]).find_map(|src| {
+            let key = serde_json::from_str::<Value>(src.text.split_once("\r\n\r\n").map(|x| x.1).unwrap_or(""))
+                .ok()
+                .and_then(|v| {
+                    let mut all = Vec::new();
+                    json_strings(&v, "", &mut all);
+                    all.into_iter().find(|(_, x)| *x == token).map(|(k, _)| k)
+                });
+            pattern_for(&src.text, &token, extraction_candidates(&src.text, &token, key.as_deref())).map(|p| (src, p))
+        });
+        match source {
+            Some((src, p)) => {
                 found.push(format!("Token in the login response, sent as {header}"));
                 profile.token_regex = Some(p);
                 profile.token_header = Some(format!("{header}: {scheme}{{{{token}}}}"));
-                evidence.token = Some(le.id);
+                evidence.token = Some(src.id);
             }
             None => {
                 warnings.push(format!(
@@ -513,20 +742,48 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
 
     // A page only a logged-in user gets, and what tells the two apart.
     let login_page = exs[..li].iter().rev().find(|e| e.has_password_input());
-    let after: Vec<&Ex> = exs[li + 1..]
+    let after: Vec<&Ex> = exs[last + 1..]
         .iter()
         .filter(|e| e.method == "GET" && e.status == 200 && e.is_page() && Some(e.origin()) == app_origin)
         .collect();
+    let action = le.url.path().to_string();
+    find_checks(
+        &mut profile,
+        login_page,
+        &after,
+        Some(&action),
+        user_value.as_ref(),
+        &mut found,
+        &mut warnings,
+        &mut evidence,
+    );
+    Proposal { mode: Mode::Replay, profile, evidence, found, warnings, code }
+}
+
+/// Finds the page that shows a login worked and what tells logged in from logged out:
+/// `login_page` is the page with the login form, `after` the site's pages opened after the
+/// login, `action` the path the login form posts to.
+#[allow(clippy::too_many_arguments)]
+fn find_checks(
+    profile: &mut AuthProfile,
+    login_page: Option<&Ex>,
+    after: &[&Ex],
+    action: Option<&str>,
+    user_value: Option<&String>,
+    found: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    evidence: &mut Evidence,
+) {
     // What says the login form is showing: on the login page, and on none of the pages after
     // the login. Any password field is the plainest, but a logged-in page may have one too (a
     // change-password form), so the login form's own field, by name, or the form that posts
     // to the login are tried next.
     let logged_out = login_page.and_then(|l| {
         let names = password_names(std::slice::from_ref(l));
-        let action = regex::escape(le.url.path());
+        let action = action.map(|a| format!(r#"(?i)<form[^>]*action=["']?[^"'\s>]*{}["'\s>?]"#, regex::escape(a)));
         let candidates = std::iter::once(PASSWORD_INPUT.as_str().to_string())
             .chain(names.iter().map(|n| format!(r#"(?i)<input[^>]*\bname=["']?{}["'\s/>]"#, regex::escape(n))))
-            .chain([format!(r#"(?i)<form[^>]*action=["']?[^"'\s>]*{action}["'\s>?]"#)]);
+            .chain(action);
         candidates.into_iter().find(|p| {
             let re = Regex::new(p).unwrap();
             re.is_match(&l.text) && !after.iter().any(|e| re.is_match(&e.text))
@@ -543,7 +800,7 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
                 let re = Regex::new(p).unwrap();
                 re.is_match(&c.text) && !login_page.is_some_and(|l| re.is_match(&l.text))
             };
-            let by_user = user_value.as_ref().filter(|u| u.len() >= 3).map(|u| regex::escape(u));
+            let by_user = user_value.filter(|u| u.len() >= 3).map(|u| regex::escape(u));
             let pattern =
                 by_user.into_iter().chain([r"(?i)\b(log ?out|sign ?out)\b".to_string()]).find(|p| not_on_login(p));
             profile.check_url = Some(c.url.to_string());
@@ -575,7 +832,6 @@ pub fn analyze(recorded: &[Recorded], name: &str, site: Option<&str>) -> Proposa
         ),
         None => {}
     }
-    Proposal { mode: Mode::Replay, profile, evidence, found, warnings }
 }
 
 /// The recorded session: the last cookies and auth header the browser sent to the site.
@@ -730,6 +986,139 @@ mod tests {
         assert_eq!(pr.check_url.as_deref(), Some("https://app.test/api/me"));
         assert_eq!(pr.logged_in.as_deref(), Some(r"bob@corp\.test"));
         pr.validate().unwrap();
+    }
+
+    #[test]
+    fn a_one_time_code_is_replayed_when_the_profile_can_make_it() {
+        let form = r#"<form method=post action=/login><input name=user><input type="password" name="password"></form>"#;
+        let code_form = r#"<form method=post action=/verify><input type=hidden name=ticket value="t1ck3t-9f8e7d"><input name=otp></form>"#;
+        let post = |path: &str, body: &str| {
+            format!("POST {path} HTTP/1.1\nHost: app.test\nCookie: pre=1\nContent-Type: application/x-www-form-urlencoded\n\n{body}")
+        };
+        let found = "HTTP/1.1 302 Found\nLocation: /next\nContent-Length: 0\n\n";
+        let recs = vec![
+            rec(1, "GET /login HTTP/1.1\nHost: app.test\n\n", &html(form, "Set-Cookie: pre=1; Path=/\n")),
+            rec(2, &post("/login", "user=al&password=pw-1"), found),
+            rec(3, "GET /verify HTTP/1.1\nHost: app.test\nCookie: pre=1\n\n", &html(code_form, "")),
+            // A mistyped code first: the last one sent is the step.
+            rec(4, &post("/verify", "ticket=t1ck3t-9f8e7d&otp=111111"), &html(code_form, "")),
+            rec(5, &post("/verify", "ticket=t1ck3t-9f8e7d&otp=654321"), found),
+            rec(
+                6,
+                "GET /home HTTP/1.1\nHost: app.test\nCookie: sid=live\n\n",
+                &html("<p>Hi al</p><a href=/logout>Log out</a>", ""),
+            ),
+        ];
+        // Without a secret, as before: the session, and the code that was typed for the caller to check.
+        let p = analyze(&recs, "mfa", Some("https://app.test/"));
+        assert_eq!((p.mode, p.code.clone()), (Mode::Session, Some(("654321".to_string(), 5))), "{p:?}");
+        assert!(p.warnings[1].contains("--totp-secret-env"), "{:?}", p.warnings);
+
+        let p = analyze_with(&recs, "mfa", Some("https://app.test/"), &Options { totp: true, ..Default::default() });
+        assert_eq!(p.mode, Mode::Replay, "{p:?}");
+        let pr = &p.profile;
+        assert!(pr.login_request.as_deref().unwrap().ends_with("user={{username}}&password={{password}}"), "{pr:?}");
+        let [step] = pr.login_steps.as_slice() else { panic!("{pr:?}") };
+        assert_eq!(step.url, "https://app.test/verify");
+        assert!(step.request.ends_with("ticket={{csrf}}&otp={{totp}}") && !step.request.contains("Cookie"), "{step:?}");
+        assert_eq!(step.csrf_url.as_deref(), Some("https://app.test/verify"));
+        let re = Regex::new(step.csrf_regex.as_deref().unwrap()).unwrap();
+        assert_eq!(&re.captures(code_form).unwrap()[1], "t1ck3t-9f8e7d");
+        // The pages after the code, not the code form, show the login worked.
+        assert_eq!(pr.check_url.as_deref(), Some("https://app.test/home"));
+        assert!(pr.login_uses_totp());
+        // The profile is whole only with the secret it was analyzed for.
+        let mut pr = pr.clone();
+        pr.totp = Some(crate::totp::Totp::from_input("GEZDGNBVGY3TQOJQ", None, None, None).unwrap());
+        pr.validate().unwrap();
+
+        // The ticket the login answers with, sent on in a header: read again at each login,
+        // not kept as recorded.
+        let api = vec![
+            rec(1, "POST /api/login HTTP/1.1\nHost: app.test\nContent-Type: application/json\n\n{\"user\":\"al\",\"password\":\"pw-1\"}", "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"mfa\":\"required\",\"ticket\":\"t1ck3t-0a1b2c3d\"}"),
+            rec(2, "POST /api/mfa HTTP/1.1\nHost: app.test\nAuthorization: Bearer t1ck3t-0a1b2c3d\nX-Device: stale-7f3a9c1d2e\nContent-Type: application/json\n\n{\"otp\":\"654321\"}", "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"ok\":true}"),
+            rec(3, "GET /api/me HTTP/1.1\nHost: app.test\nCookie: sid=live\n\n", "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"user\":\"al\"}"),
+        ];
+        let p = analyze_with(&api, "api", None, &Options { totp: true, ..Default::default() });
+        let [step] = p.profile.login_steps.as_slice() else { panic!("{p:?}") };
+        assert!(step.request.contains("Authorization: Bearer {{csrf}}\r\n"), "{step:?}");
+        assert!(step.request.ends_with(r#"{"otp":"{{totp}}"}"#) && !step.request.contains("t1ck3t"), "{step:?}");
+        assert_eq!(step.csrf_url, None, "the login's own answer has it: {step:?}");
+        let re = Regex::new(step.csrf_regex.as_deref().unwrap()).unwrap();
+        assert_eq!(&re.captures(r#"{"mfa":"required","ticket":"n3w-t1ck3t"}"#).unwrap()[1], "n3w-t1ck3t");
+
+        // A code in the login form itself.
+        let one = vec![
+            rec(1, "GET /login HTTP/1.1\nHost: app.test\n\n", &html(form, "")),
+            rec(2, &post("/login", "user=al&password=pw-1&mfa_code=654321"), found),
+            rec(3, "GET /home HTTP/1.1\nHost: app.test\nCookie: sid=live\n\n", &html("<p>Hi al</p>", "")),
+        ];
+        let p = analyze_with(&one, "one", None, &Options { totp: true, ..Default::default() });
+        assert_eq!(p.mode, Mode::Replay, "{p:?}");
+        let req = p.profile.login_request.as_deref().unwrap();
+        assert!(req.ends_with("user={{username}}&password={{password}}&mfa_code={{totp}}"), "{req}");
+        assert!(p.profile.login_steps.is_empty());
+        assert_eq!(analyze(&one, "one", None).mode, Mode::Session);
+    }
+
+    #[test]
+    fn a_login_requests_cant_repeat_replays_the_recorded_steps() {
+        use crate::browser_login::Step;
+        let page =
+            r#"<form id=f><input name=user><input type="password" name="pass"><button id=go>Sign in</button></form>"#;
+        let recs = vec![
+            rec(1, "GET /login HTTP/1.1\nHost: app.test\n\n", &html(page, "")),
+            // The page hashed the password: no request holds it.
+            rec(2, "POST /api/login HTTP/1.1\nHost: app.test\nContent-Type: application/json\n\n{\"user\":\"al\",\"proof\":\"9f86d081884c7d65\"}", "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"ok\":true}"),
+            rec(3, "GET /home HTTP/1.1\nHost: app.test\nCookie: sid=live\n\n", &html("<p id=who></p>", "")),
+            rec(4, "GET /api/me HTTP/1.1\nHost: app.test\nAuthorization: Bearer abc.def.ghi-123456\nCookie: sid=live\n\n", "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"user\":\"alice\"}"),
+        ];
+        let step = |action, css: &str, value: &str| Step {
+            action,
+            css: css.into(),
+            text: None,
+            value: value.into(),
+            masked: false,
+            page: "https://app.test/login".into(),
+        };
+        let steps = Derived {
+            steps: vec![
+                step(Do::Fill, "input[name=\"user\"]", "{{username}}"),
+                step(Do::Fill, "input[name=\"pass\"]", "{{password}}"),
+                step(Do::Click, "#go", ""),
+            ],
+            username: Some("alice".into()),
+            password: Some("pw-1".into()),
+            // The proxy was a row behind when the button was clicked: the page tells.
+            last_history: 0,
+            last_page: "https://app.test/login".into(),
+            ..Default::default()
+        };
+        // Without the steps: the session, as before.
+        assert_eq!(analyze(&recs, "js", Some("https://app.test/login")).mode, Mode::Session);
+        let opts = Options { steps: Some(&steps), ..Default::default() };
+        let p = analyze_with(&recs, "js", Some("https://app.test/login"), &opts);
+        assert_eq!(p.mode, Mode::Browser, "{p:?}");
+        let pr = &p.profile;
+        let login = pr.browser.as_ref().unwrap();
+        assert_eq!((login.start_url.as_str(), login.steps.len()), ("https://app.test/login", 3));
+        assert_eq!((pr.username.as_deref(), &pr.password), (Some("alice"), &Some(Secret::Literal("pw-1".into()))));
+        // The token is read off the page's requests: a header to carry it, no pattern.
+        assert_eq!((pr.token_header.as_deref(), &pr.token_regex), (Some("Authorization: Bearer {{token}}"), &None));
+        assert_eq!(
+            (pr.check_url.as_deref(), pr.logged_in.as_deref()),
+            (Some("https://app.test/api/me"), Some("alice"))
+        );
+        assert!(pr.logged_out.is_some() && pr.login_url.is_none());
+        pr.validate().unwrap();
+        // Steps that type a code need the secret; with plain requests enough, the steps aren't used unless asked for.
+        let mut typed = Derived { steps: steps.steps.clone(), ..Default::default() };
+        typed.steps.insert(2, step(Do::Fill, "input[name=\"otp\"]", "{{totp}}"));
+        let p = analyze_with(&recs, "js", None, &Options { steps: Some(&typed), ..Default::default() });
+        assert_eq!(p.mode, Mode::Session, "{p:?}");
+        assert!(p.warnings.iter().any(|w| w.contains("type a one-time code")), "{:?}", p.warnings);
+        let p = analyze_with(&recs, "js", None, &Options { steps: Some(&typed), totp: true, ..Default::default() });
+        assert_eq!(p.mode, Mode::Browser);
     }
 
     #[test]
