@@ -71,9 +71,11 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
     run<{ summary: Summary | null }>(["report-summary", "show"]).then(
       (r) => {
         const text = r.summary?.text ?? "";
-        setSummary(r.summary);
-        setSummaryDraft((d) => (d.trim() === shownSummary.current ? text : d));
+        // Read now: the updater runs later, after the ref has moved on.
+        const shown = shownSummary.current;
         shownSummary.current = text;
+        setSummary(r.summary);
+        setSummaryDraft((d) => (d.trim() === shown ? text : d));
       },
       (e) => app.toast(e.message, "error"),
     );
@@ -356,7 +358,7 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
             <label>
               <span className="label">Also mask</span>
               <textarea
-                className="input"
+                className="input multiline"
                 rows={2}
                 value={spec.mask}
                 placeholder="One value per line, at least 6 characters: a token in a note, say"
@@ -366,7 +368,7 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
           )}
           <h3>Executive summary</h3>
           <textarea
-            className="input note-input"
+            className="input multiline note-input"
             rows={4}
             placeholder="A few lines at the top of reports: what was tested and what it found. An agent can draft it; it's printed once a person reviews it."
             value={summaryDraft}

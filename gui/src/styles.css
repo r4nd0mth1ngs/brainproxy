@@ -2836,6 +2836,10 @@ button.chip {
   gap: 10px;
   overflow: auto;
 }
+/* The form scrolls: its parts keep their height instead of shrinking to fit. */
+.report-form > * {
+  flex-shrink: 0;
+}
 .report-form label:not(.check) {
   display: flex;
   flex-direction: column;
