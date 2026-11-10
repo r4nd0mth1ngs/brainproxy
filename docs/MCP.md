@@ -188,21 +188,24 @@ Some arguments need a person, so a command run for a tool call (the server sets
   `fuzz_run`'s `file`, `fuzz_run`'s `file:PATH` `payloads`, `ws_send`'s `file`,
   `auth_macro_add`'s `steps` files (also `ORIGIN=FILE`), `auth_add`'s `login_request`,
   `intercept_forward`'s `file`, `findings_compare`'s `baseline` and `current`, and a template
-  file for `checks_validate` or `scan_active`'s `checks`, whose bytes are sent to the target and
-  recorded as they are, or come back in the reply. A folder of templates is refused for those
-  two, as a link inside it could lead out (the `nuclei`, `brainproxy` and `local` stores a person
-  filled are not limited), and so are `checks_update`'s and `scan_data_update`'s `from` and
-  `checks_feed_verify`, which read only a folder; without `from` they download as usual. A person
-  still gives any of these a folder from the CLI or the app. A `..` in the
-  path counts only for where it leads. The refusal names the path, never the file's content.
-  An agent passes the text as the call's `stdin` (`-`; `file:-` for payloads), puts the file in
-  the project's folder, or uses what else the tool takes: an http(s) URL for a document
+  file for `checks_validate`, `checks_list` or `scan_active`'s `checks`, whose bytes are sent to
+  the target and recorded as they are, or come back in the reply. A `..` in the path counts only
+  for where it leads, and where `-` is a file name (`steps`, `login_request`, `baseline`,
+  `current`, templates) a file named `-` is checked like any other. The refusal names the path,
+  never the file's content. An agent passes the text as the call's `stdin` where the tool reads
+  it (`-` for a document, request, handshake or intercept edit; `file:-` for payloads), puts the
+  file in the project's folder, or uses what else the tool takes: an http(s) URL for a document
   (checked against the scope as usual), `url` for a request, a history id for a macro step,
   `scan` for a comparison. A `baseline` that doesn't exist is refused too, `allow_missing_baseline`
   or not. A project kept in the home folder, in a folder above it, or at `/` opens no local file
   to these tools: a person puts the project in a folder of its own. Through MCP the import
   commands' parse errors say only where a document stops being JSON or YAML (line and column),
   never quoting it.
+- A folder of templates for `checks_validate`, `checks_list` or `scan_active`'s `checks` (a
+  link inside it could lead out; the `nuclei`, `brainproxy` and `local` stores a person filled
+  are not limited), and `checks_update`'s and `scan_data_update`'s `from` and
+  `checks_feed_verify`, which read only a folder; without `from` they download as usual. A
+  person still gives any of these a folder from the CLI or the app.
 - `report_profile_save` under a name that is already saved (`conflict`): a saved layout, with
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.

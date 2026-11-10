@@ -2795,7 +2795,7 @@ other options that need a person are refused too; docs/MCP.md lists them. A loca
 call names (a request for `send`, `fuzz run` or `ws send`, a `file:` payload list, a macro step,
 a login request, an intercept edit, a document to import, a report to compare, a template) is
 read only from the project file's folder, symlinks followed, and a folder it names is refused;
-anything else comes in the call's stdin.
+where the tool reads stdin, anything else comes in the call's `stdin`.
 
 ---
 

@@ -809,7 +809,7 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 .as_deref()
                 .map(|f| {
                     // Sent and stored as it is: through MCP only a file in the project's folder.
-                    let path = crate::mcp::local_document(
+                    let path = crate::mcp::local_disk_file(
                         project,
                         "--login-request",
                         f,
@@ -1538,7 +1538,7 @@ fn read_step(project: &Path, store: &Store, spec: &str, scheme: &str) -> Result<
         _ => (None, spec),
     };
     // The step is sent as it is, and stored: through MCP only a file in the project's folder.
-    let path = crate::mcp::local_document(
+    let path = crate::mcp::local_disk_file(
         project,
         "--step",
         file,

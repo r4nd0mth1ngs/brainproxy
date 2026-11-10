@@ -194,16 +194,30 @@ pub(crate) fn check_request_files(files: &[String]) -> Result<(), brainproxy_cor
 /// again later (one swapped in between the check and the read still is: that takes writing to
 /// the project's folder while the call runs): an agent could otherwise point a command at any
 /// file the server can read and have it sent to the target, or read parts of it back from
-/// history, a preview or an error. The refusal never
-/// quotes the file; `instead` ends it with what an agent does instead ("pass its text on stdin
-/// (-)"). `-` (stdin) is the caller's own text and is not checked.
+/// history, a preview or an error. The refusal never quotes the file; `instead` ends it with
+/// what an agent does instead ("pass its text on stdin (-)"). `-` is the caller's stdin and is
+/// returned as it is: only for a command that reads `-` as stdin (else see [`local_disk_file`]).
 pub(crate) fn local_document(
     project: &Path,
     flag: &str,
     source: &str,
     instead: &str,
 ) -> Result<PathBuf, brainproxy_core::Error> {
-    if !in_tool_call() || source == "-" {
+    if source == "-" {
+        return Ok(PathBuf::from(source));
+    }
+    local_disk_file(project, flag, source, instead)
+}
+
+/// [`local_document`] for an argument that is always a file on disk, where `-` is a file named
+/// `-` and is checked like any other.
+pub(crate) fn local_disk_file(
+    project: &Path,
+    flag: &str,
+    source: &str,
+    instead: &str,
+) -> Result<PathBuf, brainproxy_core::Error> {
+    if !in_tool_call() {
         return Ok(PathBuf::from(source));
     }
     let refuse = || {
@@ -252,8 +266,8 @@ pub(crate) fn local_file_arg(
     })
 }
 
-/// [`local_document`] for a file argument kept as a path (a report to compare, a template). Through
-/// MCP a path that isn't UTF-8 text is refused, as it can't be checked.
+/// [`local_disk_file`] for a file argument kept as a path (a report to compare, a template).
+/// Through MCP a path that isn't UTF-8 text is refused, as it can't be checked.
 pub(crate) fn local_path(
     project: &Path,
     flag: &str,
@@ -268,7 +282,7 @@ pub(crate) fn local_path(
             "{flag}: through MCP a local file's path must be UTF-8 text; {instead}"
         ))
     })?;
-    local_document(project, flag, text, instead)
+    local_disk_file(project, flag, text, instead)
 }
 
 /// Under a tool call, refuses `what`, which reads a folder the caller names (an offline copy of
@@ -1386,6 +1400,7 @@ mod tests {
         const FOLDER_CHECKED: &[&str] = &[
             "auth add --login_request",
             "auth macro add --steps",
+            "checks list --selectors",
             "checks validate --paths",
             "findings compare --baseline",
             "findings compare --current",
@@ -1494,6 +1509,7 @@ mod tests {
             "payloads",
             "also",
             "browser",
+            "selectors",
         ];
         let mut found = Vec::new();
         leaves(&crate::Cli::command(), &mut Vec::new(), &mut |path, c| {

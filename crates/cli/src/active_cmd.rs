@@ -801,17 +801,7 @@ fn load_checks(
         return Ok((vec![], serde_json::Value::Null));
     }
     let opts = checks::LoadOptions { vars: args.check_vars.clone(), oob, ..Default::default() };
-    // A template file an agent names comes from the project's folder; the stores are a person's.
-    let mut paths = Vec::new();
-    for s in &args.checks {
-        match s.as_str() {
-            "nuclei" | "brainproxy" | "local" | "all" => {
-                paths.extend(checks::resolve_selectors(home, std::slice::from_ref(s)))
-            }
-            path => paths.push(crate::checks_cmd::local_template(project, "--checks", Path::new(path))?),
-        }
-    }
-    paths.dedup();
+    let paths = crate::checks_cmd::template_paths(project, home, "--checks", &args.checks)?;
     let loaded = checks::load(&paths, &opts)?;
     let filter = checks::Filter {
         ids: args.check_ids.clone(),

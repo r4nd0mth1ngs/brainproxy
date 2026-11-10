@@ -66,7 +66,8 @@ pub enum FeedSource {
 
 #[derive(clap::Args)]
 pub struct ListArgs {
-    /// `nuclei`, `local`, `all` (default), or template files/directories.
+    /// `nuclei`, `local`, `all` (default), or template files/directories. Through MCP only files in
+    /// the project's folder.
     selectors: Vec<String>,
     /// Only checks whose id or name contains this text.
     #[arg(long)]
@@ -151,6 +152,30 @@ pub(crate) fn local_template(project: &Path, flag: &str, path: &Path) -> Result<
         )));
     }
     Ok(file)
+}
+
+/// The template files and folders `selectors` name (`nuclei`, `brainproxy`, `local`, `all`, or
+/// paths). Through MCP each path goes through [`local_template`]; the stores are a person's.
+pub(crate) fn template_paths(
+    project: &Path,
+    home: &Path,
+    flag: &str,
+    selectors: &[String],
+) -> Result<Vec<PathBuf>, Error> {
+    if !crate::mcp::in_tool_call() {
+        return Ok(checks::resolve_selectors(home, selectors));
+    }
+    let mut paths = Vec::new();
+    for s in selectors {
+        match s.as_str() {
+            "nuclei" | "brainproxy" | "local" | "all" => {
+                paths.extend(checks::resolve_selectors(home, std::slice::from_ref(s)))
+            }
+            path => paths.push(local_template(project, flag, Path::new(path))?),
+        }
+    }
+    paths.dedup();
+    Ok(paths)
 }
 
 pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Result<(), Error> {
@@ -264,7 +289,7 @@ fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error
     let (min_severity, max_severity) = severity_band(a.severity, a.severity_max, "--severity")?;
     let selectors = if a.selectors.is_empty() { vec!["all".to_string()] } else { a.selectors.clone() };
     let opts = checks::LoadOptions { vars: a.check_vars.clone(), oob: oob_running(project), ..Default::default() };
-    let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
+    let loaded = checks::load(&template_paths(project, home, "checks list", &selectors)?, &opts)?;
     let filter = Filter {
         ids: vec![],
         tags: a.tags.clone(),

@@ -62,7 +62,15 @@ struct Output {
 }
 
 fn run(project: &Path, args: &[&str], agent: bool) -> Output {
+    run_in(project, args, agent, None)
+}
+
+/// [`run`] in `cwd`, where the server may have been started.
+fn run_in(project: &Path, args: &[&str], agent: bool, cwd: Option<&Path>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_brainproxy"));
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     if agent {
         cmd.env("BRAINPROXY_MCP_CALL", "1");
     } else {
@@ -137,7 +145,11 @@ impl Setup {
     }
 
     fn refused(&self, args: &[&str]) {
-        let o = run(&self.project, args, true);
+        self.refused_in(args, None)
+    }
+
+    fn refused_in(&self, args: &[&str], cwd: Option<&Path>) {
+        let o = run_in(&self.project, args, true, cwd);
         assert_eq!(o.code, 2, "{args:?}: {}", o.all);
         let msg = o.json["error"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains("project's folder"), "{args:?}: {}", o.all);
@@ -279,12 +291,14 @@ fn an_agent_names_template_files_only_in_the_projects_folder_and_no_folders() {
     let outside = s.write("elsewhere/probe.yaml", &TEMPLATE.replace("SECRET", SECRET));
     for path in s.escapes(&outside, "probe.yaml") {
         s.refused(&["checks", "validate", &path]);
+        s.refused(&["checks", "list", "--skipped", &path]);
         s.refused(&["scan", "active", &url, "--no-rules", "--checks", &path]);
     }
     // A folder, even the project's own, is refused: a link in it could lead out.
     let folder = s.proj.to_str().unwrap();
     for args in [
         vec!["checks", "validate", folder],
+        vec!["checks", "list", "--skipped", folder],
         vec!["scan", "active", &url, "--no-rules", "--checks", folder],
         vec!["checks", "update", "--from", folder],
         vec!["checks", "feed", "verify", folder],
@@ -307,4 +321,45 @@ fn an_agent_names_template_files_only_in_the_projects_folder_and_no_folders() {
     let v = person(&s.project, &["checks", "validate", &outside]);
     assert_eq!(v["files"][0]["id"], SECRET, "{v}");
     person(&s.project, &["checks", "validate", folder]);
+}
+
+/// Where `-` is a file name, not stdin (a macro step, a login request, a report, a template), a
+/// file named `-` in the server's folder is checked like any other.
+#[test]
+fn an_agent_s_dash_is_a_file_where_a_command_reads_no_stdin() {
+    let s = Setup::new("dash");
+    let elsewhere = s.dir.join("elsewhere");
+    s.write("elsewhere/-", &REQUEST.replace("SECRET", SECRET));
+    let login_url = format!("http://127.0.0.1:{}/login", s.server.port);
+    for args in [
+        vec!["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", "-"],
+        vec!["auth", "add", "app", "--login-url", &login_url, "--login-request", "-"],
+        vec!["findings", "compare", "--baseline", "-"],
+        vec!["checks", "validate", "-"],
+        vec!["checks", "list", "--skipped", "-"],
+    ] {
+        s.refused_in(&args, Some(&elsewhere));
+    }
+    // A person's `-` is the file it names, as before.
+    let o = run_in(
+        &s.project,
+        &["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", "-"],
+        false,
+        Some(&elsewhere),
+    );
+    assert_eq!(o.code, 0, "{}", o.all);
+}
+
+/// A person may name a store's folder that isn't there yet, as before: it is an empty store,
+/// not a missing file.
+#[test]
+fn a_person_s_missing_store_folder_is_an_empty_store() {
+    let s = Setup::new("store");
+    let url = format!("http://127.0.0.1:{}/", s.server.port);
+    let store = s.dir.join("home/checks/local");
+    let store = store.to_str().unwrap();
+    let v = person(&s.project, &["checks", "list", store]);
+    assert_eq!(v["loaded"], 0, "{v}");
+    let o = run(&s.project, &["scan", "active", &url, "--no-rules", "--checks", store], false);
+    assert!(o.all.contains("no checks selected"), "{}", o.all);
 }
