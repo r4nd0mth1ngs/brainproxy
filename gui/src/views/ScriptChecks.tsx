@@ -13,6 +13,7 @@ import {
   scriptAddArgs,
   scriptNameProblem,
   scriptRemoveArgs,
+  SCRIPT_LIST_ARGS,
   scriptTestArgs,
   testNote,
   type ScriptCheck,
@@ -85,7 +86,7 @@ export function ScriptChecks({ scripts, changed }: { scripts: ScriptCheck[]; cha
 }
 
 /** Opens the dialog to add a script check. */
-export function AddScriptCheck({ scripts, changed }: { scripts: ScriptCheck[]; changed: () => void }) {
+export function AddScriptCheck({ changed }: { changed: () => void }) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -96,7 +97,6 @@ export function AddScriptCheck({ scripts, changed }: { scripts: ScriptCheck[]; c
         <ScriptCheckDialog
           initial={{ name: "", file: "" }}
           known={false}
-          names={scripts.map((s) => s.name)}
           close={() => setOpen(false)}
           saved={() => {
             setOpen(false);
@@ -110,9 +110,9 @@ export function AddScriptCheck({ scripts, changed }: { scripts: ScriptCheck[]; c
 
 /**
  * Name, file, and a test on a history row. `known`: it is an existing check (the name is fixed
- * and adding names its file again). `names`: the checks there are, to ask before replacing one.
+ * and adding names its file again). Adding under a name already taken asks first.
  */
-function ScriptCheckDialog(p: { initial: { name: string; file: string }; known: boolean; names?: string[]; close: () => void; saved: () => void }) {
+function ScriptCheckDialog(p: { initial: { name: string; file: string }; known: boolean; close: () => void; saved: () => void }) {
   const app = useApp();
   const [name, setName] = useState(p.initial.name);
   const [file, setFile] = useState(p.initial.file);
@@ -155,10 +155,21 @@ function ScriptCheckDialog(p: { initial: { name: string; file: string }; known: 
   const add = async () => {
     const n = name.trim();
     if (nameProblem || !file.trim()) return;
-    if (!p.known && p.names?.includes(n) && !(await confirm(`Replace the script check ${n}?`, "A script check already has that name: it would run this file instead.", "Replace", "Cancel"))) return;
     setBusy(true);
     setError("");
     try {
+      // The names as they are now, not as last polled: an add under a name already taken
+      // replaces that check's file, so it asks first.
+      if (!p.known) {
+        const { scripts } = await run<{ scripts: ScriptCheck[] }>(SCRIPT_LIST_ARGS);
+        if (
+          scripts.some((s) => s.name === n) &&
+          !(await confirm(`Replace the script check ${n}?`, "A script check already has that name: it would run this file instead.", "Replace", "Cancel"))
+        ) {
+          setBusy(false);
+          return;
+        }
+      }
       await run(scriptAddArgs(n, file.trim(), pin));
       app.toast(p.known ? `The script check ${n} runs ${file.trim()} as it is now` : `Added the script check ${n}. Rescan to run it over the history there already is.`);
       p.saved();

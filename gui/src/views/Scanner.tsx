@@ -1077,7 +1077,7 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
               ))}
             </div>
             <div className="toolbar-end">
-              <AddScriptCheck scripts={scripts?.scripts ?? []} changed={scriptsChanged} />
+              <AddScriptCheck changed={scriptsChanged} />
               <button className="btn" disabled={busy} onClick={() => runPassive(false)}>
                 Run passive scan now
               </button>

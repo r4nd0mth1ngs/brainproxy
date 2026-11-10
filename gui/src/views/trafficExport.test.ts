@@ -19,7 +19,7 @@ test("the default filter hides refused requests, as Traffic does", () => {
 });
 
 test("URL text matches the URL or title in any case, or the method", () => {
-  assert.equal(exportQuery({ ...NONE, text: "Lo.gin" }), '(url:"lo.gin" OR title:"lo.gin" OR method~"(?i)^lo\\\\.gin$")');
+  assert.equal(exportQuery({ ...NONE, text: "Lo.gin" }), '(url~"(?i)lo\\\\.gin" OR title~"(?i)lo\\\\.gin" OR method~"(?i)^lo\\\\.gin$")');
 });
 
 test("sources and checkboxes become terms ANDed together", () => {
@@ -50,6 +50,12 @@ test("balanced pairs parentheses outside quoted values", () => {
   assert.equal(balanced("a) OR (b"), false);
   assert.equal(balanced("(a"), false);
   assert.equal(balanced('"open'), false);
+  // A quote inside an unquoted word or value is a character, as the CLI reads it.
+  assert.equal(balanced('url:foo"bar'), true);
+  assert.equal(balanced('a"b AND (c)'), true);
+  assert.equal(balanced('title="x)" AND (y)'), true);
+  assert.equal(balanced('url:"a""b"'), true);
+  assert.equal(balanced('url:"a" "b'), false);
 });
 
 test("exportProblem refuses an unbalanced query, and short masks unless secrets are kept", () => {

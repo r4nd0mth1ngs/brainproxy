@@ -31,19 +31,30 @@ export const ASSET_REGEX = `(?i)${ASSET.source}`;
 
 /**
  * Whether a query's parentheses pair up (outside quoted values). One that doesn't would join
- * the other terms differently once wrapped in ( ), so the export refuses it.
+ * the other terms differently once wrapped in ( ), so the export refuses it. As the CLI reads a
+ * query (crates/core/src/filter.rs), a quote opens a quoted value only where a word or a value
+ * starts: at the start, after a space, a parenthesis or a closed quote, or right after an
+ * operator; elsewhere (`url:foo"bar`) it is a character of the word.
  */
 export function balanced(query: string): boolean {
   let depth = 0;
   let quote = false;
+  // Whether the next character starts a word or a value.
+  let start = true;
   for (let i = 0; i < query.length; i++) {
     const c = query[i];
     if (quote) {
       if (c === "\\") i++;
-      else if (c === '"') quote = false;
-    } else if (c === '"') quote = true;
+      else if (c === '"') {
+        quote = false;
+        start = true;
+      }
+      continue;
+    }
+    if (c === '"' && start) quote = true;
     else if (c === "(") depth++;
     else if (c === ")" && --depth < 0) return false;
+    start = /[\s()]/.test(c) || ":=~<>".includes(c);
   }
   return depth === 0 && !quote;
 }
@@ -56,9 +67,11 @@ export function exportQuery(f: TrafficFilter): string {
   const terms: string[] = [];
   if (f.query && f.text.trim()) terms.push(`(${f.text})`);
   if (!f.query && !f.contents && f.text) {
-    // Traffic matches the URL or title containing the text in any case, or the method equal to it.
-    const t = f.text.toLowerCase();
-    terms.push(`(url:${quoted(t)} OR title:${quoted(t)} OR method~${quoted(`(?i)^${regexLiteral(t)}$`)})`);
+    // Traffic matches the URL or title containing the text in any case, or the method equal to
+    // it. As regexes with (?i), so letters beyond ASCII match in any case too, as they do in
+    // Traffic (`url:` folds ASCII only).
+    const t = regexLiteral(f.text.toLowerCase());
+    terms.push(`(url~${quoted(`(?i)${t}`)} OR title~${quoted(`(?i)${t}`)} OR method~${quoted(`(?i)^${t}$`)})`);
   }
   if (f.sources.length) terms.push(`(${f.sources.map((s) => `source=${quoted(s)}`).join(" OR ")})`);
   if (f.hideErrors) terms.push("status<400");

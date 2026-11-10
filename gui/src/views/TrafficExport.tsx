@@ -11,6 +11,10 @@ import { saveFailure } from "../ui/savePath.ts";
 import { DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, MIN_MASK, type ExportOptions, type ExportResult } from "./trafficExport.ts";
 import type { TrafficFilter } from "./trafficFilter";
 
+/** An export being written: one at a time, so two can't race to the same new file (the save
+ * dialog asks about replacing only a file that is there already). */
+let writing = false;
+
 /** Asks how to export what the filter shows, then writes it. `close` is called once it has started or was cancelled. */
 export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter; shown: number; close: () => void }) {
   const app = useApp();
@@ -22,6 +26,7 @@ export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter;
 
   const go = async () => {
     if (problem) return;
+    if (writing) return app.toast("An export is still being written: try again when it's done.", "error");
     // One dialog at a time: this one closes before the question and the save dialog.
     close();
     if (
@@ -42,6 +47,8 @@ export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter;
     }
     if (!chosen) return;
     const { path, overwrite } = chosen;
+    if (writing) return app.toast("An export is still being written: try again when it's done.", "error");
+    writing = true;
     try {
       const r = await run<ExportResult>(exportArgs(filter, o, path, overwrite));
       app.toast(exportNote(r));
@@ -51,6 +58,8 @@ export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter;
       }
     } catch (e: any) {
       app.toast(saveFailure(e, path), "error");
+    } finally {
+      writing = false;
     }
   };
 
