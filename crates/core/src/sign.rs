@@ -1869,7 +1869,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let started = std::time::Instant::now();
         let e = script_signed(&loaded).unwrap_err().to_string();
         assert!(e.contains("time limit") && started.elapsed() < std::time::Duration::from_secs(8), "{e}");
-        let first = crate::sign_script::LAST_CHILD.get();
+        let first = crate::sandbox::LAST_CHILD.get();
         // A copy, as each send makes, knows too, and fails at once without a run.
         let copy = loaded.clone();
         for l in [&loaded, &copy] {
@@ -1877,7 +1877,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
             let e = script_signed(l).unwrap_err().to_string();
             assert!(e.contains("stopped earlier") && started.elapsed() < std::time::Duration::from_millis(500), "{e}");
         }
-        assert_eq!(crate::sign_script::LAST_CHILD.get(), first, "no other run started");
+        assert_eq!(crate::sandbox::LAST_CHILD.get(), first, "no other run started");
         let _ = std::fs::remove_dir_all(dir);
     }
 

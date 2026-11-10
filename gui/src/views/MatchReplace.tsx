@@ -2,7 +2,7 @@
 // on a pasted message or a history row without sending anything (`rules test`).
 
 import { useEffect, useState } from "react";
-import { bodyText, isBinary, textBytes } from "../api";
+import { bodyText, inTauri, isBinary, textBytes } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import { DataTable, type Column } from "../ui/DataTable";
@@ -21,33 +21,53 @@ import {
   describeWhere,
   draftProblem,
   enginesFor,
+  failureNote,
+  importQuestion,
+  importSummary,
   isNamed,
+  isScripted,
+  scriptQuestion,
+  skippedReason,
   takesName,
   testArgs,
   testProblem,
   testedNote,
+  testedProblems,
   testedSides,
   withLocation,
   type Draft,
+  type Failure,
   type Rule,
+  type Skipped,
   type TestResult,
   type TestWhat,
 } from "./matchReplace";
 
 const GROUPS = ["Request", "Response", "WebSocket"];
 
+/** A script file's path, from the app's file dialog; null if cancelled. In a browser the path is typed. */
+async function chooseScript(): Promise<string | null> {
+  const dialog = await import("@tauri-apps/plugin-dialog");
+  const p = await dialog.open({ filters: [{ name: "JavaScript", extensions: ["js", "mjs"] }], multiple: false });
+  return typeof p === "string" ? p : null;
+}
+
 export function MatchReplace() {
   const app = useApp();
   const exec = useRunner();
   const [rules, setRules] = useState<Rule[]>([]);
+  const [skipped, setSkipped] = useState<Skipped[]>([]);
+  const [failures, setFailures] = useState<Failure[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const set = (d: Partial<Draft>) => setDraft((old) => ({ ...old, ...d }));
 
   // Every rules command that changes them answers with the full list.
   const apply = async (args: string[], input?: string) => {
-    const d = await exec<{ rules: Rule[]; host_warning?: string }>(args, input);
+    const d = await exec<{ rules: Rule[]; skipped?: Skipped[]; failures?: Failure[]; host_warning?: string }>(args, input);
     if (d) setRules(d.rules);
+    if (d) setSkipped(d.skipped ?? []);
+    if (d) setFailures(d.failures ?? []);
     if (d?.host_warning) app.toast(d.host_warning, "error");
     return d;
   };
@@ -57,6 +77,8 @@ export function MatchReplace() {
 
   const problem = draftProblem(draft);
   const add = async () => {
+    // A script is code: it runs only after this was read and agreed to.
+    if (isScripted(draft) && !(await confirm("Add a rule that runs a script", scriptQuestion(draft.script), "Add rule", "Cancel"))) return;
     if (await apply(addArgs(draft))) setDraft({ ...draft, match: "", replace: "", comment: "" });
   };
   const copy = async () => {
@@ -66,16 +88,9 @@ export function MatchReplace() {
   // What is on the clipboard is read as `rules list` JSON; each rule is checked as one added by hand is.
   const paste = async () => {
     const text = await navigator.clipboard.readText().catch(() => "");
-    let count = 0;
-    try {
-      const parsed = JSON.parse(text);
-      const list = Array.isArray(parsed) ? parsed : (parsed?.rules ?? parsed?.data?.rules);
-      count = Array.isArray(list) ? list.length : 0;
-    } catch {
-      /* not JSON */
-    }
-    if (!count) return app.toast("The clipboard holds no rules: copy them as JSON here, or from brainproxy rules list.", "error");
-    if (await confirm("Import rules", `Add the ${count} rule${count === 1 ? "" : "s"} on the clipboard to this project?`, "Import", "Cancel")) await apply(["rules", "import", "-"], text);
+    const summary = importSummary(text);
+    if (!summary) return app.toast("The clipboard holds no rules: copy them as JSON here, or from brainproxy rules list.", "error");
+    if (await confirm("Import rules", importQuestion(summary), "Import", "Cancel")) await apply(["rules", "import", "-"], text);
   };
 
   const columns: Column<Rule>[] = [
@@ -97,7 +112,20 @@ export function MatchReplace() {
     { key: "id", label: "#", width: 44, value: (r) => r.id, align: "right" },
     { key: "location", label: "Where", width: 190, value: (r) => describeWhere(r) },
     { key: "pattern", label: "Match", width: 220, value: (r) => r.pattern, render: (r) => (r.pattern ? <span className="mono">{describeMatch(r)}</span> : <span className="muted">{describeMatch(r)}</span>) },
-    { key: "replace", label: "Replace", width: 220, value: (r) => r.replace, render: (r) => (r.replace && r.action !== "remove" ? <span className="mono">{r.replace}</span> : <span className="muted">{describeReplace(r)}</span>) },
+    {
+      key: "replace",
+      label: "Replace",
+      width: 220,
+      value: (r) => describeReplace(r),
+      render: (r) => {
+        const why = skippedReason(r, skipped);
+        if (why) return <span className="warn-text" title={why}>{describeReplace(r)}: not applied ({why})</span>;
+        const failed = failureNote(r, failures);
+        if (failed) return <span className="warn-text" title={failed}>{describeReplace(r)}: {failed}</span>;
+        if (r.replacer === "script") return <span title={`${r.script?.file ?? ""}\nsha256 ${r.script?.sha256 ?? ""}`}>{describeReplace(r)}</span>;
+        return r.replace && r.action !== "remove" ? <span className="mono">{r.replace}</span> : <span className="muted">{describeReplace(r)}</span>;
+      },
+    },
     { key: "scope", label: "Applies to", width: 200, value: (r) => describeScope(r) },
     { key: "comment", label: "Comment", width: 200, value: (r) => r.comment ?? "" },
   ];
@@ -106,6 +134,7 @@ export function MatchReplace() {
   const header = draft.location.endsWith("-header");
   const noMatch = named && draft.action === "add";
   const noReplace = named && draft.action === "remove";
+  const scripted = isScripted(draft);
   return (
     <div className="col fill">
       <div className="toolbar">
@@ -152,14 +181,48 @@ export function MatchReplace() {
           value={noMatch ? "" : draft.match}
           onChange={(e) => set({ match: e.target.value })}
         />
-        <input
-          className="input grow mono"
-          placeholder={noReplace ? "(removed)" : draft.matcher === "regex" ? "replace ($1 groups; empty removes)" : "replace"}
-          aria-label="Replace"
+        <select
+          className="input"
+          aria-label="What makes the replacement"
+          title="Text you type, or a script: a JavaScript file whose replace(match, ctx) returns what to write for each match"
+          value={draft.replacer}
           disabled={noReplace}
-          value={noReplace ? "" : draft.replace}
-          onChange={(e) => set({ replace: e.target.value })}
-        />
+          onChange={(e) => set({ replacer: e.target.value === "script" ? "script" : "text" })}
+        >
+          <option value="text">Text</option>
+          <option value="script">Script</option>
+        </select>
+        {scripted && !noReplace ? (
+          <>
+            <input
+              className="input grow mono"
+              placeholder="script file: defines replace(match, ctx)"
+              aria-label="Script file"
+              value={draft.script}
+              onChange={(e) => set({ script: e.target.value })}
+            />
+            {inTauri && (
+              <button
+                className="btn"
+                onClick={async () => {
+                  const file = await chooseScript();
+                  if (file) set({ script: file });
+                }}
+              >
+                Choose…
+              </button>
+            )}
+          </>
+        ) : (
+          <input
+            className="input grow mono"
+            placeholder={noReplace ? "(removed)" : draft.matcher === "regex" ? "replace ($1 groups; empty removes)" : "replace"}
+            aria-label="Replace"
+            disabled={noReplace}
+            value={noReplace ? "" : draft.replace}
+            onChange={(e) => set({ replace: e.target.value })}
+          />
+        )}
       </div>
       <div className="toolbar">
         <span className="muted">Applies to</span>
@@ -209,7 +272,7 @@ export function MatchReplace() {
           selected={selected}
           onSelect={(r) => setSelected(r.id)}
           initialSort={{ key: "id", desc: false }}
-          rowClass={(r) => (r.enabled ? undefined : "set-off")}
+          rowClass={(r) => (r.enabled && !skippedReason(r, skipped) ? undefined : "set-off")}
           empty="No match-and-replace rules. A rule rewrites what the proxy relays and, if it says so, what Replay, the Fuzzer and scans send."
         />
         <Tester draft={draft} selected={rules.some((r) => r.id === selected) ? selected : null} />
@@ -286,6 +349,11 @@ function Tester(p: { draft: Draft; selected: number | null }) {
             shown && (
               <>
                 <span className={shown.tested.changed ? "" : "muted"}>{testedNote(shown.tested)}</span>
+                {testedProblems(shown.tested, result?.skipped).map((problem) => (
+                  <span key={problem} className="warn-text" role="alert">
+                    {problem}
+                  </span>
+                ))}
                 {sides.length > 1 && (
                   <div className="seg">
                     {sides.map((s) => (

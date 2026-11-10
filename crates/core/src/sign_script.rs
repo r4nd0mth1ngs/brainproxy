@@ -1,47 +1,20 @@
 //! Postman pre-request scripts, run for a signer that asks for one (`auth sign add --script`).
 //!
-//! These are the only documents' code brainproxy runs, and only by that explicit choice. The
-//! interpreter is memory safe and has no way out but the few helpers here: no files, no
-//! network, no process. A run gets its own context, a loop and recursion limit, and can
-//! change only the request's headers and query, on the signer's origins.
-//!
-//! The interpreter can't be interrupted (a regex that backtracks, a loop of `await`s), so
-//! each run is a child process, `brainproxy __sign-script`, killed at the time limit. Its
-//! memory is bounded on each system its own way: on Linux the child limits its address
-//! space, on Windows it runs in a job object with a memory limit, and on macOS (which
-//! accepts an address-space limit but doesn't enforce it) the parent watches its memory and
-//! kills it over the limit. On Unix it also limits its CPU time. It starts with an empty
-//! environment, and gets the script, its variables and the request on stdin.
+//! Besides the hook scripts a person names ([`crate::hooks`]), these are the only documents'
+//! code brainproxy runs, and only by that explicit choice. A run gets its own process and
+//! context in the sandbox every script runs in ([`crate::sandbox`]: no files, no network, no
+//! process, a time and a memory limit), and can change only the request's headers and query,
+//! on the signer's origins.
 
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, OnceLock};
-use std::time::{Duration, Instant};
-
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use base64::Engine;
-use boa_engine::{js_string, Context, JsError, JsResult, JsString, JsValue, NativeFunction, Script, Source};
-use ring::rand::SecureRandom;
+use boa_engine::{js_string, Script, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Digest;
+
+pub(crate) use crate::sandbox::Failure;
+pub use crate::sandbox::{child_main, set_runner};
+use crate::sandbox::{context, explain, js_text, run_once, Job, MEMORY_LIMIT};
 
 const SHIM: &str = include_str!("sign_script.js");
-const LOOP_LIMIT: u64 = 2_000_000;
-const RECURSION_LIMIT: usize = 200;
-/// The interpreter recurses on the native stack.
-const STACK_BYTES: usize = 16 * 1024 * 1024;
-const TIME_LIMIT: Duration = Duration::from_secs(5);
-/// The child's memory: the interpreter, its stack and the script's data. On Linux it bounds
-/// the address space, on Windows the committed memory, on macOS the physical footprint.
-const MEMORY_LIMIT: u64 = 1 << 30;
-/// How often the parent looks at the child's memory where the system doesn't bound it.
-const WATCH_INTERVAL: Duration = if cfg!(target_os = "macos") { Duration::from_millis(10) } else { TIME_LIMIT };
-/// A result longer than this is no request's headers.
-const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
-/// Globals a script has no use for: shared memory and blocking waits.
-const REMOVED_GLOBALS: &[&str] = &["SharedArrayBuffer", "Atomics", "Temporal"];
 
 /// Calls that a run refuses, so a preview can say so before anything is chosen.
 const UNSUPPORTED: &[&str] =
@@ -129,7 +102,7 @@ pub fn unsupported_calls(text: &str) -> Vec<String> {
 
 /// Whether `text` parses, without running it. The error holds a position, not the text.
 pub fn check_syntax(text: &str) -> std::result::Result<(), String> {
-    let mut ctx = Context::default();
+    let mut ctx = crate::sandbox::bare_context()?;
     Script::parse(Source::from_bytes(text), None, &mut ctx).map(|_| ()).map_err(|e| {
         let e = e.to_string();
         let at = e.rfind(" at ").map_or("", |i| &e[i..]);
@@ -302,151 +275,24 @@ pub(crate) struct Outcome {
     pub set: Vec<(String, String)>,
 }
 
-fn text_arg(args: &[JsValue], i: usize, ctx: &mut Context) -> JsResult<String> {
-    Ok(args.get(i).cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped())
+/// One run, as the child is handed it.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SignJob {
+    script: String,
+    vars: Vec<(String, String)>,
+    request: ScriptRequest,
 }
 
-fn bytes_arg(args: &[JsValue], i: usize, ctx: &mut Context) -> JsResult<Vec<u8>> {
-    hex::decode(text_arg(args, i, ctx)?).map_err(|_| JsError::from_opaque(js_string!("bad bytes").into()))
-}
-
-fn js_text(s: &str) -> JsValue {
-    JsString::from(s).into()
-}
-
-fn digest_of(alg: &str, data: &[u8]) -> JsResult<Vec<u8>> {
-    use md5::Md5;
-    use sha1::Sha1;
-    use sha2::{Sha256, Sha384, Sha512};
-    Ok(match alg {
-        "md5" => Md5::digest(data).to_vec(),
-        "sha1" => Sha1::digest(data).to_vec(),
-        "sha256" => Sha256::digest(data).to_vec(),
-        "sha384" => Sha384::digest(data).to_vec(),
-        "sha512" => Sha512::digest(data).to_vec(),
-        _ => return Err(JsError::from_opaque(js_string!("unknown hash").into())),
-    })
-}
-
-fn native_digest(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let alg = text_arg(args, 0, ctx)?;
-    let data = bytes_arg(args, 1, ctx)?;
-    Ok(js_text(&hex::encode(digest_of(&alg, &data)?)))
-}
-
-fn native_hmac(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let alg = text_arg(args, 0, ctx)?;
-    let key = bytes_arg(args, 1, ctx)?;
-    let data = bytes_arg(args, 2, ctx)?;
-    let mac = match alg.as_str() {
-        "sha1" => crate::sign::hmac_digest(crate::sign::HmacAlg::Sha1, &key, &data),
-        "sha256" => crate::sign::hmac_digest(crate::sign::HmacAlg::Sha256, &key, &data),
-        "sha384" => crate::sign::hmac_digest(crate::sign::HmacAlg::Sha384, &key, &data),
-        "sha512" => crate::sign::hmac_digest(crate::sign::HmacAlg::Sha512, &key, &data),
-        "md5" => hmac_md5(&key, &data),
-        _ => return Err(JsError::from_opaque(js_string!("unknown HMAC hash").into())),
-    };
-    Ok(js_text(&hex::encode(mac)))
-}
-
-fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use md5::{Digest as _, Md5};
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..16].copy_from_slice(&Md5::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |x: u8| block.iter().map(|b| b ^ x).collect::<Vec<u8>>();
-    let inner = Md5::new().chain_update(pad(0x36)).chain_update(data).finalize();
-    Md5::new().chain_update(pad(0x5c)).chain_update(inner).finalize().to_vec()
-}
-
-fn native_utf8_to_hex(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let s = args.first().cloned().unwrap_or_default().to_string(ctx)?;
-    Ok(js_text(&hex::encode(String::from_utf16_lossy(s.as_str().to_vec().as_slice()))))
-}
-
-fn native_hex_to_utf8(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    Ok(js_text(&String::from_utf8_lossy(&bytes_arg(args, 0, ctx)?)))
-}
-
-fn native_latin1_to_hex(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let s = args.first().cloned().unwrap_or_default().to_string(ctx)?;
-    let bytes: Vec<u8> = s.as_str().to_vec().iter().map(|u| *u as u8).collect();
-    Ok(js_text(&hex::encode(bytes)))
-}
-
-fn native_hex_to_latin1(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let units: Vec<u16> = bytes_arg(args, 0, ctx)?.iter().map(|b| u16::from(*b)).collect();
-    Ok(JsString::from(units.as_slice()).into())
-}
-
-fn native_hex_to_b64(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    Ok(js_text(&STANDARD.encode(bytes_arg(args, 0, ctx)?)))
-}
-
-fn native_b64_to_hex(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let text = text_arg(args, 0, ctx)?;
-    let bytes = STANDARD
-        .decode(text.trim())
-        .or_else(|_| URL_SAFE_NO_PAD.decode(text.trim().trim_end_matches('=')))
-        .map_err(|_| JsError::from_opaque(js_string!("bad base64").into()))?;
-    Ok(js_text(&hex::encode(bytes)))
-}
-
-fn native_random_hex(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let n = args.first().cloned().unwrap_or_default().to_u32(ctx)?.min(4096) as usize;
-    let mut b = vec![0u8; n];
-    ring::rand::SystemRandom::new()
-        .fill(&mut b)
-        .map_err(|_| JsError::from_opaque(js_string!("no random bytes").into()))?;
-    Ok(js_text(&hex::encode(b)))
-}
-
-type Native = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
-
-fn run_here(script: &str, vars: &[(String, String)], request: &ScriptRequest) -> std::result::Result<Outcome, String> {
-    let mut ctx = Context::default();
-    for name in REMOVED_GLOBALS {
-        ctx.global_object()
-            .delete_property_or_throw(JsString::from(*name), &mut ctx)
-            .map_err(|_| "the script runner failed to start".to_string())?;
-    }
-    let limits = ctx.runtime_limits_mut();
-    limits.set_loop_iteration_limit(LOOP_LIMIT);
-    limits.set_recursion_limit(RECURSION_LIMIT);
-    let natives: [(&str, usize, Native); 9] = [
-        ("__digest", 2, native_digest),
-        ("__hmac", 3, native_hmac),
-        ("__utf8ToHex", 1, native_utf8_to_hex),
-        ("__hexToUtf8", 1, native_hex_to_utf8),
-        ("__latin1ToHex", 1, native_latin1_to_hex),
-        ("__hexToLatin1", 1, native_hex_to_latin1),
-        ("__hexToB64", 1, native_hex_to_b64),
-        ("__b64ToHex", 1, native_b64_to_hex),
-        ("__randomHex", 1, native_random_hex),
-    ];
-    let shim_failed = |_| "the script runner failed to start".to_string();
-    for (name, len, f) in natives {
-        ctx.register_global_callable(JsString::from(name), len, NativeFunction::from_fn_ptr(f)).map_err(shim_failed)?;
-    }
-    let input = serde_json::json!({"vars": vars, "request": request}).to_string();
+/// Runs a signer's script in this process: the child's side of [`run`].
+pub(crate) fn run_here(job: &SignJob) -> std::result::Result<Outcome, String> {
+    let mut ctx = context()?;
+    let input = serde_json::json!({"vars": job.vars, "request": job.request}).to_string();
     let global = ctx.global_object();
     global
         .set(js_string!("__input"), js_text(&input), false, &mut ctx)
         .map_err(|_| "the script runner failed to start".to_string())?;
     ctx.eval(Source::from_bytes(SHIM)).map_err(|e| format!("the script runner failed to start: {e}"))?;
-    let explain = |e: JsError, ctx: &mut Context| {
-        let text = e.try_native(ctx).map_or_else(|_| "it threw a value".to_string(), |n| n.to_string());
-        match text.split_once("__unsupported:") {
-            Some((_, name)) => {
-                format!("it uses {}, which isn't available here", name.chars().take(80).collect::<String>())
-            }
-            None => text.chars().take(200).collect(),
-        }
-    };
-    if let Err(e) = ctx.eval(Source::from_bytes(script)) {
+    if let Err(e) = ctx.eval(Source::from_bytes(job.script.as_str())) {
         return Err(explain(e, &mut ctx));
     }
     let _ = ctx.run_jobs();
@@ -455,185 +301,8 @@ fn run_here(script: &str, vars: &[(String, String)], request: &ScriptRequest) ->
     serde_json::from_str(&text).map_err(|_| "its result couldn't be read".to_string())
 }
 
-/// Why a run gave no result.
-#[derive(Debug)]
-pub(crate) enum Failure {
-    /// The script failed: it threw, or used what isn't here. Another request may fare better.
-    Script(String),
-    /// The run was stopped at the time or memory limit, or couldn't start: running the
-    /// script again would only cost as much again.
-    Stopped(String),
-}
-
-/// How a run's child process starts.
-struct Runner {
-    program: PathBuf,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-}
-
-static RUNNER: OnceLock<Runner> = OnceLock::new();
-
-/// Names the program that runs scripts, with its arguments: the brainproxy command sets
-/// itself and `__sign-script`, before anything signs. Without it no script runs.
-pub fn set_runner(program: PathBuf, args: &[&str]) {
-    set_runner_with_env(program, args, &[]);
-}
-
-fn set_runner_with_env(program: PathBuf, args: &[&str], env: &[(&str, &str)]) {
-    let _ = RUNNER.set(Runner {
-        program,
-        args: args.iter().map(|a| a.to_string()).collect(),
-        env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-    });
-}
-
-/// One run, as the child reads it on stdin.
-#[derive(Serialize, Deserialize)]
-struct Job {
-    script: String,
-    vars: Vec<(String, String)>,
-    request: ScriptRequest,
-    /// The memory limit, in bytes, for the child to set where it can (Linux).
-    memory: u64,
-}
-
-/// The child's answer: one line of JSON, the last it writes.
-#[derive(Default, Serialize, Deserialize)]
-struct Reply {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ok: Option<Outcome>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// The child side of a run (`brainproxy __sign-script`): reads a [`Job`] on stdin, limits
-/// itself, runs the job on a thread with a large stack (the interpreter recurses on the
-/// native stack) and writes a [`Reply`]. Returns the exit code.
-pub fn child_main() -> i32 {
-    let mut input = Vec::new();
-    if std::io::stdin().read_to_end(&mut input).is_err() {
-        return 2;
-    }
-    let Ok(job) = serde_json::from_slice::<Job>(&input) else { return 2 };
-    drop(input);
-    limit_resources(job.memory);
-    let ran = std::thread::Builder::new()
-        .name("postman-script".into())
-        .stack_size(STACK_BYTES)
-        .spawn(move || run_here(&job.script, &job.vars, &job.request))
-        .map(|t| t.join());
-    let reply = match ran {
-        Ok(Ok(Ok(outcome))) => Reply { ok: Some(outcome), error: None },
-        Ok(Ok(Err(e))) => Reply { ok: None, error: Some(e) },
-        _ => return 3,
-    };
-    let Ok(line) = serde_json::to_string(&reply) else { return 3 };
-    let mut out = std::io::stdout().lock();
-    // On a line of its own, whatever came before it (the test harness, in tests).
-    if writeln!(out, "\n{line}").and_then(|_| out.flush()).is_err() {
-        return 3;
-    }
-    0
-}
-
-/// Bounds the child's address space to `memory` bytes and its CPU time, and turns off core
-/// dumps. A limit the system refuses is left as it was: the parent's time limit still holds.
-/// macOS accepts the address-space limit without enforcing it, which is why the parent
-/// watches the child there.
-#[cfg(unix)]
-fn limit_resources(memory: u64) {
-    let cpu = TIME_LIMIT.as_secs() * 2;
-    for (resource, soft, hard) in
-        [(libc::RLIMIT_AS, memory, memory), (libc::RLIMIT_CPU, cpu, cpu + 1), (libc::RLIMIT_CORE, 0, 0)]
-    {
-        let limit = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
-        // SAFETY: setrlimit reads the struct it is given and nothing else.
-        unsafe {
-            libc::setrlimit(resource, &limit);
-        }
-    }
-}
-
-/// Windows has no setrlimit: the parent puts the child in a [`MemoryJob`] instead.
-#[cfg(not(unix))]
-fn limit_resources(_memory: u64) {}
-
-/// The physical footprint of process `pid`, in bytes: what it holds in memory, compressed
-/// or not.
-#[cfg(target_os = "macos")]
-fn footprint(pid: u32) -> Option<u64> {
-    // SAFETY: the struct is plain integers, for which zero is a valid value.
-    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
-    let buffer = (&mut info as *mut libc::rusage_info_v0).cast::<libc::rusage_info_t>();
-    // SAFETY: proc_pid_rusage writes one rusage_info_v0, the flavor asked for, into `info`.
-    let r = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V0, buffer) };
-    (r == 0).then_some(info.ri_phys_footprint)
-}
-
-/// Whether the child is over the memory limit, where the parent has to look for itself.
-#[cfg(target_os = "macos")]
-fn over_memory(child: &std::process::Child, memory: u64) -> bool {
-    footprint(child.id()).is_some_and(|used| used > memory)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn over_memory(_child: &std::process::Child, _memory: u64) -> bool {
-    false
-}
-
-/// A Windows job object holding the child: a process in it can't commit more than its
-/// memory limit, and closing the job (when this is dropped) kills whatever is still in it.
-#[cfg(windows)]
-struct MemoryJob(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl MemoryJob {
-    fn hold(child: &std::process::Child, memory: u64) -> Option<MemoryJob> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        };
-        // SAFETY: both arguments may be null: no security attributes, no name.
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return None;
-        }
-        let job = MemoryJob(handle);
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        info.ProcessMemoryLimit = usize::try_from(memory).unwrap_or(usize::MAX);
-        // SAFETY: `info` is the struct this information class names, with its size; the
-        // child's handle stays open while `child` lives.
-        let held = unsafe {
-            SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) != 0
-                && AssignProcessToJobObject(job.0, child.as_raw_handle()) != 0
-        };
-        held.then_some(job)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for MemoryJob {
-    fn drop(&mut self) {
-        // SAFETY: the handle is the job's, and closed only here.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
 #[cfg(test)]
-thread_local! {
-    /// The process of this thread's last run.
-    pub(crate) static LAST_CHILD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
+pub(crate) use crate::sandbox::LAST_CHILD;
 
 /// Runs `script` over `request` in a child process, killed if it passes the time or memory
 /// limit, so nothing of it outlives the call. Messages have the values of `vars` masked, as
@@ -644,13 +313,6 @@ pub(crate) fn run(
     request: ScriptRequest,
 ) -> std::result::Result<Outcome, Failure> {
     run_within(script, vars, request, MEMORY_LIMIT)
-}
-
-/// How a wait for the child ended.
-enum Waited {
-    Answered(Vec<u8>),
-    OverTime,
-    OverMemory,
 }
 
 /// [`run`], with a memory limit of `memory` bytes.
@@ -667,78 +329,25 @@ fn run_within(
         }
         e
     };
-    let stopped = |e: &str| Failure::Stopped(e.to_string());
-    let runner = RUNNER.get().ok_or_else(|| stopped("scripts run only from the brainproxy command"))?;
-    let input = serde_json::to_vec(&Job { script: script.to_string(), vars, request, memory })
-        .map_err(|_| stopped("the script couldn't be handed over"))?;
-    let mut cmd = Command::new(&runner.program);
-    cmd.args(&runner.args)
-        .env_clear()
-        .envs(runner.env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        cmd.env("SystemRoot", root);
-    }
-    let mut child = cmd.spawn().map_err(|_| stopped("the script couldn't start"))?;
-    #[cfg(test)]
-    LAST_CHILD.set(child.id());
-    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(stopped("the script couldn't start"));
-    };
-    // Before the child has its job: it runs nothing until it has read it all.
-    #[cfg(windows)]
-    let Some(_job) = MemoryJob::hold(&child, memory) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(stopped("the script's memory couldn't be limited"));
-    };
-    let (send, recv) = mpsc::channel();
-    // Ends when the child does: killing it closes both pipes.
-    let io = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        drop(stdin);
-        let mut out = Vec::new();
-        let _ = stdout.take(OUTPUT_LIMIT).read_to_end(&mut out);
-        let _ = send.send(out);
-    });
-    let deadline = Instant::now() + TIME_LIMIT;
-    let waited = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match recv.recv_timeout(left.min(WATCH_INTERVAL)) {
-            Ok(out) => break Waited::Answered(out),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break Waited::Answered(Vec::new()),
-            Err(mpsc::RecvTimeoutError::Timeout) if left <= WATCH_INTERVAL => break Waited::OverTime,
-            Err(mpsc::RecvTimeoutError::Timeout) if over_memory(&child, memory) => break Waited::OverMemory,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    };
-    // Also when it answered: a child that wrote too much may still be waiting to write.
-    let _ = child.kill();
-    let status = child.wait();
-    let _ = io.join();
-    let out = match waited {
-        Waited::Answered(out) => out,
-        Waited::OverTime => return Err(stopped(&format!("it ran past the time limit of {} s", TIME_LIMIT.as_secs()))),
-        Waited::OverMemory => return Err(stopped(&format!("it went past the memory limit of {} MiB", memory >> 20))),
-    };
-    let text = String::from_utf8_lossy(&out);
-    let reply = text.lines().rev().find(|l| !l.trim().is_empty()).and_then(|l| serde_json::from_str::<Reply>(l).ok());
-    match (reply, status) {
-        (Some(Reply { ok: Some(outcome), .. }), Ok(s)) if s.success() => Ok(outcome),
-        (Some(Reply { error: Some(e), .. }), Ok(s)) if s.success() => Err(Failure::Script(mask(e))),
-        _ => Err(stopped("it ended without a result: out of memory, or the interpreter failed")),
+    let job = Job::Sign(SignJob { script: script.to_string(), vars, request });
+    match run_once(job, memory) {
+        Ok(outcome) => serde_json::from_value(outcome).map_err(|_| {
+            Failure::Stopped("it ended without a result: out of memory, or the interpreter failed".into())
+        }),
+        Err(Failure::Script(e)) => Err(Failure::Script(mask(e))),
+        Err(stopped) => Err(stopped),
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::sandbox::{hmac_md5, TIME_LIMIT};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
     use serde_json::json;
+    use sha2::Digest;
+    use std::time::Duration;
 
     fn request() -> ScriptRequest {
         ScriptRequest {
@@ -753,20 +362,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Runs in this test binary started again on [`script_child`], which then acts as
-    /// `brainproxy __sign-script`.
-    pub(crate) fn use_test_runner() {
-        let exe = std::env::current_exe().unwrap();
-        let args = ["--exact", "sign_script::tests::script_child", "--nocapture", "--test-threads=1"];
-        set_runner_with_env(exe, &args, &[("BRAINPROXY_TEST_SCRIPT_CHILD", "1")]);
-    }
-
-    #[test]
-    fn script_child() {
-        if std::env::var_os("BRAINPROXY_TEST_SCRIPT_CHILD").is_some() {
-            std::process::exit(child_main());
-        }
-    }
+    pub(crate) use crate::sandbox::tests::use_test_runner;
 
     fn run_text(script: &str, vars: Vec<(String, String)>, r: ScriptRequest) -> std::result::Result<Outcome, String> {
         use_test_runner();
@@ -862,6 +458,21 @@ pub(crate) mod tests {
         for script in ["fetch('http://x')", "new XMLHttpRequest()", "process.exit(1)", "Deno.exit()"] {
             assert!(go(script).is_err(), "{script}");
         }
+    }
+
+    /// Left to itself the engine loads `import()`ed files from the working directory.
+    #[test]
+    fn a_script_cant_load_a_file_as_a_module() {
+        let file = crate::sandbox::tests::ModuleFile::new("sign");
+        let o = go(&format!(
+            "pm.environment.set('got', 'pending');
+             import('./{}').then((m) => pm.environment.set('got', 'read ' + m.secret),
+                                 (e) => pm.environment.set('got', 'refused: ' + e.message));",
+            file.0
+        ))
+        .unwrap();
+        let refused = "refused: module resolution is disabled for this context";
+        assert_eq!(o.set, [("got".to_string(), refused.to_string())]);
     }
 
     #[test]

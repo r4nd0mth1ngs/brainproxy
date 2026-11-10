@@ -10,10 +10,17 @@ import {
   describeWhere,
   draftProblem,
   enginesFor,
+  failureNote,
+  importQuestion,
+  importSummary,
   ruleEditNote,
+  scriptName,
+  scriptQuestion,
+  skippedReason,
   testArgs,
   testProblem,
   testedNote,
+  testedProblems,
   testedSides,
   withLocation,
   type Draft,
@@ -150,4 +157,95 @@ test("a history row says which rules changed it", () => {
   // Other edits (an intercept's, a session's) are in the same list and are not rules.
   assert.equal(ruleEditNote([{ rule: 2 }, { rule: null }, {}, { rule: 5 }]), "Changed by match-and-replace rule 2, 5");
   assert.equal(ruleEditNote(undefined), "Changed by a match-and-replace rule");
+});
+
+test("a rule whose replacement a script makes names its file, not a replacement", () => {
+  const scripted = draft({ name: "X-Sig", replacer: "script", script: " /work/sign.js ", replace: "typed before", appliesTo: ["proxy", "send"] });
+  assert.deepEqual(addArgs(scripted), ["rules", "add", "--location=request-header", "--match=", "--script=/work/sign.js", "--name=X-Sig", "--applies-to=proxy,send"]);
+  assert.deepEqual(testArgs({ kind: "draft", draft: scripted }, { message: "auto", history: "7", host: "" }), [
+    "rules",
+    "test",
+    "--max-body=2000000",
+    "--history=7",
+    "--location=request-header",
+    "--match=",
+    "--script=/work/sign.js",
+    "--name=X-Sig",
+  ]);
+  // Back to text: the file is left out as the text was, and nothing of it is lost in the draft.
+  assert.deepEqual(addArgs({ ...scripted, replacer: "text" }).filter((a) => a.startsWith("--replace") || a.startsWith("--script")), ["--replace=typed before"]);
+  // An add takes no match, with a script as with text.
+  assert.ok(!addArgs({ ...scripted, action: "add" }).some((a) => a.startsWith("--match")));
+});
+
+test("a script draft needs its file, and what it returns is checked when it runs", () => {
+  assert.equal(draftProblem(draft({ replacer: "script" })), "Choose the script file.");
+  assert.equal(draftProblem(draft({ replacer: "script", script: "  " })), "Choose the script file.");
+  assert.equal(draftProblem(draft({ replacer: "script", script: "/s.js" })), null);
+  // No match and no text is fine: the script gives the header line. So is a status it computes.
+  assert.equal(draftProblem(draft({ location: "status", replacer: "script", script: "/s.js" })), null);
+  assert.equal(draftProblem(draft({ location: "status", replace: "abc" })), 'A status is a code, with a reason if you like: "404" or "404 Not Found".');
+  assert.match(draftProblem(draft({ name: "X-A", action: "remove", replacer: "script", script: "/s.js" }))!, /takes no script/);
+  assert.equal(draftProblem(draft({ location: "query-param", replacer: "script", script: "/s.js" })), "Name the query parameter.");
+  assert.equal(testProblem({ kind: "draft", draft: draft({ replacer: "script" }) }, { message: "auto", history: "", host: "" }, "x"), "Choose the script file.");
+});
+
+test("the table names a rule's script, and says why a rule is left out", () => {
+  const scripted = rule({ id: 4, name: "X-Sig", replacer: "script", script: { file: "/work/hooks/sign.js", sha256: "ab".repeat(32) } });
+  assert.equal(describeReplace(scripted), "script sign.js");
+  assert.equal(describeReplace(rule({ name: "X-Sig", action: "remove", replacer: "script" })), "(remove)");
+  assert.equal(scriptName("C:\\hooks\\sign.js"), "sign.js");
+  assert.equal(scriptName("sign.js"), "sign.js");
+  const skipped = [{ id: 4, reason: "script file /work/hooks/sign.js changed since it was named here; read it and name it again" }];
+  assert.match(skippedReason(scripted, skipped)!, /changed since it was named/);
+  assert.equal(skippedReason(rule({ id: 5 }), skipped), null);
+  assert.equal(skippedReason(scripted, []), null);
+});
+
+test("a test says which script failed or was left out", () => {
+  const tested = (t: Partial<Tested>): Tested => ({ changed: false, rules: [], result: { encoding: "utf8", content: "" }, ...t });
+  assert.deepEqual(testedProblems(tested({})), []);
+  assert.deepEqual(testedProblems(tested({ errors: [{ id: 0, error: "Error: boom" }, { id: 3, error: "it ran past the time limit of 2 s" }] })), [
+    "This rule's script failed, so it changed nothing: Error: boom",
+    "Rule 3's script failed, so it changed nothing: it ran past the time limit of 2 s",
+  ]);
+  assert.deepEqual(testedProblems(tested({}), [{ id: 2, reason: "script file /s.js can't be read" }]), ["Rule 2 was left out: script file /s.js can't be read"]);
+  // A failed script's rule changed nothing, which is what the note beside it says.
+  assert.equal(testedNote(tested({ errors: [{ id: 0, error: "x" }] })), "Unchanged");
+});
+
+test("an import says how many rules it brings and which scripts they would run", () => {
+  const text = (v: unknown) => JSON.stringify(v);
+  assert.equal(importSummary("not json"), null);
+  assert.equal(importSummary(text({ rules: [] })), null);
+  assert.equal(importSummary(text({ other: 1 })), null);
+  const plain = importSummary(text([{ location: "path" }, { location: "method" }]))!;
+  assert.deepEqual(plain, { count: 2, scripts: [] });
+  assert.equal(importQuestion(plain), "Add the 2 rules on the clipboard to this project?");
+  assert.equal(importQuestion({ count: 1, scripts: [] }), "Add the 1 rule on the clipboard to this project?");
+  const script = { file: "/work/sign.js", sha256: "0".repeat(64) };
+  const one = importSummary(text({ rules: [{ location: "path", replacer: "script", script }, { location: "path", replacer: "script", script }] }))!;
+  assert.deepEqual(one, { count: 2, scripts: ["/work/sign.js"] });
+  assert.match(importQuestion(one), /One runs a script on this computer for every match, cut off from your files and the network: \/work\/sign\.js\. Read it first\.$/);
+  const two = importSummary(text({ data: { rules: [{ script }, { script: { file: "/b.js" } }, { script: { file: "" } }, null] } }))!;
+  assert.deepEqual(two, { count: 4, scripts: ["/work/sign.js", "/b.js"] });
+  assert.match(importQuestion(two), /Some run scripts .*: \/work\/sign\.js, \/b\.js\. Read them first\.$/);
+});
+
+test("adding a script rule asks first, naming the file", () => {
+  assert.match(scriptQuestion("/work/hooks/sign.js"), /^sign\.js will run for every match of this rule, cut off from your files and the network/);
+  assert.match(scriptQuestion("/work/hooks/sign.js"), /the rule stops until you add it again\.$/);
+});
+
+test("a rule's row says when its script last failed, and where", () => {
+  const scripted = rule({ id: 4, replacer: "script", script: { file: "/s.js", sha256: "0".repeat(64) } });
+  const failure = { id: 4, error: "Error: boom", time: "2026-11-10T09:15:02.123Z", engine: "proxy" };
+  assert.equal(failureNote(scripted, []), null);
+  assert.equal(failureNote(rule({ id: 5 }), [failure]), null);
+  assert.equal(failureNote(scripted, [failure]), "its script last failed 2026-11-10 09:15:02 UTC in the Proxy, leaving the message as it was: Error: boom");
+  assert.match(failureNote(scripted, [{ ...failure, engine: "send" }])!, /in the Replay,/);
+  assert.match(failureNote(scripted, [{ ...failure, engine: "scan" }])!, /in the scans,/);
+  assert.match(failureNote(scripted, [{ ...failure, engine: "ws-to-client" }])!, /in a WebSocket message to client,/);
+  // An engine a newer build names is shown as it is named.
+  assert.match(failureNote(scripted, [{ ...failure, engine: "crawl" }])!, /in the crawl,/);
 });

@@ -834,12 +834,14 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     // The row keeps the response as received and, beside it, what the rules made of it, which
     // is what is shown.
     let mut response_rules = Vec::new();
+    let mut rule_errors = ruled.first().map(|r| r.failed.clone()).unwrap_or_default();
     let mut unkept = None;
     if let Some(rules) = &rules {
         let r = rules.response(&target, std::mem::take(&mut ex.response));
         // The request went out and its row is complete: failing now would hide the answer.
         unkept = log.ruled_response(id, &r).err();
         response_rules = r.ids();
+        rule_errors.extend(r.failed);
         ex.response = r.bytes;
     }
     let request_rules = ruled.first().map(|r| r.ids()).unwrap_or_default();
@@ -871,6 +873,10 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if !request_rules.is_empty() || !response_rules.is_empty() {
         data["rules"] = json!({"request": request_rules, "response": response_rules});
+    }
+    // A rule whose script failed left the request or the response as it was.
+    if !rule_errors.is_empty() {
+        data["rule_errors"] = json!(rule_errors);
     }
     out.ok(data, || text_exchange(id, &ex.response, ex.duration_ms));
     Ok(())
@@ -1035,6 +1041,15 @@ fn race(
         "results": items,
         "hint": "Different statuses/lengths for identical requests suggest a race window; inspect with history show ID or diff ID1 ID2. duration_ms counts from the release of the final bytes. Every recorded row is tagged race:RACE_ID.",
     });
+    // A rule whose script failed left that member's request as it was.
+    let rule_errors: Vec<Value> = ruled
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| r.failed.iter().map(move |f| json!({"request": i, "id": f.id, "error": f.error})))
+        .collect();
+    if !rule_errors.is_empty() {
+        data["rule_errors"] = json!(rule_errors);
+    }
     if group.len() > 1 {
         data["requests"] = json!(descriptions);
         data["total"] = json!(n);

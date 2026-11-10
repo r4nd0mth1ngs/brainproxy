@@ -5,4 +5,4 @@ pub mod engine;
 pub mod plan;
 
 pub use engine::{run, EngineConfig, FuzzResult, Outcome, StoreMode};
-pub use plan::{load_payloads, process, Mode, Plan, Template, DEFAULT_MARKER, PROCESSORS};
+pub use plan::{load_payloads, names_script, process, Chain, Mode, Plan, Template, DEFAULT_MARKER, PROCESSORS};

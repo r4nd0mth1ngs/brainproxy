@@ -23,7 +23,11 @@ pub enum FuzzCmd {
         Payload sources (-p, one per set, in position order): list:a,b,c | file:PATH | file:- | range:1-100[:step] | \
         wordlist:NAME (built-in: sqli, xss, path-traversal, content-discovery, ...; see `wordlists list`).\n\
         Processing (--process, applied left to right): url, url-all, base64, base64url, hex, html, gzip, zlib, \
-        deflate, md5, sha1, sha256, sha512, upper, lower, prefix:TEXT, suffix:TEXT. Prefix with N= to apply to set N only (e.g. 2=base64).\n\
+        deflate, md5, sha1, sha256, sha512, upper, lower, prefix:TEXT, suffix:TEXT, script:FILE. Prefix with N= to apply to set N only (e.g. 2=base64).\n\
+        script:FILE passes each payload through that JavaScript file's process(payload, ctx) (ctx.set, ctx.index, and \
+        ctx.base64 for a payload that isn't text), which returns the payload to send: a string, { base64 }, or null to \
+        keep it. This runs code from that file, with no file or network access; a payload it fails on stops the run \
+        before it starts. Not offered through MCP.\n\
         Results: the summary lists the baseline response shape, outliers (rare status+word-count shapes), and \
         matches. All results are in the fuzz_results table.")]
     Run(Box<RunArgs>),
@@ -71,7 +75,8 @@ pub struct RunArgs {
     /// Payload source for the next set (repeat for pitchfork/cluster-bomb).
     #[arg(short = 'p', long = "payloads", required = true)]
     payloads: Vec<String>,
-    /// Processing chain for payloads, e.g. "url" or "2=prefix:admin,base64". Repeatable.
+    /// Processing chain for payloads, e.g. "url", "2=prefix:admin,base64" or "script:sign.js,url".
+    /// Repeatable.
     #[arg(long)]
     process: Vec<String>,
     /// Position marker placed on both sides of each position.
@@ -360,17 +365,23 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     for spec in &args.payloads {
         sets.push(fuzz::load_payloads(spec, &mut stdin)?);
     }
+    // The scripts the chains name, as they were read: the run's record says what processed it.
+    let mut scripts = Vec::new();
     for chain in &args.process {
         let (which, chain) =
             match chain.split_once('=').filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()) {
                 Some((n, c)) => (Some(n.parse::<usize>().unwrap_or(0)), c),
                 None => (None, chain.as_str()),
             };
+        // Before the file is so much as read: a script is a person's to name.
+        if fuzz::names_script(chain) {
+            crate::mcp::check_script("--process script:FILE")?;
+        }
+        let chain = fuzz::Chain::parse(chain)?;
+        scripts.extend(chain.scripts().into_iter().cloned());
         for (i, set) in sets.iter_mut().enumerate() {
             if which.is_none_or(|n| n == i + 1) {
-                for p in set.iter_mut() {
-                    *p = fuzz::process(chain, p)?;
-                }
+                chain.apply(i + 1, set)?;
             }
         }
         if let Some(n) = which.filter(|n| *n == 0 || *n > args.payloads.len()) {
@@ -387,7 +398,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let plan = Plan::new(mode, &template, sets)?;
     let total = args.max_requests.map_or(plan.total(), |m| m.min(plan.total()));
 
-    let config = json!({
+    let mut config = json!({
         "mode": args.mode,
         "payloads": args.payloads,
         "process": args.process,
@@ -400,6 +411,9 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         "stop_on_match": args.stop_on_match,
         "store": match args.store { StoreArg::All => "all", StoreArg::Matches => "matches", StoreArg::None => "none" },
     });
+    if !scripts.is_empty() {
+        config["process_scripts"] = json!(scripts);
+    }
     let store = Store::open(project)?;
 
     if args.background {

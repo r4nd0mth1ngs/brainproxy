@@ -31,6 +31,10 @@ Only use it against systems you are authorized to test.
   (CVE-2026-109618, CVE-2026-109619) has its own built-in check.
 - **Passive checks.** Feed and local checks with `scope: passive` look at the traffic you
   record and send nothing, next to the built-in passive rules.
+- **Scripts where text isn't enough.** A JavaScript file of yours can compute a
+  match-and-replace rule's replacement (sign each request, say), process fuzz payloads, or be
+  a passive check that returns findings. It runs in a sandbox with no file or network access,
+  under a time and memory limit, and only when you name it: an agent through MCP can't.
 - **Reports people can read.** Findings › Report… builds a report for its reader, with a
   live preview: technical, an executive summary with posture and trends, a developer
   handoff with a curl line per finding, or a retest letter of what changed since a day.

@@ -111,6 +111,9 @@ struct Live {
     version: i64,
     scope: CompiledScope,
     rules: RuleSet,
+    /// Where a rule's script failure is noted, for whoever lists the rules. Made anew with
+    /// the rules, so a rule switched off and on is noted afresh.
+    rule_failures: crate::rules::FailureLog,
     intercept: CompiledIntercept,
 }
 
@@ -461,6 +464,7 @@ async fn reload(ctx: &Arc<Ctx>) {
             version,
             scope: scope.compile()?,
             rules: RuleSet::compile(&rules)?,
+            rule_failures: crate::rules::FailureLog::of(&store),
             intercept: intercept.compile()?,
         }))
     })
@@ -927,6 +931,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let mut original_request = None;
     if in_scope {
         let ruled = live.rules.request(Engine::Proxy, &target.host, request);
+        live.rule_failures.note(Engine::Proxy, &ruled.failed);
         // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
         // Host-header test, isn't sent: a shared front end may route the request to another site.
         // A person's rule was warned about when it was saved.
@@ -1054,6 +1059,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         true => live.rules.response(Engine::Proxy, &target.host, response),
         false => crate::rules::Ruled { bytes: response, ..Default::default() },
     };
+    live.rule_failures.note(Engine::Proxy, &ruled.failed);
     if let Some(mut c) = capture {
         if ruled.changed() {
             c.modified_response = Some(ruled.bytes.clone());
@@ -1189,6 +1195,7 @@ impl Hooks for WsHooks {
             return None;
         }
         let ruled = live.rules.ws_message(engine, &self.host, &message.payload);
+        live.rule_failures.note(engine, &ruled.failed);
         ruled.changed().then_some(ruled.bytes)
     }
 

@@ -100,6 +100,10 @@ const EXCLUDED: &[&str] = &[
     "report-profile remove",
     "scan policy remove",
     "connection review",
+    // A script is code: a person reads it and names it, and takes it away again.
+    "scan script add",
+    "scan script test",
+    "scan script remove",
     // A person reviews what an agent drafted; an agent can't vouch for itself.
     "findings issue review",
     "report-summary review",
@@ -137,6 +141,19 @@ pub(crate) fn check_force(force: bool, command: &str, instead: &str) -> Result<(
     if force && in_tool_call() {
         return Err(brainproxy_core::Error::InvalidInput(format!(
             "{command} --force is refused through MCP: {instead}"
+        )));
+    }
+    Ok(())
+}
+
+/// Under a tool call, refuses `what`, which would have a hook script run (a rule's replacement,
+/// a fuzz payload processor, a passive check): a script is code, and as for a signer's script
+/// a person reads it and names it. An agent's requests still go through the scripts a person set.
+pub(crate) fn check_script(what: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{what} runs code from a file, so it isn't offered through MCP: a person must read the script and \
+             name it in the app or a terminal"
         )));
     }
     Ok(())
@@ -465,6 +482,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("scan data update", FETCH),
     ("scan data reset", REPLACE),
     ("scan sources", SET),
+    ("scan script list", READ),
     // Through MCP it can only be turned off.
     ("scan prune", SET),
     ("scan policy list", READ),

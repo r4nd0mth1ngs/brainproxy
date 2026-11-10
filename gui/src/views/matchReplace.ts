@@ -19,6 +19,16 @@ export interface Rule {
   /** Absent: the proxy (a ws-message rule: both directions). */
   applies_to?: string[];
   host?: string;
+  /** text unless it says script: then `script` makes the replacement. */
+  replacer?: string;
+  /** The script file, and the sha256 its text had when the rule was added. */
+  script?: { file: string; sha256: string };
+}
+
+/** A rule the engines leave out, as `rules list` says: its replacement breaks a head, or its script file changed. */
+export interface Skipped {
+  id: number;
+  reason: string;
 }
 
 /** The rule being written in the editor. */
@@ -29,6 +39,10 @@ export interface Draft {
   matcher: string;
   match: string;
   replace: string;
+  /** What makes the replacement: the text in `replace`, or the script file in `script`. */
+  replacer: "text" | "script";
+  /** The script file's path. */
+  script: string;
   appliesTo: string[];
   host: string;
   comment: string;
@@ -42,6 +56,8 @@ export const EMPTY_DRAFT: Draft = {
   matcher: "regex",
   match: "",
   replace: "",
+  replacer: "text",
+  script: "",
   appliesTo: ["proxy"],
   host: "",
   comment: "",
@@ -115,6 +131,11 @@ export function draftProblem(draft: Draft): string | null {
   const named = isNamed(draft);
   if (draft.location === "query-param" && !named) return "Name the query parameter.";
   if (!draft.appliesTo.length) return "Choose what the rule applies to.";
+  if (isScripted(draft)) {
+    if (named && draft.action === "remove") return "Remove writes nothing, so it takes no script.";
+    // What the script returns is checked when it runs: a status, a header line, anything.
+    return draft.script.trim() ? null : "Choose the script file.";
+  }
   if (named) return null;
   if (!draft.match && !draft.replace) return "Give a match, a replacement, or both.";
   if (draft.location === "status" && !/^[1-9]\d\d( .*)?$/.test(draft.replace) && !(draft.matcher === "regex" && draft.replace.includes("$")))
@@ -122,13 +143,21 @@ export function draftProblem(draft: Draft): string | null {
   return null;
 }
 
+/** Whether a script makes the draft's replacement. */
+export const isScripted = (draft: Draft) => draft.replacer === "script";
+
+/** A script file's name without its folders, for a table cell or a question. */
+export const scriptName = (file: string) => file.split(/[\\/]/).pop() || file;
+
 /** The flags that say what a draft is, shared by `rules add` and `rules test`. */
 function specArgs(draft: Draft): string[] {
   const named = isNamed(draft);
   const args = [`--location=${draft.location}`];
   // Add takes no match and remove no replacement: what was typed for another action is left out.
   if (!(named && draft.action === "add")) args.push(`--match=${draft.match}`);
-  if (!(named && draft.action === "remove")) args.push(`--replace=${draft.replace}`);
+  // A script makes the replacement in place of the text, which is left out as typed for the other.
+  if (isScripted(draft)) args.push(`--script=${draft.script.trim()}`);
+  else if (!(named && draft.action === "remove")) args.push(`--replace=${draft.replace}`);
   if (draft.matcher !== "regex") args.push(`--match-kind=${draft.matcher}`);
   if (named) {
     args.push(`--name=${draft.name.trim()}`);
@@ -209,6 +238,7 @@ export function describeMatch(rule: Rule): string {
 /** What a rule writes, for the table: its replacement, or in brackets what an empty one does. */
 export function describeReplace(rule: Rule): string {
   if (rule.name && rule.action === "remove") return "(remove)";
+  if (rule.replacer === "script") return `script ${scriptName(rule.script?.file ?? "")}`;
   if (rule.replace) return rule.replace;
   // A named header or parameter is set to nothing; a match elsewhere is cut out.
   return rule.name ? "(empty)" : "(remove)";
@@ -228,6 +258,8 @@ export interface Tested {
   rules: number[];
   result: { encoding: "utf8" | "base64"; content: string; truncated?: boolean };
   original?: { encoding: "utf8" | "base64"; content: string };
+  /** Rules whose script failed on the message: each left it as it was. */
+  errors?: { id: number; error: string }[];
 }
 
 /** What `rules test` answers. */
@@ -237,6 +269,8 @@ export interface TestResult {
   message?: Tested;
   host: string;
   tried: number[];
+  /** Rules left out because their script can't run now. */
+  skipped?: Skipped[];
 }
 
 /** "Changed by rule 3, 5", "Changed by this rule", or "Unchanged", for a tested message. */
@@ -246,6 +280,61 @@ export function testedNote(t: Tested): string {
   if (!saved.length) return "Changed by this rule";
   return `Changed by rule ${saved.join(", ")}${saved.length < t.rules.length ? " and this rule" : ""}`;
 }
+
+/** What went wrong with scripts in a test, one line each; empty when nothing did. */
+export function testedProblems(t: Tested, skipped: Skipped[] = []): string[] {
+  const who = (id: number) => (id === 0 ? "This rule's script" : `Rule ${id}'s script`);
+  return [...(t.errors ?? []).map((e) => `${who(e.id)} failed, so it changed nothing: ${e.error}`), ...skipped.map((s) => `Rule ${s.id} was left out: ${s.reason}`)];
+}
+
+/** The last time a rule's script failed in an engine, as `rules list` says. */
+export interface Failure {
+  id: number;
+  error: string;
+  time: string;
+  engine: string;
+}
+
+/** What a rule's row says of its script's last failure; null when none is noted. */
+export function failureNote(rule: Rule, failures: Failure[]): string | null {
+  const f = failures.find((x) => x.id === rule.id);
+  if (!f) return null;
+  const engine = [...HTTP_ENGINES, ...WS_ENGINES].find((e) => e.id === f.engine)?.label ?? f.engine;
+  const where = f.engine.startsWith("ws-") ? `a WebSocket message ${engine.toLowerCase()}` : `the ${engine === "Scans" ? "scans" : engine}`;
+  return `its script last failed ${f.time.replace("T", " ").replace(/\.\d+Z$/, " UTC")} in ${where}, leaving the message as it was: ${f.error}`;
+}
+
+/** Why a saved rule is left out by the engines, for its row; null when it isn't. */
+export const skippedReason = (rule: Rule, skipped: Skipped[]) => skipped.find((s) => s.id === rule.id)?.reason ?? null;
+
+/**
+ * What an import would bring in, read from clipboard text (`rules list` JSON or a bare list):
+ * how many rules, and the script files they would run. Null when the text holds no rules.
+ */
+export function importSummary(text: string): { count: number; scripts: string[] } | null {
+  let list: unknown;
+  try {
+    const parsed = JSON.parse(text);
+    list = Array.isArray(parsed) ? parsed : (parsed?.rules ?? parsed?.data?.rules);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(list) || !list.length) return null;
+  const scripts = list.map((r) => r?.script?.file).filter((f): f is string => typeof f === "string" && f !== "");
+  return { count: list.length, scripts: [...new Set(scripts)] };
+}
+
+/** The question asked before rules are imported; it names the scripts they would run. */
+export function importQuestion(summary: { count: number; scripts: string[] }): string {
+  const rules = `Add the ${summary.count} rule${summary.count === 1 ? "" : "s"} on the clipboard to this project?`;
+  if (!summary.scripts.length) return rules;
+  const files = summary.scripts.join(", ");
+  return `${rules} ${summary.scripts.length === 1 ? "One runs a script" : "Some run scripts"} on this computer for every match, cut off from your files and the network: ${files}. Read ${summary.scripts.length === 1 ? "it" : "them"} first.`;
+}
+
+/** The question asked before a rule with a script is added. */
+export const scriptQuestion = (file: string) =>
+  `${scriptName(file)} will run for every match of this rule, cut off from your files and the network, with the message it works on in reach. Read it before you add it. If the file changes later, the rule stops until you add it again.`;
 
 /** The sides a result has, in order: a file's one message, or a history row's request and response. */
 export function testedSides(r: TestResult): { id: "request" | "response" | "message"; label: string; tested: Tested }[] {

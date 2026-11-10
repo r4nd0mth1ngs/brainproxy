@@ -134,6 +134,15 @@ Some arguments need a person, so a command run for a tool call (the server sets
 
 - `auth_sign_add` with `script`: a collection's pre-request script is code; a person reads it
   (`import api --show-scripts`) and adds the signer in the app or a terminal.
+- Anything that names a hook script to run (MANUAL.md, "Scripts"): `rules_add` and `rules_test`
+  with `script`, `rules_import` of a rule that has one, `rules_enable` of one that is disabled,
+  `fuzz_run` with a `script:FILE` step in `process` (refused before the file is looked at), and
+  `scan_enable` of a script check (`script:NAME`) that is off. `scan script add`, `scan script
+  test` and `scan script remove` are not tools at all. A script is code, so a person reads it
+  and names it. What a person set still applies to an agent's requests, and `rules_list`,
+  `scan_script_list`, `rules_test` with `rule` (a saved rule that is switched on; one a person
+  switched off is refused, as the tester would run its script), `rules_disable`, `rules_remove`
+  and `scan_disable` work as for any rule.
 - Environment variables named by `auth_add` (`header_env`, `query_keys`, `password_env`,
   `oauth_client_secret_env`, `oauth_refresh_token_env`) and `auth_sign_add` (`secret_env`,
   `access_key_env`, `session_token_env`) must start with `BRAINPROXY_SECRET_`, so an agent can't
