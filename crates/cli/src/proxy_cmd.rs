@@ -2876,6 +2876,11 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             out.ok(data, || String::from_utf8_lossy(&original).into_owned());
         }
         InterceptCmd::Forward { id, file, verbatim, host_header_test } => {
+            // The edit is forwarded as it is, and recorded: through MCP only a file in the
+            // project's folder, checked before anything else.
+            let file = file
+                .map(|f| crate::mcp::local_file_arg(project, "--file", &f, "pass the edit on stdin (-)"))
+                .transpose()?;
             let (entry, original, _) = store.intercept_get(id)?;
             let websocket = entry.direction.starts_with("ws-");
             let edited = match file.as_deref() {
@@ -2884,9 +2889,7 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                     let bytes = if path == "-" {
                         crate::read_input(None)?
                     } else {
-                        // Forwarded as it is, and recorded: through MCP only a file in the project's folder.
-                        let file = crate::mcp::local_document(project, "FILE", path, "pass the edit on stdin (-)")?;
-                        std::fs::read(file).map_err(|e| Error::InvalidInput(format!("cannot read {path:?}: {e}")))?
+                        std::fs::read(path).map_err(|e| Error::InvalidInput(format!("cannot read {path:?}: {e}")))?
                     };
                     let msg = RawRequest::from_bytes(bytes);
                     Some(
