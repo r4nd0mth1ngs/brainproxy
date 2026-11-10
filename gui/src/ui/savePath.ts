@@ -10,3 +10,8 @@ export function savePath(chosen: string, ext: string, asked: boolean): { path: s
   const has = chosen.toLowerCase().endsWith(`.${ext.toLowerCase()}`);
   return { path: has ? chosen : `${chosen}.${ext}`, overwrite: asked && has };
 }
+
+/** What to say when writing failed: a file that was there already and kept says so in the app's words. */
+export function saveFailure(e: { kind?: string; message: string }, path: string): string {
+  return e.kind === "conflict" && e.message.includes("already exists") ? `${path} already exists and was kept: choose another name.` : e.message;
+}

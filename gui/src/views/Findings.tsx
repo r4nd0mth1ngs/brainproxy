@@ -4,6 +4,7 @@ import { originOf, useApp } from "../store";
 import { ask, confirm } from "../ui/Confirm";
 import { Menu, useMenu } from "../ui/Menu";
 import { chooseSave } from "../ui/chooseSave.ts";
+import { saveFailure } from "../ui/savePath.ts";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
@@ -253,8 +254,9 @@ export function FindingsView({ active }: { active: boolean }) {
   const saveRepro = async () => {
     if (!finding) return;
     const id = finding.id;
+    let chosen: { path: string; overwrite: boolean } | null = null;
     try {
-      const chosen = await chooseSave(`finding-${id}-repro.json`, "JSON", "json");
+      chosen = await chooseSave(`finding-${id}-repro.json`, "JSON", "json");
       if (!chosen) return;
       await run(reproCommand(id, chosen.path, chosen.overwrite));
       app.toast(`Repro pack saved to ${chosen.path}. Secrets are masked.`);
@@ -263,7 +265,7 @@ export function FindingsView({ active }: { active: boolean }) {
         await revealItemInDir(chosen.path).catch(() => {});
       }
     } catch (e: any) {
-      app.toast(e.message, "error");
+      app.toast(chosen ? saveFailure(e, chosen.path) : e.message, "error");
     }
   };
 

@@ -7,6 +7,7 @@ import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import { useDialogFocus } from "../ui/dialogFocus";
 import { chooseSave } from "../ui/chooseSave.ts";
+import { saveFailure } from "../ui/savePath.ts";
 import { DEFAULT_EXPORT, EXPORT_LIMIT, exportArgs, exportNote, exportProblem, MIN_MASK, type ExportOptions, type ExportResult } from "./trafficExport.ts";
 import type { TrafficFilter } from "./trafficFilter";
 
@@ -49,7 +50,7 @@ export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter;
         await revealItemInDir(r.path).catch(() => {});
       }
     } catch (e: any) {
-      app.toast(e.message, "error");
+      app.toast(saveFailure(e, path), "error");
     }
   };
 
