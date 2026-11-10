@@ -48,6 +48,7 @@ import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, 
 import { EventStreams } from "./EventStreams";
 import { ruleEditNote } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
+import { filterChanged, INTERCEPT_FILTER_HELP, interceptEnableArgs, savedQueries, savedQueryFor, withFilter, type InterceptSettings } from "./intercept";
 
 export function ProxyView() {
   const app = useApp();
@@ -616,38 +617,80 @@ interface Held {
   length: number;
 }
 
-export interface InterceptSettings {
-  enabled: boolean;
-  requests: boolean;
-  responses: boolean;
-  ws_to_server?: boolean;
-  ws_to_client?: boolean;
-  host?: string;
-  path?: string;
-  method?: string;
-  timeout_secs: number;
-  timeout_action: string;
-}
+export { interceptEnableArgs, type InterceptSettings } from "./intercept";
 
-/** `intercept enable` arguments for these settings. Enable replaces every setting, so the
- * filters are passed back each time or they would be cleared. */
-export function interceptEnableArgs(s: InterceptSettings): string[] {
-  const opt = (flag: string, v?: string) => (v ? [`${flag}=${v}`] : []);
-  return [
-    "intercept",
-    "enable",
-    ...(s.requests ? ["--requests"] : []),
-    ...(s.responses ? ["--responses"] : []),
-    ...(s.ws_to_server ? ["--ws-to-server"] : []),
-    ...(s.ws_to_client ? ["--ws-to-client"] : []),
-    ...opt("--host", s.host),
-    ...opt("--path", s.path),
-    ...opt("--method", s.method),
-    "--timeout",
-    String(s.timeout_secs),
-    "--timeout-action",
-    s.timeout_action,
-  ];
+/**
+ * The intercept's filter: a query in the filter language, with the saved Traffic filters that
+ * are queries to start from. With `onCommit` (the Intercept toolbar) Enter, leaving the box or
+ * picking a saved filter applies it and Escape puts it back; without, the text is part of a
+ * draft saved elsewhere.
+ */
+export function InterceptFilter({
+  value,
+  onChange,
+  onCommit,
+  onRevert,
+  disabled,
+  width = 260,
+}: {
+  value: string;
+  onChange: (text: string) => void;
+  onCommit?: (text: string) => void;
+  onRevert?: () => void;
+  disabled?: boolean;
+  width?: number;
+}) {
+  const [saved, setSaved] = useState<{ name: string; text: string }[]>([]);
+  // Read again when the list is opened: Traffic may have saved one since.
+  const load = () =>
+    run<{ filters: unknown }>(FILTERS_LIST_ARGS)
+      .then((d) => setSaved(savedQueries(savedFrom(d.filters))))
+      .catch(() => {});
+  useEffect(() => {
+    load();
+  }, []);
+  const picked = savedQueryFor(saved, value);
+  return (
+    <>
+      <input
+        className="input mono"
+        style={{ width }}
+        aria-label="Intercept filter"
+        placeholder="Hold only: query, e.g. method=POST NOT path:/static"
+        title={INTERCEPT_FILTER_HELP}
+        spellCheck={false}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onCommit?.(value);
+          if (e.key === "Escape") onRevert?.();
+        }}
+        onBlur={() => onCommit?.(value)}
+      />
+      <select
+        className="input"
+        aria-label="Saved filters for intercept"
+        value={picked ?? ""}
+        disabled={disabled}
+        onFocus={load}
+        title="Saved Traffic filters in Query mode. Only the query is used: their sources and checkboxes are Traffic's."
+        onChange={(e) => {
+          const s = saved.find((x) => x.name === e.target.value);
+          if (!s) return;
+          onChange(s.text);
+          onCommit?.(s.text);
+        }}
+      >
+        <option value="">{saved.length ? "Saved filters" : "No saved queries"}</option>
+        {saved.map((s) => (
+          <option key={s.name} value={s.name}>
+            {s.name}
+          </option>
+        ))}
+      </select>
+    </>
+  );
 }
 
 const HELD_TITLE: Record<Held["direction"], string> = {
@@ -683,6 +726,23 @@ function Intercept({ active }: { active: boolean }) {
   }, [current]);
 
   const s = settings?.settings;
+  // The filter as typed, until it is applied (null: the saved one is shown).
+  const [filterDraft, setFilterDraft] = useState<string | null>(null);
+  // The text last applied, so Enter and then leaving the box don't apply (or refuse) it twice.
+  const triedFilter = useRef<string | null>(null);
+  const applyFilter = async (text: string) => {
+    if (!s?.enabled || !filterChanged(s, text)) return setFilterDraft(null);
+    if (triedFilter.current === text) return;
+    triedFilter.current = text;
+    try {
+      await run(interceptEnableArgs(withFilter(s, text)));
+      setFilterDraft(null);
+      refreshSettings();
+    } catch (e: any) {
+      // Kept as typed, to fix.
+      app.toast(e.message, "error");
+    }
+  };
   const toggle = async (patch: Partial<InterceptSettings>) => {
     const next = { ...s!, ...patch };
     try {
@@ -729,6 +789,17 @@ function Intercept({ active }: { active: boolean }) {
         <label className="check" title="WebSocket messages from the server (text and binary)">
           <input type="checkbox" checked={!!s?.ws_to_client} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_client: e.target.checked })} /> WS to client
         </label>
+        <InterceptFilter
+          value={filterDraft ?? s?.filter ?? ""}
+          disabled={!s?.enabled}
+          width={240}
+          onChange={(text) => {
+            triedFilter.current = null;
+            setFilterDraft(text);
+          }}
+          onCommit={applyFilter}
+          onRevert={() => setFilterDraft(null)}
+        />
         <span className="sep" />
         <button className="btn primary" disabled={!message} onClick={() => decide("forward")}>
           Forward{message && message.text !== message.original ? " edited" : ""}

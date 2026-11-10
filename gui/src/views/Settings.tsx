@@ -5,7 +5,8 @@ import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "re
 import { run } from "../api";
 import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { Split } from "../ui/Split";
-import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
+import { InterceptFilter } from "./Proxy";
+import { interceptEnableArgs, withFilter, type InterceptSettings } from "./intercept";
 import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
 import { useRunner } from "../ui/useRunner";
@@ -1004,7 +1005,7 @@ function Intercept() {
   // it was off we disable it again right away; `disable` keeps the settings.
   const applyDraft = async () => {
     if (!draft || !current) return;
-    const ok = await exec(interceptEnableArgs({ ...draft, requests: draft.requests || !draft.responses }));
+    const ok = await exec(interceptEnableArgs(withFilter({ ...draft, requests: draft.requests || !draft.responses }, draft.filter ?? "")));
     if (ok && !current.enabled) await exec(["intercept", "disable"]);
     if (ok) app.toast("Intercept options saved");
     load();
@@ -1012,7 +1013,8 @@ function Intercept() {
 
   if (!draft || !current) return <div className="blank">Loading…</div>;
   const set = (patch: Partial<InterceptSettings>) => setDraft({ ...draft, ...patch });
-  const changed = JSON.stringify(draft) !== JSON.stringify(current);
+  // A filter of only spaces is none, and spaces around one don't count.
+  const changed = JSON.stringify(withFilter(draft, draft.filter ?? "")) !== JSON.stringify(withFilter(current, current.filter ?? ""));
   return (
     <div className="detail">
       <div className="detail-head">
@@ -1045,6 +1047,13 @@ function Intercept() {
           <input className="input mono" value={draft.method ?? ""} placeholder="POST|PUT" onChange={(e) => set({ method: e.target.value })} />
         </Field>
       </div>
+      <h3>And matching a query (empty for all)</h3>
+      <div className="row gap">
+        <InterceptFilter value={draft.filter ?? ""} width={420} onChange={(filter) => set({ filter })} />
+      </div>
+      <p className="muted small">
+        The Traffic filter language, as in Traffic&apos;s Query mode. A response field such as status works only when only responses are held.
+      </p>
       <h3>Unanswered messages</h3>
       <div className="form">
         <Field label="Timeout (seconds)">
