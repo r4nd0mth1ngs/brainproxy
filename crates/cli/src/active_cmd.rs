@@ -432,7 +432,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     }
     let oob = if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) };
     let (prune, prune_hint) = prune(project, &args)?;
-    let (checks, check_summary) = load_checks(home, &args, band, oob.is_some())?;
+    let (checks, check_summary) = load_checks(project, home, &args, band, oob.is_some())?;
     let browser = args.browser.then(|| crate::browser_cmd::chromium(args.browser_id.as_deref())).transpose()?;
     if args.background {
         if let Some(source) = &args.api {
@@ -790,6 +790,7 @@ fn prune(project: &Path, args: &ActiveArgs) -> Result<(bool, Option<&'static str
 
 /// Loads and filters the --checks templates; returns them with a summary for the output.
 fn load_checks(
+    project: &Path,
     home: &Path,
     args: &ActiveArgs,
     (min_severity, max_severity): (Option<checks::Severity>, Option<checks::Severity>),
@@ -799,7 +800,20 @@ fn load_checks(
         return Ok((vec![], serde_json::Value::Null));
     }
     let opts = checks::LoadOptions { vars: args.check_vars.clone(), oob, ..Default::default() };
-    let loaded = checks::load(&checks::resolve_selectors(home, &args.checks), &opts)?;
+    // A template file an agent names comes from the project's folder; the stores are a person's.
+    let mut selectors = Vec::with_capacity(args.checks.len());
+    for s in &args.checks {
+        selectors.push(match s.as_str() {
+            "nuclei" | "brainproxy" | "local" | "all" => s.clone(),
+            path => {
+                let file = crate::checks_cmd::local_template(project, "--checks", Path::new(path))?;
+                file.into_os_string().into_string().map_err(|_| {
+                    Error::InvalidInput(format!("--checks {path:?}: the template's resolved path isn't UTF-8 text"))
+                })?
+            }
+        });
+    }
+    let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
     let filter = checks::Filter {
         ids: args.check_ids.clone(),
         tags: args.check_tags.clone(),

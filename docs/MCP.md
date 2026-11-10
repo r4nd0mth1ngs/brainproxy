@@ -187,8 +187,12 @@ Some arguments need a person, so a command run for a tool call (the server sets
   whose text could reach the agent through the preview or an error; and for `send`'s and
   `fuzz_run`'s `file`, `fuzz_run`'s `file:PATH` `payloads`, `ws_send`'s `file`,
   `auth_macro_add`'s `steps` files (also `ORIGIN=FILE`), `auth_add`'s `login_request`,
-  `intercept_forward`'s `file`, and `findings_compare`'s `baseline` and `current`, whose bytes
-  are sent to the target and recorded as they are, or come back in the reply. A `..` in the
+  `intercept_forward`'s `file`, `findings_compare`'s `baseline` and `current`, and a template
+  file for `checks_validate` or `scan_active`'s `checks`, whose bytes are sent to the target and
+  recorded as they are, or come back in the reply. A folder of templates is refused for those
+  two, as a link inside it could lead out (the `nuclei`, `brainproxy` and `local` stores a person
+  filled are not limited), and so are `checks_update`'s and `scan_data_update`'s `from` and
+  `checks_feed_verify`, which read only a folder; without `from` they download as usual. A `..` in the
   path counts only for where it leads. The refusal names the path, never the file's content.
   An agent passes the text as the call's `stdin` (`-`; `file:-` for payloads), puts the file in
   the project's folder, or uses what else the tool takes: an http(s) URL for a document

@@ -2793,8 +2793,9 @@ project's browser profile keeps the person's sign-ins), nor is naming a script t
 `--script`, `fuzz run --process script:`, `scan script add`; see [Scripts](#scripts)), and
 other options that need a person are refused too; docs/MCP.md lists them. A local file a tool
 call names (a request for `send`, `fuzz run` or `ws send`, a `file:` payload list, a macro step,
-a login request, an intercept edit, a document to import, a report to compare) is read only
-from the project file's folder, symlinks followed; anything else comes in the call's stdin.
+a login request, an intercept edit, a document to import, a report to compare, a template) is
+read only from the project file's folder, symlinks followed, and a folder it names is refused;
+anything else comes in the call's stdin.
 
 ---
 

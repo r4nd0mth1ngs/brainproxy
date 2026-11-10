@@ -1,7 +1,8 @@
 //! Through MCP, a command reads a caller-given local file only from the project's folder (#112):
 //! `send FILE`, `fuzz run FILE` and `file:` payloads, `ws send FILE`, `auth macro add --step`,
-//! `auth add --login-request`, `intercept forward --file` and `findings compare
-//! --baseline/--current`. A file elsewhere, a link out of the folder and a `..` path are refused
+//! `auth add --login-request`, `intercept forward --file`, `findings compare
+//! --baseline/--current`, and template files for `checks validate` and `scan active --checks`.
+//! Commands that read a folder the caller names are refused. A file elsewhere, a link out of the folder and a `..` path are refused
 //! without quoting the file, and nothing is sent; a person may name any file.
 
 use std::io::{Read, Write};
@@ -70,6 +71,9 @@ fn run(project: &Path, args: &[&str], agent: bool) -> Output {
     let out = cmd
         .args(["--format", "json", "--project"])
         .arg(project)
+        // The test's own home, beside the project's folder.
+        .arg("--home")
+        .arg(project.parent().unwrap().parent().unwrap().join("home"))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -242,4 +246,52 @@ fn an_agent_compares_only_report_files_in_the_projects_folder() {
     let o = run(&s.project, &["findings", "compare", "--baseline", &inside], true);
     assert_eq!(o.code, 0, "{}", o.all);
     person(&s.project, &["findings", "compare", "--baseline", &outside]);
+}
+
+const TEMPLATE: &str = r#"
+id: SECRET
+info: {name: Probe, severity: info}
+http:
+  - raw:
+      - |
+        GET /probe HTTP/1.1
+        Host: {{Hostname}}
+
+    matchers:
+      - type: word
+        words: ["never in a response"]
+"#;
+
+#[test]
+fn an_agent_names_template_files_only_in_the_projects_folder_and_no_folders() {
+    let s = Setup::new("checks");
+    let url = format!("http://127.0.0.1:{}/", s.server.port);
+    let inside = s.write("proj/probe.yaml", &TEMPLATE.replace("SECRET", "inside-probe"));
+    let outside = s.write("elsewhere/probe.yaml", &TEMPLATE.replace("SECRET", SECRET));
+    for path in s.escapes(&outside, "probe.yaml") {
+        s.refused(&["checks", "validate", &path]);
+        s.refused(&["scan", "active", &url, "--no-rules", "--checks", &path]);
+    }
+    // A folder, even the project's own, is refused: a link in it could lead out.
+    let folder = s.proj.to_str().unwrap();
+    for args in [
+        vec!["checks", "validate", folder],
+        vec!["scan", "active", &url, "--no-rules", "--checks", folder],
+        vec!["checks", "update", "--from", folder],
+        vec!["checks", "feed", "verify", folder],
+        vec!["scan", "data", "update", "--from", folder],
+    ] {
+        let o = run(&s.project, &args, true);
+        assert_eq!(o.code, 2, "{args:?}: {}", o.all);
+        assert!(o.json["error"]["message"].as_str().unwrap_or_default().contains("folder"), "{args:?}: {}", o.all);
+    }
+    let o = run(&s.project, &["checks", "validate", &inside], true);
+    assert_eq!((o.code, o.json["data"]["ok"].as_u64()), (0, Some(1)), "{}", o.all);
+    let o = run(&s.project, &["scan", "active", &url, "--no-rules", "--checks", &inside], true);
+    assert_eq!(o.code, 0, "{}", o.all);
+    assert!(s.server.sent("GET /probe"));
+    // A person may validate a template anywhere, and a folder.
+    let v = person(&s.project, &["checks", "validate", &outside]);
+    assert_eq!(v["files"][0]["id"], SECRET, "{v}");
+    person(&s.project, &["checks", "validate", folder]);
 }

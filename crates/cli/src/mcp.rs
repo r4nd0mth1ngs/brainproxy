@@ -269,6 +269,19 @@ pub(crate) fn local_path(
     local_document(project, flag, text, instead)
 }
 
+/// Under a tool call, refuses `what`, which reads a folder the caller names (an offline copy of
+/// templates or rule data): a link inside it could lead anywhere the server can read, and what
+/// it holds goes into the person's own stores. `instead` says what an agent does instead.
+pub(crate) fn check_local_folder(what: &str, instead: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{what} reads a local folder, so it isn't offered through MCP: {instead}, or have a person run it in \
+             the app or a terminal"
+        )));
+    }
+    Ok(())
+}
+
 /// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as
 /// `fuzz run --store none`), for the same reason as [`check_no_store`].
 pub(crate) fn check_records_all(flag: &str) -> Result<(), brainproxy_core::Error> {

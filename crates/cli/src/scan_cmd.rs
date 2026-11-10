@@ -1268,6 +1268,9 @@ fn data_cmd(home: &Path, cmd: DataCmd, out: &Out) -> Result<(), Error> {
             });
         }
         DataCmd::Update { reference, from } => {
+            if from.is_some() {
+                crate::mcp::check_local_folder("data update --from", "run it without --from to download the data")?;
+            }
             let source = match from {
                 Some(d) => data::Source::Dir(d),
                 None => data::Source::GitHub { reference },

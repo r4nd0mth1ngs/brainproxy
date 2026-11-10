@@ -134,10 +134,27 @@ pub struct UpdateArgs {
     job_id: Option<i64>,
 }
 
+/// A template named by path. Through MCP it is a file in the project's folder (see
+/// [`crate::mcp::local_document`]), as a template's requests are sent and its errors read back;
+/// a folder is refused, as a link inside it could lead out of the project's.
+pub(crate) fn local_template(project: &Path, flag: &str, path: &Path) -> Result<PathBuf, Error> {
+    let instead = "put the template there, or use a store (nuclei, brainproxy, local) a person filled";
+    let file = crate::mcp::local_path(project, flag, path, instead)?;
+    if crate::mcp::in_tool_call() && file.is_dir() {
+        return Err(Error::InvalidInput(format!(
+            "{flag} {:?}: through MCP name template files, not a folder (a link in it could lead out of the \
+             project's folder)",
+            path.display().to_string()
+        )));
+    }
+    Ok(file)
+}
+
 pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         ChecksCmd::List(a) => list(project, home, a, out),
         ChecksCmd::Validate { paths, limit, check_vars } => {
+            let paths = paths.iter().map(|p| local_template(project, "checks validate", p)).collect::<Result<Vec<_>, _>>()?;
             let opts = checks::LoadOptions { vars: check_vars, oob: oob_running(project), ..Default::default() };
             let loaded = checks::load(&paths, &opts)?;
             let files: Vec<_> = loaded
@@ -165,6 +182,9 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
             Ok(())
         }
         ChecksCmd::Update(a) => {
+            if a.from.is_some() {
+                crate::mcp::check_local_folder("checks update --from", "run it without --from to download them")?;
+            }
             if let Some(d) = &a.from {
                 if !d.is_dir() {
                     return Err(Error::NotFound(format!("directory {}", d.display())));
@@ -321,6 +341,7 @@ fn feed(cmd: FeedCmd, out: &Out) -> Result<(), Error> {
             });
         }
         FeedCmd::Verify { dir } => {
+            crate::mcp::check_local_folder("checks feed verify", "`checks update --source brainproxy` checks the feed it downloads")?;
             let read = |n: &str| {
                 std::fs::read(dir.join(n)).map_err(|e| Error::NotFound(format!("{}: {e}", dir.join(n).display())))
             };
