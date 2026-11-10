@@ -88,9 +88,12 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
     let settings: PassiveSettings = store.setting(passive::SETTINGS_KEY)?;
     let alert_ref = f["alert_ref"].as_str().unwrap_or_default().to_string();
     let rule = f["rule_id"].as_i64().unwrap_or(0);
-    let off = match alert_ref.strip_prefix("check:") {
-        Some(check) => settings.disabled_checks.iter().any(|c| c == check),
-        None => settings.disabled.iter().any(|&r| i64::from(r) == rule),
+    // A script check's finding names the script that raised it.
+    let script = passive::ScriptCheck::name_in(&alert_ref).map(|name| format!("{}{name}", passive::SCRIPT_PREFIX));
+    let off = match (alert_ref.strip_prefix("check:"), &script) {
+        (Some(check), _) => settings.disabled_checks.iter().any(|c| c == check),
+        (None, Some(script)) => settings.disabled_checks.contains(script),
+        (None, None) => settings.disabled.iter().any(|&r| i64::from(r) == rule),
     };
     if off {
         return Err(Error::Conflict(format!(
@@ -100,9 +103,11 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         )));
     }
     // Nor can one that isn't there any more (a local check removed, a rule this build lacks).
-    let loaded = match alert_ref.strip_prefix("check:") {
-        Some(check) => passive::checks().iter().any(|c| c.id() == check),
-        None => passive::all_rules().iter().any(|r| i64::from(r.id()) == rule),
+    let loaded = match (alert_ref.strip_prefix("check:"), &script) {
+        (Some(check), _) => passive::checks().iter().any(|c| c.id() == check),
+        // There, and its file still the one that was added: a script that can't run finds nothing.
+        (None, Some(script)) => settings.scripts.iter().any(|c| &c.id() == script && c.script().read().is_ok()),
+        (None, None) => passive::all_rules().iter().any(|r| i64::from(r.id()) == rule),
     };
     if !loaded {
         return Err(Error::Conflict(format!(
@@ -149,9 +154,24 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         .into_iter()
         .find(|m| m.history_id == row)
         .ok_or_else(|| Error::Protocol(format!("the retest's response (history {row}) can't be read back")))?;
-    let found = passive::scan_message(&msg, &settings)
+    let scripts = passive::ScriptChecks::load(&settings);
+    let found = passive::scan_message_with(&msg, &settings, &scripts)
         .iter()
         .any(|x| identity(x.def.alert_ref, &msg.method, &msg.url, &x.param) == want);
+    // A script that failed on the reply found nothing there, which isn't "fixed" either.
+    // Every failure counts, listed or not: the list holds only the first few different ones.
+    let name = passive::ScriptCheck::name_in(&alert_ref);
+    let failed = scripts.failed().into_iter().find(|script| Some(script.as_str()) == name).map(|script| {
+        let listed = scripts.errors().into_iter().find(|e| e.script == script);
+        listed.map_or_else(|| "it failed".to_string(), |e| e.error)
+    });
+    if let Some(e) = failed.filter(|_| !found) {
+        return Err(Error::Conflict(format!(
+            "finding {}: its script check failed on the retest's reply (history {row}), so it can't tell whether \
+             the finding is still there; nothing was marked ({})",
+            a.id, e
+        )));
+    }
     // A reply of another kind (a redirect to a login page, an error, a 304 or a 206) can't show
     // the finding: that isn't "fixed".
     if !found && item.entry.status.is_some_and(|w| w != msg.status) {

@@ -39,10 +39,14 @@ pub enum ScanCmd {
         #[arg(long)]
         active: bool,
     },
-    /// Enable passive rules by id, or passive checks by check id.
+    /// Enable passive rules by id, or passive checks by check id (a script check: script:NAME).
     Enable { ids: Vec<String> },
-    /// Disable passive rules by id, or passive checks by check id.
+    /// Disable passive rules by id, or passive checks by check id (a script check: script:NAME).
     Disable { ids: Vec<String> },
+    /// Passive checks you write as scripts: a JavaScript file whose check(exchange) is given
+    /// each recorded request and response and returns findings.
+    #[command(subcommand)]
+    Script(ScriptCmd),
     /// Saved scan policies: which active rules run, at what strength and threshold, for
     /// `scan active --policy NAME`.
     #[command(subcommand)]
@@ -67,6 +71,46 @@ pub enum ScanCmd {
     Prune {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ScriptCmd {
+    /// Add a script as a passive check of this project, or with a name it already has, name its
+    /// file again (after you changed it). Not offered through MCP.
+    #[command(after_help = "The file defines check(exchange). exchange has id, method, url, scheme, host, port, \
+        path, query, status, and request and response, each with headers ([name, value] pairs) and body (text; \
+        bodyBase64 when it isn't text; cut at 2 MiB, with bodyTruncated). It returns nothing, a finding or a list \
+        of findings: { name, risk (info, low, medium, high, critical; default info), confidence (low, medium, high; \
+        default medium), param, evidence, info, description, solution, cwe, id }. Only name is needed; findings \
+        with the same id (or, without one, the same name) are one alert type, script:NAME:ID.\n\
+        This runs code from that file for every exchange the passive scanner reads, with no file or network \
+        access and each call under a time limit. It sends nothing. A call that fails finds nothing, and `scan \
+        passive` lists it under script_errors. The file is pinned by its sha256: if it changes, the check stops \
+        running until you add it again. Switch it off and on with `scan disable script:NAME` and `scan enable \
+        script:NAME`; `scan passive --rescan` runs it over the history there already is.")]
+    Add {
+        /// Its name: letters, digits, '_', '-' and '.'. Its findings' alert refs start with script:NAME.
+        name: String,
+        /// The JavaScript file.
+        file: PathBuf,
+        /// The sha256 the file must have: the one of the text you read.
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
+    },
+    /// List the script checks: file, sha256, whether each is on, and why one doesn't run.
+    List,
+    /// Remove a script check. Its findings stay until a rescan (`scan passive --rescan`), which
+    /// removes the ones nobody triaged, as it does for a rule that is switched off.
+    Remove { name: String },
+    /// Run a script's check on a history row and print the findings it returns. Nothing is
+    /// saved, and nothing is sent. Not offered through MCP.
+    Test {
+        /// The JavaScript file.
+        file: PathBuf,
+        /// The history row whose request and response it is given.
+        #[arg(long)]
+        history: i64,
     },
 }
 
@@ -542,9 +586,12 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
     if let ScanCmd::Policy(cmd) = cmd {
         return crate::policy_cmd::policy(project, cmd, out);
     }
+    if let ScanCmd::Script(cmd) = cmd {
+        return script_cmd(project, cmd, out);
+    }
     let mut store = Store::open(project)?;
     match cmd {
-        ScanCmd::Active(_) | ScanCmd::Data(_) | ScanCmd::Policy(_) => unreachable!(),
+        ScanCmd::Active(_) | ScanCmd::Data(_) | ScanCmd::Policy(_) | ScanCmd::Script(_) => unreachable!(),
         ScanCmd::Passive { rescan } => {
             let stats = if rescan { passive::rescan(&mut store)? } else { passive::scan_pending(&mut store)? };
             out.ok(json!(stats), || {
@@ -553,6 +600,15 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                     text += &format!(
                         "; {removed} not found again and removed, {kept} triaged ones not found again and kept"
                     );
+                }
+                for e in &stats.script_errors {
+                    text += &match e.history_id {
+                        0 => format!("\nwarning: script check {} didn't run: {}", e.script, e.error),
+                        id => format!(
+                            "\nwarning: script check {} failed on {} exchange(s), first history {id}: {}",
+                            e.script, e.count, e.error
+                        ),
+                    };
                 }
                 text
             });
@@ -622,6 +678,20 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                         "alerts": [{"alert_ref": d.alert_ref, "name": d.name, "risk": d.risk.as_str()}],
                     })
                 }))
+                // A script's alert types are whatever it returns: none can be listed before it runs.
+                .chain(settings.scripts.iter().filter(|c| {
+                    filter.as_deref().is_none_or(|f| c.id().to_ascii_lowercase().contains(&f.to_ascii_lowercase()))
+                }).map(|c| {
+                    json!({
+                        "id": c.id(),
+                        "name": format!("Script check {}", c.name),
+                        "check": true,
+                        "script": true,
+                        "enabled": !settings.disabled_checks.contains(&c.id()),
+                        "max_risk": null,
+                        "alerts": [],
+                    })
+                }))
                 .collect();
             out.ok(json!({"count": rules.len(), "sources": settings.sources, "rules": rules}), || {
                 rules
@@ -689,16 +759,23 @@ fn update_disabled(store: &Store, ids: &[String], disable: bool, out: &Out) -> R
         return Err(Error::InvalidInput("give at least one rule id".into()));
     }
     let known: Vec<u32> = passive::all_rules().iter().map(|r| r.id()).collect();
+    let mut settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let (mut rules, mut checks) = (Vec::new(), Vec::new());
     for id in ids {
         match id.parse::<u32>() {
             Ok(n) if known.contains(&n) => rules.push(n),
             Ok(_) => return Err(Error::NotFound(format!("passive rule {id}"))),
             Err(_) if passive::checks().iter().any(|c| c.id() == id) => checks.push(id.clone()),
+            Err(_) if settings.scripts.iter().any(|c| &c.id() == id) => {
+                // Switching a script on has it run: a person's to do, as adding it is.
+                if !disable && settings.disabled_checks.contains(id) {
+                    crate::mcp::check_script(&format!("scan enable {id}: a script check"))?;
+                }
+                checks.push(id.clone())
+            }
             Err(_) => return Err(Error::NotFound(format!("passive rule or check {id}"))),
         }
     }
-    let mut settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     settings.disabled.retain(|d| !rules.contains(d));
     settings.disabled_checks.retain(|d| !checks.contains(d));
     if disable {
@@ -709,6 +786,141 @@ fn update_disabled(store: &Store, ids: &[String], disable: bool, out: &Out) -> R
     settings.disabled_checks.sort();
     store.set_setting(SETTINGS_KEY, &settings)?;
     out.ok(json!(settings), || format!("disabled rules: {:?}", settings.disabled));
+    Ok(())
+}
+
+/// `scan script`: the passive checks a person wrote as scripts.
+fn script_cmd(project: &Path, cmd: ScriptCmd, out: &Out) -> Result<(), Error> {
+    use brainproxy_core::hooks::{Hook, HookKind, ScriptRef};
+    use passive::ScriptCheck;
+    let store = Store::open(project)?;
+    let mut settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
+    // The checks as `scan script list` gives them: with whether each is on and why one doesn't run.
+    let listed = |settings: &PassiveSettings| -> Vec<serde_json::Value> {
+        settings
+            .scripts
+            .iter()
+            .map(|c| {
+                let mut item = json!(c);
+                item["id"] = json!(c.id());
+                item["enabled"] = json!(!settings.disabled_checks.contains(&c.id()));
+                if let Err(problem) = c.script().read() {
+                    item["problem"] = json!(problem);
+                }
+                item
+            })
+            .collect()
+    };
+    let text = |items: &[serde_json::Value]| -> String {
+        if items.is_empty() {
+            return "no script checks".into();
+        }
+        let line = |i: &serde_json::Value| {
+            let mut line = format!(
+                "{:<24} {:<4} {}  sha256 {}",
+                i["id"].as_str().unwrap_or(""),
+                if i["enabled"] == true { "on" } else { "off" },
+                i["file"].as_str().unwrap_or(""),
+                i["sha256"].as_str().unwrap_or("")
+            );
+            if let Some(problem) = i["problem"].as_str() {
+                line.push_str(&format!("\n  warning: it doesn't run: {problem}"));
+            }
+            line
+        };
+        items.iter().map(line).collect::<Vec<_>>().join("\n")
+    };
+    match cmd {
+        ScriptCmd::List => {}
+        ScriptCmd::Add { name, file, sha256 } => {
+            crate::mcp::check_script("scan script add")?;
+            if !ScriptCheck::valid_name(&name) {
+                return Err(Error::InvalidInput(format!(
+                    "{name:?} can't name a script check: use up to 40 letters, digits, '_', '-' and '.'"
+                )));
+            }
+            let script = ScriptRef::pin(&file, sha256.as_deref())?;
+            // Started now, so a script that throws as it loads or has no check function says so here.
+            let hook = Hook::load(HookKind::Check, &script).map_err(Error::InvalidInput)?;
+            hook.verify().map_err(|e| Error::InvalidInput(format!("script {}: {e}", hook.name())))?;
+            let check = ScriptCheck {
+                name: name.clone(),
+                file: script.file,
+                sha256: script.sha256,
+                origin: Some(brainproxy_core::provenance::origin().to_string()),
+            };
+            match settings.scripts.iter_mut().find(|c| c.name == name) {
+                Some(old) => *old = check,
+                None => settings.scripts.push(check),
+            }
+            store.set_setting(SETTINGS_KEY, &settings)?;
+        }
+        ScriptCmd::Remove { name } => {
+            let before = settings.scripts.len();
+            settings.scripts.retain(|c| c.name != name);
+            if settings.scripts.len() == before {
+                return Err(Error::NotFound(format!("script check {name}")));
+            }
+            let id = format!("{}{name}", passive::SCRIPT_PREFIX);
+            settings.disabled_checks.retain(|d| *d != id);
+            store.set_setting(SETTINGS_KEY, &settings)?;
+        }
+        ScriptCmd::Test { file, history } => {
+            crate::mcp::check_script("scan script test")?;
+            let script = ScriptRef::pin(&file, None)?;
+            let name = "test".to_string();
+            let tried = PassiveSettings {
+                disabled: passive::all_rules().iter().map(|r| r.id()).collect(),
+                disabled_checks: passive::checks().iter().map(|c| c.id().to_string()).collect(),
+                scripts: vec![ScriptCheck { name, file: script.file, sha256: script.sha256.clone(), origin: None }],
+                ..Default::default()
+            };
+            let item = store.get(history)?;
+            if item.response.is_empty() {
+                return Err(Error::InvalidInput(format!("history {history} has no response to check")));
+            }
+            let msg =
+                brainproxy_core::scan::Message::from_exchange(history, &item.target, &item.request, &item.response);
+            let scripts = passive::ScriptChecks::load(&tried);
+            let found: Vec<serde_json::Value> = passive::scan_message_with(&msg, &tried, &scripts)
+                .iter()
+                .map(|f| {
+                    json!({
+                        "alert_ref": f.def.alert_ref, "name": f.def.name, "risk": f.risk.as_str(),
+                        "confidence": f.confidence.as_str(), "param": f.param, "evidence": f.evidence,
+                        "info": f.other_info, "description": f.def.description, "solution": f.def.solution,
+                        "cwe": f.def.cwe,
+                    })
+                })
+                .collect();
+            let errors = scripts.errors();
+            let data = json!({"history": history, "sha256": script.sha256, "findings": found, "errors": errors});
+            out.ok(data, || {
+                let mut lines: Vec<String> = found
+                    .iter()
+                    .map(|f| {
+                        let line = format!(
+                            "{} [{}] {} {}",
+                            f["alert_ref"].as_str().unwrap_or(""),
+                            f["risk"].as_str().unwrap_or(""),
+                            f["name"].as_str().unwrap_or(""),
+                            f["evidence"].as_str().unwrap_or("")
+                        );
+                        // What a script found is the target's text: none of it moves the cursor.
+                        crate::output::escape_controls(&line).into_owned()
+                    })
+                    .collect();
+                lines.extend(errors.iter().map(|e| format!("error: {}", e.error)));
+                if lines.is_empty() {
+                    lines.push("no findings".into());
+                }
+                lines.join("\n")
+            });
+            return Ok(());
+        }
+    }
+    let items = listed(&settings);
+    out.ok(json!({"scripts": items}), || text(&items));
     Ok(())
 }
 

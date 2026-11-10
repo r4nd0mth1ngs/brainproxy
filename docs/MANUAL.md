@@ -598,7 +598,8 @@ attack type, and pick payloads:
   - **Numbers:** a range.
   - **File:** a wordlist on disk.
   - **Processing:** each set can be encoded, compressed (gzip, zlib, deflate), hashed, or
-    prefixed.
+    prefixed, or passed through a script of yours (`script:` and the file's full path as a
+    step; see [Scripts](#scripts)).
 - **Matching:** grep for text in responses, extract values, or match status codes.
 - **Encoding:** payloads placed in the URL or a form body are URL-encoded where needed
   (option on by default).
@@ -975,8 +976,12 @@ byte, side by side or unified.
   messages to the server, to the client, or both), and a host regex limits it to some targets.
   Below the list, **Test** tries the rule you are writing, the selected rule, or all enabled
   rules on a message you paste or on a history row, and shows the message after the rules and
-  which rules changed it; nothing is sent. *Copy as JSON* and *Import* move rules between
-  projects through the clipboard. In Traffic, an exchange a rule changed has both versions:
+  which rules changed it; nothing is sent. Choose **Script** in place of **Text** and the
+  replacement is what a JavaScript file of yours returns for each match: the app asks before
+  it adds such a rule, shows in the list which rules run a script and when one is not applied
+  because its file changed, and the tester says when a script failed (see
+  [Scripts](#scripts)). *Copy as JSON* and *Import* move rules between
+  projects through the clipboard; an import that would run scripts names their files first. In Traffic, an exchange a rule changed has both versions:
   *Before rules* and *Sent* on the request, *Received* and *After rules* on the response. See
   [Match-and-replace rules](#match-and-replace-rules-rules).
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
@@ -1070,7 +1075,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 177 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 181 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1255,6 +1260,151 @@ A rule that puts a host the scope doesn't list in the Host header (or makes the 
 target an absolute URL) is checked as before, structured or not: saving it warns a person and
 is refused through MCP without `--host-header-test`, and a request an agent's rule did that to
 isn't sent by the proxy, `send`, a fuzz run or a scan.
+
+`--script FILE` in place of `--replace` has a script make the replacement; see
+[Scripts](#scripts).
+
+### Scripts
+
+Where text isn't enough, three places take a JavaScript file of yours: a match-and-replace
+rule whose replacement is computed, a fuzz payload processor, and a passive check. A script is
+handed data and returns data. It can't send anything, open a file or read the environment, and
+whatever it is handed is read-only.
+
+```sh
+brainproxy rules add --location request-header --name X-Signature --script sign.js \
+    --applies-to proxy,send,fuzz,scan                       # a replacement computed for each request
+brainproxy rules test --history 42 --location request-header --name X-Signature --script sign.js
+brainproxy fuzz run --url 'https://app.test/api?token=§t§' -p file:tokens.txt --process script:wrap.js
+brainproxy scan script add debug-headers checks/debug.js    # a passive check of your own
+brainproxy scan script test checks/debug.js --history 42    # what it finds in one exchange; nothing saved
+```
+
+**A rule's replacement** (`rules add --script FILE`, in place of `--replace`): the file defines
+`replace(match, ctx)`, called for the matches of each message, and what it returns is written
+in place of the match.
+
+```js
+// sign.js: sign the method, path and body of each request with a shared key
+function replace(match, ctx) {
+  const r = ctx.request;
+  return CryptoJS.HmacSHA256(r.method + "\n" + r.path + "\n" + r.body, "shared-key").toString(CryptoJS.enc.Hex);
+}
+```
+
+- `match.text` is what was matched (the whole value where the rule has no `--match`, and empty
+  where the rule adds a header or parameter that isn't there). With a regex, `match.groups` are
+  its groups (`groups[0]` the whole match; a group that took no part is `null`) and
+  `match.named` its named groups. Bytes that aren't UTF-8 are also in `match.base64`.
+- `ctx` has `location`, `name` (the rule's `--name`), `engine` (`proxy`, `send`, `fuzz`, `scan`,
+  `ws-to-server`, `ws-to-client`) and `host`, and the message as it is when the rule gets to it,
+  after the rules before it: for a request location `ctx.request` (`line`, `method`, `target`,
+  `path`, `query`, `headers` as `[name, value]` pairs, `body`, and `bodyBase64` when the body
+  isn't text); for a response location `ctx.response` (`line`, `status`, `headers`, `body`
+  decoded, or `null` when it can't be decoded); for a WebSocket message `ctx.message` (`text`,
+  `base64`). A response rule isn't told the request.
+- It returns a string, `{ base64: "..." }` for bytes, or `null` to leave that match as it is.
+- The rule works in every engine it applies to and in `rules test`, with every location,
+  `--match-kind` and `--action` except `remove` (which writes nothing). All the matches of one
+  value go to the script in one call, so a regex with many matches costs one round trip.
+- What it returns is checked as a rule's text is, when it has run: a line break or NUL for a
+  request's line or headers, or something that is no status for `status`, fails the rule. A Host
+  or absolute URL a script puts in a request is seen by the same checks as a text rule's.
+
+**A fuzz payload processor** (`fuzz run --process script:FILE`, a step like `base64` or
+`prefix:`): the file defines `process(payload, ctx)`, called once for each payload of the set
+before the run starts. `payload` is the payload as text; `ctx.set` is the payload set's number,
+`ctx.index` the payload's place in it, and `ctx.base64` its bytes when it isn't text. It returns
+the payload to send: a string, `{ base64 }`, or `null` to keep it. Steps run left to right, so
+`upper,script:sign.js,url` hands the script upper-cased payloads and URL-encodes what it
+returns; `2=script:sign.js` processes only set 2; a comma in the path is written `\,`. The
+run's `config` in `fuzz_runs` records the file and its sha256 as `process_scripts`.
+
+**A passive check** (`scan script add NAME FILE`): the file defines `check(exchange)`, called
+for each exchange the passive scanner reads, after the built-in rules.
+
+```js
+// debug.js: a debug header on any response
+function check(x) {
+  const header = x.response.headers.find(([name]) => /^x-debug/i.test(name));
+  if (header) return { name: "Debug header in a response", risk: "low", param: header[0], evidence: header[1] };
+}
+```
+
+- `exchange` has `id` (the history row), `method`, `url`, `scheme`, `host`, `port`, `path`,
+  `query`, `status`, and `request` and `response`, each with `headers` (`[name, value]` pairs),
+  `body` (the response's decoded), `bodyBase64` when it isn't text, and `bodyTruncated`: a body
+  is cut at 2 MiB for a script.
+- It returns nothing, one finding or a list (50 at most): `{ name, risk, confidence, param,
+  evidence, info, description, solution, cwe, id }`. Only `name` is needed; `risk` is `info`
+  (the default), `low`, `medium`, `high` or `critical`, and `confidence` `low`, `medium` (the
+  default) or `high`. A field it doesn't know is refused, so a typo doesn't pass for a default.
+- Its findings are stored and reported like a rule's (source `passive`), with alert ref
+  `script:NAME:ID`, where the id is the finding's `id` or made of its name; the description
+  says a user's script raised it, and its tag is `user-script`. Findings of one id are one
+  alert type, whose name, description and solution are the first one's; a script may raise 64
+  types. `scan rules` lists the check as `script:NAME`, `scan disable script:NAME` and `scan
+  enable script:NAME` switch it off and on, `findings retest` runs it again on the reply, and
+  `scan passive --rescan` runs it over the history there already is. `scan script list` shows
+  the checks with their files; `scan script remove NAME` removes one; its findings stay until a rescan, which removes
+  the ones nobody triaged, as for a rule that is switched off.
+
+What every script finds around it: the language itself (no `fetch`, `XMLHttpRequest`, timers
+that wait, modules or `import`), `CryptoJS` (MD5, SHA-1, SHA-256, SHA-384, SHA-512 and their
+HMACs; the Hex, Base64, Base64url, Utf8 and Latin1 encoders), `btoa`, `atob`, `Buffer.from`,
+and `require` for `crypto-js`, `crypto` (`createHash`, `createHmac`, `randomBytes`,
+`randomUUID`) and `uuid`. `console` is there and writes nowhere. A global a script sets stays
+for the next call in the same process, and brainproxy starts and stops those processes as it
+sees fit (up to four a script), so keep nothing in one that a result depends on.
+
+How a script is kept and run:
+
+- **Pinned.** A script stays in its file. Where it is named (`rules add`, `scan script add`),
+  the file's full path and the sha256 of its text are stored, and `--script-sha256 HEX` (or
+  `scan script add --sha256`) refuses a file that isn't the one you read. A file that changes
+  afterwards doesn't run: its rule is left out and listed under `skipped` in `rules list`, its
+  check stops and `scan script list` says why, until you name it again (add the rule again and
+  remove the old one, or `scan script add` with the same name). The pin is checked whenever
+  the rules or checks are loaded: by every command as it starts, and by a running proxy when
+  the project's settings change or it restarts. Between those, a running proxy goes on with
+  the text it pinned; the changed file itself never runs. A `fuzz run` reads its script when it starts. Rules
+  copied to another project or computer carry the path and the pin, not the code.
+- **Contained.** A script runs in the sandbox a signer's Postman script runs in: a memory-safe
+  interpreter with no file, network or process access and no helper that reaches out, in a
+  child process of brainproxy with an empty environment, its memory limited to 1 GiB (as
+  below, for a signer's script) and without `SharedArrayBuffer`, `Atomics` or `Temporal`. It
+  opens no connection, so the engagement scope has nothing to check: all a script can do is
+  change the bytes of a message that goes where it was going, or report a finding.
+- **Bounded.** A script file is at most 1 MiB. Each call (the matches of one value, one
+  payload, one exchange) has 2 seconds, and a process 5 seconds to start; a loop has two million
+  rounds and recursion 200 levels. What a call is handed is at most 16 MiB, and so is what it
+  returns (for a batch of payloads, in all). A rule's script is called for at most 10,000
+  matches in one value, a pattern that matches more often fails as a script does, and a
+  payload set may come to 256 MiB after a script. A process is replaced after its calls have
+  taken 30 seconds in all.
+- **A failure is said, and changes nothing.** A script that throws, returns something of the
+  wrong shape, or reaches for what isn't there fails that call: the rule leaves that message
+  as it is, all of it (a script that fails on the second of two headers changes neither; the
+  rules after it still apply), the fuzz run doesn't start (it names the payload),
+  the check finds nothing in that exchange. A script stopped at the time or memory limit, or
+  one that doesn't load (it throws at the top, or has no function of its kind), runs no more
+  until the command or the proxy starts again (or its rule is switched off and on), so a script that hangs costs its time limit once
+  and not for every request. The failure is on stderr, once for each different one; in `rule_errors` of `send`'s
+  output (in a race, for the requests as they went out) and `errors` of `rules test`'s (the rule's
+  id and why); and in `script_errors` of
+  `scan passive`'s (the script, why, on how many exchanges, and the first history row; the
+  first twenty different failures, with every script that failed in `failed_scripts`). A
+  passive rescan keeps the findings of a script that failed or didn't run, where it removes
+  those of a rule that finds nothing any more. The last failure of each rule's script, in
+  whichever engine, is also kept with the project: `rules list` gives it under `failures`
+  (the rule, why, when, which engine) and the app shows it on the rule's row, until the rule
+  is switched off or on, or removed.
+- **A person's.** Through MCP no script is named: `rules add --script`, `rules test --script`, an
+  import or `rules enable` of a script rule, `fuzz run --process script:`, `scan enable` of a
+  script check, and `scan script add`, `test` and `remove` are refused or not offered. An
+  agent's requests still go through the script rules a person set, as they go through a
+  signer's script, and it can list them, try a saved rule that is switched on with `rules test
+  --rule`, and switch a rule or check off.
 
 ### Who recorded what
 
@@ -1780,9 +1930,9 @@ and targets that want a JWT you choose the claims of:
   `{{name}}` in the request line and in the collection headers that use it (which `import api`
   strips as credentials). Changing the method, URL, host, body, `Content-Length` or cookies fails the
   send, as do `pm.sendRequest`, `pm.cookies`, `pm.vault` and other modules.
-- A script runs in a memory-safe interpreter with no file, network or process access, in a fresh
+- A signer's script runs in a memory-safe interpreter with no file, network or process access, in a fresh
   context per request, with a loop and recursion limit and without `SharedArrayBuffer`, `Atomics` or
-  `Temporal`. Each run is a child process of brainproxy with an empty environment, killed after five
+  `Temporal` (the sandbox the scripts of [Scripts](#scripts) run in too). Each run is a child process of brainproxy with an empty environment, killed after five
   seconds, so a script that never ends (a regex that backtracks, a loop of `await`s) leaves nothing
   running. Its memory is limited to 1 GiB: on Linux as the child's address space, on Windows by a
   job object, and on macOS by brainproxy watching the child's memory and killing it over the limit
@@ -2471,8 +2621,9 @@ An agent that also runs `brainproxy` in a shell counts as `cli` there, as a pers
 it can clear the flag that way; the change is still logged. A request whose Host header names a
 host the scope doesn't list is refused without `host_header_test` (see
 [Concepts](#concepts)). `browser open` isn't offered (the
-project's browser profile keeps the person's sign-ins), and other options that need a person are
-refused too; docs/MCP.md lists them.
+project's browser profile keeps the person's sign-ins), nor is naming a script to run (a rule's
+`--script`, `fuzz run --process script:`, `scan script add`; see [Scripts](#scripts)), and
+other options that need a person are refused too; docs/MCP.md lists them.
 
 ---
 

@@ -507,6 +507,18 @@ fn history_ids(conn: &rusqlite::Connection, id: i64, first: Option<i64>, last: O
     Ok(ids)
 }
 
+/// A clause leaving out the findings whose alert ref starts with one of `keep`, for a statement
+/// whose first parameter is the findings' source; and the statement's parameters.
+fn not_kept(source: &str, keep: &[String]) -> (String, Vec<String>) {
+    let mut clause = String::new();
+    let mut args = vec![source.to_string()];
+    for prefix in keep {
+        args.push(prefix.clone());
+        clause.push_str(&format!(" AND substr(alert_ref, 1, length(?{0})) != ?{0}", args.len()));
+    }
+    (clause, args)
+}
+
 impl Store {
     /// Captures after `after_id` from the given sources, ready for scanning.
     pub fn scan_messages_after(&self, after_id: i64, sources: &[String], limit: usize) -> Result<Vec<Message>> {
@@ -803,9 +815,16 @@ impl Store {
     /// Starts a full rescan of `source` findings: their hit counts go to 0, to be counted again,
     /// and nothing else changes, so a finding found again keeps its id, state, note and who
     /// set them. Returns the highest finding id, to tell new findings from the ones found again.
-    pub(crate) fn findings_rescan_start(&mut self, source: &str) -> Result<i64> {
+    ///
+    /// Findings whose alert ref starts with one of `keep` are left as they are: what found them
+    /// (a script check whose file changed, say) won't run, so the rescan can't count them again.
+    pub(crate) fn findings_rescan_start(&mut self, source: &str, keep: &[String]) -> Result<i64> {
         let tx = self.write_tx()?;
-        tx.execute("UPDATE findings SET hits = 0 WHERE source = ?1", [source])?;
+        let (kept, args) = not_kept(source, keep);
+        tx.execute(
+            &format!("UPDATE findings SET hits = 0 WHERE source = ?1{kept}"),
+            rusqlite::params_from_iter(&args),
+        )?;
         let max: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM findings", [], |r| r.get(0))?;
         tx.commit()?;
         Ok(max)
@@ -814,8 +833,12 @@ impl Store {
     /// Ends a rescan: a finding it didn't find again goes, unless someone triaged it (changed
     /// its state, or wrote or cleared a note). That one stays with 0 hits, so a person's decision isn't lost
     /// to a rescan an agent ran. Returns (removed, kept).
-    pub(crate) fn findings_rescan_finish(&mut self, source: &str) -> Result<(usize, usize)> {
+    ///
+    /// Findings whose alert ref starts with one of `keep` stay whatever the rescan found (see
+    /// [`Store::findings_rescan_start`]): what would have found them again failed or didn't run.
+    pub(crate) fn findings_rescan_finish(&mut self, source: &str, keep: &[String]) -> Result<(usize, usize)> {
         let tx = self.write_tx()?;
+        let (kept_clause, args) = not_kept(source, keep);
         // Clearing a note is a decision too: note_origin says someone touched it.
         // So is anything else on its timeline (a retest, a move to another issue, a ticket) or
         // on its issue's (a title, a rating, a write-up): a record someone made stays. A risk
@@ -825,11 +848,14 @@ impl Store {
                 AND e.kind NOT IN ('created', 'risk'))
             OR EXISTS (SELECT 1 FROM finding_events e WHERE e.finding_id IS NULL AND e.issue_id = findings.issue_id))";
         // A finding that goes takes its timeline and scan observations with it.
-        let gone = format!("SELECT id FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}");
-        tx.execute(&format!("DELETE FROM finding_events WHERE finding_id IN ({gone})"), [source])?;
-        tx.execute(&format!("DELETE FROM scan_observations WHERE finding_id IN ({gone})"), [source])?;
-        let removed =
-            tx.execute(&format!("DELETE FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}"), [source])?;
+        let gone = format!("SELECT id FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}{kept_clause}");
+        let args = || rusqlite::params_from_iter(&args);
+        tx.execute(&format!("DELETE FROM finding_events WHERE finding_id IN ({gone})"), args())?;
+        tx.execute(&format!("DELETE FROM scan_observations WHERE finding_id IN ({gone})"), args())?;
+        let removed = tx.execute(
+            &format!("DELETE FROM findings WHERE source = ?1 AND hits = 0 AND NOT {triaged}{kept_clause}"),
+            args(),
+        )?;
         let kept: i64 = tx.query_row(
             &format!("SELECT count(*) FROM findings WHERE source = ?1 AND hits = 0 AND {triaged}"),
             [source],
@@ -1756,8 +1782,8 @@ mod tests {
         assert!(ids.len() > 1);
         s.finding_mark(ids[0], None, Some("")).unwrap();
         // Nothing is found again: only the finding someone touched stays.
-        s.findings_rescan_start("passive").unwrap();
-        assert_eq!(s.findings_rescan_finish("passive").unwrap(), (ids.len() - 1, 1));
+        s.findings_rescan_start("passive", &[]).unwrap();
+        assert_eq!(s.findings_rescan_finish("passive", &[]).unwrap(), (ids.len() - 1, 1));
         let v = s.finding_get(ids[0]).unwrap();
         assert!(v["note"].is_null() && v["hits"] == 0, "{v}");
     }
@@ -2042,7 +2068,7 @@ mod tests {
         assert_eq!(s.finding_get(id).unwrap()["risk"], "high");
         // A rescan counts afresh, so its first sighting sets the risk (a fixed rule lowers it),
         // and later ones raise it again.
-        s.findings_rescan_start("passive").unwrap();
+        s.findings_rescan_start("passive", &[]).unwrap();
         s.record_findings("passive", &msg, &[rated(Risk::Low)]).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["risk_level"], 1);
         s.record_findings("passive", &msg, &[rated(Risk::Info)]).unwrap();
@@ -2059,8 +2085,8 @@ mod tests {
             [("low".into(), "high".into()), ("high".into(), "low".into()), ("low".into(), "medium".into())]
         );
         // The scanner's own record isn't triage: a rescan that doesn't find it removes it.
-        s.findings_rescan_start("passive").unwrap();
-        s.findings_rescan_finish("passive").unwrap();
+        s.findings_rescan_start("passive", &[]).unwrap();
+        s.findings_rescan_finish("passive", &[]).unwrap();
         assert!(matches!(s.finding_get(id), Err(Error::NotFound(_))));
     }
 }

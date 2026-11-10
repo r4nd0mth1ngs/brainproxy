@@ -8,6 +8,7 @@ import { usePoll } from "../ui/usePoll";
 import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 import { ScanPolicies, usePolicies } from "./ScanPolicies";
 import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
+import { maxRiskLabel, passiveNote, type PassiveStats } from "./scriptChecks";
 
 export interface Job {
   id: number;
@@ -433,7 +434,7 @@ function TargetedPicker({ picks, setPicks }: { picks: Pick[]; setPicks: (p: Pick
   const checkHits = t.length < 2 ? [] : (checks ?? []).filter((c) => hit(c.id, c.name, ...c.tags)).slice(0, 100);
   const has = (kind: Pick["kind"], id: string) => picks.some((p) => p.kind === kind && p.id === id);
   const toggle = (p: Pick) => setPicks(has(p.kind, p.id) ? picks.filter((x) => !(x.kind === p.kind && x.id === p.id)) : [...picks, p]);
-  const asRule = (r: Rule): Pick => ({ kind: "rule", id: String(r.id), name: r.name, risk: r.max_risk });
+  const asRule = (r: Rule): Pick => ({ kind: "rule", id: String(r.id), name: r.name, risk: r.max_risk ?? "info" });
   const asCheck = (c: ListedCheck): Pick => {
     const risky = c.tags.filter((x) => RISKY.includes(x.toLowerCase()));
     return { kind: "check", id: c.id, name: c.name, risk: c.severity, source: store(c.file), risky: risky.length ? risky : undefined };
@@ -954,7 +955,8 @@ interface Rule {
   name: string;
   enabled?: boolean;
   scope?: string;
-  max_risk: Risk;
+  /** Null for a passive check written as a script: its findings say their own risk. */
+  max_risk: Risk | null;
   alerts: { alert_ref: string; name: string; risk: Risk }[];
 }
 
@@ -987,8 +989,8 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
   const runPassive = async (rescan: boolean) => {
     setBusy(true);
     try {
-      const d = await run<{ scanned: number; new_findings: number }>(["scan", "passive", ...(rescan ? ["--rescan"] : [])]);
-      app.toast(`Passive scan: ${d.scanned} captures, ${d.new_findings} new findings`);
+      const note = passiveNote(await run<PassiveStats>(["scan", "passive", ...(rescan ? ["--rescan"] : [])]));
+      app.toast(note.text, note.error ? "error" : undefined);
     } catch (e: any) {
       app.toast(e.message, "error");
     } finally {
@@ -1029,13 +1031,16 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
       key: "risk",
       label: "Max risk",
       width: 90,
-      value: (r) => RISK_RANK[r.max_risk],
-      render: (r) => (
-        <span className="row gap">
-          <span className={`dot-risk risk-${r.max_risk}`} />
-          {r.max_risk}
-        </span>
-      ),
+      value: (r) => (r.max_risk ? RISK_RANK[r.max_risk] : -1),
+      render: (r) =>
+        r.max_risk ? (
+          <span className="row gap">
+            <span className={`dot-risk risk-${r.max_risk}`} />
+            {r.max_risk}
+          </span>
+        ) : (
+          <span className="muted">{maxRiskLabel(r.max_risk)}</span>
+        ),
     },
     ...(kind === "active" ? [{ key: "scope", label: "Scope", width: 70, value: (r: Rule) => r.scope ?? "" }] : []),
     { key: "alerts", label: "Alerts", width: 300, value: (r) => r.alerts.map((a) => a.alert_ref).join(", ") },

@@ -15,7 +15,7 @@ use brainproxy_core::proxy::config::{
     RULE_IDS, SCOPE_KEY,
 };
 use brainproxy_core::proxy::{CertAuthority, ProxyOptions, ProxyState, STATE_KEY};
-use brainproxy_core::rules::{Engine, MatchKind, RuleAction};
+use brainproxy_core::rules::{Engine, MatchKind, ReplaceKind, RuleAction};
 use brainproxy_core::store::{HistoryFilter, Store};
 use brainproxy_core::{codec, Error};
 use clap::{Subcommand, ValueEnum};
@@ -401,6 +401,19 @@ pub struct RuleOptions {
     /// Only for targets whose host matches this regex (case-insensitive).
     #[arg(long)]
     pub host: Option<String>,
+    /// Have a script make the replacement, in place of --replace: a JavaScript file that defines
+    /// `replace(match, ctx)`. It is called for the matches of each message (match.text, and with
+    /// a regex match.groups and match.named; ctx has the location, engine, host and the request
+    /// or response) and returns the text to write, { base64 } for bytes, or null to leave a
+    /// match as it is. This runs code from that file, with no file or network access, each call
+    /// under a time limit; a script that fails leaves the message as it is. The file is pinned
+    /// by its sha256: if it changes, the rule is skipped until it is added again. Not offered
+    /// through MCP.
+    #[arg(long, value_name = "FILE", conflicts_with = "replace")]
+    pub script: Option<PathBuf>,
+    /// The sha256 the script file must have: the one of the text you read.
+    #[arg(long, value_name = "HEX", requires = "script")]
+    pub script_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -2267,7 +2280,16 @@ fn rule_from(
             applies_to.push(e);
         }
     }
+    let script = match &options.script {
+        Some(file) => {
+            crate::mcp::check_script("--script")?;
+            Some(brainproxy_core::hooks::ScriptRef::pin(file, options.script_sha256.as_deref())?)
+        }
+        None => None,
+    };
     Ok(Rule {
+        replacer: if script.is_some() { ReplaceKind::Script } else { ReplaceKind::Text },
+        script,
         matcher: MatchKind::parse(&options.match_kind)?,
         name: options.name,
         action: options.action.as_deref().map(RuleAction::parse).transpose()?,
@@ -2286,10 +2308,13 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         rules.iter().position(|r| r.id == id).ok_or_else(|| Error::NotFound(format!("rule {id}")))
     };
     let mut host_warning = None;
+    // Rules switched on or off by this command.
+    let mut touched = Vec::new();
     match cmd {
         RulesCmd::List => {
             let skipped = skipped_rules(&rules);
-            let data = json!({"rules": rules, "skipped": skipped});
+            let failures = rule_failures(&store, &rules);
+            let data = json!({"rules": rules, "skipped": skipped, "failures": failures});
             out.ok(data, || {
                 let mut text = serde_json::to_string_pretty(&rules).unwrap_or_default();
                 for s in skipped.as_array().into_iter().flatten() {
@@ -2297,6 +2322,15 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
                         "\nwarning: rule {} is skipped: {}",
                         s["id"],
                         s["reason"].as_str().unwrap_or("")
+                    ));
+                }
+                for f in failures.as_array().into_iter().flatten() {
+                    text.push_str(&format!(
+                        "\nwarning: rule {}'s script last failed {} ({}), leaving the message as it was: {}",
+                        f["id"],
+                        f["time"].as_str().unwrap_or(""),
+                        f["engine"].as_str().unwrap_or(""),
+                        f["error"].as_str().unwrap_or("")
                     ));
                 }
                 text
@@ -2326,6 +2360,7 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             rule.enabled = !disabled;
             rule.comment = comment;
             brainproxy_core::proxy::config::validate_rule(&rule)?;
+            brainproxy_core::rules::verify_script(&rule)?;
             // Never one a removed rule had: an old history row's `edited_by` names it.
             rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
             // A disabled rule changes nothing; enabling it is checked.
@@ -2341,7 +2376,12 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             }
             // Checked before any is given an id, so a bad one leaves the rules as they were.
             for rule in &imported {
+                // A rule's script runs code: whoever brings it in must be a person, as for `rules add`.
+                if rule.script.is_some() {
+                    crate::mcp::check_script(&format!("rule {} of the import: a script rule", rule.id))?;
+                }
                 brainproxy_core::proxy::config::validate_rule(rule)
+                    .and_then(|()| brainproxy_core::rules::verify_script(rule))
                     .map_err(|e| Error::InvalidInput(format!("rule {} of the import: {e}", rule.id)))?;
             }
             for mut rule in imported {
@@ -2366,9 +2406,14 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         }
         RulesCmd::Enable { id, host_header_test } => {
             let i = find(&mut rules, id)?;
+            if rules[i].script.is_some() && !rules[i].enabled {
+                crate::mcp::check_script(&format!("rules enable {id}: a script rule"))?;
+            }
             brainproxy_core::proxy::config::validate_rule(&rules[i])?;
+            touched.push(id);
             // Whoever turns a rule on answers for what it changes from then on.
             if !rules[i].enabled {
+                brainproxy_core::rules::verify_script(&rules[i])?;
                 host_warning = check_rule_host(&store, &rules[i], host_header_test, out)?;
                 rules[i].origin = Some(brainproxy_core::provenance::origin().to_string());
                 rules[i].host_header_test = host_header_test;
@@ -2378,11 +2423,15 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Disable { id } => {
             let i = find(&mut rules, id)?;
             rules[i].enabled = false;
+            touched.push(id);
         }
         RulesCmd::Clear => rules.clear(),
     }
     store.set_setting(RULES_KEY, &rules)?;
-    let mut data = json!({"rules": rules});
+    // What a rule's script last failed on says nothing of a rule that is gone, or that was
+    // switched off or on since.
+    brainproxy_core::rules::forget_failures(&store, |id| rules.iter().any(|r| r.id == id) && !touched.contains(&id))?;
+    let mut data = json!({"rules": rules, "skipped": skipped_rules(&rules), "failures": rule_failures(&store, &rules)});
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
     }
@@ -2521,10 +2570,17 @@ fn test_rules(
     let chosen = !test.picked.is_empty() || test.draft.is_some();
     let mut tried: Vec<Rule> = Vec::new();
     for id in &test.picked {
-        tried.push(saved.iter().find(|r| r.id == *id).cloned().ok_or_else(|| Error::NotFound(format!("rule {id}")))?);
+        let rule = saved.iter().find(|r| r.id == *id).cloned().ok_or_else(|| Error::NotFound(format!("rule {id}")))?;
+        // A picked rule is tried whether or not it is enabled: for a script rule a person
+        // switched off, that would be an agent having its script run after all.
+        if rule.script.is_some() && !rule.enabled {
+            crate::mcp::check_script(&format!("rules test --rule {id}: a script rule that is switched off"))?;
+        }
+        tried.push(rule);
     }
     if let Some(draft) = test.draft {
         brainproxy_core::proxy::config::validate_rule(&draft)?;
+        brainproxy_core::rules::verify_script(&draft)?;
         tried.push(draft);
     }
     if !chosen {
@@ -2532,6 +2588,16 @@ fn test_rules(
         let engines: Vec<Engine> = messages.iter().map(|(kind, _)| engine_for(*kind)).collect();
         let applies = |r: &&Rule| r.enabled && r.engines().iter().any(|e| engines.contains(e));
         tried = saved.iter().filter(applies).cloned().collect();
+    }
+    // A rule whose script can't run now is left out as an engine leaves it out; one asked for
+    // by id is what is being tested, so that is an error.
+    let mut skipped = Vec::new();
+    for rule in &tried {
+        match brainproxy_core::rules::script_problem(rule) {
+            Some(why) if chosen => return Err(Error::InvalidInput(format!("rule {}: {why}", rule.id))),
+            Some(why) => skipped.push(json!({"id": rule.id, "reason": why})),
+            None => {}
+        }
     }
     let mut results = serde_json::Map::new();
     let mut texts = Vec::new();
@@ -2564,11 +2630,18 @@ fn test_rules(
         if let Some(original) = &ruled.original {
             result["original"] = body_value(original, max_body);
         }
+        // A rule whose script failed left the message as it was: said, not hidden in "unchanged".
+        if !ruled.failed.is_empty() {
+            result["errors"] = json!(ruled.failed);
+        }
         results.insert(name.to_string(), result);
-        let by = match ruled.ids().as_slice() {
+        let mut by = match ruled.ids().as_slice() {
             [] => "unchanged".to_string(),
             ids => format!("changed by rule {}", ids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),
         };
+        for f in &ruled.failed {
+            by.push_str(&format!("; rule {}'s script failed ({})", f.id, f.error));
+        }
         texts.push(format!("{name}: {by}\n{}", crate::output::escape_lines(&String::from_utf8_lossy(&ruled.bytes))));
         first_bytes.get_or_insert(ruled.bytes);
     }
@@ -2579,14 +2652,37 @@ fn test_rules(
     let mut data = Value::Object(results);
     data["host"] = json!(host);
     data["tried"] = json!(tried.iter().map(|r| r.id).collect::<Vec<_>>());
+    if !skipped.is_empty() {
+        data["skipped"] = json!(skipped);
+    }
     out.ok(data, || texts.join("\n\n"));
     Ok(())
 }
 
-/// The rules the proxy leaves out when it loads them (see [`breaks_head`]), with why.
+/// The last failure noted for each rule's script, for the rules there are (see
+/// [`brainproxy_core::rules::RULE_FAILURES`]): `[{"id", "error", "time", "engine"}]`.
+fn rule_failures(store: &Store, rules: &[Rule]) -> Value {
+    let noted = brainproxy_core::rules::noted_failures(store);
+    let failures = rules.iter().filter_map(|r| {
+        let mut f = noted.get(r.id.to_string())?.clone();
+        f["id"] = json!(r.id);
+        Some(f)
+    });
+    Value::Array(failures.collect())
+}
+
+/// The rules the proxy leaves out when it loads them (see [`breaks_head`], and for a rule's
+/// script [`script_problem`]), with why.
+///
+/// [`script_problem`]: brainproxy_core::rules::script_problem
 fn skipped_rules(rules: &[Rule]) -> Value {
-    let skipped = rules.iter().filter(|r| breaks_head(r)).map(|r| {
-        json!({"id": r.id, "reason": "its replacement holds a line break or NUL, which would start another header"})
+    let skipped = rules.iter().filter_map(|r| {
+        let reason = if breaks_head(r) {
+            "its replacement holds a line break or NUL, which would start another header".to_string()
+        } else {
+            brainproxy_core::rules::script_problem(r).filter(|_| r.enabled)?
+        };
+        Some(json!({"id": r.id, "reason": reason}))
     });
     Value::Array(skipped.collect())
 }

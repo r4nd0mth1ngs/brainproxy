@@ -1510,3 +1510,51 @@ fn a_modern_call_reports_progress_and_can_be_cancelled() {
     assert_eq!(r["id"], id, "{r}");
     assert_modern(&r["result"], true);
 }
+
+#[test]
+fn an_agent_is_offered_no_way_to_run_a_script_of_its_own() {
+    let p = tmp_project("scripts");
+    let dir = p.parent().unwrap().to_path_buf();
+    let script = dir.join("hook.js");
+    std::fs::write(
+        &script,
+        "function replace(m) { return 'x'; }\nfunction process(p) { return p; }\nfunction check() {}",
+    )
+    .unwrap();
+    let script = script.display().to_string();
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    // Reading what script checks there are is offered; adding, trying and removing one is not.
+    assert!(names.contains(&"scan_script_list"), "{names:?}");
+    for hidden in ["scan_script_add", "scan_script_test", "scan_script_remove"] {
+        assert!(!names.contains(&hidden), "{hidden}");
+        let r = m.request("tools/call", json!({"name": hidden, "arguments": {"name": "a", "file": script}}));
+        assert!(r["error"].is_object() || r["result"]["isError"] == true, "{r}");
+    }
+    let (err, env) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{env}");
+    // The options that name a script are refused when a call uses them.
+    let why = "runs code from a file, so it isn't offered through MCP";
+    let (err, env) = m.call("rules_add", json!({"location": "path", "script": script}));
+    assert!(err && env["error"]["message"].as_str().unwrap().contains(why), "{env}");
+    let (err, env) = m.call(
+        "rules_test",
+        json!({"file": "-", "stdin": "GET / HTTP/1.1\r\nHost: h\r\n\r\n", "location": "path", "script": script}),
+    );
+    assert!(err && env["error"]["message"].as_str().unwrap().contains(why), "{env}");
+    let rule = json!([{"location": "path", "pattern": "", "replacer": "script",
+        "script": {"file": script, "sha256": "0".repeat(64)}}]);
+    let (err, env) = m.call("rules_import", json!({"file": "-", "stdin": rule.to_string()}));
+    assert!(err && env["error"]["message"].as_str().unwrap().contains(why), "{env}");
+    let (err, env) = m.call(
+        "fuzz_run",
+        json!({"url": "http://127.0.0.1:9/?a=§1§", "payloads": ["list:a"], "process": [format!("script:{script}")]}),
+    );
+    assert!(err && env["error"]["message"].as_str().unwrap().contains(why), "{env}");
+    let (err, env) = m.call("rules_list", json!({}));
+    assert!(!err && env["data"]["rules"] == json!([]), "{env}");
+    let (err, env) = m.call("scan_script_list", json!({}));
+    assert!(!err && env["data"]["scripts"] == json!([]), "{env}");
+}

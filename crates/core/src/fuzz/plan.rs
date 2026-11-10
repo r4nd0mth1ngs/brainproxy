@@ -300,26 +300,101 @@ pub const PROCESSORS: &[&str] = &[
     "lower",
     "prefix:TEXT",
     "suffix:TEXT",
+    "script:FILE",
 ];
 
-/// Applies a comma-separated processing chain to a payload, left to right.
+/// One built-in step of a processing chain, applied to a payload.
+fn step(step: &str, v: Vec<u8>) -> Result<Vec<u8>> {
+    Ok(match step.split_once(':') {
+        Some(("prefix", x)) => [x.as_bytes(), &v].concat(),
+        Some(("suffix", x)) => [&v[..], x.as_bytes()].concat(),
+        _ => match step {
+            "upper" => v.to_ascii_uppercase(),
+            "lower" => v.to_ascii_lowercase(),
+            "md5" | "sha1" | "sha256" | "sha512" => codec::hash(step, &v)?.into_bytes(),
+            other => codec::encode(other, &v).map_err(|_| {
+                Error::InvalidInput(format!("unknown processor {other:?}; valid: {}", PROCESSORS.join(", ")))
+            })?,
+        },
+    })
+}
+
+/// Applies a comma-separated chain of the built-in processors to a payload, left to right. A
+/// chain with a script step is a [`Chain`]: a script is handed a set's payloads together.
 pub fn process(chain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     let mut v = payload.to_vec();
-    for step in split_chain(chain) {
-        v = match step.split_once(':') {
-            Some(("prefix", x)) => [x.as_bytes(), &v].concat(),
-            Some(("suffix", x)) => [&v[..], x.as_bytes()].concat(),
-            _ => match step.as_str() {
-                "upper" => v.to_ascii_uppercase(),
-                "lower" => v.to_ascii_lowercase(),
-                "md5" | "sha1" | "sha256" | "sha512" => codec::hash(&step, &v)?.into_bytes(),
-                other => codec::encode(other, &v).map_err(|_| {
-                    Error::InvalidInput(format!("unknown processor {other:?}; valid: {}", PROCESSORS.join(", ")))
-                })?,
-            },
-        };
+    for name in split_chain(chain) {
+        if name.starts_with("script:") {
+            return Err(Error::InvalidInput("a script step processes a payload set, not one payload".into()));
+        }
+        v = step(&name, v)?;
     }
     Ok(v)
+}
+
+/// Whether a processing chain has a script step (`script:FILE`), which runs code from a file.
+pub fn names_script(chain: &str) -> bool {
+    split_chain(chain).iter().any(|s| s.starts_with("script:"))
+}
+
+/// A processing chain, read once for a run: its built-in steps and its scripts, each a file
+/// defining `process(payload, ctx)` (see [`crate::hooks`]), read and pinned when the chain is.
+#[derive(Debug, Clone)]
+pub struct Chain {
+    steps: Vec<ChainStep>,
+}
+
+#[derive(Debug, Clone)]
+enum ChainStep {
+    Builtin(String),
+    Script(crate::hooks::ScriptRef, crate::hooks::Hook),
+}
+
+impl Chain {
+    /// Reads `chain`. A `script:FILE` step's file is read and checked to parse; nothing runs.
+    pub fn parse(chain: &str) -> Result<Chain> {
+        let mut steps = Vec::new();
+        for name in split_chain(chain) {
+            steps.push(match name.strip_prefix("script:") {
+                Some(file) => {
+                    let script = crate::hooks::ScriptRef::pin(std::path::Path::new(file), None)?;
+                    let hook = crate::hooks::Hook::load(crate::hooks::HookKind::Process, &script)
+                        .map_err(Error::InvalidInput)?;
+                    ChainStep::Script(script, hook)
+                }
+                None => ChainStep::Builtin(name),
+            });
+        }
+        Ok(Chain { steps })
+    }
+
+    /// The scripts the chain runs, as they were read: a run records them.
+    pub fn scripts(&self) -> Vec<&crate::hooks::ScriptRef> {
+        self.steps
+            .iter()
+            .filter_map(|s| match s {
+                ChainStep::Script(script, _) => Some(script),
+                ChainStep::Builtin(_) => None,
+            })
+            .collect()
+    }
+
+    /// Applies the chain to every payload of set `set` (counted from 1), left to right. A script
+    /// that fails on a payload (it throws, runs past its time limit, or returns something that
+    /// isn't a payload) fails the chain: no run starts on half-processed payloads.
+    pub fn apply(&self, set: usize, payloads: &mut [Vec<u8>]) -> Result<()> {
+        for s in &self.steps {
+            match s {
+                ChainStep::Builtin(name) => {
+                    for p in payloads.iter_mut() {
+                        *p = step(name, std::mem::take(p))?;
+                    }
+                }
+                ChainStep::Script(_, hook) => hook.process(set, payloads)?,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Splits on commas, except inside prefix:/suffix: arguments where `\,` escapes a comma.
@@ -426,5 +501,43 @@ mod tests {
         for kind in codec::ENCODINGS {
             assert!(PROCESSORS.contains(kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn a_script_is_a_step_of_a_chain() {
+        let (script, dir) = crate::hooks::tests::script_file(
+            "function process(payload, ctx) {
+                if (payload === 'BAD') throw new Error('no ' + payload);
+                return ctx.set + '.' + ctx.index + ':' + CryptoJS.MD5(payload).toString().slice(0, 4) + payload;
+            }",
+        );
+        crate::sandbox::tests::use_test_runner();
+        let file = script.file.display().to_string();
+        // A comma in the path is escaped, as in prefix: and suffix:.
+        assert!(names_script(&format!("upper,script:{}", file.replace(',', "\\,"))) && !names_script("upper,md5"));
+        let chain = Chain::parse(&format!("upper,script:{file},base64")).unwrap();
+        assert_eq!(chain.scripts(), [&script]);
+        let mut set = vec![b"a".to_vec(), b"b".to_vec()];
+        chain.apply(2, &mut set).unwrap();
+        let want = |i: usize, p: &str| {
+            let md5 = codec::hash("md5", p.as_bytes()).unwrap();
+            codec::encode("base64", format!("2.{i}:{}{p}", &md5[..4]).as_bytes()).unwrap()
+        };
+        assert_eq!(set, [want(0, "A"), want(1, "B")]);
+        // A payload the script fails on fails the chain, and says which.
+        let mut set = vec![b"a".to_vec(), b"bad".to_vec()];
+        let e = chain.apply(1, &mut set).unwrap_err().to_string();
+        assert!(e.contains("payload 2 of set 1") && e.contains("no BAD"), "{e}");
+        // One payload alone has no script step, and a script that isn't there is no chain.
+        assert!(process(&format!("script:{file}"), b"x").is_err());
+        assert!(Chain::parse("script:/nonexistent/x.js").unwrap_err().to_string().contains("can't be read"));
+        let _ = std::fs::remove_dir_all(dir);
+        // A script with no process function fails the chain before any payload is changed.
+        let (script, dir) = crate::hooks::tests::script_file("function replace(m) { return 'x'; }");
+        let chain = Chain::parse(&format!("script:{}", script.file.display())).unwrap();
+        let mut set = vec![b"a".to_vec()];
+        assert!(chain.apply(1, &mut set).unwrap_err().to_string().contains("it defines no process function"));
+        assert_eq!(set, [b"a".to_vec()]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
