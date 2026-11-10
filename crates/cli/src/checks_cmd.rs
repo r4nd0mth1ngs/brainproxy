@@ -154,7 +154,8 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
     match cmd {
         ChecksCmd::List(a) => list(project, home, a, out),
         ChecksCmd::Validate { paths, limit, check_vars } => {
-            let paths = paths.iter().map(|p| local_template(project, "checks validate", p)).collect::<Result<Vec<_>, _>>()?;
+            let paths =
+                paths.iter().map(|p| local_template(project, "checks validate", p)).collect::<Result<Vec<_>, _>>()?;
             let opts = checks::LoadOptions { vars: check_vars, oob: oob_running(project), ..Default::default() };
             let loaded = checks::load(&paths, &opts)?;
             let files: Vec<_> = loaded
@@ -341,7 +342,10 @@ fn feed(cmd: FeedCmd, out: &Out) -> Result<(), Error> {
             });
         }
         FeedCmd::Verify { dir } => {
-            crate::mcp::check_local_folder("checks feed verify", "`checks update --source brainproxy` checks the feed it downloads")?;
+            crate::mcp::check_local_folder(
+                "checks feed verify",
+                "`checks update --source brainproxy` checks the feed it downloads",
+            )?;
             let read = |n: &str| {
                 std::fs::read(dir.join(n)).map_err(|e| Error::NotFound(format!("{}: {e}", dir.join(n).display())))
             };
