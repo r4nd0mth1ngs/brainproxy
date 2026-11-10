@@ -2871,3 +2871,18 @@ button.chip {
 .warn-text {
   color: var(--medium);
 }
+
+/* Proxy › Traffic › Export (views/TrafficExport.tsx). */
+.export-dialog {
+  width: min(560px, 100%);
+}
+.export-dialog .export-mask {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+  color: var(--muted);
+}
+.export-dialog p.export-problem {
+  margin: 0 0 12px;
+  color: var(--high);
+}

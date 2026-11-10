@@ -48,6 +48,7 @@ import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, 
 import { EventStreams } from "./EventStreams";
 import { ruleEditNote } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
+import { TrafficExport } from "./TrafficExport.tsx";
 
 export function ProxyView() {
   const app = useApp();
@@ -223,6 +224,7 @@ function History() {
   }, [app.project]);
   // The saved filter last chosen or saved, so two with the same state stay apart.
   const [picked, setPicked] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   const lastId = useRef(0);
   const { menu, open, close } = useMenu();
   // Opened to show one source's requests: that source alone, and none of them hidden by another filter.
@@ -524,6 +526,11 @@ function History() {
         <button className="btn" disabled={!applied} onClick={deleteFilter} title={applied ? `Delete the saved filter ${applied}` : "Pick a saved filter to delete it"}>
           Delete
         </button>
+        <span className="sep" />
+        <button className="btn" onClick={() => setExporting(true)} title="Save what the filter shows as a HAR file, secrets masked">
+          Export…
+        </button>
+        {exporting && <TrafficExport filter={filter} shown={shown.length} close={() => setExporting(false)} />}
         <div className="toolbar-end">
           <span className={found?.error && isCurrent(found, filter) ? "s5" : "muted"} aria-live="polite">
             {note}
