@@ -2886,3 +2886,48 @@ button.chip {
   margin: 0 0 12px;
   color: var(--high);
 }
+
+/* Scans › Rules › Passive: script checks (views/ScriptChecks.tsx). */
+.script-checks {
+  list-style: none;
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.script-checks li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+  min-width: 0;
+}
+.script-checks li > .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.script-dialog {
+  width: min(640px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.script-dialog .form {
+  grid-template-columns: 1fr;
+  max-width: none;
+  margin-bottom: 12px;
+}
+.script-dialog p.script-error {
+  margin: 0 0 12px;
+  color: var(--high);
+  white-space: pre-wrap;
+}
+.script-dialog .script-test {
+  margin: 0 0 12px;
+}
+.script-dialog .script-test p,
+.script-dialog .script-test ul {
+  margin: 0 0 6px;
+}
+.script-dialog .script-test ul {
+  padding-left: 20px;
+}

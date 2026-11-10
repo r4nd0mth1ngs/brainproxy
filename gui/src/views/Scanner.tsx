@@ -8,7 +8,8 @@ import { usePoll } from "../ui/usePoll";
 import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 import { ScanPolicies, usePolicies } from "./ScanPolicies";
 import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
-import { maxRiskLabel, passiveNote, type PassiveStats } from "./scriptChecks";
+import { maxRiskLabel, passiveNote, SCRIPT_LIST_ARGS, type PassiveStats, type ScriptCheck } from "./scriptChecks.ts";
+import { AddScriptCheck, ScriptChecks } from "./ScriptChecks.tsx";
 
 export interface Job {
   id: number;
@@ -969,12 +970,19 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
   const [filter, setFilter] = useState("");
   const [passive, refreshPassive] = usePoll<{ rules: Rule[]; sources: string[] }>(() => run(["scan", "rules"]), 15000, p.active);
   const [activeRules] = usePoll<{ rules: Rule[] }>(() => run(["scan", "rules", "--active"]), 60000, p.active);
+  const [scripts, refreshScripts] = usePoll<{ scripts: ScriptCheck[] }>(() => run(SCRIPT_LIST_ARGS), 15000, p.active && kind === "passive");
+  const scriptsChanged = () => {
+    refreshScripts();
+    refreshPassive();
+  };
   const [busy, setBusy] = useState(false);
 
   const call = async (args: string[]) => {
     try {
       await run(args);
       refreshPassive();
+      // A script check switched on or off: its row in the list above says so too.
+      if (args[1] === "enable" || args[1] === "disable") refreshScripts();
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -1070,6 +1078,7 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
               ))}
             </div>
             <div className="toolbar-end">
+              <AddScriptCheck scripts={scripts?.scripts ?? []} changed={scriptsChanged} />
               <button className="btn" disabled={busy} onClick={() => runPassive(false)}>
                 Run passive scan now
               </button>
@@ -1091,6 +1100,7 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
           </>
         )}
       </div>
+      {kind === "passive" && <ScriptChecks scripts={scripts?.scripts ?? []} changed={scriptsChanged} />}
       <DataTable rows={rows} columns={columns} rowKey={(r) => r.id} initialSort={{ key: "id", desc: false }} empty="No rules match." />
     </div>
   );
