@@ -82,7 +82,7 @@ export function SettingsView() {
       {sub === "proxy" && <ProxySetup />}
       {sub === "connections" && <Connections />}
       {sub === "ca" && <Ca />}
-      {sub === "updates" && <RuleData />}
+      {sub === "updates" && <RulesAndUpdates />}
       {sub === "project" && <Project />}
       {sub === "licenses" && <Licenses />}
     </div>
@@ -1162,7 +1162,7 @@ interface DataFile {
   embedded_entries: number;
 }
 
-function RuleData() {
+function RulesAndUpdates() {
   const app = useApp();
   const exec = useRunner();
   const [checks, setChecks] = useState<ChecksStatus | null>(null);
