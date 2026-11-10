@@ -46,7 +46,7 @@ import {
 } from "./trafficFilter";
 import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
 import { EventStreams } from "./EventStreams";
-import { ruleEditNote } from "./matchReplace";
+import { ruleEditNote } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {

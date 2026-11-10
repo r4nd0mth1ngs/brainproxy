@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { cli, run, withScheme } from "../api";
 import { useApp } from "../store";
 import { startProxy } from "./proxyPort";
-import { finishCall, logsIn, modeText, passkeyLine, startArgs, type PasskeyInfo, type RecordMode } from "./recordLogin";
+import { finishCall, logsIn, modeText, passkeyLine, startArgs, type PasskeyInfo, type RecordMode } from "./recordLogin.ts";
 import { loadSuggestions } from "./Scanner";
 
 interface Proposal {

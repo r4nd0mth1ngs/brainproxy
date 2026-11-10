@@ -26,9 +26,9 @@ import {
   type ProxySetup,
   type Refusal,
 } from "./proxyMode";
-import { RecordLogin } from "./RecordLogin";
-import { MatchReplace } from "./MatchReplace";
-import { TOTP_ENV, passkeyLine, type PasskeyInfo } from "./recordLogin";
+import { RecordLogin } from "./RecordLogin.tsx";
+import { MatchReplace } from "./MatchReplace.tsx";
+import { TOTP_ENV, passkeyLine, type PasskeyInfo } from "./recordLogin.ts";
 import { AppUpdateSettings } from "./AppUpdate";
 import {
   EMPTY_CERT,

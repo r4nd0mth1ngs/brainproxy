@@ -41,7 +41,7 @@ import {
   type Skipped,
   type TestResult,
   type TestWhat,
-} from "./matchReplace";
+} from "./matchReplace.ts";
 
 const GROUPS = ["Request", "Response", "WebSocket"];
 
