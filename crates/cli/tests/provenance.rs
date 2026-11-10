@@ -336,7 +336,8 @@ fn a_foreign_host_is_sent_with_a_warning_but_an_agent_must_say_it_is_a_test() {
     assert_ne!(code, 0);
     assert!(v["error"]["message"].as_str().unwrap().contains("--host-header-test"), "{v}");
     // So is an absolute request target naming another host, sent to an in-scope one.
-    let raw = std::env::temp_dir().join(format!("bp-prov-{}-host.http", std::process::id()));
+    // In the project's folder: through MCP a request file is read only from there.
+    let raw = env.project.with_extension("host.http");
     std::fs::write(&raw, "GET http://other-tenant.test/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
     let raw_send = ["send", raw.to_str().unwrap(), "--target", &url];
     let (code, v, _) = env.run(&agent, &raw_send);
