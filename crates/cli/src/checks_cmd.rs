@@ -140,7 +140,8 @@ pub struct UpdateArgs {
 /// [`crate::mcp::local_document`]), as a template's requests are sent and its errors read back;
 /// a folder is refused, as a link inside it could lead out of the project's.
 pub(crate) fn local_template(project: &Path, flag: &str, path: &Path) -> Result<PathBuf, Error> {
-    let instead = "put the template there, or use a store (nuclei, brainproxy, local) a person filled";
+    let instead = "use a store (nuclei, brainproxy, local) a person filled; through MCP a template is a file, \
+                   never a folder, which a person can still give in the app or a terminal";
     let file = crate::mcp::local_path(project, flag, path, instead)?;
     if crate::mcp::in_tool_call() && file.is_dir() {
         return Err(Error::InvalidInput(format!(
