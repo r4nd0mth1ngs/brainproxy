@@ -20,6 +20,8 @@ export interface MatrixRequest {
   cells: Record<string, MatrixCell>;
   /** Why there is nothing to compare (`skipped: …`, `error: …`). */
   skipped?: string;
+  /** Why it is noise (`authz matrix --all`): a static asset, or a request matching a skip path. */
+  hidden?: string;
 }
 
 export interface Matrix {
@@ -27,6 +29,8 @@ export interface Matrix {
   identities: string[];
   requests: MatrixRequest[];
   truncated: boolean;
+  /** Requests left out as noise (without `--all`). */
+  hidden_requests?: { static_assets: number; skip_paths: number };
 }
 
 export interface AuthzRun {
@@ -71,6 +75,8 @@ export interface GridCell {
 
 export interface GridRow {
   key: string;
+  /** Why it is noise, or null. */
+  hidden: string | null;
   method: string;
   url: string;
   owner: string;
@@ -86,19 +92,41 @@ export interface Grid {
   /** Identities as columns: `anonymous` first, then the order the run used. */
   columns: string[];
   rows: GridRow[];
-  /** Cells per kind, skipped rows not included. */
+  /** Cells per kind, skipped rows and noise not included (noise is when it is shown). */
   counts: Record<CellKind, number>;
   skipped: number;
+  /** Noise rows (static assets, skip paths), shown or not. */
+  hidden: number;
+  /** Rows left out because they show no issue (`issuesOnly`). */
+  quiet: number;
 }
 
 const rank = (k: CellKind) => KINDS.indexOf(k);
 
-/** The matrix as rows of cells, optionally only rows with a cell of `only` and worst rows first. */
-export function grid(m: Matrix, opts: { only?: CellKind | null; worstFirst?: boolean } = {}): Grid {
+/** What counts as an issue: a bypass, or a response anyone gets without a session. */
+export const ISSUE_KINDS: CellKind[] = ["bypass-high", "bypass-medium", "bypass-low", "public"];
+
+export interface GridOptions {
+  /** Only rows with a cell of this kind (overrides `issuesOnly`). */
+  only?: CellKind | null;
+  worstFirst?: boolean;
+  /** Only rows with an issue (ISSUE_KINDS). */
+  issuesOnly?: boolean;
+  /** Also rows that are noise: static assets and requests matching a skip path. */
+  showHidden?: boolean;
+}
+
+/**
+ * The matrix as rows of cells: without noise unless `showHidden`, only rows with an issue when
+ * `issuesOnly`, only rows with a cell of `only`, and worst rows first.
+ */
+export function grid(m: Matrix, opts: GridOptions = {}): Grid {
   const columns = [...m.identities.filter((i) => i === "anonymous"), ...m.identities.filter((i) => i !== "anonymous")];
   const counts = Object.fromEntries(KINDS.map((k) => [k, 0])) as Record<CellKind, number>;
   let skipped = 0;
-  let rows: GridRow[] = m.requests.map((r, i) => {
+  const hidden = m.requests.filter((r) => r.hidden).length;
+  const requests = opts.showHidden ? m.requests : m.requests.filter((r) => !r.hidden);
+  let rows: GridRow[] = requests.map((r, i) => {
     const cells = columns.map((identity): GridCell => {
       const c = r.cells[identity];
       const kind = cellKind(c);
@@ -110,6 +138,7 @@ export function grid(m: Matrix, opts: { only?: CellKind | null; worstFirst?: boo
     const worst = r.skipped ? "none" : cells.reduce<CellKind>((w, c) => (rank(c.kind) < rank(w) ? c.kind : w), "none");
     return {
       key: `${i}:${r.source_id ?? ""}:${r.method} ${r.url}`,
+      hidden: r.hidden ?? null,
       method: r.method,
       url: r.url,
       owner: r.owner,
@@ -120,9 +149,41 @@ export function grid(m: Matrix, opts: { only?: CellKind | null; worstFirst?: boo
       worst,
     };
   });
+  let quiet = 0;
   if (opts.only) rows = rows.filter((r) => r.cells.some((c) => c.kind === opts.only));
+  else if (opts.issuesOnly) {
+    const all = rows.length;
+    rows = rows.filter((r) => ISSUE_KINDS.includes(r.worst));
+    quiet = all - rows.length;
+  }
   if (opts.worstFirst) rows = rows.map((r, i) => [r, i] as const).sort((a, b) => rank(a[0].worst) - rank(b[0].worst) || a[1] - b[1]).map(([r]) => r);
-  return { columns, rows, counts, skipped };
+  return { columns, rows, counts, skipped, hidden, quiet };
+}
+
+/** A run's `skipped` counts (its summary) or a live run's progress, as what wasn't tested and why. */
+export function notTested(counts: Record<string, unknown> | null | undefined): string {
+  if (!counts) return "";
+  const n = (...keys: string[]) => keys.reduce((sum, k) => sum + (typeof counts[k] === "number" ? (counts[k] as number) : 0), 0);
+  const parts: [number, string][] = [
+    [n("static_assets", "skipped_static"), "static assets"],
+    [n("skip_paths", "skipped_skip_paths"), "skip paths"],
+    [n("head_options", "skipped_head_options"), "HEAD/OPTIONS"],
+    [n("excluded_paths", "skipped_excluded_paths"), "logout paths"],
+    [n("methods", "skipped_methods"), "other methods"],
+    [n("no_credentials", "skipped_no_credentials"), "no credentials"],
+  ];
+  const text = parts.filter(([k]) => k > 0).map(([k, what]) => `${k} ${what}`);
+  return text.length ? `not tested: ${text.join(" · ")}` : "";
+}
+
+/** Skip paths as typed, one per line: trimmed, without blanks or repeats. */
+export function parseSkipPaths(text: string): string[] {
+  return [...new Set(text.split("\n").map((l) => l.trim()).filter(Boolean))];
+}
+
+/** `authz skip set` for these paths; none clears the list. */
+export function skipSetArgs(paths: string[]): string[] {
+  return paths.length ? ["authz", "skip", "set", "--", ...paths] : ["authz", "skip", "set"];
 }
 
 /** What a run picker shows for a run: id, live or not, state and the bypass count. */
@@ -150,6 +211,8 @@ export interface RunForm {
   /** Comma-separated cookie names that aren't credentials. */
   keepCookies: string;
   rate: string;
+  /** Test static assets too (left out by default). */
+  includeStatic: boolean;
 }
 
 /** The form once a run has started: the requests from Traffic are dropped, so the next run doesn't start on them. */
@@ -209,22 +272,28 @@ export function runArgs(f: RunForm, confirmed = false): string[] {
   if (cookies.length) args.push(`--keep-cookie=${cookies.join(",")}`);
   const rate = rateOf(f.rate);
   if (rate != null) args.push(`--rate=${rate}`);
+  // Requests from Traffic are tested as they are, static or not.
+  if (f.includeStatic && f.select !== "history") args.push("--include-static");
   return args;
 }
 
-/** `proxy start` options for live testing with the form's identities, cookies and rate. Throws like `runArgs`. */
-export function liveArgs(f: Pick<RunForm, "identities" | "anonymous" | "keepCookies" | "rate">): string[] {
+/** `proxy start` options for live testing with the form's identities, cookies, rate and static assets. Throws like `runArgs`. */
+export function liveArgs(f: Pick<RunForm, "identities" | "anonymous" | "keepCookies" | "rate" | "includeStatic">): string[] {
   if (!f.identities.length && !f.anonymous) throw new Error("Pick at least one identity, or keep the anonymous control on");
   const args = [`--authz=${[...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(",")}`];
   const cookies = cookieNames(f.keepCookies);
   if (cookies.length) args.push(`--authz-keep-cookie=${cookies.join(",")}`);
   const rate = rateOf(f.rate);
   if (rate != null) args.push(`--authz-rate=${rate}`);
+  if (f.includeStatic) args.push("--authz-include-static");
   return args;
 }
 
 /** `proxy run` options that take a value; the others (--verify-tls, --no-http2, --invisible) are flags. */
-const VALUE_OPTIONS = ["--listen", "--timeout", "--wait", "--log", "--auth", "--redirect", "--authz", "--authz-rate", "--authz-queue", "--authz-exclude", "--authz-keep-cookie"];
+const VALUE_OPTIONS = ["--listen", "--timeout", "--wait", "--log", "--auth", "--redirect", "--authz", "--authz-rate", "--authz-queue", "--authz-exclude", "--authz-keep-cookie", "--authz-skip-path"];
+
+/** Live options the form sets whether on or off: an old one goes when the form leaves it off. */
+const FORM_FLAGS = ["--authz-include-static"];
 
 /**
  * The options a running proxy was started with (its `proxy run` arguments, from `proxy status`), as
@@ -244,8 +313,8 @@ export function proxyOptions(args: string[]): string[] {
   return out;
 }
 
-/** `options` from `proxyOptions` with `live` from `liveArgs` on top: what `live` doesn't set (the queue, the exclude) stays. */
+/** `options` from `proxyOptions` with `live` from `liveArgs` on top: what `live` doesn't set (the queue, the exclude, skip paths) stays. */
 export function withLive(options: string[], live: string[]): string[] {
-  const names = live.map((o) => o.split("=", 1)[0]);
+  const names = [...live.map((o) => o.split("=", 1)[0]), ...FORM_FLAGS];
   return [...options.filter((o) => !names.includes(o.split("=", 1)[0])), ...live];
 }

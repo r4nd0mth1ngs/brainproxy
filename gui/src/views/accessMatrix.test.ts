@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { afterStart, cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
+import { afterStart, cellKind, grid, hostOf, liveArgs, notTested, parseSkipPaths, proxyOptions, runArgs, runLabel, skipSetArgs, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
 
 const cell = (verdict: string, status: number | null, history_id: number, confidence: string | null = null) => ({ verdict, confidence, status, history_id });
 
@@ -100,7 +100,46 @@ test("rows can be filtered by kind and sorted worst first", () => {
   assert.deepEqual(grid(matrix, { worstFirst: true }).rows.map((r) => r.url.split("/").pop()), ["1", "dashboard", "me", "9"]);
 });
 
-const form: RunForm = { identities: ["bob", "carol"], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
+test("noise is hidden unless asked for, and only rows with an issue are shown when asked", () => {
+  const m: Matrix = {
+    ...matrix,
+    requests: [
+      ...matrix.requests,
+      { source_id: 7, method: "GET", url: "http://shop.test/static/app.js", owner: "alice", baseline_history_id: 70, baseline_status: 200, cells: { anonymous: cell("public", 200, 71), bob: cell("public", 200, 72) }, hidden: "static asset (Content-Type text/javascript)" },
+      { source_id: 8, method: "GET", url: "http://shop.test/robots.txt", owner: "alice", baseline_history_id: 80, baseline_status: 200, cells: { anonymous: cell("public", 200, 81) }, hidden: "skip path /robots.txt$" },
+    ],
+  };
+  const g = grid(m);
+  assert.equal(g.rows.length, 4, "noise left out");
+  assert.equal(g.hidden, 2);
+  assert.equal(g.counts.public, 1, "noise isn't counted");
+  const all = grid(m, { showHidden: true });
+  assert.equal(all.rows.length, 6);
+  assert.equal(all.counts.public, 4);
+  assert.equal(all.rows[4].hidden, "static asset (Content-Type text/javascript)");
+  assert.equal(all.rows[0].hidden, null);
+  // Issues only: a bypass or public row; the others are counted.
+  const issues = grid(m, { issuesOnly: true });
+  assert.deepEqual(issues.rows.map((r) => r.url.split("/").pop()), ["1", "dashboard"]);
+  assert.equal(issues.quiet, 2);
+  assert.equal(grid(m, { issuesOnly: true, showHidden: true }).rows.length, 4);
+  // A verdict picked shows its rows whatever issuesOnly says.
+  const enforced = grid(m, { issuesOnly: true, only: "enforced" });
+  assert.equal(enforced.rows.length, 2);
+  assert.equal(enforced.quiet, 0);
+});
+
+test("what a run left out, and skip paths as typed", () => {
+  assert.equal(notTested({ static_assets: 12, skip_paths: 3, head_options: 1, duplicates: 4, noise_hint: "…" }), "not tested: 12 static assets · 3 skip paths · 1 HEAD/OPTIONS");
+  assert.equal(notTested({ tested: 2, skipped_static: 5, skipped_skip_paths: 1, skipped_no_credentials: 2 }), "not tested: 5 static assets · 1 skip paths · 2 no credentials");
+  assert.equal(notTested({}), "");
+  assert.equal(notTested(null), "");
+  assert.deepEqual(parseSkipPaths(" /static/ \n\n*/health$\n/static/\n"), ["/static/", "*/health$"]);
+  assert.deepEqual(skipSetArgs(["/a", "-weird"]), ["authz", "skip", "set", "--", "/a", "-weird"]);
+  assert.deepEqual(skipSetArgs([]), ["authz", "skip", "set"]);
+});
+
+const form: RunForm = { identities: ["bob", "carol"], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "", includeStatic: false };
 
 test("a run's arguments come from the form", () => {
   assert.deepEqual(runArgs(form), ["authz", "run", "--as=bob,carol"]);
@@ -126,6 +165,9 @@ test("a run's arguments come from the form", () => {
   ];
   assert.deepEqual(runArgs({ ...form, select: "history", history }), ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8"]);
   assert.throws(() => runArgs({ ...form, select: "history" }), /No request picked/);
+  // Static assets on request; requests from Traffic are tested as they are anyway.
+  assert.deepEqual(runArgs({ ...form, includeStatic: true }), ["authz", "run", "--as=bob,carol", "--include-static"]);
+  assert.deepEqual(runArgs({ ...form, includeStatic: true, select: "history", history }), ["authz", "run", "--as=bob,carol", "--history-id=4", "--history-id=8"]);
 });
 
 test("requests from Traffic: by id only, and only while that selection is on", () => {
@@ -181,6 +223,7 @@ test("live testing options, and the running proxy's options kept on a restart", 
   assert.deepEqual(liveArgs({ ...form, anonymous: false, identities: ["bob"], keepCookies: "lang, theme", rate: "2.5" }), ["--authz=bob", "--authz-keep-cookie=lang,theme", "--authz-rate=2.5"]);
   assert.throws(() => liveArgs({ ...form, rate: "oops" }), /Rate/);
   assert.throws(() => liveArgs({ ...form, rate: "-1" }), /Rate/);
+  assert.deepEqual(liveArgs({ ...form, includeStatic: true }), ["--authz=anonymous,bob,carol", "--authz-include-static"]);
   const args = ["proxy", "run", "--listen", "127.0.0.1:8080", "--timeout", "30", "--log", "/p.proxy.log", "--verify-tls", "--auth", "alice", "--authz", "bob", "--authz-rate=5", "--no-http2"];
   assert.deepEqual(proxyOptions(args), ["--timeout=30", "--verify-tls", "--auth=alice", "--authz=bob", "--authz-rate=5", "--no-http2"]);
   // What the form doesn't set stays; what it sets replaces the old value.
@@ -188,6 +231,11 @@ test("live testing options, and the running proxy's options kept on a restart", 
   assert.deepEqual(withLive(live, ["--authz=carol"]), ["--timeout=30", "--verify-tls", "--auth=alice", "--authz-rate=5", "--no-http2", "--authz-queue=50", "--authz-exclude=(?i)a=b", "--authz=carol"]);
   assert.deepEqual(withLive(live, ["--authz=carol", "--authz-rate=2"]).filter((o) => o.startsWith("--authz-rate")), ["--authz-rate=2"]);
   assert.deepEqual(proxyOptions([]), []);
+  // Static assets follow the form, on or off; skip paths given on the command line stay.
+  const was = proxyOptions(["proxy", "run", "--authz", "bob", "--authz-include-static", "--authz-skip-path", "/x/", "--authz-skip-path=/y/"]);
+  assert.deepEqual(was, ["--authz=bob", "--authz-include-static", "--authz-skip-path=/x/", "--authz-skip-path=/y/"]);
+  assert.deepEqual(withLive(was, ["--authz=carol"]), ["--authz-skip-path=/x/", "--authz-skip-path=/y/", "--authz=carol"]);
+  assert.deepEqual(withLive(was, ["--authz=carol", "--authz-include-static"]), ["--authz-skip-path=/x/", "--authz-skip-path=/y/", "--authz=carol", "--authz-include-static"]);
   // Invisible mode is a flag, the redirect takes a value.
   assert.deepEqual(proxyOptions(["proxy", "run", "--invisible", "--redirect", "https://app.test", "--no-http2"]), ["--invisible", "--redirect=https://app.test", "--no-http2"]);
 });

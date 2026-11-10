@@ -408,7 +408,8 @@ brainproxy auth rule list app
 # scope-checked like everything else.
 
 # Access control across users (IDOR, missing authorization): re-send what alice did as bob and with
-# no session, compare with alice's responses. Only GET/HEAD/OPTIONS from history unless --include-methods.
+# no session, compare with alice's responses. Only GET from history unless --include-methods; static
+# assets (--include-static) and the skip paths (authz skip list: robots.txt, health checks, ...) are left out.
 brainproxy auth add bob --login-url https://app.example.com/login ... --username bob --password-env BOB_PW
 brainproxy authz run --as bob --where "host = 'app.example.com'"   # owner worked out per request
 brainproxy authz matrix 7                         # request x identity: enforced, bypass, public, different, ...
