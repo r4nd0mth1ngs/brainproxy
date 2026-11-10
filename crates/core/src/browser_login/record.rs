@@ -487,35 +487,61 @@ pub struct Derived {
 }
 
 fn is_otp_field(e: &Event) -> bool {
-    let names = [&e.name, &e.id, &e.hint].map(|s| s.to_ascii_lowercase());
     if e.autocomplete.contains("one-time-code") {
         return true;
     }
-    // A customer number or a postcode is a "code" too, and typed the same every time.
-    const OTHER: [&str; 12] = [
-        "zip", "post", "country", "area", "promo", "coupon", "voucher", "discount", "invite", "referral", "customer",
-        "company",
-    ];
-    if is_user_field(e) || names.iter().any(|n| OTHER.iter().any(|w| n.contains(w))) {
-        return false;
-    }
-    let word = |n: &String, words: &[&str]| n.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| words.contains(&w));
-    names.iter().any(|n| {
-        ["otp", "totp", "mfa", "2fa", "twofa", "one-time", "verification", "authenticator"]
-            .iter()
-            .any(|w| n.contains(w))
-            || word(n, &["code", "token", "passcode"])
-    })
+    !is_user_field(e) && names_a_one_time_code(&[&e.name, &e.id, &e.hint])
 }
 
-fn is_code(v: &str) -> bool {
+/// Words in a field's name that make a number in it something typed the same every time: a
+/// customer number or a postcode is a "code" too.
+const NOT_A_CODE: [&str; 12] = [
+    "zip", "post", "country", "area", "promo", "coupon", "voucher", "discount", "invite", "referral", "customer",
+    "company",
+];
+
+/// Words in a field's name that make it the user's name (or e-mail, or account).
+const USER_WORDS: [&str; 6] = ["user", "login", "email", "mail", "account", "ident"];
+
+/// Whether a field with these names (its name, id or label; or a request field's key) is for a
+/// one-time code: a word for one in a name, and no name for a code that stays the same (a
+/// postcode, a company or invite code) or for the user. The recorder and `auth record finish`,
+/// which reads the requests the login sent, both decide by this, so they agree.
+pub(crate) fn names_a_one_time_code(names: &[&str]) -> bool {
+    let lower: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    if lower.iter().any(|n| NOT_A_CODE.iter().chain(&USER_WORDS).any(|w| n.contains(w))) {
+        return false;
+    }
+    // Words split at punctuation and at a lower-case letter followed by a capital (`smsCode`).
+    let words = |n: &str| -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut prev_lower = false;
+        for c in n.chars() {
+            if !c.is_ascii_alphanumeric() {
+                out.push(String::new());
+            } else {
+                if c.is_ascii_uppercase() && prev_lower {
+                    out.push(String::new());
+                }
+                out.last_mut().expect("never empty").push(c.to_ascii_lowercase());
+            }
+            prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        }
+        out
+    };
+    let strong = ["otp", "totp", "mfa", "2fa", "twofa", "one-time", "verification", "authenticator"];
+    lower.iter().any(|n| strong.iter().any(|w| n.contains(w)))
+        || names.iter().any(|n| words(n).iter().any(|w| ["code", "token", "passcode"].contains(&w.as_str())))
+}
+
+/// A one-time code's value: 4 to 10 digits.
+pub(crate) fn is_code(v: &str) -> bool {
     (4..=10).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn is_user_field(e: &Event) -> bool {
     let names = [&e.name, &e.id, &e.hint, &e.autocomplete].map(|s| s.to_ascii_lowercase());
-    e.kind == "email"
-        || names.iter().any(|n| ["user", "login", "email", "mail", "account", "ident"].iter().any(|w| n.contains(w)))
+    e.kind == "email" || names.iter().any(|n| USER_WORDS.iter().any(|w| n.contains(w)))
 }
 
 /// Turns what was recorded into steps: what was typed into the password field becomes
@@ -727,11 +753,22 @@ mod tests {
     #[test]
     fn a_number_is_a_one_time_code_only_in_a_field_for_one() {
         let named = |name: &str| fill("#f", "text", name, "482913");
-        for name in ["otp", "mfa_code", "verification-code", "token", "code"] {
+        for name in ["otp", "mfa_code", "verification-code", "token", "code", "smsCode"] {
             assert!(is_otp_field(&named(name)), "{name}");
         }
         // Typed the same at every login: a customer number, a postcode, a user name.
-        for name in ["customer_code", "zip_code", "postcode", "promo-code", "username", "account_code", "pin"] {
+        for name in [
+            "customer_code",
+            "zip_code",
+            "postcode",
+            "promo-code",
+            "username",
+            "account_code",
+            "pin",
+            "company_code",
+            "invite_code",
+            "barcode",
+        ] {
             assert!(!is_otp_field(&named(name)), "{name}");
         }
         let mut hinted = named("customer_code");

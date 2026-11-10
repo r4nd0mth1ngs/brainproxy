@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::auth::{AuthProfile, LoginStep, Secret};
-use crate::browser_login::record::Derived;
+use crate::browser_login::record::{is_code, names_a_one_time_code, Derived};
 use crate::browser_login::{BrowserLogin, Do};
 use crate::capture::decode_body;
 use crate::http::request::split_head_body;
@@ -285,12 +285,11 @@ pub struct Options<'a> {
     pub in_browser: bool,
 }
 
-/// A value a second factor posts: a short number in a field named for one.
+/// A value a second factor posts: a short number in a field named for one, as the login
+/// recorder decides it for a field typed in (a `company_code` or an `invite_code` is not one).
 fn is_otp_field(key: &str, value: &str) -> bool {
-    let k = last_segment(key);
-    ["otp", "totp", "mfa", "2fa", "code", "verification"].iter().any(|w| k.contains(w))
-        && (4..=10).contains(&value.len())
-        && value.chars().all(|c| c.is_ascii_digit())
+    let name = key.rsplit(['.', '[']).next().unwrap_or(key).trim_end_matches(']');
+    is_code(value) && names_a_one_time_code(&[name])
 }
 
 /// A header that carries a token, with its scheme ("Bearer ") and the token.
@@ -439,14 +438,17 @@ pub fn analyze_with(recorded: &[Recorded], name: &str, site: Option<&str>, opts:
                 why_not = Some((why, "; the profile uses the recorded session instead.".into()));
             } else {
                 code_in_login = le.fields().into_iter().find(|(k, v)| is_otp_field(k, v)).map(|(k, _)| k);
-                // A second factor right after the login (the last one sent, if a code was mistyped).
-                code_step = exs
-                    .iter()
-                    .enumerate()
-                    .skip(li + 1)
-                    .rev()
-                    .find(|(_, e)| e.method == "POST" && e.fields().iter().any(|(k, v)| is_otp_field(k, v)))
-                    .map(|(i, _)| i);
+                // A second factor: the first code posted after the login, or, if it was mistyped and
+                // sent again, the last time it went to the same place. A later form elsewhere with
+                // a number in a field named like a code isn't it.
+                let posts_code = |e: &Ex| e.method == "POST" && e.fields().iter().any(|(k, v)| is_otp_field(k, v));
+                code_step = exs.iter().enumerate().skip(li + 1).find(|(_, e)| posts_code(e)).map(|(first, fe)| {
+                    exs.iter()
+                        .enumerate()
+                        .skip(first + 1)
+                        .rfind(|(_, e)| posts_code(e) && e.url == fe.url)
+                        .map_or(first, |(i, _)| i)
+                });
                 if !opts.totp {
                     if let Some(s) = code_step {
                         let why = format!("A one-time code was entered after the login (history #{})", exs[s].id);
@@ -1059,6 +1061,60 @@ mod tests {
         assert!(req.ends_with("user={{username}}&password={{password}}&mfa_code={{totp}}"), "{req}");
         assert!(p.profile.login_steps.is_empty());
         assert_eq!(analyze(&one, "one", None).mode, Mode::Session);
+    }
+
+    #[test]
+    fn a_number_in_a_field_named_for_another_code_is_no_one_time_code() {
+        // As the login recorder decides it for a field typed in.
+        for key in ["otp", "mfa_code", "code", "verification-code", "smsCode", "user[otp]", "login.totp"] {
+            assert!(is_otp_field(key, "482913"), "{key}");
+        }
+        for key in ["company_code", "invite_code", "zip_code", "postcode", "customerCode", "coupon", "account_code"] {
+            assert!(!is_otp_field(key, "0042"), "{key}");
+        }
+        assert!(!is_otp_field("otp", "12ab56") && !is_otp_field("otp", "123"));
+
+        let form = r#"<form method=post action=/login><input name=user><input type="password" name="password"></form>"#;
+        let post = |path: &str, body: &str| {
+            format!("POST {path} HTTP/1.1\nHost: app.test\nContent-Type: application/x-www-form-urlencoded\n\n{body}")
+        };
+        let found = "HTTP/1.1 302 Found\nLocation: /home\nContent-Length: 0\n\n";
+        // A plain login with a company code and an invite code: repeatable without a TOTP secret.
+        let recs = vec![
+            rec(1, "GET /login HTTP/1.1\nHost: app.test\n\n", &html(form, "")),
+            rec(2, &post("/login", "user=al&password=pw-1&company_code=0042&invite_code=123456"), found),
+            rec(3, "GET /home HTTP/1.1\nHost: app.test\nCookie: sid=live\n\n", &html("<p>Hi al</p>", "")),
+        ];
+        let p = analyze(&recs, "plain", None);
+        assert_eq!((p.mode, p.code.clone()), (Mode::Replay, None), "{p:?}");
+        let req = p.profile.login_request.as_deref().unwrap();
+        assert!(req.ends_with("company_code=0042&invite_code=123456"), "{req}");
+        assert!(p.profile.login_steps.is_empty());
+    }
+
+    #[test]
+    fn the_code_step_is_the_first_code_posted_after_the_login_or_its_retries() {
+        let form = r#"<form method=post action=/login><input name=user><input type="password" name="password"></form>"#;
+        let code_form = r#"<form method=post action=/verify><input name=otp></form>"#;
+        let post = |path: &str, body: &str| {
+            format!("POST {path} HTTP/1.1\nHost: app.test\nContent-Type: application/x-www-form-urlencoded\n\n{body}")
+        };
+        let found = "HTTP/1.1 302 Found\nLocation: /home\nContent-Length: 0\n\n";
+        let recs = vec![
+            rec(1, "GET /login HTTP/1.1\nHost: app.test\n\n", &html(form, "")),
+            rec(2, &post("/login", "user=al&password=pw-1"), found),
+            rec(3, "GET /verify HTTP/1.1\nHost: app.test\n\n", &html(code_form, "")),
+            rec(4, &post("/verify", "otp=111111"), &html(code_form, "")),
+            rec(5, &post("/verify", "otp=654321"), found),
+            rec(6, "GET /home HTTP/1.1\nHost: app.test\nCookie: sid=live\n\n", &html("<p>Hi al</p>", "")),
+            // Later, another form that posts a number in a field named like a code.
+            rec(7, &post("/devices/pair", "pairing_code=424242"), found),
+        ];
+        let p = analyze(&recs, "mfa", Some("https://app.test/"));
+        assert_eq!((p.mode, p.code.clone()), (Mode::Session, Some(("654321".to_string(), 5))), "{p:?}");
+        let p = analyze_with(&recs, "mfa", Some("https://app.test/"), &Options { totp: true, ..Default::default() });
+        let [step] = p.profile.login_steps.as_slice() else { panic!("{p:?}") };
+        assert_eq!(step.url, "https://app.test/verify");
     }
 
     #[test]

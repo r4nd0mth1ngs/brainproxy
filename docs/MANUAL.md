@@ -1983,8 +1983,12 @@ One-time codes, browser logins and passkeys in an auth profile:
   `--totp-secret`) makes a login with a code replayable: the code field of the login request
   becomes `{{totp}}`, or the request that posts the code on its own page becomes a step after
   the login request (`login_steps` in `auth show`), with the token its form or a header carries read
-  again each time. The output says whether the secret makes the code that was typed while
-  recording, and `needs_totp` is true when a code was typed and no secret is known.
+  again each time (the first request after the login that posts a code, or the last time it
+  went to the same URL when a mistyped code was sent again). A code is 4 to 10 digits in a field
+  named for one (`otp`, `mfa_code`, `smsCode`, `code`); a postcode, a company, customer, invite or
+  coupon code, or the user's name is not one, in a request as in a field typed in. The output
+  says whether the secret makes the code that was typed while recording, and `needs_totp` is true
+  when a code was typed and no secret is known.
 - **Browser steps.** `auth record start URL` opens a Chromium-based browser held by a
   background brainproxy process (Linux and macOS; Firefox, Windows and `--no-steps` record the
   traffic only, as before). Fields filled, boxes ticked, buttons and links clicked, Enter, and
