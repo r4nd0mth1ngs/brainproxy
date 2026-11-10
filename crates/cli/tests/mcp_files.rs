@@ -170,6 +170,10 @@ fn an_agent_sends_a_request_file_only_from_the_projects_folder() {
     let dotted = format!("{}/sub/../req.txt", s.proj.display());
     assert_eq!(run(&s.project, &["send", "--scheme", "http", &dotted], true).code, 0);
     assert!(s.server.sent("GET /inside"));
+    // A handshake file in the folder is sent too (the server is no WebSocket one, so it fails there).
+    let o = run(&s.project, &["ws", "send", "--scheme", "http", &inside, "--message", "hi"], true);
+    assert!(!o.all.contains("project's folder"), "{}", o.all);
+    assert_eq!(s.server.lines.lock().unwrap().iter().filter(|l| l.starts_with("GET /inside")).count(), 3);
     // A person may send any file.
     person(&s.project, &["send", "--scheme", "http", &outside]);
     assert!(s.server.sent(SECRET));
@@ -245,6 +249,11 @@ fn an_agent_compares_only_report_files_in_the_projects_folder() {
     }
     let o = run(&s.project, &["findings", "compare", "--baseline", &inside], true);
     assert_eq!(o.code, 0, "{}", o.all);
+    // A missing baseline is refused too, and the refusal says what a first run does instead.
+    let missing = format!("{}/none.json", s.proj.display());
+    let o = run(&s.project, &["findings", "compare", "--baseline", &missing, "--allow-missing-baseline"], true);
+    assert_eq!(o.code, 2, "{}", o.all);
+    assert!(o.all.contains("leave out --baseline"), "{}", o.all);
     person(&s.project, &["findings", "compare", "--baseline", &outside]);
 }
 

@@ -126,6 +126,7 @@ pub struct ActiveArgs {
     no_rules: bool,
     /// Declarative checks to run as well: `nuclei` (templates from `checks update`), `local`
     /// (<home>/checks/local), `all`, or a template file/directory. Repeatable or comma-separated.
+    /// Through MCP a template is a file in the project's folder, not a directory.
     /// Every request a check sends is recorded in history (source scan), finding or not.
     #[arg(long, value_delimiter = ',', value_name = "SELECTOR")]
     checks: Vec<String>,
@@ -801,19 +802,17 @@ fn load_checks(
     }
     let opts = checks::LoadOptions { vars: args.check_vars.clone(), oob, ..Default::default() };
     // A template file an agent names comes from the project's folder; the stores are a person's.
-    let mut selectors = Vec::with_capacity(args.checks.len());
+    let mut paths = Vec::new();
     for s in &args.checks {
-        selectors.push(match s.as_str() {
-            "nuclei" | "brainproxy" | "local" | "all" => s.clone(),
-            path => {
-                let file = crate::checks_cmd::local_template(project, "--checks", Path::new(path))?;
-                file.into_os_string().into_string().map_err(|_| {
-                    Error::InvalidInput(format!("--checks {path:?}: the template's resolved path isn't UTF-8 text"))
-                })?
+        match s.as_str() {
+            "nuclei" | "brainproxy" | "local" | "all" => {
+                paths.extend(checks::resolve_selectors(home, std::slice::from_ref(s)))
             }
-        });
+            path => paths.push(crate::checks_cmd::local_template(project, "--checks", Path::new(path))?),
+        }
     }
-    let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
+    paths.dedup();
+    let loaded = checks::load(&paths, &opts)?;
     let filter = checks::Filter {
         ids: args.check_ids.clone(),
         tags: args.check_tags.clone(),

@@ -15,7 +15,7 @@ pub enum ChecksCmd {
     List(ListArgs),
     /// Parse templates and report, per file, whether they load and why not.
     Validate {
-        /// Template files or directories.
+        /// Template files or directories. Through MCP only files in the project's folder.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         #[arg(long, default_value_t = 100)]
@@ -52,6 +52,7 @@ pub enum FeedCmd {
         key: PathBuf,
     },
     /// Check a feed folder's signature and file hashes against the keys this build trusts.
+    /// Refused through MCP.
     Verify { dir: PathBuf },
 }
 
@@ -125,6 +126,7 @@ pub struct UpdateArgs {
     #[arg(long)]
     sha256: Option<String>,
     /// Import from a local checkout instead of downloading (the feed's signature is still checked).
+    /// Refused through MCP.
     #[arg(long, value_name = "DIR")]
     from: Option<PathBuf>,
     /// Run detached; returns a job id for `job wait|status|stop`.

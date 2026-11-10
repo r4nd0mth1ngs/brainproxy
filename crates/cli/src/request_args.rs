@@ -15,7 +15,7 @@ const MARKER_SENTINEL: &str = "BPMARKERx7q";
 
 #[derive(clap::Args, Clone)]
 pub struct RequestArgs {
-    /// Raw HTTP request file; '-' or omitted reads stdin (unless --url is given).
+    /// Raw HTTP request file; '-' or omitted reads stdin (unless --url is given). Through MCP only a file in the project's folder.
     pub file: Option<String>,
 
     /// Build the request from a URL instead of a raw file.

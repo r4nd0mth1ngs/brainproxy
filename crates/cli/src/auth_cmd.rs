@@ -131,7 +131,7 @@ pub enum MacroCmd {
         profile: String,
         /// Macro name.
         name: String,
-        /// A step: history id, FILE, or ORIGIN=FILE. Repeatable, in order.
+        /// A step: history id, FILE, or ORIGIN=FILE. Repeatable, in order. Through MCP only a file in the project's folder.
         #[arg(long = "step", required = true)]
         steps: Vec<String>,
         /// STEP:VAR=KIND:EXPR. Repeatable.
@@ -447,7 +447,7 @@ pub struct AddArgs {
     #[arg(long)]
     login_body: Option<String>,
     /// Raw login request file used instead of --login-method/--login-body (placeholders allowed);
-    /// sent to the --login-url origin.
+    /// sent to the --login-url origin. Through MCP only a file in the project's folder.
     #[arg(long, value_name = "FILE")]
     login_request: Option<String>,
     /// Header for the login request only ("Name: value"). Repeatable.

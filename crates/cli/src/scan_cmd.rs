@@ -129,6 +129,8 @@ pub enum DataCmd {
         /// no GitHub API request.
         #[arg(long = "ref", default_value = "main")]
         reference: String,
+        /// A zap-extensions checkout or a folder holding the files, instead of downloading.
+        /// Refused through MCP.
         #[arg(long, value_name = "DIR")]
         from: Option<std::path::PathBuf>,
     },

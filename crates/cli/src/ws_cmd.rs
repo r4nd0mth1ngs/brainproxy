@@ -101,6 +101,7 @@ pub enum OpArg {
 #[derive(clap::Args)]
 pub struct SendArgs {
     /// Raw handshake request file; '-' or omitted reads stdin (unless --from, --history or --url is given).
+    /// Through MCP only a file in the project's folder.
     file: Option<String>,
     /// Replay the handshake of this recorded connection (see `ws list`).
     #[arg(long, value_name = "CONN")]

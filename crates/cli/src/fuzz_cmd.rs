@@ -72,7 +72,8 @@ pub struct RunArgs {
 
     #[arg(long, default_value = "sniper", value_parser = Mode::ALL.to_vec())]
     mode: String,
-    /// Payload source for the next set (repeat for pitchfork/cluster-bomb).
+    /// Payload source for the next set (repeat for pitchfork/cluster-bomb). Through MCP a
+    /// file:PATH is read only from the project's folder.
     #[arg(short = 'p', long = "payloads", required = true)]
     payloads: Vec<String>,
     /// Processing chain for payloads, e.g. "url", "2=prefix:admin,base64" or "script:sign.js,url".

@@ -588,7 +588,7 @@ pub enum InterceptCmd {
     Forward {
         id: i64,
         /// Replacement message file ('-' for stdin). Line endings and Content-Length are fixed unless
-        /// --verbatim; a WebSocket message's payload is always taken as is.
+        /// --verbatim; a WebSocket message's payload is always taken as is. Through MCP only a file in the project's folder.
         #[arg(long)]
         file: Option<String>,
         #[arg(long)]
