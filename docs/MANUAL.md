@@ -796,8 +796,8 @@ Access control across users: does the app let bob read alice's data? See
   red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
   a dashed outline inconclusive (a successful response with nothing to compare, so check it
   by hand), green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are
-  marked skipped. *Issues only* (on by default) shows only rows with a bypass or a public
-  cell; the others are counted next to the legend, and a click there shows them. Static
+  marked skipped. *Issues only* (on by default) shows only rows with a bypass, a public
+  or an error cell (a request that failed, so nothing was compared); the others are counted next to the legend, and a click there shows them. Static
   assets and requests matching a skip path that a run tested anyway (an older run, or one
   with static assets on) are hidden too, behind a box that shows them, unless one of their
   cells is a bypass. Click a verdict chip
