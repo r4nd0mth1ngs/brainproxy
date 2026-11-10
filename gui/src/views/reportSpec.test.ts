@@ -15,6 +15,7 @@ import {
   savedNote,
   specFromProfile,
   specProblem,
+  REPORT_HOSTS_SQL,
   summaryCommand,
   summaryReviewCommand,
   toggleSection,
@@ -99,13 +100,15 @@ test("the saved note counts what was written", () => {
   assert.equal(savedNote("CSV", { total: 1, included: 1, truncated: false, redacted: null }, false), "CSV report saved with 1 finding.");
   assert.equal(
     savedNote("HTML", { total: 900, included: 500, truncated: true, redacted: 2 }, false),
-    "HTML report saved with 500 of 900 findings (the first 500, riskiest first). Session secrets are masked in 2 places.",
+    "HTML report saved with 500 of 900 findings (the riskiest first). Session secrets are masked in 2 places.",
   );
   assert.equal(savedNote("JSON", { total: 3, included: 3, truncated: false, redacted: null }, true), "JSON report saved with 3 findings. Secrets are quoted as recorded.");
 });
 
-test("the executive summary is saved as one argument and reviewed by its hash", () => {
-  assert.deepEqual(summaryCommand("  --state all\nmore  "), ["report-summary", "set", "--text=--state all\nmore"]);
-  assert.deepEqual(summaryCommand(""), ["report-summary", "set", "--text="]);
+test("the executive summary goes on stdin and is reviewed by its hash", () => {
+  assert.deepEqual(summaryCommand("  --state all\nmore  "), { args: ["report-summary", "set", "--file=-"], stdin: "--state all\nmore" });
+  assert.deepEqual(summaryCommand("x".repeat(50_000)).args, ["report-summary", "set", "--file=-"]);
+  assert.deepEqual(summaryCommand(""), { args: ["report-summary", "set", "--file=-"], stdin: "" });
+  assert.match(REPORT_HOSTS_SQL, /^SELECT DISTINCT host FROM findings/);
   assert.deepEqual(summaryReviewCommand("ab12"), ["report-summary", "review", "--hash=ab12"]);
 });

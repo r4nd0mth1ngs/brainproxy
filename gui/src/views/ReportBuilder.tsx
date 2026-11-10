@@ -16,6 +16,7 @@ import {
   PRESETS,
   previewCommand,
   profileSaveCommand,
+  REPORT_HOSTS_SQL,
   REPORT_SOURCES,
   REPORT_STATES,
   reportCommand,
@@ -39,8 +40,7 @@ interface Profile {
   layout: { preset?: Preset; sections?: string[]; company?: string; accent?: string; since?: string };
 }
 
-/** `hosts`: the hosts findings were raised on, offered for the host filter. */
-export function ReportBuilder({ name, hosts = [], onClose }: { name: string; hosts?: string[]; onClose: () => void }) {
+export function ReportBuilder({ name, onClose }: { name: string; onClose: () => void }) {
   const app = useApp();
   const [spec, setSpec] = useState<ReportSpec>({ ...DEFAULT_SPEC, title: `${name} security report` });
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -50,6 +50,10 @@ export function ReportBuilder({ name, hosts = [], onClose }: { name: string; hos
   const [profileName, setProfileName] = useState("");
   const [summary, setSummary] = useState<Summary | null>(null);
   const [summaryDraft, setSummaryDraft] = useState("");
+  // What the text box held when the summary was last loaded or saved: a reload replaces the
+  // text box only while it still holds that, so nothing typed meanwhile is lost.
+  const shownSummary = useRef("");
+  const [hosts, setHosts] = useState<string[]>([]);
   // Bumped when the summary changes, so the preview shows it.
   const [previewRun, setPreviewRun] = useState(0);
   const dialog = useRef<HTMLDivElement>(null);
@@ -66,14 +70,21 @@ export function ReportBuilder({ name, hosts = [], onClose }: { name: string; hos
   const loadSummary = () =>
     run<{ summary: Summary | null }>(["report-summary", "show"]).then(
       (r) => {
+        const text = r.summary?.text ?? "";
         setSummary(r.summary);
-        setSummaryDraft(r.summary?.text ?? "");
+        setSummaryDraft((d) => (d.trim() === shownSummary.current ? text : d));
+        shownSummary.current = text;
       },
       (e) => app.toast(e.message, "error"),
     );
   useEffect(() => {
     loadProfiles();
     loadSummary();
+    // Every host with a finding, closed ones too: the filter matches a host exactly.
+    run<{ rows: [string][] }>(["query", REPORT_HOSTS_SQL]).then(
+      (r) => setHosts(r.rows.map((row) => row[0])),
+      () => setHosts([]),
+    );
   }, []);
 
   // The preview follows the choices, a moment after the last change.
@@ -165,11 +176,18 @@ export function ReportBuilder({ name, hosts = [], onClose }: { name: string; hos
     set({ keepSecrets: on });
   };
 
-  // The summary on screen is what a review approves: one changed since (by an agent, say) is refused.
+  // The summary on screen is what a review approves: one changed since (by an agent, say) is
+  // refused. A text that couldn't be saved stays in the box.
   const saveSummary = async (review: boolean) => {
     try {
-      await run(review ? summaryReviewCommand(summary?.hash ?? "") : summaryCommand(summaryDraft));
-      if (review) app.toast("Summary reviewed: reports print it.");
+      if (review) {
+        await run(summaryReviewCommand(summary?.hash ?? ""));
+        app.toast("Summary reviewed: reports print it.");
+      } else {
+        const { args, stdin } = summaryCommand(summaryDraft);
+        await run(args, stdin);
+        shownSummary.current = stdin;
+      }
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -321,12 +339,14 @@ export function ReportBuilder({ name, hosts = [], onClose }: { name: string; hos
           </label>
           <label>
             <span className="label">Host</span>
-            <input className="input" list="report-hosts" value={spec.filter.host} placeholder="Every host" onChange={(e) => setFilter({ host: e.target.value })} />
-            <datalist id="report-hosts">
+            <select className="input" value={spec.filter.host} onChange={(e) => setFilter({ host: e.target.value })}>
+              <option value="">Every host</option>
               {hosts.map((h) => (
-                <option key={h} value={h} />
+                <option key={h} value={h}>
+                  {h}
+                </option>
               ))}
-            </datalist>
+            </select>
           </label>
           <h3>Secrets</h3>
           <label className="check" title="Session cookies, credentials and tokens as recorded; by default they're shown as [redacted]">

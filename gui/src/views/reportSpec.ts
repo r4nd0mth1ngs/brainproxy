@@ -226,7 +226,7 @@ export interface ReportWritten {
 /** The toast after a report is saved. */
 export function savedNote(label: string, r: ReportWritten, keptSecrets: boolean): string {
   const n = (k: number) => `${k} finding${k === 1 ? "" : "s"}`;
-  const count = r.truncated ? `${r.included} of ${n(r.total)} (the first 500, riskiest first)` : n(r.total);
+  const count = r.truncated ? `${r.included} of ${n(r.total)} (the riskiest first)` : n(r.total);
   const masked = keptSecrets
     ? " Secrets are quoted as recorded."
     : r.redacted
@@ -238,10 +238,14 @@ export function savedNote(label: string, r: ReportWritten, keptSecrets: boolean)
 /** The executive summary (`report-summary show`): the narrative shape, null when there is none. */
 export type Summary = Narrative;
 
-/** The command that saves the executive summary (a draft until reviewed); "" clears it. */
-export function summaryCommand(text: string): string[] {
-  return ["report-summary", "set", `--text=${text.trim()}`];
+/** The command that saves the executive summary (a draft until reviewed); "" clears it. The
+ * text goes on stdin: up to 50,000 bytes is more than a Windows command line holds. */
+export function summaryCommand(text: string): { args: string[]; stdin: string } {
+  return { args: ["report-summary", "set", "--file=-"], stdin: text.trim() };
 }
+
+/** The hosts findings were raised on, for the host filter (which matches a host exactly). */
+export const REPORT_HOSTS_SQL = "SELECT DISTINCT host FROM findings WHERE host <> '' ORDER BY host LIMIT 1000";
 
 /** The command that marks the summary reviewed: it names the text read, by its hash. */
 export function summaryReviewCommand(hash: string): string[] {
