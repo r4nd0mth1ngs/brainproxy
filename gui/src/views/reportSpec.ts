@@ -1,8 +1,10 @@
 // The report builder's choices and the commands they become. Kept apart from the dialog so it
 // can be tested without a window. Presets and sections mirror crates/core/src/scan/layout.rs.
 
+import { SOURCES, STATES, type Narrative } from "./findingsFilter";
+
 export type Preset = "technical" | "executive" | "developer" | "retest";
-export type Format = "html" | "pdf" | "docx" | "markdown";
+export type Format = "html" | "pdf" | "docx" | "markdown" | "csv" | "json" | "sarif" | "defectdojo";
 
 export const PRESETS: { id: Preset; label: string; title: string }[] = [
   { id: "technical", label: "Technical", title: "Everything: summary, priorities, every issue with its evidence" },
@@ -30,12 +32,50 @@ export const PRESET_SECTIONS: Record<Preset, string[]> = {
   retest: ["retest", "about"],
 };
 
-export const FORMATS: { id: Format; label: string; ext: string }[] = [
+/** Report formats; `listing` ones are findings for another tool, which sections and branding don't change. */
+export const FORMATS: { id: Format; label: string; ext: string; listing?: boolean; note?: string }[] = [
   { id: "html", label: "HTML", ext: "html" },
-  { id: "pdf", label: "PDF", ext: "pdf" },
+  { id: "pdf", label: "PDF", ext: "pdf", note: "PDF is printed by Chromium, which must be installed." },
   { id: "docx", label: "Word (DOCX)", ext: "docx" },
   { id: "markdown", label: "Markdown", ext: "md" },
+  { id: "json", label: "JSON", ext: "json", note: "The findings with the posture and retest data, for scripts." },
+  { id: "csv", label: "CSV (spreadsheet)", ext: "csv", listing: true, note: "One row per finding, for spreadsheets." },
+  { id: "sarif", label: "SARIF", ext: "sarif", listing: true, note: "SARIF 2.1 for code-scanning tools; a CVSS score becomes its security-severity." },
+  { id: "defectdojo", label: "DefectDojo import", ext: "json", listing: true, note: "DefectDojo's Generic Findings Import JSON." },
 ];
+
+export type Risk = "info" | "low" | "medium" | "high" | "critical";
+export type Confidence = "low" | "medium" | "high";
+
+/** Which findings a report includes; "" is the CLI's default for each. */
+export interface ReportFilter {
+  /** Minimum risk. */
+  risk: "" | Risk;
+  /** Minimum confidence. */
+  confidence: "" | Confidence;
+  /** One triage state, or "all"; "" is work still to do (open, confirmed, retest pending). */
+  state: string;
+  source: "" | "passive" | "active" | "authz" | "manual";
+  host: string;
+}
+
+export const NO_REPORT_FILTER: ReportFilter = { risk: "", confidence: "", state: "", source: "", host: "" };
+
+export const RISKS: Risk[] = ["info", "low", "medium", "high", "critical"];
+export const CONFIDENCES: Confidence[] = ["low", "medium", "high"];
+
+/** The state choices: the default, each triage state, or every finding. */
+export const REPORT_STATES: { id: string; label: string }[] = [
+  { id: "", label: "Work still to do" },
+  ...STATES.map((s) => ({ id: s.id, label: s.label })),
+  { id: "all", label: "All, closed ones too" },
+];
+
+/** The source choices, as the Findings view names them. */
+export const REPORT_SOURCES: { id: ReportFilter["source"]; label: string }[] = SOURCES.map((s) => ({
+  id: s.id === "all" ? "" : s.id,
+  label: s.label,
+}));
 
 export interface ReportSpec {
   preset: Preset;
@@ -51,6 +91,14 @@ export interface ReportSpec {
   /** The saved profile this started from. */
   profile: string | null;
   title: string;
+  /** Which findings it includes (not part of a saved layout). */
+  filter: ReportFilter;
+  /** Include write-ups and the executive summary nobody has reviewed yet, marked as drafts. */
+  drafts: boolean;
+  /** Quote session cookies, credentials and tokens as recorded (`--no-redact`). */
+  keepSecrets: boolean;
+  /** More values to mask, one per line. */
+  mask: string;
 }
 
 export const DEFAULT_SPEC: ReportSpec = {
@@ -63,7 +111,33 @@ export const DEFAULT_SPEC: ReportSpec = {
   format: "html",
   profile: null,
   title: "",
+  filter: NO_REPORT_FILTER,
+  drafts: false,
+  keepSecrets: false,
+  mask: "",
 };
+
+/** The values to mask: one per line, trimmed. */
+export const maskValues = (text: string): string[] =>
+  text
+    .split(/\r?\n/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+/** The flags that choose the findings and how secrets are shown, for the report and its preview. */
+export function contentArgs(spec: ReportSpec): string[] {
+  const f = spec.filter;
+  const out: string[] = [];
+  if (f.risk) out.push(`--risk=${f.risk}`);
+  if (f.confidence) out.push(`--confidence=${f.confidence}`);
+  if (f.state) out.push(`--state=${f.state}`);
+  if (f.source) out.push(`--source=${f.source}`);
+  if (f.host.trim()) out.push(`--host=${f.host.trim()}`);
+  if (spec.drafts) out.push("--drafts");
+  if (spec.keepSecrets) out.push("--no-redact");
+  else out.push(...maskValues(spec.mask).map((v) => `--mask=${v}`));
+  return out;
+}
 
 const same = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
@@ -90,13 +164,13 @@ export function layoutArgs(spec: ReportSpec, withProfile = true): string[] {
 /** The command that writes the report to `path`. */
 export function reportCommand(spec: ReportSpec, path: string): string[] {
   const title = spec.title.trim() ? [`--title=${spec.title.trim()}`] : [];
-  return ["report", spec.format, ...layoutArgs(spec), ...title, "--output", path, "--force"];
+  return ["report", spec.format, ...layoutArgs(spec), ...contentArgs(spec), ...title, "--output", path, "--force"];
 }
 
 /** The command for the live preview: the same layout as HTML, with short evidence. */
 export function previewCommand(spec: ReportSpec): string[] {
   const title = spec.title.trim() ? [`--title=${spec.title.trim()}`] : [];
-  return ["report", "html", ...layoutArgs(spec), ...title, "--max-evidence", "1024", "--limit", "200"];
+  return ["report", "html", ...layoutArgs(spec), ...contentArgs(spec), ...title, "--max-evidence", "1024", "--limit", "200"];
 }
 
 /** The command that saves these choices as a profile, on top of the one they started from
@@ -136,5 +210,40 @@ export function specProblem(spec: ReportSpec): string | null {
   if (spec.accent && !/^#[0-9a-fA-F]{6}$/.test(spec.accent)) return "The colour must be #rrggbb.";
   if (spec.since && !/^\d{4}-\d{2}-\d{2}$/.test(spec.since)) return "The day must be YYYY-MM-DD.";
   if (spec.sections.length === 0) return "Pick at least one section.";
+  // As the CLI counts it: characters, not bytes.
+  if (!spec.keepSecrets && maskValues(spec.mask).some((v) => [...v].length < 6)) return "Each value to mask needs at least 6 characters.";
   return null;
+}
+
+/** What `report` answers when it writes a file. */
+export interface ReportWritten {
+  total: number;
+  included: number;
+  truncated: boolean;
+  redacted: number | null;
+}
+
+/** The toast after a report is saved. */
+export function savedNote(label: string, r: ReportWritten, keptSecrets: boolean): string {
+  const n = (k: number) => `${k} finding${k === 1 ? "" : "s"}`;
+  const count = r.truncated ? `${r.included} of ${n(r.total)} (the first 500, riskiest first)` : n(r.total);
+  const masked = keptSecrets
+    ? " Secrets are quoted as recorded."
+    : r.redacted
+      ? ` Session secrets are masked in ${r.redacted} place${r.redacted === 1 ? "" : "s"}.`
+      : "";
+  return `${label} report saved with ${count}.${masked}`;
+}
+
+/** The executive summary (`report-summary show`): the narrative shape, null when there is none. */
+export type Summary = Narrative;
+
+/** The command that saves the executive summary (a draft until reviewed); "" clears it. */
+export function summaryCommand(text: string): string[] {
+  return ["report-summary", "set", `--text=${text.trim()}`];
+}
+
+/** The command that marks the summary reviewed: it names the text read, by its hash. */
+export function summaryReviewCommand(hash: string): string[] {
+  return ["report-summary", "review", `--hash=${hash}`];
 }

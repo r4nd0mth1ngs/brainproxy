@@ -627,7 +627,7 @@ export function FindingsView({ active }: { active: boolean }) {
           <div className="blank">Select a finding to see its details and evidence.</div>
         )}
       </Split>
-      {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
+      {reporting && <ReportBuilder name={reportName} hosts={hosts} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
     </div>
   );
