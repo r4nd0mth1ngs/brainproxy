@@ -277,8 +277,8 @@ pub(crate) fn local_path(
 pub(crate) fn check_local_folder(what: &str, instead: &str) -> Result<(), brainproxy_core::Error> {
     if in_tool_call() {
         return Err(brainproxy_core::Error::InvalidInput(format!(
-            "{what} reads a local folder, so it isn't offered through MCP: {instead}, or have a person run it in \
-             the app or a terminal"
+            "{what} reads a local folder, so it isn't offered through MCP: {instead}, or have a person run it with \
+             the folder in the app or a terminal"
         )));
     }
     Ok(())

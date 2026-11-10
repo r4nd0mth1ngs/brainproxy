@@ -145,7 +145,7 @@ pub(crate) fn local_template(project: &Path, flag: &str, path: &Path) -> Result<
     if crate::mcp::in_tool_call() && file.is_dir() {
         return Err(Error::InvalidInput(format!(
             "{flag} {:?}: through MCP name template files, not a folder (a link in it could lead out of the \
-             project's folder)",
+             project's folder); a person can still give a folder in the app or a terminal",
             path.display().to_string()
         )));
     }

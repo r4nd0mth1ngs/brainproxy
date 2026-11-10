@@ -192,7 +192,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
   recorded as they are, or come back in the reply. A folder of templates is refused for those
   two, as a link inside it could lead out (the `nuclei`, `brainproxy` and `local` stores a person
   filled are not limited), and so are `checks_update`'s and `scan_data_update`'s `from` and
-  `checks_feed_verify`, which read only a folder; without `from` they download as usual. A `..` in the
+  `checks_feed_verify`, which read only a folder; without `from` they download as usual. A person
+  still gives any of these a folder from the CLI or the app. A `..` in the
   path counts only for where it leads. The refusal names the path, never the file's content.
   An agent passes the text as the call's `stdin` (`-`; `file:-` for payloads), puts the file in
   the project's folder, or uses what else the tool takes: an http(s) URL for a document

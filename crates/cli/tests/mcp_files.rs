@@ -292,7 +292,7 @@ fn an_agent_names_template_files_only_in_the_projects_folder_and_no_folders() {
     ] {
         let o = run(&s.project, &args, true);
         assert_eq!(o.code, 2, "{args:?}: {}", o.all);
-        assert!(o.json["error"]["message"].as_str().unwrap_or_default().contains("folder"), "{args:?}: {}", o.all);
+        assert!(o.json["error"]["message"].as_str().unwrap_or_default().contains("app or a terminal"), "{args:?}: {}", o.all);
     }
     let o = run(&s.project, &["checks", "validate", &inside], true);
     assert_eq!((o.code, o.json["data"]["ok"].as_u64()), (0, Some(1)), "{}", o.all);
