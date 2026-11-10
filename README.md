@@ -250,6 +250,7 @@ brainproxy proxy stop
 
 # Intercept without a human in the loop: held messages wait in a queue
 brainproxy intercept enable --method 'POST|PUT' --host 'target\.test' --timeout 120
+brainproxy intercept enable --filter 'method=POST req.body:role NOT path:/static'   # or a filter-language query
 brainproxy intercept list --wait 30               # block until something is held
 brainproxy intercept show 4 --raw > msg.http      # edit it...
 brainproxy intercept forward 4 --file msg.http    # ...and release it (or: intercept drop 4)
