@@ -59,8 +59,9 @@ export function AccessView({ active }: { active: boolean }) {
   const live = !!current && ["queued", "running", "stopping"].includes(current.state);
   const [job, refreshJob] = usePoll<Job>(() => run(["job", "status", String(runId)]), 2000, active && runId != null && live);
   const [matrix, refreshMatrix] = usePoll<Matrix | null>(
-    // With the noise, each marked: the view hides it unless asked.
-    () => (runId == null ? Promise.resolve(null) : run<Matrix>(["authz", "matrix", String(runId), "--limit", "2000", "--all"])),
+    // Without the noise (counted in hidden_requests), so it can't take up the limit; with it, each
+    // marked, once asked for.
+    () => (runId == null ? Promise.resolve(null) : run<Matrix>(["authz", "matrix", String(runId), "--limit", "2000", ...(showHidden ? ["--all"] : [])])),
     live ? 2000 : 30000,
     active,
   );
@@ -68,6 +69,9 @@ export function AccessView({ active }: { active: boolean }) {
     refreshMatrix();
     setPicked(null);
   }, [runId, refreshMatrix]);
+  useEffect(() => {
+    refreshMatrix();
+  }, [showHidden, refreshMatrix]);
   // A run that just finished: its last rows.
   useEffect(() => {
     if (current && !live) refreshMatrix();
@@ -136,7 +140,7 @@ export function AccessView({ active }: { active: boolean }) {
           </button>
         )}
         <div className="toolbar-end">
-          <label className="check" title="Only rows with a bypass, or a response anyone gets without a session. A verdict below picks its rows instead">
+          <label className="check" title="Only rows with a bypass, a response anyone gets without a session, or an error (a request that failed, so nothing was compared). A verdict below picks its rows instead">
             <input type="checkbox" checked={issuesOnly} onChange={(e) => setIssuesOnly(e.target.checked)} /> Issues only
           </label>
           <label className="check" title="Rows with a bypass first">
@@ -163,7 +167,7 @@ export function AccessView({ active }: { active: boolean }) {
             </button>
           ))}
           {g.skipped > 0 && <span className="muted small">{g.skipped} skipped</span>}
-          {g.hidden > 0 && (
+          {(g.hidden > 0 || showHidden) && (
             <label className="check small" title="Static assets and requests matching a skip path, tested before they were left out">
               <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> {g.hidden} static or skipped
             </label>

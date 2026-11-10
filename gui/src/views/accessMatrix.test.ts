@@ -120,8 +120,15 @@ test("noise is hidden unless asked for, and only rows with an issue are shown wh
   assert.equal(all.rows[0].hidden, null);
   // Issues only: a bypass or public row; the others are counted.
   const issues = grid(m, { issuesOnly: true });
+  // orders/1 has a bypass (and an error), the dashboard a public cell.
   assert.deepEqual(issues.rows.map((r) => r.url.split("/").pop()), ["1", "dashboard"]);
   assert.equal(issues.quiet, 2);
+  // An error is no "no issue": nothing was compared.
+  const failed: Matrix = { ...matrix, requests: [{ ...matrix.requests[0], cells: { anonymous: cell("enforced", 401, 11), bob: cell("error", null, 12) } }] };
+  assert.equal(grid(failed, { issuesOnly: true }).rows.length, 1);
+  // Noise the matrix left out is counted too.
+  const left: Matrix = { ...matrix, hidden_requests: { static_assets: 3, skip_paths: 2 } };
+  assert.equal(grid(left).hidden, 5);
   assert.equal(grid(m, { issuesOnly: true, showHidden: true }).rows.length, 4);
   // A verdict picked shows its rows whatever issuesOnly says.
   const enforced = grid(m, { issuesOnly: true, only: "enforced" });

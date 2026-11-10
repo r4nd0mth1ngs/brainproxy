@@ -95,7 +95,7 @@ export interface Grid {
   /** Cells per kind, skipped rows and noise not included (noise is when it is shown). */
   counts: Record<CellKind, number>;
   skipped: number;
-  /** Noise rows (static assets, skip paths), shown or not. */
+  /** Noise rows (static assets, skip paths), shown or not: marked ones, or those the matrix left out. */
   hidden: number;
   /** Rows left out because they show no issue (`issuesOnly`). */
   quiet: number;
@@ -106,11 +106,14 @@ const rank = (k: CellKind) => KINDS.indexOf(k);
 /** What counts as an issue: a bypass, or a response anyone gets without a session. */
 export const ISSUE_KINDS: CellKind[] = ["bypass-high", "bypass-medium", "bypass-low", "public"];
 
+/** Rows `issuesOnly` keeps: an issue, or an error (nothing was compared, so it isn't "no issue"). */
+const kept = (r: GridRow) => ISSUE_KINDS.includes(r.worst) || r.cells.some((c) => c.kind === "error");
+
 export interface GridOptions {
   /** Only rows with a cell of this kind (overrides `issuesOnly`). */
   only?: CellKind | null;
   worstFirst?: boolean;
-  /** Only rows with an issue (ISSUE_KINDS). */
+  /** Only rows with an issue (ISSUE_KINDS) or an error. */
   issuesOnly?: boolean;
   /** Also rows that are noise: static assets and requests matching a skip path. */
   showHidden?: boolean;
@@ -124,7 +127,8 @@ export function grid(m: Matrix, opts: GridOptions = {}): Grid {
   const columns = [...m.identities.filter((i) => i === "anonymous"), ...m.identities.filter((i) => i !== "anonymous")];
   const counts = Object.fromEntries(KINDS.map((k) => [k, 0])) as Record<CellKind, number>;
   let skipped = 0;
-  const hidden = m.requests.filter((r) => r.hidden).length;
+  const left = m.hidden_requests ? m.hidden_requests.static_assets + m.hidden_requests.skip_paths : 0;
+  const hidden = m.requests.filter((r) => r.hidden).length + left;
   const requests = opts.showHidden ? m.requests : m.requests.filter((r) => !r.hidden);
   let rows: GridRow[] = requests.map((r, i) => {
     const cells = columns.map((identity): GridCell => {
@@ -153,7 +157,7 @@ export function grid(m: Matrix, opts: GridOptions = {}): Grid {
   if (opts.only) rows = rows.filter((r) => r.cells.some((c) => c.kind === opts.only));
   else if (opts.issuesOnly) {
     const all = rows.length;
-    rows = rows.filter((r) => ISSUE_KINDS.includes(r.worst));
+    rows = rows.filter(kept);
     quiet = all - rows.length;
   }
   if (opts.worstFirst) rows = rows.map((r, i) => [r, i] as const).sort((a, b) => rank(a[0].worst) - rank(b[0].worst) || a[1] - b[1]).map(([r]) => r);

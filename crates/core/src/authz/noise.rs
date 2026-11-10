@@ -158,7 +158,9 @@ impl PathSkip {
         if raw.is_empty() {
             return Err(bad("empty"));
         }
-        let url = raw.contains("://");
+        // A path may hold a URL in its query (`/fetch?url=https://...`): only a pattern that
+        // starts with a scheme is a URL.
+        let url = !raw.starts_with('/') && !raw.starts_with('*') && absolute(raw).is_some();
         if !url && !raw.starts_with('/') && !raw.starts_with('*') {
             return Err(bad("start it with / or *, or give a URL"));
         }
@@ -216,12 +218,22 @@ impl PathSkips {
 }
 
 /// The path (and query) of a URL, absolute or not: an absolute one without its origin, and
-/// `/` when it has no path.
+/// `/` when it has no path. A `://` in a path's query (`/logout?next=https://...`) doesn't make
+/// it absolute.
 pub fn url_path(url: &str) -> &str {
-    match url.split_once("://") {
-        Some((_, rest)) => rest.find(['/', '?']).map_or("/", |i| &rest[i..]),
+    match absolute(url) {
+        Some(rest) => rest.find(['/', '?']).map_or("/", |i| &rest[i..]),
         None => url,
     }
+}
+
+/// What follows `scheme://` when `text` starts with a scheme (letters, digits, `+`, `-`, `.`).
+fn absolute(text: &str) -> Option<&str> {
+    let (scheme, rest) = text.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
 }
 
 /// Checks patterns before they are saved or used; returns them trimmed, without repeats.
@@ -297,6 +309,15 @@ mod tests {
         assert_eq!(s.matching("http://a.test/search?page=2"), None);
         assert_eq!(s.matching("/static/a.css"), Some("/static/"), "a bare path");
         assert_eq!(s.matching("http://a.test"), None);
+        // A URL in the query is part of the path's query, both in the pattern and the request.
+        let q = skips(&["/fetch?url=https://example.test/", "/logout$"]);
+        assert_eq!(
+            q.matching("http://a.test/fetch?url=https://example.test/x"),
+            Some("/fetch?url=https://example.test/")
+        );
+        assert_eq!(q.matching("/logout?next=https://example.test/"), Some("/logout$"));
+        assert_eq!(url_path("/logout?next=https://example.test/"), "/logout?next=https://example.test/");
+        assert_eq!(url_path("http://a.test?x=https://b.test/"), "?x=https://b.test/");
         // The default list.
         let d = PathSkips::compile(&SavedSkips::default().paths).unwrap();
         for public in ["/robots.txt", "/.well-known/openid-configuration", "/api/healthz", "/favicon.ico"] {
