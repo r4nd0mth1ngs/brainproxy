@@ -1,12 +1,40 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, type Finding, type FindingEvent, type FindingItem, type HistoryEntry, type Risk } from "../api";
 import { originOf, useApp } from "../store";
-import { confirm } from "../ui/Confirm";
+import { ask, confirm } from "../ui/Confirm";
+import { Menu, useMenu } from "../ui/Menu";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
-import { CLOSED, eventText, type FindingFilter, narrativeCommand, narrativeCredit, type Narrative, type Trail, trailLine, groupKey, hostsOf, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, SOURCES, type Source, STATES } from "./findingsFilter";
+import {
+  CLOSED,
+  eventText,
+  type FindingFilter,
+  narrativeCommand,
+  narrativeCredit,
+  type Narrative,
+  type Trail,
+  trailLine,
+  groupKey,
+  hostsOf,
+  markCommands,
+  matchesFinding,
+  NO_FILTER,
+  noteBy,
+  noteCommand,
+  recordTicketCommand,
+  reproCommand,
+  retestCommand,
+  SOURCES,
+  type Source,
+  STATES,
+  type Ticket,
+  ticketCommand,
+  ticketLinkProblem,
+  ticketText,
+  type Tracker,
+} from "./findingsFilter";
 import { addedBy } from "./manualFinding";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
@@ -188,13 +216,51 @@ export function FindingsView({ active }: { active: boolean }) {
     }
   };
 
-  // A GitHub issue's title and body, ready to paste.
-  const copyTicket = async () => {
+  // A ticket's title and body in the tracker's markup, ready to paste (nothing is sent).
+  const ticketMenu = useMenu();
+  const trackerName = (t: Tracker) => (t === "jira" ? "Jira" : "GitHub");
+  const copyTicket = async (tracker: Tracker) => {
     if (!finding) return;
     try {
-      const t = await run<{ title: string; body: string }>(["findings", "ticket", String(finding.id), "--to", "github"]);
-      await navigator.clipboard.writeText(`${t.title}\n\n${t.body}`);
-      app.toast("Ticket copied: paste it into a GitHub or Jira issue. Secrets are masked.");
+      const t = await run<Ticket>(ticketCommand(finding.id, tracker));
+      await navigator.clipboard.writeText(ticketText(t, tracker));
+      app.toast(`Ticket copied: paste it into a ${trackerName(tracker)} issue. Secrets are masked.`);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  // The link of a ticket the person filed, kept on the finding's timeline and in reports.
+  const recordTicket = async (tracker: Tracker) => {
+    if (!finding) return;
+    const id = finding.id;
+    const url = await ask(`Record a ${trackerName(tracker)} ticket`, "The link of the ticket you filed for this finding. Reports and the timeline show it.", "Record", "Cancel");
+    if (url == null) return;
+    const problem = ticketLinkProblem(url);
+    if (problem) return app.toast(problem, "error");
+    try {
+      await run(recordTicketCommand(id, tracker, url));
+      app.toast("Ticket recorded.");
+      if (openId.current === id) reloadEvents(id);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  // A repro pack as a JSON file: the request with secrets masked, a curl command, the response
+  // around the evidence, what the rule looks for and the command that checks it again.
+  const saveRepro = async () => {
+    if (!finding) return;
+    const id = finding.id;
+    try {
+      const dialogs = await import("@tauri-apps/plugin-dialog");
+      const path = await dialogs.save({ defaultPath: `finding-${id}-repro.json`, filters: [{ name: "JSON", extensions: ["json"] }] });
+      if (typeof path !== "string") return;
+      const file = path.toLowerCase().endsWith(".json") ? path : `${path}.json`;
+      await run(reproCommand(id, file));
+      app.toast(`Repro pack saved. Secrets are masked.`);
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(file).catch(() => {});
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -483,8 +549,24 @@ export function FindingsView({ active }: { active: boolean }) {
                     Send to Replay
                   </button>
                 )}
-                <button className="btn small" onClick={copyTicket} title="Copy a GitHub or Jira issue for this finding: what, where, how to fix and reproduce it">
-                  Copy ticket
+                <button
+                  className="btn small"
+                  aria-haspopup="menu"
+                  onClick={(e) =>
+                    ticketMenu.open(e, [
+                      { label: "Copy for GitHub", action: () => copyTicket("github"), hint: "Markdown: what, where, how to fix and reproduce it" },
+                      { label: "Copy for Jira", action: () => copyTicket("jira"), hint: "The same, in a block Jira shows as it is" },
+                      "-",
+                      { label: "Record GitHub ticket…", action: () => recordTicket("github"), hint: "Keep the link of the issue you filed" },
+                      { label: "Record Jira ticket…", action: () => recordTicket("jira"), hint: "Keep the link of the issue you filed" },
+                    ])
+                  }
+                  title="Write this finding up as a GitHub or Jira issue (nothing is sent), or record the one you filed"
+                >
+                  Ticket ▾
+                </button>
+                <button className="btn small" onClick={saveRepro} title="Save a JSON repro pack: the request (secrets masked), a curl command, the response around the evidence and how to check it again">
+                  Repro pack…
                 </button>
                 {finding.source === "manual" && (
                   <button className="btn small" onClick={remove} title="Take this finding out of the findings and reports">
@@ -627,6 +709,7 @@ export function FindingsView({ active }: { active: boolean }) {
           <div className="blank">Select a finding to see its details and evidence.</div>
         )}
       </Split>
+      <Menu menu={ticketMenu.menu} close={ticketMenu.close} />
       {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
     </div>
