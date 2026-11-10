@@ -769,11 +769,14 @@ function Intercept({ active }: { active: boolean }) {
     const ok = await change((cur) => (cur.enabled ? interceptEnableArgs(withFilter(cur, text)) : null));
     if (ok) appliedFilter.current = text;
   };
-  const toggle = (patch: (cur: InterceptSettings) => Partial<InterceptSettings>) =>
-    change((cur) => {
+  const toggle = (patch: (cur: InterceptSettings) => Partial<InterceptSettings>) => {
+    // A query refused for these settings may do for the new ones: Enter tries it again.
+    triedFilter.current = null;
+    return change((cur) => {
       const next = { ...cur, ...patch(cur) };
       return next.enabled ? interceptEnableArgs(next) : ["intercept", "disable"];
     });
+  };
 
   const decide = async (how: "forward" | "drop") => {
     if (current == null || !message) return;
