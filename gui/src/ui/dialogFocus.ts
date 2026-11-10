@@ -13,6 +13,12 @@ export function nextFocus(current: number, count: number, back: boolean): number
   return (current + (back ? count - 1 : 1)) % count;
 }
 
+/**
+ * Whether focus was lost (nothing, or the page itself, has it), so a dialog that closed gives
+ * it back. Not when something else took it meanwhile, such as the next dialog's field.
+ */
+export const focusLost = (active: Element | null, body: Element | null) => active == null || active === body;
+
 /** Keeps Tab inside `ref` while the component is mounted, and gives focus back when it unmounts. */
 export function useDialogFocus(ref: RefObject<HTMLElement | null>) {
   // Read while rendering, before an autoFocus in the dialog moves focus.
@@ -34,7 +40,7 @@ export function useDialogFocus(ref: RefObject<HTMLElement | null>) {
       // Only once the dialog is gone: Strict Mode runs this cleanup and the setup again on mount,
       // with the dialog still there and its autoFocus done.
       setTimeout(() => {
-        if (!dialog?.isConnected && before?.isConnected) before.focus();
+        if (!dialog?.isConnected && before?.isConnected && focusLost(document.activeElement, document.body)) before.focus();
       });
     };
   }, [ref, before]);
