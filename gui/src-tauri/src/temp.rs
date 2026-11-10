@@ -97,13 +97,13 @@ fn is_ram_backed(_: &Path) -> bool {
 /// release's leftovers.
 #[cfg(unix)]
 fn folder_name() -> String {
-    format!("{}-temp-{}", crate::CLI_NAME, unsafe { libc::getuid() })
+    format!("{}-temp-{}", crate::cli_name(), unsafe { libc::getuid() })
 }
 
 /// The Windows temp folder is already per user.
 #[cfg(not(unix))]
 fn folder_name() -> String {
-    format!("{}-temp", crate::CLI_NAME)
+    format!("{}-temp", crate::cli_name())
 }
 
 /// The folder holding `project`, resolved ("." for a bare file name).

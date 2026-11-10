@@ -505,15 +505,16 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
 
 `make dev-deb` (Linux) and `make dev-macos` (macOS) build the app from the working tree as a
 separate product, **brainproxy-dev**, that installs beside a release without replacing or
-breaking it. Each checks what it needs first (the Rust target, Node.js 23.6+ and npm, and
-WebKitGTK 4.1 and librsvg on Linux; macOS itself and the Xcode command line tools for the
-Mac), runs `npm ci` when `gui/package-lock.json` changed, builds the CLI sidecar, and
+breaking it. Each checks what it needs first (a git checkout, the Rust target, Node.js 23.6+
+and npm, and WebKitGTK 4.1 and librsvg on Linux; macOS itself and the Xcode command line tools
+for the Mac), runs `npm ci` when `gui/package-lock.json` changed (not through a symlinked
+`gui/node_modules`, which it uses as it is), builds the CLI sidecar, and
 bundles with `gui/src-tauri/tauri.dev.conf.json` merged over `tauri.conf.json` (plus the
 version). The release config and the CI job are unchanged.
 
 ```sh
 make help                        # all targets
-make dev-version                 # 0.8.0-dev.20261110170142.g6e3fad0 (.dirty with uncommitted changes)
+make dev-version                 # 0.8.0-dev.20261110170142.g6e3fad0 (.dirty with changes or untracked files)
 make dev-deb                     # -> dist/brainproxy-gui-<dev version>-linux-x86_64.deb (+ .sha256)
 make dev-macos                   # -> dist/brainproxy-gui-<dev version>-macos-arm64.dmg (+ .sha256)
 ```
@@ -521,7 +522,9 @@ make dev-macos                   # -> dist/brainproxy-gui-<dev version>-macos-ar
 `DEB_TARGET` / `MAC_TARGET` pick another Rust target and `DIST` another output folder. The
 version is `<Cargo.toml version>-dev.<commit time, UTC>.g<commit>`: valid semver for Tauri, and
 as a Debian version later dev builds upgrade earlier ones. The app shows it (Settings, update
-check), so you can tell which commit is installed.
+check), so you can tell which commit is installed. On the Mac it is also
+`CFBundleShortVersionString` (Apple describes three integers, but only the App Store enforces
+that), and `CFBundleVersion` is the commit time.
 
 | | Release | Dev |
 | --- | --- | --- |
@@ -535,10 +538,12 @@ check), so you can tell which commit is installed.
 | Temporary engagements | `brainproxy-temp-<uid>` | `brainproxy-dev-temp-<uid>` |
 | CLI home (CA, checks, rule data) | `~/.local/share/brainproxy` | the same |
 
-The app finds its CLI by name next to its own executable; a dev package is built with
-`BRAINPROXY_CLI_NAME=brainproxy-dev`, so the dev app runs the dev CLI (never the release's
-`brainproxy` beside it) and names its temp folder after it. Its own identifier gives it its
-own webview storage, so Recent, theme and update settings are its own too.
+The app finds its CLI next to its own executable under the sidecar's name in the config it
+was built with (`bundle.externalBin`: `binaries/brainproxy` for a release,
+`binaries/brainproxy-dev` from `tauri.dev.conf.json`; `brainproxy` when there is none, as in
+`cargo tauri dev`), so the dev app runs the dev CLI (never the release's `brainproxy` beside
+it) and names its temp folder after it. Its own identifier gives it its own webview storage,
+so Recent, theme and update settings are its own too.
 
 The CLI home is shared on purpose: one interception CA to trust, and one set of your checks,
 Nuclei templates and rule data. A release validates updated rule data and falls back to its
