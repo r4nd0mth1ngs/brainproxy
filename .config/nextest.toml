@@ -7,3 +7,12 @@ fail-fast = false
 # The slowest test takes about a minute. One still running after five has hung: it is stopped
 # and fails, instead of the job's timeout cancelling the whole run with no report.
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Tests that drive a Chromium each: a runner starting all of them at once takes longer than
+# the 20 seconds a browser is given to answer, so two at a time.
+[test-groups]
+browser = { max-threads = 2 }
+
+[[profile.ci.overrides]]
+filter = 'binary(=browser_crawl) | binary(=login_replay)'
+test-group = 'browser'
