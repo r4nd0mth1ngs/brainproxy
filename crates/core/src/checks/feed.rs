@@ -148,6 +148,7 @@ pub(crate) async fn update_with(home: &Path, source: Source, keys: &[&str]) -> R
     }
     let root = home.join("checks");
     std::fs::create_dir_all(&root)?;
+    let _lock = crate::data::update_lock(home)?;
     let staging = root.join(".brainproxy.new");
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;

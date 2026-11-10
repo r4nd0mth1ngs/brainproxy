@@ -123,11 +123,24 @@ gui/node_modules/.package-lock.json: gui/package-lock.json
 	@if [ -L gui/node_modules ]; then echo "gui/node_modules is a symlink: using it as it is (no npm ci)"; \
 	else echo "cd gui && npm ci"; cd gui && npm ci; fi
 
+# Where Cargo puts a workspace's output ($(1): its Cargo.toml): target/, or $CARGO_TARGET_DIR or
+# build.target-dir when set. The CLI workspace and the GUI's are separate.
+target_dir = $(shell cargo metadata --format-version 1 --no-deps --manifest-path "$(1)" 2> /dev/null \
+	| sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+
+# The version, and both workspaces' output folders, once per build.
+define dev_setup
+$(eval DEV_V := $(DEV_VERSION))
+$(eval CLI_OUT := $(call target_dir,Cargo.toml))
+$(eval GUI_OUT := $(call target_dir,$(TAURI_DIR)/Cargo.toml))
+@[ -n "$(CLI_OUT)" ] && [ -n "$(GUI_OUT)" ] || { echo "error: cargo metadata didn't say where the build output goes" >&2; exit 1; }
+endef
+
 # $(1): Rust target. Builds the CLI and puts it where Tauri's externalBin looks for brainproxy-dev.
 define dev_sidecar
 cargo build --release --target $(1) -p brainproxy
 mkdir -p $(TAURI_DIR)/binaries "$(DEV_WORK)"
-cp target/$(1)/release/brainproxy $(TAURI_DIR)/binaries/$(DEV_NAME)-$(1)
+cp "$(CLI_OUT)/$(1)/release/brainproxy" $(TAURI_DIR)/binaries/$(DEV_NAME)-$(1)
 chmod 755 $(TAURI_DIR)/binaries/$(DEV_NAME)-$(1)
 endef
 
@@ -135,7 +148,7 @@ endef
 # Copies the one brainproxy-dev bundle Tauri made to $(DIST)/brainproxy-gui-<version>-<platform>.<ext>
 # (named as CI names release assets) and writes its sha256 beside it.
 define dev_collect
-@set -- $(TAURI_DIR)/target/$(2)/release/bundle/$(1)/$(DEV_NAME)_*.$(1); \
+@set -- "$(GUI_OUT)/$(2)/release/bundle/$(1)/"$(DEV_NAME)_*.$(1); \
 [ $$# -eq 1 ] && [ -f "$$1" ] || { echo "error: expected one $(DEV_NAME) .$(1) in bundle/$(1), found: $$*" >&2; exit 1; }; \
 mkdir -p "$(DIST)" && name=brainproxy-gui-$(DEV_V)-$(3).$(1) && cp "$$1" "$(DIST)/$$name" && cd "$(DIST)" && \
 { if command -v sha256sum > /dev/null; then sha256sum "$$name"; else shasum -a 256 "$$name"; fi; } > "$$name.sha256" && \
@@ -143,20 +156,23 @@ echo "==> $(DIST)/$$name" && cat "$$name.sha256"
 endef
 
 dev-deb: dev-deb-check gui/node_modules/.package-lock.json
-	$(eval DEV_V := $(DEV_VERSION))
+	$(dev_setup)
 	@echo "==> $(DEV_NAME) $(DEV_V) for $(DEB_TARGET)"
 	$(call dev_sidecar,$(DEB_TARGET))
 	printf '{"version": "%s"}\n' '$(DEV_V)' > "$(DEV_WORK)/version.json"
-	rm -f $(TAURI_DIR)/target/$(DEB_TARGET)/release/bundle/deb/$(DEV_NAME)_*.deb
+	rm -f "$(GUI_OUT)/$(DEB_TARGET)/release/bundle/deb/"$(DEV_NAME)_*.deb
 	cd gui && npx tauri build --target $(DEB_TARGET) --bundles deb $(DEV_CONFIG)
 	$(call dev_collect,deb,$(DEB_TARGET),linux-$(call asset_arch,$(DEB_TARGET)))
 
-# CFBundleVersion (bundleVersion) is the commit time: one integer, so later dev builds count higher.
+# The app reports the full dev version, but Info.plist keeps Apple's numeric forms:
+# CFBundleShortVersionString is Cargo.toml's version (Info.plist below, merged over Tauri's) and
+# CFBundleVersion (bundleVersion) the commit time, one integer, so later dev builds count higher.
 dev-macos: dev-macos-check gui/node_modules/.package-lock.json
-	$(eval DEV_V := $(DEV_VERSION))
+	$(dev_setup)
 	@echo "==> $(DEV_NAME) $(DEV_V) for $(MAC_TARGET) (ad-hoc signed, not notarised)"
 	$(call dev_sidecar,$(MAC_TARGET))
-	printf '{"version": "%s", "bundle": {"macOS": {"bundleVersion": "%s"}}}\n' '$(DEV_V)' '$(DEV_STAMP)' > "$(DEV_WORK)/version.json"
-	rm -f $(TAURI_DIR)/target/$(MAC_TARGET)/release/bundle/dmg/$(DEV_NAME)_*.dmg
+	printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n\t<key>CFBundleShortVersionString</key>\n\t<string>%s</string>\n</dict>\n</plist>\n' '$(BASE_VERSION)' > "$(DEV_WORK)/Info.plist"
+	printf '{"version": "%s", "bundle": {"macOS": {"bundleVersion": "%s", "infoPlist": "%s"}}}\n' '$(DEV_V)' '$(DEV_STAMP)' '$(DEV_WORK)/Info.plist' > "$(DEV_WORK)/version.json"
+	rm -f "$(GUI_OUT)/$(MAC_TARGET)/release/bundle/dmg/"$(DEV_NAME)_*.dmg
 	cd gui && npx tauri build --target $(MAC_TARGET) --bundles dmg $(DEV_CONFIG)
 	$(call dev_collect,dmg,$(MAC_TARGET),macos-$(call asset_arch,$(MAC_TARGET)))

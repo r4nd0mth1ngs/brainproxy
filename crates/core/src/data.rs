@@ -84,6 +84,17 @@ pub fn rules_dir(home: &Path) -> PathBuf {
     home.join("rules")
 }
 
+/// Held (until dropped) while an update writes into `<home>`: `scan data update`, `checks
+/// update` and the feed use fixed staging and backup names there, and two of them may run at
+/// once: two apps opened together each update the feed once a day, and a release and a dev
+/// build (`make dev-deb`) share the home. A second update waits for the first.
+pub(crate) fn update_lock(home: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(home)?;
+    let file = std::fs::File::options().create(true).write(true).truncate(false).open(home.join(".update.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Manifest {
     pub repository: String,
@@ -272,6 +283,7 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
     };
     let dir = rules_dir(home);
     std::fs::create_dir_all(&dir)?;
+    let _lock = update_lock(home)?;
     let mut manifest = read_manifest(&dir).unwrap_or_default();
     let mut result = UpdateResult {
         dir: dir.clone(),

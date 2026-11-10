@@ -519,12 +519,14 @@ make dev-deb                     # -> dist/brainproxy-gui-<dev version>-linux-x8
 make dev-macos                   # -> dist/brainproxy-gui-<dev version>-macos-arm64.dmg (+ .sha256)
 ```
 
-`DEB_TARGET` / `MAC_TARGET` pick another Rust target and `DIST` another output folder. The
-version is `<Cargo.toml version>-dev.<commit time, UTC>.g<commit>`: valid semver for Tauri, and
-as a Debian version later dev builds upgrade earlier ones. The app shows it (Settings, update
-check), so you can tell which commit is installed. On the Mac it is also
-`CFBundleShortVersionString` (Apple describes three integers, but only the App Store enforces
-that), and `CFBundleVersion` is the commit time.
+`DEB_TARGET` / `MAC_TARGET` pick another Rust target and `DIST` another output folder; the build
+output goes where Cargo says (`target/`, or `$CARGO_TARGET_DIR`). The version is
+`<Cargo.toml version>-dev.<commit time, UTC>.g<commit>`: valid semver for Tauri, and as a
+Debian version a build of a later-committed commit upgrades an earlier one (two commits in the
+same second order by hash; a rebuild of one commit reinstalls). The app shows it (Settings,
+update check), so you can tell which commit is installed. On the Mac, `Info.plist` keeps
+Apple's numeric forms: `CFBundleShortVersionString` is Cargo.toml's version and
+`CFBundleVersion` the commit time.
 
 | | Release | Dev |
 | --- | --- | --- |
@@ -547,7 +549,11 @@ so Recent, theme and update settings are its own too.
 
 The CLI home is shared on purpose: one interception CA to trust, and one set of your checks,
 Nuclei templates and rule data. A release validates updated rule data and falls back to its
-built-in copy, and leaves out check files it can't parse. Project files are not in the home,
+built-in copy, and leaves out check files it can't parse. Updates into the home (`scan data
+update`, `checks update`, and the feed, which an app with daily update checks on updates when
+it opens) take
+`<home>/.update.lock`, so two apps opened together update one after the other instead of
+swapping each other's staging folders. Project files are not in the home,
 so this choice doesn't protect them either way: a dev build with a newer project schema
 migrates any project you open in it, and the release then refuses that project as newer than
 it supports. Open a copy in the dev app if you'll still need it in the release. Pass

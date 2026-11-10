@@ -91,6 +91,7 @@ fn store_path(rel: &str) -> Option<(PathBuf, bool)> {
 pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
     let root = home.join("checks");
     std::fs::create_dir_all(&root)?;
+    let _lock = crate::data::update_lock(home)?;
     let staging = root.join(".nuclei.new");
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
