@@ -39,10 +39,25 @@ pub(crate) struct Options {
     pub client: Client,
     pub auth: Option<Arc<AuthSession>>,
     pub headers: Vec<(String, String)>,
-    pub scope: Arc<Scope>,
+    /// The crawl's sites: only they get its headers and session, and page loads stay inside
+    /// them. None for a browser that isn't crawling (a login replay): the engagement scope alone
+    /// says where it may go.
+    pub scope: Option<Arc<Scope>>,
     pub exclude: Vec<Regex>,
     pub block_delete: bool,
     pub rate: Option<f64>,
+    /// The source its history rows carry.
+    pub source: &'static str,
+    /// Sees each request before it is recorded and sent, and may rewrite it.
+    pub tap: Option<Arc<dyn Tap>>,
+    /// Rows keep no content (`--no-store`).
+    pub no_store: bool,
+}
+
+/// What a gateway's owner does with the browser's requests as they pass.
+pub(crate) trait Tap: Send + Sync {
+    /// The request to record and send in place of `request`.
+    fn outgoing(&self, target: &Target, request: Vec<u8>) -> Vec<u8>;
 }
 
 #[derive(Default)]
@@ -84,7 +99,8 @@ impl Gateway {
         let addr = listener.local_addr()?;
         let save = Arc::new(Mutex::new(save));
         let queue = save.clone();
-        let rows = Rows::new("crawl-browser", move |w| drop(queue.lock().unwrap().send(Save::Row(w))));
+        let rows = Rows::new(opts.source, move |w| drop(queue.lock().unwrap().send(Save::Row(w))));
+        let rows = if opts.no_store { rows.without_content(crate::sent::NOT_STORED) } else { rows };
         let shared = Arc::new(Shared {
             limiter: Limiter::new(opts.rate),
             rows: rows.sent_by(&opts.client),
@@ -274,16 +290,18 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
     let url = format!("{}{}", target.origin(), head.target);
     let parsed = Url::parse(&url).ok();
     // The crawl's own sites (seed origins): only they get its headers and session.
-    let ours = parsed.as_ref().is_some_and(|u| s.opts.scope.on_site(u));
+    let scope = s.opts.scope.as_deref();
+    let ours = scope.is_some_and(|sc| parsed.as_ref().is_some_and(|u| sc.on_site(u)));
     // A page load (a link, form, redirect or script navigating the tab or a frame) must stay
     // inside the crawl scope; the page's own API and asset requests may go elsewhere in the engagement.
-    let leaves_scope = is_navigation(&head.headers) && !parsed.as_ref().is_some_and(|u| s.opts.scope.allows(u));
+    let leaves_scope =
+        scope.is_some_and(|sc| is_navigation(&head.headers) && !parsed.as_ref().is_some_and(|u| sc.allows(u)));
 
     if let Some(reason) = blocked_reason(&url, &method, &s.opts.exclude, s.opts.block_delete)
         .or(leaves_scope.then_some("the page would leave the crawl's sites or path prefix"))
     {
         let msg = format!("not sent by the browser crawl: {reason}");
-        send_capture(s, Capture::new("crawl-browser", target, &request, None, None, Some(&msg)));
+        send_capture(s, s.rows.capture(target, &request, None, None, Some(&msg)));
         let mut st = s.stats.lock().unwrap();
         st.blocked_count += 1;
         if st.blocked.len() < MAX_LISTED {
@@ -302,6 +320,9 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         if let Some(a) = auth {
             request = a.apply_to(&request, &[], target);
         }
+    }
+    if let Some(tap) = &s.opts.tap {
+        request = tap.outgoing(target, request);
     }
     // In flight while it waits for its turn too, so the page isn't taken as settled.
     let _busy = InFlight::new(s);
@@ -330,7 +351,7 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
             }
             // Its row says how it failed; one that couldn't go out gets one now.
             if !recorded {
-                send_capture(s, Capture::new("crawl-browser", target, &request, None, None, Some(&e.to_string())));
+                send_capture(s, s.rows.capture(target, &request, None, None, Some(&e.to_string())));
             }
             let mut st = s.stats.lock().unwrap();
             st.requests += 1;

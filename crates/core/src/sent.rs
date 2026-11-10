@@ -284,12 +284,14 @@ pub struct Rows {
     sni: Option<String>,
     /// The error of a row whose request was given up unanswered.
     abandoned: &'static str,
+    /// Keep no content: the error's first words for such rows.
+    omit: Option<&'static str>,
 }
 
 impl Rows {
     /// Rows of `source`, handed to `write` (which queues them for the writer thread).
     pub fn new(source: &'static str, write: impl Fn(RowWrite) + Send + Sync + 'static) -> Self {
-        Self { write: Arc::new(write), source, sni: None, abandoned: ABANDONED }
+        Self { write: Arc::new(write), source, sni: None, abandoned: ABANDONED, omit: None }
     }
 
     /// Rows of `source` written to `store` at once, on the sending thread: for a sender with
@@ -315,6 +317,12 @@ impl Rows {
         self
     }
 
+    /// Rows keep no content, as [`SentLog::without_content`]'s do.
+    pub fn without_content(mut self, reason: &'static str) -> Self {
+        self.omit = Some(reason);
+        self
+    }
+
     pub fn source(&self) -> &'static str {
         self.source
     }
@@ -328,7 +336,11 @@ impl Rows {
         duration_ms: Option<u64>,
         error: Option<&str>,
     ) -> Capture {
-        let c = Capture::new(self.source, target, request, response, duration_ms.map(|d| d as i64), error);
+        let duration = duration_ms.map(|d| d as i64);
+        let c = match self.omit {
+            Some(reason) => content_omitted(self.source, target, request, response, duration, error, reason),
+            None => Capture::new(self.source, target, request, response, duration, error),
+        };
         Capture { sni: sent_sni(self.sni.as_deref(), target), ..c }
     }
 

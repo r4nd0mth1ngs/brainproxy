@@ -894,9 +894,16 @@ byte, side by side or unified.
   token comes from and whether a bearer token from the login response is sent on, and picks
   a page and pattern that tell logged-in from logged-out; every pattern is checked against
   the recording. It shows what it found, then saves the profile and tests a real login.
-  Single sign-on on another site or a one-time code can't be replayed: the profile then
-  carries the recorded session until it expires. (CLI: `auth record start URL`,
-  `auth record finish NAME --save`.) The password is kept in the project, as the proxy
+  A login that asks for a one-time code is replayed too once the profile has the TOTP
+  secret (the wizard asks for it when a code was typed): brainproxy then makes each code
+  itself. In a Chromium-based browser (Linux and macOS) what you do in the page is recorded
+  as well, so a login plain requests can't repeat (single sign-on on another site, a page
+  that builds the login in JavaScript, a passkey) is replayed by running those steps again
+  in a browser with no window. *The login uses a passkey* puts a virtual authenticator in
+  the recording browser: a passkey you register there is kept with the profile and signs in
+  at every replay. Without the secret or the steps, the profile carries the recorded session
+  until it expires. (CLI: `auth record start URL`, `auth record finish NAME --save`; see
+  "One-time codes, browser logins and passkeys" below.) The password is kept in the project, as the proxy
   history already holds the recorded login; give an environment variable name instead to
   keep it out of the profile. Or set it up by hand: give a login URL with method and body (or a raw login
   request), the username, and the password, preferably as an environment variable name.
@@ -925,7 +932,8 @@ byte, side by side or unified.
     (move them up or down), then say what to take from each response into a variable: an
     HTML input by name (or a `<meta name=… content=…>`), a JSON path such as `data.token`, a
     regex (group 1), a response header, or a cookie the response sets. Later steps use a
-    value as `{{name}}` (also `{{username}}` and `{{password}}`), and their parameters with
+    value as `{{name}}` (also `{{username}}`, `{{password}}` and, with a TOTP secret in the
+    profile, `{{totp}}` for the current one-time code), and their parameters with
     the same name get it automatically; cookies carry through the steps into the session.
     *Run* shows each step's request, status and history entry, and the values found, masked
     (first four characters and the length). The values become the session's latest.
@@ -938,7 +946,8 @@ byte, side by side or unified.
     go stale. *Update request* puts the values of this rule's macros into the request: every query, form,
     JSON or multipart parameter, header or cookie with the variable's name (or the names you map,
     such as `X-CSRF-Token=csrf`; an `Authorization` header keeps its scheme, as in
-    `Bearer …`); a parameter being fuzzed or attacked keeps its payload.
+    `Bearer …`); a parameter being fuzzed or attacked keeps its payload. Mapping a name to
+    `totp` (`otp=totp`) puts the profile's current one-time code there.
     *Log in* logs in with the profile when the session isn't logged in or a check just
     failed. A response that looks logged out, or matches the rule's *stale-values* regex
     (for example `invalid csrf token`), refreshes the rule's macros (once, however many
@@ -1067,7 +1076,7 @@ local settings (scope, engagement, CA, capabilities, ...) have no `_meta`.
 
 Project files (`.bpdb`, its `-wal`/`-shm`, and `<project>.browsers/`) are readable by
 their owner only. `query` cannot read `auth_profiles`, which holds passwords, header
-values, and session tokens; `auth show` redacts them. `report -o`, `findings repro -o` and
+values, TOTP secrets, passkeys, and session tokens; `auth show` redacts them. `report -o`, `findings repro -o` and
 `ca export --out` refuse to overwrite an existing file unless given `--force`, and through MCP
 `--force` is refused for them and for `ca init`, so an agent writes new files only and keeps
 the CA. On Unix the files these and other `--out`/`-o` options write are readable by their
@@ -1122,6 +1131,16 @@ brainproxy auth macro add app csrf --step 42 --extract '1:csrf=input:csrf_token'
 brainproxy auth macro run app csrf
 brainproxy auth rule add app --tool scan,checks,fuzz --action macro:csrf:each --action update:csrf
 brainproxy scan active https://app.acme.test/account --auth app
+
+# A login with a one-time code: record it, give the secret, and it is replayed from then on
+brainproxy auth record start https://app.acme.test/login     # log in in the browser, code and all
+APP_TOTP='otpauth://totp/Acme:me?secret=JBSWY3DPEHPK3PXP' \
+    brainproxy auth record finish app --save --totp-secret-env APP_TOTP
+# A passkey: register one in a virtual authenticator, then record signing in with it
+brainproxy auth record start https://app.acme.test/login --passkey          # log in, add a passkey
+brainproxy auth record finish app --save
+brainproxy auth record start https://app.acme.test/login --passkeys-from app   # sign in with it
+brainproxy auth record finish app --save && brainproxy auth login app
 
 brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe while in use; never overwrites
 brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
@@ -1606,7 +1625,71 @@ and stores the value as `--header` does, so it stays off the command line (for a
 `«auth:NAME:query:api_key»`, the value goes only into the request line of requests to those
 origins, and scans don't attack it. `auth show` and `auth list` mask both. `auth add` on an
 existing name replaces the profile's fields, query keys (unless `--keep-query-keys`), OAuth setup
-(unless `--keep-oauth`) and session, and keeps its signers, rules and macros.
+(unless `--keep-oauth`), TOTP secret (unless `--keep-totp`), what a recording gave it (its raw
+login request, the requests after it and its browser steps, unless `--keep-recorded`) and
+session, and keeps its signers, rules, macros and passkeys.
+
+One-time codes, browser logins and passkeys in an auth profile:
+
+- **TOTP.** `auth add NAME ... --totp-secret-env VAR` names the variable that holds the secret
+  an authenticator app would hold: base32, or the `otpauth://` URI a QR code holds, whose
+  algorithm (SHA-1, SHA-256, SHA-512), digits and period then apply (`--totp-algorithm`,
+  `--totp-digits`, `--totp-period` set them otherwise; SHA-1, 6 digits and 30 seconds by
+  default). The variable is read at each login and never stored; `--totp-secret` (or
+  `BRAINPROXY_SECRET_TOTP`, which the app uses) stores the secret in the project file like a
+  stored password, and `auth show` masks it. `{{totp}}` is then the current code: in
+  `--login-body` and `--login-request`, in a macro step, in the requests and steps a recording
+  makes, and as `update:PARAM=totp` in a session rule. Requests carry the placeholder
+  `«auth:NAME:totp»`, which is worked out as the bytes go on the wire, so history, reports and
+  exports never hold a code, and a login re-sent from history gets a fresh one. Like the
+  password, it only goes to the login's origins (and a macro's, or a rule's URL).
+  A site may take each code once, so a login waits for the next code when this profile already
+  sent the current one (the project remembers, across commands; up to one period). A code
+  that went out within a few seconds of its period's edge and was refused is sent once more
+  (the next code, or the same one a little later); a login refused in the middle of a period
+  is not repeated. One process at a time logs in with a profile that sends a code, across
+  commands, so two never send the same one.
+- **A code in a recorded login.** `auth record finish NAME --totp-secret-env VAR` (or
+  `--totp-secret`) makes a login with a code replayable: the code field of the login request
+  becomes `{{totp}}`, or the request that posts the code on its own page becomes a step after
+  the login request (`login_steps` in `auth show`), with the token its form or a header carries read
+  again each time. The output says whether the secret makes the code that was typed while
+  recording, and `needs_totp` is true when a code was typed and no secret is known.
+- **Browser steps.** `auth record start URL` opens a Chromium-based browser held by a
+  background brainproxy process (Linux and macOS; Firefox, Windows and `--no-steps` record the
+  traffic only, as before). Fields filled, boxes ticked, buttons and links clicked, Enter, and
+  pages opened by their address are recorded in the tab the browser opens with; other tabs,
+  pop-up windows and embedded frames are not (the output says when something happened there).
+  `auth record finish NAME` closes the browser and lists the steps. When plain requests can't
+  repeat the login, or with `--in-browser`, the profile replays them (`mode: browser`):
+  `{{username}}`, `{{password}}` and `{{totp}}` stand for what was typed, and what went into
+  another password field is kept masked (other fields are kept as typed, and shown). The
+  recorder listens from a world of its own in the page, so a page's scripts can't add steps. `--steps-from N` keeps the steps from N on, for a
+  recording that did more than log in. An unsaved recording is held only in that background
+  process's memory (for two hours at most); the project file gets it when the profile is saved.
+- **Replay.** `auth login NAME`, and every re-login of scans, the fuzzer, the crawler, the proxy
+  and `send --auth NAME`, starts a headless browser (the first Chromium-based one of
+  `browser list`), runs the steps, and takes the site's cookies and the token its pages send
+  (the header `token_header` names) into the session. The browser's only way out is a gateway
+  that sends with the engagement-guarded client, as for `crawl --browser`: a page a step opens
+  outside the scope is refused before the browser starts, a step that leads outside it ends
+  the login with an out-of-scope error, and other hosts the pages ask for are refused one by
+  one. Its requests are recorded (source `auth`), and
+  those to the sites the password, the one-time code and anything else typed into a password
+  field were typed on carry placeholders in their place. The replay types such a value only
+  on the site it was typed on when recorded: a login that now leads somewhere else is stopped. A step waits up to 15 seconds for its element and a login
+  takes two minutes at most; `BRAINPROXY_LOGIN_BROWSER_SHOW=1` shows the window, to see why a
+  replay stops, and `BRAINPROXY_BROWSER_NO_SANDBOX=1` applies as for the browser crawl.
+- **Passkeys.** `auth record start URL --passkey` puts a virtual authenticator in the
+  recording browser (the machine's own authenticators and security keys aren't offered there).
+  Log in as usual, register a passkey in the account's security settings, and
+  `auth record finish NAME --save`: the credential (private key, site, user handle, signature
+  counter) is kept with the profile, in the table `query` can't read, and `auth show` lists it
+  without its key. To record the sign-in itself, `auth record start URL --passkeys-from NAME`
+  starts the authenticator with the profile's passkeys; sign in with the passkey and finish.
+  Every replay puts the passkeys back and stores the counters they reached, whatever came of
+  the login (a recording with `--passkeys-from` stores them as it goes, too), so a counter only
+  goes up; one process at a time signs with a profile's passkeys.
 
 OAuth 2.0 in an auth profile, in place of a login:
 
@@ -1726,8 +1809,9 @@ and targets that want a JWT you choose the claims of:
   receive.
 - Through MCP (`mcp serve`), `auth sign add --script` is refused: a person reads the script and
   adds that signer in the app or a terminal. Variables named by `--secret-env`, `--access-key-env`,
-  `--session-token-env` (and by `auth add`'s `--header-env`, `--query-key`, `--password-env` and
-  `--oauth-*-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
+  `--session-token-env` (and by `auth add`'s `--header-env`, `--query-key`, `--password-env`,
+  `--totp-secret-env` and `--oauth-*-env`, and `auth record finish`'s `--password-env` and
+  `--totp-secret-env`) must start with `BRAINPROXY_SECRET_`, and `auth oauth authorize` doesn't open a
   browser.
 
 ### Findings found by hand (`findings add`)

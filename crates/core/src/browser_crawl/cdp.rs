@@ -43,6 +43,8 @@ pub(crate) struct LaunchOptions<'a> {
     pub ca_spki: String,
     /// Run without Chromium's sandbox: only when asked for ([`sandbox_off`]).
     pub no_sandbox: bool,
+    /// A person uses the window (recording a login): dialogs and pop-ups are theirs to answer.
+    pub hands_off: bool,
 }
 
 type Reply = std::result::Result<Value, String>;
@@ -52,6 +54,10 @@ struct Conn {
     next: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     closed: AtomicBool,
+    /// Leave dialogs and pop-ups alone ([`LaunchOptions::hands_off`]).
+    hands_off: bool,
+    /// Who gets the browser's events ([`Chrome::events`]).
+    events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Value>>>,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -84,6 +90,12 @@ impl Conn {
                 };
                 let _ = tx.send(reply);
             }
+            return;
+        }
+        if let Some(events) = &*self.events.lock().unwrap() {
+            let _ = events.send(msg.clone());
+        }
+        if self.hands_off {
             return;
         }
         let session = msg.get("sessionId").and_then(Value::as_str);
@@ -183,6 +195,8 @@ impl Chrome {
             next: AtomicU64::new(1),
             pending: Mutex::default(),
             closed: AtomicBool::new(false),
+            hands_off: opts.hands_off,
+            events: Mutex::default(),
         });
         let reader = conn.clone();
         std::thread::spawn(move || {
@@ -199,6 +213,13 @@ impl Chrome {
             reader.close();
         });
         Ok(Chrome { child, conn, profile })
+    }
+
+    /// The browser's events from now on (method, params, sessionId), for one listener.
+    pub fn events(&self) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.conn.events.lock().unwrap() = Some(tx);
+        rx
     }
 
     /// Whether the browser is still connected.
@@ -483,6 +504,7 @@ mod tests {
             proxy: "127.0.0.1:41234".parse().unwrap(),
             ca_spki: "abc=".into(),
             no_sandbox: false,
+            hands_off: false,
         };
         let a = args(&opts, Path::new("/tmp/p"));
         for want in [

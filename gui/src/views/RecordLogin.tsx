@@ -1,27 +1,38 @@
 // "Record a login": log in once in a browser and brainproxy works out the auth profile from
-// the recorded traffic (login request, CSRF token, bearer token, logged-in check), then saves
-// and tests it. Runs `auth record start` / `auth record finish` and `auth login`.
+// the recorded traffic (login request, CSRF token, bearer token, logged-in check) and from
+// what was done in the page (for a login only a browser can repeat), then saves and tests it.
+// Runs `auth record start` / `auth record finish` and `auth login`.
 
 import { useEffect, useState } from "react";
-import { run, withScheme } from "../api";
+import { cli, run, withScheme } from "../api";
 import { useApp } from "../store";
 import { startProxy } from "./proxyPort";
+import { finishCall, logsIn, modeText, passkeyLine, startArgs, type PasskeyInfo, type RecordMode } from "./recordLogin";
 import { loadSuggestions } from "./Scanner";
 
 interface Proposal {
-  mode: "replay" | "session";
+  mode: RecordMode;
   recorded: number;
   found: string[];
   warnings: string[];
+  /** What was done in the page, a step a line (a browser login replays them). */
+  steps: string[];
+  passkeys: PasskeyInfo[];
+  /** A one-time code was typed and the profile has no TOTP secret to make the next one. */
+  needs_totp: boolean;
   profile: {
     login_url?: string;
     username?: string;
+    password?: { env: string } | { literal: string };
     csrf_url?: string;
     token_header?: string;
     check_url?: string;
     logged_in?: string;
     logged_out?: string;
     headers: [string, string][];
+    totp?: { secret: { env: string } | { literal: string } };
+    login_steps?: { url: string }[];
+    browser?: { start_url: string };
   };
 }
 
@@ -47,6 +58,8 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
   const [busy, setBusy] = useState(false);
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [envVar, setEnvVar] = useState("");
+  const [passkey, setPasskey] = useState(false);
+  const [totp, setTotp] = useState("");
   const [result, setResult] = useState<LoginResult | null>(null);
 
   useEffect(() => {
@@ -72,22 +85,27 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
     guard(async () => {
       const status = await run<{ running: boolean }>(["proxy", "status"]);
       if (!status.running || app.proxy.moving) await startProxy(run, app.proxy);
-      await run(["auth", "record", "start", url]);
+      // A profile of this name that has passkeys: they go in the browser, to sign in with.
+      const old = passkey ? await cli<{ passkeys?: PasskeyInfo[] }>(["auth", "show", "--", profileName]) : null;
+      const passkeysFrom = old?.ok && old.data.passkeys?.length ? profileName : undefined;
+      await run(startArgs(url, { passkey, passkeysFrom }));
       setStep("recording");
     });
 
+  // The analysis, again with the TOTP secret once it is typed.
   const analyze = () =>
     guard(async () => {
-      setProposal(await run<Proposal>(["auth", "record", "finish", "--", profileName]));
+      const call = finishCall(profileName, { save: false, totpSecret: totp });
+      setProposal(await run<Proposal>(call.args, { env: call.env }));
       setStep("review");
     });
 
   const save = () =>
     guard(async () => {
-      const env = envVar.trim() ? [`--password-env=${envVar.trim()}`] : [];
-      await run(["auth", "record", "finish", "--save", ...env, "--", profileName]);
+      const call = finishCall(profileName, { save: true, totpSecret: totp, passwordEnv: envVar });
+      const saved = await run<Proposal>(call.args, { env: call.env });
       setResult(
-        proposal?.mode === "replay"
+        logsIn(saved.mode)
           ? await run<LoginResult>(["auth", "login", profileName])
           : { login: { success: true, reason: "the recorded session is used as is" } },
       );
@@ -134,7 +152,22 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
               {busy ? "Opening…" : "Open browser and record"}
             </button>
           </div>
-          <p className="muted small">The browser starts with an empty profile, so an earlier session can't skip the login.</p>
+          <p className="muted small">
+            The browser starts with an empty profile, so an earlier session can't skip the login. In a Chromium-based
+            browser what you do in the page is recorded too, for a login only a browser can repeat (single sign-on, a
+            passkey).
+          </p>
+          <label className="row gap small">
+            <input type="checkbox" checked={passkey} onChange={(e) => setPasskey(e.target.checked)} /> The login uses a
+            passkey
+          </label>
+          {passkey && (
+            <p className="muted small">
+              The browser gets a virtual authenticator in place of this machine's own. First time: log in as usual, add a
+              passkey in the account's security settings, and come back; it is kept with the profile. Then record once
+              more and sign in with the passkey: that sign-in is what brainproxy replays.
+            </p>
+          )}
         </>
       )}
 
@@ -143,7 +176,7 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
           <ol className="record-howto">
             <li>Log in in the browser that just opened.</li>
             <li>Then open one page that only a logged-in user can see (your account, a dashboard).</li>
-            <li>Come back here.</li>
+            <li>Come back here; the browser closes by itself.</li>
           </ol>
           <div className="row gap">
             <button className="btn primary" disabled={busy} onClick={analyze}>
@@ -158,11 +191,7 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
 
       {step === "review" && proposal && pr && (
         <>
-          <p>
-            {proposal.mode === "replay"
-              ? "brainproxy can log in by itself, and again whenever the session ends."
-              : "brainproxy can't replay this login, so the profile carries your current session. Record again when it expires."}
-          </p>
+          <p>{modeText(proposal.mode)}</p>
           <dl className="facts">
             {pr.login_url && (
               <>
@@ -208,7 +237,29 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
                 <dd className="mono">{pr.headers.map(([k]) => k).join(", ")}</dd>
               </>
             )}
+            {pr.totp && (
+              <>
+                <dt>One-time code</dt>
+                <dd>made from the TOTP secret at each login</dd>
+              </>
+            )}
+            {proposal.passkeys.length > 0 && (
+              <>
+                <dt>Passkey</dt>
+                <dd>{proposal.passkeys.map(passkeyLine).join("; ")}</dd>
+              </>
+            )}
           </dl>
+          {proposal.steps.length > 0 && (
+            <>
+              <label className="label">Steps replayed in the browser</label>
+              <ol className="small mono">
+                {proposal.steps.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ol>
+            </>
+          )}
           {proposal.warnings.length > 0 && (
             <div className="wiz-warn">
               {proposal.warnings.map((w) => (
@@ -224,7 +275,28 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
               ))}
             </ul>
           </details>
-          {proposal.mode === "replay" && (
+          {(proposal.needs_totp || totp) && (
+            <>
+              <label className="label">TOTP secret</label>
+              <p className="muted small">
+                A one-time code was typed. With the secret your authenticator app holds (the letters shown beside the
+                QR code, or the otpauth:// address in it) brainproxy makes the next code itself.
+              </p>
+              <div className="row gap">
+                <input
+                  className="input grow"
+                  type="password"
+                  value={totp}
+                  placeholder="base32 secret or otpauth://…; kept in the project file"
+                  onChange={(e) => setTotp(e.target.value)}
+                />
+                <button className="btn" disabled={busy || !totp.trim()} onClick={analyze}>
+                  Use it
+                </button>
+              </div>
+            </>
+          )}
+          {logsIn(proposal.mode) && pr.password && (
             <>
               <label className="label">Password</label>
               <input
@@ -237,7 +309,7 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
           )}
           <div className="row gap">
             <button className="btn primary" disabled={busy} onClick={save}>
-              {busy ? "Saving and testing…" : proposal.mode === "replay" ? "Save and test the login" : "Save"}
+              {busy ? "Saving and testing…" : logsIn(proposal.mode) ? "Save and test the login" : "Save"}
             </button>
             <button className="btn" disabled={busy} onClick={() => setStep("start")}>
               Record again

@@ -601,6 +601,21 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
     // Passive scanning, wherever it runs, includes the feed's and your passive checks.
     brainproxy_core::scan::passive::use_checks_from(&proxy_cmd::resolve_home(cli.home.clone()));
     brainproxy_core::data::set_home(&proxy_cmd::resolve_home(cli.home.clone()));
+    // A profile that logs in with a browser finds one, and the CA its traffic is opened with, here.
+    let home = proxy_cmd::resolve_home(cli.home.clone());
+    brainproxy_core::browser_login::set_launcher(move || {
+        Ok(brainproxy_core::browser_login::Launcher {
+            browser: browser_cmd::chromium(None).map_err(|e| match e {
+                Error::NotFound(_) => Error::NotFound(
+                    "a Chromium-based browser to replay this profile's login in (Chrome, Chromium, Edge or Brave; see \
+                     `brainproxy browser list`)"
+                        .into(),
+                ),
+                e => e,
+            })?,
+            ca: std::sync::Arc::new(proxy_cmd::load_ca(&home)?.0),
+        })
+    });
     match cli.command {
         Cmd::Capabilities { command } => {
             let v = if command.is_empty() {

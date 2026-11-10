@@ -123,10 +123,41 @@ pub struct AuthProfile {
     /// OAuth 2.0 token requests in place of a login (see [`crate::oauth`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<crate::oauth::OAuth>,
+    /// The secret one-time codes are made from (see [`crate::totp`]): `{{totp}}` in the login
+    /// request, a login step, a macro step or a browser step is the current code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<crate::totp::Totp>,
+    /// Requests sent after the login request, in order: a one-time code form on its own page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub login_steps: Vec<LoginStep>,
+    /// A login replayed in a headless browser in place of a login request (see
+    /// [`crate::browser_login`]): recorded steps, for a login plain requests can't repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<crate::browser_login::BrowserLogin>,
+    /// Passkeys the browser login signs in with: credentials of its virtual authenticator.
+    /// Their private keys are stored here like a stored password, and masked like one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passkeys: Vec<crate::browser_login::Passkey>,
     /// Who saved it last: gui, cli or mcp (None: before brainproxy kept it), set when it is
     /// saved. A proxied request its session goes on records this in `edited_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+}
+
+/// A request that follows the login request, such as the form a one-time code is posted to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoginStep {
+    /// Where it goes (the request line's path is what is sent).
+    pub url: String,
+    /// The raw request, with `{{totp}}`, `{{username}}`, `{{password}}` and `{{csrf}}` placeholders.
+    pub request: String,
+    /// Page fetched first for the step's own token. Without it, `csrf_regex` reads the
+    /// responses since the request before (the login's, or the previous step's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csrf_url: Option<String>,
+    /// Regex (group 1) for the token `{{csrf}}` stands for in this step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csrf_regex: Option<String>,
 }
 
 fn post() -> String {
@@ -141,7 +172,33 @@ fn twenty() -> u32 {
 
 impl AuthProfile {
     pub fn has_login(&self) -> bool {
-        self.login_url.is_some() || self.oauth.is_some()
+        self.login_url.is_some() || self.oauth.is_some() || self.browser.is_some()
+    }
+
+    /// The origins the login sends its password and one-time code to: the login request's and
+    /// its follow-up steps', and those of the pages a browser login types them on.
+    pub(crate) fn login_origins(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let typed_on = self.browser.iter().flat_map(|b| b.secret_pages());
+        for url in
+            self.login_url.iter().chain(self.login_steps.iter().map(|s| &s.url)).map(String::as_str).chain(typed_on)
+        {
+            if let Ok(t) = Target::from_url(url) {
+                if !out.contains(&t.origin()) {
+                    out.push(t.origin());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether logging in sends a one-time code.
+    pub fn login_uses_totp(&self) -> bool {
+        const VAR: &str = "{{totp}}";
+        self.login_body.as_deref().is_some_and(|b| b.contains(VAR))
+            || self.login_request.as_deref().is_some_and(|r| r.contains(VAR))
+            || self.login_steps.iter().any(|s| s.request.contains(VAR))
+            || self.browser.as_ref().is_some_and(|b| b.uses_totp())
     }
 
     /// A profile with no login or headers, whose session its macros and rules make.
@@ -207,6 +264,39 @@ impl AuthProfile {
         if let Some(p) = &self.platform {
             p.validate(self.username.as_deref(), self.password.as_ref())?;
         }
+        if let Some(t) = &self.totp {
+            t.validate()?;
+        }
+        if let Some(b) = &self.browser {
+            if self.login_url.is_some() || self.oauth.is_some() {
+                return Err(Error::InvalidInput(
+                    "a profile logs in with a login request, OAuth or recorded browser steps, not two of them".into(),
+                ));
+            }
+            b.validate()?;
+        }
+        // A shown profile has no keys in it: it isn't one to save again.
+        if self.passkeys.iter().any(|k| k.private_key.is_empty() || k.credential_id.is_empty() || k.rp_id.is_empty()) {
+            return Err(Error::InvalidInput(
+                "a passkey without its key, id or site can't sign in: record it again".into(),
+            ));
+        }
+        if !self.login_steps.is_empty() && self.login_url.is_none() {
+            return Err(Error::InvalidInput(
+                "login steps follow a login request: the profile needs --login-url".into(),
+            ));
+        }
+        for (i, step) in self.login_steps.iter().enumerate() {
+            let what = |e: String| Error::InvalidInput(format!("login step {}: {e}", i + 1));
+            Target::from_url(&step.url).map_err(|e| what(e.to_string()))?;
+            RawRequest::from_bytes(step.request.clone().into_bytes()).head().map_err(|e| what(e.to_string()))?;
+            if let Some(r) = &step.csrf_regex {
+                Regex::new(r).map_err(|e| what(format!("token regex: {e}")))?;
+            }
+            if step.csrf_url.is_some() && step.csrf_regex.is_none() {
+                return Err(what("a token page needs the regex that reads the token".into()));
+            }
+        }
         for (what, re) in [
             ("csrf", &self.csrf_regex),
             ("token", &self.token_regex),
@@ -220,7 +310,9 @@ impl AuthProfile {
         if self.csrf_url.is_some() != self.csrf_regex.is_some() {
             return Err(Error::InvalidInput("--csrf-url and --csrf-regex go together".into()));
         }
-        if self.oauth.is_none() && self.token_regex.is_some() != self.token_header.is_some() {
+        // A browser login reads the token off the requests the page sends: no regex.
+        let token_read_for_it = self.oauth.is_some() || (self.browser.is_some() && self.token_regex.is_none());
+        if !token_read_for_it && self.token_regex.is_some() != self.token_header.is_some() {
             return Err(Error::InvalidInput("--token-regex and --token-header go together".into()));
         }
         // A line break would start another header (a Host, say) on every request.
@@ -245,6 +337,14 @@ impl AuthProfile {
             q.value = "********".into();
         }
         p.oauth = p.oauth.as_ref().map(crate::oauth::OAuth::redacted);
+        p.totp = p.totp.as_ref().map(crate::totp::Totp::redacted);
+        for step in &mut p.login_steps {
+            step.request = mask_authorization(&step.request);
+        }
+        p.browser = p.browser.as_ref().map(crate::browser_login::BrowserLogin::redacted);
+        for k in &mut p.passkeys {
+            k.private_key.clear();
+        }
         p
     }
 
@@ -258,6 +358,11 @@ impl AuthProfile {
         if let Some(o) = &self.oauth {
             out.extend([&o.client_secret, &o.refresh_token].into_iter().filter_map(resolve));
         }
+        // The secret codes are made from. A code itself is never on record (requests carry a
+        // placeholder), and one a person typed while recording a login is spent.
+        out.extend(self.totp.iter().flat_map(crate::totp::Totp::secret_values));
+        out.extend(self.browser.iter().flat_map(|b| b.secret_values()));
+        out.extend(self.passkeys.iter().map(|k| k.private_key.clone()));
         out.extend(static_cookies(self).into_iter().map(|(_, v)| v));
         // A profile's headers are there to authenticate, except the ordinary ones a profile may
         // set too: a User-Agent or Accept isn't a secret, and would be masked everywhere.
@@ -335,13 +440,20 @@ impl Store {
     /// origin; one saved as it was (the app's edit form re-saves it) keeps its own.
     pub fn auth_save_profile(&self, p: &AuthProfile) -> Result<()> {
         p.validate_with(&self.auth_handling(&p.name)?)?;
-        let kept = self
-            .auth_profile(&p.name)
-            .ok()
-            .filter(|(old, _)| *old == AuthProfile { origin: old.origin.clone(), ..p.clone() })
-            .map(|(old, _)| old.origin);
+        // Read and written in one transaction: a login in another process may be storing the
+        // count a passkey just reached.
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let old = self.auth_profile(&p.name).ok().map(|(old, _)| old);
+        // A passkey's count never goes down: one kept from before keeps the higher of the two.
+        let mut p = p.clone();
+        for k in &mut p.passkeys {
+            let before = old.iter().flat_map(|o| &o.passkeys).find(|o| o.credential_id == k.credential_id);
+            k.sign_count = k.sign_count.max(before.map_or(0, |o| o.sign_count));
+        }
+        let kept =
+            old.filter(|old| *old == AuthProfile { origin: old.origin.clone(), ..p.clone() }).map(|old| old.origin);
         let origin = kept.unwrap_or_else(|| Some(crate::provenance::origin().to_string()));
-        let p = AuthProfile { origin, ..p.clone() };
+        let p = AuthProfile { origin, ..p };
         let json = serde_json::to_string(&p).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO auth_profiles (name, profile, state) VALUES (?1, ?2, '{}')
@@ -349,6 +461,7 @@ impl Store {
                 state_changed_at = NULL, updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             params![p.name, json],
         )?;
+        tx.commit()?;
         // Running proxies reload platform credentials with the settings.
         self.bump_settings_version()
     }
@@ -414,11 +527,19 @@ impl Store {
         Ok(out)
     }
 
+    /// Notes the time step of a one-time code a profile's login has sent (typed while its
+    /// login was recorded), so the same code isn't sent again.
+    pub fn auth_note_code_used(&self, name: &str, step: u64) -> Result<()> {
+        self.meta_set(&totp_used_key(name), Some(&step.to_string()))
+    }
+
     pub fn auth_remove(&self, name: &str) -> Result<()> {
         if self.conn.execute("DELETE FROM auth_profiles WHERE name = ?1", [name])? == 0 {
             return Err(Error::NotFound(format!("auth profile {name:?}")));
         }
         self.auth_clear_handling(name)?;
+        self.meta_set(&totp_used_key(name), None)?;
+        self.meta_set(&crate::browser_login::lock_key(name), None)?;
         self.bump_settings_version()
     }
 }
@@ -460,7 +581,32 @@ struct VaultInner {
     /// Request signers, in the order they run, and the placeholders they fill.
     signers: Vec<crate::sign::Loaded>,
     sign_marks: std::collections::HashSet<String>,
+    /// Placeholders whose value is a one-time code, worked out as a request is resolved.
+    totp: HashMap<String, crate::totp::Generator>,
+    /// When each of them last went out in a request.
+    totp_sent: HashMap<String, TotpUse>,
 }
+
+/// A one-time code as it went out: its time step, and how far into its period that was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TotpUse {
+    pub step: u64,
+    pub into: Duration,
+    pub left: Duration,
+}
+
+impl TotpUse {
+    pub(crate) fn now(g: &crate::totp::Generator) -> TotpUse {
+        let (into, left) = g.window();
+        TotpUse { step: g.step(crate::totp::unix_now()), into, left }
+    }
+}
+
+/// The placeholder kind of a profile's current one-time code.
+pub(crate) const TOTP_KIND: &str = "totp";
+/// How the placeholder kinds of what a browser login types into other password fields start
+/// (the step's number follows, then `:form` or `:json`).
+const TYPED_KIND: &str = "typed:";
 
 /// Current values behind auth placeholders. The auth layer writes placeholders into
 /// requests instead of secrets, so history and every other record of a request
@@ -573,18 +719,152 @@ impl Vault {
         self.0.lock().unwrap().sign_marks.iter().any(|m| find(head, m.as_bytes()).is_some())
     }
 
-    /// Registers a password, encoded for each login body type, for the login origin (and
+    /// Registers a password, encoded for each login body type, for the login's origins (and
     /// the origins of macro steps that use it, which stay allowed).
     pub(crate) fn put_password(&self, p: &AuthProfile, password: &str) {
-        let origin = p.login_url.as_deref().and_then(|u| Target::from_url(u).ok()).map(|t| t.origin());
+        let login = p.login_origins();
         for enc in [Enc::Raw, Enc::Form, Enc::Json] {
             let ph = placeholder(&p.name, enc.password_kind());
-            let mut origins: Vec<String> = origin.iter().cloned().collect();
+            let mut origins = login.clone();
             if let Some(old) = self.0.lock().unwrap().entries.get(&ph) {
-                origins.extend(old.origins.iter().filter(|o| Some(*o) != origin.as_ref()).cloned());
+                origins.extend(old.origins.iter().filter(|o| !login.contains(o)).cloned());
             }
             self.put(ph, &encode(password, enc), None, origins);
         }
+    }
+
+    /// Registers a profile's one-time code for the login's origins (and those already allowed).
+    /// The code is worked out each time a request that carries its placeholder is resolved.
+    pub(crate) fn put_totp(&self, p: &AuthProfile, generator: crate::totp::Generator) {
+        let ph = placeholder(&p.name, TOTP_KIND);
+        let mut origins = p.login_origins();
+        let mut inner = self.0.lock().unwrap();
+        if let Some(old) = inner.entries.get(&ph) {
+            let more: Vec<String> = old.origins.iter().filter(|o| !origins.contains(o)).cloned().collect();
+            origins.extend(more);
+        }
+        let entry = VaultEntry { value: generator.now(), header: None, origins, request_line: false };
+        inner.entries.insert(ph.clone(), entry);
+        inner.totp.insert(ph, generator);
+    }
+
+    /// Registers what a browser login types into password fields other than the password's
+    /// (kept, masked, in its steps), each for the site it is typed on, so the request that
+    /// carries one is recorded with a placeholder too ([`Vault::conceal`]).
+    pub(crate) fn put_typed(&self, p: &AuthProfile) {
+        for (n, value, page) in p.browser.iter().flat_map(|b| b.typed_secrets()) {
+            let origins: Vec<String> = Target::from_url(page).ok().map(|t| t.origin()).into_iter().collect();
+            for (enc, suffix) in [(Enc::Raw, ""), (Enc::Form, ":form"), (Enc::Json, ":json")] {
+                let ph = placeholder(&p.name, &format!("{TYPED_KIND}{n}{suffix}"));
+                self.put(ph, &encode(value, enc), None, origins.clone());
+            }
+        }
+    }
+
+    /// Notes that a profile's one-time code went to the site some other way than in a request
+    /// resolved here (typed into a page by the login browser).
+    pub(crate) fn note_totp_use(&self, profile: &str, used: TotpUse) {
+        self.0.lock().unwrap().totp_sent.insert(placeholder(profile, TOTP_KIND), used);
+    }
+
+    /// When a profile's one-time code last went out, forgetting it.
+    pub(crate) fn take_totp_use(&self, profile: &str) -> Option<TotpUse> {
+        self.0.lock().unwrap().totp_sent.remove(&placeholder(profile, TOTP_KIND))
+    }
+
+    /// The placeholders for the secrets of `profile` that `request` holds in the clear, put in
+    /// their place: its password and what else its login types into password fields (as they
+    /// stand in a form, in JSON, or as they are) and its current one-time code, in the request
+    /// line, the header values and the body. A request the login browser sends is
+    /// recorded like one brainproxy builds, with no secret in it; [`Vault::resolve`] puts the
+    /// same bytes back on the wire. Only in a request to an origin the value may go to anyway
+    /// (the sites it was typed on): this never widens where a placeholder is filled in, or bytes
+    /// that happen to match on some other site would open that site to the password.
+    pub(crate) fn conceal(&self, profile: &str, request: &[u8], origin: &str) -> Vec<u8> {
+        let inner = self.0.lock().unwrap();
+        let totp = placeholder(profile, TOTP_KIND);
+        let goes_here = |ph: &String| inner.entries.get(ph).is_some_and(|e| e.origins.iter().any(|o| o == origin));
+        // The password in each form it takes, what else was typed into a password field, and
+        // the current code. Longest first, so a value that holds another is replaced whole. A
+        // value too short to be told from ordinary text stays.
+        let typed = placeholder(profile, TYPED_KIND);
+        let typed = typed.trim_end_matches('\u{bb}');
+        let mut secrets: Vec<(String, String)> = inner
+            .entries
+            .iter()
+            .filter(|(ph, e)| e.header.is_none() && !e.request_line && !inner.totp.contains_key(*ph))
+            .filter(|(ph, _)| {
+                [Enc::Form, Enc::Json, Enc::Raw].iter().any(|enc| **ph == placeholder(profile, enc.password_kind()))
+                    || ph.starts_with(typed)
+            })
+            .filter(|(ph, _)| goes_here(ph))
+            .map(|(ph, e)| (ph.clone(), e.value.clone()))
+            .collect();
+        if let Some(g) = inner.totp.get(&totp).filter(|_| goes_here(&totp)) {
+            secrets.push((totp.clone(), g.now()));
+        }
+        secrets.retain(|(_, v)| v.len() >= 4);
+        // (Of two forms that read the same, the plain one's placeholder.)
+        secrets.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.len().cmp(&b.0.len())).then_with(|| a.0.cmp(&b.0)));
+        let (head, body) = split_head_body(request);
+        let mut used = false;
+        let digit = |b: Option<&u8>| b.is_some_and(u8::is_ascii_digit);
+        // `in_head`: a value with a line break in it can't stand in a header (see [`fill`]).
+        let mut swap = |part: &[u8], in_head: bool| -> Vec<u8> {
+            // The text still to search, and the placeholders put in so far (not searched again).
+            let mut parts: Vec<(Vec<u8>, bool)> = vec![(part.to_vec(), false)];
+            for (ph, value) in secrets.iter().filter(|(_, v)| !(in_head && v.contains(['\r', '\n', '\0']))) {
+                let code = *ph == totp;
+                let mut next = Vec::with_capacity(parts.len());
+                for (bytes, placed) in parts {
+                    if placed {
+                        next.push((bytes, true));
+                        continue;
+                    }
+                    let (mut start, mut from) = (0, 0);
+                    while let Some(i) = find(&bytes[from..], value.as_bytes()).map(|i| i + from) {
+                        let end = i + value.len();
+                        // A code is a number of its own, not digits inside a longer one.
+                        if code && (digit(i.checked_sub(1).and_then(|j| bytes.get(j))) || digit(bytes.get(end))) {
+                            from = i + 1;
+                            continue;
+                        }
+                        next.push((bytes[start..i].to_vec(), false));
+                        next.push((ph.as_bytes().to_vec(), true));
+                        (start, from) = (end, end);
+                        used = true;
+                    }
+                    next.push((bytes[start..].to_vec(), false));
+                }
+                parts = next;
+            }
+            parts.into_iter().flat_map(|(b, _)| b).collect()
+        };
+        // The request line, each header's value (not the ones that frame the request), the body.
+        let mut out = Vec::with_capacity(request.len());
+        for (i, line) in head.split_inclusive(|&b| b == b'\n').enumerate() {
+            let colon = line.iter().position(|&b| b == b':').filter(|_| i > 0);
+            let name = colon.map(|c| String::from_utf8_lossy(&line[..c]).trim().to_ascii_lowercase());
+            match (colon, name.as_deref()) {
+                (_, Some("host" | "content-length" | "transfer-encoding")) => out.extend_from_slice(line),
+                (Some(c), _) => {
+                    out.extend_from_slice(&line[..=c]);
+                    out.extend(swap(&line[c + 1..], true));
+                }
+                (None, _) => out.extend(swap(line, true)),
+            }
+        }
+        let new_body = swap(body, false);
+        if !used {
+            return request.to_vec();
+        }
+        // The body's length on record is the placeholder's; `resolve` sets the real one again.
+        let changed = new_body != body;
+        out.extend(new_body);
+        if changed {
+            out = RawRequest::from_bytes(out).update_content_length().into_bytes();
+        }
+        out
     }
 
     /// The request with placeholders replaced by their values. A header value is only
@@ -598,7 +878,21 @@ impl Vault {
         if find(raw, MARK.as_bytes()).is_none() {
             return Ok(Cow::Borrowed(raw));
         }
-        let inner = self.0.lock().unwrap();
+        let mut inner = self.0.lock().unwrap();
+        // One-time codes are worked out now: a request re-sent from history gets a current one.
+        let codes: Vec<(String, crate::totp::Generator)> = inner
+            .totp
+            .iter()
+            .filter(|(ph, _)| find(raw, ph.as_bytes()).is_some())
+            .map(|(p, g)| (p.clone(), g.clone()))
+            .collect();
+        for (ph, g) in codes {
+            if let Some(e) = inner.entries.get_mut(&ph) {
+                e.value = g.now();
+            }
+            inner.totp_sent.insert(ph, TotpUse::now(&g));
+        }
+        let inner = inner;
         let origin = target.origin();
         let to_origin = |e: &VaultEntry| e.header.is_none() && e.origins.iter().any(|o| o == &origin);
         let anywhere = |e: &VaultEntry| !e.request_line && to_origin(e);
@@ -711,6 +1005,10 @@ impl Store {
             if let Some(pw) = p.password.as_ref().and_then(|s| s.resolve().ok()) {
                 vault.put_password(&p, &pw);
             }
+            if let Some(g) = p.totp.as_ref().and_then(|t| t.generator().ok()) {
+                vault.put_totp(&p, g);
+            }
+            vault.put_typed(&p);
             vault.put_signers(&p.name, &self.auth_handling(&p.name)?.signers);
         }
         Ok(())
@@ -775,7 +1073,7 @@ pub struct AuthSession {
     pub profile: AuthProfile,
     re: Compiled,
     pub(crate) client: Client,
-    project: PathBuf,
+    pub(crate) project: PathBuf,
     pub(crate) state: Mutex<SessionState>,
     /// Bumped on every login, so concurrent workers re-login only once.
     generation: AtomicU64,
@@ -785,7 +1083,9 @@ pub struct AuthSession {
     /// Macros and session rules (see [`crate::session`]).
     pub(crate) handling: crate::session::Runtime,
     /// Its own requests keep no content in history (`--no-store`).
-    no_store: std::sync::atomic::AtomicBool,
+    pub(crate) no_store: std::sync::atomic::AtomicBool,
+    /// The time step of the one-time code this session sent last.
+    totp_step: Mutex<Option<u64>>,
 }
 
 impl std::fmt::Debug for AuthSession {
@@ -830,6 +1130,7 @@ impl AuthSession {
             login_lock: tokio::sync::Mutex::new(()),
             handling: Default::default(),
             no_store: Default::default(),
+            totp_step: Mutex::new(None),
         })
     }
 
@@ -1027,6 +1328,18 @@ impl AuthSession {
         if head.status == 401 {
             return true;
         }
+        // A browser login's page is wherever the recording began or first typed: only a
+        // redirect to that very path counts (its path may be a prefix of half the site).
+        if let (Some(loc), Some(b)) = (head.header("location"), &self.profile.browser) {
+            let path = |u: &str| {
+                let u = u.split(['?', '#']).next().unwrap_or(u);
+                u.split_once("://").map_or(u, |(_, rest)| rest.find('/').map_or("/", |i| &rest[i..])).to_string()
+            };
+            let login_path = path(b.login_page());
+            if login_path.len() > 1 && path(loc) == login_path {
+                return true;
+            }
+        }
         if let (Some(loc), Some(login)) = (head.header("location"), self.profile.login_url.as_deref()) {
             let login_path = url::Url::parse(login).map(|u| u.path().to_string()).unwrap_or_default();
             if login_path.len() > 1 && loc.contains(&login_path) {
@@ -1111,7 +1424,7 @@ impl AuthSession {
         if p.oauth.is_some() {
             return self.oauth_login().await;
         }
-        let Some(login_url) = &p.login_url else {
+        if p.login_url.is_none() && p.browser.is_none() {
             return Ok(LoginResult {
                 success: true,
                 status: None,
@@ -1120,7 +1433,95 @@ impl AuthSession {
                 reason: "static headers only".into(),
                 history_ids: vec![],
             });
+        }
+        let totp = self.login_totp()?;
+        // One process at a time, across commands: a code is sent once, a passkey's count used once.
+        let _lock = match totp.is_some() || (p.browser.is_some() && !p.passkeys.is_empty()) {
+            true => Some(crate::browser_login::LoginLock::acquire(&self.project, &p.name).await?),
+            false => None,
         };
+        let Some(totp) = totp else { return self.login_once().await };
+        // A site may take each code once: one this profile already sent isn't sent again.
+        self.await_unused_code(&totp).await;
+        let vault = self.client.options().guard.as_ref().map(|g| &g.vault);
+        let first = self.login_once().await?;
+        let used = vault.and_then(|v| v.take_totp_use(&p.name));
+        if let Some(u) = used {
+            self.note_code_used(u.step);
+        }
+        // A code is refused for its timing alone when its period ended on the way, or the
+        // site's clock is a little off ours right at a period's edge: then, and only then, the
+        // login is tried once more (a wrong password isn't sent twice).
+        let Some(wait) = used.filter(|_| !first.success).and_then(|u| retry_code_after(&totp, u)) else {
+            return Ok(first);
+        };
+        eprintln!(
+            "brainproxy: {}: the one-time code went out as its {}s period turned over; logging in once more",
+            p.name, totp.period
+        );
+        tokio::time::sleep(wait).await;
+        let mut second = self.login_once().await?;
+        if let Some(u) = vault.and_then(|v| v.take_totp_use(&p.name)) {
+            self.note_code_used(u.step);
+        }
+        second.history_ids.splice(0..0, first.history_ids);
+        Ok(second)
+    }
+
+    /// The profile's code generator when its login sends a one-time code, registered with the
+    /// vault. An error when the login needs a code and the profile has no secret to make it.
+    fn login_totp(&self) -> Result<Option<crate::totp::Generator>> {
+        let p = &self.profile;
+        if !p.login_uses_totp() {
+            return Ok(None);
+        }
+        let totp = p.totp.as_ref().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "the login sends a one-time code ({{{{totp}}}}) but profile {} has no TOTP secret: \
+                 auth add {} ... --totp-secret-env VAR",
+                p.name, p.name
+            ))
+        })?;
+        let g = totp.generator()?;
+        if let Some(guard) = &self.client.options().guard {
+            guard.vault.put_totp(p, g.clone());
+        }
+        Ok(Some(g))
+    }
+
+    /// Waits for the next code when the current one was already sent, by this command or
+    /// (as the project remembers) another.
+    async fn await_unused_code(&self, g: &crate::totp::Generator) {
+        let stored = Store::open(&self.project)
+            .and_then(|s| s.meta_get(&totp_used_key(&self.profile.name)))
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok());
+        let last = (*self.totp_step.lock().unwrap()).max(stored);
+        if last.is_some_and(|l| g.step(crate::totp::unix_now()) <= l) {
+            let (_, left) = g.window();
+            // A step far in the future isn't one of ours (a clock set back): no more than a period.
+            let wait = left.min(Duration::from_secs(g.period)) + Duration::from_millis(250);
+            eprintln!(
+                "brainproxy: {}: the current one-time code was already used; waiting {:.0}s for the next",
+                self.profile.name,
+                wait.as_secs_f64().ceil()
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    fn note_code_used(&self, step: u64) {
+        *self.totp_step.lock().unwrap() = Some(step);
+        if let Ok(store) = Store::open(&self.project) {
+            let _ = store.meta_set(&totp_used_key(&self.profile.name), Some(&step.to_string()));
+        }
+    }
+
+    /// One login attempt: the login request (and its follow-up steps), or the recorded
+    /// browser steps.
+    async fn login_once(&self) -> Result<LoginResult> {
+        let p = &self.profile;
         *self.last_login.lock().unwrap() = Some(Instant::now());
         // Start from a clean jar so stale session cookies don't leak into the login.
         {
@@ -1130,24 +1531,26 @@ impl AuthSession {
             st.logged_in = false;
         }
         let mut history = Vec::new();
-        let username = p.username.clone().unwrap_or_default();
         let password = p.password.as_ref().map(Secret::resolve).transpose()?.unwrap_or_default();
         if let Some(g) = &self.client.options().guard {
             g.vault.put_password(p, &password);
         }
+        if p.browser.is_some() {
+            if let Some(g) = &self.client.options().guard {
+                g.vault.put_typed(p);
+            }
+            let (text, status) = self.browser_login(&password).await?;
+            return self.verify_login(text, status, history).await;
+        }
+        let Some(login_url) = &p.login_url else {
+            return Err(Error::InvalidInput(format!("profile {} has no login", p.name)));
+        };
+        let username = p.username.clone().unwrap_or_default();
 
         let mut csrf = String::new();
         if let (Some(url), Some(re)) = (&p.csrf_url, &self.re.csrf) {
-            let (req, target) = RawRequest::build("GET", url, &[], b"")?;
-            let (id, ex) =
-                self.send_own(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await;
-            history.push(id);
-            let ex = ex?;
-            self.observe(&ex.response);
-            csrf = re
-                .captures(&response_text(&ex.response))
-                .and_then(|c| c.get(1).or_else(|| c.get(0)))
-                .map(|m| crate::scan::passive::util::decode_entities(m.as_str()))
+            let text = self.fetch_text(url, &mut history).await?;
+            csrf = token_in(re, &text)
                 .ok_or_else(|| Error::InvalidInput("CSRF token not found on --csrf-url page".into()))?;
         }
 
@@ -1167,6 +1570,7 @@ impl AuthSession {
                 }
                 let enc = if json { Enc::Json } else { Enc::Form };
                 let body = substitute(&body, &username, &placeholder(&p.name, enc.password_kind()), &csrf, enc);
+                let body = with_code(&body, &p.name);
                 RawRequest::build(&p.login_method, login_url, &headers, body.as_bytes())?.0
             }
         };
@@ -1175,21 +1579,72 @@ impl AuthSession {
         // redirect) or one after it. When several have it, the last one wins (as before,
         // when only the final page was searched).
         let mut token = None;
-        let mut find_token = |response: &[u8]| {
+        let mut find_token = |texts: &[String]| {
             if let Some(re) = &self.re.token {
-                if let Some(m) = re.captures(&response_text(response)).and_then(|c| c.get(1).or_else(|| c.get(0))) {
-                    token = Some(m.as_str().to_string());
+                for text in texts {
+                    if let Some(m) = re.captures(text).and_then(|c| c.get(1).or_else(|| c.get(0))) {
+                        token = Some(m.as_str().to_string());
+                    }
                 }
             }
         };
-        // Send, following redirects (with cookies) like a browser would.
+        let (mut ex, mut texts) = self.send_following(&req, &target, login_url, &mut history).await?;
+        find_token(&texts);
+        // What follows the login request: a one-time code posted to its own form, say.
+        for (i, step) in p.login_steps.iter().enumerate() {
+            let mut csrf = String::new();
+            if let Some(re) = &step.csrf_regex {
+                let re = Regex::new(re).map_err(|e| Error::InvalidInput(e.to_string()))?;
+                let text = match &step.csrf_url {
+                    Some(url) => self.fetch_text(url, &mut history).await?,
+                    None => texts.join("\n"),
+                };
+                csrf = token_in(&re, &text).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "login step {}: its token wasn't found (did the request before it fail? see history)",
+                        i + 1
+                    ))
+                })?;
+            }
+            let target = Target::from_url(&step.url)?;
+            let text = fill_template(&step.request, &username, &p.name, &csrf);
+            let req = RawRequest::from_bytes(text.into_bytes()).normalize_line_endings().update_content_length();
+            (ex, texts) = self.send_following(&req, &target, &step.url, &mut history).await?;
+            find_token(&texts);
+        }
+        if self.re.token.is_some() {
+            self.state.lock().unwrap().token = token;
+        }
+        let status = parse_response_head(&ex.response).ok().map(|h| h.status);
+        self.verify_login(response_text(&ex.response), status, history).await
+    }
+
+    /// Fetches a page of the login (the CSRF page) with the session applied; its text.
+    async fn fetch_text(&self, url: &str, history: &mut Vec<Option<i64>>) -> Result<String> {
+        let (req, target) = RawRequest::build("GET", url, &[], b"")?;
         let (id, ex) =
             self.send_own(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], &target)), &target).await;
         history.push(id);
+        let ex = ex?;
+        self.observe(&ex.response);
+        Ok(response_text(&ex.response))
+    }
+
+    /// Sends one of the login's requests to `url`, following redirects (with cookies) like a
+    /// browser would. The last exchange, and the text of every response on the way.
+    async fn send_following(
+        &self,
+        req: &RawRequest,
+        target: &Target,
+        url: &str,
+        history: &mut Vec<Option<i64>>,
+    ) -> Result<(Exchange, Vec<String>)> {
+        let (id, ex) = self.send_own(&RawRequest::from_bytes(self.apply_to(req.as_bytes(), &[], target)), target).await;
+        history.push(id);
         let mut ex = ex?;
         self.observe(&ex.response);
-        find_token(&ex.response);
-        let mut current = url::Url::parse(login_url).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let mut texts = vec![response_text(&ex.response)];
+        let mut current = url::Url::parse(url).map_err(|e| Error::InvalidInput(e.to_string()))?;
         for _ in 0..5 {
             let Ok(head) = parse_response_head(&ex.response) else { break };
             if !matches!(head.status, 301 | 302 | 303 | 307 | 308) {
@@ -1211,15 +1666,20 @@ impl AuthSession {
             history.push(id);
             ex = next?;
             self.observe(&ex.response);
-            find_token(&ex.response);
+            texts.push(response_text(&ex.response));
         }
+        Ok((ex, texts))
+    }
 
-        let final_text = response_text(&ex.response);
-        if self.re.token.is_some() {
-            self.state.lock().unwrap().token = token;
-        }
-
-        // Verify: check URL if given, else the final login response.
+    /// Judges a login by what came of it: the check URL if the profile has one, else the page
+    /// the login ended on (`final_text`, with its status). Stores the session.
+    async fn verify_login(
+        &self,
+        final_text: String,
+        final_status: Option<u16>,
+        mut history: Vec<Option<i64>>,
+    ) -> Result<LoginResult> {
+        let p = &self.profile;
         let (verify_text, status) = match &p.check_url {
             Some(u) => {
                 let (r, t) = RawRequest::build("GET", u, &[], b"")?;
@@ -1231,7 +1691,7 @@ impl AuthSession {
                 let text = response_text(&cex.response);
                 (if logged_out { None } else { Some(text) }, parse_response_head(&cex.response).ok().map(|h| h.status))
             }
-            None => (Some(final_text.clone()), parse_response_head(&ex.response).ok().map(|h| h.status)),
+            None => (Some(final_text), final_status),
         };
         let st = self.state();
         let (success, reason) = match verify_text {
@@ -1384,7 +1844,9 @@ fn fill_template(tpl: &str, user: &str, profile: &str, csrf: &str) -> String {
         None if body.trim_start().starts_with('{') => Enc::Json,
         None => Enc::Raw,
     };
-    let fill = |text: &str, enc: Enc| substitute(text, user, &placeholder(profile, enc.password_kind()), csrf, enc);
+    let fill = |text: &str, enc: Enc| {
+        with_code(&substitute(text, user, &placeholder(profile, enc.password_kind()), csrf, enc), profile)
+    };
     let mut out = fill(line, Enc::Form);
     if let Some(h) = headers {
         out.push('\n');
@@ -1401,6 +1863,61 @@ fn substitute(tpl: &str, user: &str, pass: &str, csrf: &str, enc: Enc) -> String
     tpl.replace("{{username}}", &encode(user, enc))
         .replace("{{password}}", pass)
         .replace("{{csrf}}", &encode(csrf, enc))
+}
+
+/// `{{totp}}` as the placeholder of the profile's one-time code, which the vault works out
+/// as the request goes (digits: the same in a form, in JSON, and as they are).
+fn with_code(text: &str, profile: &str) -> String {
+    text.replace("{{totp}}", &placeholder(profile, TOTP_KIND))
+}
+
+/// A request template with the value of an Authorization header it holds as recorded
+/// hidden, for display (one that is a placeholder stays).
+fn mask_authorization(request: &str) -> String {
+    let head_end = request.find("\r\n\r\n").or_else(|| request.find("\n\n")).unwrap_or(request.len());
+    let (head, rest) = request.split_at(head_end);
+    let lines: Vec<String> = head
+        .split_inclusive('\n')
+        .map(|line| match line.split_once(':') {
+            Some((name, value)) if name.trim().eq_ignore_ascii_case("authorization") && !value.contains("{{") => {
+                let end = &value[value.trim_end_matches(['\r', '\n']).len()..];
+                format!("{name}: ********{end}")
+            }
+            _ => line.to_string(),
+        })
+        .collect();
+    format!("{}{rest}", lines.concat())
+}
+
+/// The token a login page hands out, as `re` (group 1, else the match) reads it.
+fn token_in(re: &Regex, text: &str) -> Option<String> {
+    re.captures(text)
+        .and_then(|c| c.get(1).or_else(|| c.get(0)))
+        .map(|m| crate::scan::passive::util::decode_entities(m.as_str()))
+}
+
+fn totp_used_key(profile: &str) -> String {
+    format!("auth.totp_used.{profile}")
+}
+
+/// How long to wait before a refused login is tried again with a one-time code, if the code's
+/// timing may be why: it went out in its period's last moments, so the period may have turned
+/// over on the way (wait for the next code), or in its first (the site's clock may be behind:
+/// wait a little, the same code is then current there too).
+fn retry_code_after(g: &crate::totp::Generator, used: TotpUse) -> Option<Duration> {
+    let edge = Duration::from_secs(5).min(Duration::from_secs(g.period) / 4);
+    let same_period = g.step(crate::totp::unix_now()) == used.step;
+    let (into, left) = g.window();
+    if used.left <= edge {
+        // The next code: now if its period has begun, else when it does.
+        Some(if same_period { left + Duration::from_millis(250) } else { Duration::ZERO })
+    } else if used.into <= edge && same_period {
+        Some(edge.saturating_sub(into))
+    } else {
+        // Sent well inside its period: the code was good when it arrived, however long the
+        // login then took. Something else is wrong, and the login isn't sent twice.
+        None
+    }
 }
 
 pub(crate) fn response_text(response: &[u8]) -> String {
@@ -1539,6 +2056,219 @@ mod tests {
     fn wire(s: &AuthSession, req: &[u8]) -> Result<String> {
         let target = Target::from_url("https://a.test").unwrap();
         Ok(String::from_utf8(vault_of(s).resolve(req, &target)?.into_owned()).unwrap())
+    }
+
+    fn totp_profile(name: &str) -> AuthProfile {
+        AuthProfile {
+            name: name.into(),
+            login_url: Some("https://a.test/login".into()),
+            login_body: Some("u={{username}}&p={{password}}&code={{totp}}".into()),
+            // "12345678901234567890", the RFC's key.
+            totp: Some(crate::totp::Totp::from_input("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", None, None, None).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_one_time_code_is_worked_out_as_the_request_goes_and_only_for_the_login_origin() {
+        let p = totp_profile("otp");
+        let s = session(p.clone());
+        let g = p.totp.as_ref().unwrap().generator().unwrap();
+        vault_of(&s).put_totp(&p, g.clone());
+        let body = with_code("code={{totp}}", "otp");
+        assert_eq!(body, "code=«auth:otp:totp»");
+        let req = format!("POST /login HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let sent = wire(&s, req.as_bytes()).unwrap();
+        // The code of now (or of a moment ago, if the period just turned over).
+        let now = g.step(crate::totp::unix_now());
+        let codes = [g.code_for_step(now), g.code_for_step(now - 1)];
+        assert!(codes.iter().any(|c| sent.ends_with(&format!("Content-Length: 11\r\n\r\ncode={c}"))), "{sent}");
+        // It went out: the session can tell which code, and when in its period.
+        let used = vault_of(&s).take_totp_use("otp").unwrap();
+        assert!(used.step == now || used.step == now - 1);
+        assert_eq!(vault_of(&s).take_totp_use("otp"), None);
+        // Nowhere else, like the password.
+        let other = Target::from_url("https://b.test").unwrap();
+        assert!(vault_of(&s).resolve(req.as_bytes(), &other).is_err());
+        // Its secret is one a report masks; the profile shown hides it.
+        assert!(p.secret_values(&SessionState::default()).contains(&"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string()));
+        assert!(!serde_json::to_string(&p.redacted()).unwrap().contains("GEZDGNBV"));
+        assert!(p.login_uses_totp() && !AuthProfile { login_body: None, ..p }.login_uses_totp());
+    }
+
+    #[test]
+    fn what_a_login_browser_sends_is_recorded_with_placeholders_and_sent_as_it_was() {
+        let p = totp_profile("b");
+        let s = session(p.clone());
+        let vault = vault_of(&s);
+        vault.put_password(&p, "p&ss w0rd");
+        let g = p.totp.as_ref().unwrap().generator().unwrap();
+        vault.put_totp(&p, g.clone());
+        let code = g.now();
+        let origin = "https://sso.a.test";
+        // Not a site the secrets go to: left as it is, and no placeholder is opened to it.
+        let stray = b"GET /p&ss w0rd HTTP/1.1\r\nHost: sso.a.test\r\n\r\n";
+        assert_eq!(vault.conceal("b", stray, origin), stray);
+        let asked = "POST /x HTTP/1.1\r\nContent-Length: 20\r\n\r\n\u{ab}auth:b:password\u{bb}";
+        assert!(vault.resolve(asked.as_bytes(), &Target::from_url(origin).unwrap()).is_err());
+        // The page the password was typed on is one.
+        for kind in ["password", "password:form", "password:json", TOTP_KIND] {
+            vault.allow(&placeholder("b", kind), origin);
+        }
+        // A form: the password as a form holds it, the code as a number of its own.
+        let body = format!("user=al&pass=p%26ss+w0rd&otp={code}&ref=9{code}9");
+        let req = format!(
+            "POST /login?c={code} HTTP/1.1\r\nHost: sso.a.test\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let kept = String::from_utf8(vault.conceal("b", req.as_bytes(), origin)).unwrap();
+        assert!(kept.starts_with("POST /login?c=«auth:b:totp» HTTP/1.1\r\n"), "{kept}");
+        assert!(
+            kept.ends_with(&format!("user=al&pass=«auth:b:password:form»&otp=«auth:b:totp»&ref=9{code}9")),
+            "{kept}"
+        );
+        assert!(!kept.contains("p%26ss"), "{kept}");
+        // The same bytes go out again (unless the code's period turned over just now), to
+        // the origin the page sent them to.
+        let target = Target::from_url(origin).unwrap();
+        let sent = String::from_utf8(vault.resolve(kept.as_bytes(), &target).unwrap().into_owned()).unwrap();
+        assert!(sent == req || g.now() != code, "{sent}");
+        // JSON, and a request with neither: as it was.
+        let json = format!("POST /api HTTP/1.1\r\n\r\n{{\"pw\":\"p&ss w0rd\",\"otp\":\"{code}\"}}");
+        let kept = String::from_utf8(vault.conceal("b", json.as_bytes(), origin)).unwrap();
+        assert!(kept.contains("\"pw\":\"«auth:b:password»\"") && kept.contains("\"otp\":\"«auth:b:totp»\""), "{kept}");
+        let plain = b"GET /home HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert_eq!(vault.conceal("b", plain, origin), plain);
+    }
+
+    #[test]
+    fn other_password_fields_and_header_values_are_concealed_and_a_shown_step_hides_its_authorization() {
+        use crate::browser_login::{BrowserLogin, Do, Step};
+        let pin = Step {
+            action: Do::Fill,
+            css: "#pin".into(),
+            text: None,
+            value: "73-41 pin".into(),
+            masked: true,
+            page: "https://a.test/login".into(),
+        };
+        let p = AuthProfile {
+            name: "b".into(),
+            browser: Some(BrowserLogin { start_url: "https://a.test/login".into(), steps: vec![pin] }),
+            login_steps: vec![],
+            ..Default::default()
+        };
+        let s = session(p.clone());
+        let vault = vault_of(&s);
+        vault.put_typed(&p);
+        let body = "pin=73-41+pin&next=%2F";
+        let req = format!(
+            "POST /pin HTTP/1.1\r\nHost: a.test\r\nX-Pin: 73-41 pin\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let kept = String::from_utf8(vault.conceal("b", req.as_bytes(), "https://a.test")).unwrap();
+        assert!(kept.contains("X-Pin: \u{ab}auth:b:typed:1\u{bb}\r\n"), "{kept}");
+        assert!(kept.ends_with("pin=\u{ab}auth:b:typed:1:form\u{bb}&next=%2F") && !kept.contains("73-41"), "{kept}");
+        assert_eq!(wire(&s, kept.as_bytes()).unwrap(), req);
+        // Typed on a.test: on another site it is left alone, and its placeholder doesn't go there.
+        assert_eq!(vault.conceal("b", req.as_bytes(), "https://b.test"), req.as_bytes());
+
+        let step = LoginStep {
+            url: "https://a.test/mfa".into(),
+            request: "POST /mfa HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer old-ticket\r\nX-Csrf: {{csrf}}\r\n\r\notp={{totp}}".into(),
+            csrf_url: None,
+            csrf_regex: None,
+        };
+        let shown = AuthProfile { login_steps: vec![step], ..totp_profile("m") }.redacted();
+        let request = &shown.login_steps[0].request;
+        assert!(request.contains("Authorization: ********\r\nX-Csrf: {{csrf}}\r\n\r\notp={{totp}}"), "{request}");
+    }
+
+    #[test]
+    fn a_refused_code_is_tried_again_only_at_a_periods_edge() {
+        let g = totp_profile("r").totp.unwrap().generator().unwrap();
+        let now = g.step(crate::totp::unix_now());
+        let secs = Duration::from_secs;
+        let used = |step, into: u64| TotpUse { step, into: secs(into), left: secs(30 - into) };
+        // Sent in its period's last second, which has turned over since: again, now.
+        assert_eq!(retry_code_after(&g, used(now - 1, 29)), Some(Duration::ZERO));
+        // In the middle of its period the code was good, however long the login then took
+        // (a browser's can outlast a period): something else is wrong, and it isn't sent twice.
+        assert_eq!(retry_code_after(&g, used(now, 15)), None);
+        assert_eq!(retry_code_after(&g, used(now - 1, 15)), None);
+        assert_eq!(retry_code_after(&g, used(now - 1, 1)), None);
+        // (The rest holds unless this very moment is the turn of a period.)
+        if g.step(crate::totp::unix_now()) == now {
+            // In its last seconds: the next code, when its period begins.
+            let wait = retry_code_after(&g, used(now, 28)).unwrap();
+            assert!(wait > Duration::ZERO && wait <= secs(30) + Duration::from_millis(250), "{wait:?}");
+            // In its first: a little later, the same code.
+            assert!(retry_code_after(&g, used(now, 1)).unwrap() <= secs(5));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_browser_login_that_starts_outside_the_scope_starts_no_browser() {
+        let step = |action, value: &str| crate::browser_login::Step {
+            action,
+            css: String::new(),
+            text: None,
+            value: value.into(),
+            masked: false,
+            page: String::new(),
+        };
+        let profile = |start: &str, steps| AuthProfile {
+            name: "b".into(),
+            browser: Some(crate::browser_login::BrowserLogin { start_url: start.into(), steps }),
+            ..Default::default()
+        };
+        let s = session(profile("https://elsewhere.test/login", vec![]));
+        let e = s.login().await.unwrap_err();
+        assert!(matches!(e, Error::OutOfScope(_)) && e.to_string().contains("elsewhere.test"), "{e}");
+        // A page a later step opens, too: refused before the first step runs.
+        let goto = step(crate::browser_login::Do::Goto, "https://idp.other.test/sso");
+        let s = session(profile("https://a.test/login", vec![goto]));
+        let e = s.login().await.unwrap_err();
+        assert!(matches!(e, Error::OutOfScope(_)) && e.to_string().contains("browser step 1"), "{e}");
+        assert!(profile("https://a.test/", vec![]).has_login());
+    }
+
+    #[test]
+    fn a_browser_logins_page_and_the_sites_its_secrets_go_to() {
+        use crate::browser_login::{BrowserLogin, Do, Step};
+        let step = |action, value: &str, page: &str| Step {
+            action,
+            css: "#x".into(),
+            text: None,
+            value: value.into(),
+            masked: false,
+            page: page.into(),
+        };
+        let p = AuthProfile {
+            name: "b".into(),
+            browser: Some(BrowserLogin {
+                start_url: "https://a.test/portal".into(),
+                steps: vec![
+                    step(Do::Click, "", "https://a.test/portal"),
+                    step(Do::Fill, "{{username}}", "https://sso.a.test/signin?next=1"),
+                    step(Do::Fill, "{{password}}", "https://sso.a.test/signin?next=1"),
+                    step(Do::Fill, "{{totp:1}}", "https://sso.a.test/code"),
+                    step(Do::Click, "", "https://a.test/portal/done"),
+                ],
+            }),
+            ..Default::default()
+        };
+        // The password and the code go where they were typed, and nowhere else.
+        assert_eq!(p.login_origins(), ["https://sso.a.test"]);
+        // Only a redirect to the page the login began on says the session is lost: its path
+        // is the start of others.
+        let s = session(p);
+        let to = |location: &str| format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\n\r\n");
+        assert!(s.is_logged_out(to("/portal").as_bytes()));
+        assert!(s.is_logged_out(to("https://a.test/portal?expired=1").as_bytes()));
+        assert!(!s.is_logged_out(to("/portal/reports/7").as_bytes()));
+        assert!(!s.is_logged_out(to("/home").as_bytes()));
+        assert!(s.is_logged_out(b"HTTP/1.1 401 Unauthorized\r\n\r\n"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::auth::{encode, placeholder, request_cookies, response_text, AuthProfile, AuthSession, Enc};
+use crate::auth::{encode, placeholder, request_cookies, response_text, AuthProfile, AuthSession, Enc, TOTP_KIND};
 use crate::capture::decode_body;
 use crate::error::{Error, Result};
 use crate::http::request::split_head_body;
@@ -917,6 +917,17 @@ impl AuthSession {
                 }
             }
         }
+        // The profile's one-time code, for steps that use {{totp}}: worked out as each goes.
+        let totp = self.profile.totp.as_ref().filter(|_| m.steps.iter().any(|s| s.request.contains("{{totp}}")));
+        let totp = totp.map(|t| t.generator()).transpose()?.is_some_and(|g| {
+            if let Some(v) = vault {
+                v.put_totp(&self.profile, g);
+                for o in &origins {
+                    v.allow(&placeholder(&self.profile.name, TOTP_KIND), o);
+                }
+            }
+            true
+        });
         // Variables found so far in this run.
         let mut found: Vec<String> = Vec::new();
         let mut out = MacroRun { name: name.to_string(), run, steps: Vec::new(), missing: Vec::new() };
@@ -929,6 +940,7 @@ impl AuthSession {
                 match var {
                     "username" => Some(encode(self.profile.username.as_deref().unwrap_or(""), enc)),
                     "password" if password.is_some() => Some(placeholder(&self.profile.name, enc.password_kind())),
+                    "totp" if totp => Some(placeholder(&self.profile.name, TOTP_KIND)),
                     _ => None,
                 }
             });
@@ -1028,6 +1040,29 @@ impl AuthSession {
         let mut placed = Vec::new();
         for (param, var) in mapping {
             if keep_params.iter().any(|k| k == &param) {
+                continue;
+            }
+            // `totp` is the profile's current one-time code, unless a macro extracts a value of
+            // that name. Like the password it goes to the login's origins, and to a rule's own URL.
+            let code = var == "totp" && !vars.contains_key(&var);
+            if code {
+                let Some(g) = self.profile.totp.as_ref().and_then(|t| t.generator().ok()) else { continue };
+                if !scoped && !self.profile.login_origins().contains(&origin) {
+                    continue;
+                }
+                let ph = placeholder(&self.profile.name, TOTP_KIND);
+                let cookies = !keep_cookies.iter().any(|k| k == &param);
+                let updated = set_param(&out, &param, cookies, |_| ph.clone());
+                if updated == out {
+                    continue;
+                }
+                out = updated;
+                if let Some(v) = vault {
+                    v.put_totp(&self.profile, g);
+                    if scoped {
+                        v.allow(&ph, &origin);
+                    }
+                }
                 continue;
             }
             let Some((latest, home)) = vars.get(&var) else { continue };

@@ -19,8 +19,8 @@
 //! remove are not clicked, confirm() dialogs answer no, logout-like URLs are not
 //! requested, and DELETE requests are not sent.
 
-mod cdp;
-mod gateway;
+pub(crate) mod cdp;
+pub(crate) mod gateway;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -230,10 +230,13 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
             client: Client::new(cfg.crawl.send.clone()),
             auth: cfg.crawl.auth.clone(),
             headers: cfg.crawl.headers.clone(),
-            scope: scope.clone(),
+            scope: Some(scope.clone()),
             exclude: cfg.crawl.exclude.clone(),
             block_delete: cfg.block_delete,
             rate: cfg.crawl.rate,
+            source: "crawl-browser",
+            tap: None,
+            no_store: false,
         },
         save,
     )
@@ -246,6 +249,7 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
             proxy: gateway.addr,
             ca_spki: cfg.ca.spki_sha256_base64(),
             no_sandbox,
+            hands_off: false,
         })?;
         let mut ex = Explorer::new(&chrome, &gateway, &cfg, &scope, &ctl, started);
         ex.summary.sandbox = !no_sandbox;
@@ -291,7 +295,7 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
 }
 
 /// Resolves on Ctrl-C or, on Unix, a request to terminate.
-async fn interrupted() {
+pub(crate) async fn interrupted() {
     let ctrl_c = async {
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;
@@ -904,6 +908,7 @@ pub async fn print_pdf(browser: &Path, html: &str) -> Result<Vec<u8>> {
         proxy: std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
         ca_spki: String::new(),
         no_sandbox: cdp::sandbox_off(),
+        hands_off: false,
     };
     let chrome = cdp::Chrome::launch(&opts)?;
     let result = async {
