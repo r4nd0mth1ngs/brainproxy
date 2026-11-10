@@ -2689,6 +2689,8 @@ button.chip {
 }
 .az-skips textarea {
   width: 100%;
+  height: auto;
+  min-height: 10em;
   resize: vertical;
 }
 .az-picked {
