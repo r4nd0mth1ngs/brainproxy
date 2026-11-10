@@ -316,7 +316,8 @@ fn run_mcp_env(project: &Path, args: &[&str], stdin: &[u8], env: &[(&str, &Path)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    // A command that fails on its arguments may exit before reading its stdin.
+    let _ = child.stdin.take().unwrap().write_all(stdin);
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

@@ -25,7 +25,8 @@ fn run(p: &Path, args: &[&str], stdin: Option<&str>, mcp: bool) -> (i32, Value) 
     }
     let mut child = cmd.spawn().unwrap();
     if let Some(data) = stdin {
-        child.stdin.take().unwrap().write_all(data.as_bytes()).unwrap();
+        // A command that fails on its arguments may exit before reading its stdin.
+        let _ = child.stdin.take().unwrap().write_all(data.as_bytes());
     }
     drop(child.stdin.take());
     let out = child.wait_with_output().unwrap();

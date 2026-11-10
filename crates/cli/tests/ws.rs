@@ -58,7 +58,8 @@ impl Env {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        // A command that fails on its arguments may exit before reading its stdin.
+        let _ = child.stdin.take().unwrap().write_all(stdin);
         let out = child.wait_with_output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(out.status.code(), Some(0), "{args:?} -> {v}");
@@ -462,7 +463,7 @@ fn ws_send_reads_messages_from_stdin() {
         .spawn()
         .unwrap();
     use std::io::Write;
-    child.stdin.take().unwrap().write_all(br#"{"mesages": []}"#).unwrap();
+    let _ = child.stdin.take().unwrap().write_all(br#"{"mesages": []}"#);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
 }
