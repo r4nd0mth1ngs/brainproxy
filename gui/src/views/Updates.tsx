@@ -1,7 +1,7 @@
 // Overview card: the ZAP rule data, brainproxy's signed checks, and the Nuclei templates, whether
 // they're downloaded, and a one-click download. They live in the user's data folder (not the
 // project), so one download serves every project. brainproxy's checks also update once a day
-// with the daily version check (Settings › Rules & data).
+// with the daily version check (Settings › Rules & Updates).
 
 import { useEffect, useRef, useState } from "react";
 import { run } from "../api";
