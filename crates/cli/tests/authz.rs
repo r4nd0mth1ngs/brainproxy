@@ -309,8 +309,16 @@ fn static_assets_and_skip_paths_are_left_out() {
     let m = ok(&p, &["authz", "matrix", &run_id]);
     assert_eq!(m["requests"].as_array().unwrap().len(), 1, "{m}");
     assert_eq!(m["hidden_requests"]["skip_paths"], 3, "{m}");
+    // A bypass is never hidden, whatever it matches.
+    ok(&p, &["authz", "skip", "add", "/api/orders/"]);
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "bypass", "{m}");
+    assert_eq!(m["hidden_requests"]["skip_paths"], 3, "{m}");
+    ok(&p, &["authz", "skip", "remove", "/api/orders/"]);
     let saved = ok(&p, &["authz", "skip", "remove", "/api/me$"]);
     assert_eq!(saved["defaults"], true, "{saved}");
+    // Adding one that is there already changes nothing.
+    assert_eq!(ok(&p, &["authz", "skip", "add", "/robots.txt$"])["defaults"], true);
     assert_eq!(run(&p, &["authz", "skip", "remove", "/nope"]).0, 4);
     assert_eq!(run(&p, &["authz", "skip", "add", "robots.txt"]).0, 2, "a path starts with / or *");
     assert_eq!(run(&p, &["authz", "run", "--as", "bob", "--skip-path", "api"]).0, 2);

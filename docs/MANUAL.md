@@ -799,7 +799,8 @@ Access control across users: does the app let bob read alice's data? See
   marked skipped. *Issues only* (on by default) shows only rows with a bypass or a public
   cell; the others are counted next to the legend, and a click there shows them. Static
   assets and requests matching a skip path that a run tested anyway (an older run, or one
-  with static assets on) are hidden too, behind a box that shows them. Click a verdict chip
+  with static assets on) are hidden too, behind a box that shows them, unless one of their
+  cells is a bypass. Click a verdict chip
   above the grid to show only those rows, whatever *Issues only* says; *Worst first* puts
   bypasses at the top.
 - **Compare:** click a cell to see the owner's response (the baseline) and that identity's
@@ -2773,7 +2774,8 @@ The run's summary counts what it left out (`skipped`: `static_assets`, `skip_pat
 each with why (`skipped_examples`: `static asset: Content-Type text/css`, `matches skip path
 /robots.txt$`). `authz matrix` hides static assets and requests matching the saved skip paths
 from any run, older ones and those that tested them on purpose included, and counts them
-(`hidden_requests`); `--all` shows them, each with why it would be `hidden`.
+(`hidden_requests`); `--all` shows them, each with why it would be `hidden`. A request with a
+`bypass` cell is never hidden.
 
 `authz run --background` returns a run id; `job wait|status|stop` work on it, and
 `authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
@@ -2783,8 +2785,8 @@ in-scope request the proxy records that carries credentials, uses GET (and isn't
 mutation), doesn't match `--authz-exclude` (default: logout and sign-off) or a skip path
 (the saved ones, which a running proxy picks up when they change, and any `--authz-skip-path`)
 and got a 2xx response that isn't a static asset (as above; `--authz-include-static` tests
-them) is also sent, in the background, as each listed profile and/or with no credentials
-(`anonymous`), exactly as `authz run` does. To test a request live mode leaves out, such as a private image, use
+them; `--authz-head-options` tests HEAD and OPTIONS too) is also sent, in the background, as
+each listed profile and/or with no credentials (`anonymous`), exactly as `authz run` does. To test a request live mode leaves out, such as a private image, use
 `authz run --history-id`. All of it goes
 under one authz run, created when the proxy starts; `proxy start` and `proxy status` print
 its id, and `authz matrix|results|list` and the desktop app's **Access** view work on it

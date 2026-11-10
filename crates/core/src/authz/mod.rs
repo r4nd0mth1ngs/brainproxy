@@ -1055,75 +1055,84 @@ impl Store {
 
     /// One row per request with a cell per identity: verdict, confidence, status, history id.
     /// Requests that are static assets or match `skips` are left out and counted in
-    /// `hidden_requests`; with `all` they are shown, each with why it would be `hidden`.
+    /// `hidden_requests`, unless one of their cells is a bypass; with `all` they are shown,
+    /// each with why it would be `hidden`.
     pub fn authz_matrix(&self, run_id: i64, limit: usize, skips: &noise::PathSkips, all: bool) -> Result<Value> {
         let rows = self.authz_results(run_id, None, None, i64::MAX as usize)?;
-        let mut identities: Vec<String> = Vec::new();
-        let mut requests: Vec<Value> = Vec::new();
+        // A request's rows are consecutive and start with its baseline (or why there is none).
+        let mut groups: Vec<Vec<Value>> = Vec::new();
         let mut current = None;
-        let mut truncated = false;
-        // The request being left out, until the next one starts.
-        let mut hiding = false;
-        let (mut hidden_static, mut hidden_paths) = (0, 0);
         for r in rows {
-            // A request's rows are consecutive and start with its baseline (or why there is none).
             let key = (r["source_id"].clone(), r["method"].clone(), r["url"].clone());
             let verdict = r["verdict"].as_str().unwrap_or("");
             if current.as_ref() != Some(&key) || matches!(verdict, "baseline" | "skipped") {
                 current = Some(key);
-                let url = r["url"].as_str().unwrap_or("");
-                let hidden = match skips.matching(url) {
-                    Some(p) => Some((false, format!("skip path {p}"))),
-                    None => self
-                        .authz_static(r["source_id"].as_i64().or(r["history_id"].as_i64()), url)?
-                        .map(|why| (true, format!("static asset ({why})"))),
-                };
-                hiding = hidden.is_some() && !all;
-                if hiding {
-                    match hidden {
-                        Some((true, _)) => hidden_static += 1,
-                        _ => hidden_paths += 1,
-                    }
-                    continue;
+                groups.push(Vec::new());
+            }
+            groups.last_mut().expect("a group was pushed").push(r);
+        }
+        let mut identities: Vec<String> = Vec::new();
+        let mut requests: Vec<Value> = Vec::new();
+        let mut truncated = false;
+        let (mut hidden_static, mut hidden_paths) = (0, 0);
+        for group in groups {
+            let first = &group[0];
+            let verdict = first["verdict"].as_str().unwrap_or("");
+            let url = first["url"].as_str().unwrap_or("");
+            // A bypass is never noise, whatever the request is.
+            let bypass = group.iter().any(|r| r["verdict"] == "bypass");
+            let hidden = if bypass {
+                None
+            } else if let Some(p) = skips.matching(url) {
+                Some((false, format!("skip path {p}")))
+            } else {
+                self.authz_static(first["source_id"].as_i64().or(first["history_id"].as_i64()), url)?
+                    .map(|why| (true, format!("static asset ({why})")))
+            };
+            if !all {
+                match hidden {
+                    Some((true, _)) => hidden_static += 1,
+                    Some((false, _)) => hidden_paths += 1,
+                    None => {}
                 }
-                if requests.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-                let mut req = json!({
-                    "source_id": r["source_id"],
-                    "method": r["method"],
-                    "url": r["url"],
-                    "owner": r["owner"],
-                    "baseline_history_id": r["history_id"],
-                    "baseline_status": r["status"],
-                    "cells": {},
-                });
-                if verdict != "baseline" {
-                    req["skipped"] = json!(format!("{verdict}: {}", r["reason"].as_str().unwrap_or("")));
-                }
-                if let Some((_, why)) = hidden {
-                    req["hidden"] = json!(why);
-                }
-                requests.push(req);
-                if matches!(verdict, "baseline" | "skipped") || r["identity"] == r["owner"] {
+                if hidden.is_some() {
                     continue;
                 }
             }
-            if hiding {
-                continue;
+            if requests.len() >= limit {
+                truncated = true;
+                break;
             }
-            let identity = r["identity"].as_str().unwrap_or("").to_string();
-            if !identities.contains(&identity) {
-                identities.push(identity.clone());
-            }
-            let last = requests.last_mut().expect("a request row was pushed");
-            last["cells"][identity] = json!({
-                "verdict": r["verdict"],
-                "confidence": r["confidence"],
-                "status": r["status"],
-                "history_id": r["history_id"],
+            let mut req = json!({
+                "source_id": first["source_id"],
+                "method": first["method"],
+                "url": first["url"],
+                "owner": first["owner"],
+                "baseline_history_id": first["history_id"],
+                "baseline_status": first["status"],
+                "cells": {},
             });
+            if verdict != "baseline" {
+                req["skipped"] = json!(format!("{verdict}: {}", first["reason"].as_str().unwrap_or("")));
+            }
+            if let Some((_, why)) = hidden {
+                req["hidden"] = json!(why);
+            }
+            // The first row is the baseline or why there is none, unless it is another identity's.
+            let skip_first = matches!(verdict, "baseline" | "skipped") || first["identity"] == first["owner"];
+            for r in group.iter().skip(usize::from(skip_first)) {
+                let identity = r["identity"].as_str().unwrap_or("").to_string();
+                if !identities.contains(&identity) {
+                    identities.push(identity.clone());
+                }
+                req["cells"][identity] = json!({
+                    "verdict": r["verdict"],
+                    "confidence": r["confidence"],
+                    "status": r["status"],
+                    "history_id": r["history_id"],
+                });
+            }
+            requests.push(req);
         }
         Ok(json!({
             "run_id": run_id,
@@ -1137,18 +1146,15 @@ impl Store {
     /// Why the request of history entry `id` (and its response) is a static asset, if it is one.
     fn authz_static(&self, id: Option<i64>, url: &str) -> Result<Option<String>> {
         let Some(id) = id else { return Ok(None) };
-        let row: Option<(Option<String>, Vec<u8>)> = self
+        let row: Option<(Option<String>, Option<String>)> = self
             .conn
-            .query_row("SELECT resp_content_type, request FROM history WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default()))
-            })
+            .prepare_cached(
+                "SELECT resp_content_type, header(req_headers, 'sec-fetch-dest') FROM history WHERE id = ?1",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some((content_type, request)) = row else { return Ok(None) };
-        let path = match url.split_once("://") {
-            Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
-            None => url,
-        };
-        Ok(noise::static_asset(content_type.as_deref(), path, noise::fetch_dest(&request).as_deref()))
+        let Some((content_type, dest)) = row else { return Ok(None) };
+        Ok(noise::static_asset(content_type.as_deref(), noise::url_path(url), dest.as_deref()))
     }
 
     /// Recent authz runs, newest first, with their rows per verdict.

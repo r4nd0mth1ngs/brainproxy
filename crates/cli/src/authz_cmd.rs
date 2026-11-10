@@ -214,7 +214,15 @@ pub fn authz(project: &Path, home: &Path, cmd: AuthzCmd, out: &Out) -> Result<()
         AuthzCmd::Matrix { run, limit, all } => {
             let store = Store::open(project)?;
             require_run(&store, run)?;
-            let m = store.authz_matrix(run, limit, &saved_skips(&store)?, all)?;
+            // Saved skip paths that don't compile (written by hand, say) hide nothing.
+            let (skips, warning) = match saved_skips(&store) {
+                Ok(s) => (s, None),
+                Err(e) => (PathSkips::default(), Some(e.to_string())),
+            };
+            let mut m = store.authz_matrix(run, limit, &skips, all)?;
+            if let Some(w) = warning {
+                m["warning"] = json!(w);
+            }
             out.ok(m.clone(), || matrix_text(&m));
             Ok(())
         }
@@ -259,10 +267,14 @@ fn skip(project: &Path, cmd: SkipCmd, out: &Out) -> Result<(), Error> {
     let paths = match cmd {
         SkipCmd::List => saved.paths,
         SkipCmd::Add { patterns } => {
-            let added = noise::check_skip_paths(&patterns)?;
+            let added: Vec<String> =
+                noise::check_skip_paths(&patterns)?.into_iter().filter(|p| !saved.paths.contains(p)).collect();
             let mut paths = saved.paths;
-            paths.extend(added.into_iter().filter(|p| !paths.contains(p)).collect::<Vec<_>>());
-            store.set_setting(SKIP_KEY, &SavedSkips { paths: paths.clone() })?;
+            // Already there: nothing to save, and running proxies needn't reload.
+            if !added.is_empty() {
+                paths.extend(added);
+                store.set_setting(SKIP_KEY, &SavedSkips { paths: paths.clone() })?;
+            }
             paths
         }
         SkipCmd::Remove { patterns } => {
@@ -309,7 +321,8 @@ fn require_run(store: &Store, run: i64) -> Result<(), Error> {
 fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Error> {
     let guard = crate::project_guard(project)?;
     let exclude = regex::Regex::new(&args.exclude).map_err(|e| Error::InvalidInput(format!("--exclude: {e}")))?;
-    let run_skips = PathSkips::compile(&args.skip_paths).map_err(|e| Error::InvalidInput(format!("--skip-path: {e}")))?;
+    let run_skips =
+        PathSkips::compile(&args.skip_paths).map_err(|e| Error::InvalidInput(format!("--skip-path: {e}")))?;
     let skips = if args.no_saved_skips { run_skips } else { saved_skips(&Store::open(project)?)?.with(&run_skips) };
     let anonymous = !args.no_anonymous;
     let identities: Vec<String> = {
@@ -622,8 +635,12 @@ fn result_line(r: &Value) -> String {
 
 fn matrix_text(m: &Value) -> String {
     let identities: Vec<&str> = m["identities"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    let mut lines =
-        vec![format!("{:<10} {}  request", "owner", identities.iter().map(|i| format!("{i:<14}")).collect::<String>())];
+    let mut lines: Vec<String> = m["warning"].as_str().map(|w| vec![format!("warning: {w}")]).unwrap_or_default();
+    lines.push(format!(
+        "{:<10} {}  request",
+        "owner",
+        identities.iter().map(|i| format!("{i:<14}")).collect::<String>()
+    ));
     for r in m["requests"].as_array().into_iter().flatten() {
         let cells: String = identities
             .iter()

@@ -45,6 +45,9 @@ pub struct LiveAuthz {
     /// Test static assets too.
     #[serde(default)]
     pub include_static: bool,
+    /// Test HEAD and OPTIONS requests too.
+    #[serde(default)]
+    pub head_options: bool,
     /// Skip paths of this run, on top of the project's saved ones (`authz skip`).
     #[serde(default)]
     pub skip_paths: Vec<String>,
@@ -72,6 +75,7 @@ impl Default for LiveAuthz {
             exclude: default_exclude(),
             keep_cookies: vec![],
             include_static: false,
+            head_options: false,
             skip_paths: vec![],
             run_id: None,
         }

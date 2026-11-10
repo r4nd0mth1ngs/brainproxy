@@ -57,6 +57,8 @@ pub struct LiveOptions {
     pub exclude: Regex,
     /// Test static assets too.
     pub include_static: bool,
+    /// Test HEAD and OPTIONS requests too.
+    pub head_options: bool,
     /// Skip paths of this run, on top of the project's saved ones.
     pub skip_paths: PathSkips,
     /// The project's saved skip paths when the proxy started ([`Live::set_saved_skips`]
@@ -87,6 +89,7 @@ pub struct Live {
     seen: Mutex<Seen>,
     exclude: Regex,
     include_static: bool,
+    head_options: bool,
     /// This run's skip paths, and the saved ones with them.
     run_skips: PathSkips,
     skips: RwLock<PathSkips>,
@@ -124,6 +127,7 @@ impl Live {
             seen: Mutex::new(Seen { set: HashSet::new(), max: MAX_SEEN }),
             exclude: opts.exclude,
             include_static: opts.include_static,
+            head_options: opts.head_options,
             skips: RwLock::new(opts.saved_skips.with(&opts.skip_paths)),
             run_skips: opts.skip_paths,
             profiles: tester.profiles(),
@@ -166,7 +170,8 @@ impl Live {
         let raw = RawRequest::from_bytes(request.to_vec());
         let Ok(head) = raw.head() else { return };
         let method = head.method.to_ascii_uppercase();
-        let path = origin_form(&head.target).split('?').next().unwrap_or("/");
+        let path_query = noise::url_path(&head.target);
+        let path = path_query.split('?').next().unwrap_or("/");
         // A GraphQL mutation is MUTATION whatever its method, so one sent as GET isn't tested.
         // Only a request with a safe method is read for one: the others are skipped anyway.
         let unsafe_method =
@@ -175,18 +180,15 @@ impl Live {
             Some(&c.methods)
         } else if self.exclude.is_match(path) {
             Some(&c.excluded)
-        } else if noise::no_body_method(&method, &[]) {
+        } else if !self.head_options && noise::no_body_method(&method, &[]) {
             Some(&c.head_options)
         } else if !has_credentials(request, &self.profiles) {
             Some(&c.no_credentials)
         } else if status.is_none_or(|s| !(200..300).contains(&s)) {
             Some(&c.status)
-        } else if !self.include_static
-            && noise::static_asset(content_type, path, noise::fetch_dest(request).as_deref()).is_some()
-        {
+        } else if !self.include_static && noise::static_asset(content_type, path, fetch_dest(&head.headers)).is_some() {
             Some(&c.assets)
-        } else if self.skips.read().unwrap().matching(&format!("{}{}", target.origin(), origin_form(&head.target))).is_some()
-        {
+        } else if self.skips.read().unwrap().matching(&format!("{}{path_query}", target.origin())).is_some() {
             Some(&c.skip_paths)
         } else {
             None
@@ -247,12 +249,9 @@ impl Live {
     }
 }
 
-/// A request target as a path: an absolute-form one (`http://host/path`) without its origin.
-fn origin_form(target: &str) -> &str {
-    match target.split_once("://") {
-        Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
-        None => target,
-    }
+/// The `Sec-Fetch-Dest` header among `headers`.
+fn fetch_dest(headers: &[(String, String)]) -> Option<&str> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("sec-fetch-dest")).map(|(_, v)| v.trim())
 }
 
 async fn work(
@@ -324,10 +323,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn origin_form_of_a_target() {
-        assert_eq!(origin_form("/a?b=1"), "/a?b=1");
-        assert_eq!(origin_form("http://a.test/x/y?z"), "/x/y?z");
-        assert_eq!(origin_form("http://a.test"), "/");
+    fn path_of_a_target() {
+        assert_eq!(noise::url_path("/a?b=1"), "/a?b=1");
+        assert_eq!(noise::url_path("http://a.test/x/y?z"), "/x/y?z");
+        assert_eq!(noise::url_path("http://a.test"), "/");
+        let headers =
+            vec![("Host".to_string(), "a".to_string()), ("sec-fetch-dest".to_string(), " image ".to_string())];
+        assert_eq!(fetch_dest(&headers), Some("image"));
     }
 
     #[test]

@@ -321,6 +321,10 @@ pub struct ProxyRunArgs {
     /// Live testing also tests static assets (stylesheets, scripts, images, fonts, media).
     #[arg(long)]
     authz_include_static: bool,
+    /// Live testing also tests HEAD and OPTIONS requests, which have no body to compare
+    /// (only the status says anything).
+    #[arg(long)]
+    authz_head_options: bool,
     /// Live testing also leaves out requests whose path or URL starts with this (* matches any
     /// characters, a trailing $ means it ends there), on top of the project's skip paths.
     /// Repeatable.
@@ -353,6 +357,7 @@ impl ProxyRunArgs {
             exclude: self.authz_exclude.clone(),
             keep_cookies: self.authz_keep_cookie.clone(),
             include_static: self.authz_include_static,
+            head_options: self.authz_head_options,
             skip_paths,
             run_id: None,
         })
@@ -1308,6 +1313,9 @@ impl Launch {
             if args.authz_include_static {
                 cmd.arg("--authz-include-static");
             }
+            if args.authz_head_options {
+                cmd.arg("--authz-head-options");
+            }
             for p in &live.skip_paths {
                 cmd.arg(format!("--authz-skip-path={p}"));
             }
@@ -2028,6 +2036,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             concurrency: 2,
             exclude,
             include_static: live.include_static,
+            head_options: live.head_options,
             skip_paths: skips(&live.skip_paths)?,
             saved_skips: skips(&saved.paths)?,
         };

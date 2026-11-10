@@ -43,7 +43,8 @@ pub const SKIP_SYNTAX: &str = "a path (/static/) or URL (https://cdn.example.com
     string unless the pattern has a ?";
 
 /// Content types of static assets, by prefix and in full.
-const STATIC_TYPE_PREFIXES: &[&str] = &["image/", "font/", "audio/", "video/", "application/font", "application/x-font"];
+const STATIC_TYPE_PREFIXES: &[&str] =
+    &["image/", "font/", "audio/", "video/", "application/font", "application/x-font"];
 const STATIC_TYPES: &[&str] = &[
     "text/css",
     "text/javascript",
@@ -208,12 +209,18 @@ impl PathSkips {
             return None;
         }
         let url = url.split('#').next().unwrap_or("");
-        let path_query = match url.split_once("://") {
-            Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
-            None => url,
-        };
+        let path_query = url_path(url);
         let path = path_query.split('?').next().unwrap_or("/");
         self.0.iter().find(|s| s.matches(url, path, path_query)).map(|s| s.raw.as_str())
+    }
+}
+
+/// The path (and query) of a URL, absolute or not: an absolute one without its origin, and
+/// `/` when it has no path.
+pub fn url_path(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((_, rest)) => rest.find(['/', '?']).map_or("/", |i| &rest[i..]),
+        None => url,
     }
 }
 
