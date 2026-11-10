@@ -195,21 +195,7 @@ pub fn ws(project: &Path, cmd: WsCmd, out: &Out) -> Result<(), Error> {
             let store = Store::open(project)?;
             close_abandoned(&store, project)?;
             let c = store.ws_connection(id)?;
-            let handshake = match c.history_id.map(|h| store.get(h)) {
-                Some(Ok(item)) => {
-                    let mut v = crate::exchange_json(
-                        Some(item.entry.id),
-                        &item.target,
-                        &item.request,
-                        &item.response,
-                        item.entry.duration_ms.map(|d| d as u64),
-                        max_body,
-                    );
-                    v["request"] = body_value(&item.request, max_body);
-                    v
-                }
-                _ => Value::Null,
-            };
+            let handshake = crate::recorded_exchange_json(&store, c.history_id, max_body);
             let counts: Vec<Value> = store
                 .ws_message_counts(id)?
                 .into_iter()
@@ -389,6 +375,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         sni: args.sni.clone(),
         http2: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
+        stream: Default::default(),
     };
     // So is a server name the scope doesn't list, before a row could say it was sent.
     send_opts.check_sni(&target)?;

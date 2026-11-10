@@ -123,7 +123,19 @@ pub(crate) fn setup_error(target: &Target, e: Error) -> Error {
 
 /// Reads a whole response body, giving flow-control capacity back as it goes.
 pub async fn read_response(fut: h2::client::ResponseFuture) -> Result<Vec<u8>> {
+    Ok(read_response_with(fut, false).await?.0)
+}
+
+/// [`read_response`], except that with `live` an event stream ([`crate::sse::is_event_stream`])
+/// is left open: its head is returned with the stream its data arrives on.
+async fn read_response_with(fut: h2::client::ResponseFuture, live: bool) -> Result<(Vec<u8>, Option<h2::RecvStream>)> {
     let (parts, mut body) = fut.await.map_err(h2_error)?.into_parts();
+    if live && !body.is_end_stream() {
+        let head = response_bytes(&parts, b"");
+        if crate::http::parse_response_head(&head).is_ok_and(|h| crate::sse::is_event_stream(&h)) {
+            return Ok((head, Some(body)));
+        }
+    }
     let mut buf = Vec::new();
     while let Some(chunk) = body.data().await {
         let chunk = chunk.map_err(h2_error)?;
@@ -133,17 +145,26 @@ pub async fn read_response(fut: h2::client::ResponseFuture) -> Result<Vec<u8>> {
             return Err(Error::Protocol("HTTP/2 response body over the 64 MB limit".into()));
         }
     }
-    Ok(response_bytes(&parts, &buf))
+    Ok((response_bytes(&parts, &buf), None))
 }
 
 /// Sends one request on an HTTP/2 connection and reads the response.
 pub async fn round_trip(sender: SendRequest<Bytes>, req: &H2Request) -> Result<Vec<u8>> {
+    Ok(round_trip_live(sender, req, false).await?.0)
+}
+
+/// [`round_trip`]; with `live` an event stream's body is left to read as it arrives.
+pub async fn round_trip_live(
+    sender: SendRequest<Bytes>,
+    req: &H2Request,
+    live: bool,
+) -> Result<(Vec<u8>, Option<h2::RecvStream>)> {
     let mut sender = sender.ready().await.map_err(h2_error)?;
     let (fut, mut stream) = sender.send_request(req.request(), req.body.is_empty()).map_err(h2_error)?;
     if !req.body.is_empty() {
         stream.send_data(req.body.clone(), true).map_err(h2_error)?;
     }
-    read_response(fut).await
+    read_response_with(fut, live).await
 }
 
 #[cfg(test)]

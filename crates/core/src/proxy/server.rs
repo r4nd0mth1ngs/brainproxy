@@ -6,6 +6,13 @@
 //! Traffic outside the recording scope is forwarded and still leaves a row: a request keeps
 //! its request line only, and a CONNECT tunnel (never decrypted) is recorded as a connection.
 //!
+//! A response that is an event stream (`text/event-stream`) is relayed to the client as it
+//! arrives instead of being read whole, over HTTP/1.1 and HTTP/2: its row is written as the
+//! stream opens, its events are recorded as they pass, and the row gets the body (as far as a
+//! stream may store) when the stream ends or the proxy stops. Response header rules apply to
+//! its head; body rules, response intercept and live access-control testing, which need a
+//! finished response, leave it alone.
+//!
 //! Connection options: TLS pass-through hosts are tunnelled without being
 //! decrypted (still scope-checked, and recorded as a connection), and with
 //! `invisible` the listener also serves clients that don't know they're proxied:
@@ -30,8 +37,9 @@ use crate::auth::AuthSession;
 use crate::authz::live::Live as LiveAuthz;
 use crate::capture::Capture;
 use crate::error::{Error, Result};
-use crate::http::client::{close_after, cut_short, final_response, Conn};
+use crate::http::client::{close_after, cut_short, final_response, Conn, LiveBody};
 use crate::http::h2::h2_error;
+use crate::http::wire::Piece;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target, WireReader};
 use crate::provenance::Edit;
 use crate::proxy::ca::CertAuthority;
@@ -42,6 +50,7 @@ use crate::proxy::config::{
 use crate::proxy::h2 as h2p;
 use crate::rules::{Engine, RuleSet};
 use crate::session::Tool;
+use crate::sse::db::SseRecord;
 use crate::store::Store;
 use crate::ws::db::WsEvent;
 use crate::ws::relay::{Hold, Hooks};
@@ -72,6 +81,14 @@ pub const PASSED_THROUGH: &str = "TLS pass-through, not decrypted";
 const TUNNEL_OPENED: &str = "open, no close recorded yet";
 /// The rest of the error of a tunnel's row when it was still open as the proxy stopped.
 const TUNNEL_OPEN: &str = "still open when the proxy stopped";
+/// The error of an event stream that was still open as the proxy stopped.
+const STREAM_OPEN: &str = "still open when the proxy stopped";
+/// The error of an event stream a proxy that was killed left open.
+const STALE_SSE: &str = "the proxy stopped before the stream ended";
+/// Body bytes the event streams open at one time may hold between them while they are
+/// recorded (each holds its own until it closes). A stream that would pass it stops being
+/// recorded, like one over its own cap.
+const STREAM_BUDGET: usize = 256 * 1024 * 1024;
 
 pub struct ProxyOptions {
     pub project: PathBuf,
@@ -128,6 +145,10 @@ struct Ctx {
     authz: Option<Arc<LiveAuthz>>,
     /// Names WebSocket connections for the recorder.
     ws_keys: AtomicU64,
+    /// Names event streams for the recorder.
+    sse_keys: AtomicU64,
+    /// Body bytes held by the event streams open now, against [`STREAM_BUDGET`].
+    stream_bytes: std::sync::atomic::AtomicUsize,
     stats: Stats,
     http2: bool,
     /// Whether each https origin negotiated HTTP/2 (tried for HTTP/2 clients).
@@ -154,6 +175,23 @@ struct FlightState {
     /// row says should it still be open at the end. Stopping doesn't wait for them: they can
     /// stay open for as long as a client likes.
     tunnels: HashMap<u64, (i64, Capture)>,
+    /// Event streams being relayed and recorded, by key. Stopping doesn't wait for them
+    /// either: each is closed then with what it has stored so far.
+    streams: HashMap<u64, Arc<OpenStream>>,
+    /// Stopping has closed the streams open then: one that opens after it isn't tracked.
+    streams_taken: bool,
+    /// Streams whose closing record is being queued (it may wait for room): stopping waits
+    /// for them as it does for requests, or the record would go nowhere.
+    closing: usize,
+}
+
+/// A stream's closing record on its way to the recorder, until dropped.
+struct Closing<'a>(&'a InFlight);
+
+impl Drop for Closing<'_> {
+    fn drop(&mut self) {
+        self.0 .0.lock().unwrap().closing -= 1;
+    }
 }
 
 /// One request in [`InFlight`], until dropped: once its exchange is queued for the recorder.
@@ -199,8 +237,35 @@ impl InFlight {
         self.0.lock().unwrap().stopping = true;
     }
 
+    /// Tracks a stream so that stopping closes it. False once stopping has closed the streams
+    /// open then: the caller closes this one itself.
+    fn add_stream(&self, stream: Arc<OpenStream>) -> bool {
+        let mut s = self.0.lock().unwrap();
+        if s.streams_taken {
+            return false;
+        }
+        s.streams.insert(stream.key, stream);
+        true
+    }
+
+    /// Stops tracking a stream that is closing; stopping waits until the result is dropped.
+    fn closing_stream(&self, key: u64) -> Closing<'_> {
+        let mut s = self.0.lock().unwrap();
+        s.streams.remove(&key);
+        s.closing += 1;
+        Closing(self)
+    }
+
+    /// The event streams open now, no longer tracked: stopping closes them.
+    fn take_streams(&self) -> Vec<Arc<OpenStream>> {
+        let mut s = self.0.lock().unwrap();
+        s.streams_taken = true;
+        s.streams.drain().map(|(_, s)| s).collect()
+    }
+
     fn is_empty(&self) -> bool {
-        self.0.lock().unwrap().open.is_empty()
+        let s = self.0.lock().unwrap();
+        s.open.is_empty() && s.closing == 0
     }
 
     /// Removes the requests nobody is recording yet: their exchanges won't be recorded by
@@ -252,12 +317,14 @@ impl Drop for OpenTunnel {
 enum Record {
     Capture(Box<Recorded>),
     Ws(WsEvent),
+    Sse(SseRecord),
 }
 
 /// The queue to the recorder thread, bounded by bytes (each record holds its permits until it
 /// is written). HTTP captures and connection open/close wait for room, so none is lost: the
 /// request that made one is delayed instead. WebSocket messages never wait, so a slow disk
-/// can't stall the relay: one that doesn't fit is left out and the connection says so.
+/// can't stall the relay: one that doesn't fit is left out and the connection says so. The
+/// events of an event stream go the same way; its opening and closing wait.
 struct Recorder {
     tx: Mutex<mpsc::Sender<(Record, u32)>>,
     budget: Arc<Semaphore>,
@@ -315,6 +382,7 @@ pub async fn run(
     const STALE_WS: &str = "the proxy stopped before the connection closed";
     let control = Store::open(&opts.project)?;
     control.ws_close_stale("proxy", STALE_WS)?;
+    control.sse_close_stale("proxy", STALE_SSE)?;
     let (recorder, rx) = Recorder::new();
     let budget = recorder.budget.clone();
     let mut writer_store = Store::open(&opts.project)?;
@@ -324,14 +392,17 @@ pub async fn run(
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer_stopping = stopping.clone();
     let writer = std::thread::spawn(move || {
-        let mut ws_ids = HashMap::new();
+        let (mut ws_ids, mut sse_ids) = (HashMap::new(), HashMap::new());
+        // Stream rows completed while stopping: scanned with their bodies by the next scan.
+        let mut unscanned = Vec::new();
         while let Ok(first) = rx.recv() {
-            let (mut batch, mut ws, mut cost) = (Vec::new(), Vec::new(), 0);
+            let (mut batch, mut ws, mut sse, mut cost) = (Vec::new(), Vec::new(), Vec::new(), 0);
             for (r, c) in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()).take(255)) {
                 cost += c as usize;
                 match r {
                     Record::Capture(c) => batch.push(*c),
                     Record::Ws(e) => ws.push(e),
+                    Record::Sse(e) => sse.push(e),
                 }
             }
             let (captures, offers): (Vec<Capture>, Vec<_>) = batch.into_iter().map(|r| (r.capture, r.authz)).unzip();
@@ -351,11 +422,22 @@ pub async fn run(
             if let Err(e) = writer_store.ws_record(&ws, &mut ws_ids) {
                 eprintln!("brainproxy: failed to record {} WebSocket events: {e}", ws.len());
             }
+            let ended = writer_store.sse_record(&sse, &mut sse_ids).unwrap_or_else(|e| {
+                eprintln!("brainproxy: failed to record {} event stream records: {e}", sse.len());
+                Vec::new()
+            });
             // Written (or given up on): their room is free again.
-            drop((captures, ws));
+            drop((captures, ws, sse));
             budget.add_permits(cost);
             if writer_stopping.load(Ordering::Relaxed) {
+                unscanned.extend(ended);
                 continue;
+            }
+            // A stream's row was scanned with its head as it opened; now it has its body.
+            for id in ended {
+                if let Err(e) = crate::scan::passive::scan_late(&mut writer_store, id) {
+                    eprintln!("brainproxy: passive scan of event stream row {id} failed: {e}");
+                }
             }
             if let Err(e) = crate::scan::passive::scan_pending(&mut writer_store) {
                 eprintln!("brainproxy: passive scan failed: {e}");
@@ -363,6 +445,12 @@ pub async fn run(
         }
         if let Err(e) = writer_store.ws_close_stale("proxy", STALE_WS) {
             eprintln!("brainproxy: WebSocket connections left open: {e}");
+        }
+        if let Err(e) = writer_store.sse_close_stale("proxy", STALE_SSE) {
+            eprintln!("brainproxy: event streams left open: {e}");
+        }
+        if let Err(e) = crate::scan::passive::scan_later(&writer_store, &unscanned) {
+            eprintln!("brainproxy: {} event stream rows not left for the passive scanner: {e}", unscanned.len());
         }
     });
 
@@ -376,6 +464,8 @@ pub async fn run(
         recorder,
         authz: opts.authz,
         ws_keys: AtomicU64::new(0),
+        sse_keys: AtomicU64::new(0),
+        stream_bytes: Default::default(),
         stats: Stats::default(),
         http2: opts.http2,
         h2_origins: Mutex::default(),
@@ -430,6 +520,10 @@ pub async fn run(
     }
     for (id, capture) in tunnels {
         complete_tunnel_row(&ctx, id, capture).await;
+    }
+    // Event streams still open: their rows get what they stored so far.
+    for stream in ctx.in_flight.take_streams() {
+        stream.close(&ctx, "stopped", Some(STREAM_OPEN.into())).await;
     }
     // Ones being recorded right now are only waiting for room in the queue (or for a
     // WebSocket connection's opening to be queued).
@@ -777,6 +871,8 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 client.flush().await?;
                 return relay_upgrade(ctx, client, reader.into_leftover(), *upgrade).await;
             }
+            // The connection ends with the stream: nothing after it is read.
+            Reply::Stream(stream) => return relay_stream(ctx, client, *stream).await,
             Reply::Response(response) => response,
         };
         client.write_all(&response).await?;
@@ -852,6 +948,7 @@ async fn serve_h2_stream(
         }
         let request = h2p::request_text(&parts, &data, target);
         match handle_request(ctx, target, request, true).await? {
+            Reply::Stream(stream) => return relay_stream_h2(ctx, respond, *stream).await,
             Reply::Response(response) | Reply::Error(response, _) => response,
             // Upgrades don't exist in HTTP/2; an HTTP/1.1 origin that answers 101 anyway gets nothing.
             Reply::Upgrade(u) => {
@@ -879,6 +976,8 @@ enum Reply {
     Response(Vec<u8>),
     /// A 101 response (sent as received) and the connection to relay from then on.
     Upgrade(Box<Upgrade>),
+    /// The head of an event stream, and its body to relay as it arrives.
+    Stream(Box<StreamReply>),
     /// A brainproxy error response; `true` ends the client connection.
     Error(Vec<u8>, bool),
 }
@@ -895,6 +994,252 @@ struct Upgrade {
     host: String,
     path: String,
     url: String,
+}
+
+/// An event stream on its way to the client.
+struct StreamReply {
+    /// The response's head, after the header rules.
+    head: Vec<u8>,
+    body: LiveBody,
+    /// Its recording, when it is recorded.
+    open: Option<Arc<OpenStream>>,
+}
+
+/// An event stream being relayed and recorded. Its row was written as it opened, with the
+/// response's head; closing rewrites the row with the body, as far as a stream may store.
+struct OpenStream {
+    key: u64,
+    target: Target,
+    /// The request as sent, and the response's head as received.
+    sent: Vec<u8>,
+    head: Vec<u8>,
+    started: Instant,
+    edited_by: Vec<Edit>,
+    /// The client it is relayed to. Kept, as the proxy closes the stream on another task when it stops.
+    client_addr: Option<String>,
+    state: Mutex<StreamState>,
+}
+
+struct StreamState {
+    recorder: crate::sse::Recorder,
+    /// Events left out because the recorder's queue was full.
+    unrecorded: u64,
+    /// What the stream's row already says of its recording (over a cap, events it can't read).
+    noted: Option<String>,
+    closed: bool,
+}
+
+impl OpenStream {
+    /// Records what a stream may store of a piece on its way to the client. Events never wait
+    /// for the recorder, so a slow disk can't stall the relay: one that doesn't fit is left
+    /// out and the stream says so.
+    fn record(&self, ctx: &Ctx, piece: &Piece) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        let held = state.recorder.body().len();
+        let full = ctx.stream_bytes.load(Ordering::Relaxed) + piece.wire.len() > STREAM_BUDGET;
+        let events = if full && !state.recorder.truncated() {
+            state.recorder.cut(format!(
+                "recording stopped: the event streams open now hold {} MiB between them",
+                STREAM_BUDGET >> 20
+            ))
+        } else {
+            state.recorder.push(piece)
+        };
+        // What it holds now: more, or less when the body was cut back to where it still reads.
+        let now = state.recorder.body().len();
+        if now >= held {
+            ctx.stream_bytes.fetch_add(now - held, Ordering::Relaxed);
+        } else {
+            ctx.stream_bytes.fetch_sub(held - now, Ordering::Relaxed);
+        }
+        for event in events {
+            let text = |t: &Option<String>| t.as_ref().map_or(0, String::len);
+            let bytes = text(&event.data) + text(&event.event_id) + event.event.len();
+            if !ctx.recorder.try_send(bytes, || Record::Sse(SseRecord::Event { key: self.key, event })) {
+                state.unrecorded += 1;
+            }
+        }
+        // Over a cap, or events that can't be read: the stream says so now, not only once it
+        // closes. If the recorder has no room, the next piece tries again, and closing says it too.
+        let note = state.recorder.note().map(str::to_string);
+        if note != state.noted {
+            let (key, truncated, error) = (self.key, state.recorder.truncated(), note.clone().unwrap_or_default());
+            if ctx.recorder.try_send(error.len(), || Record::Sse(SseRecord::Note { key, truncated, error })) {
+                state.noted = note;
+            }
+        }
+    }
+
+    /// Closes the recording, once: the row gets the body kept, the stream how it ended.
+    async fn close(&self, ctx: &Ctx, ended: &'static str, error: Option<String>) {
+        let _closing = ctx.in_flight.closing_stream(self.key);
+        let (truncated, body, notes) = {
+            let mut state = self.state.lock().unwrap();
+            if std::mem::replace(&mut state.closed, true) {
+                return;
+            }
+            let backlog = (state.unrecorded > 0)
+                .then(|| format!("{} events not recorded: the recorder was behind", state.unrecorded));
+            let notes: Vec<String> =
+                [error, state.recorder.note().map(str::to_string), backlog].into_iter().flatten().collect();
+            (state.recorder.truncated(), state.recorder.take_body(), notes)
+        };
+        ctx.stream_bytes.fetch_sub(body.len(), Ordering::Relaxed);
+        // Built outside the lock: decoding the body takes a moment, and a relay still running
+        // (the proxy is stopping) must not wait for it.
+        let response = [self.head.as_slice(), &body].concat();
+        drop(body);
+        let ms = Some(self.started.elapsed().as_millis() as i64);
+        let capture = Capture::new("proxy", &self.target, &self.sent, Some(&response), ms, None);
+        let capture = Capture { edited_by: self.edited_by.clone(), client_addr: self.client_addr.clone(), ..capture };
+        let bytes = capture_bytes(&capture);
+        let record = SseRecord::Close {
+            key: self.key,
+            time: crate::ws::now_iso(),
+            capture: Box::new(capture),
+            truncated,
+            ended,
+            error: (!notes.is_empty()).then(|| notes.join("; ")),
+        };
+        ctx.recorder.send(Record::Sse(record), bytes).await;
+    }
+}
+
+/// How a relayed stream ended: who ended it (`server`, `client`, `error`), and the error.
+type StreamEnd = (&'static str, Option<String>);
+
+/// Relays an event stream to an HTTP/1.x client as it arrives: the head, then each piece of
+/// the body as received, flushed at once. The connection ends with the stream.
+async fn relay_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    ctx: &Arc<Ctx>,
+    client: S,
+    stream: StreamReply,
+) -> Result<()> {
+    let StreamReply { head, mut body, open } = stream;
+    let (mut from_client, mut to_client) = tokio::io::split(client);
+    let relay = async {
+        if let Err(e) = async {
+            to_client.write_all(&head).await?;
+            to_client.flush().await
+        }
+        .await
+        {
+            return ("client", Some(format!("the client went away: {e}")));
+        }
+        // The client has nothing more to say on this connection: when it closes, the stream
+        // is over, even while the server is quiet.
+        let client_closed = async {
+            let mut scratch = [0u8; 1024];
+            while matches!(from_client.read(&mut scratch).await, Ok(n) if n > 0) {}
+        };
+        tokio::pin!(client_closed);
+        loop {
+            let piece = tokio::select! {
+                piece = body.next() => piece,
+                _ = &mut client_closed => return ("client", None),
+            };
+            match piece {
+                Ok(Some(piece)) => {
+                    if let Some(open) = &open {
+                        open.record(ctx, &piece);
+                    }
+                    if let Err(e) = async {
+                        to_client.write_all(&piece.wire).await?;
+                        to_client.flush().await
+                    }
+                    .await
+                    {
+                        return ("client", Some(format!("the client went away: {e}")));
+                    }
+                }
+                Ok(None) => return ("server", None),
+                Err(e) => return ("error", Some(e.to_string())),
+            }
+        }
+    };
+    let (ended, error): StreamEnd = relay.await;
+    // The upstream connection closes with the body; the client's is told the stream is over.
+    drop(body);
+    let _ = to_client.shutdown().await;
+    if let Some(open) = open {
+        open.close(ctx, ended, error).await;
+    }
+    Ok(())
+}
+
+/// Relays an event stream to an HTTP/2 client as it arrives: the head, then the content of
+/// each piece of the body as a DATA frame.
+async fn relay_stream_h2(
+    ctx: &Arc<Ctx>,
+    mut respond: h2::server::SendResponse<bytes::Bytes>,
+    stream: StreamReply,
+) -> Result<()> {
+    let StreamReply { head, mut body, open } = stream;
+    let relay = async {
+        // As for a HEAD: the body isn't here to measure a Content-Length against.
+        let head = match h2p::response_parts(&head, "HEAD") {
+            Ok((head, _)) => head,
+            Err(e) => {
+                respond.send_reset(h2::Reason::INTERNAL_ERROR);
+                return ("error", Some(e.to_string()));
+            }
+        };
+        let mut send = match respond.send_response(head, false) {
+            Ok(send) => send,
+            Err(e) => return ("client", Some(format!("the client went away: {}", h2_error(e)))),
+        };
+        loop {
+            let piece = tokio::select! {
+                piece = body.next() => piece,
+                _ = std::future::poll_fn(|cx| send.poll_reset(cx)) => return ("client", None),
+            };
+            match piece {
+                Ok(Some(piece)) => {
+                    if let Some(open) = &open {
+                        open.record(ctx, &piece);
+                    }
+                    if let Err(e) = send_h2_data(&mut send, bytes::Bytes::copy_from_slice(piece.data())).await {
+                        return ("client", Some(format!("the client went away: {e}")));
+                    }
+                }
+                Ok(None) => {
+                    let _ = send.send_data(bytes::Bytes::new(), true);
+                    return ("server", None);
+                }
+                Err(e) => {
+                    send.send_reset(h2::Reason::INTERNAL_ERROR);
+                    return ("error", Some(e.to_string()));
+                }
+            }
+        }
+    };
+    let (ended, error): StreamEnd = relay.await;
+    drop(body);
+    if let Some(open) = open {
+        open.close(ctx, ended, error).await;
+    }
+    Ok(())
+}
+
+/// Sends `data` on an HTTP/2 stream as the client's flow-control window allows, so a client
+/// that reads slowly holds the relay back instead of filling memory.
+async fn send_h2_data(send: &mut h2::SendStream<bytes::Bytes>, mut data: bytes::Bytes) -> Result<()> {
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let room = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+            Some(Ok(n)) => n,
+            Some(Err(e)) => return Err(h2_error(e)),
+            None => return Err(Error::Protocol("HTTP/2: the stream closed".into())),
+        };
+        let chunk = data.split_to(room.min(data.len()));
+        if !chunk.is_empty() {
+            send.send_data(chunk, false).map_err(h2_error)?;
+        }
+    }
+    Ok(())
 }
 
 /// One request through scope, rules, auth, and intercept, forwarded upstream
@@ -1018,7 +1363,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             }
         }
     }
-    let Upstream { conn, sent, response } = match upstream {
+    let Upstream { conn, sent, response, body } = match upstream {
         Ok(v) => v,
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -1053,6 +1398,65 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         let flight = Some(flight);
         let upgrade = Upgrade { response, conn, capture, flight, in_scope, host: target.host.clone(), path, url };
         return Ok(Reply::Upgrade(Box::new(upgrade)));
+    }
+    if let Some(body) = body {
+        // An event stream: relayed as it arrives, so only what applies to a head applies to it.
+        let ruled = match in_scope {
+            true => live.rules.response_head(Engine::Proxy, &target.host, response.clone()),
+            false => crate::rules::Ruled { bytes: response.clone(), ..Default::default() },
+        };
+        live.rule_failures.note(Engine::Proxy, &ruled.failed);
+        // The row keeps the head as received, and beside it what the header rules made of it.
+        if let Some(c) = capture.as_mut().filter(|_| ruled.changed()) {
+            c.modified_response = Some(ruled.bytes.clone());
+            c.response_edits = ruled.edits();
+        }
+        let head = ruled.bytes;
+        let open = match capture {
+            // Outside the recording scope the row is all that is kept: no events.
+            Some(c) if omit.is_some() => {
+                send_capture(ctx, c, None).await;
+                None
+            }
+            Some(c) => match parse_response_head(final_response(&response)) {
+                Ok(parsed) => {
+                    let open = Arc::new(OpenStream {
+                        key: ctx.sse_keys.fetch_add(1, Ordering::Relaxed),
+                        target: target.clone(),
+                        sent,
+                        head: response,
+                        started,
+                        edited_by: c.edited_by.clone(),
+                        client_addr: c.client_addr.clone(),
+                        state: Mutex::new(StreamState {
+                            recorder: crate::sse::Recorder::new(&parsed),
+                            unrecorded: 0,
+                            noted: None,
+                            closed: false,
+                        }),
+                    });
+                    let bytes = capture_bytes(&c);
+                    let record =
+                        SseRecord::Open { key: open.key, capture: Box::new(c), url, time: crate::ws::now_iso() };
+                    ctx.recorder.send(Record::Sse(record), bytes).await;
+                    // Tracked before the request stops being in flight, so stopping closes it.
+                    if ctx.in_flight.add_stream(open.clone()) {
+                        Some(open)
+                    } else {
+                        // Stopping has closed the streams already: this one is relayed, not recorded.
+                        open.close(ctx, "stopped", Some(STREAM_OPEN.into())).await;
+                        None
+                    }
+                }
+                Err(_) => {
+                    send_capture(ctx, c, None).await;
+                    None
+                }
+            },
+            None => None,
+        };
+        drop(flight);
+        return Ok(Reply::Stream(Box::new(StreamReply { head, body, open })));
     }
     // The row keeps the response as received, and beside it what the rules made of it.
     let ruled = match in_scope {
@@ -1289,11 +1693,13 @@ fn valid_authority(value: &str) -> bool {
 }
 
 /// An upstream exchange: the HTTP/1.1 connection to pool (none for HTTP/2),
-/// the request as sent (the recorded form), and the response.
+/// the request as sent (the recorded form), and the response. For an event stream the
+/// response is its head, and `body` what is still arriving.
 struct Upstream {
     conn: Option<Conn>,
     sent: Vec<u8>,
     response: Vec<u8>,
+    body: Option<LiveBody>,
 }
 
 async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, h2: bool) -> Result<Upstream> {
@@ -1306,10 +1712,10 @@ async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, 
         && ctx.h2_origins.lock().unwrap().get(&origin) != Some(&false);
     if try_h2 {
         // `Client::send` goes over HTTP/2 because the request line says `HTTP/2`.
-        match ctx.client.send(&RawRequest::from_bytes(request.to_vec()), target).await {
-            Ok(ex) => {
+        match ctx.client.send_live(&RawRequest::from_bytes(request.to_vec()), target).await {
+            Ok((ex, body)) => {
                 ctx.h2_origins.lock().unwrap().insert(origin, true);
-                return Ok(Upstream { conn: None, sent: ex.request, response: ex.response });
+                return Ok(Upstream { conn: None, sent: ex.request, response: ex.response, body });
             }
             Err(e) if e.to_string().contains("did not negotiate HTTP/2") => {
                 ctx.h2_origins.lock().unwrap().insert(origin, false);
@@ -1319,10 +1725,14 @@ async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, 
     }
     let request = if h2 { h2p::to_http1(request) } else { request.to_vec() };
     let timeout = ctx.client.options().timeout;
-    let (conn, response) = tokio::time::timeout(timeout, ctx.client.exchange(&request, target, method))
+    // For an event stream the time allowed is the time to its head.
+    let (conn, response) = tokio::time::timeout(timeout, ctx.client.exchange_live(&request, target, method))
         .await
         .map_err(|_| Error::Timeout(timeout))??;
-    Ok(Upstream { conn: Some(conn), sent: request, response })
+    if conn.live.is_some() {
+        return Ok(Upstream { conn: None, sent: request, response, body: LiveBody::of(conn) });
+    }
+    Ok(Upstream { conn: Some(conn), sent: request, response, body: None })
 }
 
 /// A row in the intercept queue that someone is waiting on. If the wait is abandoned (the

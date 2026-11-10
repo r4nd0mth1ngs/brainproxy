@@ -45,12 +45,13 @@ import {
   type TrafficFilter,
 } from "./trafficFilter";
 import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
+import { EventStreams } from "./EventStreams";
 import { ruleEditNote } from "./matchReplace";
 import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
   const app = useApp();
-  const [sub, setSub] = useState<"history" | "intercept" | "ws">("history");
+  const [sub, setSub] = useState<"history" | "intercept" | "ws" | "sse">("history");
   // Traffic opened from elsewhere (an import's requests).
   useEffect(() => {
     if (app.traffic) setSub("history");
@@ -67,6 +68,9 @@ export function ProxyView() {
         <button className={sub === "ws" ? "on" : ""} onClick={() => setSub("ws")}>
           WebSockets
         </button>
+        <button className={sub === "sse" ? "on" : ""} onClick={() => setSub("sse")}>
+          Event streams
+        </button>
       </div>
       <div className="fill" hidden={sub !== "history"}>
         <History />
@@ -76,6 +80,9 @@ export function ProxyView() {
       </div>
       <div className="fill" hidden={sub !== "ws"}>
         <WebSockets active={sub === "ws"} />
+      </div>
+      <div className="fill" hidden={sub !== "sse"}>
+        <EventStreams active={sub === "sse"} />
       </div>
     </div>
   );

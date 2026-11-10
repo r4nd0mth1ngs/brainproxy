@@ -316,7 +316,8 @@ mod tests {
     }
 
     fn opened(stream: tokio::io::DuplexStream) -> Opened {
-        let conn = Conn { stream: Box::new(stream), reader: WireReader::new(), reused: false, generation: 0 };
+        let conn =
+            Conn { stream: Box::new(stream), reader: WireReader::new(), reused: false, generation: 0, live: None };
         Opened { response: Vec::new(), duration_ms: 0, accept_ok: true, conn, deflate: Deflate::default() }
     }
 

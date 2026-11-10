@@ -165,7 +165,7 @@ fn decode(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, bool) {
     if let Some(enc) = header(headers, "content-encoding") {
         for coding in enc.split(',').rev().map(|c| c.trim().to_ascii_lowercase()) {
             let decoded = match coding.as_str() {
-                "" | "identity" => Some(out.clone()),
+                "" | "identity" => Some((out.clone(), true)),
                 "gzip" | "x-gzip" => read_limited(flate2::read::MultiGzDecoder::new(&out[..])),
                 "deflate" => read_limited(flate2::read::ZlibDecoder::new(&out[..]))
                     .or_else(|| read_limited(flate2::read::DeflateDecoder::new(&out[..]))),
@@ -173,7 +173,9 @@ fn decode(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, bool) {
                 _ => None,
             };
             match decoded {
-                Some(d) => out = d,
+                Some((d, true)) => out = d,
+                // Cut short: what it decoded to is the body as far as it came.
+                Some((d, false)) => return (d, false),
                 None => return (out, false),
             }
         }
@@ -181,9 +183,16 @@ fn decode(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, bool) {
     (out, true)
 }
 
-fn read_limited(r: impl Read) -> Option<Vec<u8>> {
+/// What `r` decodes to, and whether that is all of it. A stream that ends early (a body cut
+/// short: the server closed, or an event stream stopped being read) gives what came before the
+/// end; one that isn't the coding it claims gives None.
+fn read_limited(r: impl Read) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
-    r.take(MAX_DECODED_BODY).read_to_end(&mut out).ok().map(|_| out)
+    match r.take(MAX_DECODED_BODY).read_to_end(&mut out) {
+        Ok(_) => Some((out, true)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !out.is_empty() => Some((out, false)),
+        Err(_) => None,
+    }
 }
 
 fn html_title(body: &str) -> Option<String> {
@@ -221,6 +230,25 @@ mod tests {
         assert_eq!(c.status, Some(200));
         assert_eq!(c.title.as_deref(), Some("Admin Panel"));
         assert!(c.resp_headers.unwrap().contains(r#"["Content-Type","text/html"]"#));
+    }
+
+    #[test]
+    fn a_compressed_body_cut_short_is_decoded_as_far_as_it_came() {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"data: one\n\n").unwrap();
+        // As a server streaming events does, so the client can read each at once.
+        gz.flush().unwrap();
+        let cut = gz.get_ref().clone();
+        gz.write_all(b"data: two\n\n").unwrap();
+        let whole = gz.finish().unwrap();
+        let headers = vec![("Content-Encoding".to_string(), "gzip".to_string())];
+        assert_eq!(decode_body(&headers, &whole), b"data: one\n\ndata: two\n\n");
+        assert_eq!(decode_body_fully(&headers, &whole).as_deref(), Some(b"data: one\n\ndata: two\n\n".as_slice()));
+        // Cut after the first event: that event is the body, and it isn't all of it.
+        assert_eq!(decode_body(&headers, &cut), b"data: one\n\n");
+        assert_eq!(decode_body_fully(&headers, &cut), None);
+        // Bytes that aren't gzip at all stay as they are.
+        assert_eq!(decode_body(&headers, b"plain"), b"plain");
     }
 
     #[test]

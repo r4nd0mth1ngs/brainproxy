@@ -456,6 +456,21 @@ The sidebar groups the tools by what you are doing.
     or the timeout, and pings and pongs from that side wait too. The other direction isn't
     affected. A message still held when its connection ends is marked dropped. The host and
     path filters apply to the request that opened the connection.
+- **Event streams:** every server-sent event stream a client opened through the proxy (an
+  `EventSource`, an API answer streamed as `text/event-stream`), and the ones Replay read.
+  Select a stream to see its events (type, id, data, retry, arrival time); the list fills in
+  while the stream is open. Select an event to read its data. Right-click a stream to send
+  its request to Replay.
+  - **Relayed as it arrives:** the client gets each event when the server sends it, over
+    HTTP/1.1 and HTTP/2. The stream's request is in Traffic from the moment it opens; its
+    response there has the head only until the stream ends, then the body too.
+  - **Size limit:** a stream stores up to 4 MiB of body and 10000 events. One that goes over
+    is still relayed, but nothing more of it is stored: its note starts **TRUNCATED** and the
+    tab says so above the list.
+  - **What doesn't apply to a stream:** response body rules, holding the response in
+    Intercept, and live access-control testing need a finished response, so a stream skips
+    them. Response header rules, request rules and holding the request work as usual.
+  - **Replay** reads a stream for 5 seconds or 100 events and then stops, and says which.
 
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
@@ -1075,7 +1090,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 181 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 185 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1116,6 +1131,10 @@ brainproxy ws list                                        # WebSocket connection
 brainproxy ws messages 3 --contains token                 # their messages, both ways
 brainproxy ws send --from 3 -m '{"op":"whoami"}' --until whoami   # replay with a new connection
 echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   # messages off the command line
+
+brainproxy sse list                                       # event streams (text/event-stream) seen by the proxy
+brainproxy sse events 2 --contains token                  # a stream's events; sse event 41 shows one
+brainproxy send --url https://app.acme.test/api/stream --stream-wait 10 --max-events 20   # read one, then stop
 
 brainproxy replay tabs list                               # the app's Replay tabs, saved in the project
 brainproxy replay tabs list --summary                     # without the requests; --index N for one tab (from 0)
@@ -1405,6 +1424,67 @@ How a script is kept and run:
   agent's requests still go through the script rules a person set, as they go through a
   signer's script, and it can list them, try a saved rule that is switched on with `rules test
   --rule`, and switch a rule or check off.
+
+### Server-sent events (`sse`, `send --stream-wait`)
+
+A response with `Content-Type: text/event-stream` (and a 2xx status) is a stream of events
+that may never end: an `EventSource`'s feed, a chat API's answer token by token. brainproxy
+doesn't wait for its end.
+
+- **The proxy** relays the stream to the client as it arrives, over HTTP/1.1 and HTTP/2
+  (also an HTTP/2 client with an HTTP/1.1 origin), and records it meanwhile. The request is a
+  history row from the moment the response's head arrives; the row's response is the head
+  until the stream ends, then the head and the body as received. `sse list` shows the stream
+  (`state` open or closed, `events`, `history_id`), `sse events STREAM` its events as they
+  were parsed (`event`, `event_id`, `data`, `retry`, `time` of arrival; `--event TYPE`,
+  `--contains TEXT`, `--after ID` to poll), `sse event ID` one event with its whole data
+  (`--raw` for the data alone) and `sse show STREAM` the stream with its request, response
+  head and event counts by type. `history show` on the row names its stream.
+- **`send`** reads a stream until the server ends it, `--stream-wait` seconds pass (5 by
+  default, from the head; at most a day) or `--max-events` events arrive (100 by default),
+  then closes the connection. The row's response is what arrived, and `stream` in the output
+  says why reading stopped (`closed`, `wait`, `max-events`, `cap`, `error`) and lists the
+  events; they are stored too (`sse list --source send`), unless `--no-store`. Events that
+  arrive together with the last one are read and listed too, so the list can be a little
+  longer than `--max-events`: it is always every event in the row's body. Every other
+  sender (crawl, scans, fuzzing, `authz`, a login) reads a stream for 5 seconds or 100
+  events, so none of them waits out its timeout on one. `send --race` reads whole responses
+  only, as before, and refuses the two flags.
+- **An event** is a block of lines ended by a blank line. One with no `data` line is listed
+  with `data` null: a browser dispatches nothing for it, but takes its `id` and `retry`. A
+  comment line (`: keep-alive`) is in the row's body and not an event. A block the stream ends
+  inside isn't one either.
+- **The cap:** one stream stores up to 4 MiB of body (as received, and as decoded when it is
+  compressed) and 10000 events. Past either the stream is still relayed, nothing more of it
+  is stored, and it is marked at once, while it is still open: `truncated` is true in
+  `sse list`, `sse show` and `sse events`, and its `error` says which limit it reached. The
+  row's body then ends where recording stopped. The streams a proxy has open at one time
+  store up to 256 MiB of body between them; one that would pass that is marked the same way.
+- **Compressed streams** (`Content-Encoding: gzip`, `deflate`, `br`) are relayed as they are
+  and decoded for the events as they arrive. Another coding is relayed and its body kept,
+  with no events; the stream's `error` says so.
+- **How it ended** is in `ended`: `server` (the response ended, or the server closed the
+  connection), `client` (the proxy's client closed its connection or reset the stream; the
+  proxy then closes the server's too), `stopped` (the proxy stopped, or `send` stopped
+  reading) or `error`. Stopping the proxy completes the rows of the streams open then with
+  what they stored. A proxy that is killed can't: its streams stay `open` until a proxy next
+  starts on the project, which closes them with `the proxy stopped before the stream ended`;
+  their events are kept, and their rows keep the head only.
+- **What doesn't apply to a stream:** response body and status rules (`rules add --location
+  response-body` or `status`), response intercept (`intercept enable --responses`) and live
+  access-control testing (`proxy start --authz`) need a finished response, so the proxy
+  skips them for a stream. Response header rules apply to its head (all but its
+  Content-Length and Transfer-Encoding, which frame the body relayed after it), and request rules, the
+  auth session and request intercept to its request, as for any other. The passive scanner
+  reads the row when the stream opens (its headers) and again when it ends (its body); a
+  stream still open when the proxy stops is read again by the next passive scan (`scan
+  passive`, or the next proxy). HAR export writes the row as it is: the body so far.
+- An HTTP/1.x client's connection ends with the stream, and a client that closes its side
+  while the stream is open ends it, so one that half-closes after its request (`nc -N`) gets
+  no events. A `HEAD` is answered as usual. Events are recorded only for traffic inside the
+  recording scope; outside it the stream is relayed and leaves its row, as other traffic does.
+- Search events with `query`: tables `sse_streams` and `sse_events`, and the full-text index
+  `sse_events_fts` over `data` (`schema` lists the columns).
 
 ### Who recorded what
 
@@ -2213,7 +2293,7 @@ nothing is deleted: the rows were written before each request went out, as alway
 
 A row is kept if it is a finding's first or last sighting or one of a hand-added finding's
 linked entries, a finding event's request (a retest's, say), an `authz` result's request
-tested, response or baseline, a fuzz result, a WebSocket connection's upgrade, an auth macro
+tested, response or baseline, a fuzz result, a WebSocket connection's upgrade, an event stream's request, an auth macro
 step's source, or an out-of-band payload's attack (a callback can still arrive and raise a
 finding), or if it has a note or tags. The requests the scan starts from (history rows, the
 pages a URL or `--api` scan fetches first, a `--crawl`'s requests) and a login's requests are

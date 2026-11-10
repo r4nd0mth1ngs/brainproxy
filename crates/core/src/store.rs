@@ -18,7 +18,7 @@ use crate::http::{Exchange, Target};
 
 /// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
 /// one started by an older build.
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
 pub const PRUNE_CHUNK: usize = 500;
@@ -400,6 +400,8 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("Parameters seen", "SELECT DISTINCT path, query FROM history WHERE query IS NOT NULL"),
     ("WebSocket messages", "SELECT m.id, c.url, m.direction, m.payload_text FROM ws_messages m JOIN ws_connections c ON c.id = m.connection_id WHERE m.opcode = 'text' ORDER BY m.id DESC LIMIT 50"),
     ("WebSocket search", "SELECT id, connection_id, payload_text FROM ws_messages WHERE id IN (SELECT rowid FROM ws_messages_fts WHERE ws_messages_fts MATCH 'token')"),
+    ("Server-sent events", "SELECT e.id, s.url, e.event, e.data FROM sse_events e JOIN sse_streams s ON s.id = e.stream_id ORDER BY e.id DESC LIMIT 50"),
+    ("Server-sent event search", "SELECT id, stream_id, event, data FROM sse_events WHERE id IN (SELECT rowid FROM sse_events_fts WHERE sse_events_fts MATCH 'token')"),
 ];
 
 pub struct Store {
@@ -581,6 +583,10 @@ impl Store {
                  WHERE state IN ('queued', 'running', 'stopping');
              UPDATE ws_connections SET state = 'closed', error = COALESCE(error, 'still open when the project was saved'),
                  closed_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE state = 'open';
+             UPDATE sse_streams SET state = 'closed', ended = 'stopped',
+                 error = COALESCE(error, 'still open when the project was saved'),
+                 closed_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE state = 'open';",
         )?;
         owner_only(path);
@@ -739,6 +745,9 @@ impl Store {
         if version < 19 {
             add_missing_columns(&self.conn, SCHEMA_V19)?;
             seed_rule_ids(&self.conn)?;
+        }
+        if version < 20 {
+            self.conn.execute_batch(crate::sse::db::SCHEMA)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1238,7 +1247,7 @@ impl Store {
 
     /// Deletes those of history rows `ids` that nothing refers to: no finding (first or last
     /// sighting, or a hand-added finding's list in meta), finding event, fuzz or authz result
-    /// (the request tested, its response or the baseline), WebSocket connection, out-of-band
+    /// (the request tested, its response or the baseline), WebSocket connection, event stream, out-of-band
     /// payload or auth macro step, and no note or tags. An active scan with pruning on calls
     /// this with the rows it wrote itself.
     ///
@@ -1275,6 +1284,7 @@ impl Store {
                 AND id NOT IN (SELECT history_id FROM authz_results WHERE history_id IS NOT NULL)
                 AND id NOT IN (SELECT baseline_history_id FROM authz_results WHERE baseline_history_id IS NOT NULL)
                 AND id NOT IN (SELECT history_id FROM ws_connections WHERE history_id IS NOT NULL)
+                AND id NOT IN (SELECT history_id FROM sse_streams WHERE history_id IS NOT NULL)
                 AND id NOT IN (SELECT history_id FROM oob_payloads WHERE history_id IS NOT NULL)
                 AND id NOT IN (SELECT json_extract(step.value, '$.history_id')
                                FROM meta, json_each(meta.value, '$.macros') m, json_each(m.value, '$.steps') step
@@ -1527,7 +1537,7 @@ fn owner_only(path: &Path) {
 fn owner_only(_: &Path) {}
 
 /// [`Store::update_capture`] within the caller's transaction.
-fn update_capture(tx: &Connection, id: i64, c: &Capture) -> Result<()> {
+pub(crate) fn update_capture(tx: &Connection, id: i64, c: &Capture) -> Result<()> {
     const FTS: &str = "url, req_headers, req_body_text, resp_headers, resp_body_text";
     tx.execute(
         &format!(
@@ -1785,6 +1795,7 @@ mod tests {
             response: b"HTTP/1.1 500 Oops\r\nServer: nginx\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"token\":\"abc\",\"msg\":\"You have SQL syntax\"}".to_vec(),
             duration_ms: 7,
             sni: None,
+            stream: None,
         };
         store.record_exchange("send", &ex).unwrap()
     }
@@ -1884,6 +1895,41 @@ mod tests {
         assert_eq!(tables, 2);
         let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_on_v19_gets_the_event_stream_tables() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v19-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        {
+            let store = Store::open(&path).unwrap();
+            sample(&store);
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE sse_events_fts; DROP TABLE sse_events; DROP TABLE sse_streams;
+                     PRAGMA user_version = 19;",
+                )
+                .unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.count().unwrap(), 1, "what was recorded stays");
+        // The tables are there and take a stream: its row is then kept from pruning.
+        let read = crate::sse::StreamRead {
+            opened: crate::ws::now_iso(),
+            events: Vec::new(),
+            stopped: crate::sse::Stopped::Closed,
+            truncated: false,
+            note: None,
+        };
+        let stream = store.sse_record_read(1, "send", "http://a.test/events", "a.test", &read).unwrap();
+        assert_eq!(store.sse_stream(stream).unwrap().history_id, Some(1));
+        assert_eq!(store.prune_unreferenced(&[1]).0, 0);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2276,6 +2322,7 @@ mod tests {
             response: b"HTTP/1.1 500 Oops\r\nServer: nginx\r\nContent-Length: 4\r\n\r\n\xff\x00ok".to_vec(),
             duration_ms: 5,
             sni: None,
+            stream: None,
         };
         s.record_exchange("send", &ex).unwrap();
         let pieces: Vec<&str> = [
@@ -2360,6 +2407,7 @@ mod tests {
             response: b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n\x00\x01Token-AFTER".to_vec(),
             duration_ms: 1,
             sni: None,
+            stream: None,
         };
         let id = s.record_exchange("send", &ex).unwrap();
         for q in ["resp.body:token-after", "resp:TOKEN-after", "body:after"] {
@@ -2377,6 +2425,7 @@ mod tests {
             response: b"HTTP/1.1 200 OK\r\nSet-Cookie: tracking=1\r\nSet-Cookie: session=abc\r\nContent-Length: 14\r\n\r\n\xffstack trace\x00!".to_vec(),
             duration_ms: 1,
             sni: None,
+            stream: None,
         };
         let id = s.record_exchange("send", &ex).unwrap();
         let ids = |q: &str| -> Vec<i64> {
@@ -2438,8 +2487,9 @@ mod tests {
         let target = Target::from_url("http://a.test").unwrap();
         let request =
             b"POST /z HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nuser\r\n4\r\n=bob\r\n0\r\n\r\n".to_vec();
-        let gz_id =
-            s.record_exchange("proxy", &Exchange { target, request, response, duration_ms: 1, sni: None }).unwrap();
+        let gz_id = s
+            .record_exchange("proxy", &Exchange { target, request, response, duration_ms: 1, sni: None, stream: None })
+            .unwrap();
         for needle in ["hidden-in-gzip", "user=bob", "Content-Encoding: gzip"] {
             let hits = s.list(&HistoryFilter { contains: Some(needle.into()), ..Default::default() }).unwrap();
             assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [gz_id], "{needle}");
@@ -2504,7 +2554,7 @@ mod tests {
             let request = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec();
             s.record_exchange(
                 source,
-                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None },
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None, stream: None },
             )
             .unwrap()
         };
@@ -2560,7 +2610,7 @@ mod tests {
         let deflated = s
             .record_exchange(
                 "proxy",
-                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None },
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None, stream: None },
             )
             .unwrap();
         let response = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 13\r\n\r\nnot-gzip-text".to_vec();
@@ -2568,7 +2618,7 @@ mod tests {
         let corrupt = s
             .record_exchange(
                 "proxy",
-                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None },
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None, stream: None },
             )
             .unwrap();
         assert_eq!(ids(has("deflated-word")), [deflated]);

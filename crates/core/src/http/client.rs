@@ -30,7 +30,7 @@ use crate::http::h2::{setup_error, H2Request};
 use crate::http::request::RawRequest;
 use crate::http::response::parse_response_head;
 use crate::http::target::Target;
-use crate::http::wire::WireReader;
+use crate::http::wire::{LiveFraming, Piece, WireReader};
 
 /// What a client does with a request whose Host header (or request target) names a host the
 /// scope doesn't list by name, which a shared front end may send to a site outside the scope.
@@ -71,6 +71,9 @@ pub struct SendOptions {
     /// What to do with a foreign Host, checked on every request as it goes on the wire
     /// (sessions, auth values and signers applied). Defaults to [`HostPolicy::for_process`].
     pub host: HostPolicy,
+    /// How long and how much of an event stream (`text/event-stream`) [`Client::send`] reads
+    /// before it stops, so no sender waits on a response that never ends.
+    pub stream: crate::sse::StreamLimits,
 }
 
 impl Default for SendOptions {
@@ -82,6 +85,7 @@ impl Default for SendOptions {
             guard: None,
             http2: false,
             host: HostPolicy::for_process(false),
+            stream: Default::default(),
         }
     }
 }
@@ -263,6 +267,10 @@ pub struct Exchange {
     /// (see [`Client::sni`]).
     #[serde(skip)]
     pub sni: Option<String>,
+    /// The response was an event stream, read for a bounded time: its events and why reading
+    /// stopped. The response holds the body as far as it was read.
+    #[serde(skip)]
+    pub stream: Option<crate::sse::StreamRead>,
 }
 
 /// Idle connections kept per target, and how long one may sit unused.
@@ -282,6 +290,39 @@ pub struct Conn {
     /// The generation of the connection options it was opened with; it isn't
     /// pooled again once they change.
     pub generation: u64,
+    /// The response just read was left open (an event stream read with
+    /// [`Client::exchange_live`]): how the body still to come is framed.
+    pub live: Option<LiveFraming>,
+}
+
+/// The body of a response left open, an event stream, read as it arrives. Dropping it ends
+/// the exchange: an HTTP/1 connection closes, an HTTP/2 stream is reset.
+pub enum LiveBody {
+    H1 { conn: Box<Conn>, framing: LiveFraming },
+    H2(h2::RecvStream),
+}
+
+impl LiveBody {
+    /// The connection of an [`Client::exchange_live`] whose response was left open.
+    pub fn of(mut conn: Conn) -> Option<Self> {
+        let framing = conn.live.take()?;
+        Some(Self::H1 { conn: Box::new(conn), framing })
+    }
+
+    /// The next piece of the body, as soon as any has arrived; `None` once it is over.
+    pub async fn next(&mut self) -> Result<Option<Piece>> {
+        match self {
+            Self::H1 { conn, framing } => conn.reader.next_piece(&mut conn.stream, framing).await,
+            Self::H2(body) => match body.data().await {
+                None => Ok(None),
+                Some(Err(e)) => Err(crate::http::h2::h2_error(e)),
+                Some(Ok(chunk)) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    Ok(Some(Piece::plain(chunk.to_vec())))
+                }
+            },
+        }
+    }
 }
 
 /// Sockets belong to the runtime that opened them (auth logs in on a short-lived
@@ -377,7 +418,7 @@ impl Client {
     async fn fresh(&self, target: &Target) -> Result<Conn> {
         let net = self.net();
         let stream = self.connect_with(target, &net).await?;
-        Ok(Conn { stream, reader: WireReader::new(), reused: false, generation: net.generation })
+        Ok(Conn { stream, reader: WireReader::new(), reused: false, generation: net.generation, live: None })
     }
 
     pub fn options(&self) -> &SendOptions {
@@ -430,7 +471,7 @@ impl Client {
             list.pop_if(|(_, at)| at.elapsed() < max_idle)
         };
         if let Some((stream, _)) = pooled {
-            return Ok(Conn { stream, reader: WireReader::new(), reused: true, generation });
+            return Ok(Conn { stream, reader: WireReader::new(), reused: true, generation, live: None });
         }
         self.fresh(target).await
     }
@@ -439,7 +480,7 @@ impl Client {
     /// with unread bytes (a desynchronised server) are dropped.
     /// Connections opened with connection options that have since changed are dropped too.
     pub fn checkin(&self, target: &Target, conn: Conn) {
-        if !conn.reader.is_empty() || conn.generation != self.net().generation {
+        if !conn.reader.is_empty() || conn.live.is_some() || conn.generation != self.net().generation {
             return;
         }
         let mut idle = self.pool.idle.lock().unwrap();
@@ -480,42 +521,70 @@ impl Client {
         Ok(req.as_bytes().to_vec())
     }
 
+    /// Sends `req` and reads the response. An event stream (`text/event-stream`), which may
+    /// never end, is read until it ends or the options' [`crate::sse::StreamLimits`] say stop;
+    /// the exchange then holds what arrived, and says so in [`Exchange::stream`].
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
+        let started = Instant::now();
+        let (mut ex, live) = self.send_live(req, target).await?;
+        if let Some(mut body) = live {
+            let head = parse_response_head(final_response(&ex.response))?;
+            let (rest, read) = crate::sse::read(&head, &mut body, &self.opts.stream).await;
+            ex.response.extend_from_slice(&rest);
+            ex.stream = Some(read);
+            ex.duration_ms = started.elapsed().as_millis() as u64;
+        }
+        Ok(ex)
+    }
+
+    /// [`Client::send`], except that an event stream is left open: the exchange's response is
+    /// its head, and the body comes with it to read as it arrives (the proxy relays it). The
+    /// timeout covers the time to the head only.
+    pub async fn send_live(&self, req: &RawRequest, target: &Target) -> Result<(Exchange, Option<LiveBody>)> {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
         if self.sends_h2(req) {
             let filled = self.fill_auth(req.as_bytes(), target).await?;
             self.check_host(&filled, target)?;
-            let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
-                .await
-                .map_err(|_| Error::Timeout(self.opts.timeout))??;
-            return Ok(Exchange {
+            let (response, live) =
+                tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method, true))
+                    .await
+                    .map_err(|_| Error::Timeout(self.opts.timeout))??;
+            let ex = Exchange {
                 target: target.clone(),
                 // Recorded with the auth placeholders, not the values sent.
                 request: self.recorded_request(req, target)?,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
                 sni: self.sni(target),
-            });
+                stream: None,
+            };
+            return Ok((ex, live.map(LiveBody::H2)));
         }
-        let response = tokio::time::timeout(self.opts.timeout, self.round_trip(req.as_bytes(), target, &method))
-            .await
-            .map_err(|_| Error::Timeout(self.opts.timeout))??;
-        Ok(Exchange {
+        let (response, live) =
+            tokio::time::timeout(self.opts.timeout, self.round_trip(req.as_bytes(), target, &method))
+                .await
+                .map_err(|_| Error::Timeout(self.opts.timeout))??;
+        let ex = Exchange {
             target: target.clone(),
             request: req.as_bytes().to_vec(),
             response,
             duration_ms: started.elapsed().as_millis() as u64,
             sni: self.sni(target),
-        })
+            stream: None,
+        };
+        Ok((ex, live))
     }
 
-    async fn round_trip(&self, bytes: &[u8], target: &Target, method: &str) -> Result<Vec<u8>> {
-        let (conn, response) = self.exchange(bytes, target, method).await?;
+    async fn round_trip(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Vec<u8>, Option<LiveBody>)> {
+        let (conn, response) = self.exchange_live(bytes, target, method).await?;
+        if conn.live.is_some() {
+            return Ok((response, LiveBody::of(conn)));
+        }
         if !close_after(bytes, &response, method) {
             self.checkin(target, conn);
         }
-        Ok(response)
+        Ok((response, None))
     }
 
     /// Writes `bytes` on a pooled connection when there is one and reads one
@@ -530,15 +599,26 @@ impl Client {
     /// the request), a 401 challenge of their scheme is answered here, NTLM's on the
     /// same connection; the response returned is the last one.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
+        self.exchange_with(bytes, target, method, false).await
+    }
+
+    /// [`Client::exchange`], except that an event stream is left open: the response returned
+    /// is its head, and the connection's [`Conn::live`] says how the body still to come is
+    /// framed ([`LiveBody::of`] reads it). Such a connection is never pooled.
+    pub async fn exchange_live(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
+        self.exchange_with(bytes, target, method, true).await
+    }
+
+    async fn exchange_with(&self, bytes: &[u8], target: &Target, method: &str, live: bool) -> Result<(Conn, Vec<u8>)> {
         let bytes = &*self.fill_auth(bytes, target).await?;
         self.check_host(bytes, target)?;
         match self.platform_cred(target, bytes) {
-            Some(cred) => self.exchange_platform(&cred, bytes, target, method).await,
-            None => self.exchange_once(bytes, target, method).await,
+            Some(cred) => self.exchange_platform(&cred, bytes, target, method, live).await,
+            None => self.exchange_once(bytes, target, method, live).await,
         }
     }
 
-    async fn exchange_once(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
+    async fn exchange_once(&self, bytes: &[u8], target: &Target, method: &str, live: bool) -> Result<(Conn, Vec<u8>)> {
         let repeatable =
             ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"].iter().any(|m| method.eq_ignore_ascii_case(m));
         let mut c = self.checkout(target, if repeatable { POOL_IDLE } else { POOL_IDLE_UNSAFE }).await?;
@@ -546,7 +626,7 @@ impl Client {
             let result = async {
                 c.stream.write_all(bytes).await?;
                 c.stream.flush().await?;
-                c.reader.read_response(&mut c.stream, method).await
+                read_one(&mut c, method, live).await
             }
             .await;
             match result {
@@ -560,10 +640,10 @@ impl Client {
     }
 
     /// One request and response on this connection.
-    async fn on_conn(&self, mut c: Conn, bytes: &[u8], method: &str) -> Result<(Conn, Vec<u8>)> {
+    async fn on_conn(&self, mut c: Conn, bytes: &[u8], method: &str, live: bool) -> Result<(Conn, Vec<u8>)> {
         c.stream.write_all(bytes).await?;
         c.stream.flush().await?;
-        let response = c.reader.read_response(&mut c.stream, method).await?;
+        let response = read_one(&mut c, method, live).await?;
         Ok((c, response))
     }
 
@@ -635,13 +715,14 @@ impl Client {
         bytes: &[u8],
         target: &Target,
         method: &str,
+        live: bool,
     ) -> Result<(Conn, Vec<u8>)> {
         let uri = request_uri(bytes);
         let mut sent = bytes.to_vec();
         if let Some(value) = self.learned_header(cred, target, method, &uri)? {
             sent = with_header(bytes, "Authorization", &value);
         }
-        let (conn, response) = self.exchange_once(&sent, target, method).await?;
+        let (conn, response) = self.exchange_once(&sent, target, method, live).await?;
         if status(&response) != Some(401) {
             return Ok((conn, response));
         }
@@ -651,11 +732,11 @@ impl Client {
             let reuse = !close_after(prev, prev_resp, method);
             async move {
                 if reuse {
-                    self.on_conn(conn, &req, method).await
+                    self.on_conn(conn, &req, method, live).await
                 } else {
                     drop(conn);
                     let c = self.fresh(target).await?;
-                    self.on_conn(c, &req, method).await
+                    self.on_conn(c, &req, method, live).await
                 }
             }
         };
@@ -674,7 +755,7 @@ impl Client {
                 return Ok((conn, challenge));
             }
             let auth = with_header(bytes, "Authorization", &cred.ntlm_authenticate(&msg)?);
-            return self.on_conn(conn, &auth, method).await;
+            return self.on_conn(conn, &auth, method, live).await;
         }
         let Some((value, learned)) = self.answer(cred, &response, method, &uri)? else { return Ok((conn, response)) };
         let (conn, answered) = next(conn, &sent, &response, with_header(bytes, "Authorization", &value)).await?;
@@ -686,32 +767,47 @@ impl Client {
 
     /// [`Client::round_trip_h2`] with platform authentication (Basic and Digest:
     /// NTLM needs HTTP/1.1).
-    async fn round_trip_h2_auth(&self, filled: &[u8], target: &Target, method: &str) -> Result<Vec<u8>> {
+    ///
+    /// With `live` an event stream's body is left open and returned beside its head.
+    async fn round_trip_h2_auth(
+        &self,
+        filled: &[u8],
+        target: &Target,
+        method: &str,
+        live: bool,
+    ) -> Result<(Vec<u8>, Option<h2::RecvStream>)> {
         let cred = self.platform_cred(target, filled).filter(|c| c.scheme != PlatformScheme::Ntlm);
-        let Some(cred) = cred else { return self.round_trip_h2(&H2Request::from_raw(filled, target)?, target).await };
+        let Some(cred) = cred else {
+            return self.round_trip_h2(&H2Request::from_raw(filled, target)?, target, live).await;
+        };
         let uri = request_uri(filled);
         let first = match self.learned_header(&cred, target, method, &uri)? {
             Some(value) => with_header(filled, "Authorization", &value),
             None => filled.to_vec(),
         };
-        let response = self.round_trip_h2(&H2Request::from_raw(&first, target)?, target).await?;
+        let (response, body) = self.round_trip_h2(&H2Request::from_raw(&first, target)?, target, live).await?;
         if status(&response) != Some(401) {
-            return Ok(response);
+            return Ok((response, body));
         }
         self.learn(target, None);
-        let Some((value, learned)) = self.answer(&cred, &response, method, &uri)? else { return Ok(response) };
+        let Some((value, learned)) = self.answer(&cred, &response, method, &uri)? else { return Ok((response, body)) };
         let again = with_header(filled, "Authorization", &value);
-        let response = self.round_trip_h2(&H2Request::from_raw(&again, target)?, target).await?;
+        let (response, body) = self.round_trip_h2(&H2Request::from_raw(&again, target)?, target, live).await?;
         if status(&response) != Some(401) {
             self.learn(target, Some(learned));
         }
-        Ok(response)
+        Ok((response, body))
     }
 
     /// Sends on the pooled HTTP/2 connection to `target`, opening one if there
     /// is none. If the pooled connection has gone away (checked before anything
     /// is sent), a new one is opened.
-    async fn round_trip_h2(&self, req: &H2Request, target: &Target) -> Result<Vec<u8>> {
+    async fn round_trip_h2(
+        &self,
+        req: &H2Request,
+        target: &Target,
+        live: bool,
+    ) -> Result<(Vec<u8>, Option<h2::RecvStream>)> {
         let key = self.pool_key(target, self.net().generation);
         let mut fresh = false;
         let sender = match self.h2_pooled(&key).await {
@@ -729,7 +825,7 @@ impl Client {
                 }
             }
         };
-        let result = crate::http::h2::round_trip(sender, req).await;
+        let result = crate::http::h2::round_trip_live(sender, req, live).await;
         if fresh && result.is_err() {
             self.pool.h2.lock().unwrap().remove(&key);
         }
@@ -885,6 +981,17 @@ impl Client {
         self.pool.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(tcp)
     }
+}
+
+/// Reads one response on `c`; with `live`, an event stream's head only, its body left open
+/// ([`Conn::live`]).
+async fn read_one(c: &mut Conn, method: &str, live: bool) -> Result<Vec<u8>> {
+    if !live {
+        return c.reader.read_response(&mut c.stream, method).await;
+    }
+    let (response, framing) = c.reader.read_response_live(&mut c.stream, method).await?;
+    c.live = framing;
+    Ok(response)
 }
 
 /// The final response's status.

@@ -1052,6 +1052,22 @@ impl RuleSet {
         Ruled::of(response, bytes, by, run.failed())
     }
 
+    /// The head of a response from `host` whose body is relayed as it arrives (an event stream),
+    /// after the response-header rules `engine` applies there. A body rule needs the whole body,
+    /// and a status rule could leave the relayed body without the framing it came with, so
+    /// neither applies. Nor may a header rule change the head's Content-Length or
+    /// Transfer-Encoding: the body follows as the server framed it.
+    pub fn response_head(&self, engine: Engine, host: &str, head: Vec<u8>) -> Ruled {
+        let active: Vec<&CompiledRule> = self.active(engine, host, |l| l == RuleLocation::ResponseHeader).collect();
+        if active.is_empty() {
+            return Ruled::unchanged(head);
+        }
+        let run = Run::new(engine, host);
+        let (bytes, by) = response_rules(&active, &head, &run);
+        let bytes = keep_framing(&head, bytes);
+        Ruled::of(head, bytes, by, run.failed())
+    }
+
     /// Whether `engine` has a rule for responses from `host`: a sender that only holds a
     /// response by reference copies it for the rules only then.
     pub fn rewrites_responses(&self, engine: Engine, host: &str) -> bool {
@@ -1117,6 +1133,14 @@ impl EngineRules {
     /// `response` from `target` after the rules: what the engine then reads.
     pub fn response(&self, target: &Target, response: Vec<u8>) -> Ruled {
         let ruled = self.set.response(self.engine, &target.host, response);
+        self.failures.note(self.engine, &ruled.failed);
+        ruled
+    }
+
+    /// An event stream's response from `target` after the header rules only (see
+    /// [`RuleSet::response_head`]).
+    pub fn response_head(&self, target: &Target, response: Vec<u8>) -> Ruled {
+        let ruled = self.set.response_head(self.engine, &target.host, response);
         self.failures.note(self.engine, &ruled.failed);
         ruled
     }
@@ -1535,6 +1559,33 @@ fn response_rules<'a>(active: &[&'a CompiledRule], resp: &[u8], run: &Run<'_>) -
     (out, changed_by)
 }
 
+/// Whether a header line is one of the message's framing: Content-Length or Transfer-Encoding.
+fn is_framing(line: &str) -> bool {
+    header_parts(line)
+        .is_some_and(|(k, _)| ["content-length", "transfer-encoding"].iter().any(|n| k.trim().eq_ignore_ascii_case(n)))
+}
+
+/// `new` (a response head the rules rewrote) with the framing headers `original` had.
+fn keep_framing(original: &[u8], new: Vec<u8>) -> Vec<u8> {
+    let final_head = |resp: &[u8]| {
+        let start = final_response_offset(resp);
+        let (head, body) = split_head_body(&resp[start..]);
+        let (first, headers) = split_lines(head);
+        (start, first, headers, body.len())
+    };
+    let (_, _, was, _) = final_head(original);
+    let was: Vec<String> = was.into_iter().filter(|h| is_framing(h)).collect();
+    let (start, first, mut headers, body_len) = final_head(&new);
+    if headers.iter().filter(|h| is_framing(h)).eq(was.iter()) {
+        return new;
+    }
+    headers.retain(|h| !is_framing(h));
+    headers.extend(was);
+    let mut out = new[..start].to_vec();
+    out.extend(join(&first, &headers, &new[new.len() - body_len..]));
+    out
+}
+
 /// A header line's name and its value.
 fn header_parts(line: &str) -> Option<(&str, &str)> {
     line.split_once(':').map(|(name, value)| (name, value.trim()))
@@ -1708,6 +1759,31 @@ mod tests {
         let rules = [rule(1, RuleLocation::ResponseBody, "false", "true")];
         let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n{\"admin\": false}\r\n0\r\n\r\n";
         assert_eq!(response(&rules, resp).0, "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"admin\": true}");
+    }
+
+    #[test]
+    fn an_event_streams_head_gets_header_rules_but_keeps_its_framing() {
+        let rules = [
+            rule(1, RuleLocation::ResponseBody, "", "injected"),
+            rule(2, RuleLocation::Status, "200", "204"),
+            named(3, RuleLocation::ResponseHeader, "X-Seen", RuleAction::Add, "", "yes"),
+            named(4, RuleLocation::ResponseHeader, "Transfer-Encoding", RuleAction::Remove, "", ""),
+            named(5, RuleLocation::ResponseHeader, "Content-Length", RuleAction::Add, "", "0"),
+        ];
+        let set = RuleSet::compile(&rules).unwrap();
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let out = set.response_head(Engine::Proxy, "h.test", head.as_bytes().to_vec());
+        assert_eq!(
+            String::from_utf8(out.bytes.clone()).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Seen: yes\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        assert_eq!(out.ids(), [3, 4, 5]);
+
+        // Only framing rules: nothing changed.
+        let out =
+            RuleSet::compile(&rules[3..]).unwrap().response_head(Engine::Proxy, "h.test", head.as_bytes().to_vec());
+        assert!(!out.changed());
+        assert_eq!(out.bytes, head.as_bytes());
     }
 
     #[test]

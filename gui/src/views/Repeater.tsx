@@ -32,10 +32,12 @@ import {
 } from "./race";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { draftFromRequest } from "./manualFinding";
+import { readSummary, type SseRead } from "./sse";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
-type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response">;
+/** `stream` when the response was an event stream, read for a bounded time. */
+type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response"> & { stream?: SseRead | null };
 
 interface Sent {
   raw: string;
@@ -486,6 +488,7 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
             <span className="muted">
               {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms ·{" "}
               {r.id != null ? `history #${r.id}` : "not recorded"}
+              {r.stream ? ` · ${readSummary(r.stream)}` : ""}
             </span>
           )}
         </div>
