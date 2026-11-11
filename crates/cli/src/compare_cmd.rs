@@ -21,7 +21,7 @@ pub const GATE_FAILED: i32 = 5;
 #[derive(clap::Args)]
 pub struct CompareArgs {
     /// Baseline findings: a file from `report json`. Without --baseline or --scan the baseline
-    /// is empty, so every finding is new.
+    /// is empty, so every finding is new. Through MCP only a file in the project's folder.
     #[arg(long, value_name = "FILE")]
     baseline: Option<PathBuf>,
     /// Compare with an empty baseline, instead of failing, when the --baseline file doesn't
@@ -29,6 +29,7 @@ pub struct CompareArgs {
     #[arg(long, requires = "baseline")]
     allow_missing_baseline: bool,
     /// The findings to compare, from a `report json` file, instead of the --project ones.
+    /// Through MCP only a file in the project's folder.
     #[arg(long, value_name = "FILE", conflicts_with = "scan")]
     current: Option<PathBuf>,
     /// Compare with a background active scan of this project, by job id: first found by it,
@@ -58,7 +59,19 @@ pub struct CompareArgs {
     limit: usize,
 }
 
-pub fn compare(project: &Path, a: CompareArgs, out: &Out) -> Result<(), Error> {
+pub fn compare(project: &Path, mut a: CompareArgs, out: &Out) -> Result<(), Error> {
+    // A report file's findings come back in the reply: through MCP only one in the project's
+    // folder. A missing --baseline is refused too, --allow-missing-baseline or not: the refusal
+    // can't say which it is without telling whether a file elsewhere exists.
+    let instead = "compare against a scan with --scan, or save the report there with `report json --output`";
+    if let Some(path) = a.baseline.take() {
+        let first_run = format!("{instead} (on a first run, leave out --baseline: every finding is new)");
+        let instead = if a.allow_missing_baseline { first_run.as_str() } else { instead };
+        a.baseline = Some(crate::mcp::local_path(project, "--baseline", &path, instead)?);
+    }
+    if let Some(path) = a.current.take() {
+        a.current = Some(crate::mcp::local_path(project, "--current", &path, instead)?);
+    }
     let mut warnings = Vec::new();
     // A --current file without tombstones, where a removed finding added by hand looks fixed.
     let mut no_tombstones: Option<PathBuf> = None;

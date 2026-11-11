@@ -187,20 +187,43 @@ pub(crate) fn check_request_files(files: &[String]) -> Result<(), brainproxy_cor
     Ok(())
 }
 
-/// The path to read a local document `source` from (an import's spec, collection, HAR file,
-/// schema or environment). Under a tool call it must be inside the project file's folder once
-/// symlinks are followed, and the resolved path is what is read, so a link can't be swapped
-/// in between: an agent could otherwise point an import at any file the server can read and
-/// read parts of it back from the preview or an error. The refusal never quotes the file.
-/// `-` (stdin) is the caller's own text and is not checked.
-pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result<PathBuf, brainproxy_core::Error> {
-    if !in_tool_call() || source == "-" {
+/// The path to read a caller-given local file `source` from: an import's spec, collection, HAR
+/// file, schema or environment, a request or handshake file, a macro step, a payload file, a
+/// template. Under a tool call it must be inside the project file's folder once symlinks are
+/// followed, and the resolved path is what is read, so a link already there is not followed
+/// again later (one swapped in between the check and the read still is: that takes writing to
+/// the project's folder while the call runs): an agent could otherwise point a command at any
+/// file the server can read and have it sent to the target, or read parts of it back from
+/// history, a preview or an error. The refusal never quotes the file; `instead` ends it with
+/// what an agent does instead ("pass its text on stdin (-)"). `-` is the caller's stdin and is
+/// returned as it is: only for a command that reads `-` as stdin (else see [`local_disk_file`]).
+pub(crate) fn local_document(
+    project: &Path,
+    flag: &str,
+    source: &str,
+    instead: &str,
+) -> Result<PathBuf, brainproxy_core::Error> {
+    if source == "-" {
+        return Ok(PathBuf::from(source));
+    }
+    local_disk_file(project, flag, source, instead)
+}
+
+/// [`local_document`] for an argument that is always a file on disk, where `-` is a file named
+/// `-` and is checked like any other.
+pub(crate) fn local_disk_file(
+    project: &Path,
+    flag: &str,
+    source: &str,
+    instead: &str,
+) -> Result<PathBuf, brainproxy_core::Error> {
+    if !in_tool_call() {
         return Ok(PathBuf::from(source));
     }
     let refuse = || {
         brainproxy_core::Error::InvalidInput(format!(
             "{flag} {source:?}: through MCP a local file is read only from the project's folder (symlinks \
-             followed); put it there, pass its text on stdin (-), or give an http(s) URL"
+             followed); put it there, or {instead}"
         ))
     };
     let folder = match project.parent() {
@@ -214,8 +237,7 @@ pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result
     if folder.parent().is_none() || home.as_deref().is_some_and(|h| h.starts_with(&folder)) {
         return Err(brainproxy_core::Error::InvalidInput(format!(
             "{flag} {source:?}: through MCP a local file is read only from the project's folder, and this \
-             project is in {}: put the project in a folder of its own, pass the file's text on stdin (-), \
-             or give an http(s) URL",
+             project is in {}: put the project in a folder of its own, or {instead}",
             if folder.parent().is_none() { "/" } else { "your home folder or above it" }
         )));
     }
@@ -225,6 +247,55 @@ pub(crate) fn local_document(project: &Path, flag: &str, source: &str) -> Result
     } else {
         Err(refuse())
     }
+}
+
+/// [`local_document`] for a file argument kept as text (a request file, a macro step, a payload
+/// file): the path to read, as text. A resolved path that isn't UTF-8 is refused rather than
+/// read under another name.
+pub(crate) fn local_file_arg(
+    project: &Path,
+    flag: &str,
+    source: &str,
+    instead: &str,
+) -> Result<String, brainproxy_core::Error> {
+    local_document(project, flag, source, instead)?.into_os_string().into_string().map_err(|_| {
+        brainproxy_core::Error::InvalidInput(format!(
+            "{flag} {source:?}: through MCP a local file is read from its resolved path, and this one isn't UTF-8 \
+             text; {instead}"
+        ))
+    })
+}
+
+/// [`local_disk_file`] for a file argument kept as a path (a report to compare, a template).
+/// Through MCP a path that isn't UTF-8 text is refused, as it can't be checked.
+pub(crate) fn local_path(
+    project: &Path,
+    flag: &str,
+    source: &Path,
+    instead: &str,
+) -> Result<PathBuf, brainproxy_core::Error> {
+    if !in_tool_call() {
+        return Ok(source.to_path_buf());
+    }
+    let text = source.to_str().ok_or_else(|| {
+        brainproxy_core::Error::InvalidInput(format!(
+            "{flag}: through MCP a local file's path must be UTF-8 text; {instead}"
+        ))
+    })?;
+    local_disk_file(project, flag, text, instead)
+}
+
+/// Under a tool call, refuses `what`, which reads a folder the caller names (an offline copy of
+/// templates or rule data): a link inside it could lead anywhere the server can read, and what
+/// it holds goes into the person's own stores. `instead` says what an agent does instead.
+pub(crate) fn check_local_folder(what: &str, instead: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{what} reads a local folder, so it isn't offered through MCP: {instead}, or have a person run it with \
+             the folder in the app or a terminal"
+        )));
+    }
+    Ok(())
 }
 
 /// Under a tool call, refuses `flag`, an option that keeps requests out of history (such as
@@ -1317,6 +1388,163 @@ mod tests {
         }
         assert_eq!(hints("no such command"), NET);
         assert_eq!(hints("query"), READ);
+    }
+
+    /// Every tool argument that may name a local path, by what a tool call does with it, so a
+    /// new one is classified before it ships (#112): a file read from anywhere could be sent to
+    /// the target or read back.
+    #[test]
+    fn local_paths_a_tool_call_names_are_classified() {
+        use clap::CommandFactory;
+        // Read through [`local_document`]: only from the project's folder.
+        const FOLDER_CHECKED: &[&str] = &[
+            "auth add --login_request",
+            "auth macro add --steps",
+            "checks list --selectors",
+            "checks validate --paths",
+            "findings compare --baseline",
+            "findings compare --current",
+            "fuzz run --file",
+            "fuzz run --payloads",
+            "import api --environment",
+            "import api --source",
+            "import graphql --schema",
+            "import har --source",
+            "import openapi --source",
+            "import postman --source",
+            "intercept forward --file",
+            "scan active --api",
+            "scan active --checks",
+            "scan active --environment",
+            "send --file",
+            "ws send --file",
+        ];
+        // Refused through MCP, or `-` (the call's stdin) only.
+        const REFUSED: &[&str] = &[
+            "auth sign add --access_key_file",
+            "auth sign add --environment",
+            "auth sign add --script",
+            "checks feed verify --dir",
+            "checks update --from",
+            "findings add --description_file",
+            "findings add --evidence_file",
+            "findings add --solution_file",
+            "findings issue narrative --file",
+            "findings mark --from",
+            "report --logo",
+            "report-profile save --logo",
+            "report-summary set --file",
+            "rules add --script",
+            "rules import --file",
+            "rules test --file",
+            "rules test --script",
+            "scan data update --from",
+            "send --also",
+            "auth sign add --session_token_file",
+        ];
+        // Read, but only to sign or to present a client certificate: the key never goes out,
+        // and a certificate is public. Left as they were (see docs/MCP.md).
+        const KEYS: &[&str] = &[
+            "auth sign add --secret_file",
+            "connection cert add --cert",
+            "connection cert add --key",
+            "connection cert add --pkcs12",
+        ];
+        // Not a local path that is read: a name, an id, a number, a pattern, or a file written.
+        const NOT_READ: &[&str] = &[
+            "auth add --oauth_redirect_port",
+            "auth record start --browser",
+            "auth sign add --output",
+            "ca export --out",
+            "checks update --source",
+            "crawl --max_per_path",
+            "crawl --path_prefix",
+            "findings issue merge --from",
+            "findings issues --source",
+            "findings list --source",
+            "findings repro --output",
+            "findings ticket --key",
+            "history export --output",
+            "history export --source",
+            "history list --source",
+            "intercept enable --path",
+            "oob start --log",
+            "proxy restart --log",
+            "proxy restart --redirect",
+            "proxy setup set --redirect",
+            "proxy start --log",
+            "proxy start --redirect",
+            "report --output",
+            "report --source",
+            "report-profile save --from",
+            "scan policy save --from",
+            "sse list --source",
+            "update download --dir",
+            "ws list --source",
+            "ws messages --direction",
+            "ws send --from",
+        ];
+        const NAMES: &[&str] = &[
+            "file",
+            "dir",
+            "path",
+            "from",
+            "out",
+            "output",
+            "key",
+            "cert",
+            "pkcs12",
+            "log",
+            "logo",
+            "script",
+            "environment",
+            "baseline",
+            "current",
+            "steps",
+            "checks",
+            "api",
+            "schema",
+            "source",
+            "login_request",
+            "payloads",
+            "also",
+            "browser",
+            "selectors",
+        ];
+        let mut found = Vec::new();
+        leaves(&crate::Cli::command(), &mut Vec::new(), &mut |path, c| {
+            let p = path.join(" ");
+            if EXCLUDED.contains(&p.as_str()) {
+                return;
+            }
+            for a in tool_args(c).filter(|a| a.get_action().takes_values()) {
+                let id = a.get_id().as_str();
+                let value_names = a.get_value_names().unwrap_or_default();
+                // `profile` and PROFILE name an auth profile, not a file.
+                let word = |w: &str| w.contains("file") && !w.contains("profile");
+                if word(id)
+                    || id.contains("dir")
+                    || id.contains("path")
+                    || NAMES.contains(&id)
+                    || value_names.iter().any(|v| {
+                        let v = v.as_str().to_lowercase();
+                        word(&v) || v.contains("dir") || v.contains("path")
+                    })
+                {
+                    found.push(format!("{p} --{id}"));
+                }
+            }
+        });
+        let lists = [FOLDER_CHECKED, REFUSED, KEYS, NOT_READ];
+        for f in &found {
+            assert!(
+                lists.iter().any(|l| l.contains(&f.as_str())),
+                "{f} may name a local path: read it through local_document, refuse it through MCP, or list why not"
+            );
+        }
+        for listed in lists.iter().flat_map(|l| l.iter()) {
+            assert!(found.iter().any(|f| f == listed), "{listed} is no tool argument");
+        }
     }
 
     #[test]

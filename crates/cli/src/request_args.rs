@@ -15,7 +15,7 @@ const MARKER_SENTINEL: &str = "BPMARKERx7q";
 
 #[derive(clap::Args, Clone)]
 pub struct RequestArgs {
-    /// Raw HTTP request file; '-' or omitted reads stdin (unless --url is given).
+    /// Raw HTTP request file; '-' or omitted reads stdin (unless --url is given). Through MCP only a file in the project's folder.
     pub file: Option<String>,
 
     /// Build the request from a URL instead of a raw file.
@@ -79,6 +79,21 @@ impl RequestArgs {
             host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
             stream: Default::default(),
         }
+    }
+
+    /// Through MCP, points FILE at the file it resolves to inside the project's folder, and
+    /// refuses one elsewhere (see [`crate::mcp::local_document`]): its bytes go on the wire and
+    /// into history as they are. A FILE beside --url is never read, so it isn't checked.
+    pub fn resolve_file(&mut self, project: &std::path::Path) -> Result<(), Error> {
+        if let (None, Some(file)) = (&self.url, &self.file) {
+            self.file = Some(crate::mcp::local_file_arg(
+                project,
+                "FILE",
+                file,
+                "pass the request on stdin (-), or build it with --url",
+            )?);
+        }
+        Ok(())
     }
 
     /// Builds the request and works out its target. With `template_marker`

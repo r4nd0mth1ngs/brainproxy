@@ -2791,7 +2791,11 @@ host the scope doesn't list is refused without `host_header_test` (see
 [Concepts](#concepts)). `browser open` isn't offered (the
 project's browser profile keeps the person's sign-ins), nor is naming a script to run (a rule's
 `--script`, `fuzz run --process script:`, `scan script add`; see [Scripts](#scripts)), and
-other options that need a person are refused too; docs/MCP.md lists them.
+other options that need a person are refused too; docs/MCP.md lists them. A local file a tool
+call names (a request for `send`, `fuzz run` or `ws send`, a `file:` payload list, a macro step,
+a login request, an intercept edit, a document to import, a report to compare, a template) is
+read only from the project file's folder, symlinks followed, and a folder it names is refused;
+where the tool reads stdin, anything else comes in the call's `stdin`.
 
 ---
 

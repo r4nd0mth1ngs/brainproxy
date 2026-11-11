@@ -131,7 +131,7 @@ pub enum MacroCmd {
         profile: String,
         /// Macro name.
         name: String,
-        /// A step: history id, FILE, or ORIGIN=FILE. Repeatable, in order.
+        /// A step: history id, FILE, or ORIGIN=FILE. Repeatable, in order. Through MCP only a file in the project's folder.
         #[arg(long = "step", required = true)]
         steps: Vec<String>,
         /// STEP:VAR=KIND:EXPR. Repeatable.
@@ -447,7 +447,7 @@ pub struct AddArgs {
     #[arg(long)]
     login_body: Option<String>,
     /// Raw login request file used instead of --login-method/--login-body (placeholders allowed);
-    /// sent to the --login-url origin.
+    /// sent to the --login-url origin. Through MCP only a file in the project's folder.
     #[arg(long, value_name = "FILE")]
     login_request: Option<String>,
     /// Header for the login request only ("Name: value"). Repeatable.
@@ -808,7 +808,14 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 .login_request
                 .as_deref()
                 .map(|f| {
-                    std::fs::read_to_string(f)
+                    // Sent and stored as it is: through MCP only a file in the project's folder.
+                    let path = crate::mcp::local_disk_file(
+                        project,
+                        "--login-request",
+                        f,
+                        "describe the login with --login-method, --login-body and --login-header",
+                    )?;
+                    std::fs::read_to_string(path)
                         .map_err(|e| Error::InvalidInput(format!("cannot read login request {f:?}: {e}")))
                 })
                 .transpose()?;
@@ -1516,7 +1523,7 @@ fn macro_host(guard: &Arc<brainproxy_core::guard::Guard>, m: &Macro) -> Option<(
     })
 }
 
-fn read_step(store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error> {
+fn read_step(project: &Path, store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error> {
     if let Ok(id) = spec.trim().parse::<i64>() {
         let h = store.get(id)?;
         return Ok(MacroStep {
@@ -1530,7 +1537,14 @@ fn read_step(store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error
         Some((o, f)) if o.starts_with("http://") || o.starts_with("https://") => (Some(o), f),
         _ => (None, spec),
     };
-    let text = std::fs::read_to_string(file)
+    // The step is sent as it is, and stored: through MCP only a file in the project's folder.
+    let path = crate::mcp::local_disk_file(
+        project,
+        "--step",
+        file,
+        "give the step as a history id (send the request first, or find it with `query`)",
+    )?;
+    let text = std::fs::read_to_string(path)
         .map_err(|e| Error::InvalidInput(format!("cannot read macro step {file:?}: {e}")))?;
     let target = match origin {
         Some(o) => Target::from_url(o)?,
@@ -1558,7 +1572,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             let mut h = store.auth_handling(&profile)?;
             let mut m = Macro {
                 name: name.clone(),
-                steps: steps.iter().map(|s| read_step(&store, s, &scheme)).collect::<Result<_, _>>()?,
+                steps: steps.iter().map(|s| read_step(project, &store, s, &scheme)).collect::<Result<_, _>>()?,
                 origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             for spec in &extract {

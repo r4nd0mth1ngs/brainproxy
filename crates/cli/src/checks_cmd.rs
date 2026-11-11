@@ -15,7 +15,7 @@ pub enum ChecksCmd {
     List(ListArgs),
     /// Parse templates and report, per file, whether they load and why not.
     Validate {
-        /// Template files or directories.
+        /// Template files or directories. Through MCP only files in the project's folder.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         #[arg(long, default_value_t = 100)]
@@ -52,6 +52,7 @@ pub enum FeedCmd {
         key: PathBuf,
     },
     /// Check a feed folder's signature and file hashes against the keys this build trusts.
+    /// Refused through MCP.
     Verify { dir: PathBuf },
 }
 
@@ -65,7 +66,8 @@ pub enum FeedSource {
 
 #[derive(clap::Args)]
 pub struct ListArgs {
-    /// `nuclei`, `local`, `all` (default), or template files/directories.
+    /// `nuclei`, `local`, `all` (default), or template files/directories. Through MCP only files in
+    /// the project's folder.
     selectors: Vec<String>,
     /// Only checks whose id or name contains this text.
     #[arg(long)]
@@ -125,6 +127,7 @@ pub struct UpdateArgs {
     #[arg(long)]
     sha256: Option<String>,
     /// Import from a local checkout instead of downloading (the feed's signature is still checked).
+    /// Refused through MCP.
     #[arg(long, value_name = "DIR")]
     from: Option<PathBuf>,
     /// Run detached; returns a job id for `job wait|status|stop`.
@@ -134,10 +137,53 @@ pub struct UpdateArgs {
     job_id: Option<i64>,
 }
 
+/// A template named by path. Through MCP it is a file in the project's folder (see
+/// [`crate::mcp::local_document`]), as a template's requests are sent and its errors read back;
+/// a folder is refused, as a link inside it could lead out of the project's.
+pub(crate) fn local_template(project: &Path, flag: &str, path: &Path) -> Result<PathBuf, Error> {
+    let instead = "use a store (nuclei, brainproxy, local) a person filled; through MCP a template is a file, \
+                   never a folder, which a person can still give in the app or a terminal";
+    let file = crate::mcp::local_path(project, flag, path, instead)?;
+    if crate::mcp::in_tool_call() && file.is_dir() {
+        return Err(Error::InvalidInput(format!(
+            "{flag} {:?}: through MCP name template files, not a folder (a link in it could lead out of the \
+             project's folder); a person can still give a folder in the app or a terminal",
+            path.display().to_string()
+        )));
+    }
+    Ok(file)
+}
+
+/// The template files and folders `selectors` name (`nuclei`, `brainproxy`, `local`, `all`, or
+/// paths). Through MCP each path goes through [`local_template`]; the stores are a person's.
+pub(crate) fn template_paths(
+    project: &Path,
+    home: &Path,
+    flag: &str,
+    selectors: &[String],
+) -> Result<Vec<PathBuf>, Error> {
+    if !crate::mcp::in_tool_call() {
+        return Ok(checks::resolve_selectors(home, selectors));
+    }
+    let mut paths = Vec::new();
+    for s in selectors {
+        match s.as_str() {
+            "nuclei" | "brainproxy" | "local" | "all" => {
+                paths.extend(checks::resolve_selectors(home, std::slice::from_ref(s)))
+            }
+            path => paths.push(local_template(project, flag, Path::new(path))?),
+        }
+    }
+    paths.dedup();
+    Ok(paths)
+}
+
 pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         ChecksCmd::List(a) => list(project, home, a, out),
         ChecksCmd::Validate { paths, limit, check_vars } => {
+            let paths =
+                paths.iter().map(|p| local_template(project, "checks validate", p)).collect::<Result<Vec<_>, _>>()?;
             let opts = checks::LoadOptions { vars: check_vars, oob: oob_running(project), ..Default::default() };
             let loaded = checks::load(&paths, &opts)?;
             let files: Vec<_> = loaded
@@ -165,6 +211,9 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
             Ok(())
         }
         ChecksCmd::Update(a) => {
+            if a.from.is_some() {
+                crate::mcp::check_local_folder("checks update --from", "run it without --from to download them")?;
+            }
             if let Some(d) = &a.from {
                 if !d.is_dir() {
                     return Err(Error::NotFound(format!("directory {}", d.display())));
@@ -240,7 +289,7 @@ fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error
     let (min_severity, max_severity) = severity_band(a.severity, a.severity_max, "--severity")?;
     let selectors = if a.selectors.is_empty() { vec!["all".to_string()] } else { a.selectors.clone() };
     let opts = checks::LoadOptions { vars: a.check_vars.clone(), oob: oob_running(project), ..Default::default() };
-    let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
+    let loaded = checks::load(&template_paths(project, home, "checks list", &selectors)?, &opts)?;
     let filter = Filter {
         ids: vec![],
         tags: a.tags.clone(),
@@ -321,6 +370,10 @@ fn feed(cmd: FeedCmd, out: &Out) -> Result<(), Error> {
             });
         }
         FeedCmd::Verify { dir } => {
+            crate::mcp::check_local_folder(
+                "checks feed verify",
+                "`checks update --source brainproxy` checks the feed it downloads",
+            )?;
             let read = |n: &str| {
                 std::fs::read(dir.join(n)).map_err(|e| Error::NotFound(format!("{}: {e}", dir.join(n).display())))
             };

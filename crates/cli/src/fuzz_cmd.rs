@@ -72,7 +72,8 @@ pub struct RunArgs {
 
     #[arg(long, default_value = "sniper", value_parser = Mode::ALL.to_vec())]
     mode: String,
-    /// Payload source for the next set (repeat for pitchfork/cluster-bomb).
+    /// Payload source for the next set (repeat for pitchfork/cluster-bomb). Through MCP a
+    /// file:PATH is read only from the project's folder.
     #[arg(short = 'p', long = "payloads", required = true)]
     payloads: Vec<String>,
     /// Processing chain for payloads, e.g. "url", "2=prefix:admin,base64" or "script:sign.js,url".
@@ -314,6 +315,24 @@ fn text_summary(s: &Value) -> String {
     lines.join("\n")
 }
 
+/// A payload source as it is loaded: through MCP a `file:PATH` names the file it resolves to
+/// inside the project's folder, and one elsewhere is refused (see
+/// [`crate::mcp::local_document`]), as each line goes on the wire and into history.
+fn payload_source(project: &Path, spec: &str) -> Result<String, Error> {
+    match spec.split_once(':') {
+        Some(("file", path)) if path != "-" => Ok(format!(
+            "file:{}",
+            crate::mcp::local_file_arg(
+                project,
+                "--payloads file:",
+                path,
+                "pass the payloads on stdin (file:-), or use list:, range: or wordlist:",
+            )?
+        )),
+        _ => Ok(spec.to_string()),
+    }
+}
+
 fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), Error> {
     match args.store {
         StoreArg::All => {}
@@ -329,6 +348,12 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     }
     if args.background && stdin_payloads > 0 {
         return Err(Error::InvalidInput("--background can't read payloads from stdin; use files".into()));
+    }
+    // The caller's FILE, before a --background child's own request file takes its place.
+    args.req.resolve_file(project)?;
+    let mut payload_specs = Vec::with_capacity(args.payloads.len());
+    for spec in &args.payloads {
+        payload_specs.push(payload_source(project, spec)?);
     }
     // A request read from stdin is handed to the --background child in a file.
     let stdin_request = args.background && args.req.reads_stdin();
@@ -362,7 +387,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
 
     let mut stdin = || crate::read_input(None);
     let mut sets = Vec::new();
-    for spec in &args.payloads {
+    for spec in &payload_specs {
         sets.push(fuzz::load_payloads(spec, &mut stdin)?);
     }
     // The scripts the chains name, as they were read: the run's record says what processed it.

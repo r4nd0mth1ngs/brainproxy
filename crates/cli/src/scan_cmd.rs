@@ -129,6 +129,8 @@ pub enum DataCmd {
         /// no GitHub API request.
         #[arg(long = "ref", default_value = "main")]
         reference: String,
+        /// A zap-extensions checkout or a folder holding the files, instead of downloading.
+        /// Refused through MCP.
         #[arg(long, value_name = "DIR")]
         from: Option<std::path::PathBuf>,
     },
@@ -1268,6 +1270,9 @@ fn data_cmd(home: &Path, cmd: DataCmd, out: &Out) -> Result<(), Error> {
             });
         }
         DataCmd::Update { reference, from } => {
+            if from.is_some() {
+                crate::mcp::check_local_folder("data update --from", "run it without --from to download the data")?;
+            }
             let source = match from {
                 Some(d) => data::Source::Dir(d),
                 None => data::Source::GitHub { reference },

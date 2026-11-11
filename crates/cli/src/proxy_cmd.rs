@@ -588,7 +588,7 @@ pub enum InterceptCmd {
     Forward {
         id: i64,
         /// Replacement message file ('-' for stdin). Line endings and Content-Length are fixed unless
-        /// --verbatim; a WebSocket message's payload is always taken as is.
+        /// --verbatim; a WebSocket message's payload is always taken as is. Through MCP only a file in the project's folder.
         #[arg(long)]
         file: Option<String>,
         #[arg(long)]
@@ -2876,6 +2876,11 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             out.ok(data, || String::from_utf8_lossy(&original).into_owned());
         }
         InterceptCmd::Forward { id, file, verbatim, host_header_test } => {
+            // The edit is forwarded as it is, and recorded: through MCP only a file in the
+            // project's folder, checked before anything else.
+            let file = file
+                .map(|f| crate::mcp::local_file_arg(project, "--file", &f, "pass the edit on stdin (-)"))
+                .transpose()?;
             let (entry, original, _) = store.intercept_get(id)?;
             let websocket = entry.direction.starts_with("ws-");
             let edited = match file.as_deref() {
