@@ -198,7 +198,13 @@ Some arguments need a person, so a command run for a tool call (the server sets
   (checked against the scope as usual), `url` for a request, a history id for a macro step,
   `scan` for a comparison. A `baseline` that doesn't exist is refused too, `allow_missing_baseline`
   or not. A project kept in the home folder, in a folder above it, or at `/` opens no local file
-  to these tools: a person puts the project in a folder of its own. Through MCP the import
+  to these tools: a person puts the project in a folder of its own. Inside the folder, the
+  project file itself and what brainproxy keeps beside it are refused too: SQLite's `-wal`,
+  `-shm` and `-journal`, the `-<what>.lock` files, the `.browsers/` profiles, and the default
+  logs and staged requests named after the project (`<name>.proxy.log`, `.oob.log`,
+  `.record.log`, `.job-N.log`, `.fuzz-N.log`, `.fuzz-N.req`), by any case, link or `..` that
+  leads there (and on Unix a hard link to the database), since sending the database would put
+  the auth profiles' passwords and tokens that `query` hides into history. Through MCP the import
   commands' parse errors say only where a document stops being JSON or YAML (line and column),
   never quoting it.
 - A folder of templates for `checks_validate`, `checks_list` or `scan_active`'s `checks` (a

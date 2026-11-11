@@ -3,7 +3,8 @@
 //! `auth add --login-request`, `intercept forward --file`, `findings compare
 //! --baseline/--current`, and template files for `checks validate` and `scan active --checks`.
 //! Commands that read a folder the caller names are refused. A file elsewhere, a link out of the folder and a `..` path are refused
-//! without quoting the file, and nothing is sent; a person may name any file.
+//! without quoting the file, and nothing is sent; so are the project file and what is kept beside
+//! it (journal, locks, logs, browser profiles); a person may name any file.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -362,4 +363,61 @@ fn a_person_s_missing_store_folder_is_an_empty_store() {
     assert_eq!(v["loaded"], 0, "{v}");
     let o = run(&s.project, &["scan", "active", &url, "--no-rules", "--checks", store], false);
     assert!(o.all.contains("no checks selected"), "{}", o.all);
+}
+
+#[test]
+fn an_agent_can_t_send_the_project_database_or_the_files_kept_beside_it() {
+    let s = Setup::new("own");
+    let url = format!("http://127.0.0.1:{}/§x§", s.server.port);
+    // A password in an auth profile, which an agent's `query` can't read.
+    person(&s.project, &["auth", "add", "app", "--header", &format!("Authorization: Basic {SECRET}")]);
+    let wal = s.write("proj/p.bpdb-wal", &format!("{SECRET}\n"));
+    let log = s.write("proj/p.job-1.log", &format!("{SECRET}\n"));
+    let lock = s.write("proj/p.bpdb-proxy.lock", &format!("{SECRET}\n"));
+    let staged = s.write("proj/p.fuzz-3.req", &REQUEST.replace("SECRET", SECRET));
+    std::fs::create_dir_all(s.proj.join("p.bpdb.browsers/chrome")).unwrap();
+    let profile = s.write("proj/p.bpdb.browsers/chrome/Cookies", &format!("{SECRET}\n"));
+    let db = s.project.to_str().unwrap().to_string();
+    let mut paths = vec![db.clone(), wal, log, lock, staged, profile];
+    // The same files reached another way: a different case, `..`, and a link inside the folder.
+    paths.push(format!("{}/P.BPDB", s.proj.display()));
+    paths.push(format!("{}/sub/../p.bpdb", s.proj.display()));
+    #[cfg(unix)]
+    {
+        let link = s.proj.join("innocent.txt");
+        std::os::unix::fs::symlink(&s.project, &link).unwrap();
+        paths.push(link.to_str().unwrap().to_string());
+        let hard = s.proj.join("hard.txt");
+        std::fs::hard_link(&s.project, &hard).unwrap();
+        paths.push(hard.to_str().unwrap().to_string());
+    }
+    for path in &paths {
+        // A different case names the same file only on a case-insensitive file system.
+        if !Path::new(path).exists() {
+            continue;
+        }
+        for args in [
+            vec!["send", "--scheme", "http", path.as_str()],
+            vec!["fuzz", "run", "--url", &url, "-p", &format!("file:{path}")],
+            vec!["ws", "send", path.as_str(), "--message", "hi"],
+            vec!["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", path.as_str()],
+        ] {
+            let o = run(&s.project, &args, true);
+            assert_eq!(o.code, 2, "{args:?}: {}", o.all);
+            let msg = o.json["error"]["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("project's database"), "{args:?}: {}", o.all);
+            assert!(!o.all.contains(SECRET), "{args:?}: {}", o.all);
+        }
+    }
+    assert!(!s.server.sent(SECRET), "a project file was sent");
+
+    // An ordinary file in the folder, even one named like the project's, is still read.
+    let words = s.write("proj/p.words.txt", "inside-word\n");
+    let o = run(&s.project, &["fuzz", "run", "--url", &url, "-p", &format!("file:{words}")], true);
+    assert_eq!(o.code, 0, "{}", o.all);
+    assert!(s.server.sent("/inside-word"));
+    // A person may still read any of them.
+    let o = run(&s.project, &["fuzz", "run", "--url", &url, "-p", &format!("file:{}", paths[2])], false);
+    assert_eq!(o.code, 0, "{}", o.all);
+    assert!(s.server.sent(SECRET));
 }

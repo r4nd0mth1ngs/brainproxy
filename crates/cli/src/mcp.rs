@@ -242,11 +242,88 @@ pub(crate) fn local_disk_file(
         )));
     }
     let file = Path::new(source).canonicalize().map_err(|_| refuse())?;
-    if file.starts_with(&folder) && file != folder {
-        Ok(file)
-    } else {
-        Err(refuse())
+    if !file.starts_with(&folder) || file == folder {
+        return Err(refuse());
     }
+    if project_own_file(project, &folder, &file) {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{flag} {source:?}: through MCP the project's database and what brainproxy keeps beside it (its \
+             journal, locks, logs, staged requests and browser profiles) aren't read as a local file, as they \
+             hold what an agent's queries can't see; use another file in the project's folder, or {instead}"
+        )));
+    }
+    Ok(file)
+}
+
+/// Whether `file` (canonical, inside the project's canonical `folder`) is the project database
+/// itself or one of the files kept beside it: SQLite's `-wal`, `-shm` and `-journal`, the lock
+/// files `<name>-<what>.lock` (`process.rs`, `ws_cmd.rs`), browser profiles under
+/// `<name>.browsers/` (`browser_cmd.rs`), and the default logs and staged requests named after
+/// the stem (`Path::with_extension`): `<stem>.proxy.log`, `.oob.log`, `.record.log`,
+/// `.job-N.log`, `.fuzz-N.log`, `.fuzz-N.req` (`proxy_cmd.rs`, `oob_cmd.rs`, `auth_cmd.rs`,
+/// `jobs_cmd.rs`, `fuzz_cmd.rs`; the desktop app's `delete.rs` keeps the same list). Read as a
+/// payload or request file, any of them would put the database's bytes (auth profiles'
+/// passwords and tokens among them, which the store hides from an agent's `query`) into history.
+/// Names are compared ignoring ASCII case, as on macOS and Windows; the project is checked by the
+/// name it was opened under and by where a link to it leads, and on Unix a hard link to the
+/// database or its journal is caught by its inode.
+fn project_own_file(project: &Path, folder: &Path, file: &Path) -> bool {
+    let mut bases: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(name) = project.file_name().and_then(|n| n.to_str()) {
+        bases.push((folder.to_path_buf(), name.to_string()));
+    }
+    let real = project.canonicalize().ok();
+    if let Some(real) = &real {
+        if let (Some(dir), Some(name)) = (real.parent(), real.file_name().and_then(|n| n.to_str())) {
+            bases.push((dir.to_path_buf(), name.to_string()));
+        }
+    }
+    let lower = |s: &str| s.to_ascii_lowercase();
+    let numbered = |s: &str, kind: &str| {
+        s.strip_prefix(kind).is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    };
+    for (dir, name) in &bases {
+        let Ok(rel) = file.strip_prefix(dir) else { continue };
+        let mut parts = rel.components().map(|c| lower(&c.as_os_str().to_string_lossy()));
+        let Some(first) = parts.next() else { continue };
+        let name = lower(name);
+        if first == format!("{name}.browsers") {
+            return true;
+        }
+        if parts.next().is_some() {
+            continue;
+        }
+        if let Some(rest) = first.strip_prefix(&name) {
+            if matches!(rest, "" | "-wal" | "-shm" | "-journal")
+                || rest.strip_prefix('-').is_some_and(|r| r.ends_with(".lock"))
+            {
+                return true;
+            }
+        }
+        let stem = Path::new(&name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(rest) = first.strip_prefix(&stem).and_then(|r| r.strip_prefix('.')) {
+            let log = rest.strip_suffix(".log").is_some_and(|log| {
+                matches!(log, "proxy" | "oob" | "record") || numbered(log, "job-") || numbered(log, "fuzz-")
+            });
+            if log || rest.strip_suffix(".req").is_some_and(|req| numbered(req, "fuzz-")) {
+                return true;
+            }
+        }
+    }
+    #[cfg(unix)]
+    if let (Some(real), Ok(meta)) = (&real, std::fs::metadata(file)) {
+        use std::os::unix::fs::MetadataExt;
+        let same = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.dev() == meta.dev() && m.ino() == meta.ino());
+        let with = |suffix: &str| {
+            let mut s = real.as_os_str().to_owned();
+            s.push(suffix);
+            PathBuf::from(s)
+        };
+        if same(real) || ["-wal", "-shm", "-journal"].iter().any(|x| same(&with(x))) {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`local_document`] for a file argument kept as text (a request file, a macro step, a payload
