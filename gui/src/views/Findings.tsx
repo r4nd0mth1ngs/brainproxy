@@ -418,7 +418,7 @@ export function FindingsView({ active }: { active: boolean }) {
           <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
             New finding…
           </button>
-          <button className="btn small" onClick={() => setReporting(true)} title="Build a report: who it is for, its sections and branding; HTML, PDF, Word or Markdown">
+          <button className="btn small" onClick={() => setReporting(true)} title="Build a report: who it is for, its sections and branding, which findings; HTML, PDF, Word, Markdown, JSON, CSV, SARIF or DefectDojo">
             Report…
           </button>
         </div>

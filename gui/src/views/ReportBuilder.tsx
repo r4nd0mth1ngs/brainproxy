@@ -1,21 +1,35 @@
-// The report builder: who it is for, which sections, the branding, the format, with a live
-// preview of the HTML; saved layouts are report profiles in the project.
+// The report builder: who it is for, which sections, the branding, the format, which findings
+// and how secrets are shown, with a live preview of the HTML; saved layouts are report profiles
+// in the project. The executive summary at the top of reports is written and reviewed here too.
 
 import { useEffect, useRef, useState } from "react";
 import { run } from "../api";
 import { useApp } from "../store";
+import { confirm } from "../ui/Confirm";
 import { useDialogFocus } from "../ui/dialogFocus";
+import { narrativeCredit } from "./findingsFilter";
 import {
+  CONFIDENCES,
   DEFAULT_SPEC,
   FORMATS,
   PRESET_SECTIONS,
   PRESETS,
   previewCommand,
   profileSaveCommand,
+  reportHostsCommand,
+  REPORT_SOURCES,
+  REPORT_STATES,
   reportCommand,
+  type ReportFilter,
+  type ReportWritten,
+  RISKS,
+  savedNote,
   SECTIONS,
   specFromProfile,
   specProblem,
+  type Summary,
+  summaryCommand,
+  summaryReviewCommand,
   toggleSection,
   type Preset,
   type ReportSpec,
@@ -34,9 +48,18 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [profileName, setProfileName] = useState("");
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [summaryDraft, setSummaryDraft] = useState("");
+  // What the text box held when the summary was last loaded or saved: a reload replaces the
+  // text box only while it still holds that, so nothing typed meanwhile is lost.
+  const shownSummary = useRef("");
+  const [hosts, setHosts] = useState<string[]>([]);
+  // Bumped when the summary changes, so the preview shows it.
+  const [previewRun, setPreviewRun] = useState(0);
   const dialog = useRef<HTMLDivElement>(null);
   useDialogFocus(dialog);
   const set = (p: Partial<ReportSpec>) => setSpec((s) => ({ ...s, ...p }));
+  const setFilter = (p: Partial<ReportFilter>) => setSpec((s) => ({ ...s, filter: { ...s.filter, ...p } }));
   const problem = specProblem(spec);
 
   const loadProfiles = () =>
@@ -44,8 +67,26 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
       (r) => setProfiles(r.profiles),
       () => setProfiles([]),
     );
+  const loadSummary = () =>
+    run<{ summary: Summary | null }>(["report-summary", "show"]).then(
+      (r) => {
+        const text = r.summary?.text ?? "";
+        // Read now: the updater runs later, after the ref has moved on.
+        const shown = shownSummary.current;
+        shownSummary.current = text;
+        setSummary(r.summary);
+        setSummaryDraft((d) => (d.trim() === shown ? text : d));
+      },
+      (e) => app.toast(e.message, "error"),
+    );
   useEffect(() => {
     loadProfiles();
+    loadSummary();
+    // Every host with a finding, closed ones too: the filter matches a host exactly.
+    run<{ rows: [string][] }>(reportHostsCommand()).then(
+      (r) => setHosts(r.rows.map((row) => row[0])),
+      () => setHosts([]),
+    );
   }, []);
 
   // The preview follows the choices, a moment after the last change.
@@ -66,7 +107,7 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
       live = false;
       clearTimeout(t);
     };
-  }, [spec, problem]);
+  }, [spec, problem, previewRun]);
 
   const pickLogo = async () => {
     const dialogs = await import("@tauri-apps/plugin-dialog");
@@ -83,9 +124,8 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
     const file = path.toLowerCase().endsWith(`.${fmt.ext}`) ? path : `${path}.${fmt.ext}`;
     setBusy(true);
     try {
-      const r = await run<{ total: number; redacted: number | null }>(reportCommand(spec, file));
-      const masked = r.redacted ? ` Session secrets are masked in ${r.redacted} place${r.redacted === 1 ? "" : "s"}.` : "";
-      app.toast(`${fmt.label} report saved with ${r.total} finding${r.total === 1 ? "" : "s"}.${masked}`);
+      const r = await run<ReportWritten>(reportCommand(spec, file));
+      app.toast(savedNote(fmt.label, r, spec.keepSecrets));
       const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
       await revealItemInDir(file).catch(() => {});
       onClose();
@@ -109,7 +149,56 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
     }
   };
 
+  // A saved layout may be someone's branding: removing one asks first.
+  const removeProfile = async () => {
+    const p = spec.profile;
+    if (!p || !(await confirm("Delete saved layout?", `The layout "${p}" is removed from this project. Reports already written keep their look.`, "Delete", "Keep"))) return;
+    try {
+      await run(["report-profile", "remove", p]);
+      app.toast(`Deleted the layout "${p}".`);
+      setSpec((s) => (s.profile === p ? { ...s, profile: null } : s));
+      loadProfiles();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  // Secrets are masked unless the person says otherwise, knowing who may read the report.
+  const keepSecrets = async (on: boolean) => {
+    if (
+      on &&
+      !(await confirm(
+        "Quote secrets as recorded?",
+        "Session cookies, credentials, API keys and tokens go into the report as they were recorded, in its evidence, URLs and bodies. Anyone who reads the report can use them.",
+        "Quote them",
+        "Keep them masked",
+      ))
+    )
+      return;
+    set({ keepSecrets: on });
+  };
+
+  // The summary on screen is what a review approves: one changed since (by an agent, say) is
+  // refused. A text that couldn't be saved stays in the box.
+  const saveSummary = async (review: boolean) => {
+    try {
+      if (review) {
+        await run(summaryReviewCommand(summary?.hash ?? ""));
+        app.toast("Summary reviewed: reports print it.");
+      } else {
+        const { args, stdin } = summaryCommand(summaryDraft);
+        await run(args, stdin);
+        shownSummary.current = stdin;
+      }
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    await loadSummary();
+    setPreviewRun((n) => n + 1);
+  };
+
   const tick = (id: string) => set({ sections: toggleSection(spec.sections, id) });
+  const fmt = FORMATS.find((f) => f.id === spec.format)!;
 
   return (
     <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && !busy && onClose()}>
@@ -134,6 +223,11 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
               ))}
             </select>
           </label>
+          {spec.profile && (
+            <button className="btn small" onClick={removeProfile} title="Remove this saved layout from the project">
+              Delete layout…
+            </button>
+          )}
           <label>
             <span className="label">For</span>
             <select className="input" value={spec.preset} onChange={(e) => set({ preset: e.target.value as Preset, sections: PRESET_SECTIONS[e.target.value as Preset] })}>
@@ -198,7 +292,102 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
               ))}
             </select>
           </label>
-          {spec.format === "pdf" && <p className="muted small">PDF is printed by Chromium, which must be installed.</p>}
+          {fmt.note && <p className="muted small">{fmt.note}</p>}
+          {fmt.listing && <p className="muted small">Sections and branding don't change this format; the preview shows the HTML report.</p>}
+          <h3>Findings</h3>
+          <label>
+            <span className="label">Triage state</span>
+            <select className="input" value={spec.filter.state} onChange={(e) => setFilter({ state: e.target.value })}>
+              {REPORT_STATES.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="row gap">
+            <label>
+              <span className="label">Risk at least</span>
+              <select className="input" value={spec.filter.risk} onChange={(e) => setFilter({ risk: e.target.value as ReportFilter["risk"] })}>
+                <option value="">Any</option>
+                {RISKS.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span className="label">Confidence at least</span>
+              <select className="input" value={spec.filter.confidence} onChange={(e) => setFilter({ confidence: e.target.value as ReportFilter["confidence"] })}>
+                <option value="">Any</option>
+                {CONFIDENCES.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <label>
+            <span className="label">Source</span>
+            <select className="input" value={spec.filter.source} onChange={(e) => setFilter({ source: e.target.value as ReportFilter["source"] })}>
+              {REPORT_SOURCES.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span className="label">Host</span>
+            <select className="input" value={spec.filter.host} onChange={(e) => setFilter({ host: e.target.value })}>
+              <option value="">Every host</option>
+              {hosts.map((h) => (
+                <option key={h} value={h}>
+                  {h}
+                </option>
+              ))}
+            </select>
+          </label>
+          <h3>Secrets</h3>
+          <label className="check" title="Session cookies, credentials and tokens as recorded; by default they're shown as [redacted]">
+            <input type="checkbox" checked={spec.keepSecrets} onChange={(e) => keepSecrets(e.target.checked)} /> Quote secrets as recorded
+          </label>
+          {!spec.keepSecrets && (
+            <label>
+              <span className="label">Also mask</span>
+              <textarea
+                className="input multiline"
+                rows={2}
+                value={spec.mask}
+                placeholder="One value per line, at least 6 characters: a token in a note, say"
+                onChange={(e) => set({ mask: e.target.value })}
+              />
+            </label>
+          )}
+          <h3>Executive summary</h3>
+          <textarea
+            className="input multiline note-input"
+            rows={4}
+            placeholder="A few lines at the top of reports: what was tested and what it found. An agent can draft it; it's printed once a person reviews it."
+            value={summaryDraft}
+            onChange={(e) => setSummaryDraft(e.target.value)}
+          />
+          <div className="toolbar flat">
+            <button className="btn small" disabled={summaryDraft.trim() === (summary?.text ?? "")} onClick={() => saveSummary(false)}>
+              {summaryDraft.trim() === "" && summary ? "Clear summary" : "Save summary"}
+            </button>
+            {summary && !summary.reviewed_at && summaryDraft.trim() === summary.text && (
+              <button className="btn small" onClick={() => saveSummary(true)} title="You've read it and it's right: reports print it">
+                Mark reviewed
+              </button>
+            )}
+          </div>
+          {summary && <p className="muted small">{narrativeCredit(summary)}</p>}
+          <label className="check" title="Write-ups and the summary nobody has reviewed yet go in, marked as drafts">
+            <input type="checkbox" checked={spec.drafts} onChange={(e) => set({ drafts: e.target.checked })} /> Include drafts
+          </label>
           {problem && <p className="error">{problem}</p>}
           <div className="row gap">
             <input className="input" placeholder="Layout name" value={profileName} onChange={(e) => setProfileName(e.target.value)} />
