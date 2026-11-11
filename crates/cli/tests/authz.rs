@@ -80,6 +80,11 @@ fn handle(mut s: TcpStream, logouts: &AtomicUsize, counter: &AtomicUsize, flaky:
                 .into()
         }
         ("/public/info", _) => json("200 OK", r#"{"shop":"Example","currency":"EUR"}"#.into()),
+        // Public by design; a stylesheet served as text/plain (the browser says what it is).
+        ("/robots.txt", _) | ("/theme", _) => {
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into()
+        }
+        ("/api/health", _) => json("200 OK", r#"{"status":"up"}"#.into()),
         (_, None) => json("401 Unauthorized", r#"{"error":"login required"}"#.into()),
         // The bug: any logged-in user may read order 1.
         ("/api/orders/1", Some(_)) => json("200 OK", order(1, "alice")),
@@ -230,7 +235,12 @@ fn empty_and_head_responses_are_not_bypasses() {
     let p = tmp_project("empty");
     ok(&p, &["send", "--url", &srv.url("/api/orders/9"), "--auth", "alice"]);
     ok(&p, &["send", "-X", "HEAD", "--url", &srv.url("/api/orders/1"), "--auth", "alice"]);
+    // HEAD has nothing to compare, so it isn't picked unless asked for.
     let r = ok(&p, &["authz", "run", "--as", "bob"]);
+    assert_eq!(r["requests"], 1, "{r}");
+    assert_eq!(r["skipped"]["head_options"], 1, "{r}");
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--include-methods", "HEAD"]);
+    assert_eq!(r["requests"], 2, "{r}");
     assert_eq!(r["new_findings"], 0, "{r}");
     assert!(r["verdicts"].get("bypass").is_none(), "{r}");
     let run_id = r["run_id"].as_i64().unwrap().to_string();
@@ -239,6 +249,92 @@ fn empty_and_head_responses_are_not_bypasses() {
     assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "inconclusive", "{m}");
     // A refusal is still a refusal.
     assert_eq!(cell(&m, "/api/orders/9", "anonymous")["verdict"], "enforced", "{m}");
+}
+
+#[test]
+fn static_assets_and_skip_paths_are_left_out() {
+    let srv = Server::start();
+    let p = tmp_project("noise");
+    for path in ["/api/orders/1", "/api/me", "/static/app.js", "/robots.txt", "/api/health"] {
+        ok(&p, &["send", "--url", &srv.url(path), "--auth", "alice"]);
+    }
+    ok(&p, &["send", "--url", &srv.url("/theme"), "--auth", "alice", "-H", "Sec-Fetch-Dest: style"]);
+
+    // By default: the script and the stylesheet are static, robots.txt and the health check
+    // are saved skip paths. None of them is sent.
+    let r = ok(&p, &["authz", "run", "--as", "bob"]);
+    assert_eq!(r["requests"], 2, "{r}");
+    assert_eq!(r["skipped"]["static_assets"], 2, "{r}");
+    assert_eq!(r["skipped"]["skip_paths"], 2, "{r}");
+    assert!(r["skipped"]["noise_hint"].as_str().unwrap().contains("--include-static"), "{r}");
+    let examples = r["skipped_examples"].as_array().unwrap();
+    assert_eq!(examples.len(), 4, "{r}");
+    let why = |path: &str| {
+        let e = examples.iter().find(|e| e["url"].as_str().unwrap().ends_with(path)).unwrap();
+        e["why"].as_str().unwrap().to_string()
+    };
+    assert_eq!(why("/static/app.js"), "static asset: Content-Type text/javascript");
+    assert_eq!(why("/theme"), "static asset: Sec-Fetch-Dest style");
+    assert_eq!(why("/robots.txt"), "matches skip path /robots.txt$");
+    assert_eq!(why("/api/health"), "matches skip path */health$");
+    assert_eq!(r["bypasses"].as_array().unwrap().len(), 1, "the order is still found: {r}");
+
+    // A run's own skip path, on top.
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--skip-path", "/api/me$"]);
+    assert_eq!((r["requests"].clone(), r["skipped"]["skip_paths"].clone()), (1.into(), 3.into()), "{r}");
+
+    // Asked for, everything is tested; the matrix still hides the noise unless --all.
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--include-static", "--no-saved-skips"]);
+    assert_eq!(r["requests"], 6, "{r}");
+    assert!(r["skipped"].get("static_assets").is_none(), "{r}");
+    let run_id = r["run_id"].as_i64().unwrap().to_string();
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    assert_eq!(m["requests"].as_array().unwrap().len(), 2, "{m}");
+    assert_eq!(m["hidden_requests"]["static_assets"], 2, "{m}");
+    assert_eq!(m["hidden_requests"]["skip_paths"], 2, "{m}");
+    let all = ok(&p, &["authz", "matrix", &run_id, "--all"]);
+    let rows = all["requests"].as_array().unwrap();
+    assert_eq!(rows.len(), 6, "{all}");
+    let hidden = |path: &str| {
+        let r = rows.iter().find(|r| r["url"].as_str().unwrap().ends_with(path)).unwrap();
+        r["hidden"].as_str().map(str::to_string)
+    };
+    assert_eq!(hidden("/static/app.js").as_deref(), Some("static asset (Content-Type text/javascript)"));
+    assert_eq!(hidden("/robots.txt").as_deref(), Some("skip path /robots.txt$"));
+    assert_eq!(hidden("/api/orders/1"), None);
+
+    // Saved skip paths apply to runs from before they were saved.
+    let saved = ok(&p, &["authz", "skip", "add", "/api/me$"]);
+    assert_eq!(saved["defaults"], false, "{saved}");
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    assert_eq!(m["requests"].as_array().unwrap().len(), 1, "{m}");
+    assert_eq!(m["hidden_requests"]["skip_paths"], 3, "{m}");
+    // A bypass is never hidden, whatever it matches.
+    ok(&p, &["authz", "skip", "add", "/api/orders/"]);
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "bypass", "{m}");
+    assert_eq!(m["hidden_requests"]["skip_paths"], 3, "{m}");
+    ok(&p, &["authz", "skip", "remove", "/api/orders/"]);
+    let saved = ok(&p, &["authz", "skip", "remove", "/api/me$"]);
+    assert_eq!(saved["defaults"], true, "{saved}");
+    // Adding one that is there already changes nothing.
+    assert_eq!(ok(&p, &["authz", "skip", "add", "/robots.txt$"])["defaults"], true);
+    assert_eq!(run(&p, &["authz", "skip", "remove", "/nope"]).0, 4);
+    assert_eq!(run(&p, &["authz", "skip", "add", "robots.txt"]).0, 2, "a path starts with / or *");
+    assert_eq!(run(&p, &["authz", "run", "--as", "bob", "--skip-path", "api"]).0, 2);
+    let none = ok(&p, &["authz", "skip", "set"]);
+    assert_eq!(none["paths"], serde_json::json!([]), "{none}");
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    assert_eq!(m["hidden_requests"]["skip_paths"], 0, "{m}");
+    let back = ok(&p, &["authz", "skip", "set", "--defaults"]);
+    assert_eq!(back["defaults"], true, "{back}");
+    assert!(back["paths"].as_array().unwrap().iter().any(|p| p == "/.well-known/"), "{back}");
+
+    // A request named on its own is tested as it is.
+    let id = ok(&p, &["query", "SELECT id FROM history WHERE path = '/robots.txt' AND source = 'send'"]);
+    let id = id["rows"][0][0].as_i64().unwrap().to_string();
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--history-id", &id]);
+    assert_eq!(r["requests"], 1, "{r}");
 }
 
 /// curl through the proxy as alice; returns the status.
@@ -268,8 +364,16 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
     assert_eq!(curl_as_alice(&proxy, &srv.url("/api/me"), &["-X", "POST", "-d", "x=1"]), 200);
     // Nor a GraphQL mutation sent as GET: it is MUTATION, not GET (skipped before its 404 counts).
     assert_eq!(curl_as_alice(&proxy, &srv.url("/graphql?query=mutation%20%7B%20a%20%7D"), &[]), 404);
-    // Static assets and responses other than 2xx aren't tested either.
+    // Static assets (by type, or as the browser labels them), HEAD, skip paths and responses
+    // other than 2xx aren't tested either.
     assert_eq!(curl_as_alice(&proxy, &srv.url("/static/app.js"), &[]), 200);
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/theme"), &["-H", "Sec-Fetch-Dest: style"]), 200);
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/api/orders/1"), &["-I"]), 200);
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/robots.txt"), &[]), 200);
+    // A skip path saved while the proxy runs applies from its next settings reload.
+    ok(&p, &["authz", "skip", "add", "/api/me$"]);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/api/me"), &[]), 200);
     assert_eq!(curl_as_alice(&proxy, &srv.url("/no/such/page"), &[]), 404);
     // Requests without credentials aren't tested.
     let out = Command::new("curl")
@@ -306,7 +410,9 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
         ("skipped_excluded_paths", 1),
         ("skipped_methods", 2),
         ("skipped_no_credentials", 1),
-        ("skipped_static", 1),
+        ("skipped_static", 2),
+        ("skipped_head_options", 1),
+        ("skipped_skip_paths", 2),
         ("skipped_status", 1),
         ("dropped_queue_full", 0),
     ];

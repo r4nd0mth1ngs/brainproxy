@@ -42,6 +42,15 @@ pub struct LiveAuthz {
     /// Cookies that aren't credentials and stay on the request.
     #[serde(default)]
     pub keep_cookies: Vec<String>,
+    /// Test static assets too.
+    #[serde(default)]
+    pub include_static: bool,
+    /// Test HEAD and OPTIONS requests too.
+    #[serde(default)]
+    pub head_options: bool,
+    /// Skip paths of this run, on top of the project's saved ones (`authz skip`).
+    #[serde(default)]
+    pub skip_paths: Vec<String>,
     /// The authz run (job id) of the proxy that last started with live testing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<i64>,
@@ -65,6 +74,9 @@ impl Default for LiveAuthz {
             queue: default_queue(),
             exclude: default_exclude(),
             keep_cookies: vec![],
+            include_static: false,
+            head_options: false,
+            skip_paths: vec![],
             run_id: None,
         }
     }

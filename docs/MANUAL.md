@@ -770,8 +770,10 @@ Access control across users: does the app let bob read alice's data? See
 - **New run:** tick the identities to send each request as (your auth profiles, one per
   user) and keep *anonymous* on to also send with no session. *Owner* is worked out per
   request unless you pick one. Choose which requests to test: all recorded requests that
-  carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
-  OPTIONS requests are replayed, and logout paths never are. A request sent from
+  carry credentials, one site, a tag, or a SQL condition on history. Only GET requests are
+  replayed (HEAD and OPTIONS have nothing to compare), and logout paths never are. Static
+  assets and the skip paths are left out unless you tick *Also test static assets* (or edit
+  the skip paths); the legend says how many were left out and why. A request sent from
   **Traffic** (right-click › *Test access control…*) shows as *From Traffic*: it is tested
   as it is, whatever its method or path and even if it carries no credentials. It is sent
   twice as its owner, then as each identity and with no session. The form warns when it is a
@@ -785,12 +787,21 @@ Access control across users: does the app let bob read alice's data? See
   those identities in the background. It is one `proxy restart`, as in **Settings › Proxy**, so
   a proxy started meanwhile from a shell or MCP can't take its place. If it doesn't start, the
   previous proxy is started again and the message says where the proxy is. Results fill the
-  grid as you go; stopping the proxy ends the run.
+  grid as you go; stopping the proxy ends the run. *Also test static assets* applies here too.
+- **Skip paths:** the paths every run and live testing leave out, and the grid hides, saved
+  with the project: one per line, edited in place (`authz skip`). They start as files that
+  are public by design (`robots.txt`, `/.well-known/`, `favicon.ico`, health checks);
+  *Back to defaults* restores them. A change applies to runs already in the list as well.
 - **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
   red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
   a dashed outline inconclusive (a successful response with nothing to compare, so check it
   by hand), green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are
-  marked skipped. Click a verdict chip above the grid to show only those rows; *Worst first* puts
+  marked skipped. *Issues only* (on by default) shows only rows with a bypass, a public
+  or an error cell (a request that failed, so nothing was compared); the others are counted next to the legend, and a click there shows them. Static
+  assets and requests matching a skip path that a run tested anyway (an older run, or one
+  with static assets on) are hidden too, behind a box that shows them, unless one of their
+  cells is a bypass. Click a verdict chip
+  above the grid to show only those rows, whatever *Issues only* says; *Worst first* puts
   bypasses at the top.
 - **Compare:** click a cell to see the owner's response (the baseline) and that identity's
   side by side, with the evidence for the verdict. *Requests* shows what was sent, so you
@@ -1099,7 +1110,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 185 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 189 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -2704,7 +2715,7 @@ Each response gets a verdict:
 | `bypass` | the owner's data came back: most of the owner's private values (JSON values the anonymous response and the request don't contain), the owner's username, or a nearly identical response when there is nothing private to look for |
 | `public` | the anonymous control got the same response, so the page isn't protected |
 | `different` | a successful but different response, such as the identity's own data |
-| `inconclusive` | a successful response with nothing to compare: an empty body, `{}`, or a HEAD or OPTIONS request. It says nothing about access, so check it by hand |
+| `inconclusive` | a successful response with nothing to compare: an empty body, `{}`, or a HEAD or OPTIONS request (tested only with `--include-methods HEAD,OPTIONS`). It says nothing about access, so check it by hand |
 
 A bypass is `high` confidence when the request names an object (a number, UUID, long hex
 id or email address) and the owner's values or username came back, `medium` when it names
@@ -2714,9 +2725,9 @@ Medium and high bypasses are findings (source `authz`): *Access Control Bypass* 
 for another profile, *Protected Content Without Authentication* (100004) for the anonymous
 control. Low ones are only in the results, to review.
 
-Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
-replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
-another user. A GraphQL mutation needs `MUTATION` as well as its method, as in a scan (a
+Safety: from history only GET requests that carry credentials are replayed;
+`--include-methods POST,PUT` (or `all`) adds others, which then change data as another user,
+and `--include-methods HEAD,OPTIONS` adds those two, which have no body to compare. A GraphQL mutation needs `MUTATION` as well as its method, as in a scan (a
 persisted query sent without its document counts as one too), so a mutation sent as POST is
 replayed with `--include-methods POST,MUTATION`, not with either alone, and one sent as GET with
 `--include-methods MUTATION`. A URL given to `authz run` needs the same opt-in: one
@@ -2728,15 +2739,54 @@ method needs `--include-methods` like any other, and one matching `--exclude` is
 the command line are fetched with GET and need `--owner`. Every request stays inside the
 engagement scope and is recorded in history with source `authz`.
 
+**Noise.** Some requests say nothing about access control whatever comes back, and a run
+leaves them out of history's requests before sending anything:
+
+- *static assets*: stylesheets, scripts, images, fonts, audio, video, WebAssembly and source
+  maps, served to everyone. The recorded response's `Content-Type` decides first (an HTML,
+  JSON or XML response never is one, whatever its path); otherwise the browser's
+  `Sec-Fetch-Dest` (`image`, `style`, `script`, `font`, ...) or, when the response doesn't say
+  what it is, the path's extension. `--include-static` tests them;
+- *skip paths*: requests whose path or URL matches one of the project's saved skip paths
+  (`authz skip list`), plus any `--skip-path PATTERN` of the run; `--no-saved-skips` leaves
+  the saved ones out of a run. A new project's list holds files that are public by design:
+  `robots.txt`, sitemaps, `favicon.ico`, `/.well-known/`, web manifests, `crossdomain.xml`
+  and the like, and health checks (`/health`, `/healthz`, `/ping` at any depth; not `/metrics`
+  or `/actuator/...`, which are worth testing);
+- *HEAD and OPTIONS*: always `inconclusive` or `enforced`, never a bypass.
+
+A pattern is a path (`/static/`) or URL (`https://cdn.acme.test/`) a request starts with: `*`
+matches any characters, a trailing `$` means it ends there (`*/health$` is `/health` and
+`/api/health`, not `/healthcare/...`), and case doesn't matter. A path is matched without its
+query string unless the pattern has a `?`. A request named with `--history-id` or a URL is
+tested as it is.
+
+```sh
+brainproxy authz skip list
+brainproxy authz skip add /static/ '*/avatar$' https://cdn.acme.test/
+brainproxy authz skip remove '*/ping$'
+brainproxy authz skip set --defaults           # or `set P...` to replace them, `set` for none
+brainproxy authz run --as bob --skip-path /docs/ --include-static
+```
+
+The run's summary counts what it left out (`skipped`: `static_assets`, `skip_paths`,
+`head_options`, next to `excluded_paths`, `no_credentials` and the others) and lists up to ten of
+each with why (`skipped_examples`: `static asset: Content-Type text/css`, `matches skip path
+/robots.txt$`). `authz matrix` hides static assets and requests matching the saved skip paths
+from any run, older ones and those that tested them on purpose included, and counts them
+(`hidden_requests`); `--all` shows them, each with why it would be `hidden`. A request with a
+`bypass` cell is never hidden.
+
 `authz run --background` returns a run id; `job wait|status|stop` work on it, and
 `authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
 
 **Live mode.** `proxy start --authz bob,anonymous` tests requests while you browse. Each
-in-scope request the proxy records that carries credentials, uses GET, HEAD or OPTIONS
-(and isn't a GraphQL mutation), doesn't match `--authz-exclude` (default: logout and sign-off) and got a 2xx response that
-isn't a static asset (scripts, stylesheets, images, fonts, media) is also sent, in the
-background, as each listed profile and/or with no credentials (`anonymous`), exactly as
-`authz run` does. To test a request live mode leaves out, such as a private image, use
+in-scope request the proxy records that carries credentials, uses GET (and isn't a GraphQL
+mutation), doesn't match `--authz-exclude` (default: logout and sign-off) or a skip path
+(the saved ones, which a running proxy picks up when they change, and any `--authz-skip-path`)
+and got a 2xx response that isn't a static asset (as above; `--authz-include-static` tests
+them; `--authz-head-options` tests HEAD and OPTIONS too) is also sent, in the background, as
+each listed profile and/or with no credentials (`anonymous`), exactly as `authz run` does. To test a request live mode leaves out, such as a private image, use
 `authz run --history-id`. All of it goes
 under one authz run, created when the proxy starts; `proxy start` and `proxy status` print
 its id, and `authz matrix|results|list` and the desktop app's **Access** view work on it
@@ -2751,7 +2801,8 @@ brainproxy authz matrix 12     # the live run's id
 Proxied traffic never waits for the tests. Each method, URL and body is tested once; the
 requests wait in a queue of `--authz-queue` (default 100), and when it is full new ones are
 dropped and counted (`dropped_queue_full` in `proxy status`, next to `skipped_status`,
-`skipped_static` and the other reasons a request wasn't queued). `--authz-rate` caps the
+`skipped_static`, `skipped_skip_paths`, `skipped_head_options` and the other reasons a request
+wasn't queued). `--authz-rate` caps the
 requests per second the tests send (default 5, 0 for no limit); `--authz-keep-cookie`
 keeps a cookie that isn't a credential. The settings in use are stored in the project
 (setting `authz`). `proxy stop` and `project stop` end the run (state `completed`), waiting

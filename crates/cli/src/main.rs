@@ -581,6 +581,12 @@ fn command_name(cmd: &Cmd) -> String {
             authz_cmd::AuthzCmd::Results { .. } => "authz results",
             authz_cmd::AuthzCmd::Matrix { .. } => "authz matrix",
             authz_cmd::AuthzCmd::List { .. } => "authz list",
+            authz_cmd::AuthzCmd::Skip(c) => match c {
+                authz_cmd::SkipCmd::List => "authz skip list",
+                authz_cmd::SkipCmd::Add { .. } => "authz skip add",
+                authz_cmd::SkipCmd::Remove { .. } => "authz skip remove",
+                authz_cmd::SkipCmd::Set { .. } => "authz skip set",
+            },
         },
         Cmd::Job(_) => "job",
         Cmd::Oob(c) => match c {

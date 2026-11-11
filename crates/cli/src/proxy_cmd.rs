@@ -299,10 +299,10 @@ pub struct ProxyRunArgs {
     /// like a reverse proxy. Implies --invisible.
     #[arg(long, value_name = "URL")]
     redirect: Option<String>,
-    /// Live access-control testing: also send each in-scope GET/HEAD/OPTIONS request that
-    /// carries credentials and got a 2xx that isn't a static asset as these auth profiles,
-    /// and/or `anonymous` (no credentials), in the background. Comma-separated or
-    /// repeatable. Results: authz matrix RUN.
+    /// Live access-control testing: also send each in-scope GET request that carries
+    /// credentials and got a 2xx that isn't a static asset or a skip path (authz skip list) as
+    /// these auth profiles, and/or `anonymous` (no credentials), in the background.
+    /// Comma-separated or repeatable. Results: authz matrix RUN.
     #[arg(long, value_name = "NAMES", value_delimiter = ',')]
     authz: Vec<String>,
     /// Requests per second live testing sends at most (0: no limit).
@@ -318,6 +318,18 @@ pub struct ProxyRunArgs {
     /// comma-separated.
     #[arg(long, value_name = "NAME", value_delimiter = ',')]
     authz_keep_cookie: Vec<String>,
+    /// Live testing also tests static assets (stylesheets, scripts, images, fonts, media).
+    #[arg(long)]
+    authz_include_static: bool,
+    /// Live testing also tests HEAD and OPTIONS requests, which have no body to compare
+    /// (only the status says anything).
+    #[arg(long)]
+    authz_head_options: bool,
+    /// Live testing also leaves out requests whose path or URL starts with this (* matches any
+    /// characters, a trailing $ means it ends there), on top of the project's skip paths.
+    /// Repeatable.
+    #[arg(long, value_name = "PATTERN")]
+    authz_skip_path: Vec<String>,
 }
 
 impl ProxyRunArgs {
@@ -334,6 +346,8 @@ impl ProxyRunArgs {
         if self.authz_rate.is_nan() || self.authz_rate < 0.0 {
             return Err(Error::InvalidInput("--authz-rate must be 0 or more".into()));
         }
+        let skip_paths = brainproxy_core::authz::noise::check_skip_paths(&self.authz_skip_path)
+            .map_err(|e| Error::InvalidInput(format!("--authz-skip-path: {e}")))?;
         Ok(LiveAuthz {
             enabled: !self.authz.iter().all(|n| n.trim().is_empty()),
             anonymous: self.authz.iter().any(|n| n.trim() == ANONYMOUS),
@@ -342,6 +356,9 @@ impl ProxyRunArgs {
             queue: self.authz_queue.max(1),
             exclude: self.authz_exclude.clone(),
             keep_cookies: self.authz_keep_cookie.clone(),
+            include_static: self.authz_include_static,
+            head_options: self.authz_head_options,
+            skip_paths,
             run_id: None,
         })
     }
@@ -1293,6 +1310,15 @@ impl Launch {
             if !args.authz_keep_cookie.is_empty() {
                 cmd.arg("--authz-keep-cookie").arg(args.authz_keep_cookie.join(","));
             }
+            if args.authz_include_static {
+                cmd.arg("--authz-include-static");
+            }
+            if args.authz_head_options {
+                cmd.arg("--authz-head-options");
+            }
+            for p in &live.skip_paths {
+                cmd.arg(format!("--authz-skip-path={p}"));
+            }
         }
         brainproxy_core::provenance::pass_on(&mut cmd);
         Ok(Self { cmd, log, wait: args.wait })
@@ -1999,7 +2025,21 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             concurrency: 2,
             rate: live.rate,
         };
-        let opts = LiveOptions { queue: live.queue, concurrency: 2, exclude };
+        let skips = |paths: &[String]| {
+            brainproxy_core::authz::noise::PathSkips::compile(paths)
+                .map_err(|e| Error::InvalidInput(format!("authz skip paths: {e}")))
+        };
+        let saved: brainproxy_core::authz::noise::SavedSkips =
+            Store::open(project)?.setting(brainproxy_core::authz::noise::SKIP_KEY)?;
+        let opts = LiveOptions {
+            queue: live.queue,
+            concurrency: 2,
+            exclude,
+            include_static: live.include_static,
+            head_options: live.head_options,
+            skip_paths: skips(&live.skip_paths)?,
+            saved_skips: skips(&saved.paths)?,
+        };
         let summary =
             serve(project, &args, ca, info, upstream.clone(), auth, Some(LiveRun { run_id, cfg, opts, ctl }), out);
         // serve saved the --auth session.

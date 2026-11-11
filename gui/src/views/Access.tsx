@@ -9,12 +9,12 @@ import { confirm } from "../ui/Confirm";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { afterStart, grid, KIND_LABEL, KINDS, liveArgs, runArgs, runLabel, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
+import { afterStart, grid, KIND_LABEL, KINDS, liveArgs, notTested, parseSkipPaths, runArgs, runLabel, skipSetArgs, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { startLive, withPortHint } from "./proxyPort";
 import { stateClass, type Job } from "./Scanner";
 import { accessConfirm, changeKinds, isLogout } from "./trafficActions";
 
-const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "" };
+const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", history: [], keepCookies: "", rate: "", includeStatic: false };
 
 /** The cell being compared: the run's baseline and the identity's replay. */
 interface Picked {
@@ -43,6 +43,9 @@ export function AccessView({ active }: { active: boolean }) {
   const [showNew, setShowNew] = useState(false);
   const [only, setOnly] = useState<CellKind | null>(null);
   const [worstFirst, setWorstFirst] = useState(true);
+  const [issuesOnly, setIssuesOnly] = useState(true);
+  const [showHidden, setShowHidden] = useState(false);
+  const [showSkips, setShowSkips] = useState(false);
   const [picked, setPicked] = useState<Picked | null>(null);
 
   // The newest run until one is picked; the form when there are none yet.
@@ -56,7 +59,9 @@ export function AccessView({ active }: { active: boolean }) {
   const live = !!current && ["queued", "running", "stopping"].includes(current.state);
   const [job, refreshJob] = usePoll<Job>(() => run(["job", "status", String(runId)]), 2000, active && runId != null && live);
   const [matrix, refreshMatrix] = usePoll<Matrix | null>(
-    () => (runId == null ? Promise.resolve(null) : run<Matrix>(["authz", "matrix", String(runId), "--limit", "2000"])),
+    // Without the noise (counted in hidden_requests), so it can't take up the limit; with it, each
+    // marked, once asked for.
+    () => (runId == null ? Promise.resolve(null) : run<Matrix>(["authz", "matrix", String(runId), "--limit", "2000", ...(showHidden ? ["--all"] : [])])),
     live ? 2000 : 30000,
     active,
   );
@@ -64,17 +69,39 @@ export function AccessView({ active }: { active: boolean }) {
     refreshMatrix();
     setPicked(null);
   }, [runId, refreshMatrix]);
+  useEffect(() => {
+    refreshMatrix();
+  }, [showHidden, refreshMatrix]);
   // A run that just finished: its last rows.
   useEffect(() => {
     if (current && !live) refreshMatrix();
   }, [current?.state, live, refreshMatrix]);
+
+  // What a finished run left out, from its summary.
+  const [summary, setSummary] = useState<{ run: number; skipped: Record<string, unknown> | null } | null>(null);
+  useEffect(() => {
+    if (runId == null || live || !current) return;
+    let cancelled = false;
+    run<Job>(["job", "status", String(runId)]).then(
+      // A batch run's summary has them under `skipped`, live testing's at the top.
+      (j) => !cancelled && setSummary({ run: runId, skipped: j.result?.skipped ?? j.result ?? null }),
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, live, current?.state]);
+  const leftOut = live ? notTested(job?.progress as Record<string, unknown> | null) : summary?.run === runId ? notTested(summary.skipped) : "";
 
   // Requests handed over from Traffic open the new-run form.
   useEffect(() => {
     if (app.accessInput) setShowNew(true);
   }, [app.accessInput]);
 
-  const g = useMemo(() => (matrix && matrix.run_id === runId ? grid(matrix, { only, worstFirst }) : null), [matrix, runId, only, worstFirst]);
+  const g = useMemo(
+    () => (matrix && matrix.run_id === runId ? grid(matrix, { only, worstFirst, issuesOnly, showHidden }) : null),
+    [matrix, runId, only, worstFirst, issuesOnly, showHidden],
+  );
 
   const started = (id: number) => {
     setShowNew(false);
@@ -113,9 +140,15 @@ export function AccessView({ active }: { active: boolean }) {
           </button>
         )}
         <div className="toolbar-end">
+          <label className="check" title="Only rows with a bypass, a response anyone gets without a session, or an error (a request that failed, so nothing was compared). A verdict below picks its rows instead">
+            <input type="checkbox" checked={issuesOnly} onChange={(e) => setIssuesOnly(e.target.checked)} /> Issues only
+          </label>
           <label className="check" title="Rows with a bypass first">
             <input type="checkbox" checked={worstFirst} onChange={(e) => setWorstFirst(e.target.checked)} /> Worst first
           </label>
+          <button className="btn small" onClick={() => setShowSkips((s) => !s)} title="Paths runs and live testing leave out, and this view hides">
+            Skip paths
+          </button>
           <button className={`btn small ${showNew ? "" : "primary"}`} onClick={() => setShowNew((s) => !s)}>
             {showNew ? "Hide new run" : "New run"}
           </button>
@@ -125,6 +158,7 @@ export function AccessView({ active }: { active: boolean }) {
       <div className="az-new" hidden={!showNew}>
         <NewRun onStarted={started} />
       </div>
+      {showSkips && <SkipPaths onSaved={refreshMatrix} onClose={() => setShowSkips(false)} />}
       {g && (
         <div className="toolbar flat az-legend">
           {KINDS.filter((k) => k !== "none" && (g.counts[k] || only === k)).map((k) => (
@@ -133,6 +167,17 @@ export function AccessView({ active }: { active: boolean }) {
             </button>
           ))}
           {g.skipped > 0 && <span className="muted small">{g.skipped} skipped</span>}
+          {(g.hidden > 0 || showHidden) && (
+            <label className="check small" title="Static assets and requests matching a skip path, tested before they were left out">
+              <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> {g.hidden} static or skipped
+            </label>
+          )}
+          {g.quiet > 0 && (
+            <button className="link small" onClick={() => setIssuesOnly(false)} title="Rows that are all enforced, different or inconclusive">
+              {g.quiet} {g.quiet === 1 ? "row" : "rows"} with no issue
+            </button>
+          )}
+          {leftOut && <span className="muted small" title="Left out before sending: the run's summary (brainproxy job status RUN) lists some with why">{leftOut}</span>}
           {matrix?.truncated && <span className="muted small">first 2000 requests</span>}
         </div>
       )}
@@ -142,7 +187,17 @@ export function AccessView({ active }: { active: boolean }) {
         </div>
       ) : !g.rows.length ? (
         <div className="blank">
-          <p>{live ? "Waiting for results…" : only ? "No rows with that verdict." : "This run tested no requests."}</p>
+          <p>
+            {only
+              ? "No rows with that verdict."
+              : g.quiet > 0
+                ? `No issues: ${g.quiet} ${g.quiet === 1 ? "row shows" : "rows show"} only refusals, differences or nothing to compare.`
+                : live
+                  ? "Waiting for results…"
+                  : g.hidden > 0
+                    ? "Only static assets or skipped paths: tick the box above to see them."
+                    : "This run tested no requests."}
+          </p>
         </div>
       ) : (
         <div className="az-grid-wrap">
@@ -207,8 +262,62 @@ function progressText(j: Job): string {
   const p = j.progress as Record<string, number> | null;
   if (!p) return "";
   if (p.requests != null) return `${p.requests_done ?? 0}/${p.requests} requests · ${p.sent ?? 0} sent`;
-  // Live testing through the proxy.
+  // Live testing through the proxy (what it left out is next to the legend).
   return `${p.tested ?? 0} tested · ${p.waiting ?? 0} waiting · ${p.duplicates ?? 0} duplicates${p.dropped_queue_full ? ` · ${p.dropped_queue_full} dropped (queue full)` : ""}`;
+}
+
+// ---------------- skip paths ----------------
+
+function SkipPaths({ onSaved, onClose }: { onSaved: () => void; onClose: () => void }) {
+  const app = useApp();
+  const [text, setText] = useState<string | null>(null);
+  const [info, setInfo] = useState<{ defaults: boolean; syntax: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const show = (d: { paths: string[]; defaults: boolean; syntax: string }) => {
+    setText(d.paths.join("\n"));
+    setInfo({ defaults: d.defaults, syntax: d.syntax });
+  };
+  useEffect(() => {
+    run<{ paths: string[]; defaults: boolean; syntax: string }>(["authz", "skip", "list"]).then(show, (e) => app.toast(e.message, "error"));
+  }, [app.toast]);
+
+  const save = async (args: string[]) => {
+    setBusy(true);
+    try {
+      show(await run(args));
+      onSaved();
+      app.toast("Skip paths saved: they apply to new runs, live testing and this view");
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="detail sc-form az-form az-skips">
+      <div className="row gap">
+        <span className="label">Skip paths</span>
+        <span className="muted small">
+          Requests runs and live testing leave out, and this view hides, for every run. One per line: {info?.syntax ?? "…"}.
+          {info?.defaults && " These are the defaults: files that are public by design."}
+        </span>
+        <button className="icon-btn" onClick={onClose} title="Close">
+          ×
+        </button>
+      </div>
+      <textarea className="input mono" rows={8} value={text ?? ""} disabled={text == null} spellCheck={false} onChange={(e) => setText(e.target.value)} placeholder="/static/&#10;*/health$&#10;https://cdn.example.com/" />
+      <div className="row gap">
+        <button className="btn primary" disabled={busy || text == null} onClick={() => save(skipSetArgs(parseSkipPaths(text ?? "")))}>
+          Save
+        </button>
+        <button className="btn" disabled={busy} onClick={() => save(["authz", "skip", "set", "--defaults"])} title="robots.txt, /.well-known/, favicon.ico, health checks and the like">
+          Back to defaults
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ---------------- compare ----------------
@@ -354,9 +463,9 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
     <div className="detail sc-form az-form">
       <p className="muted small">
         Requests from history are sent again as each identity (with the owner's credentials removed) and with no session, and
-        compared with the owner's response. Only GET, HEAD and OPTIONS requests that carry credentials are picked; logout
-        paths are left alone. Requests sent from Traffic are the exception: they are tested as they are. Every request
-        stays inside the engagement scope.
+        compared with the owner's response. Only GET requests that carry credentials are picked; logout paths, static
+        assets and the skip paths are left alone. Requests sent from Traffic are the exception: they are tested as they
+        are. Every request stays inside the engagement scope.
       </p>
       <div className="sc-field">
         <span className="label">Send as</span>
@@ -432,6 +541,11 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
           {f.select === "tag" && <input className="input mono" value={f.tag} placeholder="api" onChange={(e) => set({ tag: e.target.value })} />}
           {f.select === "where" && <input className="input mono az-where" value={f.where} placeholder="host = 'app.example.com' AND path LIKE '/api/%'" onChange={(e) => set({ where: e.target.value })} />}
         </div>
+        {f.select !== "history" && (
+          <label className="check" title="Stylesheets, scripts, images, fonts, media and source maps, by the response's Content-Type, the browser's Sec-Fetch-Dest or the extension. Usually served to everyone">
+            <input type="checkbox" checked={f.includeStatic} onChange={(e) => set({ includeStatic: e.target.checked })} /> Also test static assets
+          </label>
+        )}
         {f.select === "history" && (
           <div className="az-picked">
             {f.history.map((h) => (
@@ -454,7 +568,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
         <button className="btn" disabled={busy || f.owner !== "" || f.select !== "all"} onClick={onLive} title="Restart the proxy so each request you browse is also tried as these identities">
           Test live while browsing
         </button>
-        <span className="muted small">Live testing restarts the proxy (same address and options) and tests in-scope GET, HEAD and OPTIONS requests as they are recorded, leaving out static assets and responses other than 2xx.</span>
+        <span className="muted small">Live testing restarts the proxy (same address and options) and tests in-scope GET requests as they are recorded, leaving out static assets (unless ticked above), skip paths and responses other than 2xx.</span>
       </div>
     </div>
   );

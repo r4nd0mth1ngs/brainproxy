@@ -2683,6 +2683,16 @@ button.chip {
 .az-where {
   min-width: 420px;
 }
+.az-skips {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+}
+.az-skips textarea {
+  width: 100%;
+  height: auto;
+  min-height: 10em;
+  resize: vertical;
+}
 .az-picked {
   margin-top: 6px;
   max-height: 120px;
