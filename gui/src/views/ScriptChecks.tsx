@@ -226,7 +226,20 @@ function ScriptCheckDialog(p: { initial: { name: string; file: string }; known: 
           <label>
             <span>Test on history #</span>
             <span className="row gap">
-              <input className="input" style={{ width: 120 }} value={row} inputMode="numeric" placeholder="id in Traffic" onChange={(e) => setRow(e.target.value)} />
+              <input
+                className="input"
+                style={{ width: 120 }}
+                value={row}
+                inputMode="numeric"
+                placeholder="id in Traffic"
+                onChange={(e) => setRow(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter here tests the row, as the button beside it does, rather than adding the check.
+                  if (e.key !== "Enter") return;
+                  e.preventDefault();
+                  if (!busy && file.trim() && id != null) test();
+                }}
+              />
               <button type="button" className="btn" disabled={busy || !file.trim() || id == null} onClick={test} title="Run the file's check on that row's request and response. Nothing is saved or sent.">
                 Test
               </button>
