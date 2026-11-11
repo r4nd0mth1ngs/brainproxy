@@ -1,7 +1,28 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { FindingItem } from "../api.ts";
-import { CLOSED, eventText, narrativeCommand, narrativeCredit, trailLine, groupKey, hostsOf, MARK_BATCH, markCommands, matchesFinding, NO_FILTER, noteBy, noteCommand, retestCommand, STATES } from "./findingsFilter.ts";
+import {
+  CLOSED,
+  eventText,
+  narrativeCommand,
+  narrativeCredit,
+  trailLine,
+  groupKey,
+  hostsOf,
+  MARK_BATCH,
+  markCommands,
+  matchesFinding,
+  NO_FILTER,
+  noteBy,
+  noteCommand,
+  recordTicketCommand,
+  reproCommand,
+  retestCommand,
+  STATES,
+  ticketCommand,
+  ticketLinkProblem,
+  ticketText,
+} from "./findingsFilter.ts";
 
 const item = (over: Partial<FindingItem>): FindingItem => ({
   id: 1,
@@ -84,4 +105,31 @@ test("write-ups and agent trails read as sentences", () => {
   assert.ok(narrativeCredit({ ...n, reviewed_origin: "gui", reviewed_at: "2026-11-06T10:00:00Z" }).includes("reviewed by the desktop app"));
   assert.equal(trailLine({ agent_involved: false, requests_total: 0, reviewed_by: null, reviewed_at: null }), "");
   assert.equal(trailLine({ agent_involved: true, requests_total: 1, reviewed_by: null, reviewed_at: null }), "An agent sent 1 request for this finding; no person has looked at it since.");
+});
+
+test("a ticket is copied in its tracker's markup; Jira gets the block it shows as it is", () => {
+  assert.deepEqual(ticketCommand(7, "jira"), ["findings", "ticket", "7", "--to", "jira"]);
+  const t = { title: "[High] SQLi on a.test", body: "**Risk:** ![x](https://e.test/p.png)", payload: { fields: { description: "{noformat}\n**Risk:** ...\n{noformat}" } } };
+  assert.equal(ticketText(t, "github"), "[High] SQLi on a.test\n\n**Risk:** ![x](https://e.test/p.png)");
+  assert.equal(ticketText(t, "jira"), "[High] SQLi on a.test\n\n{noformat}\n**Risk:** ...\n{noformat}");
+  // A Jira answer without a payload still gives the body.
+  assert.equal(ticketText({ title: "T", body: "B" }, "jira"), "T\n\nB");
+});
+
+test("a filed ticket's link is an http(s) URL, recorded as one argument", () => {
+  assert.equal(ticketLinkProblem(" https://github.com/o/r/issues/4 "), null);
+  assert.equal(ticketLinkProblem("https://acme.atlassian.net/browse/SEC-12"), null);
+  assert.equal(ticketLinkProblem(""), "Give the ticket's link.");
+  assert.equal(ticketLinkProblem("javascript:alert(1)"), "Give the ticket's http(s) link.");
+  assert.equal(ticketLinkProblem("SEC-12"), "Give the ticket's http(s) link.");
+  assert.equal(ticketLinkProblem("https://a.test/x y"), "Give the ticket's http(s) link.");
+  assert.equal(ticketLinkProblem("https://a.test/\u0007"), "Give the ticket's http(s) link.");
+  assert.equal(ticketLinkProblem(`https://a.test/${"x".repeat(2000)}`), "Give the ticket's http(s) link.");
+  assert.deepEqual(recordTicketCommand(7, "github", " https://github.com/o/r/issues/4 "), ["findings", "ticket", "7", "--to", "github", "--record=https://github.com/o/r/issues/4"]);
+  assert.deepEqual(recordTicketCommand(7, "jira", "https://x.test/--force"), ["findings", "ticket", "7", "--to", "jira", "--record=https://x.test/--force"]);
+});
+
+test("a repro pack replaces a file only when the save dialog asked about it", () => {
+  assert.deepEqual(reproCommand(9, "/w/finding-9.json", true), ["findings", "repro", "9", "--output", "/w/finding-9.json", "--force"]);
+  assert.deepEqual(reproCommand(9, "/w/finding-9.json", false), ["findings", "repro", "9", "--output", "/w/finding-9.json"]);
 });

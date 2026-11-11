@@ -152,3 +152,52 @@ export function trailLine(t: Trail): string {
   const sent = `An agent sent ${t.requests_total} request${t.requests_total === 1 ? "" : "s"} for this finding`;
   return t.reviewed_by ? `${sent}; a person looked at it after (${t.reviewed_by}).` : `${sent}; no person has looked at it since.`;
 }
+
+/** Where a ticket is filed. */
+export type Tracker = "github" | "jira";
+
+/** What `findings ticket` writes (nothing is sent): Jira's payload has the body in a block Jira shows as it is. */
+export interface Ticket {
+  title: string;
+  body: string;
+  payload?: { fields?: { description?: string } };
+}
+
+/** The command that writes a finding up for a tracker. */
+export function ticketCommand(id: number, tracker: Tracker): string[] {
+  return ["findings", "ticket", String(id), "--to", tracker];
+}
+
+/** The text to paste: the title, then the body in the tracker's own markup (Markdown for
+ * GitHub; for Jira the `{noformat}` description, since Jira's wiki markup would render links
+ * and images a response quoted). */
+export function ticketText(t: Ticket, tracker: Tracker): string {
+  const body = tracker === "jira" ? (t.payload?.fields?.description ?? t.body) : t.body;
+  return `${t.title}\n\n${body}`;
+}
+
+/** Why a filed ticket's link can't be recorded, as the CLI checks it; null when it can. */
+export function ticketLinkProblem(url: string): string | null {
+  const u = url.trim();
+  if (!u) return "Give the ticket's link.";
+  if (u.length > 2000 || /[\s\p{Cc}]/u.test(u)) return "Give the ticket's http(s) link.";
+  try {
+    const p = new URL(u);
+    if (p.protocol !== "http:" && p.protocol !== "https:") return "Give the ticket's http(s) link.";
+  } catch {
+    return "Give the ticket's http(s) link.";
+  }
+  return null;
+}
+
+/** The command that keeps a filed ticket's link on the finding (its timeline and reports).
+ * A person does this: MCP refuses it. */
+export function recordTicketCommand(id: number, tracker: Tracker, url: string): string[] {
+  return ["findings", "ticket", String(id), "--to", tracker, `--record=${url.trim()}`];
+}
+
+/** The command that writes a finding's repro pack (request with secrets masked, a curl command,
+ * the response around the evidence, what the rule looks for, the command that checks it again). */
+export function reproCommand(id: number, path: string, overwrite: boolean): string[] {
+  return ["findings", "repro", String(id), "--output", path, ...(overwrite ? ["--force"] : [])];
+}
