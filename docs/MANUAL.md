@@ -360,6 +360,22 @@ The sidebar groups the tools by what you are doing.
   sent. Edit a held message and Forward it, or Drop it. Requests outside the engagement are
   never held, because they are refused anyway. Unanswered messages are forwarded after a
   timeout (Settings › Intercept options).
+  - **Filter:** the box beside the checkboxes holds only the messages that match a query in
+    the filter language of Traffic's Query mode (below), such as `method=POST NOT
+    path:/static` or `req.header.authorization:* host:api.acme.test`. Enter (or leaving the
+    box) applies it, Escape puts it back, and an empty box holds everything. The list beside
+    it offers the saved Traffic filters that are queries; only the query is used, not their
+    sources or checkboxes. It is `intercept enable --filter` ([Intercept filter](#intercept-filter)).
+    - What the query can ask about is what is known when the message is held: a request is
+      matched by itself (as it would go out, after match-and-replace rules), a response by the
+      request sent and the response, and a WebSocket message by its connection's handshake
+      request. So response fields (`status`, `length`, `duration`, `title`, `type`, `resp`,
+      `resp.body`, `body`, `resp.headers`, `resp.header.NAME`) are refused, with a message,
+      unless only **Responses** is ticked; `id`, `error`, `note` and `tag` are refused always,
+      since a held message has none yet. A bare word searches the URL (and a response's title)
+      and matches the method.
+    - Host, path and method (Settings › Intercept options) still apply: a message is held when
+      all that are set match.
 - **Traffic:** everything that went through the proxy, Replay, the crawler, scanners, and
   imports.
   - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
@@ -404,6 +420,8 @@ The sidebar groups the tools by what you are doing.
       change it. Values are always passed to the database as values, never as SQL.
     - A query on notes or tags is run again when you change a note or a highlight in Traffic;
       a change made elsewhere (the CLI, an agent) shows once you change the query.
+    - The same language picks what Intercept holds (its filter box, `intercept enable
+      --filter`), with the fields known when a message is held.
   - **Saved filters:** *Save…* names the current filters (text and what it searches, sources
     and the checkboxes); pick one from the list to apply it again, or *Delete* it. They are kept
     in the project file (`history filters list` and `history filters save`), so they travel
@@ -1019,7 +1037,8 @@ byte, side by side or unified.
   projects through the clipboard; an import that would run scripts names their files first. In Traffic, an exchange a rule changed has both versions:
   *Before rules* and *Sent* on the request, *Received* and *After rules* on the response. See
   [Match-and-replace rules](#match-and-replace-rules-rules).
-- **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
+- **Intercept options:** which methods, hosts, and paths to hold, a query they must also match
+  (the intercept filter, with the saved Traffic queries to start from), and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
   Chromium, curl, or a shell at it. *Port* sets the port the app's proxy listens on, for every
   project. Left empty, it is 8080, or the next free one when a project opens. A chosen port
@@ -1168,6 +1187,7 @@ brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
 brainproxy history list --filter 'status:5xx resp.body:"stack trace" NOT path:/health'   # the filter language (Traffic's Query)
+brainproxy intercept enable --filter 'method=POST NOT path:/static'   # hold only what the same language matches
 brainproxy history filters list                           # the app's saved Traffic filters, kept in the project
 echo '{"filters":[{"name":"errors","filter":{"text":"status:5xx","query":true}}]}' \
     | brainproxy history filters save --append            # adds one (replaces them without --append)
@@ -1223,6 +1243,50 @@ full list. The text summary lists each member and its history rows. Different me
 normally return different statuses or lengths: compare copies within one request index.
 The flag is also on the MCP `send` tool and in `capabilities send`; through MCP a
 member comes from the call's stdin (`--also -`), not a file (see MCP.md).
+
+### Intercept filter
+
+`intercept enable --filter QUERY` holds only the messages whose exchange matches a query in the
+filter language of `history list --filter` (Traffic's Query mode; the fields are listed under
+[Proxy](#proxy) and in `capabilities history list`). The proxy asks the query the same way the
+history list does, with the same SQL, on a one-row table made from the message in flight, so a
+query that finds a recorded exchange holds the same exchange next time.
+
+```sh
+brainproxy intercept enable --filter 'req.header.authorization:* NOT path:/static'
+brainproxy intercept enable --responses --filter 'status:5xx OR resp.body:"stack trace"'
+brainproxy intercept enable --ws-to-server --filter 'host:chat.acme.test path:/socket'
+brainproxy intercept enable --method POST --filter 'req.body~"(?i)role"'   # all must match
+```
+
+- A held request is matched by itself, as it would go out (after match-and-replace rules and
+  the auth session); a held response by the request that was sent and the response the client
+  would get (after response rules); a WebSocket message by its connection's handshake request.
+  An HTTP/2 request is matched in the form it is held in (its headers as the client sent them),
+  before it is turned into HTTP/1.1 for an origin that doesn't speak HTTP/2, so a header that
+  turning adds (`Content-Length`, for one) is in its history entry but not yet in the held
+  request. A query on `time` is asked again for each WebSocket message; others once per
+  connection, until the settings change.
+- A field that isn't known yet when the message is held is refused with a message, rather
+  than never matching: the response fields (`status`, `length`, `duration`, `title`, `type`,
+  `resp`, `resp.body`, `body`, `resp.headers`, `resp.header.NAME`) unless only `--responses`
+  is held, and `id`, `error`, `note` and `tag` always (a held message has no history entry
+  yet). There is one filter for every direction held, so to pick responses by their status,
+  hold only responses.
+- A bare word searches the URL and matches the method, and searches a response's title too.
+- `--host`, `--path` and `--method` still work and combine with `--filter`: a message is held
+  when all that are given match. They read the request as the client sent it, before
+  match-and-replace rules, while the filter reads it as it goes out: with a rule that rewrites
+  the path, `--path` sees the old one and `path:` the new one. `--method` is not applied to
+  WebSocket messages; the filter is, through the handshake request (whose method is `GET`).
+- A proxy started by a build from before `--filter` doesn't know the setting and holds what
+  the other options match, and its `intercept disable` or `enable` drops the filter.
+- `enable` replaces every intercept setting, so pass `--filter` again with each call; an
+  empty one is none. `intercept status` shows it as `settings.filter`. A saved Traffic filter
+  in Query mode is a query `--filter` takes (`history filters list`, its `filter.text`).
+- The query is checked when it is saved, so a running proxy never gets one it can't use. A
+  query that fails to run on a message (not expected) holds the message, which is forwarded on
+  the intercept's timeout as usual.
 
 ### Match-and-replace rules (`rules`)
 

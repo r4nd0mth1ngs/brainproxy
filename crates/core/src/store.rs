@@ -1698,7 +1698,7 @@ fn clip_text(s: &str, max: usize) -> String {
     format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
 }
 
-fn register_functions(conn: &Connection) -> Result<()> {
+pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("header", 2, flags, |ctx| {
         let Some(json) = ctx.get::<Option<String>>(0)? else { return Ok(None) };

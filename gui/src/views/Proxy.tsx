@@ -48,6 +48,7 @@ import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, 
 import { EventStreams } from "./EventStreams";
 import { ruleEditNote } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
+import { filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
 
 export function ProxyView() {
   const app = useApp();
@@ -616,38 +617,81 @@ interface Held {
   length: number;
 }
 
-export interface InterceptSettings {
-  enabled: boolean;
-  requests: boolean;
-  responses: boolean;
-  ws_to_server?: boolean;
-  ws_to_client?: boolean;
-  host?: string;
-  path?: string;
-  method?: string;
-  timeout_secs: number;
-  timeout_action: string;
-}
+export { interceptEnableArgs, type InterceptSettings } from "./intercept";
 
-/** `intercept enable` arguments for these settings. Enable replaces every setting, so the
- * filters are passed back each time or they would be cleared. */
-export function interceptEnableArgs(s: InterceptSettings): string[] {
-  const opt = (flag: string, v?: string) => (v ? [`${flag}=${v}`] : []);
-  return [
-    "intercept",
-    "enable",
-    ...(s.requests ? ["--requests"] : []),
-    ...(s.responses ? ["--responses"] : []),
-    ...(s.ws_to_server ? ["--ws-to-server"] : []),
-    ...(s.ws_to_client ? ["--ws-to-client"] : []),
-    ...opt("--host", s.host),
-    ...opt("--path", s.path),
-    ...opt("--method", s.method),
-    "--timeout",
-    String(s.timeout_secs),
-    "--timeout-action",
-    s.timeout_action,
-  ];
+/**
+ * The intercept's filter: a query in the filter language, with the saved Traffic filters that
+ * are queries to start from. With `onCommit` (the Intercept toolbar) Enter, leaving the box or
+ * picking a saved filter applies it and Escape puts it back; without, the text is part of a
+ * draft saved elsewhere.
+ */
+export function InterceptFilter({
+  value,
+  onChange,
+  onCommit,
+  onRevert,
+  disabled,
+  width = 260,
+}: {
+  value: string;
+  onChange: (text: string) => void;
+  onCommit?: (text: string) => void;
+  onRevert?: () => void;
+  disabled?: boolean;
+  width?: number;
+}) {
+  const { project } = useApp();
+  const [saved, setSaved] = useState<{ name: string; text: string }[]>([]);
+  // Read again when the list is opened: Traffic may have saved one since.
+  const load = () =>
+    run<{ filters: unknown }>(FILTERS_LIST_ARGS, { project })
+      .then((d) => setSaved(savedQueries(savedFrom(d.filters))))
+      .catch(() => {});
+  useEffect(() => {
+    load();
+  }, []);
+  const picked = savedQueryFor(saved, value);
+  return (
+    <>
+      <input
+        className="input mono"
+        style={{ width }}
+        aria-label="Intercept filter"
+        placeholder="Hold only: query, e.g. method=POST NOT path:/static"
+        title={INTERCEPT_FILTER_HELP}
+        spellCheck={false}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onCommit?.(value);
+          if (e.key === "Escape") onRevert?.();
+        }}
+        onBlur={() => onCommit?.(value)}
+      />
+      <select
+        className="input"
+        aria-label="Saved filters for intercept"
+        value={picked ?? ""}
+        disabled={disabled}
+        onFocus={load}
+        title="Saved Traffic filters in Query mode. Only the query is used: their sources and checkboxes are Traffic's."
+        onChange={(e) => {
+          const s = saved.find((x) => x.name === e.target.value);
+          if (!s) return;
+          onChange(s.text);
+          onCommit?.(s.text);
+        }}
+      >
+        <option value="">{saved.length ? "Saved filters" : "No saved queries"}</option>
+        {saved.map((s) => (
+          <option key={s.name} value={s.name}>
+            {s.name}
+          </option>
+        ))}
+      </select>
+    </>
+  );
 }
 
 const HELD_TITLE: Record<Held["direction"], string> = {
@@ -683,15 +727,49 @@ function Intercept({ active }: { active: boolean }) {
   }, [current]);
 
   const s = settings?.settings;
-  const toggle = async (patch: Partial<InterceptSettings>) => {
-    const next = { ...s!, ...patch };
-    try {
-      if (!next.enabled) await run(["intercept", "disable"]);
-      else await run(interceptEnableArgs(next));
-      refreshSettings();
-    } catch (e: any) {
-      app.toast(e.message, "error");
-    }
+  // Changes run one after another, each on the settings as they are when its turn comes,
+  // against the project they were made for (`interceptChanger`).
+  const latest = useRef({ toast: app.toast, refresh: refreshSettings });
+  latest.current = { toast: app.toast, refresh: refreshSettings };
+  const [changer] = useState(() =>
+    interceptChanger(
+      (args, opts) => run(args, opts),
+      (e: any) => latest.current.toast(e?.message ?? String(e), "error"),
+      () => latest.current.refresh(),
+    ),
+  );
+  const change = (make: (cur: InterceptSettings) => string[] | null) => changer(app.project, make);
+
+  // The filter as typed, until it is applied and shows in the settings (null: the saved one is shown).
+  const [filterDraft, setFilterDraft] = useState<string | null>(null);
+  // The text last applied, so Enter and then leaving the box don't apply (or refuse) it twice.
+  const triedFilter = useRef<string | null>(null);
+  // Applied, and kept in the box until the settings polled show it.
+  const appliedFilter = useRef<string | null>(null);
+  useEffect(() => {
+    const text = appliedFilter.current;
+    if (!s || text == null || filterChanged(s, text)) return;
+    appliedFilter.current = null;
+    setFilterDraft((d) => (d === text ? null : d));
+  }, [s]);
+  const applyFilter = async (text: string) => {
+    if (!s?.enabled) return setFilterDraft(null);
+    // Nothing typed, and the box left: nothing to do.
+    if (filterDraft === null && !filterChanged(s, text)) return;
+    if (triedFilter.current === text) return;
+    triedFilter.current = text;
+    // Compared with the settings as they are when its turn comes, not as last polled: an apply
+    // still queued may change them. Kept as typed when refused, to fix.
+    const ok = await change(filterChange(text));
+    if (ok) appliedFilter.current = text;
+  };
+  const toggle = (patch: (cur: InterceptSettings) => Partial<InterceptSettings>) => {
+    // A query refused for these settings may do for the new ones: Enter tries it again.
+    triedFilter.current = null;
+    return change((cur) => {
+      const next = { ...cur, ...patch(cur) };
+      return next.enabled ? interceptEnableArgs(next) : ["intercept", "disable"];
+    });
   };
 
   const decide = async (how: "forward" | "drop") => {
@@ -713,22 +791,45 @@ function Intercept({ active }: { active: boolean }) {
       <div className="toolbar">
         <button
           className={`btn ${s?.enabled ? "primary" : ""}`}
-          onClick={() => s && toggle({ enabled: !s.enabled, requests: s.enabled ? s.requests : s.requests || !(s.responses || s.ws_to_server || s.ws_to_client) })}
+          onClick={() => s && toggle((c) => ({ enabled: !c.enabled, requests: c.enabled ? c.requests : c.requests || !(c.responses || c.ws_to_server || c.ws_to_client) }))}
         >
           Intercept is {s?.enabled ? "on" : "off"}
         </button>
         <label className="check">
-          <input type="checkbox" checked={!!s?.requests} disabled={!s?.enabled} onChange={(e) => toggle({ requests: e.target.checked })} /> Requests
+          <input type="checkbox" checked={!!s?.requests} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ requests: on }));
+            }} /> Requests
         </label>
         <label className="check">
-          <input type="checkbox" checked={!!s?.responses} disabled={!s?.enabled} onChange={(e) => toggle({ responses: e.target.checked })} /> Responses
+          <input type="checkbox" checked={!!s?.responses} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ responses: on }));
+            }} /> Responses
         </label>
         <label className="check" title="WebSocket messages from the browser (text and binary)">
-          <input type="checkbox" checked={!!s?.ws_to_server} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_server: e.target.checked })} /> WS to server
+          <input type="checkbox" checked={!!s?.ws_to_server} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ ws_to_server: on }));
+            }} /> WS to server
         </label>
         <label className="check" title="WebSocket messages from the server (text and binary)">
-          <input type="checkbox" checked={!!s?.ws_to_client} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_client: e.target.checked })} /> WS to client
+          <input type="checkbox" checked={!!s?.ws_to_client} disabled={!s?.enabled} onChange={(e) => {
+              const on = e.target.checked;
+              toggle(() => ({ ws_to_client: on }));
+            }} /> WS to client
         </label>
+        <InterceptFilter
+          value={filterDraft ?? s?.filter ?? ""}
+          disabled={!s?.enabled}
+          width={240}
+          onChange={(text) => {
+            triedFilter.current = null;
+            setFilterDraft(text);
+          }}
+          onCommit={applyFilter}
+          onRevert={() => setFilterDraft(null)}
+        />
         <span className="sep" />
         <button className="btn primary" disabled={!message} onClick={() => decide("forward")}>
           Forward{message && message.text !== message.original ? " edited" : ""}

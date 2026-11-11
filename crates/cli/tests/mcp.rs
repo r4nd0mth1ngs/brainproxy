@@ -1558,3 +1558,24 @@ fn an_agent_is_offered_no_way_to_run_a_script_of_its_own() {
     let (err, env) = m.call("scan_script_list", json!({}));
     assert!(!err && env["data"]["scripts"] == json!([]), "{env}");
 }
+
+#[test]
+fn an_agent_can_filter_what_intercept_holds() {
+    let mut m = Mcp::start(&tmp_project("intercept-filter"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    let enable = tools.iter().find(|t| t["name"] == "intercept_enable").unwrap();
+    assert_eq!(enable["inputSchema"]["properties"]["filter"]["type"], "string", "{enable}");
+    assert!(enable["description"].as_str().unwrap().contains("history list --filter"), "{enable}");
+
+    // A field the hold can't know yet is refused, with what to do instead.
+    let (err, e) = m.call("intercept_enable", json!({"filter": "status:5xx"}));
+    assert!(err, "{e}");
+    assert_eq!(e["error"]["kind"], "invalid_input");
+    assert!(e["error"]["message"].as_str().unwrap().contains("Hold only responses"), "{e}");
+    let (err, e) = m.call("intercept_enable", json!({"responses": true, "filter": "status:5xx resp.body:error"}));
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["settings"]["filter"], "status:5xx resp.body:error");
+    let (_, e) = m.call("intercept_status", json!({}));
+    assert_eq!(e["data"]["settings"]["filter"], "status:5xx resp.body:error");
+}
