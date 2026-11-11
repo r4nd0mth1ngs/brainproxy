@@ -80,7 +80,7 @@ export function TrafficExport({ filter, shown, close }: { filter: TrafficFilter;
         <h2 id="export-title">Export traffic as HAR</h2>
         <p id="export-help">
           Every request the current filter matches ({shown.toLocaleString("en-US")} shown now, more if not all are loaded), oldest first, up to{" "}
-          {EXPORT_LIMIT.toLocaleString("en-US")}. Browsers, Burp, ZAP and <code>import har</code> read it. Session secrets are masked, as in reports.
+          {EXPORT_LIMIT.toLocaleString("en-US")}. Browsers, ZAP and <code>import har</code> read it. Session secrets are masked, as in reports.
         </p>
         <label className="check">
           <input type="checkbox" checked={o.keepSecrets} onChange={(e) => setO({ ...o, keepSecrets: e.target.checked })} /> Keep secrets as recorded
