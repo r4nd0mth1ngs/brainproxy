@@ -92,16 +92,18 @@ fn is_ram_backed(_: &Path) -> bool {
     false
 }
 
-/// Per user, since /dev/shm and /tmp are shared.
+/// Per user, since /dev/shm and /tmp are shared. Named after the CLI (`brainproxy-temp-<uid>`,
+/// `brainproxy-dev-temp-<uid>` for a dev package), so a dev app never offers, or migrates, a
+/// release's leftovers.
 #[cfg(unix)]
 fn folder_name() -> String {
-    format!("brainproxy-temp-{}", unsafe { libc::getuid() })
+    format!("{}-temp-{}", crate::cli_name(), unsafe { libc::getuid() })
 }
 
 /// The Windows temp folder is already per user.
 #[cfg(not(unix))]
 fn folder_name() -> String {
-    "brainproxy-temp".into()
+    format!("{}-temp", crate::cli_name())
 }
 
 /// The folder holding `project`, resolved ("." for a bare file name).

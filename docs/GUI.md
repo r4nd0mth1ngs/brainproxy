@@ -501,6 +501,78 @@ mkdir -p gui/src-tauri/binaries && cp target/$T/release/brainproxy gui/src-tauri
 cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binaries/brainproxy"]}}'
 ```
 
+### Dev packages
+
+`make dev-deb` (Linux) and `make dev-macos` (macOS) build the app from the working tree as a
+separate product, **brainproxy-dev**, that installs beside a release without replacing or
+breaking it. Each checks what it needs first (a git checkout, the Rust target, Node.js 23.6+
+and npm, and WebKitGTK 4.1 and librsvg on Linux; macOS itself and the Xcode command line tools
+for the Mac), runs `npm ci` when `gui/package-lock.json` changed (not through a symlinked
+`gui/node_modules`, which it uses as it is), builds the CLI sidecar, and
+bundles with `gui/src-tauri/tauri.dev.conf.json` merged over `tauri.conf.json` (plus the
+version). The release config and the CI job are unchanged.
+
+```sh
+make help                        # all targets
+make dev-version                 # 0.8.0-dev.20261110170142.g6e3fad0 (.dirty with changes or untracked files)
+make dev-deb                     # -> dist/brainproxy-gui-<dev version>-linux-x86_64.deb (+ .sha256)
+make dev-macos                   # -> dist/brainproxy-gui-<dev version>-macos-arm64.dmg (+ .sha256)
+```
+
+`DEB_TARGET` / `MAC_TARGET` pick another Rust target and `DIST` another output folder; the build
+output goes where Cargo says (`target/`, or `$CARGO_TARGET_DIR`). The version is
+`<Cargo.toml version>-dev.<commit time, UTC>.g<commit>`: valid semver for Tauri, and as a
+Debian version a build of a later-committed commit upgrades an earlier one (two commits in the
+same second order by hash; a rebuild of one commit reinstalls). The app shows it (Settings,
+update check), so you can tell which commit is installed. On the Mac, `Info.plist` keeps
+Apple's numeric forms: `CFBundleShortVersionString` is Cargo.toml's version and
+`CFBundleVersion` the commit time.
+
+| | Release | Dev |
+| --- | --- | --- |
+| Debian package | `brainproxy` | `brainproxy-dev` |
+| GUI binary | `/usr/bin/brainproxy-gui` | `/usr/bin/brainproxy-gui-dev` |
+| CLI (sidecar) | `/usr/bin/brainproxy` | `/usr/bin/brainproxy-dev` |
+| Menu entry, icons | `brainproxy.desktop`, `hicolor/*/apps/brainproxy-gui.png` | `brainproxy-dev.desktop`, `hicolor/*/apps/brainproxy-gui-dev.png` |
+| macOS app | `/Applications/brainproxy.app` | `/Applications/brainproxy-dev.app` |
+| Identifier (app data, macOS bundle id) | `dev.brainproxy.gui` | `dev.brainproxy.gui-dev` |
+| Window title, icon | brainproxy, purple | brainproxy (dev), orange with DEV |
+| Temporary engagements | `brainproxy-temp-<uid>` | `brainproxy-dev-temp-<uid>` |
+| CLI home (CA, checks, rule data) | `~/.local/share/brainproxy` | the same |
+
+The app finds its CLI next to its own executable under the sidecar's name in the config it
+was built with (`bundle.externalBin`: `binaries/brainproxy` for a release,
+`binaries/brainproxy-dev` from `tauri.dev.conf.json`; `brainproxy` when there is none, as in
+`cargo tauri dev`), so the dev app runs the dev CLI (never the release's `brainproxy` beside
+it) and names its temp folder after it. Its own identifier gives it its own webview storage,
+so Recent, theme and update settings are its own too.
+
+The CLI home is shared on purpose: one interception CA to trust, and one set of your checks,
+Nuclei templates and rule data. A release validates updated rule data and falls back to its
+built-in copy, and leaves out check files it can't parse. Updates into the home (`scan data
+update`, `checks update`, and the feed, which an app with daily update checks on updates when
+it opens) take
+`<home>/.update.lock`, so two apps opened together update one after the other instead of
+swapping each other's staging folders. Project files are not in the home,
+so this choice doesn't protect them either way: a dev build with a newer project schema
+migrates any project you open in it, and the release then refuses that project as newer than
+it supports. Open a copy in the dev app if you'll still need it in the release. Pass
+`--home` / `$BRAINPROXY_HOME` to the dev CLI for a separate home. The update check compares
+the release part of the version, so a dev app offers the next release, which installs as
+`brainproxy` beside it.
+
+The macOS app is ad-hoc signed (`signingIdentity: "-"`, as the release config), **not**
+signed with a Developer ID and **not** notarised, so it only runs on a Mac that allows it: a
+`.dmg` you built yourself isn't quarantined, but one copied from elsewhere needs Open Anyway
+or `xattr -dr com.apple.quarantine /Applications/brainproxy-dev.app`. A `.dmg` (what CI ships)
+rather than a `.pkg`: dragging `brainproxy-dev.app` into Applications sits beside
+`brainproxy.app` because the bundle names differ, while a `.pkg` would add an installer
+receipt and need an administrator, for nothing gained. Delete the app to remove it.
+
+`tauri.dev.conf.json` repeats the release's `app.windows` entry (a merged config replaces
+arrays whole), so change both when the window changes. The icons are in
+`gui/src-tauri/icons/dev/` (`npx tauri icon icons/dev/icon.png -o <dir>` regenerates them).
+
 ## Known gaps
 
 - The Fuzzer sends the raw request on stdin (`fuzz run --background --target=... -`); the

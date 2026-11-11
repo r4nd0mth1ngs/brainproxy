@@ -653,6 +653,36 @@ async fn feed_is_signed_and_verified() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
+/// Two apps (or a release and a dev build sharing the home) updating at once: each update
+/// waits for the other, so neither loses the installed store to the other's staging swap.
+#[test]
+fn feed_updates_at_once_keep_the_store() {
+    let base = std::env::temp_dir().join(format!("bp-feed-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("repo/feed");
+    std::fs::create_dir_all(src.join("http")).unwrap();
+    std::fs::write(src.join("http/git.yaml"), GIT_CONFIG).unwrap();
+    feed::sign(&src, TEST_KEY).unwrap();
+    let home = base.join("home");
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let (home, repo) = (home.clone(), base.join("repo"));
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                for _ in 0..5 {
+                    rt.block_on(feed::update_with(&home, Source::Dir(repo.clone()), &[TEST_PUBLIC])).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert!(brainproxy_dir(&home).join("http/git.yaml").is_file());
+    assert_eq!(nuclei_status(&home).brainproxy.unwrap().stored, 1);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
 #[test]
 fn feed_lists_only_plain_template_paths() {
     let (_, pair_public, _) = feed::keygen().unwrap();

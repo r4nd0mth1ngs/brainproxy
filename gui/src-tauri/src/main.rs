@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tauri::Manager;
@@ -23,16 +23,32 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
+static CLI_NAME: OnceLock<String> = OnceLock::new();
+
+/// The CLI's file name: the sidecar's (`bundle.externalBin`) in the config this app was built
+/// with, else `brainproxy`. Releases bundle `binaries/brainproxy`; a dev package
+/// (`tauri.dev.conf.json`, `make dev-deb`) bundles `binaries/brainproxy-dev`, so it runs its own
+/// CLI, keeps its own temp folder, and installs beside a release without touching it.
+fn cli_name() -> &'static str {
+    CLI_NAME.get().map_or("brainproxy", String::as_str)
+}
+
+fn sidecar_name(config: &tauri::Config) -> Option<String> {
+    let bin = config.bundle.external_bin.as_ref()?.first()?;
+    let name = std::path::Path::new(bin).file_name()?.to_str()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The CLI to run: $BRAINPROXY_BIN, else the bundled sidecar next to this executable,
-/// else `brainproxy` on PATH.
+/// else `cli_name()` on PATH.
 fn binary() -> PathBuf {
     if let Some(bin) = std::env::var_os("BRAINPROXY_BIN") {
         return bin.into();
     }
-    let name = if cfg!(windows) { "brainproxy.exe" } else { "brainproxy" };
+    let name = if cfg!(windows) { format!("{}.exe", cli_name()) } else { cli_name().to_string() };
     std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.join(name)))
+        .and_then(|exe| Some(exe.parent()?.join(&name)))
         .filter(|p| p.is_file())
         .unwrap_or_else(|| name.into())
 }
@@ -316,6 +332,10 @@ async fn project_delete(project: String, force: Option<bool>) -> Result<Value, S
 fn main() {
     // Clear any race-request staging directory a previous hard exit left behind.
     race_files::sweep_orphans();
+    let context = tauri::generate_context!();
+    if let Some(name) = sidecar_name(context.config()) {
+        let _ = CLI_NAME.set(name);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -331,6 +351,29 @@ fn main() {
             temp_discard,
             project_delete
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running brainproxy");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(bundle: serde_json::Value) -> tauri::Config {
+        serde_json::from_value(json!({"identifier": "dev.brainproxy.test", "bundle": bundle})).unwrap()
+    }
+
+    #[test]
+    fn the_cli_is_the_bundled_sidecar() {
+        assert_eq!(sidecar_name(&config(json!({}))), None);
+        assert_eq!(sidecar_name(&config(json!({"externalBin": []}))), None);
+        assert_eq!(
+            sidecar_name(&config(json!({"externalBin": ["binaries/brainproxy"]}))).as_deref(),
+            Some("brainproxy")
+        );
+        assert_eq!(
+            sidecar_name(&config(json!({"externalBin": ["binaries/brainproxy-dev"]}))).as_deref(),
+            Some("brainproxy-dev")
+        );
+    }
 }
