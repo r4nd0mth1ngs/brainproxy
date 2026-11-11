@@ -1,4 +1,4 @@
-// New brainproxy versions: checked on GitHub once a day when enabled (Settings › Rules & data),
+// New brainproxy versions: checked on GitHub once a day when enabled (Settings › Rules & Updates),
 // downloaded on request or automatically (checked against the release's sha256), then opened by
 // the user. Nothing is installed behind their back.
 
@@ -187,7 +187,7 @@ export function AppUpdateCard() {
   );
 }
 
-/** Settings › Rules & data: the automatic check and download, and a manual check. */
+/** Settings › Rules & Updates: the automatic check and download, and a manual check. */
 export function AppUpdateSettings() {
   const app = useApp();
   const [check, setCheck] = useState(autoCheck);

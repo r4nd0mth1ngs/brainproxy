@@ -48,7 +48,7 @@ The desktop app includes the command-line tool, so you don't need both.
 **Updating.** The desktop app checks GitHub for a new version once a day and shows it on the
 Overview, with a button that downloads the installer to your Downloads folder (checked
 against its published sha256) and one that opens it. Close brainproxy before installing.
-Settings › Rules & data turns the check off, or makes the download automatic. On the
+Settings › Rules & Updates turns the check off, or makes the download automatic. On the
 command line, `brainproxy update check` says whether a newer release exists and
 `brainproxy update download` saves the binary for this machine under its release name, e.g.
 `brainproxy-0.3.9-linux-x86_64` (`--kind gui` for the app installer, `--dir` for another
@@ -1084,7 +1084,7 @@ byte, side by side or unified.
   - Passwords are never stored: give the variable's name, and set it where the command or
     the proxy runs (the proxy reads it in its own process).
 - **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.
-- **Rules & data:** update the ZAP rule data and Nuclei templates; check for a new
+- **Rules & Updates:** update the ZAP rule data and Nuclei templates; check for a new
   brainproxy daily, download it automatically, or check now.
 - **Project:** project information, the engagement, and *Start the proxy when a project
   opens* (on the port set under *Proxy*). While it is on, a proxy the app started (when the

@@ -50,7 +50,7 @@ import { MacroBuilder, SessionHandling } from "./SessionHandling";
 import type { MacroSummary, SessionRule, Signer } from "./sessionRules";
 import NOTICE from "../../../NOTICE?raw";
 
-type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "data" | "project" | "licenses";
+type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "updates" | "project" | "licenses";
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: "auth", label: "Auth profiles" },
@@ -59,7 +59,7 @@ const SUBS: { id: Sub; label: string }[] = [
   { id: "proxy", label: "Proxy" },
   { id: "connections", label: "Connections" },
   { id: "ca", label: "TLS / CA" },
-  { id: "data", label: "Rules & data" },
+  { id: "updates", label: "Rules & Updates" },
   { id: "project", label: "Project" },
   { id: "licenses", label: "Open source licenses" },
 ];
@@ -82,7 +82,7 @@ export function SettingsView() {
       {sub === "proxy" && <ProxySetup />}
       {sub === "connections" && <Connections />}
       {sub === "ca" && <Ca />}
-      {sub === "data" && <RuleData />}
+      {sub === "updates" && <RulesAndUpdates />}
       {sub === "project" && <Project />}
       {sub === "licenses" && <Licenses />}
     </div>
@@ -1145,7 +1145,7 @@ function Ca() {
   );
 }
 
-// ---------------- Rules & data ----------------
+// ---------------- Rules & Updates ----------------
 
 interface ChecksStatus {
   nuclei_dir: string;
@@ -1162,7 +1162,7 @@ interface DataFile {
   embedded_entries: number;
 }
 
-function RuleData() {
+function RulesAndUpdates() {
   const app = useApp();
   const exec = useRunner();
   const [checks, setChecks] = useState<ChecksStatus | null>(null);

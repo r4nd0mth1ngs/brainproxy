@@ -268,7 +268,7 @@ id>` / `scan enable <check id>` switch one off or on for the project, as for rul
 
 brainproxy's own checks for new CVEs ship as data, between releases: `checks update
 --source brainproxy`, the Overview's **brainproxy checks** row, and, with the daily version
-check on (Settings › Rules & data), once a day by itself. Guided Standard and Thorough
+check on (Settings › Rules & Updates), once a day by itself. Guided Standard and Thorough
 scans include its active checks.
 
 - The feed is the repository's `feed/` folder: templates, `feed.json` (every file with its
