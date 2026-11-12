@@ -175,6 +175,7 @@ const RESERVED: Record<string, string> = {
   "Mod+W": "close the window",
   "Mod+H": "hide the app on macOS",
   "Mod+M": "minimise the window",
+  "Mod+Ctrl+F": "full screen on macOS",
 };
 
 /** Why a chord can't be a shortcut, or null when it can. */
