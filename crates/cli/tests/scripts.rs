@@ -818,6 +818,12 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     assert_eq!(plain[0][0], 0, "{plain:?}");
     let listed = env.ok(&["findings", "list"]);
     assert!(listed.to_string().contains("(in a script's answer, not the target's)"), "{listed}");
+    // A passive check tried on an answered row says the same.
+    let check =
+        env.script("title.js", "function check(x) { return { name: 'Title seen', evidence: x.response.body }; }");
+    let answered = env.rows("SELECT id FROM history WHERE path = '/answered' AND source = 'proxy'")[0][0].to_string();
+    let tried = env.ok(&["scan", "script", "test", &check, "--history", &answered]);
+    assert!(tried.to_string().contains("Title seen (in a script's answer, not the target's)"), "{tried}");
     let shown = env.ok(&["history", "list", "--limit", "1"]);
     assert!(shown["items"][0]["edited_by"].to_string().contains("outcome"), "{shown}");
 }
