@@ -382,6 +382,13 @@ impl Cx {
         self.shared.client.options().http3
     }
 
+    /// Lets the scan's client learn the HTTP/3 endpoint `response` advertises for the base
+    /// target (an `Alt-Svc` header), so its next HTTP/3 request can go there once the scope
+    /// allows it.
+    pub fn learn_alt_svc(&self, response: &[u8]) {
+        self.shared.client.learn_alt_svc(&self.base.target, response);
+    }
+
     /// [`Cx::send`] over TCP (HTTP/1.1, or HTTP/2 as the scan's options or the request line
     /// say) even when the scan sends over HTTP/3. A request line saying HTTP/3 says HTTP/1.1.
     pub async fn send_tcp(&self, request: Vec<u8>) -> Result<Response> {

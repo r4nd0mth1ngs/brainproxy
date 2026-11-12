@@ -55,6 +55,11 @@ fn over_http3(status_line: &str) -> bool {
     status_line.starts_with("HTTP/3 ")
 }
 
+/// Whether `resp` advertises an HTTP/3 endpoint (`Alt-Svc: h3=...`).
+fn advertises_h3(resp: &crate::scan::active::Response, cx: &Cx) -> bool {
+    resp.headers_named("alt-svc").any(|v| matches!(crate::http::h3::parse_alt_svc(v, &cx.target().host), Some(Some(_))))
+}
+
 pub struct Http3Differs;
 
 impl ActiveRule for Http3Differs {
@@ -84,7 +89,14 @@ impl ActiveRule for Http3Differs {
                 return;
             }
             let request = cx.base_request().to_vec();
-            let Ok(h3) = cx.send(request.clone()).await else { return };
+            // What the baseline advertised, so the first request can already go there.
+            cx.learn_alt_svc(&cx.base_response().raw);
+            let Ok(mut h3) = cx.send(request.clone()).await else { return };
+            // A response that went over TCP and advertised an HTTP/3 endpoint gets one more try.
+            if !over_http3(&h3.status_line) && advertises_h3(&h3, cx) && !cx.stopped() {
+                let Ok(again) = cx.send(request.clone()).await else { return };
+                h3 = again;
+            }
             if !over_http3(&h3.status_line) || cx.stopped() {
                 return;
             }

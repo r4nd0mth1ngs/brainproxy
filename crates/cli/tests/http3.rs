@@ -67,8 +67,9 @@ fn h3_server(dir: &std::path::Path, port: u16, alpn: &[&[u8]]) -> (u16, Arc<Atom
     (port, accepted)
 }
 
-/// An HTTP/1.1 server over TLS on 127.0.0.1 answering `h1 <request line>`.
-fn h1_server(dir: &std::path::Path) -> u16 {
+/// An HTTP/1.1 server over TLS on 127.0.0.1 answering `h1 <request line>` with `status`, and
+/// `alt_svc` as its Alt-Svc header if given.
+fn h1_server(dir: &std::path::Path, status: u16, alt_svc: Option<String>) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -77,7 +78,7 @@ fn h1_server(dir: &std::path::Path) -> u16 {
     spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         while let Ok((tcp, _)) = listener.accept().await {
-            let acceptor = acceptor.clone();
+            let (acceptor, alt_svc) = (acceptor.clone(), alt_svc.clone());
             tokio::spawn(async move {
                 let Ok(mut s) = acceptor.accept(tcp).await else { return };
                 let mut buf = Vec::new();
@@ -90,8 +91,11 @@ fn h1_server(dir: &std::path::Path) -> u16 {
                 }
                 let line = String::from_utf8_lossy(&buf).lines().next().unwrap_or_default().to_string();
                 let body = format!("h1 {line}");
-                let resp =
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let alt = alt_svc.map(|a| format!("Alt-Svc: {a}\r\n")).unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\n{alt}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 let _ = s.write_all(resp.as_bytes()).await;
                 let _ = s.shutdown().await;
             });
@@ -178,7 +182,7 @@ fn send_and_fuzz_over_http3() {
 #[test]
 fn falls_back_to_tcp_and_says_why() {
     let (dir, p) = project("http3-fallback");
-    let port = h1_server(&dir);
+    let port = h1_server(&dir, 200, None);
     // QUIC on the same port, without h3: the handshake fails fast.
     h3_server(&dir, port, &[b"not-h3"]);
     run(&["engagement", "start", "--target", "127.0.0.1"], &p, None);
@@ -188,6 +192,29 @@ fn falls_back_to_tcp_and_says_why() {
     assert!(notes.contains("did not negotiate HTTP/3") && notes.contains("sent over TCP"), "{d}");
     let text = run(&["history", "show", &d["id"].to_string()], &p, None).to_string();
     assert!(text.contains("GET /a HTTP/1.1") && text.contains("h1 GET /a HTTP/1.1"), "{text}");
+
+    // A race of a recorded HTTP/3 request goes over TCP as HTTP/1.1.
+    let raw = format!("GET /r HTTP/3\r\nhost: 127.0.0.1:{port}\r\n\r\n");
+    let d = run(&["send", &format!("--target=https://127.0.0.1:{port}"), "--race=2", "-"], &p, Some(raw.as_bytes()));
+    let id = d["results"][0]["id"].to_string();
+    let text = run(&["history", "show", &id], &p, None).to_string();
+    assert!(text.contains("h1 GET /r HTTP/1.1"), "{text}");
+}
+
+#[test]
+fn the_active_scan_finds_access_control_that_only_covers_tcp() {
+    let (dir, p) = project("http3-rule");
+    // HTTP/3 at an advertised endpoint answers 200; TCP refuses with 403.
+    let (alt, accepted) = h3_server(&dir, 0, &[b"h3"]);
+    let port = h1_server(&dir, 403, Some(format!(r#"h3=":{alt}""#)));
+    h3_server(&dir, port, &[b"not-h3"]);
+    run(&["engagement", "start", "--target", "127.0.0.1"], &p, None);
+    let url = format!("https://127.0.0.1:{port}/admin");
+    let d = run(&["scan", "active", &url, "--http3", "--rules=100006"], &p, None);
+    assert_eq!(d["raised"]["100006-1"], 1, "{d}");
+    assert!(accepted.load(Ordering::Relaxed) >= 1, "{d}");
+    let f = run(&["findings", "list", "--source", "active"], &p, None).to_string();
+    assert!(f.contains("Access Control Differs over HTTP/3"), "{f}");
 }
 
 #[test]

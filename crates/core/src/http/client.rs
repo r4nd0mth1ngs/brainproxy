@@ -651,7 +651,8 @@ impl Client {
     pub async fn send_live(&self, req: &RawRequest, target: &Target) -> Result<(Exchange, Option<LiveBody>)> {
         let started = Instant::now();
         let deadline = started + self.opts.timeout;
-        if self.tries_h3(req) {
+        let wants_h3 = self.tries_h3(req);
+        if wants_h3 {
             match self.send_h3(req, target, deadline).await? {
                 H3::Sent(response, live) => {
                     let ex = Exchange {
@@ -674,7 +675,7 @@ impl Client {
         let (ex, live) = tokio::time::timeout(remaining, self.send_tcp(req, target, started))
             .await
             .map_err(|_| Error::Timeout(self.opts.timeout))??;
-        if self.opts.http3 {
+        if wants_h3 {
             self.learn_alt_svc(target, &ex.response);
         }
         Ok((ex, live))
@@ -700,7 +701,7 @@ impl Client {
             let ex = Exchange {
                 target: target.clone(),
                 // Recorded with the auth placeholders, not the values sent.
-                request: self.recorded_request(req, target)?,
+                request: H2Request::from_raw(req.as_bytes(), target)?.recorded,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
                 sni: self.sni(target),
@@ -987,7 +988,14 @@ impl Client {
         self.check_host(&filled, target)?;
         // A request HTTP/3 can't carry is refused as it is, not sent another way.
         H2Request::from_raw_as(&filled, target, "HTTP/3")?;
-        let (conn, fresh) = match self.h3_conn(target, &net, deadline).await? {
+        // Setting up (the wait for another sender's handshake, DNS, the handshakes) may take half
+        // the time left at most, so a request HTTP/3 can't carry still has time to go over TCP.
+        let budget = deadline.saturating_duration_since(Instant::now()) / 2;
+        let setup = tokio::time::timeout(budget, self.h3_conn(target, &net, Instant::now() + budget)).await;
+        let setup = setup.unwrap_or_else(|_| {
+            Ok(Err(format!("no HTTP/3 connection within {} ms (half the time the request has)", budget.as_millis())))
+        });
+        let (conn, fresh) = match setup? {
             Ok(c) => c,
             Err(why) => {
                 self.pool.h3_down.lock().unwrap().insert(down_key, (Instant::now() + H3_DOWN, why.clone()));
@@ -1030,10 +1038,19 @@ impl Client {
         deadline: Instant,
     ) -> Result<std::result::Result<(crate::http::h3::Conn, bool), String>> {
         let key = self.pool_key(target, net.generation);
+        let alt_key = (net.generation, target.origin());
+        // A connection to an advertised endpoint is used while the origin still advertises it
+        // (not cleared, expired or replaced).
+        let current = |c: &crate::http::h3::Conn| match &c.advertised {
+            None => true,
+            Some((host, port)) => self.pool.alt_svc.lock().unwrap().get(&alt_key).is_some_and(|(a, until)| {
+                *until > Instant::now() && a.host.eq_ignore_ascii_case(host) && a.port == *port
+            }),
+        };
         let pooled = || {
             let mut pool = self.pool.h3.lock().unwrap();
             match pool.get(&key) {
-                Some(c) if c.is_open() => Some(c.clone()),
+                Some(c) if c.is_open() && current(c) => Some(c.clone()),
                 Some(_) => {
                     pool.remove(&key);
                     None
@@ -1075,7 +1092,6 @@ impl Client {
             crate::http::h3::ALPN,
             identity.as_deref(),
         )?)?;
-        let alt_key = (net.generation, target.origin());
         let alt = self
             .pool
             .alt_svc
@@ -1117,11 +1133,9 @@ impl Client {
                 if left.is_zero() {
                     break;
                 }
-                // At most half the time left, so a request whose UDP goes unanswered still has
-                // time to go over TCP.
-                let wait = (left / 2).min(H3_HANDSHAKE);
-                match crate::http::h3::connect(addr, &server_name, config.clone(), wait).await {
-                    Ok(c) => {
+                // (`deadline` already leaves the request time to go over TCP.)
+                match crate::http::h3::connect(addr, &server_name, config.clone(), left.min(H3_HANDSHAKE)).await {
+                    Ok(mut c) => {
                         if advertised {
                             // The rows name the target; this says where its datagrams went.
                             self.h3_note(format!(
@@ -1129,6 +1143,7 @@ impl Client {
                                 target.origin()
                             ));
                         }
+                        c.advertised = advertised.then(|| (host.clone(), port));
                         self.pool.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.pool.h3.lock().unwrap().insert(key, c.clone());
                         return Ok(Ok((c, true)));
@@ -1142,7 +1157,7 @@ impl Client {
 
     /// Remembers (or forgets) the HTTP/3 endpoint `response`'s `Alt-Svc` header advertises for
     /// `target`'s origin, for later requests of this client that ask for HTTP/3.
-    fn learn_alt_svc(&self, target: &Target, response: &[u8]) {
+    pub fn learn_alt_svc(&self, target: &Target, response: &[u8]) {
         if !target.is_tls() {
             return;
         }

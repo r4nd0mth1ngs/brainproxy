@@ -1604,7 +1604,9 @@ as the version (`GET /a HTTP/3`, `HTTP/3 200`), so the row says which protocol w
   it goes through the engagement scope like any other (name, resolved address, internal
   addresses, port), and one the scope refuses is never contacted; the request goes to the
   target's own address instead, and the command says so. The request itself still names the
-  target (`:authority`, TLS server name), as RFC 7838 has it.
+  target (`:authority`, TLS server name), as RFC 7838 has it. A connection to an advertised
+  endpoint is used only while the site still advertises it (`Alt-Svc: clear`, a new endpoint or
+  its `ma` running out ends that), and the command's notes say where its datagrams went.
 - **Containment.** Every QUIC connection is opened by brainproxy, not the QUIC library: the
   destination is resolved and checked by the same guard as TCP (scope, DNS pinning, host
   overrides, internal-address rules), and the connection gets a UDP socket of its own that can
@@ -1615,7 +1617,8 @@ as the version (`GET /a HTTP/3`, `HTTP/3 200`), so the row says which protocol w
 - **When HTTP/3 isn't used.** For an http:// target (QUIC is always TLS), a host whose platform
   authentication is NTLM (HTTP/1.1 only), a target the connection settings send through an
   upstream proxy (HTTP CONNECT and SOCKS carry TCP only), a server that doesn't negotiate `h3`,
-  or no QUIC answer within 3 seconds (UDP blocked on the way, or nothing there). The request then
+  or no HTTP/3 connection within 3 seconds, and within half the request's timeout (UDP blocked on
+  the way, nothing there, or a server that doesn't let HTTP/3 start). The request then
   goes over TCP: HTTP/2 with `--http2`, else HTTP/1.1, a request line saying `HTTP/3` included.
   That origin goes straight to TCP for the next 5 minutes, unless it advertises a new HTTP/3
   endpoint. Nothing is sent twice: once a request has gone out over HTTP/3, a failure is an
@@ -1623,10 +1626,15 @@ as the version (`GET /a HTTP/3`, `HTTP/3 200`), so the row says which protocol w
   mode; a toast in Replay) say why HTTP/3 wasn't used, and which Alt-Svc endpoints the scope
   refused.
 - **Not with `--race`.** A race goes over TCP (last-byte sync, or single-packet with `--http2`),
-  so `send --race --http3` is refused.
+  so `send --race --http3` (and `--also`) is refused, and a race of a request whose line says
+  `HTTP/3` sends it as HTTP/1.1 (HTTP/2 with `--http2`).
+- **Responses.** Informational responses (`100`, `103 Early Hints`) are kept before the final
+  one, as over HTTP/1.1. A response header section over 256 KB (decoded) is an error, as an
+  HTTP/1.1 head that long is.
 - **Scans.** Passive rule *HTTP/3 Offered (Alt-Svc)* (100005, informational) reports a response
   whose `Alt-Svc` header offers `h3`. With `scan active --http3`, the active rule 100006 sends
-  each page's base request over HTTP/3 and over TCP, and confirms a different status with a
+  each page's base request over HTTP/3 (to the endpoint the baseline response advertised, when
+  the scope allows it) and over TCP, and confirms a different status with a
   second HTTP/3 request: *Access Control Differs over HTTP/3* (100006-1, medium) when TCP was
   refused (401, 403, 406, 451) and HTTP/3 answered, as when a firewall or allow list only sees
   TCP; *Response Differs over HTTP/3* (100006-2, informational) for any other difference. Statuses

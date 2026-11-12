@@ -755,9 +755,16 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         input.scheme = group[0].1.scheme.clone();
         group.push(input.prepare(None)?);
     }
+    let count = args.race.or_else(|| (!args.also.is_empty()).then_some(1));
+    if count.is_some() {
+        // A race goes over TCP: a recorded HTTP/3 request (its request line) goes as HTTP/1.1, or
+        // as HTTP/2 with --http2, not with an HTTP/3 line a TCP server would refuse.
+        for (req, _) in group.iter_mut() {
+            *req = brainproxy_core::http::client::tcp_form(req, args.req.http2).into_owned();
+        }
+    }
     let h2 =
         args.req.http2 || group.iter().any(|(r, _)| r.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")));
-    let count = args.race.or_else(|| (!args.also.is_empty()).then_some(1));
     if let Some(n) = count {
         // Refused before anything is sent, a login included.
         check_race_count(n, group.len(), h2)?;

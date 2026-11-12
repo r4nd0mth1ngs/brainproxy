@@ -112,6 +112,9 @@ pub(crate) fn guarded_endpoint(peer: SocketAddr) -> Result<quinn::Endpoint> {
         .map_err(|e| Error::Connect(format!("UDP socket: {e}")))
 }
 
+/// Largest response header section accepted (decoded), as for an HTTP/1.1 head.
+pub const MAX_FIELD_SECTION: u64 = 256 * 1024;
+
 /// Idle time after which an HTTP/3 connection closes (both sides agree on the lower of theirs).
 const IDLE: Duration = Duration::from_secs(30);
 
@@ -133,6 +136,8 @@ pub struct Conn {
     pub quic: quinn::Connection,
     /// Where the connection went: the target's address, or an Alt-Svc endpoint's.
     pub peer: SocketAddr,
+    /// The Alt-Svc endpoint (host and port) it was opened for; none for the target's own.
+    pub advertised: Option<(String, u16)>,
 }
 
 impl Conn {
@@ -154,29 +159,37 @@ pub(crate) async fn connect(
     let endpoint = guarded_endpoint(peer)?;
     let connecting =
         endpoint.connect_with(config, peer, server_name).map_err(|e| Error::Connect(format!("QUIC to {peer}: {e}")))?;
-    let quic = match tokio::time::timeout(handshake, connecting).await {
+    // The handshake and HTTP/3's own setup (its control streams, which a server that grants no
+    // stream credit would hold up for ever) together.
+    let setup = async {
+        let quic = connecting.await.map_err(|e| handshake_error(peer, e))?;
+        let mut builder = h3::client::builder();
+        // No reserved frames or settings of our own: what goes out is what the request says.
+        builder.send_grease(false);
+        // Response headers as large as an HTTP/1.1 head may be, not h3's 2^62.
+        builder.max_field_section_size(MAX_FIELD_SECTION);
+        let (driver, sender) = builder
+            .build(h3_quinn::Connection::new(quic.clone()))
+            .await
+            .map_err(|e| Error::Protocol(format!("HTTP/3 to {peer}: {e}")))?;
+        Ok::<_, Error>((quic, driver, sender))
+    };
+    let (quic, mut driver, sender) = match tokio::time::timeout(handshake, setup).await {
         Err(_) => {
             return Err(Error::Connect(format!(
-                "no QUIC answer from {peer} within {} ms (UDP blocked, or no HTTP/3 there)",
+                "no HTTP/3 connection to {peer} within {} ms (UDP blocked, no HTTP/3 there, or a server that \
+                 doesn't let it start)",
                 handshake.as_millis()
             )))
         }
-        Ok(Err(e)) => return Err(handshake_error(peer, e)),
-        Ok(Ok(c)) => c,
+        Ok(r) => r?,
     };
-    let mut builder = h3::client::builder();
-    // No reserved frames or settings of our own: what goes out is what the request says.
-    builder.send_grease(false);
-    let (mut driver, sender) = builder
-        .build(h3_quinn::Connection::new(quic.clone()))
-        .await
-        .map_err(|e| Error::Protocol(format!("HTTP/3 to {peer}: {e}")))?;
     tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         // The endpoint (and its socket) lives as long as the connection.
         drop(endpoint);
     });
-    Ok(Conn { sender, quic, peer })
+    Ok(Conn { sender, quic, peer, advertised: None })
 }
 
 fn handshake_error(peer: SocketAddr, e: quinn::ConnectionError) -> Error {
@@ -206,12 +219,24 @@ pub async fn round_trip_live(conn: &Conn, req: &H2Request, live: bool) -> Result
         stream.send_data(req.body.clone()).await.map_err(stream_error)?;
     }
     stream.finish().await.map_err(stream_error)?;
-    let response = stream.recv_response().await.map_err(stream_error)?;
-    let (parts, ()) = response.into_parts();
+    // Informational responses (100, 103 Early Hints) come first, each a HEADERS frame of its
+    // own; they are kept before the final one, as over HTTP/1.1.
+    let mut interim = Vec::new();
+    let parts = loop {
+        let (parts, ()) = stream.recv_response().await.map_err(stream_error)?.into_parts();
+        if !parts.status.is_informational() {
+            break parts;
+        }
+        interim.extend_from_slice(&response_bytes_as(&parts, b"", "HTTP/3"));
+        if interim.len() > crate::http::wire::MAX_BODY {
+            return Err(Error::Protocol("HTTP/3: too many informational responses".into()));
+        }
+    };
     if live {
         let head = response_bytes_as(&parts, b"", "HTTP/3");
         if crate::http::parse_response_head(&head).is_ok_and(|h| crate::sse::is_event_stream(&h)) {
-            return Ok((head, Some(stream)));
+            interim.extend_from_slice(&head);
+            return Ok((interim, Some(stream)));
         }
     }
     let mut buf = Vec::new();
@@ -226,7 +251,8 @@ pub async fn round_trip_live(conn: &Conn, req: &H2Request, live: bool) -> Result
             return Err(Error::Protocol("HTTP/3 response body over the 64 MB limit".into()));
         }
     }
-    Ok((response_bytes_as(&parts, &buf, "HTTP/3"), None))
+    interim.extend_from_slice(&response_bytes_as(&parts, &buf, "HTTP/3"));
+    Ok((interim, None))
 }
 
 /// The next piece of an event stream's body; `None` once it is over.
@@ -335,11 +361,27 @@ pub(crate) mod tests {
     }
 
     /// An HTTP/3 server on a UDP port of 127.0.0.1 (`port`, or any), offering `alpn`, answering
-    /// `<method> <uri> <body>` (with `alt_svc` as its Alt-Svc header if given), and an event
-    /// stream at `/events`. Returns the port and the count of connections it accepted.
+    /// `<method> <uri> <body>` (with `alt_svc` as its Alt-Svc header if given), an event stream
+    /// at `/events`, `103 Early Hints` before the answer at `/hints`, a 300 KB header at `/big`,
+    /// and `Alt-Svc: clear` at `/clear`. Returns the port and the connections it accepted.
     pub(crate) async fn h3_server(port: u16, alpn: &[&[u8]], alt_svc: Option<String>) -> (u16, Arc<AtomicU64>) {
+        h3_server_with(port, alpn, alt_svc, None).await
+    }
+
+    /// [`h3_server`] granting the client `uni` unidirectional streams (QUIC's default when None).
+    async fn h3_server_with(
+        port: u16,
+        alpn: &[&[u8]],
+        alt_svc: Option<String>,
+        uni: Option<u32>,
+    ) -> (u16, Arc<AtomicU64>) {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls(alpn)).unwrap();
-        let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        if let Some(n) = uni {
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_concurrent_uni_streams(n.into());
+            config.transport_config(Arc::new(transport));
+        }
         let endpoint = quinn::Endpoint::server(config, SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
         let port = endpoint.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicU64::new(0));
@@ -362,10 +404,21 @@ pub(crate) mod tests {
                             while let Ok(Some(mut c)) = stream.recv_data().await {
                                 body.extend_from_slice(&c.copy_to_bytes(c.remaining()));
                             }
-                            let events = req.uri().path() == "/events";
+                            let path = req.uri().path().to_string();
+                            let events = path == "/events";
+                            if path == "/hints" {
+                                let hint =
+                                    http::Response::builder().status(103).header("link", "</a.css>; rel=preload");
+                                let _ = stream.send_response(hint.body(()).unwrap()).await;
+                            }
                             let mut resp = http::Response::builder()
                                 .header("content-type", if events { "text/event-stream" } else { "text/plain" });
-                            if let Some(a) = &alt_svc {
+                            if path == "/big" {
+                                resp = resp.header("x-big", "a".repeat(300 * 1024));
+                            }
+                            if path == "/clear" {
+                                resp = resp.header("alt-svc", "clear");
+                            } else if let Some(a) = &alt_svc {
                                 resp = resp.header("alt-svc", a.as_str());
                             }
                             let _ = stream.send_response(resp.body(()).unwrap()).await;
@@ -513,7 +566,7 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let ex = c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
         assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
-        assert!(c.h3_notes()[0].contains("no QUIC answer"), "{:?}", c.h3_notes());
+        assert!(c.h3_notes()[0].contains("no HTTP/3 connection"), "{:?}", c.h3_notes());
         // The next request doesn't wait for another handshake.
         let again = std::time::Instant::now();
         c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
@@ -612,6 +665,150 @@ pub(crate) mod tests {
         let names = client(&["app.test".into()], true);
         let guard = names.options().guard.clone().unwrap();
         assert!(matches!(guard.resolve("evil.test", 443).await, Err(crate::Error::OutOfScope(_))));
+    }
+
+    #[tokio::test]
+    async fn informational_responses_come_before_the_answer_and_big_headers_are_refused() {
+        let (port, _) = h3_server(0, &[ALPN], None).await;
+        let c = client(&["127.0.0.1".into()], true);
+        let ex = c.send(&get("/hints", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        let t = text(&ex.response);
+        assert!(t.starts_with("HTTP/3 103\r\n") && t.contains("\r\n\r\nHTTP/3 200\r\n"), "{t}");
+        assert!(t.ends_with(&format!("GET https://127.0.0.1:{port}/hints ")), "{t}");
+        let head = crate::http::parse_response_head(crate::http::client::final_response(&ex.response)).unwrap();
+        assert_eq!((head.version.as_str(), head.status), ("HTTP/3", 200));
+        // A header section larger than an HTTP/1.1 head may be is an error, not a response.
+        assert!(c.send(&get("/big", port, "HTTP/1.1"), &target(port)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_lets_http3_start_leaves_time_for_tcp() {
+        let (port, requests) = h1_server(0, None).await;
+        // QUIC completes, but HTTP/3 can't open its control stream: no stream credit.
+        let (_, accepted) = h3_server_with(port, &[ALPN], None, Some(0)).await;
+        let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
+        let opts = SendOptions {
+            guard: Some(Guard::from_specs(vec![scope]).unwrap()),
+            http3: true,
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let c = Client::new(opts);
+        let started = std::time::Instant::now();
+        let ex = c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(c.h3_notes()[0].contains("no HTTP/3 connection"), "{:?}", c.h3_notes());
+        assert_eq!((requests.load(Ordering::Relaxed), accepted.load(Ordering::Relaxed)), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_alt_svc_endpoint_is_not_used_again() {
+        let (alt, alt_accepted) = h3_server(0, &[ALPN], None).await;
+        let (port, _) = h1_server(0, Some(format!(r#"h3=":{alt}""#))).await;
+        h3_server(port, &[b"not-h3"], None).await;
+        let c = client(&["127.0.0.1".into()], true);
+        c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        let ex = c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/3 200"), "{}", text(&ex.response));
+        // The endpoint withdraws itself: its pooled connection isn't used again.
+        let ex = c.send(&get("/clear", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/3 200"), "{}", text(&ex.response));
+        let ex = c.send(&get("/d", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
+        assert_eq!(alt_accepted.load(Ordering::Relaxed), 1);
+        assert!(
+            c.h3_notes().iter().any(|n| n.contains(&format!("Alt-Svc endpoint 127.0.0.1:{alt}"))),
+            "{:?}",
+            c.h3_notes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_http3_request_learns_alt_svc_without_the_option() {
+        let (alt, accepted) = h3_server(0, &[ALPN], None).await;
+        let (port, _) = h1_server(0, Some(format!(r#"h3=":{alt}""#))).await;
+        h3_server(port, &[b"not-h3"], None).await;
+        let c = client(&["127.0.0.1".into()], false);
+        let ex = c.send(&get("/a", port, "HTTP/3"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
+        let ex = c.send(&get("/b", port, "HTTP/3"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/3 200"), "{}", text(&ex.response));
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn an_http2_fallback_is_recorded_as_http2() {
+        let (port, _) = crate::http::h2::tests::h2_server(Some(vec![b"h2".to_vec()])).await;
+        h3_server(port, &[b"not-h3"], None).await;
+        let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
+        let opts = SendOptions {
+            guard: Some(Guard::from_specs(vec![scope]).unwrap()),
+            http2: true,
+            http3: true,
+            ..Default::default()
+        };
+        let ex = Client::new(opts).send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/2 200"), "{}", text(&ex.response));
+        assert!(ex.request.starts_with(b"GET /a HTTP/2\r\n"), "{}", text(&ex.request));
+    }
+
+    #[tokio::test]
+    async fn advertised_endpoints_the_scope_or_a_proxy_rule_keeps_out_are_not_contacted() {
+        use crate::connection::{ConnectionSettings, UpstreamRule};
+        // A host the scope doesn't list (with an address scope, its addresses decide).
+        let (port, _) = h1_server(0, Some(r#"h3="evil.test:443""#.into())).await;
+        h3_server(port, &[b"not-h3"], None).await;
+        let c = client(&["127.0.0.1".into()], true);
+        c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        let ex = c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
+        let notes = c.h3_notes().join("\n");
+        assert!(notes.contains("Alt-Svc endpoint evil.test:443") && notes.contains("out of scope"), "{notes}");
+        // A host in scope that the connection settings send through a proxy.
+        let (sink, got) = udp_sink().await;
+        let (port, _) = h1_server(0, Some(format!(r#"h3="localhost:{sink}""#))).await;
+        h3_server(port, &[b"not-h3"], None).await;
+        let c = client(&["127.0.0.1".into(), "localhost".into()], true);
+        let rule = UpstreamRule {
+            host: "localhost".into(),
+            proxy: Some("http://127.0.0.1:1".into()),
+            username: None,
+            password_env: None,
+        };
+        let settings = ConnectionSettings { upstream: vec![rule], ..Default::default() };
+        c.options().guard.as_ref().unwrap().net.set(settings.compile(vec![]).unwrap());
+        c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(c.h3_notes().join("\n").contains("goes through an upstream proxy"), "{:?}", c.h3_notes());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(got.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn host_and_sni_refusals_send_nothing_over_quic() {
+        let (port, accepted) = h3_server(0, &[ALPN], None).await;
+        let scope = || ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
+        // As through MCP without --host-header-test.
+        let refuse = Client::new(SendOptions {
+            guard: Some(Guard::from_specs(vec![scope()]).unwrap()),
+            http3: true,
+            host: crate::http::client::HostPolicy::Refuse,
+            ..Default::default()
+        });
+        let foreign = RawRequest::from_bytes(b"GET / HTTP/1.1\r\nHost: other.test\r\n\r\n".to_vec());
+        let err = refuse.send(&foreign, &target(port)).await.unwrap_err();
+        assert!(matches!(err, crate::Error::OutOfScope(_)), "{err}");
+        let sni = Client::new(SendOptions {
+            guard: Some(Guard::from_specs(vec![scope()]).unwrap()),
+            http3: true,
+            sni: Some("other.test".into()),
+            ..Default::default()
+        });
+        let err = sni.send(&get("/", port, "HTTP/1.1"), &target(port)).await.unwrap_err();
+        assert!(matches!(err, crate::Error::OutOfScope(_)), "{err}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
