@@ -1,6 +1,6 @@
 [package]
 name = "brainproxy-gui"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Desktop GUI for brainproxy"
