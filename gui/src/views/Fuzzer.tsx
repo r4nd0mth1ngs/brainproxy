@@ -70,6 +70,7 @@ interface Options {
   store: "all" | "matches" | "none";
   auth: string;
   http2: boolean;
+  http3: boolean;
 }
 
 const DEFAULTS: Options = {
@@ -85,6 +86,7 @@ const DEFAULTS: Options = {
   store: "all",
   auth: "",
   http2: false,
+  http3: false,
 };
 
 const BLANK = `GET /?q=${M}test${M} HTTP/1.1\nHost: \nUser-Agent: brainproxy\nAccept: */*\n\n`;
@@ -246,6 +248,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     if (opts.stopOnMatch) args.push("--stop-on-match");
     if (!opts.encode) args.push("--no-encode");
     if (opts.http2) args.push("--http2");
+    if (opts.http3) args.push("--http3");
     args.push(`--store=${opts.store}`, "-");
     setBusy(true);
     try {
@@ -447,6 +450,9 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
               </Field>
               <label className="check">
                 <input type="checkbox" checked={opts.http2} onChange={(e) => opt("http2", e.target.checked)} /> HTTP/2
+              </label>
+              <label className="check" title="Send over HTTP/3 (QUIC) to an https target that offers it; otherwise over TCP, with a warning saying why.">
+                <input type="checkbox" checked={opts.http3} onChange={(e) => opt("http3", e.target.checked)} /> HTTP/3
               </label>
             </div>
           </section>

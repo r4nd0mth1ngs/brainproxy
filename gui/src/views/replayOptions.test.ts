@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { raceArgs } from "./race.ts";
 import { DEFAULT_OPTIONS, validServerName, activeLabels, crlfBody, crlfHead, curlOptions, optionArgs, optionsProblem, requestToSend, savedOptions, sendArgs, sendsAsTyped, sentWithNote, withDefaults } from "./replayOptions.ts";
 import { autoEncodeRequest } from "../ui/urlencode.ts";
 import { parseCurl, toCurl } from "../ui/curl.ts";
@@ -198,7 +199,7 @@ test("withDefaults gives a new object and leaves the defaults alone", () => {
   const o = withDefaults(undefined);
   o.http2 = true;
   o.sni = "x";
-  assert.deepEqual(DEFAULT_OPTIONS, { http2: false, verbatim: false, crlfBody: false, sni: "", timeout: "", verifyTls: false, noStore: false });
+  assert.deepEqual(DEFAULT_OPTIONS, { http2: false, http3: false, verbatim: false, crlfBody: false, sni: "", timeout: "", verifyTls: false, noStore: false });
   // Reset merges the defaults over a tab's options, as the Options row does.
   assert.deepEqual({ ...withDefaults({ verbatim: true, timeout: "3" }), ...DEFAULT_OPTIONS }, DEFAULT_OPTIONS);
 });
@@ -300,4 +301,15 @@ test("an IPv6 SNI is read as rustls reads it, which a URL's host parser isn't", 
   // Left out of a saved tab rather than failing the save.
   assert.equal(savedOptions({ sni: "::1]/x/[" }, "http"), undefined);
   assert.deepEqual(savedOptions({ sni: " ::1 " }, "http"), { sni: "::1" });
+});
+
+test("HTTP/3: its flag, label and saved option, never as typed, and not for races or ws tabs", () => {
+  const o = { ...DEFAULT_OPTIONS, http3: true, verbatim: true };
+  assert.deepEqual(sendArgs("https://a.test", o), ["send", "--target=https://a.test", "--http3", "-"]);
+  assert.equal(sendsAsTyped(o), false);
+  assert.deepEqual(activeLabels(o, "http"), ["HTTP/3"]);
+  assert.deepEqual(optionArgs(o, "ws"), []);
+  assert.deepEqual(savedOptions(o, "http"), { http3: true, verbatim: true });
+  assert.equal(curlOptions(o).http3, true);
+  assert.deepEqual(raceArgs("https://a.test", 5, o), ["send", "--target=https://a.test", "--race=5", "-"]);
 });

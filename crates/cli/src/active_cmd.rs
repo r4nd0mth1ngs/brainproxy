@@ -205,6 +205,10 @@ pub struct ActiveArgs {
     /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http).
     #[arg(long)]
     http2: bool,
+    /// Send over HTTP/3 (QUIC) to https targets that offer it, else over TCP with a warning; adds
+    /// the check comparing HTTP/3 answers with TCP ones.
+    #[arg(long)]
+    http3: bool,
     /// Scan logged in with this auth profile; re-logs in when the session is lost.
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
@@ -469,6 +473,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         sni: None,
         guard: Some(guard.clone()),
         http2: args.http2,
+        http3: args.http3,
         // Base requests (baselines, API items, a session's) are checked as any are; the rules'
         // own Host changes are allowed by the scan itself.
         host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
@@ -674,6 +679,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             a.save()?;
         }
         let summary = summary?;
+        if !out.json() {
+            for n in &summary.http3_notes {
+                eprintln!("warning: HTTP/3: {}", crate::output::escape_controls(n));
+            }
+        }
         let store = Store::open(project)?;
         let findings = store.findings_grouped(&FindingFilter {
             source: Some("active".into()),

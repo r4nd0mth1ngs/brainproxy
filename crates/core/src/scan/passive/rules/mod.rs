@@ -39,6 +39,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rules.len(), 54, "expected all passive rules");
+        assert_eq!(rules.len(), 55, "expected all passive rules");
     }
 }

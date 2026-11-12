@@ -341,6 +341,7 @@ const SCAN_DEFAULTS = {
   noRules: false,
   noOob: false,
   http2: false,
+  http3: false,
   verifyTls: false,
   // crawl
   depth: "",
@@ -577,6 +578,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...opt("--rate", f.rate),
           ...opt("--timeout", f.timeout),
           ...flag("--http2", f.http2),
+          ...flag("--http3", f.http3),
           ...flag("--verify-tls", f.verifyTls),
         ]
       : kind === "crawl"
@@ -633,6 +635,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...flag("--url-path", f.urlPath),
           ...flag("--no-oob", f.noOob),
           ...flag("--http2", f.http2),
+          ...flag("--http3", f.http3),
           ...flag("--verify-tls", f.verifyTls),
         ];
 
@@ -923,6 +926,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           </>
         ) : null}
         {check("HTTP/2", "http2")}
+        {kind !== "crawl" && check("HTTP/3", "http3")}
         {check("Verify TLS", "verifyTls")}
       </div>
       {kind !== "crawl" && (

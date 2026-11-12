@@ -10,6 +10,11 @@ export interface ReplayOptions {
   /** `--http2`: ALPN h2 for https, prior knowledge for http. */
   http2: boolean;
   /**
+   * `--http3`: QUIC to an https target that offers it (its own UDP port, or its Alt-Svc
+   * endpoint), else TCP with a warning. Like HTTP/2 it rebuilds the request, so not as typed.
+   */
+  http3: boolean;
+  /**
    * `--verbatim`: no Content-Length update and no header end added; the GUI skips auto URL-encode
    * too. HTTP/1 only: with `http2` on it is kept but not used (sendsAsTyped).
    */
@@ -29,7 +34,7 @@ export interface ReplayOptions {
 /** HTTP tabs offer every option; WebSocket tabs only what `ws send` has. */
 export type TabKind = "http" | "ws";
 
-export const DEFAULT_OPTIONS: ReplayOptions = { http2: false, verbatim: false, crlfBody: false, sni: "", timeout: "", verifyTls: false, noStore: false };
+export const DEFAULT_OPTIONS: ReplayOptions = { http2: false, http3: false, verbatim: false, crlfBody: false, sni: "", timeout: "", verifyTls: false, noStore: false };
 
 /** The CLI's default `--timeout` for both `send` and `ws send`. */
 export const DEFAULT_TIMEOUT = 30;
@@ -47,7 +52,7 @@ export function withDefaults(o: Partial<ReplayOptions> | undefined): ReplayOptio
  */
 export function sendsAsTyped(o: Partial<ReplayOptions> | undefined): boolean {
   const f = withDefaults(o);
-  return f.verbatim && !f.http2;
+  return f.verbatim && !f.http2 && !f.http3;
 }
 
 /**
@@ -138,6 +143,7 @@ export function validServerName(name: string): boolean {
 /** A tab's options as `replay tabs save` keeps them (`options`), or undefined when all are defaults. */
 export interface SavedOptions {
   http2?: true;
+  http3?: true;
   verbatim?: true;
   crlfBody?: true;
   sni?: string;
@@ -154,6 +160,7 @@ export function savedOptions(o: Partial<ReplayOptions> | undefined, kind: TabKin
   const f = withDefaults(o);
   const out: SavedOptions = {};
   if (kind === "http" && f.http2) out.http2 = true;
+  if (kind === "http" && f.http3) out.http3 = true;
   if (kind === "http" && f.verbatim) out.verbatim = true;
   if (kind === "http" && f.crlfBody) out.crlfBody = true;
   const sni = f.sni.trim();
@@ -170,6 +177,7 @@ export function optionsFromSaved(v: unknown, kind: TabKind): Partial<ReplayOptio
   const s = v as Record<string, unknown>;
   const out: Partial<ReplayOptions> = {};
   if (kind === "http" && s.http2 === true) out.http2 = true;
+  if (kind === "http" && s.http3 === true) out.http3 = true;
   if (kind === "http" && s.verbatim === true) out.verbatim = true;
   if (kind === "http" && s.crlfBody === true) out.crlfBody = true;
   if (typeof s.sni === "string" && validServerName(s.sni)) out.sni = s.sni;
@@ -183,6 +191,7 @@ export function optionArgs(o: Partial<ReplayOptions> | undefined, kind: TabKind)
   const f = withDefaults(o);
   const args: string[] = [];
   if (kind === "http" && f.http2) args.push("--http2");
+  if (kind === "http" && f.http3) args.push("--http3");
   if (kind === "http" && sendsAsTyped(f)) args.push("--verbatim");
   if (f.sni.trim()) args.push(`--sni=${f.sni.trim()}`);
   const t = timeoutSeconds(f);
@@ -203,10 +212,10 @@ export function sendArgs(target: string, o: Partial<ReplayOptions> | undefined):
  * warning for "send as typed" and SNI, which curl can't reproduce. The CRLF body is already in
  * the text requestToSend gives; Don't record has nothing to do with curl.
  */
-export function curlOptions(o: Partial<ReplayOptions> | undefined): { http2: boolean; insecure: boolean; asTyped: boolean; sni: string; timeout?: number } {
+export function curlOptions(o: Partial<ReplayOptions> | undefined): { http2: boolean; http3: boolean; insecure: boolean; asTyped: boolean; sni: string; timeout?: number } {
   const f = withDefaults(o);
   const t = timeoutSeconds(f);
-  return { http2: f.http2, insecure: !f.verifyTls, asTyped: sendsAsTyped(f), sni: f.sni.trim(), ...(typeof t === "number" ? { timeout: t } : {}) };
+  return { http2: f.http2, http3: f.http3, insecure: !f.verifyTls, asTyped: sendsAsTyped(f), sni: f.sni.trim(), ...(typeof t === "number" ? { timeout: t } : {}) };
 }
 
 /** Short labels for the options that aren't the default, shown on the tab. */
@@ -214,6 +223,7 @@ export function activeLabels(o: Partial<ReplayOptions> | undefined, kind: TabKin
   const f = withDefaults(o);
   const out: string[] = [];
   if (kind === "http" && f.http2) out.push("HTTP/2");
+  if (kind === "http" && f.http3) out.push("HTTP/3");
   if (kind === "http" && sendsAsTyped(f)) out.push("as typed");
   if (kind === "http" && f.crlfBody) out.push("CRLF body");
   if (f.sni.trim()) out.push(`SNI ${f.sni.trim()}`);

@@ -286,6 +286,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         sni: None,
         guard: Some(guard),
         http2: false,
+        http3: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
         stream: Default::default(),
     };
@@ -596,6 +597,7 @@ pub(crate) fn check_remote_vars(
         sni: None,
         guard: Some(guard.clone()),
         http2: false,
+        http3: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
         stream: Default::default(),
     };

@@ -593,6 +593,7 @@ impl NetArgs {
             sni: None,
             guard: Some(crate::project_guard(project)?),
             http2: false,
+            http3: false,
             host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
             stream: Default::default(),
         })

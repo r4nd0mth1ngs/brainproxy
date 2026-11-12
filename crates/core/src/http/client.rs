@@ -68,6 +68,10 @@ pub struct SendOptions {
     pub guard: Option<Arc<Guard>>,
     /// Send over HTTP/2 (ALPN `h2` for https, prior knowledge for http).
     pub http2: bool,
+    /// Send over HTTP/3 (QUIC, ALPN `h3`) when the target offers it, to its own UDP port or the
+    /// endpoint its `Alt-Svc` header named; else over TCP as `http2` says (see
+    /// [`Client::h3_note`]).
+    pub http3: bool,
     /// What to do with a foreign Host, checked on every request as it goes on the wire
     /// (sessions, auth values and signers applied). Defaults to [`HostPolicy::for_process`].
     pub host: HostPolicy,
@@ -84,6 +88,7 @@ impl Default for SendOptions {
             sni: None,
             guard: None,
             http2: false,
+            http3: false,
             host: HostPolicy::for_process(false),
             stream: Default::default(),
         }
@@ -300,6 +305,7 @@ pub struct Conn {
 pub enum LiveBody {
     H1 { conn: Box<Conn>, framing: LiveFraming },
     H2(h2::RecvStream),
+    H3(Box<crate::http::h3::Body>),
 }
 
 impl LiveBody {
@@ -321,8 +327,61 @@ impl LiveBody {
                     Ok(Some(Piece::plain(chunk.to_vec())))
                 }
             },
+            Self::H3(body) => Ok(crate::http::h3::next_piece(body).await?.map(Piece::plain)),
         }
     }
+}
+
+/// `req` as it goes over TCP: a request line saying `HTTP/3` says `HTTP/2` with `http2`, else
+/// `HTTP/1.1`. HTTP/3's text form has no framing of its own (a chunked body was de-chunked), so
+/// a body without Content-Length or Transfer-Encoding gets a Content-Length for HTTP/1.1.
+pub fn tcp_form(req: &RawRequest, http2: bool) -> std::borrow::Cow<'_, RawRequest> {
+    use std::borrow::Cow;
+    let Ok(head) = req.head() else { return Cow::Borrowed(req) };
+    if !head.version.eq_ignore_ascii_case("HTTP/3") {
+        return Cow::Borrowed(req);
+    }
+    let bytes = req.as_bytes();
+    let end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line = String::from_utf8_lossy(&bytes[..end]);
+    let cr = line.ends_with('\r');
+    let line = line.trim_end_matches('\r');
+    let Some((start, _)) = line.rsplit_once(' ') else { return Cow::Borrowed(req) };
+    let version = if http2 { "HTTP/2" } else { "HTTP/1.1" };
+    let mut out = format!("{start} {version}{}", if cr { "\r" } else { "" }).into_bytes();
+    out.extend_from_slice(&bytes[end..]);
+    let framed = head
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("transfer-encoding"));
+    let body_len = req.split().1.len();
+    if !http2 && !framed && body_len > 0 {
+        out = with_header(&out, "Content-Length", &body_len.to_string());
+    }
+    Cow::Owned(RawRequest::from_bytes(out))
+}
+
+/// How long a QUIC handshake may take before HTTP/3 counts as not offered (or UDP blocked).
+const H3_HANDSHAKE: Duration = Duration::from_secs(3);
+/// How many notes about HTTP/3 a client keeps (see [`Client::h3_notes`]).
+const H3_NOTES: usize = 8;
+/// How long an origin HTTP/3 failed for goes straight to TCP.
+const H3_DOWN: Duration = Duration::from_secs(300);
+
+/// The multiplexed connection a request goes on.
+#[derive(Clone, Copy)]
+enum Mux<'a> {
+    /// The pooled HTTP/2 connection to the target (opened if there is none).
+    H2,
+    H3(&'a crate::http::h3::Conn),
+}
+
+/// What [`Client::send_h3`] did.
+enum H3 {
+    /// Sent: the response, and an event stream's body left open.
+    Sent(Vec<u8>, Option<LiveBody>),
+    /// Not sent, for this reason: the request goes over TCP.
+    NotUsed(String),
 }
 
 /// Sockets belong to the runtime that opened them (auth logs in on a short-lived
@@ -352,6 +411,20 @@ struct Pool {
     generation: std::sync::atomic::AtomicU64,
     /// The first foreign host sent under [`HostPolicy::Warn`]: only it is reported.
     foreign: std::sync::OnceLock<String>,
+    /// One HTTP/3 connection per key.
+    h3: Mutex<HashMap<PoolKey, crate::http::h3::Conn>>,
+    /// One handshake at a time per key, so concurrent senders share a connection while
+    /// handshakes to other origins (which may wait for an answer that never comes) go ahead.
+    h3_connecting: Mutex<HashMap<PoolKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// HTTP/3 endpoints origins advertised (`Alt-Svc`), keyed by generation and origin, with
+    /// when they expire. Each must pass the guard like any other destination before it's used.
+    alt_svc: Mutex<HashMap<(u64, String), (crate::http::h3::AltSvc, Instant)>>,
+    /// Origins HTTP/3 just failed for, keyed by generation and origin, with until when and why:
+    /// meanwhile their requests go straight to TCP instead of waiting for a handshake each.
+    h3_down: Mutex<HashMap<(u64, String), (Instant, String)>>,
+    /// What to say about HTTP/3 asked for: why it wasn't used, or an Alt-Svc endpoint the
+    /// scope refused. Each once, and the first few only.
+    h3_notes: Mutex<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -360,6 +433,12 @@ pub struct Client {
     tls_h2: TlsConnector,
     opts: SendOptions,
     pool: Arc<Pool>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client").field("opts", &self.opts).finish_non_exhaustive()
+    }
 }
 
 /// A TLS client configuration offering `alpn`, verifying certificates or not, and
@@ -405,6 +484,10 @@ impl Client {
             self.pool.h2.lock().unwrap().retain(|k, _| k.1 == gen);
             self.pool.cert_tls.lock().unwrap().retain(|k, _| k.0 == gen);
             self.pool.learned.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.h3.lock().unwrap().retain(|k, _| k.1 == gen);
+            self.pool.alt_svc.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.h3_down.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.h3_connecting.lock().unwrap().retain(|k, _| k.1 == gen);
         }
         net
     }
@@ -506,15 +589,40 @@ impl Client {
             .map(std::borrow::Cow::Owned)
     }
 
-    /// Whether [`Client::send`] sends `req` over HTTP/2.
+    /// Whether [`Client::send`] sends `req` over HTTP/2 (when it isn't sent over HTTP/3).
     fn sends_h2(&self, req: &RawRequest) -> bool {
         self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2"))
     }
 
+    /// Whether [`Client::send`] tries HTTP/3 for `req`: `http3` is set, or its request line says
+    /// `HTTP/3` (a recorded HTTP/3 exchange sent again).
+    pub fn tries_h3(&self, req: &RawRequest) -> bool {
+        self.opts.http3 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/3"))
+    }
+
+    /// What to say about HTTP/3 this client (and its clones) was asked for, for a command to
+    /// warn about: why it wasn't used (the request then went over TCP), or an Alt-Svc endpoint
+    /// the scope refused (it then went to the target's own address). The first few, each once.
+    pub fn h3_notes(&self) -> Vec<String> {
+        self.pool.h3_notes.lock().unwrap().clone()
+    }
+
+    fn h3_note(&self, note: String) {
+        let mut notes = self.pool.h3_notes.lock().unwrap();
+        if notes.len() < H3_NOTES && !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+
     /// The request as [`Client::send`] records it (its `Exchange::request`): the bytes given,
-    /// or their HTTP/2 text form; auth placeholders stay. Callers that record a request before
-    /// it goes out use this, so the row matches what is sent.
+    /// or their HTTP/2 or HTTP/3 text form; auth placeholders stay. Callers that record a
+    /// request before it goes out use this, so the row matches what is sent. (When HTTP/3
+    /// can't be used, the exchange holds the request as it went over TCP instead.)
     pub fn recorded_request(&self, req: &RawRequest, target: &Target) -> Result<Vec<u8>> {
+        if self.tries_h3(req) && target.is_tls() {
+            return Ok(H2Request::from_raw_as(req.as_bytes(), target, "HTTP/3")?.recorded);
+        }
+        let req = &self.over_tcp(req);
         if self.sends_h2(req) {
             return Ok(H2Request::from_raw(req.as_bytes(), target)?.recorded);
         }
@@ -541,30 +649,67 @@ impl Client {
     /// its head, and the body comes with it to read as it arrives (the proxy relays it). The
     /// timeout covers the time to the head only.
     pub async fn send_live(&self, req: &RawRequest, target: &Target) -> Result<(Exchange, Option<LiveBody>)> {
-        let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
+        let deadline = started + self.opts.timeout;
+        let wants_h3 = self.tries_h3(req);
+        if wants_h3 {
+            match self.send_h3(req, target, deadline).await? {
+                H3::Sent(response, live) => {
+                    let ex = Exchange {
+                        target: target.clone(),
+                        request: H2Request::from_raw_as(req.as_bytes(), target, "HTTP/3")?.recorded,
+                        response,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        sni: self.sni(target),
+                        stream: None,
+                    };
+                    return Ok((ex, live));
+                }
+                H3::NotUsed(why) => {
+                    self.h3_note(format!("{}: {why}; sent over TCP", target.origin()));
+                }
+            }
+        }
+        let req = &self.over_tcp(req);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (ex, live) = tokio::time::timeout(remaining, self.send_tcp(req, target, started))
+            .await
+            .map_err(|_| Error::Timeout(self.opts.timeout))??;
+        if wants_h3 {
+            self.learn_alt_svc(target, &ex.response);
+        }
+        Ok((ex, live))
+    }
+
+    /// `req` as it goes over TCP (see [`tcp_form`]).
+    fn over_tcp<'a>(&self, req: &'a RawRequest) -> std::borrow::Cow<'a, RawRequest> {
+        tcp_form(req, self.opts.http2)
+    }
+
+    /// [`Client::send_live`] over TCP: HTTP/2 or HTTP/1.x.
+    async fn send_tcp(
+        &self,
+        req: &RawRequest,
+        target: &Target,
+        started: Instant,
+    ) -> Result<(Exchange, Option<LiveBody>)> {
+        let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         if self.sends_h2(req) {
             let filled = self.fill_auth(req.as_bytes(), target).await?;
             self.check_host(&filled, target)?;
-            let (response, live) =
-                tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method, true))
-                    .await
-                    .map_err(|_| Error::Timeout(self.opts.timeout))??;
+            let (response, live) = self.multiplexed_auth(&filled, target, &method, Mux::H2).await?;
             let ex = Exchange {
                 target: target.clone(),
                 // Recorded with the auth placeholders, not the values sent.
-                request: self.recorded_request(req, target)?,
+                request: H2Request::from_raw(req.as_bytes(), target)?.recorded,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
                 sni: self.sni(target),
                 stream: None,
             };
-            return Ok((ex, live.map(LiveBody::H2)));
+            return Ok((ex, live));
         }
-        let (response, live) =
-            tokio::time::timeout(self.opts.timeout, self.round_trip(req.as_bytes(), target, &method))
-                .await
-                .map_err(|_| Error::Timeout(self.opts.timeout))??;
+        let (response, live) = self.round_trip(req.as_bytes(), target, &method).await?;
         let ex = Exchange {
             target: target.clone(),
             request: req.as_bytes().to_vec(),
@@ -769,34 +914,278 @@ impl Client {
     /// NTLM needs HTTP/1.1).
     ///
     /// With `live` an event stream's body is left open and returned beside its head.
-    async fn round_trip_h2_auth(
+    /// One request over HTTP/2 or HTTP/3 (`mux`), answering a Basic or Digest challenge of the
+    /// target's platform credentials (NTLM needs HTTP/1.1) with a second request. An event
+    /// stream's body is left open.
+    async fn multiplexed_auth(
         &self,
         filled: &[u8],
         target: &Target,
         method: &str,
-        live: bool,
-    ) -> Result<(Vec<u8>, Option<h2::RecvStream>)> {
+        mux: Mux<'_>,
+    ) -> Result<(Vec<u8>, Option<LiveBody>)> {
+        let send = |bytes: Vec<u8>| self.multiplexed(bytes, target, mux);
         let cred = self.platform_cred(target, filled).filter(|c| c.scheme != PlatformScheme::Ntlm);
         let Some(cred) = cred else {
-            return self.round_trip_h2(&H2Request::from_raw(filled, target)?, target, live).await;
+            return send(filled.to_vec()).await;
         };
         let uri = request_uri(filled);
         let first = match self.learned_header(&cred, target, method, &uri)? {
             Some(value) => with_header(filled, "Authorization", &value),
             None => filled.to_vec(),
         };
-        let (response, body) = self.round_trip_h2(&H2Request::from_raw(&first, target)?, target, live).await?;
+        let (response, body) = send(first).await?;
         if status(&response) != Some(401) {
             return Ok((response, body));
         }
         self.learn(target, None);
         let Some((value, learned)) = self.answer(&cred, &response, method, &uri)? else { return Ok((response, body)) };
         let again = with_header(filled, "Authorization", &value);
-        let (response, body) = self.round_trip_h2(&H2Request::from_raw(&again, target)?, target, live).await?;
+        let (response, body) = send(again).await?;
         if status(&response) != Some(401) {
             self.learn(target, Some(learned));
         }
         Ok((response, body))
+    }
+
+    /// One request on the multiplexed connection `mux` says, its body left open if it's an event stream.
+    async fn multiplexed(&self, bytes: Vec<u8>, target: &Target, mux: Mux<'_>) -> Result<(Vec<u8>, Option<LiveBody>)> {
+        match mux {
+            Mux::H2 => {
+                let (response, body) = self.round_trip_h2(&H2Request::from_raw(&bytes, target)?, target, true).await?;
+                Ok((response, body.map(LiveBody::H2)))
+            }
+            Mux::H3(conn) => {
+                let r = H2Request::from_raw_as(&bytes, target, "HTTP/3")?;
+                let (response, body) = crate::http::h3::round_trip_live(conn, &r, true).await?;
+                Ok((response, body.map(|b| LiveBody::H3(Box::new(b)))))
+            }
+        }
+    }
+
+    /// Sends `req` over HTTP/3, or says why it can't be: then nothing was sent, and the caller
+    /// sends it over TCP. Once a request has gone out over HTTP/3, a failure is an error, never
+    /// a reason to send it again over TCP.
+    async fn send_h3(&self, req: &RawRequest, target: &Target, deadline: Instant) -> Result<H3> {
+        if !target.is_tls() {
+            return Ok(H3::NotUsed("HTTP/3 needs https".into()));
+        }
+        let net = self.net();
+        if net.platform(&target.host, target.port).is_some_and(|c| c.scheme == PlatformScheme::Ntlm) {
+            return Ok(H3::NotUsed("its platform authentication (NTLM) needs HTTP/1.1".into()));
+        }
+        if matches!(net.route(&target.host, target.port), Route::Proxy(_)) {
+            return Ok(H3::NotUsed(
+                "the connection settings send it through an upstream proxy, which carries TCP only".into(),
+            ));
+        }
+        let down_key = (net.generation, target.origin());
+        if let Some(why) = self.h3_down(&down_key) {
+            return Ok(H3::NotUsed(why));
+        }
+        let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
+        let filled = self.fill_auth(req.as_bytes(), target).await?;
+        self.check_host(&filled, target)?;
+        // A request HTTP/3 can't carry is refused as it is, not sent another way.
+        H2Request::from_raw_as(&filled, target, "HTTP/3")?;
+        // Setting up (the wait for another sender's handshake, DNS, the handshakes) may take half
+        // the time left at most, so a request HTTP/3 can't carry still has time to go over TCP.
+        let budget = deadline.saturating_duration_since(Instant::now()) / 2;
+        let setup = tokio::time::timeout(budget, self.h3_conn(target, &net, Instant::now() + budget)).await;
+        let setup = setup.unwrap_or_else(|_| {
+            Ok(Err(format!("no HTTP/3 connection within {} ms (half the time the request has)", budget.as_millis())))
+        });
+        let (conn, fresh) = match setup? {
+            Ok(c) => c,
+            Err(why) => {
+                self.pool.h3_down.lock().unwrap().insert(down_key, (Instant::now() + H3_DOWN, why.clone()));
+                return Ok(H3::NotUsed(why));
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = tokio::time::timeout(remaining, self.multiplexed_auth(&filled, target, &method, Mux::H3(&conn)))
+            .await
+            .map_err(|_| Error::Timeout(self.opts.timeout))
+            .and_then(|r| r);
+        match result {
+            Ok((response, live)) => {
+                self.learn_alt_svc(target, &response);
+                Ok(H3::Sent(response, live))
+            }
+            Err(e) => {
+                if fresh || !conn.is_open() {
+                    self.pool.h3.lock().unwrap().remove(&self.pool_key(target, net.generation));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Why HTTP/3 just failed for the origin `key` names, while it is still to go straight to TCP.
+    fn h3_down(&self, key: &(u64, String)) -> Option<String> {
+        let down = self.pool.h3_down.lock().unwrap();
+        down.get(key).filter(|(until, _)| *until > Instant::now()).map(|(_, why)| why.clone())
+    }
+
+    /// The pooled HTTP/3 connection to `target` (and whether it's new), or a new one: to the
+    /// HTTP/3 endpoint it advertised if the scope allows that, else to its own address. Each
+    /// destination passes the guard before any datagram goes to it. `Err(why)` when none
+    /// answered; nothing was sent then.
+    async fn h3_conn(
+        &self,
+        target: &Target,
+        net: &Compiled,
+        deadline: Instant,
+    ) -> Result<std::result::Result<(crate::http::h3::Conn, bool), String>> {
+        let key = self.pool_key(target, net.generation);
+        let alt_key = (net.generation, target.origin());
+        // A connection to an advertised endpoint is used while the origin still advertises it
+        // (not cleared, expired or replaced).
+        let current = |c: &crate::http::h3::Conn| match &c.advertised {
+            None => true,
+            Some((host, port)) => self.pool.alt_svc.lock().unwrap().get(&alt_key).is_some_and(|(a, until)| {
+                *until > Instant::now() && a.host.eq_ignore_ascii_case(host) && a.port == *port
+            }),
+        };
+        let pooled = || {
+            let mut pool = self.pool.h3.lock().unwrap();
+            match pool.get(&key) {
+                Some(c) if c.is_open() && current(c) => Some(c.clone()),
+                Some(_) => {
+                    pool.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(c) = pooled() {
+            return Ok(Ok((c, false)));
+        }
+        let lock = self.pool.h3_connecting.lock().unwrap().entry(key.clone()).or_default().clone();
+        let _connecting = lock.lock().await;
+        if let Some(c) = pooled() {
+            return Ok(Ok((c, false)));
+        }
+        // A sender that waited here while HTTP/3 failed for this origin doesn't try again.
+        if let Some(why) = self.h3_down(&(net.generation, target.origin())) {
+            return Ok(Err(why));
+        }
+        let guard = self.opts.guard.as_ref().ok_or_else(|| {
+            Error::OutOfScope("no engagement scope: run `brainproxy engagement start --target HOST ...` first".into())
+        })?;
+        // A server name refused, or a client certificate that can't be loaded, fails before any datagram.
+        self.server_name_for(target)?;
+        let server_name = self.opts.sni.clone().unwrap_or_else(|| target.host.clone());
+        let identity = match net.client_cert(&target.host, target.port) {
+            Some((_, id)) if id.error.is_some() => {
+                return Err(Error::Tls(format!(
+                    "client certificate for {}: {}",
+                    target.host,
+                    id.error.as_deref().unwrap_or_default()
+                )))
+            }
+            Some((_, id)) => Some(id),
+            None => None,
+        };
+        let config = crate::http::h3::client_config(tls_config(
+            self.opts.verify_tls,
+            crate::http::h3::ALPN,
+            identity.as_deref(),
+        )?)?;
+        let alt = self
+            .pool
+            .alt_svc
+            .lock()
+            .unwrap()
+            .get(&alt_key)
+            .filter(|(_, until)| *until > Instant::now())
+            .map(|(a, _)| a.clone());
+        let mut endpoints = Vec::new();
+        if let Some(a) = alt.filter(|a| !(a.host.eq_ignore_ascii_case(&target.host) && a.port == target.port)) {
+            endpoints.push((a.host, a.port, true));
+        }
+        endpoints.push((target.host.clone(), target.port, false));
+        let mut why = Vec::new();
+        for (host, port, advertised) in endpoints {
+            // An advertised host the connection settings send through an upstream proxy isn't
+            // reached directly either (the target's own route was checked before).
+            if advertised && matches!(net.route(&host, port), Route::Proxy(_)) {
+                why.push(format!("the Alt-Svc endpoint {host}:{port} goes through an upstream proxy"));
+                continue;
+            }
+            let addrs = match guard.resolve_with(&host, port, net).await {
+                Ok(a) => a,
+                // An advertised endpoint is a destination of its own: refused, it's never tried.
+                Err(e) if advertised => {
+                    let note = format!("the Alt-Svc endpoint {host}:{port} of {} isn't used: {e}", target.origin());
+                    self.h3_note(note);
+                    self.pool.alt_svc.lock().unwrap().remove(&alt_key);
+                    continue;
+                }
+                Err(e @ Error::OutOfScope(_)) => return Err(e),
+                Err(e) => {
+                    why.push(e.to_string());
+                    continue;
+                }
+            };
+            for addr in addrs {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                // (`deadline` already leaves the request time to go over TCP.)
+                match crate::http::h3::connect(addr, &server_name, config.clone(), left.min(H3_HANDSHAKE)).await {
+                    Ok(mut c) => {
+                        if advertised {
+                            // The rows name the target; this says where its datagrams went.
+                            self.h3_note(format!(
+                                "{}: HTTP/3 went to its Alt-Svc endpoint {host}:{port} ({addr})",
+                                target.origin()
+                            ));
+                        }
+                        c.advertised = advertised.then(|| (host.clone(), port));
+                        self.pool.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.pool.h3.lock().unwrap().insert(key, c.clone());
+                        return Ok(Ok((c, true)));
+                    }
+                    Err(e) => why.push(e.to_string()),
+                }
+            }
+        }
+        Ok(Err(why.join("; ")))
+    }
+
+    /// Remembers (or forgets) the HTTP/3 endpoint `response`'s `Alt-Svc` header advertises for
+    /// `target`'s origin, for later requests of this client that ask for HTTP/3.
+    pub fn learn_alt_svc(&self, target: &Target, response: &[u8]) {
+        if !target.is_tls() {
+            return;
+        }
+        let Ok(head) = parse_response_head(final_response(response)) else { return };
+        // The first header that says something about h3 (several Alt-Svc headers are one list).
+        let Some(alt) = head
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("alt-svc"))
+            .find_map(|(_, v)| crate::http::h3::parse_alt_svc(v, &target.host))
+        else {
+            return;
+        };
+        let key = (self.net().generation, target.origin());
+        let mut cache = self.pool.alt_svc.lock().unwrap();
+        match alt.filter(|a| !a.max_age.is_zero()) {
+            Some(a) => {
+                let until = Instant::now() + a.max_age.min(Duration::from_secs(86_400 * 7));
+                // A new endpoint is worth a try even if the target's own address just failed.
+                if cache.get(&key).is_none_or(|(old, _)| *old != a) {
+                    self.pool.h3_down.lock().unwrap().remove(&key);
+                }
+                cache.insert(key, (a, until));
+            }
+            None => {
+                cache.remove(&key);
+            }
+        }
     }
 
     /// Sends on the pooled HTTP/2 connection to `target`, opening one if there

@@ -281,6 +281,7 @@ fn send_again(
         verify_tls: false,
         sni: None,
         http2: false,
+        http3: false,
         // Sent again as it was recorded, with whatever Host it had then.
         host: brainproxy_core::http::client::HostPolicy::Allow,
         stream: Default::default(),

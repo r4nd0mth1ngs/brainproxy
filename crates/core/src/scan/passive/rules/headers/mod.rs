@@ -1,5 +1,6 @@
 //! HTTP header rules, ported from ZAP's pscanrules add-on (Apache License 2.0).
 
+mod alt_svc_h3;
 mod anti_clickjacking;
 mod big_redirects;
 mod cache_control;
@@ -26,6 +27,7 @@ use crate::scan::PassiveRule;
 pub fn all() -> Vec<Box<dyn PassiveRule>> {
     vec![
         Box::new(x_backend_server::XBackendServer),
+        Box::new(alt_svc_h3::AltSvcH3),
         Box::new(x_aspnet_version::XAspNetVersion),
         Box::new(content_type_missing::ContentTypeMissing),
         Box::new(cache_control::CacheControl),
@@ -55,7 +57,7 @@ mod tests {
     fn rule_ids_and_alert_refs_are_unique() {
         let rules = super::all();
         let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
-        assert_eq!(ids.len(), 19);
+        assert_eq!(ids.len(), 20);
         let mut seen = HashSet::new();
         for r in &rules {
             for a in r.alerts() {

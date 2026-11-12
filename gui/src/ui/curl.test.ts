@@ -91,8 +91,9 @@ test("method rules: -I, -G, --json, HTTP versions", () => {
   assert.match(parseCurl("curl --http2 --http1.1 https://h.test").raw, /^GET \/ HTTP\/1\.1\n/);
   assert.match(parseCurl("curl -0 https://h.test").raw, /^GET \/ HTTP\/1\.0\n/);
   const h3 = parseCurl("curl --http3 https://h.test");
-  assert.match(h3.raw, /HTTP\/1\.1/);
-  assert.match(h3.warnings[0], /HTTP\/3/);
+  assert.match(h3.raw, /^GET \/ HTTP\/3\n/);
+  assert.deepEqual(h3.warnings, []);
+  assert.match(parseCurl("curl --http3-only https://h.test").warnings[0], /--http3-only/);
   const j = parseCurl(`curl --json '{"a":1}' --json '{"b":2}' https://h.test/api`);
   assert.equal(
     j.raw,

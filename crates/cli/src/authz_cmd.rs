@@ -351,6 +351,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
         sni: None,
         guard: Some(guard.clone()),
         http2: args.http2,
+        http3: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
         stream: Default::default(),
     };

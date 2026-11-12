@@ -163,6 +163,10 @@ CIDR range in scope, any host name that resolves to it, by DNS or through a `con
 override, is in scope as a target too. On a shared front end (a CDN or load balancer), list the
 sites' names in the scope rather than its addresses.
 
+The same goes for HTTP/3, which runs over UDP: a scope entry's port is then the UDP port, and an
+HTTP/3 endpoint a site advertises in its `Alt-Svc` header is a destination of its own, used only
+when the scope allows it. See [HTTP/3](#http3---http3).
+
 A `Host` header (HTTP/2 sends it as `:authority`) doesn't pick where the connection goes, but on
 a shared front end it can pick the site, so a request to an in-scope address can reach a site
 outside the scope. Host-header injection tests need such a request, so it isn't simply refused.
@@ -529,7 +533,7 @@ Edit a raw request and send it as often as you like, in separate tabs.
   is). The toast notes what curl will send differently (only the first of several `Host`
   headers, its own `Content-Length`, HTTP/2's dropped `Connection` or `Upgrade`) and when the
   command holds credentials (`Authorization`, `Cookie`), so take care where you paste it.
-  It follows the tab's **Options**: `--http2` with HTTP/2 on, `-k` for https unless Verify TLS
+  It follows the tab's **Options**: `--http2` with HTTP/2 on, `--http3` with HTTP/3 on, `-k` for https unless Verify TLS
   is on (Send doesn't check certificates either), `--max-time` for a timeout, and the CRLF
   body; the toast says when Send as typed or SNI is set, since curl can't do either.
   The command runs outside brainproxy, so the engagement scope doesn't apply to it. Bodies
@@ -538,9 +542,12 @@ Edit a raw request and send it as often as you like, in separate tabs.
 - **Options** (per tab): each option that isn't the default shows as a chip next to the
   button, so you can see how the tab sends.
   - **HTTP/2**: send over HTTP/2 (`send --http2`). The request line can stay `HTTP/1.1`.
+  - **HTTP/3**: send over HTTP/3 where the target offers it (`send --http3`; see
+    [HTTP/3](#http3---http3)); otherwise the request goes over TCP and a note says why. A race
+    goes over TCP whatever this says.
   - **Send as typed** (`send --verbatim`): for request smuggling and other malformed
-    requests. HTTP/1 only: HTTP/2 rebuilds the request into frames, so it is greyed out
-    while **HTTP/2** is on (and applies again when it is turned off). Content-Length isn't
+    requests. HTTP/1 only: HTTP/2 and HTTP/3 rebuild the request into frames, so it is greyed
+    out while **HTTP/2** or **HTTP/3** is on (and applies again when they are turned off). Content-Length isn't
     updated, auto URL-encode is skipped, and no blank line is added after the headers. The
     editor can't hold a CR, so the head's line breaks go out as CRLF. The body goes out as
     the editor holds it: one sent from Traffic keeps its own line breaks, and one you typed
@@ -636,6 +643,8 @@ attack type, and pick payloads:
 - **Matching:** grep for text in responses, extract values, or match status codes.
 - **Encoding:** payloads placed in the URL or a form body are URL-encoded where needed
   (option on by default).
+- **HTTP/2, HTTP/3:** send over HTTP/2, or over HTTP/3 where the target offers it
+  (`fuzz run --http2`, `--http3`; see [HTTP/3](#http3---http3)).
 - **Results:** show live, with the baseline response and *outliers* (unusual status or size)
   highlighted.
 - **Discover content:** sets up `GET /§path§` with the content-discovery list to find
@@ -1579,6 +1588,65 @@ doesn't wait for its end.
   recording scope; outside it the stream is relayed and leaves its row, as other traffic does.
 - Search events with `query`: tables `sse_streams` and `sse_events`, and the full-text index
   `sse_events_fts` over `data` (`schema` lists the columns).
+
+### HTTP/3 (`--http3`)
+
+`send`, `fuzz run` and `scan active` take `--http3`, and Replay, the Fuzzer and the Scanner have
+an **HTTP/3** option: requests to an https target go over HTTP/3 (QUIC, over UDP) when it offers
+it, and over TCP otherwise. A raw request whose request line says `HTTP/3` (a recorded HTTP/3
+exchange sent again from Replay, `send`, `findings retest` or `authz`) is tried over HTTP/3
+without the flag. History records an HTTP/3 exchange as text, like an HTTP/2 one, with `HTTP/3`
+as the version (`GET /a HTTP/3`, `HTTP/3 200`), so the row says which protocol was used.
+
+- **Where it goes.** To the target's own UDP port (`https://app.example.com` is UDP 443), or to
+  the HTTP/3 endpoint the site advertised in an `Alt-Svc` header (`h3=":8443"`, or another
+  host) on an earlier response to the same command. An advertised endpoint is a new destination:
+  it goes through the engagement scope like any other (name, resolved address, internal
+  addresses, port), and one the scope refuses is never contacted; the request goes to the
+  target's own address instead, and the command says so. The request itself still names the
+  target (`:authority`, TLS server name), as RFC 7838 has it. A connection to an advertised
+  endpoint is used only while the site still advertises it (`Alt-Svc: clear`, a new endpoint or
+  its `ma` running out ends that), and the command's notes say where its datagrams went.
+- **Containment.** Every QUIC connection is opened by brainproxy, not the QUIC library: the
+  destination is resolved and checked by the same guard as TCP (scope, DNS pinning, host
+  overrides, internal-address rules), and the connection gets a UDP socket of its own that can
+  only exchange datagrams with that one checked address. A datagram for any other address (a
+  server's preferred address, a reset to a stray sender) is refused before it is sent, and
+  datagrams from other addresses are dropped unread. The Host-header checks, `--sni`'s rule,
+  `--rate` and MCP's refusals apply as they do over TCP.
+- **When HTTP/3 isn't used.** For an http:// target (QUIC is always TLS), a host whose platform
+  authentication is NTLM (HTTP/1.1 only), a target the connection settings send through an
+  upstream proxy (HTTP CONNECT and SOCKS carry TCP only), a server that doesn't negotiate `h3`,
+  or no HTTP/3 connection within 3 seconds, and within half the request's timeout (UDP blocked on
+  the way, nothing there, or a server that doesn't let HTTP/3 start). The request then
+  goes over TCP: HTTP/2 with `--http2`, else HTTP/1.1, a request line saying `HTTP/3` included.
+  That origin goes straight to TCP for the next 5 minutes, unless it advertises a new HTTP/3
+  endpoint. Nothing is sent twice: once a request has gone out over HTTP/3, a failure is an
+  error, not a reason to send it again over TCP. The output's `http3_notes` (and stderr in text
+  mode; a toast in Replay) say why HTTP/3 wasn't used, and which Alt-Svc endpoints the scope
+  refused.
+- **Not with `--race`.** A race goes over TCP (last-byte sync, or single-packet with `--http2`),
+  so `send --race --http3` (and `--also`) is refused, and a race of a request whose line says
+  `HTTP/3` sends it as HTTP/1.1 (HTTP/2 with `--http2`).
+- **Responses.** Informational responses (`100`, `103 Early Hints`) are kept before the final
+  one, as over HTTP/1.1. A response header section over 256 KB (decoded) is an error, as an
+  HTTP/1.1 head that long is.
+- **Scans.** Passive rule *HTTP/3 Offered (Alt-Svc)* (100005, informational) reports a response
+  whose `Alt-Svc` header offers `h3`. With `scan active --http3`, the active rule 100006 sends
+  each page's base request over HTTP/3 (to the endpoint the baseline response advertised, when
+  the scope allows it) and over TCP, and confirms a different status with a
+  second HTTP/3 request: *Access Control Differs over HTTP/3* (100006-1, medium) when TCP was
+  refused (401, 403, 406, 451) and HTTP/3 answered, as when a firewall or allow list only sees
+  TCP; *Response Differs over HTTP/3* (100006-2, informational) for any other difference. Statuses
+  that come and go with load (429, 5xx) don't count.
+- **The proxy doesn't intercept HTTP/3.** Browsers never send HTTP/3 through an HTTP proxy, and
+  the browser brainproxy starts has QUIC turned off, so it uses HTTP/1.1 or HTTP/2 through the
+  proxy. A browser of your own may still reach a site over QUIC directly, around the proxy: turn
+  QUIC off in it (Chrome's `--disable-quic`) when everything should go through brainproxy.
+  Upstream, the proxy uses HTTP/1.1 and HTTP/2 only.
+- **Copy as cURL and curl import.** A tab with HTTP/3 on (or a request line saying `HTTP/3`)
+  copies as `curl --http3`; a pasted `curl --http3` or `--http3-only` becomes a request line
+  saying `HTTP/3`.
 
 ### Who recorded what
 

@@ -234,6 +234,9 @@ enum Report {
 
 struct Shared {
     client: Client,
+    /// With HTTP/3 asked for, a client that sends over TCP only, for comparing the two
+    /// ([`Cx::send_tcp`]); otherwise `client` already does.
+    tcp: Option<Client>,
     /// Every request's row, written by the recorder thread.
     rows: Rows,
     auth: Option<Arc<AuthSession>>,
@@ -374,11 +377,35 @@ impl Cx {
         self.send_to(&target, request).await
     }
 
+    /// Whether the scan sends over HTTP/3 where targets offer it (`--http3`).
+    pub fn sends_http3(&self) -> bool {
+        self.shared.client.options().http3
+    }
+
+    /// Lets the scan's client learn the HTTP/3 endpoint `response` advertises for the base
+    /// target (an `Alt-Svc` header), so its next HTTP/3 request can go there once the scope
+    /// allows it.
+    pub fn learn_alt_svc(&self, response: &[u8]) {
+        self.shared.client.learn_alt_svc(&self.base.target, response);
+    }
+
+    /// [`Cx::send`] over TCP (HTTP/1.1, or HTTP/2 as the scan's options or the request line
+    /// say) even when the scan sends over HTTP/3. A request line saying HTTP/3 says HTTP/1.1.
+    pub async fn send_tcp(&self, request: Vec<u8>) -> Result<Response> {
+        let target = self.base.target.clone();
+        self.send_via(&target, request, true).await
+    }
+
     /// Sends a raw request to another target (e.g. the same host over http).
     /// Still subject to the engagement scope.
     /// A 429, or a 503 with Retry-After, pauses every request to that origin for
     /// the time asked (5 s without one, at most 60 s); the request is then sent once more.
     pub async fn send_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
+        self.send_via(target, request, false).await
+    }
+
+    /// [`Cx::send_to`]; with `tcp`, over TCP only (see [`Cx::send_tcp`]).
+    async fn send_via(&self, target: &Target, request: Vec<u8>, tcp: bool) -> Result<Response> {
         let origin = target.origin();
         let mut retried = false;
         loop {
@@ -386,7 +413,7 @@ impl Cx {
             while until.is_some_and(|u| Instant::now() < u) && !self.stopped() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            let resp = self.send_to_once(target, request.clone()).await?;
+            let resp = self.send_to_once(target, request.clone(), tcp).await?;
             let retry_after = resp.header("retry-after").map(|v| v.trim().parse::<u64>().unwrap_or(5));
             if retried || !(resp.status == 429 || resp.status == 503 && retry_after.is_some()) {
                 return Ok(resp);
@@ -399,7 +426,7 @@ impl Cx {
         }
     }
 
-    async fn send_to_once(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
+    async fn send_to_once(&self, target: &Target, request: Vec<u8>, tcp: bool) -> Result<Response> {
         self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         // Match-and-replace rules that list scans see the request as the scan rule made it; the
@@ -411,7 +438,7 @@ impl Cx {
         };
         let request = ruled.as_ref().map_or(&given, |r| &r.bytes);
         let Some(auth) = &self.shared.auth else {
-            return self.client_send(request.clone(), target, &given, ruled.as_ref()).await;
+            return self.client_send(request.clone(), target, &given, ruled.as_ref(), tcp).await;
         };
         // The attacked cookie or parameter keeps its payload.
         let (cookie, param): (Vec<&str>, Vec<&str>) = match &self.point {
@@ -420,10 +447,10 @@ impl Cx {
             None => (vec![], vec![]),
         };
         let prepared = auth.prepare(self.tool, target, request, &cookie, &param).await;
-        let mut resp = self.client_send(prepared.request.clone(), target, &given, ruled.as_ref()).await?;
+        let mut resp = self.client_send(prepared.request.clone(), target, &given, ruled.as_ref(), tcp).await?;
         if auth.after_response(&prepared, resp.received()).await {
             let again = auth.prepare(self.tool, target, request, &cookie, &param).await;
-            resp = self.client_send(again.request, target, &given, ruled.as_ref()).await?;
+            resp = self.client_send(again.request, target, &given, ruled.as_ref(), tcp).await?;
             auth.observe(resp.received());
         }
         Ok(resp)
@@ -440,9 +467,15 @@ impl Cx {
         target: &Target,
         given: &[u8],
         ruled: Option<&Ruled>,
+        tcp: bool,
     ) -> Result<Response> {
         let req = RawRequest::from_bytes(request);
-        let client = &self.shared.client;
+        let client = match &self.shared.tcp {
+            Some(tcp_client) if tcp => tcp_client,
+            _ => &self.shared.client,
+        };
+        // A request line saying HTTP/3 says HTTP/1.1 (or HTTP/2 with `--http2`) over TCP.
+        let req = if tcp { crate::http::client::tcp_form(&req, client.options().http2).into_owned() } else { req };
         let out_of_scope = client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port));
         // As for the targets the ported rules attack. Out of scope, the client refuses it
         // before anything is sent.
@@ -855,6 +888,10 @@ pub struct ActiveSummary {
     /// (through MCP without `--host-header-test`): those requests weren't attacked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub refused_hosts: Vec<String>,
+    /// What there is to say about HTTP/3 asked for (`--http3`): why it wasn't used for an
+    /// origin (its requests went over TCP), or an Alt-Svc endpoint the scope refused.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub http3_notes: Vec<String>,
     /// None when no OOB listener was running (out-of-band checks skipped).
     pub oob: Option<OobSummary>,
     /// Attack rows deleted at the end because nothing referred to them; None when the scan
@@ -966,6 +1003,8 @@ pub async fn run(
     // A rule's own change to the Host is its test (Cloud Metadata names the metadata service),
     // so the rules' client lets those go; base requests are checked below.
     let client = Client::new(SendOptions { host: HostPolicy::Allow, ..cfg.send.clone() });
+    let tcp =
+        cfg.send.http3.then(|| Client::new(SendOptions { host: HostPolicy::Allow, http3: false, ..cfg.send.clone() }));
     let tx_rows = tx.clone();
     let rows = Rows::new("scan", move |w| drop(tx_rows.send(Report::Row(w)))).abandoned_as(ABANDONED).sent_by(&client);
 
@@ -988,6 +1027,7 @@ pub async fn run(
         .collect();
     let shared = Arc::new(Shared {
         client,
+        tcp,
         rows,
         auth: cfg.auth.clone(),
         strength: cfg.strength,
@@ -1117,6 +1157,7 @@ pub async fn run(
     let oob_payloads = shared.oob_payloads.load(Ordering::Relaxed);
     let oob_enabled = shared.oob.is_some();
     let check_skipped_methods = shared.check_skipped_methods.load(Ordering::Relaxed);
+    let http3_notes = shared.client.h3_notes();
     // Close the channel so the writer finishes.
     *shared.reports.lock().unwrap() = mpsc::channel().0;
     drop(shared);
@@ -1170,6 +1211,7 @@ pub async fn run(
         new_findings,
         errors,
         check_skipped_methods,
+        http3_notes,
         refused_hosts,
         oob,
         pruned,

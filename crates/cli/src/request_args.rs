@@ -58,6 +58,11 @@ pub struct RequestArgs {
     /// request whose request line says HTTP/2 is sent over HTTP/2 anyway.
     #[arg(long)]
     pub http2: bool,
+    /// Send over HTTP/3 (QUIC) to an https target that offers it, on its own UDP port or the
+    /// one its Alt-Svc header named (which must be in scope too); else over TCP, with a warning
+    /// saying why. A raw request whose request line says HTTP/3 is tried over HTTP/3 anyway.
+    #[arg(long)]
+    pub http3: bool,
     /// The request's Host header (or absolute URL) deliberately names a host the scope doesn't
     /// list, for a Host-header test. Through MCP such a request is refused without it.
     #[arg(long)]
@@ -76,6 +81,7 @@ impl RequestArgs {
             verify_tls: self.verify_tls,
             sni: self.sni.clone(),
             http2: self.http2,
+            http3: self.http3,
             host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
             stream: Default::default(),
         }

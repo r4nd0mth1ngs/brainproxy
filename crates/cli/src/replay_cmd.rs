@@ -56,7 +56,7 @@ pub enum TabsCmd {
         \"messages\": [\"{\\\"op\\\":\\\"sub\\\"}\"], \"wait\": 3, \"until\": \"done\"}], \"active\": 0}. \
         kind is http (default) or ws; binary marks an http request held one character per byte; messages, \
         wait (seconds, at most 86400) and until (regex) are for ws tabs; options holds how a tab sends: \
-        {\"http2\", \"verbatim\", \"crlfBody\" (http tabs), \"sni\", \"timeout\" (seconds, at most 86400), \
+        {\"http2\", \"http3\", \"verbatim\", \"crlfBody\" (http tabs), \"sni\", \"timeout\" (seconds, at most 86400), \
         \"verifyTls\"}, never noStore; active is the index of the tab shown \
         (with --append, among the tabs given). Text is stored as given, auth placeholders included: write \
         «auth:...» placeholders rather than live cookies or tokens. Responses are never stored. At most 500 tabs \
@@ -113,6 +113,9 @@ struct TabOptions {
     /// `--http2` (HTTP tabs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     http2: bool,
+    /// `--http3` (HTTP tabs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    http3: bool,
     /// `--verbatim` (HTTP tabs; the app sends as typed over HTTP/1 only).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     verbatim: bool,
@@ -138,8 +141,8 @@ impl TabOptions {
         if self.no_store.as_ref().is_some_and(|v| *v != Value::Bool(false)) {
             return Err("noStore isn't kept with a tab: whether a send is recorded is chosen when it is sent".into());
         }
-        if kind == Kind::Ws && (self.http2 || self.verbatim || self.crlf_body) {
-            return Err("http2, verbatim and crlfBody are for HTTP tabs".into());
+        if kind == Kind::Ws && (self.http2 || self.http3 || self.verbatim || self.crlf_body) {
+            return Err("http2, http3, verbatim and crlfBody are for HTTP tabs".into());
         }
         if let Some(t) = self.timeout.filter(|t| !(*t > 0.0 && *t <= MAX_TIMEOUT_SECS)) {
             return Err(format!("timeout must be above 0 and at most {MAX_TIMEOUT_SECS} seconds, not {t}"));
@@ -386,14 +389,14 @@ mod tests {
     #[test]
     fn tab_options_are_kept_checked_and_never_no_store() {
         let (json, _) = save(
-            br#"{"tabs": [{"request": "x", "options": {"http2": true, "verbatim": false, "sni": "other.test", "timeout": 2.5, "verifyTls": true}},
+            br#"{"tabs": [{"request": "x", "options": {"http2": true, "http3": true, "verbatim": false, "sni": "other.test", "timeout": 2.5, "verifyTls": true}},
                 {"kind": "ws", "request": "", "options": {"sni": "127.0.0.1", "noStore": false}}]}"#,
         )
         .unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             v["tabs"][0]["options"],
-            json!({"http2": true, "sni": "other.test", "timeout": 2.5, "verifyTls": true})
+            json!({"http2": true, "http3": true, "sni": "other.test", "timeout": 2.5, "verifyTls": true})
         );
         assert_eq!(v["tabs"][1]["options"], json!({"sni": "127.0.0.1"}));
         let err = |s: &str| parse(s.as_bytes()).unwrap_err().to_string();

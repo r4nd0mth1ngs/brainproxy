@@ -30,8 +30,11 @@ base64.workspace = true
 bytes = "1"
 flate2.workspace = true
 h2 = "0.4"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 hex.workspace = true
 http = "1"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 ring = "0.17"
 tokio.workspace = true
 tokio-rustls.workspace = true

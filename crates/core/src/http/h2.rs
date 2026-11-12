@@ -32,9 +32,15 @@ pub struct H2Request {
 impl H2Request {
     /// Converts a raw HTTP/1.x request for sending to `target` over HTTP/2.
     pub fn from_raw(raw: &[u8], target: &Target) -> Result<Self> {
+        Self::from_raw_as(raw, target, "HTTP/2")
+    }
+
+    /// [`H2Request::from_raw`] for `version` (`HTTP/2` or `HTTP/3`, which carry requests the
+    /// same way: pseudo-headers, no connection-specific headers), recorded with that version.
+    pub fn from_raw_as(raw: &[u8], target: &Target, version: &str) -> Result<Self> {
         let req = RawRequest::from_bytes(raw.to_vec());
         let head = req.head()?;
-        let unfit = |what: &str| Error::InvalidInput(format!("can't be sent over HTTP/2: {what}"));
+        let unfit = |what: &str| Error::InvalidInput(format!("can't be sent over {version}: {what}"));
         let method = http::Method::from_bytes(head.method.as_bytes()).map_err(|_| unfit("method"))?;
         // Origin form (/...), absolute form, or `*`: anything else would run into the authority
         // (`.evil.test/` after `app.test`), so the request would go to another site than it says.
@@ -60,7 +66,7 @@ impl H2Request {
             .map_err(|e| unfit(&format!("{authority} {path}: {e}")))?;
 
         let mut headers = http::HeaderMap::new();
-        let mut recorded = format!("{method} {path} HTTP/2\r\nhost: {authority}\r\n");
+        let mut recorded = format!("{method} {path} {version}\r\nhost: {authority}\r\n");
         for (k, v) in &head.headers {
             let name = k.trim().to_ascii_lowercase();
             if DROPPED.contains(&name.as_str()) || (name == "te" && !v.eq_ignore_ascii_case("trailers")) {
@@ -91,7 +97,12 @@ impl H2Request {
 
 /// The text form of a response: `HTTP/2 <status>`, headers, blank line, body.
 pub fn response_bytes(parts: &http::response::Parts, body: &[u8]) -> Vec<u8> {
-    let mut out = format!("HTTP/2 {}\r\n", parts.status.as_u16());
+    response_bytes_as(parts, body, "HTTP/2")
+}
+
+/// [`response_bytes`] with `version` (`HTTP/3`) in place of `HTTP/2`.
+pub fn response_bytes_as(parts: &http::response::Parts, body: &[u8], version: &str) -> Vec<u8> {
+    let mut out = format!("{version} {}\r\n", parts.status.as_u16());
     for (k, v) in &parts.headers {
         out.push_str(&format!("{k}: {}\r\n", String::from_utf8_lossy(v.as_bytes())));
     }

@@ -50,6 +50,9 @@ pub struct EngineConfig {
     pub max_requests: Option<u64>,
     /// Logged-in session applied to every request; fuzzed cookies are left alone.
     pub auth: Option<Arc<AuthSession>>,
+    /// The client to send with, made with `send` (a clone shares its connections and what it
+    /// noted, so the caller can read [`Client::h3_notes`] afterwards); one is made when None.
+    pub client: Option<Client>,
 }
 
 /// Outcome of one request.
@@ -152,7 +155,7 @@ pub async fn run(
     let stopped_by_user = Arc::new(AtomicBool::new(false));
     let matched_stop = Arc::new(AtomicBool::new(false));
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Arc::new(Limiter::new(r)));
-    let client = Arc::new(Client::new(cfg.send.clone()));
+    let client = Arc::new(cfg.client.clone().unwrap_or_else(|| Client::new(cfg.send.clone())));
     // With `--store all`, each request's row is written before it goes out.
     let rows = (cfg.store == StoreMode::All).then(|| {
         let tx = tx.clone();

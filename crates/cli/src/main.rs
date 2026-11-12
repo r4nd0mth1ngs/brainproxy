@@ -755,12 +755,26 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         input.scheme = group[0].1.scheme.clone();
         group.push(input.prepare(None)?);
     }
+    let count = args.race.or_else(|| (!args.also.is_empty()).then_some(1));
+    if count.is_some() {
+        // A race goes over TCP: a recorded HTTP/3 request (its request line) goes as HTTP/1.1, or
+        // as HTTP/2 with --http2, not with an HTTP/3 line a TCP server would refuse.
+        for (req, _) in group.iter_mut() {
+            *req = brainproxy_core::http::client::tcp_form(req, args.req.http2).into_owned();
+        }
+    }
     let h2 =
         args.req.http2 || group.iter().any(|(r, _)| r.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")));
-    let count = args.race.or_else(|| (!args.also.is_empty()).then_some(1));
     if let Some(n) = count {
         // Refused before anything is sent, a login included.
         check_race_count(n, group.len(), h2)?;
+        if args.req.http3 {
+            return Err(Error::InvalidInput(
+                "--http3 doesn't go with --race or --also: their requests go over TCP (last-byte sync, or \
+                 single-packet with --http2)"
+                    .into(),
+            ));
+        }
     }
     let guard = project_guard(project)?;
     // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
@@ -922,6 +936,7 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     let id = Some(id);
     let host_warning =
         mcp::sent_host_warning([&client].into_iter().chain(session.as_deref().map(|s| s.client())), host_warning, out);
+    let http3_notes = mcp::h3_notes([&client].into_iter().chain(session.as_deref().map(|s| s.client())), out);
 
     if args.raw {
         out.raw(&ex.response);
@@ -941,6 +956,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
+    }
+    if !http3_notes.is_empty() {
+        data["http3_notes"] = json!(http3_notes);
     }
     if !request_rules.is_empty() || !response_rules.is_empty() {
         data["rules"] = json!({"request": request_rules, "response": response_rules});
