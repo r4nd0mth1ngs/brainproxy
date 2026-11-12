@@ -1033,7 +1033,10 @@ byte, side by side or unified.
   replacement is what a JavaScript file of yours returns for each match: the app asks before
   it adds such a rule, shows in the list which rules run a script and when one is not applied
   because its file changed, and the tester says when a script failed (see
-  [Scripts](#scripts)). *Copy as JSON* and *Import* move rules between
+  [Scripts](#scripts)). **Whole request (script)** gives each request to a script that may
+  change it, block it, or answer it itself so nothing is sent; the tester says what it did and
+  shows its answer, and Traffic marks a row it answered (`200*`, a *script answer* tag) or
+  blocked. *Copy as JSON* and *Import* move rules between
   projects through the clipboard; an import that would run scripts names their files first. In Traffic, an exchange a rule changed has both versions:
   *Before rules* and *Sent* on the request, *Received* and *After rules* on the response. See
   [Match-and-replace rules](#match-and-replace-rules-rules).
@@ -1302,6 +1305,7 @@ there and `--replace` what to write instead:
 | `request-body`, `response-body` | The body (a compressed response body is decoded first and sent on decoded). A response that has no body (1xx, 204, 304, or the answer to a `HEAD`) is left without one |
 | `ws-message` | The payload of a WebSocket text or binary message the proxy relays |
 | `request-line`, `request-header`, `response-header` (no `--name`) | The raw request line, or each header line (`Name: value`) on its own; with an empty `--match`, a header location adds `--replace` as a new header line |
+| `request --script FILE` | The whole request, given to a script that sends it as it is, changes it, blocks it, or answers it itself so nothing is sent (see [Scripts](#scripts)); it takes no `--match` or `--replace` |
 
 `--match-kind` says how `--match` is read: `regex` (the default; the replacement may use `$1`),
 `literal` (plain text, each occurrence replaced with `--replace` as written) or `whole` (the
@@ -1374,20 +1378,22 @@ target an absolute URL) is checked as before, structured or not: saving it warns
 is refused through MCP without `--host-header-test`, and a request an agent's rule did that to
 isn't sent by the proxy, `send`, a fuzz run or a scan.
 
-`--script FILE` in place of `--replace` has a script make the replacement; see
-[Scripts](#scripts).
+`--script FILE` in place of `--replace` has a script make the replacement, and `--location
+request --script FILE` has one decide what happens to each request; see [Scripts](#scripts).
 
 ### Scripts
 
-Where text isn't enough, three places take a JavaScript file of yours: a match-and-replace
-rule whose replacement is computed, a fuzz payload processor, and a passive check. A script is
-handed data and returns data. It can't send anything, open a file or read the environment, and
-whatever it is handed is read-only.
+Where text isn't enough, four places take a JavaScript file of yours: a match-and-replace
+rule whose replacement is computed, a request rule that may block a request or answer it
+itself, a fuzz payload processor, and a passive check. A script is handed data and returns
+data. It can't send anything, open a file or read the environment, and whatever it is handed
+is read-only.
 
 ```sh
 brainproxy rules add --location request-header --name X-Signature --script sign.js \
     --applies-to proxy,send,fuzz,scan                       # a replacement computed for each request
 brainproxy rules test --history 42 --location request-header --name X-Signature --script sign.js
+brainproxy rules add --location request --script gate.js --applies-to proxy,scan   # block or answer requests
 brainproxy fuzz run --url 'https://app.test/api?token=§t§' -p file:tokens.txt --process script:wrap.js
 brainproxy scan script add debug-headers checks/debug.js    # a passive check of your own
 brainproxy scan script test checks/debug.js --history 42    # what it finds in one exchange; nothing saved
@@ -1423,6 +1429,62 @@ function replace(match, ctx) {
 - What it returns is checked as a rule's text is, when it has run: a line break or NUL for a
   request's line or headers, or something that is no status for `status`, fails the rule. A Host
   or absolute URL a script puts in a request is seen by the same checks as a text rule's.
+
+**A request rule** (`rules add --location request --script FILE`): the file defines
+`request(req, ctx)`, called for each request the rule applies to, as the rules before it left
+it, and what it returns says what happens to the request. Nothing is sent for a blocked or
+answered request: no connection is opened, as if the engine had never got to it.
+
+```js
+// gate.js: never log out or delete anything; stub the feature flags endpoint
+function request(req, ctx) {
+  if (req.path === "/logout" || req.method === "DELETE") return { block: "not on " + ctx.engine };
+  if (req.path === "/api/flags")
+    return { response: { status: 200, headers: { "Content-Type": "application/json" }, body: '{"beta":true}' } };
+}
+```
+
+- `req` has `line`, `method`, `target`, `path`, `query`, `headers` (`[name, value]` pairs),
+  `body` (a chunked body as its data), and `bodyBase64` when the body isn't text. `ctx` has
+  `engine` (`proxy`, `send`, `fuzz` or `scan`), `host` and `rule` (the rule's id). The request
+  is the one before a session of `--auth` (or the proxy's auth profile) is applied to it, as for
+  every rule.
+- It returns nothing (or `null`) to send the request as it is; `{ request: { method, target,
+  headers, body } }` to send it changed (each part optional; `headers` replaces them all, as
+  `[name, value]` pairs or an object; `bodyBase64` for bytes); `{ block: "reason" }` (or
+  `{ block: true }`) to not send it; or `{ response: { status, reason, headers, body } }` to not
+  send it and use that response as if the server had sent it (`status` from 200 to 999, 200 by
+  default; `bodyBase64` for bytes). Anything else, or a key it doesn't know, fails the call.
+- brainproxy frames what the script gives: a changed request's body goes with a
+  `Content-Length` of its own, and a response gets its `Content-Length` (none for a 204 or 304,
+  which can have no body; the answer to a `HEAD` has no body). It also adds
+  `X-Brainproxy-Answer: rule N; this response is the rule's script's, the target sent nothing`
+  to every answer, and drops a header of that name, `Content-Length` or `Transfer-Encoding` the
+  script gives: wherever the response is shown (Traffic, `history show`, a HAR export, a report)
+  it says the target didn't send it.
+- The rules after it don't see a request it blocked or answered, and an answer goes past the
+  response rules and the response intercept, to the client as the script made it.
+- **The proxy** answers a blocked request `403` with `X-Brainproxy-Error: blocked` and the
+  reason, and records it as a row with that error and no response. An answered request's row
+  has the script's response. Neither is held in the request intercept, and an answer isn't
+  handed to live access-control testing.
+- **`send`** shows an answer like any response, with `answered_by` (the rule) in its output; a
+  blocked request fails with kind `blocked` and exit code 7. A race in which the script stops a
+  request isn't sent at all, and leaves no rows.
+- **A fuzz run** analyses an answer like any response, and an answered request always has its
+  row, whatever `--store` says, so the result doesn't pass for the target's; a blocked one is an
+  error result.
+- **A scan** records each answer and judges none: the attack (or the baseline of a URL given to
+  `scan active`, which then isn't attacked) fails with kind `blocked`. A probe's raw connection
+  (the Heartbleed check's TLS records) isn't made to a host a request rule's script sees in
+  scans, as the script couldn't have blocked it.
+- Every such row says what the script did in `entry.edited_by`: `{"rule": N, "outcome":
+  "answered"}` or `"blocked"`, which nothing can change later (unlike tags). `history list`
+  marks it, `history show` describes it, and the app marks its status in Traffic (`200*`, or
+  *blocked*) with a *script answer* tag and a note over the response. Passive checks skip an
+  answered row, so no finding is ever raised against the target from a script's response.
+- `rules test` says what the engine would do (`stopped`, with the script's response or the
+  reason), and sends nothing either way.
 
 **A fuzz payload processor** (`fuzz run --process script:FILE`, a step like `base64` or
 `prefix:`): the file defines `process(payload, ctx)`, called once for each payload of the set
@@ -1487,7 +1549,8 @@ How a script is kept and run:
   child process of brainproxy with an empty environment, its memory limited to 1 GiB (as
   below, for a signer's script) and without `SharedArrayBuffer`, `Atomics` or `Temporal`. It
   opens no connection, so the engagement scope has nothing to check: all a script can do is
-  change the bytes of a message that goes where it was going, or report a finding.
+  change the bytes of a message that goes where it was going, stop a request from going at all
+  (blocked, or answered with a response marked as the script's), or report a finding.
 - **Bounded.** A script file is at most 1 MiB. Each call (the matches of one value, one
   payload, one exchange) has 2 seconds, and a process 5 seconds to start; a loop has two million
   rounds and recursion 200 levels. What a call is handed is at most 16 MiB, and so is what it
@@ -1498,7 +1561,8 @@ How a script is kept and run:
 - **A failure is said, and changes nothing.** A script that throws, returns something of the
   wrong shape, or reaches for what isn't there fails that call: the rule leaves that message
   as it is, all of it (a script that fails on the second of two headers changes neither; the
-  rules after it still apply), the fuzz run doesn't start (it names the payload),
+  rules after it still apply), a request rule sends the request as it was (it neither blocks
+  nor answers it), the fuzz run doesn't start (it names the payload),
   the check finds nothing in that exchange. A script stopped at the time or memory limit, or
   one that doesn't load (it throws at the top, or has no function of its kind), runs no more
   until the command or the proxy starts again (or its rule is switched off and on), so a script that hangs costs its time limit once
@@ -1512,7 +1576,7 @@ How a script is kept and run:
   whichever engine, is also kept with the project: `rules list` gives it under `failures`
   (the rule, why, when, which engine) and the app shows it on the rule's row, until the rule
   is switched off or on, or removed.
-- **A person's.** Through MCP no script is named: `rules add --script`, `rules test --script`, an
+- **A person's.** Through MCP no script is named: `rules add --script` (a request rule's too), `rules test --script`, an
   import or `rules enable` of a script rule, `fuzz run --process script:`, `scan enable` of a
   script check, and `scan script add`, `test` and `remove` are refused or not offered. An
   agent's requests still go through the script rules a person set, as they go through a
