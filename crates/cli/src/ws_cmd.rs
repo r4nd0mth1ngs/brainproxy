@@ -386,6 +386,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
         verify_tls: args.verify_tls,
         sni: args.sni.clone(),
         http2: false,
+        http3: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
         stream: Default::default(),
     };

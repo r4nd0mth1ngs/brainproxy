@@ -41,15 +41,23 @@ export function OptionsRow({ id, options, set, kind, binary }: { id: string; opt
       {kind === "http" && (
         <label
           className="check"
+          title="Send over HTTP/3 (QUIC) to an https target that offers it, on its own UDP port or the endpoint its Alt-Svc header named (which must be in scope too). Otherwise it goes over TCP, and a note says why. A request line ending in HTTP/3 does the same."
+        >
+          <input type="checkbox" checked={options.http3} onChange={(e) => set({ http3: e.target.checked })} /> HTTP/3
+        </label>
+      )}
+      {kind === "http" && (
+        <label
+          className="check"
           title={
-            options.http2
-              ? "HTTP/1 only: HTTP/2 rebuilds the request into frames, so it can't be sent as typed. Turn HTTP/2 off to use it."
+            options.http2 || options.http3
+              ? "HTTP/1 only: HTTP/2 and HTTP/3 rebuild the request into frames, so it can't be sent as typed. Turn them off to use it."
               : "Send the request exactly as it is in the editor, for request smuggling and other malformed requests: " +
                 "Content-Length isn't updated, auto URL-encode is skipped, and no blank line is added after the headers. " +
                 "The head's line breaks go out as CRLF; the body goes out as the editor holds it (see CRLF body)."
           }
         >
-          <input type="checkbox" checked={sendsAsTyped(options)} disabled={options.http2} onChange={(e) => set({ verbatim: e.target.checked })} /> Send as typed
+          <input type="checkbox" checked={sendsAsTyped(options)} disabled={options.http2 || options.http3} onChange={(e) => set({ verbatim: e.target.checked })} /> Send as typed
         </label>
       )}
       {kind === "http" && !binary && (

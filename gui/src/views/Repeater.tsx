@@ -37,7 +37,11 @@ import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
 
 /** `stream` when the response was an event stream, read for a bounded time. */
-type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response"> & { stream?: SseRead | null };
+type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response"> & {
+  stream?: SseRead | null;
+  /** Why HTTP/3 wasn't used (sent over TCP instead), or an Alt-Svc endpoint the scope refused. */
+  http3_notes?: string[];
+};
 
 interface Sent {
   raw: string;
@@ -247,6 +251,7 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
     try {
       const result = await run<SendResult>(sendArgs(to, options), { stdin: textBytes(sent, tab.binary), call: id, project });
       entry = { raw, sent, encoded, labels, result, error: null };
+      for (const note of result?.http3_notes ?? []) app.toast(`HTTP/3: ${note}`, "info");
     } catch (e: any) {
       entry = { raw, sent, encoded, labels, result: null, error: failureText(e, "http") };
     }

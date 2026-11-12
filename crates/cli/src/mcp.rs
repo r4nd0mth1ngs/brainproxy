@@ -441,6 +441,26 @@ pub(crate) fn sent_host_warning<'a>(
     Some(warning)
 }
 
+/// What the clients have to say about HTTP/3 asked for (see `Client::h3_notes`): why it wasn't
+/// used, or an Alt-Svc endpoint the scope refused. In text mode they go to stderr too.
+pub(crate) fn h3_notes<'a>(
+    clients: impl IntoIterator<Item = &'a brainproxy_core::http::Client>,
+    out: &crate::output::Out,
+) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::new();
+    for note in clients.into_iter().flat_map(|c| c.h3_notes()) {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    if !out.json() {
+        for n in &notes {
+            eprintln!("warning: HTTP/3: {}", crate::output::escape_controls(n));
+        }
+    }
+    notes
+}
+
 fn host_verdict(
     refused: &str,
     warned: &str,

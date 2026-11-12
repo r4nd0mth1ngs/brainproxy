@@ -761,6 +761,11 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(n) = count {
         // Refused before anything is sent, a login included.
         check_race_count(n, group.len(), h2)?;
+        if args.req.http3 {
+            return Err(Error::InvalidInput(
+                "--http3 doesn't race: a race goes over TCP (last-byte sync, or single-packet with --http2)".into(),
+            ));
+        }
     }
     let guard = project_guard(project)?;
     // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
@@ -922,6 +927,7 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     let id = Some(id);
     let host_warning =
         mcp::sent_host_warning([&client].into_iter().chain(session.as_deref().map(|s| s.client())), host_warning, out);
+    let http3_notes = mcp::h3_notes([&client].into_iter().chain(session.as_deref().map(|s| s.client())), out);
 
     if args.raw {
         out.raw(&ex.response);
@@ -941,6 +947,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     }
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
+    }
+    if !http3_notes.is_empty() {
+        data["http3_notes"] = json!(http3_notes);
     }
     if !request_rules.is_empty() || !response_rules.is_empty() {
         data["rules"] = json!({"request": request_rules, "response": response_rules});

@@ -404,6 +404,12 @@ pub struct Client {
     pool: Arc<Pool>,
 }
 
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client").field("opts", &self.opts).finish_non_exhaustive()
+    }
+}
+
 /// A TLS client configuration offering `alpn`, verifying certificates or not, and
 /// presenting `identity` when given.
 fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> Result<ClientConfig> {

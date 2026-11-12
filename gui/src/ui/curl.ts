@@ -32,6 +32,8 @@ export interface ParsedCurl {
 export interface CurlSendOptions {
   /** HTTP/2 whatever the request line says (`send --http2`). */
   http2?: boolean;
+  /** HTTP/3 where the target offers it (`send --http3`): curl's --http3, which falls back the same way. */
+  http3?: boolean;
   /** Don't check the server certificate (`-k`), as `send` does without `--verify-tls`. */
   insecure?: boolean;
   /** Sent as typed (`send --verbatim`), which curl can't reproduce: only a warning. */
@@ -563,7 +565,11 @@ function readOptions(words: string[], stdin?: string): Options {
       else if (name === "http2" || name === "http2-prior-knowledge") {
         o.version = "HTTP/2";
         o.h2Upgrade = name === "http2";
-      } else if (name === "http3" || name === "http3-only") o.warnings.push("brainproxy doesn't speak HTTP/3: the request is sent over HTTP/1.1.");
+      } else if (name === "http3" || name === "http3-only") {
+        // The request line says HTTP/3, which send tries over QUIC and otherwise sends over TCP.
+        o.version = "HTTP/3";
+        if (name === "http3-only") o.warnings.push("curl --http3-only fails without HTTP/3; brainproxy sends over TCP when it can't use HTTP/3, and says so.");
+      }
       else o.flags.add(name);
       return;
     }
@@ -1100,7 +1106,8 @@ export function toCurl(raw: string, target: string, binary = false, send: CurlSe
   const rl = /^(\S+)[ \t]+(.+?)(?:[ \t]+(HTTP\/\S+))?[ \t]*$/i.exec(lines[0] ?? "");
   if (!rl) throw new CurlError("The request line isn't METHOD target HTTP/version.");
   const [, method, reqTarget, version = "HTTP/1.1"] = rl;
-  const h2 = !!send.http2 || /^HTTP\/2/i.test(version);
+  const h3 = scheme === "https" && (!!send.http3 || /^HTTP\/3/i.test(version));
+  const h2 = !h3 && (!!send.http2 || /^HTTP\/2/i.test(version));
 
   const args: string[] = [];
   let url: string;
@@ -1116,7 +1123,8 @@ export function toCurl(raw: string, target: string, binary = false, send: CurlSe
   const path = url.replace(/^https?:\/\/[^/?#]*/i, "").replace(/[?#].*$/s, "");
   if (/[[\]{}]/.test(url)) args.push("--globoff");
   if (/(^|\/)\.\.?(\/|$)/.test(path)) args.push("--path-as-is");
-  if (h2) args.push(scheme === "http" ? "--http2-prior-knowledge" : "--http2");
+  if (h3) args.push("--http3");
+  else if (h2) args.push(scheme === "http" ? "--http2-prior-knowledge" : "--http2");
   else if (/^HTTP\/1\.0$/i.test(version)) args.push("--http1.0");
   // Over https curl negotiates HTTP/2 when the server offers it.
   else if (scheme === "https") args.push("--http1.1");
@@ -1156,9 +1164,9 @@ export function toCurl(raw: string, target: string, binary = false, send: CurlSe
   const hosts = named("host");
   const lengths = named("content-length");
   // curl reads only the first Transfer-Encoding, and chunks the body when one of its
-  // comma-separated codings is chunked (not over HTTP/2).
+  // comma-separated codings is chunked (not over HTTP/2 or HTTP/3).
   const te = named("transfer-encoding")[0]?.value ?? "";
-  const chunked = !h2 && te.split(",").some((c) => trimHws(c).toLowerCase() === "chunked");
+  const chunked = !h2 && !h3 && te.split(",").some((c) => trimHws(c).toLowerCase() === "chunked");
 
   const seen = new Set<string>();
   const spaced: string[] = [];
@@ -1197,14 +1205,15 @@ export function toCurl(raw: string, target: string, binary = false, send: CurlSe
   if (spaced.length)
     warnings.push(`Copied as written with a space before the colon: ${spaced.map(decodeOr).join(", ")}. curl sends such a header as it is over HTTP/1, but pasting the command back into brainproxy is refused; edit the header in the tab instead.`);
   if (blanked.length) warnings.push(`curl sends an empty header only as "Name:", so ${blanked.map(decodeOr).join(", ")} lose${blanked.length > 1 ? "" : "s"} the spaces around the colon.`);
-  if (h2) {
-    // Not allowed in HTTP/2: curl leaves them out, and keeps TE only as "trailers", when it
-    // names that coding.
+  if (h2 || h3) {
+    // Not allowed in HTTP/2 or HTTP/3: curl leaves them out, and keeps TE only as "trailers",
+    // when it names that coding.
+    const v = h3 ? "HTTP/3" : "HTTP/2";
     const codings = (v: string) => v.split(",").map((c) => trimHws(c).toLowerCase());
     const te = parsed.filter((h) => !h.spaced && h.lower === "te");
     const hop = parsed.filter((h) => !h.spaced && (H2_DROPPED.has(h.lower) || (h.lower === "te" && !codings(h.value).includes("trailers"))));
-    if (hop.length) warnings.push(`Over HTTP/2 curl leaves out ${[...new Set(hop.map((h) => decodeOr(h.name)))].join(", ")}, which HTTP/2 doesn't allow.`);
-    if (te.some((h) => codings(h.value).includes("trailers") && h.value !== "trailers")) warnings.push('Over HTTP/2 curl sends TE as "trailers" alone.');
+    if (hop.length) warnings.push(`Over ${v} curl leaves out ${[...new Set(hop.map((h) => decodeOr(h.name)))].join(", ")}, which ${v} doesn't allow.`);
+    if (te.some((h) => codings(h.value).includes("trailers") && h.value !== "trailers")) warnings.push(`Over ${v} curl sends TE as "trailers" alone.`);
   }
   const secrets = new Map(parsed.filter((h) => CREDENTIALS.test(h.lower)).reverse().map((h) => [h.lower, decodeOr(h.name)]));
   if (secrets.size) warnings.push(`The command carries the request's credentials as they are (${[...secrets.values()].reverse().join(", ")}); keep it where you would keep them.`);

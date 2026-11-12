@@ -485,6 +485,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             return Err(e);
         }
     };
+    let client = brainproxy_core::http::Client::new(send.clone());
     let engine_cfg = EngineConfig {
         concurrency: args.concurrency.clamp(1, 1000),
         rate: args.rate,
@@ -502,6 +503,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         encode_payloads: !args.no_encode && !args.req.verbatim,
         max_requests: args.max_requests,
         auth: auth.clone(),
+        client: Some(client.clone()),
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let started = Instant::now();
@@ -517,6 +519,10 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             summary["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
             if let Some(w) = host_warning {
                 summary["host_warning"] = json!(w);
+            }
+            let notes = crate::mcp::h3_notes([&client], out);
+            if !notes.is_empty() {
+                summary["http3_notes"] = json!(notes);
             }
             out.ok(summary.clone(), || text_summary(&summary));
             Ok(())

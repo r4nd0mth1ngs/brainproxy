@@ -131,6 +131,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         sni: None,
         guard: Some(guard),
         http2: args.http2,
+        http3: false,
         host: brainproxy_core::http::client::HostPolicy::for_process(false),
         stream: Default::default(),
     };

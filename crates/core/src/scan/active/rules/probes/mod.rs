@@ -12,6 +12,7 @@ mod get_for_post;
 mod heartbleed;
 pub(crate) mod hidden_files;
 mod htaccess;
+mod http3_differs;
 mod http_only_site;
 mod https_as_http;
 mod php2shell;
@@ -38,6 +39,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(heartbleed::HeartBleed),
         Box::new(hidden_files::HiddenFilesRule),
         Box::new(htaccess::HtAccess),
+        Box::new(http3_differs::Http3Differs),
         Box::new(http_only_site::HttpOnlySite),
         Box::new(https_as_http::HttpsAsHttp),
         Box::new(rce_cve_2012_1823::RceCve20121823),

@@ -1999,6 +1999,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         sni: None,
         guard: Some(guard),
         http2: false,
+        http3: false,
         // A proxied client's request goes out with its own Host; an agent's edits and rules
         // are checked when they are made.
         host: brainproxy_core::http::client::HostPolicy::Allow,

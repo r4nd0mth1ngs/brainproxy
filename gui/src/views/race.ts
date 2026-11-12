@@ -2,7 +2,7 @@
 // tested on its own (race.test.ts).
 
 import { autoEncodeRequest } from "../ui/urlencode.ts";
-import { optionArgs, type ReplayOptions } from "./replayOptions.ts";
+import { optionArgs, sendsAsTyped, type ReplayOptions } from "./replayOptions.ts";
 
 /**
  * One request of a race, as `send --race` returns it: a response, or why it failed. `id` is the
@@ -76,7 +76,10 @@ export function parseRaceCount(text: string, raw: string, http2 = false): number
  * timeout, Verify TLS, Don't record), plus --race.
  */
 export function raceArgs(target: string, n: number, options?: Partial<ReplayOptions>): string[] {
-  return ["send", `--target=${target}`, `--race=${n}`, ...optionArgs(options, "http"), "-"];
+  // A race goes over TCP: the tab's HTTP/3 option doesn't apply (send refuses --http3 with --race),
+  // and "as typed", which the tab shows off while HTTP/3 is on, stays off.
+  const tcp = { ...options, http3: false, verbatim: sendsAsTyped(options) };
+  return ["send", `--target=${target}`, `--race=${n}`, ...optionArgs(tcp, "http"), "-"];
 }
 
 /** The technique in words. */
