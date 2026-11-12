@@ -75,6 +75,12 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
         "history.id where last seen (source manual: the last linked entry; `findings show` lists them all in history_ids)",
     ),
     (
+        "base_history_id",
+        "INTEGER",
+        "Source active: history.id of the request the attack (history_id) was built from, its baseline \
+         (`findings verify` sends both); NULL for other sources and for findings from before brainproxy kept it",
+    ),
+    (
         "hits",
         "INTEGER",
         "Times seen (same alert, method, URL without query or path parameters, param); 0 for a triaged passive finding that \
@@ -562,6 +568,19 @@ impl Store {
 
     /// Stores findings for one message; returns how many were new.
     pub fn record_findings(&mut self, source: &str, msg: &Message, findings: &[Finding]) -> Result<usize> {
+        self.record_findings_from(source, msg, findings, None)
+    }
+
+    /// [`Store::record_findings`] for an attack: `base` is the history row of the request it
+    /// was built from. Like the attack and evidence, a finding keeps the base of its first
+    /// sighting, so the three always describe the same exchange (history_id).
+    pub fn record_findings_from(
+        &mut self,
+        source: &str,
+        msg: &Message,
+        findings: &[Finding],
+        base: Option<i64>,
+    ) -> Result<usize> {
         if findings.is_empty() {
             return Ok(0);
         }
@@ -589,8 +608,9 @@ impl Store {
             )?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, cwe, wasc, host,
-                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19)
+                    method, url, param, evidence, other_info, history_id, last_history_id, dedupe, attack, origin,
+                    base_history_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id,
                     risk = CASE WHEN hits = 0 OR excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
                     risk_level = CASE WHEN hits = 0 THEN excluded.risk_level
@@ -647,6 +667,7 @@ impl Store {
                         dedupe,
                         truncate(&f.attack, 2000),
                         crate::provenance::origin(),
+                        base,
                     ],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
