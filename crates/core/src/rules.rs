@@ -1182,6 +1182,13 @@ impl RuleSet {
         self.active(engine, host, RuleLocation::is_response).next().is_some()
     }
 
+    /// Whether a request rule's script sees `engine`'s requests to `host`: then whatever the
+    /// engine would send there that isn't an HTTP request (a raw connection) is not made, as the
+    /// script couldn't have blocked it.
+    pub fn scripts_requests(&self, engine: Engine, host: &str) -> bool {
+        self.active(engine, host, |l| l == RuleLocation::Request).next().is_some()
+    }
+
     /// Whether a WebSocket message going `engine`'s way on a connection to `host` may be
     /// rewritten, so the relay only takes a message apart when a rule is waiting for it.
     pub fn rewrites_ws(&self, engine: Engine, host: &str) -> bool {
@@ -1230,6 +1237,12 @@ impl EngineRules {
         self.failures.note(self.engine, &ruled.failed);
         ruled.check_host(opts, target)?;
         Ok(ruled)
+    }
+
+    /// Whether a request rule's script sees requests to `target` (see
+    /// [`RuleSet::scripts_requests`]).
+    pub fn scripts_requests(&self, target: &Target) -> bool {
+        self.set.scripts_requests(self.engine, &target.host)
     }
 
     /// Whether a response from `target` has rules to go through (see
@@ -2931,5 +2944,162 @@ mod tests {
         let out = respond(MAX_MATCHES + 1);
         assert!(!out.changed() && failed(&out)[0].1.contains("matches in too many places"), "{out:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A request rule over `script`; the folder is the caller's to remove.
+    fn request_rule_of(id: u32, script: &str) -> (Rule, std::path::PathBuf) {
+        let (r, dir) = scripted(id, RuleLocation::Request, "", script);
+        (Rule { applies_to: vec![Engine::Proxy, Engine::Send], ..r }, dir)
+    }
+
+    const HOOK: &str = "function request(req, ctx) {
+        switch (req.path) {
+            case '/keep': return;
+            case '/rewrite':
+                return { request: { method: 'PUT', target: req.target + '&x=1',
+                    headers: req.headers.concat([['X-Hook', ctx.engine + ' ' + ctx.host + ' ' + ctx.rule + ' ' + req.body]]),
+                    body: 'new body' } };
+            case '/headers': return { request: { headers: { 'X-Only': 1 } } };
+            case '/block': return { block: 'no \\u001b[2J admin' };
+            case '/bare': return { block: true };
+            case '/answer':
+                return { response: { status: 201, headers: { 'Content-Type': 'text/plain', 'Content-Length': '999',
+                    'Transfer-Encoding': 'chunked', 'X-Brainproxy-Answer': 'forged' }, body: 'hi ' + req.method } };
+            case '/bytes': return { response: { headers: [['A', 'b']], bodyBase64: 'AP8=' } };
+            case '/empty': return { response: { status: 204 } };
+        }
+    }";
+
+    #[test]
+    fn a_request_script_keeps_rewrites_blocks_or_answers_a_request() {
+        let (hook, dir) = request_rule_of(3, HOOK);
+        validate_rule(&hook).unwrap();
+        verify_script(&hook).unwrap();
+        let set = RuleSet::compile(std::slice::from_ref(&hook)).unwrap();
+        let run = |req: &str| set.request(Engine::Send, "h.test", req.as_bytes().to_vec());
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+
+        let keep = "GET /keep HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        let out = run(keep);
+        assert!(!out.changed() && out.stopped.is_none() && out.failed.is_empty(), "{out:?}");
+        assert_eq!(out.bytes, keep.as_bytes());
+
+        // Rewritten: the line, the headers and the body it gave, framed by brainproxy.
+        let out = run("POST /rewrite?a=1 HTTP/1.1\r\nHost: h.test\r\nContent-Length: 3\r\n\r\nold");
+        assert_eq!(
+            text(&out.bytes),
+            "PUT /rewrite?a=1&x=1 HTTP/1.1\r\nHost: h.test\r\nX-Hook: send h.test 3 old\r\nContent-Length: 8\r\n\r\nnew body"
+        );
+        assert_eq!((out.ids(), out.stopped.is_none()), (vec![3], true));
+        assert_eq!(out.edits(), [Edit { rule: Some(3), ..Default::default() }]);
+        // Headers alone replace the headers; the body stays, with a length of its own.
+        let out = run("POST /headers HTTP/1.1\r\nHost: h.test\r\nContent-Length: 2\r\n\r\nab");
+        assert_eq!(text(&out.bytes), "POST /headers HTTP/1.1\r\nX-Only: 1\r\nContent-Length: 2\r\n\r\nab");
+        // A chunked body is handed over as its data, and sent with a length.
+        let chunked = "POST /headers HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n";
+        assert_eq!(text(&run(chunked).bytes), "POST /headers HTTP/1.1\r\nX-Only: 1\r\nContent-Length: 2\r\n\r\nab");
+
+        // Blocked: nothing to send, with the reason made safe to show.
+        let out = run("GET /block HTTP/1.1\r\nHost: h.test\r\n\r\n");
+        let stopped = out.stopped.clone().unwrap();
+        assert_eq!(stopped.stop, Stop::Block("no \\u{1b}[2J admin".into()));
+        assert_eq!(stopped.message(), "blocked by the script of match-and-replace rule 3: no \\u{1b}[2J admin");
+        assert_eq!(out.edits(), [Edit { rule: Some(3), outcome: Some(Outcome::Blocked), ..Default::default() }]);
+        assert!(out.noted() && !out.changed());
+        let bare = run("GET /bare HTTP/1.1\r\n\r\n").stopped.unwrap();
+        assert_eq!(bare.message(), "blocked by the script of match-and-replace rule 3");
+
+        // Answered: framed by brainproxy, with its own mark the script can't forge or drop.
+        let out = run("GET /answer HTTP/1.1\r\nHost: h.test\r\n\r\n");
+        let answer = text(out.stopped.as_ref().unwrap().answer().unwrap());
+        assert_eq!(
+            answer,
+            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nX-Brainproxy-Answer: rule 3; this \
+             response is the rule's script's, the target sent nothing\r\n\r\nhi GET"
+        );
+        assert_eq!(out.edits()[0].outcome, Some(Outcome::Answered));
+        // The answer to a HEAD has no body, and says how long it would be.
+        let head = run("HEAD /answer HTTP/1.1\r\n\r\n").stopped.unwrap();
+        assert!(text(head.answer().unwrap()).ends_with("Content-Length: 7\r\nX-Brainproxy-Answer: rule 3; this response is the rule's script's, the target sent nothing\r\n\r\n"));
+        let bytes = run("GET /bytes HTTP/1.1\r\n\r\n").stopped.unwrap();
+        let bytes = bytes.answer().unwrap();
+        assert!(bytes.starts_with(b"HTTP/1.1 200 OK\r\nA: b\r\nContent-Length: 2\r\n") && bytes.ends_with(&[0x00, 0xff]));
+        let empty = run("GET /empty HTTP/1.1\r\n\r\n").stopped.unwrap();
+        assert!(text(empty.answer().unwrap()).starts_with("HTTP/1.1 204 No Content\r\nX-Brainproxy-Answer: "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_script_sees_the_rules_before_it_and_stops_the_ones_after() {
+        let (hook, dir) = request_rule_of(2, HOOK);
+        let before = Rule { applies_to: vec![Engine::Proxy], ..rule(1, RuleLocation::Path, "^/x$", "/answer") };
+        let after = Rule { applies_to: vec![Engine::Proxy], ..rule(3, RuleLocation::RequestHeader, "", "X-After: 1") };
+        let set = RuleSet::compile(&[before, hook, after]).unwrap();
+        let out = set.request(Engine::Proxy, "h.test", b"GET /x HTTP/1.1\r\n\r\n".to_vec());
+        // The rule before it made /answer of /x; the one after it had no turn.
+        assert_eq!(out.ids(), [1]);
+        assert_eq!(out.bytes, b"GET /answer HTTP/1.1\r\n\r\n");
+        assert_eq!(out.original.as_deref(), Some(&b"GET /x HTTP/1.1\r\n\r\n"[..]));
+        assert_eq!(out.stopped.as_ref().map(|s| s.id), Some(2));
+        let outcomes: Vec<_> = out.edits().iter().map(|e| (e.rule, e.outcome)).collect();
+        assert_eq!(outcomes, [(Some(1), None), (Some(2), Some(Outcome::Answered))]);
+        // Not an engine it applies to: no turn at all.
+        assert!(set.request(Engine::Scan, "h.test", b"GET /answer HTTP/1.1\r\n\r\n".to_vec()).stopped.is_none());
+        // Nor a response, a WebSocket message or a response's head.
+        assert!(!set.rewrites_responses(Engine::Proxy, "h.test"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_script_that_fails_sends_the_request_as_it_was() {
+        let req = "GET /a HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        for (script, why) in [
+            ("function request() { throw new Error('nope'); }", "Error: nope"),
+            ("function request() { return 'x'; }", "it returned a string"),
+            ("function request() { return [1]; }", "it returned an array"),
+            ("function request() { return Promise.resolve(null); }", "promise"),
+            ("function request() { return { other: 1 }; }", "no request, block or response"),
+            ("function request() { return { block: 'a', response: {} }; }", "block and response"),
+            ("function request() { return { block: 5 }; }", "give the reason as a string"),
+            ("function request() { return { response: 'x' }; }", "its response is a string"),
+            ("function request() { return { response: { status: 101 } }; }", "a code from 200 to 999"),
+            ("function request() { return { response: { status: '200' } }; }", "status is a number"),
+            ("function request() { return { response: { headers: { 'Bad Name': 'x' } } }; }", "can't be a header's name"),
+            ("function request() { return { response: { headers: { A: 'x\\r\\nB: y' } } }; }", "line break or NUL"),
+            ("function request() { return { response: { status: 204, body: 'x' } }; }", "which has no body"),
+            ("function request() { return { response: { body: 'a', bodyBase64: 'YQ==' } }; }", "give one"),
+            ("function request() { return { response: { code: 200 } }; }", "has no \"code\""),
+            ("function request() { return { request: { method: 'GET X' } }; }", "can't be a request's method"),
+            ("function request() { return { request: { target: '/a b' } }; }", "can't be a request's target"),
+            ("function request() { return { request: { headers: [['A']] } }; }", "[name, value] pairs"),
+            ("function request() { /^(a+)+$/.test('a'.repeat(40) + 'b'); }", "time limit"),
+        ] {
+            let (hook, dir) = request_rule_of(5, script);
+            let out = RuleSet::compile(&[hook]).unwrap().request(Engine::Proxy, "h.test", req.as_bytes().to_vec());
+            assert!(out.stopped.is_none() && !out.changed(), "{script}: {out:?}");
+            assert_eq!(out.bytes, req.as_bytes(), "{script}");
+            let failed = failed_of(&out);
+            assert!(failed.len() == 1 && failed[0].0 == 5 && failed[0].1.contains(why), "{script}: {failed:?}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_request_rule_is_a_script_given_the_whole_request() {
+        let (hook, dir) = request_rule_of(1, "function request(req) {}");
+        validate_rule(&hook).unwrap();
+        let no = |r: Rule| validate_rule(&r).unwrap_err().to_string();
+        assert!(no(Rule { replacer: ReplaceKind::Text, script: None, ..hook.clone() }).contains("is a script"));
+        assert!(no(Rule { pattern: "x".into(), ..hook.clone() }).contains("takes no --match"));
+        assert!(no(Rule { name: Some("X".into()), ..hook.clone() }).contains("takes no --match"));
+        assert!(no(Rule { applies_to: vec![Engine::WsToServer], ..hook.clone() }).contains("ws-message rule"));
+        // Its script defines request, not replace.
+        let (replace, dir2) = request_rule_of(2, "function replace(m) { return m.text; }");
+        assert!(verify_script(&replace).unwrap_err().to_string().contains("it defines no request function"));
+        // Saved and read back as any rule is: an older build that doesn't know the location skips it.
+        let json = serde_json::to_value(&hook).unwrap();
+        assert_eq!((json["location"].as_str(), json["replacer"].as_str()), (Some("request"), Some("script")));
+        assert_eq!(serde_json::from_value::<Rule>(json).unwrap(), hook);
+        let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(dir2));
     }
 }

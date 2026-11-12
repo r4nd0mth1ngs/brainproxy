@@ -525,10 +525,18 @@ impl Cx {
 
     /// A raw TCP connection to `host:port` for rules that speak another protocol
     /// (e.g. TLS records). Goes through the client, so the engagement scope applies.
+    /// Not made where a request rule's script sees the scan's requests: it couldn't block this.
     pub async fn connect_raw(&self, host: &str, port: u16) -> Result<crate::http::client::Stream> {
+        let target = Target { scheme: "http".into(), host: host.into(), port };
+        if self.shared.match_rules.as_ref().is_some_and(|r| r.scripts_requests(&target)) {
+            return Err(Error::Blocked(format!(
+                "a request rule's script sees this scan's requests to {host}, and couldn't block a raw connection; \
+                 none is made"
+            )));
+        }
         self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
-        self.shared.client.connect(&Target { scheme: "http".into(), host: host.into(), port }).await
+        self.shared.client.connect(&target).await
     }
 
     /// Sends a request and follows up to 5 redirects with GETs (ZAP's default

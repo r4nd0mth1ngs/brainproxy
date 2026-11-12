@@ -925,8 +925,19 @@ fn select_targets(
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Each request is on record before it goes out (as `send` records).
         let rows = Rows::direct("scan", Store::open(project)?).sent_by(&client);
+        // A request rule's script that blocks or answers a baseline: nothing is sent (its row says
+        // why), and there is nothing to attack.
+        let rules = brainproxy_core::rules::EngineRules::load(&store, brainproxy_core::rules::Engine::Scan)?;
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
+            if let Some(rules) = &rules {
+                let ruled = rules.request(send, &target, req.as_bytes().to_vec())?;
+                if let Some(stopped) = &ruled.stopped {
+                    let stopped_req = RawRequest::from_bytes(ruled.bytes.clone());
+                    let _ = rt.block_on(rows.send_ruled(&client, &stopped_req, &target, Some((rules, &ruled))));
+                    return Err(Error::Blocked(format!("{u}: {}; a scan doesn't attack it", stopped.message())));
+                }
+            }
             let (ids, sent) = rt.block_on(rows.send_with(&client, auth, Tool::Scan, &req, &target));
             let ex = sent?;
             let Some(&id) = ids.last() else { return Err(Error::Protocol("the request wasn't recorded".into())) };
