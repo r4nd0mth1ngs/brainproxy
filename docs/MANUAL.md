@@ -317,7 +317,7 @@ The sidebar groups the tools by what you are doing.
   actions (send in Replay, forward or drop a held message, export Traffic, start a scan or
   an attack, ...), start or stop the proxy, turn intercept on or off, open a browser, new
   finding, build a report, switch project, and open a Recent project. Type a few letters
-  of it (`tgi` finds *Turn intercept on or off*), move with the arrow keys and press Enter.
+  of it (`tio` finds *Turn intercept on or off*), move with the arrow keys and press Enter.
   Each entry shows its shortcut. One that can't run now is dimmed and says why. An action
   asks the same questions from the palette as from its button (stop running sends before
   switching project, say).
@@ -326,8 +326,8 @@ The sidebar groups the tools by what you are doing.
   held message in Proxy › Intercept, ⌘Enter sends in Replay and ⌘PageDown / ⌘PageUp move
   between its tabs, and ⌘U / ⌘⇧U URL-encode or decode the selection in a message editor
   (Ctrl instead of ⌘ on Linux and Windows). Shortcuts don't run while you type in a text
-  field, except the ones meant for it (send, encode, the palette; forward only in the
-  message editor, not in the filter box), and not while a dialog or a right-click menu is
+  field, except the ones meant for it (go to a tool, send, encode, the palette; forward
+  only in the message editor, not in the filter box), and not while a dialog or a right-click menu is
   open. On macOS the Control-key combinations are left to text editing (⌃K, ⌃F, ...), so
   the defaults use ⌘. Arrow keys, Enter, Esc and Tab work in lists and dialogs as usual.
 - **Change them** in **Settings › Keyboard**: every action is listed with its shortcut and

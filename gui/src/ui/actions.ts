@@ -90,6 +90,20 @@ export function actions(): Action[] {
 
 export const actionsVersion = () => version;
 
+/** The order groups are listed in; others follow in the order their actions were added. */
+const GROUP_ORDER = ["Go to", "App", "Project", "Recent projects", "Proxy", "Replay", "Fuzzer", "Scans", "Findings", "Message editor", "Dialogs"];
+
+/** The groups of `list`, each once, in the order they're listed. */
+export function groupsOf(list: ActionDef[]): string[] {
+  const seen: string[] = [];
+  for (const a of list) if (!seen.includes(a.group)) seen.push(a.group);
+  const at = (g: string) => {
+    const i = GROUP_ORDER.indexOf(g);
+    return i < 0 ? GROUP_ORDER.length : i;
+  };
+  return seen.sort((x, y) => at(x) - at(y));
+}
+
 /** Tells the palette and Settings that an action's title or state changed. */
 export const actionsChanged = changed;
 export function subscribeActions(l: () => void): () => void {

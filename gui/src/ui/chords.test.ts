@@ -36,6 +36,9 @@ test("a modifier alone, AltGr and the Windows key make no chord", () => {
 
 test("a keyboard with no codes names letters by what they type", () => {
   assert.equal(chordOf(press({ key: "k", ctrlKey: true }), false), "Mod+K");
+  assert.equal(chordOf(press({ key: ",", ctrlKey: true }), false), "Mod+,");
+  // With a code, what it types doesn't decide: an unknown key makes none.
+  assert.equal(chordOf(press({ key: "k", code: "IntlRo", ctrlKey: true }), false), null);
 });
 
 test("normalize puts modifiers in order and accepts other spellings", () => {

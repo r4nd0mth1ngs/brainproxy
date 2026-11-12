@@ -2,9 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fuzzy, rank } from "./fuzzy.ts";
 
-test("letters match in order, skipping others, ignoring case", () => {
-  assert.deepEqual(fuzzy("tgi", "Toggle intercept")?.at.length, 3);
+test("letters match in order as word starts and runs, ignoring case", () => {
+  assert.deepEqual(fuzzy("tio", "Turn intercept on or off")?.at, [0, 5, 15]);
+  assert.deepEqual(fuzzy("turint", "Turn intercept on or off")?.at, [0, 1, 2, 5, 6, 7]);
   assert.equal(fuzzy("TI", "toggle intercept") != null, true);
+  // Letters scattered inside words don't count.
+  assert.equal(fuzzy("send", "Switch between light and dark"), null);
+  assert.equal(fuzzy("tgi", "Toggle intercept"), null);
+  // A run inside a word does.
+  assert.deepEqual(fuzzy("port", "Build a report")?.at, [10, 11, 12, 13]);
   assert.equal(fuzzy("it", "Toggle") != null, false);
   assert.equal(fuzzy("xyz", "Proxy"), null);
   assert.deepEqual(fuzzy("", "anything"), { score: 0, at: [] });

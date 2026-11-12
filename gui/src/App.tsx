@@ -345,7 +345,8 @@ function Shell({ onClose, onOpen, toggleTheme }: { onClose: () => Promise<void>;
   };
   // Recent changes only when a project opens, so read once for this one.
   const recents = useMemo(() => recent().filter((p) => p !== app.project), [app.project]);
-  const goTo = (t: NavItem): Action => ({ id: `go.${t.id}`, title: t.label, group: "Go to", keys: t.keys, run: () => app.setTab(t.id) });
+  // Mod+digit and Mod+, mean nothing in a text field, so they go to a view from one too.
+  const goTo = (t: NavItem): Action => ({ id: `go.${t.id}`, title: t.label, group: "Go to", keys: t.keys, typing: true, run: () => app.setTab(t.id) });
   useActions([
     { id: "app.palette", title: "Open the command palette", group: "App", keys: "Mod+K", typing: true, noPalette: true, run: () => setPalette(true) },
     ...NAV.flatMap((g) => g.items).map(goTo),

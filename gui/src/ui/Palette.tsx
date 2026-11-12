@@ -3,7 +3,7 @@
 // question it asks (stop running sends? discard?) comes up as it would from its button.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { bindingOf, matches, type Action } from "./actions.ts";
+import { bindingOf, groupsOf, matches, type Action, type Overrides } from "./actions.ts";
 import { chordOf, formatChord } from "./chords.ts";
 import { rank } from "./fuzzy.ts";
 import { useDialogFocus } from "./dialogFocus";
@@ -17,15 +17,25 @@ export function paletteActions(list: Action[], view: string): Action[] {
   return list.filter((a) => a.run && !a.noPalette && !a.hidden && ((a.where ?? "global") === "global" || a.where === view));
 }
 
-/** With nothing typed: recent runs, then this view's, then the rest, each group together. */
-function byDefault(list: Action[], view: string): { a: Action; heading: string }[] {
+/**
+ * With nothing typed: recent runs, then this view's, then the rest, each group together and
+ * the ones with a shortcut first in it (the main views before their sub-tabs, say).
+ */
+function byDefault(list: Action[], view: string, o: Overrides): { a: Action; heading: string }[] {
   const recent = recentRuns.map((id) => list.find((a) => a.id === id)).filter((a): a is Action => !!a && !a.disabled).slice(0, 5);
   const rest = list.filter((a) => !recent.includes(a));
-  const groups: string[] = [];
-  for (const a of rest) if (!groups.includes(a.group)) groups.push(a.group);
+  const groups = groupsOf(rest);
   // This view's own actions first.
   groups.sort((x, y) => Number(rest.some((a) => a.group === y && a.where === view)) - Number(rest.some((a) => a.group === x && a.where === view)));
-  return [...recent.map((a) => ({ a, heading: "Recently used" })), ...groups.flatMap((g) => rest.filter((a) => a.group === g).map((a) => ({ a, heading: g })))];
+  return [
+    ...recent.map((a) => ({ a, heading: "Recently used" })),
+    ...groups.flatMap((g) =>
+      rest
+        .filter((a) => a.group === g)
+        .sort((x, y) => Number(!!bindingOf(y, o)) - Number(!!bindingOf(x, o)))
+        .map((a) => ({ a, heading: g })),
+    ),
+  ];
 }
 
 function highlight(text: string, at: number[]): ReactNode {
@@ -45,11 +55,11 @@ export function Palette({ view, mac, close }: { view: string; mac: boolean; clos
 
   const offered = useMemo(() => paletteActions(all, view), [all, view]);
   const rows = useMemo(() => {
-    if (!query.trim()) return byDefault(offered, view).map(({ a, heading }) => ({ a, heading, marks: [] as number[] }));
+    if (!query.trim()) return byDefault(offered, view, overrides).map(({ a, heading }) => ({ a, heading, marks: [] as number[] }));
     // Disabled ones after the rest.
     const ranked = rank(query, offered, (a) => a.title, (a) => `${a.group} ${a.keywords ?? ""}`);
     return [...ranked.filter((r) => !r.item.disabled), ...ranked.filter((r) => r.item.disabled)].map((r) => ({ a: r.item, heading: "", marks: r.at }));
-  }, [offered, query, view]);
+  }, [offered, query, view, overrides]);
   useEffect(() => setAt(0), [query]);
   const sel = Math.min(at, rows.length - 1);
 

@@ -74,8 +74,9 @@ function keyName(e: KeyPress): string | null {
   if (k === " ") return "Space";
   if (k === "+") return "Plus";
   if (NAMED.has(k) || /^F([1-9]|1[0-9]|2[0-4])$/.test(k)) return k;
-  // A keyboard that reports no code: a letter or digit by what it types.
-  if (/^[a-z0-9]$/i.test(k)) return k.toUpperCase();
+  // A keyboard that reports no code (some virtual and remote ones): by what the key types.
+  if (!c && /^[a-z0-9]$/i.test(k)) return k.toUpperCase();
+  if (!c && Object.values(PUNCT).includes(k)) return k;
   return null;
 }
 

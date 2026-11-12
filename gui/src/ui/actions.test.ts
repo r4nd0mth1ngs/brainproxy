@@ -8,6 +8,7 @@ import {
   clashes,
   conflicts,
   define,
+  groupsOf,
   inEditor,
   isTyping,
   loadOverrides,
@@ -78,6 +79,11 @@ test("an action matched where it happens follows the person's binding", () => {
   assert.equal(matches("t.editor", "Mod+E"), false);
   setOverrides({});
   assert.equal(matches("t.unknown", "Mod+U"), false);
+});
+
+test("groups are listed in a set order, others after in the order they came", () => {
+  const list = [def("a", { group: "Dialogs" }), def("b", { group: "Zeta" }), def("c", { group: "Replay" }), def("d", { group: "Go to" }), def("e", { group: "Dialogs" }), def("f", { group: "Alpha" })];
+  assert.deepEqual(groupsOf(list), ["Go to", "Replay", "Dialogs", "Zeta", "Alpha"]);
 });
 
 // ---------------- Bindings and persistence ----------------

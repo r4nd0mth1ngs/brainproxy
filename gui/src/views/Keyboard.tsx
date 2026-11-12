@@ -4,7 +4,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useApp } from "../store";
 import { whereLabel } from "../nav";
-import { bindingOf, clashes, conflicts, setOverrides, withBinding, type Action, type Overrides } from "../ui/actions.ts";
+import { bindingOf, clashes, conflicts, groupsOf, setOverrides, withBinding, type Action, type Overrides } from "../ui/actions.ts";
 import { bindProblem, chordOf, formatChord, isMac } from "../ui/chords.ts";
 import { confirm } from "../ui/Confirm";
 import { useActionList, useKeyLabel, useOverrides } from "../ui/useActions.ts";
@@ -36,11 +36,7 @@ export function Keyboard() {
     // Matches the title, its heading, where it applies and the shortcut as shown.
     return rank(filter, list, (a) => a.title, (a) => `${a.group} ${whereLabel(a.where)} ${keysOf(a, overrides)}`).map((r) => r.item);
   }, [list, filter, overrides]);
-  const groups = useMemo(() => {
-    const out: string[] = [];
-    for (const a of shown) if (!out.includes(a.group)) out.push(a.group);
-    return out;
-  }, [shown]);
+  const groups = useMemo(() => groupsOf(shown), [shown]);
   const titleOf = (id: string) => list.find((a) => a.id === id)?.title ?? id;
 
   const save = (o: Overrides) => {
