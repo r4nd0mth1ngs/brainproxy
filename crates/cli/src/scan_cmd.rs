@@ -221,6 +221,18 @@ pub enum FindingsCmd {
         retested by scanning again (the error gives the command), findings added by hand by hand, and \
         access-control findings with authz run. The outcome is on the finding's timeline.")]
     Retest(crate::retest_cmd::RetestArgs),
+    /// Send a finding's request with and without its payload, now, and show what differs.
+    #[command(after_help = "For an active scan's finding: the request the scan built the attack from \
+        (base_history_id; for a finding from before brainproxy recorded it, a request in history that the \
+        attack repeats with only the payload changed) and the attack request are sent again as recorded, \
+        alternately --repeat times, each recorded in history with source retest. The output gives, for each \
+        side (without, with), every send's history id, status, body length, time and whether the finding's \
+        evidence is in the response, and what differs: status, length, time (a second or more), the \
+        evidence only with the payload, and the body's changed lines. A finding with no baseline is \
+        refused (kind invalid_input), and so is a request refused for the scope when it was recorded. Only \
+        GET, HEAD and OPTIONS are sent unless --allow-unsafe. --request - reads an edited attack from \
+        stdin. The finding itself doesn't change: judge it, then findings mark.")]
+    Verify(crate::verify_cmd::VerifyArgs),
     /// What an agent did for a finding: the requests it sent to that host around it, its
     /// changes to the finding, and the first change a person made after them.
     Trail { id: i64 },
@@ -933,6 +945,9 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     if let FindingsCmd::Retest(args) = cmd {
         return crate::retest_cmd::retest(project, args, out);
     }
+    if let FindingsCmd::Verify(args) = cmd {
+        return crate::verify_cmd::verify(project, args, out);
+    }
     if let FindingsCmd::Repro { id, no_redact, mask, output, force } = &cmd {
         // Any file the server can write: an agent writes new files only.
         crate::mcp::check_force(*force, "findings repro", "write the pack to a new file, or leave out --output")?;
@@ -955,7 +970,9 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
     // Findings always reflect everything captured so far.
     passive::scan_pending(&mut store)?;
     match cmd {
-        FindingsCmd::Compare(_) | FindingsCmd::Retest(_) | FindingsCmd::Repro { .. } => unreachable!(),
+        FindingsCmd::Compare(_) | FindingsCmd::Retest(_) | FindingsCmd::Verify(_) | FindingsCmd::Repro { .. } => {
+            unreachable!()
+        }
         FindingsCmd::Trail { id } => {
             let t = store.agent_trail(id)?;
             out.ok(json!(t), || {

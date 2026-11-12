@@ -33,7 +33,7 @@ use crate::output::Out;
 use crate::{auth_cmd, process, sent};
 
 /// Methods a retest sends without being told it may: they shouldn't change anything.
-const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
+pub(crate) const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
 
 #[derive(clap::Args)]
 pub struct RetestArgs {
@@ -218,10 +218,10 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
 }
 
 /// Headers that tell a server to act as if the request had another method.
-const METHOD_OVERRIDES: &[&str] = &["x-http-method-override", "x-http-method", "x-method-override"];
+pub(crate) const METHOD_OVERRIDES: &[&str] = &["x-http-method-override", "x-http-method", "x-method-override"];
 
 /// A raw message's header lines, as (name, value).
-fn request_headers(raw: &[u8]) -> Vec<(String, String)> {
+pub(crate) fn request_headers(raw: &[u8]) -> Vec<(String, String)> {
     let head = raw.split(|&b| b == b'\n').skip(1).take_while(|l| !l.iter().all(|b| b.is_ascii_whitespace()));
     head.filter_map(|l| {
         let l = String::from_utf8_lossy(l);
@@ -273,75 +273,119 @@ fn send_again(
     target: &brainproxy_core::http::Target,
     request: &[u8],
 ) -> Result<i64, Error> {
-    let guard = store.guard()?;
-    crate::require_in_scope(&guard, target)?;
-    let opts = SendOptions {
-        guard: Some(guard),
-        timeout: std::time::Duration::from_secs_f64(a.timeout.max(0.001)),
-        verify_tls: false,
-        sni: None,
-        http2: false,
-        // Sent again as it was recorded, with whatever Host it had then.
-        host: brainproxy_core::http::client::HostPolicy::Allow,
-        stream: Default::default(),
-    };
-    let session = auth_cmd::maybe_session(project, a.auth.as_deref(), &opts)?;
-    let client = Client::new(opts);
-    let req = RawRequest::from_bytes(request.to_vec());
-    let mut log = sent::SentLog::open(project, RETEST_SOURCE, false)?.sent_by(&client);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-    let mut rows: Vec<i64> = Vec::new();
-    let mut open: Option<(i64, Vec<u8>)> = None;
-    let result = {
-        let (log, rows, open) = (&mut log, &mut rows, &mut open);
-        let sending = async {
-            let sending = |log: &mut sent::SentLog, rows: &mut Vec<i64>, open: &mut Option<_>, r: &RawRequest| {
-                let recorded = client.recorded_request(r, target)?;
-                let id = log.pending(target, &recorded)?;
-                rows.push(id);
-                *open = Some((id, recorded));
-                Ok::<_, Error>(())
-            };
-            match &session {
-                Some(s) => {
-                    let watch = |at: Attempt<'_>| match at {
-                        Attempt::Sending(r) => sending(log, rows, open, r),
-                        Attempt::Answered(ex) => match open.take() {
-                            Some((id, _)) => log.answered(id, ex),
-                            None => Ok(()),
-                        },
-                    };
-                    s.send_as_watched(brainproxy_core::session::Tool::Send, &req, target, watch).await
-                }
-                None => {
-                    sending(log, rows, open, &req)?;
-                    let ex = client.send(&req, target).await?;
-                    if let Some((id, _)) = open.take() {
-                        log.answered(id, &ex)?;
-                    }
-                    Ok(ex)
-                }
-            }
-        };
-        rt.block_on(async {
-            tokio::select! {
-                r = sending => Some(r),
-                _ = process::interrupted() => None,
-            }
-        })
-    };
-    let outcome = match (result, open) {
-        (Some(Ok(_)), _) => Ok(*rows.last().expect("every request is recorded before it is sent")),
-        (Some(Err(e)), Some((id, recorded))) => log.failed(id, target, &recorded, &e.to_string()).and(Err(e)),
-        (Some(Err(e)), None) => Err(e),
-        (None, Some((id, recorded))) => {
-            log.failed(id, target, &recorded, sent::CANCELLED).and(Err(sent::cancelled(&rows)))
-        }
-        (None, None) => Err(sent::cancelled(&rows)),
-    };
-    if let Some(s) = &session {
-        // A session that couldn't be saved logs in again next time; the retest stands.
-        let _ = s.save();
+    let mut sender = Resender::open(project, store, a.auth.as_deref(), a.timeout)?;
+    let sent = sender.send(target, request);
+    sender.finish();
+    match sent? {
+        Resent::Answered(id) => Ok(id),
+        Resent::Failed(_, e) => Err(e),
     }
-    outcome
+}
+
+/// How a request sent again ended: answered, or failed on the wire (its row records why).
+pub(crate) enum Resent {
+    Answered(i64),
+    Failed(i64, Error),
+}
+
+/// Sends recorded requests again as they were recorded, each recorded with source `retest`
+/// (which the background passive scan leaves alone), in the engagement's scope, with an auth
+/// profile's session when one is given.
+pub(crate) struct Resender {
+    session: Option<std::sync::Arc<brainproxy_core::auth::AuthSession>>,
+    client: Client,
+    log: sent::SentLog,
+    rt: tokio::runtime::Runtime,
+}
+
+impl Resender {
+    pub(crate) fn open(project: &Path, store: &Store, auth: Option<&str>, timeout: f64) -> Result<Self, Error> {
+        let opts = SendOptions {
+            guard: Some(store.guard()?),
+            timeout: std::time::Duration::from_secs_f64(timeout.max(0.001)),
+            verify_tls: false,
+            sni: None,
+            http2: false,
+            // Sent again as it was recorded, with whatever Host it had then.
+            host: brainproxy_core::http::client::HostPolicy::Allow,
+            stream: Default::default(),
+        };
+        let session = auth_cmd::maybe_session(project, auth, &opts)?;
+        let client = Client::new(opts);
+        let log = sent::SentLog::open(project, RETEST_SOURCE, false)?.sent_by(&client);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
+        Ok(Self { session, client, log, rt })
+    }
+
+    /// Sends one request. Fails, sending nothing, for a target out of scope; and when the
+    /// request couldn't be recorded or the user interrupted it.
+    pub(crate) fn send(&mut self, target: &brainproxy_core::http::Target, request: &[u8]) -> Result<Resent, Error> {
+        let guard = self.client.options().guard.clone().expect("a resender has a guard");
+        crate::require_in_scope(&guard, target)?;
+        let req = RawRequest::from_bytes(request.to_vec());
+        let client = &self.client;
+        let mut rows: Vec<i64> = Vec::new();
+        let mut open: Option<(i64, Vec<u8>)> = None;
+        let result = {
+            let (log, rows, open) = (&mut self.log, &mut rows, &mut open);
+            let session = &self.session;
+            let sending = async {
+                let sending = |log: &mut sent::SentLog, rows: &mut Vec<i64>, open: &mut Option<_>, r: &RawRequest| {
+                    let recorded = client.recorded_request(r, target)?;
+                    let id = log.pending(target, &recorded)?;
+                    rows.push(id);
+                    *open = Some((id, recorded));
+                    Ok::<_, Error>(())
+                };
+                match session {
+                    Some(s) => {
+                        let watch = |at: Attempt<'_>| match at {
+                            Attempt::Sending(r) => sending(log, rows, open, r),
+                            Attempt::Answered(ex) => match open.take() {
+                                Some((id, _)) => log.answered(id, ex),
+                                None => Ok(()),
+                            },
+                        };
+                        s.send_as_watched(brainproxy_core::session::Tool::Send, &req, target, watch).await
+                    }
+                    None => {
+                        sending(log, rows, open, &req)?;
+                        let ex = client.send(&req, target).await?;
+                        if let Some((id, _)) = open.take() {
+                            log.answered(id, &ex)?;
+                        }
+                        Ok(ex)
+                    }
+                }
+            };
+            self.rt.block_on(async {
+                tokio::select! {
+                    r = sending => Some(r),
+                    _ = process::interrupted() => None,
+                }
+            })
+        };
+        match (result, open) {
+            (Some(Ok(_)), _) => {
+                Ok(Resent::Answered(*rows.last().expect("every request is recorded before it is sent")))
+            }
+            (Some(Err(e)), Some((id, recorded))) => {
+                self.log.failed(id, target, &recorded, &e.to_string())?;
+                Ok(Resent::Failed(id, e))
+            }
+            (Some(Err(e)), None) => Err(e),
+            (None, Some((id, recorded))) => {
+                self.log.failed(id, target, &recorded, sent::CANCELLED).and(Err(sent::cancelled(&rows)))
+            }
+            (None, None) => Err(sent::cancelled(&rows)),
+        }
+    }
+
+    /// Keeps the session for next time. One that couldn't be saved logs in again next time;
+    /// what was sent stands.
+    pub(crate) fn finish(self) {
+        if let Some(s) = &self.session {
+            let _ = s.save();
+        }
+    }
 }

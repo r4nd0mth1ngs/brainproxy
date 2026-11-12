@@ -1579,3 +1579,87 @@ fn an_agent_can_filter_what_intercept_holds() {
     let (_, e) = m.call("intercept_status", json!({}));
     assert_eq!(e["data"]["settings"]["filter"], "status:5xx resp.body:error");
 }
+
+/// Serves an item page that errors on a quote in its query, as SQL built from it would.
+fn serve_sql() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = vec![0u8; 8192];
+            let mut len = 0;
+            while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf[len..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => len += n,
+                }
+            }
+            let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or_default().to_string();
+            let (status, body) = if line.contains("%27") || line.contains('\'') {
+                ("500 Internal Server Error", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version")
+            } else {
+                ("200 OK", "item")
+            };
+            let resp =
+                format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn an_agent_verifies_a_finding_with_and_without_its_payload() {
+    let port = serve_sql();
+    let p = tmp_project("verify");
+    let cli = |args: &[&str]| -> Value {
+        let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .env_remove("BRAINPROXY_PROJECT")
+            .args(["--format", "json", "--project"])
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], true, "{args:?}: {v}");
+        v["data"].clone()
+    };
+    cli(&["engagement", "start", "--target", "127.0.0.1"]);
+    let base = cli(&["send", "--url", &format!("http://127.0.0.1:{port}/item?q=hi")])["id"].as_i64().unwrap();
+    cli(&["scan", "active", "--history-id", &base.to_string(), "--rules=40018", "--strength", "low"]);
+    let list = cli(&["findings", "list", "--all", "--source", "active"]);
+    let id = list["items"][0]["id"].as_i64().unwrap_or_else(|| panic!("{list}"));
+
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}));
+    let tool = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "findings_verify").cloned();
+    let tool = tool.unwrap_or_else(|| panic!("no findings_verify tool"));
+    // It sends traffic, as a retest does.
+    assert_eq!(tool["annotations"]["openWorldHint"], true, "{tool}");
+    assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
+    assert!(tool["inputSchema"]["properties"]["stdin"].is_object(), "{tool}");
+
+    let (err, e) = m.call("findings_verify", json!({"id": id}));
+    assert!(!err, "{e}");
+    assert_eq!(
+        (e["data"]["without"]["status"].as_u64(), e["data"]["with"]["status"].as_u64()),
+        (Some(200), Some(500)),
+        "{e}"
+    );
+    assert_eq!(e["data"]["differences"]["evidence_only_with_payload"], true, "{e}");
+    // What it sent is on the record as an agent's.
+    let row = e["data"]["with"]["history_ids"][0].to_string();
+    assert_eq!(cli(&["history", "show", &row])["entry"]["origin"], "mcp");
+
+    // An edited attack comes from the call's stdin, never a file the server can read.
+    let file = p.parent().unwrap().join("req.txt");
+    std::fs::write(&file, format!("GET /item?q=x HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")).unwrap();
+    let (err, e) = m.call("findings_verify", json!({"id": id, "request": file.to_str().unwrap()}));
+    assert!(err && e["error"]["message"].as_str().unwrap().contains("through MCP"), "{e}");
+    let raw = format!("GET /item?q=x HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    let (err, e) = m.call("findings_verify", json!({"id": id, "request": "-", "stdin": raw}));
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["with"]["status"], 200, "{e}");
+}

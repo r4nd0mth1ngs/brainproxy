@@ -306,6 +306,7 @@ brainproxy findings mark 7 8 9 --state confirmed     # several at once: all or n
 brainproxy findings issues                        # one row per root cause (alert type on a host)
 brainproxy findings mark --issue 3 --state accepted-risk   # every finding of an issue
 brainproxy findings retest 7                      # send it again: not reproduced marks it fixed
+brainproxy findings verify 12 --repeat 3         # an active finding with and without its payload: what differs
 brainproxy findings timeline 7                    # found, triaged, retested, seen again, by whom
 brainproxy findings posture                       # open issues by risk, trends across scans
 brainproxy findings ticket 7 --to github --repo acme/web   # a ready-to-file issue (nothing is sent)

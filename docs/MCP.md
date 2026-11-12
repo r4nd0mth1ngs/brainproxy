@@ -110,7 +110,8 @@ file's) is refused, so an agent can't hide a set of findings in one call.
   `title`) from a table keyed by command path in `mcp.rs` (`HINTS`). Read-only and local:
   `query`, `schema`, `capabilities`, `history_*` reads, `findings_list`/`show`, `job_wait`,
   `ws_list`/`show`/`messages`, `sse_list`/`show`/`events`/`event`, ... Open world and destructive (requests can change state on the target): `send`,
-  `fuzz_run`, `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`.
+  `fuzz_run`, `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`,
+  `findings_retest`, `findings_verify`.
   Destructive locally: `engagement_start` (write-once), `*_stop`, `proxy_restart` (its `wait` is at
   most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
   goes back to the old proxy if it had stopped it and the new one isn't up: with its old options
@@ -173,6 +174,11 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
   would copy any file the server can read into the project for the agent to read back; pass the
   text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `findings_verify` with a `request` other than `-`: the edited attack is sent and recorded as it
+  is, so a file could reach the target and be read back from history. The request is the
+  call's `stdin` (`request: "-"`). Like `findings_retest`, it sends only GET, HEAD and OPTIONS
+  unless `allow_unsafe`, to the scope's targets only, and its requests are recorded as the
+  agent's (origin `mcp`, source `retest`).
 - `send` with an `also` file other than `-`: a race group member is sent and recorded as it is
   (and a request line that doesn't parse is quoted in the error), so it could send any file the
   server can read to a target and have it read back from history. An agent races a group of two

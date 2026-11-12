@@ -31,6 +31,7 @@ mod scan_cmd;
 mod sent;
 mod sse_cmd;
 mod update_cmd;
+mod verify_cmd;
 mod ws_cmd;
 
 use std::io::Read;

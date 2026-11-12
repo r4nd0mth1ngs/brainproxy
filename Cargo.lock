@@ -427,6 +427,7 @@ dependencies = [
  "libc",
  "regex",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
