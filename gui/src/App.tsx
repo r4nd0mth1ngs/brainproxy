@@ -29,6 +29,7 @@ import { formatChord, isMac } from "./ui/chords.ts";
 import { useActions, useOverrides, useShortcuts, withKey } from "./ui/useActions.ts";
 import { Palette } from "./ui/Palette";
 import { baseName } from "./views/deleteProject";
+import { openableRecents } from "./views/recentProjects";
 import { closeQuestion, stopAllCalls } from "./views/replayCalls";
 import { onCloseRequested } from "./quit";
 import { usePoll } from "./ui/usePoll";
@@ -343,8 +344,9 @@ function Shell({ onClose, onOpen, toggleTheme }: { onClose: () => Promise<void>;
     const p = await dialog.open({ filters: FILTERS, multiple: false });
     if (typeof p === "string") switchTo(p);
   };
-  // Recent changes only when a project opens, so read once for this one.
-  const recents = useMemo(() => recent().filter((p) => p !== app.project), [app.project]);
+  // Recent changes only when a project opens, so read once for this one. Only the paths Welcome
+  // would open: a relative one would open whatever it names from the CLI's folder.
+  const recents = useMemo(() => openableRecents(recent(), app.project), [app.project]);
   // Mod+digit and Mod+, mean nothing in a text field, so they go to a view from one too.
   const goTo = (t: NavItem): Action => ({ id: `go.${t.id}`, title: t.label, group: "Go to", keys: t.keys, typing: true, run: () => app.setTab(t.id) });
   useActions([

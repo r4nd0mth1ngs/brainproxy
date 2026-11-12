@@ -12,6 +12,7 @@ import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
 import { baseName, deletedNotice, forgetProject } from "./deleteProject";
 import { copySaved } from "./trafficFilter";
+import { isAbsolute } from "./recentProjects";
 
 const RECENT = "recent-projects";
 
@@ -54,10 +55,6 @@ function dirOf(path: string): string {
   return i > 0 ? path.slice(0, i) : "";
 }
 
-/** The CLI resolves a relative path against wherever it was started (the dev server's folder). */
-/** On Windows "/foo" is relative to the current drive, so only a drive letter or UNC path counts. */
-const isAbsolute = (path: string) =>
-  (navigator.userAgent.includes("Windows") ? /^([a-z]:[\\/]|\\\\)/i : /^\//).test(path);
 const FULL_PATH = "Use a full path, e.g. /home/you/engagements";
 
 /** Where to save a project named after the engagement; null if the user cancels. */
