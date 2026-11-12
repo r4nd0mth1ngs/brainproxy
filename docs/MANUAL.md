@@ -1445,13 +1445,17 @@ function request(req, ctx) {
 ```
 
 - `req` has `line`, `method`, `target`, `path`, `query`, `headers` (`[name, value]` pairs),
-  `body` (a chunked body as its data), and `bodyBase64` when the body isn't text. `ctx` has
+  `body` (a chunked body as its data), and `bodyBase64` when the body isn't text. A body over
+  1 MiB is cut there for the script and `bodyTruncated` is true; the request still goes whole
+  unless the script gives a body of its own. `ctx` has
   `engine` (`proxy`, `send`, `fuzz` or `scan`), `host` and `rule` (the rule's id). The request
   is the one before a session of `--auth` (or the proxy's auth profile) is applied to it, as for
   every rule.
 - It returns nothing (or `null`) to send the request as it is; `{ request: { method, target,
   headers, body } }` to send it changed (each part optional; `headers` replaces them all, as
-  `[name, value]` pairs or an object; `bodyBase64` for bytes); `{ block: "reason" }` (or
+  `[name, value]` pairs or an object; `bodyBase64` for bytes; what it was given may come back
+  with it, so `{ request: { ...req, method: "PUT" } }` works, and a changed `path` or `query`
+  makes the target); `{ block: "reason" }` (or
   `{ block: true }`) to not send it; or `{ response: { status, reason, headers, body } }` to not
   send it and use that response as if the server had sent it (`status` from 200 to 999, 200 by
   default; `bodyBase64` for bytes). Anything else, or a key it doesn't know, fails the call.
@@ -1475,7 +1479,9 @@ function request(req, ctx) {
   row, whatever `--store` says, so the result doesn't pass for the target's; a blocked one is an
   error result.
 - **A scan** records each answer and judges none: the attack (or the baseline of a URL given to
-  `scan active`, which then isn't attacked) fails with kind `blocked`. A probe's raw connection
+  `scan active`, which then isn't attacked) fails with kind `blocked`. A recorded row a script
+  answered is no baseline either: `scan active` passes it over, and refuses it by
+  `--history-id`. A probe's raw connection
   (the Heartbleed check's TLS records) isn't made to a host a request rule's script sees in
   scans, as the script couldn't have blocked it.
 - Every such row says what the script did in `entry.edited_by`: `{"rule": N, "outcome":
@@ -1566,7 +1572,8 @@ How a script is kept and run:
   the check finds nothing in that exchange. A script stopped at the time or memory limit, or
   one that doesn't load (it throws at the top, or has no function of its kind), runs no more
   until the command or the proxy starts again (or its rule is switched off and on), so a script that hangs costs its time limit once
-  and not for every request. The failure is on stderr, once for each different one; in `rule_errors` of `send`'s
+  and not for every request. For a request rule that means its requests go out as they are
+  from then on, so keep its work small: a body is cut at 1 MiB for it. The failure is on stderr, once for each different one; in `rule_errors` of `send`'s
   output (in a race, for the requests as they went out) and `errors` of `rules test`'s (the rule's
   id and why); and in `script_errors` of
   `scan passive`'s (the script, why, on how many exchanges, and the first history row; the
@@ -1581,7 +1588,9 @@ How a script is kept and run:
   script check, and `scan script add`, `test` and `remove` are refused or not offered. An
   agent's requests still go through the script rules a person set, as they go through a
   signer's script, and it can list them, try a saved rule that is switched on with `rules test
-  --rule`, and switch a rule or check off.
+  --rule`, and switch a rule or check off, except a request rule: its script may be what keeps
+  some requests from the target, so `rules disable`, `rules remove`, `rules clear` and `rules
+  import --replace` are refused through MCP while one is on.
 
 ### Server-sent events (`sse`, `send --stream-wait`)
 

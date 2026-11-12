@@ -411,9 +411,7 @@ impl Hook {
         }
         list.iter().map(ScriptFinding::read).collect::<std::result::Result<_, _>>().map_err(Failure::Script)
     }
-}
 
-impl Hook {
     /// Calls `request` on one request (`req`, as a script reads it) with `cx` (the engine and
     /// host): what it returned, in the shape `hook.js` gives it (`{keep}`, `{request}`,
     /// `{block}` or `{response}`), for [`crate::rules`] to read.

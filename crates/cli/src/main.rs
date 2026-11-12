@@ -843,18 +843,10 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         // Not sent, and no session is applied (a re-login would send): its row says why.
         let recorded = client.recorded_request(&req, &target)?;
         let id = log.pending(&target, &recorded)?;
-        let Some(response) = stopped.answer() else {
+        let Some(ex) = stopped.exchange(&target, recorded.clone()) else {
             let why = stopped.message();
             log.failed(id, &target, &recorded, &why)?;
             return Err(Error::Blocked(format!("{why}; nothing was sent (history #{id})")));
-        };
-        let ex = brainproxy_core::http::client::Exchange {
-            target: target.clone(),
-            request: recorded,
-            response: response.to_vec(),
-            duration_ms: 0,
-            sni: None,
-            stream: None,
         };
         log.answered(id, &ex)?;
         if args.raw {

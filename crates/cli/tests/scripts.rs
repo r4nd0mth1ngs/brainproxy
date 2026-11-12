@@ -730,7 +730,20 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     untouched("scan baseline");
     // Attacks on a recorded request: each is answered or blocked, none sent, nothing concluded;
     // a probe's raw connection (which no script could see) isn't made either.
-    let base = env.rows("SELECT id FROM history WHERE source = 'send' AND path = '/answered/send'")[0][0].to_string();
+    // A row the script answered is no baseline.
+    let answered = env.rows("SELECT id FROM history WHERE source = 'send' AND path = '/answered/send'")[0][0].to_string();
+    let (code, v) = env.run(&["scan", "active", "--history-id", &answered, "--strength", "low", "-c", "1"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("no baseline"), "{v}");
+    // A recorded exchange (written here, so the target is never asked) is attacked.
+    let base = {
+        use brainproxy_core::{capture::Capture, http::Target, store::Store};
+        let target = Target { scheme: "http".into(), host: "127.0.0.1".into(), port };
+        let req = format!("GET /answered/base?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\n\r\nok";
+        let c = Capture::new("proxy", &target, req.as_bytes(), Some(resp), Some(1), None);
+        Store::open(&env.project).unwrap().record(&c).unwrap().to_string()
+    };
     let (code, v) = env.run(&["scan", "active", "--history-id", &base, "--strength", "low", "-c", "1"]);
     assert!(env.rows("SELECT count(*) FROM history WHERE source = 'scan'")[0][0].as_i64().unwrap() > 1, "{code} {v}");
     assert_eq!(env.rows("SELECT count(*) FROM findings WHERE source = 'active'")[0][0], 0, "{v}");
@@ -772,6 +785,13 @@ fn a_request_script_is_a_persons_and_is_pinned_like_any_script() {
     env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send", "--disabled"]);
     assert!(env.refused(&agent, &["rules", "enable", "1"], None).contains(why));
     env.ok(&["rules", "enable", "1"]);
+    // Nor switch it off or remove it: it may be what keeps requests from the target.
+    let guard = "isn't switched off or removed through MCP";
+    for args in [&["rules", "disable", "1"][..], &["rules", "remove", "1"], &["rules", "clear"]] {
+        assert!(env.refused(&agent, args, None).contains(guard), "{args:?}");
+    }
+    assert!(env.refused(&agent, &["rules", "import", "-", "--replace"], Some(b"[]")).contains(guard));
+    assert_eq!(env.ok(&["rules", "list"])["rules"][0]["enabled"], true);
     // rules test says what the engine would do, sending nothing.
     let tried = env.ok_stdin(&["rules", "test", "-", "--as", "send"], b"GET /answered HTTP/1.1\r\nHost: h.test\r\n\r\n");
     assert_eq!(tried["request"]["stopped"]["outcome"], "answered", "{tried}");

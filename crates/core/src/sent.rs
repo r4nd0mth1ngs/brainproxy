@@ -460,18 +460,10 @@ impl Rows {
 
     /// Completes `row`, for a request a request rule's script stopped, with what the script did.
     fn stopped(&self, row: &mut OpenRow, stopped: &crate::rules::Stopped) -> Result<Exchange> {
-        let Some(response) = stopped.answer() else {
+        let Some(ex) = stopped.exchange(&row.target, row.request.clone()) else {
             let why = stopped.message();
             row.failed(&why);
             return Err(Error::Blocked(why));
-        };
-        let ex = Exchange {
-            target: row.target.clone(),
-            request: row.request.clone(),
-            response: response.to_vec(),
-            duration_ms: 0,
-            sni: None,
-            stream: None,
         };
         row.answered(&ex);
         Ok(ex)

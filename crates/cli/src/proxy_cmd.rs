@@ -2327,6 +2327,12 @@ pub fn scope(project: &Path, cmd: ScopeCmd, out: &Out) -> Result<(), Error> {
     Ok(())
 }
 
+/// A request rule that is on: its script may block or answer requests, so through MCP it is
+/// neither switched off nor removed (see [`crate::mcp::check_guard`]).
+fn is_guard(rule: &Rule) -> bool {
+    rule.enabled && rule.location == RuleLocation::Request
+}
+
 /// A rule from `rules add`'s flags (or `rules test`'s), not yet checked or given an id.
 fn rule_from(
     location: &str,
@@ -2434,6 +2440,9 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Import { file, replace, disabled, host_header_test } => {
             let imported = read_rules(file.as_deref())?;
             if replace {
+                if let Some(r) = rules.iter().find(|r| is_guard(r)) {
+                    crate::mcp::check_guard(&format!("rules import --replace would remove rule {}", r.id))?;
+                }
                 rules.clear();
             }
             // Checked before any is given an id, so a bad one leaves the rules as they were.
@@ -2464,6 +2473,9 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         }
         RulesCmd::Remove { id } => {
             let i = find(&mut rules, id)?;
+            if is_guard(&rules[i]) {
+                crate::mcp::check_guard(&format!("rules remove {id}"))?;
+            }
             rules.remove(i);
         }
         RulesCmd::Enable { id, host_header_test } => {
@@ -2484,10 +2496,18 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         }
         RulesCmd::Disable { id } => {
             let i = find(&mut rules, id)?;
+            if is_guard(&rules[i]) {
+                crate::mcp::check_guard(&format!("rules disable {id}"))?;
+            }
             rules[i].enabled = false;
             touched.push(id);
         }
-        RulesCmd::Clear => rules.clear(),
+        RulesCmd::Clear => {
+            if let Some(r) = rules.iter().find(|r| is_guard(r)) {
+                crate::mcp::check_guard(&format!("rules clear would remove rule {}", r.id))?;
+            }
+            rules.clear();
+        }
     }
     store.set_setting(RULES_KEY, &rules)?;
     // What a rule's script last failed on says nothing of a rule that is gone, or that was

@@ -14,7 +14,7 @@ use crate::auth::{request_cookies, AuthSession};
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
 use crate::fuzz::plan::{Plan, Template};
-use crate::http::client::{final_response, Exchange};
+use crate::http::client::final_response;
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::rules::{Engine, EngineRules, Ruled};
@@ -392,15 +392,7 @@ async fn exchange(
         // A request rule's script stopped it: nothing is sent, and its answer is no server's
         // for the response rules to rewrite.
         (None, Some(stopped)) => {
-            let answer = stopped.answer().map(|response| Exchange {
-                target: target.clone(),
-                request: request.to_vec(),
-                response: response.to_vec(),
-                duration_ms: 0,
-                sni: None,
-                stream: None,
-            });
-            let sent = answer.ok_or_else(|| Error::Blocked(stopped.message()));
+            let sent = stopped.exchange(target, request.to_vec()).ok_or_else(|| Error::Blocked(stopped.message()));
             let ruled = sent.as_ref().ok().map(|ex| Ruled { bytes: ex.response.clone(), ..Default::default() });
             (None, sent, ruled)
         }

@@ -985,6 +985,19 @@ impl Stopped {
         Edit { by: self.origin.clone(), rule: Some(self.id), outcome: Some(outcome), ..Default::default() }
     }
 
+    /// The exchange an engine takes in place of sending `request` to `target`: the script's
+    /// response, received in no time. None for a blocked request.
+    pub fn exchange(&self, target: &Target, request: Vec<u8>) -> Option<crate::http::client::Exchange> {
+        Some(crate::http::client::Exchange {
+            target: target.clone(),
+            request,
+            response: self.answer()?.to_vec(),
+            duration_ms: 0,
+            sni: None,
+            stream: None,
+        })
+    }
+
     /// The script's response, when it answered.
     pub fn answer(&self) -> Option<&[u8]> {
         match &self.stop {
@@ -1239,6 +1252,22 @@ impl EngineRules {
         Ok(ruled)
     }
 
+    /// `request` to `target` after the engine's request rules alone, for a request sent without
+    /// the other rules (a scan's baseline): what their scripts did with it, when one blocked or
+    /// answered it.
+    pub fn stop(&self, target: &Target, request: Vec<u8>) -> Option<Ruled> {
+        let active: Vec<&CompiledRule> =
+            self.set.active(self.engine, &target.host, |l| l == RuleLocation::Request).collect();
+        if active.is_empty() {
+            return None;
+        }
+        let run = Run::new(self.engine, &target.host);
+        let (bytes, by, stopped) = request_rules(&active, &request, &run);
+        let ruled = Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) };
+        self.failures.note(self.engine, &ruled.failed);
+        ruled.stopped.is_some().then_some(ruled)
+    }
+
     /// Whether a request rule's script sees requests to `target` (see
     /// [`RuleSet::scripts_requests`]).
     pub fn scripts_requests(&self, target: &Target) -> bool {
@@ -1277,19 +1306,6 @@ pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
     }
     // A script's failure on a request made up for the check is not one of traffic's.
     request_rules(&active, &req, &Run { quiet: true, ..Run::new(Engine::Proxy, "") }).0
-}
-
-/// [`apply_request_rules`], saying what each rule did: which changed the request, which failed,
-/// and whether a request rule's script stopped it. `host` and `engine` are what a script is
-/// told. Nothing is sent: this is `rules test`.
-pub fn test_request_rules(rules: &[CompiledRule], engine: Engine, host: &str, req: Vec<u8>) -> Ruled {
-    let active: Vec<&CompiledRule> = rules.iter().filter(|r| r.location.is_request()).collect();
-    if active.is_empty() {
-        return Ruled::unchanged(req);
-    }
-    let run = Run { quiet: true, ..Run::new(engine, host) };
-    let (bytes, by, stopped) = request_rules(&active, &req, &run);
-    Ruled { stopped, ..Ruled::of(req, bytes, by, run.failed()) }
 }
 
 /// The request line's method, target and version, when it is those three with single spaces.
@@ -1441,16 +1457,7 @@ const MAX_SCRIPT_HEADERS: usize = 500;
 /// `s` as it may be shown: at most `max` characters, control characters and text-direction
 /// overrides written out (a script's reason can be whatever a target sent).
 fn shown(s: &str, max: usize) -> String {
-    let bidi = |c: char| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-    let mut out = String::new();
-    for c in s.chars().take(max) {
-        match c {
-            c if c.is_control() => out.extend(c.escape_debug()),
-            c if bidi(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
+    crate::sandbox::shown_cut(s, max)
 }
 
 /// The keys of `o` that aren't `known`: a misspelt key would otherwise be ignored in silence.
@@ -1510,13 +1517,18 @@ fn script_body(o: &serde_json::Map<String, Value>, what: &str) -> std::result::R
     }
 }
 
+/// The most of a request's body a request rule's script is handed: more is cut, and said
+/// (`bodyTruncated`), so a large body can't put the request past its script.
+const MAX_SCRIPT_BODY: usize = 1 << 20;
+
 fn is_framing_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
 /// What a request rule's script returned (in the shape `hook.js` gives it), read for the
-/// request whose line is `first`: refused if it isn't one of the shapes allowed.
-fn read_turn(v: &Value, rule: u32, first: &str) -> std::result::Result<Turn, String> {
+/// request whose line is `first`: refused if it isn't one of the shapes allowed. `cut` is the
+/// body it was handed, when that was cut.
+fn read_turn(v: &Value, rule: u32, first: &str, cut: Option<&[u8]>) -> std::result::Result<Turn, String> {
     if v["keep"] == true {
         return Ok(Turn::Keep);
     }
@@ -1525,7 +1537,10 @@ fn read_turn(v: &Value, rule: u32, first: &str) -> std::result::Result<Turn, Str
     }
     let (method, target, version) = line_parts(first).unwrap_or(("GET", "/", "HTTP/1.1"));
     if let Some(o) = v["request"].as_object() {
-        only_keys(o, "request", &["method", "target", "headers", "body", "bodyBase64"])?;
+        // What it was given may come back with it (`{ ...req, method: "PUT" }`): `line`, `path`
+        // and `query` say again what `method` and `target` say, and `bodyTruncated` is ours.
+        let known = ["method", "target", "headers", "body", "bodyBase64", "line", "path", "query", "bodyTruncated"];
+        only_keys(o, "request", &known)?;
         let text = |key: &str| -> std::result::Result<Option<&str>, String> {
             match o.get(key) {
                 None | Some(Value::Null) => Ok(None),
@@ -1537,7 +1552,33 @@ fn read_turn(v: &Value, rule: u32, first: &str) -> std::result::Result<Turn, Str
         if !is_token(new_method) {
             return Err(format!("{:?} can't be a request's method", shown(new_method, 40)));
         }
-        let new_target = text("target")?.unwrap_or(target);
+        if text("line")?.is_some_and(|line| line != first) {
+            return Err("its request's line changed: change method and target instead".into());
+        }
+        let (_, path, query) = target_parts(target);
+        let given_path = text("path")?.unwrap_or(path);
+        let given_query = match o.get("query") {
+            None => query,
+            Some(Value::Null) => None,
+            Some(Value::String(q)) => Some(q.as_str()),
+            Some(_) => return Err("its request's query is a string or null".into()),
+        };
+        let moved = given_path != path || given_query != query;
+        let built;
+        let new_target = match text("target")? {
+            Some(t) if t != target && moved => {
+                return Err("its request changed target and path or query: change one of them".into())
+            }
+            Some(t) if t != target => t,
+            _ if moved => {
+                built = match given_query {
+                    Some(q) => format!("{given_path}?{q}"),
+                    None => given_path.to_string(),
+                };
+                built.as_str()
+            }
+            _ => target,
+        };
         if new_target.is_empty() || new_target.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(format!("{:?} can't be a request's target", shown(new_target, 80)));
         }
@@ -1546,7 +1587,18 @@ fn read_turn(v: &Value, rule: u32, first: &str) -> std::result::Result<Turn, Str
             None => None,
         };
         let line = format!("{new_method} {new_target} {version}");
-        return Ok(Turn::Rewrite(line, headers, script_body(o, "request")?));
+        // A body that isn't UTF-8 came with both: the text, unless the script changed it, is
+        // only the bytes' stand-in.
+        let body = match (o.get("body"), o.get("bodyBase64")) {
+            (Some(Value::String(text)), Some(Value::String(b))) => {
+                let bytes = STANDARD.decode(b.trim()).map_err(|_| "its request's bodyBase64 isn't base64".to_string())?;
+                Some(if String::from_utf8_lossy(&bytes) == text.as_str() { bytes } else { text.as_bytes().to_vec() })
+            }
+            _ => script_body(o, "request")?,
+        };
+        // A body cut for the script that comes back as it was handed over stays whole.
+        let body = body.filter(|new| cut.is_none_or(|cut| new.as_slice() != cut));
+        return Ok(Turn::Rewrite(line, headers, body));
     }
     let Some(o) = v["response"].as_object() else { return Err("its result couldn't be read".into()) };
     only_keys(o, "response", &["status", "reason", "headers", "body", "bodyBase64"])?;
@@ -1730,10 +1782,16 @@ fn request_turn(
     run: &Run<'_>,
 ) -> Turn {
     let cx = json!({ "engine": run.engine.name(), "host": run.host, "rule": rule.id });
+    let handed = &body[..body.len().min(MAX_SCRIPT_BODY)];
+    let cut = (body.len() > MAX_SCRIPT_BODY).then_some(handed);
+    let mut req = request_object(first, headers, handed);
+    if cut.is_some() {
+        req["bodyTruncated"] = json!(true);
+    }
     let read = hook
-        .request(&cx, &request_object(first, headers, body))
+        .request(&cx, &req)
         .map_err(|e| e.text().to_string())
-        .and_then(|v| read_turn(&v, rule.id, first));
+        .and_then(|v| read_turn(&v, rule.id, first, cut));
     match read {
         Ok(turn) => turn,
         Err(e) => {
@@ -3101,5 +3159,45 @@ mod tests {
         assert_eq!((json["location"].as_str(), json["replacer"].as_str()), (Some("request"), Some("script")));
         assert_eq!(serde_json::from_value::<Rule>(json).unwrap(), hook);
         let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(dir2));
+    }
+
+    #[test]
+    fn a_request_script_may_give_back_what_it_was_given_changed() {
+        let (hook, dir) = request_rule_of(
+            1,
+            "function request(req) {
+                if (req.path === '/spread') return { request: { ...req, method: 'PUT' } };
+                if (req.path === '/path') return { request: { ...req, path: '/moved', query: 'b=2' } };
+                if (req.path === '/both') return { request: { ...req, target: '/x', path: '/y' } };
+                if (req.path === '/line') return { request: { ...req, line: 'GET / HTTP/1.1' } };
+                if (req.path === '/big') return req.bodyTruncated ? { request: { ...req, method: 'PUT' } } : { block: 'whole' };
+                if (req.path === '/bigblock') return req.body.length < 1100000 ? { block: 'seen ' + req.body.length } : null;
+            }",
+        );
+        let set = RuleSet::compile(std::slice::from_ref(&hook)).unwrap();
+        let run = |req: Vec<u8>| set.request(Engine::Proxy, "h.test", req);
+        // A body that isn't UTF-8 comes back exact, though it came with both forms.
+        let mut req = b"POST /spread?a=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\n".to_vec();
+        req.extend([0xff, 0x00]);
+        let out = run(req);
+        assert!(out.bytes.starts_with(b"PUT /spread?a=1 HTTP/1.1\r\n") && out.bytes.ends_with(&[0xff, 0x00]), "{out:?}");
+        let out = run(b"GET /path?a=1 HTTP/1.1\r\n\r\n".to_vec());
+        assert_eq!(out.bytes, b"GET /moved?b=2 HTTP/1.1\r\n\r\n");
+        for path in ["/both", "/line"] {
+            let out = run(format!("GET {path} HTTP/1.1\r\n\r\n").into_bytes());
+            assert!(!out.changed() && out.failed.len() == 1, "{path}: {out:?}");
+        }
+        // A body over what a script is handed is cut for it, and said; one it gives back as it was
+        // handed over goes whole.
+        let body = vec![b'a'; MAX_SCRIPT_BODY + 10];
+        let mut req = format!("POST /big HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        req.extend(&body);
+        let out = run(req);
+        assert!(out.bytes.starts_with(b"PUT /big HTTP/1.1\r\n") && out.bytes.ends_with(&body), "{:?}", out.failed);
+        // And a large body doesn't take the request past the script.
+        let mut req = format!("POST /bigblock HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        req.extend(&body);
+        assert_eq!(run(req).stopped.map(|s| s.stop), Some(Stop::Block(format!("seen {MAX_SCRIPT_BODY}"))));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

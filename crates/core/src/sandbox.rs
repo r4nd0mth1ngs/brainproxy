@@ -663,10 +663,15 @@ const NO_RESULT: &str = "it ended without a result: out of memory, or the interp
 /// A script's own message as it may be shown: short, with control characters and text-direction
 /// overrides written out. A script can throw whatever it read in a response, and the message
 /// goes to a terminal.
-fn shown(error: &str) -> String {
+pub(crate) fn shown(error: &str) -> String {
+    shown_cut(error, 300)
+}
+
+/// [`shown`], at most `max` characters.
+pub(crate) fn shown_cut(error: &str, max: usize) -> String {
     let bidi = |c: char| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     let mut out = String::new();
-    for c in error.chars().take(300) {
+    for c in error.chars().take(max) {
         match c {
             c if c.is_control() => out.extend(c.escape_debug()),
             c if bidi(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),

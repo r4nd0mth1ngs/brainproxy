@@ -930,13 +930,13 @@ fn select_targets(
         let rules = brainproxy_core::rules::EngineRules::load(&store, brainproxy_core::rules::Engine::Scan)?;
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
-            if let Some(rules) = &rules {
-                let ruled = rules.request(send, &target, req.as_bytes().to_vec())?;
-                if let Some(stopped) = &ruled.stopped {
-                    let stopped_req = RawRequest::from_bytes(ruled.bytes.clone());
-                    let _ = rt.block_on(rows.send_ruled(&client, &stopped_req, &target, Some((rules, &ruled))));
-                    return Err(Error::Blocked(format!("{u}: {}; a scan doesn't attack it", stopped.message())));
-                }
+            // The baseline goes without the other rules, as it always did.
+            if let Some(ruled) = rules.as_ref().and_then(|r| Some((r, r.stop(&target, req.as_bytes().to_vec())?))) {
+                let (rules, ruled) = ruled;
+                let stopped_req = RawRequest::from_bytes(ruled.bytes.clone());
+                let _ = rt.block_on(rows.send_ruled(&client, &stopped_req, &target, Some((rules, &ruled))));
+                let why = ruled.stopped.as_ref().map(|s| s.message()).unwrap_or_default();
+                return Err(Error::Blocked(format!("{u}: {why}; a scan doesn't attack it")));
             }
             let (ids, sent) = rt.block_on(rows.send_with(&client, auth, Tool::Scan, &req, &target));
             let ex = sent?;
@@ -975,6 +975,18 @@ fn select_targets(
             continue;
         }
         if item.response.is_empty() {
+            continue;
+        }
+        // A response a request rule's script made up is no baseline: what the attacks' responses
+        // were compared with would be the script's.
+        let answered = item.entry.edited_by.iter().any(|e| e.outcome == Some(brainproxy_core::provenance::Outcome::Answered));
+        if answered {
+            if named.contains(&id) {
+                return Err(Error::Blocked(format!(
+                    "--history-id {id} was answered by a request rule's script, not the target: there is no baseline to \
+                     compare with; send it again to scan it"
+                )));
+            }
             continue;
         }
         if !guard.may_allow(&item.target.host, item.target.port) {
