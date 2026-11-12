@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bindProblem, chordOf, formatChord, hasCommandModifier, normalize, type KeyPress } from "./chords.ts";
+import { bindProblem, chordOf, formatChord, hasCommandModifier, normalize, typesText, type KeyPress } from "./chords.ts";
 
 const press = (p: Partial<KeyPress>): KeyPress => ({ key: "", code: "", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...p });
 
@@ -70,6 +70,17 @@ test("a command modifier is Mod, Ctrl or Alt, not Shift", () => {
   // Option types characters on macOS.
   assert.equal(hasCommandModifier("Alt+K", true), false);
   assert.equal(hasCommandModifier("Ctrl+K", true), true);
+});
+
+test("a chord types text when it is a character with no command modifier", () => {
+  assert.equal(typesText("P", false), true);
+  assert.equal(typesText("Shift+/", false), true);
+  assert.equal(typesText("Space", false), true);
+  assert.equal(typesText("Alt+A", true), true);
+  assert.equal(typesText("Alt+A", false), false);
+  assert.equal(typesText("Mod+K", true), false);
+  assert.equal(typesText("F5", false), false);
+  assert.equal(typesText("Alt+Enter", true), false);
 });
 
 test("keys the window and fields use can't be shortcuts", () => {

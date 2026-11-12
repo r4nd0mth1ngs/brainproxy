@@ -135,6 +135,12 @@ export function hasCommandModifier(chord: string, mac = false): boolean {
   return mods.has("Mod") || mods.has("Ctrl") || (mods.has("Alt") && !mac);
 }
 
+/** Whether the chord types a character into a text field (a letter, digit, punctuation or Space, with no command modifier). */
+export function typesText(chord: string, mac: boolean): boolean {
+  const { key } = split(chord);
+  return (key.length === 1 || key === "Space" || key === "Plus") && !hasCommandModifier(chord, mac);
+}
+
 const MAC_KEYS: Record<string, string> = {
   Enter: "↩",
   Escape: "⎋",

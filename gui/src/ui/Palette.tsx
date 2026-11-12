@@ -4,7 +4,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { actions, bindingOf, groupsOf, matches, type Action, type Overrides } from "./actions.ts";
-import { chordOf, formatChord } from "./chords.ts";
+import { chordOf, formatChord, typesText } from "./chords.ts";
 import { rank } from "./fuzzy.ts";
 import { useDialogFocus } from "./dialogFocus";
 import { useActionList, useOverrides } from "./useActions.ts";
@@ -83,8 +83,10 @@ export function Palette({ view, mac, close }: { view: string; mac: boolean; clos
   const onKey = (e: React.KeyboardEvent) => {
     // Kept here: nothing else runs while the palette is open.
     e.stopPropagation();
-    // Its own shortcut closes it again.
-    if (matches("app.palette", chordOf(e.nativeEvent, mac), e.target as HTMLElement, mac)) {
+    // Its own shortcut closes it again, unless it types a character into the search (a plain
+    // letter, or ⌥ and a letter on macOS): then it is typed.
+    const chord = chordOf(e.nativeEvent, mac);
+    if (chord && !typesText(chord, mac) && matches("app.palette", chord, null, mac)) {
       e.preventDefault();
       return close();
     }
@@ -94,7 +96,7 @@ export function Palette({ view, mac, close }: { view: string; mac: boolean; clos
       // Page keys stop at the ends; arrows wrap round.
       if (Math.abs(step) > 1) setAt(Math.max(0, Math.min(rows.length - 1, sel + step)));
       else move(step);
-    } else if (e.key === "Enter") {
+    } else if (e.key === "Enter" && !e.altKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
       if (!e.nativeEvent.isComposing) choose(rows[sel]?.a);
     } else if (e.key === "Escape") {
