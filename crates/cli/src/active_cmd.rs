@@ -1019,10 +1019,16 @@ fn select_targets(
             skipped += 1;
             continue;
         }
+        // An API baseline a request rule's script rewrote is attacked from the request as the
+        // document gave it: each attack goes through the script again.
+        let request = match item.rule_edit.and_then(|e| e.original_request).filter(|_| args.preapproved) {
+            Some(original) => original,
+            None => item.request,
+        };
         targets.push(ScanTarget {
             history_id: Some(id),
             target: item.target,
-            request: item.request,
+            request,
             response: item.response,
             duration_ms: item.entry.duration_ms.map(|d| d.max(0) as u64),
         });

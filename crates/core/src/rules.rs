@@ -1199,6 +1199,7 @@ impl RuleSet {
         }
         let run = Run::new(engine, host);
         let (bytes, by) = response_rules(&active, &response, answers_head(request), &run);
+        let bytes = keep_answer_mark(&response, bytes);
         Ruled::of(response, bytes, by, run.failed())
     }
 
@@ -1214,7 +1215,7 @@ impl RuleSet {
         }
         let run = Run::new(engine, host);
         let (bytes, by) = response_rules(&active, &head, false, &run);
-        let bytes = keep_framing(&head, bytes);
+        let bytes = keep_answer_mark(&head, keep_framing(&head, bytes));
         Ruled::of(head, bytes, by, run.failed())
     }
 
@@ -2035,6 +2036,25 @@ fn response_rules<'a>(
 }
 
 /// Whether a header line is one of the message's framing: Content-Length or Transfer-Encoding.
+/// `new`, what the response rules made of `original`, with the mark of a request rule's script's
+/// answer ([`ANSWER_HEADER`]) as `original` had it: a response rule can neither remove nor
+/// change it, so the answer says whose it is wherever it goes next (the intercept, the client).
+fn keep_answer_mark(original: &[u8], new: Vec<u8>) -> Vec<u8> {
+    let is_mark =
+        |line: &str| header_parts(line).is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(ANSWER_HEADER));
+    let (head, _) = split_head_body(original);
+    let (_, lines) = split_lines(head);
+    let marks: Vec<&String> = lines.iter().filter(|l| is_mark(l)).collect();
+    let (new_head, new_body) = split_head_body(&new);
+    let (first, mut new_lines) = split_lines(new_head);
+    if new_lines.iter().filter(|l| is_mark(l)).eq(marks.iter().copied()) {
+        return new;
+    }
+    new_lines.retain(|l| !is_mark(l));
+    new_lines.extend(marks.into_iter().cloned());
+    join(&first, &new_lines, new_body)
+}
+
 fn is_framing(line: &str) -> bool {
     header_parts(line)
         .is_some_and(|(k, _)| ["content-length", "transfer-encoding"].iter().any(|n| k.trim().eq_ignore_ascii_case(n)))
@@ -3245,5 +3265,20 @@ mod tests {
         req.extend(&body);
         assert_eq!(run(req).stopped.map(|s| s.stop), Some(Stop::Block(format!("seen {MAX_SCRIPT_BODY}"))));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_response_rule_neither_removes_nor_changes_a_scripts_answer_mark() {
+        let rules = [
+            named(1, RuleLocation::ResponseHeader, ANSWER_HEADER, RuleAction::Remove, "", ""),
+            named(2, RuleLocation::ResponseHeader, "X-Added", RuleAction::Add, "", "1"),
+        ];
+        let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{ANSWER_HEADER}: rule 3; mark\r\n\r\nok");
+        let out = RuleSet::compile(&rules).unwrap().response(Engine::Proxy, "h", b"", answer.clone().into_bytes());
+        let text = String::from_utf8(out.bytes).unwrap();
+        assert!(text.contains(&format!("{ANSWER_HEADER}: rule 3; mark\r\n")) && text.contains("X-Added: 1"), "{text}");
+        let forge = [named(1, RuleLocation::ResponseHeader, ANSWER_HEADER, RuleAction::Set, "", "the target's")];
+        let out = RuleSet::compile(&forge).unwrap().response(Engine::Proxy, "h", b"", answer.into_bytes());
+        assert!(!out.changed(), "{:?}", String::from_utf8_lossy(&out.bytes));
     }
 }

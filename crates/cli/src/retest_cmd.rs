@@ -87,6 +87,15 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
     // The rule must be able to look: one switched off would call every finding fixed.
     let settings: PassiveSettings = store.setting(passive::SETTINGS_KEY)?;
     let alert_ref = f["alert_ref"].as_str().unwrap_or_default().to_string();
+    // Raised from a response a request rule's script made up: what the target answers says nothing
+    // of it either way (a target's finding is another alert type), so "fixed" would mislead.
+    if alert_ref.starts_with(passive::SCRIPT_ANSWER_PREFIX) {
+        return Err(Error::InvalidInput(format!(
+            "finding {} was raised from a request rule's script's answer, not a response of the target's: switch \
+             the rule off and send the request to the target to see whether the finding is there",
+            a.id
+        )));
+    }
     let rule = f["rule_id"].as_i64().unwrap_or(0);
     // A script check's finding names the script that raised it.
     let script = passive::ScriptCheck::name_in(&alert_ref).map(|name| format!("{}{name}", passive::SCRIPT_PREFIX));

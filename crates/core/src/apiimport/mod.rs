@@ -445,6 +445,12 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
             Some(r) => Capture { edited_by: r.edits(), original_request: r.original.clone(), ..c },
             None => c,
         };
+        // A script's answer goes through the response rules as a server's would; the row keeps
+        // what they made of it beside it. (A baseline the target answered gets them in the scan.)
+        let answered_by_rules = |ex: &crate::http::client::Exchange| {
+            let rules = cfg.rules.as_ref().filter(|_| noted.is_some_and(|r| r.stopped.is_some()))?;
+            Some(rules.response(&target, &ex.request, ex.response.clone())).filter(|r| r.changed())
+        };
         // Host names pass may_allow; the resolved address can still be out of scope.
         if let Err(e @ Error::OutOfScope(_)) = &sent {
             summary.skipped_out_of_scope += 1;
@@ -457,14 +463,19 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
         let (status, error, id) = match sent {
             Ok(ex) => {
                 let status = parse_response_head(&ex.response).ok().map(|h| h.status);
-                let id = store.record(&mark(Capture::new(
+                let mut c = mark(Capture::new(
                     SOURCE,
                     &target,
                     &ex.request,
                     Some(&ex.response),
                     Some(ex.duration_ms as i64),
                     None,
-                )))?;
+                ));
+                if let Some(r) = answered_by_rules(&ex) {
+                    c.response_edits = r.edits();
+                    c.modified_response = Some(r.bytes);
+                }
+                let id = store.record(&c)?;
                 // A script's answer is on record, but it is no response of the target's.
                 let answered = noted.and_then(|r| r.stopped.as_ref()).map(|s| s.message());
                 (status, answered, id)

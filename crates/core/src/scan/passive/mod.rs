@@ -504,7 +504,13 @@ pub fn rescan(store: &mut Store) -> Result<ScanStats> {
     // they stay as they are, where a rule's that finds nothing any more go.
     let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let kept = |names: Vec<String>| -> Vec<String> {
-        names.into_iter().map(|name| format!("{SCRIPT_PREFIX}{name}:")).collect()
+        // Its findings in a script's answer too (see `in_script_answer`).
+        names
+            .into_iter()
+            .flat_map(|name| {
+                [format!("{SCRIPT_PREFIX}{name}:"), format!("{SCRIPT_ANSWER_PREFIX}{SCRIPT_PREFIX}{name}:")]
+            })
+            .collect()
     };
     let unloaded = kept(script_problems(&settings).into_iter().map(|(name, _)| name).collect());
     let before = store.findings_rescan_start("passive", &unloaded)?;

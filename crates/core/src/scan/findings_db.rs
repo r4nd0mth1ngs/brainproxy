@@ -624,7 +624,9 @@ impl Store {
             )?;
             for (f, dedupe) in findings.iter().zip(&keys) {
                 let d = f.def;
-                let rule_id: u32 = d.alert_ref.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                // A finding raised from a script's answer is filed under its rule's id all the same.
+                let of = d.alert_ref.strip_prefix(crate::scan::passive::SCRIPT_ANSWER_PREFIX).unwrap_or(d.alert_ref);
+                let rule_id: u32 = of.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 types.execute(params![
                     d.alert_ref,
                     rule_id,

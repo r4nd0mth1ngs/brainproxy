@@ -678,7 +678,7 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
         "--replace",
         "yes",
         "--applies-to",
-        "proxy,send",
+        "proxy,send,scan",
     ]);
     let mark = "X-Brainproxy-Answer: rule 1; this response is the rule's script's, the target sent nothing";
     let untouched = |engine: &str| {
@@ -690,10 +690,7 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     wait_for_settings();
     let resp = through(&listen, port, "/answered?a=1", "");
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains(mark) && resp.contains("X-Ruled: yes"), "{resp}");
-    assert!(
-        resp.ends_with("<html><title>made up</title>proxy GET http://127.0.0.1:") || resp.contains("proxy GET "),
-        "{resp}"
-    );
+    assert!(resp.contains("<title>made up</title>proxy GET ") && resp.ends_with("/answered?a=1</html>"), "{resp}");
     let resp = through(&listen, port, "/blocked", "");
     assert!(resp.starts_with("HTTP/1.1 403 Forbidden\r\n") && resp.contains("X-Brainproxy-Error: blocked"), "{resp}");
     assert!(resp.contains("blocked by the script of match-and-replace rule 1: not on proxy"), "{resp}");
@@ -789,13 +786,19 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     let rows = env.rows("SELECT path, edited_by FROM history WHERE path LIKE '%/api' ORDER BY path");
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(rows.iter().all(|r| r[1].as_str().is_some_and(|e| e.contains("outcome"))), "{rows:?}");
+    // The answered one went through the scan's response rules as a server's response would.
+    let ruled = env.rows(
+        "SELECT count(*) FROM rule_edits e JOIN history h ON h.id = e.history_id \
+         WHERE h.path = '/answered/api' AND instr(e.modified_response, 'X-Ruled: yes') > 0",
+    );
+    assert_eq!(ruled[0][0], 1, "{ruled:?}");
     untouched("scan --api");
 
     // Passive checks read a script's response, and every finding raised from it says it is the
     // script's: an alert type of its own, a name, a description, a tag and other info that say so.
     env.ok(&["scan", "passive", "--rescan"]);
     let found = env.rows(
-        "SELECT f.alert_ref, f.name, f.other_info, t.description, t.tags FROM findings f \
+        "SELECT f.alert_ref, f.name, f.other_info, t.description, t.tags, f.rule_id, f.id FROM findings f \
          JOIN history h ON h.id = f.history_id JOIN finding_types t ON t.alert_ref = f.alert_ref \
          WHERE h.edited_by LIKE '%answered%'",
     );
@@ -809,7 +812,11 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
             "{f:?}"
         );
         assert!(f[4].as_str().unwrap().contains("script-answer"), "{f:?}");
+        // Filed under its rule's id, which a retest refuses: the target's answer says nothing of it.
+        assert_ne!(f[5], 0, "{f:?}");
     }
+    let e = env.refused(&[], &["findings", "retest", &found[0][6].to_string()], None);
+    assert!(e.contains("raised from a request rule's script's answer"), "{e}");
     // None of them is one with a finding of the target's: no finding lacks the mark there.
     let plain = env.rows(
         "SELECT count(*) FROM findings f JOIN history h ON h.id IN (f.history_id, f.last_history_id) \
@@ -945,4 +952,52 @@ fn a_request_scripts_rewrite_goes_to_scan_baselines_and_meets_the_host_check() {
     let (code, v) = env.run(&["send", "--url", &format!("http://127.0.0.1:{port}/elsewhere")]);
     assert_eq!((code, v["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("the script of request rule 1 put a host"), "{v}");
+}
+
+#[test]
+fn an_api_scan_attacks_from_the_request_before_the_script() {
+    // Answers every request 200, and keeps each request line it got.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = lines.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 65536];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string());
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            });
+        }
+    });
+    let env = Env::new("stops-api");
+    // Not idempotent: applied twice, it would say so in the path.
+    let script = env
+        .script("prefix.js", "function request(req) { return { request: { ...req, path: '/prefix' + req.path } }; }");
+    env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "scan"]);
+    let spec = env.script(
+        "api.json",
+        &json!({
+            "openapi": "3.0.0", "info": {"title": "t", "version": "1"},
+            "servers": [{"url": format!("http://127.0.0.1:{port}")}],
+            "paths": {"/item": {"get": {"parameters": [{"name": "q", "in": "query", "schema": {"type": "string"}}],
+                                        "responses": {"200": {"description": "ok"}}}}},
+        })
+        .to_string(),
+    );
+    let _ = env.run(&["scan", "active", "--api", &spec, "--strength", "low", "-c", "1"]);
+    let got = lines.lock().unwrap().clone();
+    assert!(got.iter().any(|l| l.starts_with("GET /prefix/item")), "{got:?}");
+    assert!(!got.iter().any(|l| l.contains("/prefix/prefix")), "{got:?}");
 }

@@ -1467,7 +1467,7 @@ function request(req, ctx) {
   which can have no body; the answer to a `HEAD` has no body). It also adds
   `X-Brainproxy-Answer: rule N; this response is the rule's script's, the target sent nothing`
   to every answer, and drops a header of that name, `Content-Length` or `Transfer-Encoding` the
-  script gives: wherever the response is shown (Traffic, `history show`, a HAR export, a report)
+  script gives; nor can a response rule remove or change it afterwards: wherever the response is shown (Traffic, `history show`, a HAR export, a report)
   it says the target didn't send it.
 - The rules after it don't see a request it blocked or answered. An answer is taken as a
   server's response would be: it goes through the response rules (the row keeps it as the
@@ -1504,7 +1504,8 @@ function request(req, ctx) {
   names the rule and the history row. It is never one finding with the target's (another alert
   type), and the name and description go wherever the finding goes: `findings list`, reports
   and their exports, and the app, which tags it *script answer* and says over it what it is.
-  Its host and URL are where the request was going.
+  Its host and URL are where the request was going, and its rule id is the rule's own. `findings
+  retest` refuses it: what the target answers says nothing of a finding in a script's answer.
 - `rules test` says what the engine would do (`stopped`, with the script's response or the
   reason), and sends nothing either way.
 
