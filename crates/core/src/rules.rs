@@ -717,9 +717,6 @@ pub fn validate_rule(rule: &Rule) -> Result<()> {
             if rule.action == Some(RuleAction::Remove) {
                 return bad("--action remove takes no --script: nothing is written".into());
             }
-            if rule.host_header_test && loc == RuleLocation::Request {
-                return bad("a request rule takes no --host-header-test: the client checks the Host its script sends".into());
-            }
             if script.sha256.len() != 64 || !script.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return bad("a script is pinned by its sha256".into());
             }

@@ -71,6 +71,7 @@ export const LOCATIONS: { id: string; label: string; group: string }[] = [
   { id: "request-header", label: "Request header", group: "Request" },
   { id: "request-body", label: "Request body", group: "Request" },
   { id: "request-line", label: "Request line (raw)", group: "Request" },
+  { id: "request", label: "Whole request (script)", group: "Request" },
   { id: "status", label: "Status code", group: "Response" },
   { id: "response-header", label: "Response header", group: "Response" },
   { id: "response-body", label: "Response body", group: "Response" },
@@ -96,6 +97,8 @@ export const WS_ENGINES = [
 ];
 
 const isWs = (location: string) => location === "ws-message";
+/** A request rule: its script gets the whole request, and may change, block or answer it. */
+export const isRequestRule = (location: string) => location === "request";
 const isHeader = (location: string) => location === "request-header" || location === "response-header";
 
 /** Whether a location takes a name: a query parameter must have one, a header may. */
@@ -116,6 +119,8 @@ export function withLocation(draft: Draft, location: string): Draft {
     name: takesName(location) ? draft.name : "",
     action: takesName(location) ? draft.action : "set",
     appliesTo: sameKind ? draft.appliesTo : defaultEngines(location),
+    // A request rule is a script, nothing else.
+    replacer: isRequestRule(location) ? "script" : draft.replacer,
   };
 }
 
@@ -131,6 +136,7 @@ export function draftProblem(draft: Draft): string | null {
   const named = isNamed(draft);
   if (draft.location === "query-param" && !named) return "Name the query parameter.";
   if (!draft.appliesTo.length) return "Choose what the rule applies to.";
+  if (isRequestRule(draft.location)) return draft.script.trim() ? null : "Choose the script file: it defines request(req, ctx).";
   if (isScripted(draft)) {
     if (named && draft.action === "remove") return "Remove writes nothing, so it takes no script.";
     // What the script returns is checked when it runs: a status, a header line, anything.
@@ -144,7 +150,7 @@ export function draftProblem(draft: Draft): string | null {
 }
 
 /** Whether a script makes the draft's replacement. */
-export const isScripted = (draft: Draft) => draft.replacer === "script";
+export const isScripted = (draft: Draft) => draft.replacer === "script" || isRequestRule(draft.location);
 
 /** A script file's name without its folders, for a table cell or a question. */
 export const scriptName = (file: string) => file.split(/[\\/]/).pop() || file;
@@ -153,6 +159,12 @@ export const scriptName = (file: string) => file.split(/[\\/]/).pop() || file;
 function specArgs(draft: Draft): string[] {
   const named = isNamed(draft);
   const args = [`--location=${draft.location}`];
+  if (isRequestRule(draft.location)) {
+    // The script is given the whole request: nothing to match, nothing to write.
+    args.push(`--script=${draft.script.trim()}`);
+    if (draft.host.trim()) args.push(`--host=${draft.host.trim()}`);
+    return args;
+  }
   // Add takes no match and remove no replacement: what was typed for another action is left out.
   if (!(named && draft.action === "add")) args.push(`--match=${draft.match}`);
   // A script makes the replacement in place of the text, which is left out as typed for the other.
@@ -225,6 +237,7 @@ export function describeWhere(rule: Rule): string {
 
 /** What a rule matches, for the table. */
 export function describeMatch(rule: Rule): string {
+  if (isRequestRule(rule.location)) return "(the whole request)";
   if (rule.name && rule.action === "add") return "(add)";
   if (!rule.pattern) {
     if (isHeader(rule.location) && !rule.name) return "(add header)";
@@ -260,6 +273,24 @@ export interface Tested {
   original?: { encoding: "utf8" | "base64"; content: string };
   /** Rules whose script failed on the message: each left it as it was. */
   errors?: { id: number; error: string }[];
+  /** A request rule's script blocked or answered the request: nothing would be sent. */
+  stopped?: Stopped;
+  /** This side is a script's answer, not anything the rules were tried on. */
+  answer?: boolean;
+}
+
+/** What a request rule's script did instead of letting the request go, as `rules test` says. */
+export interface Stopped {
+  rule: number;
+  outcome: "blocked" | "answered";
+  reason?: string;
+  response?: { encoding: "utf8" | "base64"; content: string; truncated?: boolean };
+}
+
+/** What a stopped request's note says: who stopped it, how, and that nothing would be sent. */
+export function stoppedNote(s: Stopped): string {
+  const who = s.rule === 0 ? "this rule's script" : `rule ${s.rule}'s script`;
+  return s.outcome === "answered" ? `Answered by ${who}: nothing would be sent` : `Blocked by ${who}: nothing would be sent`;
 }
 
 /** What `rules test` answers. */
@@ -275,6 +306,8 @@ export interface TestResult {
 
 /** "Changed by rule 3, 5", "Changed by this rule", or "Unchanged", for a tested message. */
 export function testedNote(t: Tested): string {
+  if (t.answer) return "The script's response, which the target never sent";
+  if (t.stopped) return t.changed ? `${stoppedNote(t.stopped)} (changed first by rule ${t.rules.join(", ")})` : stoppedNote(t.stopped);
   if (!t.changed) return "Unchanged";
   const saved = t.rules.filter((id) => id !== 0);
   if (!saved.length) return "Changed by this rule";
@@ -333,13 +366,17 @@ export function importQuestion(summary: { count: number; scripts: string[] }): s
 }
 
 /** The question asked before a rule with a script is added. */
-export const scriptQuestion = (file: string) =>
-  `${scriptName(file)} will run for every match of this rule, cut off from your files and the network, with the message it works on in reach. Read it before you add it. If the file changes later, the rule stops until you add it again.`;
+export const scriptQuestion = (file: string, location = "") =>
+  isRequestRule(location)
+    ? `${scriptName(file)} will see every request this rule applies to, cut off from your files and the network, and can change it, block it, or answer it with a response of its own so nothing is sent. Read it before you add it. If the file changes later, the rule stops until you add it again.`
+    : `${scriptName(file)} will run for every match of this rule, cut off from your files and the network, with the message it works on in reach. Read it before you add it. If the file changes later, the rule stops until you add it again.`;
 
 /** The sides a result has, in order: a file's one message, or a history row's request and response. */
-export function testedSides(r: TestResult): { id: "request" | "response" | "message"; label: string; tested: Tested }[] {
+export function testedSides(r: TestResult): { id: "request" | "answer" | "response" | "message"; label: string; tested: Tested }[] {
+  const answer = r.request?.stopped?.response;
   const sides = [
     { id: "request" as const, label: "Request", tested: r.request },
+    { id: "answer" as const, label: "Script's answer", tested: answer && { changed: false, rules: [], result: answer, answer: true } },
     { id: "response" as const, label: "Response", tested: r.response },
     { id: "message" as const, label: "Message", tested: r.message },
   ];
@@ -347,7 +384,23 @@ export function testedSides(r: TestResult): { id: "request" | "response" | "mess
 }
 
 /** "Changed by match-and-replace rule 1, 2", from a row's `edited_by` or `response_edits`. */
-export function ruleEditNote(edits: { rule?: number | null }[] | undefined): string {
-  const ids = (edits ?? []).map((e) => e.rule).filter((id): id is number => id != null);
-  return ids.length ? `Changed by match-and-replace rule ${ids.join(", ")}` : "Changed by a match-and-replace rule";
+export function ruleEditNote(edits: { rule?: number | null; outcome?: string }[] | undefined): string {
+  const ids = (edits ?? []).filter((e) => !e.outcome).map((e) => e.rule).filter((id): id is number => id != null);
+  const changed = ids.length ? `Changed by match-and-replace rule ${ids.join(", ")}` : "Changed by a match-and-replace rule";
+  const stop = scriptStop(edits);
+  if (!stop) return changed;
+  return ids.length ? `${changed}. ${stop.note}` : stop.note;
+}
+
+/**
+ * What a request rule's script did with a row's request, from its `edited_by`: it blocked it,
+ * or answered it itself (the row's response is the script's: the target sent nothing). Null
+ * for a request that went out.
+ */
+export function scriptStop(edits: { rule?: number | null; outcome?: string }[] | undefined): { outcome: "blocked" | "answered"; rule: number; note: string } | null {
+  const e = (edits ?? []).find((x) => x.outcome === "blocked" || x.outcome === "answered");
+  if (!e || e.rule == null) return null;
+  return e.outcome === "answered"
+    ? { outcome: "answered", rule: e.rule, note: `Answered by the script of rule ${e.rule}: the response is the script's, the target sent nothing` }
+    : { outcome: "blocked", rule: e.rule, note: `Blocked by the script of rule ${e.rule}: nothing was sent` };
 }

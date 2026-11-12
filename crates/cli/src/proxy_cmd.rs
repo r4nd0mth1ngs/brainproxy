@@ -426,6 +426,14 @@ pub struct RuleOptions {
     /// under a time limit; a script that fails leaves the message as it is. The file is pinned
     /// by its sha256: if it changes, the rule is skipped until it is added again. Not offered
     /// through MCP.
+    ///
+    /// With --location request the file defines `request(req, ctx)` instead: it is given the
+    /// whole request (req.method, target, path, query, line, headers as [name, value] pairs,
+    /// body, and bodyBase64 when the body isn't UTF-8; ctx has the engine, host and rule) and
+    /// returns nothing to send it as it is, { request: { method, target, headers, body } } to
+    /// send it changed, { block: "reason" } to not send it, or { response: { status, reason,
+    /// headers, body } } to not send it and use that response as the server's. Nothing is sent
+    /// for a blocked or answered request: no connection is opened.
     #[arg(long, value_name = "FILE", conflicts_with = "replace")]
     pub script: Option<PathBuf>,
     /// The sha256 the script file must have: the one of the text you read.
@@ -449,7 +457,8 @@ pub enum RulesCmd {
     /// response-body match in the raw text (header rules match each header line; an empty --match
     /// adds --replace as a new header); method, path, query-param (--name), status and, with
     /// --name, request-header and response-header work on that one value; ws-message on the
-    /// payload of WebSocket messages the proxy relays.
+    /// payload of WebSocket messages the proxy relays; request gives the whole request to a
+    /// --script, which may change it, block it, or answer it itself so that nothing is sent.
     Add {
         #[arg(long, value_parser = RuleLocation::ALL.to_vec())]
         location: String,
@@ -2693,6 +2702,13 @@ fn test_rules(
         if !ruled.failed.is_empty() {
             result["errors"] = json!(ruled.failed);
         }
+        // A request rule's script that blocked or answered it: the engine would send nothing.
+        if let Some(stopped) = &ruled.stopped {
+            result["stopped"] = match stopped.answer() {
+                Some(response) => json!({"rule": stopped.id, "outcome": "answered", "response": body_value(response, max_body)}),
+                None => json!({"rule": stopped.id, "outcome": "blocked", "reason": stopped.message()}),
+            };
+        }
         results.insert(name.to_string(), result);
         let mut by = match ruled.ids().as_slice() {
             [] => "unchanged".to_string(),
@@ -2700,6 +2716,15 @@ fn test_rules(
         };
         for f in &ruled.failed {
             by.push_str(&format!("; rule {}'s script failed ({})", f.id, f.error));
+        }
+        if let Some(stopped) = &ruled.stopped {
+            by.push_str(&format!("; {}, so nothing would be sent", stopped.message()));
+            if let Some(response) = stopped.answer() {
+                by.push_str(&format!(
+                    "\nits response:\n{}",
+                    crate::output::escape_lines(&String::from_utf8_lossy(response))
+                ));
+            }
         }
         texts.push(format!("{name}: {by}\n{}", crate::output::escape_lines(&String::from_utf8_lossy(&ruled.bytes))));
         first_bytes.get_or_insert(ruled.bytes);

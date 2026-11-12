@@ -1398,8 +1398,17 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                         let mut by: Vec<&str> =
                             e.edited_by.iter().map(|x| x.by.as_deref().unwrap_or("unknown")).collect();
                         by.dedup();
-                        let edited =
+                        let mut edited =
                             if by.is_empty() { String::new() } else { format!("  edited by {}", by.join(",")) };
+                        // A request rule's script answered or blocked it: nothing was sent.
+                        let stopped = e.edited_by.iter().find(|x| x.outcome.is_some());
+                        if let Some((rule, outcome)) = stopped.and_then(|x| Some((x.rule?, x.outcome?))) {
+                            use brainproxy_core::provenance::Outcome;
+                            edited.push_str(&match outcome {
+                                Outcome::Answered => format!("  ANSWERED by rule {rule}'s script, not the target"),
+                                Outcome::Blocked => format!("  BLOCKED by rule {rule}'s script"),
+                            });
+                        }
                         format!("{:>6}  {:<4} {:<7} {}  {len}B  {origin}{edited}", e.id, status, e.method, e.url)
                     })
                     .collect::<Vec<_>>()
