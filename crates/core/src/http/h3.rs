@@ -118,13 +118,24 @@ pub const MAX_FIELD_SECTION: u64 = 256 * 1024;
 /// Idle time after which an HTTP/3 connection closes (both sides agree on the lower of theirs).
 const IDLE: Duration = Duration::from_secs(30);
 
+/// How often a quiet connection is pinged, well within [`IDLE`] (and the 30 s many servers
+/// use), so an event stream that sends nothing for a while, or a pooled connection between
+/// requests, isn't closed for being idle.
+const KEEP_ALIVE: Duration = Duration::from_secs(10);
+
 /// The QUIC client configuration for a rustls configuration offering ALPN `h3`.
 pub(crate) fn client_config(tls: rustls::ClientConfig) -> Result<quinn::ClientConfig> {
+    client_config_timed(tls, IDLE, KEEP_ALIVE)
+}
+
+/// [`client_config`] with its idle timeout and keep-alive interval.
+fn client_config_timed(tls: rustls::ClientConfig, idle: Duration, keep_alive: Duration) -> Result<quinn::ClientConfig> {
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|e| Error::Tls(format!("QUIC needs TLS 1.3: {e}")))?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(IDLE.try_into().expect("30 s fits a QUIC idle timeout")));
+    transport.max_idle_timeout(Some(idle.try_into().map_err(|_| Error::InvalidInput("QUIC idle timeout".into()))?));
+    transport.keep_alive_interval(Some(keep_alive));
     config.transport_config(Arc::new(transport));
     Ok(config)
 }
@@ -805,6 +816,36 @@ pub(crate) mod tests {
             assert!(started.elapsed() < Duration::from_secs(1), "{path}: {:?}", started.elapsed());
         }
         assert_eq!(requests.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_connection_is_kept_alive() {
+        const { assert!(KEEP_ALIVE.as_secs() * 2 < IDLE.as_secs()) };
+        let (port, accepted) = h3_server(0, &[ALPN], None).await;
+        let peer = SocketAddr::from(([127, 0, 0, 1], port));
+        let tls = || crate::http::client::tls_config(false, ALPN, None).unwrap();
+        // A 1 s idle timeout: pinged every 300 ms the connection outlives it; pinged too seldom
+        // it closes, as a connection without a keep-alive would after IDLE.
+        let kept = connect(
+            peer,
+            "127.0.0.1",
+            client_config_timed(tls(), Duration::from_secs(1), Duration::from_millis(300)).unwrap(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let quiet = connect(
+            peer,
+            "127.0.0.1",
+            client_config_timed(tls(), Duration::from_secs(1), Duration::from_secs(60)).unwrap(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(kept.is_open());
+        assert!(!quiet.is_open());
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

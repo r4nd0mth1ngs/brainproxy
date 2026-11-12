@@ -450,7 +450,7 @@ impl std::fmt::Debug for Client {
 
 /// A TLS client configuration offering `alpn`, verifying certificates or not, and
 /// presenting `identity` when given.
-fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> Result<ClientConfig> {
+pub(crate) fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> Result<ClientConfig> {
     let builder = if verify {
         let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
         ClientConfig::builder().with_root_certificates(roots)
