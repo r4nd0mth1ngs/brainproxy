@@ -31,6 +31,26 @@
     }
     return { findings: list };
   };
+  // What a request rule's script decides: nothing (send it), or one of { request } (send it
+  // rewritten), { block } (don't send it) and { response } (don't send it: answer with this).
+  // The parts are read, and refused if wrong, by brainproxy.
+  const verdict = (out) => {
+    if (out === undefined || out === null) return { keep: true };
+    if (typeof out === "object" && typeof out.then === "function") throw new TypeError("it returned a promise: return the value itself");
+    if (typeof out !== "object" || isArray(out)) throw new TypeError("it returned " + kindOf(out) + ": return nothing, { request }, { block } or { response }");
+    const keys = ["request", "block", "response"].filter((k) => out[k] !== undefined && out[k] !== null);
+    if (keys.length === 0) throw new TypeError("it returned an object with no request, block or response");
+    if (keys.length > 1) throw new TypeError("it returned " + keys.join(" and ") + ": return one of them");
+    const key = keys[0];
+    const value = out[key];
+    if (key === "block") {
+      if (value === true) return { block: "" };
+      if (typeof value !== "string") throw new TypeError("its block is " + kindOf(value) + ": give the reason as a string");
+      return { block: value };
+    }
+    if (typeof value !== "object" || isArray(value)) throw new TypeError("its " + key + " is " + kindOf(value) + ": return an object");
+    return key === "request" ? { request: value } : { response: value };
+  };
   return function (fn, kind) {
     let cx = freeze({});
     return {
@@ -44,6 +64,8 @@
             return stringify(bytes(fn(item, cx)));
           case "process":
             return stringify(bytes(fn(item.text, freeze({ ...cx, ...item }))));
+          case "request":
+            return stringify(verdict(fn(item, cx)));
           default:
             return stringify(findings(fn(item)));
         }

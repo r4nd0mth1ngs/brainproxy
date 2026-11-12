@@ -379,7 +379,8 @@ struct Served {
 }
 
 impl Served {
-    /// Reads `script` and finds the function its kind names (`replace`, `process` or `check`).
+    /// Reads `script` and finds the function its kind names (`replace`, `process`, `check` or
+    /// `request`).
     fn new(kind: &str, script: &str) -> std::result::Result<Served, String> {
         let mut ctx = context()?;
         let not_started = |_| NOT_STARTED.to_string();

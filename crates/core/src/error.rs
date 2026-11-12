@@ -26,6 +26,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("storage error: {0}")]
     Store(#[from] rusqlite::Error),
+    /// A request rule's script stopped the request: nothing was sent.
+    #[error("blocked: {0}")]
+    Blocked(String),
 }
 
 impl Error {
@@ -41,6 +44,7 @@ impl Error {
             Error::Protocol(_) => "protocol",
             Error::Io(_) => "io",
             Error::Store(_) => "store",
+            Error::Blocked(_) => "blocked",
         }
     }
 
@@ -57,6 +61,7 @@ impl Error {
             Error::Protocol(s) => Error::Protocol(s.clone()),
             Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
             Error::Store(e) => Error::Store(rusqlite::Error::UserFunctionError(e.to_string().into())),
+            Error::Blocked(s) => Error::Blocked(s.clone()),
         }
     }
 
@@ -68,6 +73,7 @@ impl Error {
             Error::OutOfScope(_) => 6,
             Error::Connect(_) | Error::Tls(_) | Error::Timeout(_) | Error::Protocol(_) => 3,
             Error::Io(_) | Error::Store(_) => 1,
+            Error::Blocked(_) => 7,
         }
     }
 }

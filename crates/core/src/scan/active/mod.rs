@@ -410,7 +410,10 @@ impl Cx {
             None => None,
         };
         let request = ruled.as_ref().map_or(&given, |r| &r.bytes);
-        let Some(auth) = &self.shared.auth else {
+        // A request rule's script that blocked or answered it: nothing is sent, so no session
+        // is applied either (a re-login would send).
+        let stopped = ruled.as_ref().is_some_and(|r| r.stopped.is_some());
+        let Some(auth) = self.shared.auth.as_ref().filter(|_| !stopped) else {
             return self.client_send(request.clone(), target, &given, ruled.as_ref()).await;
         };
         // The attacked cookie or parameter keeps its payload.
@@ -456,6 +459,12 @@ impl Cx {
         }
         let by = self.shared.match_rules.as_ref().zip(ruled);
         let (id, result, response) = self.shared.rows.send_ruled(client, &req, target, by).await;
+        // A script's answer is on record, but no scan rule judges it: what it found there would
+        // be the script's, not the target's.
+        let result = match (result, ruled.and_then(|r| r.stopped.as_ref())) {
+            (Ok(_), Some(stopped)) => Err(Error::Blocked(format!("{}; a scan doesn't judge it", stopped.message()))),
+            (result, _) => result,
+        };
         let ex = match result {
             Ok(ex) => ex,
             Err(e) => {

@@ -14,7 +14,7 @@ use crate::auth::{request_cookies, AuthSession};
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
 use crate::fuzz::plan::{Plan, Template};
-use crate::http::client::final_response;
+use crate::http::client::{final_response, Exchange};
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use crate::rules::{Engine, EngineRules, Ruled};
@@ -255,9 +255,12 @@ pub async fn run(
                     None => None,
                 };
                 let by = rules.as_ref().zip(ruled.as_ref());
+                // A request rule's script blocked or answered it: nothing is sent, so no session
+                // is applied (a re-login would send).
+                let stopped = ruled.as_ref().and_then(|r| r.stopped.as_ref());
                 let rendered = request.clone();
                 let mut prepared = None;
-                if let Some(a) = cfg.auth.as_ref().filter(|_| refused.is_none()) {
+                if let Some(a) = cfg.auth.as_ref().filter(|_| refused.is_none() && stopped.is_none()) {
                     let p = a.prepare(Tool::Fuzz, &target, &rendered, &keep_cookies, &keep_params).await;
                     request = p.request.clone();
                     prepared = Some(p);
@@ -295,7 +298,10 @@ pub async fn run(
                 let capture = match result {
                     Ok(answer) => {
                         analyze(&answer.response.bytes, &compiled, &cfg.match_status, &mut res);
-                        (cfg.store == StoreMode::Matches && res.matched).then(|| {
+                        // A script's answer always has its row, which says whose response it is:
+                        // the result alone would pass for the target's.
+                        let answered = stopped.is_some() && row.is_none();
+                        (answered || (cfg.store == StoreMode::Matches && res.matched)).then(|| {
                             let mut c =
                                 Capture::new("fuzz", &target, &request, Some(answer.received()), Some(duration), None);
                             if answer.response.changed() {
@@ -315,7 +321,7 @@ pub async fn run(
                 // A row written here says what the rules did to its request, as one written
                 // before the request went out does.
                 let capture = capture.map(|mut c| {
-                    if let Some(ruled) = ruled.as_ref().filter(|r| r.changed()) {
+                    if let Some(ruled) = ruled.as_ref().filter(|r| r.noted()) {
                         c.original_request = ruled.original.clone();
                         c.edited_by = ruled.edits();
                     }
@@ -380,9 +386,25 @@ async fn exchange(
     by: Option<(&EngineRules, &Ruled)>,
 ) -> (Option<i64>, Result<Answer>) {
     let req = RawRequest::from_bytes(request.to_vec());
-    let (id, sent, ruled) = match rows {
-        Some(rows) => rows.send_ruled(client, &req, target, by).await,
-        None => (None, client.send(&req, target).await, None),
+    let stopped = by.and_then(|(_, ruled)| ruled.stopped.as_ref());
+    let (id, sent, ruled) = match (rows, stopped) {
+        (Some(rows), _) => rows.send_ruled(client, &req, target, by).await,
+        // A request rule's script stopped it: nothing is sent, and its answer is no server's
+        // for the response rules to rewrite.
+        (None, Some(stopped)) => {
+            let answer = stopped.answer().map(|response| Exchange {
+                target: target.clone(),
+                request: request.to_vec(),
+                response: response.to_vec(),
+                duration_ms: 0,
+                sni: None,
+                stream: None,
+            });
+            let sent = answer.ok_or_else(|| Error::Blocked(stopped.message()));
+            let ruled = sent.as_ref().ok().map(|ex| Ruled { bytes: ex.response.clone(), ..Default::default() });
+            (None, sent, ruled)
+        }
+        (None, None) => (None, client.send(&req, target).await, None),
     };
     let answer = sent.map(|ex| Answer {
         ms: ex.duration_ms,

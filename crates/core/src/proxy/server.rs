@@ -1290,6 +1290,25 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     if in_scope {
         let ruled = live.rules.request(Engine::Proxy, &target.host, request);
         live.rule_failures.note(Engine::Proxy, &ruled.failed);
+        // A request rule's script blocked or answered it: nothing is sent and no connection is
+        // opened, no session applied, nothing held in intercept. The row says what the script
+        // did; an answer goes to the client as it is, past the response rules and intercept, and
+        // isn't handed to live access-control testing (passive checks skip it too).
+        if let Some(stopped) = &ruled.stopped {
+            let edited_by = ruled.edits();
+            let (response, error) = match stopped.answer() {
+                Some(response) => (Some(response), None),
+                None => (None, Some(stopped.message())),
+            };
+            let c = row(target, &ruled.bytes, response, response.map(|_| 0), error.as_deref());
+            send_capture(ctx, Capture { edited_by, original_request: ruled.original.clone(), ..c }, None).await;
+            return Ok(match (response, error) {
+                (Some(response), _) => Reply::Response(response.to_vec()),
+                (None, error) => {
+                    Reply::Error(error_response(403, "blocked", &error.unwrap_or_default()), false)
+                }
+            });
+        }
         // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
         // Host-header test, isn't sent: a shared front end may route the request to another site.
         // A person's rule was warned about when it was saved.

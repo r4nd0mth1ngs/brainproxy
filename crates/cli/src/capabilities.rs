@@ -25,6 +25,7 @@ pub fn describe(cmd: &Command) -> Value {
             "4": "not found",
             "5": "findings compare --fail-on: findings at or above that risk (the command itself succeeded; its output is complete)",
             "6": "out of scope: target not allowed by the engagement/system scope, or no scope set",
+            "7": "blocked: a request rule's script blocked the request, or answered it where its answer can't be used; nothing was sent",
         },
         "env": {
             "BRAINPROXY_PROJECT": "project file path",

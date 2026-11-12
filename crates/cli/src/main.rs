@@ -794,6 +794,13 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
             ruled.push(r);
         }
     }
+    // A request rule's script that blocked or answered a request: nothing of it is sent. A race
+    // sends its requests together, so one it stopped stops the race, before any row is written.
+    if let Some((i, stopped)) = ruled.iter().enumerate().find_map(|(i, r)| Some((i, r.stopped.as_ref()?))) {
+        if count.is_some() {
+            return Err(Error::Blocked(format!("request {i} of the race: {}; nothing was sent", stopped.message())));
+        }
+    }
     let target = group[0].1.clone();
     for (i, (_, other)) in group.iter().enumerate().skip(1) {
         if other != &target {
@@ -831,6 +838,41 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
     if let Some(r) = ruled.first() {
         log.ruled(r);
+    }
+    if let Some(stopped) = ruled.first().and_then(|r| r.stopped.as_ref()) {
+        // Not sent, and no session is applied (a re-login would send): its row says why.
+        let recorded = client.recorded_request(&req, &target)?;
+        let id = log.pending(&target, &recorded)?;
+        let Some(response) = stopped.answer() else {
+            let why = stopped.message();
+            log.failed(id, &target, &recorded, &why)?;
+            return Err(Error::Blocked(format!("{why}; nothing was sent (history #{id})")));
+        };
+        let ex = brainproxy_core::http::client::Exchange {
+            target: target.clone(),
+            request: recorded,
+            response: response.to_vec(),
+            duration_ms: 0,
+            sni: None,
+            stream: None,
+        };
+        log.answered(id, &ex)?;
+        if args.raw {
+            out.raw(&ex.response);
+            return Ok(());
+        }
+        let mut data = exchange_json(Some(id), &target, &ex.request, &ex.response, Some(0), args.max_body);
+        if args.show_request {
+            data["request"] = body_value(&ex.request, args.max_body);
+        }
+        data["answered_by"] = json!({"rule": stopped.id, "note": stopped.message()});
+        data["rules"] = json!({"request": ruled[0].ids(), "response": []});
+        if !ruled[0].failed.is_empty() {
+            data["rule_errors"] = json!(ruled[0].failed);
+        }
+        let note = stopped.message();
+        out.ok(data, || format!("{note}\n\n{}", text_exchange(Some(id), &ex.response, 0)));
+        return Ok(());
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request is on record (its row and the bytes recorded) before it goes out. `open`
