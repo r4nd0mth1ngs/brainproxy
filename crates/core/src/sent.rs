@@ -125,7 +125,9 @@ impl SentLog {
             }
             // A row without content still says a script blocked or answered its request: an
             // answered row's status is the script's, not the target's.
-            (Some((_, edits)), Some(_)) => c.edited_by = edits.iter().filter(|e| e.outcome.is_some()).cloned().collect(),
+            (Some((_, edits)), Some(_)) => {
+                c.edited_by = edits.iter().filter(|e| e.outcome.is_some()).cloned().collect()
+            }
             (None, _) => {}
         }
         Capture { sni: sent_sni(self.sni.as_deref(), target), ..c }

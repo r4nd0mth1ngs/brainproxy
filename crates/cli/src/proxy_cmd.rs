@@ -2725,7 +2725,9 @@ fn test_rules(
         // A request rule's script that blocked or answered it: the engine would send nothing.
         if let Some(stopped) = &ruled.stopped {
             result["stopped"] = match stopped.answer() {
-                Some(response) => json!({"rule": stopped.id, "outcome": "answered", "response": body_value(response, max_body)}),
+                Some(response) => {
+                    json!({"rule": stopped.id, "outcome": "answered", "response": body_value(response, max_body)})
+                }
                 None => json!({"rule": stopped.id, "outcome": "blocked", "reason": stopped.message()}),
             };
         }

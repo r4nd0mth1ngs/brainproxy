@@ -661,7 +661,8 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     let (port, reached) = untouchable();
     let env = Env::new("stops");
     let script = env.script("stops.js", STOPS);
-    let listed = env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "proxy,send,fuzz,scan"]);
+    let listed =
+        env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "proxy,send,fuzz,scan"]);
     let rule = &listed["rules"][0];
     assert_eq!((rule["location"].as_str(), rule["replacer"].as_str()), (Some("request"), Some("script")), "{listed}");
     let mark = "X-Brainproxy-Answer: rule 1; this response is the rule's script's, the target sent nothing";
@@ -674,7 +675,10 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     wait_for_settings();
     let resp = through(&listen, port, "/answered?a=1", "");
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains(mark), "{resp}");
-    assert!(resp.ends_with("<html><title>made up</title>proxy GET http://127.0.0.1:") || resp.contains("proxy GET "), "{resp}");
+    assert!(
+        resp.ends_with("<html><title>made up</title>proxy GET http://127.0.0.1:") || resp.contains("proxy GET "),
+        "{resp}"
+    );
     let resp = through(&listen, port, "/blocked", "");
     assert!(resp.starts_with("HTTP/1.1 403 Forbidden\r\n") && resp.contains("X-Brainproxy-Error: blocked"), "{resp}");
     assert!(resp.contains("blocked by the script of match-and-replace rule 1: not on proxy"), "{resp}");
@@ -683,7 +687,10 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     untouched("proxy");
     let rows = env.rows("SELECT path, status, error, edited_by FROM history WHERE source = 'proxy' ORDER BY id");
     assert_eq!((rows[0][0].as_str(), rows[0][1].as_u64(), &rows[0][2]), (Some("/answered"), Some(200), &Value::Null));
-    assert_eq!(serde_json::from_str::<Value>(rows[0][3].as_str().unwrap()).unwrap(), json!([{"by": "cli", "rule": 1, "outcome": "answered"}]));
+    assert_eq!(
+        serde_json::from_str::<Value>(rows[0][3].as_str().unwrap()).unwrap(),
+        json!([{"by": "cli", "rule": 1, "outcome": "answered"}])
+    );
     assert_eq!((rows[1][0].as_str(), &rows[1][1]), (Some("/blocked"), &Value::Null));
     assert!(rows[1][2].as_str().unwrap().contains("not on proxy"), "{rows:?}");
     assert_eq!(serde_json::from_str::<Value>(rows[1][3].as_str().unwrap()).unwrap()[0]["outcome"], "blocked");
@@ -711,7 +718,8 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
         let fuzz = format!("http://127.0.0.1:{port}/§p§/{store}");
         env.ok(&["fuzz", "run", "--url", &fuzz, "-p", "list:answered,blocked", "--store", store]);
         let rows = env.rows(&format!("SELECT path, status, error, edited_by FROM history WHERE source = 'fuzz' AND path LIKE '%/{store}' ORDER BY path"));
-        let answered = rows.iter().find(|r| r[0] == format!("/answered/{store}")).unwrap_or_else(|| panic!("{store}: {rows:?}"));
+        let answered =
+            rows.iter().find(|r| r[0] == format!("/answered/{store}")).unwrap_or_else(|| panic!("{store}: {rows:?}"));
         assert_eq!(answered[1], 200, "{store}: {rows:?}");
         assert!(answered[3].as_str().unwrap().contains("answered"), "{store}: {rows:?}");
         if store == "all" {
@@ -731,7 +739,8 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     // Attacks on a recorded request: each is answered or blocked, none sent, nothing concluded;
     // a probe's raw connection (which no script could see) isn't made either.
     // A row the script answered is no baseline.
-    let answered = env.rows("SELECT id FROM history WHERE source = 'send' AND path = '/answered/send'")[0][0].to_string();
+    let answered =
+        env.rows("SELECT id FROM history WHERE source = 'send' AND path = '/answered/send'")[0][0].to_string();
     let (code, v) = env.run(&["scan", "active", "--history-id", &answered, "--strength", "low", "-c", "1"]);
     assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("no baseline"), "{v}");
@@ -758,7 +767,6 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     assert_eq!(found[0][0], 0, "{found:?}");
     let shown = env.ok(&["history", "list", "--limit", "1"]);
     assert!(shown["items"][0]["edited_by"].to_string().contains("outcome"), "{shown}");
-
 }
 
 #[test]
@@ -768,9 +776,17 @@ fn a_request_script_is_a_persons_and_is_pinned_like_any_script() {
     let agent = [(MCP, "1")];
     let script = env.script("stops.js", STOPS);
     let why = "runs code from a file, so it isn't offered through MCP";
-    let e = env.refused(&agent, &["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send"], None);
+    let e = env.refused(
+        &agent,
+        &["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send"],
+        None,
+    );
     assert!(e.contains(why), "{e}");
-    let e = env.refused(&agent, &["rules", "test", "-", "--location", "request", "--script", &script], Some(b"GET / HTTP/1.1\r\n\r\n"));
+    let e = env.refused(
+        &agent,
+        &["rules", "test", "-", "--location", "request", "--script", &script],
+        Some(b"GET / HTTP/1.1\r\n\r\n"),
+    );
     assert!(e.contains(why), "{e}");
     // A request rule takes nothing but its script.
     let no = env.refused(&[], &["rules", "add", "--location", "request", "--match", "x", "--script", &script], None);
@@ -793,7 +809,8 @@ fn a_request_script_is_a_persons_and_is_pinned_like_any_script() {
     assert!(env.refused(&agent, &["rules", "import", "-", "--replace"], Some(b"[]")).contains(guard));
     assert_eq!(env.ok(&["rules", "list"])["rules"][0]["enabled"], true);
     // rules test says what the engine would do, sending nothing.
-    let tried = env.ok_stdin(&["rules", "test", "-", "--as", "send"], b"GET /answered HTTP/1.1\r\nHost: h.test\r\n\r\n");
+    let tried =
+        env.ok_stdin(&["rules", "test", "-", "--as", "send"], b"GET /answered HTTP/1.1\r\nHost: h.test\r\n\r\n");
     assert_eq!(tried["request"]["stopped"]["outcome"], "answered", "{tried}");
     let tried = env.ok_stdin(&["rules", "test", "-", "--as", "send"], b"GET /blocked HTTP/1.1\r\nHost: h.test\r\n\r\n");
     assert_eq!(tried["request"]["stopped"]["outcome"], "blocked", "{tried}");

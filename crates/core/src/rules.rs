@@ -673,7 +673,8 @@ pub fn validate_rule(rule: &Rule) -> Result<()> {
         if rule.replacer != ReplaceKind::Script {
             return bad("a request rule is a script: name its file with --script".into());
         }
-        if !rule.pattern.is_empty() || rule.matcher != MatchKind::Regex || rule.name.is_some() || rule.action.is_some() {
+        if !rule.pattern.is_empty() || rule.matcher != MatchKind::Regex || rule.name.is_some() || rule.action.is_some()
+        {
             return bad("a request rule's script is given the whole request: it takes no --match, --match-kind, --name or --action".into());
         }
     }
@@ -1591,7 +1592,8 @@ fn read_turn(v: &Value, rule: u32, first: &str, cut: Option<&[u8]>) -> std::resu
         // only the bytes' stand-in.
         let body = match (o.get("body"), o.get("bodyBase64")) {
             (Some(Value::String(text)), Some(Value::String(b))) => {
-                let bytes = STANDARD.decode(b.trim()).map_err(|_| "its request's bodyBase64 isn't base64".to_string())?;
+                let bytes =
+                    STANDARD.decode(b.trim()).map_err(|_| "its request's bodyBase64 isn't base64".to_string())?;
                 Some(if String::from_utf8_lossy(&bytes) == text.as_str() { bytes } else { text.as_bytes().to_vec() })
             }
             _ => script_body(o, "request")?,
@@ -1635,7 +1637,8 @@ fn read_turn(v: &Value, rule: u32, first: &str, cut: Option<&[u8]>) -> std::resu
     if !bodiless {
         out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-    let mark = format!("{ANSWER_HEADER}: rule {rule}; this response is the rule's script's, the target sent nothing\r\n\r\n");
+    let mark =
+        format!("{ANSWER_HEADER}: rule {rule}; this response is the rule's script's, the target sent nothing\r\n\r\n");
     out.extend_from_slice(mark.as_bytes());
     // The answer to a HEAD says how long the body would be, and has none.
     if !method.eq_ignore_ascii_case("HEAD") {
@@ -1643,7 +1646,6 @@ fn read_turn(v: &Value, rule: u32, first: &str, cut: Option<&[u8]>) -> std::resu
     }
     Ok(Turn::Stop(Stop::Answer(out)))
 }
-
 
 /// A response as a script reads it; `body` is its body decoded, when it could be.
 fn response_view(first: &str, headers: &[String], body: Option<&[u8]>) -> Value {
@@ -1773,14 +1775,7 @@ fn request_rules<'a>(
 /// A request rule's script's turn at the request as the rules before it left it. A script
 /// that fails (it throws, runs past a limit, or returns what can't be read) leaves the request
 /// as it is, and the failure is noted.
-fn request_turn(
-    rule: &CompiledRule,
-    hook: &Hook,
-    first: &str,
-    headers: &[String],
-    body: &[u8],
-    run: &Run<'_>,
-) -> Turn {
+fn request_turn(rule: &CompiledRule, hook: &Hook, first: &str, headers: &[String], body: &[u8], run: &Run<'_>) -> Turn {
     let cx = json!({ "engine": run.engine.name(), "host": run.host, "rule": rule.id });
     let handed = &body[..body.len().min(MAX_SCRIPT_BODY)];
     let cut = (body.len() > MAX_SCRIPT_BODY).then_some(handed);
@@ -1788,10 +1783,8 @@ fn request_turn(
     if cut.is_some() {
         req["bodyTruncated"] = json!(true);
     }
-    let read = hook
-        .request(&cx, &req)
-        .map_err(|e| e.text().to_string())
-        .and_then(|v| read_turn(&v, rule.id, first, cut));
+    let read =
+        hook.request(&cx, &req).map_err(|e| e.text().to_string()).and_then(|v| read_turn(&v, rule.id, first, cut));
     match read {
         Ok(turn) => turn,
         Err(e) => {
@@ -3081,7 +3074,9 @@ mod tests {
         assert!(text(head.answer().unwrap()).ends_with("Content-Length: 7\r\nX-Brainproxy-Answer: rule 3; this response is the rule's script's, the target sent nothing\r\n\r\n"));
         let bytes = run("GET /bytes HTTP/1.1\r\n\r\n").stopped.unwrap();
         let bytes = bytes.answer().unwrap();
-        assert!(bytes.starts_with(b"HTTP/1.1 200 OK\r\nA: b\r\nContent-Length: 2\r\n") && bytes.ends_with(&[0x00, 0xff]));
+        assert!(
+            bytes.starts_with(b"HTTP/1.1 200 OK\r\nA: b\r\nContent-Length: 2\r\n") && bytes.ends_with(&[0x00, 0xff])
+        );
         let empty = run("GET /empty HTTP/1.1\r\n\r\n").stopped.unwrap();
         assert!(text(empty.answer().unwrap()).starts_with("HTTP/1.1 204 No Content\r\nX-Brainproxy-Answer: "));
         let _ = std::fs::remove_dir_all(dir);
@@ -3122,7 +3117,10 @@ mod tests {
             ("function request() { return { response: 'x' }; }", "its response is a string"),
             ("function request() { return { response: { status: 101 } }; }", "a code from 200 to 999"),
             ("function request() { return { response: { status: '200' } }; }", "status is a number"),
-            ("function request() { return { response: { headers: { 'Bad Name': 'x' } } }; }", "can't be a header's name"),
+            (
+                "function request() { return { response: { headers: { 'Bad Name': 'x' } } }; }",
+                "can't be a header's name",
+            ),
             ("function request() { return { response: { headers: { A: 'x\\r\\nB: y' } } }; }", "line break or NUL"),
             ("function request() { return { response: { status: 204, body: 'x' } }; }", "which has no body"),
             ("function request() { return { response: { body: 'a', bodyBase64: 'YQ==' } }; }", "give one"),
@@ -3180,7 +3178,10 @@ mod tests {
         let mut req = b"POST /spread?a=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\n".to_vec();
         req.extend([0xff, 0x00]);
         let out = run(req);
-        assert!(out.bytes.starts_with(b"PUT /spread?a=1 HTTP/1.1\r\n") && out.bytes.ends_with(&[0xff, 0x00]), "{out:?}");
+        assert!(
+            out.bytes.starts_with(b"PUT /spread?a=1 HTTP/1.1\r\n") && out.bytes.ends_with(&[0xff, 0x00]),
+            "{out:?}"
+        );
         let out = run(b"GET /path?a=1 HTTP/1.1\r\n\r\n".to_vec());
         assert_eq!(out.bytes, b"GET /moved?b=2 HTTP/1.1\r\n\r\n");
         for path in ["/both", "/line"] {

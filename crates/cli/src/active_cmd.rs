@@ -979,7 +979,8 @@ fn select_targets(
         }
         // A response a request rule's script made up is no baseline: what the attacks' responses
         // were compared with would be the script's.
-        let answered = item.entry.edited_by.iter().any(|e| e.outcome == Some(brainproxy_core::provenance::Outcome::Answered));
+        let answered =
+            item.entry.edited_by.iter().any(|e| e.outcome == Some(brainproxy_core::provenance::Outcome::Answered));
         if answered {
             if named.contains(&id) {
                 return Err(Error::Blocked(format!(

@@ -1304,9 +1304,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             send_capture(ctx, Capture { edited_by, original_request: ruled.original.clone(), ..c }, None).await;
             return Ok(match (response, error) {
                 (Some(response), _) => Reply::Response(response.to_vec()),
-                (None, error) => {
-                    Reply::Error(error_response(403, "blocked", &error.unwrap_or_default()), false)
-                }
+                (None, error) => Reply::Error(error_response(403, "blocked", &error.unwrap_or_default()), false),
             });
         }
         // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
