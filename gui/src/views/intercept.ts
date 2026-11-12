@@ -2,7 +2,15 @@
 // enable` call that sets them, and the filter that picks which messages are held, a query in
 // the Traffic filter language (`intercept enable --filter`) that can start from a saved filter.
 
+import type { ActionDef } from "../ui/actions.ts";
 import type { SavedFilter } from "./trafficFilter";
+
+/**
+ * Forwarding the held message. Not while typing: in the message editor (or the filter box) ⌘F /
+ * Ctrl+F is find, and a held request mustn't go out half edited. From there, the Forward button
+ * or the palette (⌘K, which opens while typing) forward it.
+ */
+export const FORWARD = { id: "proxy.intercept.forward", title: "Forward the held message", group: "Proxy", where: "proxy", keys: "Mod+F" } as const satisfies ActionDef;
 
 export interface InterceptSettings {
   enabled: boolean;

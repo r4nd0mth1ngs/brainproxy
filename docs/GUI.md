@@ -174,7 +174,8 @@ once the palette has closed, through the same function as its button, so its que
 A single window keydown handler (`useShortcuts`) runs the bound action for the view that shows, a view's
 own before a global one; it does nothing while a modal dialog is open, for a key held down, while
 composing (IME), while a right-click menu is open, or while typing in a text field unless the action is
-meant to run there (`typing`: any field, or `"editor"`: only a multi-line editor, as Forward) and the
+meant to run there (`typing`: any field, or `"editor"`: only a multi-line editor; Forward is neither, so ⌘F stays find
+while a held message or the filter is edited, and the button or the palette forwards from there) and the
 chord holds Mod or Ctrl, or Alt except on macOS where Option types characters (`mayRunWhileTyping`;
 `matches` applies the same rule). The palette runs an action as the registry has it when it runs,
 not as its row showed it; tables ignore arrow and page keys with a modifier, so those reach shortcuts. Replay's Send and Stop are defined hidden

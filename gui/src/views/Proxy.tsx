@@ -50,7 +50,7 @@ import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, 
 import { EventStreams } from "./EventStreams";
 import { ruleEditNote, scriptStop } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
-import { filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
+import { FORWARD, filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
 import { TrafficExport } from "./TrafficExport.tsx";
 
 export function ProxyView() {
@@ -856,7 +856,7 @@ function Intercept({ active }: { active: boolean }) {
       // On the settings as they are when it runs, polled or not.
       run: () => toggle((c) => ({ enabled: !c.enabled, requests: c.enabled ? c.requests : c.requests || !(c.responses || c.ws_to_server || c.ws_to_client) })),
     },
-    { id: "proxy.intercept.forward", title: "Forward the held message", group: "Proxy", where: "proxy", keys: "Mod+F", typing: "editor", hidden: !active, disabled: nothingHeld, run: () => decide("forward") },
+    { ...FORWARD, hidden: !active, disabled: nothingHeld, run: () => decide("forward") },
     { id: "proxy.intercept.drop", title: "Drop the held message", group: "Proxy", where: "proxy", hidden: !active, disabled: nothingHeld, run: () => decide("drop") },
     {
       id: "proxy.intercept.replay",

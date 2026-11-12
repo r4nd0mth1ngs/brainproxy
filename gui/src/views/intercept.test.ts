@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { filterChange, filterChanged, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, withFilter, type InterceptSettings } from "./intercept.ts";
+import { mayRunWhileTyping } from "../ui/actions.ts";
+import { FORWARD, filterChange, filterChanged, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, withFilter, type InterceptSettings } from "./intercept.ts";
 import { DEFAULT_FILTER } from "./trafficFilter.ts";
 
 const base: InterceptSettings = { enabled: true, requests: true, responses: false, timeout_secs: 120, timeout_action: "forward" };
@@ -106,4 +107,13 @@ test("a change runs against the project it was made for", async () => {
   assert.equal(settings.b.filter, undefined);
   assert.equal(settings.b.enabled, false);
   assert.deepEqual(calls, ["a: intercept status", "a: intercept enable", "b: intercept status"]);
+});
+
+test("Forward's shortcut isn't taken from find while a message or the filter is being edited", () => {
+  const chord = FORWARD.keys;
+  for (const t of [{ tagName: "TEXTAREA" }, { tagName: "DIV", isContentEditable: true }, { tagName: "INPUT", type: "text" }])
+    for (const mac of [true, false]) assert.equal(mayRunWhileTyping(FORWARD, chord, t, mac), false, `${t.tagName} ${mac}`);
+  // Elsewhere in Proxy (the held list, a button) it forwards, and the palette always lists it.
+  for (const t of [null, { tagName: "BUTTON" }, { tagName: "TR" }]) assert.ok(mayRunWhileTyping(FORWARD, chord, t, true));
+  assert.ok(!("noPalette" in FORWARD));
 });

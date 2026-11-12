@@ -327,11 +327,11 @@ The sidebar groups the tools by what you are doing.
   switching project, say).
 - **Shortcuts:** ⌘1 to ⌘9 go to the tools in sidebar order (Overview to Callbacks), ⌘,
   to Settings, ⌘B collapses the sidebar, ⌘T turns intercept on or off, ⌘F forwards the
-  held message in Proxy › Intercept, ⌘Enter sends in Replay and ⌘PageDown / ⌘PageUp move
+  held message in Proxy › Intercept (not while you edit it, where ⌘F is find: use the
+  Forward button or the palette there), ⌘Enter sends in Replay and ⌘PageDown / ⌘PageUp move
   between its tabs, and ⌘U / ⌘⇧U URL-encode or decode the selection in a message editor
   (Ctrl instead of ⌘ on Linux and Windows). Shortcuts don't run while you type in a text
-  field, except the ones meant for it (go to a tool, send, encode, the palette; forward
-  only in the message editor, not in the filter box), and not while a dialog or a right-click menu is
+  field, except the ones meant for it (go to a tool, send, encode, the palette), and not while a dialog or a right-click menu is
   open. On macOS the Control-key combinations are left to text editing (⌃K, ⌃F, ...), so
   the defaults use ⌘, and a shortcut with only ⌥ never runs while typing (⌥ types
   characters there). Arrow keys, Enter, Esc and Tab work in lists and dialogs as usual.
