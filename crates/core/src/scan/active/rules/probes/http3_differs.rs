@@ -8,7 +8,7 @@ use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
 use crate::scan::{AlertDef, Confidence, Risk};
 
 static ACCESS: AlertDef = AlertDef {
-    alert_ref: "100006",
+    alert_ref: "100006-1",
     name: "Access Control Differs over HTTP/3",
     risk: Risk::Medium,
     confidence: Confidence::Medium,
@@ -24,7 +24,7 @@ static ACCESS: AlertDef = AlertDef {
 };
 
 static DIFFERS: AlertDef = AlertDef {
-    alert_ref: "100007",
+    alert_ref: "100006-2",
     name: "Response Differs over HTTP/3",
     risk: Risk::Info,
     confidence: Confidence::Medium,

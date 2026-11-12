@@ -568,6 +568,27 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_upstream_proxy_keeps_requests_on_tcp() {
+        use crate::connection::{ConnectionSettings, UpstreamRule};
+        // A target the connection settings send through a proxy: nothing goes to it over UDP.
+        let (sink, got) = udp_sink().await;
+        let c = client(&["127.0.0.1".into()], true);
+        let rule = UpstreamRule {
+            host: "*".into(),
+            proxy: Some("http://127.0.0.1:1".into()),
+            username: None,
+            password_env: None,
+        };
+        let settings = ConnectionSettings { upstream: vec![rule], ..Default::default() };
+        c.options().guard.as_ref().unwrap().net.set(settings.compile(vec![]).unwrap());
+        // The proxy isn't there, so the TCP request fails too.
+        assert!(c.send(&get("/", sink, "HTTP/1.1"), &target(sink)).await.is_err());
+        assert!(c.h3_notes()[0].contains("upstream proxy"), "{:?}", c.h3_notes());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(got.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn the_socket_only_reaches_the_checked_address() {
         let (allowed, _) = udp_sink().await;
         let (other, got) = udp_sink().await;

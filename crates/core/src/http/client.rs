@@ -1065,6 +1065,12 @@ impl Client {
         endpoints.push((target.host.clone(), target.port, false));
         let mut why = Vec::new();
         for (host, port, advertised) in endpoints {
+            // An advertised host the connection settings send through an upstream proxy isn't
+            // reached directly either (the target's own route was checked before).
+            if advertised && matches!(net.route(&host, port), Route::Proxy(_)) {
+                why.push(format!("the Alt-Svc endpoint {host}:{port} goes through an upstream proxy"));
+                continue;
+            }
             let addrs = match guard.resolve_with(&host, port, net).await {
                 Ok(a) => a,
                 // An advertised endpoint is a destination of its own: refused, it's never tried.

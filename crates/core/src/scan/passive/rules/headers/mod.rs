@@ -57,7 +57,7 @@ mod tests {
     fn rule_ids_and_alert_refs_are_unique() {
         let rules = super::all();
         let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
-        assert_eq!(ids.len(), 19);
+        assert_eq!(ids.len(), 20);
         let mut seen = HashSet::new();
         for r in &rules {
             for a in r.alerts() {
