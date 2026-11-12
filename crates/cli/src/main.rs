@@ -763,7 +763,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         check_race_count(n, group.len(), h2)?;
         if args.req.http3 {
             return Err(Error::InvalidInput(
-                "--http3 doesn't race: a race goes over TCP (last-byte sync, or single-packet with --http2)".into(),
+                "--http3 doesn't go with --race or --also: their requests go over TCP (last-byte sync, or \
+                 single-packet with --http2)"
+                    .into(),
             ));
         }
     }

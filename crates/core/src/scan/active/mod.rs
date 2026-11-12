@@ -467,7 +467,8 @@ impl Cx {
             Some(tcp_client) if tcp => tcp_client,
             _ => &self.shared.client,
         };
-        let req = if tcp { tcp_request(req) } else { req };
+        // A request line saying HTTP/3 says HTTP/1.1 (or HTTP/2 with `--http2`) over TCP.
+        let req = if tcp { crate::http::client::tcp_form(&req, client.options().http2).into_owned() } else { req };
         let out_of_scope = client.options().guard.as_ref().is_some_and(|g| !g.may_allow(&target.host, target.port));
         // As for the targets the ported rules attack. Out of scope, the client refuses it
         // before anything is sent.
@@ -896,24 +897,6 @@ pub struct ActiveSummary {
     pub stopped: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
-}
-
-/// `req` with a request line saying HTTP/3 saying HTTP/1.1, for sending over TCP.
-fn tcp_request(req: RawRequest) -> RawRequest {
-    if !req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/3")) {
-        return req;
-    }
-    let bytes = req.as_bytes();
-    let end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
-    let line = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    let (line, cr) = match line.strip_suffix('\r') {
-        Some(l) => (l.to_string(), "\r"),
-        None => (line, ""),
-    };
-    let Some((start, _)) = line.rsplit_once(' ') else { return req };
-    let mut out = format!("{start} HTTP/1.1{cr}").into_bytes();
-    out.extend_from_slice(&bytes[end..]);
-    RawRequest::from_bytes(out)
 }
 
 /// Counts down a rule's units left when dropped.

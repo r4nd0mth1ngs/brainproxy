@@ -521,6 +521,53 @@ pub(crate) mod tests {
         assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
 
+    #[tokio::test]
+    async fn concurrent_and_hurried_requests_still_reach_tcp_when_udp_gets_no_answer() {
+        let (port, requests) = h1_server(0, None).await;
+        // Senders that wait for the same handshake don't each try again once it failed.
+        let c = client(&["127.0.0.1".into()], true);
+        let started = std::time::Instant::now();
+        let sends: Vec<_> = (0..4)
+            .map(|i| {
+                let c = c.clone();
+                tokio::spawn(async move { c.send(&get(&format!("/{i}"), port, "HTTP/1.1"), &target(port)).await })
+            })
+            .collect();
+        for s in sends {
+            assert!(s.await.unwrap().unwrap().response.starts_with(b"HTTP/1.1 200"));
+        }
+        assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+        // A short timeout leaves time for TCP.
+        let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
+        let opts = SendOptions {
+            guard: Some(Guard::from_specs(vec![scope]).unwrap()),
+            http3: true,
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let ex = Client::new(opts).send(&get("/short", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
+        assert_eq!(requests.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn a_recorded_http3_request_is_framed_for_http1() {
+        let raw = RawRequest::from_bytes(b"POST /x HTTP/3\r\nhost: a.test\r\n\r\na=1".to_vec());
+        let tcp = crate::http::client::tcp_form(&raw, false);
+        assert_eq!(tcp.as_bytes(), b"POST /x HTTP/1.1\r\nhost: a.test\r\nContent-Length: 3\r\n\r\na=1");
+        // HTTP/2 frames the body itself, and a request with framing keeps it.
+        assert!(crate::http::client::tcp_form(&raw, true)
+            .as_bytes()
+            .starts_with(b"POST /x HTTP/2\r\nhost: a.test\r\n\r\n"));
+        let framed = RawRequest::from_bytes(b"POST /x HTTP/3\r\ncontent-length: 3\r\n\r\na=1".to_vec());
+        assert_eq!(
+            crate::http::client::tcp_form(&framed, false).as_bytes(),
+            b"POST /x HTTP/1.1\r\ncontent-length: 3\r\n\r\na=1"
+        );
+        let plain = RawRequest::from_bytes(b"GET / HTTP/1.1\r\n\r\n".to_vec());
+        assert!(matches!(crate::http::client::tcp_form(&plain, false), std::borrow::Cow::Borrowed(_)));
+    }
+
     /// The handshake time of the client, for the test above.
     const H3_WAIT: Duration = Duration::from_secs(3);
 

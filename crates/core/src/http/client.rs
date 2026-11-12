@@ -332,6 +332,35 @@ impl LiveBody {
     }
 }
 
+/// `req` as it goes over TCP: a request line saying `HTTP/3` says `HTTP/2` with `http2`, else
+/// `HTTP/1.1`. HTTP/3's text form has no framing of its own (a chunked body was de-chunked), so
+/// a body without Content-Length or Transfer-Encoding gets a Content-Length for HTTP/1.1.
+pub fn tcp_form(req: &RawRequest, http2: bool) -> std::borrow::Cow<'_, RawRequest> {
+    use std::borrow::Cow;
+    let Ok(head) = req.head() else { return Cow::Borrowed(req) };
+    if !head.version.eq_ignore_ascii_case("HTTP/3") {
+        return Cow::Borrowed(req);
+    }
+    let bytes = req.as_bytes();
+    let end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line = String::from_utf8_lossy(&bytes[..end]);
+    let cr = line.ends_with('\r');
+    let line = line.trim_end_matches('\r');
+    let Some((start, _)) = line.rsplit_once(' ') else { return Cow::Borrowed(req) };
+    let version = if http2 { "HTTP/2" } else { "HTTP/1.1" };
+    let mut out = format!("{start} {version}{}", if cr { "\r" } else { "" }).into_bytes();
+    out.extend_from_slice(&bytes[end..]);
+    let framed = head
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("transfer-encoding"));
+    let body_len = req.split().1.len();
+    if !http2 && !framed && body_len > 0 {
+        out = with_header(&out, "Content-Length", &body_len.to_string());
+    }
+    Cow::Owned(RawRequest::from_bytes(out))
+}
+
 /// How long a QUIC handshake may take before HTTP/3 counts as not offered (or UDP blocked).
 const H3_HANDSHAKE: Duration = Duration::from_secs(3);
 /// How many notes about HTTP/3 a client keeps (see [`Client::h3_notes`]).
@@ -384,7 +413,9 @@ struct Pool {
     foreign: std::sync::OnceLock<String>,
     /// One HTTP/3 connection per key.
     h3: Mutex<HashMap<PoolKey, crate::http::h3::Conn>>,
-    h3_connecting: tokio::sync::Mutex<()>,
+    /// One handshake at a time per key, so concurrent senders share a connection while
+    /// handshakes to other origins (which may wait for an answer that never comes) go ahead.
+    h3_connecting: Mutex<HashMap<PoolKey, Arc<tokio::sync::Mutex<()>>>>,
     /// HTTP/3 endpoints origins advertised (`Alt-Svc`), keyed by generation and origin, with
     /// when they expire. Each must pass the guard like any other destination before it's used.
     alt_svc: Mutex<HashMap<(u64, String), (crate::http::h3::AltSvc, Instant)>>,
@@ -456,6 +487,7 @@ impl Client {
             self.pool.h3.lock().unwrap().retain(|k, _| k.1 == gen);
             self.pool.alt_svc.lock().unwrap().retain(|k, _| k.0 == gen);
             self.pool.h3_down.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.h3_connecting.lock().unwrap().retain(|k, _| k.1 == gen);
         }
         net
     }
@@ -648,23 +680,9 @@ impl Client {
         Ok((ex, live))
     }
 
-    /// `req` as it goes over TCP: a request line saying `HTTP/3` says `HTTP/2` with `http2`,
-    /// else `HTTP/1.1`.
+    /// `req` as it goes over TCP (see [`tcp_form`]).
     fn over_tcp<'a>(&self, req: &'a RawRequest) -> std::borrow::Cow<'a, RawRequest> {
-        let three = req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/3"));
-        if !three {
-            return std::borrow::Cow::Borrowed(req);
-        }
-        let bytes = req.as_bytes();
-        let end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
-        let line = String::from_utf8_lossy(&bytes[..end]);
-        let cr = line.ends_with('\r');
-        let line = line.trim_end_matches('\r');
-        let Some((start, _)) = line.rsplit_once(' ') else { return std::borrow::Cow::Borrowed(req) };
-        let version = if self.opts.http2 { "HTTP/2" } else { "HTTP/1.1" };
-        let mut out = format!("{start} {version}{}", if cr { "\r" } else { "" }).into_bytes();
-        out.extend_from_slice(&bytes[end..]);
-        std::borrow::Cow::Owned(RawRequest::from_bytes(out))
+        tcp_form(req, self.opts.http2)
     }
 
     /// [`Client::send_live`] over TCP: HTTP/2 or HTTP/1.x.
@@ -960,17 +978,15 @@ impl Client {
                 "the connection settings send it through an upstream proxy, which carries TCP only".into(),
             ));
         }
+        let down_key = (net.generation, target.origin());
+        if let Some(why) = self.h3_down(&down_key) {
+            return Ok(H3::NotUsed(why));
+        }
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let filled = self.fill_auth(req.as_bytes(), target).await?;
         self.check_host(&filled, target)?;
         // A request HTTP/3 can't carry is refused as it is, not sent another way.
         H2Request::from_raw_as(&filled, target, "HTTP/3")?;
-        let down_key = (net.generation, target.origin());
-        if let Some((_, why)) =
-            self.pool.h3_down.lock().unwrap().get(&down_key).filter(|(until, _)| *until > Instant::now())
-        {
-            return Ok(H3::NotUsed(why.clone()));
-        }
         let (conn, fresh) = match self.h3_conn(target, &net, deadline).await? {
             Ok(c) => c,
             Err(why) => {
@@ -995,6 +1011,12 @@ impl Client {
                 Err(e)
             }
         }
+    }
+
+    /// Why HTTP/3 just failed for the origin `key` names, while it is still to go straight to TCP.
+    fn h3_down(&self, key: &(u64, String)) -> Option<String> {
+        let down = self.pool.h3_down.lock().unwrap();
+        down.get(key).filter(|(until, _)| *until > Instant::now()).map(|(_, why)| why.clone())
     }
 
     /// The pooled HTTP/3 connection to `target` (and whether it's new), or a new one: to the
@@ -1022,10 +1044,14 @@ impl Client {
         if let Some(c) = pooled() {
             return Ok(Ok((c, false)));
         }
-        // One handshake at a time, so concurrent senders share a connection.
-        let _connecting = self.pool.h3_connecting.lock().await;
+        let lock = self.pool.h3_connecting.lock().unwrap().entry(key.clone()).or_default().clone();
+        let _connecting = lock.lock().await;
         if let Some(c) = pooled() {
             return Ok(Ok((c, false)));
+        }
+        // A sender that waited here while HTTP/3 failed for this origin doesn't try again.
+        if let Some(why) = self.h3_down(&(net.generation, target.origin())) {
+            return Ok(Err(why));
         }
         let guard = self.opts.guard.as_ref().ok_or_else(|| {
             Error::OutOfScope("no engagement scope: run `brainproxy engagement start --target HOST ...` first".into())
@@ -1076,9 +1102,8 @@ impl Client {
                 // An advertised endpoint is a destination of its own: refused, it's never tried.
                 Err(e) if advertised => {
                     let note = format!("the Alt-Svc endpoint {host}:{port} of {} isn't used: {e}", target.origin());
-                    self.h3_note(note.clone());
+                    self.h3_note(note);
                     self.pool.alt_svc.lock().unwrap().remove(&alt_key);
-                    why.push(note);
                     continue;
                 }
                 Err(e @ Error::OutOfScope(_)) => return Err(e),
@@ -1092,8 +1117,18 @@ impl Client {
                 if left.is_zero() {
                     break;
                 }
-                match crate::http::h3::connect(addr, &server_name, config.clone(), left.min(H3_HANDSHAKE)).await {
+                // At most half the time left, so a request whose UDP goes unanswered still has
+                // time to go over TCP.
+                let wait = (left / 2).min(H3_HANDSHAKE);
+                match crate::http::h3::connect(addr, &server_name, config.clone(), wait).await {
                     Ok(c) => {
+                        if advertised {
+                            // The rows name the target; this says where its datagrams went.
+                            self.h3_note(format!(
+                                "{}: HTTP/3 went to its Alt-Svc endpoint {host}:{port} ({addr})",
+                                target.origin()
+                            ));
+                        }
                         self.pool.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.pool.h3.lock().unwrap().insert(key, c.clone());
                         return Ok(Ok((c, true)));
@@ -1112,8 +1147,15 @@ impl Client {
             return;
         }
         let Ok(head) = parse_response_head(final_response(response)) else { return };
-        let Some(value) = head.header("alt-svc") else { return };
-        let Some(alt) = crate::http::h3::parse_alt_svc(value, &target.host) else { return };
+        // The first header that says something about h3 (several Alt-Svc headers are one list).
+        let Some(alt) = head
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("alt-svc"))
+            .find_map(|(_, v)| crate::http::h3::parse_alt_svc(v, &target.host))
+        else {
+            return;
+        };
         let key = (self.net().generation, target.origin());
         let mut cache = self.pool.alt_svc.lock().unwrap();
         match alt.filter(|a| !a.max_age.is_zero()) {
