@@ -8,6 +8,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { useActions } from "../ui/useActions.ts";
 import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
@@ -27,6 +28,22 @@ export function TargetView({ active }: { active: boolean }) {
     window.addEventListener(SHOW_SCOPE, show);
     return () => window.removeEventListener(SHOW_SCOPE, show);
   }, []);
+  useActions(
+    (
+      [
+        ["map", "Map"],
+        ["scope", "Scope"],
+      ] as const
+    ).map(([id, label]) => ({
+      id: `go.target.${id}`,
+      title: `Site map › ${label}`,
+      group: "Go to",
+      run: () => {
+        app.setTab("target");
+        setSub(id);
+      },
+    })),
+  );
   return (
     <div className="col fill">
       <div className="subtabs">

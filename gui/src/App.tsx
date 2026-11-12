@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cancelCli, inTauri, run, setProject, tempProjects } from "./api";
-import { AppProvider, autoProxy, useApp, type Tab, type TempInfo } from "./store";
+import { AppProvider, autoProxy, useApp, type TempInfo } from "./store";
 import { ProxyView } from "./views/Proxy";
 import { RepeaterView } from "./views/Repeater";
 import { FindingsView } from "./views/Findings";
@@ -22,13 +22,23 @@ import { SideBrand } from "./ui/Brand";
 import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
-import { Welcome, remember, saveTempAs } from "./views/Welcome";
+import { Welcome, recent, remember, saveTempAs } from "./views/Welcome";
+import { NAV, SETTINGS_NAV, type NavItem } from "./nav";
+import { bindingOf, initBindings, type Action } from "./ui/actions.ts";
+import { formatChord, isMac } from "./ui/chords.ts";
+import { useActions, useOverrides, useShortcuts, withKey } from "./ui/useActions.ts";
+import { Palette } from "./ui/Palette";
+import { baseName } from "./views/deleteProject";
 import { closeQuestion, stopAllCalls } from "./views/replayCalls";
 import { onCloseRequested } from "./quit";
 import { usePoll } from "./ui/usePoll";
 import { leaveProject, leaver } from "./views/leave";
 import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
+
+/** Mod is ⌘ here, Ctrl on Linux and Windows. */
+const MAC = isMac();
+initBindings(MAC);
 
 const DISCARD_TITLE = "Discard this temporary engagement?";
 const DISCARD = "Its traffic, findings and settings are deleted for good. Use Save as… first to keep them.";
@@ -104,13 +114,16 @@ export function App() {
     await open(dest, null, notice).catch((e) => setNotice(`Saved to ${dest}, but it didn't open: ${e.message}`));
   }, [open, project]);
 
+  // Another project, from the palette's Recent or Open project…: the shell has closed this one.
+  const openOther = useCallback((path: string) => open(path).catch((e) => setNotice(`${path} didn't open: ${e.message}`)), [open]);
+
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   return (
     <>
       {project ? (
         // Keyed by project: per-project state (Replay's sends and results among it) never carries over.
         <AppProvider key={project} project={project} temp={temp} saveAs={saveAs} notice={opened}>
-          <Shell onClose={close} toggleTheme={toggleTheme} />
+          <Shell onClose={close} onOpen={openOther} toggleTheme={toggleTheme} />
         </AppProvider>
       ) : (
         <Welcome open={open} notice={notice} />
@@ -119,41 +132,6 @@ export function App() {
     </>
   );
 }
-
-/** Sidebar: tools grouped by what you're doing. */
-const NAV: { group: string; items: { id: Tab; label: string; icon: string }[] }[] = [
-  {
-    group: "Recon",
-    items: [
-      { id: "dashboard", label: "Overview", icon: "overview" },
-      { id: "target", label: "Site map", icon: "sitemap" },
-    ],
-  },
-  { group: "Capture", items: [{ id: "proxy", label: "Proxy", icon: "proxy" }] },
-  {
-    group: "Attack",
-    items: [
-      { id: "repeater", label: "Replay", icon: "replay" },
-      { id: "fuzzer", label: "Fuzzer", icon: "fuzzer" },
-      { id: "scanner", label: "Scans", icon: "scans" },
-      { id: "access", label: "Access", icon: "access" },
-    ],
-  },
-  {
-    group: "Results",
-    items: [
-      { id: "findings", label: "Findings", icon: "findings" },
-      { id: "oob", label: "Callbacks", icon: "callbacks" },
-    ],
-  },
-  {
-    group: "Tools",
-    items: [
-      { id: "decoder", label: "Codec", icon: "codec" },
-      { id: "comparer", label: "Diff", icon: "diff" },
-    ],
-  },
-];
 
 interface ProxyStatus {
   running: boolean;
@@ -165,7 +143,7 @@ interface ProxyStatus {
   routing_changed_by_agent?: RecordingChange[];
 }
 
-function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleTheme: () => void }) {
+function Shell({ onClose, onOpen, toggleTheme }: { onClose: () => Promise<void>; onOpen: (path: string) => Promise<void>; toggleTheme: () => void }) {
   const app = useApp();
   const [scope, setScope] = useState<string[] | null>(null);
   const [engName, setEngName] = useState("");
@@ -296,7 +274,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
   // shell or its project is gone.
   const leaving = useMemo(leaver, []);
   useEffect(() => leaving.attach(), [leaving, app.project]);
-  const leave = () =>
+  // `then` runs once this project has closed (another opening, say).
+  const leave = (then?: () => Promise<void>) =>
     leaving.run((stale) =>
       leaveProject({
         temp: !!app.temp,
@@ -311,7 +290,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
             "Keep open",
           ),
         discard: () => confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"),
-        close: onClose,
+        close: then ? () => onClose().then(then) : onClose,
         stale,
       }),
     );
@@ -352,19 +331,61 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
       return !c;
     });
 
-  const navItem = (t: { id: Tab; label: string; icon: string }) => (
-    <button key={t.id} className={`nav-item ${app.tab === t.id ? "on" : ""}`} onClick={() => app.setTab(t.id)} title={collapsed ? t.label : undefined}>
+  const [palette, setPalette] = useState(false);
+  useShortcuts(app.tab, MAC);
+  // Opens another project once this one has closed (asking what closing asks first).
+  const switchTo = (path: string) => {
+    if (path === app.project) return app.toast("That project is open already.");
+    leave(() => onOpen(path));
+  };
+  const openProject = async () => {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    const p = await dialog.open({ filters: [{ name: "brainproxy project", extensions: ["bpdb"] }], multiple: false });
+    if (typeof p === "string") switchTo(p);
+  };
+  const goTo = (t: NavItem): Action => ({ id: `go.${t.id}`, title: t.label, group: "Go to", keys: t.keys, run: () => app.setTab(t.id) });
+  useActions([
+    { id: "app.palette", title: "Open the command palette", group: "App", keys: "Mod+K", typing: true, noPalette: true, run: () => setPalette(true) },
+    ...NAV.flatMap((g) => g.items).map(goTo),
+    goTo(SETTINGS_NAV),
+    {
+      id: "proxy.toggle",
+      title: status?.running ? "Stop the proxy" : "Start the proxy",
+      group: "Proxy",
+      keywords: "proxy on off listen",
+      disabled: app.proxy.moving ? "The proxy is restarting on another port" : false,
+      run: proxyToggle,
+    },
+    ...browsers.map((b) => ({ id: `browser.open.${b.id}`, title: `Open ${b.name} through the proxy`, group: "Proxy", keywords: "browser launch", run: () => openBrowser(b.id) })),
+    { id: "scan.guided", title: "Start a guided scan", group: "Scans", keywords: "wizard overview", run: () => app.openWizard(true) },
+    { id: "app.theme", title: "Switch between light and dark", group: "App", keywords: "theme dark light mode", run: toggleTheme },
+    { id: "app.sidebar", title: collapsed ? "Expand the sidebar" : "Collapse the sidebar", group: "App", keys: "Mod+B", keywords: "sidebar navigation", run: toggleSidebar },
+    { id: "project.switch", title: "Switch project", group: "Project", keywords: "close welcome", run: () => leave() },
+    { id: "project.open", title: "Open a project file…", group: "Project", keywords: "bpdb browse", hidden: !inTauri, run: openProject },
+    { id: "project.saveAs", title: "Save the temporary engagement as…", group: "Project", keywords: "save file", hidden: !app.temp, run: save },
+    ...recent()
+      .filter((p) => p !== app.project)
+      .map((p) => ({ id: `project.recent.${p}`, title: `Open ${baseName(p)}`, group: "Recent projects", keywords: p, unbindable: true, run: () => switchTo(p) })),
+  ]);
+
+  const overrides = useOverrides();
+  const navItem = (t: NavItem) => {
+    const chord = bindingOf({ id: `go.${t.id}`, title: t.label, group: "Go to", keys: t.keys }, overrides);
+    const key = chord ? formatChord(chord, MAC) : "";
+    return (
+    <button key={t.id} className={`nav-item ${app.tab === t.id ? "on" : ""}`} onClick={() => app.setTab(t.id)} title={collapsed ? withKey(t.label, key) : key || undefined}>
       <Icon name={t.icon} />
       <span className="nav-label">{t.label}</span>
       {t.id === "repeater" && app.repeater.length > 0 && <span className="count">{app.repeater.length}</span>}
     </button>
-  );
+    );
+  };
 
   return (
     <div className={`app ${collapsed ? "nav-collapsed" : ""}`}>
       <header className="top">
         <div className="top-left">
-          <div className="brand" onClick={leave} title="Switch project">
+          <div className="brand" onClick={() => leave()} title="Switch project">
             <Logo size={22} />
             <span className="brand-name">brainproxy</span>
           </div>
@@ -463,14 +484,14 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
             ))}
           </nav>
           <div className="nav-foot">
-            {navItem({ id: "settings", label: "Settings", icon: "settings" })}
+            {navItem(SETTINGS_NAV)}
             {app.temp && (
               <button className="nav-item" onClick={save} title={collapsed ? "Save as…" : tempTitle}>
                 <Icon name="save" />
                 <span className="nav-label">Save as…</span>
               </button>
             )}
-            <button className="nav-item" onClick={leave} title={collapsed ? "Switch project" : undefined}>
+            <button className="nav-item" onClick={() => leave()} title={collapsed ? "Switch project" : undefined}>
               <Icon name="switch" />
               <span className="nav-label">Switch project</span>
             </button>
@@ -525,6 +546,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => Promise<void>; toggleT
       </main>
       </div>
       <Menu menu={browserMenu.menu} close={browserMenu.close} />
+      {palette && <Palette view={app.tab} mac={MAC} close={() => setPalette(false)} />}
       <EngageHost />
       <div className="toasts">
         {app.toasts.map((t) => (

@@ -8,6 +8,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { useActions } from "../ui/useActions.ts";
 import {
   appliedSaved,
   clearLocalSaved,
@@ -58,6 +59,24 @@ export function ProxyView() {
   useEffect(() => {
     if (app.traffic) setSub("history");
   }, [app.traffic]);
+  useActions(
+    (
+      [
+        ["intercept", "Intercept"],
+        ["history", "Traffic"],
+        ["ws", "WebSockets"],
+        ["sse", "Event streams"],
+      ] as const
+    ).map(([id, label]) => ({
+      id: `go.proxy.${id}`,
+      title: `Proxy › ${label}`,
+      group: "Go to",
+      run: () => {
+        app.setTab("proxy");
+        setSub(id);
+      },
+    })),
+  );
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -75,7 +94,7 @@ export function ProxyView() {
         </button>
       </div>
       <div className="fill" hidden={sub !== "history"}>
-        <History />
+        <History active={sub === "history"} />
       </div>
       <div className="fill" hidden={sub !== "intercept"}>
         <Intercept active={sub === "intercept"} />
@@ -161,7 +180,7 @@ const MODE_HELP: Record<SearchMode, string> = {
   query: QUERY_HELP,
 };
 
-function History() {
+function History({ active }: { active: boolean }) {
   const app = useApp();
   const [rows, setRows] = useState<HistoryItem[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
@@ -396,6 +415,28 @@ function History() {
       .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, tags: withHighlight(x.tags, on) } : x))))
       .then(rerunQuery)
       .catch((e) => app.toast(e.message, "error"));
+
+  // The palette's and shortcuts' Traffic actions, on the selected row, while Traffic shows.
+  const row = rows.find((r) => r.id === selected);
+  const noRow: string | false = row ? false : "Select a request in Traffic first";
+  const rowBlocker = row ? scanBlocker(row) : null;
+  useActions([
+    { id: "proxy.traffic.export", title: "Export Traffic as HAR…", group: "Proxy", where: "proxy", hidden: !active, keywords: "save har file", run: () => setExporting(true) },
+    ...[
+      { id: "proxy.traffic.replay", title: "Send the selected request to Replay", run: (r: HistoryItem) => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
+      { id: "proxy.traffic.fuzzer", title: "Send the selected request to Fuzzer", run: (r: HistoryItem) => handoff(r.id, app.sendToFuzzer) },
+      { id: "proxy.traffic.finding", title: "Create a finding from the selected request…", run: (r: HistoryItem) => app.newFinding({ url: r.url, method: r.method, history: [r.id] }) },
+    ].map((a) => ({ ...a, group: "Proxy", where: "proxy", hidden: !active, disabled: noRow, run: () => row && a.run(row) })),
+    {
+      id: "proxy.traffic.scan",
+      title: "Scan the selected request…",
+      group: "Proxy",
+      where: "proxy",
+      hidden: !active,
+      disabled: noRow || rowBlocker || false,
+      run: () => row && scan({ id: row.id, method: row.method, url: row.url }),
+    },
+  ]);
 
   const rowMenu = (r: HistoryItem, ev: React.MouseEvent) => {
     const pick = { id: r.id, method: r.method, url: r.url };
@@ -793,6 +834,30 @@ function Intercept({ active }: { active: boolean }) {
   };
 
   const item = items.find((i) => i.id === current);
+  const toReplay = () => item && message && app.sendToRepeater({ raw: message.text, binary: message.binary, target: originOf(item.url) });
+  const nothingHeld: string | false = message ? false : "Nothing is held";
+  useActions([
+    {
+      id: "proxy.intercept.toggle",
+      title: "Turn intercept on or off",
+      group: "Proxy",
+      keys: "Mod+T",
+      keywords: "hold intercept",
+      // On the settings as they are when it runs, polled or not.
+      run: () => toggle((c) => ({ enabled: !c.enabled, requests: c.enabled ? c.requests : c.requests || !(c.responses || c.ws_to_server || c.ws_to_client) })),
+    },
+    { id: "proxy.intercept.forward", title: "Forward the held message", group: "Proxy", where: "proxy", keys: "Mod+F", typing: true, hidden: !active, disabled: nothingHeld, run: () => decide("forward") },
+    { id: "proxy.intercept.drop", title: "Drop the held message", group: "Proxy", where: "proxy", hidden: !active, disabled: nothingHeld, run: () => decide("drop") },
+    {
+      id: "proxy.intercept.replay",
+      title: "Send the held request to Replay",
+      group: "Proxy",
+      where: "proxy",
+      hidden: !active,
+      disabled: nothingHeld || (message?.truncated ? "Over 2 MB: read-only" : item?.direction !== "request" ? "Only a held request can go to Replay" : false),
+      run: toReplay,
+    },
+  ]);
   return (
     <div className="col fill">
       <div className="toolbar">
@@ -847,7 +912,7 @@ function Intercept({ active }: { active: boolean }) {
         <button
           className="btn"
           disabled={!message || message.truncated || item?.direction !== "request"}
-          onClick={() => item && message && app.sendToRepeater({ raw: message.text, binary: message.binary, target: originOf(item.url) })}
+          onClick={toReplay}
         >
           Send to Replay
         </button>

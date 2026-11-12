@@ -6,6 +6,7 @@ import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { confirm } from "../ui/Confirm";
+import { useActions, useKeyLabel, withKey } from "../ui/useActions.ts";
 import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { activeLabels, curlOptions, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
 import {
@@ -90,6 +91,25 @@ export function RepeaterView() {
       app.setRepeaterActive(rest[rest.length - 1]?.key ?? 0);
     }
   };
+
+  // Next and previous tab, round the ends.
+  const step = (d: number) => {
+    const i = tabs.findIndex((t) => t.key === active?.key);
+    if (tabs.length > 1) app.setRepeaterActive(tabs[(i + d + tabs.length) % tabs.length].key);
+  };
+  const noTabs = tabs.length > 1 ? false : "Only one tab is open";
+  const inReplay = (f: () => void) => () => {
+    app.setTab("repeater");
+    f();
+  };
+  useActions([
+    { id: "replay.new", title: "New Replay tab", group: "Replay", keywords: "blank request", run: inReplay(newTab) },
+    { id: "replay.newWs", title: "New WebSocket tab in Replay", group: "Replay", keywords: "ws websocket", run: inReplay(newWsTab) },
+    { id: "replay.curl", title: "New Replay tab from a cURL command…", group: "Replay", keywords: "paste curl import", run: inReplay(() => setPasting(true)) },
+    { id: "replay.close", title: "Close this Replay tab", group: "Replay", where: "repeater", disabled: active ? false : "No tab is open", run: () => active && closeTab(active.key) },
+    { id: "replay.next", title: "Next Replay tab", group: "Replay", where: "repeater", keys: "Mod+PageDown", disabled: noTabs, run: () => step(1) },
+    { id: "replay.previous", title: "Previous Replay tab", group: "Replay", where: "repeater", keys: "Mod+PageUp", disabled: noTabs, run: () => step(-1) },
+  ]);
 
   return (
     <div className="col fill">
@@ -353,18 +373,19 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
     setRaw(sent.list[at].raw);
   };
 
-  // Views stay mounted when hidden: only while Replay is showing.
-  const showing = app.tab === "repeater";
-  useEffect(() => {
-    const key = (e: KeyboardEvent) => {
-      if (showing && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
-        e.preventDefault();
-        if (!busy) send();
-      }
-    };
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  });
+  // Only while Replay shows (its where), and in the editor too.
+  const sendKey = useKeyLabel("replay.send");
+  useActions([
+    { id: "replay.send", title: "Send the request", group: "Replay", where: "repeater", keys: "Mod+Enter", typing: true, disabled: busy ? "Sending…" : false, run: send },
+    {
+      id: "replay.stop",
+      title: racing ? "Stop the race" : "Stop waiting for the response",
+      group: "Replay",
+      where: "repeater",
+      disabled: busy ? false : "Nothing is being sent",
+      run: () => stopCall(tab.key, cancelCli),
+    },
+  ]);
 
   const r = current?.result;
   const note = current ? sentWithNote(current.labels, activeLabels(options, "http")) : null;
@@ -389,9 +410,9 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
     />
   );
   return (
-    <div className="col fill" onKeyDown={() => {}}>
+    <div className="col fill">
       <div className="toolbar">
-        <button className="btn primary" disabled={busy} onClick={send} title="Send (⌘/Ctrl+Enter)">
+        <button className="btn primary" disabled={busy} onClick={send} title={withKey("Send", sendKey)}>
           {busy && !racing ? "Sending…" : "Send"}
         </button>
         {busy && (

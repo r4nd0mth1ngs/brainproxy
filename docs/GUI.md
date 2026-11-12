@@ -162,6 +162,28 @@ via tauri-plugin-opener, limited to assertivesolutions.io); tools with several p
 Views stay mounted when hidden, so state (selection, edits, Replay tabs) survives switching;
 Replay tabs are also kept in the project file (below).
 
+**Command palette and shortcuts** (`ui/actions.ts`, `ui/chords.ts`, `ui/fuzzy.ts`, `ui/useActions.ts`,
+`ui/Palette.tsx`, `views/Keyboard.tsx`). One registry holds the app's actions: each view adds its own
+while mounted with `useActions` (id, title, group, default chord, where it applies: anywhere, one view,
+the message editor or a dialog; whether it may run while typing; hidden or disabled with a reason, read
+from the latest render), so a new feature lists itself. ⌘K / Ctrl+K opens the palette: fuzzy matching on
+the title (then the group and keywords), arrow keys and Enter, each entry with its shortcut, recently
+used first; it lists the actions for anywhere and for the view that shows, Go to for every view, sub-tab
+and Settings section, and Recent projects (opening one asks what Switch project asks). An action runs
+once the palette has closed, through the same function as its button, so its questions still come up.
+A single window keydown handler (`useShortcuts`) runs the bound action for the view that shows, a view's
+own before a global one; it does nothing while a modal dialog is open, for a key held down, while
+composing (IME), or while typing in a text field unless the action is meant to run there and the chord
+holds Mod, Ctrl or Alt (`mayRunWhileTyping`). The editor's encode/decode and the cURL dialog's open are
+defined in the registry (`define`) and matched where they happen (`matches`). Chords are written
+`Mod+Shift+K`, Mod being ⌘ on macOS and Ctrl elsewhere (Ctrl is the Control key on macOS only);
+letters, digits and punctuation are named by `KeyboardEvent.code`, AltGr and the Windows/Super key
+make none. Settings › Keyboard lists every bindable action with where it applies, records a new chord,
+refuses Esc, plain Tab, plain moving keys and the window's own (copy, paste, undo, quit, ...), finds
+conflicts (two actions that one key press can reach: `overlaps`) and offers to take the chord from the
+others, clears, resets one or all (after asking). Bindings are per user: only the changes from the
+defaults, in local storage (`shortcuts`), like the theme and Recent.
+
 | Group | Tool | Parts | CLI used |
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & Updates; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
@@ -175,7 +197,7 @@ Replay tabs are also kept in the project file (below).
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps, including gzip, zlib, and raw deflate (Brotli decodes only). **Smart decode** finds the layers (URL, Base64, hex, HTML, JWT, gzip, zlib) and puts them in as steps to check or change, stopping at JSON; its note says if the 8-layer limit or a decompression bomb stopped it | `encode`, `decode`, `hash`; Smart decode: `decode auto -` (its `steps` and `stopped`) |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; a TOTP secret for one-time codes; with macros built from Traffic and session rules; *Record a login* also records the page's steps for a login only a browser can repeat, asks for the TOTP secret when a code was typed, and with *The login uses a passkey* puts a virtual authenticator in the recording browser, see `views/recordLogin.ts`; a recorded profile shows its browser steps and passkeys, never a key), match & replace (`views/MatchReplace.tsx`, `views/matchReplace.ts`: structured locations, what a rule applies to, a host condition, a replacement that is text or a script file (chosen with the file dialog, added after a confirmation that names it, listed as `script NAME` with why it is not applied when its file changed), a tester that sends nothing and says when a script failed, copy as JSON and import, which names the scripts the rules would run), intercept options, proxy (status, start, the port, who can connect, invisible mode and a redirect the app uses, and restarting with them, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth record start [--passkey \| --passkeys-from]`, `auth record finish [--save]` with `BRAINPROXY_SECRET_TOTP`, `auth add --keep-totp --keep-recorded`, `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *` (incl. `rules test`, `rules import -`), `intercept *`, `proxy status/start/stop/restart` (incl. `--invisible`, `--redirect`), `proxy setup show/set`, `engagement check` (the redirect), `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; a TOTP secret for one-time codes; with macros built from Traffic and session rules; *Record a login* also records the page's steps for a login only a browser can repeat, asks for the TOTP secret when a code was typed, and with *The login uses a passkey* puts a virtual authenticator in the recording browser, see `views/recordLogin.ts`; a recorded profile shows its browser steps and passkeys, never a key), match & replace (`views/MatchReplace.tsx`, `views/matchReplace.ts`: structured locations, what a rule applies to, a host condition, a replacement that is text or a script file (chosen with the file dialog, added after a confirmation that names it, listed as `script NAME` with why it is not applied when its file changed), a tester that sends nothing and says when a script failed, copy as JSON and import, which names the scripts the rules would run), intercept options, proxy (status, start, the port, who can connect, invisible mode and a redirect the app uses, and restarting with them, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, keyboard (shortcuts, above), open source licenses (credits and NOTICE) | `auth *` (incl. `auth record start [--passkey \| --passkeys-from]`, `auth record finish [--save]` with `BRAINPROXY_SECRET_TOTP`, `auth add --keep-totp --keep-recorded`, `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *` (incl. `rules test`, `rules import -`), `intercept *`, `proxy status/start/stop/restart` (incl. `--invisible`, `--redirect`), `proxy setup show/set`, `engagement check` (the redirect), `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 

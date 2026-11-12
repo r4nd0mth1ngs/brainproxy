@@ -5,6 +5,7 @@ import { useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { useActions } from "../ui/useActions.ts";
 import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 import { ScanPolicies, usePolicies } from "./ScanPolicies";
 import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
@@ -81,6 +82,25 @@ export function ScannerView({ active }: { active: boolean }) {
     setSub("tasks");
   };
 
+  useActions(
+    (
+      [
+        ["tasks", "Tasks"],
+        ["new", "New scan"],
+        ["rules", "Rules"],
+        ["policies", "Policies"],
+      ] as const
+    ).map(([id, label]) => ({
+      id: `go.scanner.${id}`,
+      title: `Scans › ${label}`,
+      group: "Go to",
+      run: () => {
+        app.setTab("scanner");
+        setSub(id);
+      },
+    })),
+  );
+
   // A job another tool started and asked to show (Traffic's Scan this request).
   useEffect(() => {
     if (app.jobFocus) launched(app.jobFocus.id);
@@ -127,7 +147,7 @@ export function ScannerView({ active }: { active: boolean }) {
         <Tasks jobs={jobs?.jobs ?? []} selected={selected} setSelected={setSelected} refresh={refreshJobs} />
       </div>
       <div className="fill" hidden={sub !== "new"}>
-        <NewScan picked={picked} onLaunched={launched} />
+        <NewScan picked={picked} onLaunched={launched} active={sub === "new"} />
       </div>
       <div className="fill" hidden={sub !== "rules"}>
         <Rules active={active && sub === "rules"} picked={picked} setPicked={setPicked} />
@@ -506,7 +526,7 @@ function TargetedPicker({ picks, setPicks }: { picks: Pick[]; setPicks: (p: Pick
   );
 }
 
-function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id: number) => void }) {
+function NewScan({ picked, onLaunched, active }: { picked: Set<number>; onLaunched: (id: number) => void; active: boolean }) {
   const app = useApp();
   const [kind, setKind] = useState<"scan" | "targeted" | "crawl" | "php2shell" | "quick">("scan");
   // Targeted scan: only the rules and checks picked in the search.
@@ -660,6 +680,16 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       app.toast(e.message, "error");
     }
   };
+  useActions([
+    {
+      id: "scan.start",
+      title: kind === "crawl" ? "Start the crawl" : kind === "php2shell" || kind === "quick" ? "Start the check" : "Start the scan",
+      group: "Scans",
+      where: "scanner",
+      hidden: !active,
+      run: launch,
+    },
+  ]);
 
   const text = (label: string, key: keyof typeof SCAN_DEFAULTS, placeholder = "", title?: string) => (
     <label className="sc-field" title={title}>
