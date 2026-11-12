@@ -1499,7 +1499,8 @@ function request(req, ctx) {
   `[name, value]` pairs or an object; `bodyBase64` for bytes; what it was given may come back
   with it, so `{ request: { ...req, method: "PUT" } }` works, and a changed `path` or `query`
   makes the target); `{ block: "reason" }` (or
-  `{ block: true }`) to not send it; or `{ response: { status, reason, headers, body } }` to not
+  `{ block: true }`) to not send it (`{ block: false }` blocks nothing, so
+  `return { block: isBad(req) }` works); or `{ response: { status, reason, headers, body } }` to not
   send it and use that response as if the server had sent it (`status` from 200 to 999, 200 by
   default; `bodyBase64` for bytes). Anything else, or a key it doesn't know, fails the call.
 - A host the scope doesn't list that a changed request names (its Host, or an absolute target)

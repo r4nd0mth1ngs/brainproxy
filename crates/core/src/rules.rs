@@ -3076,6 +3076,8 @@ mod tests {
             case '/headers': return { request: { headers: { 'X-Only': 1 } } };
             case '/block': return { block: 'no \\u001b[2J admin' };
             case '/bare': return { block: true };
+            case '/unblocked': return { block: req.path === '/admin' };
+            case '/unblocked-rewrite': return { block: false, request: { method: 'PUT' } };
             case '/answer':
                 return { response: { status: 201, headers: { 'Content-Type': 'text/plain', 'Content-Length': '999',
                     'Transfer-Encoding': 'chunked', 'X-Brainproxy-Answer': 'forged' }, body: 'hi ' + req.method } };
@@ -3122,6 +3124,14 @@ mod tests {
         assert!(out.noted() && !out.changed());
         let bare = run("GET /bare HTTP/1.1\r\n\r\n").stopped.unwrap();
         assert_eq!(bare.message(), "blocked by the script of match-and-replace rule 3");
+        // `{ block: false }` is no block: the request goes as it is (or as the rest says).
+        let unblocked = "GET /unblocked HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        let out = run(unblocked);
+        assert!(out.stopped.is_none() && !out.changed() && out.failed.is_empty(), "{out:?}");
+        assert_eq!(out.bytes, unblocked.as_bytes());
+        let out = run("GET /unblocked-rewrite HTTP/1.1\r\n\r\n");
+        assert!(out.stopped.is_none() && out.failed.is_empty(), "{out:?}");
+        assert_eq!(text(&out.bytes), "PUT /unblocked-rewrite HTTP/1.1\r\n\r\n");
 
         // Answered: framed by brainproxy, with its own mark the script can't forge or drop.
         let out = run("GET /answer HTTP/1.1\r\nHost: h.test\r\n\r\n");

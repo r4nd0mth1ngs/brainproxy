@@ -33,12 +33,15 @@
   };
   // What a request rule's script decides: nothing (send it), or one of { request } (send it
   // rewritten), { block } (don't send it) and { response } (don't send it: answer with this).
-  // The parts are read, and refused if wrong, by brainproxy.
+  // { block: false } is no block, so `return { block: isBad(req) }` works. The parts are read,
+  // and refused if wrong, by brainproxy.
   const verdict = (out) => {
     if (out === undefined || out === null) return { keep: true };
     if (typeof out === "object" && typeof out.then === "function") throw new TypeError("it returned a promise: return the value itself");
     if (typeof out !== "object" || isArray(out)) throw new TypeError("it returned " + kindOf(out) + ": return nothing, { request }, { block } or { response }");
-    const keys = ["request", "block", "response"].filter((k) => out[k] !== undefined && out[k] !== null);
+    const given = (k) => out[k] !== undefined && out[k] !== null && !(k === "block" && out[k] === false);
+    const keys = ["request", "block", "response"].filter(given);
+    if (keys.length === 0 && out.block === false) return { keep: true };
     if (keys.length === 0) throw new TypeError("it returned an object with no request, block or response");
     if (keys.length > 1) throw new TypeError("it returned " + keys.join(" and ") + ": return one of them");
     const key = keys[0];
