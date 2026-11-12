@@ -786,6 +786,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_alt_svc_endpoint_does_not_turn_http3_back_on() {
+        // Nothing answers QUIC on the origin's own UDP port (a handshake waits it out), and the
+        // endpoint it keeps advertising is out of scope.
+        let (port, requests) = h1_server(0, Some(r#"h3="evil.test:443""#.into())).await;
+        let c = client(&["127.0.0.1".into()], true);
+        // The first request waits for its own address; the second learnt the endpoint, finds
+        // it refused, and waits once more.
+        c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
+        assert!(c.h3_notes().join("\n").contains("Alt-Svc endpoint evil.test:443"), "{:?}", c.h3_notes());
+        // The same refused endpoint, advertised again, isn't news: HTTP/3 stays off for the
+        // origin rather than costing every request another handshake.
+        for path in ["/c", "/d", "/e"] {
+            let started = std::time::Instant::now();
+            let ex = c.send(&get(path, port, "HTTP/1.1"), &target(port)).await.unwrap();
+            assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
+            assert!(started.elapsed() < Duration::from_secs(1), "{path}: {:?}", started.elapsed());
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
     async fn host_and_sni_refusals_send_nothing_over_quic() {
         let (port, accepted) = h3_server(0, &[ALPN], None).await;
         let scope = || ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };

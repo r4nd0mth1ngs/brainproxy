@@ -396,6 +396,9 @@ enum Learned {
     Digest(crate::connection::platform::DigestChallenge, u32),
 }
 
+/// A host and port.
+type HostPort = (String, u16);
+
 #[derive(Default)]
 struct Pool {
     idle: Mutex<HashMap<PoolKey, Vec<(Stream, Instant)>>>,
@@ -422,6 +425,10 @@ struct Pool {
     /// Origins HTTP/3 just failed for, keyed by generation and origin, with until when and why:
     /// meanwhile their requests go straight to TCP instead of waiting for a handshake each.
     h3_down: Mutex<HashMap<(u64, String), (Instant, String)>>,
+    /// Alt-Svc endpoints (host and port) the guard refused, keyed by generation and origin: an
+    /// origin that keeps advertising one doesn't make it new again (which would turn HTTP/3
+    /// back on for an origin it just failed for, on every response).
+    alt_svc_refused: Mutex<HashMap<(u64, String), Vec<HostPort>>>,
     /// What to say about HTTP/3 asked for: why it wasn't used, or an Alt-Svc endpoint the
     /// scope refused. Each once, and the first few only.
     h3_notes: Mutex<Vec<String>>,
@@ -487,6 +494,7 @@ impl Client {
             self.pool.h3.lock().unwrap().retain(|k, _| k.1 == gen);
             self.pool.alt_svc.lock().unwrap().retain(|k, _| k.0 == gen);
             self.pool.h3_down.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.alt_svc_refused.lock().unwrap().retain(|k, _| k.0 == gen);
             self.pool.h3_connecting.lock().unwrap().retain(|k, _| k.1 == gen);
         }
         net
@@ -1120,6 +1128,12 @@ impl Client {
                     let note = format!("the Alt-Svc endpoint {host}:{port} of {} isn't used: {e}", target.origin());
                     self.h3_note(note);
                     self.pool.alt_svc.lock().unwrap().remove(&alt_key);
+                    let mut refused = self.pool.alt_svc_refused.lock().unwrap();
+                    let refused = refused.entry(alt_key.clone()).or_default();
+                    // (A few at most: an origin advertises one endpoint at a time.)
+                    if refused.len() < 16 && !refused.iter().any(|r| r.0.eq_ignore_ascii_case(&host) && r.1 == port) {
+                        refused.push((host.clone(), port));
+                    }
                     continue;
                 }
                 Err(e @ Error::OutOfScope(_)) => return Err(e),
@@ -1174,6 +1188,15 @@ impl Client {
         let key = (self.net().generation, target.origin());
         let mut cache = self.pool.alt_svc.lock().unwrap();
         match alt.filter(|a| !a.max_age.is_zero()) {
+            // An endpoint the guard refused under these settings stays refused: it isn't
+            // remembered again, nor a reason to try HTTP/3 again.
+            Some(a)
+                if self.pool.alt_svc_refused.lock().unwrap().get(&key).is_some_and(|r| {
+                    r.iter().any(|(host, port)| a.host.eq_ignore_ascii_case(host) && a.port == *port)
+                }) =>
+            {
+                cache.remove(&key);
+            }
             Some(a) => {
                 let until = Instant::now() + a.max_age.min(Duration::from_secs(86_400 * 7));
                 // A new endpoint is worth a try even if the target's own address just failed.
