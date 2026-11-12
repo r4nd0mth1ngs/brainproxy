@@ -147,7 +147,11 @@ Some arguments need a person, so a command run for a tool call (the server sets
   by `rules_import` with `replace`. Nor can a rule an agent adds change what such a script
   let through: request rules run after every other request rule of the engine, whatever their
   place in the list. Under a person's request rule (`--location request`), an
-  agent's `send`, fuzz run or scan whose request its script blocks fails with `error.kind` `blocked`, and one it answers carries the script's response, marked
+  agent's `send`, fuzz run or scan (the engines a rule's `applies_to` lists: `proxy`, `send`,
+  `fuzz`, `scan`; no other tool applies match-and-replace rules, so the requests of
+  `findings_retest`, `authz_run`, `crawl`, the `import_*` tools, `ws_send`, `oob_*`,
+  `auth_login` and `auth_macro_run` never reach a request rule's script) whose request its
+  script blocks fails with `error.kind` `blocked`, and one it answers carries the script's response, marked
   with an `X-Brainproxy-Answer` header (and `answered_by` in `send`'s output); the target got
   nothing.
 - Environment variables named by `auth_add` (`header_env`, `query_keys`, `password_env`,

@@ -1478,6 +1478,17 @@ added later can't change what a script let through (a `path` rule making `/admin
 is applied before the script that blocks `/admin`, which then blocks it). Nothing is sent for a blocked or
 answered request: no connection is opened, as if the engine had never got to it.
 
+**Which requests it sees.** Only those of the engines its `--applies-to` lists, as for every
+rule: `proxy` (in-scope requests the proxy relays, the browser brainproxy starts included),
+`send` (the app's Replay, races and event streams too), `fuzz`, and `scan` (the attacks and
+baselines of `scan active` and `scan checks`). Nothing else brainproxy sends goes through any
+match-and-replace rule, a request rule included, so no script blocks, rewrites or answers it:
+`findings retest`, `authz run` (and the proxy's live access-control testing), `crawl` (and the
+crawl of `scan active --crawl`), the requests of `import api`, `openapi`, `postman`, `graphql`
+and `har`, `ws send`, `oob`, and a session's logins and macros (`auth login`, `auth macro
+run`, and re-logins in any engine). Keep requests a script must stop out of those commands, or
+out of the scope.
+
 ```js
 // gate.js: never log out or delete anything; stub the feature flags endpoint
 function request(req, ctx) {
@@ -1651,7 +1662,9 @@ How a script is kept and run:
   signer's script, and it can list them, try a saved rule that is switched on with `rules test
   --rule`, and switch a rule or check off, except a request rule: its script may be what keeps
   some requests from the target, so `rules disable`, `rules remove`, `rules clear` and `rules
-  import --replace` are refused through MCP while one is on.
+  import --replace` are refused through MCP while one is on. It sees only the engines it
+  applies to (proxy, send, fuzz, scan): `findings retest`, `authz run`, `crawl`, the imports,
+  `ws send`, `oob` and logins go through no rule at all (see *Which requests it sees* above).
 
 ### Server-sent events (`sse`, `send --stream-wait`)
 
