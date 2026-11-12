@@ -3,7 +3,7 @@
 // question it asks (stop running sends? discard?) comes up as it would from its button.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { bindingOf, groupsOf, matches, type Action, type Overrides } from "./actions.ts";
+import { actions, bindingOf, groupsOf, matches, type Action, type Overrides } from "./actions.ts";
 import { chordOf, formatChord } from "./chords.ts";
 import { rank } from "./fuzzy.ts";
 import { useDialogFocus } from "./dialogFocus";
@@ -72,7 +72,11 @@ export function Palette({ view, mac, close }: { view: string; mac: boolean; clos
     recentRuns = [a.id, ...recentRuns.filter((id) => id !== a.id)].slice(0, 10);
     close();
     // After the palette is gone, so focus is back where it was and a question it asks shows alone.
-    setTimeout(() => a.run?.());
+    // The action as it is then, not as this row showed it: a held message may have changed since.
+    setTimeout(() => {
+      const live = actions().find((x) => x.id === a.id);
+      if (live && !live.hidden && !live.disabled) live.run?.();
+    });
   };
 
   const move = (d: number) => rows.length && setAt((sel + d + rows.length) % rows.length);
@@ -80,7 +84,7 @@ export function Palette({ view, mac, close }: { view: string; mac: boolean; clos
     // Kept here: nothing else runs while the palette is open.
     e.stopPropagation();
     // Its own shortcut closes it again.
-    if (matches("app.palette", chordOf(e.nativeEvent, mac))) {
+    if (matches("app.palette", chordOf(e.nativeEvent, mac), e.target as HTMLElement, mac)) {
       e.preventDefault();
       return close();
     }

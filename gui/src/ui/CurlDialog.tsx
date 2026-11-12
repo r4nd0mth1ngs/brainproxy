@@ -68,7 +68,7 @@ export function CurlDialog({ close, opener }: { close: () => void; opener?: RefO
         e.stopPropagation();
         keepFocusIn(box.current, e);
         if (e.key === "Escape") close();
-        if (matches("dialog.curlOpen", chordOf(e.nativeEvent, MAC))) {
+        if (matches("dialog.curlOpen", chordOf(e.nativeEvent, MAC), e.target as HTMLElement, MAC)) {
           e.preventDefault();
           open();
         }

@@ -54,6 +54,15 @@ export function Keyboard() {
     bind(a, chord);
   };
 
+  // Back to the default, asking first if another action has that chord now.
+  const reset = (a: Action) => {
+    setProblem(null);
+    const others = a.keys ? clashes(list, overrides, a, a.keys) : [];
+    if (a.keys && others.length) return setPending({ id: a.id, chord: a.keys, others });
+    setPending(null);
+    bind(a, a.keys ?? null);
+  };
+
   const resetAll = async () => {
     if (!(await confirm("Reset every shortcut?", "Each action goes back to its default shortcut, or none. Your changes are lost.", "Reset all", "Keep mine"))) return;
     setPending(null);
@@ -138,7 +147,7 @@ export function Keyboard() {
                       <button
                         className="btn small"
                         disabled={!isChanged}
-                        onClick={() => bind(a, a.keys ?? null)}
+                        onClick={() => reset(a)}
                         title={a.keys ? `Back to ${formatChord(a.keys, MAC)}` : "Back to no shortcut"}
                       >
                         Reset

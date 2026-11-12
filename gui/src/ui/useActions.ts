@@ -61,7 +61,7 @@ export function useShortcuts(view: string, mac: boolean): void {
       if (e.defaultPrevented || e.isComposing) return;
       const chord = chordOf(e, mac);
       if (!chord || dialogOpen()) return;
-      const a = actionFor(actions(), currentOverrides(), chord, viewRef.current, e.target as HTMLElement | null);
+      const a = actionFor(actions(), currentOverrides(), chord, viewRef.current, e.target as HTMLElement | null, mac);
       if (!a) return;
       e.preventDefault();
       if (e.repeat || a.disabled) return;

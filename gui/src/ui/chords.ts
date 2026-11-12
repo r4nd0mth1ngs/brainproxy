@@ -126,10 +126,13 @@ const split = (chord: string) => {
   return { mods: new Set(parts.slice(0, -1)), key: parts[parts.length - 1] };
 };
 
-/** Whether the chord holds Mod, Ctrl or Alt: one that doesn't types text in a field. */
-export function hasCommandModifier(chord: string): boolean {
+/**
+ * Whether the chord holds a modifier that doesn't type text in a field: Mod or Ctrl, or Alt
+ * except on macOS (where Option types characters: ⌥A is "å").
+ */
+export function hasCommandModifier(chord: string, mac = false): boolean {
   const { mods } = split(chord);
-  return mods.has("Mod") || mods.has("Ctrl") || mods.has("Alt");
+  return mods.has("Mod") || mods.has("Ctrl") || (mods.has("Alt") && !mac);
 }
 
 const MAC_KEYS: Record<string, string> = {

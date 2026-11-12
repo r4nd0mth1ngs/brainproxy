@@ -70,7 +70,8 @@ export function DataTable<T>(p: Props<T>) {
   }, [index]);
 
   const onKey = (e: React.KeyboardEvent) => {
-    if (!sorted.length || !p.onSelect) return;
+    // With Ctrl, ⌘ or Alt it is a shortcut (Replay's next tab, say), not a move.
+    if (!sorted.length || !p.onSelect || e.ctrlKey || e.metaKey || e.altKey) return;
     const step = { ArrowDown: 1, ArrowUp: -1, PageDown: 20, PageUp: -20 }[e.key];
     if (step) {
       e.preventDefault();

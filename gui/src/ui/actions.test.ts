@@ -67,18 +67,26 @@ test("actions are read when used, so a view's latest state counts", () => {
   undo();
 });
 
-test("an action matched where it happens follows the person's binding", () => {
+test("an action matched where it happens follows the person's binding and the typing rule", () => {
   define([def("t.editor", { keys: "Mod+U", where: "editor", typing: true })]);
-  assert.equal(matches("t.editor", "Mod+U"), true);
-  assert.equal(matches("t.editor", "Mod+Shift+U"), false);
-  assert.equal(matches("t.editor", null), false);
+  const editor = { tagName: "TEXTAREA" };
+  assert.equal(matches("t.editor", "Mod+U", editor), true);
+  assert.equal(matches("t.editor", "Mod+Shift+U", editor), false);
+  assert.equal(matches("t.editor", null, editor), false);
   setOverrides({ "t.editor": "Mod+E" });
-  assert.equal(matches("t.editor", "Mod+U"), false);
-  assert.equal(matches("t.editor", "Mod+E"), true);
+  assert.equal(matches("t.editor", "Mod+U", editor), false);
+  assert.equal(matches("t.editor", "Mod+E", editor), true);
+  // Rebound to a plain letter: typing it in the editor types it.
+  setOverrides({ "t.editor": "G" });
+  assert.equal(matches("t.editor", "G", editor), false);
+  // Option alone types characters on macOS (⌥A is "å"); elsewhere Alt doesn't.
+  setOverrides({ "t.editor": "Alt+A" });
+  assert.equal(matches("t.editor", "Alt+A", editor, true), false);
+  assert.equal(matches("t.editor", "Alt+A", editor, false), true);
   setOverrides({ "t.editor": null });
-  assert.equal(matches("t.editor", "Mod+E"), false);
+  assert.equal(matches("t.editor", "Mod+E", editor), false);
   setOverrides({});
-  assert.equal(matches("t.unknown", "Mod+U"), false);
+  assert.equal(matches("t.unknown", "Mod+U", editor), false);
 });
 
 test("groups are listed in a set order, others after in the order they came", () => {
@@ -222,6 +230,11 @@ test("while typing, only actions meant to run there do, and only with a command 
   assert.equal(mayRunWhileTyping(send, "G", field), false);
   assert.equal(mayRunWhileTyping(send, "Shift+G", field), false);
   assert.equal(mayRunWhileTyping(send, "G", { tagName: "DIV" }), true);
+  // Option alone on macOS types characters, so it isn't enough there; Ctrl (the Control key) is.
+  assert.equal(mayRunWhileTyping(send, "Alt+A", field, true), false);
+  assert.equal(mayRunWhileTyping(send, "Alt+A", field, false), true);
+  assert.equal(mayRunWhileTyping(send, "Ctrl+A", field, true), true);
+  assert.equal(mayRunWhileTyping(send, "Mod+Alt+A", field, true), true);
 });
 
 test("an editor-only action runs while editing a message, not in a one-line box", () => {

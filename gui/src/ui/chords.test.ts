@@ -67,6 +67,9 @@ test("a command modifier is Mod, Ctrl or Alt, not Shift", () => {
   assert.equal(hasCommandModifier("Ctrl+K"), true);
   assert.equal(hasCommandModifier("Shift+K"), false);
   assert.equal(hasCommandModifier("K"), false);
+  // Option types characters on macOS.
+  assert.equal(hasCommandModifier("Alt+K", true), false);
+  assert.equal(hasCommandModifier("Ctrl+K", true), true);
 });
 
 test("keys the window and fields use can't be shortcuts", () => {

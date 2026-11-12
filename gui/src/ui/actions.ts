@@ -269,10 +269,13 @@ export function isTyping(t: Target | null | undefined): boolean {
   return tag === "INPUT" && TEXT_INPUTS.has((t.type ?? "").toLowerCase());
 }
 
-/** Whether `chord` may run `a` with focus on `t`: while typing only ones meant to, and only with a command modifier. */
-export function mayRunWhileTyping(a: ActionDef, chord: string, t: Target | null | undefined): boolean {
+/**
+ * Whether `chord` may run `a` with focus on `t`: while typing only ones meant to, and only with
+ * a modifier that doesn't type (on macOS not Option alone).
+ */
+export function mayRunWhileTyping(a: ActionDef, chord: string, t: Target | null | undefined, isMac = mac): boolean {
   if (!isTyping(t)) return true;
-  return hasCommandModifier(chord) && (a.typing === true || (a.typing === "editor" && inEditor(t)));
+  return hasCommandModifier(chord, isMac) && (a.typing === true || (a.typing === "editor" && inEditor(t)));
 }
 
 /**
@@ -280,19 +283,22 @@ export function mayRunWhileTyping(a: ActionDef, chord: string, t: Target | null 
  * there (a view's own before a global one), isn't hidden, and may run while typing. Editor and
  * dialog actions are matched where they happen, never here.
  */
-export function actionFor(list: Action[], o: Overrides, chord: string, view: string, t: Target | null | undefined): Action | null {
+export function actionFor(list: Action[], o: Overrides, chord: string, view: string, t: Target | null | undefined, isMac = mac): Action | null {
   let found: Action | null = null;
   for (const a of list) {
     const where = a.where ?? "global";
-    if (a.hidden || (where !== "global" && where !== view) || bindingOf(a, o) !== chord || !mayRunWhileTyping(a, chord, t)) continue;
+    if (a.hidden || (where !== "global" && where !== view) || bindingOf(a, o) !== chord || !mayRunWhileTyping(a, chord, t, isMac)) continue;
     if (!found || (where !== "global" && (found.where ?? "global") === "global")) found = a;
   }
   return found;
 }
 
-/** Whether a key press is `id`'s current chord (for actions matched where they happen). */
-export function matches(id: string, chord: string | null): boolean {
+/**
+ * Whether a key press on `t` is `id`'s current chord and may run it there (for actions matched
+ * where they happen, under the same rule for typing as the rest).
+ */
+export function matches(id: string, chord: string | null, t: Target | null | undefined, isMac = mac): boolean {
   if (!chord) return false;
   const a = entries.get(id)?.at(-1)?.get();
-  return !!a && bindingOf(a, currentOverrides()) === chord;
+  return !!a && bindingOf(a, currentOverrides()) === chord && mayRunWhileTyping(a, chord, t, isMac);
 }

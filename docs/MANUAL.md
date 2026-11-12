@@ -329,7 +329,8 @@ The sidebar groups the tools by what you are doing.
   field, except the ones meant for it (go to a tool, send, encode, the palette; forward
   only in the message editor, not in the filter box), and not while a dialog or a right-click menu is
   open. On macOS the Control-key combinations are left to text editing (⌃K, ⌃F, ...), so
-  the defaults use ⌘. Arrow keys, Enter, Esc and Tab work in lists and dialogs as usual.
+  the defaults use ⌘, and a shortcut with only ⌥ never runs while typing (⌥ types
+  characters there). Arrow keys, Enter, Esc and Tab work in lists and dialogs as usual.
 - **Change them** in **Settings › Keyboard**: every action is listed with its shortcut and
   where it works. Click the shortcut and press a new one; Clear removes it, Reset goes back
   to the default, *Reset all to defaults* undoes every change. A shortcut another action

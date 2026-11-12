@@ -233,8 +233,8 @@ export function HttpView(p: {
               className="code editor"
               onKeyDown={(e) => {
                 const chord = chordOf(e.nativeEvent, MAC);
-                const encode = matches("editor.urlEncode", chord);
-                if (!encode && !matches("editor.urlDecode", chord)) return;
+                const encode = matches("editor.urlEncode", chord, e.currentTarget, MAC);
+                if (!encode && !matches("editor.urlDecode", chord, e.currentTarget, MAC)) return;
                 // Taken here: no other shortcut runs on it.
                 e.preventDefault();
                 transformSelection(encode ? encodeAll : (s) => decode(s, true));
