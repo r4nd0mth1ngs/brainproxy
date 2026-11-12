@@ -8,6 +8,7 @@ import { saveFailure } from "../ui/savePath.ts";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { useActions } from "../ui/useActions.ts";
 import { compareArgs, seenById, type ScanCompare, type ScanJob, type Seen } from "./compare";
 import {
   CLOSED,
@@ -350,6 +351,19 @@ export function FindingsView({ active }: { active: boolean }) {
   // The report builder: audience, sections, branding, format, with a preview.
   const [reporting, setReporting] = useState(false);
   const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
+  useActions([
+    { id: "findings.new", title: "New finding…", group: "Findings", keywords: "write up manual issue", run: () => app.newFinding({}) },
+    {
+      id: "findings.report",
+      title: "Build a report…",
+      group: "Findings",
+      keywords: "export html pdf word docx markdown csv sarif defectdojo",
+      run: () => {
+        app.setTab("findings");
+        setReporting(true);
+      },
+    },
+  ]);
 
   const toggle = <T,>(set: Set<T>, v: T) => {
     const s = new Set(set);

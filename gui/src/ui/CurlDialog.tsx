@@ -6,6 +6,11 @@ import { pathOf } from "../api";
 import { useApp } from "../store";
 import { parseCurl, toCurl, type CurlSendOptions } from "./curl";
 import { keepFocusIn } from "./focus";
+import { define, matches } from "./actions.ts";
+import { chordOf, isMac } from "./chords.ts";
+
+define([{ id: "dialog.curlOpen", title: "Open the pasted cURL command (New tab from cURL)", group: "Dialogs", keys: "Mod+Enter", where: "dialog", typing: true, noPalette: true }]);
+const MAC = isMac();
 
 /**
  * Copies a raw request to `target` as a cURL command, with a toast for the result. `send` is a
@@ -59,11 +64,11 @@ export function CurlDialog({ close, opener }: { close: () => void; opener?: RefO
     <div
       className="confirm-backdrop"
       onKeyDown={(e) => {
-        // Kept here, so Replay's own ⌘/Ctrl+Enter (Send) doesn't fire too.
+        // Kept here, so no other shortcut (Replay's Send, say) runs too.
         e.stopPropagation();
         keepFocusIn(box.current, e);
         if (e.key === "Escape") close();
-        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        if (matches("dialog.curlOpen", chordOf(e.nativeEvent, MAC), e.target as HTMLElement, MAC)) {
           e.preventDefault();
           open();
         }

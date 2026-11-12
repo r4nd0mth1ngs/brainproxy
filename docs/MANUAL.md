@@ -315,6 +315,34 @@ brainproxy kept this show as unknown. See [Who recorded what](#who-recorded-what
 
 The sidebar groups the tools by what you are doing.
 
+### Command palette and keyboard shortcuts
+- **Command palette:** ⌘K (Ctrl+K on Linux and Windows) opens a list of everything you can
+  do from where you are: go to any tool, sub-tab or Settings section, the current tool's
+  actions (send in Replay, forward or drop a held message, export Traffic, start a scan or
+  an attack, ...), start or stop the proxy, turn intercept on or off, open a browser, new
+  finding, build a report, switch project, and open a Recent project. Type a few letters
+  of it (`tio` finds *Turn intercept on or off*), move with the arrow keys and press Enter.
+  Each entry shows its shortcut. One that can't run now is dimmed and says why. An action
+  asks the same questions from the palette as from its button (stop running sends before
+  switching project, say).
+- **Shortcuts:** ⌘1 to ⌘9 go to the tools in sidebar order (Overview to Callbacks), ⌘,
+  to Settings, ⌘B collapses the sidebar, ⌘T turns intercept on or off, ⌘F forwards the
+  held message in Proxy › Intercept, ⌘Enter sends in Replay and ⌘PageDown / ⌘PageUp move
+  between its tabs, and ⌘U / ⌘⇧U URL-encode or decode the selection in a message editor
+  (Ctrl instead of ⌘ on Linux and Windows). Shortcuts don't run while you type in a text
+  field, except the ones meant for it (go to a tool, send, encode, the palette; forward
+  only in the message editor, not in the filter box), and not while a dialog or a right-click menu is
+  open. On macOS the Control-key combinations are left to text editing (⌃K, ⌃F, ...), so
+  the defaults use ⌘, and a shortcut with only ⌥ never runs while typing (⌥ types
+  characters there). Arrow keys, Enter, Esc and Tab work in lists and dialogs as usual.
+- **Change them** in **Settings › Keyboard**: every action is listed with its shortcut and
+  where it works. Click the shortcut and press a new one; Clear removes it, Reset goes back
+  to the default, *Reset all to defaults* undoes every change. A shortcut another action
+  already has (where both could run) is offered to move to this one; Esc, Tab, the moving
+  keys without a modifier, and copy, paste, cut, select all, undo, redo, quit, close, hide,
+  minimise and full screen can't be shortcuts. Shortcuts are yours, not the project's: the app keeps
+  them on this computer with its other preferences, the same in every project.
+
 ### Overview
 - **Guided scan:** shown until a project has a scan; after that, open it with *Guided
   scan* in the Tasks card or in **Scans › New scan**.
@@ -496,7 +524,7 @@ The sidebar groups the tools by what you are doing.
 
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
-- **Sending:** ⌘/Ctrl+Enter sends; **Stop** gives up on a request that is still waiting.
+- **Sending:** ⌘/Ctrl+Enter sends (Settings › Keyboard changes it); **Stop** gives up on a request that is still waiting.
   A stopped request may already have reached the server; if it went out, history has it,
   marked cancelled (on Windows, where the app can only kill the command, its row keeps
   `sent; no response recorded`). A stopped WebSocket tab's connection is closed as
@@ -1132,6 +1160,8 @@ byte, side by side or unified.
   opens* (on the port set under *Proxy*). While it is on, a proxy the app started (when the
   project opened, or from the proxy pill, *Open browser*, *Start proxy* or *Record a login*)
   stops when the project or the window closes; one started from a shell or MCP keeps running.
+- **Keyboard:** every action's shortcut, to change, clear or reset (see *Command palette
+  and keyboard shortcuts* above).
 - **Open source licenses:** credits for the projects the rules, checks and wordlists come
   from (OWASP ZAP, Nuclei, SecLists, ...) and the full NOTICE.
 

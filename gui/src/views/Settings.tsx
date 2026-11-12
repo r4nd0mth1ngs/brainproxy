@@ -1,5 +1,5 @@
 // Project and tool settings: auth profiles, match & replace, intercept options, proxy setup,
-// connection options, the CA, rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
+// connection options, the CA, rule data, project info, keyboard shortcuts, and open-source licenses. Each sub-tab loads its data when first shown.
 
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { run } from "../api";
@@ -50,8 +50,10 @@ import {
 import { MacroBuilder, SessionHandling } from "./SessionHandling";
 import type { MacroSummary, SessionRule, Signer } from "./sessionRules";
 import NOTICE from "../../../NOTICE?raw";
+import { Keyboard } from "./Keyboard";
+import { useActions } from "../ui/useActions.ts";
 
-type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "updates" | "project" | "licenses";
+type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "updates" | "project" | "keyboard" | "licenses";
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: "auth", label: "Auth profiles" },
@@ -62,11 +64,25 @@ const SUBS: { id: Sub; label: string }[] = [
   { id: "ca", label: "TLS / CA" },
   { id: "updates", label: "Rules & Updates" },
   { id: "project", label: "Project" },
+  { id: "keyboard", label: "Keyboard" },
   { id: "licenses", label: "Open source licenses" },
 ];
 
 export function SettingsView() {
   const [sub, setSub] = useState<Sub>("auth");
+  const app = useApp();
+  useActions(
+    SUBS.map((s) => ({
+      id: `go.settings.${s.id}`,
+      title: `Settings › ${s.label}`,
+      group: "Go to",
+      keywords: s.id === "keyboard" ? "shortcuts keys hotkeys bindings" : undefined,
+      run: () => {
+        app.setTab("settings");
+        setSub(s.id);
+      },
+    })),
+  );
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -85,6 +101,7 @@ export function SettingsView() {
       {sub === "ca" && <Ca />}
       {sub === "updates" && <RulesAndUpdates />}
       {sub === "project" && <Project />}
+      {sub === "keyboard" && <Keyboard />}
       {sub === "licenses" && <Licenses />}
     </div>
   );

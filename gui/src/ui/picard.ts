@@ -1,5 +1,7 @@
 // For Jean-Luc Picard: what typing "engage" answers and shows (see Engage.tsx).
 
+import { isTyping, type Target } from "./actions.ts";
+
 export const WORD = "engage";
 export const REPLY = "Make it so.";
 
@@ -30,7 +32,5 @@ export function typed(sofar: string, key: string): [string, boolean] {
   return ["", false];
 }
 
-export function editable(t: EventTarget | null): boolean {
-  const el = t as HTMLElement | null;
-  return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
-}
+/** Typing in a field (the same rule as shortcuts'), where the word isn't being spelt. */
+export const editable = (t: EventTarget | null): boolean => isTyping(t as Target | null);

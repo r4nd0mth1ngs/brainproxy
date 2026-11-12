@@ -41,7 +41,7 @@ export function remember(path: string) {
   }
 }
 
-const FILTERS = [{ name: "brainproxy project", extensions: ["bpdb"] }];
+export const FILTERS = [{ name: "brainproxy project", extensions: ["bpdb"] }];
 
 /** A file name from an engagement name: "Acme Web (Q4)" -> "acme-web-q4.bpdb". */
 function fileName(name: string): string {

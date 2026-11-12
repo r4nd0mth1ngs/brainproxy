@@ -9,6 +9,15 @@ import { decode, encodeAll } from "./urlencode";
 import { RENDER_CAP, renderable } from "./render";
 import { textBytes } from "../api";
 import { normalizeHead, withBody } from "./message";
+import { define, matches } from "./actions.ts";
+import { chordOf, isMac } from "./chords.ts";
+
+// Matched in the editor itself (on its selection), so not in the palette.
+define([
+  { id: "editor.urlEncode", title: "URL-encode the selection", group: "Message editor", keys: "Mod+U", where: "editor", typing: true, noPalette: true },
+  { id: "editor.urlDecode", title: "URL-decode the selection", group: "Message editor", keys: "Mod+Shift+U", where: "editor", typing: true, noPalette: true },
+]);
+const MAC = isMac();
 
 type Mode = "raw" | "pretty" | "hex" | "render";
 
@@ -223,10 +232,12 @@ export function HttpView(p: {
               ref={editor}
               className="code editor"
               onKeyDown={(e) => {
-                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "u") {
-                  e.preventDefault();
-                  transformSelection(e.shiftKey ? (s) => decode(s, true) : encodeAll);
-                }
+                const chord = chordOf(e.nativeEvent, MAC);
+                const encode = matches("editor.urlEncode", chord, e.currentTarget, MAC);
+                if (!encode && !matches("editor.urlDecode", chord, e.currentTarget, MAC)) return;
+                // Taken here: no other shortcut runs on it.
+                e.preventDefault();
+                transformSelection(encode ? encodeAll : (s) => decode(s, true));
               }}
               spellCheck={false}
               value={text}

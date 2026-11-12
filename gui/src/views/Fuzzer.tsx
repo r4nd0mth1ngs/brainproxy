@@ -11,6 +11,8 @@ import { markable, normalizeHead, splitRaw, templateBytes, withBody } from "../u
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { useActions } from "../ui/useActions.ts";
+import { subTabActions } from "../nav";
 
 const M = "§";
 
@@ -143,6 +145,12 @@ export function FuzzerView() {
     setSub("results");
   };
 
+  useActions(
+    subTabActions("fuzzer", "Fuzzer", [["attack", "Attack"], ["results", "Results"], ["runs", "Runs"]] as const, (s) => {
+      app.setTab("fuzzer");
+      setSub(s);
+    }),
+  );
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -157,7 +165,7 @@ export function FuzzerView() {
         </button>
       </div>
       <div className="fill" hidden={sub !== "attack"}>
-        <Attack onStarted={open} onShow={() => setSub("attack")} />
+        <Attack onStarted={open} onShow={() => setSub("attack")} active={sub === "attack"} />
       </div>
       <div className="fill" hidden={sub !== "results"}>
         {runId == null ? (
@@ -178,7 +186,7 @@ export function FuzzerView() {
 
 // ---------------- Attack (positions, payloads, options) ----------------
 
-function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow: () => void }) {
+function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void; onShow: () => void; active: boolean }) {
   const app = useApp();
   const [raw, setRaw] = useState(BLANK);
   // The template holds a binary body, one char per byte (see `bodyText`).
@@ -259,6 +267,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     }
     setBusy(false);
   };
+  useActions([{ id: "fuzzer.start", title: "Start the attack", group: "Fuzzer", where: "fuzzer", hidden: !active, disabled: busy ? "Starting…" : false, run: start }]);
 
   // Content discovery: GET /§path§ on the target with the built-in path list. GET only,
   // since some listed endpoints (e.g. /actuator/shutdown) act on POST.

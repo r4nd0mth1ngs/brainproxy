@@ -8,6 +8,8 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu, type MenuItem } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { useActions } from "../ui/useActions.ts";
+import { subTabActions } from "../nav";
 import { ApiWizard, ImportProgress, useImportJob } from "./ApiWizard";
 import type { Job } from "./Scanner";
 import { importLive, importRequest, readImportJob } from "./apiScan";
@@ -27,6 +29,12 @@ export function TargetView({ active }: { active: boolean }) {
     window.addEventListener(SHOW_SCOPE, show);
     return () => window.removeEventListener(SHOW_SCOPE, show);
   }, []);
+  useActions(
+    subTabActions("target", "Site map", [["map", "Map"], ["scope", "Scope"]] as const, (s) => {
+      app.setTab("target");
+      setSub(s);
+    }),
+  );
   return (
     <div className="col fill">
       <div className="subtabs">
