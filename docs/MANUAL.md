@@ -1470,8 +1470,12 @@ function replace(match, ctx) {
   or absolute URL a script puts in a request is seen by the same checks as a text rule's.
 
 **A request rule** (`rules add --location request --script FILE`): the file defines
-`request(req, ctx)`, called for each request the rule applies to, as the rules before it left
-it, and what it returns says what happens to the request. Nothing is sent for a blocked or
+`request(req, ctx)`, called for each request the rule applies to, and what it returns says
+what happens to the request. It sees the request as the engine's other rules left it: request
+rules have their turn after every other request rule (path, header, body and the rest), in
+the order they are listed among themselves, whatever place they have in the list, so a rule
+added later can't change what a script let through (a `path` rule making `/admin` of `/safe`
+is applied before the script that blocks `/admin`, which then blocks it). Nothing is sent for a blocked or
 answered request: no connection is opened, as if the engine had never got to it.
 
 ```js
@@ -1508,7 +1512,7 @@ function request(req, ctx) {
   to every answer, and drops a header of that name, `Content-Length` or `Transfer-Encoding` the
   script gives; nor can a response rule remove or change it afterwards: wherever the response is shown (Traffic, `history show`, a HAR export, a report)
   it says the target didn't send it.
-- The rules after it don't see a request it blocked or answered. An answer is taken as a
+- The request rules after it don't see a request it blocked or answered. An answer is taken as a
   server's response would be: it goes through the response rules (the row keeps it as the
   script made it, and beside it what the rules made of it) and, in the proxy, the response
   intercept.

@@ -433,7 +433,9 @@ pub struct RuleOptions {
     /// returns nothing to send it as it is, { request: { method, target, headers, body } } to
     /// send it changed, { block: "reason" } to not send it, or { response: { status, reason,
     /// headers, body } } to not send it and use that response as the server's. Nothing is sent
-    /// for a blocked or answered request: no connection is opened.
+    /// for a blocked or answered request: no connection is opened. Request rules run after
+    /// the engine's other request rules, wherever they are in the list, so the script sees
+    /// the request as it will be sent.
     #[arg(long, value_name = "FILE", conflicts_with = "replace")]
     pub script: Option<PathBuf>,
     /// The sha256 the script file must have: the one of the text you read.

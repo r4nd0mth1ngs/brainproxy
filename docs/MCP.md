@@ -144,7 +144,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
   switched off is refused, as the tester would run its script), `rules_disable`, `rules_remove`
   and `scan_disable` work as for any rule, except that a request rule that is on (its script
   may be what keeps requests from the target) can't be disabled, removed, cleared or replaced
-  by `rules_import` with `replace`. Under a person's request rule (`--location request`), an
+  by `rules_import` with `replace`. Nor can a rule an agent adds change what such a script
+  let through: request rules run after every other request rule of the engine, whatever their
+  place in the list. Under a person's request rule (`--location request`), an
   agent's `send`, fuzz run or scan whose request its script blocks fails with `error.kind` `blocked`, and one it answers carries the script's response, marked
   with an `X-Brainproxy-Answer` header (and `answered_by` in `send`'s output); the target got
   nothing.

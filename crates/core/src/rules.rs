@@ -15,7 +15,9 @@
 //! [`Ruled::failed`] for whoever applied the rules.
 //!
 //! A request rule ([`RuleLocation::Request`]) is a script alone: its `request(req, ctx)` sees
-//! the request as the rules before it left it and says what to do with it. Nothing (or null)
+//! the request as the engine's other request rules left it (it has its turn after all of them,
+//! wherever it is in the list, so no rule can change what it let through) and says what to do
+//! with it. Nothing (or null)
 //! sends it as it is; `{ request }` sends it rewritten; `{ block: "reason" }` and `{ response }`
 //! stop it: nothing is sent, no connection is opened, and the engine either says it was
 //! blocked or takes the script's response as if the server had sent it ([`Ruled::stopped`]).
@@ -1718,12 +1720,17 @@ fn request_rule(
 }
 
 /// The rules' turns at a request: the request after them, the rules that changed it, and the
-/// request rule whose script stopped it, if one did (the rules after it then have no turn).
+/// request rule whose script stopped it, if one did (the request rules after it then have no
+/// turn). The request rules (scripts) come after all the others, in their own order: what a
+/// script let through is what is sent, whatever rule was added after it.
 fn request_rules<'a>(
     active: &[&'a CompiledRule],
     req: &[u8],
     run: &Run<'_>,
 ) -> (Vec<u8>, Vec<&'a CompiledRule>, Option<Stopped>) {
+    let is_script = |r: &&CompiledRule| r.location == RuleLocation::Request;
+    let active: Vec<&CompiledRule> =
+        active.iter().copied().filter(|r| !is_script(r)).chain(active.iter().copied().filter(is_script)).collect();
     let (head, raw_body) = split_head_body(req);
     let (mut first, mut headers) = split_lines(head);
     // Body rules see the data, not the chunk framing (which they would break).
@@ -1742,7 +1749,7 @@ fn request_rules<'a>(
     let mut scripted = false;
     let mut stopped = None;
     let mut changed_by = Vec::new();
-    for &rule in active {
+    for &rule in &active {
         if rule.location == RuleLocation::Request {
             let Replacer::Script(hook) = &rule.replacer else { continue };
             match request_turn(rule, hook, &first, &headers, &body, run) {
@@ -1806,7 +1813,8 @@ fn request_rules<'a>(
     (bytes, changed_by, stopped)
 }
 
-/// A request rule's script's turn at the request as the rules before it left it. A script
+/// A request rule's script's turn at the request as the other rules (and the request rules
+/// before it) left it. A script
 /// that fails (it throws, runs past a limit, or returns what can't be read) leaves the request
 /// as it is, and the failure is noted.
 fn request_turn(rule: &CompiledRule, hook: &Hook, first: &str, headers: &[String], body: &[u8], run: &Run<'_>) -> Turn {
@@ -3138,23 +3146,48 @@ mod tests {
     }
 
     #[test]
-    fn a_request_script_sees_the_rules_before_it_and_stops_the_ones_after() {
+    fn a_request_script_sees_the_other_rules_first_and_stops_the_request_rules_after_it() {
         let (hook, dir) = request_rule_of(2, HOOK);
         let before = Rule { applies_to: vec![Engine::Proxy], ..rule(1, RuleLocation::Path, "^/x$", "/answer") };
         let after = Rule { applies_to: vec![Engine::Proxy], ..rule(3, RuleLocation::RequestHeader, "", "X-After: 1") };
-        let set = RuleSet::compile(&[before, hook, after]).unwrap();
+        let (later, later_dir) = request_rule_of(4, "function request() { return { block: 'later' }; }");
+        let later = Rule { applies_to: vec![Engine::Proxy], ..later };
+        let set = RuleSet::compile(&[before, hook, after, later]).unwrap();
         let out = set.request(Engine::Proxy, "h.test", b"GET /x HTTP/1.1\r\n\r\n".to_vec());
-        // The rule before it made /answer of /x; the one after it had no turn.
-        assert_eq!(out.ids(), [1]);
-        assert_eq!(out.bytes, b"GET /answer HTTP/1.1\r\n\r\n");
+        // The plain rules had their turns first, wherever they are in the list: the one before it
+        // made /answer of /x, and the one after it added its header. The request rule after it
+        // had no turn.
+        assert_eq!(out.ids(), [1, 3]);
+        assert_eq!(out.bytes, b"GET /answer HTTP/1.1\r\nX-After: 1\r\n\r\n");
         assert_eq!(out.original.as_deref(), Some(&b"GET /x HTTP/1.1\r\n\r\n"[..]));
         assert_eq!(out.stopped.as_ref().map(|s| s.id), Some(2));
         let outcomes: Vec<_> = out.edits().iter().map(|e| (e.rule, e.outcome)).collect();
-        assert_eq!(outcomes, [(Some(1), None), (Some(2), Some(Outcome::Answered))]);
+        assert_eq!(outcomes, [(Some(1), None), (Some(3), None), (Some(2), Some(Outcome::Answered))]);
         // Not an engine it applies to: no turn at all.
         assert!(set.request(Engine::Scan, "h.test", b"GET /answer HTTP/1.1\r\n\r\n".to_vec()).stopped.is_none());
         // Nor a response, a WebSocket message or a response's head.
         assert!(!set.rewrites_responses(Engine::Proxy, "h.test"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(later_dir);
+    }
+
+    #[test]
+    fn a_rule_added_after_a_request_rule_cannot_rewrite_what_its_script_let_through() {
+        // A person's script keeps /admin from the target; a plain rule added later (as an agent
+        // may add one) rewrites /safe, which the script lets through, to /admin.
+        let (gate, dir) =
+            request_rule_of(1, "function request(req) { if (req.path === '/admin') return { block: 'no admin' }; }");
+        let rewrite =
+            Rule { applies_to: vec![Engine::Proxy, Engine::Send], ..rule(2, RuleLocation::Path, "^/safe$", "/admin") };
+        for rules in [vec![gate.clone(), rewrite.clone()], vec![rewrite.clone(), gate.clone()]] {
+            let set = RuleSet::compile(&rules).unwrap();
+            for engine in [Engine::Proxy, Engine::Send] {
+                let out = set.request(engine, "h.test", b"GET /safe HTTP/1.1\r\nHost: h.test\r\n\r\n".to_vec());
+                let stopped = out.stopped.as_ref().unwrap_or_else(|| panic!("{engine:?}: {out:?}"));
+                assert_eq!(stopped.stop, Stop::Block("no admin".into()));
+                assert_eq!(out.ids(), [2]);
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
