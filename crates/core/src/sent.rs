@@ -55,8 +55,8 @@ pub struct SentLog {
     /// The sending client's `--sni`, recorded on the rows of TLS targets (see [`sent_sni`]).
     sni: Option<String>,
     /// What match-and-replace rules did to the request the rows are for: the request before
-    /// them and who changed it (see [`SentLog::ruled`]).
-    ruled: Option<(Vec<u8>, Vec<crate::provenance::Edit>)>,
+    /// them (when they changed it) and who changed or stopped it (see [`SentLog::ruled`]).
+    ruled: Option<(Option<Vec<u8>>, Vec<crate::provenance::Edit>)>,
 }
 
 impl SentLog {
@@ -86,11 +86,11 @@ impl SentLog {
         self.omit.is_some()
     }
 
-    /// The rows written from now on are for a request match-and-replace rules changed: they say
-    /// which rules (`edited_by`) and keep the request as it was before them. Rows that keep no
-    /// content keep neither.
+    /// The rows written from now on are for a request match-and-replace rules changed (or a
+    /// request rule's script stopped): they say which rules (`edited_by`) and keep the request
+    /// as it was before them. Rows that keep no content keep neither.
     pub fn ruled(&mut self, request: &crate::rules::Ruled) {
-        self.ruled = request.original.clone().map(|original| (original, request.edits()));
+        self.ruled = request.noted().then(|| (request.original.clone(), request.edits()));
     }
 
     /// Keeps what the rules made of row `id`'s response, when they changed it and the row keeps
@@ -118,9 +118,17 @@ impl SentLog {
         error: Option<&str>,
     ) -> Capture {
         let mut c = self.content(target, request, response, duration_ms, error);
-        if let Some((original, edits)) = self.ruled.as_ref().filter(|_| self.omit.is_none()) {
-            c.original_request = Some(original.clone());
-            c.edited_by = edits.clone();
+        match (&self.ruled, self.omit) {
+            (Some((original, edits)), None) => {
+                c.original_request = original.clone();
+                c.edited_by = edits.clone();
+            }
+            // A row without content still says a script blocked or answered its request: an
+            // answered row's status is the script's, not the target's.
+            (Some((_, edits)), Some(_)) => {
+                c.edited_by = edits.iter().filter(|e| e.outcome.is_some()).cloned().collect()
+            }
+            (None, _) => {}
         }
         Capture { sni: sent_sni(self.sni.as_deref(), target), ..c }
     }
@@ -379,7 +387,7 @@ impl Rows {
     async fn open_ruled(&self, target: &Target, request: Vec<u8>, ruled: Option<&Ruled>) -> Result<OpenRow> {
         let (reply, id) = tokio::sync::oneshot::channel();
         let mut capture = self.capture(target, &request, None, None, Some(PENDING));
-        if let Some(ruled) = ruled.filter(|r| r.changed()) {
+        if let Some(ruled) = ruled.filter(|r| r.noted()) {
             capture.original_request = ruled.original.clone();
             capture.edited_by = ruled.edits();
         }
@@ -405,6 +413,11 @@ impl Rows {
     /// also the exchange's, and beside it what the rules made of it, which is returned third
     /// for the sender to read (None without response rules or without an answer: the sender
     /// then reads the exchange's).
+    ///
+    /// A request a request rule's script stopped ([`Ruled::stopped`]) isn't sent: no connection
+    /// is opened. Its row says so. A blocked one fails with [`Error::Blocked`]; an answered one
+    /// gives the script's response as the exchange's, and it goes through the response rules as
+    /// a server's would.
     pub async fn send_ruled(
         &self,
         client: &Client,
@@ -423,7 +436,17 @@ impl Rows {
             Ok(row) => row,
             Err(e) => return (None, Err(e), None),
         };
-        let result = client.send(req, target).await;
+        let result = match by.and_then(|(_, ruled)| ruled.stopped.as_ref()) {
+            Some(stopped) => match stopped.exchange(&row.target, row.request.clone()) {
+                Some(ex) => Ok(ex),
+                None => {
+                    let why = stopped.message();
+                    row.failed(&why);
+                    return (Some(row.id), Err(Error::Blocked(why)), None);
+                }
+            },
+            None => client.send(req, target).await,
+        };
         let mut ruled = None;
         match &result {
             Ok(ex) => {

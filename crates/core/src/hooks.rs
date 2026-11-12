@@ -6,7 +6,10 @@
 //! - a fuzz payload processor (`fuzz run --process script:FILE`): its `process(payload, ctx)`
 //!   gives the payload to send ([`crate::fuzz`]);
 //! - a passive check (`scan script add`): its `check(exchange)` gives findings for a recorded
-//!   exchange ([`crate::scan::passive`]).
+//!   exchange ([`crate::scan::passive`]);
+//! - a request rule (`rules add --location request --script`): its `request(req, ctx)` sees a
+//!   request about to be sent and says to send it, send it rewritten, block it, or answer it
+//!   itself so nothing is sent ([`crate::rules`]).
 //!
 //! A script is a file, named where it is used and pinned by the SHA-256 of its text as a
 //! signer's script is: a file that changed since it was named doesn't run. It runs in the
@@ -61,6 +64,8 @@ pub enum HookKind {
     Process,
     /// `check(exchange)`: a passive check.
     Check,
+    /// `request(req, ctx)`: a request rule, which may block or answer a request.
+    Request,
 }
 
 impl HookKind {
@@ -70,6 +75,7 @@ impl HookKind {
             HookKind::Replace => "replace",
             HookKind::Process => "process",
             HookKind::Check => "check",
+            HookKind::Request => "request",
         }
     }
 }
@@ -404,6 +410,14 @@ impl Hook {
             )));
         }
         list.iter().map(ScriptFinding::read).collect::<std::result::Result<_, _>>().map_err(Failure::Script)
+    }
+
+    /// Calls `request` on one request (`req`, as a script reads it) with `cx` (the engine and
+    /// host): what it returned, in the shape `hook.js` gives it (`{keep}`, `{request}`,
+    /// `{block}` or `{response}`), for [`crate::rules`] to read.
+    pub(crate) fn request(&self, cx: &Value, req: &Value) -> std::result::Result<Value, Failure> {
+        let result = self.0.call(cx, std::slice::from_ref(req))?.pop();
+        result.unwrap_or_else(|| Err("it gave no result".into())).map_err(Failure::Script)
     }
 }
 

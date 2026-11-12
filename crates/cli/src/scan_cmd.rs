@@ -794,6 +794,7 @@ fn update_disabled(store: &Store, ids: &[String], disable: bool, out: &Out) -> R
 /// `scan script`: the passive checks a person wrote as scripts.
 fn script_cmd(project: &Path, cmd: ScriptCmd, out: &Out) -> Result<(), Error> {
     use brainproxy_core::hooks::{Hook, HookKind, ScriptRef};
+    use brainproxy_core::provenance::Outcome;
     use passive::ScriptCheck;
     let store = Store::open(project)?;
     let mut settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
@@ -881,8 +882,12 @@ fn script_cmd(project: &Path, cmd: ScriptCmd, out: &Out) -> Result<(), Error> {
             if item.response.is_empty() {
                 return Err(Error::InvalidInput(format!("history {history} has no response to check")));
             }
+            // A response a request rule's script made up: what is found there is said to be the script's.
+            let answered =
+                item.entry.edited_by.iter().find(|e| e.outcome == Some(Outcome::Answered)).and_then(|e| e.rule);
             let msg =
-                brainproxy_core::scan::Message::from_exchange(history, &item.target, &item.request, &item.response);
+                brainproxy_core::scan::Message::from_exchange(history, &item.target, &item.request, &item.response)
+                    .answered_by(answered);
             let scripts = passive::ScriptChecks::load(&tried);
             let found: Vec<serde_json::Value> = passive::scan_message_with(&msg, &tried, &scripts)
                 .iter()

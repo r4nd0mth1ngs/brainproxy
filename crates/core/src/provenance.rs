@@ -83,6 +83,20 @@ pub struct Edit {
     /// The profile's macro whose values a session rule put into it.
     #[serde(default, rename = "macro", skip_serializing_if = "Option::is_none")]
     pub macro_name: Option<String>,
+    /// What a request rule's script did instead of letting the request go: it blocked it, or
+    /// answered it itself (the row's response is the script's, and the target sent nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+}
+
+/// What a request rule's script did with a request, instead of letting it be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    /// Not sent: the client or engine was told why.
+    Blocked,
+    /// Not sent: the script's own response was used as if the server had sent it.
+    Answered,
 }
 
 impl Edit {
@@ -91,6 +105,12 @@ impl Edit {
         let profile = self.auth.as_deref().unwrap_or_default();
         let how = match (self.intercept, self.rule, self.session_rule, &self.macro_name) {
             (Some(i), ..) => format!("edited in intercept {i}"),
+            (_, Some(r), ..) if self.outcome == Some(Outcome::Blocked) => {
+                format!("blocked by the script of rule {r}, so not sent")
+            }
+            (_, Some(r), ..) if self.outcome == Some(Outcome::Answered) => {
+                format!("answered by the script of rule {r}: the response is the script's, the target sent nothing")
+            }
             (_, Some(r), ..) => format!("changed by rule {r}"),
             (_, _, Some(r), _) => format!("changed by session rule {r} of auth profile {profile}"),
             (.., Some(m)) => format!("given values by macro {m} of auth profile {profile}"),
@@ -124,5 +144,19 @@ mod tests {
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json, serde_json::json!({"by": null, "auth": "admin", "macro": "csrf"}));
         assert_eq!(serde_json::from_value::<Edit>(json).unwrap(), m);
+    }
+
+    #[test]
+    fn a_request_scripts_answer_says_the_target_sent_nothing() {
+        let e = Edit { by: Some("cli".into()), rule: Some(4), outcome: Some(Outcome::Answered), ..Default::default() };
+        assert_eq!(
+            e.describe(),
+            "answered by the script of rule 4: the response is the script's, the target sent nothing added from the \
+             command line"
+        );
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json, serde_json::json!({"by": "cli", "rule": 4, "outcome": "answered"}));
+        let b = Edit { outcome: Some(Outcome::Blocked), ..e };
+        assert!(b.describe().starts_with("blocked by the script of rule 4, so not sent"), "{}", b.describe());
     }
 }

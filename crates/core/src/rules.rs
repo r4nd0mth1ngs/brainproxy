@@ -13,9 +13,21 @@
 //! past its time limit, gives something that isn't a replacement, or its file changed) leaves
 //! what its rule would have rewritten as it is, and the failure is said: on stderr, and in
 //! [`Ruled::failed`] for whoever applied the rules.
+//!
+//! A request rule ([`RuleLocation::Request`]) is a script alone: its `request(req, ctx)` sees
+//! the request as the rules before it left it and says what to do with it. Nothing (or null)
+//! sends it as it is; `{ request }` sends it rewritten; `{ block: "reason" }` and `{ response }`
+//! stop it: nothing is sent, no connection is opened, and the engine either says it was
+//! blocked or takes the script's response as if the server had sent it ([`Ruled::stopped`]).
+//! Such a response says so in a header of its own ([`ANSWER_HEADER`]), which the script can't
+//! write or remove, and its history row says so in `edited_by` ([`Outcome::Answered`]). A
+//! script that fails sends the request as it was, as any failing replacer leaves its message.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 
 use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
@@ -30,7 +42,7 @@ use crate::http::client::SendOptions;
 use crate::http::request::split_head_body;
 use crate::http::response::dechunk;
 use crate::http::{parse_response_head, RawRequest, Target};
-use crate::provenance::Edit;
+use crate::provenance::{Edit, Outcome};
 use crate::store::Store;
 
 pub const RULES_KEY: &str = "rules";
@@ -60,6 +72,9 @@ pub enum RuleLocation {
     Status,
     /// The payload of a WebSocket data message the proxy relays.
     WsMessage,
+    /// The whole request, given to a script's `request(req, ctx)`, which may rewrite it, block
+    /// it, or answer it itself so that nothing is sent.
+    Request,
 }
 
 impl RuleLocation {
@@ -74,6 +89,7 @@ impl RuleLocation {
         "query-param",
         "status",
         "ws-message",
+        "request",
     ];
 
     pub fn parse(s: &str) -> Result<Self> {
@@ -88,7 +104,13 @@ impl RuleLocation {
     fn is_request(self) -> bool {
         matches!(
             self,
-            Self::RequestLine | Self::RequestHeader | Self::RequestBody | Self::Method | Self::Path | Self::QueryParam
+            Self::RequestLine
+                | Self::RequestHeader
+                | Self::RequestBody
+                | Self::Method
+                | Self::Path
+                | Self::QueryParam
+                | Self::Request
         )
     }
 
@@ -98,7 +120,7 @@ impl RuleLocation {
 
     /// In the request's head, where a line break would start another header.
     fn request_head(self) -> bool {
-        self.is_request() && self != Self::RequestBody
+        self.is_request() && !matches!(self, Self::RequestBody | Self::Request)
     }
 
     fn is_header(self) -> bool {
@@ -354,7 +376,8 @@ impl Replacer {
             ReplaceKind::Text => Ok(Self::Text(rule.replace.clone())),
             ReplaceKind::Script => {
                 let script = rule.script.as_ref().ok_or("it names no script")?;
-                Hook::load(HookKind::Replace, script).map(Self::Script)
+                let kind = if rule.location == RuleLocation::Request { HookKind::Request } else { HookKind::Replace };
+                Hook::load(kind, script).map(Self::Script)
             }
         }
     }
@@ -416,6 +439,18 @@ impl<'a> Run<'a> {
     fn failed(self) -> Vec<Failed> {
         self.failed.into_inner()
     }
+
+    /// Notes that `rule`'s script failed on this message: said on stderr (unless quiet) and
+    /// kept for whoever applied the rules.
+    fn note_failure(&self, rule: &CompiledRule, what: &str, error: &str) {
+        if let (Replacer::Script(hook), false) = (&rule.replacer, self.quiet) {
+            hook.warn(&format!("match-and-replace rule {} {what}", rule.id), error);
+        }
+        let mut failed = self.failed.borrow_mut();
+        if !failed.iter().any(|f| f.id == rule.id) {
+            failed.push(Failed { id: rule.id, error: error.to_string() });
+        }
+    }
 }
 
 /// A rule's turn at a message.
@@ -434,13 +469,7 @@ impl Cx<'_> {
     /// Notes that `rule`'s script failed here, so the message stays as it is for that rule.
     fn fail(&self, rule: &CompiledRule, error: &str) {
         self.failed.set(true);
-        if let (Replacer::Script(hook), false) = (&rule.replacer, self.run.quiet) {
-            hook.warn(&format!("match-and-replace rule {} left a message as it was", rule.id), error);
-        }
-        let mut failed = self.run.failed.borrow_mut();
-        if !failed.iter().any(|f| f.id == rule.id) {
-            failed.push(Failed { id: rule.id, error: error.to_string() });
-        }
+        self.run.note_failure(rule, "left a message as it was", error);
     }
 }
 
@@ -640,6 +669,15 @@ fn is_token(s: &str) -> bool {
 pub fn validate_rule(rule: &Rule) -> Result<()> {
     let bad = |m: String| Err(Error::InvalidInput(m));
     let loc = rule.location;
+    if loc == RuleLocation::Request {
+        if rule.replacer != ReplaceKind::Script {
+            return bad("a request rule is a script: name its file with --script".into());
+        }
+        if !rule.pattern.is_empty() || rule.matcher != MatchKind::Regex || rule.name.is_some() || rule.action.is_some()
+        {
+            return bad("a request rule's script is given the whole request: it takes no --match, --match-kind, --name or --action".into());
+        }
+    }
     match (&rule.name, loc) {
         (None, RuleLocation::QueryParam) => return bad("a query-param rule needs the parameter's --name".into()),
         // The name as it reads decoded: it is written encoded where the rule adds the parameter.
@@ -753,7 +791,10 @@ fn compile(r: &Rule) -> Result<Option<CompiledRule>> {
         }
     };
     let bad = |e: regex::Error| Error::InvalidInput(format!("rule {} pattern: {e}", r.id));
-    let matcher = if r.pattern.is_empty() {
+    let matcher = if r.location == RuleLocation::Request {
+        // The script is given the whole request: there is nothing to match.
+        None
+    } else if r.pattern.is_empty() {
         match (r.location, r.name.is_some(), r.matcher) {
             // Adds a header line.
             (RuleLocation::RequestHeader | RuleLocation::ResponseHeader, false, _) => None,
@@ -807,6 +848,17 @@ pub struct Fired {
     pub id: u32,
     pub origin: Option<String>,
     pub host_header_test: bool,
+    /// A request rule's script rewrote it: what it wrote was checked by nobody before it ran.
+    pub script: bool,
+}
+
+impl Fired {
+    /// Whether a host the scope doesn't list that it brought into a request was checked by
+    /// nobody: an agent's rule, or a request rule's script, not saved as a Host-header test. A
+    /// person's text rule was warned about when it was saved.
+    fn unchecked(&self) -> bool {
+        (self.script || self.origin.as_deref() == Some("mcp")) && !self.host_header_test
+    }
 }
 
 /// A rule whose script failed on a message, which that rule then left as it was.
@@ -911,6 +963,75 @@ pub fn forget_failures(store: &Store, keep: impl Fn(u32) -> bool) -> Result<()> 
     store.meta_set(RULE_FAILURES, (!map.is_empty()).then(|| all.to_string()).as_deref())
 }
 
+/// The header a request rule's script's response carries, put there by brainproxy (one the
+/// script writes is dropped): wherever the response is shown, it says the target didn't send it.
+pub const ANSWER_HEADER: &str = "X-Brainproxy-Answer";
+
+/// What a request rule's script did instead of letting the request be sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// Don't send it, for this reason (as the script gave it, made safe to show).
+    Block(String),
+    /// Don't send it: this response (a whole HTTP/1.1 message, framed by brainproxy and
+    /// carrying [`ANSWER_HEADER`]) stands in for the server's.
+    Answer(Vec<u8>),
+}
+
+/// A request a request rule's script stopped: nothing of it is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    /// The rule.
+    pub id: u32,
+    /// Who added (or last enabled) the rule.
+    pub origin: Option<String>,
+    pub stop: Stop,
+}
+
+impl Stopped {
+    /// The history row's mark: who stopped the request, and how.
+    pub fn edit(&self) -> Edit {
+        let outcome = match self.stop {
+            Stop::Block(_) => Outcome::Blocked,
+            Stop::Answer(_) => Outcome::Answered,
+        };
+        Edit { by: self.origin.clone(), rule: Some(self.id), outcome: Some(outcome), ..Default::default() }
+    }
+
+    /// The exchange an engine takes in place of sending `request` to `target`: the script's
+    /// response, received in no time. None for a blocked request.
+    pub fn exchange(&self, target: &Target, request: Vec<u8>) -> Option<crate::http::client::Exchange> {
+        Some(crate::http::client::Exchange {
+            target: target.clone(),
+            request,
+            response: self.answer()?.to_vec(),
+            duration_ms: 0,
+            sni: None,
+            stream: None,
+        })
+    }
+
+    /// The script's response, when it answered.
+    pub fn answer(&self) -> Option<&[u8]> {
+        match &self.stop {
+            Stop::Answer(response) => Some(response),
+            Stop::Block(_) => None,
+        }
+    }
+
+    /// Why the request wasn't sent, for a blocked request's error (and an answered request's,
+    /// where an engine can't use a script's response).
+    pub fn message(&self) -> String {
+        match &self.stop {
+            Stop::Block(why) if why.is_empty() => format!("blocked by the script of match-and-replace rule {}", self.id),
+            Stop::Block(why) => format!("blocked by the script of match-and-replace rule {}: {why}", self.id),
+            Stop::Answer(_) => format!(
+                "answered by the script of match-and-replace rule {}: the response is the script's, the target sent nothing",
+                self.id
+            ),
+        }
+    }
+}
+
 /// A message after an engine's rules.
 #[derive(Debug, Clone, Default)]
 pub struct Ruled {
@@ -922,6 +1043,9 @@ pub struct Ruled {
     pub fired: Vec<Fired>,
     /// The rules whose script failed on it: each left the message as it was.
     pub failed: Vec<Failed>,
+    /// A request a request rule's script blocked or answered: it isn't sent. `bytes` is the
+    /// request as the script saw it.
+    pub stopped: Option<Stopped>,
 }
 
 impl Ruled {
@@ -936,41 +1060,65 @@ impl Ruled {
         }
         let fired = by
             .iter()
-            .map(|r| Fired { id: r.id, origin: r.origin.clone(), host_header_test: r.host_header_test })
+            .map(|r| Fired {
+                id: r.id,
+                origin: r.origin.clone(),
+                host_header_test: r.host_header_test,
+                script: r.location == RuleLocation::Request,
+            })
             .collect();
-        Ruled { bytes, original: Some(original), fired, failed }
+        Ruled { bytes, original: Some(original), fired, failed, stopped: None }
     }
 
     pub fn changed(&self) -> bool {
         self.original.is_some()
     }
 
-    /// The rules that changed it, for a history row's `edited_by`.
+    /// The rules that changed it, and the one whose script stopped it, for a history row's
+    /// `edited_by`.
     pub fn edits(&self) -> Vec<Edit> {
-        self.fired.iter().map(|r| Edit { by: r.origin.clone(), rule: Some(r.id), ..Default::default() }).collect()
+        let changed = self.fired.iter().map(|r| Edit { by: r.origin.clone(), rule: Some(r.id), ..Default::default() });
+        changed.chain(self.stopped.as_ref().map(Stopped::edit)).collect()
+    }
+
+    /// Whether a row for it has something to say about the rules: one changed it, or stopped it.
+    pub fn noted(&self) -> bool {
+        self.changed() || self.stopped.is_some()
     }
 
     pub fn ids(&self) -> Vec<u32> {
         self.fired.iter().map(|r| r.id).collect()
     }
 
-    /// The host an agent's rule brought into this request that the scope doesn't list: a rule
-    /// added through MCP and not saved as a Host-header test. Such a request isn't sent, as a
-    /// shared front end may route it to another site. A person's rule was warned about when it
-    /// was saved.
+    /// The host that the scope doesn't list that a rule nobody checked brought into this
+    /// request: an agent's rule, or a request rule's script, not saved as a Host-header test
+    /// ([`Fired::unchecked`]). Such a request isn't sent, as a shared front end may route it to
+    /// another site.
     pub fn agent_host(&self, opts: &SendOptions, target: &Target) -> Option<String> {
         let before = self.original.as_deref()?;
-        if !self.fired.iter().any(|r| r.origin.as_deref() == Some("mcp") && !r.host_header_test) {
+        if !self.fired.iter().any(Fired::unchecked) {
             return None;
         }
         let had = opts.foreign_hosts(before, target);
         opts.foreign_hosts(&self.bytes, target).into_iter().find(|h| !had.contains(h))
     }
 
+    /// Why the request [`Ruled::agent_host`] finds `host` in isn't sent.
+    pub fn host_refusal(&self, host: &str) -> String {
+        match self.fired.iter().find(|r| r.unchecked() && r.script) {
+            Some(r) if !self.fired.iter().any(|r| r.unchecked() && !r.script) => format!(
+                "Host {host}: the script of request rule {} put a host the scope doesn't list in the request; \
+                 add the rule with --host-header-test for a Host-header test",
+                r.id
+            ),
+            _ => agent_host_refusal(host),
+        }
+    }
+
     /// Refuses the request [`Ruled::agent_host`] finds a host in.
     pub fn check_host(&self, opts: &SendOptions, target: &Target) -> Result<()> {
         match self.agent_host(opts, target) {
-            Some(host) => Err(Error::OutOfScope(agent_host_refusal(&host))),
+            Some(host) => Err(Error::OutOfScope(self.host_refusal(&host))),
             None => Ok(()),
         }
     }
@@ -1037,8 +1185,8 @@ impl RuleSet {
             return Ruled::unchanged(request);
         }
         let run = Run::new(engine, host);
-        let (bytes, by) = request_rules(&active, &request, &run);
-        Ruled::of(request, bytes, by, run.failed())
+        let (bytes, by, stopped) = request_rules(&active, &request, &run);
+        Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) }
     }
 
     /// `response` from `host`, the answer to `request`, after the rules `engine` applies there.
@@ -1051,6 +1199,7 @@ impl RuleSet {
         }
         let run = Run::new(engine, host);
         let (bytes, by) = response_rules(&active, &response, answers_head(request), &run);
+        let bytes = keep_answer_mark(&response, bytes);
         Ruled::of(response, bytes, by, run.failed())
     }
 
@@ -1066,7 +1215,7 @@ impl RuleSet {
         }
         let run = Run::new(engine, host);
         let (bytes, by) = response_rules(&active, &head, false, &run);
-        let bytes = keep_framing(&head, bytes);
+        let bytes = keep_answer_mark(&head, keep_framing(&head, bytes));
         Ruled::of(head, bytes, by, run.failed())
     }
 
@@ -1074,6 +1223,13 @@ impl RuleSet {
     /// response by reference copies it for the rules only then.
     pub fn rewrites_responses(&self, engine: Engine, host: &str) -> bool {
         self.active(engine, host, RuleLocation::is_response).next().is_some()
+    }
+
+    /// Whether a request rule's script sees `engine`'s requests to `host`: then whatever the
+    /// engine would send there that isn't an HTTP request (a raw connection) is not made, as the
+    /// script couldn't have blocked it.
+    pub fn scripts_requests(&self, engine: Engine, host: &str) -> bool {
+        self.active(engine, host, |l| l == RuleLocation::Request).next().is_some()
     }
 
     /// Whether a WebSocket message going `engine`'s way on a connection to `host` may be
@@ -1124,6 +1280,28 @@ impl EngineRules {
         self.failures.note(self.engine, &ruled.failed);
         ruled.check_host(opts, target)?;
         Ok(ruled)
+    }
+
+    /// `request` to `target` after the engine's request rules alone, for a request sent without
+    /// the other rules (a scan's baseline): what their scripts did with it (rewrote, blocked or
+    /// answered it). None when no request rule applies there.
+    pub fn scripted(&self, target: &Target, request: Vec<u8>) -> Option<Ruled> {
+        let active: Vec<&CompiledRule> =
+            self.set.active(self.engine, &target.host, |l| l == RuleLocation::Request).collect();
+        if active.is_empty() {
+            return None;
+        }
+        let run = Run::new(self.engine, &target.host);
+        let (bytes, by, stopped) = request_rules(&active, &request, &run);
+        let ruled = Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) };
+        self.failures.note(self.engine, &ruled.failed);
+        Some(ruled)
+    }
+
+    /// Whether a request rule's script sees requests to `target` (see
+    /// [`RuleSet::scripts_requests`]).
+    pub fn scripts_requests(&self, target: &Target) -> bool {
+        self.set.scripts_requests(self.engine, &target.host)
     }
 
     /// Whether a response from `target` has rules to go through (see
@@ -1282,13 +1460,225 @@ fn header_pairs(headers: &[String]) -> Value {
 
 /// A request as a script reads it, as it is when its rule gets to it.
 fn request_view(first: &str, headers: &[String], body: &[u8]) -> Value {
+    json!({ "request": request_object(first, headers, body) })
+}
+
+fn request_object(first: &str, headers: &[String], body: &[u8]) -> Value {
     let (method, target, _) = line_parts(first).unwrap_or(("", "", ""));
     let (_, path, query) = target_parts(target);
     let request = json!({
         "line": first, "method": method, "target": target, "path": path, "query": query,
         "headers": header_pairs(headers),
     });
-    json!({ "request": with_bytes(request, "body", "bodyBase64", body) })
+    with_bytes(request, "body", "bodyBase64", body)
+}
+
+/// What a request rule's script made of a request.
+enum Turn {
+    Keep,
+    /// The request line to send, and the header lines and body when the script gave them.
+    Rewrite(String, Option<Vec<String>>, Option<Vec<u8>>),
+    Stop(Stop),
+}
+
+/// The most header lines a script may give a request or a response.
+const MAX_SCRIPT_HEADERS: usize = 500;
+
+/// `s` as it may be shown: at most `max` characters, control characters and text-direction
+/// overrides written out (a script's reason can be whatever a target sent).
+fn shown(s: &str, max: usize) -> String {
+    crate::sandbox::shown_cut(s, max)
+}
+
+/// The keys of `o` that aren't `known`: a misspelt key would otherwise be ignored in silence.
+fn only_keys(o: &serde_json::Map<String, Value>, what: &str, known: &[&str]) -> std::result::Result<(), String> {
+    match o.keys().find(|k| !known.contains(&k.as_str())) {
+        Some(k) => Err(format!("its {what} has no {:?}; it has {}", shown(k, 40), known.join(", "))),
+        None => Ok(()),
+    }
+}
+
+/// Header lines a script gave, as `[[name, value], ...]` or `{ name: value }`: names are
+/// tokens, values hold no line break or NUL.
+fn script_headers(v: &Value, what: &str) -> std::result::Result<Vec<(String, String)>, String> {
+    let pairs: Vec<(&str, &Value)> = match v {
+        Value::Array(list) => list
+            .iter()
+            .map(|pair| match pair.as_array().map(Vec::as_slice) {
+                Some([Value::String(name), value]) => Ok((name.as_str(), value)),
+                _ => Err(format!("its {what} headers are [name, value] pairs, or an object of them")),
+            })
+            .collect::<std::result::Result<_, _>>()?,
+        Value::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        _ => return Err(format!("its {what} headers are [name, value] pairs, or an object of them")),
+    };
+    if pairs.len() > MAX_SCRIPT_HEADERS {
+        return Err(format!("it gave {} {what} headers; at most {MAX_SCRIPT_HEADERS}", pairs.len()));
+    }
+    pairs
+        .into_iter()
+        .map(|(name, value)| {
+            let value = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => return Err(format!("its {what} header {:?} has a value that isn't a string", shown(name, 40))),
+            };
+            if !is_token(name) {
+                return Err(format!("{:?} can't be a header's name", shown(name, 40)));
+            }
+            if value.contains(['\r', '\n', '\0']) {
+                return Err(format!("its {what} header {name} holds a line break or NUL"));
+            }
+            Ok((name.to_string(), value))
+        })
+        .collect()
+}
+
+/// A body a script gave: `body` as text or `bodyBase64`; None when it gave neither.
+fn script_body(o: &serde_json::Map<String, Value>, what: &str) -> std::result::Result<Option<Vec<u8>>, String> {
+    match (o.get("body").filter(|v| !v.is_null()), o.get("bodyBase64").filter(|v| !v.is_null())) {
+        (Some(_), Some(_)) => Err(format!("its {what} has body and bodyBase64: give one")),
+        (Some(Value::String(text)), None) => Ok(Some(text.as_bytes().to_vec())),
+        (None, Some(Value::String(b))) => {
+            STANDARD.decode(b.trim()).map(Some).map_err(|_| format!("its {what}'s bodyBase64 isn't base64"))
+        }
+        (None, None) => Ok(None),
+        _ => Err(format!("its {what}'s body is a string")),
+    }
+}
+
+/// The most of a request's body a request rule's script is handed: more is cut, and said
+/// (`bodyTruncated`), so a large body can't put the request past its script.
+const MAX_SCRIPT_BODY: usize = 1 << 20;
+
+fn is_framing_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
+}
+
+/// What a request rule's script returned (in the shape `hook.js` gives it), read for the
+/// request whose line is `first`: refused if it isn't one of the shapes allowed. `handed` is
+/// the body it was handed, and `cut` whether that was cut.
+fn read_turn(v: &Value, rule: u32, first: &str, handed: &[u8], cut: bool) -> std::result::Result<Turn, String> {
+    if v["keep"] == true {
+        return Ok(Turn::Keep);
+    }
+    if let Some(why) = v["block"].as_str() {
+        return Ok(Turn::Stop(Stop::Block(shown(why.trim(), 300))));
+    }
+    let (method, target, version) = line_parts(first).unwrap_or(("GET", "/", "HTTP/1.1"));
+    if let Some(o) = v["request"].as_object() {
+        // What it was given may come back with it (`{ ...req, method: "PUT" }`): `line`, `path`
+        // and `query` say again what `method` and `target` say, and `bodyTruncated` is ours.
+        let known = ["method", "target", "headers", "body", "bodyBase64", "line", "path", "query", "bodyTruncated"];
+        only_keys(o, "request", &known)?;
+        let text = |key: &str| -> std::result::Result<Option<&str>, String> {
+            match o.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s)),
+                Some(_) => Err(format!("its request's {key} is a string")),
+            }
+        };
+        let new_method = text("method")?.unwrap_or(method);
+        if !is_token(new_method) {
+            return Err(format!("{:?} can't be a request's method", shown(new_method, 40)));
+        }
+        if text("line")?.is_some_and(|line| line != first) {
+            return Err("its request's line changed: change method and target instead".into());
+        }
+        let (_, path, query) = target_parts(target);
+        let given_path = text("path")?.unwrap_or(path);
+        let given_query = match o.get("query") {
+            None => query,
+            Some(Value::Null) => None,
+            Some(Value::String(q)) => Some(q.as_str()),
+            Some(_) => return Err("its request's query is a string or null".into()),
+        };
+        let moved = given_path != path || given_query != query;
+        let built;
+        let new_target = match text("target")? {
+            Some(t) if t != target && moved => {
+                return Err("its request changed target and path or query: change one of them".into())
+            }
+            Some(t) if t != target => t,
+            _ if moved => {
+                built = match given_query {
+                    Some(q) => format!("{given_path}?{q}"),
+                    None => given_path.to_string(),
+                };
+                built.as_str()
+            }
+            _ => target,
+        };
+        if new_target.is_empty() || new_target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(format!("{:?} can't be a request's target", shown(new_target, 80)));
+        }
+        let headers = match o.get("headers").filter(|h| !h.is_null()) {
+            Some(h) => Some(script_headers(h, "request")?.into_iter().map(|(n, v)| format!("{n}: {v}")).collect()),
+            None => None,
+        };
+        let line = format!("{new_method} {new_target} {version}");
+        // A body that isn't UTF-8 came with both: whichever of them the script changed is the
+        // body; the text, left as it was, is only the bytes' stand-in.
+        let body = match (o.get("body"), o.get("bodyBase64")) {
+            (Some(Value::String(text)), Some(Value::String(b))) => {
+                let bytes =
+                    STANDARD.decode(b.trim()).map_err(|_| "its request's bodyBase64 isn't base64".to_string())?;
+                let text_kept = *text == String::from_utf8_lossy(handed);
+                match (bytes.as_slice() != handed, text_kept) {
+                    (false, false) => Some(text.as_bytes().to_vec()),
+                    (true, false) => return Err("its request changed both body and bodyBase64: give one".into()),
+                    _ => Some(bytes),
+                }
+            }
+            _ => script_body(o, "request")?,
+        };
+        // A body cut for the script that comes back as it was handed over stays whole.
+        let body = body.filter(|new| !cut || new.as_slice() != handed);
+        return Ok(Turn::Rewrite(line, headers, body));
+    }
+    let Some(o) = v["response"].as_object() else { return Err("its result couldn't be read".into()) };
+    only_keys(o, "response", &["status", "reason", "headers", "body", "bodyBase64"])?;
+    let code = match o.get("status") {
+        None | Some(Value::Null) => 200,
+        Some(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or("its response's status is a number")?,
+    };
+    if !(200..=999).contains(&code) {
+        return Err(format!("its response's status is {code}: a code from 200 to 999"));
+    }
+    let reason_text = match o.get("reason") {
+        None | Some(Value::Null) => reason(code).to_string(),
+        Some(Value::String(r)) if !r.contains(['\r', '\n', '\0']) => r.chars().take(200).collect(),
+        Some(_) => return Err("its response's reason is a string without line breaks".into()),
+    };
+    let headers = match o.get("headers").filter(|h| !h.is_null()) {
+        Some(h) => script_headers(h, "response")?,
+        None => Vec::new(),
+    };
+    let body = script_body(o, "response")?.unwrap_or_default();
+    // A 204 or 304 has no body, and says nothing of one's length.
+    let bodiless = code == 204 || code == 304;
+    if bodiless && !body.is_empty() {
+        return Err(format!("its response is a {code}, which has no body"));
+    }
+    let mut out = format!("HTTP/1.1 {code} {reason_text}\r\n").into_bytes();
+    for (name, value) in &headers {
+        // The framing is brainproxy's, and so is the header that says whose response this is.
+        if is_framing_name(name) || name.eq_ignore_ascii_case(ANSWER_HEADER) {
+            continue;
+        }
+        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    if !bodiless {
+        out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    let mark =
+        format!("{ANSWER_HEADER}: rule {rule}; this response is the rule's script's, the target sent nothing\r\n\r\n");
+    out.extend_from_slice(mark.as_bytes());
+    // The answer to a HEAD says how long the body would be, and has none.
+    if !method.eq_ignore_ascii_case("HEAD") {
+        out.extend_from_slice(&body);
+    }
+    Ok(Turn::Stop(Stop::Answer(out)))
 }
 
 /// A response as a script reads it; `body` is its body decoded, when it could be.
@@ -1327,7 +1717,13 @@ fn request_rule(
     }
 }
 
-fn request_rules<'a>(active: &[&'a CompiledRule], req: &[u8], run: &Run<'_>) -> (Vec<u8>, Vec<&'a CompiledRule>) {
+/// The rules' turns at a request: the request after them, the rules that changed it, and the
+/// request rule whose script stopped it, if one did (the rules after it then have no turn).
+fn request_rules<'a>(
+    active: &[&'a CompiledRule],
+    req: &[u8],
+    run: &Run<'_>,
+) -> (Vec<u8>, Vec<&'a CompiledRule>, Option<Stopped>) {
     let (head, raw_body) = split_head_body(req);
     let (mut first, mut headers) = split_lines(head);
     // Body rules see the data, not the chunk framing (which they would break).
@@ -1336,11 +1732,37 @@ fn request_rules<'a>(active: &[&'a CompiledRule], req: &[u8], run: &Run<'_>) -> 
             k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
         })
     });
-    let has_body_rule = active.iter().any(|r| r.location == RuleLocation::RequestBody && r.matcher.is_some());
+    let framed = headers.iter().any(|h| h.split_once(':').is_some_and(|(k, _)| is_framing_name(k.trim())));
+    let has_body_rule = active.iter().any(|r| {
+        (r.location == RuleLocation::RequestBody && r.matcher.is_some()) || r.location == RuleLocation::Request
+    });
     let mut body = if chunked && has_body_rule { dechunk(raw_body) } else { raw_body.to_vec() };
     let mut body_changed = false;
+    // A request rule's script rewrote it: brainproxy frames what it gave.
+    let mut scripted = false;
+    let mut stopped = None;
     let mut changed_by = Vec::new();
     for &rule in active {
+        if rule.location == RuleLocation::Request {
+            let Replacer::Script(hook) = &rule.replacer else { continue };
+            match request_turn(rule, hook, &first, &headers, &body, run) {
+                Turn::Keep => {}
+                Turn::Rewrite(line, lines, new_body) => {
+                    let lines = lines.unwrap_or_else(|| headers.clone());
+                    let new_body = new_body.unwrap_or_else(|| body.clone());
+                    if line != first || lines != headers || new_body != body {
+                        (first, headers, body) = (line, lines, new_body);
+                        scripted = true;
+                        changed_by.push(rule);
+                    }
+                }
+                Turn::Stop(stop) => {
+                    stopped = Some(Stopped { id: rule.id, origin: rule.origin.clone(), stop });
+                    break;
+                }
+            }
+            continue;
+        }
         // Dry, a script rule changes nothing: the line and headers are copies all the same.
         if !run.wants(rule, |dry| {
             request_rule(rule, &mut first.clone(), &mut headers.clone(), &mut body, dry);
@@ -1361,17 +1783,51 @@ fn request_rules<'a>(active: &[&'a CompiledRule], req: &[u8], run: &Run<'_>) -> 
     }
     if changed_by.is_empty() {
         // Sent as it came, chunks and all.
-        return (req.to_vec(), changed_by);
+        return (req.to_vec(), changed_by, stopped);
+    }
+    if scripted {
+        // Whatever framing the script's headers say, the body goes with a length of its own.
+        headers.retain(|h| !h.split_once(':').is_some_and(|(k, _)| is_framing_name(k.trim())));
+        if framed || !body.is_empty() {
+            headers.push(format!("Content-Length: {}", body.len()));
+        }
+        return (join(&first, &headers, &body), changed_by, stopped);
     }
     if !body_changed {
-        return (join(&first, &headers, if chunked && has_body_rule { raw_body } else { &body }), changed_by);
+        let body = if chunked && has_body_rule { raw_body } else { &body };
+        return (join(&first, &headers, body), changed_by, stopped);
     }
     if chunked {
         // Only the chunks were taken off: a Content-Encoding still applies to the body.
         reframe(&mut headers, body.len(), false);
-        return (join(&first, &headers, &body), changed_by);
+        return (join(&first, &headers, &body), changed_by, stopped);
     }
-    (RawRequest::from_bytes(join(&first, &headers, &body)).update_content_length().into_bytes(), changed_by)
+    let bytes = RawRequest::from_bytes(join(&first, &headers, &body)).update_content_length().into_bytes();
+    (bytes, changed_by, stopped)
+}
+
+/// A request rule's script's turn at the request as the rules before it left it. A script
+/// that fails (it throws, runs past a limit, or returns what can't be read) leaves the request
+/// as it is, and the failure is noted.
+fn request_turn(rule: &CompiledRule, hook: &Hook, first: &str, headers: &[String], body: &[u8], run: &Run<'_>) -> Turn {
+    let cx = json!({ "engine": run.engine.name(), "host": run.host, "rule": rule.id });
+    let handed = &body[..body.len().min(MAX_SCRIPT_BODY)];
+    let cut = body.len() > MAX_SCRIPT_BODY;
+    let mut req = request_object(first, headers, handed);
+    if cut {
+        req["bodyTruncated"] = json!(true);
+    }
+    let read = hook
+        .request(&cx, &req)
+        .map_err(|e| e.text().to_string())
+        .and_then(|v| read_turn(&v, rule.id, first, handed, cut));
+    match read {
+        Ok(turn) => turn,
+        Err(e) => {
+            run.note_failure(rule, "sent a request as it was", &e);
+            Turn::Keep
+        }
+    }
 }
 
 /// Drops the framing headers of a de-chunked body (and with `decoded`, its coding header)
@@ -1580,6 +2036,25 @@ fn response_rules<'a>(
 }
 
 /// Whether a header line is one of the message's framing: Content-Length or Transfer-Encoding.
+/// `new`, what the response rules made of `original`, with the mark of a request rule's script's
+/// answer ([`ANSWER_HEADER`]) as `original` had it: a response rule can neither remove nor
+/// change it, so the answer says whose it is wherever it goes next (the intercept, the client).
+fn keep_answer_mark(original: &[u8], new: Vec<u8>) -> Vec<u8> {
+    let is_mark =
+        |line: &str| header_parts(line).is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(ANSWER_HEADER));
+    let (head, _) = split_head_body(original);
+    let (_, lines) = split_lines(head);
+    let marks: Vec<&String> = lines.iter().filter(|l| is_mark(l)).collect();
+    let (new_head, new_body) = split_head_body(&new);
+    let (first, mut new_lines) = split_lines(new_head);
+    if new_lines.iter().filter(|l| is_mark(l)).eq(marks.iter().copied()) {
+        return new;
+    }
+    new_lines.retain(|l| !is_mark(l));
+    new_lines.extend(marks.into_iter().cloned());
+    join(&first, &new_lines, new_body)
+}
+
 fn is_framing(line: &str) -> bool {
     header_parts(line)
         .is_some_and(|(k, _)| ["content-length", "transfer-encoding"].iter().any(|n| k.trim().eq_ignore_ascii_case(n)))
@@ -2575,5 +3050,235 @@ mod tests {
         let out = respond(MAX_MATCHES + 1);
         assert!(!out.changed() && failed(&out)[0].1.contains("matches in too many places"), "{out:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A request rule over `script`; the folder is the caller's to remove.
+    fn request_rule_of(id: u32, script: &str) -> (Rule, std::path::PathBuf) {
+        let (r, dir) = scripted(id, RuleLocation::Request, "", script);
+        (Rule { applies_to: vec![Engine::Proxy, Engine::Send], ..r }, dir)
+    }
+
+    const HOOK: &str = "function request(req, ctx) {
+        switch (req.path) {
+            case '/keep': return;
+            case '/rewrite':
+                return { request: { method: 'PUT', target: req.target + '&x=1',
+                    headers: req.headers.concat([['X-Hook', ctx.engine + ' ' + ctx.host + ' ' + ctx.rule + ' ' + req.body]]),
+                    body: 'new body' } };
+            case '/headers': return { request: { headers: { 'X-Only': 1 } } };
+            case '/block': return { block: 'no \\u001b[2J admin' };
+            case '/bare': return { block: true };
+            case '/answer':
+                return { response: { status: 201, headers: { 'Content-Type': 'text/plain', 'Content-Length': '999',
+                    'Transfer-Encoding': 'chunked', 'X-Brainproxy-Answer': 'forged' }, body: 'hi ' + req.method } };
+            case '/bytes': return { response: { headers: [['A', 'b']], bodyBase64: 'AP8=' } };
+            case '/empty': return { response: { status: 204 } };
+        }
+    }";
+
+    #[test]
+    fn a_request_script_keeps_rewrites_blocks_or_answers_a_request() {
+        let (hook, dir) = request_rule_of(3, HOOK);
+        validate_rule(&hook).unwrap();
+        verify_script(&hook).unwrap();
+        let set = RuleSet::compile(std::slice::from_ref(&hook)).unwrap();
+        let run = |req: &str| set.request(Engine::Send, "h.test", req.as_bytes().to_vec());
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+
+        let keep = "GET /keep HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        let out = run(keep);
+        assert!(!out.changed() && out.stopped.is_none() && out.failed.is_empty(), "{out:?}");
+        assert_eq!(out.bytes, keep.as_bytes());
+
+        // Rewritten: the line, the headers and the body it gave, framed by brainproxy.
+        let out = run("POST /rewrite?a=1 HTTP/1.1\r\nHost: h.test\r\nContent-Length: 3\r\n\r\nold");
+        assert_eq!(
+            text(&out.bytes),
+            "PUT /rewrite?a=1&x=1 HTTP/1.1\r\nHost: h.test\r\nX-Hook: send h.test 3 old\r\nContent-Length: 8\r\n\r\nnew body"
+        );
+        assert_eq!((out.ids(), out.stopped.is_none()), (vec![3], true));
+        assert_eq!(out.edits(), [Edit { rule: Some(3), ..Default::default() }]);
+        // Headers alone replace the headers; the body stays, with a length of its own.
+        let out = run("POST /headers HTTP/1.1\r\nHost: h.test\r\nContent-Length: 2\r\n\r\nab");
+        assert_eq!(text(&out.bytes), "POST /headers HTTP/1.1\r\nX-Only: 1\r\nContent-Length: 2\r\n\r\nab");
+        // A chunked body is handed over as its data, and sent with a length.
+        let chunked = "POST /headers HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n";
+        assert_eq!(text(&run(chunked).bytes), "POST /headers HTTP/1.1\r\nX-Only: 1\r\nContent-Length: 2\r\n\r\nab");
+
+        // Blocked: nothing to send, with the reason made safe to show.
+        let out = run("GET /block HTTP/1.1\r\nHost: h.test\r\n\r\n");
+        let stopped = out.stopped.clone().unwrap();
+        assert_eq!(stopped.stop, Stop::Block("no \\u{1b}[2J admin".into()));
+        assert_eq!(stopped.message(), "blocked by the script of match-and-replace rule 3: no \\u{1b}[2J admin");
+        assert_eq!(out.edits(), [Edit { rule: Some(3), outcome: Some(Outcome::Blocked), ..Default::default() }]);
+        assert!(out.noted() && !out.changed());
+        let bare = run("GET /bare HTTP/1.1\r\n\r\n").stopped.unwrap();
+        assert_eq!(bare.message(), "blocked by the script of match-and-replace rule 3");
+
+        // Answered: framed by brainproxy, with its own mark the script can't forge or drop.
+        let out = run("GET /answer HTTP/1.1\r\nHost: h.test\r\n\r\n");
+        let answer = text(out.stopped.as_ref().unwrap().answer().unwrap());
+        assert_eq!(
+            answer,
+            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nX-Brainproxy-Answer: rule 3; this \
+             response is the rule's script's, the target sent nothing\r\n\r\nhi GET"
+        );
+        assert_eq!(out.edits()[0].outcome, Some(Outcome::Answered));
+        // The answer to a HEAD has no body, and says how long it would be.
+        let head = run("HEAD /answer HTTP/1.1\r\n\r\n").stopped.unwrap();
+        assert!(text(head.answer().unwrap()).ends_with("Content-Length: 7\r\nX-Brainproxy-Answer: rule 3; this response is the rule's script's, the target sent nothing\r\n\r\n"));
+        let bytes = run("GET /bytes HTTP/1.1\r\n\r\n").stopped.unwrap();
+        let bytes = bytes.answer().unwrap();
+        assert!(
+            bytes.starts_with(b"HTTP/1.1 200 OK\r\nA: b\r\nContent-Length: 2\r\n") && bytes.ends_with(&[0x00, 0xff])
+        );
+        let empty = run("GET /empty HTTP/1.1\r\n\r\n").stopped.unwrap();
+        assert!(text(empty.answer().unwrap()).starts_with("HTTP/1.1 204 No Content\r\nX-Brainproxy-Answer: "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_script_sees_the_rules_before_it_and_stops_the_ones_after() {
+        let (hook, dir) = request_rule_of(2, HOOK);
+        let before = Rule { applies_to: vec![Engine::Proxy], ..rule(1, RuleLocation::Path, "^/x$", "/answer") };
+        let after = Rule { applies_to: vec![Engine::Proxy], ..rule(3, RuleLocation::RequestHeader, "", "X-After: 1") };
+        let set = RuleSet::compile(&[before, hook, after]).unwrap();
+        let out = set.request(Engine::Proxy, "h.test", b"GET /x HTTP/1.1\r\n\r\n".to_vec());
+        // The rule before it made /answer of /x; the one after it had no turn.
+        assert_eq!(out.ids(), [1]);
+        assert_eq!(out.bytes, b"GET /answer HTTP/1.1\r\n\r\n");
+        assert_eq!(out.original.as_deref(), Some(&b"GET /x HTTP/1.1\r\n\r\n"[..]));
+        assert_eq!(out.stopped.as_ref().map(|s| s.id), Some(2));
+        let outcomes: Vec<_> = out.edits().iter().map(|e| (e.rule, e.outcome)).collect();
+        assert_eq!(outcomes, [(Some(1), None), (Some(2), Some(Outcome::Answered))]);
+        // Not an engine it applies to: no turn at all.
+        assert!(set.request(Engine::Scan, "h.test", b"GET /answer HTTP/1.1\r\n\r\n".to_vec()).stopped.is_none());
+        // Nor a response, a WebSocket message or a response's head.
+        assert!(!set.rewrites_responses(Engine::Proxy, "h.test"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_script_that_fails_sends_the_request_as_it_was() {
+        let req = "GET /a HTTP/1.1\r\nHost: h.test\r\n\r\n";
+        for (script, why) in [
+            ("function request() { throw new Error('nope'); }", "Error: nope"),
+            ("function request() { return 'x'; }", "it returned a string"),
+            ("function request() { return [1]; }", "it returned an array"),
+            ("function request() { return Promise.resolve(null); }", "promise"),
+            ("function request() { return { other: 1 }; }", "no request, block or response"),
+            ("function request() { return { block: 'a', response: {} }; }", "block and response"),
+            ("function request() { return { block: 5 }; }", "give the reason as a string"),
+            ("function request() { return { response: 'x' }; }", "its response is a string"),
+            ("function request() { return { response: { status: 101 } }; }", "a code from 200 to 999"),
+            ("function request() { return { response: { status: '200' } }; }", "status is a number"),
+            (
+                "function request() { return { response: { headers: { 'Bad Name': 'x' } } }; }",
+                "can't be a header's name",
+            ),
+            ("function request() { return { response: { headers: { A: 'x\\r\\nB: y' } } }; }", "line break or NUL"),
+            ("function request() { return { response: { status: 204, body: 'x' } }; }", "which has no body"),
+            ("function request() { return { response: { body: 'a', bodyBase64: 'YQ==' } }; }", "give one"),
+            ("function request() { return { response: { code: 200 } }; }", "has no \"code\""),
+            ("function request() { return { request: { method: 'GET X' } }; }", "can't be a request's method"),
+            ("function request() { return { request: { target: '/a b' } }; }", "can't be a request's target"),
+            ("function request() { return { request: { headers: [['A']] } }; }", "[name, value] pairs"),
+            ("function request() { /^(a+)+$/.test('a'.repeat(40) + 'b'); }", "time limit"),
+        ] {
+            let (hook, dir) = request_rule_of(5, script);
+            let out = RuleSet::compile(&[hook]).unwrap().request(Engine::Proxy, "h.test", req.as_bytes().to_vec());
+            assert!(out.stopped.is_none() && !out.changed(), "{script}: {out:?}");
+            assert_eq!(out.bytes, req.as_bytes(), "{script}");
+            let failed = failed_of(&out);
+            assert!(failed.len() == 1 && failed[0].0 == 5 && failed[0].1.contains(why), "{script}: {failed:?}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_request_rule_is_a_script_given_the_whole_request() {
+        let (hook, dir) = request_rule_of(1, "function request(req) {}");
+        validate_rule(&hook).unwrap();
+        let no = |r: Rule| validate_rule(&r).unwrap_err().to_string();
+        assert!(no(Rule { replacer: ReplaceKind::Text, script: None, ..hook.clone() }).contains("is a script"));
+        assert!(no(Rule { pattern: "x".into(), ..hook.clone() }).contains("takes no --match"));
+        assert!(no(Rule { name: Some("X".into()), ..hook.clone() }).contains("takes no --match"));
+        assert!(no(Rule { applies_to: vec![Engine::WsToServer], ..hook.clone() }).contains("ws-message rule"));
+        // Its script defines request, not replace.
+        let (replace, dir2) = request_rule_of(2, "function replace(m) { return m.text; }");
+        assert!(verify_script(&replace).unwrap_err().to_string().contains("it defines no request function"));
+        // Saved and read back as any rule is: an older build that doesn't know the location skips it.
+        let json = serde_json::to_value(&hook).unwrap();
+        assert_eq!((json["location"].as_str(), json["replacer"].as_str()), (Some("request"), Some("script")));
+        assert_eq!(serde_json::from_value::<Rule>(json).unwrap(), hook);
+        let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(dir2));
+    }
+
+    #[test]
+    fn a_request_script_may_give_back_what_it_was_given_changed() {
+        let (hook, dir) = request_rule_of(
+            1,
+            "function request(req) {
+                if (req.path === '/spread') return { request: { ...req, method: 'PUT' } };
+                if (req.path === '/b64') return { request: { ...req, bodyBase64: 'AA==' } };
+                if (req.path === '/text') return { request: { ...req, body: 'new' } };
+                if (req.path === '/path') return { request: { ...req, path: '/moved', query: 'b=2' } };
+                if (req.path === '/both') return { request: { ...req, target: '/x', path: '/y' } };
+                if (req.path === '/line') return { request: { ...req, line: 'GET / HTTP/1.1' } };
+                if (req.path === '/big') return req.bodyTruncated ? { request: { ...req, method: 'PUT' } } : { block: 'whole' };
+                if (req.path === '/bigblock') return req.body.length < 1100000 ? { block: 'seen ' + req.body.length } : null;
+            }",
+        );
+        let set = RuleSet::compile(std::slice::from_ref(&hook)).unwrap();
+        let run = |req: Vec<u8>| set.request(Engine::Proxy, "h.test", req);
+        // A body that isn't UTF-8 comes back exact, though it came with both forms.
+        let mut req = b"POST /spread?a=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\n".to_vec();
+        req.extend([0xff, 0x00]);
+        let out = run(req);
+        assert!(
+            out.bytes.starts_with(b"PUT /spread?a=1 HTTP/1.1\r\n") && out.bytes.ends_with(&[0xff, 0x00]),
+            "{out:?}"
+        );
+        // Changed, either form is the body.
+        let binary = |path: &str| {
+            let mut req = format!("POST {path} HTTP/1.1\r\nContent-Length: 2\r\n\r\n").into_bytes();
+            req.extend([0xff, 0x00]);
+            run(req).bytes
+        };
+        assert!(binary("/b64").ends_with(b"Content-Length: 1\r\n\r\n\0"), "{:?}", binary("/b64"));
+        assert!(binary("/text").ends_with(b"Content-Length: 3\r\n\r\nnew"), "{:?}", binary("/text"));
+        let out = run(b"GET /path?a=1 HTTP/1.1\r\n\r\n".to_vec());
+        assert_eq!(out.bytes, b"GET /moved?b=2 HTTP/1.1\r\n\r\n");
+        for path in ["/both", "/line"] {
+            let out = run(format!("GET {path} HTTP/1.1\r\n\r\n").into_bytes());
+            assert!(!out.changed() && out.failed.len() == 1, "{path}: {out:?}");
+        }
+        // A body over what a script is handed is cut for it, and said; one it gives back as it was
+        // handed over goes whole.
+        let body = vec![b'a'; MAX_SCRIPT_BODY + 10];
+        let mut req = format!("POST /big HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        req.extend(&body);
+        let out = run(req);
+        assert!(out.bytes.starts_with(b"PUT /big HTTP/1.1\r\n") && out.bytes.ends_with(&body), "{:?}", out.failed);
+        // And a large body doesn't take the request past the script.
+        let mut req = format!("POST /bigblock HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        req.extend(&body);
+        assert_eq!(run(req).stopped.map(|s| s.stop), Some(Stop::Block(format!("seen {MAX_SCRIPT_BODY}"))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_response_rule_neither_removes_nor_changes_a_scripts_answer_mark() {
+        let rules = [
+            named(1, RuleLocation::ResponseHeader, ANSWER_HEADER, RuleAction::Remove, "", ""),
+            named(2, RuleLocation::ResponseHeader, "X-Added", RuleAction::Add, "", "1"),
+        ];
+        let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{ANSWER_HEADER}: rule 3; mark\r\n\r\nok");
+        let out = RuleSet::compile(&rules).unwrap().response(Engine::Proxy, "h", b"", answer.clone().into_bytes());
+        let text = String::from_utf8(out.bytes).unwrap();
+        assert!(text.contains(&format!("{ANSWER_HEADER}: rule 3; mark\r\n")) && text.contains("X-Added: 1"), "{text}");
+        let forge = [named(1, RuleLocation::ResponseHeader, ANSWER_HEADER, RuleAction::Set, "", "the target's")];
+        let out = RuleSet::compile(&forge).unwrap().response(Engine::Proxy, "h", b"", answer.into_bytes());
+        assert!(!out.changed(), "{:?}", String::from_utf8_lossy(&out.bytes));
     }
 }

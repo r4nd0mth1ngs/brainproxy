@@ -365,6 +365,8 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         list_limit: c.limit,
         tool: Tool::Crawl,
         stage: None,
+        // An import is no engine a rule applies to.
+        rules: None,
     };
     let summary = crate::jobs_cmd::run_job(project, c.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -459,6 +461,8 @@ fn import_api(
         list_limit: c.limit,
         tool: Tool::Crawl,
         stage: None,
+        // An import is no engine a rule applies to.
+        rules: None,
     };
     let summary = crate::jobs_cmd::run_job(project, c.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;

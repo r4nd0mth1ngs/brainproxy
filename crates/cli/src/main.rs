@@ -808,6 +808,13 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
             ruled.push(r);
         }
     }
+    // A request rule's script that blocked or answered a request: nothing of it is sent. A race
+    // sends its requests together, so one it stopped stops the race, before any row is written.
+    if let Some((i, stopped)) = ruled.iter().enumerate().find_map(|(i, r)| Some((i, r.stopped.as_ref()?))) {
+        if count.is_some() {
+            return Err(Error::Blocked(format!("request {i} of the race: {}; nothing was sent", stopped.message())));
+        }
+    }
     let target = group[0].1.clone();
     for (i, (_, other)) in group.iter().enumerate().skip(1) {
         if other != &target {
@@ -818,7 +825,13 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
             )));
         }
     }
-    let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
+    // A request rule's script that blocked or answered it: nothing is sent, so no session is set
+    // up either (a login would send).
+    let stopped = ruled.first().and_then(|r| r.stopped.clone());
+    let session = match stopped {
+        Some(_) => None,
+        None => auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?,
+    };
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
         s.keep_no_content();
     }
@@ -846,6 +859,8 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(r) = ruled.first() {
         log.ruled(r);
     }
+    // A request the script stopped has a row that says what it did; an answer is taken as the
+    // server's would be, through the response rules, passive checks and what is shown.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request is on record (its row and the bytes recorded) before it goes out. `open`
     // is the one out and unanswered; a row answered already is never rewritten.
@@ -861,6 +876,15 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
                 *open = Some((id, recorded));
                 Ok::<_, Error>(())
             };
+            if let Some(stopped) = &stopped {
+                sending(log, rows, open, &req)?;
+                let recorded = open.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+                let ex = stopped.exchange(&target, recorded).ok_or_else(|| Error::Blocked(stopped.message()))?;
+                if let Some((id, _)) = open.take() {
+                    log.answered(id, &ex)?;
+                }
+                return Ok(ex);
+            }
             match &session {
                 Some(s) => {
                     let watch = |a: Attempt<'_>| match a {
@@ -963,6 +987,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if !request_rules.is_empty() || !response_rules.is_empty() {
         data["rules"] = json!({"request": request_rules, "response": response_rules});
     }
+    if let Some(stopped) = &stopped {
+        data["answered_by"] = json!({"rule": stopped.id, "note": stopped.message()});
+    }
     // A rule whose script failed left the request or the response as it was.
     if !rule_errors.is_empty() {
         data["rule_errors"] = json!(rule_errors);
@@ -970,8 +997,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(read) = &ex.stream {
         data["stream"] = sse_cmd::read_json(read, stream_id, args.max_body);
     }
+    let answered = stopped.as_ref().map(|s| format!("{}\n\n", s.message())).unwrap_or_default();
     out.ok(data, || {
-        let text = text_exchange(id, &ex.response, ex.duration_ms);
+        let text = format!("{answered}{}", text_exchange(id, &ex.response, ex.duration_ms));
         match &ex.stream {
             Some(read) => format!("{}\n\n{}", text.trim_end(), sse_cmd::read_text(read, args.max_body)),
             None => text,
@@ -1374,8 +1402,17 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                         let mut by: Vec<&str> =
                             e.edited_by.iter().map(|x| x.by.as_deref().unwrap_or("unknown")).collect();
                         by.dedup();
-                        let edited =
+                        let mut edited =
                             if by.is_empty() { String::new() } else { format!("  edited by {}", by.join(",")) };
+                        // A request rule's script answered or blocked it: nothing was sent.
+                        let stopped = e.edited_by.iter().find(|x| x.outcome.is_some());
+                        if let Some((rule, outcome)) = stopped.and_then(|x| Some((x.rule?, x.outcome?))) {
+                            use brainproxy_core::provenance::Outcome;
+                            edited.push_str(&match outcome {
+                                Outcome::Answered => format!("  ANSWERED by rule {rule}'s script, not the target"),
+                                Outcome::Blocked => format!("  BLOCKED by rule {rule}'s script"),
+                            });
+                        }
                         format!("{:>6}  {:<4} {:<7} {}  {len}B  {origin}{edited}", e.id, status, e.method, e.url)
                     })
                     .collect::<Vec<_>>()

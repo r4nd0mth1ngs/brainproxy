@@ -322,7 +322,48 @@ pub fn scan_message_with(msg: &Message, settings: &PassiveSettings, scripts: &Sc
     if msg.status != 0 {
         scripts.scan(msg, &mut out);
     }
-    out
+    match msg.answered_by {
+        Some(rule) => out.into_iter().map(|f| in_script_answer(f, rule, msg.history_id)).collect(),
+        None => out,
+    }
+}
+
+/// What an alert ref is given for a finding raised from a response a request rule's script made
+/// up (`script-answer:REF`): an alert type of its own, so it is never one with the target's.
+pub const SCRIPT_ANSWER_PREFIX: &str = "script-answer:";
+
+/// `f`, raised from history row `history_id`, whose response request rule `rule`'s script made
+/// up: the finding is the script's, whatever host and URL it is filed under, and says so in
+/// its alert type (its own ref, a name, a description and a tag that say so) and its other info.
+fn in_script_answer(mut f: Finding, rule: u32, history_id: i64) -> Finding {
+    static DEFS: OnceLock<Mutex<HashMap<&'static str, &'static AlertDef>>> = OnceLock::new();
+    let mut defs = DEFS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let def = *defs.entry(f.def.alert_ref).or_insert_with(|| {
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let of = f.def;
+        let tags: Vec<&'static str> = of.tags.iter().copied().chain(["script-answer"]).collect();
+        Box::leak(Box::new(AlertDef {
+            alert_ref: leak(format!("{SCRIPT_ANSWER_PREFIX}{}", of.alert_ref)),
+            name: leak(format!("{} (in a script's answer, not the target's)", of.name)),
+            description: leak(format!(
+                "Found in a response that a request rule's script made up: the target never sent it, and this says \
+                 nothing of the target until the request is sent to it. {}",
+                of.description
+            )),
+            tags: Box::leak(tags.into_boxed_slice()),
+            ..of.clone()
+        }))
+    });
+    f.def = def;
+    let note = format!(
+        "Raised from history #{history_id}, whose response the script of match-and-replace rule {rule} made up: \
+         the target sent nothing."
+    );
+    f.other_info = match f.other_info.trim() {
+        "" => note,
+        other => format!("{note}\n\n{other}"),
+    };
+    f
 }
 
 /// What the built-in rules and the declarative passive checks find in one message.
@@ -463,7 +504,13 @@ pub fn rescan(store: &mut Store) -> Result<ScanStats> {
     // they stay as they are, where a rule's that finds nothing any more go.
     let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let kept = |names: Vec<String>| -> Vec<String> {
-        names.into_iter().map(|name| format!("{SCRIPT_PREFIX}{name}:")).collect()
+        // Its findings in a script's answer too (see `in_script_answer`).
+        names
+            .into_iter()
+            .flat_map(|name| {
+                [format!("{SCRIPT_PREFIX}{name}:"), format!("{SCRIPT_ANSWER_PREFIX}{SCRIPT_PREFIX}{name}:")]
+            })
+            .collect()
     };
     let unloaded = kept(script_problems(&settings).into_iter().map(|(name, _)| name).collect());
     let before = store.findings_rescan_start("passive", &unloaded)?;

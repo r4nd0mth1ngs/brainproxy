@@ -46,7 +46,7 @@ import {
 } from "./trafficFilter";
 import { highlightArgs, isMutationRequest, REFUSED_HINT, scanArgs, scanBlocker, scanConfirm, withHighlight, type HistoryPick } from "./trafficActions";
 import { EventStreams } from "./EventStreams";
-import { ruleEditNote } from "./matchReplace.ts";
+import { ruleEditNote, scriptStop } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
 import { filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
 import { TrafficExport } from "./TrafficExport.tsx";
@@ -107,7 +107,18 @@ const COLUMNS: Column<HistoryItem>[] = [
     label: "Status",
     width: 58,
     value: (r) => r.status,
-    render: (r) => (r.error ? <span className="s5" title={r.error}>error</span> : <span className={statusClass(r.status)}>{r.status ?? "—"}</span>),
+    render: (r) => {
+      if (r.error) return <span className="s5" title={r.error}>{scriptStop(r.edited_by)?.outcome === "blocked" ? "blocked" : "error"}</span>;
+      // A request rule's script answered it: the status is the script's, not the target's.
+      const stop = scriptStop(r.edited_by);
+      if (stop?.outcome === "answered")
+        return (
+          <span className={`${statusClass(r.status)} script-answer`} title={stop.note}>
+            {r.status ?? "—"}*
+          </span>
+        );
+      return <span className={statusClass(r.status)}>{r.status ?? "—"}</span>;
+    },
     align: "right",
   },
   { key: "length", label: "Length", width: 70, value: (r) => r.resp_body_length, align: "right" },
@@ -126,9 +137,14 @@ const COLUMNS: Column<HistoryItem>[] = [
     key: "notes",
     label: "Notes",
     width: 160,
-    value: (r) => [r.note, ...r.tags].filter(Boolean).join(" "),
+    value: (r) => [scriptStop(r.edited_by)?.outcome === "answered" ? "script answer" : null, r.note, ...r.tags].filter(Boolean).join(" "),
     render: (r) => (
       <>
+        {scriptStop(r.edited_by)?.outcome === "answered" && (
+          <span className="tag warn" title={scriptStop(r.edited_by)?.note}>
+            script answer
+          </span>
+        )}
         {r.tags.map((t) => (
           <span key={t} className="tag">
             {t}
@@ -590,6 +606,11 @@ function History() {
             placeholder={entry?.entry.error ?? ""}
             extra={
               <>
+                {scriptStop(entry?.entry.edited_by) && (
+                  <span className="warn-text" role="note">
+                    {scriptStop(entry?.entry.edited_by)?.note}
+                  </span>
+                )}
                 {entry?.modified_response && (
                   <div className="seg" title={ruleEditNote(entry.response_edits)}>
                     <button className={afterRules ? "" : "on"} onClick={() => setAfterRules(false)}>

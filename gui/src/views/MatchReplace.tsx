@@ -25,6 +25,7 @@ import {
   importQuestion,
   importSummary,
   isNamed,
+  isRequestRule,
   isScripted,
   scriptQuestion,
   skippedReason,
@@ -78,7 +79,7 @@ export function MatchReplace() {
   const problem = draftProblem(draft);
   const add = async () => {
     // A script is code: it runs only after this was read and agreed to.
-    if (isScripted(draft) && !(await confirm("Add a rule that runs a script", scriptQuestion(draft.script), "Add rule", "Cancel"))) return;
+    if (isScripted(draft) && !(await confirm("Add a rule that runs a script", scriptQuestion(draft.script, draft.location), "Add rule", "Cancel"))) return;
     if (await apply(addArgs(draft))) setDraft({ ...draft, match: "", replace: "", comment: "" });
   };
   const copy = async () => {
@@ -135,6 +136,8 @@ export function MatchReplace() {
   const noMatch = named && draft.action === "add";
   const noReplace = named && draft.action === "remove";
   const scripted = isScripted(draft);
+  // A request rule's script gets the whole request: nothing to match or type in.
+  const wholeRequest = isRequestRule(draft.location);
   return (
     <div className="col fill">
       <div className="toolbar">
@@ -166,37 +169,43 @@ export function MatchReplace() {
             <option value="remove">Remove</option>
           </select>
         )}
-        <select className="input" aria-label="How the match is read" value={draft.matcher} disabled={noMatch} onChange={(e) => set({ matcher: e.target.value })}>
-          {MATCHERS.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.label}
-            </option>
-          ))}
-        </select>
-        <input
-          className="input grow mono"
-          placeholder={noMatch ? "(add takes no match)" : header && !named ? "match (empty: add a header)" : named || !["request-line", "request-body", "response-body"].includes(draft.location) ? "match (empty: the whole value)" : "match"}
-          aria-label="Match"
-          disabled={noMatch}
-          value={noMatch ? "" : draft.match}
-          onChange={(e) => set({ match: e.target.value })}
-        />
-        <select
-          className="input"
-          aria-label="What makes the replacement"
-          title="Text you type, or a script: a JavaScript file whose replace(match, ctx) returns what to write for each match"
-          value={draft.replacer}
-          disabled={noReplace}
-          onChange={(e) => set({ replacer: e.target.value === "script" ? "script" : "text" })}
-        >
-          <option value="text">Text</option>
-          <option value="script">Script</option>
-        </select>
+        {!wholeRequest && (
+          <>
+            <select className="input" aria-label="How the match is read" value={draft.matcher} disabled={noMatch} onChange={(e) => set({ matcher: e.target.value })}>
+              {MATCHERS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+            <input
+              className="input grow mono"
+              placeholder={noMatch ? "(add takes no match)" : header && !named ? "match (empty: add a header)" : named || !["request-line", "request-body", "response-body"].includes(draft.location) ? "match (empty: the whole value)" : "match"}
+              aria-label="Match"
+              disabled={noMatch}
+              value={noMatch ? "" : draft.match}
+              onChange={(e) => set({ match: e.target.value })}
+            />
+          </>
+        )}
+        {!wholeRequest && (
+          <select
+            className="input"
+            aria-label="What makes the replacement"
+            title="Text you type, or a script: a JavaScript file whose replace(match, ctx) returns what to write for each match"
+            value={draft.replacer}
+            disabled={noReplace}
+            onChange={(e) => set({ replacer: e.target.value === "script" ? "script" : "text" })}
+          >
+            <option value="text">Text</option>
+            <option value="script">Script</option>
+          </select>
+        )}
         {scripted && !noReplace ? (
           <>
             <input
               className="input grow mono"
-              placeholder="script file: defines replace(match, ctx)"
+              placeholder={wholeRequest ? "script file: defines request(req, ctx), which may change, block or answer it" : "script file: defines replace(match, ctx)"}
               aria-label="Script file"
               value={draft.script}
               onChange={(e) => set({ script: e.target.value })}

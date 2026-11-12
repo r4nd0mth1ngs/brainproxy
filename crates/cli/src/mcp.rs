@@ -161,6 +161,18 @@ pub(crate) fn check_script(what: &str) -> Result<(), brainproxy_core::Error> {
 
 /// Under a tool call, refuses `--no-store`: whatever an agent sends goes into the project's
 /// history, so a person can see what was sent on their behalf.
+/// Refuses, through MCP, switching off or removing a request rule that is on (`what`): its
+/// script may be what keeps some requests from the target, a person's to lift.
+pub(crate) fn check_guard(what: &str) -> Result<(), brainproxy_core::Error> {
+    if in_tool_call() {
+        return Err(brainproxy_core::Error::InvalidInput(format!(
+            "{what}: a request rule's script may be what keeps requests from the target, so it isn't switched off \
+             or removed through MCP; a person can in the app or a terminal"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn check_no_store(no_store: bool) -> Result<(), brainproxy_core::Error> {
     if no_store && in_tool_call() {
         return Err(brainproxy_core::Error::InvalidInput(

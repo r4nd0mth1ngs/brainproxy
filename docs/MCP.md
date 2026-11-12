@@ -142,7 +142,12 @@ Some arguments need a person, so a command run for a tool call (the server sets
   and names it. What a person set still applies to an agent's requests, and `rules_list`,
   `scan_script_list`, `rules_test` with `rule` (a saved rule that is switched on; one a person
   switched off is refused, as the tester would run its script), `rules_disable`, `rules_remove`
-  and `scan_disable` work as for any rule.
+  and `scan_disable` work as for any rule, except that a request rule that is on (its script
+  may be what keeps requests from the target) can't be disabled, removed, cleared or replaced
+  by `rules_import` with `replace`. Under a person's request rule (`--location request`), an
+  agent's `send`, fuzz run or scan whose request its script blocks fails with `error.kind` `blocked`, and one it answers carries the script's response, marked
+  with an `X-Brainproxy-Answer` header (and `answered_by` in `send`'s output); the target got
+  nothing.
 - Environment variables named by `auth_add` (`header_env`, `query_keys`, `password_env`,
   `totp_secret_env`, `oauth_client_secret_env`, `oauth_refresh_token_env`), `auth_record_finish`
   (`password_env`, `totp_secret_env`) and `auth_sign_add` (`secret_env`,

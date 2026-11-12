@@ -633,3 +633,371 @@ fn what_a_proxied_rules_script_failed_on_is_listed_with_the_rules() {
     assert_eq!(env.ok(&["rules", "disable", "1"])["failures"], json!([]));
     assert_eq!(env.ok(&["rules", "list"])["failures"], json!([]));
 }
+
+/// A target that must never be reached: it counts every connection it gets.
+fn untouchable() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = reached.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (port, reached)
+}
+
+/// Blocks or answers every request, by path: nothing is ever sent.
+const STOPS: &str = "function request(req, ctx) {
+    if (req.path.startsWith('/blocked')) return { block: 'not on ' + ctx.engine };
+    return { response: { status: 200, headers: { 'Content-Type': 'text/html' },
+        body: '<html><title>made up</title>' + ctx.engine + ' ' + req.method + ' ' + req.target + '</html>' } };
+}";
+
+#[test]
+fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_target() {
+    let (port, reached) = untouchable();
+    let env = Env::new("stops");
+    let script = env.script("stops.js", STOPS);
+    let listed =
+        env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "proxy,send,fuzz,scan"]);
+    let rule = &listed["rules"][0];
+    assert_eq!((rule["location"].as_str(), rule["replacer"].as_str()), (Some("request"), Some("script")), "{listed}");
+    // A response rule applies to an answer as to a server's response.
+    env.ok(&[
+        "rules",
+        "add",
+        "--location",
+        "response-header",
+        "--name",
+        "X-Ruled",
+        "--action",
+        "add",
+        "--replace",
+        "yes",
+        "--applies-to",
+        "proxy,send,scan",
+    ]);
+    let mark = "X-Brainproxy-Answer: rule 1; this response is the rule's script's, the target sent nothing";
+    let untouched = |engine: &str| {
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0, "{engine}: a connection reached the target");
+    };
+
+    // The proxy: an answer goes to the client as the script made it, marked; a block is an error.
+    let listen = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["listen"].as_str().unwrap().to_string();
+    wait_for_settings();
+    let resp = through(&listen, port, "/answered?a=1", "");
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains(mark) && resp.contains("X-Ruled: yes"), "{resp}");
+    assert!(resp.contains("<title>made up</title>proxy GET ") && resp.ends_with("/answered?a=1</html>"), "{resp}");
+    let resp = through(&listen, port, "/blocked", "");
+    assert!(resp.starts_with("HTTP/1.1 403 Forbidden\r\n") && resp.contains("X-Brainproxy-Error: blocked"), "{resp}");
+    assert!(resp.contains("blocked by the script of match-and-replace rule 1: not on proxy"), "{resp}");
+    env.wait_rows("SELECT count(*) FROM history WHERE source = 'proxy'", 2);
+    env.ok(&["proxy", "stop"]);
+    untouched("proxy");
+    let rows = env.rows("SELECT path, status, error, edited_by FROM history WHERE source = 'proxy' ORDER BY id");
+    assert_eq!((rows[0][0].as_str(), rows[0][1].as_u64(), &rows[0][2]), (Some("/answered"), Some(200), &Value::Null));
+    assert_eq!(
+        serde_json::from_str::<Value>(rows[0][3].as_str().unwrap()).unwrap(),
+        json!([{"by": "cli", "rule": 1, "outcome": "answered"}])
+    );
+    assert_eq!((rows[1][0].as_str(), &rows[1][1]), (Some("/blocked"), &Value::Null));
+    assert!(rows[1][2].as_str().unwrap().contains("not on proxy"), "{rows:?}");
+    assert_eq!(serde_json::from_str::<Value>(rows[1][3].as_str().unwrap()).unwrap()[0]["outcome"], "blocked");
+
+    // send: the answer is shown, saying whose it is; a block fails with its own exit code.
+    let url = format!("http://127.0.0.1:{port}/answered/send");
+    let sent = env.ok(&["send", "--url", &url, "-X", "POST", "-d", "x=1"]);
+    assert_eq!(sent["answered_by"]["rule"], 1, "{sent}");
+    assert_eq!(ids(&sent["rules"]["response"]), [2], "{sent}");
+    assert!(sent["response"]["body"]["content"].as_str().unwrap().contains("send POST /answered/send"), "{sent}");
+    let (code, v) = env.run(&["send", "--url", &format!("http://127.0.0.1:{port}/blocked/send")]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("not on send"), "{v}");
+    // A race isn't sent at all, and leaves no rows.
+    let before = env.rows("SELECT count(*) FROM history")[0][0].clone();
+    let (code, v) = env.run(&["send", "--url", &url, "--race", "2"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
+    assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], before);
+    untouched("send");
+    let rows = env.rows("SELECT path, status, edited_by FROM history WHERE source = 'send' ORDER BY id");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows[0][2].as_str().unwrap().contains("answered") && rows[1][2].as_str().unwrap().contains("blocked"));
+
+    // The fuzzer, whatever it keeps: each answer has its marked row, each block its error.
+    for store in ["all", "none"] {
+        let fuzz = format!("http://127.0.0.1:{port}/§p§/{store}");
+        env.ok(&["fuzz", "run", "--url", &fuzz, "-p", "list:answered,blocked", "--store", store]);
+        let rows = env.rows(&format!("SELECT path, status, error, edited_by FROM history WHERE source = 'fuzz' AND path LIKE '%/{store}' ORDER BY path"));
+        let answered =
+            rows.iter().find(|r| r[0] == format!("/answered/{store}")).unwrap_or_else(|| panic!("{store}: {rows:?}"));
+        assert_eq!(answered[1], 200, "{store}: {rows:?}");
+        assert!(answered[3].as_str().unwrap().contains("answered"), "{store}: {rows:?}");
+        if store == "all" {
+            let blocked = rows.iter().find(|r| r[0] == "/blocked/all").unwrap();
+            assert!(blocked[2].as_str().unwrap().contains("not on fuzz"), "{rows:?}");
+        }
+    }
+
+    untouched("fuzz");
+    // An active scan: the answers are on record, and no scan rule judges them.
+    // A URL's baseline answered by the script is on record and not attacked.
+    let scan_url = format!("http://127.0.0.1:{port}/answered/scan?q=1");
+    let (code, v) = env.run(&["scan", "active", &scan_url, "--strength", "low", "-c", "1"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
+    assert_eq!(env.rows("SELECT count(*) FROM history WHERE source = 'scan'")[0][0], 1);
+    untouched("scan baseline");
+    // Attacks on a recorded request: each is answered or blocked, none sent, nothing concluded;
+    // a probe's raw connection (which no script could see) isn't made either.
+    // A row the script answered is no baseline.
+    let answered =
+        env.rows("SELECT id FROM history WHERE source = 'send' AND path = '/answered/send'")[0][0].to_string();
+    let (code, v) = env.run(&["scan", "active", "--history-id", &answered, "--strength", "low", "-c", "1"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("no baseline"), "{v}");
+    // A recorded exchange (written here, so the target is never asked) is attacked.
+    let base = {
+        use brainproxy_core::{capture::Capture, http::Target, store::Store};
+        let target = Target { scheme: "http".into(), host: "127.0.0.1".into(), port };
+        let req = format!("GET /answered/base?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\n\r\nok";
+        let c = Capture::new("proxy", &target, req.as_bytes(), Some(resp), Some(1), None);
+        Store::open(&env.project).unwrap().record(&c).unwrap().to_string()
+    };
+    let (code, v) = env.run(&["scan", "active", "--history-id", &base, "--strength", "low", "-c", "1"]);
+    assert!(env.rows("SELECT count(*) FROM history WHERE source = 'scan'")[0][0].as_i64().unwrap() > 1, "{code} {v}");
+    assert_eq!(env.rows("SELECT count(*) FROM findings WHERE source = 'active'")[0][0], 0, "{v}");
+    untouched("scan");
+    // An API scan's baselines go through the script too: none is sent.
+    let spec = env.script(
+        "api.json",
+        &json!({
+            "openapi": "3.0.0", "info": {"title": "t", "version": "1"},
+            "servers": [{"url": format!("http://127.0.0.1:{port}")}],
+            "paths": {"/blocked/api": {"get": {"responses": {"200": {"description": "ok"}}}},
+                      "/answered/api": {"get": {"responses": {"200": {"description": "ok"}}}}},
+        })
+        .to_string(),
+    );
+    let (code, v) = env.run(&["scan", "active", "--api", &spec, "--strength", "low", "-c", "1"]);
+    assert_ne!(code, 0, "{v}");
+    let rows = env.rows("SELECT path, edited_by FROM history WHERE path LIKE '%/api' ORDER BY path");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r[1].as_str().is_some_and(|e| e.contains("outcome"))), "{rows:?}");
+    // The answered one went through the scan's response rules as a server's response would.
+    let ruled = env.rows(
+        "SELECT count(*) FROM rule_edits e JOIN history h ON h.id = e.history_id \
+         WHERE h.path = '/answered/api' AND instr(e.modified_response, 'X-Ruled: yes') > 0",
+    );
+    assert_eq!(ruled[0][0], 1, "{ruled:?}");
+    untouched("scan --api");
+
+    // Passive checks read a script's response, and every finding raised from it says it is the
+    // script's: an alert type of its own, a name, a description, a tag and other info that say so.
+    env.ok(&["scan", "passive", "--rescan"]);
+    let found = env.rows(
+        "SELECT f.alert_ref, f.name, f.other_info, t.description, t.tags, f.rule_id, f.id FROM findings f \
+         JOIN history h ON h.id = f.history_id JOIN finding_types t ON t.alert_ref = f.alert_ref \
+         WHERE h.edited_by LIKE '%answered%'",
+    );
+    assert!(!found.is_empty(), "the made-up page has missing headers to find");
+    for f in &found {
+        assert!(f[0].as_str().unwrap().starts_with("script-answer:"), "{f:?}");
+        assert!(f[1].as_str().unwrap().ends_with("(in a script's answer, not the target's)"), "{f:?}");
+        assert!(f[2].as_str().unwrap().contains("the script of match-and-replace rule 1 made up"), "{f:?}");
+        assert!(
+            f[3].as_str().unwrap().starts_with("Found in a response that a request rule's script made up"),
+            "{f:?}"
+        );
+        assert!(f[4].as_str().unwrap().contains("script-answer"), "{f:?}");
+        // Filed under its rule's id, which a retest refuses: the target's answer says nothing of it.
+        assert_ne!(f[5], 0, "{f:?}");
+    }
+    let e = env.refused(&[], &["findings", "retest", &found[0][6].to_string()], None);
+    assert!(e.contains("raised from a request rule's script's answer"), "{e}");
+    // None of them is one with a finding of the target's: no finding lacks the mark there.
+    let plain = env.rows(
+        "SELECT count(*) FROM findings f JOIN history h ON h.id IN (f.history_id, f.last_history_id) \
+         WHERE h.edited_by LIKE '%answered%' AND f.alert_ref NOT LIKE 'script-answer:%'",
+    );
+    assert_eq!(plain[0][0], 0, "{plain:?}");
+    let listed = env.ok(&["findings", "list"]);
+    assert!(listed.to_string().contains("(in a script's answer, not the target's)"), "{listed}");
+    // A passive check tried on an answered row says the same.
+    let check =
+        env.script("title.js", "function check(x) { return { name: 'Title seen', evidence: x.response.body }; }");
+    let answered = env.rows("SELECT id FROM history WHERE path = '/answered' AND source = 'proxy'")[0][0].to_string();
+    let tried = env.ok(&["scan", "script", "test", &check, "--history", &answered]);
+    assert!(tried.to_string().contains("Title seen (in a script's answer, not the target's)"), "{tried}");
+    let shown = env.ok(&["history", "list", "--limit", "1"]);
+    assert!(shown["items"][0]["edited_by"].to_string().contains("outcome"), "{shown}");
+}
+
+#[test]
+fn a_request_script_is_a_persons_and_is_pinned_like_any_script() {
+    let port = serve();
+    let env = Env::new("stops-mcp");
+    let agent = [(MCP, "1")];
+    let script = env.script("stops.js", STOPS);
+    let why = "runs code from a file, so it isn't offered through MCP";
+    let e = env.refused(
+        &agent,
+        &["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send"],
+        None,
+    );
+    assert!(e.contains(why), "{e}");
+    let e = env.refused(
+        &agent,
+        &["rules", "test", "-", "--location", "request", "--script", &script],
+        Some(b"GET / HTTP/1.1\r\n\r\n"),
+    );
+    assert!(e.contains(why), "{e}");
+    // A request rule takes nothing but its script.
+    let no = env.refused(&[], &["rules", "add", "--location", "request", "--match", "x", "--script", &script], None);
+    assert!(no.contains("takes no --match"), "{no}");
+    let no = env.refused(&[], &["rules", "add", "--location", "request", "--replace", "x"], None);
+    assert!(no.contains("is a script"), "{no}");
+    let replacer = env.script("replace.js", "function replace(m) { return m.text; }");
+    let no = env.refused(&[], &["rules", "add", "--location", "request", "--script", &replacer], None);
+    assert!(no.contains("it defines no request function"), "{no}");
+
+    // A person's rule, added disabled: an agent can't turn it on.
+    env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send", "--disabled"]);
+    assert!(env.refused(&agent, &["rules", "enable", "1"], None).contains(why));
+    env.ok(&["rules", "enable", "1"]);
+    // Nor switch it off or remove it: it may be what keeps requests from the target.
+    let guard = "isn't switched off or removed through MCP";
+    for args in [&["rules", "disable", "1"][..], &["rules", "remove", "1"], &["rules", "clear"]] {
+        assert!(env.refused(&agent, args, None).contains(guard), "{args:?}");
+    }
+    assert!(env.refused(&agent, &["rules", "import", "-", "--replace"], Some(b"[]")).contains(guard));
+    assert_eq!(env.ok(&["rules", "list"])["rules"][0]["enabled"], true);
+    // rules test says what the engine would do, sending nothing.
+    let tried =
+        env.ok_stdin(&["rules", "test", "-", "--as", "send"], b"GET /answered HTTP/1.1\r\nHost: h.test\r\n\r\n");
+    assert_eq!(tried["request"]["stopped"]["outcome"], "answered", "{tried}");
+    let tried = env.ok_stdin(&["rules", "test", "-", "--as", "send"], b"GET /blocked HTTP/1.1\r\nHost: h.test\r\n\r\n");
+    assert_eq!(tried["request"]["stopped"]["outcome"], "blocked", "{tried}");
+
+    // The file changes: the rule is skipped, and the request goes out as any would.
+    std::fs::write(&script, "function request() { return { block: 'changed' }; }").unwrap();
+    let listed = env.ok(&["rules", "list"]);
+    assert!(listed["skipped"][0]["reason"].as_str().unwrap().contains("changed since it was named"), "{listed}");
+    let sent = env.ok(&["send", "--url", &format!("http://127.0.0.1:{port}/blocked")]);
+    assert_eq!(sent["response"]["status"], 403, "{sent}");
+    assert!(sent.get("answered_by").is_none(), "{sent}");
+}
+
+#[test]
+fn a_failing_request_script_sends_the_request_and_says_so() {
+    let port = serve();
+    let env = Env::new("stops-fail");
+    let script = env.script("bad.js", "function request(req) { return { response: { status: 101 } }; }");
+    env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send"]);
+    let sent = env.ok(&["send", "--url", &format!("http://127.0.0.1:{port}/a")]);
+    assert_eq!(sent["response"]["status"], 403, "the target answered: {sent}");
+    assert!(sent["rule_errors"][0]["error"].as_str().unwrap().contains("a code from 200 to 999"), "{sent}");
+    let failures = env.ok(&["rules", "list"])["failures"].clone();
+    assert_eq!(failures[0]["engine"], "send", "{failures}");
+}
+
+#[test]
+fn a_request_scripts_rewrite_goes_to_scan_baselines_and_meets_the_host_check() {
+    // Answers every request 200, and keeps each request line it got.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = lines.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 65536];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(line);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            });
+        }
+    });
+    let env = Env::new("stops-rewrite");
+    let script = env.script(
+        "rewrite.js",
+        "function request(req) {
+            if (req.path.startsWith('/danger')) return { request: { ...req, path: '/safe' } };
+            if (req.path === '/elsewhere') return { request: { headers: [['Host', 'evil.test']] } };
+        }",
+    );
+    env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send,scan"]);
+    // A scan's baseline goes as the script rewrote it, as its attacks do.
+    let _ =
+        env.run(&["scan", "active", &format!("http://127.0.0.1:{port}/danger?q=1"), "--strength", "low", "-c", "1"]);
+    let got = lines.lock().unwrap().clone();
+    assert!(got.iter().any(|l| l.starts_with("GET /safe")), "{got:?}");
+    assert!(!got.iter().any(|l| l.contains("/danger")), "{got:?}");
+    // The baseline's row says the script changed it.
+    let baseline = env.rows("SELECT path, edited_by FROM history WHERE source = 'scan' ORDER BY id LIMIT 1");
+    assert_eq!(baseline[0][0], "/safe", "{baseline:?}");
+    assert!(baseline[0][1].as_str().is_some_and(|e| e.contains("\"rule\":1")), "{baseline:?}");
+    // A host the scope doesn't list that the script brought in isn't sent: nobody checked it.
+    let (code, v) = env.run(&["send", "--url", &format!("http://127.0.0.1:{port}/elsewhere")]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("the script of request rule 1 put a host"), "{v}");
+}
+
+#[test]
+fn an_api_scan_attacks_from_the_request_before_the_script() {
+    // Answers every request 200, and keeps each request line it got.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = lines.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 65536];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string());
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            });
+        }
+    });
+    let env = Env::new("stops-api");
+    // Not idempotent: applied twice, it would say so in the path.
+    let script = env
+        .script("prefix.js", "function request(req) { return { request: { ...req, path: '/prefix' + req.path } }; }");
+    env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "scan"]);
+    let spec = env.script(
+        "api.json",
+        &json!({
+            "openapi": "3.0.0", "info": {"title": "t", "version": "1"},
+            "servers": [{"url": format!("http://127.0.0.1:{port}")}],
+            "paths": {"/item": {"get": {"parameters": [{"name": "q", "in": "query", "schema": {"type": "string"}}],
+                                        "responses": {"200": {"description": "ok"}}}}},
+        })
+        .to_string(),
+    );
+    let _ = env.run(&["scan", "active", "--api", &spec, "--strength", "low", "-c", "1"]);
+    let got = lines.lock().unwrap().clone();
+    assert!(got.iter().any(|l| l.starts_with("GET /prefix/item")), "{got:?}");
+    assert!(!got.iter().any(|l| l.contains("/prefix/prefix")), "{got:?}");
+}

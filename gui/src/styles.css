@@ -1639,6 +1639,13 @@ select {
   color: var(--ok);
   background: var(--accent-soft);
 }
+/* A row whose response a request rule's script made up: the target sent nothing. */
+.tag.warn {
+  color: var(--medium);
+}
+.script-answer {
+  font-style: italic;
+}
 .set-err {
   color: var(--high);
 }

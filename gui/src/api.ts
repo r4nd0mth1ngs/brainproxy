@@ -178,8 +178,9 @@ export interface HistoryItem {
   client_addr?: string | null;
   /** The TLS server name sent, when overridden with --sni. */
   sni?: string | null;
-  /** Who changed the request before it went out: an intercept edit, a session, or a match-and-replace `rule`. */
-  edited_by?: { by: string | null; rule?: number }[];
+  /** Who changed the request before it went out: an intercept edit, a session, or a match-and-replace `rule`;
+   * with an `outcome`, a request rule's script that blocked the request or answered it itself (nothing was sent). */
+  edited_by?: { by: string | null; rule?: number; outcome?: "blocked" | "answered" }[];
 }
 
 export interface HistoryEntry {

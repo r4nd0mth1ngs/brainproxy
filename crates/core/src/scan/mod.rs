@@ -89,7 +89,7 @@ impl Confidence {
 }
 
 /// Static description of one alert type (ZAP "alert ref").
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AlertDef {
     pub alert_ref: &'static str,
     pub name: &'static str,
