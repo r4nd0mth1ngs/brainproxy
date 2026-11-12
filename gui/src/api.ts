@@ -270,6 +270,8 @@ export interface Finding extends FindingItem {
   note_changed_at?: string | null;
   /** A finding added by hand: every history entry it links to. */
   history_ids?: number[];
+  /** An active finding: the request its attack was built from (`findings verify` sends both). */
+  base_history_id?: number | null;
 }
 
 /** True when a body came as base64, i.e. `bodyText` gives one char per byte (Latin-1). */

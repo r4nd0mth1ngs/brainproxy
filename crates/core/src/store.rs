@@ -18,7 +18,7 @@ use crate::http::{Exchange, Target};
 
 /// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
 /// one started by an older build.
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
 pub const PRUNE_CHUNK: usize = 500;
@@ -112,6 +112,14 @@ ALTER TABLE auth_profiles ADD COLUMN state_changed_at TEXT;
 ALTER TABLE finding_types ADD COLUMN description_origin TEXT;
 ALTER TABLE finding_types ADD COLUMN solution_origin TEXT;
 CREATE TABLE IF NOT EXISTS setting_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), key TEXT NOT NULL, origin TEXT NOT NULL);
+";
+
+/// v21: the request an active finding's attack was built from (its baseline), so the finding
+/// can be sent with and without its payload (`findings verify`). An out-of-band attack keeps
+/// it until a callback raises the finding.
+const SCHEMA_V21: &str = "
+ALTER TABLE findings ADD COLUMN base_history_id INTEGER;
+ALTER TABLE oob_payloads ADD COLUMN base_history_id INTEGER;
 ";
 
 /// Column documentation for the log of setting changes.
@@ -749,6 +757,9 @@ impl Store {
         if version < 20 {
             self.conn.execute_batch(crate::sse::db::SCHEMA)?;
         }
+        if version < 21 {
+            add_missing_columns(&self.conn, SCHEMA_V21)?;
+        }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -1276,6 +1287,8 @@ impl Store {
                 AND COALESCE(note, '') = '' AND tags = '[]'
                 AND id NOT IN (SELECT history_id FROM findings WHERE history_id IS NOT NULL)
                 AND id NOT IN (SELECT last_history_id FROM findings WHERE last_history_id IS NOT NULL)
+                AND id NOT IN (SELECT base_history_id FROM findings WHERE base_history_id IS NOT NULL)
+                AND id NOT IN (SELECT base_history_id FROM oob_payloads WHERE base_history_id IS NOT NULL)
                 AND id NOT IN (SELECT j.value FROM meta, json_each(meta.value) j
                                WHERE meta.key LIKE 'finding.%.history' AND json_valid(meta.value))
                 AND id NOT IN (SELECT history_id FROM finding_events WHERE history_id IS NOT NULL)
@@ -2052,6 +2065,30 @@ mod tests {
             assert!(has, "{table}.{column}");
         }
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_on_v20_gets_the_finding_baseline_columns() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v20-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE findings DROP COLUMN base_history_id; ALTER TABLE oob_payloads DROP COLUMN base_history_id;
+             PRAGMA user_version = 20;",
+        )
+        .unwrap();
+        drop(conn);
+        // Twice: the second open finds it done.
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            assert!(has_column(&store.conn, "findings", "base_history_id").unwrap());
+            assert!(has_column(&store.conn, "oob_payloads", "base_history_id").unwrap());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

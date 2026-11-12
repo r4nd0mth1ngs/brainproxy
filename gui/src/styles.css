@@ -944,6 +944,15 @@ select {
   color: inherit;
   border-radius: 2px;
 }
+/* A finding's payload in Replay: its own color, and an underline that takes no room, so the
+   editor's backdrop stays aligned with the text typed over it. */
+.code mark.payload {
+  background: var(--accent-soft);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.code mark.payload.hit {
+  background: var(--mark);
+}
 .h-method {
   color: var(--code-method);
   font-weight: 600;
@@ -3106,4 +3115,23 @@ button.chip {
 .keys-actions {
   display: flex;
   gap: 6px;
+/* Findings: a finding sent with and without its payload (PayloadCompare.tsx). */
+.verify-strip {
+  margin: 8px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.verify-table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.verify-table th,
+.verify-table td {
+  padding: 2px 12px 2px 0;
+  text-align: left;
+}
+.verify-table thead th {
+  font-weight: 500;
+  color: var(--muted);
 }

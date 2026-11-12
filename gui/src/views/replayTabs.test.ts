@@ -602,3 +602,16 @@ test("a set saved by a newer version isn't saved over", async () => {
   const b = app({ ...f, cli: async () => Promise.reject(new CliError("invalid_input", "over 16 MB")) }, []);
   await assert.rejects(b.revs.save("{}"), /over 16 MB/);
 });
+
+test("a tab from a finding keeps its highlighted payload and the finding", () => {
+  const raw = "GET /?q=%27 HTTP/1.1\n\n";
+  const tabs = [{ key: 1, title: "SQL", target: "https://a.test", raw, marks: [{ at: 8, text: "%27" }], finding: 7 }];
+  const saved = toSaved(tabs, 1);
+  assert.deepEqual(saved.tabs[0], { kind: "http", title: "SQL", target: "https://a.test", request: raw, marks: [{ at: 8, text: "%27" }], finding: 7 });
+  let n = 0;
+  const back = fromSaved(saved, () => ++n).tabs[0];
+  assert.deepEqual([back.marks, back.finding], [[{ at: 8, text: "%27" }], 7]);
+  // Bad ones are dropped, and a WebSocket tab has neither.
+  const odd = fromSaved({ tabs: [{ request: "x", marks: "no", finding: -1 }, { kind: "ws", request: "", marks: [{ at: 0, text: "x" }], finding: 3 }] }, () => ++n).tabs;
+  assert.deepEqual(odd.map((t) => [t.marks, t.finding]), [[undefined, undefined], [undefined, undefined]]);
+});

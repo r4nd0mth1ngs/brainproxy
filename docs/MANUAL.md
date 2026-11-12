@@ -222,7 +222,7 @@ nothing runs into the `:authority`.
 Not checked: what active scan rules and check templates put in the Host header themselves
 (Cloud Metadata names the metadata service, for one; `scan active --inject-header Host` puts
 payloads there), which are Host-header tests by nature and connect to the scanned in-scope host;
-requests sent again as they were recorded (`findings retest`); and a proxied client's own
+requests sent again as they were recorded (`findings retest`, `findings verify`); and a proxied client's own
 requests.
 
 **Proxy scope.** A separate, changeable list that decides which proxied traffic is
@@ -628,10 +628,18 @@ Edit a raw request and send it as often as you like, in separate tabs.
   **Don't record** on, only the handshake gets a row, without its content. Their Options are
   SNI, Timeout, Verify TLS and Don't record. **Stop** ends a run early; what it sent may
   already have reached the server, and history keeps what was recorded up to then.
+- **From a finding:** *Send to Replay* in Findings opens the attack with its payload
+  highlighted: what the attack changed against the request the scan started from, or, for a
+  finding without one, the payload as typed, percent-encoded or JSON-escaped. Editing keeps
+  the highlight on the payload's text wherever it moves, and drops it once that text is
+  gone. **Compare with baseline** sends the request the scan started from and the tab's
+  request (as Send would send it) to the finding's target, says what differs, and opens both
+  responses in Diff (`findings verify ID --request -`).
 - **Kept with the project:** open tabs are saved in the project file a moment after you
   change them and when you close it, and come back when you open it again (copies made with
   `project save` or *Save as…* have them too). A tab keeps its title, target, request (or
-  handshake and messages), Listen and Until, and its Options except **Don't record**, which
+  handshake and messages), Listen and Until, a finding's highlighted payload and the finding
+  it came from, and its Options except **Don't record**, which
   is chosen again each time (so a reopened tab, or one an agent prepared, never sends
   unrecorded); responses and the ‹ › send history are not kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
   (more than 500 tabs or 16 MB), the app says so and the tabs stay open; *Save as…* keeps
@@ -889,7 +897,13 @@ Access control across users: does the app let bob read alice's data? See
   finding still counts as triaged, so a rescan that no longer finds it keeps it.
 - **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
   references, the evidence highlighted in the response, and the request.
-- **Actions:** set its state, retest it, send the request to Replay.
+- **Actions:** set its state, retest it, send the request to Replay (the payload is
+  highlighted in the request), compare it with and without its payload (below).
+- **Compare with/without payload** (findings with an attack): sends the request the scan
+  started from and the attack again (`findings verify ID`), and shows each one's status,
+  length, time and whether the evidence is there, with what differs; *Diff responses* opens
+  both responses in Diff. A Replay tab opened from such a finding has *Compare with baseline*,
+  which does the same with the request as edited in the tab (`findings verify ID --request -`).
 - **New finding…:** write up an issue you found by hand: title, risk, confidence, URL,
   parameter, CWE, the history entries that show it, description, solution and evidence.
   Nothing is sent; it is only recorded in the project. *Create finding…* in Traffic's
@@ -1171,7 +1185,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 189 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 190 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1483,7 +1497,7 @@ rule: `proxy` (in-scope requests the proxy relays, the browser brainproxy starts
 `send` (the app's Replay, races and event streams too), `fuzz`, and `scan` (the attacks and
 baselines of `scan active` and `scan checks`). Nothing else brainproxy sends goes through any
 match-and-replace rule, a request rule included, so no script blocks, rewrites or answers it:
-`findings retest`, `authz run` (and the proxy's live access-control testing), `crawl` (and the
+`findings retest` and `findings verify`, `authz run` (and the proxy's live access-control testing), `crawl` (and the
 crawl of `scan active --crawl`), the requests of `import api`, `openapi`, `postman`, `graphql`
 and `har`, `ws send`, `oob`, and a session's logins and macros (`auth login`, `auth macro
 run`, and re-logins in any engine). Keep requests a script must stop out of those commands, or
@@ -1663,7 +1677,7 @@ How a script is kept and run:
   --rule`, and switch a rule or check off, except a request rule: its script may be what keeps
   some requests from the target, so `rules disable`, `rules remove`, `rules clear` and `rules
   import --replace` are refused through MCP while one is on. It sees only the engines it
-  applies to (proxy, send, fuzz, scan): `findings retest`, `authz run`, `crawl`, the imports,
+  applies to (proxy, send, fuzz, scan): `findings retest`, `findings verify`, `authz run`, `crawl`, the imports,
   `ws send`, `oob` and logins go through no rule at all (see *Which requests it sees* above).
 
 ### Server-sent events (`sse`, `send --stream-wait`)
@@ -2729,6 +2743,26 @@ Findings are records with a history, not just rows:
   the scan started from, and its rule may send other methods, so it is retested by scanning
   again: the error gives the `scan active` command. Findings added by hand are retested by
   hand, access-control findings with `authz run`.
+- **Verify** (`findings verify ID [--repeat N] [--auth PROFILE] [--allow-unsafe] [--request FILE]`):
+  sends an active finding's request without and with its payload, now, and says what differs,
+  to help judge whether it is real. Without the payload is the request the scan built the attack
+  from: an active scan records it with each finding (`base_history_id`, first sighting's, like
+  the attack and evidence). A finding from before brainproxy recorded it falls back to the
+  latest request in history (not a scan's or a retest's) to the same method, host and path that
+  the attack request repeats with only the payload changed (`baseline_from: "history"` rather
+  than `"scan"`); with neither, or for a finding with no payload (passive, by hand), it is
+  refused. Both are sent again as recorded, alternately `--repeat` times (at most 20; a
+  time-based finding wants a few), each recorded with source `retest`, so the passive scan leaves
+  them alone; the scope applies, and so does `--allow-unsafe` as for a retest. `--request FILE`
+  (`-` for stdin) sends an edited attack, to the attack's target, in place of the recorded one.
+  The output has, for `without` and `with`: the request's history id, every send (`history_id`,
+  `status`, body `length`, `duration_ms`, whether the finding's `evidence` is in the response),
+  and the first status, median length and time, and how many sends showed the evidence; and
+  `differences`: `status_changed`, `length_delta`, `duration_delta_ms`,
+  `evidence_only_with_payload` (null without evidence), the last bodies' line diff (`body`:
+  `identical`, `similarity`, the first 20 changed lines) and a `summary` in words (a time
+  difference under a second isn't named there). Nothing about the finding changes: mark it
+  once you've judged it.
 - **Posture** (`findings posture`): open issues and findings by risk, findings by state, a
   risk × confidence grid, the 20 hosts with most open findings, what each completed
   background active scan found new, still and no longer (the `scan_observations` table, stored

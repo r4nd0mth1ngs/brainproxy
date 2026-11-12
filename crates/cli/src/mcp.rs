@@ -698,6 +698,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("report-profile remove", REPLACE),
     ("findings timeline", READ),
     ("findings retest", NET),
+    ("findings verify", NET),
     ("findings posture", READ),
     // Through MCP it can't replace the write-up findings of the same title share (--replace-text).
     ("findings add", ADD),
@@ -1554,6 +1555,7 @@ mod tests {
             "scan data update --from",
             "send --also",
             "auth sign add --session_token_file",
+            "findings verify --request",
         ];
         // Read, but only to sign or to present a client certificate: the key never goes out,
         // and a certificate is public. Left as they were (see docs/MCP.md).

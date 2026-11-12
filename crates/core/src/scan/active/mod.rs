@@ -213,6 +213,8 @@ enum Report {
         finding: Finding,
         /// The row that already holds the exchange; None records it now.
         history_id: Option<i64>,
+        /// The row of the request the attack was built from.
+        base_history_id: Option<i64>,
         request: Vec<u8>,
         response: Vec<u8>,
         duration_ms: i64,
@@ -228,6 +230,7 @@ enum Report {
         duration_ms: Option<i64>,
         /// The attack's row.
         history_id: Option<i64>,
+        base_history_id: Option<i64>,
         check: Option<String>,
     },
 }
@@ -637,6 +640,7 @@ impl Cx {
             target: self.base.target.clone(),
             finding,
             history_id: resp.history_id,
+            base_history_id: self.base.history_id,
             request: resp.request.clone(),
             response: resp.raw.clone(),
             duration_ms: resp.duration.as_millis() as i64,
@@ -722,6 +726,7 @@ impl Cx {
             response: resp.map(|r| r.raw.clone()),
             duration_ms: resp.map(|r| r.duration.as_millis() as i64),
             history_id,
+            base_history_id: self.base.history_id,
         });
     }
 }
@@ -736,7 +741,7 @@ const ROW_BATCH: usize = 512;
 /// payload; returns the new findings.
 fn record_report(store: &mut Store, r: Report) -> Result<usize> {
     match r {
-        Report::Finding { target, finding, history_id, request, response, duration_ms } => {
+        Report::Finding { target, finding, history_id, base_history_id, request, response, duration_ms } => {
             let id = match history_id {
                 Some(id) => id,
                 None => {
@@ -744,9 +749,9 @@ fn record_report(store: &mut Store, r: Report) -> Result<usize> {
                 }
             };
             let msg = Message::from_exchange(id, &target, &request, &response);
-            store.record_findings("active", &msg, std::slice::from_ref(&finding))
+            store.record_findings_from("active", &msg, std::slice::from_ref(&finding), base_history_id)
         }
-        Report::Oob { target, token, finding, request, response, duration_ms, history_id, check } => {
+        Report::Oob { target, token, finding, request, response, duration_ms, history_id, base_history_id, check } => {
             store.oob_add_scan_payload(&ScanPayload {
                 token: &token,
                 alert_ref: finding.def.alert_ref,
@@ -759,6 +764,7 @@ fn record_report(store: &mut Store, r: Report) -> Result<usize> {
                 response: response.as_deref(),
                 duration_ms,
                 history_id,
+                base_history_id,
                 check: check.as_deref(),
             })?;
             Ok(0)
@@ -1434,6 +1440,10 @@ mod tests {
             .into_iter()
             .map(|e| (e.id, Url::parse(&e.url).unwrap().path().to_string()))
             .collect();
+        // Each finding names the request its attack was built from, for `findings verify`.
+        let bases = store.query("SELECT base_history_id FROM findings", &[], 100, 100).unwrap();
+        assert_eq!(bases.rows.len(), s.new_findings, "{s:?}");
+        assert!(bases.rows.iter().all(|r| r[0] == base), "{:?}", bases.rows);
         drop(store);
         let _ = std::fs::remove_file(&project);
         (base, s, rows)

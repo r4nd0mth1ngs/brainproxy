@@ -26,6 +26,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 brainproxy-core = { path = "../core" }
+rusqlite.workspace = true
 base64.workspace = true
 bytes = "1"
 flate2.workspace = true

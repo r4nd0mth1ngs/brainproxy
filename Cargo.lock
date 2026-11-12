@@ -430,6 +430,7 @@ dependencies = [
  "quinn",
  "regex",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
