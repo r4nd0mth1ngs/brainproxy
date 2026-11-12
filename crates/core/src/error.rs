@@ -27,7 +27,7 @@ pub enum Error {
     #[error("storage error: {0}")]
     Store(#[from] rusqlite::Error),
     /// A request rule's script stopped the request: nothing was sent.
-    #[error("blocked: {0}")]
+    #[error("{0}")]
     Blocked(String),
 }
 

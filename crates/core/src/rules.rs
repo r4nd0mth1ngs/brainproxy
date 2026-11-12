@@ -848,6 +848,17 @@ pub struct Fired {
     pub id: u32,
     pub origin: Option<String>,
     pub host_header_test: bool,
+    /// A request rule's script rewrote it: what it wrote was checked by nobody before it ran.
+    pub script: bool,
+}
+
+impl Fired {
+    /// Whether a host the scope doesn't list that it brought into a request was checked by
+    /// nobody: an agent's rule, or a request rule's script, not saved as a Host-header test. A
+    /// person's text rule was warned about when it was saved.
+    fn unchecked(&self) -> bool {
+        (self.script || self.origin.as_deref() == Some("mcp")) && !self.host_header_test
+    }
 }
 
 /// A rule whose script failed on a message, which that rule then left as it was.
@@ -1049,7 +1060,12 @@ impl Ruled {
         }
         let fired = by
             .iter()
-            .map(|r| Fired { id: r.id, origin: r.origin.clone(), host_header_test: r.host_header_test })
+            .map(|r| Fired {
+                id: r.id,
+                origin: r.origin.clone(),
+                host_header_test: r.host_header_test,
+                script: r.location == RuleLocation::Request,
+            })
             .collect();
         Ruled { bytes, original: Some(original), fired, failed, stopped: None }
     }
@@ -1074,23 +1090,35 @@ impl Ruled {
         self.fired.iter().map(|r| r.id).collect()
     }
 
-    /// The host an agent's rule brought into this request that the scope doesn't list: a rule
-    /// added through MCP and not saved as a Host-header test. Such a request isn't sent, as a
-    /// shared front end may route it to another site. A person's rule was warned about when it
-    /// was saved.
+    /// The host that the scope doesn't list that a rule nobody checked brought into this
+    /// request: an agent's rule, or a request rule's script, not saved as a Host-header test
+    /// ([`Fired::unchecked`]). Such a request isn't sent, as a shared front end may route it to
+    /// another site.
     pub fn agent_host(&self, opts: &SendOptions, target: &Target) -> Option<String> {
         let before = self.original.as_deref()?;
-        if !self.fired.iter().any(|r| r.origin.as_deref() == Some("mcp") && !r.host_header_test) {
+        if !self.fired.iter().any(Fired::unchecked) {
             return None;
         }
         let had = opts.foreign_hosts(before, target);
         opts.foreign_hosts(&self.bytes, target).into_iter().find(|h| !had.contains(h))
     }
 
+    /// Why the request [`Ruled::agent_host`] finds `host` in isn't sent.
+    pub fn host_refusal(&self, host: &str) -> String {
+        match self.fired.iter().find(|r| r.unchecked() && r.script) {
+            Some(r) if !self.fired.iter().any(|r| r.unchecked() && !r.script) => format!(
+                "Host {host}: the script of request rule {} put a host the scope doesn't list in the request; \
+                 add the rule with --host-header-test for a Host-header test",
+                r.id
+            ),
+            _ => agent_host_refusal(host),
+        }
+    }
+
     /// Refuses the request [`Ruled::agent_host`] finds a host in.
     pub fn check_host(&self, opts: &SendOptions, target: &Target) -> Result<()> {
         match self.agent_host(opts, target) {
-            Some(host) => Err(Error::OutOfScope(agent_host_refusal(&host))),
+            Some(host) => Err(Error::OutOfScope(self.host_refusal(&host))),
             None => Ok(()),
         }
     }
@@ -1254,9 +1282,9 @@ impl EngineRules {
     }
 
     /// `request` to `target` after the engine's request rules alone, for a request sent without
-    /// the other rules (a scan's baseline): what their scripts did with it, when one blocked or
-    /// answered it.
-    pub fn stop(&self, target: &Target, request: Vec<u8>) -> Option<Ruled> {
+    /// the other rules (a scan's baseline): what their scripts did with it (rewrote, blocked or
+    /// answered it). None when no request rule applies there.
+    pub fn scripted(&self, target: &Target, request: Vec<u8>) -> Option<Ruled> {
         let active: Vec<&CompiledRule> =
             self.set.active(self.engine, &target.host, |l| l == RuleLocation::Request).collect();
         if active.is_empty() {
@@ -1266,7 +1294,7 @@ impl EngineRules {
         let (bytes, by, stopped) = request_rules(&active, &request, &run);
         let ruled = Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) };
         self.failures.note(self.engine, &ruled.failed);
-        ruled.stopped.is_some().then_some(ruled)
+        Some(ruled)
     }
 
     /// Whether a request rule's script sees requests to `target` (see
@@ -1527,9 +1555,9 @@ fn is_framing_name(name: &str) -> bool {
 }
 
 /// What a request rule's script returned (in the shape `hook.js` gives it), read for the
-/// request whose line is `first`: refused if it isn't one of the shapes allowed. `cut` is the
-/// body it was handed, when that was cut.
-fn read_turn(v: &Value, rule: u32, first: &str, cut: Option<&[u8]>) -> std::result::Result<Turn, String> {
+/// request whose line is `first`: refused if it isn't one of the shapes allowed. `handed` is
+/// the body it was handed, and `cut` whether that was cut.
+fn read_turn(v: &Value, rule: u32, first: &str, handed: &[u8], cut: bool) -> std::result::Result<Turn, String> {
     if v["keep"] == true {
         return Ok(Turn::Keep);
     }
@@ -1588,18 +1616,23 @@ fn read_turn(v: &Value, rule: u32, first: &str, cut: Option<&[u8]>) -> std::resu
             None => None,
         };
         let line = format!("{new_method} {new_target} {version}");
-        // A body that isn't UTF-8 came with both: the text, unless the script changed it, is
-        // only the bytes' stand-in.
+        // A body that isn't UTF-8 came with both: whichever of them the script changed is the
+        // body; the text, left as it was, is only the bytes' stand-in.
         let body = match (o.get("body"), o.get("bodyBase64")) {
             (Some(Value::String(text)), Some(Value::String(b))) => {
                 let bytes =
                     STANDARD.decode(b.trim()).map_err(|_| "its request's bodyBase64 isn't base64".to_string())?;
-                Some(if String::from_utf8_lossy(&bytes) == text.as_str() { bytes } else { text.as_bytes().to_vec() })
+                let text_kept = *text == String::from_utf8_lossy(handed);
+                match (bytes.as_slice() != handed, text_kept) {
+                    (false, false) => Some(text.as_bytes().to_vec()),
+                    (true, false) => return Err("its request changed both body and bodyBase64: give one".into()),
+                    _ => Some(bytes),
+                }
             }
             _ => script_body(o, "request")?,
         };
         // A body cut for the script that comes back as it was handed over stays whole.
-        let body = body.filter(|new| cut.is_none_or(|cut| new.as_slice() != cut));
+        let body = body.filter(|new| !cut || new.as_slice() != handed);
         return Ok(Turn::Rewrite(line, headers, body));
     }
     let Some(o) = v["response"].as_object() else { return Err("its result couldn't be read".into()) };
@@ -1778,13 +1811,15 @@ fn request_rules<'a>(
 fn request_turn(rule: &CompiledRule, hook: &Hook, first: &str, headers: &[String], body: &[u8], run: &Run<'_>) -> Turn {
     let cx = json!({ "engine": run.engine.name(), "host": run.host, "rule": rule.id });
     let handed = &body[..body.len().min(MAX_SCRIPT_BODY)];
-    let cut = (body.len() > MAX_SCRIPT_BODY).then_some(handed);
+    let cut = body.len() > MAX_SCRIPT_BODY;
     let mut req = request_object(first, headers, handed);
-    if cut.is_some() {
+    if cut {
         req["bodyTruncated"] = json!(true);
     }
-    let read =
-        hook.request(&cx, &req).map_err(|e| e.text().to_string()).and_then(|v| read_turn(&v, rule.id, first, cut));
+    let read = hook
+        .request(&cx, &req)
+        .map_err(|e| e.text().to_string())
+        .and_then(|v| read_turn(&v, rule.id, first, handed, cut));
     match read {
         Ok(turn) => turn,
         Err(e) => {
@@ -3165,6 +3200,8 @@ mod tests {
             1,
             "function request(req) {
                 if (req.path === '/spread') return { request: { ...req, method: 'PUT' } };
+                if (req.path === '/b64') return { request: { ...req, bodyBase64: 'AA==' } };
+                if (req.path === '/text') return { request: { ...req, body: 'new' } };
                 if (req.path === '/path') return { request: { ...req, path: '/moved', query: 'b=2' } };
                 if (req.path === '/both') return { request: { ...req, target: '/x', path: '/y' } };
                 if (req.path === '/line') return { request: { ...req, line: 'GET / HTTP/1.1' } };
@@ -3182,6 +3219,14 @@ mod tests {
             out.bytes.starts_with(b"PUT /spread?a=1 HTTP/1.1\r\n") && out.bytes.ends_with(&[0xff, 0x00]),
             "{out:?}"
         );
+        // Changed, either form is the body.
+        let binary = |path: &str| {
+            let mut req = format!("POST {path} HTTP/1.1\r\nContent-Length: 2\r\n\r\n").into_bytes();
+            req.extend([0xff, 0x00]);
+            run(req).bytes
+        };
+        assert!(binary("/b64").ends_with(b"Content-Length: 1\r\n\r\n\0"), "{:?}", binary("/b64"));
+        assert!(binary("/text").ends_with(b"Content-Length: 3\r\n\r\nnew"), "{:?}", binary("/text"));
         let out = run(b"GET /path?a=1 HTTP/1.1\r\n\r\n".to_vec());
         assert_eq!(out.bytes, b"GET /moved?b=2 HTTP/1.1\r\n\r\n");
         for path in ["/both", "/line"] {

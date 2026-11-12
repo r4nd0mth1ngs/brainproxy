@@ -1459,6 +1459,9 @@ function request(req, ctx) {
   `{ block: true }`) to not send it; or `{ response: { status, reason, headers, body } }` to not
   send it and use that response as if the server had sent it (`status` from 200 to 999, 200 by
   default; `bodyBase64` for bytes). Anything else, or a key it doesn't know, fails the call.
+- A host the scope doesn't list that a changed request names (its Host, or an absolute target)
+  is checked as an agent's rule's is: nobody saw it before the script ran, so the request isn't
+  sent (kind `out_of_scope`), unless the rule was added with `--host-header-test`.
 - brainproxy frames what the script gives: a changed request's body goes with a
   `Content-Length` of its own, and a response gets its `Content-Length` (none for a 204 or 304,
   which can have no body; the answer to a `HEAD` has no body). It also adds
@@ -1466,8 +1469,12 @@ function request(req, ctx) {
   to every answer, and drops a header of that name, `Content-Length` or `Transfer-Encoding` the
   script gives: wherever the response is shown (Traffic, `history show`, a HAR export, a report)
   it says the target didn't send it.
-- The rules after it don't see a request it blocked or answered, and an answer goes past the
-  response rules and the response intercept, to the client as the script made it.
+- The rules after it don't see a request it blocked or answered. An answer is taken as a
+  server's response would be: it goes through the response rules (the row keeps it as the
+  script made it, and beside it what the rules made of it) and, in the proxy, the response
+  intercept.
+- No session is applied to a request it blocked or answered, and `send --auth` doesn't set one
+  up (a login would send).
 - **The proxy** answers a blocked request `403` with `X-Brainproxy-Error: blocked` and the
   reason, and records it as a row with that error and no response. An answered request's row
   has the script's response. Neither is held in the request intercept, and an answer isn't
@@ -1479,7 +1486,9 @@ function request(req, ctx) {
   row, whatever `--store` says, so the result doesn't pass for the target's; a blocked one is an
   error result.
 - **A scan** records each answer and judges none: the attack (or the baseline of a URL given to
-  `scan active`, which then isn't attacked) fails with kind `blocked`. A recorded row a script
+  `scan active`, which then isn't attacked) fails with kind `blocked`. Baselines go through the
+  script as the attacks do, a URL's and an API document's (`--api`) alike: rewritten, blocked or
+  answered (the other rules don't apply to a baseline, as before). A recorded row a script
   answered is no baseline either: `scan active` passes it over, and refuses it by
   `--history-id`. A probe's raw connection
   (the Heartbleed check's TLS records) isn't made to a host a request rule's script sees in
@@ -1487,8 +1496,15 @@ function request(req, ctx) {
 - Every such row says what the script did in `entry.edited_by`: `{"rule": N, "outcome":
   "answered"}` or `"blocked"`, which nothing can change later (unlike tags). `history list`
   marks it, `history show` describes it, and the app marks its status in Traffic (`200*`, or
-  *blocked*) with a *script answer* tag and a note over the response. Passive checks skip an
-  answered row, so no finding is ever raised against the target from a script's response.
+  *blocked*) with a *script answer* tag and a note over the response.
+- **Findings from an answer say so.** Passive checks read an answered row as any other, and each
+  finding raised from it gets an alert type of its own, `script-answer:REF` (REF the rule's
+  own), whose name ends *(in a script's answer, not the target's)*, whose description starts by
+  saying the target never sent the response, and whose tags hold `script-answer`; its other info
+  names the rule and the history row. It is never one finding with the target's (another alert
+  type), and the name and description go wherever the finding goes: `findings list`, reports
+  and their exports, and the app, which tags it *script answer* and says over it what it is.
+  Its host and URL are where the request was going.
 - `rules test` says what the engine would do (`stopped`, with the script's response or the
   reason), and sends nothing either way.
 
@@ -1572,7 +1588,7 @@ How a script is kept and run:
   the check finds nothing in that exchange. A script stopped at the time or memory limit, or
   one that doesn't load (it throws at the top, or has no function of its kind), runs no more
   until the command or the proxy starts again (or its rule is switched off and on), so a script that hangs costs its time limit once
-  and not for every request. For a request rule that means its requests go out as they are
+  and not for every request. A request rule fails open: its requests go out as they are
   from then on, so keep its work small: a body is cut at 1 MiB for it. The failure is on stderr, once for each different one; in `rule_errors` of `send`'s
   output (in a race, for the requests as they went out) and `errors` of `rules test`'s (the rule's
   id and why); and in `script_errors` of

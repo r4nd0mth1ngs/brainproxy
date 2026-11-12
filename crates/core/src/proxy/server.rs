@@ -1291,27 +1291,49 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         let ruled = live.rules.request(Engine::Proxy, &target.host, request);
         live.rule_failures.note(Engine::Proxy, &ruled.failed);
         // A request rule's script blocked or answered it: nothing is sent and no connection is
-        // opened, no session applied, nothing held in intercept. The row says what the script
-        // did; an answer goes to the client as it is, past the response rules and intercept, and
-        // isn't handed to live access-control testing (passive checks skip it too).
+        // opened, no session applied, and the request isn't held in intercept. The row says what
+        // the script did. An answer is taken as a server's response would be: through the
+        // response rules and the response intercept (passive checks read it too, and say what
+        // they find there is the script's), but it isn't handed to live access-control testing.
         if let Some(stopped) = &ruled.stopped {
-            let edited_by = ruled.edits();
-            let (response, error) = match stopped.answer() {
-                Some(response) => (Some(response), None),
-                None => (None, Some(stopped.message())),
+            let (edited_by, original_request) = (ruled.edits(), ruled.original.clone());
+            let Some(answer) = stopped.answer() else {
+                let msg = stopped.message();
+                let c = row(target, &ruled.bytes, None, None, Some(&msg));
+                send_capture(ctx, Capture { edited_by, original_request, ..c }, None).await;
+                return Ok(Reply::Error(error_response(403, "blocked", &msg), false));
             };
-            let c = row(target, &ruled.bytes, response, response.map(|_| 0), error.as_deref());
-            send_capture(ctx, Capture { edited_by, original_request: ruled.original.clone(), ..c }, None).await;
-            return Ok(match (response, error) {
-                (Some(response), _) => Reply::Response(response.to_vec()),
-                (None, error) => Reply::Error(error_response(403, "blocked", &error.unwrap_or_default()), false),
+            let sent = &ruled.bytes;
+            let answered = live.rules.response(Engine::Proxy, &target.host, sent, answer.to_vec());
+            live.rule_failures.note(Engine::Proxy, &answered.failed);
+            let mut c = Capture { edited_by, original_request, ..row(target, sent, Some(answer), Some(0), None) };
+            if answered.changed() {
+                c.modified_response = Some(answered.bytes.clone());
+                c.response_edits = answered.edits();
+            }
+            let method =
+                RawRequest::from_bytes(sent.clone()).head().map(|h| h.method).unwrap_or_else(|_| method.clone());
+            let held = live.intercept.matches(true, &method, &target.host, &path, || {
+                Cow::Owned(Capture::new("proxy", target, sent, Some(&answered.bytes), Some(0), None))
             });
+            send_capture(ctx, c, None).await;
+            let mut response = answered.bytes;
+            if held {
+                let status = parse_response_head(&response).ok().map(|h| h.status);
+                match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
+                    Some(released) => response = released.message,
+                    None => {
+                        return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true))
+                    }
+                }
+            }
+            return Ok(Reply::Response(response));
         }
         // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
         // Host-header test, isn't sent: a shared front end may route the request to another site.
         // A person's rule was warned about when it was saved.
         if let Some(host) = ruled.agent_host(ctx.client.options(), target) {
-            let msg = format!("out of scope: {}", crate::rules::agent_host_refusal(&host));
+            let msg = format!("out of scope: {}", ruled.host_refusal(&host));
             let c = row(target, &ruled.bytes, None, None, Some(&msg));
             send_capture(ctx, Capture { edited_by: ruled.edits(), original_request: ruled.original, ..c }, None).await;
             return Ok(Reply::Error(error_response(502, "out_of_scope", &msg), false));

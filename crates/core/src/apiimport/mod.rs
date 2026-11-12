@@ -312,6 +312,9 @@ pub struct RunConfig {
     pub tool: Tool,
     /// Report progress after every response under this stage, not every 25 responses.
     pub stage: Option<&'static str>,
+    /// Request rules whose scripts see each request first (a scan's, for its baselines): one may
+    /// rewrite it, block it, or answer it so nothing is sent.
+    pub rules: Option<crate::rules::EngineRules>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -402,6 +405,7 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
     let mut tasks = Vec::new();
     for (i, (req, raw, target)) in work.into_iter().enumerate() {
         let (sem, client, auth, ctl) = (sem.clone(), client.clone(), cfg.auth.clone(), ctl.clone());
+        let rules = cfg.rules.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.ok()?;
             if let Some(d) = limiter {
@@ -411,15 +415,36 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
             if ctl.stopped() {
                 return None;
             }
-            let sent = match auth.as_deref() {
-                Some(a) => a.send_as(tool, &raw, &target).await,
-                None => client.send(&raw, &target).await,
+            // A request rule's script sees it first: rewritten it goes as rewritten, blocked or
+            // answered it doesn't go at all (and no session is applied to it).
+            let ruled = rules.as_ref().and_then(|r| r.scripted(&target, raw.as_bytes().to_vec()));
+            let checked = match &ruled {
+                Some(r) => r.check_host(client.options(), &target),
+                None => Ok(()),
             };
-            Some((req, raw, target, sent))
+            let sent = match (ruled.as_ref().and_then(|r| r.stopped.as_ref().map(|s| (r, s))), checked) {
+                (Some((ruled, stopped)), _) => {
+                    stopped.exchange(&target, ruled.bytes.clone()).ok_or_else(|| Error::Blocked(stopped.message()))
+                }
+                (None, Err(e)) => Err(e),
+                (None, Ok(())) => {
+                    let raw = ruled.as_ref().map_or_else(|| raw.clone(), |r| RawRequest::from_bytes(r.bytes.clone()));
+                    match auth.as_deref() {
+                        Some(a) => a.send_as(tool, &raw, &target).await,
+                        None => client.send(&raw, &target).await,
+                    }
+                }
+            };
+            Some((req, raw, target, sent, ruled))
         }));
     }
     for task in tasks {
-        let Ok(Some((req, raw, target, sent))) = task.await else { continue };
+        let Ok(Some((req, raw, target, sent, ruled))) = task.await else { continue };
+        let noted = ruled.as_ref().filter(|r| r.noted());
+        let mark = |c: Capture| match noted {
+            Some(r) => Capture { edited_by: r.edits(), original_request: r.original.clone(), ..c },
+            None => c,
+        };
         // Host names pass may_allow; the resolved address can still be out of scope.
         if let Err(e @ Error::OutOfScope(_)) = &sent {
             summary.skipped_out_of_scope += 1;
@@ -432,19 +457,21 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
         let (status, error, id) = match sent {
             Ok(ex) => {
                 let status = parse_response_head(&ex.response).ok().map(|h| h.status);
-                let id = store.record(&Capture::new(
+                let id = store.record(&mark(Capture::new(
                     SOURCE,
                     &target,
                     &ex.request,
                     Some(&ex.response),
                     Some(ex.duration_ms as i64),
                     None,
-                ))?;
-                (status, None, id)
+                )))?;
+                // A script's answer is on record, but it is no response of the target's.
+                let answered = noted.and_then(|r| r.stopped.as_ref()).map(|s| s.message());
+                (status, answered, id)
             }
             Err(e) => {
                 let msg = e.to_string();
-                let id = store.record(&Capture::new(SOURCE, &target, raw.as_bytes(), None, None, Some(&msg)))?;
+                let id = store.record(&mark(Capture::new(SOURCE, &target, raw.as_bytes(), None, None, Some(&msg))))?;
                 (None, Some(msg), id)
             }
         };

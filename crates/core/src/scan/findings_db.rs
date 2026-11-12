@@ -519,18 +519,22 @@ fn not_kept(source: &str, keep: &[String]) -> (String, Vec<String>) {
     (clause, args)
 }
 
+/// The request rule whose script answered a history row, from its `edited_by` (JSON).
+pub fn answered_by(edited_by: Option<&str>) -> Option<u32> {
+    let edits: Vec<crate::provenance::Edit> = serde_json::from_str(edited_by?).ok()?;
+    edits.iter().find(|e| e.outcome == Some(crate::provenance::Outcome::Answered)).and_then(|e| e.rule)
+}
+
 impl Store {
     /// Captures after `after_id` from the given sources, ready for scanning. A row whose
-    /// response a request rule's script made up (its `edited_by` says it was answered) isn't
-    /// one: a finding raised from it would be the script's, attributed to the target.
+    /// response a request rule's script made up (its `edited_by` says it was answered) says so
+    /// ([`Message::answered_by`]), and so do the findings raised from it.
     pub fn scan_messages_after(&self, after_id: i64, sources: &[String], limit: usize) -> Result<Vec<Message>> {
         let placeholders = (0..sources.len()).map(|i| format!("?{}", i + 3)).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, method, url, scheme, host, port, path, query, req_headers, req_body, status, resp_headers, resp_body
-             FROM history WHERE id > ?1 AND status IS NOT NULL AND source IN ({placeholders})
-               AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(edited_by) THEN edited_by ELSE '[]' END)
-                               WHERE json_extract(value, '$.outcome') = 'answered')
-             ORDER BY id LIMIT ?2"
+            "SELECT id, method, url, scheme, host, port, path, query, req_headers, req_body, status, resp_headers, resp_body,
+                    edited_by
+             FROM history WHERE id > ?1 AND status IS NOT NULL AND source IN ({placeholders}) ORDER BY id LIMIT ?2"
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(after_id), Box::new(limit as i64)];
         for s in sources {
@@ -555,7 +559,8 @@ impl Store {
                 r.get(10)?,
                 headers(r.get(11)?),
                 r.get::<_, Option<Vec<u8>>>(12)?.unwrap_or_default(),
-            ))
+            )
+            .answered_by(answered_by(r.get::<_, Option<String>>(13)?.as_deref())))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }

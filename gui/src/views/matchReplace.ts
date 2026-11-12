@@ -404,3 +404,10 @@ export function scriptStop(edits: { rule?: number | null; outcome?: string }[] |
     ? { outcome: "answered", rule: e.rule, note: `Answered by the script of rule ${e.rule}: the response is the script's, the target sent nothing` }
     : { outcome: "blocked", rule: e.rule, note: `Blocked by the script of rule ${e.rule}: nothing was sent` };
 }
+
+/** Whether a finding's alert type is one raised from a response a request rule's script made up. */
+export const isScriptAnswer = (alertRef: string | null | undefined) => (alertRef ?? "").startsWith("script-answer:");
+
+/** What a finding raised from a script's answer says over it. */
+export const SCRIPT_ANSWER_NOTE =
+  "Found in a response a request rule's script made up, not one the target sent: its host and URL are where the request was going. Send the request to the target to see whether it holds there.";

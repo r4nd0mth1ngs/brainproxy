@@ -10,6 +10,7 @@ use brainproxy_core::apiimport::{self, graphql, RunConfig};
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use brainproxy_core::rules::{Engine, EngineRules};
 use brainproxy_core::scan::active::policy::Policy;
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget};
 use brainproxy_core::scan::compare::ScanScope;
@@ -559,6 +560,8 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     list_limit: usize::MAX,
                     tool: Tool::Scan,
                     stage: Some("baseline"),
+                    // A request rule's script sees each baseline first, as it sees the attacks.
+                    rules: EngineRules::load(&Store::open(project)?, Engine::Scan)?,
                 };
                 let baselines = rt.block_on(apiimport::run(project, requests, run_cfg, ctl.clone()));
                 if let Some(a) = &auth {
@@ -930,22 +933,44 @@ fn select_targets(
         let rules = brainproxy_core::rules::EngineRules::load(&store, brainproxy_core::rules::Engine::Scan)?;
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
-            // The baseline goes without the other rules, as it always did.
-            if let Some(ruled) = rules.as_ref().and_then(|r| Some((r, r.stop(&target, req.as_bytes().to_vec())?))) {
-                let (rules, ruled) = ruled;
+            // A request rule's script sees the baseline first, as it sees the attacks (the other
+            // rules don't, as they never did): a rewritten baseline goes as rewritten, and one it
+            // blocked or answered isn't sent and isn't attacked.
+            let scripted = rules.as_ref().and_then(|r| Some((r, r.scripted(&target, req.as_bytes().to_vec())?)));
+            if let Some((rules, ruled)) = scripted.as_ref().filter(|(_, r)| r.stopped.is_some()) {
                 let stopped_req = RawRequest::from_bytes(ruled.bytes.clone());
-                let _ = rt.block_on(rows.send_ruled(&client, &stopped_req, &target, Some((rules, &ruled))));
+                let _ = rt.block_on(rows.send_ruled(&client, &stopped_req, &target, Some((*rules, ruled))));
                 let why = ruled.stopped.as_ref().map(|s| s.message()).unwrap_or_default();
                 return Err(Error::Blocked(format!("{u}: {why}; a scan doesn't attack it")));
             }
-            let (ids, sent) = rt.block_on(rows.send_with(&client, auth, Tool::Scan, &req, &target));
+            if let Some((_, ruled)) = scripted.as_ref().filter(|(_, r)| r.changed()) {
+                ruled.check_host(send, &target)?;
+            }
+            let given = req.clone();
+            let req = match scripted.as_ref().filter(|(_, r)| r.changed()) {
+                Some((_, ruled)) => RawRequest::from_bytes(ruled.bytes.clone()),
+                None => req,
+            };
+            // Without a session the row says what the script changed, as any engine's row does.
+            let (ids, sent) = match (scripted.as_ref().filter(|(_, r)| r.changed()), auth) {
+                (Some((rules, ruled)), None) => {
+                    let (id, sent, _) = rt.block_on(rows.send_ruled(&client, &req, &target, Some((*rules, ruled))));
+                    (id.into_iter().collect(), sent)
+                }
+                _ => rt.block_on(rows.send_with(&client, auth, Tool::Scan, &req, &target)),
+            };
             let ex = sent?;
             let Some(&id) = ids.last() else { return Err(Error::Protocol("the request wasn't recorded".into())) };
             named.insert(id);
             targets.push(ScanTarget {
                 history_id: Some(id),
                 target,
-                request: ex.request,
+                // The attacks start from the request as given: each goes through the rules again.
+                request: if scripted.as_ref().is_some_and(|(_, r)| r.changed()) {
+                    given.into_bytes()
+                } else {
+                    ex.request
+                },
                 response: ex.response,
                 duration_ms: Some(ex.duration_ms),
             });

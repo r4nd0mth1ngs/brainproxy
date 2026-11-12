@@ -665,6 +665,21 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
         env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "proxy,send,fuzz,scan"]);
     let rule = &listed["rules"][0];
     assert_eq!((rule["location"].as_str(), rule["replacer"].as_str()), (Some("request"), Some("script")), "{listed}");
+    // A response rule applies to an answer as to a server's response.
+    env.ok(&[
+        "rules",
+        "add",
+        "--location",
+        "response-header",
+        "--name",
+        "X-Ruled",
+        "--action",
+        "add",
+        "--replace",
+        "yes",
+        "--applies-to",
+        "proxy,send",
+    ]);
     let mark = "X-Brainproxy-Answer: rule 1; this response is the rule's script's, the target sent nothing";
     let untouched = |engine: &str| {
         assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0, "{engine}: a connection reached the target");
@@ -674,7 +689,7 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     let listen = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["listen"].as_str().unwrap().to_string();
     wait_for_settings();
     let resp = through(&listen, port, "/answered?a=1", "");
-    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains(mark), "{resp}");
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains(mark) && resp.contains("X-Ruled: yes"), "{resp}");
     assert!(
         resp.ends_with("<html><title>made up</title>proxy GET http://127.0.0.1:") || resp.contains("proxy GET "),
         "{resp}"
@@ -699,6 +714,7 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     let url = format!("http://127.0.0.1:{port}/answered/send");
     let sent = env.ok(&["send", "--url", &url, "-X", "POST", "-d", "x=1"]);
     assert_eq!(sent["answered_by"]["rule"], 1, "{sent}");
+    assert_eq!(ids(&sent["rules"]["response"]), [2], "{sent}");
     assert!(sent["response"]["body"]["content"].as_str().unwrap().contains("send POST /answered/send"), "{sent}");
     let (code, v) = env.run(&["send", "--url", &format!("http://127.0.0.1:{port}/blocked/send")]);
     assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
@@ -757,14 +773,51 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     assert!(env.rows("SELECT count(*) FROM history WHERE source = 'scan'")[0][0].as_i64().unwrap() > 1, "{code} {v}");
     assert_eq!(env.rows("SELECT count(*) FROM findings WHERE source = 'active'")[0][0], 0, "{v}");
     untouched("scan");
+    // An API scan's baselines go through the script too: none is sent.
+    let spec = env.script(
+        "api.json",
+        &json!({
+            "openapi": "3.0.0", "info": {"title": "t", "version": "1"},
+            "servers": [{"url": format!("http://127.0.0.1:{port}")}],
+            "paths": {"/blocked/api": {"get": {"responses": {"200": {"description": "ok"}}}},
+                      "/answered/api": {"get": {"responses": {"200": {"description": "ok"}}}}},
+        })
+        .to_string(),
+    );
+    let (code, v) = env.run(&["scan", "active", "--api", &spec, "--strength", "low", "-c", "1"]);
+    assert_ne!(code, 0, "{v}");
+    let rows = env.rows("SELECT path, edited_by FROM history WHERE path LIKE '%/api' ORDER BY path");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r[1].as_str().is_some_and(|e| e.contains("outcome"))), "{rows:?}");
+    untouched("scan --api");
 
-    // Passive checks raise nothing from a script's response (its page would have had missing headers).
+    // Passive checks read a script's response, and every finding raised from it says it is the
+    // script's: an alert type of its own, a name, a description, a tag and other info that say so.
     env.ok(&["scan", "passive", "--rescan"]);
     let found = env.rows(
-        "SELECT count(*) FROM findings f JOIN history h ON h.id IN (f.history_id, f.last_history_id) \
+        "SELECT f.alert_ref, f.name, f.other_info, t.description, t.tags FROM findings f \
+         JOIN history h ON h.id = f.history_id JOIN finding_types t ON t.alert_ref = f.alert_ref \
          WHERE h.edited_by LIKE '%answered%'",
     );
-    assert_eq!(found[0][0], 0, "{found:?}");
+    assert!(!found.is_empty(), "the made-up page has missing headers to find");
+    for f in &found {
+        assert!(f[0].as_str().unwrap().starts_with("script-answer:"), "{f:?}");
+        assert!(f[1].as_str().unwrap().ends_with("(in a script's answer, not the target's)"), "{f:?}");
+        assert!(f[2].as_str().unwrap().contains("the script of match-and-replace rule 1 made up"), "{f:?}");
+        assert!(
+            f[3].as_str().unwrap().starts_with("Found in a response that a request rule's script made up"),
+            "{f:?}"
+        );
+        assert!(f[4].as_str().unwrap().contains("script-answer"), "{f:?}");
+    }
+    // None of them is one with a finding of the target's: no finding lacks the mark there.
+    let plain = env.rows(
+        "SELECT count(*) FROM findings f JOIN history h ON h.id IN (f.history_id, f.last_history_id) \
+         WHERE h.edited_by LIKE '%answered%' AND f.alert_ref NOT LIKE 'script-answer:%'",
+    );
+    assert_eq!(plain[0][0], 0, "{plain:?}");
+    let listed = env.ok(&["findings", "list"]);
+    assert!(listed.to_string().contains("(in a script's answer, not the target's)"), "{listed}");
     let shown = env.ok(&["history", "list", "--limit", "1"]);
     assert!(shown["items"][0]["edited_by"].to_string().contains("outcome"), "{shown}");
 }
@@ -835,4 +888,55 @@ fn a_failing_request_script_sends_the_request_and_says_so() {
     assert!(sent["rule_errors"][0]["error"].as_str().unwrap().contains("a code from 200 to 999"), "{sent}");
     let failures = env.ok(&["rules", "list"])["failures"].clone();
     assert_eq!(failures[0]["engine"], "send", "{failures}");
+}
+
+#[test]
+fn a_request_scripts_rewrite_goes_to_scan_baselines_and_meets_the_host_check() {
+    // Answers every request 200, and keeps each request line it got.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = lines.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 65536];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(line);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            });
+        }
+    });
+    let env = Env::new("stops-rewrite");
+    let script = env.script(
+        "rewrite.js",
+        "function request(req) {
+            if (req.path.startsWith('/danger')) return { request: { ...req, path: '/safe' } };
+            if (req.path === '/elsewhere') return { request: { headers: [['Host', 'evil.test']] } };
+        }",
+    );
+    env.ok(&["rules", "add", "--location", "request", "--script", &script, "--applies-to", "send,scan"]);
+    // A scan's baseline goes as the script rewrote it, as its attacks do.
+    let _ =
+        env.run(&["scan", "active", &format!("http://127.0.0.1:{port}/danger?q=1"), "--strength", "low", "-c", "1"]);
+    let got = lines.lock().unwrap().clone();
+    assert!(got.iter().any(|l| l.starts_with("GET /safe")), "{got:?}");
+    assert!(!got.iter().any(|l| l.contains("/danger")), "{got:?}");
+    // The baseline's row says the script changed it.
+    let baseline = env.rows("SELECT path, edited_by FROM history WHERE source = 'scan' ORDER BY id LIMIT 1");
+    assert_eq!(baseline[0][0], "/safe", "{baseline:?}");
+    assert!(baseline[0][1].as_str().is_some_and(|e| e.contains("\"rule\":1")), "{baseline:?}");
+    // A host the scope doesn't list that the script brought in isn't sent: nobody checked it.
+    let (code, v) = env.run(&["send", "--url", &format!("http://127.0.0.1:{port}/elsewhere")]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("the script of request rule 1 put a host"), "{v}");
 }

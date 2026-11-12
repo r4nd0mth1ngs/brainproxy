@@ -389,12 +389,10 @@ async fn exchange(
     let stopped = by.and_then(|(_, ruled)| ruled.stopped.as_ref());
     let (id, sent, ruled) = match (rows, stopped) {
         (Some(rows), _) => rows.send_ruled(client, &req, target, by).await,
-        // A request rule's script stopped it: nothing is sent, and its answer is no server's
-        // for the response rules to rewrite.
+        // A request rule's script stopped it: nothing is sent, and its answer goes through the
+        // response rules below as a server's would.
         (None, Some(stopped)) => {
-            let sent = stopped.exchange(target, request.to_vec()).ok_or_else(|| Error::Blocked(stopped.message()));
-            let ruled = sent.as_ref().ok().map(|ex| Ruled { bytes: ex.response.clone(), ..Default::default() });
-            (None, sent, ruled)
+            (None, stopped.exchange(target, request.to_vec()).ok_or_else(|| Error::Blocked(stopped.message())), None)
         }
         (None, None) => (None, client.send(&req, target).await, None),
     };

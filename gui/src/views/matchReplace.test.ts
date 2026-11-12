@@ -16,6 +16,7 @@ import {
   ruleEditNote,
   scriptName,
   scriptStop,
+  isScriptAnswer,
   scriptQuestion,
   skippedReason,
   testArgs,
@@ -281,4 +282,11 @@ test("a request a script stopped says so in the tester and on its history row", 
     "Changed by match-and-replace rule 2. Answered by the script of rule 5: the response is the script's, the target sent nothing",
   );
   assert.equal(ruleEditNote([{ rule: 5, outcome: "blocked" }]), "Blocked by the script of rule 5: nothing was sent");
+});
+
+test("a finding raised from a script's answer is told apart by its alert type", () => {
+  assert.equal(isScriptAnswer("script-answer:10021"), true);
+  assert.equal(isScriptAnswer("10021"), false);
+  assert.equal(isScriptAnswer("script:check:x"), false);
+  assert.equal(isScriptAnswer(undefined), false);
 });

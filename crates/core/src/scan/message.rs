@@ -19,6 +19,9 @@ pub struct Message {
     pub resp_headers: Vec<(String, String)>,
     /// Decoded (de-chunked, decompressed) response body.
     pub resp_body: Vec<u8>,
+    /// The request rule whose script made the response up, when the target sent none: what is
+    /// found in it is said to be found in that script's answer.
+    pub answered_by: Option<u32>,
     text: OnceLock<String>,
 }
 
@@ -53,8 +56,16 @@ impl Message {
             status,
             resp_headers,
             resp_body,
+            answered_by: None,
             text: OnceLock::new(),
         }
+    }
+
+    /// The same message, its response made up by request rule `rule`'s script (see
+    /// [`Message::answered_by`]); None leaves it as it is.
+    pub fn answered_by(mut self, rule: Option<u32>) -> Self {
+        self.answered_by = rule;
+        self
     }
 
     /// Parses a raw exchange (as sent/received) into a message.

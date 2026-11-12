@@ -811,7 +811,13 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
             )));
         }
     }
-    let session = auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
+    // A request rule's script that blocked or answered it: nothing is sent, so no session is set
+    // up either (a login would send).
+    let stopped = ruled.first().and_then(|r| r.stopped.clone());
+    let session = match stopped {
+        Some(_) => None,
+        None => auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?,
+    };
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
         s.keep_no_content();
     }
@@ -839,33 +845,8 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(r) = ruled.first() {
         log.ruled(r);
     }
-    if let Some(stopped) = ruled.first().and_then(|r| r.stopped.as_ref()) {
-        // Not sent, and no session is applied (a re-login would send): its row says why.
-        let recorded = client.recorded_request(&req, &target)?;
-        let id = log.pending(&target, &recorded)?;
-        let Some(ex) = stopped.exchange(&target, recorded.clone()) else {
-            let why = stopped.message();
-            log.failed(id, &target, &recorded, &why)?;
-            return Err(Error::Blocked(format!("{why}; nothing was sent (history #{id})")));
-        };
-        log.answered(id, &ex)?;
-        if args.raw {
-            out.raw(&ex.response);
-            return Ok(());
-        }
-        let mut data = exchange_json(Some(id), &target, &ex.request, &ex.response, Some(0), args.max_body);
-        if args.show_request {
-            data["request"] = body_value(&ex.request, args.max_body);
-        }
-        data["answered_by"] = json!({"rule": stopped.id, "note": stopped.message()});
-        data["rules"] = json!({"request": ruled[0].ids(), "response": []});
-        if !ruled[0].failed.is_empty() {
-            data["rule_errors"] = json!(ruled[0].failed);
-        }
-        let note = stopped.message();
-        out.ok(data, || format!("{note}\n\n{}", text_exchange(Some(id), &ex.response, 0)));
-        return Ok(());
-    }
+    // A request the script stopped has a row that says what it did; an answer is taken as the
+    // server's would be, through the response rules, passive checks and what is shown.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request is on record (its row and the bytes recorded) before it goes out. `open`
     // is the one out and unanswered; a row answered already is never rewritten.
@@ -881,6 +862,15 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
                 *open = Some((id, recorded));
                 Ok::<_, Error>(())
             };
+            if let Some(stopped) = &stopped {
+                sending(log, rows, open, &req)?;
+                let recorded = open.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+                let ex = stopped.exchange(&target, recorded).ok_or_else(|| Error::Blocked(stopped.message()))?;
+                if let Some((id, _)) = open.take() {
+                    log.answered(id, &ex)?;
+                }
+                return Ok(ex);
+            }
             match &session {
                 Some(s) => {
                     let watch = |a: Attempt<'_>| match a {
@@ -979,6 +969,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if !request_rules.is_empty() || !response_rules.is_empty() {
         data["rules"] = json!({"request": request_rules, "response": response_rules});
     }
+    if let Some(stopped) = &stopped {
+        data["answered_by"] = json!({"rule": stopped.id, "note": stopped.message()});
+    }
     // A rule whose script failed left the request or the response as it was.
     if !rule_errors.is_empty() {
         data["rule_errors"] = json!(rule_errors);
@@ -986,8 +979,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(read) = &ex.stream {
         data["stream"] = sse_cmd::read_json(read, stream_id, args.max_body);
     }
+    let answered = stopped.as_ref().map(|s| format!("{}\n\n", s.message())).unwrap_or_default();
     out.ok(data, || {
-        let text = text_exchange(id, &ex.response, ex.duration_ms);
+        let text = format!("{answered}{}", text_exchange(id, &ex.response, ex.duration_ms));
         match &ex.stream {
             Some(read) => format!("{}\n\n{}", text.trim_end(), sse_cmd::read_text(read, args.max_body)),
             None => text,

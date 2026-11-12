@@ -38,6 +38,7 @@ import {
   type Tracker,
 } from "./findingsFilter";
 import { addedBy } from "./manualFinding";
+import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
 
@@ -484,6 +485,11 @@ export function FindingsView({ active }: { active: boolean }) {
                       {g.name}
                       {hosts.length > 1 && <span className="muted"> · {hostsOf(g.items).join(", ")}</span>}
                     </span>
+                    {isScriptAnswer(g.alert) && (
+                      <span className="tag warn" title={SCRIPT_ANSWER_NOTE}>
+                        script answer
+                      </span>
+                    )}
                     {g.alert.startsWith("manual:") &&
                       [...new Set(g.items.map((f) => addedBy(f.origin).tag))].map((t) => (
                         <span key={t} className="tag">
@@ -526,6 +532,11 @@ export function FindingsView({ active }: { active: boolean }) {
                 <RiskBadge risk={finding.risk} />
                 <h2>{finding.name}</h2>
               </div>
+              {isScriptAnswer(finding.alert_ref) && (
+                <p className="warn-text" role="note">
+                  {SCRIPT_ANSWER_NOTE}
+                </p>
+              )}
               <div className="toolbar flat">
                 <div className="seg">
                   {STATES.map((s) => (

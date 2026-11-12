@@ -416,7 +416,8 @@ impl Rows {
     ///
     /// A request a request rule's script stopped ([`Ruled::stopped`]) isn't sent: no connection
     /// is opened. Its row says so. A blocked one fails with [`Error::Blocked`]; an answered one
-    /// gives the script's response as the exchange's, which no response rule touches.
+    /// gives the script's response as the exchange's, and it goes through the response rules as
+    /// a server's would.
     pub async fn send_ruled(
         &self,
         client: &Client,
@@ -435,10 +436,17 @@ impl Rows {
             Ok(row) => row,
             Err(e) => return (None, Err(e), None),
         };
-        if let Some(stopped) = by.and_then(|(_, ruled)| ruled.stopped.as_ref()) {
-            return (Some(row.id), self.stopped(&mut row, stopped), None);
-        }
-        let result = client.send(req, target).await;
+        let result = match by.and_then(|(_, ruled)| ruled.stopped.as_ref()) {
+            Some(stopped) => match stopped.exchange(&row.target, row.request.clone()) {
+                Some(ex) => Ok(ex),
+                None => {
+                    let why = stopped.message();
+                    row.failed(&why);
+                    return (Some(row.id), Err(Error::Blocked(why)), None);
+                }
+            },
+            None => client.send(req, target).await,
+        };
         let mut ruled = None;
         match &result {
             Ok(ex) => {
@@ -458,17 +466,6 @@ impl Rows {
             Err(e) => row.failed(&e.to_string()),
         }
         (Some(row.id), result, ruled)
-    }
-
-    /// Completes `row`, for a request a request rule's script stopped, with what the script did.
-    fn stopped(&self, row: &mut OpenRow, stopped: &crate::rules::Stopped) -> Result<Exchange> {
-        let Some(ex) = stopped.exchange(&row.target, row.request.clone()) else {
-            let why = stopped.message();
-            row.failed(&why);
-            return Err(Error::Blocked(why));
-        };
-        row.answered(&ex);
-        Ok(ex)
     }
 
     /// [`Rows::send_as`] with `session` if there is one, else [`Rows::send`] with `client`.
