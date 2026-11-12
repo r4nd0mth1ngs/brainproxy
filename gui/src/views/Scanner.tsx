@@ -6,6 +6,7 @@ import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { useActions } from "../ui/useActions.ts";
+import { subTabActions } from "../nav";
 import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 import { ScanPolicies, usePolicies } from "./ScanPolicies";
 import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
@@ -83,22 +84,10 @@ export function ScannerView({ active }: { active: boolean }) {
   };
 
   useActions(
-    (
-      [
-        ["tasks", "Tasks"],
-        ["new", "New scan"],
-        ["rules", "Rules"],
-        ["policies", "Policies"],
-      ] as const
-    ).map(([id, label]) => ({
-      id: `go.scanner.${id}`,
-      title: `Scans › ${label}`,
-      group: "Go to",
-      run: () => {
-        app.setTab("scanner");
-        setSub(id);
-      },
-    })),
+    subTabActions("scanner", "Scans", [["tasks", "Tasks"], ["new", "New scan"], ["rules", "Rules"], ["policies", "Policies"]] as const, (s) => {
+      app.setTab("scanner");
+      setSub(s);
+    }),
   );
 
   // A job another tool started and asked to show (Traffic's Scan this request).

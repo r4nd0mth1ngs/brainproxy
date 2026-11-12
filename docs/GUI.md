@@ -173,8 +173,11 @@ and Settings section, and Recent projects (opening one asks what Switch project 
 once the palette has closed, through the same function as its button, so its questions still come up.
 A single window keydown handler (`useShortcuts`) runs the bound action for the view that shows, a view's
 own before a global one; it does nothing while a modal dialog is open, for a key held down, while
-composing (IME), or while typing in a text field unless the action is meant to run there and the chord
-holds Mod, Ctrl or Alt (`mayRunWhileTyping`). The editor's encode/decode and the cURL dialog's open are
+composing (IME), while a right-click menu is open, or while typing in a text field unless the action is
+meant to run there (`typing`: any field, or `"editor"`: only a multi-line editor, as Forward) and the
+chord holds Mod, Ctrl or Alt (`mayRunWhileTyping`). Replay's Send and Stop are defined hidden
+(`define`) and each HTTP tab adds the live ones, so Settings lists them with no tab open; views tell the
+palette when an action's title or state changes (`actionsChanged`). The editor's encode/decode and the cURL dialog's open are
 defined in the registry (`define`) and matched where they happen (`matches`). Chords are written
 `Mod+Shift+K`, Mod being ⌘ on macOS and Ctrl elsewhere (Ctrl is the Control key on macOS only);
 letters, digits and punctuation are named by `KeyboardEvent.code`, AltGr and the Windows/Super key

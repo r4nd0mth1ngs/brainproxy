@@ -22,7 +22,7 @@ import { SideBrand } from "./ui/Brand";
 import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
-import { Welcome, recent, remember, saveTempAs } from "./views/Welcome";
+import { FILTERS, Welcome, recent, remember, saveTempAs } from "./views/Welcome";
 import { NAV, SETTINGS_NAV, type NavItem } from "./nav";
 import { bindingOf, initBindings, type Action } from "./ui/actions.ts";
 import { formatChord, isMac } from "./ui/chords.ts";
@@ -340,9 +340,11 @@ function Shell({ onClose, onOpen, toggleTheme }: { onClose: () => Promise<void>;
   };
   const openProject = async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
-    const p = await dialog.open({ filters: [{ name: "brainproxy project", extensions: ["bpdb"] }], multiple: false });
+    const p = await dialog.open({ filters: FILTERS, multiple: false });
     if (typeof p === "string") switchTo(p);
   };
+  // Recent changes only when a project opens, so read once for this one.
+  const recents = useMemo(() => recent().filter((p) => p !== app.project), [app.project]);
   const goTo = (t: NavItem): Action => ({ id: `go.${t.id}`, title: t.label, group: "Go to", keys: t.keys, run: () => app.setTab(t.id) });
   useActions([
     { id: "app.palette", title: "Open the command palette", group: "App", keys: "Mod+K", typing: true, noPalette: true, run: () => setPalette(true) },
@@ -363,9 +365,7 @@ function Shell({ onClose, onOpen, toggleTheme }: { onClose: () => Promise<void>;
     { id: "project.switch", title: "Switch project", group: "Project", keywords: "close welcome", run: () => leave() },
     { id: "project.open", title: "Open a project file…", group: "Project", keywords: "bpdb browse", hidden: !inTauri, run: openProject },
     { id: "project.saveAs", title: "Save the temporary engagement as…", group: "Project", keywords: "save file", hidden: !app.temp, run: save },
-    ...recent()
-      .filter((p) => p !== app.project)
-      .map((p) => ({ id: `project.recent.${p}`, title: `Open ${baseName(p)}`, group: "Recent projects", keywords: p, unbindable: true, run: () => switchTo(p) })),
+    ...recents.map((p) => ({ id: `project.recent.${p}`, title: `Open ${baseName(p)}`, group: "Recent projects", keywords: p, unbindable: true, run: () => switchTo(p) })),
   ]);
 
   const overrides = useOverrides();

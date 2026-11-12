@@ -25,8 +25,11 @@ export interface ActionDef {
   /** The default chord ("Mod+Enter"), if it has one. */
   keys?: string;
   where?: Where;
-  /** Runs while typing in a text field too (only with Mod, Ctrl or Alt held). */
-  typing?: boolean;
+  /**
+   * Runs while typing too (only with Mod, Ctrl or Alt held): true in any text field, "editor"
+   * only in a multi-line editor (a message), not in a one-line box such as a filter.
+   */
+  typing?: boolean | "editor";
   /** Left out of the palette (it needs a place: the editor's selection, an open dialog). */
   noPalette?: boolean;
   /** Left out of Settings › Keyboard and never bound (a Recent project, ...). */
@@ -71,8 +74,12 @@ export function register(list: { id: string; get: () => Action }[]): () => void 
   };
 }
 
-/** Defines actions that are matched where they happen, listed whatever is mounted. */
-export function define(defs: ActionDef[]): void {
+/**
+ * Defines actions listed whatever is mounted: ones matched where they happen, and the base of
+ * ones a component adds while mounted (hidden until it does, so Settings › Keyboard still lists
+ * them and finds their conflicts).
+ */
+export function define(defs: Action[]): void {
   register(defs.map((d) => ({ id: d.id, get: () => d })));
 }
 
@@ -82,6 +89,9 @@ export function actions(): Action[] {
 }
 
 export const actionsVersion = () => version;
+
+/** Tells the palette and Settings that an action's title or state changed. */
+export const actionsChanged = changed;
 export function subscribeActions(l: () => void): () => void {
   listeners.add(l);
   return () => listeners.delete(l);
@@ -231,6 +241,11 @@ export interface Target {
 /** Input types that take typed text (not checkboxes, buttons, ...). */
 const TEXT_INPUTS = new Set(["", "text", "search", "url", "email", "password", "number", "tel", "date", "datetime-local", "month", "week", "time"]);
 
+/** Whether a key press on `t` is in a multi-line editor: a text area or editable text. */
+export function inEditor(t: Target | null | undefined): boolean {
+  return !!t && (!!t.isContentEditable || (t.tagName ?? "").toUpperCase() === "TEXTAREA");
+}
+
 /** Whether a key press on `t` is typing: in a text field, text area, list box or editable text. */
 export function isTyping(t: Target | null | undefined): boolean {
   if (!t) return false;
@@ -242,7 +257,8 @@ export function isTyping(t: Target | null | undefined): boolean {
 
 /** Whether `chord` may run `a` with focus on `t`: while typing only ones meant to, and only with a command modifier. */
 export function mayRunWhileTyping(a: ActionDef, chord: string, t: Target | null | undefined): boolean {
-  return !isTyping(t) || (!!a.typing && hasCommandModifier(chord));
+  if (!isTyping(t)) return true;
+  return hasCommandModifier(chord) && (a.typing === true || (a.typing === "editor" && inEditor(t)));
 }
 
 /**

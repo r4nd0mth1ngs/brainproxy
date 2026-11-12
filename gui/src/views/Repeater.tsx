@@ -7,6 +7,7 @@ import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { confirm } from "../ui/Confirm";
 import { useActions, useKeyLabel, withKey } from "../ui/useActions.ts";
+import { define } from "../ui/actions.ts";
 import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { activeLabels, curlOptions, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
 import {
@@ -176,6 +177,14 @@ export function RepeaterView() {
     </div>
   );
 }
+
+// Each HTTP tab adds these while it shows; listed (hidden) without one, for Settings › Keyboard.
+const SEND = { id: "replay.send", title: "Send the request", group: "Replay", where: "repeater", keys: "Mod+Enter", typing: true } as const;
+const STOP = { id: "replay.stop", title: "Stop waiting for the response", group: "Replay", where: "repeater" } as const;
+define([
+  { ...SEND, hidden: true },
+  { ...STOP, hidden: true },
+]);
 
 const AUTO_ENCODE = "repeater-auto-encode";
 const RACE_COUNT = "repeater-race-count";
@@ -376,12 +385,10 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
   // Only while Replay shows (its where), and in the editor too.
   const sendKey = useKeyLabel("replay.send");
   useActions([
-    { id: "replay.send", title: "Send the request", group: "Replay", where: "repeater", keys: "Mod+Enter", typing: true, disabled: busy ? "Sending…" : false, run: send },
+    { ...SEND, disabled: busy ? "Sending…" : false, run: send },
     {
-      id: "replay.stop",
-      title: racing ? "Stop the race" : "Stop waiting for the response",
-      group: "Replay",
-      where: "repeater",
+      ...STOP,
+      title: racing ? "Stop the race" : STOP.title,
       disabled: busy ? false : "Nothing is being sent",
       run: () => stopCall(tab.key, cancelCli),
     },

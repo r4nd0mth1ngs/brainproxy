@@ -12,6 +12,7 @@ import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { useActions } from "../ui/useActions.ts";
+import { subTabActions } from "../nav";
 
 const M = "§";
 
@@ -143,21 +144,10 @@ export function FuzzerView() {
   };
 
   useActions(
-    (
-      [
-        ["attack", "Attack"],
-        ["results", "Results"],
-        ["runs", "Runs"],
-      ] as const
-    ).map(([id, label]) => ({
-      id: `go.fuzzer.${id}`,
-      title: `Fuzzer › ${label}`,
-      group: "Go to",
-      run: () => {
-        app.setTab("fuzzer");
-        setSub(id);
-      },
-    })),
+    subTabActions("fuzzer", "Fuzzer", [["attack", "Attack"], ["results", "Results"], ["runs", "Runs"]] as const, (s) => {
+      app.setTab("fuzzer");
+      setSub(s);
+    }),
   );
   return (
     <div className="col fill">

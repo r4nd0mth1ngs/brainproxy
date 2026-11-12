@@ -8,6 +8,7 @@ import {
   clashes,
   conflicts,
   define,
+  inEditor,
   isTyping,
   loadOverrides,
   matches,
@@ -215,6 +216,30 @@ test("while typing, only actions meant to run there do, and only with a command 
   assert.equal(mayRunWhileTyping(send, "G", field), false);
   assert.equal(mayRunWhileTyping(send, "Shift+G", field), false);
   assert.equal(mayRunWhileTyping(send, "G", { tagName: "DIV" }), true);
+});
+
+test("an editor-only action runs while editing a message, not in a one-line box", () => {
+  const forward = def("forward", { typing: "editor" });
+  assert.equal(inEditor({ tagName: "TEXTAREA" }), true);
+  assert.equal(inEditor({ tagName: "INPUT", type: "text" }), false);
+  assert.equal(mayRunWhileTyping(forward, "Mod+F", { tagName: "TEXTAREA" }), true);
+  assert.equal(mayRunWhileTyping(forward, "Mod+F", { tagName: "DIV", isContentEditable: true }), true);
+  // The intercept filter box: Ctrl+F there doesn't forward the held request.
+  assert.equal(mayRunWhileTyping(forward, "Mod+F", { tagName: "INPUT", type: "text" }), false);
+  assert.equal(mayRunWhileTyping(forward, "Mod+F", { tagName: "BUTTON" }), true);
+});
+
+test("a defined base stays listed, hidden, while no component adds the action", () => {
+  define([{ ...def("t.base", { keys: "Mod+Enter", where: "repeater", typing: true }), hidden: true }]);
+  const body = { tagName: "BODY" };
+  assert.equal(actions().find((a) => a.id === "t.base")?.hidden, true);
+  assert.equal(actionFor(actions(), {}, "Mod+Enter", "repeater", body)?.id ?? null, null);
+  let sent = 0;
+  const undo = register([{ id: "t.base", get: () => ({ ...def("t.base", { keys: "Mod+Enter", where: "repeater", typing: true }), run: () => sent++ }) }]);
+  actionFor(actions(), {}, "Mod+Enter", "repeater", body)?.run?.();
+  assert.equal(sent, 1);
+  undo();
+  assert.equal(actions().find((a) => a.id === "t.base")?.hidden, true);
 });
 
 test("a key press runs the action for the view that shows, its own before a global one", () => {

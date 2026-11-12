@@ -1,6 +1,7 @@
 // The app's views as the sidebar lists them, with their default Go to shortcuts.
 
 import type { Tab } from "./store";
+import type { Action } from "./ui/actions.ts";
 
 export interface NavItem {
   id: Tab;
@@ -54,4 +55,9 @@ export function whereLabel(where: string | undefined): string {
   if (where === "dialog") return "In a dialog";
   const item = [...NAV.flatMap((g) => g.items), SETTINGS_NAV].find((i) => i.id === where);
   return `In ${item?.label ?? where}`;
+}
+
+/** Go to each of a view's sub-tabs (`show` opens the view on it), for the palette. */
+export function subTabActions<S extends string>(tab: Tab, label: string, subs: readonly (readonly [S, string])[], show: (sub: S) => void): Action[] {
+  return subs.map(([id, sub]) => ({ id: `go.${tab}.${id}`, title: `${label} › ${sub}`, group: "Go to", run: () => show(id) }));
 }

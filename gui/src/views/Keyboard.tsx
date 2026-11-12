@@ -98,7 +98,7 @@ export function Keyboard() {
                   <div key={a.id} className="keys-row" role="listitem">
                     <div className="keys-what">
                       <span>{a.title}</span>
-                      <span className="muted small">{whereLabel(a.where)}{a.typing ? ", also while typing" : ""}</span>
+                      <span className="muted small">{whereLabel(a.where)}{a.typing === "editor" ? ", also while editing a message" : a.typing ? ", also while typing" : ""}</span>
                       {others && <span className="keys-clash small">Also the shortcut of {others.map(titleOf).join(", ")}: only one runs.</span>}
                       {problem?.id === a.id && <span className="keys-clash small">{problem.text}</span>}
                       {pending?.id === a.id && (

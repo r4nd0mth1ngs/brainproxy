@@ -9,6 +9,7 @@ import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { useActions } from "../ui/useActions.ts";
+import { subTabActions } from "../nav";
 import {
   appliedSaved,
   clearLocalSaved,
@@ -60,22 +61,10 @@ export function ProxyView() {
     if (app.traffic) setSub("history");
   }, [app.traffic]);
   useActions(
-    (
-      [
-        ["intercept", "Intercept"],
-        ["history", "Traffic"],
-        ["ws", "WebSockets"],
-        ["sse", "Event streams"],
-      ] as const
-    ).map(([id, label]) => ({
-      id: `go.proxy.${id}`,
-      title: `Proxy › ${label}`,
-      group: "Go to",
-      run: () => {
-        app.setTab("proxy");
-        setSub(id);
-      },
-    })),
+    subTabActions("proxy", "Proxy", [["intercept", "Intercept"], ["history", "Traffic"], ["ws", "WebSockets"], ["sse", "Event streams"]] as const, (s) => {
+      app.setTab("proxy");
+      setSub(s);
+    }),
   );
   return (
     <div className="col fill">
@@ -846,7 +835,7 @@ function Intercept({ active }: { active: boolean }) {
       // On the settings as they are when it runs, polled or not.
       run: () => toggle((c) => ({ enabled: !c.enabled, requests: c.enabled ? c.requests : c.requests || !(c.responses || c.ws_to_server || c.ws_to_client) })),
     },
-    { id: "proxy.intercept.forward", title: "Forward the held message", group: "Proxy", where: "proxy", keys: "Mod+F", typing: true, hidden: !active, disabled: nothingHeld, run: () => decide("forward") },
+    { id: "proxy.intercept.forward", title: "Forward the held message", group: "Proxy", where: "proxy", keys: "Mod+F", typing: "editor", hidden: !active, disabled: nothingHeld, run: () => decide("forward") },
     { id: "proxy.intercept.drop", title: "Drop the held message", group: "Proxy", where: "proxy", hidden: !active, disabled: nothingHeld, run: () => decide("drop") },
     {
       id: "proxy.intercept.replay",

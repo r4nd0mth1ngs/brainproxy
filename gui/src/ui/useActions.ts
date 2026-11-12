@@ -2,7 +2,7 @@
 // the window's key presses run the bound ones.
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { actionFor, actions, actionsVersion, bindingOf, currentOverrides, register, subscribeActions, subscribeBindings, type Action, type Overrides } from "./actions.ts";
+import { actionFor, actions, actionsChanged, actionsVersion, bindingOf, currentOverrides, register, subscribeActions, subscribeBindings, type Action, type Overrides } from "./actions.ts";
 import { chordOf, formatChord, isMac } from "./chords.ts";
 
 /**
@@ -14,6 +14,14 @@ export function useActions(list: Action[]): void {
   const ref = useRef(list);
   ref.current = list;
   const ids = list.map((a) => a.id).join("\n");
+  // What the palette and Settings show of them: when it changes, they show it again.
+  const shown = JSON.stringify(list.map((a) => [a.title, a.disabled, a.hidden]));
+  const lastShown = useRef(shown);
+  useEffect(() => {
+    if (shown === lastShown.current) return;
+    lastShown.current = shown;
+    actionsChanged();
+  }, [shown]);
   useEffect(() => {
     if (!ids) return;
     return register(
@@ -37,8 +45,8 @@ export function useOverrides(): Overrides {
   return useSyncExternalStore(subscribeBindings, currentOverrides);
 }
 
-/** Whether a modal dialog is open (the palette, a confirmation, ...): shortcuts wait for it to close. */
-const dialogOpen = () => typeof document !== "undefined" && !!document.querySelector('[aria-modal="true"]');
+/** Whether a modal dialog (the palette, a confirmation, ...) or a right-click menu is open: shortcuts wait for it to close. */
+const dialogOpen = () => typeof document !== "undefined" && !!document.querySelector('[aria-modal="true"], .menu');
 
 /**
  * Runs the action bound to each key press in the window, for the view that shows. A press
