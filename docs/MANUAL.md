@@ -1316,7 +1316,8 @@ brainproxy intercept enable --method POST --filter 'req.body~"(?i)role"'   # all
 ```
 
 - A held request is matched by itself, as it would go out (after match-and-replace rules and
-  the auth session); a held response by the request that was sent and the response the client
+  the auth session; one forwarded edited goes through the request rules' scripts again, see
+  *Edited in intercept* under Match-and-replace rules); a held response by the request that was sent and the response the client
   would get (after response rules); a WebSocket message by its connection's handshake request.
   An HTTP/2 request is matched in the form it is held in (its headers as the client sent them),
   before it is turned into HTTP/1.1 for an origin that doesn't speak HTTP/2, so a header that
@@ -1491,6 +1492,15 @@ the order they are listed among themselves, whatever place they have in the list
 added later can't change what a script let through (a `path` rule making `/admin` of `/safe`
 is applied before the script that blocks `/admin`, which then blocks it). Nothing is sent for a blocked or
 answered request: no connection is opened, as if the engine had never got to it.
+
+**Edited in intercept.** The proxy holds a request in intercept after its rules ran. Forwarded
+as held, it goes out as the script let it through. Forwarded edited (`intercept forward --file`,
+MCP's `intercept_forward`, the app's intercept editor), it goes through the request rules'
+scripts again, as edited, before anything is sent: an edit that turns an allowed `/safe` into
+a blocked `/admin` is blocked (the client gets the 403 any blocked request gets, and the row
+says so), one the script answers gets the script's answer, and one it rewrites goes out
+rewritten. Only the request rules run again: the other request rules (path, header, body and
+the rest) had their turn before it was held, and aren't applied to the edit a second time.
 
 **Which requests it sees.** Only those of the engines its `--applies-to` lists, as for every
 rule: `proxy` (in-scope requests the proxy relays, the browser brainproxy starts included),

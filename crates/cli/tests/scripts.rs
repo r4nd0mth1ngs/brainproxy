@@ -1001,3 +1001,120 @@ fn an_api_scan_attacks_from_the_request_before_the_script() {
     assert!(got.iter().any(|l| l.starts_with("GET /prefix/item")), "{got:?}");
     assert!(!got.iter().any(|l| l.contains("/prefix/prefix")), "{got:?}");
 }
+
+/// A target that answers `200 OK` with the request it got as the body, and keeps each request
+/// line it got.
+fn recording() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = lines.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 16384];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(line);
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&buf[..len]);
+            });
+        }
+    });
+    (port, lines)
+}
+
+/// Blocks `/admin`, answers `/answered`, and marks every other request with one more `x` in
+/// `X-Runs` each time it sees it.
+const GATE: &str = "function request(req) {
+    if (req.path.startsWith('/admin')) return { block: 'no admin' };
+    if (req.path.startsWith('/answered')) return { response: { status: 200, body: 'from the script' } };
+    const runs = req.headers.find(h => h[0] === 'X-Runs');
+    const rest = req.headers.filter(h => h[0] !== 'X-Runs');
+    return { request: { ...req, headers: rest.concat([['X-Runs', runs ? runs[1] + ' x' : 'x']]) } };
+}";
+
+#[test]
+fn a_request_edited_in_intercept_goes_through_the_request_scripts_again() {
+    let (port, lines) = recording();
+    let env = Env::new("intercept-rescript");
+    let script = env.script("gate.js", GATE);
+    env.ok(&["rules", "add", "--location", "request", "--script", &script]);
+    // A plain rule had its turn before the request was held: it isn't applied again to the edit.
+    env.ok(&["rules", "add", "--location", "request-header", "--name", "X-Plain", "--action", "add", "--replace", "1"]);
+    env.ok(&["intercept", "enable", "--timeout", "30"]);
+    let listen = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["listen"].as_str().unwrap().to_string();
+    wait_for_settings();
+    let agent = [(MCP, "1")];
+
+    // Held as the rules left it, then forwarded by `forward` (edit in hand, or none).
+    let held_then = |path: &str, forward: &dyn Fn(&str, &str)| {
+        let (listen, target) = (listen.clone(), path.to_string());
+        let client = std::thread::spawn(move || through(&listen, port, &target, ""));
+        let listed = env.ok(&["intercept", "list", "--wait", "10"]);
+        assert_eq!(listed["count"], 1, "{listed}");
+        let id = listed["items"][0]["id"].as_i64().unwrap().to_string();
+        let held = env.ok(&["intercept", "show", &id])["message"]["content"].as_str().unwrap().to_string();
+        assert!(held.contains("\r\nX-Runs: x\r\n") && held.contains("\r\nX-Plain: 1\r\n"), "{held}");
+        forward(&id, &held);
+        client.join().unwrap()
+    };
+
+    // An agent turns the allowed /safe into /admin: the script blocks it, and nothing is sent.
+    let resp = held_then("/safe", &|id, held| {
+        let edit = held.replace("GET /safe", "GET /admin");
+        let (code, v) = env.run_as(&agent, &["intercept", "forward", id, "--file", "-"], Some(edit.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+    });
+    assert!(resp.starts_with("HTTP/1.1 403 Forbidden\r\n") && resp.contains("X-Brainproxy-Error: blocked"), "{resp}");
+    assert!(resp.contains("blocked by the script of match-and-replace rule 1: no admin"), "{resp}");
+    env.wait_rows("SELECT count(*) FROM history WHERE source = 'proxy'", 1);
+    let rows = env.rows("SELECT path, status, error, edited_by FROM history WHERE source = 'proxy' ORDER BY id");
+    assert_eq!((rows[0][0].as_str(), &rows[0][1]), (Some("/admin"), &Value::Null), "{rows:?}");
+    assert!(rows[0][2].as_str().unwrap().contains("no admin"), "{rows:?}");
+    let by: Value = serde_json::from_str(rows[0][3].as_str().unwrap()).unwrap();
+    let by = by.as_array().unwrap();
+    assert!(by.iter().any(|e| e["by"] == "mcp" && e["intercept"].is_number()), "{by:?}");
+    assert_eq!(by.last().unwrap()["outcome"], "blocked", "{by:?}");
+
+    // Edited to /answered: the client gets the script's answer, and the row says so.
+    let resp = held_then("/safe", &|id, held| {
+        let edit = env.dir.join("answered.http");
+        std::fs::write(&edit, held.replace("GET /safe", "GET /answered")).unwrap();
+        env.ok(&["intercept", "forward", id, "--file", edit.to_str().unwrap()]);
+    });
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.ends_with("from the script"), "{resp}");
+    assert!(resp.contains("X-Brainproxy-Answer: rule 1"), "{resp}");
+    env.wait_rows("SELECT count(*) FROM history WHERE source = 'proxy'", 2);
+    let by = env.rows("SELECT edited_by FROM history WHERE source = 'proxy' ORDER BY id DESC LIMIT 1");
+    let by: Value = serde_json::from_str(by[0][0].as_str().unwrap()).unwrap();
+    assert_eq!(by.as_array().unwrap().last().unwrap()["outcome"], "answered", "{by}");
+    assert!(lines.lock().unwrap().is_empty(), "the target was reached: {:?}", lines.lock().unwrap());
+
+    // Edited to /other, which the script allows: sent as the script left it (it saw the edit),
+    // and the plain rule isn't applied a second time.
+    let resp = held_then("/safe", &|id, held| {
+        let edit = held.replace("GET /safe", "GET /other");
+        let (code, v) = env.run_as(&agent, &["intercept", "forward", id, "--file", "-"], Some(edit.as_bytes()));
+        assert_eq!(code, 0, "{v}");
+    });
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(resp.contains("GET /other HTTP/1.1\r\n") && resp.contains("\r\nX-Runs: x x\r\n"), "{resp}");
+    assert_eq!(resp.matches("X-Plain: 1").count(), 1, "{resp}");
+
+    // Forwarded as held: the script has seen it already, and isn't run again.
+    let resp = held_then("/safe", &|id, _| {
+        env.ok(&["intercept", "forward", id]);
+    });
+    assert!(resp.contains("GET /safe HTTP/1.1\r\n") && resp.contains("\r\nX-Runs: x\r\n"), "{resp}");
+    assert_eq!(*lines.lock().unwrap(), ["GET /other HTTP/1.1", "GET /safe HTTP/1.1"]);
+}

@@ -50,7 +50,7 @@ use crate::proxy::config::{
     RULES_KEY, SCOPE_KEY,
 };
 use crate::proxy::h2 as h2p;
-use crate::rules::{Engine, RuleSet};
+use crate::rules::{Engine, RuleSet, Stopped};
 use crate::session::Tool;
 use crate::sse::db::SseRecord;
 use crate::store::Store;
@@ -1290,44 +1290,22 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     if in_scope {
         let ruled = live.rules.request(Engine::Proxy, &target.host, request);
         live.rule_failures.note(Engine::Proxy, &ruled.failed);
-        // A request rule's script blocked or answered it: nothing is sent and no connection is
-        // opened, no session applied, and the request isn't held in intercept. The row says what
-        // the script did. An answer is taken as a server's response would be: through the
-        // response rules and the response intercept (passive checks read it too, and say what
-        // they find there is the script's), but it isn't handed to live access-control testing.
+        // A request rule's script blocked or answered it: it isn't sent, nor held in intercept.
         if let Some(stopped) = &ruled.stopped {
             let (edited_by, original_request) = (ruled.edits(), ruled.original.clone());
-            let Some(answer) = stopped.answer() else {
-                let msg = stopped.message();
-                let c = row(target, &ruled.bytes, None, None, Some(&msg));
-                send_capture(ctx, Capture { edited_by, original_request, ..c }, None).await;
-                return Ok(Reply::Error(error_response(403, "blocked", &msg), false));
-            };
-            let sent = &ruled.bytes;
-            let answered = live.rules.response(Engine::Proxy, &target.host, sent, answer.to_vec());
-            live.rule_failures.note(Engine::Proxy, &answered.failed);
-            let mut c = Capture { edited_by, original_request, ..row(target, sent, Some(answer), Some(0), None) };
-            if answered.changed() {
-                c.modified_response = Some(answered.bytes.clone());
-                c.response_edits = answered.edits();
-            }
-            let method =
-                RawRequest::from_bytes(sent.clone()).head().map(|h| h.method).unwrap_or_else(|_| method.clone());
-            let held = live.intercept.matches(true, &method, &target.host, &path, || {
-                Cow::Owned(Capture::new("proxy", target, sent, Some(&answered.bytes), Some(0), None))
-            });
-            send_capture(ctx, c, None).await;
-            let mut response = answered.bytes;
-            if held {
-                let status = parse_response_head(&response).ok().map(|h| h.status);
-                match hold(ctx, &live.intercept, "response", &method, &url, status, response.clone()).await? {
-                    Some(released) => response = released.message,
-                    None => {
-                        return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true))
-                    }
-                }
-            }
-            return Ok(Reply::Response(response));
+            return stopped_reply(
+                ctx,
+                &live,
+                target,
+                &row,
+                stopped,
+                &ruled.bytes,
+                edited_by,
+                original_request,
+                &url,
+                &path,
+            )
+            .await;
         }
         // An agent's rule that brings in a Host the scope doesn't list, unless it was saved as a
         // Host-header test, isn't sent: a shared front end may route the request to another site.
@@ -1355,8 +1333,37 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         if live.intercept.matches(false, &method, &target.host, &path, exchange) {
             match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
                 Some(released) => {
+                    let edited = released.edit.is_some();
                     request = released.message;
                     edited_by.extend(released.edit);
+                    // An edited request goes through the request rules' scripts again, as edited:
+                    // what they let through is what is sent. The other rules had their turn
+                    // before it was held; applied again they would undo or repeat the edit.
+                    // Forwarded as held, it has been through them already.
+                    let scripted = edited.then(|| live.rules.scripted(Engine::Proxy, &target.host, request.clone()));
+                    if let Some(scripted) = scripted.flatten() {
+                        live.rule_failures.note(Engine::Proxy, &scripted.failed);
+                        let by = [edited_by.clone(), scripted.edits()].concat();
+                        // The request as the client sent it, when a rule changed it; else, the
+                        // edit as the script was given it.
+                        let original = original_request.clone().or_else(|| scripted.original.clone());
+                        if let Some(stopped) = &scripted.stopped {
+                            let sent = &scripted.bytes;
+                            return stopped_reply(ctx, &live, target, &row, stopped, sent, by, original, &url, &path)
+                                .await;
+                        }
+                        if let Some(host) = scripted.agent_host(ctx.client.options(), target) {
+                            let msg = format!("out of scope: {}", scripted.host_refusal(&host));
+                            let c = row(target, &scripted.bytes, None, None, Some(&msg));
+                            let c = Capture { edited_by: by, original_request: original, ..c };
+                            send_capture(ctx, c, None).await;
+                            return Ok(Reply::Error(error_response(502, "out_of_scope", &msg), false));
+                        }
+                        if scripted.changed() {
+                            (edited_by, original_request) = (by, original);
+                            request = scripted.bytes;
+                        }
+                    }
                 }
                 None => {
                     return Ok(Reply::Error(error_response(502, "dropped", "request dropped by brainproxy"), false))
@@ -1834,6 +1841,57 @@ async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, 
         return Ok(Upstream { conn: None, sent: request, response, body: LiveBody::of(conn) });
     }
     Ok(Upstream { conn: Some(conn), sent: request, response, body: None })
+}
+
+/// A history row for an exchange: target, request, response, time taken, error.
+type Row<'a> = dyn Fn(&Target, &[u8], Option<&[u8]>, Option<i64>, Option<&str>) -> Capture + Sync + 'a;
+
+/// What the client gets for a request a request rule's script `stopped`, and its row: nothing
+/// is sent and no connection is opened, no session applied, and the request isn't held in
+/// intercept. The row says what the script did. An answer is taken as a server's response
+/// would be: through the response rules and the response intercept (passive checks read it
+/// too, and say what they find there is the script's), but it isn't handed to live
+/// access-control testing. `sent` is the request as the script saw it.
+#[allow(clippy::too_many_arguments)]
+async fn stopped_reply(
+    ctx: &Arc<Ctx>,
+    live: &Live,
+    target: &Target,
+    row: &Row<'_>,
+    stopped: &Stopped,
+    sent: &[u8],
+    edited_by: Vec<Edit>,
+    original_request: Option<Vec<u8>>,
+    url: &str,
+    path: &str,
+) -> Result<Reply> {
+    let Some(answer) = stopped.answer() else {
+        let msg = stopped.message();
+        let c = row(target, sent, None, None, Some(&msg));
+        send_capture(ctx, Capture { edited_by, original_request, ..c }, None).await;
+        return Ok(Reply::Error(error_response(403, "blocked", &msg), false));
+    };
+    let answered = live.rules.response(Engine::Proxy, &target.host, sent, answer.to_vec());
+    live.rule_failures.note(Engine::Proxy, &answered.failed);
+    let mut c = Capture { edited_by, original_request, ..row(target, sent, Some(answer), Some(0), None) };
+    if answered.changed() {
+        c.modified_response = Some(answered.bytes.clone());
+        c.response_edits = answered.edits();
+    }
+    let method = RawRequest::from_bytes(sent.to_vec()).head().map(|h| h.method).unwrap_or_default();
+    let held = live.intercept.matches(true, &method, &target.host, path, || {
+        Cow::Owned(Capture::new("proxy", target, sent, Some(&answered.bytes), Some(0), None))
+    });
+    send_capture(ctx, c, None).await;
+    let mut response = answered.bytes;
+    if held {
+        let status = parse_response_head(&response).ok().map(|h| h.status);
+        match hold(ctx, &live.intercept, "response", &method, url, status, response.clone()).await? {
+            Some(released) => response = released.message,
+            None => return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true)),
+        }
+    }
+    Ok(Reply::Response(response))
 }
 
 /// A row in the intercept queue that someone is waiting on. If the wait is abandoned (the

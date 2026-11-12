@@ -24,6 +24,9 @@
 //! Such a response says so in a header of its own ([`ANSWER_HEADER`]), which the script can't
 //! write or remove, and its history row says so in `edited_by` ([`Outcome::Answered`]). A
 //! script that fails sends the request as it was, as any failing replacer leaves its message.
+//! In the proxy, a request held in intercept and forwarded edited goes through the request
+//! rules' scripts again, as edited ([`RuleSet::scripted`]); the other rules aren't applied
+//! again, so a person's edit is sent as they made it unless a script says otherwise.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -1191,6 +1194,20 @@ impl RuleSet {
         Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) }
     }
 
+    /// `request` to `host` after the request rules alone (their scripts), none of the other
+    /// rules `engine` applies there: for a request the other rules have already had (or mustn't
+    /// have) their turn on, such as a scan's baseline or a held request someone edited in
+    /// intercept. None when no request rule applies there.
+    pub fn scripted(&self, engine: Engine, host: &str, request: Vec<u8>) -> Option<Ruled> {
+        let active: Vec<&CompiledRule> = self.active(engine, host, |l| l == RuleLocation::Request).collect();
+        if active.is_empty() {
+            return None;
+        }
+        let run = Run::new(engine, host);
+        let (bytes, by, stopped) = request_rules(&active, &request, &run);
+        Some(Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) })
+    }
+
     /// `response` from `host`, the answer to `request`, after the rules `engine` applies there.
     /// The request is read for its method only: the response to a `HEAD` has no body for a body
     /// rule to change (see [`response_rules`]). Empty when there is none to go by.
@@ -1288,14 +1305,7 @@ impl EngineRules {
     /// the other rules (a scan's baseline): what their scripts did with it (rewrote, blocked or
     /// answered it). None when no request rule applies there.
     pub fn scripted(&self, target: &Target, request: Vec<u8>) -> Option<Ruled> {
-        let active: Vec<&CompiledRule> =
-            self.set.active(self.engine, &target.host, |l| l == RuleLocation::Request).collect();
-        if active.is_empty() {
-            return None;
-        }
-        let run = Run::new(self.engine, &target.host);
-        let (bytes, by, stopped) = request_rules(&active, &request, &run);
-        let ruled = Ruled { stopped, ..Ruled::of(request, bytes, by, run.failed()) };
+        let ruled = self.set.scripted(self.engine, &target.host, request)?;
         self.failures.note(self.engine, &ruled.failed);
         Some(ruled)
     }

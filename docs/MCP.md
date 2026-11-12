@@ -147,7 +147,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
   may be what keeps requests from the target) can't be disabled, removed, cleared or replaced
   by `rules_import` with `replace`. Nor can a rule an agent adds change what such a script
   let through: request rules run after every other request rule of the engine, whatever their
-  place in the list. Under a person's request rule (`--location request`), an
+  place in the list. Nor can an edit: a request the proxy held that `intercept_forward` sends
+  on with a `file` goes through the request rules' scripts again, as edited, and is blocked,
+  answered or rewritten as any request would be (the other rules aren't applied again). Under a person's request rule (`--location request`), an
   agent's `send`, fuzz run or scan (the engines a rule's `applies_to` lists: `proxy`, `send`,
   `fuzz`, `scan`; no other tool applies match-and-replace rules, so the requests of
   `findings_retest`, `findings_verify`, `authz_run`, `crawl`, the `import_*` tools, `ws_send`, `oob_*`,
