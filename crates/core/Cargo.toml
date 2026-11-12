@@ -38,6 +38,11 @@ pem = "4.0.0"
 similar = "3.2.0"
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 h2 = "0.4"
+# HTTP/3: QUIC on the same rustls + ring as TCP. quinn never opens a socket of its own:
+# the client hands it a guarded one (see http/h3.rs).
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 http = "1"
 bytes = "1"
 boa_engine = { version = "0.22", default-features = false }

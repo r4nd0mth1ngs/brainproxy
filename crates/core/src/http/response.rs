@@ -24,8 +24,10 @@ impl ResponseHead {
 /// Parses the head of a raw response (everything up to the blank line).
 pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead> {
     let (head, _) = split_head_body(raw);
-    // HTTP/2 exchanges are recorded as `HTTP/2 <status>` (see http::h2).
-    let h2 = head.starts_with(b"HTTP/2 ");
+    // HTTP/2 and HTTP/3 exchanges are recorded as `HTTP/2 <status>` and `HTTP/3 <status>`
+    // (see http::h2 and http::h3).
+    let multiplexed = [b"HTTP/2 ".as_slice(), b"HTTP/3 "].into_iter().find(|v| head.starts_with(v));
+    let h2 = multiplexed.is_some();
     let rewritten;
     let head = if h2 {
         rewritten = [b"HTTP/1.1 ".as_slice(), &head[7..]].concat();
@@ -49,7 +51,10 @@ pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead> {
         Err(e) => return Err(Error::Protocol(format!("bad response head: {e}"))),
     }
     Ok(ResponseHead {
-        version: if h2 { "HTTP/2".into() } else { format!("HTTP/1.{}", resp.version.unwrap_or(1)) },
+        version: match multiplexed {
+            Some(v) => String::from_utf8_lossy(&v[..6]).into_owned(),
+            None => format!("HTTP/1.{}", resp.version.unwrap_or(1)),
+        },
         status: resp.code.unwrap_or(0),
         reason: resp.reason.unwrap_or("").to_string(),
         headers: resp
