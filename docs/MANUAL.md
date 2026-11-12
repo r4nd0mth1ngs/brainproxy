@@ -1744,7 +1744,10 @@ as the version (`GET /a HTTP/3`, `HTTP/3 200`), so the row says which protocol w
   endpoint. Nothing is sent twice: once a request has gone out over HTTP/3, a failure is an
   error, not a reason to send it again over TCP. The output's `http3_notes` (and stderr in text
   mode; a toast in Replay) say why HTTP/3 wasn't used, and which Alt-Svc endpoints the scope
-  refused.
+  refused. A request HTTP/3 can't carry (a method, request target, authority, header name or
+  value its encoding refuses, as for HTTP/2) is an error saying so, sent nowhere: it doesn't
+  fall back to TCP. Send it without `--http3` (and with a request line that doesn't say
+  `HTTP/3`) to send it as it is over HTTP/1.1.
 - **Not with `--race`.** A race goes over TCP (last-byte sync, or single-packet with `--http2`),
   so `send --race --http3` (and `--also`) is refused, and a race of a request whose line says
   `HTTP/3` sends it as HTTP/1.1 (HTTP/2 with `--http2`).
