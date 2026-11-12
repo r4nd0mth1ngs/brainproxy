@@ -15,6 +15,7 @@ import {
   importSummary,
   ruleEditNote,
   scriptName,
+  scriptStop,
   scriptQuestion,
   skippedReason,
   testArgs,
@@ -248,4 +249,36 @@ test("a rule's row says when its script last failed, and where", () => {
   assert.match(failureNote(scripted, [{ ...failure, engine: "ws-to-client" }])!, /in a WebSocket message to client,/);
   // An engine a newer build names is shown as it is named.
   assert.match(failureNote(scripted, [{ ...failure, engine: "crawl" }])!, /in the crawl,/);
+});
+
+test("a request rule is a script given the whole request: no match, no replacement", () => {
+  const draft: Draft = withLocation({ ...EMPTY_DRAFT, match: "x", replace: "y" }, "request");
+  assert.equal(draft.replacer, "script");
+  assert.equal(draftProblem(draft), "Choose the script file: it defines request(req, ctx).");
+  const ready = { ...draft, script: " /s/gate.js ", host: "app" };
+  assert.equal(draftProblem(ready), null);
+  assert.deepEqual(addArgs(ready), ["rules", "add", "--location=request", "--script=/s/gate.js", "--host=app"]);
+  assert.deepEqual(addArgs({ ...ready, appliesTo: ["proxy", "scan"] }).slice(-1), ["--applies-to=proxy,scan"]);
+  const rule: Rule = { id: 4, location: "request", pattern: "", replace: "", enabled: true, replacer: "script", script: { file: "/s/gate.js", sha256: "ab" } };
+  assert.equal(describeMatch(rule), "(the whole request)");
+  assert.equal(describeReplace(rule), "script gate.js");
+  assert.match(scriptQuestion("/s/gate.js", "request"), /block it, or answer it/);
+});
+
+test("a request a script stopped says so in the tester and on its history row", () => {
+  const answer = { encoding: "utf8" as const, content: "HTTP/1.1 200 OK\r\n\r\nhi" };
+  const tested: Tested = { changed: false, rules: [], result: { encoding: "utf8", content: "GET / HTTP/1.1" }, stopped: { rule: 0, outcome: "answered", response: answer } };
+  assert.equal(testedNote(tested), "Answered by this rule's script: nothing would be sent");
+  const sides = testedSides({ request: tested, host: "h", tried: [] });
+  assert.deepEqual(sides.map((s) => s.id), ["request", "answer"]);
+  assert.equal(testedNote(sides[1].tested), "The script's response, which the target never sent");
+  assert.equal(testedNote({ ...tested, stopped: { rule: 3, outcome: "blocked", reason: "no" } }), "Blocked by rule 3's script: nothing would be sent");
+
+  assert.equal(scriptStop([{ rule: 2 }]), null);
+  assert.equal(scriptStop([{ rule: 2 }, { rule: 5, outcome: "answered" }])?.rule, 5);
+  assert.equal(
+    ruleEditNote([{ rule: 2 }, { rule: 5, outcome: "answered" }]),
+    "Changed by match-and-replace rule 2. Answered by the script of rule 5: the response is the script's, the target sent nothing",
+  );
+  assert.equal(ruleEditNote([{ rule: 5, outcome: "blocked" }]), "Blocked by the script of rule 5: nothing was sent");
 });
