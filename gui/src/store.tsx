@@ -4,6 +4,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { cancelCli, run } from "./api";
 import type { FindingDraft } from "./views/manualFinding";
+import type { Mark } from "./views/payloadMarks";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
 import { clearReplayTabs } from "./views/replayCalls";
 import type { ReplayOptions } from "./views/replayOptions";
@@ -33,6 +34,10 @@ export interface Handoff {
   binary?: boolean;
   /** A WebSocket handshake: Replay opens it in WebSocket mode with these messages to send. */
   ws?: string[];
+  /** Parts of `raw` Replay highlights: a finding's payload (see payloadMarks.ts). */
+  marks?: Mark[];
+  /** The finding the request is the attack of: Replay can compare it with its baseline. */
+  finding?: number;
 }
 
 export interface RepeaterTab extends Handoff {

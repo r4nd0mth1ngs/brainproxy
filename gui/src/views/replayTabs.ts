@@ -5,6 +5,7 @@
 // elsewhere meanwhile (an agent's) are added to the app's rather than replaced.
 
 import type { RepeaterTab } from "../store";
+import { marksFromSaved, type Mark } from "./payloadMarks.ts";
 import { optionsFromSaved, savedOptions, type SavedOptions } from "./replayOptions.ts";
 
 /** One tab as `replay tabs save` takes it. */
@@ -20,6 +21,9 @@ export interface SavedTab {
   until?: string;
   /** How the tab sends; never Don't record (see savedOptions). */
   options?: SavedOptions;
+  /** HTTP tabs: the highlighted parts of the request, and the finding it came from. */
+  marks?: Mark[];
+  finding?: number;
 }
 
 export interface SavedTabs {
@@ -66,7 +70,14 @@ export function toSaved(tabs: RepeaterTab[], activeKey: number): SavedTabs {
         ...(t.wsUntil ? { until: t.wsUntil } : {}),
         ...opts(savedOptions(t.options, "ws")),
       };
-    return { kind: "http", ...base, ...(t.binary ? { binary: true } : {}), ...opts(savedOptions(t.options, "http")) };
+    return {
+      kind: "http",
+      ...base,
+      ...(t.binary ? { binary: true } : {}),
+      ...opts(savedOptions(t.options, "http")),
+      ...(t.marks?.length ? { marks: t.marks } : {}),
+      ...(t.finding != null ? { finding: t.finding } : {}),
+    };
   });
   const active = tabs.findIndex((t) => t.key === activeKey);
   return active >= 0 ? { tabs: saved, active } : { tabs: saved };
@@ -95,7 +106,12 @@ export function fromSaved(data: unknown, nextKey: () => number, firstNumber = 1)
       tab.ws = Array.isArray(t.messages) ? t.messages.filter((m): m is string => typeof m === "string") : [];
       if (typeof t.wait === "number" && t.wait >= 0 && t.wait <= MAX_WAIT) tab.wsWait = t.wait;
       if (t.until) tab.wsUntil = str(t.until);
-    } else if (t.binary === true) tab.binary = true;
+    } else {
+      if (t.binary === true) tab.binary = true;
+      const marks = marksFromSaved(t.marks);
+      if (marks) tab.marks = marks;
+      if (Number.isInteger(t.finding) && t.finding! > 0) tab.finding = t.finding;
+    }
     const options = optionsFromSaved(t.options, t.kind === "ws" ? "ws" : "http");
     if (options) tab.options = options;
     tabs.push(tab);

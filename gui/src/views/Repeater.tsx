@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { bodyText, cancelCli, isBinary, MAX_BODY, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { copyAsCurl, CurlDialog } from "../ui/CurlDialog";
 import { DataTable, type Column } from "../ui/DataTable";
-import { HttpView } from "../ui/HttpView";
+import { HttpView, normalize } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { confirm } from "../ui/Confirm";
 import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
@@ -35,6 +35,9 @@ import { draftFromRequest } from "./manualFinding";
 import { readSummary, type SseRead } from "./sse";
 import { BLANK_HANDSHAKE } from "./ws";
 import { WsReplayTab } from "./WebSockets";
+import { openVerifyDiff, verifyFinding } from "./PayloadCompare";
+import { markRanges } from "./payloadMarks.ts";
+import { verdictLine } from "./verifyFinding.ts";
 
 /** `stream` when the response was an event stream, read for a bounded time. */
 type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response"> & { stream?: SseRead | null };
@@ -254,6 +257,30 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
     if (endCall(key, id)) sentByTab.update(key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
   };
 
+  // A finding's payload, found again in the request as edited (payloadMarks.ts).
+  const ranges = useMemo(() => markRanges(normalize(raw), tab.marks), [raw, tab.marks]);
+
+  // A tab opened from a finding: the request the scan started from and this tab's request (as
+  // Send would send it) go out now, through `findings verify`, and their responses open in Diff.
+  const [comparing, setComparing] = useState(false);
+  const compare = async () => {
+    if (tab.finding == null) return;
+    const problem = optionsProblem(options);
+    if (problem) return app.toast(problem, "error");
+    const { text } = requestToSend(raw, { binary: tab.binary, autoEncode, options });
+    setComparing(true);
+    try {
+      const v = await verifyFinding(tab.finding, { stdin: textBytes(text, tab.binary), project });
+      if (!v) return;
+      app.toast(`Finding #${v.id}: ${verdictLine(v)}`);
+      await openVerifyDiff(app, v);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    } finally {
+      setComparing(false);
+    }
+  };
+
   // The request as Send would send it (auto URL-encoding, CRLF body), with the tab's options.
   const copyCurl = () => {
     const problem = optionsProblem(options);
@@ -453,6 +480,16 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
         <button className="btn" onClick={copyCurl} title="Copy this request as a curl command (POSIX shell)">
           Copy as cURL
         </button>
+        {tab.finding != null && (
+          <button
+            className="btn"
+            disabled={comparing}
+            onClick={compare}
+            title={`Send the request finding #${tab.finding}'s scan started from (without the payload) and this request, now, to the finding's target, and open both responses in Diff`}
+          >
+            {comparing ? "Comparing…" : "Compare with baseline"}
+          </button>
+        )}
         <OptionsToggle options={options} kind="http" open={showOptions} onToggle={() => setShowOptions(!showOptions)} controls={optionsId} />
         <div className="toolbar-end">
           {note && (
@@ -495,7 +532,7 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
       </div>
       {showOptions && <OptionsRow id={optionsId} options={options} set={setOptions} kind="http" binary={tab.binary} />}
       <Split id="repeater" dir="row">
-        <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} />
+        <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} ranges={ranges} />
         {raced ? (
           <Split id="repeater-race" dir="col" initial={0.35}>
             <DataTable

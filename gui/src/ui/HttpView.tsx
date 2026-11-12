@@ -24,43 +24,67 @@ function splitMessage(text: string): [string, string, string] {
   return i < 0 ? [text, "", ""] : [text.slice(0, i), "\n\n", text.slice(i + 2)];
 }
 
-function marks(text: string, query: string, key: string): ReactNode[] {
-  if (!query) return [text];
-  const out: ReactNode[] = [];
-  const lower = text.toLowerCase();
-  const q = query.toLowerCase();
-  let at = 0;
-  for (let i = lower.indexOf(q); i >= 0; i = lower.indexOf(q, i + q.length)) {
-    out.push(text.slice(at, i), <mark key={`${key}${i}`}>{text.slice(i, i + q.length)}</mark>);
-    at = i + q.length;
+type Range = [number, number];
+
+/**
+ * `text` with search matches marked, and the parts of `ranges` (offsets into the whole
+ * message; `text` starts at `offset`) marked as a payload. Marking only wraps text, so the
+ * editor's backdrop stays aligned with what is typed.
+ */
+function marks(text: string, query: string, key: string, offset = 0, ranges: Range[] = []): ReactNode[] {
+  const local = ranges.map(([s, e]): Range => [Math.max(s - offset, 0), Math.min(e - offset, text.length)]).filter(([s, e]) => s < e);
+  if (!query && !local.length) return [text];
+  const hits: Range[] = [];
+  if (query) {
+    const lower = text.toLowerCase();
+    const q = query.toLowerCase();
+    for (let i = lower.indexOf(q); i >= 0; i = lower.indexOf(q, i + q.length)) hits.push([i, i + q.length]);
   }
-  out.push(text.slice(at));
+  const cuts = [...new Set([0, text.length, ...hits.flat(), ...local.flat()])].sort((a, b) => a - b);
+  const out: ReactNode[] = [];
+  for (let i = 0; i + 1 < cuts.length; i++) {
+    const [a, b] = [cuts[i], cuts[i + 1]];
+    const piece = text.slice(a, b);
+    const hit = hits.some(([s, e]) => a >= s && b <= e);
+    const payload = local.some(([s, e]) => a >= s && b <= e);
+    if (!hit && !payload) out.push(piece);
+    else out.push(<mark key={`${key}${a}`} className={payload ? (hit ? "payload hit" : "payload") : undefined} title={payload ? "Payload" : undefined}>{piece}</mark>);
+  }
   return out;
 }
 
-/** Colors the start line and header names; marks search matches everywhere. */
-function highlight(text: string, query: string): ReactNode[] {
+/** Colors the start line and header names; marks search matches and `ranges` everywhere. */
+function highlight(text: string, query: string, ranges: Range[] = []): ReactNode[] {
   const [head, sep, body] = splitMessage(text);
   const lines = head.split("\n");
   const out: ReactNode[] = [];
+  let at = 0;
   lines.forEach((line, n) => {
     if (n > 0) out.push("\n");
+    const start = at;
+    at += line.length + 1;
     if (n === 0) {
       const m = /^(\S+)(\s+)(\S+)(.*)$/.exec(line);
       if (m && /^HTTP\//.test(m[1])) {
         const cls = Number(m[3]) >= 500 ? "s5" : Number(m[3]) >= 400 ? "s4" : Number(m[3]) >= 300 ? "s3" : "s2";
         out.push(<span key="v" className="h-ver">{m[1]}</span>, m[2], <span key="s" className={`h-status ${cls}`}>{m[3]}</span>, <span key="r" className="h-reason">{m[4]}</span>);
       } else if (m) {
-        out.push(<span key="m" className="h-method">{m[1]}</span>, m[2], <span key="u" className="h-url">{marks(m[3], query, "u")}</span>, <span key="v" className="h-ver">{m[4]}</span>);
-      } else out.push(...marks(line, query, `l${n}`));
+        const url = start + m[1].length + m[2].length;
+        out.push(
+          <span key="m" className="h-method">{marks(m[1], "", "m", start, ranges)}</span>,
+          m[2],
+          <span key="u" className="h-url">{marks(m[3], query, "u", url, ranges)}</span>,
+          <span key="v" className="h-ver">{marks(m[4], "", "w", url + m[3].length, ranges)}</span>,
+        );
+      } else out.push(...marks(line, query, `l${n}`, start, ranges));
       return;
     }
     const c = line.indexOf(":");
     if (c > 0) {
-      out.push(<span key={`h${n}`} className="h-name">{marks(line.slice(0, c), query, `n${n}`)}</span>, ":", <span key={`v${n}`} className="h-value">{marks(line.slice(c + 1), query, `v${n}`)}</span>);
-    } else out.push(...marks(line, query, `l${n}`));
+      out.push(<span key={`h${n}`} className="h-name">{marks(line.slice(0, c), query, `n${n}`, start, ranges)}</span>, ":", <span key={`v${n}`} className="h-value">{marks(line.slice(c + 1), query, `v${n}`, start + c + 1, ranges)}</span>);
+    } else out.push(...marks(line, query, `l${n}`, start, ranges));
   });
-  out.push(sep, <span key="body" className="h-body">{marks(body, query, "b")}</span>);
+  out.push(sep, <span key="body" className="h-body">{marks(body, query, "b", head.length + sep.length, ranges)}</span>);
   return out;
 }
 
@@ -113,6 +137,8 @@ export function HttpView(p: {
   highlight?: string;
   /** The text holds a binary body, one char per byte (see `bodyText`). */
   binary?: boolean;
+  /** Parts of the text (offsets with line breaks as \n) marked as a payload in the Raw view. */
+  ranges?: Range[];
 }) {
   const [mode, setMode] = useState<Mode>("raw");
   const [query, setQuery] = useState(p.highlight ?? "");
@@ -156,7 +182,9 @@ export function HttpView(p: {
     const from = at < VIEW_CAP / 2 ? 0 : body.lastIndexOf("\n", at - VIEW_CAP / 2) + 1;
     return { text: head + sep + body.slice(from, from + VIEW_CAP), hidden: body.length - VIEW_CAP };
   }, [shown, editable, all, query]);
-  const nodes = useMemo(() => (view === "hex" ? [hexdump(bytes)] : highlight(slice.text, query)), [view, slice, bytes, query]);
+  // Offsets are into the whole text as it is: not Pretty's, nor a slice of it.
+  const ranges = view === "raw" && slice.text === shown ? p.ranges : undefined;
+  const nodes = useMemo(() => (view === "hex" ? [hexdump(bytes)] : highlight(slice.text, query, ranges)), [view, slice, bytes, query, ranges]);
   const hits = useMemo(() => {
     if (!query) return 0;
     const l = shown.toLowerCase();

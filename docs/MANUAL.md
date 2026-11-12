@@ -593,10 +593,18 @@ Edit a raw request and send it as often as you like, in separate tabs.
   **Don't record** on, only the handshake gets a row, without its content. Their Options are
   SNI, Timeout, Verify TLS and Don't record. **Stop** ends a run early; what it sent may
   already have reached the server, and history keeps what was recorded up to then.
+- **From a finding:** *Send to Replay* in Findings opens the attack with its payload
+  highlighted: what the attack changed against the request the scan started from, or, for a
+  finding without one, the payload as typed, percent-encoded or JSON-escaped. Editing keeps
+  the highlight on the payload's text wherever it moves, and drops it once that text is
+  gone. **Compare with baseline** sends the request the scan started from and the tab's
+  request (as Send would send it) to the finding's target, says what differs, and opens both
+  responses in Diff (`findings verify ID --request -`).
 - **Kept with the project:** open tabs are saved in the project file a moment after you
   change them and when you close it, and come back when you open it again (copies made with
   `project save` or *Save as…* have them too). A tab keeps its title, target, request (or
-  handshake and messages), Listen and Until, and its Options except **Don't record**, which
+  handshake and messages), Listen and Until, a finding's highlighted payload and the finding
+  it came from, and its Options except **Don't record**, which
   is chosen again each time (so a reopened tab, or one an agent prepared, never sends
   unrecorded); responses and the ‹ › send history are not kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
   (more than 500 tabs or 16 MB), the app says so and the tabs stay open; *Save as…* keeps

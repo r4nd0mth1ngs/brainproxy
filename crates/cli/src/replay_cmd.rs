@@ -25,6 +25,9 @@ const MAX_TABS: usize = 500;
 const MAX_TITLE: usize = 200;
 const MAX_TARGET: usize = 2048;
 const MAX_UNTIL: usize = 1000;
+/// Highlighted parts per tab, and the longest one: a finding's payload (the app's payloadMarks.ts).
+const MAX_MARKS: usize = 20;
+const MAX_MARK_TEXT: usize = 2000;
 /// Longest timeout a tab keeps, in seconds (a day), as the app allows.
 const MAX_TIMEOUT_SECS: f64 = 86400.0;
 
@@ -57,7 +60,9 @@ pub enum TabsCmd {
         kind is http (default) or ws; binary marks an http request held one character per byte; messages, \
         wait (seconds, at most 86400) and until (regex) are for ws tabs; options holds how a tab sends: \
         {\"http2\", \"verbatim\", \"crlfBody\" (http tabs), \"sni\", \"timeout\" (seconds, at most 86400), \
-        \"verifyTls\"}, never noStore; active is the index of the tab shown \
+        \"verifyTls\"}, never noStore; marks (http tabs, at most 20) are parts of the request the app \
+        highlights, [{\"at\": N, \"text\": \"...\"}] (at: where it started, in UTF-16 units with line breaks as \\n; the app finds the text again if it moved), and finding \
+        the id of the finding the request attacks, which the app compares with its baseline; active is the index of the tab shown \
         (with --append, among the tabs given). Text is stored as given, auth placeholders included: write \
         «auth:...» placeholders rather than live cookies or tokens. Responses are never stored. At most 500 tabs \
         and 16 MB. An empty list leaves no tabs. Through MCP only --append is allowed, so an agent can't remove \
@@ -103,6 +108,19 @@ struct Tab {
     /// How the tab sends (the app's Options), as `send` / `ws send` flags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     options: Option<TabOptions>,
+    /// Parts of the request the app highlights (a finding's payload), by text and where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marks: Option<Vec<Mark>>,
+    /// The finding the request is the attack of, which the app compares with its baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finding: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Mark {
+    at: usize,
+    text: String,
 }
 
 /// A tab's send options. Never Don't record (`--no-store`): a tab reopened, or prepared by an
@@ -321,6 +339,9 @@ fn parse(input: &[u8]) -> Result<Tabs, Error> {
                 return Err(bad("messages, wait and until are for WebSocket tabs (kind ws)".into()));
             }
             Kind::Ws if t.binary => return Err(bad("WebSocket tabs hold text only, not binary".into())),
+            Kind::Ws if t.marks.is_some() || t.finding.is_some() => {
+                return Err(bad("marks and finding are for http tabs".into()));
+            }
             _ => {}
         }
         // `ws send` holds the connection this long once someone presses Send.
@@ -332,6 +353,17 @@ fn parse(input: &[u8]) -> Result<Tabs, Error> {
         }
         if let Some(o) = &t.options {
             o.check(t.kind).map_err(bad)?;
+        }
+        if let Some(m) = &t.marks {
+            if m.len() > MAX_MARKS {
+                return Err(bad(format!("at most {MAX_MARKS} marks")));
+            }
+            if m.iter().any(|m| m.text.is_empty() || m.text.chars().count() > MAX_MARK_TEXT) {
+                return Err(bad(format!("a mark's text must be 1 to {MAX_MARK_TEXT} characters")));
+            }
+        }
+        if t.finding.is_some_and(|f| f < 1) {
+            return Err(bad("finding must be a finding id".into()));
         }
     }
     Ok(set)
@@ -447,6 +479,17 @@ mod tests {
         assert!(err(r#"{"tabs": [{"request": "", "kind": "grpc"}]}"#).contains("unknown variant"));
         assert!(err(r#"{"tabs": [{"request": "", "messages": ["a"]}]}"#).contains("WebSocket tabs"));
         assert!(err(r#"{"tabs": [{"request": "", "kind": "ws", "binary": true}]}"#).contains("text only"));
+        assert!(err(r#"{"tabs": [{"request": "", "kind": "ws", "finding": 3}]}"#).contains("http tabs"));
+        assert!(err(r#"{"tabs": [{"request": "x", "marks": [{"at": 0, "text": ""}]}]}"#).contains("mark's text"));
+        assert!(err(r#"{"tabs": [{"request": "x", "marks": [{"at": 0}]}]}"#).contains("text"));
+        assert!(err(r#"{"tabs": [{"request": "x", "finding": 0}]}"#).contains("finding id"));
+        let (json, _) =
+            save(br#"{"tabs": [{"request": "q=%27", "marks": [{"at": 2, "text": "%27"}], "finding": 7}]}"#).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (v["tabs"][0]["marks"][0]["text"].as_str(), v["tabs"][0]["finding"].as_i64()),
+            (Some("%27"), Some(7))
+        );
         assert!(err(r#"{"tabs": [{"request": "", "kind": "ws", "wait": -1}]}"#).contains("wait"));
         // Send would hold the connection for ages (or panic making the duration).
         assert!(

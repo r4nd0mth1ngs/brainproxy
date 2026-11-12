@@ -38,6 +38,9 @@ import {
   type Tracker,
 } from "./findingsFilter";
 import { addedBy } from "./manualFinding";
+import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare";
+import { payloadMarks } from "./payloadMarks.ts";
+import type { Verify } from "./verifyFinding.ts";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
 
@@ -96,6 +99,9 @@ export function FindingsView({ active }: { active: boolean }) {
   const [writeup, setWriteup] = useState("");
   const [trail, setTrail] = useState<Trail | null>(null);
   const [retesting, setRetesting] = useState(false);
+  // The finding sent with and without its payload, for the finding it was run on.
+  const [verified, setVerified] = useState<Verify | null>(null);
+  const [verifying, setVerifying] = useState(false);
   // Compare with a scan: what's new, still there, or no longer found (likely fixed).
   const [compare, setCompare] = useState<Compare>("all");
   const [scanId, setScanId] = useState<number | null>(null);
@@ -141,6 +147,7 @@ export function FindingsView({ active }: { active: boolean }) {
     if (selected == null) return;
     let live = true;
     setEntry(null);
+    setVerified(null);
     setEvents([]);
     setNarrative(null);
     setWriteup("");
@@ -308,6 +315,44 @@ export function FindingsView({ active }: { active: boolean }) {
       app.toast(e.message, "error");
     } finally {
       setRetesting(false);
+    }
+  };
+
+  // Sends the request the scan started from and the attack again, and shows how they differ.
+  const verify = async () => {
+    if (!finding) return;
+    const id = finding.id;
+    setVerifying(true);
+    try {
+      const v = await verifyFinding(id);
+      if (v && openId.current === id) setVerified(v);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  // The attack, with its payload highlighted: located against the request the scan started
+  // from where there is one (payloadMarks.ts).
+  const sendToReplay = async () => {
+    if (!finding || !entry) return;
+    const f = finding;
+    try {
+      const { raw, binary } = await historyRequest(entry.id);
+      let base: string | null = null;
+      if (f.base_history_id != null && !binary) base = await historyRequest(f.base_history_id).then((b) => (b.binary ? null : b.raw), () => null);
+      const marks = binary ? [] : payloadMarks(raw, f.attack, base);
+      app.sendToRepeater({
+        raw,
+        binary,
+        target: originOf(entry.url),
+        title: f.name.slice(0, 24),
+        ...(marks.length ? { marks } : {}),
+        ...(canVerify(f) && entry.id === f.history_id ? { finding: f.id } : {}),
+      });
+    } catch (e: any) {
+      app.toast(e.message, "error");
     }
   };
 
@@ -540,16 +585,18 @@ export function FindingsView({ active }: { active: boolean }) {
                   </button>
                 )}
                 {entry && (
+                  <button className="btn small" onClick={sendToReplay} title={finding.attack ? "Open the attack in Replay, its payload highlighted" : undefined}>
+                    Send to Replay
+                  </button>
+                )}
+                {canVerify(finding) && (
                   <button
                     className="btn small"
-                    onClick={() =>
-                      historyRequest(entry.id).then(
-                        ({ raw, binary }) => app.sendToRepeater({ raw, binary, target: originOf(entry.url), title: finding.name.slice(0, 24) }),
-                        (e) => app.toast(e.message, "error"),
-                      )
-                    }
+                    disabled={verifying}
+                    onClick={verify}
+                    title="Send the request the scan started from and the attack again, now, and compare the responses: does the payload make the difference?"
                   >
-                    Send to Replay
+                    {verifying ? "Comparing…" : "Compare with/without payload"}
                   </button>
                 )}
                 <button
@@ -621,6 +668,7 @@ export function FindingsView({ active }: { active: boolean }) {
                   </>
                 )}
               </dl>
+              {verified && verified.id === finding.id && <VerifyStrip v={verified} onDiff={() => openVerifyDiff(app, verified).catch((e) => app.toast(e.message, "error"))} />}
               {trail && trailLine(trail) && <p className={trail.reviewed_by ? "muted" : "warn-text"}>{trailLine(trail)}</p>}
               {finding.issue_id != null && (
                 <>
@@ -717,4 +765,9 @@ export function FindingsView({ active }: { active: boolean }) {
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
     </div>
   );
+}
+
+/** Whether a finding can be sent with and without its payload: one with an attack, or a baseline. */
+function canVerify(f: Finding): boolean {
+  return f.history_id != null && (!!f.attack || f.base_history_id != null);
 }
