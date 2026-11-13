@@ -14,6 +14,12 @@ brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
 `X-Powered-By` or `Server` that has no fix (5.4 to 8.1, and 8.2 to 8.5 before 8.2.35,
 8.3.36, 8.4.27, 8.5.12, including their -dev, beta and RC builds). It only reads the reported version: distributions back-port fixes
 without changing it, and a server that hides its version isn't flagged.
+**100008 JWT Issues** reads JSON Web Tokens in traffic: a token in the query string
+(100008-1, low), and for tokens the server hands out (in a response's headers, such as
+`Set-Cookie` or `Location`, or its body) one with `alg: none` (100008-2, high), one with no
+`exp` (100008-3, low), and one with a claim named like a secret, such as `password`,
+`client_secret`, `ssn` or `card_number` (100008-4, low). Tokens only the client sends are
+left to the active rule 100007, so a token isn't reported again on every request.
 
 ## Rules
 
@@ -73,6 +79,8 @@ without changing it, and a server that hides its version isn't flagged.
 | 90022 | Application Error Disclosure | medium | 90022 |
 | 90033 | Loosely Scoped Cookie | info | 90033 |
 | 100001 | PHP2Shell PHP Remote Code Execution (Indicative) | high | 100001 |
+| 100005 | HTTP/3 Offered (Alt-Svc) | info | 100005 |
+| 100008 | JWT Issues | high | 100008-1, 100008-2, 100008-3, 100008-4 |
 
 Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 

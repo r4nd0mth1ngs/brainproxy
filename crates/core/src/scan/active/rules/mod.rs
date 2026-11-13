@@ -3,6 +3,9 @@
 mod crlf_injection;
 pub(crate) mod env_file;
 mod injection;
+mod jwt;
+#[cfg(test)]
+mod jwt_e2e;
 mod params;
 pub(crate) mod probes;
 
@@ -10,7 +13,7 @@ use crate::scan::active::ActiveRule;
 
 pub fn all() -> Vec<Box<dyn ActiveRule>> {
     let mut rules: Vec<Box<dyn ActiveRule>> =
-        vec![Box::new(crlf_injection::CrlfInjection), Box::new(env_file::EnvFile)];
+        vec![Box::new(crlf_injection::CrlfInjection), Box::new(env_file::EnvFile), Box::new(jwt::JwtWeaknesses)];
     rules.extend(injection::all());
     rules.extend(params::all());
     rules.extend(probes::all());
@@ -45,7 +48,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rules.len(), 55, "expected all active rules");
+        assert_eq!(rules.len(), 56, "expected all active rules");
         // No active rule id collides with a passive rule id.
         let passive: HashSet<u32> = crate::scan::passive::all_rules().iter().map(|r| r.id()).collect();
         for id in &ids {

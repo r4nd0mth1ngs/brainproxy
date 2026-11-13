@@ -35,6 +35,34 @@ These use IDs from 100000, so they never clash with ZAP's.
   report it as "SQL Injection". Input used as an ORDER BY or entity name isn't covered.
   Requests per parameter: 3 at LOW, 6 at MEDIUM, 9 at HIGH and INSANE. 40018 no longer
   takes Hibernate's "unexpected token:" for Hypersonic SQL's error.
+- **100007 JWT Weaknesses**, per page that sends a JSON Web Token (in a header such as
+  `Authorization: Bearer`, a cookie, or a query or body parameter). An HMAC token (HS256,
+  HS384, HS512) is first cracked offline against a list of common and default secrets plus
+  the host's own name, sending nothing (100007-4, high confidence). The rule then checks the
+  page reads the token: the token as recorded is sent again, and one whose payload isn't
+  JSON; a page that answers both alike is left (2 pages per origin and token place are
+  tried at LOW, 3 at MEDIUM, 5 at HIGH, 10 at INSANE), so a page that ignores the token
+  costs two requests. On the first page that reads it, forged tokens follow, each counted
+  as accepted when it gets the real token's answer and not the broken one's:
+  - a changed signature (100007-1, *Signature Not Verified*; nothing else is sent after it);
+  - the signature removed (100007-3), then `alg: none` without a signature (100007-2; at
+    MEDIUM and above also `None`, `NONE`, `nOnE`), which is skipped when the first was
+    accepted, as it says nothing more;
+  - with the secret cracked and an `exp` in the token: the same token, expired a day ago and
+    signed again (100007-5, *Expiry Not Enforced*);
+  - MEDIUM and above: a `kid` of `../../../../../../../../dev/null` signed with an empty key
+    (100007-6, when the token has a `kid`); for an RS or PS token, HS256 signed with the
+    origin's RSA public key as the secret (100007-7, *Algorithm Confusion*), the key taken
+    from `/.well-known/jwks.json`, `/jwks.json` or the same-origin `jwks_uri` of
+    `/.well-known/openid-configuration`, in four PEM forms; and with `oob start`, a `jku`
+    and an `x5u` naming the listener (100007-8 when the server calls it).
+
+  The payload is never changed except `exp` in the expiry test, so a forged token claims
+  the same user as the real one. The attacks run once per origin, token place, algorithm
+  and `kid`. With `--auth`, the session leaves the token's header, cookie or parameter as
+  the rule set it. A token the auth profile adds itself is a placeholder the client fills
+  in, so the rule doesn't see it: scan a recorded request that carries the token. The
+  passive rule 100008 reports what traffic shows without sending anything.
 
 ## Rules
 
@@ -94,6 +122,8 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 90039 | NoSQL Injection - MongoDB (Time Based) | param | high | 90039 |
 | 100002 | PHP2Shell PHP Remote Code Execution (Suspected) | host | high | 100002 |
 | 100003 | HQL Injection | param | high | 100003 |
+| 100006 | Response Differs over HTTP/3 | page | medium | 100006-1, 100006-2 |
+| 100007 | JWT Weaknesses | page | high | 100007-1, 100007-2, 100007-3, 100007-4, 100007-5, 100007-6, 100007-7, 100007-8 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
 headers and URL path segments when enabled), `page` once per target request, `host` once per scheme://host:port.

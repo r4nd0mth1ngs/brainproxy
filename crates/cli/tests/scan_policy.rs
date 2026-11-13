@@ -110,7 +110,7 @@ fn policies_are_saved_shown_listed_and_removed() {
 
     let shown = ok(&p, &["scan", "policy", "show", "api"]);
     let table = shown["rule_table"].as_array().unwrap();
-    assert_eq!(table.len(), 55);
+    assert_eq!(table.len(), 56);
     let rule = |id: u64| table.iter().find(|r| r["id"] == id).unwrap().clone();
     assert_eq!(
         rule(40018),
