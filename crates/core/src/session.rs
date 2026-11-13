@@ -642,6 +642,21 @@ impl AuthSession {
         keep_cookies: &[&str],
         keep_params: &[&str],
     ) -> Prepared {
+        self.prepare_keeping(tool, target, raw, keep_cookies, keep_params, &[]).await
+    }
+
+    /// [`AuthSession::prepare`], also leaving the headers in `keep_headers` as the request
+    /// has them: the profile's token header and headers aren't put on over them. Session
+    /// rules still run as they are configured.
+    pub async fn prepare_keeping(
+        &self,
+        tool: Tool,
+        target: &Target,
+        raw: &[u8],
+        keep_cookies: &[&str],
+        keep_params: &[&str],
+        keep_headers: &[&str],
+    ) -> Prepared {
         self.oauth_renew_if_due().await;
         let generation = self.generation();
         let macro_generation = self.handling.generation.load(Ordering::SeqCst);
@@ -680,7 +695,7 @@ impl AuthSession {
         let mut keep: Vec<&str> = keep_cookies.to_vec();
         keep.extend(set.iter().map(String::as_str));
         let ruled = request;
-        let mut request = self.apply_to(&ruled, &keep, target);
+        let mut request = self.apply_to_keeping(&ruled, &keep, keep_headers, target);
         for (k, v) in &headers {
             request = RawRequest::from_bytes(request).set_header(k, v).into_bytes();
         }

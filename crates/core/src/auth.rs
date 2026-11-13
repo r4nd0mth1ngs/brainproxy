@@ -1226,6 +1226,14 @@ impl AuthSession {
     /// values (stale captures), except cookies named in `keep`, which are left as
     /// the caller set them (e.g. a cookie being attacked or fuzzed).
     pub fn apply(&self, raw: &[u8], keep: &[&str]) -> Vec<u8> {
+        self.apply_keeping(raw, keep, &[])
+    }
+
+    /// [`AuthSession::apply`], also leaving the headers named in `keep_headers` (any case)
+    /// as the caller set them: the token header and the profile's headers aren't put on
+    /// over them (e.g. a scan rule's forged token in `Authorization`).
+    pub fn apply_keeping(&self, raw: &[u8], keep: &[&str], keep_headers: &[&str]) -> Vec<u8> {
+        let kept = |name: &str| keep_headers.iter().any(|h| h.eq_ignore_ascii_case(name));
         let st = self.state.lock().unwrap();
         if let Some(g) = &self.client.options().guard {
             g.vault.put_session(&self.profile, &st);
@@ -1258,10 +1266,12 @@ impl AuthSession {
         }
         if let (Some(tpl), Some(_)) = (&self.profile.token_header, &st.token) {
             if let Some((k, v)) = tpl.replace("{{token}}", &ph("token")).split_once(':') {
-                req = req.set_header(k.trim(), v.trim());
+                if !kept(k.trim()) {
+                    req = req.set_header(k.trim(), v.trim());
+                }
             }
         }
-        for (k, _) in self.profile.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
+        for (k, _) in self.profile.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie") && !kept(k)) {
             req = req.set_header(k, &ph(&format!("header:{k}")));
         }
         req.into_bytes()
@@ -1269,7 +1279,12 @@ impl AuthSession {
 
     /// [`AuthSession::apply`] plus the query keys for `target`'s origin, as placeholders.
     pub fn apply_to(&self, raw: &[u8], keep: &[&str], target: &Target) -> Vec<u8> {
-        let mut out = self.apply(raw, keep);
+        self.apply_to_keeping(raw, keep, &[], target)
+    }
+
+    /// [`AuthSession::apply_to`] with [`AuthSession::apply_keeping`]'s `keep_headers`.
+    pub fn apply_to_keeping(&self, raw: &[u8], keep: &[&str], keep_headers: &[&str], target: &Target) -> Vec<u8> {
+        let mut out = self.apply_keeping(raw, keep, keep_headers);
         for q in &self.profile.query_keys {
             if q.origins.iter().any(|o| crate::sign::same_origin(o, target)) {
                 let ph = placeholder(&self.profile.name, &format!("query:{}", q.name));
@@ -2314,6 +2329,23 @@ mod tests {
         // Deletion cookies are forgotten.
         s.observe(b"HTTP/1.1 200 OK\r\nSet-Cookie: theme=; Max-Age=0\r\n\r\n");
         assert_eq!(s.state().cookies, vec![("sid".to_string(), "new".to_string())]);
+    }
+
+    #[test]
+    fn kept_headers_are_left_as_the_request_has_them() {
+        let p = AuthProfile {
+            name: "t".into(),
+            headers: vec![("Authorization".into(), "Bearer real".into()), ("X-Api".into(), "k".into())],
+            ..Default::default()
+        };
+        let s = session(p);
+        let a = Target::from_url("https://a.test").unwrap();
+        let req = b"GET / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer forged\r\n\r\n";
+        let out = String::from_utf8(s.apply_to(req, &[], &a)).unwrap();
+        assert!(out.contains("Authorization: «auth:t:header:Authorization»"), "{out}");
+        let out = String::from_utf8(s.apply_to_keeping(req, &[], &["authorization"], &a)).unwrap();
+        assert!(out.contains("Authorization: Bearer forged"), "{out}");
+        assert!(out.contains("X-Api: «auth:t:header:X-Api»"), "{out}");
     }
 
     #[test]

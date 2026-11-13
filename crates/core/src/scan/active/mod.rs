@@ -396,7 +396,7 @@ impl Cx {
     /// say) even when the scan sends over HTTP/3. A request line saying HTTP/3 says HTTP/1.1.
     pub async fn send_tcp(&self, request: Vec<u8>) -> Result<Response> {
         let target = self.base.target.clone();
-        self.send_via(&target, request, true).await
+        self.send_via(&target, request, true, &Keep::default()).await
     }
 
     /// Sends a raw request to another target (e.g. the same host over http).
@@ -404,11 +404,20 @@ impl Cx {
     /// A 429, or a 503 with Retry-After, pauses every request to that origin for
     /// the time asked (5 s without one, at most 60 s); the request is then sent once more.
     pub async fn send_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
-        self.send_via(target, request, false).await
+        self.send_via(target, request, false, &Keep::default()).await
+    }
+
+    /// [`Cx::send`], with the logged-in session (`--auth`) leaving what `keep` names as the
+    /// request has it: for a rule that attacks a credential the session would put on over
+    /// it, such as a token in `Authorization` or a cookie. The insertion point under attack
+    /// is kept as always.
+    pub async fn send_keeping(&self, request: Vec<u8>, keep: &Keep) -> Result<Response> {
+        let target = self.base.target.clone();
+        self.send_via(&target, request, false, keep).await
     }
 
     /// [`Cx::send_to`]; with `tcp`, over TCP only (see [`Cx::send_tcp`]).
-    async fn send_via(&self, target: &Target, request: Vec<u8>, tcp: bool) -> Result<Response> {
+    async fn send_via(&self, target: &Target, request: Vec<u8>, tcp: bool, keep: &Keep) -> Result<Response> {
         let origin = target.origin();
         let mut retried = false;
         loop {
@@ -416,7 +425,7 @@ impl Cx {
             while until.is_some_and(|u| Instant::now() < u) && !self.stopped() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            let resp = self.send_to_once(target, request.clone(), tcp).await?;
+            let resp = self.send_to_once(target, request.clone(), tcp, keep).await?;
             let retry_after = resp.header("retry-after").map(|v| v.trim().parse::<u64>().unwrap_or(5));
             if retried || !(resp.status == 429 || resp.status == 503 && retry_after.is_some()) {
                 return Ok(resp);
@@ -429,7 +438,7 @@ impl Cx {
         }
     }
 
-    async fn send_to_once(&self, target: &Target, request: Vec<u8>, tcp: bool) -> Result<Response> {
+    async fn send_to_once(&self, target: &Target, request: Vec<u8>, tcp: bool, keep: &Keep) -> Result<Response> {
         self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         // Match-and-replace rules that list scans see the request as the scan rule made it; the
@@ -447,15 +456,19 @@ impl Cx {
             return self.client_send(request.clone(), target, &given, ruled.as_ref(), tcp).await;
         };
         // The attacked cookie or parameter keeps its payload.
-        let (cookie, param): (Vec<&str>, Vec<&str>) = match &self.point {
-            Some(p) if p.kind == PointKind::Cookie => (vec![p.name.as_str()], vec![]),
-            Some(p) => (vec![], vec![p.session_name()]),
-            None => (vec![], vec![]),
+        let (mut cookie, mut param, mut header): (Vec<&str>, Vec<&str>, Vec<&str>) = match &self.point {
+            Some(p) if p.kind == PointKind::Cookie => (vec![p.name.as_str()], vec![], vec![]),
+            Some(p) if p.kind == PointKind::Header => (vec![], vec![], vec![p.name.as_str()]),
+            Some(p) => (vec![], vec![p.session_name()], vec![]),
+            None => (vec![], vec![], vec![]),
         };
-        let prepared = auth.prepare(self.tool, target, request, &cookie, &param).await;
+        cookie.extend(keep.cookies.iter().map(String::as_str));
+        param.extend(keep.params.iter().map(String::as_str));
+        header.extend(keep.headers.iter().map(String::as_str));
+        let prepared = auth.prepare_keeping(self.tool, target, request, &cookie, &param, &header).await;
         let mut resp = self.client_send(prepared.request.clone(), target, &given, ruled.as_ref(), tcp).await?;
         if auth.after_response(&prepared, resp.received()).await {
-            let again = auth.prepare(self.tool, target, request, &cookie, &param).await;
+            let again = auth.prepare_keeping(self.tool, target, request, &cookie, &param, &header).await;
             resp = self.client_send(again.request, target, &given, ruled.as_ref(), tcp).await?;
             auth.observe(resp.received());
         }
@@ -875,6 +888,15 @@ pub struct OobSummary {
     /// Interactions that matched a scan payload and raised a finding hit.
     pub matched: usize,
     pub waited_ms: u64,
+}
+
+/// What the logged-in session leaves as a rule's request has it ([`Cx::send_keeping`]):
+/// cookies and parameters by name, headers by name in any case.
+#[derive(Debug, Clone, Default)]
+pub struct Keep {
+    pub cookies: Vec<String>,
+    pub params: Vec<String>,
+    pub headers: Vec<String>,
 }
 
 /// A request to attack, with its baseline response.

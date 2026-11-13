@@ -2,7 +2,7 @@
 //! (Apache License 2.0).
 
 mod buffer_overflow;
-mod common;
+pub(super) mod common;
 mod cross_site_scripting;
 mod external_redirect;
 mod format_string;

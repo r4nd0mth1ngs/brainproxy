@@ -10,6 +10,7 @@ mod hash_disclosure;
 mod in_page_banner;
 mod jsf_viewstate;
 mod jso;
+mod jwt;
 mod link_target;
 mod modern_app;
 mod pii;
@@ -44,5 +45,6 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(viewstate::Viewstate),
         Box::new(jsf_viewstate::InsecureJsfViewState),
         Box::new(vulnerable_js::VulnerableJs),
+        Box::new(jwt::JwtIssues),
     ]
 }
