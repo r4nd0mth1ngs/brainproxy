@@ -122,8 +122,13 @@ fn handle(req: &str) -> String {
         .find_map(|l| l.strip_prefix("Authorization: Bearer ").or_else(|| l.strip_prefix("authorization: Bearer ")))
         .unwrap_or("")
         .trim();
-    if token.split('.').nth(1).and_then(object).is_none() && path != "/ignores" {
-        return page("400 Bad Request", "{\"error\":\"malformed token\"}", "application/json");
+    if !token.is_empty() && token.split('.').nth(1).and_then(object).is_none() && path != "/ignores" {
+        return page("500 Internal Server Error", "{\"error\":\"Unexpected end of JSON input\"}", "application/json");
+    }
+    // Reads its user from a cookie, never the bearer token; a middleware in front of every page
+    // fails on a token it can't decode (Juice Shop's /rest/user/whoami).
+    if path == "/whoami" {
+        return page("200 OK", "{\"user\":{}}", "application/json");
     }
     if path == "/ignores" || accepts(path, token) {
         page(
@@ -218,6 +223,7 @@ async fn each_weakness_is_found_and_only_it() {
         ("/safe", Strength::High, vec![]),
         // Refused as recorded: forged tokens are refused alike, which says nothing.
         ("/expired", Strength::High, vec![]),
+        ("/whoami", Strength::High, vec![]),
         ("/noverify", Strength::Medium, vec!["100007-1"]),
         ("/none", Strength::Medium, vec!["100007-2"]),
         ("/stripped", Strength::Medium, vec!["100007-3"]),
@@ -243,5 +249,5 @@ async fn a_page_that_ignores_the_token_gets_two_requests() {
     let port = spawn_app();
     let (refs, requests) = scan(port, "/ignores", Strength::High).await;
     assert!(refs.is_empty(), "{refs:?}");
-    assert_eq!(requests, 2, "the real token and a broken one, then nothing");
+    assert_eq!(requests, 2, "the real token and none, then nothing");
 }

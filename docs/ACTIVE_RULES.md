@@ -39,11 +39,14 @@ These use IDs from 100000, so they never clash with ZAP's.
   `Authorization: Bearer`, a cookie, or a query or body parameter). An HMAC token (HS256,
   HS384, HS512) is first cracked offline against a list of common and default secrets plus
   the host's own name, sending nothing (100007-4, high confidence). The rule then checks the
-  page reads the token: the token as recorded is sent again, and one whose payload isn't
-  JSON; a page that answers both alike is left (2 pages per origin and token place are
+  page depends on the token: the token as recorded is sent again, and the same request with
+  the token taken out (an empty value). The real token has to get a success (below 400) and
+  a different answer; otherwise the page is left (2 pages per origin and token place are
   tried at LOW, 3 at MEDIUM, 5 at HIGH, 10 at INSANE), so a page that ignores the token
-  costs two requests. On the first page that reads it, forged tokens follow, each counted
-  as accepted when it gets the real token's answer and not the broken one's:
+  costs two requests. (A malformed token is no control: a middleware may fail on one in
+  front of a page that never reads the token.) On the first page that depends on it, forged
+  tokens follow, each counted as accepted when it gets the real token's answer and not the
+  answer without a token:
   - a changed signature (100007-1, *Signature Not Verified*; nothing else is sent after it);
   - the signature removed (100007-3), then `alg: none` without a signature (100007-2; at
     MEDIUM and above also `None`, `NONE`, `nOnE`), which is skipped when the first was

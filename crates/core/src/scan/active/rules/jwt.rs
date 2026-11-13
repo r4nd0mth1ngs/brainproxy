@@ -6,11 +6,13 @@
 //!
 //! - cracks an HMAC signature (HS256/384/512) against a list of common secrets, offline:
 //!   nothing is sent;
-//! - checks the page actually checks the token: the token as recorded, sent again, has to be
-//!   answered with a success (below 400) and differently from one whose payload isn't JSON. A page that answers both alike
-//!   doesn't read the token, and it is left (a few pages per origin are tried);
+//! - checks the page depends on the token: the token as recorded, sent again, has to be
+//!   answered with a success (below 400) and differently from the same request with the token
+//!   taken out (an empty value). A page that answers both alike doesn't depend on it, and it is
+//!   left (a few pages per origin are tried). A malformed token is no control: a middleware may
+//!   fail on one in front of a page that never reads the token;
 //! - then sends forged tokens, each judged accepted when its answer matches the real token's
-//!   and differs from the broken one's: a changed signature, `alg: none`, no signature, an
+//!   and differs from the one without a token: a changed signature, `alg: none`, no signature, an
 //!   expired token (only once the secret is known), a `kid` pointing at `/dev/null` signed
 //!   with an empty key, the site's own RSA public key used as an HMAC secret (taken from its
 //!   JWKS), and a `jku`/`x5u` header naming the OOB listener (needs `oob start`).
@@ -395,7 +397,8 @@ struct Probe<'a> {
     keep: Keep,
     place: String,
     real: Response,
-    broken: Response,
+    /// The answer without the token.
+    absent: Response,
 }
 
 impl Probe<'_> {
@@ -405,7 +408,7 @@ impl Probe<'_> {
             return None;
         }
         let resp = self.cx.send_keeping(with_token(self.request, &self.jwt.raw, forged), &self.keep).await.ok()?;
-        (same(&resp, &self.real) && !same(&resp, &self.broken)).then_some(resp)
+        (same(&resp, &self.real) && !same(&resp, &self.absent)).then_some(resp)
     }
 
     fn report(&self, def: &'static AlertDef, forged: &str, other: String, resp: &Response) {
@@ -464,7 +467,7 @@ impl Probe<'_> {
         let flipped = format!("{}.{}", jwt.signing_input(), URL_SAFE_NO_PAD.encode(&sig));
         if let Some(resp) = self.accepted(&flipped).await {
             let other = "The token was sent with one bit of its signature changed and was answered like the \
-                real token, while a token with a broken payload was answered differently."
+                real token, while the request without a token was answered differently."
                 .to_string();
             self.report(&NOT_VERIFIED, &flipped, other, &resp);
             return;
@@ -622,23 +625,17 @@ impl ActiveRule for JwtWeaknesses {
                 if !(0..tries(cx.strength())).any(|i| cx.once(&format!("{key}|try{i}"))) {
                     continue;
                 }
-                // Does this page read the token? The real token against one with a broken payload.
-                let broken_token = format!(
-                    "{}.{}.{}",
-                    jwt.header_b64,
-                    URL_SAFE_NO_PAD.encode(b"{\"bp\":"),
-                    URL_SAFE_NO_PAD.encode(&jwt.signature)
-                );
+                // Does this page depend on the token? The real token against none at all.
                 let Ok(real) = cx.send_keeping(request.clone(), &keep).await else { continue };
-                let Ok(broken) = cx.send_keeping(with_token(&request, &jwt.raw, &broken_token), &keep).await else {
+                let Ok(absent) = cx.send_keeping(with_token(&request, &jwt.raw, ""), &keep).await else {
                     continue;
                 };
                 // A refused real token (it expired since it was recorded, say) would make every forged
                 // one look accepted.
-                if real.status >= 400 || same(&real, &broken) || !cx.once(&format!("{key}|attacked")) {
+                if real.status >= 400 || same(&real, &absent) || !cx.once(&format!("{key}|attacked")) {
                     continue;
                 }
-                let probe = Probe { cx, request: &request, jwt, keep, place, real, broken };
+                let probe = Probe { cx, request: &request, jwt, keep, place, real, absent };
                 probe.run(secret.as_deref()).await;
             }
         })
