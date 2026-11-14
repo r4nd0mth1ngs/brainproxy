@@ -3,6 +3,7 @@
 //! The reflected (`-1`) and timing (`-2`) attacks are ported. ZAP has no
 //! callback/OAST variant for this rule, so nothing OAST-only is omitted. The
 //! sleep time is ZAP's default (5s); brainproxy has no rule-config override.
+//! The timing check must pass twice (ZAP: once), against jittery servers.
 
 use super::common::check_timing_dependence;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
@@ -110,23 +111,34 @@ impl ActiveRule for ShellShock {
                 return;
             }
             let last: std::sync::Mutex<Option<(crate::scan::active::Response, String)>> = std::sync::Mutex::new(None);
-            let vulnerable = check_timing_dependence(
-                BLIND_REQUESTS_LIMIT,
-                DEFAULT_SLEEP_TIME,
-                |delay| {
-                    let attack = timing_attack(delay);
-                    let last = &last;
-                    async move {
-                        let resp = cx.send_payload(&attack).await.ok()?;
-                        let secs = resp.duration.as_secs_f64();
-                        *last.lock().unwrap() = Some((resp, attack));
-                        Some(secs)
-                    }
-                },
-                TIME_CORRELATION_ERROR_RANGE,
-                TIME_SLOPE_ERROR_RANGE,
-            )
-            .await;
+            // Unlike ZAP, a passing sequence must pass a second time: jittery latency can
+            // line up with one high/low sequence by chance, rarely with two.
+            let mut vulnerable = false;
+            for _ in 0..2 {
+                vulnerable = check_timing_dependence(
+                    BLIND_REQUESTS_LIMIT,
+                    DEFAULT_SLEEP_TIME,
+                    |delay| {
+                        let attack = timing_attack(delay);
+                        let last = &last;
+                        async move {
+                            let resp = cx.send_payload(&attack).await.ok()?;
+                            let secs = resp.duration.as_secs_f64();
+                            *last.lock().unwrap() = Some((resp, attack));
+                            Some(secs)
+                        }
+                    },
+                    TIME_CORRELATION_ERROR_RANGE,
+                    TIME_SLOPE_ERROR_RANGE,
+                )
+                .await;
+                if !vulnerable {
+                    break;
+                }
+                if cx.stopped() {
+                    return;
+                }
+            }
 
             if vulnerable {
                 if let Some((resp, attack)) = last.into_inner().unwrap() {

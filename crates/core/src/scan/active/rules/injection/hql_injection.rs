@@ -10,7 +10,8 @@
 //!   before, and an echo of the input doesn't match: the ORM's phrasing must be around
 //!   them. High confidence; the entity class goes into the finding where it's named.
 //! - Parser errors: quotes and brackets that break the query, with an error of the ORM's
-//!   query parser in the answer that the original page didn't show. Medium confidence.
+//!   query parser in the answer that the original page didn't show, and that the same
+//!   attack with a random value in place of the original brings too. Medium confidence.
 //!
 //! Blind HQL injection (no error shown) is left to 40018's boolean checks, which work on
 //! HQL as they do on SQL, and report "SQL Injection".
@@ -19,7 +20,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::common::point;
+use super::common::{control_token, point};
 use crate::scan::active::{rand_u64, ActiveRule, BoxFuture, Cx, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
 
@@ -177,6 +178,15 @@ async fn parser_errors(cx: &Cx, param: &str, value: &str, budget: usize) {
         let attack = template.replace("{V}", value);
         let Ok(resp) = cx.send_payload(&attack).await else { return };
         if let Some((orm, evidence)) = parser_error(resp.body_str()) {
+            // The parser error must come back with a random value in place of (or in
+            // front of) the original too, or it was content the attack value found.
+            let token = control_token(value.parse::<f64>().is_ok());
+            let control =
+                if template.contains("{V}") { template.replace("{V}", &token) } else { format!("{token}{template}") };
+            let Ok(again) = cx.send_payload(&control).await else { return };
+            if parser_error(again.body_str()).is_none() {
+                continue;
+            }
             let info = format!(
                 "The value broke the query, and the answer has an error of the {orm} query parser, which the \
                  original page doesn't. The unknown property check didn't confirm it, so the query may only be \

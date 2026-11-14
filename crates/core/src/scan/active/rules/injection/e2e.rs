@@ -12,6 +12,44 @@ use crate::jobs::JobControl;
 use crate::scan::active::{run, ActiveConfig, ActiveSummary, PointOptions, ScanTarget, Strength};
 use crate::scan::message::url_decode;
 
+fn status(code: u16, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {code} X\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// `LIKE` with `%` as the only wildcard, case-insensitive.
+fn like(pattern: &str, s: &str) -> bool {
+    let (p, s) = (pattern.to_lowercase(), s.to_lowercase());
+    let parts: Vec<&str> = p.split('%').collect();
+    let mut rest = s.as_str();
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            let Some(r) = rest.strip_prefix(part) else { return false };
+            rest = r;
+        } else if i == parts.len() - 1 {
+            return rest.ends_with(part);
+        } else {
+            let Some(at) = rest.find(part) else { return false };
+            rest = &rest[at + part.len()..];
+        }
+    }
+    rest.is_empty()
+}
+
+const FRUIT: [&str; 3] = ["apple", "pear", "banana"];
+
+fn fruit_list(pattern: &str) -> String {
+    let items: String = FRUIT.iter().filter(|f| like(pattern, f)).map(|f| format!("<li>{f}</li>")).collect();
+    html(&format!("<ul>{items}</ul>"))
+}
+
+/// One transient error has been served by `/blip`.
+static BLIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Requests `/sleeponce` has honoured a `sleep()` for.
+static SLEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn html(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -99,6 +137,83 @@ fn handle(path: &str, query: &str) -> String {
                 Some(_) => false,
             };
             html(if rows { "<ul><li>apple: 3</li></ul>" } else { "<ul></ul>" })
+        }
+        // String column in a 500 page for broken SQL: an unbalanced quote breaks it.
+        "/sql500" => {
+            if param("name").matches('\'').count() % 2 == 1 {
+                status(500, "<p>Server error</p>")
+            } else {
+                html("<ul></ul>")
+            }
+        }
+        // `name LIKE '%<value>%'`, errors hidden.
+        "/sqllike" => {
+            let q = param("q");
+            match q.split_once('\'') {
+                None => fruit_list(&format!("%{q}%")),
+                Some((head, tail)) if tail.trim_start().starts_with("--") => fruit_list(&format!("%{head}")),
+                Some(_) => html("<ul></ul>"),
+            }
+        }
+        // The same, echoing the term HTML escaped as frameworks do (`'` as `&#39;`).
+        "/sqllikeecho" => {
+            let q = param("q");
+            let list = handle("/sqllike", query);
+            let echo =
+                format!("<p>Results for {}</p>", q.replace('&', "&amp;").replace('<', "&lt;").replace('\'', "&#39;"));
+            let body = list.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+            html(&format!("{echo}{body}"))
+        }
+        // Safe: a knowledge base search; one article quotes an SQL error message.
+        "/kb" => {
+            const ARTICLE: &str = "Escape the quote's: You have an error in your SQL syntax; \
+                org.hibernate.hql.internal.ast.QuerySyntaxException: unexpected token: ' near line 1, column 41; \
+                com.mongodb.MongoResultException: bad query";
+            let q = param("q");
+            if !q.is_empty() && ARTICLE.contains(q.as_str()) {
+                html(&format!("<p>{ARTICLE}</p>"))
+            } else {
+                html("<p>No articles.</p>")
+            }
+        }
+        // Safe: input validation throws on special characters.
+        "/validate" => {
+            if param("name").contains(['\'', '"', '(', ')', ';']) {
+                status(500, "<p>Server error</p>")
+            } else {
+                html("<ul><li>apple</li></ul>")
+            }
+        }
+        // Safe: free-text search, any word of the query anywhere in a description.
+        "/words" => {
+            let q = param("q").to_lowercase();
+            let items: String = ["A crisp apple", "Pear from Oregon", "Banana, 1 kg"]
+                .iter()
+                .filter(|d| q.split_whitespace().any(|w| d.to_lowercase().contains(w)))
+                .map(|d| format!("<li>{d}</li>"))
+                .collect();
+            html(&format!("<ul>{items}</ul>"))
+        }
+        // Safe: parameterised `LIKE '%' + ? + '%'`, wildcards not escaped.
+        "/like" => fruit_list(&format!("%{}%", param("q"))),
+        // Safe: one transient error, for the first "AND false" request.
+        "/blip" => {
+            let name = param("name");
+            if name.contains("1=2") && !BLIPPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                status(503, "<p>Try again</p>")
+            } else {
+                html("<ul><li>apple</li></ul>")
+            }
+        }
+        // Safe: slow for the first high/low sequence only, as a jittery server can be.
+        "/sleeponce" => {
+            let id = param("id");
+            if let Some(n) = id.split("sleep(").nth(1).and_then(|r| r.split(')').next()).and_then(|n| n.parse().ok()) {
+                if SLEPT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 4 {
+                    std::thread::sleep(Duration::from_secs(n));
+                }
+            }
+            html("<p>item</p>")
         }
         // Shell command output in the page.
         "/ping" => {
@@ -400,20 +515,22 @@ async fn mongodb_time_based() {
             .await;
     assert_eq!(s.raised.get("90039"), Some(&1), "{found:?}");
     assert_eq!(found[0].3, "\"); sleep(2); print(\"");
-    assert_eq!(s.requests, 4 + 6, "{s:?}");
+    // Two passing sequences of 4 timed requests, then one per payload for the safe page.
+    assert_eq!(s.requests, 8 + 6, "{s:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_time_based() {
-    // Tests sleep 2s for the high delay; the vulnerable endpoint needs 2+1+2+1 seconds.
+    // Tests sleep 2s for the high delay; the vulnerable endpoint needs 2+1+2+1 seconds, twice.
     let port = spawn_app();
     let (s, found) =
         scan("mysql", 40019, Strength::Low, vec![target(port, "/sleepy?id=1"), target(port, "/safe?id=1")]).await;
     assert_eq!(s.raised.get("40019"), Some(&1), "{s:?}");
     assert_eq!(found[0].3, "1 / sleep(2) ");
-    // Vulnerable: 4 timed requests; safe: one request per payload (6 at LOW), each
-    // giving up at once because the response came back before the requested delay.
-    assert_eq!(s.requests, 4 + 6, "{s:?}");
+    // Vulnerable: two passing sequences of 4 timed requests; safe: one request per
+    // payload (6 at LOW), each giving up at once because the response came back
+    // before the requested delay.
+    assert_eq!(s.requests, 8 + 6, "{s:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -485,6 +602,51 @@ async fn hql_injection_unknown_property_and_parser_errors() {
     // The unknown path error isn't shown there: only the parser error is left.
     assert!(attacks.contains(&"'"), "{attacks:?}");
     assert!(found.iter().all(|f| f.1 == "HQL Injection"), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_false_positive_classes() {
+    let port = spawn_app();
+    // Safe pages that used to raise 40018: error text that is page content, a 500 from
+    // input validation, a word search ("OR 1=1" and "OR 1=2" both find more), a
+    // parameterised LIKE ("%" against "XYZABCDEFGHIJ"), a transient error.
+    let safe = ["/kb?q=zzz", "/validate?name=apple", "/words?q=zzz", "/words?q=crisp", "/like?q=", "/like?q=app"];
+    for strength in [Strength::Medium, Strength::High] {
+        let targets = safe.iter().map(|p| target(port, p)).collect();
+        let (s, found) = scan("sqlifp", 40018, strength, targets).await;
+        assert!(s.raised.is_empty(), "{strength:?}: {found:?}");
+    }
+    let (s, found) = scan("sqliblip", 40018, Strength::Medium, vec![target(port, "/blip?name=apple")]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
+    // The same search for the HQL and MongoDB error checks.
+    for rule in [100003, 40033] {
+        let (s, found) =
+            scan("kberr", rule, Strength::High, vec![target(port, "/kb?q="), target(port, "/kb?q=zzz")]).await;
+        assert!(s.raised.is_empty(), "{rule}: {found:?}");
+    }
+    // The true positives next to them: a 500 for broken SQL, "OR true" with no data
+    // originally, a concatenated LIKE (found by the quoted LIKE pair at HIGH), also with
+    // the term echoed HTML escaped.
+    let targets = vec![
+        target(port, "/sql500?name=apple"),
+        target(port, "/sqlbool?name=zzz"),
+        target(port, "/sqllike?q=app"),
+        target(port, "/sqllikeecho?q=app"),
+    ];
+    let (s, found) = scan("sqlitp", 40018, Strength::High, targets).await;
+    assert_eq!(s.raised.get("40018"), Some(&4), "{found:?}");
+    assert_eq!(found.iter().filter(|f| f.3 == "app%'  -- ").count(), 2, "{found:?}");
+    let attack = |param: &str| found.iter().find(|f| f.2 == param).map(|f| f.3.clone());
+    assert_eq!(attack("name").as_deref().map(|a| a.contains('\'')), Some(true), "{found:?}");
+    assert_eq!(attack("q").as_deref(), Some("app%'  -- "), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_based_needs_two_passing_sequences() {
+    let port = spawn_app();
+    // Slow for one high/low sequence only: no finding (one sequence was enough before).
+    let (s, found) = scan("sleeponce", 40019, Strength::Low, vec![target(port, "/sleeponce?id=1")]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -6,6 +6,8 @@
 //! Asking for real seconds would find more, but could hold a large collection for hours
 //! after the request timed out. Difference: no technology filter; ZAP only runs this
 //! against targets it knows use MongoDB, and by default assumes all do.
+//!
+//! Unlike ZAP, the timing check must pass twice (`timing::check_timing`).
 
 use super::common::{by_strength, point};
 use super::timing::{check_timing, sleep_seconds, whole_seconds, TimingOutcome};

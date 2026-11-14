@@ -3,6 +3,8 @@
 //! The out-of-band variant (payloads running `curl`/`wget` against a callback
 //! URL at HIGH/INSANE strength) uses the OOB listener when one is running
 //! (`brainproxy oob start`); an interaction raises the alert later.
+//!
+//! Unlike ZAP, the timing check must pass twice (`timing::check_timing`).
 
 use super::common::point;
 use super::timing::{check_timing, fractional_seconds, sleep_seconds, TimingOutcome};
