@@ -102,7 +102,6 @@ function readForm(params: string, out: GraphqlRead) {
   if (Object.keys(op).length) readOperation(op, out);
 }
 
-/** Whether the text parses as JSON. */
 function isJson(text: string): boolean {
   try {
     JSON.parse(text);

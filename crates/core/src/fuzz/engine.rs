@@ -74,7 +74,6 @@ pub struct FuzzResult {
     pub error: Option<String>,
 }
 
-/// A result and its history row.
 pub type Row = (History, FuzzResult);
 
 /// A fuzz result's history row.
@@ -364,7 +363,6 @@ pub async fn run(
     })
 }
 
-/// A fuzz request's answer.
 struct Answer {
     /// The response after the fuzzer's match-and-replace rules, which is what is analysed.
     response: Ruled,

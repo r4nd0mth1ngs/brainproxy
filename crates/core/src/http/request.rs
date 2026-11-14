@@ -110,7 +110,6 @@ impl RawRequest {
             out.push(b);
             prev = b;
         }
-        // Make sure the head ends with an empty line.
         if !out.ends_with(b"\r\n\r\n") {
             if out.ends_with(b"\r\n") {
                 out.extend_from_slice(b"\r\n");
@@ -275,9 +274,31 @@ fn join_head(lines: &[&[u8]], body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The origin-form target (`/path?query`) of an absolute-form one, given what follows its
+/// `scheme://`. The authority ends at the first `/`, `?` or `#` (RFC 3986 3.2), so
+/// `a.test?next=http://b.test/x` is `/?next=http://b.test/x`, not `//b.test/x`, and
+/// `a.test?id=1` keeps its query.
+pub fn origin_form(after_scheme: &str) -> String {
+    match after_scheme.find(['/', '?', '#']).map(|i| (i, after_scheme.as_bytes()[i])) {
+        Some((i, b'/')) => after_scheme[i..].to_string(),
+        Some((i, b'?')) => format!("/{}", &after_scheme[i..]),
+        _ => "/".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_form_ends_the_authority_at_a_path_query_or_fragment() {
+        assert_eq!(origin_form("a.test/x?y=1"), "/x?y=1");
+        assert_eq!(origin_form("a.test?id=1"), "/?id=1");
+        assert_eq!(origin_form("a.test?next=http://b.test/x"), "/?next=http://b.test/x");
+        assert_eq!(origin_form("a.test:8080"), "/");
+        assert_eq!(origin_form("a.test#top"), "/");
+        assert_eq!(origin_form("[::1]:8080/p"), "/p");
+    }
 
     #[test]
     fn header_edits_keep_other_bytes() {

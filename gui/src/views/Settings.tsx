@@ -1,5 +1,6 @@
 // Project and tool settings: auth profiles, match & replace, intercept options, proxy setup,
-// connection options, the CA, rule data, project info, keyboard shortcuts, and open-source licenses. Each sub-tab loads its data when first shown.
+// connection options, the CA, rule data, project info, keyboard shortcuts, and open-source licenses. Only the open sub-tab
+// is mounted, so it loads its data each time it is opened.
 
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { run } from "../api";
@@ -51,6 +52,7 @@ import { MacroBuilder, SessionHandling } from "./SessionHandling";
 import type { MacroSummary, SessionRule, Signer } from "./sessionRules";
 import NOTICE from "../../../NOTICE?raw";
 import { Keyboard } from "./Keyboard";
+import { passwordArgs } from "./authPassword.ts";
 import { useActions } from "../ui/useActions.ts";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "updates" | "project" | "keyboard" | "licenses";
@@ -203,6 +205,8 @@ interface Form {
   passwordMode: "env" | "literal" | "none";
   passwordEnv: string;
   password: string;
+  /** The profile being edited has a stored password (redacted by `auth show`). */
+  passwordStored: boolean;
   /** keep: the stored secret, which this form can't see. */
   totpMode: "none" | "env" | "literal" | "keep";
   totpEnv: string;
@@ -233,6 +237,7 @@ const EMPTY_FORM: Form = {
   passwordMode: "env",
   passwordEnv: "",
   password: "",
+  passwordStored: false,
   totpMode: "none",
   totpEnv: "",
   totpKeptEnv: "",
@@ -270,9 +275,9 @@ function formOf(p: Profile): Form {
     loginBody: p.login_body ?? "",
     loginHeaders: headerLines(p.login_headers),
     username: p.username ?? "",
-    // A stored password is redacted by `auth show`, so editing asks for it again.
     passwordMode: !pw ? "none" : "env" in pw ? "env" : "literal",
     passwordEnv: pw && "env" in pw ? pw.env : "",
+    passwordStored: !!pw && "literal" in pw,
     totpMode: !p.totp ? "none" : "env" in p.totp.secret ? "env" : "keep",
     totpEnv: p.totp && "env" in p.totp.secret ? p.totp.secret.env : "",
     totpKeptEnv: p.totp && "env" in p.totp.secret ? p.totp.secret.env : "",
@@ -307,7 +312,7 @@ function addArgs(f: Form): string[] {
   opt("--login-request", f.loginRequestFile);
   lines("--login-header", f.loginHeaders);
   opt("--username", f.username);
-  if (f.passwordMode === "env") opt("--password-env", f.passwordEnv);
+  args.push(...passwordArgs(f));
   // A typed TOTP secret goes in the environment (see `save`); a stored one this form can't see
   // is kept, and so is a variable left as it was (with its digits, period and algorithm, which
   // this form doesn't show).
@@ -485,7 +490,11 @@ function Auth() {
       </div>
       {recording ? (
         <RecordLogin
-          onCancel={() => setRecording(false)}
+          onCancel={() => {
+            setRecording(false);
+            // Cancel on the last step leaves a saved profile.
+            load();
+          }}
           onDone={(name) => {
             setRecording(false);
             setSelected(name);
@@ -587,7 +596,7 @@ function Auth() {
                   className="input"
                   type="password"
                   value={form.password}
-                  placeholder={editing ? "re-enter: the stored one is redacted" : ""}
+                  placeholder={form.passwordStored ? "Leave empty to keep the stored password" : ""}
                   onChange={(e) => set({ password: e.target.value })}
                 />
               </Field>

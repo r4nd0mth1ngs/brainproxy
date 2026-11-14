@@ -261,7 +261,6 @@ impl ActiveRule for ExternalRedirect {
                     return;
                 }
                 let injection = if placeholder { payload.replace(ORIGINAL_VALUE_PLACEHOLDER, &value) } else { payload };
-                // Don't follow redirects.
                 let Ok(resp) = common::send_no_follow(cx, &injection).await else { continue };
                 if let Some((alert, reason)) = redirect_type(&resp, &redirect_url) {
                     let f = alert.raise(cx.point().name.clone(), redirect_url).attack(injection).other_info(reason);

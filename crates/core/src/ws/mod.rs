@@ -409,7 +409,7 @@ pub fn new_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(k)
 }
 
-/// The ws:// or wss:// URL of an upgrade request sent to `origin` (http(s)://host[:port]).
+/// The ws:// or wss:// form of an upgrade request's http(s):// URL (path and query kept).
 pub fn ws_url(http_url: &str) -> String {
     if let Some(rest) = http_url.strip_prefix("https://") {
         format!("wss://{rest}")

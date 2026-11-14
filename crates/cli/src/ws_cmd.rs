@@ -377,12 +377,13 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let wait = Duration::try_from_secs_f64(args.wait.max(0.0)).ok().filter(|_| args.wait <= MAX_WAIT_SECS).ok_or_else(
         || Error::InvalidInput(format!("--wait: at most {MAX_WAIT_SECS} seconds (a day), not {}", args.wait)),
     )?;
+    let timeout = crate::request_args::secs_arg("--timeout", args.timeout)?.max(Duration::from_millis(1));
     let guard = store.guard()?;
     // Refuse out-of-scope targets up front, before any connection is attempted.
     crate::require_in_scope(&guard, &target)?;
     let send_opts = SendOptions {
         guard: Some(guard),
-        timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
+        timeout,
         verify_tls: args.verify_tls,
         sni: args.sni.clone(),
         http2: false,
@@ -398,12 +399,7 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let session = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send_opts)?;
     let client = Client::new(send_opts);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
-    let opts = client::Options {
-        wait,
-        until,
-        max_messages: args.max_messages.max(1),
-        write_timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
-    };
+    let opts = client::Options { wait, until, max_messages: args.max_messages.max(1), write_timeout: timeout };
 
     if let Some(s) = session.as_ref().filter(|_| args.no_store) {
         // Its logins and checks keep no content either.

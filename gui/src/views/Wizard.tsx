@@ -11,6 +11,7 @@ import { apiResultNotes, baselineText, isApiJob } from "./apiScan";
 import { hasChromium, wizardBrowserArgs, type BrowserList } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
 import { attacksPaths, DEPTHS, depthArgs, type Depth } from "./wizardDepths";
+import { followsJob, readWizardJob } from "./wizardJob.ts";
 import { usePolicies } from "./ScanPolicies";
 import { describe as describePolicy } from "./scanPolicy";
 
@@ -58,7 +59,7 @@ export function PostWarning() {
   );
 }
 
-export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) => void; onDismiss: () => void; onApi?: () => void }) {
+export function ScanWizard(p: { jobId: number | null; active: boolean; onStarted: (id: number) => void; onDismiss: () => void; onApi?: () => void }) {
   const app = useApp();
   const [step, setStep] = useState(0);
   const [hints, setHints] = useState<Suggestions | null>(null);
@@ -126,7 +127,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   };
 
   // After every hook above: the hook count must not change between renders.
-  if (p.jobId != null) return <WizardProgress jobId={p.jobId} onClose={p.onDismiss} />;
+  if (p.jobId != null) return <WizardProgress jobId={p.jobId} active={p.active} onClose={p.onDismiss} />;
 
   const steps = ["Website", "Login", "Depth", "Start"];
   return (
@@ -335,11 +336,16 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
 }
 
 /** The wizard's scan as it runs, then what it found, in plain words. */
-export function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void }) {
+export function WizardProgress({ jobId, active, onClose }: { jobId: number; active: boolean; onClose: () => void }) {
   const app = useApp();
-  const [job] = usePoll<Job>(() => run(["job", "status", String(jobId)]), 1500);
+  // The last answer decides whether to ask again (usePoll's own answer can't, being read after it).
+  const [seen, setSeen] = useState<Job | "gone" | null>(null);
+  const [read] = usePoll<Job | "gone">(() => readWizardJob(run<Job>(["job", "status", String(jobId)])), 1500, followsJob(seen, active));
+  useEffect(() => setSeen(read), [read]);
+  const gone = read === "gone";
+  const job = gone ? null : read;
   const done = job != null && !["queued", "running", "stopping"].includes(job.state);
-  const [risks] = usePoll<{ rows: [Risk, number][] }>(() => run(["query", RISK_SQL]), 3000, done);
+  const [risks] = usePoll<{ rows: [Risk, number][] }>(() => run(["query", RISK_SQL]), 3000, done && active);
   const pr: Record<string, any> = job?.progress ?? {}; // numbers, and an API scan's `stage`
   const api = isApiJob(job?.args);
   const baseline = pr.stage === "baseline";
@@ -353,20 +359,35 @@ export function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () 
       <header>
         <div>
           <div className="wiz-kicker">Guided scan</div>
-          <h2>{!job ? "Starting…" : !done ? (baseline ? "Sending the API's operations…" : testing ? "Testing for vulnerabilities…" : api ? "Preparing to test the operations…" : "Exploring the website…") : job.state === "completed" ? "Scan finished" : `Scan ${job.state}`}</h2>
+          <h2>{gone ? "Scan not found" : !job ? "Starting…" : !done ? (baseline ? "Sending the API's operations…" : testing ? "Testing for vulnerabilities…" : api ? "Preparing to test the operations…" : "Exploring the website…") : job.state === "completed" ? "Scan finished" : `Scan ${job.state}`}</h2>
         </div>
         {!done && job && (
           <button className="btn" onClick={() => run(["job", "stop", String(jobId)]).catch((e) => app.toast(e.message, "error"))}>
             Stop
           </button>
         )}
-        {done && (
+        {(done || gone) && (
           <button className="link" onClick={onClose}>
             Close
           </button>
         )}
       </header>
-      {!done ? (
+      {gone ? (
+        <div className="wiz-body">
+          <p className="muted">This project has no record of the scan this card was following: the project file may have been replaced or restored from a copy.</p>
+          <div className="row gap wiz-next">
+            <button
+              className="btn primary"
+              onClick={() => {
+                onClose();
+                app.openWizard(true);
+              }}
+            >
+              Start a new scan
+            </button>
+          </div>
+        </div>
+      ) : !done ? (
         <div className="wiz-body">
           <div className="wiz-bar">
             <span style={{ width: frac == null ? "100%" : `${Math.round(frac * 100)}%` }} className={frac == null ? "indeterminate" : ""} />

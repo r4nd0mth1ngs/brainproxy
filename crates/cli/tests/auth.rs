@@ -344,6 +344,42 @@ fn literal_password_is_redacted_and_bad_login_fails() {
     assert_eq!(code, 2);
 }
 
+/// An edit that can't see the stored password keeps it with --keep-password; without the flag
+/// the password goes, as it always did.
+#[test]
+fn keep_password_keeps_the_stored_password() {
+    let srv = Server::start(100);
+    let p = tmp_project("keep-password");
+    let password = |p: &std::path::Path| ok(p, &["auth", "show", "app"])["profile"]["password"].clone();
+    add_form_profile(&p, &srv, &["--password", PASS]);
+    add_form_profile(&p, &srv, &["--keep-password"]);
+    assert_eq!(password(&p), serde_json::json!({"literal": "********"}));
+    // It is the password it was: the login works.
+    let login = ok(&p, &["auth", "login", "app"]);
+    assert_eq!(login["login"]["success"], true, "{login}");
+    // One read from a variable stays that.
+    add_form_profile(&p, &srv, &["--password-env", "BP_TEST_PASSWORD"]);
+    add_form_profile(&p, &srv, &["--keep-password"]);
+    assert_eq!(password(&p), serde_json::json!({"env": "BP_TEST_PASSWORD"}));
+    add_form_profile(&p, &srv, &[]);
+    assert!(password(&p).is_null(), "{}", password(&p));
+
+    // Not with a password given, however it is given.
+    for given in [&["--password", "x"][..], &["--password-env", "BP_TEST_PASSWORD"]] {
+        let (code, v) = run(&p, &[&["auth", "add", "app", "--keep-password"][..], given].concat());
+        assert_eq!((code, &v["error"]["kind"]), (2, &Value::from("usage")), "{given:?}: {v}");
+    }
+    let out = bin()
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["auth", "add", "app", "--keep-password"])
+        .env("BRAINPROXY_SECRET_PASSWORD", "x")
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((out.status.code(), &v["error"]["kind"]), (Some(2), &Value::from("usage")), "{v}");
+}
+
 #[test]
 fn json_login_with_bearer_token() {
     let srv = Server::start(100);

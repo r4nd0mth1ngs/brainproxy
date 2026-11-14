@@ -19,7 +19,6 @@ use crate::scan::compare::Comparison;
 use crate::scan::findings_db::{FindingFilter, REMOVED};
 use crate::store::Store;
 
-/// Schema v15.
 pub(crate) const SCHEMA_V15: &str = "
 CREATE TABLE IF NOT EXISTS issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,7 +235,7 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.alert_ref, i.host, COALESCE(i.title, 
         json_group_object(f.host, 1) AS hosts, i.cvss_vector, i.cvss_score
     FROM issues i JOIN findings f ON f.issue_id = i.id";
 
-fn risk_name(level: i64) -> &'static str {
+pub(crate) fn risk_name(level: i64) -> &'static str {
     ["info", "low", "medium", "high", "critical"].get(level.clamp(0, 4) as usize).copied().unwrap_or("info")
 }
 

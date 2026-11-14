@@ -12,11 +12,12 @@ import { ScanPolicies, usePolicies } from "./ScanPolicies";
 import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
 import { maxRiskLabel, passiveNote, SCRIPT_LIST_ARGS, type PassiveStats, type ScriptCheck } from "./scriptChecks.ts";
 import { AddScriptCheck, ScriptChecks } from "./ScriptChecks.tsx";
+import { jobEndedText, sourcesToggle } from "./scanJobs.ts";
 
 export interface Job {
   id: number;
   time: string;
-  kind: string; // crawl, active-scan, import
+  kind: string; // crawl, active-scan, import, authz, checks-update
   state: string; // queued, running, stopping, completed, stopped, failed
   pid: number | null;
   args: string[];
@@ -71,7 +72,7 @@ export function ScannerView({ active }: { active: boolean }) {
       const before = seen.current.get(j.id) ?? (primed ? "queued" : undefined);
       seen.current.set(j.id, j.state);
       if (before && before !== j.state && !isLive(j)) {
-        app.toast(`${j.kind === "crawl" ? "Crawl" : "Scan"} #${j.id} ${j.state}`, j.state === "failed" ? "error" : "info");
+        app.toast(jobEndedText(j), j.state === "failed" ? "error" : "info");
         if (j.kind === "active-scan") setFinished(j);
       }
     }
@@ -1011,9 +1012,9 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
   };
 
   const toggleSource = (s: string) => {
-    const cur = new Set(passive?.sources ?? []);
-    cur.has(s) ? cur.delete(s) : cur.add(s);
-    call(["scan", "sources", ...SOURCES.filter((x) => cur.has(x))]);
+    const next = sourcesToggle(passive?.sources ?? [], s, SOURCES);
+    if ("refused" in next) app.toast(next.refused, "error");
+    else call(next.args);
   };
 
   const runPassive = async (rescan: boolean) => {

@@ -321,6 +321,8 @@ fn require_run(store: &Store, run: i64) -> Result<(), Error> {
 fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Error> {
     let guard = crate::project_guard(project)?;
     let exclude = regex::Regex::new(&args.exclude).map_err(|e| Error::InvalidInput(format!("--exclude: {e}")))?;
+    let timeout = crate::request_args::secs_arg("--timeout", args.timeout)?.max(Duration::from_millis(100));
+    crate::request_args::check_rate("--rate", args.rate)?;
     let run_skips =
         PathSkips::compile(&args.skip_paths).map_err(|e| Error::InvalidInput(format!("--skip-path: {e}")))?;
     let skips = if args.no_saved_skips { run_skips } else { saved_skips(&Store::open(project)?)?.with(&run_skips) };
@@ -346,7 +348,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
         return crate::jobs_cmd::spawn_background("authz", project, home, out);
     }
     let send = SendOptions {
-        timeout: Duration::from_secs_f64(args.timeout.max(0.1)),
+        timeout,
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard.clone()),

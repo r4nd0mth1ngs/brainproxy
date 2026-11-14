@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { actions, bindingOf, groupsOf, matches, type Action, type Overrides } from "./actions.ts";
 import { chordOf, formatChord, typesText } from "./chords.ts";
-import { rank } from "./fuzzy.ts";
+import { marked, rank } from "./fuzzy.ts";
 import { useDialogFocus } from "./dialogFocus";
 import { useActionList, useOverrides } from "./useActions.ts";
 
@@ -40,8 +40,7 @@ function byDefault(list: Action[], view: string, o: Overrides): { a: Action; hea
 
 function highlight(text: string, at: number[]): ReactNode {
   if (!at.length) return text;
-  const set = new Set(at);
-  return [...text].map((c, i) => (set.has(i) ? <mark key={i}>{c}</mark> : c));
+  return marked(text, at).map((p, i) => (p.on ? <mark key={i}>{p.text}</mark> : p.text));
 }
 
 export function Palette({ view, mac, close }: { view: string; mac: boolean; close: () => void }) {
@@ -108,7 +107,17 @@ export function Palette({ view, mac, close }: { view: string; mac: boolean; clos
   const id = (i: number) => `palette-row-${i}`;
   return (
     <div className="confirm-backdrop palette-backdrop" onMouseDown={(e) => e.target === e.currentTarget && close()} onKeyDown={onKey}>
-      <div ref={box} className="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div
+        ref={box}
+        className="palette"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        // Focus stays in the search box. A click elsewhere in the palette (a heading, a dimmed row,
+        // the footer) would otherwise move it to the page, outside this element, and then no key
+        // (Esc, the arrows, typing) would reach the palette.
+        onMouseDown={(e) => e.target instanceof HTMLInputElement || e.preventDefault()}
+      >
         <input
           className="palette-input"
           autoFocus

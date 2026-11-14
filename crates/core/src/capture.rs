@@ -72,7 +72,7 @@ impl Capture {
         // Absolute-form targets carry their own origin (origin-form ones start
         // with `/` and may carry URLs in the query: `/fetch?url=http://x/y`).
         let path_and_query = match req_target.find("://").filter(|_| !req_target.starts_with('/')) {
-            Some(i) => req_target[i + 3..].find('/').map(|j| req_target[i + 3 + j..].to_string()).unwrap_or("/".into()),
+            Some(i) => crate::http::request::origin_form(&req_target[i + 3..]),
             // A CONNECT's authority-form target (`host:port`) names the origin, no path under it.
             None if method.eq_ignore_ascii_case("CONNECT") => String::new(),
             None => req_target.clone(),
@@ -188,7 +188,12 @@ fn decode(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, bool) {
 /// end; one that isn't the coding it claims gives None.
 fn read_limited(r: impl Read) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
-    match r.take(MAX_DECODED_BODY).read_to_end(&mut out) {
+    // One byte past the cap tells a body that decodes to exactly the cap from a longer one.
+    match r.take(MAX_DECODED_BODY + 1).read_to_end(&mut out) {
+        Ok(_) if out.len() as u64 > MAX_DECODED_BODY => {
+            out.truncate(MAX_DECODED_BODY as usize);
+            Some((out, false))
+        }
         Ok(_) => Some((out, true)),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !out.is_empty() => Some((out, false)),
         Err(_) => None,
@@ -196,7 +201,12 @@ fn read_limited(r: impl Read) -> Option<(Vec<u8>, bool)> {
 }
 
 fn html_title(body: &str) -> Option<String> {
-    let lower = body.get(..body.len().min(256 * 1024))?.to_ascii_lowercase();
+    // Cut back to a character's start: a cut inside one would give no title at all.
+    let mut cut = body.len().min(256 * 1024);
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let lower = body[..cut].to_ascii_lowercase();
     let start = lower.find("<title")?;
     let open_end = start + lower[start..].find('>')? + 1;
     let close = open_end + lower[open_end..].find("</title")?;
@@ -261,5 +271,31 @@ mod tests {
         assert_eq!(q.url, "http://b.test:8080/f?u=http://o.test/a");
         assert_eq!(c.status, None);
         assert_eq!(c.error.as_deref(), Some("boom"));
+        // No path before the query: the query is kept, and a URL inside it isn't read as the path.
+        let n = Capture::new(
+            "proxy",
+            &target,
+            b"GET http://b.test:8080?next=http://o.test/a HTTP/1.1\r\n\r\n",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(n.url, "http://b.test:8080/?next=http://o.test/a");
+        assert_eq!((n.path.as_str(), n.query.as_deref()), ("/", Some("next=http://o.test/a")));
+    }
+
+    #[test]
+    fn a_body_that_decodes_past_the_cap_is_not_all_of_it() {
+        let (out, all) = read_limited(std::io::repeat(0).take(MAX_DECODED_BODY + 10)).unwrap();
+        assert_eq!((out.len() as u64, all), (MAX_DECODED_BODY, false));
+        let (out, all) = read_limited(std::io::repeat(0).take(MAX_DECODED_BODY)).unwrap();
+        assert_eq!((out.len() as u64, all), (MAX_DECODED_BODY, true));
+    }
+
+    #[test]
+    fn a_long_page_cut_inside_a_character_keeps_its_title() {
+        let page = format!("<html> <title>Accueil</title>{}</html>", "é".repeat(150_000));
+        assert!(!page.is_char_boundary(256 * 1024));
+        assert_eq!(html_title(&page).as_deref(), Some("Accueil"));
     }
 }

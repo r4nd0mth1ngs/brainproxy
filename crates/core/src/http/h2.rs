@@ -44,8 +44,10 @@ impl H2Request {
         let method = http::Method::from_bytes(head.method.as_bytes()).map_err(|_| unfit("method"))?;
         // Origin form (/...), absolute form, or `*`: anything else would run into the authority
         // (`.evil.test/` after `app.test`), so the request would go to another site than it says.
-        let path = match head.target.split_once("://") {
-            Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]).to_string(),
+        // An origin-form target may carry a URL in its query (`/fetch?url=http://x.test/y`): only
+        // one that doesn't start with `/` is absolute.
+        let path = match head.target.split_once("://").filter(|_| !head.target.starts_with('/')) {
+            Some((_, rest)) => crate::http::request::origin_form(rest),
             None if head.target.starts_with('/') || head.target == "*" => head.target.clone(),
             None => return Err(unfit(&format!("request target {:?} isn't a path, a URL or *", head.target))),
         };
@@ -314,6 +316,15 @@ pub(crate) mod tests {
         assert!(H2Request::from_raw(b"GET / HTTP/2\r\nHost: a.test@evil.test\r\n\r\n", &t).is_err());
         let star = H2Request::from_raw(b"OPTIONS * HTTP/2\r\nHost: a.test\r\n\r\n", &t).unwrap();
         assert_eq!((star.uri.host(), star.uri.path()), (Some("a.test"), "*"));
+        // A URL in an origin-form target's query is part of the query, not the path.
+        for (target, uri) in [
+            ("/fetch?url=http://x.test/y", "https://a.test/fetch?url=http://x.test/y"),
+            ("/login?next=https://a.test", "https://a.test/login?next=https://a.test"),
+            ("http://a.test?next=http://x.test/y", "https://a.test/?next=http://x.test/y"),
+        ] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: a.test\r\n\r\n");
+            assert_eq!(H2Request::from_raw(raw.as_bytes(), &t).unwrap().uri.to_string(), uri, "{target}");
+        }
     }
 
     #[test]

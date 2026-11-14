@@ -83,3 +83,22 @@ export function rank<T>(query: string, items: T[], title: (t: T) => string, othe
   });
   return out.sort((a, b) => b.score - a.score || a.i - b.i).map(({ item, score, at }) => ({ item, score, at }));
 }
+
+/**
+ * `text` cut into runs that are matched or not, from the positions `fuzzy` gives (UTF-16 units,
+ * as the string is indexed). A character beyond the BMP, such as an emoji, is two units but one
+ * character, so it is never split.
+ */
+export function marked(text: string, at: number[]): { text: string; on: boolean }[] {
+  const set = new Set(at);
+  const out: { text: string; on: boolean }[] = [];
+  let unit = 0;
+  for (const c of text) {
+    const on = set.has(unit);
+    unit += c.length;
+    const last = out[out.length - 1];
+    if (last && last.on === on) last.text += c;
+    else out.push({ text: c, on });
+  }
+  return out;
+}

@@ -9,6 +9,9 @@ description = "AI-first, non-interactive web security testing CLI"
 name = "brainproxy"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 brainproxy-core = { path = "../core" }
 anyhow.workspace = true

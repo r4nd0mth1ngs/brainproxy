@@ -156,7 +156,7 @@ pub enum FindingsCmd {
         /// open, confirmed, false_positive, fixed, accepted_risk, retest_pending, removed, or all,
         /// or several separated by commas (default: work still to do, so it hides false
         /// positives, fixed and accepted findings, and removed findings added by hand).
-        #[arg(long)]
+        #[arg(long, value_parser = StatesParser)]
         state: Option<String>,
         /// Only findings from this scanner, or those added by hand (manual).
         #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
@@ -197,7 +197,7 @@ pub enum FindingsCmd {
         #[arg(long)]
         alert: Option<String>,
         /// States of the findings counted, as for `findings list` (default: work still to do).
-        #[arg(long)]
+        #[arg(long, value_parser = StatesParser)]
         state: Option<String>,
         /// Only findings from this scanner, or those added by hand (manual).
         #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
@@ -537,6 +537,33 @@ pub const STATE_VALUES: [&str; 11] = [
     "removed",
     "all",
 ];
+
+/// `--state` where several states pick findings (`findings list`, `findings issues`): each of
+/// the comma-separated values must be one of [`STATE_VALUES`], refused as `report` refuses one.
+#[derive(Clone)]
+struct StatesParser;
+
+impl clap::builder::TypedValueParser for StatesParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        let text = clap::builder::StringValueParser::new().parse_ref(cmd, arg, value)?;
+        let one = clap::builder::PossibleValuesParser::new(STATE_VALUES);
+        let mut states = text.split(',').map(str::trim).filter(|s| !s.is_empty()).peekable();
+        if states.peek().is_none() {
+            one.parse_ref(cmd, arg, value)?;
+        }
+        for state in states {
+            one.parse_ref(cmd, arg, std::ffi::OsStr::new(state))?;
+        }
+        Ok(text)
+    }
+}
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum StateArg {
@@ -1170,14 +1197,23 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                         .join("\n")
                 });
             } else {
-                let groups = store.findings_grouped(&filter)?;
+                let mut groups = store.findings_grouped(&filter)?;
                 let mut by_risk = serde_json::Map::new();
                 for g in &groups {
                     let r = g["risk"].as_str().unwrap_or("info").to_string();
                     let n = by_risk.get(&r).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
                     by_risk.insert(r, json!(n));
                 }
-                out.ok(json!({"alert_types": groups.len(), "by_risk": by_risk, "groups": groups}), || {
+                // The counts are of every alert type; only the list is cut at --limit.
+                let alert_types = groups.len();
+                groups.truncate(limit);
+                let data = json!({
+                    "alert_types": alert_types,
+                    "by_risk": by_risk,
+                    "groups": groups,
+                    "truncated": alert_types > groups.len(),
+                });
+                out.ok(data, || {
                     groups
                         .iter()
                         .map(|g| {

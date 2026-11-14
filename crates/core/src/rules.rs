@@ -2005,7 +2005,6 @@ fn response_rules<'a>(
     let mut decoded: Option<Option<Vec<u8>>> = None;
     let mut body_changed = false;
     let mut changed_by = Vec::new();
-    // The response's body decoded, the first time something needs it.
     let decode = || decode_body_fully(&parsed.headers, raw_body);
     for rule in active {
         if !run.wants(rule, |dry| {

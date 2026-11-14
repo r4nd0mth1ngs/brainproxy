@@ -518,14 +518,14 @@ function Scope({ active }: { active: boolean }) {
         setEdit({ include: s.include.join("\n"), exclude: s.exclude.join("\n"), record: s.record_out_of_scope });
       })
       .catch((e) => app.toast(e.message, "error"));
-  useEffect(() => {
-    if (active) loadScope();
-  }, [active]);
-  // The header's notice reloads it even when it is showing already: the change it names came
-  // since. Edits not saved yet stay as they are.
+  // Read again each time it shows, and on the header's notice even when it is showing already:
+  // the change it names came since. Edits not saved yet stay as they are.
   const dirty = !!scope && (edit.include !== scope.include.join("\n") || edit.exclude !== scope.exclude.join("\n") || edit.record !== scope.record_out_of_scope);
+  const reload = () => (dirty ? run<ProxyScope>(["scope", "show"]).then(setScope, (e) => app.toast(e.message, "error")) : loadScope());
   useEffect(() => {
-    const reload = () => (dirty ? run<ProxyScope>(["scope", "show"]).then(setScope, (e) => app.toast(e.message, "error")) : loadScope());
+    if (active) reload();
+  }, [active]);
+  useEffect(() => {
     window.addEventListener(SHOW_SCOPE, reload);
     return () => window.removeEventListener(SHOW_SCOPE, reload);
   }, [dirty]);

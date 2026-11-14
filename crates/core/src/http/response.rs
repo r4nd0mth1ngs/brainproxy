@@ -35,7 +35,11 @@ pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead> {
     } else {
         head
     };
-    let mut headers = [httparse::EMPTY_HEADER; 256];
+    // Room for every line: a response with hundreds of Set-Cookie headers is still one browsers
+    // read, and httparse refuses the whole head when it runs out of slots.
+    // Bounded: a head can be any bytes passed in (an imported or edited exchange).
+    let lines = head.iter().filter(|&&b| b == b'\n').count() + 1;
+    let mut headers = vec![httparse::EMPTY_HEADER; lines.clamp(64, 8192)];
     let mut resp = httparse::Response::new(&mut headers);
     // Read what browsers and curl read (RFC 9112 5.2: a folded line is part of the value):
     // `Name : value`, folded lines, and header lines that aren't valid are skipped.
@@ -109,6 +113,15 @@ pub fn dechunk(body: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hundreds_of_headers_are_read() {
+        let cookies: String = (0..300).map(|i| format!("Set-Cookie: c{i}=v\r\n")).collect();
+        let h =
+            parse_response_head(format!("HTTP/1.1 200 OK\r\n{cookies}Content-Length: 0\r\n\r\n").as_bytes()).unwrap();
+        assert_eq!(h.headers.len(), 301);
+        assert_eq!(h.header("content-length"), Some("0"));
+    }
 
     #[test]
     fn odd_header_lines_are_read_not_rejected() {

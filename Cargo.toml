@@ -31,6 +31,11 @@ sha2 = "0.11"
 url = "2"
 clap = { version = "4", features = ["derive", "env", "string"] }
 
+# On top of clippy's defaults, which CI runs with -D warnings.
+[workspace.lints.clippy]
+# Every unsafe block says why it is sound, in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

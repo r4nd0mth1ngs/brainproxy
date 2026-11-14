@@ -386,7 +386,6 @@ impl Xss<'_> {
                 return false;
             }
         }
-        // Try adding an onMouseOver.
         let attack = format!("{q} onMouseOver={q}alert(1);");
         let Some(c) = self.perform(&attack, Some(ctx), None, Opts::ignore(IGNORE_TAG | IGNORE_IN_URL)).await else {
             return false;

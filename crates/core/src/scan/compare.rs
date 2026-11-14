@@ -150,7 +150,8 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
 
 /// A scan against a findings set from a file, for a pipeline that starts each run with a fresh
 /// project and keeps the known findings between runs. New: found by the scan and not in the
-/// set. Unchanged: found by the scan and in the set, keeping a false-positive mark from the set.
+/// set. Unchanged: found by the scan and in the set, keeping a false-positive or accepted-risk
+/// mark from the set, as [`compare_sets`] does.
 /// Fixed: in the set, covered by the scan, and not found by it. The set's findings the scan
 /// didn't cover, and the project's own findings the scan didn't find, count as "other".
 pub fn compare_scan_with_set(store: &Store, scope: &ScanScope, baseline: Vec<Item>) -> Result<Comparison> {
@@ -165,8 +166,8 @@ pub fn compare_scan_with_set(store: &Store, scope: &ScanScope, baseline: Vec<Ite
         }
         match base.remove(&key) {
             Some(old) => {
-                if old.false_positive() {
-                    f.state = FALSE_POSITIVE.into();
+                if old.dismissed() && !f.dismissed() {
+                    f.state = old.state;
                 }
                 out.unchanged.push(f);
             }
@@ -928,6 +929,27 @@ mod tests {
         let c =
             compare_scan(&s, &ScanScope { start: "2000-01-01T00:00:00.000Z".into(), ..Default::default() }).unwrap();
         assert_eq!((c.new.len(), c.fixed.len()), (total, 0));
+    }
+
+    #[test]
+    fn a_scan_keeps_the_sets_accepted_risks_as_well_as_its_false_positives() {
+        let s = store_with_findings();
+        let live = project_items(&s).unwrap();
+        assert!(live.len() >= 2, "{live:?}");
+        let mut known = live.clone();
+        known[0].state = ACCEPTED_RISK.into();
+        known[1].state = FALSE_POSITIVE.into();
+        let (accepted, false_positive) = (known[0].key(), known[1].key());
+        let window = ScanScope { start: "2000-01-01T00:00:00.000Z".into(), ..Default::default() };
+        let c = compare_scan_with_set(&s, &window, known.clone()).unwrap();
+        assert_eq!(c.unchanged.len(), live.len(), "{c:?}");
+        let state = |key: &str| c.unchanged.iter().find(|f| f.key() == key).map(|f| f.state.clone());
+        assert_eq!(state(&accepted).as_deref(), Some(ACCEPTED_RISK));
+        assert_eq!(state(&false_positive).as_deref(), Some(FALSE_POSITIVE));
+        // The gate counts what the set alone would.
+        let gated = |c: &Comparison| c.gate(Risk::Info, false).iter().map(|f| f.key()).collect::<HashSet<_>>();
+        assert_eq!(gated(&c), gated(&compare_sets(known, live.clone())));
+        assert_eq!(gated(&c).len(), live.len() - 2);
     }
 
     #[test]

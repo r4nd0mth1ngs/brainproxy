@@ -396,7 +396,6 @@ enum Learned {
     Digest(crate::connection::platform::DigestChallenge, u32),
 }
 
-/// A host and port.
 type HostPort = (String, u16);
 
 #[derive(Default)]
@@ -918,10 +917,6 @@ impl Client {
         Ok((conn, answered))
     }
 
-    /// [`Client::round_trip_h2`] with platform authentication (Basic and Digest:
-    /// NTLM needs HTTP/1.1).
-    ///
-    /// With `live` an event stream's body is left open and returned beside its head.
     /// One request over HTTP/2 or HTTP/3 (`mux`), answering a Basic or Digest challenge of the
     /// target's platform credentials (NTLM needs HTTP/1.1) with a second request. An event
     /// stream's body is left open.

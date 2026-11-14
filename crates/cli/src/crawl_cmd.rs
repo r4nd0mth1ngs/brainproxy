@@ -114,6 +114,9 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
     // Found before going to the background, so a missing browser is reported at once.
     let browser = args.browser.then(|| crate::browser_cmd::chromium(args.browser_id.as_deref())).transpose()?;
     let avoid = avoid_patterns(&args.avoid, args.allow_destructive)?;
+    let timeout = crate::request_args::secs_arg("--timeout", args.timeout)?.max(std::time::Duration::from_millis(100));
+    let max_duration = args.max_minutes.map(|m| crate::request_args::minutes_arg("--max-minutes", m)).transpose()?;
+    crate::request_args::check_rate("--rate", args.rate)?;
     if args.background {
         return crate::jobs_cmd::spawn_background("crawl", project, home, out);
     }
@@ -126,7 +129,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
     }
     let headers = args.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
     let send = SendOptions {
-        timeout: std::time::Duration::from_secs_f64(args.timeout.max(0.1)),
+        timeout,
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard),
@@ -153,7 +156,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         robots: !args.no_robots,
         sitemap: !args.no_sitemap,
         auth: auth.clone(),
-        max_duration: args.max_minutes.map(|m| std::time::Duration::from_secs_f64(m.max(0.0) * 60.0)),
+        max_duration,
     };
     let browser_cfg = match browser {
         Some(path) => Some(browser_config(home, cfg.clone(), path, !args.headful, avoid, args.allow_destructive)?),

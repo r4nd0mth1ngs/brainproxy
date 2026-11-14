@@ -805,12 +805,25 @@ export const signerFormOrigins = (f: Pick<SignerForm, "origins">): string[] =>
 
 /** Whether a rule's `--url` covers a URL: a host pattern or a URL prefix, as the CLI matches it. */
 export function urlPatternMatches(pattern: string, url: string): boolean {
-  const glob = pattern.trim().replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  if (pattern.includes("://")) return new RegExp(`^${glob}`, "i").test(url);
+  const p = pattern.trim();
+  const escape = (s: string) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  const glob = escape(p).replace(/\*/g, ".*");
+  if (p.includes("://")) {
+    // As session.rs: the pattern's origin is the whole origin (no longer host, other port, or
+    // a `*` in the host reaching into the path), since the rule's values may go wherever it matches.
+    const host = p.indexOf("://") + 3;
+    const cut = p.slice(host).search(/[/?#]/);
+    const end = cut < 0 ? p.length : host + cut;
+    const origin = escape(p.slice(0, end)).replace(/\*/g, "[^/?#@\\\\]*");
+    const rest = escape(p.slice(end)).replace(/\*/g, ".*");
+    // The URL as the CLI matches it (url::Url's form): no default port, lower-case host, a path.
+    return new RegExp(`^${origin}${rest || "(?:[/?#]|$)"}`, "i").test(parseUrl(url)?.href ?? url);
+  }
   const u = parseUrl(url);
   if (!u) return false;
   const wild = glob.startsWith(".*\\.") ? `(.*\\.)?${glob.slice(4)}` : glob;
-  return new RegExp(`^${wild}$`, "i").test(u.hostname);
+  // The host as the CLI has it: an IPv6 address without its brackets.
+  return new RegExp(`^${wild}$`, "i").test(u.hostname.replace(/^\[(.*)\]$/, "$1"));
 }
 
 export interface SignerCoverage {

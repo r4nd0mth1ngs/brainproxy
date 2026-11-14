@@ -500,11 +500,23 @@ impl ScriptFinding {
             Value::Null => 0,
             n => n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or("a finding's cwe is a number")?,
         };
-        let slug = |s: &str| -> String {
-            let s: String =
-                s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+        // The id is part of a stored alert type, so an ASCII one must stay as it always was;
+        // letters of other alphabets are kept so "Утечка токена" and "SQL注入" stay apart.
+        let slug = |text: &str| -> String {
+            let mut s = String::new();
+            for c in text.chars() {
+                if c.is_alphanumeric() {
+                    s.extend(c.to_lowercase());
+                } else {
+                    s.push('-');
+                }
+            }
             let parts: Vec<&str> = s.split('-').filter(|p| !p.is_empty()).collect();
-            cut(&parts.join("-"), 60)
+            match cut(&parts.join("-"), 60) {
+                // Nothing a slug keeps, such as only emoji: still one kind per text.
+                slug if slug.is_empty() => crate::fetch::sha256_hex(text.as_bytes())[..12].to_string(),
+                slug => slug,
+            }
         };
         let id = match text("id", 60)? {
             id if id.is_empty() => slug(&name),
@@ -757,6 +769,14 @@ pub(crate) mod tests {
         );
         let two = on("/two").unwrap();
         assert_eq!((two[0].id.as_str(), two[1].id.as_str(), two[1].cwe), ("my-id", "b", 200));
+        let id = |v: Value| ScriptFinding::read(&v).unwrap().id;
+        assert_eq!(id(json!({"name": "Утечка токена"})), "утечка-токена");
+        assert_eq!(id(json!({"name": "SQL注入"})), "sql注入");
+        assert_eq!(id(json!({"name": "A", "id": "Ünïcode ID"})), "ünïcode-id");
+        assert_eq!(id(json!({"name": "Session cookie w/o HttpOnly!"})), "session-cookie-w-o-httponly");
+        let (a, b) = (id(json!({"name": "🔥"})), id(json!({"name": "🔥🔥"})));
+        assert!(a != b && a.len() == 12 && a == id(json!({"name": "🔥"})), "{a} {b}");
+        assert_eq!(id(json!({"name": "x", "id": "🔥"})), a);
         for (path, why) in [
             ("/risk", "risk is info, low"),
             ("/noname", "needs a name"),

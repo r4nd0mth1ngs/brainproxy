@@ -72,8 +72,8 @@ pub struct RunArgs {
 
     #[arg(long, default_value = "sniper", value_parser = Mode::ALL.to_vec())]
     mode: String,
-    /// Payload source for the next set (repeat for pitchfork/cluster-bomb). Through MCP a
-    /// file:PATH is read only from the project's folder.
+    /// Payload source for the next set (repeat for pitchfork/cluster-bomb); file:- reads stdin.
+    /// Through MCP a file:PATH is read only from the project's folder.
     #[arg(short = 'p', long = "payloads", required = true)]
     payloads: Vec<String>,
     /// Processing chain for payloads, e.g. "url", "2=prefix:admin,base64" or "script:sign.js,url".
@@ -340,6 +340,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         StoreArg::None => crate::mcp::check_records_all("--store none")?,
     }
     let mode = Mode::parse(&args.mode)?;
+    crate::request_args::check_rate("--rate", args.rate)?;
     let stdin_payloads = args.payloads.iter().filter(|p| *p == "file:-").count();
     if stdin_payloads > 1 || (stdin_payloads == 1 && args.req.reads_stdin()) {
         return Err(Error::InvalidInput(
@@ -367,7 +368,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let (req, target) = prepared?;
     let guard = crate::project_guard(project)?;
     crate::require_in_scope(&guard, &target)?;
-    let opts = args.req.send_options(guard.clone());
+    let opts = args.req.send_options(guard.clone())?;
     // So is a server name the scope doesn't list, before a row could say it was sent.
     opts.check_sni(&target)?;
     // And, through MCP, a Host the scope doesn't list unless it is a stated Host-header test. A
@@ -477,7 +478,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         Ok::<_, Error>(())
     };
 
-    let send = args.req.send_options(guard);
+    let send = args.req.send_options(guard)?;
     let auth = match crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send) {
         Ok(a) => a,
         Err(e) => {

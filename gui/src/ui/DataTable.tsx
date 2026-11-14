@@ -60,14 +60,20 @@ export function DataTable<T>(p: Props<T>) {
   const last = Math.min(sorted.length, Math.ceil((scroll + height) / ROW) + 10);
   const index = p.selected == null ? -1 : sorted.findIndex((r) => p.rowKey(r) === p.selected);
 
-  // Keep the selected row in view when it moves by keyboard.
+  // The selection last scrolled into view. Only a new selection (by keyboard, click or a view
+  // picking one) scrolls: rows added around it (a poll, newest first) move its index, and
+  // following that would pull the list back from wherever it was scrolled to on every poll.
+  const revealed = useRef<number | string | null>(null);
   useEffect(() => {
     const el = box.current;
-    if (!el || index < 0) return;
+    // Not in the list (filtered out, or none): shown again when it comes back.
+    if (index < 0) revealed.current = null;
+    if (!el || index < 0 || revealed.current === p.selected) return;
+    revealed.current = p.selected ?? null;
     const top = index * ROW;
     if (top < el.scrollTop) el.scrollTop = top;
     else if (top + ROW * 2 > el.scrollTop + el.clientHeight) el.scrollTop = top + ROW * 2 - el.clientHeight;
-  }, [index]);
+  }, [index, p.selected]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (!sorted.length || !p.onSelect) return;

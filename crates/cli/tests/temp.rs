@@ -86,6 +86,7 @@ fn stop_stops_the_proxy_and_deletes_nothing() {
     assert_eq!(d["proxy"], pid, "{d}");
     assert_eq!(env.ok(&env.project, &["proxy", "status"])["running"], false);
     #[cfg(unix)]
+    // SAFETY: signal 0 only checks that the process exists.
     assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0, "proxy {pid} still running");
     assert!(env.project.exists());
     // Nothing running: stopping again is fine.

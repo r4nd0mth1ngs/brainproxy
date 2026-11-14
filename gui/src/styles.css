@@ -1052,6 +1052,10 @@ select {
   border-radius: 12px;
   box-shadow: var(--shadow);
 }
+/* A dialog with no field to focus first takes focus itself (ui/dialogFocus.ts); no ring for that. */
+[role="dialog"]:focus {
+  outline: none;
+}
 .confirm-dialog h2 {
   margin: 0 0 8px;
   font-size: 15px;
@@ -2847,7 +2851,6 @@ button.chip {
   border-radius: 2px;
   margin-right: 4px;
 }
-/* Six triage states and the actions beside them wrap in a narrow detail pane. */
 /* The report builder (views/ReportBuilder.tsx): choices on the left, the preview on the right. */
 .report-dialog {
   width: min(1180px, 100%);
@@ -2897,7 +2900,8 @@ button.chip {
     grid-template-rows: auto minmax(300px, 1fr);
   }
 }
-/* An agent's work nobody has looked at yet. */
+/* Text that needs a second look: an agent's work nobody has reviewed, a script's answer, a rule
+   that wasn't applied. */
 .warn-text {
   color: var(--medium);
 }

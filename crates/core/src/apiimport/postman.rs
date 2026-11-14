@@ -29,6 +29,15 @@ const HOST_VARIABLE: &str = "unresolved variable in host";
 /// Folders nested deeper than this are ignored.
 const MAX_DEPTH: usize = 32;
 
+/// Levels of variables inside variable values that are substituted; past this, a variable
+/// that refers back to itself stays as it is.
+const MAX_NESTING: usize = 8;
+
+/// Bytes of values one string's nested variables may read. Values that each refer to the next
+/// many times over grow exponentially with depth, and when they end in empty values the
+/// output cap never stops them.
+const MAX_NESTED_READ: usize = 1 << 20;
+
 pub fn build(doc: &Value, opts: &Options) -> Result<Built> {
     let items = doc
         .get("item")
@@ -57,9 +66,16 @@ struct Cx {
 }
 
 impl Cx {
-    /// Substitutes `{{name}}`; unknown variables are left as they are.
+    /// Substitutes `{{name}}`, and the variables in the values it puts in, as Postman does
+    /// (`{{base}}` may be `https://{{host}}`); unknown variables are left as they are.
     fn sub(&self, s: &str) -> String {
         let mut out = String::new();
+        let mut budget = MAX_NESTED_READ;
+        self.sub_into(s, 0, &mut budget, &mut out);
+        out
+    }
+
+    fn sub_into(&self, s: &str, depth: usize, budget: &mut usize, out: &mut String) {
         let mut rest = s;
         while let Some(i) = rest.find("{{") {
             out.push_str(&rest[..i]);
@@ -68,6 +84,10 @@ impl Cx {
                 Some(j) => {
                     let name = after[..j].trim();
                     match self.vars.get(name).filter(|v| out.len() + v.len() <= super::MAX_DOCUMENT) {
+                        Some(v) if depth < MAX_NESTING && v.contains("{{") && v.len() <= *budget => {
+                            *budget -= v.len();
+                            self.sub_into(v, depth + 1, budget, out);
+                        }
                         Some(v) => out.push_str(v),
                         None => out.push_str(&rest[i..i + 2 + j + 2]),
                     }
@@ -80,8 +100,12 @@ impl Cx {
             }
         }
         out.push_str(rest);
-        out
     }
+}
+
+/// An item's own auth: `inherit` means its parent's, as no auth at all does.
+fn own_auth(a: Option<&Value>) -> Option<&Value> {
+    a.filter(|a| a.get("type").and_then(Value::as_str) != Some("inherit"))
 }
 
 fn walk(cx: &Cx, items: &[Value], prefix: &str, auth: Option<&Value>, depth: usize, out: &mut Built) {
@@ -94,7 +118,7 @@ fn walk(cx: &Cx, items: &[Value], prefix: &str, auth: Option<&Value>, depth: usi
     for it in items {
         let name = it.get("name").and_then(Value::as_str).unwrap_or("");
         let path = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
-        let auth = it.get("auth").or(auth);
+        let auth = own_auth(it.get("auth")).or(auth);
         if let Some(children) = it.get("item").and_then(Value::as_array) {
             walk(cx, children, &path, auth, depth + 1, out);
             continue;
@@ -104,7 +128,7 @@ fn walk(cx: &Cx, items: &[Value], prefix: &str, auth: Option<&Value>, depth: usi
             out.skip(path, "contains a reserved placeholder".into());
             continue;
         }
-        match request(cx, &path, req, req.get("auth").or(auth)) {
+        match request(cx, &path, req, own_auth(req.get("auth")).or(auth)) {
             Ok(r) => out.keep(cx.guarded, path, r),
             Err(e) => {
                 out.base_url_required |= cx.guarded && e.to_string().contains(HOST_VARIABLE);
@@ -460,7 +484,7 @@ fn auth_credential(a: &Value, label: &str) -> Option<Credential> {
         }
     };
     let (kind, location, name) = match ty {
-        "noauth" => return None,
+        "noauth" | "inherit" => return None,
         "bearer" => header("bearer"),
         "basic" => header("basic"),
         "apikey" => {
@@ -695,6 +719,51 @@ mod tests {
         assert!(!format!("{b:?}").contains("KEYVALUE"), "{b:?}");
         let b = build(&doc, &Options::default()).unwrap();
         assert!(!format!("{b:?}").contains("KEYVALUE"), "{b:?}");
+    }
+
+    #[test]
+    fn variables_in_variable_values_are_substituted() {
+        let doc = json!({
+            "variable": [
+                {"key": "baseUrl", "value": "https://{{host}}/v1"},
+                {"key": "host", "value": "api.test"},
+                {"key": "trace", "value": "t-{{token}}"},
+                {"key": "token", "value": "TOKENVALUE"},
+                {"key": "a", "value": "{{b}}"},
+                {"key": "b", "value": "{{a}}"}],
+            "item": [
+                {"name": "Users", "request": {"url": "{{baseUrl}}/users",
+                    "header": [{"key": "X-Trace", "value": "{{trace}}"}]}},
+                {"name": "Loop", "request": "https://{{a}}/x"}]});
+        let o = Options { guarded: true, withheld: vec!["token".into()], ..Default::default() };
+        let b = build(&doc, &o).unwrap();
+        assert_eq!(b.requests.len(), 1, "{b:?}");
+        assert_eq!(b.requests[0].url, "https://api.test/v1/users");
+        assert_eq!(header(&b.requests[0], "X-Trace"), Some("t-{{token}}"), "withheld stays withheld");
+        assert!(b.skipped.iter().any(|s| s.operation == "Loop" && s.reason.contains(HOST_VARIABLE)), "{b:?}");
+
+        // Each value refers to the next a thousand times, and the last is empty: 1000^8 lookups unchecked.
+        let mut vars: HashMap<String, String> =
+            (0..MAX_NESTING).map(|i| (format!("v{i}"), format!("{{{{v{}}}}}", i + 1).repeat(1000))).collect();
+        vars.insert(format!("v{MAX_NESTING}"), String::new());
+        let out = Cx { vars, base: None, guarded: false }.sub("{{v0}}");
+        assert!(out.len() < 2 * crate::apiimport::MAX_DOCUMENT, "{}", out.len());
+    }
+
+    #[test]
+    fn inherit_auth_is_the_parents() {
+        let bearer = json!({"type": "bearer", "bearer": [{"key": "token", "value": "T0K"}]});
+        let inherit = json!({"type": "inherit"});
+        let doc = json!({"auth": bearer, "item": [
+            {"name": "F", "auth": inherit, "item": [
+                {"name": "One", "auth": inherit, "request": {"url": "http://a.test/1", "auth": inherit}},
+                {"name": "None", "request": {"url": "http://a.test/2", "auth": {"type": "noauth"}}}]}]});
+        let b = build(&doc, &Options::default()).unwrap();
+        assert_eq!(header(&b.requests[0], "Authorization"), Some("Bearer T0K"));
+        assert_eq!(header(&b.requests[1], "Authorization"), None);
+        let a = analyze(&doc, &Environment::default(), &[]);
+        assert_eq!(a.credentials.len(), 1, "{:?}", a.credentials);
+        assert_eq!((a.credentials[0].kind.as_str(), a.credentials[0].source.as_str()), ("bearer", "auth:collection"));
     }
 
     #[test]

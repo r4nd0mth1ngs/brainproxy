@@ -115,6 +115,8 @@ interface Props {
   mode?: ApiMode;
   /** The scan's job, kept by the host. An import's job is shown by the host (the Site map). */
   jobId?: number | null;
+  /** The host is showing: the scan's progress is read only then. */
+  active?: boolean;
   /** The job started: the host keeps its id, so it outlives this card and a reload. */
   onStarted?: (id: number) => void;
   /** The start command was sent (true) or answered (false). Until then the card can't be closed: the job may still start. */
@@ -311,7 +313,7 @@ export function ApiWizard(p: Props) {
   };
 
   // After every hook above: the hook count must not change between renders.
-  if (mode === "scan" && p.jobId != null) return <WizardProgress jobId={p.jobId} onClose={p.onDismiss} />;
+  if (mode === "scan" && p.jobId != null) return <WizardProgress jobId={p.jobId} active={p.active ?? true} onClose={p.onDismiss} />;
 
   // The GraphQL tick changes what the URL is read as, so a preview without it is of something else.
   const previewed = !!preview && source === typed.trim() && target.graphql === (graphqlEndpoint && sourceKind(source) === "url");

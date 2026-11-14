@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { cli, run, withScheme } from "../api";
 import { useApp } from "../store";
 import { startProxy } from "./proxyPort";
-import { finishCall, logsIn, modeText, passkeyLine, startArgs, type PasskeyInfo, type RecordMode } from "./recordLogin.ts";
+import { failedLogin, finishCall, logsIn, modeText, passkeyLine, startArgs, type LoginResult, type PasskeyInfo, type RecordMode } from "./recordLogin.ts";
 import { loadSuggestions } from "./Scanner";
 
 interface Proposal {
@@ -34,10 +34,6 @@ interface Proposal {
     login_steps?: { url: string }[];
     browser?: { start_url: string };
   };
-}
-
-interface LoginResult {
-  login: { success: boolean; reason: string };
 }
 
 type Step = "start" | "recording" | "review" | "done";
@@ -106,7 +102,7 @@ export function RecordLogin(p: { onDone: (name: string) => void; onCancel: () =>
       const saved = await run<Proposal>(call.args, { env: call.env });
       setResult(
         logsIn(saved.mode)
-          ? await run<LoginResult>(["auth", "login", profileName])
+          ? await run<LoginResult>(["auth", "login", profileName]).catch((e: any) => failedLogin(String(e?.message ?? e)))
           : { login: { success: true, reason: "the recorded session is used as is" } },
       );
       setStep("done");

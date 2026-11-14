@@ -627,6 +627,69 @@ where
     regression.within_confidence(correlation_error, 1.0, slope_error)
 }
 
+/// Runs rule `id` on `GET /` of a local server that answers each request target with
+/// `answer(target)`, in a project holding the match-and-replace rules `rules`.
+#[cfg(test)]
+pub(super) async fn scan_page(
+    id: u32,
+    rules: Vec<crate::rules::Rule>,
+    answer: fn(&str) -> String,
+) -> crate::scan::active::ActiveSummary {
+    use crate::guard::{Guard, ScopeSpec};
+    use crate::http::{SendOptions, Target};
+    use crate::scan::active::{rand_u64, run, ActiveConfig, PointOptions, ScanTarget, Strength};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut buf, mut got) = (vec![0u8; 4096], Vec::new());
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&got).into_owned();
+                let _ = s.write_all(answer(head.split(' ').nth(1).unwrap_or("/")).as_bytes()).await;
+            });
+        }
+    });
+    let project = std::env::temp_dir().join(format!("bp-probe-{id}-{}-{}.bpdb", std::process::id(), rand_u64()));
+    crate::store::Store::create(&project).unwrap().set_setting(crate::rules::RULES_KEY, &rules).unwrap();
+    let target = ScanTarget {
+        history_id: None,
+        target: Target::from_url(&format!("http://127.0.0.1:{port}/")).unwrap(),
+        request: format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes(),
+        response: answer("/").into_bytes(),
+        duration_ms: None,
+    };
+    let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
+    let guard = Guard::from_specs(vec![scope]).unwrap();
+    let cfg = ActiveConfig {
+        strength: Strength::Medium,
+        tuning: Default::default(),
+        concurrency: 1,
+        rate: None,
+        send: SendOptions { guard: Some(guard), ..Default::default() },
+        points: PointOptions::default(),
+        rules: Some(vec![id]),
+        exclude_rules: vec![],
+        no_rules: false,
+        checks: vec![],
+        max_duration: None,
+        auth: None,
+        oob: None,
+        oob_wait: Duration::ZERO,
+        check_methods: vec![],
+        prune: false,
+    };
+    let summary = run(&project, vec![target], cfg, crate::jobs::JobControl::default()).await.unwrap();
+    let _ = std::fs::remove_file(&project);
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

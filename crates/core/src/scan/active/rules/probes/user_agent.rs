@@ -66,7 +66,9 @@ impl ActiveRule for UserAgent {
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
         Box::pin(async move {
             let base = cx.base();
-            let (orig_status, orig_body) = (base.status, base.resp_body.clone());
+            // The response as the scan's response rules left it, as each attack's is.
+            let orig = cx.base_response();
+            let (orig_status, orig_body) = (orig.status, orig.body.clone());
             // Keep the base request as-is (method, path, params), only the UA changes.
             let line_target = {
                 let head = String::from_utf8_lossy(base_line(cx.base_request()));
@@ -109,5 +111,17 @@ mod tests {
         assert!(!differs(200, b"hello", 200, b"hello"));
         assert!(differs(200, b"hello", 200, b"world"));
         assert!(differs(200, b"hello", 301, b"hello"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_response_rule_is_no_difference() {
+        use crate::rules::{Engine, Rule, RuleLocation};
+        fn page(_: &str) -> String {
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhello".into()
+        }
+        let rule =
+            Rule { applies_to: vec![Engine::Scan], ..Rule::new(1, RuleLocation::ResponseBody, "hello", "HELLO") };
+        let s = super::super::common::scan_page(10104, vec![rule], page).await;
+        assert_eq!((s.requests, s.new_findings), (12, 0), "{s:?}");
     }
 }

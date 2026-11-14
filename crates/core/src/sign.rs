@@ -919,7 +919,6 @@ fn read_text(source: &KeySource) -> Result<String> {
     Ok(text.to_string())
 }
 
-/// Reads a signer's key.
 pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
     if matches!(s.kind, SignKind::Script { .. }) {
         return load_script(s);
@@ -1057,12 +1056,17 @@ impl<'a> Parts<'a> {
         let mut words = line.split(' ');
         let method = words.next().unwrap_or_default();
         let uri = words.next().unwrap_or_default();
-        // The origin of an absolute-form target isn't part of the path.
+        // The origin of an absolute-form target isn't part of the path. It ends at the first
+        // `/`, `?` or `#`: `http://h?x=1` has the query `x=1` (as http::request::origin_form).
         let uri = match uri.find("://").filter(|_| !uri.starts_with('/')) {
-            Some(i) => uri[i + 3..].find('/').map_or("/", |j| &uri[i + 3 + j..]),
+            Some(i) => {
+                let rest = &uri[i + 3..];
+                rest.find(['/', '?', '#']).filter(|&j| rest.as_bytes()[j] != b'#').map_or("/", |j| &rest[j..])
+            }
             None => uri,
         };
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let path = if path.is_empty() { "/" } else { path };
         // A signature in the query can't cover itself.
         let query = query.split('&').filter(|p| !p.contains(mark)).collect::<Vec<_>>().join("&");
         let headers = RawRequest::from_bytes(head.to_vec()).head().map(|h| h.headers).unwrap_or_default();
@@ -1232,7 +1236,6 @@ fn encode_output(output: Output, bytes: &[u8]) -> String {
     }
 }
 
-/// HMAC of `data`.
 pub fn hmac_digest(alg: HmacAlg, key: &[u8], data: &[u8]) -> Vec<u8> {
     let alg = match alg {
         HmacAlg::Sha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
@@ -1326,6 +1329,21 @@ pub(crate) fn generate_jwt(claims: &str, alg: JwtAlg, key: &[u8], expires: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absolute_target_without_a_path_keeps_its_query() {
+        let target = Target::from_url("http://h.test").unwrap();
+        let stamp = Stamp::new().unwrap();
+        for (raw, path, query) in [
+            (&b"GET http://h.test?x=1 HTTP/1.1\r\nHost: h.test\r\n\r\n"[..], "/", "x=1"),
+            (b"GET http://h.test/p?x=1 HTTP/1.1\r\n\r\n", "/p", "x=1"),
+            (b"GET http://h.test?next=http://o.test/a HTTP/1.1\r\n\r\n", "/", "next=http://o.test/a"),
+            (b"GET http://h.test HTTP/1.1\r\n\r\n", "/", ""),
+        ] {
+            let p = Parts::new(raw, &target, "MARK", &stamp);
+            assert_eq!((p.path, p.query.as_str()), (path, query));
+        }
+    }
 
     /// A throwaway key made for this test, used nowhere else.
     const TEST_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----

@@ -462,7 +462,7 @@ fn cli_main(argv: Vec<String>) {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
                 e.exit();
             }
-            let out = Out::new(Format::sniff(&argv), argv.get(1).cloned().unwrap_or_default());
+            let out = Out::new(Format::sniff(&argv), usage_command(&argv));
             // `mcp serve` owns stdout for JSON-RPC, so its usage errors go to stderr too.
             let mcp_serve = argv.windows(2).any(|w| w[0] == "mcp" && w[1] == "serve");
             if out.json() && !mcp_serve {
@@ -480,6 +480,36 @@ fn cli_main(argv: Vec<String>) {
         out.error(e.kind(), &e.to_string());
         std::process::exit(e.exit_code());
     }
+}
+
+/// The command a usage error's envelope names: the first argument that isn't an option or a
+/// global option's value, since the GUI and MCP put `--format json --project P` first.
+fn usage_command(argv: &[String]) -> String {
+    let cli = Cli::command();
+    let valued: Vec<&clap::Arg> =
+        cli.get_arguments().filter(|a| a.is_global_set() && a.get_action().takes_values()).collect();
+    let mut args = argv.iter().skip(1);
+    while let Some(a) = args.next() {
+        // `--project=P` and `-pP` carry their value; `--project P` and `-p P` are followed by it.
+        // Only a command this binary has: an unknown option's value (`--timeout 5 send`) isn't one.
+        let known = |name: &String| cli.find_subcommand(name).is_some();
+        let value_follows = if a == "--" {
+            return args.next().filter(|a| known(a)).cloned().unwrap_or_default();
+        } else if let Some(long) = a.strip_prefix("--") {
+            valued.iter().any(|g| g.get_long() == Some(long))
+        } else if let Some(short) = a.strip_prefix('-') {
+            let mut c = short.chars();
+            matches!((c.next(), c.next()), (Some(s), None) if valued.iter().any(|g| g.get_short() == Some(s)))
+        } else if known(a) {
+            return a.clone();
+        } else {
+            false
+        };
+        if value_follows {
+            args.next();
+        }
+    }
+    String::new()
 }
 
 fn command_name(cmd: &Cmd) -> String {
@@ -778,13 +808,13 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         }
     }
     let guard = project_guard(project)?;
-    // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
-    // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
-    // non-race send) would be pushed onto HTTP/2 too.
     if !(0.0..=ws_cmd::MAX_WAIT_SECS).contains(&args.stream_wait) {
         return Err(Error::InvalidInput(format!("--stream-wait: 0 to {} seconds", ws_cmd::MAX_WAIT_SECS)));
     }
-    let mut send_opts = args.req.send_options(guard.clone());
+    // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
+    // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
+    // non-race send) would be pushed onto HTTP/2 too.
+    let mut send_opts = args.req.send_options(guard.clone())?;
     send_opts.stream = brainproxy_core::sse::StreamLimits {
         wait: std::time::Duration::from_secs_f64(args.stream_wait),
         max_events: args.max_events as usize,

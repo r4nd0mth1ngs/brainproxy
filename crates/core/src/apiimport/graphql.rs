@@ -25,7 +25,6 @@ const MAX_INPUT_DEPTH: usize = 4;
 /// `[[[...]]]` levels a schema file may nest.
 const MAX_LIST_NESTING: usize = 32;
 
-/// Body for the introspection request.
 pub fn introspection_body() -> Vec<u8> {
     serde_json::to_vec(&json!({"query": INTROSPECTION_QUERY, "operationName": "IntrospectionQuery"}))
         .unwrap_or_default()

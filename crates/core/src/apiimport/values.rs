@@ -18,7 +18,7 @@ pub fn resolve<'a>(root: &'a Value, v: &'a Value) -> &'a Value {
     let mut cur = v;
     for _ in 0..16 {
         match cur.get("$ref").and_then(Value::as_str) {
-            Some(r) if r.starts_with('#') => match root.pointer(&r[1..]) {
+            Some(r) if r.starts_with('#') => match local(root, &r[1..]) {
                 Some(t) => cur = t,
                 None => return &Value::Null,
             },
@@ -27,6 +27,14 @@ pub fn resolve<'a>(root: &'a Value, v: &'a Value) -> &'a Value {
         }
     }
     &Value::Null
+}
+
+/// What a `$ref`'s fragment points to. A fragment is a URI fragment, so its JSON pointer is
+/// percent-encoded (RFC 6901 §6): `{id}` in a path key arrives as `%7Bid%7D`.
+fn local<'a>(root: &'a Value, fragment: &str) -> Option<&'a Value> {
+    let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8().ok();
+    // A ref written unencoded to a key that holds a `%` itself still resolves.
+    decoded.and_then(|d| root.pointer(&d)).or_else(|| root.pointer(fragment))
 }
 
 /// Whether `text` appears in any string, or object key, of `v`.
@@ -56,7 +64,7 @@ pub fn ref_problems(root: &Value, v: &Value) -> Vec<String> {
                 if !seen.insert(r) {
                     continue;
                 }
-                match r.strip_prefix('#').map(|p| root.pointer(p)) {
+                match r.strip_prefix('#').map(|p| local(root, p)) {
                     Some(Some(target)) => stack.push(target),
                     Some(None) => out.push(format!("broken $ref {r:?}")),
                     None => out.push(format!("external $ref {r:?} is not followed")),
@@ -204,7 +212,7 @@ pub fn scalar(v: &Value) -> String {
     }
 }
 
-/// application/x-www-form-urlencoded body from an object.
+/// application/x-www-form-urlencoded body from name/value pairs (see `fields` for an object).
 pub fn form(fields: &[(String, String)]) -> Vec<u8> {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
     for (k, v) in fields {
@@ -310,6 +318,24 @@ mod tests {
         let all = json!({"allOf": [{"$ref": "#/components/schemas/Tag"}, {"properties": {"x": {"type": "boolean"}}}]});
         assert_eq!(example(&root, &all), json!({"id": 5, "w": 1.5, "x": true}));
         assert_eq!(example(&root, &json!({"oneOf": [{"type": "integer"}, {"type": "string"}]})), json!(1));
+    }
+
+    #[test]
+    fn ref_fragments_are_percent_decoded() {
+        let root = json!({
+            "paths": {"/users/{id}": {"get": {"parameters": [{"name": "id", "in": "path"}]}}},
+            "components": {"schemas": {"Café": {"type": "integer"}, "a b": {"type": "boolean"}}},
+        });
+        let param = json!({"$ref": "#/paths/~1users~1%7Bid%7D/get/parameters/0"});
+        assert_eq!(resolve(&root, &param), &json!({"name": "id", "in": "path"}));
+        assert_eq!(example(&root, &json!({"$ref": "#/components/schemas/Caf%C3%A9"})), json!(1));
+        assert_eq!(example(&root, &json!({"$ref": "#/components/schemas/a%20b"})), json!(true));
+        let refs = json!([param, {"$ref": "#/components/schemas/Caf%C3%A9"}, {"$ref": "#/components/schemas/Caf%E9"}]);
+        assert_eq!(ref_problems(&root, &refs), ["broken $ref \"#/components/schemas/Caf%E9\""]);
+        assert!(resolve(&root, &json!({"$ref": "#/components/schemas/Caf%E9"})).is_null());
+        // A ref written unencoded to a key that holds a `%` itself.
+        let literal = json!({"components": {"schemas": {"a%20b": {"type": "string"}}}});
+        assert_eq!(example(&literal, &json!({"$ref": "#/components/schemas/a%20b"})), json!("test"));
     }
 
     #[test]

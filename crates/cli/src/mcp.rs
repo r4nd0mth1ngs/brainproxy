@@ -1093,7 +1093,17 @@ impl Server {
             let secs = self.timeout.as_secs();
             return failure(command, "timeout", &format!("stopped after {secs} s; use --background and job_wait"));
         };
-        let mut text = String::from_utf8_lossy(&stdout).into_owned();
+        let mut text = match std::str::from_utf8(&stdout) {
+            Ok(s) => s.to_string(),
+            // Only the last character was cut off at --max-output.
+            Err(e) if truncated && e.error_len().is_none() => String::from_utf8_lossy(&stdout).into_owned(),
+            // Raw bytes (`decode --raw`): as base64, rather than text with every byte that isn't
+            // UTF-8 replaced.
+            Err(_) => {
+                let b64 = brainproxy_core::codec::encode("base64", &stdout).unwrap_or_default();
+                format!("[binary output, {} bytes, base64]\n{}", stdout.len(), String::from_utf8_lossy(&b64))
+            }
+        };
         if truncated {
             text.push_str(&format!("\n[output cut off at {} bytes]", self.max_output));
         }
@@ -1103,10 +1113,19 @@ impl Server {
             content.push(json!({"type": "text", "text": format!("stderr: {}", stderr.trim())}));
         }
         let mut result = json!({"content": content, "isError": !status.success()});
-        if let Ok(v @ Value::Object(_)) = serde_json::from_slice::<Value>(&stdout) {
-            // Lift the envelope's provenance mark to the tool result, where clients look for it.
-            if v["_meta"].is_object() {
-                result["_meta"] = v["_meta"].clone();
+        // The provenance mark is the server's to give, by the command, as the envelope gives it,
+        // and never read from what the command printed: a raw response body (`--raw`) can be a
+        // JSON object with a `_meta` of its own, and an envelope cut off at --max-output has lost
+        // its mark.
+        let untrusted = !crate::output::local_only(command);
+        if untrusted {
+            result["_meta"] = json!({"provenance": {"untrusted_content": true}});
+        }
+        if let Ok(mut v @ Value::Object(_)) = serde_json::from_slice::<Value>(&stdout) {
+            if untrusted {
+                v["_meta"] = result["_meta"].clone();
+            } else if let Some(o) = v.as_object_mut() {
+                o.remove("_meta");
             }
             result["structuredContent"] = v;
         }
@@ -1428,14 +1447,14 @@ fn argv(path: &[String], cmd: &Command, args: &Map<String, Value>) -> Result<Vec
                 let values = match value {
                     Value::Null => continue,
                     Value::Array(items) if repeatable(a) => {
-                        items.iter().map(|v| scalar(key, v)).collect::<Result<Vec<_>, _>>()?
+                        items.iter().map(|v| scalar(a, v)).collect::<Result<Vec<_>, _>>()?
                     }
                     Value::Array(_) => return Err(format!("{key} takes one value, not an array")),
-                    v => vec![scalar(key, v)?],
+                    v => vec![scalar(a, v)?],
                 };
                 match &flag {
                     Some(f) => flags.extend(values.iter().map(|v| format!("{f}={v}"))),
-                    None => positionals.push((a.get_index().unwrap_or(0), values)),
+                    None => positionals.push((position(cmd, a), values)),
                 }
             }
         }
@@ -1450,10 +1469,30 @@ fn argv(path: &[String], cmd: &Command, args: &Map<String, Value>) -> Result<Vec
     Ok(out)
 }
 
-fn scalar(key: &str, v: &Value) -> Result<String, String> {
+/// Where `a` goes among the command's positionals. clap numbers positionals only when it builds
+/// the command, which the tool list never does, so `get_index()` is unset for derived ones:
+/// they are numbered in the order they're declared, as clap would. Without this they would
+/// follow the order of the client's JSON keys (`history_note {"text":..,"id":..}` would note
+/// entry `text` with `id`).
+fn position(cmd: &Command, a: &Arg) -> usize {
+    a.get_index().unwrap_or_else(|| {
+        let declared = cmd.get_positionals().position(|p| p.get_id() == a.get_id()).unwrap_or(0);
+        declared + 1
+    })
+}
+
+fn scalar(a: &Arg, v: &Value) -> Result<String, String> {
+    let key = a.get_id().as_str();
     match v {
         Value::String(s) => Ok(s.clone()),
-        Value::Number(n) => Ok(n.to_string()),
+        // JSON Schema's "integer" includes 1.0, which some clients send for 1; clap would refuse
+        // "1.0" for an integer argument.
+        Value::Number(n) => Ok(match n.as_f64() {
+            Some(f) if value_type(a) == "integer" && n.is_f64() && f.fract() == 0.0 && f.abs() < 9.0e15 => {
+                format!("{}", f as i64)
+            }
+            _ => n.to_string(),
+        }),
         Value::Bool(b) => Ok(b.to_string()),
         _ => Err(format!("{key}: expected a string, number, or boolean")),
     }
@@ -1477,6 +1516,34 @@ mod tests {
         let args = json!({"verbose": true, "limit": 5, "tag": ["a", "-b"], "rest": ["-x", "y"], "first": "-"});
         let v = argv(&["t".into()], &cmd(), args.as_object().unwrap()).unwrap();
         assert_eq!(v, ["t", "--verbose", "--limit=5", "--tag=a", "--tag=-b", "--", "-", "-x", "y"]);
+    }
+
+    #[test]
+    fn positionals_go_in_the_commands_order_whatever_the_key_order() {
+        use clap::CommandFactory;
+        let root = crate::Cli::command();
+        let leaf = |path: &[&str]| path.iter().fold(root.clone(), |c, p| c.find_subcommand(p).unwrap().clone());
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The real tree, unbuilt as the server keeps it: clap hasn't numbered its positionals.
+        let note = leaf(&["history", "note"]);
+        for args in [json!({"id": 1, "text": "2"}), json!({"text": "2", "id": 1})] {
+            let v = argv(&path(&["history", "note"]), &note, args.as_object().unwrap()).unwrap();
+            assert_eq!(v, ["history", "note", "--", "1", "2"], "{args}");
+        }
+        let encode = leaf(&["encode"]);
+        let v = argv(&path(&["encode"]), &encode, json!({"input": "hello", "kind": "base64"}).as_object().unwrap());
+        assert_eq!(v.unwrap(), ["encode", "--", "base64", "hello"]);
+    }
+
+    #[test]
+    fn whole_numbers_written_as_floats_pass_as_integers() {
+        let v = argv(&["t".into()], &cmd(), json!({"limit": 1e2}).as_object().unwrap()).unwrap();
+        assert_eq!(v, ["t", "--limit=100"]);
+        // Only for an integer argument: a string one keeps what was sent.
+        let v = argv(&["t".into()], &cmd(), json!({"limit": 5.0, "first": 1.0}).as_object().unwrap()).unwrap();
+        assert_eq!(v, ["t", "--limit=5", "--", "1.0"]);
+        let v = argv(&["t".into()], &cmd(), json!({"limit": 1.5}).as_object().unwrap()).unwrap();
+        assert_eq!(v, ["t", "--limit=1.5"]);
     }
 
     #[test]

@@ -341,6 +341,7 @@ fn fd_budget_applies_to_the_total_not_the_copy_count() {
         "--race=25",
     ]);
     // The CLI raises the soft limit to the hard one, so constrain both in this child only.
+    // SAFETY: between fork and exec the closure only calls setrlimit, which is async-signal-safe.
     unsafe {
         cmd.pre_exec(|| {
             let limit = libc::rlimit { rlim_cur: 96, rlim_max: 96 };

@@ -166,7 +166,6 @@ pub(crate) fn records_steps(found: &[Found], id: Option<&str>) -> bool {
     BROWSER_CRAWL && chosen.is_some_and(|f| f.kind == Kind::Chromium)
 }
 
-/// Whether `id` is one of the browsers found.
 pub(crate) fn known(found: &[Found], id: &str) -> bool {
     found.iter().any(|f| f.id == id)
 }

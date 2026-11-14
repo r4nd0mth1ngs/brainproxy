@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { TOTP_ENV, finishCall, logsIn, modeText, passkeyLine, startArgs } from "./recordLogin.ts";
+import { TOTP_ENV, failedLogin, finishCall, logsIn, modeText, passkeyLine, startArgs } from "./recordLogin.ts";
 
 test("a recording starts with a virtual authenticator only when a passkey is asked for", () => {
   assert.deepEqual(startArgs("https://app.test/login", { passkey: false }), ["auth", "record", "start", "--", "https://app.test/login"]);
@@ -38,4 +38,15 @@ test("each mode says what happens when the session ends", () => {
 test("a passkey is described without its key", () => {
   assert.equal(passkeyLine({ rp_id: "app.test", credential_id: "aWQ=", user_name: "carol", sign_count: 3 }), "carol at app.test · used 3 times");
   assert.equal(passkeyLine({ rp_id: "app.test", credential_id: "aWQ=", user_name: null, sign_count: 1 }), "app.test · used 1 time");
+});
+
+test("a failed test login shows its reason, as auth login reports it", () => {
+  // As the CLI's error message has it, with its kind first.
+  assert.deepEqual(failedLogin("invalid input: login failed: no cookies or token were set; add --logged-in to verify (requests: [2])"), {
+    login: { success: false, reason: "no cookies or token were set; add --logged-in to verify (requests: [2])" },
+  });
+  assert.deepEqual(failedLogin("login failed: logged-in pattern not found (requests: [4, 5]; inspect with history show ID)"), {
+    login: { success: false, reason: "logged-in pattern not found (requests: [4, 5]; inspect with history show ID)" },
+  });
+  assert.deepEqual(failedLogin("connect to app.test:443: connection refused"), { login: { success: false, reason: "connect to app.test:443: connection refused" } });
 });

@@ -48,11 +48,13 @@ pub fn tags(html: &str) -> Vec<Tag> {
             };
             continue;
         }
-        let name_len = rest[1..].bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b':').count();
-        if name_len == 0 {
+        // A start tag's name begins with a letter: `<3` or `<-` is text, and read as a tag it
+        // would swallow the next real tag up to that one's `>`.
+        if !rest.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic) {
             i = start + 1;
             continue;
         }
+        let name_len = rest[1..].bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b':').count();
         let name = rest[1..1 + name_len].to_ascii_lowercase();
         let (attrs, end) = parse_attrs(html, start + 1 + name_len);
         out.push(Tag { name: name.clone(), attrs, start, end });
@@ -124,6 +126,13 @@ pub fn comments(html: &str) -> Vec<&str> {
     let mut i = 0;
     while let Some(s) = html[i..].find("<!--") {
         let start = i + s + 4;
+        // `<!-->` and `<!--->` are empty comments that end there (the HTML spec's abrupt
+        // closing of an empty comment): looking for `-->` would take the page after them for
+        // one. Left out, as they hold no text and callers find a comment's `-->` after its text.
+        if let Some(close) = [">", "->"].into_iter().find(|c| html[start..].starts_with(c)) {
+            i = start + close.len();
+            continue;
+        }
         match html[start..].find("-->") {
             Some(e) => {
                 out.push(&html[start..start + e]);
@@ -198,6 +207,28 @@ mod tests {
         assert_eq!(url_host("https://user@CDN.test:8443/x"), Some("cdn.test".into()));
         assert_eq!(url_host("//other.test/x"), Some("other.test".into()));
         assert_eq!(url_host("/relative"), None);
+    }
+
+    #[test]
+    fn a_lt_sign_in_text_hides_no_tag() {
+        for text in ["I <3", "x <- y", "a <: b", "1 < 2", "<"] {
+            let html = format!("<p>{text} <script src=https://cdn.other.test/x.js></script><a href=/b>");
+            let t = tags(&html);
+            let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["p", "script", "a"], "{text}");
+            assert_eq!(t[1].attr("src"), Some("https://cdn.other.test/x.js"));
+        }
+    }
+
+    #[test]
+    fn abruptly_closed_empty_comments_end_where_they_close() {
+        for empty in ["<!-->", "<!--->"] {
+            let html = format!("<p>a{empty} TODO: visible text <!-- real --><img src=x>");
+            assert_eq!(comments(&html), [" real "], "{empty}");
+            let names: Vec<String> = tags(&html).into_iter().map(|t| t.name).collect();
+            assert_eq!(names, ["p", "img"], "{empty}");
+        }
+        assert_eq!(comments("<!---->x<!-- -->"), ["", " "]);
     }
 }
 
