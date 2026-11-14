@@ -1,6 +1,9 @@
 //! Time based detection, ported from ZAP commonlib `TimingUtils` and
 //! `OnlineSimpleLinearRegression` (Apache License 2.0), plus the request loop
 //! shared by the RDBMS-specific time based SQL injection rules.
+//!
+//! Unlike ZAP, `check_timing` needs a passing sequence to pass twice; every rule
+//! using it inherits that (SQL 40019-40027, 90037, 90039, 90036).
 
 use std::time::Duration;
 
@@ -225,13 +228,34 @@ pub(super) enum TimingOutcome {
     Failed,
 }
 
-/// Runs one timing check against the insertion point: `payload(delay)` is the
+/// Runs a timing check against the insertion point: `payload(delay)` is the
 /// value for a request asking for `delay` seconds (escaped for its context, like
 /// ZAP's `setParameter`); `seconds` converts the elapsed time.
+///
+/// Unlike ZAP, a passing sequence is run a second time, and both must pass: a
+/// server whose latency jumps around (queues, GC pauses, a busy host) can line
+/// up with one high/low sequence by chance, but rarely with two. It costs
+/// requests only where the first sequence passed.
 pub(super) async fn check_timing(
     cx: &Cx,
     high_sleep: u32,
     payload: impl Fn(f64) -> String,
+    seconds: fn(Duration) -> f64,
+) -> TimingOutcome {
+    match check_timing_once(cx, high_sleep, &payload, seconds).await {
+        TimingOutcome::Injectable(first) => match check_timing_once(cx, high_sleep, &payload, seconds).await {
+            TimingOutcome::Injectable(_) => TimingOutcome::Injectable(first),
+            other => other,
+        },
+        other => other,
+    }
+}
+
+/// One high/low sequence of ZAP's `checkTimingDependence`.
+async fn check_timing_once(
+    cx: &Cx,
+    high_sleep: u32,
+    payload: &impl Fn(f64) -> String,
     seconds: fn(Duration) -> f64,
 ) -> TimingOutcome {
     let mut check =

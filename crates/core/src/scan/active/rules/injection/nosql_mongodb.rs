@@ -12,10 +12,12 @@
 //! - No check for an authentication page bypass: scans don't know of a login page.
 //! - No technology filter: ZAP only runs this against targets it knows use MongoDB,
 //!   and by default assumes all do.
+//! - A MongoDB error for a quote or bracket counts only when the same characters
+//!   after a random value bring it too (a search page may quote the error).
 
 use serde_json::{json, Value};
 
-use super::common::point;
+use super::common::{control_token, point};
 use crate::scan::active::points::{self, PointKind};
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
@@ -117,6 +119,13 @@ async fn crash(cx: &Cx, param: &str) -> Step {
         }
         let Ok(resp) = cx.send_payload(injected).await else { return Step::Done };
         if new_error(base, resp.body_str()) {
+            // Not in ZAP: the error must come back after a random value too, or it was
+            // content the attack value found (a search page quoting the error).
+            let control = format!("{}{injected}", control_token(false));
+            let Ok(again) = cx.send_payload(&control).await else { return Step::Done };
+            if !new_error(base, again.body_str()) {
+                continue;
+            }
             let finding = ALERT.raise(param, "").attack(injected).other_info(CRASH_INFO).confidence(Confidence::Medium);
             cx.report(finding, &resp);
             return Step::Done;

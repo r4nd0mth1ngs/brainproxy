@@ -1,4 +1,5 @@
 //! Ported from ZAP CommandInjectionTimingScanRule (ascanrules, Apache License 2.0).
+//! Unlike ZAP, the timing check must pass twice (`timing::check_timing`).
 
 use std::sync::LazyLock;
 

@@ -95,6 +95,11 @@ pub(super) fn zap_html_encode(s: &str) -> String {
     s.replace('<', "&#60;").replace('>', "&#62;")
 }
 
+/// HTML escaping as web frameworks do it, with `apos` for a single quote.
+fn framework_html_escape(s: &str, apos: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', apos)
+}
+
 /// commons-text `StringEscapeUtils.escapeXml10`.
 pub(super) fn escape_xml10(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -123,9 +128,16 @@ pub(super) fn strip_off(body: &str, pattern: &str) -> String {
     let html1 = zap_html_encode(pattern);
     let html2 = zap_html_encode(&url);
     let xml = escape_xml10(pattern);
+    // Not in ZAP: the escapes most frameworks write for a quote (`&#39;`: PHP, Rails,
+    // Django, Go; `&#x27;`: Python, Jinja; `&quot;` for double quotes), and a JSON
+    // string. A page that echoes `x' AND '1'='1` HTML or JSON escaped would differ
+    // from the original page for that alone.
+    let html_dec = framework_html_escape(pattern, "&#39;");
+    let html_hex = framework_html_escape(pattern, "&#x27;");
+    let json = serde_json::to_string(pattern).map(|j| j[1..j.len() - 1].to_string()).unwrap_or_default();
     // Unlike ZAP, the value as sent goes last: `x%` would leave `25` of an echoed `x%25`.
     let mut result = body.to_string();
-    for p in [&url, &html2, &html1, &xml] {
+    for p in [&url, &html2, &html1, &xml, &html_dec, &html_hex, &json] {
         if !p.is_empty() {
             result = result.replace(p.as_str(), "");
         }
@@ -220,6 +232,21 @@ pub(super) fn insert_uninit_var(cmd: &str) -> String {
     out
 }
 
+/// A random value for control requests: 8 digits for a numeric original, else
+/// 8 lowercase letters. Error checks send it in front of their error characters:
+/// a syntax error doesn't depend on the value before the quote, content that
+/// the attack value happened to find does.
+pub(super) fn control_token(numeric: bool) -> String {
+    let mut n = crate::scan::active::rand_u64();
+    (0..8)
+        .map(|_| {
+            let c = if numeric { b'1' + (n % 9) as u8 } else { b'a' + (n % 26) as u8 };
+            n /= 26;
+            c as char
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +293,10 @@ mod tests {
         assert_eq!(strip_off("a 'q' &apos;q&apos;", "'q'"), "a  ");
         assert_eq!(strip_off("keep", ""), "keep");
         assert_eq!(strip_off("/a/x%25", "x%"), "/a/");
+        // Framework HTML escapes and JSON strings (not in ZAP).
+        assert_eq!(strip_off("for app%&#39;  -- !", "app%'  -- "), "for !");
+        assert_eq!(strip_off("for app%&#x27; &quot;x&quot;!", "app%' \"x\""), "for !");
+        assert_eq!(strip_off(r#"{"q":"a\" AND \"1\"=\"1"}"#, "a\" AND \"1\"=\"1"), r#"{"q":""}"#);
         // Original and attack both go, so a value always on the page doesn't skew results.
         assert_eq!(strip_off_both("about cats. You sent cats AND 1=1", "cats", "cats AND 1=1"), "about . You sent ");
     }

@@ -28,7 +28,8 @@ These use IDs from 100000, so they never clash with ZAP's.
   or "Could not interpret path expression", so that confirms it (high confidence), and the
   finding names the entity where the message does; a database would name a table or
   column instead. Failing that, it looks for a query parser error (Hibernate 3 to 6,
-  EclipseLink, OpenJPA) that quotes and brackets cause and the original page lacks (medium
+  EclipseLink, OpenJPA) that quotes and brackets cause and the original page lacks, and that
+  the same attack with a random value in place of the original causes too (medium
   confidence). Both need the error to reach the page, also HTML or JSON escaped. Spring
   Boot 2.3 and later leave the message out of error responses by default, so there, and
   wherever errors are hidden, HQL injection is left to 40018's boolean checks, which
@@ -164,7 +165,28 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   `abc`, skips the DNS-only patterns in host mode, and has no Java technology filter. XXE's
   check #1 (ZAP's own callback service) is covered by check #2 and not run separately.
 - **Timing rules** port ZAP's TimingUtils regression; the sleep time is fixed at ZAP's
-  default of 5 seconds.
+  default of 5 seconds. A passing high/low sequence is run a second time and must pass
+  again (all time based rules: SQL 40019-40027, command injection 90037, MongoDB 90039,
+  blind SSTI 90036, Shellshock 10048), so jittery latency doesn't line up by chance.
+- **SQL Injection (40018)** confirms before it reports, against false positives:
+  - a comparison that finds SQL (expression, boolean, ORDER BY) is repeated: the
+    original, the value that keeps the original page and the one that changes it are
+    sent again, so transient errors, rate limits, clocks and live data that changes
+    between requests don't pass (the changed page must not be a 5xx or 429 then);
+  - values echoed with the quote escapes frameworks use (`&#39;`, `&#x27;`) or JSON
+    escaped are stripped before comparing, as ZAP strips URL and its own HTML encoding;
+  - "OR 1=1" findings need "OR 1=2" to keep the original page (free-text searches
+    match words of both);
+  - the bare LIKE pair (`%` against `XYZABCDEFGHIJ`) isn't sent: a parameterised
+    `LIKE` with unescaped wildcards answers it the same way. The quoted LIKE pairs
+    (`%'  -- `) still find concatenated LIKE clauses;
+  - an SQL error message must come back for the same error characters after a random
+    value too, so a search whose results quote an SQL error isn't reported;
+  - (HQL Injection 100003 and NoSQL Injection - MongoDB 40033 do the same for their error
+    messages;)
+  - the HTTP 500 check runs for quotes only, and the 500 must repeat and go away when
+    each quote is doubled (an escaped quote in an SQL string): input validation and
+    type errors (`true'` in a JSON boolean) reject both.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.

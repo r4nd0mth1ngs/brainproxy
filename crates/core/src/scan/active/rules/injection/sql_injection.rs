@@ -7,12 +7,30 @@
 //! the attack strength's request budgets, and stop at the first finding for the
 //! parameter. Not ported: the "SQL Injection - Authentication Bypass" alert,
 //! which needs ZAP's authentication contexts to know the login URL.
+//!
+//! Differences from ZAP, against false positives:
+//! - A comparison that finds SQL (expression, boolean, ORDER BY) is repeated
+//!   before it is reported: the original, the value that gives the original
+//!   page and the one that changes it are sent again (`confirm`); the changed
+//!   page must not be a 5xx or 429 the second time.
+//! - Echoed values are also stripped in the HTML escapes frameworks use for
+//!   quotes (`&#39;`, `&#x27;`) and JSON escaped (`common::strip_off`).
+//! - "OR true" findings need "OR false" to give the original page
+//!   (`SQL_LOGIC_OR_FALSE`): word searches show more for both.
+//! - The bare LIKE pair ("%" / "XYZABCDEFGHIJ") is not sent (`BARE_LIKE`), nor
+//!   the "OR" form of the LIKE pairs, which repeats the "AND true" value.
+//! - Error based: the error characters after a random value must bring an error
+//!   of the same RDBMS too (`error_persists`); the HTTP 500 check runs for quotes
+//!   only, and needs the 500 again and none with the quotes doubled
+//!   (`quote_breaks_query`).
 
 use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
 
-use super::common::{java_len, java_regex, point, strip_off, strip_off_both, SQL_DESC, SQL_REFS, SQL_SOLN};
+use super::common::{
+    control_token, java_len, java_regex, point, strip_off, strip_off_both, SQL_DESC, SQL_REFS, SQL_SOLN,
+};
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
 
@@ -263,6 +281,17 @@ const SQL_LOGIC_OR_TRUE: [&str; 9] = [
     "%\"  -- ",
 ];
 
+/// "OR false" controls for the first six "OR true" conditions (not in ZAP): a
+/// page that also shows more for these is matching words, not running SQL.
+const SQL_LOGIC_OR_FALSE: [&str; 6] =
+    [" OR 1=2 -- ", "' OR '1'='2' -- ", "\" OR \"1\"=\"2\" -- ", " OR 1=2", "' OR '1'='2", "\" OR \"1\"=\"2"];
+
+/// The bare LIKE pair ("%" and "XYZABCDEFGHIJ"), skipped (ZAP sends it): a
+/// parameterised `LIKE '%' + ? + '%'` with unescaped wildcards answers it the
+/// same way, so it shows a search, not an injection. The quoted LIKE pairs
+/// after it close the string and still find concatenated LIKE clauses.
+const BARE_LIKE: usize = 6;
+
 /// UNION statements hoping for a recognisable column count error.
 const SQL_UNION_APPENDAGES: [&str; 6] = [
     " UNION ALL select NULL -- ",
@@ -503,10 +532,11 @@ impl Scan<'_> {
                 let Some(resp) = self.send(&value).await else { continue };
                 self.n_error += 1;
 
-                if resp.status == 500 && base_status != 500 {
+                // Only for quotes, unlike ZAP: see `quote_breaks_query`.
+                if resp.status == 500 && base_status != 500 && err.contains(['\'', '"']) {
                     // Make sure the service doesn't answer 500 for any invalid value.
                     let safe = self.send("S4feV4lu3").await;
-                    if safe.is_some_and(|s| s.status != 500) {
+                    if safe.is_some_and(|s| s.status != 500) && self.quote_breaks_query(prefix, err).await {
                         let finding = ALERT
                             .raise(self.param.clone(), resp.status_line.clone())
                             .attack(value.clone())
@@ -517,20 +547,29 @@ impl Scan<'_> {
                     }
                 }
 
-                for i in 0..RDBMS.len() {
+                for (i, rdbms) in RDBMS.iter().enumerate() {
                     if self.cx.stopped() {
                         return;
                     }
-                    if self.check_specific_errors(i, &resp, &value) {
-                        break;
+                    let Some((j, evidence)) = self.specific_error(i, &resp) else { continue };
+                    if self.error_persists(i, err).await {
+                        self.report(
+                            rdbms.alert,
+                            &evidence,
+                            &value,
+                            error_based_info(rdbms.name, rdbms.errors[j]),
+                            &resp,
+                        );
                     }
+                    break;
                 }
             }
         }
     }
 
-    /// An error message of RDBMS `i` in the attack response that the original lacked.
-    fn check_specific_errors(&mut self, i: usize, resp: &Response, attack: &str) -> bool {
+    /// An error message of RDBMS `i` in `resp` that the original lacked: the index
+    /// of its pattern and the matched text.
+    fn specific_error(&self, i: usize, resp: &Response) -> Option<(usize, String)> {
         let body = resp.body_str();
         for (j, pattern) in COMPILED[i].errors.iter().enumerate() {
             if self.base_hits()[i][j] {
@@ -544,12 +583,57 @@ impl Scan<'_> {
                 continue;
             }
             if let Some(m) = pattern.find(body) {
-                let rdbms = &RDBMS[i];
-                self.report(rdbms.alert, m.as_str(), attack, error_based_info(rdbms.name, rdbms.errors[j]), resp);
-                return true;
+                return Some((j, m.as_str().to_string()));
             }
         }
-        false
+        None
+    }
+
+    /// Not in ZAP: the same error characters after a random value must bring an
+    /// error of the same RDBMS too. A syntax error doesn't depend on the value in
+    /// front of the quote; a search that found a page quoting an SQL error for
+    /// the attack value finds nothing for a random one.
+    async fn error_persists(&self, i: usize, err: &str) -> bool {
+        let numeric = self.orig.parse::<f64>().is_ok();
+        let control = format!("{}{err}", control_token(numeric));
+        match self.send(&control).await {
+            Some(resp) => self.specific_error(i, &resp).is_some(),
+            None => false,
+        }
+    }
+
+    /// Not in ZAP: a 500 for a quote counts only when it repeats and the same
+    /// value with each quote doubled (an escaped quote inside an SQL string) is
+    /// not a 500. Input validation, a type conversion (a JSON boolean sent
+    /// `true'`) or a broken template rejects both.
+    async fn quote_breaks_query(&self, prefix: &str, err: &str) -> bool {
+        let Some(again) = self.send(&format!("{prefix}{err}")).await else { return false };
+        if again.status != 500 {
+            return false;
+        }
+        let balanced = format!("{prefix}{}", err.replace('\'', "''").replace('"', "\"\""));
+        self.send(&balanced).await.is_some_and(|r| r.status != 500)
+    }
+
+    /// Not in ZAP: repeats a comparison that found a difference. The original,
+    /// `same` and `diff` are sent again; the first two must still give the
+    /// normal page (`normal`), and `diff` must still not. Transient errors, rate
+    /// limits, clocks and data that changes between requests rarely pass twice.
+    async fn confirm(&self, same: &str, diff: &str, normal: impl Fn(&Response, &str) -> bool) -> bool {
+        if self.cx.stopped() {
+            return false;
+        }
+        let Ok(orig) = self.cx.send(self.cx.base_request().to_vec()).await else { return false };
+        if !normal(&orig, &self.orig) {
+            return false;
+        }
+        let Some(same_resp) = self.send(same).await else { return false };
+        if !normal(&same_resp, same) {
+            return false;
+        }
+        // An error or a rate limit is neither fewer rows nor more: the query broke, or
+        // the server did. The repeated "different" page must be an ordinary answer.
+        self.send(diff).await.is_some_and(|r| r.status < 500 && r.status != 429 && !normal(&r, diff))
     }
 
     /// Check 4: an integer value replaced by an expression with the same value
@@ -585,7 +669,9 @@ impl Scan<'_> {
         if compare_responses(&normal, &Comparable::new(&resp, value)) == 1.0 {
             let Some(confirm_resp) = self.send(confirm).await else { return };
             self.n_expression += 1;
-            if compare_responses(&normal, &Comparable::new(&confirm_resp, confirm)) < 1.0 {
+            if compare_responses(&normal, &Comparable::new(&confirm_resp, confirm)) < 1.0
+                && self.confirm(value, confirm, |r, v| compare_responses(&normal, &Comparable::new(r, v)) == 1.0).await
+            {
                 self.report(&ALERT, "", value, expression_based_info(value, ""), &resp);
             }
         }
@@ -608,6 +694,9 @@ impl Scan<'_> {
             if self.cx.stopped() {
                 return;
             }
+            if i == BARE_LIKE {
+                continue;
+            }
             let and_true = format!("{orig}{}", SQL_LOGIC_AND_TRUE[i]);
             let and_false = format!("{orig}{}", SQL_LOGIC_AND_FALSE[i]);
             let Some(resp) = self.send(&and_true).await else { continue };
@@ -620,15 +709,27 @@ impl Scan<'_> {
             }
             let Some(false_resp) = self.send(&and_false).await else { continue };
             self.n_boolean += 1;
-            if compare_responses(&normal, &Comparable::new(&false_resp, &and_false)) < 1.0 {
+            let same = |r: &Response, v: &str| compare_responses(&normal, &Comparable::new(r, v)) == 1.0;
+            if !same(&false_resp, &and_false) {
+                if !self.confirm(&and_true, &and_false, same).await {
+                    continue;
+                }
                 let info = format!("{}\n{DATA_EXISTS}", boolean_based_info(&and_true, &and_false, ""));
                 self.report(&ALERT, "", &and_true, info, &resp);
                 break;
             }
+            // The LIKE conditions have no "OR" form (ZAP sends the "AND true" one again).
+            let Some(or_false_suffix) = SQL_LOGIC_OR_FALSE.get(i) else { continue };
             let or_true = format!("{orig}{}", SQL_LOGIC_OR_TRUE[i]);
             let Some(or_resp) = self.send(&or_true).await else { continue };
             self.n_boolean += 1;
-            if compare_responses(&normal, &Comparable::new(&or_resp, &or_true)) < 1.0 {
+            if !same(&or_resp, &or_true) {
+                let or_false = format!("{orig}{or_false_suffix}");
+                if !self.send(&or_false).await.is_some_and(|r| same(&r, &or_false))
+                    || !self.confirm(&and_true, &or_true, same).await
+                {
+                    continue;
+                }
                 // As ZAP: the evidence message is the "AND true" one.
                 let info = format!("{}\n{DATA_NOT_EXISTS}", boolean_based_info(&and_true, &or_true, ""));
                 self.report(&ALERT, "", &or_true, info, &resp);
@@ -652,6 +753,9 @@ impl Scan<'_> {
             if self.cx.stopped() {
                 return;
             }
+            if i == BARE_LIKE {
+                continue;
+            }
             let or_true = format!("{orig}{}", SQL_LOGIC_OR_TRUE[i]);
             let and_false = format!("{orig}{}", SQL_LOGIC_AND_FALSE[i]);
             let Some(resp) = self.send(&or_true).await else { continue };
@@ -669,6 +773,18 @@ impl Scan<'_> {
             let by_unstripped = false_unstripped == normal_unstripped;
             let by_stripped = false_stripped == normal_stripped;
             if by_unstripped || by_stripped {
+                let normal = |r: &Response, v: &str| {
+                    r.body_str() == normal_unstripped || strip_off_both(r.body_str(), &orig, v) == normal_stripped
+                };
+                if let Some(suffix) = SQL_LOGIC_OR_FALSE.get(i) {
+                    let or_false = format!("{orig}{suffix}");
+                    if !self.send(&or_false).await.is_some_and(|r| normal(&r, &or_false)) {
+                        continue;
+                    }
+                }
+                if !self.confirm(&and_false, &or_true, normal).await {
+                    continue;
+                }
                 let not = if by_stripped { "" } else { "NOT " };
                 let info = format!("{}\n{DATA_NOT_EXISTS}", boolean_based_info(&or_true, &and_false, not));
                 self.report(&ALERT, "", &or_true, info, &resp);
@@ -749,7 +865,11 @@ impl Scan<'_> {
                 0 => confirm_resp.body_str().to_string(),
                 _ => strip_off_both(confirm_resp.body_str(), &orig, &confirm),
             };
-            if confirm_body != normal[idx] {
+            let same = |r: &Response, v: &str| match idx {
+                0 => r.body_str() == normal[0],
+                _ => strip_off_both(r.body_str(), &orig, v) == normal[1],
+            };
+            if confirm_body != normal[idx] && self.confirm(&value, &confirm, same).await {
                 let not = if idx == 1 { "" } else { "NOT " };
                 self.report(&ALERT, "", &value, order_by_based_info(&value, not), &resp);
                 break;
