@@ -19,7 +19,6 @@ use crate::scan::compare::Comparison;
 use crate::scan::findings_db::{FindingFilter, REMOVED};
 use crate::store::Store;
 
-/// Schema v15.
 pub(crate) const SCHEMA_V15: &str = "
 CREATE TABLE IF NOT EXISTS issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

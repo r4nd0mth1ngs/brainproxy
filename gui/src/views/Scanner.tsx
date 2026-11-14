@@ -17,7 +17,7 @@ import { jobEndedText, sourcesToggle } from "./scanJobs.ts";
 export interface Job {
   id: number;
   time: string;
-  kind: string; // crawl, active-scan, import
+  kind: string; // crawl, active-scan, import, authz, checks-update
   state: string; // queued, running, stopping, completed, stopped, failed
   pid: number | null;
   args: string[];

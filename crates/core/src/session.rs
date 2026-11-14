@@ -506,7 +506,6 @@ pub struct Extracted {
     pub value: Option<String>,
 }
 
-/// Outcome of a macro run.
 #[derive(Debug, Clone, Serialize)]
 pub struct MacroRun {
     pub name: String,
@@ -1243,7 +1242,6 @@ fn set_multipart(raw: &[u8], name: &str, value: &str) -> Vec<u8> {
     RawRequest::from_bytes(out).update_content_length().into_bytes()
 }
 
-/// Runs an extractor on a response.
 pub fn extract(x: &Extractor, response: &[u8]) -> Option<String> {
     // The final response of any 1xx interim ones.
     let mut rest = response;

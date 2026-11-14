@@ -176,7 +176,6 @@ impl ActiveRule for ParameterTamper {
 
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
         Box::pin(async move {
-            // Always try the normal request first.
             let Ok(normal) = cx.send_following(cx.base_request().to_vec()).await else { return };
             if normal.status != 200 {
                 return;

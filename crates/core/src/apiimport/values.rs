@@ -212,7 +212,7 @@ pub fn scalar(v: &Value) -> String {
     }
 }
 
-/// application/x-www-form-urlencoded body from an object.
+/// application/x-www-form-urlencoded body from name/value pairs (see `fields` for an object).
 pub fn form(fields: &[(String, String)]) -> Vec<u8> {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
     for (k, v) in fields {

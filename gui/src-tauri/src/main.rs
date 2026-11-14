@@ -138,7 +138,6 @@ async fn cli(
     }
 }
 
-/// Reads a pipe to the end.
 fn read_all<R: tokio::io::AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> tokio::task::JoinHandle<Vec<u8>> {
     tokio::spawn(async move {
         let mut buf = Vec::new();

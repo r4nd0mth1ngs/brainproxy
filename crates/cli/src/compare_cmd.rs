@@ -293,7 +293,6 @@ fn with_policy(scope: &mut ScanScope, applied: &Value, id: i64, warnings: &mut V
     }
 }
 
-/// An active scan job.
 fn active_scan(store: &Store, id: i64) -> Result<Value, Error> {
     let job = store.job_get(id)?;
     let kind = job["kind"].as_str().unwrap_or("");

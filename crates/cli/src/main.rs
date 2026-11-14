@@ -808,12 +808,12 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         }
     }
     let guard = project_guard(project)?;
-    // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
-    // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
-    // non-race send) would be pushed onto HTTP/2 too.
     if !(0.0..=ws_cmd::MAX_WAIT_SECS).contains(&args.stream_wait) {
         return Err(Error::InvalidInput(format!("--stream-wait: 0 to {} seconds", ws_cmd::MAX_WAIT_SECS)));
     }
+    // The request line's HTTP/2, if any, is honoured by the race itself (single_packet opens its
+    // own HTTP/2 connection); it must not be forced onto send_opts, or an --auth login (and a
+    // non-race send) would be pushed onto HTTP/2 too.
     let mut send_opts = args.req.send_options(guard.clone())?;
     send_opts.stream = brainproxy_core::sse::StreamLimits {
         wait: std::time::Duration::from_secs_f64(args.stream_wait),

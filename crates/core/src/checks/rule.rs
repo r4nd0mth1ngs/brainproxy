@@ -346,7 +346,6 @@ struct Outcome {
     stop: bool,
 }
 
-/// Runs one request block.
 async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<String, String>) -> Outcome {
     let mut out = Outcome::default();
     if !block.inject.is_empty() {

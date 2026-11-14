@@ -859,7 +859,6 @@ struct Selection {
 
 const POST_HINT: &str = "POST requests are replayed with attack payloads, often many times, and can change data or trigger side effects such as email.";
 
-/// Targets replayed as POST.
 fn post_targets(targets: &[ScanTarget]) -> usize {
     targets
         .iter()

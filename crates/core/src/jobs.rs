@@ -197,7 +197,7 @@ impl JobControl {
     }
 
     /// Starts a thread that writes progress and watches for a stop request
-    /// every half second. Returns a handle; drop it (or call `finish`) to end it.
+    /// every half second. Returns a handle; dropping it ends the thread.
     pub fn watch(&self, project: &std::path::Path, job_id: Option<i64>) -> Watcher {
         let done = Arc::new(AtomicBool::new(false));
         let (ctl, flag, project) = (self.clone(), done.clone(), project.to_path_buf());

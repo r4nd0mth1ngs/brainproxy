@@ -110,7 +110,6 @@ impl RawRequest {
             out.push(b);
             prev = b;
         }
-        // Make sure the head ends with an empty line.
         if !out.ends_with(b"\r\n\r\n") {
             if out.ends_with(b"\r\n") {
                 out.extend_from_slice(b"\r\n");

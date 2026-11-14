@@ -199,7 +199,6 @@ fn seed_rule_ids(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Whether `table` has `column`.
 pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?;
     Ok(stmt.exists([column])?)

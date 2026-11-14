@@ -249,7 +249,6 @@ impl Live {
     }
 }
 
-/// The `Sec-Fetch-Dest` header among `headers`.
 fn fetch_dest(headers: &[(String, String)]) -> Option<&str> {
     headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("sec-fetch-dest")).map(|(_, v)| v.trim())
 }

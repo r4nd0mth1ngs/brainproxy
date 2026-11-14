@@ -111,11 +111,12 @@ impl ActiveRule for SourceDisclosureCve20121823 {
             if !is_text_type(&base.content_type()) || contains_control_chars(base.body_str()) {
                 return; // Ignore images, pdfs, etc.
             }
-            // At MEDIUM threshold, skip JavaScript resources.
+            // JavaScript resources are skipped (ZAP does so at MEDIUM threshold; here always).
             if is_javascript(cx) || Self::evidence_in_original(cx) {
                 return;
             }
-            // At LOW/MEDIUM strength, do not attack URLs that returned "Not Found".
+            // Pages that are "Not Found" aren't attacked (ZAP skips them at LOW/MEDIUM strength;
+            // here always).
             if cx.not_found(cx.base_response()).await || cx.stopped() {
                 return;
             }

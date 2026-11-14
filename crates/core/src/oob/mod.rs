@@ -561,7 +561,6 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
     Ok(out)
 }
 
-/// Parses a stored state.
 pub fn read_state(store: &Store) -> Result<Option<OobState>> {
     match store.meta_get(STATE_KEY)? {
         Some(s) => serde_json::from_str(&s).map(Some).map_err(|e| Error::Protocol(format!("bad {STATE_KEY}: {e}"))),

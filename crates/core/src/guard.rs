@@ -511,7 +511,7 @@ impl Guard {
         unwrap_v4(ip).is_loopback() || self.scopes.iter().all(|s| s.allows_proxy(bare, port, ip))
     }
 
-    /// Quick name-only check (no DNS): false when no scope could ever allow it.
+    /// Quick name-only check (no DNS): an out-of-scope error when no scope could ever allow it.
     fn precheck_name(&self, host: &str, port: u16) -> Result<()> {
         let host = norm_host(host);
         for scope in &self.scopes {

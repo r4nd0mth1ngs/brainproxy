@@ -919,7 +919,6 @@ fn read_text(source: &KeySource) -> Result<String> {
     Ok(text.to_string())
 }
 
-/// Reads a signer's key.
 pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
     if matches!(s.kind, SignKind::Script { .. }) {
         return load_script(s);
@@ -1237,7 +1236,6 @@ fn encode_output(output: Output, bytes: &[u8]) -> String {
     }
 }
 
-/// HMAC of `data`.
 pub fn hmac_digest(alg: HmacAlg, key: &[u8], data: &[u8]) -> Vec<u8> {
     let alg = match alg {
         HmacAlg::Sha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,

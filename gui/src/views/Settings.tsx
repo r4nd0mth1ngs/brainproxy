@@ -1,5 +1,6 @@
 // Project and tool settings: auth profiles, match & replace, intercept options, proxy setup,
-// connection options, the CA, rule data, project info, keyboard shortcuts, and open-source licenses. Each sub-tab loads its data when first shown.
+// connection options, the CA, rule data, project info, keyboard shortcuts, and open-source licenses. Only the open sub-tab
+// is mounted, so it loads its data each time it is opened.
 
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { run } from "../api";
