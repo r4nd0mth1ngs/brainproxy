@@ -236,7 +236,7 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.alert_ref, i.host, COALESCE(i.title, 
         json_group_object(f.host, 1) AS hosts, i.cvss_vector, i.cvss_score
     FROM issues i JOIN findings f ON f.issue_id = i.id";
 
-fn risk_name(level: i64) -> &'static str {
+pub(crate) fn risk_name(level: i64) -> &'static str {
     ["info", "low", "medium", "high", "critical"].get(level.clamp(0, 4) as usize).copied().unwrap_or("info")
 }
 

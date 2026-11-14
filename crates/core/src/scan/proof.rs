@@ -279,10 +279,11 @@ impl Store {
     pub fn agent_touched(&self, ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
         use std::collections::HashSet;
         let list = serde_json::to_string(ids).unwrap_or_default();
+        // IFNULL: a finding without an origin makes the test NULL, which doesn't read as a bool.
         let mut stmt = self.conn.prepare(
-            "SELECT f.id, f.host, f.method, f.url, (f.origin = 'mcp' AND f.source = 'manual')
+            "SELECT f.id, f.host, f.method, f.url, IFNULL((f.origin = 'mcp' AND f.source = 'manual')
                 OR EXISTS (SELECT 1 FROM finding_events e WHERE e.origin = 'mcp' AND e.kind NOT IN ('created', 'regressed')
-                    AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id)))
+                    AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id))), 0)
              FROM findings f WHERE f.id IN (SELECT value FROM json_each(?1))",
         )?;
         type Row = (i64, String, String, String, bool);
@@ -560,6 +561,13 @@ mod tests {
         assert!(s.agent_touched(&[f]).unwrap().contains(&f));
         let t = s.agent_trail(f).unwrap();
         assert!(t.agent_involved && t.requests.iter().any(|r| r.history_id == agent), "{t:?}");
+    }
+
+    #[test]
+    fn a_finding_added_by_hand_without_an_origin_is_not_an_agents() {
+        let (s, f, _) = store();
+        s.conn.execute("UPDATE findings SET source = 'manual', origin = NULL WHERE id = ?1", [f]).unwrap();
+        assert!(s.agent_touched(&[f]).unwrap().is_empty());
     }
 
     #[test]

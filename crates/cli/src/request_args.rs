@@ -10,8 +10,51 @@ use brainproxy_core::http::{RawRequest, SendOptions, Target};
 use brainproxy_core::Error;
 
 /// ASCII stand-in for a fuzz marker while a --url request is built, so URL
-/// parsing doesn't percent-encode the marker.
-const MARKER_SENTINEL: &str = "BPMARKERx7q";
+/// parsing doesn't percent-encode the marker. Lower case, as parsing makes a host.
+const MARKER_SENTINEL: &str = "bpmarkerx7q";
+
+/// Longest wait or timeout a seconds flag takes: a day, as `ws send --wait` and Replay tabs.
+const MAX_SECS: f64 = crate::ws_cmd::MAX_WAIT_SECS;
+/// Longest `--max-minutes`: a week.
+const MAX_MINUTES: f64 = 7.0 * 24.0 * 60.0;
+
+/// A seconds flag as a duration. A value that isn't from 0 to a day is refused:
+/// `Duration::from_secs_f64` panics on a negative, NaN or huge one, and a longer
+/// wait would hold a connection, or the caller, for years.
+pub(crate) fn secs_arg(flag: &str, secs: f64) -> Result<Duration, Error> {
+    if !(0.0..=MAX_SECS).contains(&secs) {
+        return Err(Error::InvalidInput(format!("{flag}: 0 to {MAX_SECS} seconds (a day), not {secs:?}")));
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// A wait for a whole job (`job wait --timeout`) as a duration: up to a week, as long as
+/// `--max-minutes` lets a scan run (see [`secs_arg`]).
+pub(crate) fn job_wait_arg(flag: &str, secs: f64) -> Result<Duration, Error> {
+    if !(0.0..=MAX_MINUTES * 60.0).contains(&secs) {
+        return Err(Error::InvalidInput(format!("{flag}: 0 to {} seconds (a week), not {secs:?}", MAX_MINUTES * 60.0)));
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// `--max-minutes` as a duration, refused unless it is from 0 to a week (see [`secs_arg`]).
+pub(crate) fn minutes_arg(flag: &str, minutes: f64) -> Result<Duration, Error> {
+    if !(0.0..=MAX_MINUTES).contains(&minutes) {
+        return Err(Error::InvalidInput(format!("{flag}: 0 to {MAX_MINUTES} minutes (a week), not {minutes:?}")));
+    }
+    Ok(Duration::from_secs_f64(minutes * 60.0))
+}
+
+/// Refuses a requests-per-second flag the engine's limiters can't space: they wait 1/rate
+/// seconds between requests, which panics making a `Duration` for a tiny rate. 0 is no limit.
+pub(crate) fn check_rate(flag: &str, rate: Option<f64>) -> Result<(), Error> {
+    match rate {
+        Some(r) if r != 0.0 && !(r.is_finite() && r >= 1.0 / MAX_SECS) => Err(Error::InvalidInput(format!(
+            "{flag}: 0 (no limit) or at least one request a day (1/{MAX_SECS} per second), not {r:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
 
 #[derive(clap::Args, Clone)]
 pub struct RequestArgs {
@@ -74,17 +117,17 @@ impl RequestArgs {
         self.url.is_none() && self.file.as_deref().is_none_or(|f| f == "-")
     }
 
-    pub fn send_options(&self, guard: Arc<Guard>) -> SendOptions {
-        SendOptions {
+    pub fn send_options(&self, guard: Arc<Guard>) -> Result<SendOptions, Error> {
+        Ok(SendOptions {
             guard: Some(guard),
-            timeout: Duration::from_secs_f64(self.timeout.max(0.001)),
+            timeout: secs_arg("--timeout", self.timeout)?.max(Duration::from_millis(1)),
             verify_tls: self.verify_tls,
             sni: self.sni.clone(),
             http2: self.http2,
             http3: self.http3,
             host: brainproxy_core::http::client::HostPolicy::for_process(self.host_header_test),
             stream: Default::default(),
-        }
+        })
     }
 
     /// Through MCP, points FILE at the file it resolves to inside the project's folder, and
@@ -149,7 +192,9 @@ impl RequestArgs {
         for name in &self.remove_header {
             req = req.remove_header(name);
         }
-        if !self.verbatim && template_marker.is_none() {
+        // A removed Content-Length stays removed: the update would add it back for any body.
+        let keeps_length = !self.remove_header.iter().any(|h| h.eq_ignore_ascii_case("content-length"));
+        if !self.verbatim && template_marker.is_none() && keeps_length {
             req = req.update_content_length();
         }
         let target = match (&self.target, inferred) {
@@ -172,4 +217,69 @@ pub fn parse_header(h: &str) -> Result<(String, String), Error> {
         .ok_or_else(|| Error::InvalidInput(format!("header {h:?} must look like 'Name: value'")))?;
     brainproxy_core::http::request::check_header(&k, &v)?;
     Ok((k, v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        req: RequestArgs,
+    }
+
+    fn args(argv: &[&str]) -> RequestArgs {
+        Args::parse_from(std::iter::once("t").chain(argv.iter().copied())).req
+    }
+
+    #[test]
+    fn a_marker_in_the_url_host_is_kept() {
+        let (req, _) = args(&["--url", "http://§a§.local/§p§"]).prepare(Some("§")).unwrap();
+        let text = String::from_utf8_lossy(req.as_bytes()).into_owned();
+        assert!(text.starts_with("GET /§p§ HTTP/1.1\r\n"), "{text}");
+        assert!(text.contains("\r\nHost: §a§.local\r\n"), "{text}");
+    }
+
+    #[test]
+    fn a_removed_content_length_stays_removed() {
+        let file = std::env::temp_dir().join(format!("bp-remove-cl-{}.http", std::process::id()));
+        let path = file.to_str().unwrap();
+        let head = |request: &str, argv: &[&str]| {
+            std::fs::write(&file, request).unwrap();
+            let (req, _) = args(&[&[path], argv].concat()).prepare(None).unwrap();
+            String::from_utf8_lossy(req.as_bytes()).to_ascii_lowercase()
+        };
+        let post = "POST / HTTP/1.1\nHost: a.test\nContent-Length: 2\n\nhello";
+        assert!(!head(post, &["--remove-header", "content-length"]).contains("content-length"));
+        // The update still applies otherwise, and to a request whose Transfer-Encoding is removed.
+        assert!(head(post, &[]).contains("content-length: 5\r\n"));
+        let chunked = "POST / HTTP/1.1\nHost: a.test\nTransfer-Encoding: chunked\n\nhello";
+        assert!(!head(chunked, &[]).contains("content-length"));
+        assert!(head(chunked, &["--remove-header", "Transfer-Encoding"]).contains("content-length: 5\r\n"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn seconds_and_rates_are_checked_not_panicked_on() {
+        for bad in [f64::INFINITY, f64::NAN, -1.0, 1e300, MAX_SECS + 0.5] {
+            let e = secs_arg("--timeout", bad).unwrap_err();
+            assert!(e.to_string().contains("--timeout: 0 to 86400 seconds"), "{bad}: {e}");
+            assert!(minutes_arg("--max-minutes", bad * 60.0).is_err(), "{bad}");
+        }
+        assert_eq!(secs_arg("--wait", 1.5).unwrap(), Duration::from_millis(1500));
+        assert_eq!(minutes_arg("--max-minutes", 0.5).unwrap(), Duration::from_secs(30));
+        // A job may run for as long as --max-minutes allows, so waiting for one may too.
+        assert_eq!(job_wait_arg("--timeout", 100_000.0).unwrap(), Duration::from_secs(100_000));
+        for bad in [-1.0, f64::INFINITY, f64::NAN, 604_801.0] {
+            assert!(job_wait_arg("--timeout", bad).is_err(), "{bad}");
+        }
+        for bad in [1e-300, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(check_rate("--rate", Some(bad)).unwrap_err().to_string().contains("--rate:"), "{bad}");
+        }
+        for ok in [None, Some(0.0), Some(1.0 / MAX_SECS), Some(1000.0)] {
+            assert!(check_rate("--rate", ok).is_ok(), "{ok:?}");
+        }
+    }
 }

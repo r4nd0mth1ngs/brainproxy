@@ -666,7 +666,9 @@ impl Redactor {
                 if i.is_empty() || plain_subprotocol(i) {
                     return i.to_string();
                 }
-                if i.len() > K8S_BEARER.len() && i[..K8S_BEARER.len()].eq_ignore_ascii_case(K8S_BEARER) {
+                if i.len() > K8S_BEARER.len()
+                    && i.get(..K8S_BEARER.len()).is_some_and(|p| p.eq_ignore_ascii_case(K8S_BEARER))
+                {
                     let token = &i[K8S_BEARER.len()..];
                     if let Ok(b) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token.trim_end_matches('='))
                     {
@@ -1172,6 +1174,17 @@ mod tests {
                 format!("Sec-WebSocket-Protocol: {value}")
             );
         }
+    }
+
+    #[test]
+    fn a_subprotocol_with_a_multibyte_char_where_the_k8s_prefix_ends() {
+        // `é` straddles byte 38, the length of the Kubernetes prefix.
+        let value = format!("{}é…", "a".repeat(K8S_BEARER.len() - 1));
+        assert_eq!(redacted(&format!("Sec-WebSocket-Protocol: {value}")), "Sec-WebSocket-Protocol: [redacted]");
+        let mut r = Redactor::default();
+        let mut h = vec![("Sec-WebSocket-Protocol".to_string(), value)];
+        r.headers(&mut h);
+        assert_eq!(h[0].1, "[redacted]");
     }
 
     #[test]

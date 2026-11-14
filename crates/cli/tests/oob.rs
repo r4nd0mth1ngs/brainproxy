@@ -388,6 +388,33 @@ fn oob_run_validates_arguments() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn oob_poll_says_truncated_only_when_more_are_left() {
+    let (dir, project) = setup("truncated");
+    let store = brainproxy_core::store::Store::open(&project).unwrap();
+    let token = brainproxy_core::oob::new_token().unwrap();
+    store.oob_add_manual_payload(&token, None).unwrap();
+    for i in 0..3 {
+        store.oob_add_interaction("http", "127.0.0.1:1", "GET", format!("GET /{token}/{i}").as_bytes()).unwrap();
+    }
+    let poll = |since: &str, limit: &str| {
+        let (code, v) = run(&["oob", "poll", "--token", &token, "--since", since, "--limit", limit], &project);
+        assert_eq!(code, 0, "{v}");
+        (
+            v["data"]["count"].as_u64().unwrap(),
+            v["data"]["truncated"].as_bool().unwrap(),
+            v["data"]["next_since"].clone(),
+        )
+    };
+    assert_eq!(poll("0", "3").0, 3);
+    assert!(!poll("0", "3").1, "exactly --limit interactions is all of them");
+    let (count, truncated, next) = poll("0", "2");
+    assert_eq!((count, truncated), (2, true));
+    let (count, truncated, _) = poll(&next.to_string(), "2");
+    assert_eq!((count, truncated), (1, false));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Nuclei interactsh templates: `{{interactsh-url}}` becomes a listener
 /// payload, and interactsh matchers decide at correlation.
 #[test]

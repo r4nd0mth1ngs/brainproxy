@@ -126,8 +126,14 @@ impl Entry {
             }
     }
 
-    fn matches_addr(&self, ip: IpAddr, port: u16) -> bool {
-        self.port_ok(port) && matches!(self.pattern, Pattern::Net(net, bits) if in_net(ip, net, bits))
+    /// Whether an include (or proxy) entry lists `ip`.
+    fn includes_addr(&self, ip: IpAddr, port: u16) -> bool {
+        self.port_ok(port) && matches!(self.pattern, Pattern::Net(net, bits) if includes(ip, net, bits))
+    }
+
+    /// Whether an exclude entry covers `ip`.
+    fn excludes_addr(&self, ip: IpAddr, port: u16) -> bool {
+        self.port_ok(port) && matches!(self.pattern, Pattern::Net(net, bits) if excludes(ip, net, bits))
     }
 }
 
@@ -139,11 +145,26 @@ fn valid_host(h: &str) -> bool {
         })
 }
 
-fn in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-        v4 => v4,
+/// Whether an exclude entry's `net`/`bits` covers `ip`, as written or behind IPv4-mapped or
+/// NAT64 wrapping: under DNS64 an IPv4-only host also resolves to a `64:ff9b::` address, which
+/// must stay excluded as the IPv4 address it reaches is.
+fn excludes(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
+    in_net(ip, net, bits) || in_net(unwrap_v4(ip), net, bits)
+}
+
+/// Whether an include entry's `net`/`bits` covers `ip`. Behind NAT64 only for a public IPv4
+/// address: an internal one (`64:ff9b::a00:1`) is whatever 10.0.0.1 is from the NAT64 gateway,
+/// not necessarily the tester's.
+fn includes(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
+    let mapped = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+        IpAddr::V4(_) => None,
     };
+    let nat64 = Some(unwrap_v4(ip)).filter(|v4| v4.is_ipv4() && internal(*v4).is_none());
+    in_net(ip, net, bits) || [mapped, nat64].into_iter().flatten().any(|v4| in_net(v4, net, bits))
+}
+
+fn in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
     match (ip, net) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
             let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits as u32) };
@@ -252,7 +273,7 @@ impl Scope {
     /// A proxy listed by name may not be a link-local or metadata address unless
     /// listed by address too.
     fn allows_proxy(&self, host: &str, port: u16, ip: IpAddr) -> bool {
-        self.proxies.iter().any(|e| e.matches_addr(ip, port))
+        self.proxies.iter().any(|e| e.includes_addr(ip, port))
             || (self.proxies.iter().any(|e| e.matches_name(host, port)) && internal(ip) != Some(Internal::Sensitive))
     }
 
@@ -271,10 +292,10 @@ impl Scope {
         let mut ok = Vec::new();
         let mut refused = None;
         for &ip in addrs {
-            if self.exclude.iter().any(|e| e.matches_addr(ip, port)) {
+            if self.exclude.iter().any(|e| e.excludes_addr(ip, port)) {
                 continue;
             }
-            let addr_ok = self.include.iter().any(|e| e.matches_addr(ip, port));
+            let addr_ok = self.include.iter().any(|e| e.includes_addr(ip, port));
             if !(name_ok || addr_ok) {
                 continue;
             }
@@ -413,7 +434,7 @@ impl Guard {
         if internal(ip).is_none() {
             return Ok(());
         }
-        match self.scopes.iter().find(|s| !s.include.iter().any(|e| e.matches_addr(ip, port))) {
+        match self.scopes.iter().find(|s| !s.include.iter().any(|e| e.includes_addr(ip, port))) {
             Some(s) => Err(Error::OutOfScope(format!(
                 "host override {bare} -> {ip} is an internal address the {} doesn't list; it must list the address \
                  (or its CIDR) for an override to reach it",
@@ -677,6 +698,26 @@ mod tests {
         assert!(m.allowed_addrs("169.254.169.254", 80, &ips(&["169.254.169.254"])).is_ok());
         // IPv4-mapped IPv6 is treated as IPv4.
         assert!(s.allowed_addrs("::ffff:10.0.0.5", 80, &ips(&["::ffff:10.0.0.5"])).is_ok());
+    }
+
+    #[test]
+    fn nat64_addresses_meet_the_ipv4_excludes_and_includes() {
+        // Under DNS64 an in-scope name also resolves to 64:ff9b::<IPv4>: an excluded IPv4
+        // address must stay excluded that way.
+        let s = Scope::compile(spec(&["app.test", "198.51.100.0/24"], &["93.184.216.34"]), "t").unwrap();
+        for excluded in ["93.184.216.34", "::ffff:93.184.216.34", "64:ff9b::5db8:d822"] {
+            assert!(s.allowed_addrs("app.test", 443, &ips(&[excluded])).is_err(), "{excluded}");
+        }
+        assert!(s.allowed_addrs("app.test", 443, &ips(&["64:ff9b::5db8:d823"])).is_ok());
+        // An IPv4 range included reaches its hosts through NAT64 too.
+        assert!(s.allowed_addrs("64:ff9b::c633:6407", 443, &ips(&["64:ff9b::c633:6407"])).is_ok());
+        // Not an internal one: 64:ff9b::a00:5 is 10.0.0.5 as the NAT64 gateway sees it.
+        let private = Scope::compile(spec(&["10.0.0.0/24"], &[]), "t").unwrap();
+        assert!(private.allowed_addrs("64:ff9b::a00:5", 443, &ips(&["64:ff9b::a00:5"])).is_err());
+        assert!(private.allowed_addrs("::ffff:10.0.0.5", 443, &ips(&["::ffff:10.0.0.5"])).is_ok());
+        // An IPv6 entry still matches the address as written.
+        let v6 = Scope::compile(spec(&["64:ff9b::/96"], &[]), "t").unwrap();
+        assert!(v6.allowed_addrs("64:ff9b::c633:6407", 443, &ips(&["64:ff9b::c633:6407"])).is_ok());
     }
 
     #[tokio::test]

@@ -1052,6 +1052,10 @@ select {
   border-radius: 12px;
   box-shadow: var(--shadow);
 }
+/* A dialog with no field to focus first takes focus itself (ui/dialogFocus.ts); no ring for that. */
+[role="dialog"]:focus {
+  outline: none;
+}
 .confirm-dialog h2 {
   margin: 0 0 8px;
   font-size: 15px;

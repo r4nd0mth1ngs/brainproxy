@@ -1770,7 +1770,7 @@ pub(crate) fn resolve_target(
     }
     let target = Target::from_url(&head.target)?;
     let after_scheme = &head.target[head.target.find("://").unwrap() + 3..];
-    let origin_form = after_scheme.find('/').map(|i| &after_scheme[i..]).unwrap_or("/").to_string();
+    let origin_form = crate::http::request::origin_form(after_scheme);
     // Rewrite only the request line; keep every other byte as the client sent it.
     let bytes = req.into_bytes();
     let line_end = crate::http::request::find(&bytes, b"\r\n").unwrap_or(bytes.len());

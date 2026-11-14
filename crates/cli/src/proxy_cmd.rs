@@ -343,9 +343,7 @@ impl ProxyRunArgs {
             }
         }
         regex::Regex::new(&self.authz_exclude).map_err(|e| Error::InvalidInput(format!("--authz-exclude: {e}")))?;
-        if self.authz_rate.is_nan() || self.authz_rate < 0.0 {
-            return Err(Error::InvalidInput("--authz-rate must be 0 or more".into()));
-        }
+        crate::request_args::check_rate("--authz-rate", Some(self.authz_rate))?;
         let skip_paths = brainproxy_core::authz::noise::check_skip_paths(&self.authz_skip_path)
             .map_err(|e| Error::InvalidInput(format!("--authz-skip-path: {e}")))?;
         Ok(LiveAuthz {
@@ -1289,6 +1287,7 @@ impl Launch {
         if !(0.0..=max_wait).contains(&args.wait) {
             return Err(Error::InvalidInput(format!("--wait must be from 0 to {max_wait} seconds")));
         }
+        crate::request_args::secs_arg("--timeout", args.timeout)?; // `proxy run` refuses it, in the log.
         check_listen_arg(&args.listen)?;
         check_routing(args.invisible, args.redirect.is_some())?;
         load_ca(home)?; // Surface CA and scope problems here rather than in the log.
@@ -2005,7 +2004,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     // Fail before listening if there is no scope; the scope can't change while we run.
     let guard = store.guard()?;
     let upstream = SendOptions {
-        timeout: Duration::from_secs_f64(args.timeout.max(0.001)),
+        timeout: crate::request_args::secs_arg("--timeout", args.timeout)?.max(Duration::from_millis(1)),
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard),
@@ -2949,7 +2948,7 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                 StateArg::All => None,
             };
             let started = Instant::now();
-            let deadline = started + Duration::from_secs_f64(wait.max(0.0));
+            let deadline = started + crate::request_args::secs_arg("--wait", wait)?;
             let items = loop {
                 let items = store.intercept_list(state, limit)?;
                 if !items.is_empty() || Instant::now() >= deadline {

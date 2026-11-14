@@ -60,6 +60,7 @@ export function DashboardView({ active }: { active: boolean }) {
   const live = jobs?.jobs.filter(isLive).length ?? 0;
   const hosted = {
     jobId: wizardJob,
+    active,
     onStarted: (id: number) => {
       setWizardJob(id);
       store("job", String(id));

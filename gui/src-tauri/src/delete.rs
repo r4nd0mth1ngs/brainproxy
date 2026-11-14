@@ -7,9 +7,10 @@
 //! - lock files `<name>.bpdb-<what>.lock`: `proxy`, `oob`, `proxy-restart`, `job-<id>`, ...
 //!   (cli `process.rs`);
 //! - browser profiles in `<name>.bpdb.browsers/` (cli `browser_cmd.rs`);
-//! - default logs `<name>.proxy.log`, `<name>.oob.log`, `<name>.job-<id>.log` and
-//!   `<name>.fuzz-<id>.log`, and a fuzz run's staged request `<name>.fuzz-<id>.req` (cli
-//!   `proxy_cmd.rs`, `oob_cmd.rs`, `jobs_cmd.rs`, `fuzz_cmd.rs`).
+//! - default logs `<name>.proxy.log`, `<name>.oob.log`, `<name>.record.log`, `<name>.job-<id>.log`
+//!   and `<name>.fuzz-<id>.log`, and a fuzz run's staged request `<name>.fuzz-<id>.req` (cli
+//!   `proxy_cmd.rs`, `oob_cmd.rs`, `auth_cmd.rs`, `jobs_cmd.rs`, `fuzz_cmd.rs`; cli `mcp.rs`'s
+//!   `project_own_file` keeps the same list).
 //!
 //! The logs are named after the file's stem alone, so another project with that stem and a
 //! different extension (`acme.db`, which the CLI allows) would share them: they are kept then.
@@ -138,9 +139,9 @@ fn sidecar(entry: &str, name: &str, stem: &str) -> Option<Sidecar> {
     }
     // `Path::with_extension`: these swap `.bpdb` for their own extension.
     let rest = entry.strip_prefix(stem)?.strip_prefix('.')?;
-    let log = rest
-        .strip_suffix(".log")
-        .is_some_and(|log| matches!(log, "proxy" | "oob") || numbered(log, "job-") || numbered(log, "fuzz-"));
+    let log = rest.strip_suffix(".log").is_some_and(|log| {
+        matches!(log, "proxy" | "oob" | "record") || numbered(log, "job-") || numbered(log, "fuzz-")
+    });
     let staged = rest.strip_suffix(".req").is_some_and(|req| numbered(req, "fuzz-"));
     (log || staged).then_some(Sidecar::Stem)
 }
@@ -270,6 +271,7 @@ mod tests {
             "acme.bpdb-job-12.lock",
             "acme.proxy.log",
             "acme.oob.log",
+            "acme.record.log",
             "acme.job-3.log",
             "acme.fuzz-40.log",
             "acme.fuzz-40.req",
@@ -286,6 +288,8 @@ mod tests {
             "acme.job-.log",
             "acme.job-1a.log",
             "acme.report.log",
+            "acme.record.req",
+            "acme.v2.record.log",
             "acme.job-3.req",
             "acme.fuzz-.req",
             "acme.html",
@@ -338,7 +342,14 @@ mod tests {
         let dir = folder("remove");
         let project = dir.join("acme.bpdb");
         database(&project);
-        for f in ["acme.bpdb-wal", "acme.bpdb-shm", "acme.bpdb-proxy.lock", "acme.proxy.log", "acme.job-2.log"] {
+        for f in [
+            "acme.bpdb-wal",
+            "acme.bpdb-shm",
+            "acme.bpdb-proxy.lock",
+            "acme.proxy.log",
+            "acme.record.log",
+            "acme.job-2.log",
+        ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
         std::fs::create_dir_all(dir.join("acme.bpdb.browsers/chrome/Default")).unwrap();
@@ -359,7 +370,7 @@ mod tests {
 
         let done = remove(&checked(&project)).unwrap();
         assert!(done.left.is_empty(), "{:?}", done.left);
-        assert_eq!(done.removed.len(), 7, "{:?}", done.removed);
+        assert_eq!(done.removed.len(), 8, "{:?}", done.removed);
         let mut left: Vec<String> =
             std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();

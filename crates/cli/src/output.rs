@@ -76,6 +76,12 @@ const LOCAL_ONLY: &[&str] = &[
     "replay tabs save",
 ];
 
+/// Whether a command, named as its path (`proxy start`, `engagement start`), is one of
+/// [`LOCAL_ONLY`]. Some are listed by their group (`engagement`, `ca`, `scope`).
+pub(crate) fn local_only(path: &str) -> bool {
+    LOCAL_ONLY.contains(&path) || path.split(' ').next().is_some_and(|group| LOCAL_ONLY.contains(&group))
+}
+
 pub struct Out {
     pub format: Format,
     pub command: String,

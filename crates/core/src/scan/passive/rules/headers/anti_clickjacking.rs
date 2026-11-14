@@ -93,8 +93,10 @@ impl PassiveRule for AntiClickjacking {
         if is_error(msg.status) || is_redirect(msg.status) {
             return;
         }
-        // ZAP: plain substring test on the joined CSP header values, no parsing.
-        if header_values(msg, "Content-Security-Policy").any(|v| v.contains("frame-ancestors")) {
+        // ZAP: plain substring test on the joined CSP header values, no parsing. Directive names
+        // are case-insensitive, though, and the CSP rule (10055) takes `Frame-Ancestors` as one.
+        let csp = |v: &str| v.to_ascii_lowercase().contains("frame-ancestors");
+        if header_values(msg, "Content-Security-Policy").any(csp) {
             return;
         }
         let xfo: Vec<&str> = header_values(msg, HEADER).collect();
@@ -145,8 +147,10 @@ mod tests {
     #[test]
     fn ignores_good_header_csp_and_out_of_scope() {
         assert!(msg("https://a.test/").html("<p>").header(HEADER, "SAMEORIGIN").scan(&AntiClickjacking).is_empty());
-        let csp = msg("https://a.test/").html("<p>").header("Content-Security-Policy", "frame-ancestors 'none'");
-        assert!(csp.scan(&AntiClickjacking).is_empty());
+        for v in ["frame-ancestors 'none'", "Frame-Ancestors 'none'", "default-src 'self'; FRAME-ANCESTORS 'self'"] {
+            let csp = msg("https://a.test/").html("<p>").header("Content-Security-Policy", v);
+            assert!(csp.scan(&AntiClickjacking).is_empty(), "{v}");
+        }
         assert!(msg("https://a.test/").html("<p>").status(404).scan(&AntiClickjacking).is_empty());
         assert!(msg("https://a.test/").html("<p>").status(302).scan(&AntiClickjacking).is_empty());
         assert!(msg("https://a.test/")

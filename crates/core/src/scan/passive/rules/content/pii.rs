@@ -70,7 +70,13 @@ fn extract_text(html: &str) -> String {
         }
         let closing = rest.starts_with("</");
         let name_start = lt + if closing { 2 } else { 1 };
-        let name_len = html[name_start..].bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'-').count();
+        // A start tag's name begins with a letter: `<3` is text, and read as a tag it would hide
+        // the text up to the next `>`.
+        let name_len = if closing || b.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
+            html[name_start..].bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'-').count()
+        } else {
+            0
+        };
         if name_len == 0 && !rest.starts_with("<!") && !rest.starts_with("<?") {
             raw.push('<');
             i = lt + 1;
@@ -188,6 +194,9 @@ mod tests {
     fn extracts_visible_text() {
         let html = "<p>Card:</p><div>4111 <b>1111</b>&nbsp;x</div><script>var a='9';</script><!-- c -->end";
         assert_eq!(extract_text(html), "Card: 4111 1111\u{a0}x end");
+        // `<3` isn't a tag, so the text after it is kept up to the real one.
+        assert_eq!(extract_text("I <3 card 4716 1869 7854 4330 <b>ok</b>"), "I <3 card 4716 1869 7854 4330 ok");
+        assert_eq!(extract_text("a <- b</p>c"), "a <- b c");
     }
 
     #[test]

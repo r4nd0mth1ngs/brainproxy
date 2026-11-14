@@ -724,7 +724,7 @@ impl Store {
     pub fn findings_grouped(&self, filter: &FindingFilter) -> Result<Vec<Value>> {
         let (where_sql, args) = filter.sql();
         let sql = format!(
-            "SELECT alert_ref, name, risk, max(risk_level) AS risk_level, count(*) AS instances, sum(hits) AS hits,
+            "SELECT alert_ref, name, max(risk_level) AS risk_level, count(*) AS instances, sum(hits) AS hits,
                 count(DISTINCT host) AS hosts, min(id) AS first_id,
                 json_group_array(json_object('id', id, 'url', url, 'param', param, 'evidence', substr(evidence, 1, 200)))
                     AS examples,
@@ -733,19 +733,20 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
-            let examples: String = r.get(8)?;
+            let examples: String = r.get(7)?;
             let mut ex: Vec<Value> = serde_json::from_str(&examples).unwrap_or_default();
             let total = ex.len();
             ex.truncate(filter.examples);
             Ok(json!({
                 "alert_ref": r.get::<_, String>(0)?,
                 "name": r.get::<_, String>(1)?,
-                "risk": r.get::<_, String>(2)?,
+                // From the highest level: a bare `risk` column would be the first finding's.
+                "risk": crate::scan::issues::risk_name(r.get(2)?),
                 // One source, or several joined by commas when scanners share an alert type.
-                "source": r.get::<_, String>(9)?,
-                "instances": r.get::<_, i64>(4)?,
-                "hits": r.get::<_, i64>(5)?,
-                "hosts": r.get::<_, i64>(6)?,
+                "source": r.get::<_, String>(8)?,
+                "instances": r.get::<_, i64>(3)?,
+                "hits": r.get::<_, i64>(4)?,
+                "hosts": r.get::<_, i64>(5)?,
                 "examples": ex,
                 "more_examples": total.saturating_sub(filter.examples),
             }))
@@ -1528,6 +1529,19 @@ mod tests {
         // Marked like any other.
         s.finding_mark(id, Some("confirmed"), Some("checked")).unwrap();
         assert_eq!(s.finding_get(id).unwrap()["state"], "confirmed");
+    }
+
+    #[test]
+    fn a_group_is_as_risky_as_its_riskiest_finding() {
+        let (mut s, _) = store();
+        for (path, risk) in [("/orders/7", Risk::Low), ("/orders/8", Risk::High), ("/orders/9", Risk::Medium)] {
+            let mut f = manual("Order IDOR", Some(&format!("https://app.test{path}")), vec![]);
+            f.risk = risk;
+            s.finding_add(&f).unwrap();
+        }
+        let groups = s.findings_grouped(&FindingFilter::default()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!((groups[0]["risk"].as_str(), groups[0]["instances"].as_i64()), (Some("high"), Some(3)));
     }
 
     #[test]

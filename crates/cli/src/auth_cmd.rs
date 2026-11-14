@@ -462,6 +462,9 @@ pub struct AddArgs {
     /// Environment variable holding the password, read at each login; never stored.
     #[arg(long)]
     password_env: Option<String>,
+    /// When replacing a profile, keep its password. For an edit that can't see it.
+    #[arg(long, conflicts_with_all = ["password", "password_env"])]
+    keep_password: bool,
     /// Page fetched before login to extract a CSRF token.
     #[arg(long)]
     csrf_url: Option<String>,
@@ -588,7 +591,7 @@ pub struct NetArgs {
 impl NetArgs {
     fn send_options(&self, project: &Path) -> Result<SendOptions, Error> {
         Ok(SendOptions {
-            timeout: Duration::from_secs_f64(self.timeout.max(0.1)),
+            timeout: crate::request_args::secs_arg("--timeout", self.timeout)?.max(Duration::from_millis(100)),
             verify_tls: self.verify_tls,
             sni: None,
             guard: Some(crate::project_guard(project)?),
@@ -905,6 +908,9 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 }
                 if a.keep_totp {
                     profile.totp = old.totp;
+                }
+                if a.keep_password {
+                    profile.password = old.password;
                 }
                 // No flag gives a passkey: the profile keeps those a recording gave it.
                 profile.passkeys = old.passkeys;

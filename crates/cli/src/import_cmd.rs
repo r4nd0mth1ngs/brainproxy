@@ -173,7 +173,7 @@ impl From<HarArgs> for ApiArgs {
 pub struct GraphqlArgs {
     /// GraphQL endpoint URL.
     url: String,
-    /// Introspection result (JSON file or '-') instead of querying the endpoint.
+    /// Introspection result (a JSON file; '-' reads stdin) instead of querying the endpoint.
     #[arg(long, value_name = "FILE")]
     schema: Option<String>,
     #[command(flatten)]
@@ -233,6 +233,8 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
         ImportCmd::Graphql(a) => ("graphql", &a.common, a.schema.as_deref() == Some("-")),
         ImportCmd::Har(_) => unreachable!("made an `import api` above"),
     };
+    let timeout = crate::request_args::secs_arg("--timeout", c.timeout)?.max(Duration::from_millis(100));
+    crate::request_args::check_rate("--rate", c.rate)?;
     if let ImportCmd::Api(a) = &cmd {
         api::check_source(&a.doc.source)?;
     }
@@ -270,7 +272,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
                     auth: c.auth.as_deref(),
                     headers: &headers,
                     tool: Tool::Crawl,
-                    timeout: c.timeout,
+                    timeout,
                     verify_tls: c.verify_tls,
                     graphql: a.graphql,
                 };
@@ -281,7 +283,7 @@ pub fn import(project: &Path, home: &Path, cmd: ImportCmd, out: &Out) -> Result<
     }
     let headers = c.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
     let send = SendOptions {
-        timeout: Duration::from_secs_f64(c.timeout.max(0.1)),
+        timeout,
         verify_tls: c.verify_tls,
         sni: None,
         guard: Some(guard),
@@ -577,7 +579,7 @@ pub(crate) struct RemoteFetch<'a> {
     pub auth: Option<&'a str>,
     pub headers: &'a [(String, String)],
     pub tool: Tool,
-    pub timeout: f64,
+    pub timeout: Duration,
     pub verify_tls: bool,
     /// The source is a GraphQL endpoint, where --var doesn't apply.
     pub graphql: bool,
@@ -596,7 +598,7 @@ pub(crate) fn check_remote_vars(
         return Ok(());
     }
     let send = SendOptions {
-        timeout: Duration::from_secs_f64(from.timeout.max(0.1)),
+        timeout: from.timeout,
         verify_tls: from.verify_tls,
         sni: None,
         guard: Some(guard.clone()),

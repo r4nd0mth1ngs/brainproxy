@@ -311,7 +311,7 @@ impl Resender {
     pub(crate) fn open(project: &Path, store: &Store, auth: Option<&str>, timeout: f64) -> Result<Self, Error> {
         let opts = SendOptions {
             guard: Some(store.guard()?),
-            timeout: std::time::Duration::from_secs_f64(timeout.max(0.001)),
+            timeout: crate::request_args::secs_arg("--timeout", timeout)?.max(std::time::Duration::from_millis(1)),
             verify_tls: false,
             sni: None,
             http2: false,

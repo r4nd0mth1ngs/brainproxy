@@ -41,6 +41,8 @@ pub(crate) fn detach(cmd: &mut Command) {
         // whoever reads our output (the app, a script) would then wait until the child exits.
         // The child's stdio is given explicitly, as inheritable copies, so it still gets those.
         for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle returns this process's own handle (or null, checked), and
+            // SetHandleInformation only changes its inherit flag.
             unsafe {
                 let h = GetStdHandle(id);
                 if !h.is_null() {
@@ -471,17 +473,20 @@ mod sys {
     /// Signal 0 checks without delivering anything; EPERM means another user's process,
     /// which is not ours.
     pub fn alive(pid: u32) -> bool {
+        // SAFETY: signal 0 delivers nothing; kill only checks the process exists.
         pid_t(pid).is_some_and(|p| unsafe { libc::kill(p, 0) } == 0)
     }
 
     pub fn ask_to_exit(pid: u32) {
         if let Some(p) = signal_target(pid) {
+            // SAFETY: plain kill(2); `signal_target` never gives 0, -1 or init.
             unsafe { libc::kill(p, libc::SIGTERM) };
         }
     }
 
     pub fn kill(pid: u32) {
         if let Some(p) = signal_target(pid) {
+            // SAFETY: plain kill(2); `signal_target` never gives 0, -1 or init.
             unsafe { libc::kill(p, libc::SIGKILL) };
         }
     }
@@ -497,6 +502,7 @@ mod sys {
             return None;
         }
         let null = std::fs::File::open("/dev/null").ok()?;
+        // SAFETY: dup2 on two open descriptors; `held` keeps its own copy of the old stdin.
         (unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } == libc::STDIN_FILENO).then_some(held)
     }
 
@@ -518,9 +524,11 @@ mod sys {
     #[cfg(target_os = "macos")]
     pub fn start_time(pid: u32) -> Option<u64> {
         let p = pid_t(pid)?;
+        // SAFETY: the struct is plain integers and arrays, for which zero is a valid value.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         let ptr = (&mut info as *mut libc::proc_bsdinfo).cast();
+        // SAFETY: proc_pidinfo writes at most `size` bytes, one proc_bsdinfo, into `info`.
         let n = unsafe { libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, ptr, size) };
         (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
     }
@@ -556,6 +564,7 @@ mod sys {
             if pid <= 4 {
                 return None;
             }
+            // SAFETY: OpenProcess takes plain values; a null handle (checked) means it failed.
             let h = unsafe { OpenProcess(access, 0, pid) };
             (!h.is_null()).then_some(Self(h))
         }
@@ -563,6 +572,7 @@ mod sys {
 
     impl Drop for Process {
         fn drop(&mut self) {
+            // SAFETY: the handle is this value's own, open since `open`, and closed only here.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -570,6 +580,7 @@ mod sys {
     pub fn alive(pid: u32) -> bool {
         let Some(p) = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else { return false };
         let mut code = 0u32;
+        // SAFETY: an open process handle and a u32 to write the exit code into.
         (unsafe { GetExitCodeProcess(p.0, &mut code) } != 0) && code == STILL_ACTIVE
     }
 
@@ -589,6 +600,7 @@ mod sys {
 
     pub fn kill(pid: u32) {
         if let Some(p) = Process::open(pid, PROCESS_TERMINATE) {
+            // SAFETY: a handle opened with PROCESS_TERMINATE, open for this call.
             unsafe { TerminateProcess(p.0, 1) };
         }
     }
@@ -597,6 +609,7 @@ mod sys {
         let p = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
         let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
         let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: an open process handle and four FILETIMEs to write into.
         let ok = unsafe { GetProcessTimes(p.0, &mut created, &mut exited, &mut kernel, &mut user) };
         (ok != 0).then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
     }

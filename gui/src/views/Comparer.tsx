@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { bodyText, rawResponse, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
 import { Split } from "../ui/Split";
+import { shownSimilarity, type Similarity } from "./comparerSimilarity.ts";
 
 export type Unit = "lines" | "words" | "bytes";
 type Op = 0 | 1 | -1; // equal, insert (B only), delete (A only)
@@ -123,7 +124,7 @@ export function ComparerView() {
   const [layout, setLayout] = useState<"side" | "unified">("side");
   const [paste, setPaste] = useState("");
   const [hist, setHist] = useState({ a: "", b: "", part: "response" as "request" | "response" | "response-body" });
-  const [similarity, setSimilarity] = useState<{ a: number; b: number; value: number } | null>(null);
+  const [similarity, setSimilarity] = useState<Similarity | null>(null);
 
   // When the list changes, compare the last two items, so "send, send" compares those two.
   useEffect(() => setPick({ a: items.length > 1 ? items.length - 2 : null, b: items.length ? items.length - 1 : null }), [items]);
@@ -152,15 +153,15 @@ export function ComparerView() {
         run<{ similarity: number }>(["diff", ids[0], ids[1], "--part", hist.part, "--mode", unit, "--max-changes", "0"]),
       ]);
       const part = (e: HistoryEntry) => (hist.part === "request" ? bodyText(e.request) : hist.part === "response" ? rawResponse(e) : bodyText(e.response?.body));
-      const n = items.length;
-      app.setComparer([...items, part(ea), part(eb)]);
-      setSimilarity({ a: n, b: n + 1, value: d.similarity });
+      const [a, b] = [part(ea), part(eb)];
+      app.setComparer([...items, a, b]);
+      setSimilarity({ a, b, unit, value: d.similarity });
     } catch (e: any) {
       app.toast(e.message, "error");
     }
   };
 
-  const cliSimilarity = similarity && similarity.a === pick.a && similarity.b === pick.b ? similarity.value : null;
+  const cliSimilarity = shownSimilarity(similarity, A, B, unit);
   return (
     <Split id="comparer" dir="row" initial={0.3}>
       <div className="col fill cmp-items">

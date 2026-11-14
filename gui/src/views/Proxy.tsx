@@ -25,6 +25,7 @@ import {
   newSearch,
   refilter,
   rerun,
+  searchFrom,
   mergeLocal,
   deleteNamed,
   saveAs,
@@ -52,6 +53,7 @@ import { ruleEditNote, scriptStop } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
 import { FORWARD, filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
 import { TrafficExport } from "./TrafficExport.tsx";
+import { dueIds, mergeRechecked, recheckCalls, SLOW_EVERY_MS, stillPending, withPending, type Pending } from "./trafficPending.ts";
 
 export function ProxyView() {
   const app = useApp();
@@ -299,12 +301,44 @@ function History({ active }: { active: boolean }) {
     }
   };
 
+  // Rows whose request was out when they were read (see trafficPending.ts), read again by id.
+  const pending = useRef<Pending>(new Map());
+  const rechecking = useRef(false);
+  const lastSlow = useRef(0);
+  const recheck = async (ids: number[]) => {
+    if (!ids.length || rechecking.current) return;
+    rechecking.current = true;
+    try {
+      for (const c of recheckCalls(ids)) {
+        const d = await run<{ items: HistoryItem[] }>(c.args);
+        const before = pending.current;
+        pending.current = stillPending(before, c.ids, d.items, Date.now());
+        setRows((r) => mergeRechecked(r, d.items));
+        // Answered now: a search that passed them while they had no response looks again.
+        const answered = c.ids.filter((id) => before.has(id) && !pending.current.has(id));
+        if (answered.length && search.current) {
+          search.current = searchFrom(search.current, Math.min(...answered));
+          setFound(search.current);
+        }
+      }
+    } catch {
+      // Still pending: the next poll asks again.
+    } finally {
+      rechecking.current = false;
+    }
+  };
+
   // Fetch only new rows each tick (ids only grow), then search them.
   usePoll(async () => {
+    const now = Date.now();
+    const slow = now - lastSlow.current >= SLOW_EVERY_MS;
+    if (slow) lastSlow.current = now;
+    const waiting = dueIds(pending.current, now, slow);
     for (;;) {
       const d = await run<{ items: HistoryItem[] }>(["history", "list", "--after", String(lastId.current), "--limit", "2000"]);
       if (!d.items.length) break;
       lastId.current = d.items[d.items.length - 1].id;
+      pending.current = withPending(pending.current, d.items, Date.now());
       // Overlapping polls can fetch the same rows; keep each id once.
       setRows((r) => {
         const max = r.length ? r[r.length - 1].id : 0;
@@ -312,6 +346,7 @@ function History({ active }: { active: boolean }) {
       });
       if (d.items.length < 2000) break;
     }
+    await recheck(waiting);
     await searchMore();
   }, 1500);
 
@@ -357,6 +392,8 @@ function History({ active }: { active: boolean }) {
     setAfterRules(false);
   }, [selected]);
 
+  const row = rows.find((r) => r.id === selected);
+  // A pending row's detail is read again once its response (or failure) is recorded.
   useEffect(() => {
     if (selected == null) return setEntry(null);
     let live = true;
@@ -366,7 +403,7 @@ function History({ active }: { active: boolean }) {
     return () => {
       live = false;
     };
-  }, [selected, app.toast]);
+  }, [selected, row?.status, row?.error, app.toast]);
 
   const refused = useMemo(() => rows.filter(isRefused).length, [rows]);
   const shown = useMemo(() => visibleRows(rows, filter, found), [rows, filter, found]);
@@ -422,7 +459,6 @@ function History({ active }: { active: boolean }) {
       .catch((e) => app.toast(e.message, "error"));
 
   // The palette's and shortcuts' Traffic actions, on the selected row, while Traffic shows.
-  const row = rows.find((r) => r.id === selected);
   const noRow: string | false = row ? false : "Select a request in Traffic first";
   const rowBlocker = row ? scanBlocker(row) : null;
   useActions([

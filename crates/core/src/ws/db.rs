@@ -267,6 +267,18 @@ impl Store {
     /// to database ids across calls; a closed connection's key is removed. Events for a key
     /// with no `Open` (it failed to record) are skipped.
     pub fn ws_record(&mut self, events: &[WsEvent], ids: &mut HashMap<u64, i64>) -> Result<()> {
+        // A batch that fails is rolled back whole: the keys it opened or closed must be too, or
+        // later messages would be written under a rolled-back id, which AUTOINCREMENT hands to
+        // the next connection.
+        let before = ids.clone();
+        let result = self.ws_record_in_tx(events, ids);
+        if result.is_err() {
+            *ids = before;
+        }
+        result
+    }
+
+    fn ws_record_in_tx(&mut self, events: &[WsEvent], ids: &mut HashMap<u64, i64>) -> Result<()> {
         let tx = self.write_tx()?;
         for e in events {
             match e {
@@ -412,6 +424,35 @@ mod tests {
             url: "ws://a.test/chat".into(),
             time: crate::ws::now_iso(),
         }
+    }
+
+    #[test]
+    fn a_failed_batch_leaves_the_keys_as_they_were() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut ids = HashMap::new();
+        let msg = |key, p: &[u8]| WsEvent::Message {
+            key,
+            direction: Direction::ToClient,
+            message: Message::new(OP_TEXT, p.to_vec()),
+            intercept: None,
+        };
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER no_fail BEFORE INSERT ON ws_messages WHEN new.payload_text = 'fail'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        // Connection 1's batch is rolled back whole: its key mustn't keep the id it was given.
+        assert!(s.ws_record(&[open_event(1), msg(1, b"fail")], &mut ids).is_err());
+        assert!(ids.is_empty());
+        s.conn.execute_batch("DROP TRIGGER no_fail").unwrap();
+        // So connection 2, which AUTOINCREMENT gives the same id, gets only its own messages.
+        s.ws_record(&[open_event(2), msg(1, b"lost: connection 1 never opened"), msg(2, b"mine")], &mut ids).unwrap();
+        let conns = s.ws_connections(&ConnectionFilter { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(conns.len(), 1);
+        let all = MessageFilter { limit: 10, ..Default::default() };
+        let payloads: Vec<_> = s.ws_messages(conns[0].id, &all).unwrap().into_iter().map(|m| m.payload).collect();
+        assert_eq!(payloads, [b"mine".to_vec()]);
     }
 
     #[test]

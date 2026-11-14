@@ -198,7 +198,8 @@ async fn handle_tcp(mut s: TcpStream, remote: SocketAddr) -> Option<Interaction>
 fn head_complete(buf: &[u8]) -> bool {
     let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { return buf.len() >= MAX_RECORD };
     let len: usize = header(buf, "content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-    buf.len() >= (end + 4 + len).min(MAX_RECORD)
+    // Saturating: a Content-Length near usize::MAX would wrap to a small total.
+    buf.len() >= end.saturating_add(4).saturating_add(len).min(MAX_RECORD)
 }
 
 fn header(buf: &[u8], name: &str) -> Option<String> {
@@ -357,6 +358,8 @@ mod tests {
         assert!(head_complete(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
         assert!(!head_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab"));
         assert!(head_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nabcde"));
+        let huge = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\nab", usize::MAX - 2);
+        assert!(!head_complete(huge.as_bytes()));
         assert_eq!(header(b"GET / HTTP/1.1\r\nHOST: x.test\r\n\r\n", "host").as_deref(), Some("x.test"));
     }
 

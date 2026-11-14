@@ -300,7 +300,8 @@ async fn run(rule: &CheckRule, cx: &Cx) {
         }
         None => {
             for block in &check.blocks {
-                if run_block(rule, cx, block, &mut vars).await.stop {
+                // Boxed: a block's future is about 100 KB, too much to hold on the stack.
+                if Box::pin(run_block(rule, cx, block, &mut vars)).await.stop {
                     return;
                 }
             }
@@ -325,7 +326,7 @@ fn run_flow<'a>(
             Expr::Var(v) => {
                 let n: usize = v.trim_start_matches("__http_").parse().unwrap_or(0);
                 match rule.check.blocks.get(n.wrapping_sub(1)) {
-                    Some(block) => run_block(rule, cx, block, vars).await.matched,
+                    Some(block) => Box::pin(run_block(rule, cx, block, vars)).await.matched,
                     None => false,
                 }
             }
@@ -405,7 +406,7 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
                 }
             };
             let sent = match key {
-                Some(k) => cx.send_once(&k, send).await,
+                Some(k) => Box::pin(cx.send_once(&k, send)).await,
                 None => send.await,
             };
             let oob_sent = oob.as_ref().zip(sent_req.as_deref());

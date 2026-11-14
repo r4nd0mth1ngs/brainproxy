@@ -1480,6 +1480,13 @@ impl Store {
             }
             Error::InvalidInput(format!("SQL: {e}"))
         })?;
+        // The read-only connection refuses a write when it runs, but `VACUUM INTO 'path'` has
+        // already created the file by then, anywhere the process may write.
+        if !stmt.readonly() {
+            return Err(Error::InvalidInput(
+                "SQL: query runs only statements that read (SELECT, WITH, EXPLAIN, PRAGMA table_info, ...)".into(),
+            ));
+        }
         let columns: Vec<String> = stmt.column_names().map(str::to_string).collect();
         let mut rows_iter = stmt
             .query(rusqlite::params_from_iter(params.iter().map(|p| bind_value(p))))
@@ -1530,6 +1537,7 @@ fn project_dir(path: &Path) -> &Path {
 fn owner_only(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     // ponytail: process-wide umask; it is a single-user CLI, nothing it writes needs to be shared.
+    // SAFETY: umask only sets the process's file mode mask; it can't fail or touch memory.
     unsafe { libc::umask(0o077) };
     let with = |suffix: &str| {
         let mut s = path.as_os_str().to_owned();
@@ -2806,6 +2814,12 @@ mod tests {
         let ro = Store::open_read_only(&path).unwrap();
         assert!(ro.query("DELETE FROM history", &[], 10, 10).is_err());
         assert_eq!(ro.count().unwrap(), 1);
+        // A statement that writes is refused before it runs: VACUUM INTO would create its file.
+        let copy = dir.join("copy.db");
+        let _ = std::fs::remove_file(&copy);
+        let e = ro.query(&format!("VACUUM INTO '{}'", copy.display()), &[], 10, 10).unwrap_err().to_string();
+        assert!(e.contains("only statements that read"), "{e}");
+        assert!(!copy.exists());
         // Secrets stay out of reach, directly or through a subquery.
         for sql in ["SELECT state FROM AUTH_PROFILES", "SELECT (SELECT profile FROM auth_profiles)"] {
             let e = ro.query(sql, &[], 10, 10).unwrap_err().to_string();

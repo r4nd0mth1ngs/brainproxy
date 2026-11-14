@@ -21,6 +21,7 @@ import {
   parseSaved,
   refilter,
   rerun,
+  searchFrom,
   deleteNamed,
   saveAs,
   SavedMoved,
@@ -245,6 +246,20 @@ test("a rerun search keeps showing the earlier matches it hasn't reached yet", (
   s = mergePage(s, [row(6)], 6, f);
   assert.equal(s.previous, undefined);
   assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 6]);
+});
+
+test("rows searched before their response came are searched again from the first of them", () => {
+  const f = qf("status=200");
+  const all = rows(1, 6);
+  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(5)], 6, f);
+  assert.equal(searchFrom(s, 7), s, "not searched yet: nothing to do");
+  s = searchFrom(s, 3);
+  assert.equal(s.cursor, 2);
+  assert.deepEqual([...s.matches.keys()], [1]);
+  // Until the search gets there again, what showed still shows.
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 5]);
+  s = mergePage(s, [row(3), row(5)], 6, f);
+  assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 3, 5]);
 });
 
 test("a query on notes or tags is searched again after an edit", () => {

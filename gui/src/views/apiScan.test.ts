@@ -830,6 +830,10 @@ test("signer coverage", () => {
   // As session.rs matches: a prefix with a scheme, else the host; *.x covers x itself.
   assert.ok(urlPatternMatches("https://a.test/", "https://a.test/x"));
   assert.ok(urlPatternMatches("HTTPS://A.test/", "https://a.test/x"));
+  // The URL as the CLI matches it: the default port left out, the host in lower case.
+  assert.ok(urlPatternMatches("https://a.test", "https://A.TEST:443/x"));
+  assert.ok(!urlPatternMatches("https://a.test:*", "https://a.test:x@evil.test/"), "a * in the origin doesn't pass a userinfo @");
+  assert.ok(urlPatternMatches("::1", "http://[::1]:8080/"), "an IPv6 host without its brackets, as the CLI has it");
   assert.ok(urlPatternMatches("https://*.a.test/", "https://b.a.test/x"));
   assert.ok(!urlPatternMatches("https://a.test/", "http://a.test/x"));
   assert.ok(urlPatternMatches("a.test", "https://a.test:8/x"));
@@ -838,6 +842,21 @@ test("signer coverage", () => {
   assert.ok(urlPatternMatches("*.a.test", "https://b.a.test/"));
   assert.ok(!urlPatternMatches("*.a.test", "https://evil-a.test/"));
   assert.ok(!urlPatternMatches("a.test", "not a url"));
+  // A pattern with a scheme names a whole origin (session.rs's url_patterns cases).
+  for (const u of ["https://app.corp.test", "https://app.corp.test/", "https://APP.corp.test/x", "https://app.corp.test?q"]) assert.ok(urlPatternMatches("https://app.corp.test", u), u);
+  for (const u of ["https://app.corp.test.evil.corp.test/x", "https://app.corp.test:8443/x", "https://app.corp.test@e.test/"]) assert.ok(!urlPatternMatches("https://app.corp.test", u), u);
+  assert.ok(urlPatternMatches("https://app.corp.test:8443", "https://app.corp.test:8443/x"));
+  assert.ok(!urlPatternMatches("https://app.corp.test:844", "https://app.corp.test:8443/x"));
+  assert.ok(urlPatternMatches("https://app.test/api/", "https://app.test/api/users?x=1"));
+  assert.ok(!urlPatternMatches("https://app.test/api/", "https://app.test.evil.test/api/"));
+  assert.ok(urlPatternMatches("https://a.test/api/*/edit", "https://a.test/api/7/edit?x=1"));
+  assert.ok(!urlPatternMatches("https://a.test/api/*/edit", "https://a.test/web/7/edit"));
+  assert.ok(urlPatternMatches("https://*.app.test", "https://x.y.app.test/a"));
+  for (const u of ["https://e.test/a.app.test", "https://e.test/?h=.app.test", "https://x.app.test:8443/"]) assert.ok(!urlPatternMatches("https://*.app.test", u), u);
+  assert.ok(urlPatternMatches("https://*.app.test/api/*", "https://x.app.test/api/v1"));
+  assert.ok(!urlPatternMatches("https://*.app.test/api/*", "https://e.test/x.app.test/api/v1"));
+  assert.ok(urlPatternMatches("https://app.test/api*", "https://app.test/api-v2/x"));
+  assert.ok(urlPatternMatches("https://app.test*", "https://app.test:8443/x"), "a * the pattern asks for");
 
   assert.deepEqual(signerFormOrigins({ origins: " https://a.test \n\nhttps://b.test" }), ["https://a.test", "https://b.test"]);
   assert.deepEqual(newSignerForm(["https://a.test", "https://b.test"]).origins, "https://a.test\nhttps://b.test");

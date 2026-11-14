@@ -289,25 +289,28 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
                 }
             }
             let limit = limit.clamp(1, 1000);
-            let deadline = Instant::now() + Duration::from_secs_f64(wait.max(0.0));
+            let deadline = Instant::now() + crate::request_args::secs_arg("--wait", wait)?;
             let mut correlated = oob::Correlation::default();
-            let rows = loop {
+            let mut rows = loop {
                 let c = oob::correlate(&mut store, active::alert_def)?;
                 correlated.interactions += c.interactions;
                 correlated.matched += c.matched;
                 correlated.new_findings += c.new_findings;
                 correlated.raised.extend(c.raised);
-                let rows = store.oob_interactions(since, token.as_deref(), limit, max_raw)?;
+                // One more than shown says whether there are more.
+                let rows = store.oob_interactions(since, token.as_deref(), limit + 1, max_raw)?;
                 if !rows.is_empty() || Instant::now() >= deadline {
                     break rows;
                 }
                 std::thread::sleep(Duration::from_millis(250));
             };
+            let truncated = rows.len() > limit;
+            rows.truncate(limit);
             let next_since = rows.last().and_then(|r| r["id"].as_i64()).unwrap_or(since);
             let data = json!({
                 "interactions": rows,
                 "count": rows.len(),
-                "truncated": rows.len() == limit,
+                "truncated": truncated,
                 "next_since": next_since,
                 "listener_running": running(&store)?.is_some(),
                 "scan_findings": {"matched": correlated.matched, "new_findings": correlated.new_findings},
@@ -335,6 +338,7 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
 }
 
 fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
+    let wait = crate::request_args::secs_arg("--wait", args.wait)?.max(Duration::from_millis(100));
     let store = Store::open(project)?;
     if let Some((s, known)) = recorded(&store)? {
         return Err(already_running(&s, known));
@@ -361,7 +365,7 @@ fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
     process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
-    let deadline = Instant::now() + Duration::from_secs_f64(args.wait.max(0.1));
+    let deadline = Instant::now() + wait;
     loop {
         if let Some(status) = child.try_wait()? {
             let text = std::fs::read(&log).unwrap_or_default();
@@ -381,7 +385,7 @@ fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
-            return Err(Error::Timeout(Duration::from_secs_f64(args.wait)));
+            return Err(Error::Timeout(wait));
         }
         std::thread::sleep(Duration::from_millis(50));
     }

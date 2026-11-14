@@ -386,6 +386,7 @@ pub fn raise_fd_limit() {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
         return;
     }
+    // SAFETY: setrlimit only reads the struct passed in.
     let set = |cur: libc::rlim_t| unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: cur, ..lim }) } == 0;
     let want = lim.rlim_max.min(fd_soft_cap());
     if want <= lim.rlim_cur || set(want) {
@@ -477,6 +478,7 @@ mod tests {
     fn fd_limit_is_raised_and_read() {
         let get = || {
             let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: getrlimit only writes the struct passed in.
             assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
             lim
         };

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "brainproxy engine: HTTP model, raw client, capture store, codecs"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true

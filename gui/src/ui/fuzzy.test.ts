@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fuzzy, rank } from "./fuzzy.ts";
+import { fuzzy, marked, rank } from "./fuzzy.ts";
 
 test("letters match in order as word starts and runs, ignoring case", () => {
   assert.deepEqual(fuzzy("tio", "Turn intercept on or off")?.at, [0, 5, 15]);
@@ -62,4 +62,18 @@ test("ties keep their order", () => {
     rank("a", same, (x) => x.t).map((r) => same.indexOf(r.item)),
     [0, 1, 2],
   );
+});
+
+test("matched runs line up with the text, past an emoji too", () => {
+  assert.deepEqual(marked("Open notes", fuzzy("notes", "Open notes")!.at), [
+    { text: "Open ", on: false },
+    { text: "notes", on: true },
+  ]);
+  // "📁" is two UTF-16 units: the match after it still covers "notes", not "otes".
+  assert.deepEqual(marked("Open 📁notes", fuzzy("notes", "Open 📁notes")!.at), [
+    { text: "Open 📁", on: false },
+    { text: "notes", on: true },
+  ]);
+  assert.deepEqual(marked("Proxy", []), [{ text: "Proxy", on: false }]);
+  assert.deepEqual(marked("", [0]), []);
 });

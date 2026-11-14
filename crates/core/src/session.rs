@@ -403,7 +403,17 @@ impl UrlPattern {
         let url = p.contains("://");
         let glob = regex::escape(p).replace(r"\*", ".*");
         let src = if url {
-            format!("^{glob}")
+            // A rule's URL lets its values go to the origins it matches, so the pattern's origin
+            // must be the whole origin: `https://app.test` doesn't cover `https://app.test.evil.test`
+            // or `https://app.test:8443`, and a `*` in the host doesn't reach into the path.
+            let host = p.find("://").map_or(0, |i| i + 3);
+            let end = p[host..].find(['/', '?', '#']).map_or(p.len(), |i| host + i);
+            // Nor past a userinfo `@` or a backslash, which browsers read as `/`.
+            let origin = regex::escape(&p[..end]).replace(r"\*", r"[^/?#@\\]*");
+            match regex::escape(&p[end..]).replace(r"\*", ".*") {
+                rest if rest.is_empty() => format!("^{origin}(?:[/?#]|$)"),
+                rest => format!("^{origin}{rest}"),
+            }
         } else {
             // `*.example.com` covers example.com itself too.
             match glob.strip_prefix(r".*\.") {
@@ -592,13 +602,17 @@ fn handling_key(profile: &str) -> String {
     format!("auth.handling.{profile}")
 }
 
-/// The URL a request goes to.
+/// The URL a request goes to: the target's origin, whatever an absolute-form request line
+/// names, since rules match it to decide where their values may go (`GET https://app.test/`
+/// sent to another host must not match a rule for https://app.test).
 fn request_url(raw: &[u8], target: &Target) -> String {
-    let path = RawRequest::from_bytes(raw.to_vec()).head().map(|h| h.target).unwrap_or_else(|_| "/".into());
-    if path.starts_with("http://") || path.starts_with("https://") {
-        return path;
-    }
-    let joined = format!("{}{}", target.origin(), if path.starts_with('/') { path } else { format!("/{path}") });
+    let line = RawRequest::from_bytes(raw.to_vec()).head().map(|h| h.target).unwrap_or_else(|_| "/".into());
+    let path = match line.split_once("://").filter(|_| !line.starts_with('/')) {
+        Some((_, rest)) => crate::http::request::origin_form(rest),
+        None if line.starts_with('/') => line,
+        None => format!("/{line}"),
+    };
+    let joined = format!("{}{path}", target.origin());
     url::Url::parse(&joined).map(|u| u.to_string()).unwrap_or(joined)
 }
 
@@ -1348,7 +1362,40 @@ mod tests {
         let url = UrlPattern::new("https://a.test/api/*/edit").unwrap();
         assert!(url.matches(&t("https://a.test"), "https://a.test/api/7/edit?x=1"));
         assert!(!url.matches(&t("https://a.test"), "https://a.test/web/7/edit"));
+        let m = |pattern: &str, u: &str| UrlPattern::new(pattern).unwrap().matches(&t(u), u);
+        for u in
+            ["https://app.corp.test", "https://app.corp.test/", "https://APP.corp.test/x", "https://app.corp.test?q"]
+        {
+            assert!(m("https://app.corp.test", u), "{u}");
+        }
+        // Its values would be allowed to go to whatever origin it matches.
+        for u in
+            ["https://app.corp.test.evil.corp.test/x", "https://app.corp.test:8443/x", "https://app.corp.test@e.test/"]
+        {
+            assert!(!m("https://app.corp.test", u), "{u}");
+        }
+        assert!(m("https://app.corp.test:8443", "https://app.corp.test:8443/x"));
+        assert!(!m("https://app.corp.test:844", "https://app.corp.test:8443/x"));
+        assert!(m("https://app.test/api/", "https://app.test/api/users?x=1"));
+        assert!(!m("https://app.test/api/", "https://app.test.evil.test/api/"));
+        assert!(m("https://*.app.test", "https://x.y.app.test/a"));
+        for u in ["https://e.test/a.app.test", "https://e.test/?h=.app.test", "https://x.app.test:8443/"] {
+            assert!(!m("https://*.app.test", u), "{u}");
+        }
+        assert!(m("https://*.app.test/api/*", "https://x.app.test/api/v1"));
+        assert!(!m("https://*.app.test/api/*", "https://e.test/x.app.test/api/v1"));
+        assert!(m("https://app.test/api*", "https://app.test/api-v2/x"));
+        assert!(m("https://app.test*", "https://app.test:8443/x"), "a * the pattern asks for");
+        assert!(
+            !m("https://app.test:*", "https://app.test:x@evil.test/"),
+            "a * in the origin doesn't pass a userinfo @"
+        );
         assert_eq!(request_url(b"GET /p?q=1 HTTP/1.1\r\n\r\n", &t("https://a.test")), "https://a.test/p?q=1");
+        // Where the request goes, not what an absolute-form line names.
+        let other = t("https://other.test");
+        assert_eq!(request_url(b"GET https://app.test/p?q=1 HTTP/1.1\r\n\r\n", &other), "https://other.test/p?q=1");
+        assert_eq!(request_url(b"GET https://app.test?q=1 HTTP/1.1\r\n\r\n", &other), "https://other.test/?q=1");
+        assert!(!m("https://app.test", &request_url(b"GET https://app.test/ HTTP/1.1\r\n\r\n", &other)));
     }
 
     #[test]

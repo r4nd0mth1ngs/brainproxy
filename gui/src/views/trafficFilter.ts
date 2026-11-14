@@ -343,6 +343,18 @@ export const newSearch = (query: SearchQuery): ContentSearch => ({
 /** The same search from the start, showing `s`'s matches until it gets to them. */
 export const rerun = (s: ContentSearch): ContentSearch => ({ ...newSearch(s.query), previous: s.matches });
 
+/**
+ * The search with the rows from `id` on searched again. A row read while its request was still
+ * out had no response, so a query on its status or response text didn't match it; once it has
+ * one it may. What showed past the new cursor keeps showing until the search gets there.
+ */
+export function searchFrom(s: ContentSearch, id: number): ContentSearch {
+  if (id > s.cursor) return s;
+  const matches = new Map([...s.matches].filter(([k]) => k < id));
+  const previous = new Map([...(s.previous ?? []), ...s.matches]);
+  return { ...s, matches, cursor: id - 1, capped: false, previous };
+}
+
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
   const want = searchFor(f);

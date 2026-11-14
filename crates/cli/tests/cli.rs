@@ -152,6 +152,36 @@ fn usage_and_not_found_errors() {
     assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")));
 }
 
+/// The GUI and MCP put the global options first; a usage error names the command, not them.
+#[test]
+fn usage_errors_name_the_command_after_global_options() {
+    let project = tmp_project("usage-command");
+    let (code, v) = run(&["history", "lsit"], &project, None);
+    assert_eq!((code, v["command"].as_str(), v["error"]["kind"].as_str()), (2, Some("history"), Some("usage")), "{v}");
+    let home = project.parent().unwrap().join("home");
+    let forms: [&[&str]; 4] = [
+        &["--format=json", "--project", "P", "--home", "H", "capabilities", "--bogus"],
+        &["--project=P", "--home=H", "--format", "json", "capabilities", "--bogus"],
+        &["--format", "json", "--", "capabilities", "--bogus"],
+        // An unknown option's value isn't taken for the command.
+        &["--format", "json", "--timeout", "5", "capabilities"],
+    ];
+    for argv in forms {
+        let out = bin()
+            .args(argv.iter().map(|a| match *a {
+                "P" => project.as_os_str(),
+                "H" => home.as_os_str(),
+                a => std::ffi::OsStr::new(a),
+            }))
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["command"], "capabilities", "{argv:?}: {v}");
+        // A command that shows only local state isn't marked as carrying a target's content.
+        assert!(v.get("_meta").is_none(), "{argv:?}: {v}");
+    }
+}
+
 #[test]
 fn codecs_chain() {
     let project = tmp_project("codec");
@@ -380,6 +410,30 @@ fn background_start_errors_are_the_childs_own() {
     // Not "active-scan exited (...): {json envelope}", and the prefix isn't doubled.
     assert!(!msg.contains("exited (") && !msg.contains("{\"ok\""), "{msg}");
     assert_eq!(msg.matches("invalid input:").count(), 1, "{msg}");
+}
+
+/// A background child that fails before its job starts fails as it would in the foreground.
+#[test]
+fn background_start_errors_keep_their_kind() {
+    // Accepts and never answers: the login times out.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || listener.incoming().collect::<Vec<_>>());
+    let project = tmp_project("bgkind");
+    let login = format!("http://127.0.0.1:{port}/login");
+    let (code, v) =
+        run(&["auth", "add", "slow", "--login-url", &login, "--username", "u", "--password", "p"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let site = format!("http://127.0.0.1:{port}/");
+    for background in [false, true] {
+        let mut args = vec!["crawl", "--auth", "slow", "--timeout", "1", "--no-robots", "--no-sitemap", &site];
+        if background {
+            args.push("--background");
+        }
+        let (code, v) = run(&args, &project, None);
+        assert_eq!((code, &v["error"]["kind"]), (3, &Value::from("timeout")), "{background}: {v}");
+        assert_eq!(v["error"]["message"], "timed out after 1s", "{background}: {v}");
+    }
 }
 
 #[test]
@@ -831,6 +885,37 @@ fn ws_send_refuses_a_wait_over_a_day() {
         assert_eq!(v["error"]["kind"], "invalid_input", "{wait}: {v}");
         assert!(v["error"]["message"].as_str().unwrap().contains("--wait: at most 86400"), "{v}");
         assert_eq!(code, 2);
+    }
+}
+
+/// Seconds, minutes and rates a person or an agent gives are checked: a value `Duration`
+/// can't hold used to panic (exit 101, no envelope).
+#[test]
+fn out_of_range_times_and_rates_are_refused() {
+    let project = tmp_project("float-flags");
+    let url = "http://127.0.0.1:9/";
+    let cases: [(&str, &[&str]); 16] = [
+        ("--timeout", &["send", "--url", url, "--timeout", "inf"]),
+        ("--timeout", &["job", "wait", "1", "--timeout", "inf"]),
+        ("--timeout", &["crawl", "--timeout=1e300", url]),
+        ("--max-minutes", &["crawl", "--max-minutes=-1", url]),
+        ("--rate", &["crawl", "--rate=1e-300", url]),
+        ("--max-minutes", &["scan", "active", "--max-minutes=-1", url]),
+        ("--check-timeout", &["scan", "active", "--check-timeout", "NaN", url]),
+        ("--oob-wait", &["scan", "active", "--oob-wait", "NaN", url]),
+        ("--rate", &["fuzz", "run", "--url", "http://127.0.0.1:9/?a=§1§", "-p", "list:1", "--rate", "1e-300"]),
+        ("--timeout", &["ws", "send", "--url", "ws://127.0.0.1:9/", "--timeout", "inf"]),
+        ("--wait", &["oob", "poll", "--wait", "inf"]),
+        ("--wait", &["oob", "start", "--listen", "127.0.0.1:0", "--wait", "1e300"]),
+        ("--wait", &["intercept", "list", "--wait", "NaN"]),
+        ("--timeout", &["proxy", "start", "--listen", "127.0.0.1:0", "--timeout", "inf"]),
+        ("--timeout", &["authz", "run", "--as", "nobody", "--timeout=-1"]),
+        ("--timeout", &["auth", "login", "nobody", "--timeout", "inf"]),
+    ];
+    for (flag, args) in cases {
+        let (code, v) = run(args, &project, None);
+        assert_eq!((code, &v["error"]["kind"]), (2, &Value::from("invalid_input")), "{args:?}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains(&format!("{flag}: 0 ")), "{args:?}: {v}");
     }
 }
 
@@ -1535,6 +1620,37 @@ fn findings_added_by_hand_warn_outside_scope_and_send_nothing() {
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("warning: other.test:80 is outside") && text.contains("added finding"), "{text}");
+}
+
+/// The grouped list is cut at --limit like the others, and --state is checked as `report` checks it.
+#[test]
+fn findings_list_keeps_to_its_limit_and_checks_states() {
+    let project = tmp_project("findings-limit");
+    for title in ["One", "Two", "Three"] {
+        let url = format!("http://127.0.0.1:9/{title}");
+        let (code, v) = run(&["findings", "add", "--title", title, "--risk", "low", "--url", &url], &project, None);
+        assert_eq!(code, 0, "{v}");
+    }
+    let list = |limit: &str| run(&["findings", "list", "--limit", limit], &project, None).1["data"].clone();
+    let d = list("2");
+    assert_eq!(
+        (d["groups"].as_array().map(Vec::len), &d["alert_types"], &d["truncated"]),
+        (Some(2), &3.into(), &true.into()),
+        "{d}"
+    );
+    let d = list("3");
+    assert_eq!((d["groups"].as_array().map(Vec::len), &d["truncated"]), (Some(3), &false.into()), "{d}");
+
+    for cmd in ["list", "issues"] {
+        for state in ["Open", "open,bogus", ""] {
+            let (code, v) = run(&["findings", cmd, "--state", state], &project, None);
+            assert_eq!((code, &v["error"]["kind"]), (2, &Value::from("usage")), "{cmd} {state:?}: {v}");
+        }
+        let (code, v) = run(&["findings", cmd, "--state", "open, false-positive,"], &project, None);
+        assert_eq!(code, 0, "{cmd}: {v}");
+    }
+    let (_, v) = run(&["findings", "issues", "--state", "open"], &project, None);
+    assert_eq!(v["data"]["count"], 3, "{v}");
 }
 
 /// Long texts come from a flag, a file, or stdin (only one of them), with clear errors.

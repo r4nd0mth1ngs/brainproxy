@@ -30,8 +30,8 @@ pub struct ActiveArgs {
     /// --where, every crawled/proxied/sent/imported request in history is a target.
     urls: Vec<String>,
     /// Scan an API from its description (OpenAPI 3.x, Swagger 2.0, Postman v2.0/v2.1, a GraphQL schema,
-    /// or a HAR file; a file or an http(s) URL): build requests as `import api` does, send each selected in-scope
-    /// operation once as a baseline, then attack exactly those.
+    /// or a HAR file; a file, '-' reads stdin, or an http(s) URL): build requests as `import api` does, send
+    /// each selected in-scope operation once as a baseline, then attack exactly those.
     #[arg(long, value_name = "SOURCE", conflicts_with_all = ["urls", "crawl", "history_ids", "where_sql"])]
     api: Option<String>,
     /// With --api: send to this server instead: scheme://host[:port] replaces the origin; with a path, the whole base.
@@ -409,6 +409,12 @@ pub enum StrengthArg {
 
 pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Result<(), Error> {
     args.check_api_flags()?;
+    let timeout = crate::request_args::secs_arg("--timeout", args.timeout)?.max(Duration::from_millis(100));
+    let check_timeout = crate::request_args::secs_arg("--check-timeout", args.check_timeout)?
+        .clamp(Duration::from_millis(100), timeout);
+    let max_duration = args.max_minutes.map(|m| crate::request_args::minutes_arg("--max-minutes", m)).transpose()?;
+    let oob_wait = crate::request_args::secs_arg("--oob-wait", args.oob_wait)?.min(Duration::from_secs(3600));
+    crate::request_args::check_rate("--rate", args.rate)?;
     let guard = crate::project_guard(project)?;
     let band = crate::checks_cmd::severity_band(args.check_severity, args.check_severity_max, "--check-severity")?;
     if let Some(bad) =
@@ -459,7 +465,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     auth: args.auth.as_deref(),
                     headers: &[],
                     tool: Tool::Scan,
-                    timeout: args.timeout,
+                    timeout,
                     verify_tls: args.verify_tls,
                     graphql: args.graphql,
                 };
@@ -469,7 +475,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
     }
     let send = SendOptions {
-        timeout: Duration::from_secs_f64(args.timeout.max(0.1)),
+        timeout,
         verify_tls: args.verify_tls,
         sni: None,
         guard: Some(guard.clone()),
@@ -536,14 +542,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         rules: applied.rules,
         exclude_rules: applied.exclude_rules,
         no_rules: args.no_rules,
-        checks: brainproxy_core::checks::into_rules(
-            checks,
-            Duration::from_secs_f64(args.check_timeout.clamp(0.1, args.timeout.max(0.1))),
-        ),
-        max_duration: args.max_minutes.map(|m| Duration::from_secs_f64(m * 60.0)),
+        checks: brainproxy_core::checks::into_rules(checks, check_timeout),
+        max_duration,
         auth: auth.clone(),
         oob,
-        oob_wait: Duration::from_secs_f64(args.oob_wait.clamp(0.0, 3600.0)),
+        oob_wait,
         check_methods: args.include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(),
         prune,
     };

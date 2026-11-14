@@ -40,6 +40,12 @@ export function useDialogFocus(ref: RefObject<HTMLElement | null>) {
     // Its own token: the element can be absent, and the same one may mount twice (Strict Mode).
     const me = {};
     dialogOpened(me);
+    // Focus has to be inside the dialog for Esc and its other keys to reach it. Focusable itself,
+    // a click on its blank area keeps focus there instead of dropping it to the page; and one
+    // with no autoFocus field (Export traffic, the report builder) takes focus when it opens,
+    // rather than leaving it on the button that opened it.
+    if (dialog && !dialog.hasAttribute("tabindex")) dialog.tabIndex = -1;
+    if (dialog && !dialog.contains(document.activeElement)) dialog.focus({ preventScroll: true });
     const onKey = (e: KeyboardEvent) => {
       const el = ref.current;
       if (e.key !== "Tab" || !el || !isTopDialog(me)) return;

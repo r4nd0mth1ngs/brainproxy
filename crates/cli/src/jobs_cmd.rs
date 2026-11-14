@@ -66,7 +66,7 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
             out.ok(j.clone(), || text(&j));
         }
         JobCmd::Wait { id, timeout } => {
-            let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
+            let deadline = Instant::now() + crate::request_args::job_wait_arg("--timeout", timeout)?;
             loop {
                 reap(project, &store, id)?;
                 let state = store.job_state(id)?;
@@ -189,17 +189,9 @@ pub fn child_failure(what: &str, status: std::process::ExitStatus, log: &str) ->
     let Some((kind, message)) = logged_error(log) else {
         return Error::InvalidInput(format!("{what} exited ({status}): {}", log.trim()));
     };
-    // The message is the child's Display text; drop its "<kind>: " prefix before re-wrapping.
-    let strip = |prefix: &str| message.strip_prefix(prefix).unwrap_or(&message).to_string();
-    match kind.as_str() {
-        "not_found" => Error::NotFound(strip("not found: ")),
-        "conflict" => Error::Conflict(strip("conflict: ")),
-        "out_of_scope" => Error::OutOfScope(strip("out of scope: ")),
-        "connect" => Error::Connect(strip("connection failed: ")),
-        "tls" => Error::Tls(strip("TLS error: ")),
-        "protocol" => Error::Protocol(strip("protocol error: ")),
-        _ => Error::InvalidInput(strip("invalid input: ")),
-    }
+    // The child's own error, with its kind and exit code; a kind this build doesn't know (a
+    // usage error) reads as invalid input.
+    Error::from_kind(&kind, &message).unwrap_or(Error::InvalidInput(message))
 }
 
 pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> Result<(), Error> {
@@ -329,4 +321,39 @@ pub fn run_job(
         process::forget_work_lock(&store, &lock_name(id));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_childs_error_keeps_its_kind_and_message() {
+        let errors = [
+            Error::InvalidInput("bad flag".into()),
+            Error::NotFound("auth profile x".into()),
+            Error::Conflict("already running".into()),
+            Error::OutOfScope("a.test".into()),
+            Error::Connect("refused".into()),
+            Error::Tls("bad certificate".into()),
+            Error::Timeout(Duration::from_secs(1)),
+            Error::Timeout(Duration::new(30, 5)),
+            Error::Timeout(Duration::from_millis(250)),
+            Error::Timeout(Duration::from_micros(12)),
+            Error::Timeout(Duration::ZERO),
+            Error::Protocol("bad response".into()),
+            Error::Io(std::io::Error::other("disk full")),
+            Error::Store(rusqlite::Error::UserFunctionError("database is locked".into())),
+            Error::Blocked("a request rule's script stopped the request".into()),
+        ];
+        for e in errors {
+            let envelope = json!({"ok": false, "error": {"kind": e.kind(), "message": e.to_string()}});
+            let got = child_failure("crawl", std::process::ExitStatus::default(), &format!("warning: x\n{envelope}\n"));
+            assert_eq!(
+                (got.kind(), got.to_string(), got.exit_code()),
+                (e.kind(), e.to_string(), e.exit_code()),
+                "{envelope}"
+            );
+        }
+    }
 }

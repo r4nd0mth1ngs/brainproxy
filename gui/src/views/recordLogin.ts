@@ -63,3 +63,15 @@ export function passkeyLine(k: PasskeyInfo): string {
   const who = k.user_name ? `${k.user_name} at ${k.rp_id}` : k.rp_id;
   return `${who} · used ${k.sign_count} time${k.sign_count === 1 ? "" : "s"}`;
 }
+
+export interface LoginResult {
+  login: { success: boolean; reason: string };
+}
+
+/**
+ * A test login that failed. `auth login` exits with an error then (the profile is saved all the
+ * same), its message the reason: "login failed: REASON (requests: ...)", or why it couldn't try.
+ */
+export const failedLogin = (message: string): LoginResult => ({
+  login: { success: false, reason: message.replace(/^(?:invalid input: )?login failed: /, "") },
+});
