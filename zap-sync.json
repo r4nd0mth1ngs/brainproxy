@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/zaproxy/zap-extensions.git",
   "branch": "main",
-  "commit": "f200855df5526e74c5105cf780e3e8424dec5032",
+  "commit": "1de40c5e1c1323609cfff65302eb4ddf7d8fdc29",
   "data_files": [
     {
       "upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml",
@@ -31,11 +31,12 @@
   "feed_rules": {
     "ServerSideVersionScanRule": {
       "addon": "pscanrules",
-      "generator": "scripts/php_feed.py",
+      "generator": "scripts/version_feed.py",
       "data": [
-        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/php-known-vulnerabilities.json"
+        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/php-known-vulnerabilities.json",
+        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/apache-known-vulnerabilities.json"
       ],
-      "ours": "feed/passive/php/"
+      "ours": "feed/passive/php/ and feed/passive/apache/"
     }
   }
 }

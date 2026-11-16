@@ -550,31 +550,34 @@ fn feed_brotli_check_flags_accepted_br_bodies() {
     assert_eq!(passive_hits(&c, "GET / HTTP/1.1\r\nAccept-Encoding: gzip, br\r\n", 200, &[]), 0);
 }
 
-#[test]
-fn feed_php_checks_list_known_vulnerabilities() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../feed/passive/php");
+/// (findings, matched CVE ids, confidences) of a feed folder's checks for one response header.
+fn feed_version_scan(folder: &str, name: &str, value: &str) -> (usize, Vec<String>, Vec<Confidence>) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../feed/passive").join(folder);
     let checks: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| passive_check(&std::fs::read_to_string(e.unwrap().path()).unwrap()))
         .collect();
-    assert_eq!(checks.len(), 4, "one check per severity band");
-    // (findings, matched CVE ids) for one response header.
-    let scan = |name: &str, value: &str| {
-        let resp =
-            crate::scan::active::Response::recorded(200, vec![(name.to_string(), value.to_string())], Vec::new());
-        let mut out = Vec::new();
-        for c in &checks {
-            c.scan("a.test", "GET / HTTP/1.1\r\n", &resp, &mut out);
-        }
-        let cves: Vec<String> = out
-            .iter()
-            .filter_map(|f| f.other_info.lines().find_map(|l| l.strip_prefix("Matched: ")))
-            .flat_map(|m| m.split(", ").map(|n| n.split(' ').next().unwrap().to_string()))
-            .collect();
-        (out.len(), cves)
-    };
-    let (n, cves) = scan("X-Powered-By", "PHP/7.4.33");
+    assert_eq!(checks.len(), 8, "two checks per severity band");
+    let resp = crate::scan::active::Response::recorded(200, vec![(name.to_string(), value.to_string())], Vec::new());
+    let mut out = Vec::new();
+    for c in &checks {
+        c.scan("a.test", "GET / HTTP/1.1\r\n", &resp, &mut out);
+    }
+    let mut cves: Vec<String> = out
+        .iter()
+        .filter_map(|f| f.other_info.lines().find_map(|l| l.strip_prefix("Matched: ")))
+        .flat_map(|m| m.split(", ").map(|n| n.split(' ').next().unwrap().to_string()))
+        .collect();
+    cves.sort();
+    (out.len(), cves, out.iter().map(|f| f.confidence).collect())
+}
+
+#[test]
+fn feed_php_checks_list_known_vulnerabilities() {
+    let scan = |name: &str, value: &str| feed_version_scan("php", name, value);
+    let (n, cves, conf) = scan("X-Powered-By", "PHP/7.4.33");
     assert!(n <= 4 && cves.iter().any(|c| c == "CVE-2024-4577"));
+    assert!(conf.iter().all(|c| *c == Confidence::Medium));
     // Fixed in 7.3.11, so only earlier 7.x releases.
     assert!(
         !cves.iter().any(|c| c == "CVE-2019-11043")
@@ -584,6 +587,13 @@ fn feed_php_checks_list_known_vulnerabilities() {
     assert!(!scan("X-Powered-By", "PHP/8.1.2").1.iter().any(|c| c == "CVE-2024-2756"));
     // PHP2Shell is reported by rule 100001, not here.
     assert!(!scan("X-Powered-By", "PHP/8.2.34").1.iter().any(|c| c.starts_with("CVE-2026-10961")));
+    // A distribution package (a suffix after the version, or a distribution's name in a comment
+    // on the line) is reported at low confidence only, with the same CVEs.
+    for v in ["PHP/7.4.3-4ubuntu2.20", "PHP/7.4.3 (Debian)", "Apache/2.4.41 (Ubuntu) PHP/7.4.3"] {
+        let (n, cves, conf) = scan("X-Powered-By", v);
+        assert!(n > 0 && conf.iter().all(|c| *c == Confidence::Low), "{v}: {conf:?}");
+        assert_eq!(cves, scan("X-Powered-By", "PHP/7.4.3").1, "{v}");
+    }
     // Fixed or unreleased versions, versions without a patch number, and other products.
     for (h, v) in [
         ("X-Powered-By", "PHP/8.5.12"),
@@ -592,6 +602,24 @@ fn feed_php_checks_list_known_vulnerabilities() {
         ("Server", "Foo-PHP/7.4.33"),
     ] {
         assert_eq!(scan(h, v).0, 0, "{v}");
+    }
+}
+
+#[test]
+fn feed_apache_checks_list_known_vulnerabilities() {
+    let scan = |value: &str| feed_version_scan("apache", "Server", value);
+    let (n, cves, conf) = scan("Apache/2.4.49");
+    // CVE-2021-41773 (path traversal) is in 2.4.49 only.
+    assert!(n <= 4 && cves.iter().any(|c| c == "CVE-2021-41773"), "{cves:?}");
+    assert!(conf.iter().all(|c| *c == Confidence::Medium));
+    assert!(!scan("Apache/2.4.50").1.iter().any(|c| c == "CVE-2021-41773"));
+    // Ubuntu's 2.4.41 has its fixes backported: low confidence.
+    let (n, _, conf) = scan("Apache/2.4.41 (Ubuntu)");
+    assert!(n > 0 && conf.iter().all(|c| *c == Confidence::Low), "{conf:?}");
+    // A comment that names no distribution keeps medium confidence.
+    assert!(scan("Apache/2.4.41 (Unix) OpenSSL/1.1.1").2.iter().all(|c| *c == Confidence::Medium));
+    for v in ["Apache/2.4", "Apache", "Apache-Coyote/1.1", "Apache/9.0.0"] {
+        assert_eq!(scan(v).0, 0, "{v}");
     }
 }
 

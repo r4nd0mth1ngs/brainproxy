@@ -2,10 +2,22 @@
   "version": 1,
   "files": {
     "http/brotli/brotli-request-body-decoded.yaml": "407561170256eeb7fd6af55d7a604593d8576b1ccc50a76f691ec7f22346dc47",
+    "passive/apache/apache-known-vulnerabilities-critical-distribution.yaml": "c14e8c31eb2ccfcaa33056bc6c243612c48848d6042328324b629dae82ac5d75",
+    "passive/apache/apache-known-vulnerabilities-critical.yaml": "38eb8c5cea75b95c08982cebf4c1937df21cbfb01b2ccc3bdfda95a6a3168796",
+    "passive/apache/apache-known-vulnerabilities-high-distribution.yaml": "5183a4649bc4e276570c13eb366b9fff2576a251ce0fee93a9bc0ac5a23fe94b",
+    "passive/apache/apache-known-vulnerabilities-high.yaml": "71fdd894530897f54c02e36bcbdd405242cf4fd848c6c6eabb72c8bf1296e701",
+    "passive/apache/apache-known-vulnerabilities-low-distribution.yaml": "edea24bffecf663598a414106c19b81852376f4126591948793a36f1717a096c",
+    "passive/apache/apache-known-vulnerabilities-low.yaml": "f3999d913ab5bdfd43461f58b13c36c8bb871f2fd1223958253b45ecd31eb03a",
+    "passive/apache/apache-known-vulnerabilities-medium-distribution.yaml": "773425547d544ed1e75dca7d0d73f7da39d14b49caa4a3df01eb6f3f32f071c6",
+    "passive/apache/apache-known-vulnerabilities-medium.yaml": "160e0c3c9f7d8d9a978cac157bdb4401e0bbe8ad41dd335fb5bf7873d73a5d8d",
     "passive/brotli/brotli-request-body-accepted.yaml": "eadd1a3a43d368c55f81135aef2025902d317d788c37719cadee4a33960efd77",
-    "passive/php/php-known-vulnerabilities-critical.yaml": "d5b03a12e1cb2474799e82dd47b101468a1f81576f2e4af878cfd2b658e83bb6",
-    "passive/php/php-known-vulnerabilities-high.yaml": "53f4a60e3d1e50e300aba9717b7958aca7d0d563203c6f35586e9a901f389105",
-    "passive/php/php-known-vulnerabilities-low.yaml": "5109a11984a5800c01e667c82b15f0b3a9166b0fed936a8ff97728bc0d58c1da",
-    "passive/php/php-known-vulnerabilities-medium.yaml": "a16151ff84696b5d25d70794722d4a08e5b1b411a8302eac716e748689e1324c"
+    "passive/php/php-known-vulnerabilities-critical-distribution.yaml": "8a6b1d8ea78286a54ebd3a602d82d818a74b867591d9fabafc28efc265f64b7c",
+    "passive/php/php-known-vulnerabilities-critical.yaml": "02e00c70c0cf6dfd9dc9a70d44bd67a96f9b776b7abc32bdfc53ccc15e4be08c",
+    "passive/php/php-known-vulnerabilities-high-distribution.yaml": "77983eddf66b5c65a1d7483b743c3c23b3c3fc5bb0f0bbf080efc7249550d065",
+    "passive/php/php-known-vulnerabilities-high.yaml": "91fd12c9b1b9613fbf85998487152b3a1f04e9c1acc91c5f553ad8f601198e8a",
+    "passive/php/php-known-vulnerabilities-low-distribution.yaml": "ccf22637e28d88b14fe0d106c3e92bc5f467d8c5e5de6f9689a0dc61f365ec5a",
+    "passive/php/php-known-vulnerabilities-low.yaml": "d81c728acdafb806fb455b1ae745402a148211361199455fd2ed2cdaa1d3d82a",
+    "passive/php/php-known-vulnerabilities-medium-distribution.yaml": "2542941cbf5bda20d4210adfe7707995aed1875d269132e8cfa445e31f36f26f",
+    "passive/php/php-known-vulnerabilities-medium.yaml": "4168d204daf2da73dc976e02b71398ec86263eba4d1783c8c48a3ca851cb304c"
   }
 }

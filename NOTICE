@@ -14,8 +14,9 @@ Copyright the ZAP development team, licensed under the Apache License, Version 2
   TimingUtils), including their alert texts and payload lists.
 - crates/core/src/scan/active/rules/probes/data/hidden_files.json: copied from ascanrules.
 - crates/core/src/scan/passive/rules/content/vulnerable_js.rs: ported from the retire add-on.
-- feed/passive/php/: checks generated (scripts/php_feed.py) from the pscanrules add-on's
-  php-known-vulnerabilities.json, covering its ServerSideVersionScanRule.
+- feed/passive/php/ and feed/passive/apache/: checks generated (scripts/version_feed.py) from
+  the pscanrules add-on's php- and apache-known-vulnerabilities.json, covering its
+  ServerSideVersionScanRule.
 
 The vulnerable JavaScript library database (crates/core/src/scan/passive/data/jsrepository.json,
 as the ZAP retire add-on ships it) is from Retire.js (https://github.com/RetireJS/retire.js),

@@ -109,7 +109,7 @@ static ALERTS: [&AlertDef; 12] = [
 const CSP: &str = "Content-Security-Policy";
 const XCSP_HEADER: &str = "X-Content-Security-Policy";
 const XWKCSP_HEADER: &str = "X-WebKit-CSP";
-const DIRECTIVES_WITHOUT_FALLBACK: [&str; 2] = ["form-action", "frame-ancestors"];
+const DIRECTIVES_WITHOUT_FALLBACK: [&str; 3] = ["form-action", "frame-ancestors", "base-uri"];
 /// Directives that have no effect when the policy is delivered via `<meta>`.
 const META_IGNORED: [&str; 3] = ["frame-ancestors", "report-uri", "sandbox"];
 
@@ -514,11 +514,15 @@ fn check_effective(policies: &[Policy], texts: &[&str], param: &str, out: &mut V
     };
     let raise = |def: &'static AlertDef, info: String| def.raise(param, evidence).other_info(with_multi(info, &multi));
 
-    let allowed: Vec<&str> = URL_CHECKS
+    let mut allowed: Vec<&str> = URL_CHECKS
         .iter()
         .filter(|(name, chain)| all_allow_url(policies, chain, *name == "script-src"))
         .map(|(name, _)| *name)
         .collect();
+    // As ZAP: base-uri isn't matched against a URL; missing or `*` in every policy allows any <base>.
+    if policies.iter().all(|p| p.get("base-uri").is_none_or(|d| d.values.iter().any(|v| v == "*"))) {
+        allowed.push("base-uri");
+    }
     let (no_fallback, rest): (Vec<&str>, Vec<&str>) =
         allowed.into_iter().partition(|n| DIRECTIVES_WITHOUT_FALLBACK.contains(n));
     if !no_fallback.is_empty() {
@@ -667,10 +671,10 @@ mod tests {
 
     const REASONABLE: &str = "default-src 'self'; script-src 'self' storage.googleapis.com cdn.temasys.io \
         cdn.tiny.cloud *.google-analytics.com; style-src 'self' *.googleapis.com; font-src 'self' data: \
-        *.googleapis.com fonts.gstatic.com; frame-ancestors 'none'; worker-src 'self'; form-action 'none'";
+        *.googleapis.com fonts.gstatic.com; frame-ancestors 'none'; worker-src 'self'; form-action 'none'; base-uri 'none'";
     const REASONABLE_META: &str = "default-src 'self'; script-src 'self' storage.googleapis.com cdn.temasys.io \
         cdn.tiny.cloud *.google-analytics.com; style-src 'self' *.googleapis.com; font-src 'self' data: \
-        *.googleapis.com fonts.gstatic.com; worker-src 'self'; form-action 'none'";
+        *.googleapis.com fonts.gstatic.com; worker-src 'self'; form-action 'none'; base-uri 'none'";
 
     fn page() -> M {
         msg("https://www.example.com/test/").html("<html></html>").header("Server", "Apache-Coyote/1.1")
@@ -721,19 +725,19 @@ mod tests {
 
     #[test]
     fn no_fallback_frame_ancestors() {
-        let f = scan(with_csp("frame-ancestors *; default-src 'self'; form-action 'none'"));
+        let f = scan(with_csp("frame-ancestors *; default-src 'self'; form-action 'none'; base-uri 'none'"));
         assert_eq!(refs(&f), ["10055-13"]);
         assert_eq!(
             f[0].other_info,
             "The directive(s): frame-ancestors is/are among the directives that do not fallback to default-src."
         );
-        assert_eq!(f[0].evidence, "frame-ancestors *; default-src 'self'; form-action 'none'");
+        assert_eq!(f[0].evidence, "frame-ancestors *; default-src 'self'; form-action 'none'; base-uri 'none'");
         assert_eq!(f[0].risk, Risk::Medium);
     }
 
     #[test]
     fn wildcard_connect_src() {
-        let p = "connect-src *; default-src 'self'; form-action 'none'; frame-ancestors 'self'";
+        let p = "connect-src *; default-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
         let f = scan(with_csp(p));
         assert_eq!(refs(&f), ["10055-4"]);
         assert_eq!(
@@ -777,8 +781,8 @@ mod tests {
 
     #[test]
     fn multiple_policies() {
-        let first = "script-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'";
-        let second = "default-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'";
+        let first = "script-src 'unsafe-inline'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+        let second = "default-src 'unsafe-inline'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
         let f = scan(with_csp(first).header(CSP, second));
         let ui = f.iter().find(|f| f.def.alert_ref == "10055-5").unwrap();
         assert_eq!(ui.evidence, first);
@@ -788,23 +792,26 @@ mod tests {
         let ui = f.iter().find(|f| f.def.alert_ref == "10055-5").unwrap();
         assert!(ui.other_info.contains("The response contained 2 Content-Security-Policy policies"));
 
-        let permissive = "connect-src *; default-src 'self'; form-action 'none'; frame-ancestors 'self'";
-        let restrictive = "connect-src 'self'; default-src 'self'; form-action 'none'; frame-ancestors 'self'";
+        let permissive =
+            "connect-src *; default-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
+        let restrictive =
+            "connect-src 'self'; default-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
         assert!(scan(with_csp(permissive).header(CSP, restrictive)).is_empty());
         let f = scan(with_csp(permissive).header(CSP, permissive));
         assert_eq!(refs(&f), ["10055-4"]);
         assert!(f[0].other_info.contains("The response contained 2 Content-Security-Policy policies"));
 
         let hashes = "default-src 'self'; script-src 'unsafe-hashes' \
-            'sha256-jzgBGA4UWFFmpOBq0JpdsySukE1FrEN5bUpoK8Z29fY='; form-action 'none'; frame-ancestors 'none'";
-        let plain = "default-src 'self'; script-src 'self'; form-action 'none'; frame-ancestors 'none'";
+            'sha256-jzgBGA4UWFFmpOBq0JpdsySukE1FrEN5bUpoK8Z29fY='; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+        let plain =
+            "default-src 'self'; script-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
         assert!(scan(with_csp(hashes).header(CSP, plain)).is_empty());
         assert_eq!(refs(&scan(with_csp(hashes))), ["10055-7"]);
     }
 
     #[test]
     fn notices_for_noisy_header_only() {
-        let noisy = "default-src none; form-action 'none'; frame-ancestors 'none'";
+        let noisy = "default-src none; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
         let f = scan(with_csp(REASONABLE).header(CSP, noisy));
         assert_eq!(refs(&f), ["10055-3"]);
         assert_eq!(f[0].evidence, noisy);
@@ -813,7 +820,7 @@ mod tests {
 
     #[test]
     fn trusted_types_notices() {
-        let base = "default-src 'self'; frame-ancestors 'none'; form-action 'none'";
+        let base = "default-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'";
         for (add, expected) in [
             ("; trusted-types", "Empty trusted-types directive allows all policy names"),
             ("; require-trusted-types-for", "The require-trusted-types-for directive requires a value"),
@@ -846,10 +853,11 @@ mod tests {
     fn unsafe_inline_eval_and_hashes() {
         let f = scan(with_csp("script-src 'unsafe-inline'"));
         assert_eq!(refs(&f), ["10055-13", "10055-4", "10055-5", "10055-6"]);
-        assert_eq!(f[0].other_info, "The directive(s): frame-ancestors, form-action is/are among the directives that do not fallback to default-src.");
+        assert_eq!(f[0].other_info, "The directive(s): frame-ancestors, form-action, base-uri is/are among the directives that do not fallback to default-src.");
         assert_eq!(f[2].other_info, "script-src includes unsafe-inline.");
-        let f =
-            scan(with_csp("script-src 'strict-dynamic' 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'"));
+        let f = scan(with_csp(
+            "script-src 'strict-dynamic' 'unsafe-inline'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+        ));
         assert!(!refs(&f).contains(&"10055-5"));
         let f = scan(with_csp("script-src 'unsafe-eval'"));
         assert_eq!(refs(&f), ["10055-13", "10055-4", "10055-6", "10055-10"]);
@@ -869,6 +877,25 @@ mod tests {
             let f = scan(with_csp(&p));
             assert_eq!(refs(&f), ["10055-13"], "{p}");
         }
+    }
+
+    #[test]
+    fn missing_or_wildcard_base_uri() {
+        for p in [
+            "default-src 'self'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri *",
+        ] {
+            let f = scan(with_csp(p));
+            assert_eq!(refs(&f), ["10055-13"], "{p}");
+            assert_eq!(
+                (f[0].other_info.as_str(), f[0].evidence.as_str()),
+                ("The directive(s): base-uri is/are among the directives that do not fallback to default-src.", p)
+            );
+        }
+        // A sibling policy that restricts it is enough, as browsers enforce every policy.
+        let both = "default-src 'self'; form-action 'none'; frame-ancestors 'none', \
+                    default-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'self'";
+        assert!(scan(with_csp(both)).is_empty());
     }
 
     #[test]
