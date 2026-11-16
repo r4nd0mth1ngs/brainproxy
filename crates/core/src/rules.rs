@@ -1,7 +1,9 @@
 //! Match-and-replace rules. A rule names a place in a message (its location, and for a header
 //! or query parameter a name), what to match there (a regex, literal text, or the whole value),
 //! and what to write instead. It applies to the traffic of the engines it lists (the proxy
-//! unless it says otherwise) and, with a host condition, only to targets whose host matches.
+//! unless it says otherwise) and, with a host condition, only to targets whose host matches; a
+//! response rule with a Content-Type condition, only to responses of a type it matches. Ready-made
+//! response rules are in [`crate::rule_presets`].
 //!
 //! Rules live in the project's settings ([`RULES_KEY`]). The proxy reloads them as they change;
 //! `send`, the fuzzer and the active scanner read them when a run starts ([`RuleSet::load`]).
@@ -278,6 +280,10 @@ pub struct Rule {
     /// Regex on the target's host (case-insensitive): the rule applies only where it matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Regex on the Content-Type the response came with (case-insensitive; a response without
+    /// one is matched as empty text): a response rule applies only where it matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// What makes the replacement.
     #[serde(default, skip_serializing_if = "ReplaceKind::is_text")]
     pub replacer: ReplaceKind,
@@ -308,6 +314,7 @@ impl Rule {
             action: None,
             applies_to: Vec::new(),
             host: None,
+            content_type: None,
             replacer: ReplaceKind::Text,
             script: None,
         }
@@ -536,12 +543,18 @@ pub struct CompiledRule {
     matcher: Option<Matcher>,
     replacer: Replacer,
     host: Option<Regex>,
+    content_type: Option<Regex>,
     engines: Vec<Engine>,
 }
 
 impl CompiledRule {
     fn applies(&self, engine: Engine, host: &str) -> bool {
         self.engines.contains(&engine) && self.host.as_ref().is_none_or(|re| re.is_match(host))
+    }
+
+    /// Whether the rule applies to a response with this Content-Type ("" for none).
+    fn takes_type(&self, content_type: &str) -> bool {
+        self.content_type.as_ref().is_none_or(|re| re.is_match(content_type))
     }
 
     /// `value` rewritten, or None when the rule doesn't match it, or its script failed (which
@@ -747,6 +760,12 @@ pub fn validate_rule(rule: &Rule) -> Result<()> {
             ));
         }
     }
+    if rule.content_type.as_deref().is_some_and(|t| !t.is_empty()) && !loc.is_response() {
+        return bad(format!(
+            "--content-type goes with a response location (status, response-header, response-body), not {}",
+            loc.name()
+        ));
+    }
     let ws = loc == RuleLocation::WsMessage;
     if let Some(e) = rule.applies_to.iter().find(|e| e.is_ws() != ws) {
         return bad(if ws {
@@ -817,14 +836,18 @@ fn compile(r: &Rule) -> Result<Option<CompiledRule>> {
             MatchKind::Whole => Matcher::Whole(r.pattern.clone().into_bytes()),
         })
     };
-    let host = r
-        .host
-        .as_deref()
-        .filter(|h| !h.is_empty())
-        .map(|h| {
-            Regex::new(&format!("(?i){h}")).map_err(|e| Error::InvalidInput(format!("rule {} host pattern: {e}", r.id)))
-        })
-        .transpose()?;
+    let condition = |pattern: &Option<String>, what: &str| {
+        pattern
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                Regex::new(&format!("(?i){p}"))
+                    .map_err(|e| Error::InvalidInput(format!("rule {} {what} pattern: {e}", r.id)))
+            })
+            .transpose()
+    };
+    let host = condition(&r.host, "host")?;
+    let content_type = condition(&r.content_type, "content type")?;
     Ok(Some(CompiledRule {
         id: r.id,
         origin: r.origin.clone(),
@@ -835,6 +858,7 @@ fn compile(r: &Rule) -> Result<Option<CompiledRule>> {
         matcher,
         replacer,
         host,
+        content_type,
         engines: r.engines(),
     }))
 }
@@ -1996,8 +2020,13 @@ fn response_rules<'a>(
     let (prefix, rest) = resp.split_at(final_start);
     let Ok(parsed) = parse_response_head(rest) else { return (resp.to_vec(), Vec::new()) };
     let no_body = to_head || (100..200).contains(&parsed.status) || matches!(parsed.status, 204 | 304);
-    let active: Vec<&'a CompiledRule> =
-        active.iter().copied().filter(|r| !(no_body && r.location == RuleLocation::ResponseBody)).collect();
+    // A Content-Type condition reads the response as it came, whatever a rule before it rewrites.
+    let content_type = parsed.header("content-type").unwrap_or("");
+    let active: Vec<&'a CompiledRule> = active
+        .iter()
+        .copied()
+        .filter(|r| !(no_body && r.location == RuleLocation::ResponseBody) && r.takes_type(content_type))
+        .collect();
     let (head, raw_body) = split_head_body(rest);
     let (mut first, mut headers) = split_lines(head);
     // Decoded once, when a body rule needs it; None if it can't be decoded (then body rules
@@ -3332,5 +3361,47 @@ mod tests {
         let forge = [named(1, RuleLocation::ResponseHeader, ANSWER_HEADER, RuleAction::Set, "", "the target's")];
         let out = RuleSet::compile(&forge).unwrap().response(Engine::Proxy, "h", b"", answer.into_bytes());
         assert!(!out.changed(), "{:?}", String::from_utf8_lossy(&out.bytes));
+    }
+
+    #[test]
+    fn a_content_type_condition_picks_the_responses_a_rule_applies_to() {
+        let json = |r: Rule| Rule { content_type: Some(r"^application/(.+\+)?json\b".into()), ..r };
+        let rules = [
+            json(named(1, RuleLocation::ResponseHeader, "X-Json", RuleAction::Add, "", "1")),
+            json(rule(2, RuleLocation::ResponseBody, "secret", "public")),
+            json(rule(3, RuleLocation::Status, "200", "201")),
+            named(4, RuleLocation::ResponseHeader, "Content-Type", RuleAction::Set, "", "application/json"),
+            // Read as the response came: rule 4 making it JSON doesn't bring it to rule 5.
+            json(named(5, RuleLocation::ResponseHeader, "X-After", RuleAction::Add, "", "1")),
+            Rule {
+                content_type: Some("^$".into()),
+                ..named(6, RuleLocation::ResponseHeader, "X-Untyped", RuleAction::Add, "", "1")
+            },
+        ];
+        let set = RuleSet::compile(&rules).unwrap();
+        let respond = |head: &str| {
+            let response = format!("HTTP/1.1 200 OK\r\n{head}Content-Length: 6\r\n\r\nsecret");
+            let out = set.response(Engine::Proxy, "h", b"GET / HTTP/1.1\r\n\r\n", response.into_bytes());
+            (String::from_utf8(out.bytes.clone()).unwrap(), out.ids())
+        };
+        let (text, ids) = respond("Content-Type: Application/Problem+JSON; charset=utf-8\r\n");
+        assert_eq!(ids, [1, 2, 3, 4, 5], "{text}");
+        assert!(text.starts_with("HTTP/1.1 201 Created\r\n") && text.ends_with("public"), "{text}");
+        let (text, ids) = respond("Content-Type: text/html\r\n");
+        assert_eq!(ids, [4], "{text}");
+        assert!(text.contains("Content-Type: application/json\r\n") && text.ends_with("secret"), "{text}");
+        // A response without a Content-Type is matched as empty text.
+        let (text, ids) = respond("");
+        assert_eq!(ids, [4, 6], "{text}");
+        // An empty condition is none; a request or WebSocket rule takes none at all.
+        let any = Rule { content_type: Some(String::new()), ..rule(7, RuleLocation::ResponseBody, "secret", "x") };
+        assert!(validate_rule(&any).is_ok());
+        for loc in [RuleLocation::RequestBody, RuleLocation::WsMessage, RuleLocation::Method] {
+            let bad = Rule { content_type: Some("html".into()), ..rule(8, loc, "a", "b") };
+            let e = validate_rule(&bad).unwrap_err().to_string();
+            assert!(e.contains("--content-type goes with a response location"), "{e}");
+        }
+        let bad = Rule { content_type: Some("(".into()), ..rule(9, RuleLocation::ResponseBody, "a", "b") };
+        assert!(validate_rule(&bad).unwrap_err().to_string().contains("rule 9 content type pattern"));
     }
 }

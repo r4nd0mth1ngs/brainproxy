@@ -325,8 +325,8 @@ an agent's changes to proxied traffic are recorded on their own:
 - `intercept_forward` and `intercept_drop` set the intercept's `resolved_by` to `mcp`, and
   `edited` says whether the message was replaced. A request forwarded edited gets
   `edited_by: [{"by": "mcp", "intercept": ID}]` on its history row.
-- `rules_add` (and `rules_enable` of a disabled rule) gives the rule origin `mcp`; a request
-  the rule changes gets `edited_by: [{"by": "mcp", "rule": ID}]`.
+- `rules_add`, `rules_presets_add` (and `rules_enable` of a disabled rule) give the rule origin
+  `mcp`; a request the rule changes gets `edited_by: [{"by": "mcp", "rule": ID}]`.
 - `findings_mark` with a note sets `note_origin`; `history_note` and `history_tag` set
   `note_origin` and `tags_origin`.
 - `scan_passive` with `rescan` keeps every finding's state, note and origins, and keeps a

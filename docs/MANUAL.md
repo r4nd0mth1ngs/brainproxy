@@ -1077,8 +1077,12 @@ byte, side by side or unified.
   header line or the request line. It says *what to match* there (a regex, plain text, or the
   whole value; nothing means the whole value) and what to write instead. **Applies to** is whose
   traffic it changes: the proxy unless you tick Replay, the Fuzzer or Scans too (a WebSocket rule:
-  messages to the server, to the client, or both), and a host regex limits it to some targets.
-  Below the list, **Test** tries the rule you are writing, the selected rule, or all enabled
+  messages to the server, to the client, or both), and a host regex limits it to some targets
+  (and, on a response rule, a Content-Type regex to some responses). **Response preset** adds a
+  preset's ready-made rules (unhide or enable form fields, remove length limits, form validation,
+  scripts, plugins or a cookie flag; see [Response presets](#response-presets-rules-presets)),
+  says beside each preset whether it is added already, and its rules show in the list as any
+  other. Below the list, **Test** tries the rule you are writing, the selected rule, or all enabled
   rules on a message you paste or on a history row, and shows the message after the rules and
   which rules changed it; nothing is sent. Choose **Script** in place of **Text** and the
   replacement is what a JavaScript file of yours returns for each match: the app asks before
@@ -1185,7 +1189,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 190 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 192 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1380,7 +1384,11 @@ it (with `--match`, only where the value matches).
 `--applies-to` lists whose traffic the rule changes: `proxy` (the default: in-scope requests and
 responses the proxy relays), `send` (and so the app's Replay, a race included), `fuzz`, `scan`
 (the attack requests of active scans and checks), and for a `ws-message` rule `ws-to-server` and
-`ws-to-client` (default: both). `--host REGEX` limits it to targets whose host matches. `send`,
+`ws-to-client` (default: both). `--host REGEX` limits it to targets whose host matches, and on a
+`status`, `response-header` or `response-body` rule `--content-type REGEX` limits it to responses
+whose Content-Type matches (case-insensitive, as the response came: a rule before it that rewrites
+the Content-Type doesn't change what this one reads; a response with none is matched as empty
+text, so `^$` picks those). `send`,
 a fuzz run and a scan read the rules when they start and apply them before the session of
 `--auth`, as the proxy does. A rule applies to every request an engine sends, so `add` on a
 request recorded with the same rule adds a second copy; `set` doesn't. A response rule changes
@@ -1396,6 +1404,8 @@ brainproxy rules add --location request-header --name X-Forwarded-For --action a
     --applies-to proxy,send,fuzz,scan --host '(^|\.)app\.test$'
 brainproxy rules add --location status --match '^403$' --replace 200
 brainproxy rules add --location response-header --name Content-Security-Policy --action remove
+brainproxy rules add --location response-body --match '"debug":false' --replace '"debug":true' \
+    --content-type '^application/json'
 brainproxy rules add --location ws-message --match-kind literal --match '"admin":false' --replace '"admin":true' \
     --applies-to ws-to-client
 ```
@@ -1439,6 +1449,53 @@ isn't sent by the proxy, `send`, a fuzz run or a scan.
 
 `--script FILE` in place of `--replace` has a script make the replacement, and `--location
 request --script FILE` has one decide what happens to each request; see [Scripts](#scripts).
+
+#### Response presets (`rules presets`)
+
+A preset is a set of ready-made response rules for what a tester most often changes in what the
+browser is shown, like the response modification options of Burp's proxy. `rules presets list`
+describes them with the rules each adds; `rules presets add NAME...` saves those rules. They are
+ordinary rules for the responses the proxy relays (no `--applies-to`), each with a comment that
+names its preset (`preset unhide-fields: ...`), so they list, switch on and off, and are removed
+like any other. `--host REGEX` limits them to some targets, and `--disabled` adds them switched
+off. A rule the project already has (the same place, match, replacement and conditions, on or
+off) isn't added again: the result's `added` lists the new rules' ids and `existing` the ones that
+were there, so adding a preset twice changes nothing (a switched-off one stays off). The rules
+`rules presets list` shows have no ids yet.
+
+| Preset | What it does |
+|---|---|
+| `unhide-fields` | Hidden inputs become text inputs, outlined in red so they stand out (a style element written before each, which a style of the page's own can't undo) |
+| `enable-fields` | Removes `disabled` from form controls, and `readonly` from inputs and text areas |
+| `remove-length-limits` | Removes `maxlength` from inputs and text areas |
+| `remove-form-validation` | Marks every form `novalidate` (no browser checks of `required`, `pattern`, `type` and the like) and removes its `onsubmit` |
+| `remove-scripts` | Removes `script` elements and adds `Content-Security-Policy: script-src 'none'`, so no inline handler or `javascript:` link runs either |
+| `remove-objects` | Removes `object` elements (with what they hold) and `embed` tags |
+| `remove-cookie-httponly` | Removes `HttpOnly` from every `Set-Cookie`, so the page's scripts can read the cookies |
+| `remove-cookie-secure` | Removes `Secure` from every `Set-Cookie`, so the cookies go over plain HTTP too. Browsers then refuse `__Secure-` and `__Host-` cookies and `SameSite=None` ones, which must be `Secure` |
+
+The HTML presets apply only to responses whose Content-Type is `text/html` (`--content-type`,
+above), so scripts, JSON and images pass untouched; the cookie presets apply to the `Set-Cookie`
+headers of any response. XHTML served as `application/xhtml+xml` is left alone too: the browser
+parses it as XML, where an attribute without a value (`novalidate`) fails the whole page. Their
+patterns read a body as bytes, so one that isn't UTF-8 is still rewritten, and the regex engine's
+time is linear in the body whatever it holds. What they write adds no quote character, so a script
+whose strings hold markup still runs.
+
+They work on markup as the server sent it, not on a parsed page: a field a script adds later, or a
+check a script makes, is out of their reach (`remove-scripts` stops those scripts). Markup inside
+an attribute value, a `<textarea>`, a script's string or a comment is rewritten like any other, so
+a commented-out `<script>` without its end tag is removed with everything up to the next real
+`</script>`. A page in a charset that isn't ASCII-compatible (UTF-16) is matched by none of them.
+Burp's "convert HTTPS links to HTTP" isn't offered: the browser would then ask the proxy for
+plain HTTP, and nothing upgrades such a request back to HTTPS upstream, so most sites would
+redirect back or break.
+
+```sh
+brainproxy rules presets list
+brainproxy rules presets add unhide-fields enable-fields remove-length-limits --host '(^|\.)app\.test$'
+brainproxy rules presets add remove-cookie-httponly
+```
 
 ### Scripts
 

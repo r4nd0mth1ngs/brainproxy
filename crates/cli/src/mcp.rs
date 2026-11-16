@@ -622,6 +622,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("rules clear", REPLACE),
     ("rules test", READ),
     ("rules import", REPLACE),
+    ("rules presets list", READ),
+    ("rules presets add", SET),
     ("intercept enable", SET),
     ("intercept disable", SET),
     ("intercept status", READ),

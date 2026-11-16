@@ -290,3 +290,14 @@ test("a finding raised from a script's answer is told apart by its alert type", 
   assert.equal(isScriptAnswer("script:check:x"), false);
   assert.equal(isScriptAnswer(undefined), false);
 });
+
+test("a response rule may say which Content-Type it applies to; no other rule takes one", () => {
+  const d = draft({ location: "response-body", match: "a", replace: "b", contentType: " json " });
+  assert.deepEqual(addArgs(d).slice(2), ["--location=response-body", "--match=a", "--replace=b", "--content-type=json"]);
+  assert.deepEqual(testArgs({ kind: "draft", draft: d }, { message: "auto", history: "", host: "" }).at(-1), "--content-type=json");
+  // Moved to a request location it is dropped; moved between response locations it stays.
+  assert.equal(withLocation(d, "status").contentType, " json ");
+  assert.equal(withLocation(d, "request-body").contentType, "");
+  assert.ok(!addArgs({ ...d, location: "request-body" }).some((a) => a.startsWith("--content-type")));
+  assert.equal(describeScope(rule({ location: "response-body", content_type: "^text/html", host: "^a$" })), "Proxy · host ^a$ · type ^text/html");
+});

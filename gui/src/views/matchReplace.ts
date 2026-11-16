@@ -19,6 +19,8 @@ export interface Rule {
   /** Absent: the proxy (a ws-message rule: both directions). */
   applies_to?: string[];
   host?: string;
+  /** Regex on the Content-Type a response came with: a response rule applies only where it matches. */
+  content_type?: string;
   /** text unless it says script: then `script` makes the replacement. */
   replacer?: string;
   /** The script file, and the sha256 its text had when the rule was added. */
@@ -45,6 +47,8 @@ export interface Draft {
   script: string;
   appliesTo: string[];
   host: string;
+  /** Regex on the response's Content-Type; a response rule's only. */
+  contentType: string;
   comment: string;
   disabled: boolean;
 }
@@ -60,6 +64,7 @@ export const EMPTY_DRAFT: Draft = {
   script: "",
   appliesTo: ["proxy"],
   host: "",
+  contentType: "",
   comment: "",
   disabled: false,
 };
@@ -100,6 +105,8 @@ const isWs = (location: string) => location === "ws-message";
 /** A request rule: its script gets the whole request, and may change, block or answer it. */
 export const isRequestRule = (location: string) => location === "request";
 const isHeader = (location: string) => location === "request-header" || location === "response-header";
+/** A response rule: one that may say which Content-Type it applies to. */
+export const isResponseRule = (location: string) => location === "status" || location === "response-header" || location === "response-body";
 
 /** Whether a location takes a name: a query parameter must have one, a header may. */
 export const takesName = (location: string) => isHeader(location) || location === "query-param";
@@ -119,6 +126,7 @@ export function withLocation(draft: Draft, location: string): Draft {
     name: takesName(location) ? draft.name : "",
     action: takesName(location) ? draft.action : "set",
     appliesTo: sameKind ? draft.appliesTo : defaultEngines(location),
+    contentType: isResponseRule(location) ? draft.contentType : "",
     // A request rule is a script, nothing else.
     replacer: isRequestRule(location) ? "script" : draft.replacer,
   };
@@ -176,6 +184,7 @@ function specArgs(draft: Draft): string[] {
     if (draft.action !== "set") args.push(`--action=${draft.action}`);
   }
   if (draft.host.trim()) args.push(`--host=${draft.host.trim()}`);
+  if (isResponseRule(draft.location) && draft.contentType.trim()) args.push(`--content-type=${draft.contentType.trim()}`);
   return args;
 }
 
@@ -257,12 +266,13 @@ export function describeReplace(rule: Rule): string {
   return rule.name ? "(empty)" : "(remove)";
 }
 
-/** What a rule applies to, for the table: "Proxy", "Replay, Fuzzer · host ^api\\." */
+/** What a rule applies to, for the table: "Proxy", "Replay, Fuzzer · host ^api\\.", "Proxy · type json". */
 export function describeScope(rule: Rule): string {
   const ids = rule.applies_to?.length ? rule.applies_to : defaultEngines(rule.location);
   const names = ids.map((id) => [...HTTP_ENGINES, ...WS_ENGINES].find((e) => e.id === id)?.label ?? id);
   const where = isWs(rule.location) ? `WebSocket: ${names.join(", ").toLowerCase()}` : names.join(", ");
-  return rule.host ? `${where} · host ${rule.host}` : where;
+  const host = rule.host ? ` · host ${rule.host}` : "";
+  return where + host + (rule.content_type ? ` · type ${rule.content_type}` : "");
 }
 
 /** One side of a test's result, as `rules test` gives it. */
