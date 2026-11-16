@@ -8,7 +8,21 @@
 //! carry a Content-Type condition ([`HTML`]), so a script, JSON or an image passes untouched. Their
 //! patterns are bytes regexes with Unicode off (`-u`), so a body that isn't UTF-8 is still matched
 //! byte by byte, and the regex engine's search time is linear in the body whatever it holds (it
-//! never backtracks); bodies are already capped where the proxy reads and decodes them.
+//! never backtracks); bodies are already capped where the proxy reads and decodes them. What they
+//! write adds no quote character, so markup inside a script's string (`"<input type=hidden>"`)
+//! may change but can't end the string early.
+//!
+//! XHTML served as `application/xhtml+xml` is left alone: the browser parses it as XML, where an
+//! attribute without a value fails the whole page, and a quoted one could break a script's string.
+//!
+//! ponytail: the patterns read markup, not a parsed page. A tag written inside an attribute value,
+//! a `<textarea>`, a script's string or a comment is rewritten like any other, so a commented-out
+//! `<script>` without its end tag takes the page up to the next real `</script>` with it; and a
+//! page in a charset that isn't ASCII-compatible (UTF-16) matches nothing. Stepping over comments
+//! with an alternative (`<!--.*?-->|<script...`) was tried: an unclosed `<script>` among many
+//! comments then makes every search run to the end of the body, quadratic in it, which a hostile
+//! page could use to stall the proxy. An HTML parser would fix all of it, at the cost of rules
+//! that are no longer ordinary regex rules.
 //!
 //! Burp's "convert HTTPS links to HTTP" is left out on purpose: the browser would then ask the
 //! proxy for plain HTTP, and brainproxy has nothing that upgrades such a request back to HTTPS
@@ -17,19 +31,25 @@
 use crate::error::{Error, Result};
 use crate::rules::{Rule, RuleAction, RuleLocation};
 
-/// The Content-Type of an HTML page: text/html or XHTML, with any parameters.
-pub const HTML: &str = r"^\s*(text/html|application/xhtml\+xml)\s*(;|$)";
+/// The Content-Type of an HTML page, with any parameters (not XHTML: see the module's note).
+pub const HTML: &str = r"^\s*text/html\s*(;|$)";
 
 /// An attribute's value: quoted, or unquoted as HTML allows.
 const VALUE: &str = r#"(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)"#;
 
 /// One attribute of a tag, with the space before it. A quoted value may hold a `>` or another
-/// attribute's name, which the tag patterns step over rather than read.
+/// attribute's name, which the tag patterns step over rather than read. The tag patterns need
+/// it (or a space, `/` or `>`) right after the tag's name, so `<form-field>` or `<script-loader>`
+/// (custom elements) is never read as `<form>` or `<script>`.
 const ATTR: &str = r#"\s+[^\s"'<>/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?"#;
 
-/// How an unhidden field is marked. Written first in the tag: of two `style` attributes the
-/// first counts, so one the page gave the field (`display:none`, say) doesn't hide it again.
-const SHOWN: &str = r#"style="display:inline-block;visibility:visible;outline:2px dashed #e5484d" title="hidden field, shown by brainproxy""#;
+/// The attribute that marks an unhidden field, and the style written before it that shows it.
+/// A style element rather than a `style` attribute, which the field may have already, and whose
+/// value would need quotes: `!important` also beats a page rule that hides it (`.d-none`, say).
+const UNHIDDEN: &str = "data-brainproxy-unhidden";
+const SHOWN: &str =
+    "<style>input[data-brainproxy-unhidden]{display:inline-block!important;visibility:visible!important;\
+                     opacity:1!important;position:static!important;outline:2px dashed #e5484d!important}</style>";
 
 /// A preset: its name (what `rules presets add` takes), a title and what it does.
 pub struct Preset {
@@ -124,7 +144,7 @@ pub fn same_rule(a: &Rule, b: &Rule) -> bool {
         && a.pattern == b.pattern
         && a.replace == b.replace
         && a.matcher == b.matcher
-        && a.name == b.name
+        && given(&a.name) == given(&b.name)
         && a.action.unwrap_or_default() == b.action.unwrap_or_default()
         && a.engines() == b.engines()
         && given(&a.host) == given(&b.host)
@@ -145,7 +165,14 @@ fn html_body(what: &str, pattern: String, replace: &str) -> Rule {
 /// A rule that removes `attr` (with any value) from the start tags of `tags` (alternatives, as
 /// in a regex). One match removes it once from a tag, which is all a tag should hold.
 fn drop_attr(what: &str, tags: &str, attr: &str) -> Rule {
-    html_body(what, format!(r"(?i-u)(<(?:{tags})\b(?:{ATTR})*?)\s+{attr}(?:\s*=\s*{VALUE})?([\s/>])"), "${1}${2}")
+    html_body(what, format!(r"(?i-u)(<(?:{tags})(?:{ATTR})*?)\s+{attr}(?:\s*=\s*{VALUE})?([\s/>])"), "${1}${2}")
+}
+
+/// A rule that removes the `tag` elements, with what they hold. An element ends at the first end
+/// tag, whatever it holds, as the browser reads a script. One alternative only: see the module's
+/// note on why comments aren't stepped over.
+fn drop_element(what: &str, tag: &str) -> Rule {
+    html_body(what, format!(r"(?is-u)<{tag}[\s/>].*?</{tag}(?:[\s/][^>]*)?>"), "")
 }
 
 /// A rule that removes a flag from each Set-Cookie header (of any response). A cookie's value
@@ -161,8 +188,9 @@ fn drop_cookie_flag(what: &str, flag: &str) -> Rule {
 fn unhide_fields() -> Vec<Rule> {
     vec![html_body(
         "hidden inputs become outlined text inputs",
-        format!(r#"(?i-u)<input\b((?:{ATTR})*?\s+type\s*=\s*)(?:"hidden"|'hidden'|hidden)([\s/>])"#),
-        &format!(r#"<input {SHOWN}${{1}}"text"${{2}}"#),
+        // The value keeps the quotes it had.
+        format!(r#"(?i-u)<input((?:{ATTR})*?\s+type\s*=\s*)(?:(")hidden"|(')hidden'|hidden)([\s/>])"#),
+        &format!("{SHOWN}<input {UNHIDDEN}${{1}}${{2}}${{3}}text${{2}}${{3}}${{4}}"),
     )]
 }
 
@@ -179,15 +207,14 @@ fn remove_length_limits() -> Vec<Rule> {
 
 fn remove_form_validation() -> Vec<Rule> {
     vec![
-        html_body("forms are novalidate", r"(?i-u)<form\b".into(), "<form novalidate"),
+        html_body("forms are novalidate", r"(?i-u)<form([\s/>])".into(), "<form novalidate${1}"),
         drop_attr("remove onsubmit", "form", "onsubmit"),
     ]
 }
 
 fn remove_scripts() -> Vec<Rule> {
     vec![
-        // A script element ends at the first `</script`, whatever it holds: as the browser reads it.
-        html_body("remove script elements", r"(?is-u)<script\b.*?</script(?:[\s/][^>]*)?>".into(), ""),
+        drop_element("remove script elements", "script"),
         Rule {
             name: Some("Content-Security-Policy".into()),
             action: Some(RuleAction::Add),
@@ -200,8 +227,8 @@ fn remove_scripts() -> Vec<Rule> {
 
 fn remove_objects() -> Vec<Rule> {
     vec![
-        html_body("remove object elements", r"(?is-u)<object\b.*?</object(?:[\s/][^>]*)?>".into(), ""),
-        html_body("remove embed tags", format!(r"(?i-u)<embed\b(?:{ATTR})*\s*/?>"), ""),
+        drop_element("remove object elements", "object"),
+        html_body("remove embed tags", format!(r"(?i-u)<embed(?:{ATTR})*\s*/?>"), ""),
     ]
 }
 
@@ -266,16 +293,19 @@ mod tests {
             r#"<form><INPUT TYPE=HIDDEN name=csrf value="a>b"><input name="t" type='hidden'/>
 <input value="type=hidden" type="text"><input data-type="hidden" name=x><input type="hiddenish"></form>"#,
         );
+        let shown = format!("{SHOWN}<input {UNHIDDEN}");
         assert_eq!(
             out,
             format!(
-                r#"<form><input {SHOWN} TYPE="text" name=csrf value="a>b"><input {SHOWN} name="t" type="text"/>
+                r#"<form>{shown} TYPE=text name=csrf value="a>b">{shown} name="t" type='text'/>
 <input value="type=hidden" type="text"><input data-type="hidden" name=x><input type="hiddenish"></form>"#
             )
         );
-        // The page's own style comes after the one written first, so it can't hide the field.
-        let out = html("unhide-fields", r#"<input style="display:none" type="hidden">"#);
-        assert!(out.starts_with(&format!(r#"<input {SHOWN} style="display:none""#)), "{out}");
+        // What shows it is a style of its own, which a style the field has can't undo.
+        assert!(SHOWN.contains(&format!("input[{UNHIDDEN}]{{")) && SHOWN.matches("!important").count() == 5);
+        let out = html("unhide-fields", r#"<input style="display:none" type="hidden"><input-x type=hidden>"#);
+        assert_eq!(out, format!(r#"{shown} style="display:none" type="text"><input-x type=hidden>"#));
+        assert!(!SHOWN.contains(['"', '\'', '\\', '$']), "what is written before a field holds no quote");
     }
 
     #[test]
@@ -284,13 +314,13 @@ mod tests {
             "enable-fields",
             r#"<input disabled name=a><select name=b disabled="disabled"><option DISABLED>x</option></select>
 <textarea readonly disabled></textarea><button class="btn disabled" disabled/>
-<input data-disabled="1" title='disabled'><div disabled></div><input readonly=readonly>"#,
+<input data-disabled="1" title='disabled'><div disabled></div><input readonly=readonly><input-date disabled>"#,
         );
         assert_eq!(
             out,
             r#"<input name=a><select name=b><option>x</option></select>
 <textarea></textarea><button class="btn disabled"/>
-<input data-disabled="1" title='disabled'><div disabled></div><input>"#
+<input data-disabled="1" title='disabled'><div disabled></div><input><input-date disabled>"#
         );
     }
 
@@ -307,9 +337,15 @@ mod tests {
     fn remove_form_validation_makes_forms_novalidate_without_onsubmit() {
         let out = html(
             "remove-form-validation",
-            r#"<form action=/x onsubmit="return check(this)"><input required pattern="\d+"></form><FORM>"#,
+            r#"<form action=/x onsubmit="return check(this)"><input required pattern="\d+"></form><FORM>
+<form novalidate method=post><form-field a=1></form-field><form/>"#,
         );
-        assert_eq!(out, r#"<form novalidate action=/x><input required pattern="\d+"></form><form novalidate>"#);
+        // A second novalidate on a form that had one does no harm in HTML.
+        assert_eq!(
+            out,
+            r#"<form novalidate action=/x><input required pattern="\d+"></form><form novalidate>
+<form novalidate novalidate method=post><form-field a=1></form-field><form novalidate/>"#
+        );
     }
 
     #[test]
@@ -320,6 +356,9 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\r\nContent-Security-Policy: script-src 'none'\r\n"), "{text}");
         assert!(text.ends_with("<head></head><body onload=go()><p>hi</p></body>"), "{text}");
+        // A custom element named script-something is no script: it doesn't take the page after it.
+        let out = html("remove-scripts", "<script-loader x></script-loader><p>keep</p><script>1</script><!--a-->");
+        assert_eq!(out, "<script-loader x></script-loader><p>keep</p><!--a-->");
     }
 
     #[test]
@@ -329,6 +368,23 @@ mod tests {
             r#"<p>a</p><object data="x.swf"><param name=a value=b><embed src="y.swf"></object><EMBED src=z.swf type="a/b"/><p>b</p>"#,
         );
         assert_eq!(out, "<p>a</p><p>b</p>");
+        let out = html("remove-objects", "<object-viewer></object-viewer><p>x</p><object></object>");
+        assert_eq!(out, "<object-viewer></object-viewer><p>x</p>");
+    }
+
+    /// Markup inside a script's string may be rewritten (the patterns don't parse the page), but
+    /// what is written adds no quote, so the string still ends where it did.
+    #[test]
+    fn markup_in_a_scripts_string_keeps_its_quotes() {
+        let page = r#"<script>var a = "<input type=hidden name=x>", b = '<form><input type="hidden">';
+var c = "<input disabled maxlength=2>"</script><p onclick="w('<form>')">x</p>"#;
+        let quotes = |s: &str| (s.matches('"').count(), s.matches('\'').count());
+        for p in PRESETS.iter().filter(|p| !p.name.starts_with("remove-cookie") && p.name != "remove-scripts") {
+            let out = html(p.name, page);
+            assert_eq!(quotes(&out), quotes(page), "{}: {out}", p.name);
+        }
+        let out = html("unhide-fields", page);
+        assert!(out.contains(&format!(r#"var a = "{SHOWN}<input {UNHIDDEN} type=text name=x>", b"#)), "{out}");
     }
 
     #[test]
@@ -348,14 +404,16 @@ mod tests {
     fn html_presets_leave_what_isnt_html_alone() {
         let body = br#"{"form": "<input type=hidden disabled maxlength=1><script>x</script><form><embed src=x>"}"#;
         for p in PRESETS.iter().filter(|p| !p.name.starts_with("remove-cookie")) {
-            for content_type in ["application/json", "text/javascript", "image/svg+xml", "text/htmlx", "", "none"] {
+            let others =
+                ["application/json", "text/javascript", "image/svg+xml", "application/xhtml+xml", "text/htmlx"];
+            for content_type in others.into_iter().chain(["", "none"]) {
                 let response = through(p.name, content_type, "", body);
                 assert!(response.ends_with(body), "{} changed {content_type}", p.name);
                 assert!(!String::from_utf8_lossy(&response).contains("Content-Security-Policy"), "{}", p.name);
             }
-            // XHTML is HTML, whatever the case or parameters.
-            let response = through(p.name, "Application/XHTML+XML;charset=utf-8", "", body);
-            assert!(!response.ends_with(body), "{} left XHTML alone", p.name);
+            // HTML is HTML whatever the case or parameters.
+            let response = through(p.name, " Text/HTML;charset=utf-8", "", body);
+            assert!(!response.ends_with(body), "{} left HTML alone", p.name);
         }
     }
 
@@ -377,13 +435,20 @@ mod tests {
     /// quickly (the regex engine doesn't backtrack; this checks no pattern defeats it).
     #[test]
     fn large_hostile_bodies_go_through_every_preset_quickly() {
-        let size = 4 << 20;
+        // A quadratic pattern takes minutes on 1 MiB; a linear one well under a second.
+        let size = 1 << 20;
         let unit: &[&[u8]] = &[
             b"<input a=1 b='2' c=\"3\" ",
             b"<script <object <form <embed x ",
             b"<input type=\"hidden",
             b"<textarea disabled readonly maxlength",
             b"\xff\x00<\xfe",
+            // Matches all through, each near one that never ends: no search may run to the end.
+            b"<!-- a --><script>",
+            b"<object><!-- --><embed x>",
+            b"<input a='<input disabled>",
+            b"<form x=\"<form>",
+            b"<input type=hidden a=\"<input type=hidden>",
         ];
         for u in unit {
             let body: Vec<u8> = u.iter().copied().cycle().take(size).collect();
@@ -392,8 +457,8 @@ mod tests {
                 through(p.name, "text/html", "", &body);
                 let took = started.elapsed();
                 assert!(
-                    took < Duration::from_secs(20),
-                    "{} took {took:?} on 4 MiB of {:?}",
+                    took < Duration::from_secs(10),
+                    "{} took {took:?} on 1 MiB of {:?}",
                     p.name,
                     String::from_utf8_lossy(u)
                 );
@@ -419,5 +484,8 @@ mod tests {
         // No action is the default action, set.
         let c = &preset("remove-cookie-secure").unwrap().rules(None)[0];
         assert!(same_rule(c, &Rule { action: Some(RuleAction::Set), ..c.clone() }));
+        // Nor is an empty name any other than none.
+        let body = &preset("remove-objects").unwrap().rules(None)[0];
+        assert!(same_rule(body, &Rule { name: Some(String::new()), ..body.clone() }));
     }
 }

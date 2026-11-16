@@ -1,13 +1,13 @@
 //! Response modification presets end to end: `rules presets list` and `add`, the rules they
 //! save, and what they make of pages the proxy relays from a local server.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const MCP: &str = "BRAINPROXY_MCP_CALL";
 const CLIENT: &str = "BRAINPROXY_CLIENT";
@@ -132,8 +132,9 @@ fn presets_add_ordinary_rules_that_rewrite_proxied_html_and_cookies() {
     let listed = env.ok(&["rules", "presets", "list"]);
     let names: Vec<&str> = listed["presets"].as_array().unwrap().iter().filter_map(|p| p["name"].as_str()).collect();
     assert_eq!(names.len(), 8, "{listed}");
-    // The rules a preset would add are shown, and listing saves nothing.
+    // The rules a preset would add are shown, without ids, and listing saves nothing.
     assert_eq!(listed["presets"][4]["rules"][1]["name"], "Content-Security-Policy", "{listed}");
+    assert!(listed["presets"][4]["rules"][1].get("id").is_none(), "{listed}");
     assert!(env.ok(&["rules", "list"])["rules"].as_array().unwrap().is_empty());
 
     let mut args = vec!["rules", "presets", "add"];
@@ -141,7 +142,7 @@ fn presets_add_ordinary_rules_that_rewrite_proxied_html_and_cookies() {
     let added = env.ok(&args);
     let first = ids(&added["added"]);
     assert_eq!(first.len(), added["rules"].as_array().unwrap().len(), "{added}");
-    assert!(ids(&added["present"]).is_empty(), "{added}");
+    assert!(ids(&added["existing"]).is_empty(), "{added}");
     for rule in added["rules"].as_array().unwrap() {
         assert!(rule["comment"].as_str().unwrap().starts_with("preset "), "{rule}");
         assert_eq!(rule["origin"], "cli", "{rule}");
@@ -150,7 +151,7 @@ fn presets_add_ordinary_rules_that_rewrite_proxied_html_and_cookies() {
     // Adding them again adds nothing: they are there, and said to be.
     let again = env.ok(&args);
     assert!(ids(&again["added"]).is_empty(), "{again}");
-    assert_eq!(ids(&again["present"]), first, "{again}");
+    assert_eq!(ids(&again["existing"]), first, "{again}");
     // And an agent's call adds them as its own.
     let (code, v) = env.run_as(&[(MCP, "1")], &["rules", "presets", "add", "remove-objects", "--host", "^other$"]);
     assert_eq!(code, 0, "{v}");
@@ -195,7 +196,73 @@ fn presets_add_ordinary_rules_that_rewrite_proxied_html_and_cookies() {
     assert!(!head.contains("Content-Security-Policy") && !body.contains("<script"), "{head}{body}");
     // And a preset added again leaves the one switched off as it is, and says so.
     let v = env.ok(&["rules", "presets", "add", "remove-scripts"]);
-    assert!(ids(&v["added"]).is_empty() && ids(&v["present"]).contains(&csp.parse().unwrap()), "{v}");
+    assert!(ids(&v["added"]).is_empty() && ids(&v["existing"]).contains(&csp.parse().unwrap()), "{v}");
+}
+
+#[test]
+fn presets_add_checks_everything_before_it_saves_anything() {
+    let env = Env::new("checks");
+    // A bad --host is said as the flag's, and nothing is saved.
+    let (code, v) = env.run_as(&[], &["rules", "presets", "add", "enable-fields", "--host", "("]);
+    assert_ne!(code, 0, "{v}");
+    assert_eq!(v["error"]["kind"], "invalid_input", "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("invalid input: --host: ") && !message.contains("rule 0"), "{message}");
+    assert!(env.ok(&["rules", "list"])["rules"].as_array().unwrap().is_empty());
+    // A preset named twice is added once; --disabled adds its rules switched off.
+    let v = env.ok(&["rules", "presets", "add", "enable-fields", "enable-fields", "--disabled"]);
+    assert_eq!(ids(&v["added"]), [1, 2], "{v}");
+    assert!(ids(&v["existing"]).is_empty(), "{v}");
+    assert!(v["rules"].as_array().unwrap().iter().all(|r| r["enabled"] == false), "{v}");
+}
+
+#[test]
+fn an_agent_has_the_presets_as_tools() {
+    let env = Env::new("mcp");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env_remove(MCP)
+        .env_remove(CLIENT)
+        .arg("--project")
+        .arg(&env.project)
+        .arg("--home")
+        .arg(&env.home)
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut request = |id: i64, method: &str, params: Value| -> Value {
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        writeln!(stdin, "{line}").unwrap();
+        let mut reply = String::new();
+        stdout.read_line(&mut reply).unwrap();
+        serde_json::from_str(&reply).unwrap()
+    };
+    let hello =
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}});
+    request(1, "initialize", hello);
+    let tools = request(2, "tools/list", json!({}))["result"]["tools"].clone();
+    let tool = |name: &str| tools.as_array().unwrap().iter().find(|t| t["name"] == name).cloned().unwrap();
+    let add = tool("rules_presets_add");
+    let preset = &add["inputSchema"]["properties"]["preset"];
+    assert_eq!((&preset["type"], &preset["items"]["enum"][0]), (&json!("array"), &json!("unhide-fields")), "{add}");
+    assert_eq!(add["inputSchema"]["required"], json!(["preset"]), "{add}");
+    // Adding a preset again changes nothing, and it adds rules only.
+    let hints = &add["annotations"];
+    assert_eq!(
+        (&hints["readOnlyHint"], &hints["destructiveHint"], &hints["idempotentHint"]),
+        (&json!(false), &json!(false), &json!(true))
+    );
+    assert_eq!(tool("rules_presets_list")["annotations"]["readOnlyHint"], true);
+    let called =
+        request(3, "tools/call", json!({"name": "rules_presets_add", "arguments": {"preset": ["remove-objects"]}}));
+    let envelope: Value = serde_json::from_str(called["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(ids(&envelope["data"]["added"]), [1, 2], "{envelope}");
+    assert_eq!(envelope["data"]["rules"][0]["origin"], "mcp", "{envelope}");
+    drop(stdin);
+    let _ = child.wait();
 }
 
 #[test]

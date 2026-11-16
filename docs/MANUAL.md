@@ -1459,12 +1459,13 @@ ordinary rules for the responses the proxy relays (no `--applies-to`), each with
 names its preset (`preset unhide-fields: ...`), so they list, switch on and off, and are removed
 like any other. `--host REGEX` limits them to some targets, and `--disabled` adds them switched
 off. A rule the project already has (the same place, match, replacement and conditions, on or
-off) isn't added again: the result's `added` lists the new rules' ids and `present` the ones that
-were there, so adding a preset twice changes nothing (a switched-off one stays off).
+off) isn't added again: the result's `added` lists the new rules' ids and `existing` the ones that
+were there, so adding a preset twice changes nothing (a switched-off one stays off). The rules
+`rules presets list` shows have no ids yet.
 
 | Preset | What it does |
 |---|---|
-| `unhide-fields` | Hidden inputs become text inputs, outlined in red and titled so they stand out |
+| `unhide-fields` | Hidden inputs become text inputs, outlined in red so they stand out (a style element written before each, which a style of the page's own can't undo) |
 | `enable-fields` | Removes `disabled` from form controls, and `readonly` from inputs and text areas |
 | `remove-length-limits` | Removes `maxlength` from inputs and text areas |
 | `remove-form-validation` | Marks every form `novalidate` (no browser checks of `required`, `pattern`, `type` and the like) and removes its `onsubmit` |
@@ -1473,12 +1474,19 @@ were there, so adding a preset twice changes nothing (a switched-off one stays o
 | `remove-cookie-httponly` | Removes `HttpOnly` from every `Set-Cookie`, so the page's scripts can read the cookies |
 | `remove-cookie-secure` | Removes `Secure` from every `Set-Cookie`, so the cookies go over plain HTTP too. Browsers then refuse `__Secure-` and `__Host-` cookies and `SameSite=None` ones, which must be `Secure` |
 
-The HTML presets apply only to responses whose Content-Type is `text/html` or
-`application/xhtml+xml` (`--content-type`, above), so scripts, JSON and images pass untouched;
-the cookie presets apply to the `Set-Cookie` headers of any response. Their patterns read a body
-as bytes, so one that isn't UTF-8 is still rewritten, and the regex engine's time is linear in
-the body whatever it holds. They work on markup as the server sent it: a field a script adds
-later, or a check a script makes, is out of their reach (`remove-scripts` stops those scripts).
+The HTML presets apply only to responses whose Content-Type is `text/html` (`--content-type`,
+above), so scripts, JSON and images pass untouched; the cookie presets apply to the `Set-Cookie`
+headers of any response. XHTML served as `application/xhtml+xml` is left alone too: the browser
+parses it as XML, where an attribute without a value (`novalidate`) fails the whole page. Their
+patterns read a body as bytes, so one that isn't UTF-8 is still rewritten, and the regex engine's
+time is linear in the body whatever it holds. What they write adds no quote character, so a script
+whose strings hold markup still runs.
+
+They work on markup as the server sent it, not on a parsed page: a field a script adds later, or a
+check a script makes, is out of their reach (`remove-scripts` stops those scripts). Markup inside
+an attribute value, a `<textarea>`, a script's string or a comment is rewritten like any other, so
+a commented-out `<script>` without its end tag is removed with everything up to the next real
+`</script>`. A page in a charset that isn't ASCII-compatible (UTF-16) is matched by none of them.
 Burp's "convert HTTPS links to HTTP" isn't offered: the browser would then ask the proxy for
 plain HTTP, and nothing upgrades such a request back to HTTPS upstream, so most sites would
 redirect back or break.

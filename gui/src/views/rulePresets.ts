@@ -15,7 +15,7 @@ export interface Preset {
 export interface PresetAdded {
   rules: Rule[];
   added?: number[];
-  present?: number[];
+  existing?: number[];
 }
 
 /**
@@ -42,7 +42,10 @@ export function sameRule(a: Rule, b: Rule): boolean {
   return key(a) === key(b);
 }
 
-/** How much of a preset the project has: all, some or none of its rules, and the ids of those switched off. */
+/**
+ * How much of a preset the project has: all, some or none of its rules, and the ids of those
+ * switched off. A preset added from the CLI with --host has rules of its own, so it counts as not added.
+ */
 export function presetState(preset: Preset, rules: Rule[]): { have: "all" | "some" | "none"; off: number[] } {
   const found = preset.rules.map((p) => rules.find((r) => sameRule(r, p)));
   const there = found.filter((r): r is Rule => !!r);
@@ -65,10 +68,10 @@ export const presetArgs = (name: string) => ["rules", "presets", "add", name];
 /** What the app says once a preset is added: how many rules it added, and which were there already. */
 export function presetNote(preset: Preset, result: PresetAdded): string {
   const added = result.added ?? [];
-  const present = result.present ?? [];
-  const off = result.rules.filter((r) => present.includes(r.id) && !r.enabled).map((r) => r.id);
+  const existing = result.existing ?? [];
+  const off = result.rules.filter((r) => existing.includes(r.id) && !r.enabled).map((r) => r.id);
   const switchedOff = off.length ? `; switched off: ${off.map((id) => `#${id}`).join(", ")}, which the table's On box turns on` : "";
   if (!added.length) return `${preset.title}: its rules are here already${switchedOff}.`;
   const rules = `${added.length} rule${added.length === 1 ? "" : "s"}`;
-  return present.length ? `${preset.title}: added ${rules}; the rest were here already${switchedOff}.` : `${preset.title}: added ${rules}.`;
+  return existing.length ? `${preset.title}: added ${rules}; the rest were here already${switchedOff}.` : `${preset.title}: added ${rules}.`;
 }

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { Rule } from "./matchReplace.ts";
 import { presetArgs, presetLabel, presetNote, presetState, sameRule, type Preset } from "./rulePresets.ts";
 
-const HTML = "^\\s*(text/html|application/xhtml\\+xml)\\s*(;|$)";
+const HTML = "^\\s*text/html\\s*(;|$)";
 const body: Rule = { id: 0, location: "response-body", pattern: "(?is-u)<script\\b.*?</script>", replace: "", enabled: true, comment: "preset remove-scripts: remove script elements", content_type: HTML };
 const csp: Rule = { id: 0, location: "response-header", pattern: "", replace: "script-src 'none'", enabled: true, name: "Content-Security-Policy", action: "add", content_type: HTML };
 const scripts: Preset = { name: "remove-scripts", title: "Remove all JavaScript", description: "…", rules: [body, csp] };
@@ -43,7 +43,7 @@ test("adding a preset is one command, and what it did is said", () => {
     { ...body, id: 3 },
     { ...csp, id: 7, enabled: false },
   ];
-  assert.equal(presetNote(scripts, { rules: saved, added: [3, 7], present: [] }), "Remove all JavaScript: added 2 rules.");
-  assert.equal(presetNote(scripts, { rules: saved, added: [3], present: [7] }), "Remove all JavaScript: added 1 rule; the rest were here already; switched off: #7, which the table's On box turns on.");
-  assert.equal(presetNote(scripts, { rules: saved, added: [], present: [3] }), "Remove all JavaScript: its rules are here already.");
+  assert.equal(presetNote(scripts, { rules: saved, added: [3, 7], existing: [] }), "Remove all JavaScript: added 2 rules.");
+  assert.equal(presetNote(scripts, { rules: saved, added: [3], existing: [7] }), "Remove all JavaScript: added 1 rule; the rest were here already; switched off: #7, which the table's On box turns on.");
+  assert.equal(presetNote(scripts, { rules: saved, added: [], existing: [3] }), "Remove all JavaScript: its rules are here already.");
 });

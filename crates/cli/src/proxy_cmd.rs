@@ -570,13 +570,14 @@ pub enum RulesCmd {
 
 #[derive(Subcommand)]
 pub enum PresetsCmd {
-    /// List the presets, each with the rules it adds.
+    /// List the presets: each one's name, title and what it does, and in JSON the rules it adds
+    /// (without ids, which `rules presets add` gives them).
     List,
     /// Add presets' rules. They are ordinary rules for the responses the proxy relays, each with a
     /// comment that names its preset, so they list, switch on and off and are removed like any
     /// other. The HTML presets apply only to responses whose Content-Type is HTML, the cookie ones
     /// to Set-Cookie headers. A rule the project already has (the same place, match, replacement
-    /// and conditions, on or off) isn't added again: `present` lists those, `added` the new ones.
+    /// and conditions, on or off) isn't added again: `existing` lists those, `added` the new ones.
     Add {
         /// The presets to add; `rules presets list` says what each does.
         #[arg(required = true, value_parser = preset_names())]
@@ -2556,9 +2557,14 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         RulesCmd::Presets(PresetsCmd::List) => {
             let presets: Vec<Value> = rule_presets::PRESETS
                 .iter()
-                .map(
-                    |p| json!({"name": p.name, "title": p.title, "description": p.description, "rules": p.rules(None)}),
-                )
+                .map(|p| {
+                    // No id: one shown here isn't saved, and an id of 0 would read as a rule's.
+                    let mut rules = json!(p.rules(None));
+                    for rule in rules.as_array_mut().into_iter().flatten() {
+                        rule.as_object_mut().map(|r| r.remove("id"));
+                    }
+                    json!({"name": p.name, "title": p.title, "description": p.description, "rules": rules})
+                })
                 .collect();
             out.ok(json!({"presets": presets}), || {
                 let lines: Vec<String> = rule_presets::PRESETS
@@ -2570,25 +2576,28 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             return Ok(());
         }
         RulesCmd::Presets(PresetsCmd::Add { preset, host, disabled }) => {
+            // Checked as a rule's would be, but said as the flag's.
+            if let Some(h) = host.as_deref().filter(|h| !h.is_empty()) {
+                regex::Regex::new(&format!("(?i){h}")).map_err(|e| Error::InvalidInput(format!("--host: {e}")))?;
+            }
             let mut picked: Vec<&str> = Vec::new();
             for name in &preset {
                 if !picked.contains(&name.as_str()) {
                     picked.push(name);
                 }
             }
-            // Every rule is checked before any is saved: a bad --host leaves the rules as they were.
+            // Every rule is checked before any is saved, so a bad one leaves the rules as they were.
             let mut new = Vec::new();
             for name in picked {
                 for rule in rule_presets::preset(name)?.rules(host.as_deref()) {
-                    brainproxy_core::proxy::config::validate_rule(&rule)
-                        .map_err(|e| Error::InvalidInput(format!("preset {name}: {e}")))?;
+                    brainproxy_core::proxy::config::validate_rule(&rule)?;
                     new.push(rule);
                 }
             }
-            let (mut added, mut present) = (Vec::new(), Vec::new());
+            let (mut added, mut existing) = (Vec::new(), Vec::new());
             for mut rule in new {
                 if let Some(there) = rules.iter().find(|r| rule_presets::same_rule(r, &rule)) {
-                    present.push(there.id);
+                    existing.push(there.id);
                     continue;
                 }
                 rule.enabled = !disabled;
@@ -2597,7 +2606,7 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
                 added.push(rule.id);
                 rules.push(rule);
             }
-            from_presets = Some((added, present));
+            from_presets = Some((added, existing));
         }
     }
     store.set_setting(RULES_KEY, &rules)?;
@@ -2608,22 +2617,22 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
     }
-    if let Some((added, present)) = &from_presets {
+    if let Some((added, existing)) = &from_presets {
         data["added"] = json!(added);
-        data["present"] = json!(present);
+        data["existing"] = json!(existing);
     }
     out.ok(data, || match &from_presets {
-        Some((added, present)) => {
+        Some((added, existing)) => {
             let ids = |ids: &[u32]| ids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
             let mut text = match added.len() {
                 0 => "no rules added".to_string(),
                 1 => format!("added rule {}", ids(added)),
                 _ => format!("added rules {}", ids(added)),
             };
-            if !present.is_empty() {
+            if !existing.is_empty() {
                 let off: Vec<u32> =
-                    rules.iter().filter(|r| present.contains(&r.id) && !r.enabled).map(|r| r.id).collect();
-                text.push_str(&format!("; there already: {}", ids(present)));
+                    rules.iter().filter(|r| existing.contains(&r.id) && !r.enabled).map(|r| r.id).collect();
+                text.push_str(&format!("; there already: {}", ids(existing)));
                 if !off.is_empty() {
                     text.push_str(&format!(" (switched off: {}; `rules enable ID` switches one on)", ids(&off)));
                 }
