@@ -8,7 +8,10 @@ import {
   describeReplace,
   describeScope,
   describeWhere,
+  draftFromRule,
   draftProblem,
+  editArgs,
+  editRunsNewScript,
   enginesFor,
   failureNote,
   importQuestion,
@@ -289,4 +292,62 @@ test("a finding raised from a script's answer is told apart by its alert type", 
   assert.equal(isScriptAnswer("10021"), false);
   assert.equal(isScriptAnswer("script:check:x"), false);
   assert.equal(isScriptAnswer(undefined), false);
+});
+
+test("a saved rule opens in the editor as it is, and saving it unchanged runs nothing", () => {
+  const r = rule({ id: 4, name: "X-Role", action: "set", replace: "admin", comment: "role", host: "^api\\.", applies_to: ["proxy", "send"] });
+  const d = draftFromRule(r);
+  assert.deepEqual(
+    [d.location, d.name, d.action, d.matcher, d.match, d.replace, d.replacer, d.appliesTo, d.host, d.comment, d.disabled],
+    ["request-header", "X-Role", "set", "regex", "", "admin", "text", ["proxy", "send"], "^api\\.", "role", false],
+  );
+  assert.equal(editArgs(4, d, d, "r1"), null);
+  // A rule that lists no engines applies to its location's default; a ws-message rule to both directions.
+  assert.deepEqual(draftFromRule(rule({ location: "ws-message", enabled: false })).appliesTo, ["ws-to-server", "ws-to-client"]);
+  assert.equal(draftFromRule(rule({ location: "ws-message", enabled: false })).disabled, true);
+  const script = draftFromRule(rule({ location: "request", replacer: "script", script: { file: "/s/stops.js", sha256: "ab" } }));
+  assert.deepEqual([script.replacer, script.script], ["script", "/s/stops.js"]);
+});
+
+test("an edit passes only what changed, with the revision the dialog read", () => {
+  const before = draftFromRule(rule({ id: 4, name: "X-Role", replace: "admin", applies_to: ["proxy"] }));
+  assert.deepEqual(editArgs(4, before, { ...before, replace: "user", comment: "now user" }, "r1"), [
+    "rules",
+    "edit",
+    "4",
+    "--replace=user",
+    "--comment=now user",
+    "--if-revision=r1",
+  ]);
+  assert.deepEqual(editArgs(4, before, { ...before, appliesTo: ["send", "proxy"], host: " ^a\\. " }), ["rules", "edit", "4", "--applies-to=proxy,send", "--host=^a\\."]);
+  // A new action says so; an empty name takes the action with it, and what it greys out isn't sent.
+  assert.deepEqual(editArgs(4, before, { ...before, action: "add", match: "typed before" }), ["rules", "edit", "4", "--action=add"]);
+  const added = draftFromRule(rule({ id: 4, name: "X-Role", action: "remove" }));
+  assert.deepEqual(editArgs(4, added, { ...added, name: "", replace: "X-New: 1" }), ["rules", "edit", "4", "--name=", "--replace=X-New: 1"]);
+});
+
+test("moving a rule to another location sends what withLocation reset", () => {
+  const before = draftFromRule(rule({ id: 2, name: "X-A", replace: "1" }));
+  assert.deepEqual(editArgs(2, before, withLocation(before, "path")), ["rules", "edit", "2", "--location=path", "--name="]);
+  assert.deepEqual(editArgs(2, before, withLocation(before, "ws-message")), [
+    "rules",
+    "edit",
+    "2",
+    "--location=ws-message",
+    "--name=",
+    "--applies-to=ws-to-server,ws-to-client",
+  ]);
+});
+
+test("a script is sent only when it is a new one, and text in place of a script says so", () => {
+  const scripted = draftFromRule(rule({ id: 3, location: "response-body", pattern: "x", replacer: "script", script: { file: "/s/a.js", sha256: "ab" } }));
+  assert.equal(editArgs(3, scripted, { ...scripted, comment: "c" })?.includes("--script=/s/a.js"), false);
+  assert.equal(editRunsNewScript(scripted, { ...scripted, comment: "c" }), false);
+  const other = { ...scripted, script: "/s/b.js" };
+  assert.deepEqual(editArgs(3, scripted, other), ["rules", "edit", "3", "--script=/s/b.js"]);
+  assert.equal(editRunsNewScript(scripted, other), true);
+  assert.deepEqual(editArgs(3, scripted, { ...scripted, replacer: "text", replace: "y" }), ["rules", "edit", "3", "--replace=y"]);
+  const text = draftFromRule(rule({ id: 5, location: "response-body", pattern: "x", replace: "y" }));
+  assert.equal(editRunsNewScript(text, { ...text, replacer: "script", script: "/s/a.js" }), true);
+  assert.deepEqual(editArgs(5, text, { ...text, replacer: "script", script: "/s/a.js" }), ["rules", "edit", "5", "--script=/s/a.js"]);
 });

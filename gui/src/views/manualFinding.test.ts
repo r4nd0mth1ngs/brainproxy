@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { addedBy, asksToReplace, draftFromRequest, findingAddArgs, formFromDraft, formProblem, historyIds, type FindingForm } from "./manualFinding.ts";
+import type { Finding } from "../api";
+import { addedBy, asksToReplace, draftFromRequest, editProblem, findingAddArgs, findingEditArgs, formChanges, formFromDraft, formFromFinding, formProblem, historyIds, type FindingForm } from "./manualFinding.ts";
 
 const filled = (over: Partial<FindingForm> = {}): FindingForm => ({
   ...formFromDraft({ url: "https://app.test/orders/7?x=1", method: "post", history: [12] }),
@@ -162,4 +163,71 @@ test("Replay drafts keep the path and query as written", () => {
 test("a finding an agent added never reads as found by hand", () => {
   assert.deepEqual(addedBy("mcp"), { tag: "via MCP", text: "Added via MCP (an agent)" });
   for (const o of ["gui", "cli", null, undefined]) assert.equal(addedBy(o).text, "Added by hand");
+});
+
+const shown = {
+  id: 7,
+  alert_ref: "manual:order-idor",
+  name: "Order IDOR",
+  risk: "high",
+  confidence: "medium",
+  host: "app.test",
+  method: "GET",
+  url: "https://app.test/orders/7",
+  param: "",
+  evidence: "",
+  hits: 1,
+  history_id: 12,
+  state: "confirmed",
+  source: "manual",
+  rule_id: 0,
+  cwe: 639,
+  wasc: null,
+  other_info: "",
+  attack: "",
+  description: "Any user reads any order.",
+  solution: "",
+  tags: ["manual"],
+  note: "seen twice",
+  history_ids: [12, 15],
+} as Finding;
+
+test("an edit starts from the finding as it is, and changes nothing until something is changed", () => {
+  const form = formFromFinding(shown);
+  assert.deepEqual(
+    [form.title, form.risk, form.confidence, form.method, form.url, form.cwe, form.history, form.description],
+    ["Order IDOR", "high", "medium", "GET", "https://app.test/orders/7", "639", "12, 15", "Any user reads any order."],
+  );
+  assert.deepEqual(formChanges(form, form), []);
+  assert.equal(findingEditArgs(7, form, form, "abc"), null);
+  // Spaces around the title or the texts, or the method's case, change nothing either.
+  assert.deepEqual(formChanges(form, { ...form, title: " Order IDOR ", method: "get", description: "Any user reads any order.\n" }), []);
+  assert.equal(formFromFinding({ ...shown, confidence: "certain" }).confidence, "medium");
+});
+
+test("an edit passes only what changed, with the revision it was read at", () => {
+  const before = formFromFinding(shown);
+  const after = { ...before, risk: "critical" as const, param: "id", cwe: "", history: "15" };
+  const call = findingEditArgs(7, before, after, "abc");
+  assert.deepEqual(call, { args: ["findings", "edit", "7", "--risk=critical", "--param=id", "--cwe=0", "--history-id=15", "--if-revision=abc"] });
+  // Unlinking every entry is said as such.
+  assert.deepEqual(findingEditArgs(7, before, { ...before, history: "" })?.args, ["findings", "edit", "7", "--no-history"]);
+});
+
+test("an edited URL and texts go on stdin, and a changed write-up replaces the shared one", () => {
+  const before = formFromFinding(shown);
+  const after = { ...before, url: " https://app.test/orders/8?token=FAKE ", method: "post", solution: "Check the owner. ", evidence: "order 8" };
+  const call = findingEditArgs(7, before, after);
+  assert.deepEqual(call?.args, ["findings", "edit", "7", "--replace-text", "--input-json"]);
+  assert.deepEqual(JSON.parse(call?.stdin ?? ""), { url: "https://app.test/orders/8?token=FAKE", method: "POST", solution: "Check the owner.", evidence: "order 8" });
+  assert.ok(!call?.args.join(" ").includes("FAKE"));
+  const titled = findingEditArgs(7, before, { ...before, title: "Invoice IDOR" });
+  assert.deepEqual(titled, { args: ["findings", "edit", "7", "--title=Invoice IDOR"] });
+});
+
+test("an edited finding keeps a URL", () => {
+  const form = formFromFinding(shown);
+  assert.equal(editProblem({ ...form, url: " " }), "Give the URL where the issue is.");
+  assert.equal(editProblem({ ...form, history: "x" }), "History entries are numbers, such as 12, 15.");
+  assert.equal(editProblem(form), null);
 });

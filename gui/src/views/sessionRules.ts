@@ -21,6 +21,8 @@ export interface MacroSummary {
   vars: string[];
   /** "METHOD URL" per step. */
   requests: string[];
+  /** What `auth macro edit --if-revision` checks. */
+  revision?: string;
 }
 
 export type Action =
@@ -125,6 +127,69 @@ export function macroAddArgs(profile: string, name: string, steps: number[], ext
   }
   args.push("--", profile, name.trim());
   return args;
+}
+
+/** A macro as `auth macro show` gives it, with the revision an edit passes back. */
+export interface MacroDetail {
+  name: string;
+  steps: { target: string; request: string; history_id?: number; extract: { var: string; from: ExtractFrom; expr: string }[] }[];
+  origin?: string;
+}
+
+/** A step in the macro editor: one of the macro's own (`n`, from 1) or a Traffic row to add. `key` stays with it as it moves. */
+export type EditorStep = { key: string; line: string } & ({ kind: "kept"; n: number } | { kind: "history"; id: number });
+
+/** An extractor in the editor, on the step whose `key` it names. */
+export interface EditorExtract {
+  key: string;
+  var: string;
+  from: ExtractFrom;
+  expr: string;
+}
+
+/** "METHOD URL" of a macro step, as `auth macro list` says it. */
+export function stepLine(s: { target: string; request: string }): string {
+  const [method = "", path = ""] = (s.request.split(/\r?\n/, 1)[0] ?? "").split(" ");
+  return /^https?:\/\//.test(path) ? `${method} ${path}` : `${method} ${s.target.replace(/\/$/, "")}${path}`;
+}
+
+/** The editor's steps and extractors for a macro as it is. */
+export function macroEditor(m: MacroDetail): { steps: EditorStep[]; extract: EditorExtract[] } {
+  const steps: EditorStep[] = m.steps.map((s, i) => ({ key: `step${i + 1}`, kind: "kept", n: i + 1, line: stepLine(s) }));
+  const extract = m.steps.flatMap((s, i) => s.extract.map((x) => ({ key: `step${i + 1}`, var: x.var, from: x.from, expr: x.expr })));
+  return { steps, extract };
+}
+
+/** Why the edited macro can't be saved yet; null when it can. The CLI checks the rest. */
+export function macroEditProblem(steps: EditorStep[], extract: EditorExtract[]): string | null {
+  if (!steps.length) return "A macro needs at least one step.";
+  if (extract.some((x) => !steps.some((s) => s.key === x.key))) return "An extractor is on a step that was taken out.";
+  if (extract.some((x) => !x.var.trim() || !x.expr)) return "Give each extractor a variable and what to look for, or take it out.";
+  return null;
+}
+
+/**
+ * `auth macro edit` for the editor's steps and extractors, or null when they are what `start`
+ * was. Every step and extractor is said, so the result doesn't depend on what is carried: a
+ * kept step as step:N, a Traffic row as its history id. The revision makes a macro changed
+ * elsewhere since the editor opened fail rather than be overwritten.
+ */
+export function macroEditArgs(
+  profile: string,
+  name: string,
+  start: { steps: EditorStep[]; extract: EditorExtract[] },
+  steps: EditorStep[],
+  extract: EditorExtract[],
+  revision?: string,
+): string[] | null {
+  const body = (st: EditorStep[], ex: EditorExtract[]) => {
+    const args = st.map((s) => `--step=${s.kind === "kept" ? `step:${s.n}` : s.id}`);
+    const rows = ex.map((x) => `--extract=${st.findIndex((s) => s.key === x.key) + 1}:${x.var.trim()}=${x.from}:${x.expr}`);
+    return [...args, ...(rows.length ? rows : ["--no-extract"])];
+  };
+  const now = body(steps, extract);
+  if (now.join("\n") === body(start.steps, start.extract).join("\n")) return null;
+  return ["auth", "macro", "edit", ...now, ...(revision ? [`--if-revision=${revision}`] : []), "--", profile, name];
 }
 
 export interface RuleForm {

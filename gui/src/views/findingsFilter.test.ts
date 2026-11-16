@@ -98,6 +98,23 @@ test("timeline events read as sentences", () => {
   assert.equal(eventText(e({ kind: "moved", old: "1", new: "2" })), "Moved from issue #1 to #2");
 });
 
+test("an edit's timeline line says what changed, from what to what", () => {
+  const e = (over: object) => ({ id: 1, time: "", kind: "edited", old: null, new: null, text: null, by: "", history_id: null, ...over });
+  const edit = e({
+    text: "risk, param, cwe, history_ids, description",
+    old: JSON.stringify({ risk: "high", param: "", cwe: null, history_ids: [3] }),
+    new: JSON.stringify({ risk: "critical", param: "id", cwe: 639, history_ids: [] }),
+  });
+  assert.equal(eventText(edit), 'Edited: risk "high" → "critical"; parameter none → "id"; cwe none → 639; history entries #3 → none; description');
+  // A long value is cut, and an event with nothing readable still says it was an edit.
+  const long = eventText(e({ text: "evidence", old: JSON.stringify({ evidence: "" }), new: JSON.stringify({ evidence: "x".repeat(200) }) }));
+  assert.ok(long.length < 100 && long.endsWith("…"), long);
+  const astral = eventText(e({ text: "evidence", new: JSON.stringify({ evidence: "\u{1F600}".repeat(80) }) }));
+  assert.ok(!/[\uD800-\uDBFF]…/.test(astral), astral);
+  assert.equal(eventText(e({ text: "solution" })), "Edited: solution");
+  assert.equal(eventText(e({ old: "not json" })), "Edited");
+});
+
 test("write-ups and agent trails read as sentences", () => {
   assert.deepEqual(narrativeCommand(3, " text "), ["findings", "issue", "narrative", "3", "--text=text"]);
   const n = { text: "x", hash: "00", origin: "mcp", at: null, reviewed_origin: null, reviewed_at: null };

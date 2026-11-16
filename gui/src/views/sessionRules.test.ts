@@ -7,6 +7,9 @@ import {
   actionLabel,
   actionSpec,
   macroAddArgs,
+  macroEditArgs,
+  macroEditProblem,
+  macroEditor,
   parseParams,
   ruleAddArgs,
   ruleProblems,
@@ -14,7 +17,10 @@ import {
   signerForm,
   signerLabel,
   signerProblems,
+  stepLine,
   type Action,
+  type EditorStep,
+  type MacroDetail,
   type Signer,
   type SignerForm,
 } from "./sessionRules.ts";
@@ -194,4 +200,53 @@ test("a signer that can't be saved says why, without repeating a key pasted in",
   const jwt = { ...hmacForm, kind: "jwt" as const, canonical: "" };
   assert.deepEqual(signerProblems(jwt, []), []);
   assert.deepEqual(signerProblems({ ...jwt, ttl: "5m" }, []), ["Give the JWT's lifetime in whole seconds."]);
+});
+
+const login: MacroDetail = {
+  name: "login",
+  steps: [
+    { target: "https://app.test", request: "GET /form HTTP/1.1\r\nHost: app.test\r\n\r\n", history_id: 3, extract: [{ var: "csrf", from: "input", expr: "csrf" }] },
+    { target: "https://app.test:8443", request: "POST https://app.test:8443/login HTTP/1.1\r\n\r\n", extract: [] },
+  ],
+};
+
+test("a macro opens in the editor as it is, and saving it unchanged runs nothing", () => {
+  const start = macroEditor(login);
+  assert.deepEqual(
+    start.steps.map((s) => s.line),
+    ["GET https://app.test/form", "POST https://app.test:8443/login"],
+  );
+  assert.deepEqual(start.extract, [{ key: "step1", var: "csrf", from: "input", expr: "csrf" }]);
+  assert.equal(macroEditArgs("app", "login", start, start.steps, start.extract, "r1"), null);
+  assert.equal(stepLine({ target: "http://a.test/", request: "GET /x HTTP/1.1" }), "GET http://a.test/x");
+});
+
+test("an edited macro says every step and extractor, an extractor following its step", () => {
+  const start = macroEditor(login);
+  const added: EditorStep = { key: "h42", kind: "history", id: 42, line: "GET https://app.test/next" };
+  // Steps swapped and one added from Traffic: the extractor moves with step 1, now step 2.
+  const steps = [start.steps[1], start.steps[0], added];
+  assert.deepEqual(macroEditArgs("app", "-login", start, steps, start.extract, "r1"), [
+    "auth",
+    "macro",
+    "edit",
+    "--step=step:2",
+    "--step=step:1",
+    "--step=42",
+    "--extract=2:csrf=input:csrf",
+    "--if-revision=r1",
+    "--",
+    "app",
+    "-login",
+  ]);
+  // No extractors left is said as such.
+  assert.deepEqual(macroEditArgs("app", "login", start, start.steps, []), ["auth", "macro", "edit", "--step=step:1", "--step=step:2", "--no-extract", "--", "app", "login"]);
+});
+
+test("an edited macro that can't be saved says why", () => {
+  const start = macroEditor(login);
+  assert.equal(macroEditProblem([], []), "A macro needs at least one step.");
+  assert.equal(macroEditProblem([start.steps[1]], start.extract), "An extractor is on a step that was taken out.");
+  assert.equal(macroEditProblem(start.steps, [{ ...start.extract[0], var: " " }]), "Give each extractor a variable and what to look for, or take it out.");
+  assert.equal(macroEditProblem(start.steps, start.extract), null);
 });
