@@ -1104,6 +1104,17 @@ select {
 .finding-dialog-actions {
   margin-top: 16px;
 }
+/* Settings › Match & replace › Edit rule (views/MatchReplace.tsx). */
+.rule-dialog {
+  width: min(960px, 100%);
+}
+.rule-dialog-row {
+  flex-wrap: wrap;
+  padding-left: 0;
+  padding-right: 0;
+  border-bottom: none;
+  background: transparent;
+}
 
 .toasts {
   position: fixed;

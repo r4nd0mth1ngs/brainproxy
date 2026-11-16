@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use brainproxy_core::scan::active::{self, ActiveSettings};
 use brainproxy_core::scan::compare;
-use brainproxy_core::scan::findings_db::{FindingFilter, ManualFinding};
+use brainproxy_core::scan::findings_db::{FindingEdit, FindingFilter, ManualFinding};
 use brainproxy_core::scan::passive::{self, PassiveSettings, SETTINGS_KEY};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -313,6 +313,24 @@ pub enum FindingsCmd {
         refused. Text on the command line is visible in the process list; --input-json keeps the URL, \
         evidence and write-ups off it.")]
     Add(Box<AddArgs>),
+    /// Change a finding added by hand in place. Only the fields given change; its id, state, note,
+    /// origin and timeline stay. Nothing is sent.
+    #[command(after_help = "The flags are those of `findings add`; --history-id replaces the linked entries \
+        (--no-history unlinks them all) and --cwe 0 clears the CWE. An edit that changes something is on the \
+        finding's timeline (kind edited: who, which fields, their old and new values). With a new title or a \
+        URL on another host it joins the issue of the findings of that title and host; the only finding of \
+        its issue takes the issue (its title, CVSS and write-up) with it instead, and a host change alone keeps \
+        it in an issue merged across hosts. `findings compare` still knows it by its earlier identities. The \
+        description and solution \
+        are shared by every finding with the same title: a given one fills a blank one, and one that differs \
+        from the shared one (an empty one too) is refused (kind conflict) unless --replace-text, which keeps \
+        the earlier text in replaced_texts. A new title takes the write-up of the findings it joins, or this \
+        finding's when they have none. The same title, method, URL without its query or path parameters, and \
+        parameter as another finding is refused (kind conflict). --if-revision takes the revision `findings \
+        show` gives and refuses (kind conflict) a finding changed since. Through MCP an agent edits only the \
+        findings it added that no person has changed since (its state, note or fields, a ticket, or its \
+        issue's write-up), the *-file flags only take '-' and --replace-text is refused.")]
+    Edit(Box<EditArgs>),
     /// Remove findings added by hand (`findings add`); scanner findings can only be marked.
     #[command(after_help = "A removed finding is kept with state removed, hidden unless --state all, so a \
         compare against a baseline that had it lists it as removed, not fixed. findings show says when it \
@@ -493,6 +511,167 @@ impl AddArgs {
             history: self.history,
             replace_text: self.replace_text,
         })
+    }
+}
+
+#[derive(clap::Args)]
+pub struct EditArgs {
+    /// The finding (added by hand).
+    id: i64,
+    /// The issue's name, as reports show it.
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long, value_enum)]
+    risk: Option<RiskArg>,
+    #[arg(long, value_enum)]
+    confidence: Option<crate::report_cmd::ConfidenceArg>,
+    /// Where it is: an http(s) or ws(s) URL.
+    #[arg(long)]
+    url: Option<String>,
+    /// Request method.
+    #[arg(long)]
+    method: Option<String>,
+    /// Affected parameter, header, or cookie; empty for none.
+    #[arg(long)]
+    param: Option<String>,
+    /// CWE id; 0 clears it.
+    #[arg(long, value_name = "ID")]
+    cwe: Option<u32>,
+    /// History entries that show it, in place of the linked ones (repeatable or comma-separated);
+    /// the first is the evidence.
+    #[arg(long = "history-id", value_name = "ID", value_delimiter = ',')]
+    history: Option<Vec<i64>>,
+    /// Unlink every history entry.
+    #[arg(long, conflicts_with = "history")]
+    no_history: bool,
+    /// What the issue is and why it matters (shared by the findings with this title).
+    #[arg(long, conflicts_with = "description_file")]
+    description: Option<String>,
+    /// Read the description from FILE ('-' reads stdin).
+    #[arg(long, value_name = "FILE")]
+    description_file: Option<String>,
+    /// How to fix it (shared by the findings with this title).
+    #[arg(long, conflicts_with = "solution_file")]
+    solution: Option<String>,
+    /// Read the solution from FILE ('-' reads stdin).
+    #[arg(long, value_name = "FILE")]
+    solution_file: Option<String>,
+    /// What shows it, such as a line of the response.
+    #[arg(long, conflicts_with = "evidence_file")]
+    evidence: Option<String>,
+    /// Read the evidence from FILE ('-' reads stdin).
+    #[arg(long, value_name = "FILE")]
+    evidence_file: Option<String>,
+    /// Read JSON from stdin: {"description": "...", "solution": "...", "evidence": "...", "url":
+    /// "...", "method": "..."}. Each is optional and changes only what it gives; use it instead
+    /// of the text flags above (and of --url and --method, to keep a token in the URL out of
+    /// the process list).
+    #[arg(long, conflicts_with_all = [
+        "description", "description_file", "solution", "solution_file", "evidence", "evidence_file",
+    ])]
+    input_json: bool,
+    /// Replace the description or solution that findings with this title share when the one
+    /// given differs (the earlier text is kept). Refused through MCP.
+    #[arg(long)]
+    replace_text: bool,
+    /// Edit only if the finding is still at this revision (`revision` from `findings show` or an
+    /// earlier edit); otherwise fail with a conflict and change nothing.
+    #[arg(long, value_name = "REV")]
+    if_revision: Option<String>,
+}
+
+/// What `findings edit --input-json` reads from stdin: only what it gives changes.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditInput {
+    description: Option<String>,
+    solution: Option<String>,
+    evidence: Option<String>,
+    url: Option<String>,
+    method: Option<String>,
+}
+
+impl EditArgs {
+    /// The edit, with long texts read from their files or stdin.
+    fn edit(self) -> Result<(i64, FindingEdit), Error> {
+        let stdin_readers = [&self.description_file, &self.solution_file, &self.evidence_file]
+            .iter()
+            .filter(|f| f.as_deref() == Some("-"))
+            .count();
+        if stdin_readers > 1 {
+            return Err(Error::InvalidInput(
+                "only one of --description-file, --solution-file and --evidence-file can read stdin".into(),
+            ));
+        }
+        if self.replace_text && crate::mcp::in_tool_call() {
+            return Err(Error::InvalidInput(
+                "--replace-text is refused through MCP: the shared write-up may be a person's; leave the \
+                 description and solution out"
+                    .into(),
+            ));
+        }
+        // Only a text given (as a flag or its file) changes.
+        let text = |flag: &str, text: Option<String>, file: Option<String>| -> Result<Option<String>, Error> {
+            match (&text, &file) {
+                (None, None) => Ok(None),
+                _ => text_arg(flag, text, file).map(Some),
+            }
+        };
+        let texts: EditInput = if self.input_json {
+            serde_json::from_slice(&crate::read_input(None)?)
+                .map_err(|e| Error::InvalidInput(format!("--input-json: {e}")))?
+        } else {
+            EditInput {
+                description: text("--description-file", self.description, self.description_file)?,
+                solution: text("--solution-file", self.solution, self.solution_file)?,
+                evidence: text("--evidence-file", self.evidence, self.evidence_file)?,
+                url: None,
+                method: None,
+            }
+        };
+        for (flag, given, from_json) in [("--url", &self.url, &texts.url), ("--method", &self.method, &texts.method)] {
+            if given.is_some() && from_json.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "give the {} either as {flag} or in --input-json, not both",
+                    &flag[2..]
+                )));
+            }
+        }
+        let edit = FindingEdit {
+            title: self.title,
+            risk: self.risk.map(RiskArg::get),
+            confidence: self.confidence.map(|c| c.get()),
+            url: self.url.or(texts.url),
+            method: self.method.or(texts.method),
+            param: self.param,
+            cwe: self.cwe.map(|c| Some(c).filter(|&c| c > 0)),
+            history: if self.no_history { Some(Vec::new()) } else { self.history },
+            evidence: texts.evidence,
+            description: texts.description,
+            solution: texts.solution,
+            replace_text: self.replace_text,
+            if_revision: self.if_revision,
+            only_own: crate::mcp::in_tool_call(),
+        };
+        let given = [
+            edit.title.is_some(),
+            edit.risk.is_some(),
+            edit.confidence.is_some(),
+            edit.url.is_some(),
+            edit.method.is_some(),
+            edit.param.is_some(),
+            edit.cwe.is_some(),
+            edit.history.is_some(),
+            edit.evidence.is_some(),
+            edit.description.is_some(),
+            edit.solution.is_some(),
+        ];
+        if !given.contains(&true) {
+            return Err(Error::InvalidInput(
+                "findings edit: give what to change (--title, --risk, --url, --evidence, ...)".into(),
+            ));
+        }
+        Ok((self.id, edit))
     }
 }
 
@@ -1286,6 +1465,48 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             out.ok(json!({"id": id, "finding": finding, "history": links, "warnings": warnings}), || {
                 warnings.iter().map(|w| format!("warning: {w}\n")).collect::<String>() + &text
             });
+        }
+        FindingsCmd::Edit(args) => {
+            let (id, edit) = args.edit()?;
+            let edited = store.finding_edit(id, &edit)?;
+            let finding = store.finding_get(id)?;
+            let mut warnings: Vec<String> = Vec::new();
+            if edited.changed.contains(&"url") {
+                let url = finding["url"].as_str().unwrap_or_default();
+                warnings.extend(outside_scope(&store, url));
+            }
+            if !edited.replaced.is_empty() {
+                warnings.push(format!(
+                    "replaced the {} that every finding titled {:?} shares (the earlier text is kept in replaced_texts)",
+                    edited.replaced.join(" and "),
+                    finding["name"].as_str().unwrap_or_default()
+                ));
+            }
+            // An entry on another site may be linked by mistake, and would be the report's evidence.
+            let links = store.finding_links(id)?;
+            if edited.changed.iter().any(|c| matches!(*c, "url" | "history_ids")) {
+                for l in links.iter().filter(|l| l["other_site"] == true) {
+                    warnings.push(format!(
+                        "history entry {} is {} {}, not on the finding's host and port",
+                        l["id"],
+                        l["method"].as_str().unwrap_or_default(),
+                        l["url"].as_str().unwrap_or_default()
+                    ));
+                }
+            }
+            let text = match edited.changed.as_slice() {
+                [] => format!("finding {id} unchanged"),
+                changed => format!("edited finding {id} ({})", changed.join(", ")),
+            };
+            let data = json!({
+                "id": id,
+                "changed": edited.changed,
+                "revision": edited.revision,
+                "finding": finding,
+                "history": links,
+                "warnings": warnings,
+            });
+            out.ok(data, || warnings.iter().map(|w| format!("warning: {w}\n")).collect::<String>() + &text);
         }
         FindingsCmd::Remove { ids } => {
             // An agent can't tell a person's finding from its own, so it marks rather than removes.

@@ -1,7 +1,8 @@
 // A finding written up by hand: the form behind "New finding…" (Findings) and "Create
-// finding…" (Traffic, Replay), and the `findings add` call it becomes. Nothing is sent.
+// finding…" (Traffic, Replay), and the `findings add` call it becomes; and the same form
+// editing one ("Edit…" in Findings), with the `findings edit` call. Nothing is sent.
 
-import type { Risk } from "../api";
+import type { Finding, Risk } from "../api";
 
 /** What another tool hands over: where the issue is and the history entries that show it. */
 export interface FindingDraft {
@@ -132,4 +133,82 @@ export function draftFromRequest(raw: string, target: string, historyId?: number
     }
   }
   return { method: method || undefined, url: where || undefined, history: historyId != null ? [historyId] : [] };
+}
+
+/** The form holding a finding added by hand, to edit it. */
+export function formFromFinding(f: Finding): FindingForm {
+  const confidence = (["low", "medium", "high"] as const).find((c) => c === f.confidence) ?? "medium";
+  return {
+    title: f.name,
+    risk: f.risk,
+    confidence,
+    method: f.method,
+    url: f.url,
+    param: f.param ?? "",
+    cwe: f.cwe != null ? String(f.cwe) : "",
+    history: (f.history_ids ?? []).join(", "),
+    description: f.description ?? "",
+    solution: f.solution ?? "",
+    evidence: f.evidence ?? "",
+    replaceText: false,
+  };
+}
+
+/** Why the edited form can't be saved yet, or null. A finding always has a URL. */
+export function editProblem(f: FindingForm): string | null {
+  if (!f.url.trim()) return "Give the URL where the issue is.";
+  return formProblem(f);
+}
+
+/** The fields an edit changes, as `findings edit` names them: what differs from the finding as it was. */
+export function formChanges(before: FindingForm, after: FindingForm): string[] {
+  const same = (a: number[] | null, b: number[] | null) => JSON.stringify(a) === JSON.stringify(b);
+  const changed: [string, boolean][] = [
+    ["title", after.title.trim() !== before.title.trim()],
+    ["risk", after.risk !== before.risk],
+    ["confidence", after.confidence !== before.confidence],
+    ["method", after.method.trim().toUpperCase() !== before.method.trim().toUpperCase()],
+    ["url", after.url.trim() !== before.url.trim()],
+    ["param", after.param !== before.param],
+    ["cwe", after.cwe.trim() !== before.cwe.trim()],
+    ["history_ids", !same(historyIds(after.history), historyIds(before.history))],
+    ["evidence", after.evidence !== before.evidence],
+    ["description", after.description.trim() !== before.description.trim()],
+    ["solution", after.solution.trim() !== before.solution.trim()],
+  ];
+  return changed.filter(([, c]) => c).map(([k]) => k);
+}
+
+/**
+ * The `findings edit` call for what changed, or null when nothing did. As for `findings add`,
+ * the URL, method and texts go on stdin as JSON. A changed description or solution passes
+ * --replace-text when the title stays: the dialog says they are shared by every finding with
+ * it. With a new title they would replace the write-up of the findings it joins, which the
+ * dialog didn't name, so that is asked first, as for a new finding (`replaceText`). The
+ * revision makes a finding changed elsewhere since it was opened fail rather than be overwritten.
+ */
+export function findingEditArgs(id: number, before: FindingForm, after: FindingForm, revision?: string): { args: string[]; stdin?: string } | null {
+  const changed = new Set(formChanges(before, after));
+  if (!changed.size) return null;
+  const args = ["findings", "edit", String(id)];
+  if (changed.has("title")) args.push(`--title=${after.title.trim()}`);
+  if (changed.has("risk")) args.push(`--risk=${after.risk}`);
+  if (changed.has("confidence")) args.push(`--confidence=${after.confidence}`);
+  if (changed.has("param")) args.push(`--param=${after.param}`);
+  if (changed.has("cwe")) args.push(`--cwe=${after.cwe.trim() || "0"}`);
+  if (changed.has("history_ids")) {
+    const ids = historyIds(after.history) ?? [];
+    args.push(ids.length ? `--history-id=${ids.join(",")}` : "--no-history");
+  }
+  const texts = changed.has("description") || changed.has("solution");
+  if (after.replaceText || (texts && !changed.has("title"))) args.push("--replace-text");
+  if (revision) args.push(`--if-revision=${revision}`);
+  const input: Record<string, string> = {};
+  if (changed.has("url")) input.url = after.url.trim();
+  if (changed.has("method")) input.method = after.method.trim().toUpperCase();
+  if (changed.has("description")) input.description = after.description.trim();
+  if (changed.has("solution")) input.solution = after.solution.trim();
+  if (changed.has("evidence")) input.evidence = after.evidence;
+  if (!Object.keys(input).length) return { args };
+  return { args: [...args, "--input-json"], stdin: JSON.stringify(input) };
 }

@@ -1,5 +1,5 @@
-// Match & replace rules as the app edits them: what a draft must hold, the `rules add` and
-// `rules test` commands made from it, and how a saved rule reads in the table.
+// Match & replace rules as the app edits them: what a draft must hold, the `rules add`,
+// `rules edit` and `rules test` commands made from it, and how a saved rule reads in the table.
 
 /** A rule as `rules list` gives it. */
 export interface Rule {
@@ -25,6 +25,8 @@ export interface Rule {
   replacer?: string;
   /** The script file, and the sha256 its text had when the rule was added. */
   script?: { file: string; sha256: string };
+  /** Saved as a Host-header test: a Host it puts in a request is meant. */
+  host_header_test?: boolean;
 }
 
 /** A rule the engines leave out, as `rules list` says: its replacement breaks a head, or its script file changed. */
@@ -51,6 +53,8 @@ export interface Draft {
   contentType: string;
   comment: string;
   disabled: boolean;
+  /** A saved rule being edited is a Host-header test, which the edit keeps. */
+  hostHeaderTest?: boolean;
 }
 
 export const EMPTY_DRAFT: Draft = {
@@ -198,6 +202,79 @@ export function addArgs(draft: Draft): string[] {
   if (draft.comment) args.push(`--comment=${draft.comment}`);
   if (draft.disabled) args.push("--disabled");
   return args;
+}
+
+/** The editor's draft of a saved rule, for the Edit dialog. */
+export function draftFromRule(r: Rule): Draft {
+  return {
+    location: r.location,
+    name: r.name ?? "",
+    action: r.action ?? "set",
+    matcher: r.matcher ?? "regex",
+    match: r.pattern,
+    replace: r.replace ?? "",
+    replacer: r.replacer === "script" || isRequestRule(r.location) ? "script" : "text",
+    script: r.script?.file ?? "",
+    appliesTo: r.applies_to?.length ? [...r.applies_to] : defaultEngines(r.location),
+    host: r.host ?? "",
+    contentType: r.content_type ?? "",
+    comment: r.comment ?? "",
+    disabled: !r.enabled,
+    hostHeaderTest: r.host_header_test === true,
+  };
+}
+
+/** What a draft amounts to, field by field, as `rules edit` takes it: what the editor greys out is left out. */
+function spec(d: Draft) {
+  const named = isNamed(d);
+  const request = isRequestRule(d.location);
+  const engines = enginesFor(d.location).map((e) => e.id);
+  return {
+    location: d.location,
+    name: takesName(d.location) ? d.name.trim() : "",
+    action: named ? d.action : "set",
+    matcher: request ? "regex" : d.matcher,
+    match: request || (named && d.action === "add") ? "" : d.match,
+    script: isScripted(d) ? d.script.trim() : null,
+    replace: isScripted(d) || (named && d.action === "remove") ? "" : d.replace,
+    appliesTo: engines.filter((id) => d.appliesTo.includes(id)),
+    host: d.host.trim(),
+    contentType: isResponseRule(d.location) ? d.contentType.trim() : "",
+    comment: d.comment,
+  };
+}
+
+/** Whether saving the edit would have the rule run a script file it didn't run before: that is asked first. */
+export function editRunsNewScript(before: Draft, after: Draft): boolean {
+  const s = spec(after).script;
+  return s != null && s !== spec(before).script;
+}
+
+/**
+ * `rules edit` for what the dialog changed, or null when nothing did. The revision makes a rule
+ * changed elsewhere since the dialog opened fail rather than be overwritten.
+ */
+export function editArgs(id: number, before: Draft, after: Draft, revision?: string): string[] | null {
+  const [was, now] = [spec(before), spec(after)];
+  const args: string[] = [];
+  if (now.location !== was.location) args.push(`--location=${now.location}`);
+  if (now.name !== was.name) args.push(`--name=${now.name}`);
+  // An empty name takes the action with it; a new name keeps the action there is.
+  if (now.name && now.action !== was.action) args.push(`--action=${now.action}`);
+  if (now.matcher !== was.matcher) args.push(`--match-kind=${now.matcher}`);
+  if (now.match !== was.match) args.push(`--match=${now.match}`);
+  if (now.script != null) {
+    if (now.script !== was.script) args.push(`--script=${now.script}`);
+  } else if (was.script != null || now.replace !== was.replace) args.push(`--replace=${now.replace}`);
+  if (now.appliesTo.join() !== was.appliesTo.join()) args.push(`--applies-to=${now.appliesTo.join(",")}`);
+  if (now.host !== was.host) args.push(`--host=${now.host}`);
+  if (now.contentType !== was.contentType) args.push(`--content-type=${now.contentType}`);
+  if (now.comment !== was.comment) args.push(`--comment=${now.comment}`);
+  if (!args.length) return null;
+  // `rules edit` takes the mark from the command when the rule changes: a person's Host-header
+  // test stays one.
+  if (before.hostHeaderTest) args.push("--host-header-test");
+  return ["rules", "edit", String(id), ...args, ...(revision ? [`--if-revision=${revision}`] : [])];
 }
 
 /** What the tester tries: the draft, one saved rule, or every enabled rule as an engine applies them. */

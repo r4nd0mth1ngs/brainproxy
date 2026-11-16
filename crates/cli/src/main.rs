@@ -619,6 +619,7 @@ fn command_name(cmd: &Cmd) -> String {
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Finish { .. }) => "auth record finish",
             auth_cmd::AuthCmd::Macro(c) => match c {
                 auth_cmd::MacroCmd::Add { .. } => "auth macro add",
+                auth_cmd::MacroCmd::Edit { .. } => "auth macro edit",
                 auth_cmd::MacroCmd::List { .. } => "auth macro list",
                 auth_cmd::MacroCmd::Show { .. } => "auth macro show",
                 auth_cmd::MacroCmd::Run { .. } => "auth macro run",

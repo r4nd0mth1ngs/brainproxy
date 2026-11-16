@@ -44,7 +44,7 @@ export function connectionsLabel(c: Connections): string {
   return c === "single" ? "one connection" : "separate connections";
 }
 
-/** A stored choice, or one connection (Burp's and Caido's default for a sequence). */
+/** A stored choice, or one connection (the usual default for a sequence). */
 export function parseConnections(text: string | null): Connections {
   return text === "separate" ? "separate" : "single";
 }

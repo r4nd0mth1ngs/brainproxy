@@ -24,7 +24,7 @@
 //! page could use to stall the proxy. An HTML parser would fix all of it, at the cost of rules
 //! that are no longer ordinary regex rules.
 //!
-//! Burp's "convert HTTPS links to HTTP" is left out on purpose: the browser would then ask the
+//! A preset that turns HTTPS links into HTTP is left out on purpose: the browser would then ask the
 //! proxy for plain HTTP, and brainproxy has nothing that upgrades such a request back to HTTPS
 //! upstream, so most sites would redirect back or break.
 

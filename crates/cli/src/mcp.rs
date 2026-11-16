@@ -559,6 +559,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth record finish", REPLACE),
     // Adds or replaces a macro of that name.
     ("auth macro add", REPLACE),
+    // Overwrites the macro; the old one isn't kept.
+    ("auth macro edit", REPLACE),
     ("auth macro list", READ),
     ("auth macro show", READ),
     // Sends the macro's requests to the target and stores the values it extracts.
@@ -616,6 +618,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("scope check", READ),
     ("rules list", READ),
     ("rules add", ADD),
+    // Overwrites the rule; the old one isn't kept.
+    ("rules edit", REPLACE),
     ("rules remove", REPLACE),
     ("rules enable", SET),
     ("rules disable", SET),
@@ -704,6 +708,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings posture", READ),
     // Through MCP it can't replace the write-up findings of the same title share (--replace-text).
     ("findings add", ADD),
+    // The old values stay on the finding's timeline.
+    ("findings edit", SET),
     ("findings remove", REPLACE),
     // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
     ("report", ADD),
@@ -1583,6 +1589,7 @@ mod tests {
         const FOLDER_CHECKED: &[&str] = &[
             "auth add --login_request",
             "auth macro add --steps",
+            "auth macro edit --steps",
             "checks list --selectors",
             "checks validate --paths",
             "findings compare --baseline",
@@ -1612,12 +1619,16 @@ mod tests {
             "findings add --description_file",
             "findings add --evidence_file",
             "findings add --solution_file",
+            "findings edit --description_file",
+            "findings edit --evidence_file",
+            "findings edit --solution_file",
             "findings issue narrative --file",
             "findings mark --from",
             "report --logo",
             "report-profile save --logo",
             "report-summary set --file",
             "rules add --script",
+            "rules edit --script",
             "rules import --file",
             "rules test --file",
             "rules test --script",

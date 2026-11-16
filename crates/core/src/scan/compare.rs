@@ -46,6 +46,10 @@ pub struct Item {
     /// None for the project's own findings and reports written before it was kept.
     #[serde(skip)]
     pub fingerprint: Option<String>,
+    /// The identities a finding added by hand had before `findings edit` changed its title,
+    /// method, URL or parameter: a baseline from before the edit knows it by one of them.
+    #[serde(skip)]
+    pub earlier: Vec<String>,
 }
 
 impl Item {
@@ -128,7 +132,8 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
         if !seen.insert(key.clone()) {
             continue;
         }
-        match base.remove(&key) {
+        // A finding edited since the baseline is the one the baseline knew by its old identity.
+        match base.remove(&key).or_else(|| f.earlier.iter().find_map(|k| base.remove(k))) {
             Some(old) => {
                 if old.dismissed() && !f.dismissed() {
                     f.state = old.state;
@@ -140,7 +145,7 @@ pub fn compare_sets(baseline: Vec<Item>, current: Vec<Item>) -> Comparison {
     }
     // A tombstone stands for the baseline's finding only when nothing current has taken its place.
     for f in gone {
-        if base.remove(&f.key()).is_some() {
+        if base.remove(&f.key()).or_else(|| f.earlier.iter().find_map(|k| base.remove(k))).is_some() {
             out.removed.push(f);
         }
     }
@@ -353,17 +358,26 @@ fn item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         origin: r.get("origin")?,
         rule_id: r.get("rule_id")?,
         fingerprint: None,
+        earlier: Vec::new(),
     })
 }
 
-/// Every finding of a project, false positives and removed ones (tombstones) included.
+/// Every finding of a project, false positives and removed ones (tombstones) included, each
+/// with the identities it had before an edit.
 pub fn project_items(store: &Store) -> Result<Vec<Item>> {
     let mut stmt = store.conn.prepare(
         "SELECT id, alert_ref, name, risk, confidence, source, method, url, param, state, origin, rule_id
          FROM findings",
     )?;
     let rows = stmt.query_map([], item)?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let mut items: Vec<Item> = rows.collect::<std::result::Result<_, _>>()?;
+    let mut earlier = crate::scan::findings_db::earlier_identities(&store.conn)?;
+    for f in &mut items {
+        if let Some(list) = f.id.and_then(|id| earlier.remove(&id)) {
+            f.earlier = list;
+        }
+    }
+    Ok(items)
 }
 
 /// A findings set read from a file.
@@ -447,6 +461,7 @@ pub fn load_set(path: &Path) -> Result<LoadedSet> {
                 origin: i.origin,
                 rule_id,
                 fingerprint: i.fingerprint.filter(|f| !f.trim().is_empty()),
+                earlier: Vec::new(),
             })
         })
         .collect();
@@ -506,6 +521,7 @@ pub fn load_marks(path: &Path) -> Result<LoadedSet> {
             origin: None,
             rule_id: None,
             fingerprint: None,
+            earlier: Vec::new(),
         });
     }
     Ok(LoadedSet { items, warnings: vec![], tombstones: false })
@@ -648,6 +664,7 @@ mod tests {
             origin: None,
             rule_id: alert_ref.parse().ok(),
             fingerprint: None,
+            earlier: Vec::new(),
         }
     }
 

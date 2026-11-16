@@ -74,8 +74,8 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, retest, regressed, risk (a sighting rated it otherwise), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
-    ("old", "TEXT", "Value before (a state, a note, an issue id)"),
+    ("kind", "TEXT", "created, state, note, retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
+    ("old", "TEXT", "Value before (a state, a note, an issue id; for edited, the changed fields as JSON)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
     ("history_id", "INTEGER", "history.id involved (a retest's request, a regression's sighting)"),
@@ -615,7 +615,7 @@ fn exists(conn: &Connection, issue: i64) -> Result<()> {
 }
 
 /// Moves findings between issues, recording a `moved` event for each.
-fn move_findings(conn: &Connection, ids: &[i64], from: i64, to: i64) -> Result<usize> {
+pub(crate) fn move_findings(conn: &Connection, ids: &[i64], from: i64, to: i64) -> Result<usize> {
     let (old, new) = (from.to_string(), to.to_string());
     let mut n = 0;
     for &id in ids {

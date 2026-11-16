@@ -793,6 +793,16 @@ impl Store {
 
     /// One finding with its alert type's description, solution, and references.
     pub fn finding_get(&self, id: i64) -> Result<Value> {
+        // Read in one transaction, so what it shows and its revision are of the same moment: a
+        // revision of an edit made between two reads would let an edit from what was shown
+        // overwrite that change unseen. It only reads, so it is rolled back.
+        let snapshot = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let found = self.finding_read(id);
+        drop(snapshot);
+        found
+    }
+
+    fn finding_read(&self, id: i64) -> Result<Value> {
         let r = self.query(
             "SELECT f.*, t.description, t.solution, json(t.refs) AS refs, json(t.tags) AS tags, t.description_origin,
                 t.solution_origin
@@ -814,6 +824,8 @@ impl Store {
         }
         if obj.get("source").and_then(Value::as_str) == Some(MANUAL_SOURCE) {
             obj.insert("history_ids".into(), json!(self.finding_history_ids(id)?));
+            // What `findings edit --if-revision` checks.
+            obj.insert("revision".into(), json!(manual_revision(&self.conn, id)?));
             let stored = |key: String| -> Result<Option<Value>> {
                 Ok(self.meta_get(&key)?.and_then(|v| serde_json::from_str(&v).ok()))
             };
@@ -919,48 +931,15 @@ impl Store {
             return Err(Error::InvalidInput(format!("the title must be 1 to {MANUAL_TITLE_MAX} bytes")));
         }
         let alert_ref = manual_alert_ref(title)?;
-        for (what, text, max) in [
+        check_sizes(&[
             ("evidence", &f.evidence, MANUAL_EVIDENCE_MAX),
             ("parameter", &f.param, MANUAL_EVIDENCE_MAX),
             ("description", &f.description, MANUAL_TEXT_MAX),
             ("solution", &f.solution, MANUAL_TEXT_MAX),
-        ] {
-            if text.len() > max {
-                return Err(Error::InvalidInput(format!("the {what} is over {max} bytes")));
-            }
-        }
-        if f.history.len() > MANUAL_HISTORY_MAX {
-            return Err(Error::InvalidInput(format!("link at most {MANUAL_HISTORY_MAX} history entries")));
-        }
-        let mut history: Vec<i64> = Vec::new();
-        for &id in &f.history {
-            if !history.contains(&id) {
-                history.push(id);
-            }
-        }
+        ])?;
         let tx = self.write_tx()?;
         // The linked entries must exist; the first gives the URL and method when none are given.
-        let mut first: Option<(String, String)> = None;
-        for &id in &history {
-            let row: Option<(String, String, Option<String>)> = tx
-                .query_row("SELECT method, url, error FROM history WHERE id = ?1", [id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .optional()?;
-            match row {
-                // A request refused for its scope (its Host, say) went nowhere, so it shows
-                // nothing, and a retest would send what was refused.
-                Some((_, _, Some(e))) if e.starts_with("out of scope") => {
-                    return Err(Error::OutOfScope(format!(
-                        "history entry {id} was refused for the scope when it was sent, so it can't be evidence"
-                    )))
-                }
-                Some((method, url, _)) => {
-                    first.get_or_insert((method, url));
-                }
-                None => return Err(Error::NotFound(format!("history entry {id}"))),
-            }
-        }
+        let (history, first) = linked_entries(&tx, &f.history)?;
         let url = match (&f.url, &first) {
             (Some(u), _) => u.trim().to_string(),
             (None, Some((_, u))) => u.clone(),
@@ -968,17 +947,11 @@ impl Store {
         };
         let (parsed, url) = manual_url(&url)?;
         let method = match (&f.method, &first) {
-            (Some(m), _) => m.trim().to_ascii_uppercase(),
+            (Some(m), _) => manual_method(m)?,
             (None, Some((m, _))) => m.clone(),
             (None, None) => "GET".to_string(),
         };
-        if method.is_empty()
-            || method.len() > 32
-            || !method.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(Error::InvalidInput(format!("{method:?} is not an HTTP method")));
-        }
-        let host = parsed.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
+        let host = url_host(&parsed);
         let dedupe = dedupe_key(&alert_ref, &method, &url, &f.param);
         if let Some(id) =
             tx.query_row("SELECT id FROM findings WHERE dedupe = ?1", [&dedupe], |r| r.get::<_, i64>(0)).optional()?
@@ -997,28 +970,7 @@ impl Store {
                     replaced.join(" and ")
                 )));
             }
-            // The text it replaces is kept, with when it was replaced and by whom (gui, cli or
-            // mcp; MCP calls can't pass --replace-text, so an agent never does).
-            let key = replaced_texts_key(&alert_ref);
-            let earlier: Option<String> =
-                tx.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?;
-            let mut list: Vec<Value> = earlier.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-            let (description, solution, time): (String, String, String) = tx.query_row(
-                "SELECT description, solution, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM finding_types
-                 WHERE alert_ref = ?1",
-                [&alert_ref],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            list.push(json!({
-                "time": time,
-                "by": crate::provenance::origin(),
-                "description": description,
-                "solution": solution,
-            }));
-            tx.execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, Value::Array(list).to_string()],
-            )?;
+            keep_replaced_texts(&tx, &alert_ref)?;
         }
         // Each text says who wrote it: whoever gave it first, filled it in when it was blank, or
         // replaced it. Giving the same text again changes neither.
@@ -1070,6 +1022,223 @@ impl Store {
         }
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Changes a finding added by hand in place: only what `e` gives changes, and its id, state,
+    /// note, origin and timeline stay. Returns what changed. An edit that changes something
+    /// records an `edited` event (by this process's origin) whose `text` names the fields and
+    /// whose `old` and `new` hold their values (the description's and solution's are in
+    /// `replaced_texts` when replaced). A new title or host moves it to the issue of its new alert
+    /// type and host, with a `moved` event.
+    ///
+    /// The description and solution belong to the alert type that every finding of a title
+    /// shares, as for [`Store::finding_add`]: a given one fills a blank one, and one that differs
+    /// from a text the type has (an empty one too) is refused unless `replace_text`. A new title
+    /// takes the texts of the type it joins, or this finding's when that one has none.
+    pub fn finding_edit(&mut self, id: i64, e: &FindingEdit) -> Result<FindingEdited> {
+        let title = match &e.title {
+            Some(t) => {
+                let t = t.trim();
+                if t.is_empty() || t.len() > MANUAL_TITLE_MAX {
+                    return Err(Error::InvalidInput(format!("the title must be 1 to {MANUAL_TITLE_MAX} bytes")));
+                }
+                Some(t.to_string())
+            }
+            None => None,
+        };
+        let none = String::new();
+        check_sizes(&[
+            ("evidence", e.evidence.as_ref().unwrap_or(&none), MANUAL_EVIDENCE_MAX),
+            ("parameter", e.param.as_ref().unwrap_or(&none), MANUAL_EVIDENCE_MAX),
+            ("description", e.description.as_ref().unwrap_or(&none), MANUAL_TEXT_MAX),
+            ("solution", e.solution.as_ref().unwrap_or(&none), MANUAL_TEXT_MAX),
+        ])?;
+        let tx = self.write_tx()?;
+        let old = ManualRow::load(&tx, id)?;
+        if old.source != MANUAL_SOURCE {
+            return Err(Error::InvalidInput(format!(
+                "finding {id} came from the {} scanner; only findings added by hand can be edited (mark it instead)",
+                old.source
+            )));
+        }
+        if old.state == REMOVED {
+            return Err(Error::Conflict(format!("finding {id} was removed")));
+        }
+        if e.only_own {
+            // A person who triaged it, noted it, edited it, filed it, moved it, or wrote up or
+            // reviewed its issue has vouched for it as it is: an agent then marks it, as it
+            // would a person's own.
+            let person_touched: bool = tx.query_row(
+                "SELECT IFNULL(f.state_origin, 'mcp') != 'mcp' OR IFNULL(f.note_origin, 'mcp') != 'mcp'
+                    OR EXISTS (SELECT 1 FROM finding_events e WHERE IFNULL(e.origin, '') != 'mcp'
+                        AND e.kind NOT IN ('created', 'regressed', 'risk')
+                        AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id)))
+                 FROM findings f WHERE f.id = ?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            if old.origin.as_deref() != Some("mcp") || person_touched {
+                let whose = if old.origin.as_deref() != Some("mcp") {
+                    format!("it was added {}", crate::provenance::describe(old.origin.as_deref()))
+                } else {
+                    "a person has changed it since (its state, note, fields, ticket or issue)".to_string()
+                };
+                return Err(Error::InvalidInput(format!(
+                    "finding {id}: through MCP an agent edits only the findings it added that no person has changed \
+                     since, and {whose}; mark it with a note instead (findings mark {id} --note ...)"
+                )));
+            }
+        }
+        if let Some(want) = e.if_revision.as_deref() {
+            let now = old.revision();
+            if want != now {
+                return Err(Error::Conflict(format!(
+                    "finding {id} is at revision {now}, not {want}: it was changed elsewhere meanwhile; show it again"
+                )));
+            }
+        }
+
+        let mut new = old.clone();
+        if let Some(t) = &title {
+            new.title = t.clone();
+            new.alert_ref = manual_alert_ref(t)?;
+        }
+        if let Some(r) = e.risk {
+            new.risk = r.as_str().to_string();
+        }
+        if let Some(c) = e.confidence {
+            new.confidence = c.as_str().to_string();
+        }
+        if let Some(u) = &e.url {
+            let (parsed, url) = manual_url(u.trim())?;
+            new.host = url_host(&parsed);
+            new.url = url;
+        }
+        if let Some(m) = &e.method {
+            new.method = manual_method(m)?;
+        }
+        if let Some(p) = &e.param {
+            new.param = p.clone();
+        }
+        if let Some(c) = e.cwe {
+            new.cwe = c.filter(|&c| c > 0).map(i64::from);
+        }
+        if let Some(h) = &e.history {
+            new.history = linked_entries(&tx, h)?.0;
+        }
+        if let Some(ev) = &e.evidence {
+            new.evidence = ev.clone();
+        }
+
+        let dedupe = dedupe_key(&new.alert_ref, &new.method, &new.url, &new.param);
+        if let Some(other) = tx
+            .query_row("SELECT id FROM findings WHERE dedupe = ?1 AND id != ?2", params![dedupe, id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+        {
+            return Err(Error::Conflict(format!(
+                "finding {other} is already this issue (same title, method, URL without its query or path \
+                 parameters, and parameter)"
+            )));
+        }
+
+        // The texts of the alert type it is in after the edit: given ones, else (for a new title)
+        // this finding's, where that type has none.
+        let carried = (new.alert_ref != old.alert_ref).then_some(&old);
+        let (texts, replaced) =
+            edit_texts(&tx, &new, e.description.as_deref(), e.solution.as_deref(), carried, e.replace_text)?;
+        new.description = texts.0;
+        new.solution = texts.1;
+
+        let changed = old.changes(&new);
+        if changed.is_empty() {
+            tx.commit()?;
+            return Ok(FindingEdited { changed, replaced, revision: old.revision() });
+        }
+        // Looked up before the row changes, which would make it find itself.
+        let issue = match old.issue {
+            Some(from) if new.alert_ref != old.alert_ref || new.host != old.host => {
+                issue_after_edit(&tx, id, from, &old, &new)?
+            }
+            _ => IssueChange::Keep,
+        };
+        tx.execute(
+            "UPDATE findings SET name = ?2, alert_ref = ?3, risk = ?4, risk_level = ?5, confidence = ?6, cwe = ?7,
+                host = ?8, method = ?9, url = ?10, param = ?11, evidence = ?12, history_id = ?13,
+                last_history_id = ?14, dedupe = ?15
+             WHERE id = ?1",
+            params![
+                id,
+                new.title,
+                new.alert_ref,
+                new.risk,
+                Risk::parse(&new.risk).map_or(0, Risk::level),
+                new.confidence,
+                new.cwe,
+                new.host,
+                new.method,
+                new.url,
+                new.param,
+                new.evidence,
+                new.history.first(),
+                new.history.last(),
+                dedupe,
+            ],
+        )?;
+        // The table holds a first and a last entry; a longer list goes in meta.
+        let list = (new.history.len() > 2).then(|| serde_json::to_string(&new.history).unwrap_or_default());
+        match list {
+            Some(l) => tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![history_key(id), l],
+            )?,
+            None => tx.execute("DELETE FROM meta WHERE key = ?1", [history_key(id)])?,
+        };
+        let (was, now) = old.values(&new, &changed);
+        crate::scan::issues::record(
+            &tx,
+            &crate::scan::issues::Event {
+                finding: Some(id),
+                kind: "edited",
+                old: was.as_deref(),
+                new: now.as_deref(),
+                text: Some(&changed.join(", ")),
+                ..Default::default()
+            },
+        )?;
+        match issue {
+            IssueChange::Keep => {}
+            IssueChange::Rekey(i) => {
+                tx.execute(
+                    "UPDATE issues SET alert_ref = ?2, host = ?3 WHERE id = ?1",
+                    params![i, new.alert_ref, new.host],
+                )?;
+            }
+            IssueChange::Move(from, to) => {
+                crate::scan::issues::move_findings(&tx, &[id], from, to)?;
+            }
+        }
+        // A comparison with a report from before the edit still knows it by what it was.
+        let was = dedupe_key(&old.alert_ref, &old.method, &old.url, &old.param);
+        if was != dedupe {
+            let key = identities_key(id);
+            let stored: Option<String> =
+                tx.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?;
+            let mut earlier: Vec<String> = stored.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+            let print = fingerprint(&old.alert_ref, &old.method, &old.url, &old.param);
+            if !earlier.contains(&print) {
+                earlier.push(print);
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, serde_json::to_string(&earlier).unwrap_or_default()],
+                )?;
+            }
+        }
+        let revision = ManualRow::load(&tx, id)?.revision();
+        tx.commit()?;
+        Ok(FindingEdited { changed, replaced, revision })
     }
 
     /// Removes findings added by hand; scanner findings are refused (mark them instead), and
@@ -1212,8 +1381,389 @@ pub struct ManualFinding {
     pub replace_text: bool,
 }
 
+/// What `findings edit` changes in a finding added by hand: each field given, and nothing else.
+#[derive(Debug, Clone, Default)]
+pub struct FindingEdit {
+    pub title: Option<String>,
+    pub risk: Option<Risk>,
+    pub confidence: Option<Confidence>,
+    pub url: Option<String>,
+    pub method: Option<String>,
+    pub param: Option<String>,
+    /// `Some(None)` clears it.
+    pub cwe: Option<Option<u32>>,
+    /// The history entries it links to, in place of the ones it has (empty: none).
+    pub history: Option<Vec<i64>>,
+    pub evidence: Option<String>,
+    pub description: Option<String>,
+    pub solution: Option<String>,
+    /// Replace the description or solution its alert type has when the one given differs.
+    pub replace_text: bool,
+    /// Only if the finding is still at this revision (see [`crate::store::revision`]).
+    pub if_revision: Option<String>,
+    /// Only a finding added through MCP that no person has edited since (an agent's edit).
+    pub only_own: bool,
+}
+
+/// What [`Store::finding_edit`] did.
+#[derive(Debug, Clone)]
+pub struct FindingEdited {
+    /// The fields that changed, in the order `findings edit` lists them; empty when none did.
+    pub changed: Vec<&'static str>,
+    /// The texts of its alert type that were replaced ("description", "solution").
+    pub replaced: Vec<&'static str>,
+    /// Its revision after the edit.
+    pub revision: String,
+}
+
+/// A finding added by hand, as `findings edit` reads and writes it.
+#[derive(Debug, Clone)]
+struct ManualRow {
+    source: String,
+    state: String,
+    origin: Option<String>,
+    issue: Option<i64>,
+    title: String,
+    alert_ref: String,
+    risk: String,
+    confidence: String,
+    cwe: Option<i64>,
+    host: String,
+    method: String,
+    url: String,
+    param: String,
+    evidence: String,
+    history: Vec<i64>,
+    description: String,
+    solution: String,
+}
+
+impl ManualRow {
+    fn load(conn: &rusqlite::Connection, id: i64) -> Result<Self> {
+        type Row = (Option<i64>, Option<i64>, ManualRow);
+        let (first, last, mut row): Row = conn
+            .query_row(
+                "SELECT f.history_id, f.last_history_id, f.source, f.state, f.origin, f.issue_id, f.name, f.alert_ref,
+                    f.risk, f.confidence, f.cwe, f.host, f.method, f.url, f.param, f.evidence,
+                    coalesce(t.description, ''), coalesce(t.solution, '')
+                 FROM findings f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref WHERE f.id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        ManualRow {
+                            source: r.get(2)?,
+                            state: r.get(3)?,
+                            origin: r.get(4)?,
+                            issue: r.get(5)?,
+                            title: r.get(6)?,
+                            alert_ref: r.get(7)?,
+                            risk: r.get(8)?,
+                            confidence: r.get(9)?,
+                            cwe: r.get(10)?,
+                            host: r.get(11)?,
+                            method: r.get(12)?,
+                            url: r.get(13)?,
+                            param: r.get(14)?,
+                            evidence: r.get(15)?,
+                            history: Vec::new(),
+                            description: r.get(16)?,
+                            solution: r.get(17)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
+        row.history = history_ids(conn, id, first, last)?;
+        Ok(row)
+    }
+
+    /// What `findings edit` can change, as stored.
+    fn fields(&self) -> [(&'static str, Value); 11] {
+        [
+            ("title", json!(self.title)),
+            ("risk", json!(self.risk)),
+            ("confidence", json!(self.confidence)),
+            ("method", json!(self.method)),
+            ("url", json!(self.url)),
+            ("param", json!(self.param)),
+            ("cwe", json!(self.cwe)),
+            ("history_ids", json!(self.history)),
+            ("evidence", json!(self.evidence)),
+            ("description", json!(self.description)),
+            ("solution", json!(self.solution)),
+        ]
+    }
+
+    fn revision(&self) -> String {
+        crate::store::revision(&Value::Object(self.fields().into_iter().map(|(k, v)| (k.to_string(), v)).collect()))
+    }
+
+    /// The fields that differ in `new`.
+    fn changes(&self, new: &ManualRow) -> Vec<&'static str> {
+        self.fields().into_iter().zip(new.fields()).filter(|(a, b)| a.1 != b.1).map(|(a, _)| a.0).collect()
+    }
+
+    /// The values the `changed` fields had and have, as JSON objects for the `edited` event;
+    /// None when only texts changed. The description and solution are left out: the type keeps
+    /// a replaced one in `replaced_texts`, and one filled in replaced nothing.
+    fn values(&self, new: &ManualRow, changed: &[&str]) -> (Option<String>, Option<String>) {
+        let pick = |row: &ManualRow| -> Option<String> {
+            let fields = row.fields().into_iter();
+            let kept = fields.filter(|(k, _)| changed.contains(k) && !matches!(*k, "description" | "solution"));
+            let map: serde_json::Map<String, Value> = kept.map(|(k, v)| (k.to_string(), v)).collect();
+            (!map.is_empty()).then(|| Value::Object(map).to_string())
+        };
+        (pick(self), pick(new))
+    }
+}
+
+/// The revision of finding `id` when it was added by hand (`findings show` gives it); None for
+/// a scanner's, which `findings edit` doesn't change.
+fn manual_revision(conn: &rusqlite::Connection, id: i64) -> Result<Option<String>> {
+    let row = ManualRow::load(conn, id)?;
+    Ok((row.source == MANUAL_SOURCE).then(|| row.revision()))
+}
+
+/// Refuses a text over its limit: (what it is, the text, the most bytes it may have).
+fn check_sizes(texts: &[(&str, &String, usize)]) -> Result<()> {
+    match texts.iter().find(|(_, text, max)| text.len() > *max) {
+        Some((what, _, max)) => Err(Error::InvalidInput(format!("the {what} is over {max} bytes"))),
+        None => Ok(()),
+    }
+}
+
+/// A history entry's method and URL.
+type Line = (String, String);
+
+/// The history entries `ids` links to, each once and in order, with the first one's method and
+/// URL. Each must exist and must not have been refused for the scope.
+fn linked_entries(conn: &rusqlite::Connection, ids: &[i64]) -> Result<(Vec<i64>, Option<Line>)> {
+    if ids.len() > MANUAL_HISTORY_MAX {
+        return Err(Error::InvalidInput(format!("link at most {MANUAL_HISTORY_MAX} history entries")));
+    }
+    let mut history: Vec<i64> = Vec::new();
+    let mut first: Option<Line> = None;
+    for &id in ids {
+        if history.contains(&id) {
+            continue;
+        }
+        history.push(id);
+        let row: Option<(String, String, Option<String>)> = conn
+            .query_row("SELECT method, url, error FROM history WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        match row {
+            // A request refused for its scope (its Host, say) went nowhere, so it shows
+            // nothing, and a retest would send what was refused.
+            Some((_, _, Some(e))) if e.starts_with("out of scope") => {
+                return Err(Error::OutOfScope(format!(
+                    "history entry {id} was refused for the scope when it was sent, so it can't be evidence"
+                )))
+            }
+            Some((method, url, _)) => {
+                first.get_or_insert((method, url));
+            }
+            None => return Err(Error::NotFound(format!("history entry {id}"))),
+        }
+    }
+    Ok((history, first))
+}
+
+/// A method as given for a finding added by hand, in upper case: one word.
+fn manual_method(method: &str) -> Result<String> {
+    let method = method.trim().to_ascii_uppercase();
+    if method.is_empty()
+        || method.len() > 32
+        || !method.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(Error::InvalidInput(format!("{method:?} is not an HTTP method")));
+    }
+    Ok(method)
+}
+
+/// The host of a finding's URL as stored: without an IPv6 address's brackets.
+fn url_host(parsed: &url::Url) -> String {
+    parsed.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string()
+}
+
+/// Keeps the description and solution the alert type `alert_ref` has before they are replaced,
+/// with when and by whom (gui, cli or mcp; MCP calls can't pass --replace-text, so an agent
+/// never does), for `findings show` to list in `replaced_texts`.
+fn keep_replaced_texts(conn: &rusqlite::Connection, alert_ref: &str) -> Result<()> {
+    let key = replaced_texts_key(alert_ref);
+    let earlier: Option<String> =
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?;
+    let mut list: Vec<Value> = earlier.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+    let (description, solution, time): (String, String, String) = conn.query_row(
+        "SELECT description, solution, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM finding_types WHERE alert_ref = ?1",
+        [alert_ref],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    list.push(json!({
+        "time": time,
+        "by": crate::provenance::origin(),
+        "description": description,
+        "solution": solution,
+    }));
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, Value::Array(list).to_string()],
+    )?;
+    Ok(())
+}
+
+/// Sets the description and solution of the alert type an edited finding `row` is in (made
+/// for a new title, named by it), and returns them with the texts it replaced. A given text
+/// fills a blank one; one that differs from a text the type has (an empty one too) replaces it
+/// only with `replace_text`, and the earlier one is kept. A text not given stays, or, when the
+/// finding moved here from another type (`carried`) and this one has none, is that type's, with
+/// whoever wrote it.
+fn edit_texts(
+    conn: &rusqlite::Connection,
+    row: &ManualRow,
+    description: Option<&str>,
+    solution: Option<&str>,
+    carried: Option<&ManualRow>,
+    replace_text: bool,
+) -> Result<((String, String), Vec<&'static str>)> {
+    type Texts = (String, String, Option<String>, Option<String>);
+    let texts = |alert_ref: &str| -> Result<Option<Texts>> {
+        Ok(conn
+            .query_row(
+                "SELECT coalesce(description, ''), coalesce(solution, ''), description_origin, solution_origin
+                 FROM finding_types WHERE alert_ref = ?1",
+                [alert_ref],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?)
+    };
+    let current = texts(&row.alert_ref)?;
+    let exists = current.is_some();
+    let (mut d, mut s, mut d_by, mut s_by) = current.clone().unwrap_or_default();
+    let from = match carried {
+        Some(c) => texts(&c.alert_ref)?,
+        None => None,
+    };
+    let by = crate::provenance::origin().to_string();
+    let mut replaced = Vec::new();
+    for (what, text, text_by, given, carry) in [
+        ("description", &mut d, &mut d_by, description, from.as_ref().map(|f| (&f.0, &f.2))),
+        ("solution", &mut s, &mut s_by, solution, from.as_ref().map(|f| (&f.1, &f.3))),
+    ] {
+        match given.map(str::trim) {
+            Some(g) if g == text.as_str() => {}
+            Some(g) => {
+                if !text.is_empty() {
+                    replaced.push(what);
+                }
+                *text = g.to_string();
+                *text_by = (!g.is_empty()).then(|| by.clone());
+            }
+            None => {
+                if let Some((t, t_by)) = carry.filter(|(t, _)| text.is_empty() && !t.is_empty()) {
+                    *text = t.clone();
+                    *text_by = t_by.clone();
+                }
+            }
+        }
+    }
+    if !replaced.is_empty() {
+        if !replace_text {
+            return Err(Error::Conflict(format!(
+                "the {} differs from the one every finding titled {:?} shares; leave it out to keep that one, or \
+                 give --replace-text to replace it",
+                replaced.join(" and "),
+                row.title
+            )));
+        }
+        keep_replaced_texts(conn, &row.alert_ref)?;
+    }
+    if !exists {
+        conn.execute(
+            "INSERT INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags,
+                description_origin, solution_origin)
+             VALUES (?1, 0, ?2, ?3, ?4, '[]', '[\"manual\"]', ?5, ?6)",
+            params![row.alert_ref, row.title, d, s, d_by, s_by],
+        )?;
+    } else if current != Some((d.clone(), s.clone(), d_by.clone(), s_by.clone())) {
+        conn.execute(
+            "UPDATE finding_types SET description = ?2, solution = ?3, description_origin = ?4, solution_origin = ?5
+             WHERE alert_ref = ?1",
+            params![row.alert_ref, d, s, d_by, s_by],
+        )?;
+    }
+    Ok(((d, s), replaced))
+}
+
 fn history_key(id: i64) -> String {
     format!("finding.{id}.history")
+}
+
+/// The identities (`fingerprint`s) a finding added by hand had before `findings edit` changed
+/// its title, method, URL or parameter, oldest first, which `findings compare` still matches.
+fn identities_key(id: i64) -> String {
+    format!("finding.{id}.identities")
+}
+
+/// The earlier identities of every finding edited by hand, by finding id (see [`identities_key`]).
+pub(crate) fn earlier_identities(conn: &rusqlite::Connection) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+    let mut stmt = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'finding.%.identities'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        let id = key.strip_prefix("finding.").and_then(|k| k.strip_suffix(".identities")).and_then(|k| k.parse().ok());
+        if let (Some(id), Ok(list)) = (id, serde_json::from_str::<Vec<String>>(&value)) {
+            out.insert(id, list);
+        }
+    }
+    Ok(out)
+}
+
+/// What an edit that changed a finding's alert type or host does to its issue.
+enum IssueChange {
+    Keep,
+    /// The finding was its issue's only one: the issue (its title, CVSS and write-up) goes
+    /// with it, to its new alert type and host.
+    Rekey(i64),
+    Move(i64, i64),
+}
+
+/// Where finding `id` of issue `from` goes once edited from `old` to `new`, which changed its
+/// alert type or host. It joins the issue findings of its new type and host are in; else the
+/// issue it was the only live finding of goes with it; else it leaves for one of its own. A
+/// host change alone keeps it in an issue a person merged across hosts.
+fn issue_after_edit(
+    conn: &rusqlite::Connection,
+    id: i64,
+    from: i64,
+    old: &ManualRow,
+    new: &ManualRow,
+) -> Result<IssueChange> {
+    // Removed findings don't count: the issue's write-up isn't about them.
+    let (others, elsewhere): (i64, i64) = conn.query_row(
+        "SELECT count(*), coalesce(sum(host != ?3), 0) FROM findings WHERE issue_id = ?1 AND id != ?2 AND state != ?4",
+        params![from, id, old.host, REMOVED],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if new.alert_ref == old.alert_ref && elsewhere > 0 {
+        return Ok(IssueChange::Keep);
+    }
+    let joined: Option<i64> = conn.query_row(
+        "SELECT min(issue_id) FROM findings WHERE alert_ref = ?1 AND host = ?2 AND id != ?3",
+        params![new.alert_ref, new.host, id],
+        |r| r.get(0),
+    )?;
+    let to = match joined {
+        Some(to) => to,
+        None if others == 0 => return Ok(IssueChange::Rekey(from)),
+        None => crate::scan::issues::issue_for(conn, &new.alert_ref, &new.host)?,
+    };
+    Ok(if to == from { IssueChange::Keep } else { IssueChange::Move(from, to) })
 }
 
 /// When a finding was removed and by whom (`by`: gui or cli), and the triage state it had and
@@ -2135,5 +2685,89 @@ mod tests {
         s.findings_rescan_start("passive", &[]).unwrap();
         s.findings_rescan_finish("passive", &[]).unwrap();
         assert!(matches!(s.finding_get(id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn only_a_finding_added_by_hand_is_edited_and_its_links_are_kept_in_order() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/a");
+        let scanner = xpb(&s)[0]["id"].as_i64().unwrap();
+        let e = s.finding_edit(scanner, &FindingEdit { risk: Some(Risk::High), ..Default::default() }).unwrap_err();
+        assert!(matches!(e, Error::InvalidInput(ref m) if m.contains("passive scanner")), "{e}");
+        assert_eq!(s.finding_get(scanner).unwrap()["risk"], "low");
+
+        // More entries than the row holds go in meta; back to two, the list there goes.
+        let hs: Vec<i64> = ["/b", "/c", "/d"].iter().map(|p| seen_at(&mut s, p)).collect();
+        let id = s.finding_add(&manual("Leak", Some("http://app.test/x"), vec![])).unwrap();
+        let rev = manual_revision(&s.conn, id).unwrap().unwrap();
+        let edit = FindingEdit { history: Some(hs.clone()), if_revision: Some(rev.clone()), ..Default::default() };
+        let done = s.finding_edit(id, &edit).unwrap();
+        assert_eq!(done.changed, ["history_ids"]);
+        assert_eq!(s.finding_history_ids(id).unwrap(), hs);
+        assert_eq!(done.revision, manual_revision(&s.conn, id).unwrap().unwrap());
+        s.finding_edit(id, &FindingEdit { history: Some(hs[..2].to_vec()), ..Default::default() }).unwrap();
+        assert_eq!(s.finding_history_ids(id).unwrap(), hs[..2]);
+        assert!(s.meta_get(&history_key(id)).unwrap().is_none());
+        let stale = FindingEdit { risk: Some(Risk::Low), if_revision: Some(rev), ..Default::default() };
+        assert!(matches!(s.finding_edit(id, &stale), Err(Error::Conflict(_))));
+
+        // Joining a title whose findings have a write-up takes theirs; its own stays with its old title.
+        let theirs =
+            ManualFinding { description: "Theirs.".into(), ..manual("Other", Some("http://app.test/y"), vec![]) };
+        s.finding_add(&theirs).unwrap();
+        s.finding_edit(id, &FindingEdit { description: Some("Mine.".into()), ..Default::default() }).unwrap();
+        let done = s.finding_edit(id, &FindingEdit { title: Some("other".into()), ..Default::default() }).unwrap();
+        assert_eq!(done.changed, ["title", "description"]);
+        let f = s.finding_get(id).unwrap();
+        assert_eq!((f["alert_ref"].as_str(), f["description"].as_str()), (Some("manual:other"), Some("Theirs.")));
+        let leak: String = s
+            .conn
+            .query_row("SELECT description FROM finding_types WHERE alert_ref = 'manual:leak'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leak, "Mine.");
+        // The same finding as the one it now shares a title with is refused.
+        let same = FindingEdit { url: Some("http://app.test/y".into()), ..Default::default() };
+        assert!(matches!(s.finding_edit(id, &same), Err(Error::Conflict(_))));
+    }
+
+    #[test]
+    fn a_finding_is_shown_with_the_revision_of_what_it_shows() {
+        let dir = std::env::temp_dir().join(format!("bp-findings-rev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let mut reader = Store::create(&path).unwrap();
+        let id = reader.finding_add(&manual("Leak", Some("http://app.test/x"), vec![])).unwrap();
+        let before = manual_revision(&reader.conn, id).unwrap().unwrap();
+        // Another process edits the finding while it is being read: once the first statement has
+        // its snapshot (its first instructions open the read), and before the read ends.
+        let mut writer = std::panic::AssertUnwindSafe(Some(Store::open(&path).unwrap()));
+        let mut steps = 0;
+        reader
+            .conn
+            .progress_handler(
+                1,
+                Some(move || {
+                    steps += 1;
+                    if steps < 20 {
+                        return false;
+                    }
+                    if let Some(mut w) = writer.take() {
+                        let edit = FindingEdit { evidence: Some("changed".into()), ..Default::default() };
+                        w.finding_edit(id, &edit).unwrap();
+                    }
+                    false
+                }),
+            )
+            .unwrap();
+        let shown = reader.finding_get(id).unwrap();
+        reader.conn.progress_handler(1, None::<fn() -> bool>).unwrap();
+        let after = manual_revision(&reader.conn, id).unwrap().unwrap();
+        assert_ne!(before, after, "the edit happened");
+        // Whichever version it showed, its revision is that version's.
+        let want = if shown["evidence"] == "changed" { &after } else { &before };
+        assert_eq!(shown["revision"].as_str(), Some(want.as_str()), "{shown}");
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

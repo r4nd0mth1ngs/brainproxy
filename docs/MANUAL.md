@@ -199,8 +199,9 @@ CRLF-injection test) needs `--host-header-test` through MCP, as it can start a H
 
 Settings that put a Host on requests still to come are checked when they are saved too: an auth
 profile's `--header` or `--token-header`, its login request and `--login-header` (the login
-URL's own host is fine), a macro's steps (`auth macro add`), and a match-and-replace rule (`rules
-add`, `rules import`, or `rules enable` of a disabled one) whose replacement writes a Host line
+URL's own host is fine), a macro's steps (`auth macro add` and `auth macro edit`: every step's,
+except a host the macro it replaces already sent), and a match-and-replace rule (`rules add`,
+`rules edit`, `rules import`, or `rules enable` of a disabled one) whose replacement writes a Host line
 or an absolute URL, sets the header named `Host`, rewrites the Host of a request to a host the
 engagement lists, or copies a header's name or the request target from the request (`$1`). A rule
 can match anything, so that check is best effort; the proxy also compares each request's foreign
@@ -931,6 +932,12 @@ Access control across users: does the app let bob read alice's data? See
   earlier report shows it as removed, not fixed. Scanner findings can't be removed, only
   marked. If the description or solution differs from the one findings with that title
   already share, the form says so and offers to replace it (the earlier text is kept).
+  *Edit…* opens the same form filled in with a finding you added: only what you change is
+  saved, and the finding keeps its number, state, note and timeline, where the edit shows with
+  the values before and after. A changed description or solution replaces the one every finding
+  with that title shares (the dialog says so; the earlier text is kept). If the finding was
+  changed elsewhere meanwhile (by an agent, say), the save fails and says so rather than
+  overwrite it.
 - **Compare with a scan:** pick a finished active scan to show only what it found for the
   first time (*New in*), what it found again (*Still found by*), or what it covered but
   didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
@@ -1052,6 +1059,9 @@ byte, side by side or unified.
     the same name get it automatically; cookies carry through the steps into the session.
     *Run* shows each step's request, status and history entry, and the values found, masked
     (first four characters and the length). The values become the session's latest.
+    *Edit…* changes a macro in place: move steps up or down, take them out, add more from
+    Traffic, and change what is extracted (an extractor moves with its step). The macro keeps
+    its name and its place, and the session rules that run it go on running it.
   - **Session rules:** what to do before a request goes out with this profile, for the
     tools you tick (proxy, send, fuzz, crawl including API import requests, scan, checks;
     none ticked means all) and a URL: a host pattern like `*.app.test` or a URL prefix like
@@ -1109,7 +1119,11 @@ byte, side by side or unified.
   [Scripts](#scripts)). **Whole request (script)** gives each request to a script that may
   change it, block it, or answer it itself so nothing is sent; the tester says what it did and
   shows its answer, and Traffic marks a row it answered (`200*`, a *script answer* tag) or
-  blocked. *Copy as JSON* and *Import* move rules between
+  blocked. *Edit…* (or a double-click on a rule) changes a saved rule in place, keeping its
+  number, its place in the list and whether it is on; changing what it does (anything but the
+  comment) makes you the one who set it, and a new script file is asked about first. If the
+  rule was changed elsewhere meanwhile, the save fails and the list is read again.
+  *Copy as JSON* and *Import* move rules between
   projects through the clipboard; an import that would run scripts names their files first. In Traffic, an exchange a rule changed has both versions:
   *Before rules* and *Sent* on the request, *Received* and *After rules* on the response. See
   [Match-and-replace rules](#match-and-replace-rules-rules).
@@ -1207,7 +1221,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 192 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 195 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1518,6 +1532,28 @@ stdin) into this or another project: each rule gets a new id and the importer's 
 checked as `rules add` checks it; `--replace` removes the rules there are first, `--disabled`
 adds them all disabled.
 
+`rules edit ID` changes a rule in place, with the flags of `rules add`: only what is given
+changes, and the rule keeps its id, its place in the list and whether it is on. An empty
+`--name`, `--host`, `--content-type` or `--comment` removes it (the action goes with the name), `--replace` makes
+a script rule's replacement text again and `--script` has a script make it. The edited rule is
+checked as `rules add` checks one. An edit that changes what the rule does (anything but its
+comment) records whoever made it as the rule's origin, as `rules enable` does, so an agent's
+change to a person's rule is the agent's in `edited_by` and is held to the agent's checks;
+`--host-header-test` is taken from the edit (alone, it marks the rule as a Host-header test). A
+comment alone keeps both. Through MCP a script rule's workings can't be changed (only its
+comment), nor a request rule's that is on, and `--script` is refused.
+
+`rules list` gives each rule's `revision` in `revisions` (by id); `rules edit --if-revision REV`
+fails with a conflict, changing nothing, when the rule has changed since. A revision is a
+fingerprint of the rule as saved, not a counter. Every `rules` command that changes the rules
+saves them only if no other process saved them since it read them, and otherwise fails with a
+conflict, so two changes made at once never lose one.
+
+```sh
+brainproxy rules edit 3 --replace admin --comment "was user"
+brainproxy rules edit 3 --applies-to proxy,send --if-revision 6c64c02d78891421
+```
+
 A rule that puts a host the scope doesn't list in the Host header (or makes the request
 target an absolute URL) is checked as before, structured or not: saving it warns a person and
 is refused through MCP without `--host-header-test`, and a request an agent's rule did that to
@@ -1529,7 +1565,7 @@ request --script FILE` has one decide what happens to each request; see [Scripts
 #### Response presets (`rules presets`)
 
 A preset is a set of ready-made response rules for what a tester most often changes in what the
-browser is shown, like the response modification options of Burp's proxy. `rules presets list`
+browser is shown. `rules presets list`
 describes them with the rules each adds; `rules presets add NAME...` saves those rules. They are
 ordinary rules for the responses the proxy relays (no `--applies-to`), each with a comment that
 names its preset (`preset unhide-fields: ...`), so they list, switch on and off, and are removed
@@ -1563,7 +1599,7 @@ check a script makes, is out of their reach (`remove-scripts` stops those script
 an attribute value, a `<textarea>`, a script's string or a comment is rewritten like any other, so
 a commented-out `<script>` without its end tag is removed with everything up to the next real
 `</script>`. A page in a charset that isn't ASCII-compatible (UTF-16) is matched by none of them.
-Burp's "convert HTTPS links to HTTP" isn't offered: the browser would then ask the proxy for
+A preset that turns HTTPS links into HTTP isn't offered: the browser would then ask the proxy for
 plain HTTP, and nothing upgrades such a request back to HTTPS upstream, so most sites would
 redirect back or break.
 
@@ -2383,6 +2419,18 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   step is sent to its `Host` over `--scheme` (default https) unless the request line has a
   full URL or ORIGIN is given. `auth macro list/show/run/remove`; a macro a rule runs
   can't be removed until the rule is.
+- `auth macro edit PROFILE NAME [--step SPEC ...] [--extract STEP:VAR=KIND:EXPR ... | --no-extract]`
+  changes a macro in place: it keeps its name and its place among the profile's macros, and the
+  session rules that run it go on running it. `--step` replaces the steps, in order; besides what
+  `auth macro add` takes, `step:N` is the macro's own step N as it is, with its extractors
+  (`--step step:2 --step step:1` swaps two steps, `--step step:1 --step 42` adds one).
+  `--extract` replaces every extractor (STEP is a step of the edited macro) and `--no-extract`
+  removes them all. The macro is checked as `auth macro add` checks one, and a changed macro
+  records whoever edited it as its origin. `auth macro show` gives its `revision`, and
+  `--if-revision REV` fails with a conflict, changing nothing, when the macro has changed since.
+- Every `auth macro`, `auth rule` and `auth sign` command that changes a profile's macros, rules
+  or signers saves them only if no other process saved them since it read them, and otherwise
+  fails with a conflict, so two changes made at once never lose one.
 - `auth macro run` fails (exit code 2) when a step gets no response or a value isn't
   found, and says which, with each step's status and history id.
 - `auth rule add PROFILE --action SPEC ... [--tool T,...] [--url PATTERN] [--invalid REGEX]`,
@@ -2666,6 +2714,46 @@ brainproxy findings remove 17
   `removed` in `findings show` also says who removed it (`by`) and who set the state it had.
   Reports say how each was added, and one an agent added is marked *added via MCP (an agent)*
   in the HTML report and in the app, never *found by hand*.
+
+`findings edit ID` changes a finding added by hand in place, with the flags of `findings add`:
+only what is given changes, and the finding keeps its id, state, note, timeline and `origin`.
+
+```sh
+brainproxy findings edit 17 --risk critical --param order_id --evidence 'order 8 of bob'
+brainproxy findings edit 17 --title "Invoice IDOR" --if-revision 6c64c02d78891421
+```
+
+- `--history-id` replaces the linked entries, `--no-history` unlinks them all, and `--cwe 0`
+  clears the CWE. `--input-json` changes only the fields its JSON gives.
+- An edit that changes something adds an `edited` event to the finding's timeline: who made it
+  (`origin`), the fields in `text`, and their values before and after as JSON in `old` and
+  `new` (a replaced description or solution is kept in `replaced_texts` instead). The result
+  names the fields in `changed`; an edit that gives the values the finding has changes nothing
+  and records nothing.
+- The description and solution belong to the title's alert type, as for `findings add`: a given
+  one fills a blank one, and one that differs from the type's (an empty one too) is refused with
+  `conflict` unless `--replace-text`. A new title moves the finding to its alert type; it takes
+  that type's write-up, or this finding's when the type has none, and the old title's other
+  findings keep theirs.
+- With a new title or a URL on another host, the finding joins the issue of the findings of that
+  title and host (a `moved` event), or one of its own when there are none. The only live finding
+  of its issue takes the issue with it instead, so the issue's title, CVSS and write-up stay with
+  the finding they describe; and a host change alone keeps a finding in an issue merged across
+  hosts.
+- A finding keeps the identities it had before an edit changed its title, method, URL or
+  parameter (`finding.ID.identities` in `meta`), and `findings compare` against a baseline from
+  before the edit matches it by them: it is unchanged (or removed, if it was removed since), not
+  fixed and new. Comparing two report files doesn't know them.
+- The same title, method, URL without its query or path parameters, and parameter as another
+  finding is refused with `conflict`; so is a removed finding. A scanner's finding is refused:
+  mark it instead.
+- `findings show` gives a finding added by hand its `revision`; `--if-revision REV` fails with a
+  conflict, changing nothing, when it has changed since (a revision is a fingerprint of the
+  fields an edit changes, write-up included).
+- Through MCP an agent edits only the findings it added (`origin` `mcp`) that no person has
+  changed since: a person's triage, note, edit or ticket, a move between issues, or a write-up,
+  title or review of its issue vouches for it as it is. Such a finding is refused, and the agent
+  marks it with a note instead. The file flags only take `-`, and `--replace-text` is refused.
 
 ### What is recorded when a request doesn't finish
 

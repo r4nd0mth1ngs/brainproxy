@@ -109,9 +109,43 @@ export function eventText(e: FindingEvent): string {
       return "Removed";
     case "ticket":
       return `${e.new === "jira" ? "Jira" : "GitHub"} ticket filed${e.text ? `: ${e.text}` : ""}`;
+    case "edited":
+      return editedText(e);
     default:
       return `${e.kind} ${said(e.new)}`.trim();
   }
+}
+
+/** The longest value an edit's timeline line quotes. */
+const EDITED_VALUE_MAX = 60;
+
+/**
+ * What a `findings edit` changed, for its timeline line: each field with its value before and
+ * after ("risk high → critical"), the description and solution by name only (the earlier
+ * text is in the finding's replaced texts).
+ */
+export function editedText(e: FindingEvent): string {
+  const parse = (s: string | null): Record<string, unknown> => {
+    try {
+      const v = s ? JSON.parse(s) : {};
+      return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+    } catch {
+      return {};
+    }
+  };
+  const was = parse(e.old);
+  const now = parse(e.new);
+  const label = (f: string) => (f === "history_ids" ? "history entries" : f === "param" ? "parameter" : f);
+  const shown = (v: unknown): string => {
+    if (v == null || v === "") return "none";
+    if (Array.isArray(v)) return v.length ? v.map((id) => `#${id}`).join(", ") : "none";
+    // Cut by code point, so an emoji or other astral character isn't split in half.
+    const chars = [...(typeof v === "string" ? `"${v}"` : String(v))];
+    return chars.length > EDITED_VALUE_MAX ? `${chars.slice(0, EDITED_VALUE_MAX - 1).join("")}…` : chars.join("");
+  };
+  const fields = (e.text ?? "").split(",").map((f) => f.trim()).filter(Boolean);
+  const parts = fields.map((f) => (f in was || f in now ? `${label(f)} ${shown(was[f])} → ${shown(now[f])}` : label(f)));
+  return parts.length ? `Edited: ${parts.join("; ")}` : "Edited";
 }
 
 /** An issue's write-up and who wrote and reviewed it (`findings issue show`'s narrative). */

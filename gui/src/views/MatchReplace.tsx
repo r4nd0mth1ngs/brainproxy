@@ -1,11 +1,12 @@
-// Settings › Match & replace: the rules, an editor for a new one, response presets that add
-// ready-made rules, and a tester that tries rules on a pasted message or a history row without
-// sending anything (`rules test`).
+// Settings › Match & replace: the rules, an editor for a new one, a dialog that edits a saved
+// one in place (`rules edit`), response presets that add ready-made rules, and a tester that
+// tries rules on a pasted message or a history row without sending anything (`rules test`).
 
-import { useEffect, useState } from "react";
-import { bodyText, inTauri, isBinary, textBytes } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { bodyText, CliError, inTauri, isBinary, run, textBytes } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
+import { useDialogFocus } from "../ui/dialogFocus";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
@@ -20,7 +21,10 @@ import {
   describeReplace,
   describeScope,
   describeWhere,
+  draftFromRule,
   draftProblem,
+  editArgs,
+  editRunsNewScript,
   enginesFor,
   failureNote,
   importQuestion,
@@ -62,20 +66,42 @@ export function MatchReplace() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [skipped, setSkipped] = useState<Skipped[]>([]);
   const [failures, setFailures] = useState<Failure[]>([]);
+  // Each rule's revision, which an edit passes so a rule changed elsewhere meanwhile isn't overwritten.
+  const [revisions, setRevisions] = useState<Record<string, string>>({});
   const [selected, setSelected] = useState<number | null>(null);
+  const [editing, setEditing] = useState<Rule | null>(null);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
-  const set = (d: Partial<Draft>) => setDraft((old) => ({ ...old, ...d }));
   const [presets, setPresets] = useState<Preset[]>([]);
   const [presetName, setPresetName] = useState("");
 
-  // Every rules command that changes them answers with the full list.
+  // Every rules command answers with the full list.
+  const show = (d: Listed) => {
+    setRules(d.rules);
+    setSkipped(d.skipped ?? []);
+    setFailures(d.failures ?? []);
+    setRevisions(d.revisions ?? {});
+    if (d.host_warning) app.toast(d.host_warning, "error");
+  };
   const apply = async (args: string[], input?: string) => {
-    const d = await exec<{ rules: Rule[]; skipped?: Skipped[]; failures?: Failure[]; host_warning?: string }>(args, input);
-    if (d) setRules(d.rules);
-    if (d) setSkipped(d.skipped ?? []);
-    if (d) setFailures(d.failures ?? []);
-    if (d?.host_warning) app.toast(d.host_warning, "error");
+    const d = await exec<Listed>(args, input);
+    if (d) show(d);
     return d;
+  };
+  // An edit refused because the rule changed elsewhere reads the rules again and closes the
+  // dialog: saved over, the other change would be lost.
+  const saveEdit = async (id: number, args: string[]) => {
+    try {
+      show(await run<Listed>(args));
+      return true;
+    } catch (e: any) {
+      if (!(e instanceof CliError && e.kind === "conflict")) {
+        app.toast(e.message, "error");
+        return false;
+      }
+      app.toast(`Rule ${id} was changed elsewhere meanwhile, so this edit wasn't saved. The rules were read again: edit it as it is now.`, "error");
+      await apply(["rules", "list"]);
+      return true;
+    }
   };
   useEffect(() => {
     apply(["rules", "list"]);
@@ -146,141 +172,25 @@ export function MatchReplace() {
     { key: "comment", label: "Comment", width: 200, value: (r) => r.comment ?? "" },
   ];
 
-  const named = isNamed(draft);
-  const header = draft.location.endsWith("-header");
-  const noMatch = named && draft.action === "add";
-  const noReplace = named && draft.action === "remove";
-  const scripted = isScripted(draft);
-  // A request rule's script gets the whole request: nothing to match or type in.
-  const wholeRequest = isRequestRule(draft.location);
+  const selectedRule = rules.find((r) => r.id === selected) ?? null;
   return (
     <div className="col fill">
       <div className="toolbar">
-        <select className="input" aria-label="Where the rule works" value={draft.location} onChange={(e) => setDraft(withLocation(draft, e.target.value))}>
-          {GROUPS.map((g) => (
-            <optgroup key={g} label={g}>
-              {LOCATIONS.filter((l) => l.group === g).map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.label}
-                </option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-        {takesName(draft.location) && (
-          <input
-            className="input mono"
-            style={{ width: 150 }}
-            placeholder={header ? "header name (empty: each line)" : "parameter name"}
-            aria-label={header ? "Header name" : "Parameter name"}
-            value={draft.name}
-            onChange={(e) => set({ name: e.target.value })}
-          />
-        )}
-        {named && (
-          <select className="input" aria-label="What to do with it" value={draft.action} onChange={(e) => set({ action: e.target.value })}>
-            <option value="set">Set</option>
-            <option value="add">Add</option>
-            <option value="remove">Remove</option>
-          </select>
-        )}
-        {!wholeRequest && (
-          <>
-            <select className="input" aria-label="How the match is read" value={draft.matcher} disabled={noMatch} onChange={(e) => set({ matcher: e.target.value })}>
-              {MATCHERS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-            <input
-              className="input grow mono"
-              placeholder={noMatch ? "(add takes no match)" : header && !named ? "match (empty: add a header)" : named || !["request-line", "request-body", "response-body"].includes(draft.location) ? "match (empty: the whole value)" : "match"}
-              aria-label="Match"
-              disabled={noMatch}
-              value={noMatch ? "" : draft.match}
-              onChange={(e) => set({ match: e.target.value })}
-            />
-          </>
-        )}
-        {!wholeRequest && (
-          <select
-            className="input"
-            aria-label="What makes the replacement"
-            title="Text you type, or a script: a JavaScript file whose replace(match, ctx) returns what to write for each match"
-            value={draft.replacer}
-            disabled={noReplace}
-            onChange={(e) => set({ replacer: e.target.value === "script" ? "script" : "text" })}
-          >
-            <option value="text">Text</option>
-            <option value="script">Script</option>
-          </select>
-        )}
-        {scripted && !noReplace ? (
-          <>
-            <input
-              className="input grow mono"
-              placeholder={wholeRequest ? "script file: defines request(req, ctx), which may change, block or answer it" : "script file: defines replace(match, ctx)"}
-              aria-label="Script file"
-              value={draft.script}
-              onChange={(e) => set({ script: e.target.value })}
-            />
-            {inTauri && (
-              <button
-                className="btn"
-                onClick={async () => {
-                  const file = await chooseScript();
-                  if (file) set({ script: file });
-                }}
-              >
-                Choose…
-              </button>
-            )}
-          </>
-        ) : (
-          <input
-            className="input grow mono"
-            placeholder={noReplace ? "(removed)" : draft.matcher === "regex" ? "replace ($1 groups; empty removes)" : "replace"}
-            aria-label="Replace"
-            disabled={noReplace}
-            value={noReplace ? "" : draft.replace}
-            onChange={(e) => set({ replace: e.target.value })}
-          />
-        )}
+        <RuleFields draft={draft} onChange={setDraft} />
       </div>
       <div className="toolbar">
-        <span className="muted">Applies to</span>
-        {enginesFor(draft.location).map((e) => (
-          <label className="check" key={e.id}>
-            <input
-              type="checkbox"
-              checked={draft.appliesTo.includes(e.id)}
-              onChange={(ev) => set({ appliesTo: ev.target.checked ? [...draft.appliesTo, e.id] : draft.appliesTo.filter((x) => x !== e.id) })}
-            />{" "}
-            {e.label}
-          </label>
-        ))}
-        <input className="input mono" style={{ width: 170 }} placeholder="host regex (any host)" aria-label="Host regex" value={draft.host} onChange={(e) => set({ host: e.target.value })} />
-        {isResponseRule(draft.location) && (
-          <input
-            className="input mono"
-            style={{ width: 170 }}
-            placeholder="content type (any)"
-            title="Only for responses whose Content-Type matches, as they came (none: empty text)"
-            aria-label="Content type regex"
-            value={draft.contentType}
-            onChange={(e) => set({ contentType: e.target.value })}
-          />
-        )}
-        <input className="input" placeholder="comment" aria-label="Comment" value={draft.comment} onChange={(e) => set({ comment: e.target.value })} />
+        <RuleScope draft={draft} onChange={setDraft} />
         <label className="check">
-          <input type="checkbox" checked={draft.disabled} onChange={(e) => set({ disabled: e.target.checked })} /> disabled
+          <input type="checkbox" checked={draft.disabled} onChange={(e) => setDraft({ ...draft, disabled: e.target.checked })} /> disabled
         </label>
         <button className="btn primary" disabled={!!problem} title={problem ?? undefined} onClick={add}>
           Add rule
         </button>
         <span className="grow" />
         <div className="toolbar-end">
+          <button className="btn" disabled={!selectedRule} title="Change the selected rule in place (or double-click it)" onClick={() => setEditing(selectedRule)}>
+            Edit…
+          </button>
           <button className="btn" disabled={selected == null} onClick={() => selected != null && apply(["rules", "remove", String(selected)]).then(() => setSelected(null))}>
             Remove
           </button>
@@ -322,12 +232,210 @@ export function MatchReplace() {
           rowKey={(r) => r.id}
           selected={selected}
           onSelect={(r) => setSelected(r.id)}
+          onActivate={(r) => setEditing(r)}
           initialSort={{ key: "id", desc: false }}
           rowClass={(r) => (r.enabled && !skippedReason(r, skipped) ? undefined : "set-off")}
           empty="No match-and-replace rules. A rule rewrites what the proxy relays and, if it says so, what Replay, the Fuzzer and scans send."
         />
         <Tester draft={draft} selected={rules.some((r) => r.id === selected) ? selected : null} />
       </Split>
+      {editing && <EditRule key={editing.id} rule={editing} revision={revisions[String(editing.id)]} onClose={() => setEditing(null)} onSave={saveEdit} />}
+    </div>
+  );
+}
+
+/** What every rules command answers. */
+interface Listed {
+  rules: Rule[];
+  skipped?: Skipped[];
+  failures?: Failure[];
+  revisions?: Record<string, string>;
+  host_warning?: string;
+}
+
+/** Where a rule works, what it matches and what it writes: the editor's first row, and the Edit dialog's. */
+function RuleFields({ draft, onChange }: { draft: Draft; onChange: (d: Draft) => void }) {
+  const set = (d: Partial<Draft>) => onChange({ ...draft, ...d });
+  const named = isNamed(draft);
+  const header = draft.location.endsWith("-header");
+  const noMatch = named && draft.action === "add";
+  const noReplace = named && draft.action === "remove";
+  const scripted = isScripted(draft);
+  // A request rule's script gets the whole request: nothing to match or type in.
+  const wholeRequest = isRequestRule(draft.location);
+  return (
+    <>
+      <select className="input" aria-label="Where the rule works" value={draft.location} onChange={(e) => onChange(withLocation(draft, e.target.value))}>
+        {GROUPS.map((g) => (
+          <optgroup key={g} label={g}>
+            {LOCATIONS.filter((l) => l.group === g).map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.label}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+      {takesName(draft.location) && (
+        <input
+          className="input mono"
+          style={{ width: 150 }}
+          placeholder={header ? "header name (empty: each line)" : "parameter name"}
+          aria-label={header ? "Header name" : "Parameter name"}
+          value={draft.name}
+          onChange={(e) => set({ name: e.target.value })}
+        />
+      )}
+      {named && (
+        <select className="input" aria-label="What to do with it" value={draft.action} onChange={(e) => set({ action: e.target.value })}>
+          <option value="set">Set</option>
+          <option value="add">Add</option>
+          <option value="remove">Remove</option>
+        </select>
+      )}
+      {!wholeRequest && (
+        <>
+          <select className="input" aria-label="How the match is read" value={draft.matcher} disabled={noMatch} onChange={(e) => set({ matcher: e.target.value })}>
+            {MATCHERS.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+          <input
+            className="input grow mono"
+            placeholder={noMatch ? "(add takes no match)" : header && !named ? "match (empty: add a header)" : named || !["request-line", "request-body", "response-body"].includes(draft.location) ? "match (empty: the whole value)" : "match"}
+            aria-label="Match"
+            disabled={noMatch}
+            value={noMatch ? "" : draft.match}
+            onChange={(e) => set({ match: e.target.value })}
+          />
+        </>
+      )}
+      {!wholeRequest && (
+        <select
+          className="input"
+          aria-label="What makes the replacement"
+          title="Text you type, or a script: a JavaScript file whose replace(match, ctx) returns what to write for each match"
+          value={draft.replacer}
+          disabled={noReplace}
+          onChange={(e) => set({ replacer: e.target.value === "script" ? "script" : "text" })}
+        >
+          <option value="text">Text</option>
+          <option value="script">Script</option>
+        </select>
+      )}
+      {scripted && !noReplace ? (
+        <>
+          <input
+            className="input grow mono"
+            placeholder={wholeRequest ? "script file: defines request(req, ctx), which may change, block or answer it" : "script file: defines replace(match, ctx)"}
+            aria-label="Script file"
+            value={draft.script}
+            onChange={(e) => set({ script: e.target.value })}
+          />
+          {inTauri && (
+            <button
+              className="btn"
+              onClick={async () => {
+                const file = await chooseScript();
+                if (file) set({ script: file });
+              }}
+            >
+              Choose…
+            </button>
+          )}
+        </>
+      ) : (
+        <input
+          className="input grow mono"
+          placeholder={noReplace ? "(removed)" : draft.matcher === "regex" ? "replace ($1 groups; empty removes)" : "replace"}
+          aria-label="Replace"
+          disabled={noReplace}
+          value={noReplace ? "" : draft.replace}
+          onChange={(e) => set({ replace: e.target.value })}
+        />
+      )}
+    </>
+  );
+}
+
+/** Whose traffic a rule applies to, its host and Content-Type conditions and its comment. */
+function RuleScope({ draft, onChange }: { draft: Draft; onChange: (d: Draft) => void }) {
+  const set = (d: Partial<Draft>) => onChange({ ...draft, ...d });
+  return (
+    <>
+      <span className="muted">Applies to</span>
+      {enginesFor(draft.location).map((e) => (
+        <label className="check" key={e.id}>
+          <input
+            type="checkbox"
+            checked={draft.appliesTo.includes(e.id)}
+            onChange={(ev) => set({ appliesTo: ev.target.checked ? [...draft.appliesTo, e.id] : draft.appliesTo.filter((x) => x !== e.id) })}
+          />{" "}
+          {e.label}
+        </label>
+      ))}
+      <input className="input mono" style={{ width: 170 }} placeholder="host regex (any host)" aria-label="Host regex" value={draft.host} onChange={(e) => set({ host: e.target.value })} />
+      {isResponseRule(draft.location) && (
+        <input
+          className="input mono"
+          style={{ width: 170 }}
+          placeholder="content type (any)"
+          title="Only for responses whose Content-Type matches, as they came (none: empty text)"
+          aria-label="Content type regex"
+          value={draft.contentType}
+          onChange={(e) => set({ contentType: e.target.value })}
+        />
+      )}
+      <input className="input" placeholder="comment" aria-label="Comment" value={draft.comment} onChange={(e) => set({ comment: e.target.value })} />
+    </>
+  );
+}
+
+/** Edits a saved rule in place: only what changes is sent, with the revision it was opened at. */
+function EditRule(p: { rule: Rule; revision?: string; onClose: () => void; onSave: (id: number, args: string[]) => Promise<boolean> }) {
+  const [before] = useState(() => draftFromRule(p.rule));
+  const [draft, setDraft] = useState(before);
+  const [busy, setBusy] = useState(false);
+  const dialog = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialog);
+  const problem = draftProblem(draft);
+  const save = async () => {
+    const args = editArgs(p.rule.id, before, draft, p.revision);
+    if (!args) return p.onClose();
+    // A script is code: it runs only after this was read and agreed to.
+    if (editRunsNewScript(before, draft) && !(await confirm("Save a rule that runs a script", scriptQuestion(draft.script, draft.location), "Save rule", "Cancel"))) return;
+    setBusy(true);
+    const done = await p.onSave(p.rule.id, args);
+    setBusy(false);
+    if (done) p.onClose();
+  };
+  return (
+    <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && !busy && p.onClose()}>
+      <div ref={dialog} className="confirm-dialog rule-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-rule-title">
+        <h2 id="edit-rule-title">Edit rule #{p.rule.id}</h2>
+        <p>
+          Only what you change is saved; the rule keeps its number, its place in the list and whether it is on. Changing what it does (anything but the comment) records you as the
+          one who set it.
+        </p>
+        <div className="toolbar rule-dialog-row">
+          <RuleFields draft={draft} onChange={setDraft} />
+        </div>
+        <div className="toolbar rule-dialog-row">
+          <RuleScope draft={draft} onChange={setDraft} />
+        </div>
+        <div className="row gap finding-dialog-actions">
+          <div className="toolbar-end">
+            <button className="btn" disabled={busy} onClick={p.onClose}>
+              Cancel
+            </button>
+            <button className="btn primary" disabled={busy || !!problem} title={problem ?? undefined} onClick={save}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

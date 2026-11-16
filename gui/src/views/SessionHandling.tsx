@@ -1,12 +1,14 @@
 // Settings › Auth profiles › a profile's macros, session rules and request signers. A macro
 // is built by picking requests from Traffic in order and saying what to extract from each
-// response; a rule says, for some tools and URLs, what to do before each request goes out; a
-// signer says how to compute a rule's signature or JWT, and where its key is.
+// response, and edited in place the same way (`auth macro edit`); a rule says, for some tools
+// and URLs, what to do before each request goes out; a signer says how to compute a rule's
+// signature or JWT, and where its key is.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { run } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
+import { useDialogFocus } from "../ui/dialogFocus";
 import {
   EMPTY_SIGNER,
   EXTRACT_FROM,
@@ -18,6 +20,9 @@ import {
   TOOLS,
   actionLabel,
   macroAddArgs,
+  macroEditArgs,
+  macroEditProblem,
+  macroEditor,
   parseParams,
   ruleAddArgs,
   ruleProblems,
@@ -26,7 +31,10 @@ import {
   signerLabel,
   signerProblems,
   type Action,
+  type EditorExtract,
+  type EditorStep,
   type ExtractRow,
+  type MacroDetail,
   type MacroRun,
   type MacroSummary,
   type RuleForm,
@@ -62,6 +70,7 @@ function useExec() {
 export function SessionHandling(p: Props) {
   const exec = useExec();
   const [building, setBuilding] = useState(false);
+  const [editingMacro, setEditingMacro] = useState<MacroSummary | null>(null);
   const [ruleForm, setRuleForm] = useState<RuleForm | null>(null);
   const [signer, setSigner] = useState<{ form: SignerForm; editing: boolean } | null>(null);
   const [runs, setRuns] = useState<Record<string, MacroRun | string>>({});
@@ -117,6 +126,9 @@ export function SessionHandling(p: Props) {
               <button className="btn small" disabled={!!busy} onClick={() => runMacro(m.name)}>
                 {busy === m.name ? "Running…" : "Run"}
               </button>
+              <button className="btn small" title="Change its steps or what it extracts, in place" onClick={() => setEditingMacro(m)}>
+                Edit…
+              </button>
               <button className="btn small" onClick={() => removeMacro(m.name)}>
                 Remove
               </button>
@@ -164,6 +176,18 @@ export function SessionHandling(p: Props) {
             New macro from Traffic
           </button>
         </div>
+      )}
+      {editingMacro && (
+        <MacroEditor
+          key={editingMacro.name}
+          profile={p.profile}
+          name={editingMacro.name}
+          onClose={() => setEditingMacro(null)}
+          onSaved={() => {
+            setEditingMacro(null);
+            p.onChange();
+          }}
+        />
       )}
 
       <h3>Session rules</h3>
@@ -304,14 +328,11 @@ interface Picked {
   status: number | null;
 }
 
-export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
+/** Requests from Traffic to pick, newest first, filtered as typed; each picked one shows its place in the order. */
+function TrafficPicker(p: { place: (id: number) => number; onPick: (h: Picked) => void }) {
   const exec = useExec();
   const [items, setItems] = useState<Picked[]>([]);
   const [filter, setFilter] = useState("");
-  const [name, setName] = useState("");
-  const [steps, setSteps] = useState<Picked[]>([]);
-  const [extract, setExtract] = useState<ExtractRow[]>([]);
-
   useEffect(() => {
     // Newest first: the requests just made in the browser are the ones wanted.
     exec<{ rows: [number, string, string, number | null][] }>([
@@ -319,8 +340,41 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
       "SELECT id, method, url, status FROM history ORDER BY id DESC LIMIT 500",
     ]).then((d) => d && setItems(d.rows.map(([id, method, url, status]) => ({ id, method, url, status }))));
   }, []);
-
   const shown = items.filter((h) => !filter || `${h.method} ${h.url} ${h.status ?? ""}`.toLowerCase().includes(filter.toLowerCase()));
+  return (
+    <>
+      <div className="form">
+        <label className="wide">
+          <span className="label">Pick requests from Traffic, in the order they should run</span>
+          <input className="input" value={filter} placeholder="Filter by method, URL or status" onChange={(e) => setFilter(e.target.value)} />
+        </label>
+      </div>
+      <div className="tree sh-pick">
+        {shown.length === 0 && <div className="empty">No requests in Traffic yet. Browse the site through the proxy first.</div>}
+        {shown.slice(0, 300).map((h) => {
+          const n = p.place(h.id);
+          return (
+            <button key={h.id} className={`tree-item ${n >= 0 ? "on" : ""}`} onClick={() => p.onPick(h)}>
+              <span className="sh-n">{n >= 0 ? n + 1 : ""}</span>
+              <span className="muted">#{h.id}</span>
+              <span className="grow ellipsis mono">
+                {h.method} {h.url}
+              </span>
+              <span className="muted">{h.status ?? ""}</span>
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
+  const exec = useExec();
+  const [name, setName] = useState("");
+  const [steps, setSteps] = useState<Picked[]>([]);
+  const [extract, setExtract] = useState<ExtractRow[]>([]);
+
   const toggle = (h: Picked) =>
     setSteps((s) => (s.some((x) => x.id === h.id) ? s.filter((x) => x.id !== h.id) : [...s, h]));
   const move = (i: number, by: number) =>
@@ -345,27 +399,8 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
           <span className="label">Macro name</span>
           <input className="input" value={name} placeholder="csrf" onChange={(e) => setName(e.target.value)} />
         </label>
-        <label className="wide">
-          <span className="label">Pick requests from Traffic, in the order they should run</span>
-          <input className="input" value={filter} placeholder="Filter by method, URL or status" onChange={(e) => setFilter(e.target.value)} />
-        </label>
       </div>
-      <div className="tree sh-pick">
-        {shown.length === 0 && <div className="empty">No requests in Traffic yet. Browse the site through the proxy first.</div>}
-        {shown.slice(0, 300).map((h) => {
-          const n = steps.findIndex((s) => s.id === h.id);
-          return (
-            <button key={h.id} className={`tree-item ${n >= 0 ? "on" : ""}`} onClick={() => toggle(h)}>
-              <span className="sh-n">{n >= 0 ? n + 1 : ""}</span>
-              <span className="muted">#{h.id}</span>
-              <span className="grow ellipsis mono">
-                {h.method} {h.url}
-              </span>
-              <span className="muted">{h.status ?? ""}</span>
-            </button>
-          );
-        })}
-      </div>
+      <TrafficPicker place={(id) => steps.findIndex((s) => s.id === id)} onPick={toggle} />
       {steps.length > 0 && (
         <>
           <h4>Steps</h4>
@@ -432,6 +467,152 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
         <button className="btn" onClick={p.onCancel}>
           Cancel
         </button>
+      </div>
+    </div>
+  );
+}
+
+/** Edits a macro in place: its steps (reordered, taken out, added from Traffic) and its extractors. */
+function MacroEditor(p: { profile: string; name: string; onClose: () => void; onSaved: () => void }) {
+  const [start, setStart] = useState<{ steps: EditorStep[]; extract: EditorExtract[] } | null>(null);
+  const [revision, setRevision] = useState<string | undefined>();
+  const [steps, setSteps] = useState<EditorStep[]>([]);
+  const [extract, setExtract] = useState<EditorExtract[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dialog = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialog);
+
+  useEffect(() => {
+    run<{ macro: MacroDetail; revision: string }>(["auth", "macro", "show", "--", p.profile, p.name]).then(
+      (d) => {
+        const e = macroEditor(d.macro);
+        setStart(e);
+        setSteps(e.steps);
+        setExtract(e.extract);
+        setRevision(d.revision);
+      },
+      (e) => setError(e.message),
+    );
+  }, []);
+
+  const move = (i: number, by: number) =>
+    setSteps((s) => {
+      const out = [...s];
+      const j = i + by;
+      if (j < 0 || j >= out.length) return s;
+      [out[i], out[j]] = [out[j], out[i]];
+      return out;
+    });
+  // A step taken out takes its extractors with it.
+  const takeOut = (key: string) => {
+    setSteps((s) => s.filter((x) => x.key !== key));
+    setExtract((rows) => rows.filter((x) => x.key !== key));
+  };
+  const pick = (h: Picked) => {
+    const key = `history${h.id}`;
+    if (steps.some((s) => s.key === key)) return takeOut(key);
+    setSteps((s) => [...s, { key, kind: "history", id: h.id, line: `${h.method} ${h.url}` }]);
+  };
+  const setRow = (i: number, patch: Partial<EditorExtract>) => setExtract((rows) => rows.map((r, k) => (k === i ? { ...r, ...patch } : r)));
+  const problem = start ? macroEditProblem(steps, extract) : "Reading the macro…";
+
+  const save = async () => {
+    if (!start) return;
+    const args = macroEditArgs(p.profile, p.name, start, steps, extract, revision);
+    if (!args) return p.onClose();
+    setBusy(true);
+    setError(null);
+    try {
+      await run(args);
+      p.onSaved();
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && !busy && p.onClose()}>
+      <div ref={dialog} className="confirm-dialog finding-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-macro-title">
+        <h2 id="edit-macro-title">Edit macro {p.name}</h2>
+        <p>
+          It keeps its name and its place, and session rules that run it go on running it. Saving a change records you as the one who set it. An extractor moves with its step.
+        </p>
+        <h4>Steps</h4>
+        <ol className="sh-steps small">
+          {steps.map((s, i) => (
+            <li key={s.key}>
+              <span className="mono">{s.line}</span>
+              {s.kind === "history" && <span className="muted"> · new, from #{s.id}</span>}{" "}
+              <button className="btn small" aria-label={`Move step ${i + 1} up`} onClick={() => move(i, -1)} disabled={i === 0}>
+                ↑
+              </button>
+              <button className="btn small" aria-label={`Move step ${i + 1} down`} onClick={() => move(i, 1)} disabled={i === steps.length - 1}>
+                ↓
+              </button>
+              <button className="btn small" aria-label={`Take out step ${i + 1}`} onClick={() => takeOut(s.key)}>
+                ✕
+              </button>
+            </li>
+          ))}
+        </ol>
+        {adding ? (
+          <TrafficPicker place={(id) => steps.findIndex((s) => s.key === `history${id}`)} onPick={pick} />
+        ) : (
+          <button className="btn small" disabled={!start} onClick={() => setAdding(true)}>
+            Add steps from Traffic
+          </button>
+        )}
+        <h4>Extract values</h4>
+        {extract.map((x, i) => (
+          <div key={i} className="row gap sh-extract">
+            <select className="input" aria-label="Step" value={x.key} onChange={(e) => setRow(i, { key: e.target.value })}>
+              {steps.map((s, k) => (
+                <option key={s.key} value={s.key}>
+                  step {k + 1}
+                </option>
+              ))}
+            </select>
+            <input className="input" aria-label="Variable" value={x.var} placeholder="variable" onChange={(e) => setRow(i, { var: e.target.value })} />
+            <select className="input" aria-label="Where it is" value={x.from} onChange={(e) => setRow(i, { from: e.target.value as EditorExtract["from"] })}>
+              {EXTRACT_FROM.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+            <input
+              className="input grow mono"
+              aria-label="What to look for"
+              value={x.expr}
+              placeholder={EXTRACT_FROM.find((f) => f.id === x.from)?.hint}
+              onChange={(e) => setRow(i, { expr: e.target.value })}
+            />
+            <button className="btn small" aria-label="Take out this extractor" onClick={() => setExtract((rows) => rows.filter((_, k) => k !== i))}>
+              ✕
+            </button>
+          </div>
+        ))}
+        <button className="btn small" disabled={!steps.length} onClick={() => setExtract((rows) => [...rows, { key: steps[0].key, var: "", from: "input", expr: "" }])}>
+          Add extractor
+        </button>
+        {error && (
+          <div className="error" role="alert">
+            {error}
+          </div>
+        )}
+        <div className="row gap finding-dialog-actions">
+          <div className="toolbar-end">
+            <button className="btn" disabled={busy} onClick={p.onClose}>
+              Cancel
+            </button>
+            <button className="btn primary" disabled={busy || !!problem} title={problem ?? undefined} onClick={save}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

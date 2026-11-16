@@ -101,6 +101,8 @@ export function FindingsView({ active }: { active: boolean }) {
   const [writeup, setWriteup] = useState("");
   const [trail, setTrail] = useState<Trail | null>(null);
   const [retesting, setRetesting] = useState(false);
+  // The finding added by hand being edited, as it was when the dialog opened.
+  const [editing, setEditing] = useState<Finding | null>(null);
   // The finding sent with and without its payload, for the finding it was run on.
   const [verified, setVerified] = useState<Verify | null>(null);
   const [verifying, setVerifying] = useState(false);
@@ -181,6 +183,17 @@ export function FindingsView({ active }: { active: boolean }) {
       () => setOpen((o) => new Set(o).add(`alert:${ref}`)),
     );
     setSelected(id);
+    refresh();
+  };
+
+  // An edit keeps the finding's id: it is read again, with its timeline, if it is still open.
+  const edited = (id: number, changed: string[], warnings: string[]) => {
+    setEditing(null);
+    app.toast([changed.length ? `Finding #${id} edited.` : `Finding #${id} unchanged.`, ...warnings].join("\n"));
+    if (openId.current === id) {
+      run<Finding>(["findings", "show", String(id)]).then((f) => openId.current === id && setFinding(f), () => {});
+      reloadEvents(id);
+    }
     refresh();
   };
 
@@ -643,6 +656,11 @@ export function FindingsView({ active }: { active: boolean }) {
                 <button className="btn small" onClick={saveRepro} title="Save a JSON repro pack: the request (secrets masked), a curl command, the response around the evidence and how to check it again">
                   Repro pack…
                 </button>
+                {finding.source === "manual" && finding.state !== "removed" && (
+                  <button className="btn small" onClick={() => setEditing(finding)} title="Change this finding's title, risk, URL, evidence or write-up">
+                    Edit…
+                  </button>
+                )}
                 {finding.source === "manual" && (
                   <button className="btn small" onClick={remove} title="Take this finding out of the findings and reports">
                     Remove
@@ -788,6 +806,7 @@ export function FindingsView({ active }: { active: boolean }) {
       <Menu menu={ticketMenu.menu} close={ticketMenu.close} />
       {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
+      {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
     </div>
   );
 }
