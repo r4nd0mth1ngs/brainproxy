@@ -223,6 +223,10 @@ test("an edited URL and texts go on stdin, and a changed write-up replaces the s
   assert.ok(!call?.args.join(" ").includes("FAKE"));
   const titled = findingEditArgs(7, before, { ...before, title: "Invoice IDOR" });
   assert.deepEqual(titled, { args: ["findings", "edit", "7", "--title=Invoice IDOR"] });
+  // Under a new title the write-up would be the one the findings it joins share: asked first.
+  const joined = { ...before, title: "Invoice IDOR", description: "Other text." };
+  assert.deepEqual(findingEditArgs(7, before, joined)?.args, ["findings", "edit", "7", "--title=Invoice IDOR", "--input-json"]);
+  assert.deepEqual(findingEditArgs(7, before, { ...joined, replaceText: true })?.args, ["findings", "edit", "7", "--title=Invoice IDOR", "--replace-text", "--input-json"]);
 });
 
 test("an edited finding keeps a URL", () => {

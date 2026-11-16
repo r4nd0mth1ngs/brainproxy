@@ -23,6 +23,8 @@ export interface Rule {
   replacer?: string;
   /** The script file, and the sha256 its text had when the rule was added. */
   script?: { file: string; sha256: string };
+  /** Saved as a Host-header test: a Host it puts in a request is meant. */
+  host_header_test?: boolean;
 }
 
 /** A rule the engines leave out, as `rules list` says: its replacement breaks a head, or its script file changed. */
@@ -47,6 +49,8 @@ export interface Draft {
   host: string;
   comment: string;
   disabled: boolean;
+  /** A saved rule being edited is a Host-header test, which the edit keeps. */
+  hostHeaderTest?: boolean;
 }
 
 export const EMPTY_DRAFT: Draft = {
@@ -206,6 +210,7 @@ export function draftFromRule(r: Rule): Draft {
     host: r.host ?? "",
     comment: r.comment ?? "",
     disabled: !r.enabled,
+    hostHeaderTest: r.host_header_test === true,
   };
 }
 
@@ -254,6 +259,9 @@ export function editArgs(id: number, before: Draft, after: Draft, revision?: str
   if (now.host !== was.host) args.push(`--host=${now.host}`);
   if (now.comment !== was.comment) args.push(`--comment=${now.comment}`);
   if (!args.length) return null;
+  // `rules edit` takes the mark from the command when the rule changes: a person's Host-header
+  // test stays one.
+  if (before.hostHeaderTest) args.push("--host-header-test");
   return ["rules", "edit", String(id), ...args, ...(revision ? [`--if-revision=${revision}`] : [])];
 }
 

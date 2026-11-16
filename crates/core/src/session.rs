@@ -550,26 +550,30 @@ impl Store {
         self.meta_set(&handling_key(profile), None)
     }
 
-    /// Makes a profile with no login or headers for its first macro.
-    pub fn auth_create_for_macros(&self, name: &str, h: &Handling) -> Result<()> {
+    /// Makes a profile with no login or headers for its first macro (or rule, or signer). As for
+    /// [`Store::auth_save_handling`], `expected` is what [`Store::auth_handling_as_stored`] read.
+    pub fn auth_create_for_macros(&self, name: &str, expected: Option<&str>, h: &Handling) -> Result<()> {
         let p = AuthProfile::without_login(name);
         h.validate(&p)?;
         p.validate_with(h)?;
-        self.auth_write_handling(name, h)?;
+        self.auth_swap_handling(name, expected, h)?;
         self.auth_save_profile(&p)
     }
 
-    /// Stores a profile's macros and rules (checked against the profile first). A profile
-    /// with no login or headers can't lose its last macro or rule: it would do nothing.
-    pub fn auth_save_handling(&self, profile: &str, h: &Handling) -> Result<()> {
+    /// Stores a profile's macros and rules (checked against the profile first), only if they are
+    /// still as `expected`: their text as [`Store::auth_handling_as_stored`] read it (None: none
+    /// stored). A change another process saved in between is refused (kind conflict) rather than
+    /// lost. A profile with no login or headers can't lose its last macro or rule: it would do
+    /// nothing.
+    pub fn auth_save_handling(&self, profile: &str, expected: Option<&str>, h: &Handling) -> Result<()> {
         let (p, _) = self.auth_profile(profile)?;
         p.validate_with(h)
             .map_err(|e| Error::InvalidInput(format!("{e}; to delete the profile itself: auth remove {profile}")))?;
         h.validate(&p)?;
-        self.auth_write_handling(profile, h)
+        self.auth_swap_handling(profile, expected, h)
     }
 
-    /// A profile's macros and rules with their text as stored, for [`Store::auth_save_handling_if`].
+    /// A profile's macros and rules with their text as stored, for [`Store::auth_save_handling`].
     pub fn auth_handling_as_stored(&self, profile: &str) -> Result<(Option<String>, Handling)> {
         let stored = self.meta_get(&handling_key(profile))?;
         let h = match &stored {
@@ -581,37 +585,20 @@ impl Store {
         Ok((stored, h))
     }
 
-    /// [`Store::auth_save_handling`], only if they are still as `expected` (their text as
-    /// [`Store::auth_handling_as_stored`] read it): a change saved by another process in between
-    /// is refused (kind conflict) rather than lost.
-    pub fn auth_save_handling_if(&self, profile: &str, expected: Option<&str>, h: &Handling) -> Result<()> {
-        let (p, _) = self.auth_profile(profile)?;
-        p.validate_with(h)
-            .map_err(|e| Error::InvalidInput(format!("{e}; to delete the profile itself: auth remove {profile}")))?;
-        h.validate(&p)?;
+    /// Writes them over `expected` with who changed them (a rule or macro saved as it was keeps
+    /// its origin, a new or changed one gets this process's, whatever the caller put there), in
+    /// one statement that fails if another process wrote them since.
+    fn auth_swap_handling(&self, profile: &str, expected: Option<&str>, h: &Handling) -> Result<()> {
         let old: Handling = expected.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
         let json = with_origins(&old, h).map(|h| serde_json::to_string(&h)).transpose();
         let json = json.map_err(|e| Error::InvalidInput(e.to_string()))?;
         if !self.meta_swap(&handling_key(profile), expected, json.as_deref())? {
             return Err(Error::Conflict(format!(
-                "the macros and session rules of profile {profile:?} were changed elsewhere meanwhile; nothing was \
-                 saved: run it again"
+                "the macros, session rules and signers of profile {profile:?} were changed elsewhere meanwhile; \
+                 nothing was saved: run it again"
             )));
         }
         Ok(())
-    }
-
-    /// Writes them with who changed them: a rule or macro saved as it was keeps its origin, a
-    /// new or changed one gets this process's, whatever the caller put there.
-    fn auth_write_handling(&self, profile: &str, h: &Handling) -> Result<()> {
-        let old = self.auth_handling(profile).unwrap_or_default();
-        match with_origins(&old, h) {
-            None => self.auth_clear_handling(profile),
-            Some(h) => {
-                let json = serde_json::to_string(&h).map_err(|e| Error::InvalidInput(e.to_string()))?;
-                self.meta_set(&handling_key(profile), Some(&json))
-            }
-        }
     }
 }
 
@@ -1641,20 +1628,20 @@ mod tests {
             extract: vec![],
         };
         let one = Macro { name: "one".into(), steps: vec![step], origin: None };
-        s.auth_create_for_macros("app", &Handling { macros: vec![one.clone()], ..Default::default() }).unwrap();
+        s.auth_create_for_macros("app", None, &Handling { macros: vec![one.clone()], ..Default::default() }).unwrap();
         let (read, mut h) = s.auth_handling_as_stored("app").unwrap();
         // Another process adds a macro after this one read them.
         let mut theirs = h.clone();
         theirs.macros.push(Macro { name: "two".into(), ..one.clone() });
-        s.auth_save_handling("app", &theirs).unwrap();
+        s.auth_save_handling("app", read.as_deref(), &theirs).unwrap();
         h.macros[0].steps[0].request = "GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n".into();
-        let e = s.auth_save_handling_if("app", read.as_deref(), &h).unwrap_err();
+        let e = s.auth_save_handling("app", read.as_deref(), &h).unwrap_err();
         assert!(matches!(e, Error::Conflict(_)), "{e}");
         assert_eq!(s.auth_handling("app").unwrap().macros.len(), 2, "theirs is kept");
         // Saved over what is there now, the changed macro is this process's.
         let (read, mut h) = s.auth_handling_as_stored("app").unwrap();
         h.macros[0].steps[0].request = "GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n".into();
-        s.auth_save_handling_if("app", read.as_deref(), &h).unwrap();
+        s.auth_save_handling("app", read.as_deref(), &h).unwrap();
         let saved = s.auth_handling("app").unwrap();
         assert_eq!(saved.macros[0].origin.as_deref(), Some(crate::provenance::origin()));
         assert!(saved.macros[0].steps[0].request.starts_with("GET /x "));

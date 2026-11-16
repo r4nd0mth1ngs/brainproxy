@@ -317,16 +317,19 @@ pub enum FindingsCmd {
     /// origin and timeline stay. Nothing is sent.
     #[command(after_help = "The flags are those of `findings add`; --history-id replaces the linked entries \
         (--no-history unlinks them all) and --cwe 0 clears the CWE. An edit that changes something is on the \
-        finding's timeline (kind edited: who, which fields, their old and new values). A new title or a URL on \
-        another host moves the finding to the issue of that alert type and host. The description and solution \
+        finding's timeline (kind edited: who, which fields, their old and new values). With a new title or a \
+        URL on another host it joins the issue of the findings of that title and host; the only finding of \
+        its issue takes the issue (its title, CVSS and write-up) with it instead, and a host change alone keeps \
+        it in an issue merged across hosts. `findings compare` still knows it by its earlier identities. The \
+        description and solution \
         are shared by every finding with the same title: a given one fills a blank one, and one that differs \
         from the shared one (an empty one too) is refused (kind conflict) unless --replace-text, which keeps \
         the earlier text in replaced_texts. A new title takes the write-up of the findings it joins, or this \
         finding's when they have none. The same title, method, URL without its query or path parameters, and \
         parameter as another finding is refused (kind conflict). --if-revision takes the revision `findings \
         show` gives and refuses (kind conflict) a finding changed since. Through MCP an agent edits only the \
-        findings it added that no person has edited since, the *-file flags only take '-' and --replace-text \
-        is refused.")]
+        findings it added that no person has changed since (its state, note or fields, a ticket, or its \
+        issue's write-up), the *-file flags only take '-' and --replace-text is refused.")]
     Edit(Box<EditArgs>),
     /// Remove findings added by hand (`findings add`); scanner findings can only be marked.
     #[command(after_help = "A removed finding is kept with state removed, hidden unless --state all, so a \

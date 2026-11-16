@@ -105,7 +105,7 @@ export function NewFinding({
       onAdded?.(r.id, r.finding.alert_ref, r.warnings);
     } catch (e: any) {
       setError(e.message);
-      if (!edit && asksToReplace(e.message)) setOfferReplace(true);
+      if (asksToReplace(e.message)) setOfferReplace(true);
     }
     setBusy(false);
   };
@@ -121,7 +121,7 @@ export function NewFinding({
         {edit ? (
           <p>
             Only what you change is saved; the finding keeps its state, note and timeline. The description and solution are shared by every finding titled
-            “{edit.name}”: changing them changes them for all of those (the earlier text is kept).
+            “{edit.name}”: changing them changes them for all of those (the earlier text is kept). Under a new title it takes the write-up of the findings it joins.
           </p>
         ) : (
           <p>An issue you found by hand. It is only recorded in this project: nothing is sent.</p>

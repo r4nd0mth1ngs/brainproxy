@@ -199,8 +199,9 @@ CRLF-injection test) needs `--host-header-test` through MCP, as it can start a H
 
 Settings that put a Host on requests still to come are checked when they are saved too: an auth
 profile's `--header` or `--token-header`, its login request and `--login-header` (the login
-URL's own host is fine), a macro's steps (`auth macro add`), and a match-and-replace rule (`rules
-add`, `rules import`, or `rules enable` of a disabled one) whose replacement writes a Host line
+URL's own host is fine), a macro's steps (`auth macro add` and `auth macro edit`: every step's,
+except a host the macro it replaces already sent), and a match-and-replace rule (`rules add`,
+`rules edit`, `rules import`, or `rules enable` of a disabled one) whose replacement writes a Host line
 or an absolute URL, sets the header named `Host`, rewrites the Host of a request to a host the
 engagement lists, or copies a header's name or the request target from the request (`$1`). A rule
 can match anything, so that check is best effort; the proxy also compares each request's foreign
@@ -2292,8 +2293,10 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   `--extract` replaces every extractor (STEP is a step of the edited macro) and `--no-extract`
   removes them all. The macro is checked as `auth macro add` checks one, and a changed macro
   records whoever edited it as its origin. `auth macro show` gives its `revision`, and
-  `--if-revision REV` fails with a conflict, changing nothing, when the macro has changed since;
-  the profile's macros and rules are saved only if no other process saved them meanwhile.
+  `--if-revision REV` fails with a conflict, changing nothing, when the macro has changed since.
+- Every `auth macro`, `auth rule` and `auth sign` command that changes a profile's macros, rules
+  or signers saves them only if no other process saved them since it read them, and otherwise
+  fails with a conflict, so two changes made at once never lose one.
 - `auth macro run` fails (exit code 2) when a step gets no response or a value isn't
   found, and says which, with each step's status and history id.
 - `auth rule add PROFILE --action SPEC ... [--tool T,...] [--url PATTERN] [--invalid REGEX]`,
@@ -2595,9 +2598,18 @@ brainproxy findings edit 17 --title "Invoice IDOR" --if-revision 6c64c02d7889142
   and records nothing.
 - The description and solution belong to the title's alert type, as for `findings add`: a given
   one fills a blank one, and one that differs from the type's (an empty one too) is refused with
-  `conflict` unless `--replace-text`. A new title moves the finding to its alert type (and, with
-  a new host, to that type and host's issue, with a `moved` event); it takes that type's write-up,
-  or this finding's when the type has none, and the old title's other findings keep theirs.
+  `conflict` unless `--replace-text`. A new title moves the finding to its alert type; it takes
+  that type's write-up, or this finding's when the type has none, and the old title's other
+  findings keep theirs.
+- With a new title or a URL on another host, the finding joins the issue of the findings of that
+  title and host (a `moved` event), or one of its own when there are none. The only live finding
+  of its issue takes the issue with it instead, so the issue's title, CVSS and write-up stay with
+  the finding they describe; and a host change alone keeps a finding in an issue merged across
+  hosts.
+- A finding keeps the identities it had before an edit changed its title, method, URL or
+  parameter (`finding.ID.identities` in `meta`), and `findings compare` against a baseline from
+  before the edit matches it by them: it is unchanged (or removed, if it was removed since), not
+  fixed and new. Comparing two report files doesn't know them.
 - The same title, method, URL without its query or path parameters, and parameter as another
   finding is refused with `conflict`; so is a removed finding. A scanner's finding is refused:
   mark it instead.
@@ -2605,8 +2617,9 @@ brainproxy findings edit 17 --title "Invoice IDOR" --if-revision 6c64c02d7889142
   conflict, changing nothing, when it has changed since (a revision is a fingerprint of the
   fields an edit changes, write-up included).
 - Through MCP an agent edits only the findings it added (`origin` `mcp`) that no person has
-  edited since: a person's finding is refused, and the agent marks it with a note instead. The
-  file flags only take `-`, and `--replace-text` is refused.
+  changed since: a person's triage, note, edit or ticket, a move between issues, or a write-up,
+  title or review of its issue vouches for it as it is. Such a finding is refused, and the agent
+  marks it with a note instead. The file flags only take `-`, and `--replace-text` is refused.
 
 ### What is recorded when a request doesn't finish
 

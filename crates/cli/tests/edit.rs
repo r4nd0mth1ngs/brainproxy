@@ -381,7 +381,7 @@ fn an_agent_edits_only_the_findings_it_added() {
     // Once a person has edited it, it is theirs too.
     env.ok_as(&GUI, &["findings", "edit", &mine, "--risk", "medium"]);
     let (_, msg) = env.fails(&AGENT, &["findings", "edit", &mine, "--risk", "info"], None);
-    assert!(msg.contains("a person has edited it since"), "{msg}");
+    assert!(msg.contains("a person has changed it since"), "{msg}");
     assert_eq!(env.ok(&["findings", "show", &mine])["origin"], "mcp", "the agent still added it");
 }
 
@@ -458,4 +458,119 @@ fn a_macro_is_edited_in_place_and_keeps_its_place_and_its_rules() {
     assert!(msg.contains("macro login step 2 sets Host e.test") && msg.contains("--host-header-test"), "{msg}");
     let d = env.ok_as(&AGENT, &[&edit[..], &["--step", "step:1", "--step", &spec, "--host-header-test"]].concat());
     assert_eq!((d["macro"]["steps"].as_u64(), d["macro"]["origin"].as_str()), (Some(2), Some("mcp")));
+}
+
+#[test]
+fn an_edited_finding_keeps_its_issue_and_write_up_where_they_belong() {
+    let env = Env::new("issues");
+    let add = |title: &str, url: &str| {
+        env.ok(&["findings", "add", "--title", title, "--risk", "high", "--url", url])["id"].to_string()
+    };
+    let issue = |id: &str| env.ok(&["findings", "show", id])["issue_id"].clone();
+
+    // The only finding of its issue takes the issue, with its write-up, to its new title or host.
+    let alone = add("Leak", "http://127.0.0.1/a");
+    let i = issue(&alone);
+    env.ok(&["findings", "issue", "narrative", &i.to_string(), "--text", "What leaks, and why it matters."]);
+    env.ok(&["findings", "edit", &alone, "--title", "Leaks"]);
+    env.ok(&["findings", "edit", &alone, "--url", "http://localhost/a"]);
+    assert_eq!(issue(&alone), i);
+    let shown = env.ok(&["findings", "issue", "show", &i.to_string()]);
+    assert_eq!((shown["alert_ref"].as_str(), shown["host"].as_str()), (Some("manual:leaks"), Some("localhost")));
+    assert_eq!(shown["narrative"]["text"], "What leaks, and why it matters.", "{shown}");
+
+    // One that shares its issue leaves it, for the issue of the findings of its new title.
+    let (a, b, c) =
+        (add("IDOR", "http://127.0.0.1/o/1"), add("IDOR", "http://127.0.0.1/o/2"), add("BOLA", "http://127.0.0.1/o/3"));
+    assert_eq!(issue(&a), issue(&b));
+    env.ok(&["findings", "edit", &b, "--title", "BOLA"]);
+    assert_eq!(issue(&b), issue(&c));
+    assert_ne!(issue(&a), issue(&b));
+    // Or for one of its own, when no finding has its new title on that host.
+    env.ok(&["findings", "edit", &b, "--title", "Mass assignment"]);
+    assert!(issue(&b) != issue(&c) && issue(&b) != issue(&a));
+
+    // A host change alone keeps it in an issue a person merged across hosts.
+    let (d, e) = (add("XSS", "http://127.0.0.1/q"), add("XSS", "http://localhost/q"));
+    let merged = issue(&d);
+    env.ok(&["findings", "issue", "merge", &merged.to_string(), &issue(&e).to_string()]);
+    assert_eq!(issue(&e), merged);
+    env.ok(&["findings", "edit", &e, "--url", "http://127.0.0.1/r"]);
+    assert_eq!(issue(&e), merged);
+}
+
+#[test]
+fn an_agent_doesnt_edit_its_finding_once_a_person_has_vouched_for_it() {
+    let env = Env::new("findings-vouched");
+    let add = |title: &str| {
+        let url = format!("http://127.0.0.1/{title}");
+        env.ok_as(&AGENT, &["findings", "add", "--title", title, "--risk", "low", "--url", &url])["id"].to_string()
+    };
+    let refused = |id: &str| {
+        let (kind, msg) = env.fails(&AGENT, &["findings", "edit", id, "--risk", "critical"], None);
+        assert!(kind == "invalid_input" && msg.contains("a person has changed it since"), "{kind}: {msg}");
+    };
+    // A person's triage, note or ticket vouches for the finding as it is.
+    let marked = add("marked");
+    env.ok(&["findings", "mark", &marked, "--state", "confirmed"]);
+    refused(&marked);
+    let noted = add("noted");
+    env.ok_as(&GUI, &["findings", "mark", &noted, "--note", "seen it"]);
+    refused(&noted);
+    let ticket = add("ticketed");
+    env.ok(&["findings", "ticket", &ticket, "--record", "https://github.com/o/r/issues/3"]);
+    refused(&ticket);
+    // So does a person's write-up of its issue.
+    let written = add("written");
+    let issue = env.ok(&["findings", "show", &written])["issue_id"].to_string();
+    env.ok(&["findings", "issue", "narrative", &issue, "--text", "Checked by hand."]);
+    refused(&written);
+    // An agent's own triage doesn't.
+    let own = add("own");
+    env.ok_as(&AGENT, &["findings", "mark", &own, "--note", "agent's note"]);
+    assert_eq!(env.ok_as(&AGENT, &["findings", "edit", &own, "--risk", "critical"])["changed"], json!(["risk"]));
+}
+
+#[test]
+fn a_comparison_knows_an_edited_finding_by_what_it_was() {
+    let env = Env::new("findings-compare");
+    let id = env.ok(&["findings", "add", "--title", "Order IDOR", "--risk", "high", "--url", "http://127.0.0.1/o/7"])
+        ["id"]
+        .to_string();
+    let other = env.ok(&["findings", "add", "--title", "Leak", "--risk", "low", "--url", "http://127.0.0.1/l"])["id"]
+        .to_string();
+    let base = env.dir.join("base.json").display().to_string();
+    env.ok(&["report", "json", "--state", "all", "--no-evidence", "--output", &base]);
+    // A new title, method, URL and parameter: still the same finding to the baseline, twice over.
+    env.ok(&["findings", "edit", &id, "--title", "Invoice IDOR", "--param", "id"]);
+    env.ok(&["findings", "edit", &id, "--url", "http://127.0.0.1/invoices/7", "--method", "post"]);
+    let v = env.ok(&["findings", "compare", "--baseline", &base]);
+    let count = |k: &str| v[k].as_array().map_or(0, Vec::len);
+    assert_eq!((count("new"), count("unchanged"), count("fixed"), count("removed")), (0, 2, 0, 0), "{v}");
+    // Removed after the edit, it is removed, not fixed.
+    env.ok(&["findings", "remove", &id]);
+    let v = env.ok(&["findings", "compare", "--baseline", &base]);
+    let count = |k: &str| v[k].as_array().map_or(0, Vec::len);
+    assert_eq!((count("new"), count("unchanged"), count("fixed"), count("removed")), (0, 1, 0, 1), "{v}");
+    let _ = other;
+}
+
+#[test]
+fn every_host_a_macro_brings_in_is_checked_not_only_the_first() {
+    let env = Env::new("macro-hosts");
+    let step = |name: &str, host: &str| env.file(name, &format!("GET /x HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+    let (e, f) = (step("e.txt", "e.test"), step("f.txt", "f.test"));
+    let (e, f) = (format!("http://127.0.0.1:9={e}"), format!("http://127.0.0.1:9={f}"));
+    // A person's macro sends one Host the scope doesn't list, on purpose.
+    env.ok_as(&GUI, &["auth", "macro", "add", "app", "m", "--step", &e]);
+    // An agent can keep that one, but not bring in another behind it: by edit or by replacing it.
+    let (_, msg) = env.fails(&AGENT, &["auth", "macro", "edit", "app", "m", "--step", "step:1", "--step", &f], None);
+    assert!(msg.contains("step 2 sets Host f.test"), "{msg}");
+    let (_, msg) = env.fails(&AGENT, &["auth", "macro", "add", "app", "m", "--step", &e, "--step", &f], None);
+    assert!(msg.contains("step 2 sets Host f.test"), "{msg}");
+    assert_eq!(env.ok(&["auth", "macro", "show", "app", "m"])["macro"]["steps"].as_array().unwrap().len(), 1);
+    env.ok_as(&AGENT, &["auth", "macro", "edit", "app", "m", "--step", "step:1", "--step", "step:1"]);
+    let d = env
+        .ok_as(&AGENT, &["auth", "macro", "edit", "app", "m", "--step", "step:1", "--step", &f, "--host-header-test"]);
+    assert_eq!(d["macro"]["steps"], 2);
 }

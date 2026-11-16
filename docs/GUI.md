@@ -502,15 +502,18 @@ The record keeps its id (a rule its number, a macro its name) and its place in t
   filled in. It runs `findings edit ID` with the fields that changed; the URL, method and texts
   go on stdin (`--input-json`). The dialog says the description and solution are shared by
   every finding with the title, and a changed one is saved with `--replace-text` (the earlier
-  text is kept in `replaced_texts`). The finding keeps its state, note and who added it; the
+  text is kept in `replaced_texts`). Under a new title they would replace the write-up of the
+  findings it joins, so then `findings edit` is asked first, and the dialog offers to replace
+  it when it refuses, as New finding does. The finding keeps its state, note and who added it; the
   edit is on its timeline (*Edited: risk "high" → "critical"; …*, `editedText` in
   `views/findingsFilter.ts`). A removed finding has no *Edit…*.
 - **Rule** (Settings › Match & replace › *Edit…* or a double-click, `EditRule` in
   `views/MatchReplace.tsx`, logic in `draftFromRule`, `editArgs` and `editRunsNewScript` of
   `views/matchReplace.ts`): the editor's fields (shared with the row that adds a rule). It runs
   `rules edit ID` with the flags that changed, what the editor greys out left out. A new
-  script file is asked about first, as for a new rule. A conflict reads the rules again and
-  closes the dialog, with a toast. Whether a rule is on stays with its checkbox.
+  script file is asked about first, as for a new rule. A rule saved as a Host-header test stays
+  one (`--host-header-test` goes with the edit). A conflict reads the rules again and closes the
+  dialog, with a toast. Whether a rule is on stays with its checkbox.
 - **Macro** (Settings › Auth profiles › a macro's *Edit…*, `MacroEditor` in
   `views/SessionHandling.tsx`, logic in `macroEditor`, `macroEditArgs` and `macroEditProblem` of
   `views/sessionRules.ts`): reads `auth macro show`, then lists the steps (move up or down, take

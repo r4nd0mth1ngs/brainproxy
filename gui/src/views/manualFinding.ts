@@ -182,7 +182,9 @@ export function formChanges(before: FindingForm, after: FindingForm): string[] {
 /**
  * The `findings edit` call for what changed, or null when nothing did. As for `findings add`,
  * the URL, method and texts go on stdin as JSON. A changed description or solution passes
- * --replace-text: the dialog says they are shared by every finding with the title. The
+ * --replace-text when the title stays: the dialog says they are shared by every finding with
+ * it. With a new title they would replace the write-up of the findings it joins, which the
+ * dialog didn't name, so that is asked first, as for a new finding (`replaceText`). The
  * revision makes a finding changed elsewhere since it was opened fail rather than be overwritten.
  */
 export function findingEditArgs(id: number, before: FindingForm, after: FindingForm, revision?: string): { args: string[]; stdin?: string } | null {
@@ -198,7 +200,8 @@ export function findingEditArgs(id: number, before: FindingForm, after: FindingF
     const ids = historyIds(after.history) ?? [];
     args.push(ids.length ? `--history-id=${ids.join(",")}` : "--no-history");
   }
-  if (changed.has("description") || changed.has("solution")) args.push("--replace-text");
+  const texts = changed.has("description") || changed.has("solution");
+  if (after.replaceText || (texts && !changed.has("title"))) args.push("--replace-text");
   if (revision) args.push(`--if-revision=${revision}`);
   const input: Record<string, string> = {};
   if (changed.has("url")) input.url = after.url.trim();

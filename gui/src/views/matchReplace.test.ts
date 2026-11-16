@@ -326,6 +326,15 @@ test("an edit passes only what changed, with the revision the dialog read", () =
   assert.deepEqual(editArgs(4, added, { ...added, name: "", replace: "X-New: 1" }), ["rules", "edit", "4", "--name=", "--replace=X-New: 1"]);
 });
 
+test("a Host-header test stays one when a person edits it", () => {
+  const r = rule({ id: 6, name: "Host", replace: "e.test", host_header_test: true });
+  const before = draftFromRule(r);
+  assert.equal(before.hostHeaderTest, true);
+  assert.deepEqual(editArgs(6, before, { ...before, replace: "f.test" }, "r2"), ["rules", "edit", "6", "--replace=f.test", "--host-header-test", "--if-revision=r2"]);
+  assert.equal(editArgs(6, before, before), null);
+  assert.equal(draftFromRule(rule({})).hostHeaderTest, false);
+});
+
 test("moving a rule to another location sends what withLocation reset", () => {
   const before = draftFromRule(rule({ id: 2, name: "X-A", replace: "1" }));
   assert.deepEqual(editArgs(2, before, withLocation(before, "path")), ["rules", "edit", "2", "--location=path", "--name="]);

@@ -1568,14 +1568,40 @@ fn profile_host(guard: &Arc<brainproxy_core::guard::Guard>, p: &AuthProfile) -> 
     opts.foreign_host(request.as_bytes(), &login).map(|host| ("login request", host))
 }
 
-/// The first macro step whose request names a Host the scope doesn't list in place of its
-/// own target's, and that host.
-fn macro_host(guard: &Arc<brainproxy_core::guard::Guard>, m: &Macro) -> Option<(usize, String)> {
+/// Every Host the scope doesn't list that a macro's steps name in place of their own targets',
+/// each with the first step (from 1) that names it.
+fn macro_hosts(guard: &Arc<brainproxy_core::guard::Guard>, m: &Macro) -> Vec<(usize, String)> {
     let opts = SendOptions { guard: Some(guard.clone()), ..Default::default() };
-    m.steps.iter().enumerate().find_map(|(i, s)| {
-        let target = Target::from_url(&s.target).ok()?;
-        opts.foreign_host(s.request.as_bytes(), &target).map(|host| (i + 1, host))
-    })
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for (i, s) in m.steps.iter().enumerate() {
+        let Ok(target) = Target::from_url(&s.target) else { continue };
+        for host in opts.foreign_hosts(s.request.as_bytes(), &target) {
+            if !found.iter().any(|(_, h)| *h == host) {
+                found.push((i + 1, host));
+            }
+        }
+    }
+    found
+}
+
+/// Checks each Host the scope doesn't list that macro `m`'s steps put on their requests, as
+/// `send` checks one, except those `old` (the macro it replaces) already sent: every one, so a
+/// new host can't hide behind one a person allowed in an earlier step. Returns the warnings a
+/// person gets, joined.
+fn check_macro_hosts(
+    guard: &Arc<brainproxy_core::guard::Guard>,
+    m: &Macro,
+    old: Option<&Macro>,
+    test: bool,
+    out: &Out,
+) -> Result<Option<String>, Error> {
+    let had: Vec<String> = old.map(|o| macro_hosts(guard, o).into_iter().map(|(_, h)| h).collect()).unwrap_or_default();
+    let mut warnings = Vec::new();
+    for (step, host) in macro_hosts(guard, m).into_iter().filter(|(_, h)| !had.contains(h)) {
+        let what = format!("macro {} step {step}", m.name);
+        warnings.extend(crate::mcp::check_host_setting(&what, Some(host), test, out)?);
+    }
+    Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
 fn read_step(project: &Path, store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error> {
@@ -1624,7 +1650,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
         MacroCmd::Add { profile, name, steps, extract, scheme, host_header_test } => {
-            let mut h = store.auth_handling(&profile)?;
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
             let mut m = Macro {
                 name: name.clone(),
                 steps: steps.iter().map(|s| read_step(project, &store, s, &scheme)).collect::<Result<_, _>>()?,
@@ -1639,26 +1665,20 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                     .ok_or_else(|| Error::InvalidInput(format!("--extract {spec:?}: the macro has steps 1 to {n}")))?;
                 s.extract.push(x);
             }
-            // Its steps go out as a session rule's, so a Host the scope doesn't list is checked as
-            // `send` checks one, unless the macro it replaces sent the same one.
+            // Its steps go out as a session rule's, so each Host the scope doesn't list is checked
+            // as `send` checks one, unless the macro it replaces sent the same one.
             let guard = store.guard()?;
-            let old = h.macros.iter().find(|o| o.name == name).and_then(|o| macro_host(&guard, o));
-            let host_warning = match macro_host(&guard, &m).filter(|(_, h)| old.as_ref().map(|o| &o.1) != Some(h)) {
-                Some((step, host)) => {
-                    let what = format!("macro {name} step {step}");
-                    crate::mcp::check_host_setting(&what, Some(host), host_header_test, out)?
-                }
-                None => None,
-            };
+            let old = h.macros.iter().find(|o| o.name == name);
+            let host_warning = check_macro_hosts(&guard, &m, old, host_header_test, out)?;
             let replaced = h.macros.iter().any(|o| o.name == name);
             h.macros.retain(|o| o.name != name);
             h.macros.push(m.clone());
             // A macro can start a profile with no login; `auth add` can set its options after.
             let created = matches!(store.auth_profile(&profile), Err(Error::NotFound(_)));
             if created {
-                store.auth_create_for_macros(&profile, &h)?;
+                store.auth_create_for_macros(&profile, stored.as_deref(), &h)?;
             } else {
-                store.auth_save_handling(&profile, &h)?;
+                store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             }
             let summary = macro_summary(&m);
             let mut data =
@@ -1726,18 +1746,11 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             }
             // Checked as `auth macro add` checks the macro it replaces.
             let guard = store.guard()?;
-            let was = macro_host(&guard, &old);
-            let host_warning = match macro_host(&guard, &m).filter(|(_, h)| was.as_ref().map(|o| &o.1) != Some(h)) {
-                Some((step, host)) => {
-                    let what = format!("macro {name} step {step}");
-                    crate::mcp::check_host_setting(&what, Some(host), host_header_test, out)?
-                }
-                None => None,
-            };
+            let host_warning = check_macro_hosts(&guard, &m, Some(&old), host_header_test, out)?;
             let changed = m != old;
             if changed {
                 h.macros[i] = m;
-                store.auth_save_handling_if(&profile, stored.as_deref(), &h)?;
+                store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             }
             let saved = store.auth_handling(&profile)?.macros.into_iter().find(|x| x.name == name);
             let saved = saved.ok_or_else(|| Error::Conflict(format!("macro {name:?} was removed meanwhile")))?;
@@ -1814,7 +1827,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             out.ok(json!({"profile": profile, "run": run}), || lines.join("\n"));
         }
         MacroCmd::Remove { profile, name } => {
-            let mut h = store.auth_handling(&profile)?;
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
             if !h.macros.iter().any(|m| m.name == name) {
                 return Err(Error::NotFound(format!("macro {name:?} of profile {profile:?}")));
             }
@@ -1830,7 +1843,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                 )));
             }
             h.macros.retain(|m| m.name != name);
-            store.auth_save_handling(&profile, &h)?;
+            store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             out.ok(json!({"profile": profile, "name": name, "removed": true}), || format!("macro {name:?} removed"));
         }
     }
@@ -1872,7 +1885,7 @@ fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
     match cmd {
         RuleCmd::Add { profile, actions, tools, url, invalid, description } => {
-            let mut h = store.auth_handling(&profile)?;
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
             let mut tools = tools.iter().map(|t| Tool::parse(t)).collect::<Result<Vec<_>, _>>()?;
             tools.dedup();
             let actions = actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?;
@@ -1890,7 +1903,7 @@ fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
                 origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             h.rules.push(rule.clone());
-            store.auth_save_handling(&profile, &h)?;
+            store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             out.ok(json!({"profile": profile, "rule": rule}), || format!("session rule added: {}", rule_line(&rule)));
         }
         RuleCmd::List { profile } => {
@@ -1905,13 +1918,13 @@ fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
             });
         }
         RuleCmd::Remove { profile, id } => {
-            let mut h = store.auth_handling(&profile)?;
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
             let before = h.rules.len();
             h.rules.retain(|r| r.id != id);
             if h.rules.len() == before {
                 return Err(Error::NotFound(format!("session rule {id} of profile {profile:?}")));
             }
-            store.auth_save_handling(&profile, &h)?;
+            store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             out.ok(json!({"profile": profile, "id": id, "removed": true}), || format!("session rule {id} removed"));
         }
     }
@@ -2055,7 +2068,7 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 headers,
                 kind,
             };
-            let mut h = store.auth_handling(&profile)?;
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
             let place = h.signers.iter().position(|s| s.name == name);
             let replaced = place.is_some();
             h.signers.retain(|s| s.name != name);
@@ -2065,9 +2078,9 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
             }
             let created = matches!(store.auth_profile(&profile), Err(Error::NotFound(_)));
             if created {
-                store.auth_create_for_macros(&profile, &h)?;
+                store.auth_create_for_macros(&profile, stored.as_deref(), &h)?;
             } else {
-                store.auth_save_handling(&profile, &h)?;
+                store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             }
             out.ok(
                 json!({"profile": profile, "profile_created": created, "signer": signer, "replaced": replaced}),
@@ -2095,7 +2108,7 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
             });
         }
         SignCmd::Remove { profile, name } => {
-            let mut h = store.auth_handling(&profile)?;
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
             if h.rules.iter().any(|r| r.actions.iter().any(|a| matches!(a, Action::Sign { signer } if signer == &name)))
             {
                 return Err(Error::InvalidInput(format!("a session rule uses signer {name:?}; remove the rule first")));
@@ -2105,7 +2118,7 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
             if h.signers.len() == before {
                 return Err(Error::NotFound(format!("signer {name:?} of profile {profile:?}")));
             }
-            store.auth_save_handling(&profile, &h)?;
+            store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             out.ok(json!({"profile": profile, "name": name, "removed": true}), || format!("signer {name:?} removed"));
         }
     }

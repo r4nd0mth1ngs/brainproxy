@@ -196,15 +196,17 @@ Some arguments need a person, so a command run for a tool call (the server sets
   read back; pass the text as the call's `stdin` instead (`input_json` takes all three as JSON).
   `replace_text` is refused for both, since a write-up findings share may be a person's.
 - `findings_edit` of a finding the agent didn't add (its `origin` isn't `mcp`), or one a person
-  has edited since: an agent edits only its own findings, and marks a person's with a note
-  (`findings_mark`) instead. Each edit is on the finding's timeline with origin `mcp` and the
+  has changed since (its state, note or fields, a ticket, a move between issues, or its issue's
+  write-up, title or review): an agent edits only its own findings, and marks a person's with a
+  note (`findings_mark`) instead. Each edit is on the finding's timeline with origin `mcp` and the
   values before and after, and `findings_trail` lists it.
 - What an edit changes is checked as an add would be, and the editor answers for it:
   `rules_edit` that changes what a rule does records `mcp` as its origin (a comment alone
   doesn't), so a Host the scope doesn't list that the rule brings into a request is refused
   where it is sent, and one its replacement writes is refused when it is saved, unless
-  `host_header_test`; `auth_macro_edit` checks a step's Host as `auth_macro_add` does, takes
-  step files only from the project's folder, and records `mcp` as the macro's origin. Each edit
+  `host_header_test`; `auth_macro_edit` and `auth_macro_add` check every step's Host the scope
+  doesn't list (a host the macro they replace already sent excepted, but no new one behind it),
+  take step files only from the project's folder, and record `mcp` as the macro's origin. Each edit
   takes `if_revision` (from `rules_list`'s `revisions`, `findings_show`'s or
   `auth_macro_show`'s `revision`) and fails with a conflict when the record changed since.
 - `findings_verify` with a `request` other than `-`: the edited attack is sent and recorded as it

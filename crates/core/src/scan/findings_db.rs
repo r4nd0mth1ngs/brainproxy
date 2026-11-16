@@ -793,6 +793,16 @@ impl Store {
 
     /// One finding with its alert type's description, solution, and references.
     pub fn finding_get(&self, id: i64) -> Result<Value> {
+        // Read in one transaction, so what it shows and its revision are of the same moment: a
+        // revision of an edit made between two reads would let an edit from what was shown
+        // overwrite that change unseen. It only reads, so it is rolled back.
+        let snapshot = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let found = self.finding_read(id);
+        drop(snapshot);
+        found
+    }
+
+    fn finding_read(&self, id: i64) -> Result<Value> {
         let r = self.query(
             "SELECT f.*, t.description, t.solution, json(t.refs) AS refs, json(t.tags) AS tags, t.description_origin,
                 t.solution_origin
@@ -1055,22 +1065,27 @@ impl Store {
             return Err(Error::Conflict(format!("finding {id} was removed")));
         }
         if e.only_own {
-            // A person's edit makes it theirs too: an agent then marks it, as for a person's own.
-            let person_edited: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM finding_events WHERE finding_id = ?1 AND kind = 'edited'
-                    AND IFNULL(origin, '') != 'mcp')",
+            // A person who triaged it, noted it, edited it, filed it, moved it, or wrote up or
+            // reviewed its issue has vouched for it as it is: an agent then marks it, as it
+            // would a person's own.
+            let person_touched: bool = tx.query_row(
+                "SELECT IFNULL(f.state_origin, 'mcp') != 'mcp' OR IFNULL(f.note_origin, 'mcp') != 'mcp'
+                    OR EXISTS (SELECT 1 FROM finding_events e WHERE IFNULL(e.origin, '') != 'mcp'
+                        AND e.kind NOT IN ('created', 'regressed', 'risk')
+                        AND (e.finding_id = f.id OR (e.finding_id IS NULL AND e.issue_id = f.issue_id)))
+                 FROM findings f WHERE f.id = ?1",
                 [id],
                 |r| r.get(0),
             )?;
-            if old.origin.as_deref() != Some("mcp") || person_edited {
+            if old.origin.as_deref() != Some("mcp") || person_touched {
                 let whose = if old.origin.as_deref() != Some("mcp") {
                     format!("it was added {}", crate::provenance::describe(old.origin.as_deref()))
                 } else {
-                    "a person has edited it since".to_string()
+                    "a person has changed it since (its state, note, fields, ticket or issue)".to_string()
                 };
                 return Err(Error::InvalidInput(format!(
-                    "finding {id}: through MCP an agent edits only the findings it added, and {whose}; mark it with \
-                     a note instead (findings mark {id} --note ...)"
+                    "finding {id}: through MCP an agent edits only the findings it added that no person has changed \
+                     since, and {whose}; mark it with a note instead (findings mark {id} --note ...)"
                 )));
             }
         }
@@ -1141,12 +1156,12 @@ impl Store {
             tx.commit()?;
             return Ok(FindingEdited { changed, replaced, revision: old.revision() });
         }
-        // Looked up before the row changes, which would make it find this finding's own issue.
-        let move_to = match old.issue {
+        // Looked up before the row changes, which would make it find itself.
+        let issue = match old.issue {
             Some(from) if new.alert_ref != old.alert_ref || new.host != old.host => {
-                Some((from, crate::scan::issues::issue_for(&tx, &new.alert_ref, &new.host)?)).filter(|(f, t)| f != t)
+                issue_after_edit(&tx, id, from, &old, &new)?
             }
-            _ => None,
+            _ => IssueChange::Keep,
         };
         tx.execute(
             "UPDATE findings SET name = ?2, alert_ref = ?3, risk = ?4, risk_level = ?5, confidence = ?6, cwe = ?7,
@@ -1192,8 +1207,34 @@ impl Store {
                 ..Default::default()
             },
         )?;
-        if let Some((from, to)) = move_to {
-            crate::scan::issues::move_findings(&tx, &[id], from, to)?;
+        match issue {
+            IssueChange::Keep => {}
+            IssueChange::Rekey(i) => {
+                tx.execute(
+                    "UPDATE issues SET alert_ref = ?2, host = ?3 WHERE id = ?1",
+                    params![i, new.alert_ref, new.host],
+                )?;
+            }
+            IssueChange::Move(from, to) => {
+                crate::scan::issues::move_findings(&tx, &[id], from, to)?;
+            }
+        }
+        // A comparison with a report from before the edit still knows it by what it was.
+        let was = dedupe_key(&old.alert_ref, &old.method, &old.url, &old.param);
+        if was != dedupe {
+            let key = identities_key(id);
+            let stored: Option<String> =
+                tx.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?;
+            let mut earlier: Vec<String> = stored.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+            let print = fingerprint(&old.alert_ref, &old.method, &old.url, &old.param);
+            if !earlier.contains(&print) {
+                earlier.push(print);
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, serde_json::to_string(&earlier).unwrap_or_default()],
+                )?;
+            }
         }
         let revision = ManualRow::load(&tx, id)?.revision();
         tx.commit()?;
@@ -1660,6 +1701,69 @@ fn edit_texts(
 
 fn history_key(id: i64) -> String {
     format!("finding.{id}.history")
+}
+
+/// The identities (`fingerprint`s) a finding added by hand had before `findings edit` changed
+/// its title, method, URL or parameter, oldest first, which `findings compare` still matches.
+fn identities_key(id: i64) -> String {
+    format!("finding.{id}.identities")
+}
+
+/// The earlier identities of every finding edited by hand, by finding id (see [`identities_key`]).
+pub(crate) fn earlier_identities(conn: &rusqlite::Connection) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+    let mut stmt = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'finding.%.identities'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        let id = key.strip_prefix("finding.").and_then(|k| k.strip_suffix(".identities")).and_then(|k| k.parse().ok());
+        if let (Some(id), Ok(list)) = (id, serde_json::from_str::<Vec<String>>(&value)) {
+            out.insert(id, list);
+        }
+    }
+    Ok(out)
+}
+
+/// What an edit that changed a finding's alert type or host does to its issue.
+enum IssueChange {
+    Keep,
+    /// The finding was its issue's only one: the issue (its title, CVSS and write-up) goes
+    /// with it, to its new alert type and host.
+    Rekey(i64),
+    Move(i64, i64),
+}
+
+/// Where finding `id` of issue `from` goes once edited from `old` to `new`, which changed its
+/// alert type or host. It joins the issue findings of its new type and host are in; else the
+/// issue it was the only live finding of goes with it; else it leaves for one of its own. A
+/// host change alone keeps it in an issue a person merged across hosts.
+fn issue_after_edit(
+    conn: &rusqlite::Connection,
+    id: i64,
+    from: i64,
+    old: &ManualRow,
+    new: &ManualRow,
+) -> Result<IssueChange> {
+    // Removed findings don't count: the issue's write-up isn't about them.
+    let (others, elsewhere): (i64, i64) = conn.query_row(
+        "SELECT count(*), coalesce(sum(host != ?3), 0) FROM findings WHERE issue_id = ?1 AND id != ?2 AND state != ?4",
+        params![from, id, old.host, REMOVED],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if new.alert_ref == old.alert_ref && elsewhere > 0 {
+        return Ok(IssueChange::Keep);
+    }
+    let joined: Option<i64> = conn.query_row(
+        "SELECT min(issue_id) FROM findings WHERE alert_ref = ?1 AND host = ?2 AND id != ?3",
+        params![new.alert_ref, new.host, id],
+        |r| r.get(0),
+    )?;
+    let to = match joined {
+        Some(to) => to,
+        None if others == 0 => return Ok(IssueChange::Rekey(from)),
+        None => crate::scan::issues::issue_for(conn, &new.alert_ref, &new.host)?,
+    };
+    Ok(if to == from { IssueChange::Keep } else { IssueChange::Move(from, to) })
 }
 
 /// When a finding was removed and by whom (`by`: gui or cli), and the triage state it had and
@@ -2624,5 +2728,46 @@ mod tests {
         // The same finding as the one it now shares a title with is refused.
         let same = FindingEdit { url: Some("http://app.test/y".into()), ..Default::default() };
         assert!(matches!(s.finding_edit(id, &same), Err(Error::Conflict(_))));
+    }
+
+    #[test]
+    fn a_finding_is_shown_with_the_revision_of_what_it_shows() {
+        let dir = std::env::temp_dir().join(format!("bp-findings-rev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let mut reader = Store::create(&path).unwrap();
+        let id = reader.finding_add(&manual("Leak", Some("http://app.test/x"), vec![])).unwrap();
+        let before = manual_revision(&reader.conn, id).unwrap().unwrap();
+        // Another process edits the finding while it is being read: once the first statement has
+        // its snapshot (its first instructions open the read), and before the read ends.
+        let mut writer = std::panic::AssertUnwindSafe(Some(Store::open(&path).unwrap()));
+        let mut steps = 0;
+        reader
+            .conn
+            .progress_handler(
+                1,
+                Some(move || {
+                    steps += 1;
+                    if steps < 20 {
+                        return false;
+                    }
+                    if let Some(mut w) = writer.take() {
+                        let edit = FindingEdit { evidence: Some("changed".into()), ..Default::default() };
+                        w.finding_edit(id, &edit).unwrap();
+                    }
+                    false
+                }),
+            )
+            .unwrap();
+        let shown = reader.finding_get(id).unwrap();
+        reader.conn.progress_handler(1, None::<fn() -> bool>).unwrap();
+        let after = manual_revision(&reader.conn, id).unwrap().unwrap();
+        assert_ne!(before, after, "the edit happened");
+        // Whichever version it showed, its revision is that version's.
+        let want = if shown["evidence"] == "changed" { &after } else { &before };
+        assert_eq!(shown["revision"].as_str(), Some(want.as_str()), "{shown}");
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
