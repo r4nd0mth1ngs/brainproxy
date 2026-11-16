@@ -122,7 +122,9 @@ file's) is refused, so an agent marks findings by id, with a note.
   and a new pid, which `proxy_status` shows in `restart_gone`), `*_remove`, `*_clear`,
   `scope_set`, `scan_data_reset`. `replay_tabs_save` and `history_filters_save` are local and not
   destructive: through MCP they only add Replay tabs or saved Traffic filters (below), and they send nothing; nor are
-  `report`, `findings_repro`, `ca_export` and `ca_init`, whose `force` is refused (below). A command
+  `report`, `findings_repro`, `ca_export` and `ca_init`, whose `force` is refused (below).
+  `rules_edit` and `auth_macro_edit` are destructive locally (the version they change isn't
+  kept); `findings_edit` isn't, since the values it changes stay on the finding's timeline. A command
   missing from the table gets the spec's cautious defaults (not read-only, destructive, not
   idempotent, open world); a test fails until it is classified. These are hints for clients
   deciding what to confirm; the scope is enforced by the commands regardless.
@@ -139,8 +141,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
 
 - `auth_sign_add` with `script`: a collection's pre-request script is code; a person reads it
   (`import api --show-scripts`) and adds the signer in the app or a terminal.
-- Anything that names a hook script to run (MANUAL.md, "Scripts"): `rules_add` and `rules_test`
-  with `script`, `rules_import` of a rule that has one, `rules_enable` of one that is disabled,
+- Anything that names a hook script to run (MANUAL.md, "Scripts"): `rules_add`, `rules_edit` and
+  `rules_test` with `script`, `rules_import` of a rule that has one, `rules_enable` of one that is
+  disabled, `rules_edit` of a script rule's workings (its comment alone can change),
   `fuzz_run` with a `script:FILE` step in `process` (refused before the file is looked at), and
   `scan_enable` of a script check (`script:NAME`) that is off. `scan script add`, `scan script
   test` and `scan script remove` are not tools at all. A script is code, so a person reads it
@@ -148,8 +151,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
   `scan_script_list`, `rules_test` with `rule` (a saved rule that is switched on; one a person
   switched off is refused, as the tester would run its script), `rules_disable`, `rules_remove`
   and `scan_disable` work as for any rule, except that a request rule that is on (its script
-  may be what keeps requests from the target) can't be disabled, removed, cleared or replaced
-  by `rules_import` with `replace`. Nor can a rule an agent adds change what such a script
+  may be what keeps requests from the target) can't be disabled, removed, cleared, replaced
+  by `rules_import` with `replace`, or changed by `rules_edit`. Nor can a rule an agent adds change what such a script
   let through: request rules run after every other request rule of the engine, whatever their
   place in the list. Nor can an edit: a request the proxy held that `intercept_forward` sends
   on with a `file` goes through the request rules' scripts again, as edited, and is blocked,
@@ -188,9 +191,22 @@ Some arguments need a person, so a command run for a tool call (the server sets
   replace, change or clear the ones they keep, or fill the 200 a project holds. A filter it adds is stored with origin `mcp`, which the app
   keeps when it saves the list back. `history_list` takes the same query language as Traffic's Query mode in
   `filter`; its description lists the fields.
-- `findings_add` with `description_file`, `solution_file` or `evidence_file` other than `-`: it
-  would copy any file the server can read into the project for the agent to read back; pass the
-  text as the call's `stdin` instead (`input_json` takes all three as JSON).
+- `findings_add` and `findings_edit` with `description_file`, `solution_file` or `evidence_file`
+  other than `-`: it would copy any file the server can read into the project for the agent to
+  read back; pass the text as the call's `stdin` instead (`input_json` takes all three as JSON).
+  `replace_text` is refused for both, since a write-up findings share may be a person's.
+- `findings_edit` of a finding the agent didn't add (its `origin` isn't `mcp`), or one a person
+  has edited since: an agent edits only its own findings, and marks a person's with a note
+  (`findings_mark`) instead. Each edit is on the finding's timeline with origin `mcp` and the
+  values before and after, and `findings_trail` lists it.
+- What an edit changes is checked as an add would be, and the editor answers for it:
+  `rules_edit` that changes what a rule does records `mcp` as its origin (a comment alone
+  doesn't), so a Host the scope doesn't list that the rule brings into a request is refused
+  where it is sent, and one its replacement writes is refused when it is saved, unless
+  `host_header_test`; `auth_macro_edit` checks a step's Host as `auth_macro_add` does, takes
+  step files only from the project's folder, and records `mcp` as the macro's origin. Each edit
+  takes `if_revision` (from `rules_list`'s `revisions`, `findings_show`'s or
+  `auth_macro_show`'s `revision`) and fails with a conflict when the record changed since.
 - `findings_verify` with a `request` other than `-`: the edited attack is sent and recorded as it
   is, so a file could reach the target and be read back from history. The request is the
   call's `stdin` (`request: "-"`). Like `findings_retest`, it sends only GET, HEAD and OPTIONS
