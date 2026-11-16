@@ -631,8 +631,9 @@ Edit a raw request and send it as often as you like, in separate tabs.
   there: the tabs after it say why they weren't sent, and a toast says where it stopped. Every
   request sent is recorded in Traffic (source `send`), tagged `sequence:ID`,
   `sequence-conn:single` or `sequence-conn:separate`, and `sequence-pos:2/3`; the toolbar shows
-  the tab's place in the group. **Stop** in any of the tabs stops the group: the request going
-  out is marked cancelled and the rest aren't sent. The command palette has both choices. The
+  the tab's place in the group. **Stop** in any of the tabs stops the group: tabs already
+  answered keep their responses, the request going out is marked cancelled, and the rest aren't
+  sent. The command palette has both choices. The
   same as `brainproxy send req.http --also cart.http --sequence single` (or `separate`), with
   the active tab's options as flags.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
@@ -1035,7 +1036,9 @@ byte, side by side or unified.
   - **Platform authentication:** HTTP Basic, Digest, or NTLM for some hosts, with the
     profile's username and password (for NTLM, the domain in its own field or as
     `DOMAIN\user`). brainproxy answers those hosts' 401 challenges on every command and
-    through the proxy, without choosing the profile; the header is added on the wire only,
+    through the proxy, without choosing the profile, except in a race or a sequence (`send
+    --race`, `--also`, `--sequence`), whose requests go without them (a sequence's output says
+    so in `platform_auth_warning`); the header is added on the wire only,
     so history keeps the request without it. A request that brings its own Authorization
     header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
     requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
@@ -1342,11 +1345,12 @@ anything is sent, a login included.
   response that said `Connection: close`, an HTTP/1.0 response without keep-alive, a `101`, a
   body that ran to the close, or an HTTP/2 connection the server closed. The requests after a
   stop aren't sent and get no row.
-- With `--auth`, each request gets the session as it is when the request goes out, and each
-  response's cookies are learned, so a cookie an earlier response set goes with the later
-  requests. A lost session isn't renewed partway through, since that would send a login
-  between two requests. Match-and-replace rules apply to each request and response as in a
-  race.
+- With `--auth`, every request gets the session before the first goes out, as in a race: the
+  session's rules (a check, a macro, a login) run then, so nothing of the session's is sent
+  between two requests of the group. A cookie an earlier response sets isn't carried to the
+  later requests. Match-and-replace rules apply to each request and response as in a race.
+- Platform credentials (`auth add --platform`) aren't answered, as in a race: a 401 challenge
+  is that request's response, and `platform_auth_warning` in the output says so.
 - Not with `--race`, `--raw`, `--show-request`, `--http3`, `--stream-wait` or `--max-events`.
 
 Each request is recorded like any send (source `send`), its row written just before it goes
@@ -1361,10 +1365,14 @@ JSON has `sequence` (`single` or `separate`), `sequence_id`, `target`, `http2`, 
 `kind`, and a `not_sent` one nothing more. `stopped` is null, or `{request, cause, reason}`:
 with `cause` `failed`, request `request` failed and `reason` is its error; with `closed`,
 request `request` wasn't sent because the connection ended after the one before it, and
-`reason` says how. A sequence that stops fails with the failed request's error kind (`protocol`
-for a closed connection) and exit code, its message saying how far it got (`request 1 of the
-sequence of 3 failed, so request 2 wasn't sent: ...`), and the envelope's `error.data` holds the
-whole result. The text output lists each request with its history row. Through MCP the flag is
+`reason` says how; with `cancelled`, the command was stopped (Ctrl-C, SIGTERM, the app's Stop)
+while request `request` was going out. A sequence that stops fails with the failed request's
+error kind (`protocol` for a closed connection, `io` when cancelled) and exit code, its message
+saying how far it got (`request 1 of the sequence of 3 failed, so request 2 wasn't sent: ...`;
+a timeout's message is only its duration), and the envelope's `error.data` holds the whole
+result, the responses answered before the stop included. `rule_errors` lists the
+match-and-replace rules whose script failed on a request or its response, `warning` what
+wasn't kept (the session's state, or what the rules made of a response). The text output lists each request with its history row. Through MCP the flag is
 the `send` tool's `sequence` argument, and the other requests come from the call's stdin
 (`also: ["-"]`), as for a race.
 
@@ -2635,7 +2643,8 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
 - A sequence (`send --sequence`) writes each request's row just before that request goes out,
   so the requests after a stop have none. Stopped with Ctrl-C or SIGTERM, the request going out
-  is marked cancelled and the rest aren't sent.
+  is marked cancelled, the rest aren't sent, and `error.data` still lists the responses
+  answered before the stop.
 - The document fetches of `import` and `scan active --api` (with `--graphql`, the
   introspection) are recorded the same way: a row just before the request goes out, completed
   with the response or the failure.

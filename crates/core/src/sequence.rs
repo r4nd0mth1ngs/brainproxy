@@ -9,18 +9,23 @@
 //!
 //! The sequence stops at the first request that fails, and before a request the one connection
 //! can't carry: the server closed it, or said it would, after the request before.
+//!
+//! An auth session is the caller's to apply, to every request before the first goes out (as for
+//! a race), so nothing of the session's (a check, a macro, a login) goes out between two of them.
+//! ponytail: platform credentials (`auth add --platform`) aren't answered here, as in a race: a
+//! 401 challenge is the request's response. Answering one on the sequence's own connection (NTLM
+//! authenticates that connection) needs `Client::exchange_platform` to work on a given connection;
+//! revisit for races and sequences together.
 
 use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 
-use crate::auth::AuthSession;
 use crate::error::{Error, Result};
 use crate::http::client::connection_ends;
 use crate::http::h2::{h2_error, setup_error, H2Request};
 use crate::http::{Client, Exchange, RawRequest, Stream, Target, WireReader};
-use crate::session::Tool;
 
 /// How a sequence's requests are carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +47,8 @@ impl Connections {
 
 /// What [`send_in_order`] reports as it goes, for the caller to record each request.
 pub enum Step<'a> {
-    /// Request `index` is about to go out: its bytes as recorded (the session applied, auth
-    /// placeholders in place of their values, in HTTP/2's text form over HTTP/2).
+    /// Request `index` is about to go out: its bytes as recorded (auth placeholders in place of
+    /// their values, in HTTP/2's text form over HTTP/2).
     Sending(usize, &'a [u8]),
     /// Request `index` is answered.
     Answered(usize, &'a Exchange),
@@ -78,17 +83,13 @@ enum Conn {
 
 /// Sends `requests` to `target` one after another, each once the one before is answered, over
 /// one connection or a new one each (`connections`), over HTTP/2 with `h2`. Every connection goes
-/// through `client`, so through the scope guard, the connection options and `--sni`.
-///
-/// With a `session`, each request gets the session as it is when the request goes out, and its
-/// response's cookies are learned, so a cookie an earlier response set goes with later requests.
-/// A lost session isn't renewed partway through (that would send a login between two requests).
+/// through `client`, so through the scope guard, the connection options and `--sni`, and every
+/// request through its auth placeholders and Host policy as it goes on the wire.
 ///
 /// `watch` hears of each request just before it goes out and once it is answered; an error from
 /// it stops the sequence and is returned, the request it was about left as it was.
 pub async fn send_in_order(
     client: &Client,
-    session: Option<&AuthSession>,
     target: &Target,
     requests: &[RawRequest],
     connections: Connections,
@@ -98,7 +99,7 @@ pub async fn send_in_order(
     let timeout = client.options().timeout;
     let mut out = Sequence { results: Vec::new(), connections: 0, stopped: None };
     let mut conn: Option<Conn> = None;
-    for (i, given) in requests.iter().enumerate() {
+    for (i, req) in requests.iter().enumerate() {
         // An HTTP/2 connection the server has closed (GOAWAY, or gone) is found before anything
         // more is sent on it.
         conn = match conn.take() {
@@ -111,10 +112,6 @@ pub async fn send_in_order(
                 }
             },
             other => other,
-        };
-        let req = match session {
-            Some(s) => RawRequest::from_bytes(s.prepare(Tool::Send, target, given.as_bytes(), &[], &[]).await.request),
-            None => given.clone(),
         };
         // A request HTTP/2 can't carry fails before anything of it is sent or recorded.
         let recorded = match h2 {
@@ -176,9 +173,6 @@ pub async fn send_in_order(
             stream: None,
         };
         watch(Step::Answered(i, &ex))?;
-        if let Some(s) = session {
-            s.observe(&ex.response);
-        }
         let ends = match (&conn, connections) {
             (Some(Conn::H1 { .. }), Connections::Single) => connection_ends(&wire, &ex.response, &method),
             _ => None,
@@ -287,7 +281,7 @@ mod tests {
             let (port, accepted, lines) = server(vec![Some(OK), Some(OK), Some(OK)]);
             let mut steps = Vec::new();
             let c = client(std::time::Duration::from_secs(5));
-            let seq = send_in_order(&c, None, &target(port), &requests(port, &["/a", "/b", "/c"]), how, false, |s| {
+            let seq = send_in_order(&c, &target(port), &requests(port, &["/a", "/b", "/c"]), how, false, |s| {
                 steps.push(match s {
                     Step::Sending(i, _) => format!("sending {i}"),
                     Step::Answered(i, _) => format!("answered {i}"),
@@ -312,11 +306,9 @@ mod tests {
         let (port, accepted, lines) = server(vec![Some(close), Some(OK)]);
         let c = client(std::time::Duration::from_secs(5));
         let seq =
-            send_in_order(&c, None, &target(port), &requests(port, &["/a", "/b"]), Connections::Single, false, |_| {
-                Ok(())
-            })
-            .await
-            .unwrap();
+            send_in_order(&c, &target(port), &requests(port, &["/a", "/b"]), Connections::Single, false, |_| Ok(()))
+                .await
+                .unwrap();
         assert_eq!(seq.results.len(), 1);
         match &seq.stopped {
             Some(Stop::Closed { next: 1, why }) => assert!(why.contains("Connection: close"), "{why}"),
@@ -328,17 +320,12 @@ mod tests {
         // The server just closes after the first answer: the second request fails, the third
         // isn't tried.
         let (port, _, _) = server(vec![Some(OK), None]);
-        let seq = send_in_order(
-            &c,
-            None,
-            &target(port),
-            &requests(port, &["/a", "/b", "/c"]),
-            Connections::Single,
-            false,
-            |_| Ok(()),
-        )
-        .await
-        .unwrap();
+        let seq =
+            send_in_order(&c, &target(port), &requests(port, &["/a", "/b", "/c"]), Connections::Single, false, |_| {
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert_eq!(seq.results.len(), 2);
         assert!(seq.results[0].is_ok());
         assert!(matches!(seq.stopped, Some(Stop::Failed { at: 1 })), "{:?}", seq.stopped);
@@ -353,11 +340,9 @@ mod tests {
         let (port, _, _) = server(vec![Some(two), Some(OK)]);
         let c = client(std::time::Duration::from_secs(5));
         let seq =
-            send_in_order(&c, None, &target(port), &requests(port, &["/a", "/b"]), Connections::Single, false, |_| {
-                Ok(())
-            })
-            .await
-            .unwrap();
+            send_in_order(&c, &target(port), &requests(port, &["/a", "/b"]), Connections::Single, false, |_| Ok(()))
+                .await
+                .unwrap();
         let second = seq.results[1].as_ref().unwrap();
         assert!(second.response.starts_with(b"HTTP/1.1 404"), "{}", String::from_utf8_lossy(&second.response));
     }
@@ -366,7 +351,7 @@ mod tests {
     async fn refuses_an_out_of_scope_target_and_stops_when_watch_fails() {
         let c = client(std::time::Duration::from_secs(5));
         let other = Target { scheme: "http".into(), host: "127.0.0.2".into(), port: 9 };
-        let seq = send_in_order(&c, None, &other, &requests(9, &["/a", "/b"]), Connections::Single, false, |_| Ok(()))
+        let seq = send_in_order(&c, &other, &requests(9, &["/a", "/b"]), Connections::Single, false, |_| Ok(()))
             .await
             .unwrap();
         assert!(matches!(seq.results[0], Err(Error::OutOfScope(_))), "{:?}", seq.results);
@@ -374,11 +359,9 @@ mod tests {
 
         let (port, _, lines) = server(vec![Some(OK), Some(OK)]);
         let err =
-            send_in_order(&c, None, &target(port), &requests(port, &["/a", "/b"]), Connections::Single, false, |s| {
-                match s {
-                    Step::Sending(1, _) => Err(Error::InvalidInput("no room".into())),
-                    _ => Ok(()),
-                }
+            send_in_order(&c, &target(port), &requests(port, &["/a", "/b"]), Connections::Single, false, |s| match s {
+                Step::Sending(1, _) => Err(Error::InvalidInput("no room".into())),
+                _ => Ok(()),
             })
             .await
             .unwrap_err();
@@ -392,7 +375,7 @@ mod tests {
         let c = client(std::time::Duration::from_secs(5));
         let reqs = requests(port, &["/a", "/b", "/c"]);
         let mut recorded = Vec::new();
-        let seq = send_in_order(&c, None, &target(port), &reqs, Connections::Single, true, |s| {
+        let seq = send_in_order(&c, &target(port), &reqs, Connections::Single, true, |s| {
             if let Step::Sending(_, r) = s {
                 recorded.push(String::from_utf8_lossy(r).lines().next().unwrap_or("").to_string());
             }
@@ -409,11 +392,9 @@ mod tests {
         }
         let (port, accepted) = crate::http::h2::tests::h2_server(None).await;
         let seq =
-            send_in_order(&c, None, &target(port), &requests(port, &["/a", "/b"]), Connections::Separate, true, |_| {
-                Ok(())
-            })
-            .await
-            .unwrap();
+            send_in_order(&c, &target(port), &requests(port, &["/a", "/b"]), Connections::Separate, true, |_| Ok(()))
+                .await
+                .unwrap();
         assert!(seq.stopped.is_none());
         assert_eq!((seq.connections, accepted.load(Ordering::Relaxed)), (2, 2));
     }

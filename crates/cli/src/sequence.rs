@@ -7,20 +7,21 @@ use std::sync::Arc;
 
 use brainproxy_core::auth::AuthSession;
 use brainproxy_core::http::h2::H2Request;
-use brainproxy_core::http::{Client, RawRequest, Target};
+use brainproxy_core::http::{Client, Exchange, RawRequest, Target};
 use brainproxy_core::rules::{EngineRules, Ruled};
 use brainproxy_core::sequence::{send_in_order, Connections, Step, Stop};
 use brainproxy_core::Error;
 use serde_json::{json, Value};
 
-use crate::output::Out;
+use crate::output::{escape_controls, Out};
 use crate::{exchange_json, mcp, process, sent, SendArgs};
 
 /// The most requests one sequence takes, as for a race's total.
 pub(crate) const MAX: usize = 1000;
 
-/// What `send` set up for the group besides its requests: the rules and what they did to each
-/// request, the client, the auth session, and the Host-header warning so far.
+/// What `send` set up for the group besides its requests (which already have the auth session
+/// applied): the rules and what they did to each request, the client, the session (whose own
+/// requests may have put a Host in), and the Host-header warning so far.
 pub(crate) struct Setup<'a> {
     pub rules: Option<&'a EngineRules>,
     pub ruled: &'a [Ruled],
@@ -53,6 +54,16 @@ fn row_tags(id: &str, connections: Connections, pos: usize, n: usize) -> Vec<Str
     ]
 }
 
+/// Why the sequence ended before its last request was answered, as the output says it.
+enum Ended {
+    /// Request `at` failed (its result says how).
+    Failed { at: usize },
+    /// Request `next` wasn't sent: the connection ended after the one before it.
+    Closed { next: usize, why: String },
+    /// Stopped (Ctrl-C, SIGTERM, the app's Stop) while request `at` was going out or answered.
+    Cancelled { at: usize },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send(
     project: &Path,
@@ -80,10 +91,12 @@ pub(crate) fn send(
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
     // Each request's row, written just before it goes out; `open` is the one out and unanswered.
+    // The answers are kept as they come, so a sequence stopped partway still shows them.
     let mut ids: Vec<Option<i64>> = vec![None; n];
     let mut open: Option<(usize, i64, Vec<u8>)> = None;
+    let mut answers: Vec<Option<Exchange>> = vec![None; n];
     let outcome = {
-        let (log, ids, open) = (&mut log, &mut ids, &mut open);
+        let (log, ids, open, answers) = (&mut log, &mut ids, &mut open, &mut answers);
         let watch = |step: Step<'_>| -> Result<(), Error> {
             match step {
                 Step::Sending(i, recorded) => {
@@ -96,13 +109,16 @@ pub(crate) fn send(
                     *open = Some((i, id, recorded.to_vec()));
                     Ok(())
                 }
-                Step::Answered(_, ex) => match open.take() {
-                    Some((_, id, _)) => log.answered(id, ex),
-                    None => Ok(()),
-                },
+                Step::Answered(i, ex) => {
+                    answers[i] = Some(ex.clone());
+                    match open.take() {
+                        Some((_, id, _)) => log.answered(id, ex),
+                        None => Ok(()),
+                    }
+                }
             }
         };
-        let sending = send_in_order(&client, session.as_deref(), &target, &requests, connections, h2, watch);
+        let sending = send_in_order(&client, &target, &requests, connections, h2, watch);
         rt.block_on(async {
             tokio::select! {
                 r = sending => Some(r),
@@ -111,18 +127,28 @@ pub(crate) fn send(
         })
     };
     let rows: Vec<i64> = ids.iter().flatten().copied().collect();
-    // Rows first: a failure saving the session mustn't leave one pending.
-    let seq = match outcome {
-        Some(Ok(seq)) => seq,
+    // One result per request sent or tried, and why it ended early. Rows first: the request out
+    // when it ended gets its error before anything else can fail.
+    let (results, ended): (Vec<Result<Exchange, Error>>, Option<Ended>) = match outcome {
+        Some(Ok(seq)) => {
+            let ended = seq.stopped.map(|stop| match stop {
+                Stop::Failed { at } => Ended::Failed { at },
+                Stop::Closed { next, why } => Ended::Closed { next, why },
+            });
+            (seq.results, ended)
+        }
         Some(Err(e)) => {
             let failed = open.take().map(|(_, id, recorded)| log.failed(id, &target, &recorded, &e.to_string()));
-            let _ = session.as_ref().map(|s| s.save());
             return failed.transpose().and(Err(e));
         }
         None => {
-            let failed = open.take().map(|(_, id, recorded)| log.failed(id, &target, &recorded, sent::CANCELLED));
-            let _ = session.as_ref().map(|s| s.save());
-            return failed.transpose().and(Err(sent::cancelled(&rows)));
+            let at = open.as_ref().map_or_else(|| answers.iter().flatten().count(), |(i, _, _)| *i);
+            let mut results: Vec<Result<Exchange, Error>> =
+                answers.iter().take(at).flatten().cloned().map(Ok).collect();
+            if open.is_some() {
+                results.push(Err(Error::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, sent::CANCELLED))));
+            }
+            (results, Some(Ended::Cancelled { at }))
         }
     };
     // Every row is completed before a store error is reported, so none stays pending.
@@ -132,26 +158,48 @@ pub(crate) fn send(
             store_error.get_or_insert(e);
         }
     };
-    // The request that failed after its row was written: the row says how.
+    // The request out when the sequence ended (it failed, or was stopped): the row says how.
     if let Some((i, id, recorded)) = open.take() {
-        let error = seq.results.get(i).and_then(|r| r.as_ref().err()).map(Error::to_string);
+        let cancelled = matches!(ended, Some(Ended::Cancelled { .. }));
+        let error = results.get(i).and_then(|r| r.as_ref().err()).map(Error::to_string).filter(|_| !cancelled);
         done(log.failed(id, &target, &recorded, error.as_deref().unwrap_or(sent::CANCELLED)));
     }
-    let saved = session.as_ref().map(|s| s.save()).transpose();
+    if let Some(e) = store_error {
+        return Err(e);
+    }
+    let mut warnings = Vec::new();
+    if let Some(Err(e)) = session.as_ref().map(|s| s.save()) {
+        warnings.push(format!("the session's state wasn't saved: {e}"));
+    }
+    // A rule whose script failed left that request, or its response, as it was.
+    let mut rule_errors: Vec<Value> = ruled
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| r.failed.iter().map(move |f| json!({"request": i, "id": f.id, "error": f.error})))
+        .collect();
     let mut items = Vec::with_capacity(n);
     let mut answered = 0;
     for (i, line) in lines.iter().enumerate() {
-        let mut item = match seq.results.get(i) {
+        let mut item = match results.get(i) {
             Some(Ok(ex)) => {
                 answered += 1;
                 // As for one send: the row keeps the response as received and, beside it, what
-                // the rules made of it, which is what is shown.
+                // the rules made of it, which is what is shown. The requests went out and their
+                // rows are complete: failing to keep that would hide the answers.
                 let after = rules
                     .filter(|rules| rules.rewrites_responses(&target))
-                    .map(|rules| rules.response(&target, &ex.request, ex.response.clone()))
-                    .filter(|after| after.changed());
+                    .map(|rules| rules.response(&target, &ex.request, ex.response.clone()));
+                if let Some(after) = &after {
+                    rule_errors
+                        .extend(after.failed.iter().map(|f| json!({"request": i, "id": f.id, "error": f.error})));
+                }
+                let after = after.filter(|after| after.changed());
                 if let (Some(after), Some(id)) = (&after, ids[i]) {
-                    done(log.ruled_response(id, after));
+                    if let Err(e) = log.ruled_response(id, after) {
+                        warnings.push(format!(
+                            "history #{id} keeps the response as received, but not what the rules made of it: {e}"
+                        ));
+                    }
                 }
                 let response = after.as_ref().map_or(&ex.response, |after| &after.bytes);
                 let mut v = exchange_json(ids[i], &target, &ex.request, response, Some(ex.duration_ms), args.max_body);
@@ -165,9 +213,6 @@ pub(crate) fn send(
         item["request_line"] = json!(line);
         items.push(item);
     }
-    if let Some(e) = store_error {
-        return Err(e);
-    }
     let new_findings = log.scan(&rows)?;
     let clients = [&client].into_iter().chain(session.as_deref().map(|s| s.client()));
     let host_warning = mcp::sent_host_warning(clients, host_warning, out);
@@ -176,22 +221,26 @@ pub(crate) fn send(
         1 => format!("request {from} wasn't sent"),
         _ => format!("requests {from} to {} weren't sent", n - 1),
     };
+    let so = |from: usize| if from < n { format!(", so {}", unsent(from)) } else { String::new() };
     // Why it stopped, and the error it ends with: the failed request's (its kind and exit code),
-    // saying where in the sequence it was.
-    let (stopped, error) = match &seq.stopped {
+    // saying where in the sequence it was. A timeout's message is its duration only.
+    let (stopped, error) = match &ended {
         None => (Value::Null, None),
-        Some(Stop::Failed { at }) => {
-            let so = if at + 1 < n { format!(", so {}", unsent(at + 1)) } else { String::new() };
-            let prefix = format!("request {at} of the sequence of {n} failed{so}: ");
-            let e = seq.results.get(*at).and_then(|r| r.as_ref().err());
+        Some(Ended::Failed { at }) => {
+            let prefix = format!("request {at} of the sequence of {n} failed{}: ", so(at + 1));
+            let e = results.get(*at).and_then(|r| r.as_ref().err());
             let reason = e.map(Error::to_string).unwrap_or_default();
             let error = e.map_or_else(|| Error::Protocol(prefix.clone()), |e| e.prefixed(&prefix));
             (json!({"request": at, "cause": "failed", "reason": reason}), Some(error))
         }
-        Some(Stop::Closed { next, why }) => {
+        Some(Ended::Closed { next, why }) => {
             let message =
                 format!("the sequence of {n} stopped after request {}, so {}: {why}", next - 1, unsent(*next));
             (json!({"request": next, "cause": "closed", "reason": why}), Some(Error::Protocol(message)))
+        }
+        Some(Ended::Cancelled { at }) => {
+            let reason = "cancelled by user";
+            (json!({"request": at, "cause": "cancelled", "reason": reason}), Some(sent::cancelled(&rows)))
         }
     };
     let mut data = json!({
@@ -199,21 +248,15 @@ pub(crate) fn send(
         "sequence_id": sequence_id,
         "target": target.origin(),
         "http2": h2,
-        "connections": seq.connections,
+        "connections": client.connections_opened(),
         "total": n,
         "answered": answered,
-        "complete": seq.stopped.is_none(),
+        "complete": ended.is_none(),
         "stopped": stopped,
         "results": items,
         "hint": "Each result is one request of the group, in the order sent; outcome is answered, failed, or not_sent \
                  (after a stop). Open a row with history show ID; every row is tagged sequence:SEQUENCE_ID.",
     });
-    // A rule whose script failed left that request as it was.
-    let rule_errors: Vec<Value> = ruled
-        .iter()
-        .enumerate()
-        .flat_map(|(i, r)| r.failed.iter().map(move |f| json!({"request": i, "id": f.id, "error": f.error})))
-        .collect();
     if !rule_errors.is_empty() {
         data["rule_errors"] = json!(rule_errors);
     }
@@ -223,8 +266,20 @@ pub(crate) fn send(
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
     }
-    if let Err(e) = saved {
-        data["warning"] = json!(format!("the session's state wasn't saved: {e}"));
+    // ponytail: platform credentials aren't answered in a sequence, as in a race (see
+    // brainproxy_core::sequence); say so rather than leave a 401 unexplained.
+    let own_auth = |req: &RawRequest| {
+        req.head().is_ok_and(|h| h.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+    };
+    if client.has_platform_auth(&target) && !requests.iter().all(own_auth) {
+        data["platform_auth_warning"] = json!(format!(
+            "{} has platform credentials (auth add --platform), but a sequence, like a race, doesn't answer \
+             their 401 challenges: its requests went without them. Send them one at a time to use them.",
+            target.origin()
+        ));
+    }
+    if !warnings.is_empty() {
+        data["warning"] = json!(warnings.join("; "));
     }
     let text = text(&data);
     match error {
@@ -266,14 +321,19 @@ fn text(data: &Value) -> String {
             _ => "not sent".into(),
         };
         let (index, line) = (item["request"].as_u64().unwrap_or(0), item["request_line"].as_str().unwrap_or(""));
-        lines.push(format!("{index:>4}  {id:<7} {what}  {line}"));
+        // The reason phrase, the error and the request line are the target's or the request's:
+        // a control character in them mustn't rewrite the listing.
+        lines.push(format!("{index:>4}  {id:<7} {}  {}", escape_controls(&what), escape_controls(line)));
     }
     let stopped = &data["stopped"];
     if let (Some(at), Some(reason)) = (stopped["request"].as_u64(), stopped["reason"].as_str()) {
         lines.push(match stopped["cause"].as_str() {
-            Some("closed") => {
-                format!("stopped: the connection ended after request {} ({reason})", at.saturating_sub(1))
-            }
+            Some("closed") => format!(
+                "stopped: the connection ended after request {} ({})",
+                at.saturating_sub(1),
+                escape_controls(reason)
+            ),
+            Some("cancelled") => format!("stopped: cancelled at request {at}"),
             _ => format!("stopped: request {at} failed"),
         });
     }

@@ -799,6 +799,12 @@ impl Client {
         Ok((c, response))
     }
 
+    /// Whether the connection options give `target` platform credentials (`auth add --platform`),
+    /// whose 401 challenges [`Client::exchange`] and [`Client::send`] answer.
+    pub fn has_platform_auth(&self, target: &Target) -> bool {
+        self.net().platform(&target.host, target.port).is_some()
+    }
+
     /// Whether requests to `target` must use HTTP/1.1: its platform auth is NTLM.
     pub fn needs_http1(&self, target: &Target) -> bool {
         self.net().platform(&target.host, target.port).is_some_and(|c| c.scheme == PlatformScheme::Ntlm)
@@ -1614,6 +1620,36 @@ mod tests {
         assert!(!ok(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn a_sequence_connection_ends_only_when_the_server_or_the_request_says_so() {
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let get = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+        // A request carrying a second message keeps the connection for a sequence (the server's
+        // answers to both are read in turn), though the pool wouldn't reuse it.
+        let two = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n";
+        assert_eq!(connection_ends(two, ok, "POST"), None);
+        assert!(close_after(two, ok, "POST"));
+        assert_eq!(connection_ends(get, ok, "GET"), None);
+        let ends = |req: &[u8], resp: &[u8], method: &str| connection_ends(req, resp, method).unwrap_or("");
+        assert!(ends(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", ok, "GET").contains("request said"));
+        assert!(ends(get, b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", "GET")
+            .contains("response said"));
+        assert!(ends(get, b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", "GET").contains("HTTP/1.0"));
+        assert_eq!(
+            connection_ends(get, b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n", "GET"),
+            None
+        );
+        assert!(ends(get, b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n", "GET").contains("101"));
+        assert!(ends(get, b"HTTP/1.1 200 OK\r\n\r\nbody to the close", "GET").contains("ran to"));
+        assert!(
+            ends(get, b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", "GET").contains("before the whole body")
+        );
+        // A HEAD's answer, a 204 and a 304 have no body to run to the close.
+        for (method, resp) in [("HEAD", "200 OK"), ("GET", "204 No Content"), ("GET", "304 Not Modified")] {
+            assert_eq!(connection_ends(get, format!("HTTP/1.1 {resp}\r\n\r\n").as_bytes(), method), None, "{resp}");
+        }
     }
 
     #[test]

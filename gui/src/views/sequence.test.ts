@@ -88,6 +88,24 @@ test("a stop says, in the tabs that weren't sent, where and why by tab name", ()
   assert.match(sequenceSummary(failed), /^1 of 3 answered, one connection \(1 opened\)\. History rows tagged sequence:abc$/);
 });
 
+test("stopped by the user: answered tabs keep their responses, the one going out says it was stopped", () => {
+  const cancelled = result({
+    complete: false,
+    answered: 1,
+    stopped: { request: 1, cause: "cancelled", reason: "cancelled by user" },
+    results: [
+      result().results[0],
+      { request: 1, request_line: "GET /1 HTTP/1.1", outcome: "failed", id: 11, error: "I/O error: cancelled by user before a response was recorded", kind: "io" },
+      { request: 2, request_line: "GET /2 HTTP/1.1", outcome: "not_sent" },
+    ],
+  });
+  const titles = ["login", "cart", "pay"];
+  assert.equal(tabOutcome(cancelled, 0, titles, "Stopped")?.result?.id, 10);
+  assert.deepEqual(tabOutcome(cancelled, 1, titles, "Stopped"), { result: null, error: "Stopped" });
+  assert.equal(tabOutcome(cancelled, 1, titles)?.error, "I/O error: cancelled by user before a response was recorded");
+  assert.equal(tabOutcome(cancelled, 2, titles, "Stopped")?.error, "Not sent: stopped at “cart”");
+});
+
 test("labels, the stored choice, and what a group needs", () => {
   assert.equal(connectionsLabel("single"), "one connection");
   assert.equal(connectionsLabel("separate"), "separate connections");

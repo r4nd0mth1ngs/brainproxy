@@ -230,28 +230,179 @@ fn a_server_that_closes_early_stops_the_sequence_and_says_how_far_it_got() {
 }
 
 #[test]
-fn a_url_request_keeps_the_connection_open_and_the_session_carries_cookies_along() {
+fn a_url_request_keeps_the_connection_open_and_the_session_is_applied_before_the_first_goes_out() {
     let p = project("url-auth");
-    // The first answer sets a cookie; every answer echoes the request's Connection and Cookie.
-    let (port, seen) = server(|k, r| {
+    // Every answer echoes the request's Connection, Cookie and X-App; the one to /a sets a cookie.
+    let (port, seen) = server(|_, r| {
         let header = |n: &str| {
             r.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(n))).map(|(_, v)| v.trim())
         };
-        let body = format!("{} {}", header("connection").unwrap_or("-"), header("cookie").unwrap_or("-"));
-        let cookie = if k == 0 { "Set-Cookie: step=one\r\n" } else { "" };
+        let body = ["connection", "cookie", "x-app"].map(|h| header(h).unwrap_or("-")).join(" ");
+        let cookie = if r.starts_with("GET /a ") { "Set-Cookie: step=one\r\n" } else { "" };
         Some(format!("HTTP/1.1 200 OK\r\n{cookie}Content-Length: {}\r\n\r\n{body}", body.len()))
     });
-    assert_eq!(run(&p, &["auth", "add", "app", "-H", "X-App: 1"]).0, 0);
+    // A session rule that fetches the profile's check URL before each request of any tool.
+    let check = format!("http://127.0.0.1:{port}/check");
+    assert_eq!(run(&p, &["auth", "add", "app", "-H", "X-App: 1", "--check-url", &check]).0, 0);
+    let (code, v) = run(&p, &["auth", "rule", "add", "app", "--action", "check"]);
+    assert_eq!(code, 0, "{v}");
     let b = raw(&p, "b", port);
     let url = format!("http://127.0.0.1:{port}/a");
     let (code, v) = run(&p, &["send", "--url", &url, "--also", &b, "--sequence", "single", "--auth", "app"]);
     assert_eq!(code, 0, "{v}");
     let results = v["data"]["results"].as_array().unwrap();
-    // --url says keep-alive, not its usual close, so the second request has a connection to go on.
-    assert_eq!(results[0]["response"]["body"]["content"], "keep-alive -");
-    // The cookie the first response set goes with the second request.
-    assert_eq!(results[1]["response"]["body"]["content"], "- step=one");
-    assert!(lines(&seen).iter().all(|(c, _)| *c == 1), "{:?}", lines(&seen));
+    // --url says keep-alive, not its usual close, so the second request has a connection to go
+    // on; the session's header goes with both.
+    assert_eq!(results[0]["response"]["body"]["content"], "keep-alive - 1");
+    // The session went on before the first request went out, as for a race: the cookie the first
+    // response set isn't carried to the second.
+    assert_eq!(results[1]["response"]["body"]["content"], "- - 1");
+    // Its rule's checks went out before the group, not between its requests, which share one
+    // connection.
+    let seen = lines(&seen);
+    let n = seen.len();
+    assert!(n >= 3 && seen[..n - 2].iter().all(|(_, l)| l.starts_with("GET /check ")), "{seen:?}");
+    assert_eq!((seen[n - 2].1.as_str(), seen[n - 1].1.as_str()), ("GET /a HTTP/1.1", "POST /b HTTP/1.1"), "{seen:?}");
+    assert_eq!(seen[n - 2].0, seen[n - 1].0, "{seen:?}");
+}
+
+#[test]
+fn bytes_past_one_response_are_read_as_the_next_requests_response() {
+    // As a desynchronised server answers a request smuggled in a body: two responses to the
+    // first request, and the second request reads the second of them.
+    let p = project("desync");
+    let (port, seen) = server(|k, _| match k {
+        0 => Some(format!("{}HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nsmuggled", ok("first"))),
+        _ => Some(ok("late")),
+    });
+    let (a, b) = (raw(&p, "a", port), raw(&p, "b", port));
+    let (code, v) = run(&p, &["send", &a, "--scheme=http", "--also", &b, "--sequence", "single"]);
+    assert_eq!(code, 0, "{v}");
+    let results = v["data"]["results"].as_array().unwrap();
+    assert_eq!(results[0]["response"]["body"]["content"], "first");
+    assert_eq!(
+        (results[1]["response"]["status"].as_u64(), results[1]["response"]["body"]["content"].as_str()),
+        (Some(404), Some("smuggled"))
+    );
+    assert_eq!(lines(&seen).len(), 2);
+}
+
+#[test]
+fn a_timeout_stops_the_sequence_and_its_row_says_so() {
+    let p = project("timeout");
+    // The second request is read and never answered.
+    let (port, seen) = server(|k, r| {
+        if k == 1 {
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        echo(k, r)
+    });
+    let (a, b, c) = (raw(&p, "a", port), raw(&p, "b", port), raw(&p, "c", port));
+    let args = ["send", &a, "--scheme=http", "--also", &b, "--also", &c, "--sequence", "single", "--timeout", "1"];
+    let (code, v) = run(&p, &args);
+    assert_eq!((code, v["error"]["kind"].as_str()), (3, Some("timeout")), "{v}");
+    let d = &v["error"]["data"];
+    assert_eq!((d["stopped"]["request"].as_u64(), d["stopped"]["cause"].as_str()), (Some(1), Some("failed")), "{d}");
+    let outcomes: Vec<&str> = d["results"].as_array().unwrap().iter().map(|r| r["outcome"].as_str().unwrap()).collect();
+    assert_eq!(outcomes, ["answered", "failed", "not_sent"]);
+    assert_eq!(d["results"][1]["kind"], "timeout");
+    let (_, rows) = run(&p, &["query", "SELECT status, error FROM history ORDER BY id"]);
+    let rows = rows["data"]["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][0], 200);
+    assert!(rows[1][1].as_str().unwrap_or("").contains("timed out"), "{rows:?}");
+    assert_eq!(lines(&seen).len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn stopped_partway_it_keeps_what_was_answered_and_marks_the_request_out_as_cancelled() {
+    let p = project("cancel");
+    let (port, seen) = server(|k, r| {
+        if k == 1 {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        echo(k, r)
+    });
+    let (a, b, c) = (raw(&p, "a", port), raw(&p, "b", port), raw(&p, "c", port));
+    let child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["send", &a, "--scheme=http", "--also", &b, "--also", &c, "--sequence", "single", "--timeout", "60"])
+        .env_remove("BRAINPROXY_MCP_CALL")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait until the second request has arrived, then stop the command as the app's Stop does.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while lines(&seen).len() < 2 {
+        assert!(std::time::Instant::now() < deadline, "the second request never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap().success());
+    let out = child.wait_with_output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    let d = &v["error"]["data"];
+    assert_eq!((d["stopped"]["request"].as_u64(), d["stopped"]["cause"].as_str()), (Some(1), Some("cancelled")), "{d}");
+    let results = d["results"].as_array().unwrap();
+    assert_eq!(results[0]["response"]["body"]["content"], "/a", "{d}");
+    assert_eq!((results[1]["outcome"].as_str(), results[2]["outcome"].as_str()), (Some("failed"), Some("not_sent")));
+    let (_, rows) = run(&p, &["query", "SELECT status, error FROM history ORDER BY id"]);
+    let rows = rows["data"]["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0][0].as_u64(), rows[1][1].as_str()),
+        (Some(200), Some("cancelled by user before a response was recorded"))
+    );
+}
+
+#[test]
+fn rules_no_store_and_platform_credentials() {
+    let p = project("extras");
+    let (port, _) = server(echo);
+    let (a, b) = (raw(&p, "a", port), raw(&p, "b", port));
+    // A response rule for send changes what each result shows; the row keeps both.
+    let args =
+        ["rules", "add", "--location", "response-body", "--match", "/b", "--replace", "/ruled", "--applies-to", "send"];
+    assert_eq!(run(&p, &args).0, 0);
+    let (code, v) = run(&p, &["send", &a, "--scheme=http", "--also", &b, "--sequence", "separate"]);
+    assert_eq!(code, 0, "{v}");
+    let results = v["data"]["results"].as_array().unwrap();
+    assert_eq!(
+        (results[0]["response"]["body"]["content"].as_str(), results[1]["response"]["body"]["content"].as_str()),
+        (Some("/a"), Some("/ruled"))
+    );
+    let (_, show) = run(&p, &["history", "show", &results[1]["id"].to_string()]);
+    assert!(show["data"]["modified_response"]["content"].as_str().unwrap_or("").ends_with("/ruled"), "{show}");
+    assert!(v["data"].get("platform_auth_warning").is_none(), "{v}");
+
+    // --no-store: each row is written, without its content.
+    let (code, v) = run(&p, &["send", &a, "--scheme=http", "--also", &b, "--sequence", "single", "--no-store"]);
+    assert_eq!(code, 0, "{v}");
+    let ids: Vec<String> = v["data"]["results"].as_array().unwrap().iter().map(|r| r["id"].to_string()).collect();
+    let (_, rows) = run(&p, &["query", &format!("SELECT status, error FROM history WHERE id IN ({})", ids.join(","))]);
+    for row in rows["data"]["rows"].as_array().unwrap() {
+        assert!(row[0].is_null() && row[1].as_str().unwrap_or("").starts_with("not stored (--no-store)"), "{row:?}");
+    }
+
+    // Platform credentials for the target aren't answered by a sequence, and the output says so.
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["auth", "add", "corp", "--platform", "basic", "--platform-host", "127.0.0.1", "--username", "u"])
+        .args(["--password-env", "BP_SEQUENCE_TEST_PW"])
+        .env("BP_SEQUENCE_TEST_PW", "pw")
+        .env_remove("BRAINPROXY_MCP_CALL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let (code, v) = run(&p, &["send", &a, "--scheme=http", "--also", &b, "--sequence", "single"]);
+    assert_eq!(code, 0, "{v}");
+    let warning = v["data"]["platform_auth_warning"].as_str().unwrap_or("");
+    assert!(warning.contains("doesn't answer their 401 challenges"), "{v}");
 }
 
 #[test]
@@ -280,4 +431,19 @@ fn refused_before_anything_is_sent() {
     assert!(lines(&seen).is_empty());
     let (_, rows) = run(&p, &["query", "SELECT count(*) FROM history"]);
     assert_eq!(rows["data"]["rows"][0][0], 0);
+
+    // A Host that only a rule brings in is refused as the request goes on the wire, so the
+    // sequence stops there and nothing reaches the server.
+    let args = ["rules", "add", "--location", "request-header", "--name", "Host", "--replace", "elsewhere.test"];
+    assert_eq!(run(&p, &[&args[..], &["--applies-to", "send"]].concat()).0, 0);
+    let member = format!("GET /x HTTP/1.1\nHost: 127.0.0.1:{port}\n\n");
+    let (code, v) = run_mcp(&p, &["send", &a, "--target", &target, "--also=-", "--sequence", "single"], &member);
+    assert_eq!((code, v["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{v}");
+    let d = &v["error"]["data"];
+    assert_eq!(
+        (d["stopped"]["request"].as_u64(), d["results"][0]["kind"].as_str()),
+        (Some(0), Some("out_of_scope")),
+        "{v}"
+    );
+    assert!(lines(&seen).is_empty());
 }

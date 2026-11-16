@@ -29,11 +29,14 @@ export interface SequenceResult {
   answered: number;
   complete: boolean;
   /**
-   * Where and why it stopped early: request `request` failed ("failed"), or wasn't sent because
-   * the connection ended after the one before it ("closed").
+   * Where and why it stopped early: request `request` failed ("failed"), wasn't sent because the
+   * connection ended after the one before it ("closed"), or was going out when the user stopped
+   * the group ("cancelled").
    */
-  stopped: { request: number; cause: "failed" | "closed"; reason: string } | null;
+  stopped: { request: number; cause: "failed" | "closed" | "cancelled"; reason: string } | null;
   results: SequenceItem[];
+  /** The target has platform credentials, which a sequence (like a race) doesn't answer. */
+  platform_auth_warning?: string;
 }
 
 /** The connection choice in words. */
@@ -66,18 +69,19 @@ export interface TabOutcome {
 }
 
 /**
- * Tab `index`'s part of the sequence (the active tab is 0, the others follow in the order sent).
- * `titles` names the group's tabs in that order, for saying where the sequence stopped. Null when
- * the result has no item for it.
+ * The part of the sequence of the tab sent `index`th (from 0, in the order sent). `titles` names
+ * the group's tabs in that order, for saying where the sequence stopped; `stopped` is what to say
+ * for the request that was going out when the user stopped the group. Null when the result has
+ * no item for it.
  */
-export function tabOutcome(r: SequenceResult, index: number, titles: string[]): TabOutcome | null {
+export function tabOutcome(r: SequenceResult, index: number, titles: string[], stopped?: string): TabOutcome | null {
   const item = r.results.find((x) => x.request === index);
   if (!item) return null;
   if (item.outcome === "answered") {
     const { id, url, duration_ms, response } = item;
     return { result: { id, url, duration_ms, response }, error: null };
   }
-  if (item.outcome === "failed") return { result: null, error: item.error };
+  if (item.outcome === "failed") return { result: null, error: r.stopped?.cause === "cancelled" && stopped ? stopped : item.error };
   return { result: null, error: `Not sent: ${stopText(r, titles) ?? "the sequence stopped before it"}` };
 }
 
@@ -90,6 +94,7 @@ export function stopText(r: SequenceResult, titles: string[]): string | null {
   if (!s) return null;
   const name = (i: number) => (titles[i] != null ? `“${titles[i]}”` : `request ${i + 1}`);
   if (s.cause === "closed") return `the connection ended after ${name(s.request - 1)} (${s.reason})`;
+  if (s.cause === "cancelled") return `stopped at ${name(s.request)}`;
   return `${name(s.request)} failed (${s.reason})`;
 }
 

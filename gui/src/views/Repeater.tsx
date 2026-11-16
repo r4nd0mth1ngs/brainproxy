@@ -32,7 +32,19 @@ import {
   type RaceResult,
   type RaceRow,
 } from "./race";
-import { CONNECTIONS, connectionsLabel, parseConnections, sequenceArgs, sequenceProblem, sequenceSummary, sequenceTag, stopText, tabOutcome, type Connections, type SequenceResult } from "./sequence";
+import {
+  CONNECTIONS,
+  connectionsLabel,
+  parseConnections,
+  sequenceArgs,
+  sequenceProblem,
+  sequenceSummary,
+  sequenceTag,
+  stopText,
+  tabOutcome,
+  type Connections,
+  type SequenceResult,
+} from "./sequence";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { draftFromRequest } from "./manualFinding";
 import { readSummary, type SseRead } from "./sse";
@@ -358,8 +370,8 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
         ...requestToSend(source, { binary: t.binary, autoEncode, options }),
       };
     });
-  // Why the group can't go: a tab without a target, or with another origin than the active tab's
-  // (`what` names the tabs), one already sending, or the options.
+  // Why the group can't go: a tab without a target, or with another origin than the first
+  // member's (`what` names the tabs), one already sending, or the options.
   const groupProblem = (members: ReturnType<typeof groupMembers>, what: string): string | null => {
     const to = members[0].to;
     if (!to || members.some((m) => !m.to)) return "Set a target (scheme://host[:port]) or a Host header for every tab";
@@ -426,8 +438,9 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
     const members = groupMembers(orderedTabs);
     const problem = groupProblem(members, "Tabs sent in order");
     if (problem) return app.toast(problem, "error");
+    // The first tab's request goes on stdin with its target; the active tab keeps its own.
     const to = members[0].to;
-    setTarget(to);
+    setTarget(members.find((m) => m.tab.key === tab.key)?.to ?? target);
     setInOrderOver(over);
     try {
       localStorage.setItem(IN_ORDER_OVER, over);
@@ -454,7 +467,7 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
     const titles = members.map((m) => m.tab.title);
     members.forEach((member, index) => {
       if (!endCall(member.tab.key, id)) return;
-      const outcome = result ? tabOutcome(result, index, titles) : null;
+      const outcome = result ? tabOutcome(result, index, titles, error ?? undefined) : null;
       const entry: Sent = {
         raw: member.raw, sent: member.text, encoded: member.encoded, labels,
         result: outcome?.result ?? null, error: outcome ? outcome.error : error,
@@ -462,8 +475,10 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
       };
       sentByTab.update(member.tab.key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
     });
-    const stopped = result && stopText(result, titles);
+    // Stopped by the user, the tabs say so; any other stop gets a toast too.
+    const stopped = result && result.stopped?.cause !== "cancelled" && stopText(result, titles);
     if (stopped) app.toast(`The group stopped: ${stopped}`, "error");
+    if (result?.platform_auth_warning) app.toast(result.platform_auth_warning, "info");
   };
 
   // Opens one raced response in the response pane (`history show`). The race's entry is found by

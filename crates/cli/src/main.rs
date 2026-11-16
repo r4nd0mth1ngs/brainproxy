@@ -912,12 +912,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         s.keep_no_content();
     }
     let client = Client::new(send_opts);
-    if let Some(how) = args.sequence {
-        let requests = group.into_iter().map(|(req, _)| req).collect();
-        let setup = sequence::Setup { rules: rules.as_ref(), ruled: &ruled, client, session, host_warning };
-        return sequence::send(project, &args, requests, target, setup, how.connections(), h2, out);
-    }
-    if let Some(n) = count {
+    if count.is_some() || args.sequence.is_some() {
+        // A group gets the session before any of it goes out: the session's rules (a check, a
+        // macro, a login) run now, so nothing of the session's is sent between its requests.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
         let mut requests = Vec::with_capacity(group.len());
         for (req, target) in group {
@@ -933,7 +930,16 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         if let Some(session) = &session {
             session.save()?;
         }
-        return race(project, &args, requests, (rules.as_ref(), &ruled), target, client, n, h2, host_warning, out);
+        return match (args.sequence, count) {
+            (Some(how), _) => {
+                let setup = sequence::Setup { rules: rules.as_ref(), ruled: &ruled, client, session, host_warning };
+                sequence::send(project, &args, requests, target, setup, how.connections(), h2, out)
+            }
+            (None, Some(n)) => {
+                race(project, &args, requests, (rules.as_ref(), &ruled), target, client, n, h2, host_warning, out)
+            }
+            (None, None) => unreachable!("a group is a race or a sequence"),
+        };
     }
     let req = group.remove(0).0;
     let mut log = sent::SentLog::open(project, "send", args.no_store)?.sent_by(&client);

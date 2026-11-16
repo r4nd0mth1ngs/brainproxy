@@ -336,7 +336,10 @@ Each tab gets one step with its own request's response from `results[].request` 
 the same shape as a send's, so the response pane shows it with no `history show`. A sequence
 that stops fails with the whole result in `error.data`: a tab whose request failed shows its
 error, a tab it didn't reach says where and why it stopped, naming the tabs (`stopText`), and a
-toast says so too. The toolbar tags the step with its place and the connections
+toast says so too. Stopped with **Stop**, the tabs already answered keep their responses, the
+tab whose request was going out shows the stopped text, and there is no toast. When the
+target has platform credentials, which a sequence doesn't answer, the CLI's
+`platform_auth_warning` is a toast. The toolbar tags the step with its place and the connections
 (`sequenceTag`), its tooltip how far the group got and its `sequence:ID` tag. The palette
 lists both choices (*Send the group in order over one connection* / *over separate
 connections*, `replay.inOrderSingle` and `replay.inOrderSeparate`), defined hidden like Send and
