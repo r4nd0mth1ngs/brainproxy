@@ -799,6 +799,12 @@ impl Client {
         Ok((c, response))
     }
 
+    /// Whether the connection options give `target` platform credentials (`auth add --platform`),
+    /// whose 401 challenges [`Client::exchange`] and [`Client::send`] answer.
+    pub fn has_platform_auth(&self, target: &Target) -> bool {
+        self.net().platform(&target.host, target.port).is_some()
+    }
+
     /// Whether requests to `target` must use HTTP/1.1: its platform auth is NTLM.
     pub fn needs_http1(&self, target: &Target) -> bool {
         self.net().platform(&target.host, target.port).is_some_and(|c| c.scheme == PlatformScheme::Ntlm)
@@ -1427,25 +1433,44 @@ fn stale(e: &Error) -> bool {
 
 /// Whether the connection can't be reused after this exchange.
 pub fn close_after(request: &[u8], response: &[u8], method: &str) -> bool {
-    let req_close = RawRequest::from_bytes(request.to_vec())
-        .head()
-        .map(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")))
-        .unwrap_or(true);
     // More than one message went out (pipelined or smuggled, or a body longer than its
-    // Content-Length): the server's other answers may still arrive, and the next request
-    // on this connection would read them.
-    if req_close || !one_message(request) {
-        return true;
+    // Content-Length), or the head isn't one: the server's other answers may still arrive,
+    // and the next request on this connection would read them.
+    !one_message(request) || connection_ends(request, response, method).is_some()
+}
+
+/// Why the server takes no further request on this HTTP/1 connection after answering `request`
+/// with `response`, if it doesn't: one of them said `Connection: close`, the server switched
+/// protocols, or the response's body ran (or was cut short) to the connection's close. Unlike
+/// [`close_after`], a request that carries more than one message doesn't count: over a
+/// connection kept for a sequence, the answers to the rest are read as the next responses.
+pub fn connection_ends(request: &[u8], response: &[u8], method: &str) -> Option<&'static str> {
+    let closes = |v: &str| v.eq_ignore_ascii_case("close");
+    let (head, _) = crate::http::request::split_head_body(request);
+    let asked = RawRequest::from_bytes(head.to_vec())
+        .head()
+        .is_ok_and(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && closes(v)));
+    if asked {
+        return Some("the request said Connection: close");
     }
-    let Ok(h) = parse_response_head(final_response(response)) else { return true };
-    h.status == 101
-        || cut_short(response, method)
-        || h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
-        || (h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")))
-        || (h.header("content-length").is_none()
-            && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-            && !method.eq_ignore_ascii_case("HEAD")
-            && !matches!(h.status, 100..=199 | 204 | 304))
+    let Ok(h) = parse_response_head(final_response(response)) else { return Some("its response isn't HTTP") };
+    let framed = h.header("content-length").is_some()
+        || h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+        || method.eq_ignore_ascii_case("HEAD")
+        || matches!(h.status, 100..=199 | 204 | 304);
+    if h.status == 101 {
+        Some("it switched protocols (101)")
+    } else if cut_short(response, method) {
+        Some("it closed the connection before the whole body arrived")
+    } else if h.header("connection").is_some_and(closes) {
+        Some("the response said Connection: close")
+    } else if h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")) {
+        Some("the response is HTTP/1.0 without Connection: keep-alive")
+    } else if !framed {
+        Some("the response's body ran to the connection's close (no Content-Length or chunked encoding)")
+    } else {
+        None
+    }
 }
 
 /// Whether `request` is exactly one HTTP/1 message: its body is all its framing says.
@@ -1595,6 +1620,36 @@ mod tests {
         assert!(!ok(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n"));
         assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn a_sequence_connection_ends_only_when_the_server_or_the_request_says_so() {
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let get = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+        // A request carrying a second message keeps the connection for a sequence (the server's
+        // answers to both are read in turn), though the pool wouldn't reuse it.
+        let two = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n";
+        assert_eq!(connection_ends(two, ok, "POST"), None);
+        assert!(close_after(two, ok, "POST"));
+        assert_eq!(connection_ends(get, ok, "GET"), None);
+        let ends = |req: &[u8], resp: &[u8], method: &str| connection_ends(req, resp, method).unwrap_or("");
+        assert!(ends(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", ok, "GET").contains("request said"));
+        assert!(ends(get, b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", "GET")
+            .contains("response said"));
+        assert!(ends(get, b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", "GET").contains("HTTP/1.0"));
+        assert_eq!(
+            connection_ends(get, b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n", "GET"),
+            None
+        );
+        assert!(ends(get, b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n", "GET").contains("101"));
+        assert!(ends(get, b"HTTP/1.1 200 OK\r\n\r\nbody to the close", "GET").contains("ran to"));
+        assert!(
+            ends(get, b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", "GET").contains("before the whole body")
+        );
+        // A HEAD's answer, a 204 and a 304 have no body to run to the close.
+        for (method, resp) in [("HEAD", "200 OK"), ("GET", "204 No Content"), ("GET", "304 Not Modified")] {
+            assert_eq!(connection_ends(get, format!("HTTP/1.1 {resp}\r\n\r\n").as_bytes(), method), None, "{resp}");
+        }
     }
 
     #[test]

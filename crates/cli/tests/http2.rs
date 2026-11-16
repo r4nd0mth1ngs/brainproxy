@@ -151,3 +151,33 @@ fn different_requests_share_one_single_packet_connection() {
     }
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn a_sequence_goes_over_one_http2_connection_or_one_each() {
+    let (port, accepted) = serve();
+    let dir = std::env::temp_dir().join(format!("bp-test-{}-http2-sequence", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("p.bpdb");
+    let _ = std::fs::remove_file(&p);
+    run(&["engagement", "start", "--target", "127.0.0.1"], &p, None);
+    let base = format!("http://127.0.0.1:{port}");
+    let also = dir.join("second.http");
+    // An HTTP/2 line on the additional request makes the whole sequence HTTP/2.
+    std::fs::write(&also, format!("POST /second HTTP/2\r\nhost: 127.0.0.1:{port}\r\n\r\nb")).unwrap();
+    let also = also.to_str().unwrap();
+    for (how, opened) in [("single", 1), ("separate", 2)] {
+        let before = accepted.load(Ordering::Relaxed);
+        let d = run(&["send", "--url", &format!("{base}/first"), "--also", also, "--sequence", how], &p, None);
+        assert_eq!((d["http2"].as_bool(), d["connections"].as_u64()), (Some(true), Some(opened)), "{d}");
+        assert_eq!(accepted.load(Ordering::Relaxed) - before, opened);
+        let bodies: Vec<&str> = d["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["response"]["body"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(bodies, ["GET /first ", "POST /second b"], "{d}");
+        let h = run(&["history", "show", &d["results"][0]["id"].to_string()], &p, None);
+        assert!(h["request"]["content"].as_str().unwrap_or("").starts_with("GET /first HTTP/2"), "{h}");
+    }
+}

@@ -86,6 +86,24 @@ impl Error {
         }
     }
 
+    /// The same error with `prefix` before its message, keeping its kind and exit code; a
+    /// timeout, whose message is its duration, stays as it is.
+    pub fn prefixed(&self, prefix: &str) -> Error {
+        match self {
+            Error::InvalidInput(s) => Error::InvalidInput(format!("{prefix}{s}")),
+            Error::NotFound(s) => Error::NotFound(format!("{prefix}{s}")),
+            Error::OutOfScope(s) => Error::OutOfScope(format!("{prefix}{s}")),
+            Error::Conflict(s) => Error::Conflict(format!("{prefix}{s}")),
+            Error::Connect(s) => Error::Connect(format!("{prefix}{s}")),
+            Error::Tls(s) => Error::Tls(format!("{prefix}{s}")),
+            Error::Timeout(d) => Error::Timeout(*d),
+            Error::Protocol(s) => Error::Protocol(format!("{prefix}{s}")),
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), format!("{prefix}{e}"))),
+            Error::Store(e) => Error::Store(rusqlite::Error::UserFunctionError(format!("{prefix}{e}").into())),
+            Error::Blocked(s) => Error::Blocked(format!("{prefix}{s}")),
+        }
+    }
+
     /// Process exit code. 2 is reserved for usage errors from argument parsing.
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -150,5 +168,26 @@ mod tests {
         }
         assert!(Error::from_kind("usage", "error: unexpected argument").is_none());
         assert!(Error::from_kind("timeout", "timed out after a while").is_none());
+    }
+
+    #[test]
+    fn a_prefixed_error_keeps_its_kind_and_exit_code() {
+        let errors = [
+            Error::InvalidInput("bad flag".into()),
+            Error::OutOfScope("a.test".into()),
+            Error::Connect("refused".into()),
+            Error::Protocol("connection closed before any response".into()),
+            Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe")),
+            Error::Store(rusqlite::Error::UserFunctionError("database is locked".into())),
+            Error::Blocked("stopped".into()),
+        ];
+        for e in errors {
+            let got = e.prefixed("request 1 of 3: ");
+            assert_eq!((got.kind(), got.exit_code()), (e.kind(), e.exit_code()));
+            assert!(got.to_string().contains("request 1 of 3: "), "{got}");
+        }
+        // A timeout's message is its duration, which stays as it was.
+        let t = Error::Timeout(Duration::from_secs(5)).prefixed("request 1: ");
+        assert_eq!(t.to_string(), "timed out after 5s");
     }
 }

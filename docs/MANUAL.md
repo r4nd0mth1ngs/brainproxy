@@ -620,6 +620,22 @@ Edit a raw request and send it as often as you like, in separate tabs.
   `brainproxy send req.http --also checkout.http --race 20` for a two-tab group (omit
   `--also` for one tab), with the active tab's options as flags (`--http2`, `--sni`,
   `--timeout`, `--verify-tls`, `--no-store`).
+- **Send in order:** tick other HTTP tabs as for a race group, choose **over one connection**
+  or **over separate connections**, and click **Send G tabs in order** to send the active tab's
+  and the ticked tabs' requests one after another in tab order (left to right, wherever the
+  active tab is), each once the one before is answered, with the active tab's options. Over one connection they share one keep-alive
+  HTTP/1.1 connection (one HTTP/2 connection with **HTTP/2** on or a request line ending in
+  `HTTP/2`), which request smuggling and connection-state tests need; over separate connections
+  each gets a new one. All tabs need the same origin. Each tab shows its own response. If a
+  request fails, or the server closes the one connection (or says it will), the group stops
+  there: the tabs after it say why they weren't sent, and a toast says where it stopped. Every
+  request sent is recorded in Traffic (source `send`), tagged `sequence:ID`,
+  `sequence-conn:single` or `sequence-conn:separate`, and `sequence-pos:2/3`; the toolbar shows
+  the tab's place in the group. **Stop** in any of the tabs stops the group: tabs already
+  answered keep their responses, the request going out is marked cancelled, and the rest aren't
+  sent. The command palette has both choices. The
+  same as `brainproxy send req.http --also cart.http --sequence single` (or `separate`), with
+  the active tab's options as flags.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
   handshake and the messages to send (text, separated by a line with `---`), then
   **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
@@ -1020,7 +1036,9 @@ byte, side by side or unified.
   - **Platform authentication:** HTTP Basic, Digest, or NTLM for some hosts, with the
     profile's username and password (for NTLM, the domain in its own field or as
     `DOMAIN\user`). brainproxy answers those hosts' 401 challenges on every command and
-    through the proxy, without choosing the profile; the header is added on the wire only,
+    through the proxy, without choosing the profile, except in a race or a sequence (`send
+    --race`, `--also`, `--sequence`), whose requests go without them (a sequence's output says
+    so in `platform_auth_warning`); the header is added on the wire only,
     so history keeps the request without it. A request that brings its own Authorization
     header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
     requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
@@ -1220,6 +1238,7 @@ brainproxy browser open --browser chrome https://app.acme.test/
 brainproxy send --url https://app.acme.test/search?q=test
 brainproxy send coupon.http --also checkout.http          # race each request once
 brainproxy send coupon.http --also checkout.http --race 5 # 2*5 = 10 requests
+brainproxy send login.http --also cart.http --sequence single   # in order, over one keep-alive connection
 brainproxy crawl https://app.acme.test/ --background
 brainproxy scan active https://app.acme.test/ --crawl --checks nuclei --check-severity high \
     --check-include-tags eol --background     # plus the end-of-life checks (rated info)
@@ -1308,6 +1327,63 @@ full list. The text summary lists each member and its history rows. Different me
 normally return different statuses or lengths: compare copies within one request index.
 The flag is also on the MCP `send` tool and in `capabilities send`; through MCP a
 member comes from the call's stdin (`--also -`), not a file (see MCP.md).
+
+### Sending a group in order (`send --sequence`)
+
+`send PRIMARY --also FILE [--also FILE ...] --sequence single|separate` sends the group one
+request after another: the primary, then each `--also` in the order given, each once the one
+before it is answered. The group is checked as a race group is (one origin, the scope, SNI, the
+MCP Host-header opt-in, request rules that would stop a request, at most 1000 requests) before
+anything is sent, a login included.
+
+- `single` sends every request over one keep-alive connection, opened for the first. Over
+  HTTP/1.1 the server's bytes are read in order: bytes past one response (a desynchronised
+  server, the answer to a request smuggled in a body) are read as the next request's response,
+  which is what request smuggling and connection-state tests look for. A primary built with
+  `--url` says `Connection: keep-alive` instead of its usual `close`, unless `-H` or
+  `--remove-header` names Connection. With `--http2`, or when any request line says `HTTP/2`,
+  the group goes over one HTTP/2 connection, one stream after another.
+- `separate` opens a new connection for each request, HTTP/2 ones too.
+- It stops at the first request that fails (a timeout, a refused connection, a response that
+  doesn't parse), and before a request the one connection can't carry: after a request or
+  response that said `Connection: close`, an HTTP/1.0 response without keep-alive, a `101`, a
+  body that ran to the close, or an HTTP/2 connection the server closed. The requests after a
+  stop aren't sent and get no row.
+- With `--auth`, every request gets the session before the first goes out, as in a race: the
+  session's rules (a check, a macro, a login) run then, so nothing of the session's is sent
+  between two requests of the group. A cookie an earlier response sets isn't carried to the
+  later requests. Match-and-replace rules apply to each request and response as in a race.
+- Platform credentials (`auth add --platform`) aren't answered, as in a race: a 401 challenge
+  is that request's response, and `platform_auth_warning` in the output says so.
+- Not with `--race`, `--raw`, `--show-request`, `--http3`, `--stream-wait` or `--max-events`.
+
+Each request is recorded like any send (source `send`), its row written just before it goes
+out and tagged `sequence:ID`, `sequence-conn:single` or `sequence-conn:separate`, and
+`sequence-pos:I/N`.
+
+JSON has `sequence` (`single` or `separate`), `sequence_id`, `target`, `http2`, `connections`
+(how many were opened), `total`, `answered`, `complete`, `stopped`, `results` and `hint`.
+`results` has one item per request in the order sent, each with its zero-based `request` index,
+`request_line` and `outcome`: an `answered` item has the response as `send` gives it (`id`,
+`url`, `duration_ms`, `response`, after the response rules), a `failed` one `id`, `error` and
+`kind`, and a `not_sent` one nothing more. `stopped` is null, or `{request, cause, reason}`:
+with `cause` `failed`, request `request` failed and `reason` is its error; with `closed`,
+request `request` wasn't sent because the connection ended after the one before it, and
+`reason` says how; with `cancelled`, the command was stopped (Ctrl-C, SIGTERM, the app's Stop)
+while request `request` was going out. A sequence that stops fails with the failed request's
+error kind (`protocol` for a closed connection, `io` when cancelled) and exit code, its message
+saying how far it got (`request 1 of the sequence of 3 failed, so request 2 wasn't sent: ...`;
+a timeout's message is only its duration), and the envelope's `error.data` holds the whole
+result, the responses answered before the stop included. `rule_errors` lists the
+match-and-replace rules whose script failed on a request or its response, `warning` what
+wasn't kept (the session's state, or what the rules made of a response). The text output lists each request with its history row. Through MCP the flag is
+the `send` tool's `sequence` argument, and the other requests come from the call's stdin
+(`also: ["-"]`), as for a race.
+
+```sh
+brainproxy send attack.http --also normal.http --sequence single   # whose answer does the second request get?
+brainproxy send login.http --also cart.http --also pay.http --sequence separate --auth app
+```
 
 ### Intercept filter
 
@@ -1775,8 +1851,8 @@ doesn't wait for its end.
   arrive together with the last one are read and listed too, so the list can be a little
   longer than `--max-events`: it is always every event in the row's body. Every other
   sender (crawl, scans, fuzzing, `authz`, a login) reads a stream for 5 seconds or 100
-  events, so none of them waits out its timeout on one. `send --race` reads whole responses
-  only, as before, and refuses the two flags.
+  events, so none of them waits out its timeout on one. `send --race` and `send --sequence`
+  read whole responses only, and refuse the two flags.
 - **An event** is a block of lines ended by a blank line. One with no `data` line is listed
   with `data` null: a browser dispatches nothing for it, but takes its `id` and `retry`. A
   comment line (`: keep-alive`) is in the row's body and not an event. A block the stream ends
@@ -1852,9 +1928,10 @@ as the version (`GET /a HTTP/3`, `HTTP/3 200`), so the row says which protocol w
   value its encoding refuses, as for HTTP/2) is an error saying so, sent nowhere: it doesn't
   fall back to TCP. Send it without `--http3` (and with a request line that doesn't say
   `HTTP/3`) to send it as it is over HTTP/1.1.
-- **Not with `--race`.** A race goes over TCP (last-byte sync, or single-packet with `--http2`),
-  so `send --race --http3` (and `--also`) is refused, and a race of a request whose line says
-  `HTTP/3` sends it as HTTP/1.1 (HTTP/2 with `--http2`).
+- **Not with `--race` or `--sequence`.** A race goes over TCP (last-byte sync, or single-packet
+  with `--http2`), and so does a sequence, so `send --race --http3` (and `--also`, and
+  `--sequence`) is refused, and a race or sequence of a request whose line says `HTTP/3` sends it
+  as HTTP/1.1 (HTTP/2 with `--http2`).
 - **Responses.** Informational responses (`100`, `103 Early Hints`) are kept before the final
   one, as over HTTP/1.1. A response header section over 256 KB (decoded) is an error, as an
   HTTP/1.1 head that long is.
@@ -2594,7 +2671,7 @@ brainproxy findings remove 17
 
 Every request brainproxy puts on the wire leaves a history row, whatever happens next.
 
-- `send`, `send --race` and `ws send` write each request's row just before it goes out, with
+- `send`, `send --race`, `send --sequence` and `ws send` write each request's row just before it goes out, with
   the error `sent; no response recorded (cancelled or interrupted)`, and complete it with the
   response or the failure. A command that is killed or crashes keeps that row. Ctrl-C or
   SIGTERM while it waits records `cancelled by user before a response was recorded` instead
@@ -2621,6 +2698,10 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   with the error. If no copy got a response, the command fails with the error's kind (exit
   3) and the message lists the rows; with `--format json` the envelope's `data.results`
   has each copy's `id` too. Every item of a race that ran, failed or not, has its history `id`.
+- A sequence (`send --sequence`) writes each request's row just before that request goes out,
+  so the requests after a stop have none. Stopped with Ctrl-C or SIGTERM, the request going out
+  is marked cancelled, the rest aren't sent, and `error.data` still lists the responses
+  answered before the stop.
 - The document fetches of `import` and `scan active --api` (with `--graphql`, the
   introspection) are recorded the same way: a row just before the request goes out, completed
   with the response or the failure.
@@ -2652,7 +2733,7 @@ Every request brainproxy puts on the wire leaves a history row, whatever happens
   re-login retry. The proxy then writes out every capture still queued
   (passive checks of the last ones wait for the next scan); `proxy stop` waits up to 30
   seconds for it to exit before killing it.
-- `--no-store` (`send`, `send --race`, `ws send`) keeps no content, but still writes a row:
+- `--no-store` (`send`, `send --race`, `send --sequence`, `ws send`) keeps no content, but still writes a row:
   the time, source, target, method, and path. The query string is left out too, since it
   often holds a token: `query` is empty, and `url` and the stored request line stop at the
   path. Headers, bodies, and the response are left out, `status` is empty (so passive checks

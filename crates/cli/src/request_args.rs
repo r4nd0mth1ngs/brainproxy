@@ -204,6 +204,12 @@ impl RequestArgs {
         };
         Ok((req, target))
     }
+
+    /// Whether `-H` or `--remove-header` names header `name` (any case).
+    pub fn names_header(&self, name: &str) -> bool {
+        let given = |h: &String| h.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(name));
+        self.headers.iter().any(given) || self.remove_header.iter().any(|h| h.trim().eq_ignore_ascii_case(name))
+    }
 }
 
 /// `Name: value`, refused with a line break or NUL in it (see [`check_header`]).

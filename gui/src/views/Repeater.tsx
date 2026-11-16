@@ -32,6 +32,19 @@ import {
   type RaceResult,
   type RaceRow,
 } from "./race";
+import {
+  CONNECTIONS,
+  connectionsLabel,
+  parseConnections,
+  sequenceArgs,
+  sequenceProblem,
+  sequenceSummary,
+  sequenceTag,
+  stopText,
+  tabOutcome,
+  type Connections,
+  type SequenceResult,
+} from "./sequence";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import { draftFromRequest } from "./manualFinding";
 import { readSummary, type SseRead } from "./sse";
@@ -59,6 +72,8 @@ interface Sent {
   error: string | null;
   /** A race (`send --race`): its results and the one open in the response pane. */
   race?: Raced;
+  /** A group sent in order (`send --sequence`), and where this tab's request was in it. */
+  sequence?: { result: SequenceResult; index: number };
 }
 
 const BLANK = "GET / HTTP/1.1\nHost: \nUser-Agent: brainproxy\nAccept: */*\n\n";
@@ -80,10 +95,11 @@ export function RepeaterView() {
   const app = useApp();
   const tabs = app.repeater;
   const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
-  const [raceSelected, setRaceSelected] = useState<number[]>([]);
+  // The other HTTP tabs in the active tab's group, to race or send in order with it.
+  const [grouped, setGrouped] = useState<number[]>([]);
   const [pasting, setPasting] = useState(false);
   const curlButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => setRaceSelected([]), [app.project]);
+  useEffect(() => setGrouped([]), [app.project]);
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
   const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
@@ -92,7 +108,7 @@ export function RepeaterView() {
     const q = closeQuestion(key);
     if (q && !(await confirm(q.title, q.message, "Stop and close", "Keep open"))) return;
     forgetTab(key, cancelCli);
-    setRaceSelected((keys) => keys.filter((k) => k !== key));
+    setGrouped((keys) => keys.filter((k) => k !== key));
     app.setRepeater((ts) => ts.filter((t) => t.key !== key));
     if (key === active?.key) {
       const rest = tabs.filter((t) => t.key !== key);
@@ -127,10 +143,10 @@ export function RepeaterView() {
             {!t.ws && (
               <input
                 type="checkbox"
-                aria-label={`Include ${t.title} in race`}
-                title="Race this tab with the active tab, using the active tab's options"
-                checked={raceSelected.includes(t.key)}
-                onChange={(e) => setRaceSelected((keys) => e.target.checked ? [...keys, t.key] : keys.filter((k) => k !== t.key))}
+                aria-label={`Include ${t.title} in the group`}
+                title="Group this tab with the active tab, to race them or send them in order, using the active tab's options"
+                checked={grouped.includes(t.key)}
+                onChange={(e) => setGrouped((keys) => e.target.checked ? [...keys, t.key] : keys.filter((k) => k !== t.key))}
               />
             )}
             <button
@@ -165,7 +181,7 @@ export function RepeaterView() {
       </div>
       {active ? (
         // key: each tab has its own editor state and send history.
-        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} raceSelected={raceSelected} />
+        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} grouped={grouped} />
       ) : (
         <div className="blank">
           <p>Send a request here from Traffic (right-click → Send to Replay, or double-click), or</p>
@@ -188,13 +204,19 @@ export function RepeaterView() {
 // Each HTTP tab adds these while it shows; listed (hidden) without one, for Settings › Keyboard.
 const SEND = { id: "replay.send", title: "Send the request", group: "Replay", where: "repeater", keys: "Mod+Enter", typing: true } as const;
 const STOP = { id: "replay.stop", title: "Stop waiting for the response", group: "Replay", where: "repeater" } as const;
+const IN_ORDER: Record<Connections, { id: string; title: string; group: string; where: "repeater"; keywords: string }> = {
+  single: { id: "replay.inOrderSingle", title: "Send the group in order over one connection", group: "Replay", where: "repeater", keywords: "sequence keep-alive smuggling group tabs" },
+  separate: { id: "replay.inOrderSeparate", title: "Send the group in order over separate connections", group: "Replay", where: "repeater", keywords: "sequence group tabs" },
+};
 define([
   { ...SEND, hidden: true },
   { ...STOP, hidden: true },
+  ...CONNECTIONS.map((c) => ({ ...IN_ORDER[c], hidden: true })),
 ]);
 
 const AUTO_ENCODE = "repeater-auto-encode";
 const RACE_COUNT = "repeater-race-count";
+const IN_ORDER_OVER = "repeater-in-order-connections";
 
 const RACE_COLUMNS: Column<RaceRow>[] = [
   { key: "idx", label: "#", width: 50, value: (r) => r.idx + 1, align: "right" },
@@ -218,7 +240,7 @@ function storedAutoEncode(): boolean {
 // can run for a while: coming back to its tab shows it still running.
 const sentByTab = tabSlot<{ list: Sent[]; at: number }>({ list: [], at: -1 });
 
-function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected: number[] }) {
+function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[] }) {
   const app = useApp();
   // Pinned to this project: another may be open by the time a send or race ends.
   const { project } = app;
@@ -234,6 +256,14 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
   const [call] = useTabSlot(replayCalls, tab.key);
   const busy = call != null;
   const racing = busy && call.startsWith("replay-race-");
+  const sequencing = busy && call.startsWith("replay-sequence-");
+  const [inOrderOver, setInOrderOver] = useState<Connections>(() => {
+    try {
+      return parseConnections(localStorage.getItem(IN_ORDER_OVER));
+    } catch {
+      return "single";
+    }
+  });
   const [raceCount, setRaceCount] = useState(() => {
     try {
       return localStorage.getItem(RACE_COUNT) || "20";
@@ -323,12 +353,15 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
   };
 
   // The active tab is primary; checked HTTP tabs follow it in tab order.
-  const raceTabs = [tab, ...app.repeater.filter((t) => t.key !== tab.key && !t.ws && raceSelected.includes(t.key))];
-  const groupLines = raceTabs.map((t) => sentRequestLine(t.key === tab.key ? raw : t.raw, autoEncode && !sendsAsTyped(options)));
+  const groupTabs = [tab, ...app.repeater.filter((t) => t.key !== tab.key && !t.ws && grouped.includes(t.key))];
+  // Sent in order, the same tabs go left to right, wherever the active one is.
+  const orderedTabs = app.repeater.filter((t) => groupTabs.some((g) => g.key === t.key));
+  const groupLines = groupTabs.map((t) => sentRequestLine(t.key === tab.key ? raw : t.raw, autoEncode && !sendsAsTyped(options)));
   const groupMax = groupRaceMax(groupLines, options.http2);
   const groupHttp2 = groupLines.some((line) => racesHttp2(line, options.http2));
-  const race = async () => {
-    const members = raceTabs.map((t) => {
+  // The group's requests as they would be sent, with the active tab's options.
+  const groupMembers = (tabs = groupTabs) =>
+    tabs.map((t) => {
       const source = t.key === tab.key ? raw : t.raw;
       return {
         tab: t,
@@ -337,20 +370,28 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
         ...requestToSend(source, { binary: t.binary, autoEncode, options }),
       };
     });
-    const n = parseGroupRaceCount(raceCount, members.map((m) => m.text), options.http2);
-    if (n == null) return app.toast(`Race takes ${members.length > 1 ? 1 : RACE_MIN} to ${groupMax} copies per tab`, "error");
+  // Why the group can't go: a tab without a target, or with another origin than the first
+  // member's (`what` names the tabs), one already sending, or the options.
+  const groupProblem = (members: ReturnType<typeof groupMembers>, what: string): string | null => {
     const to = members[0].to;
-    if (!to || members.some((m) => !m.to)) return app.toast("Set a target (scheme://host[:port]) or a Host header for every tab", "error");
+    if (!to || members.some((m) => !m.to)) return "Set a target (scheme://host[:port]) or a Host header for every tab";
     try {
       const origin = new URL(to).origin;
       const other = members.find((m) => new URL(m.to).origin !== origin);
-      if (other) return app.toast(`Race tabs must have the same origin: ${origin} and ${new URL(other.to).origin}`, "error");
+      if (other) return `${what} must have the same origin: ${origin} and ${new URL(other.to).origin}`;
     } catch {
-      return app.toast("Set a valid target for every tab", "error");
+      return "Set a valid target for every tab";
     }
-    if (members.some((m) => replayCalls.get(m.tab.key) != null)) return app.toast("A selected tab already has a send running", "error");
-    const problem = optionsProblem(options);
+    if (members.some((m) => replayCalls.get(m.tab.key) != null)) return "A selected tab already has a send running";
+    return optionsProblem(options);
+  };
+  const race = async () => {
+    const members = groupMembers();
+    const n = parseGroupRaceCount(raceCount, members.map((m) => m.text), options.http2);
+    if (n == null) return app.toast(`Race takes ${members.length > 1 ? 1 : RACE_MIN} to ${groupMax} copies per tab`, "error");
+    const problem = groupProblem(members, "Race tabs");
     if (problem) return app.toast(problem, "error");
+    const to = members[0].to;
     setTarget(to);
     try {
       localStorage.setItem(RACE_COUNT, String(n));
@@ -389,6 +430,57 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
     });
   };
 
+  // The group one after another (`send --sequence`), each tab then showing its own request's
+  // response, or why it has none (it failed, or the sequence stopped before it).
+  const sendInOrder = async (over: Connections) => {
+    const tooFew = sequenceProblem(groupTabs.length);
+    if (tooFew) return app.toast(tooFew, "error");
+    const members = groupMembers(orderedTabs);
+    const problem = groupProblem(members, "Tabs sent in order");
+    if (problem) return app.toast(problem, "error");
+    // The first tab's request goes on stdin with its target; the active tab keeps its own.
+    const to = members[0].to;
+    setTarget(members.find((m) => m.tab.key === tab.key)?.to ?? target);
+    setInOrderOver(over);
+    try {
+      localStorage.setItem(IN_ORDER_OVER, over);
+    } catch {
+      /* storage unavailable */
+    }
+    const labels = activeLabels(options, "http");
+    const id = beginCall(tab.key, "replay-sequence");
+    for (const member of members) if (member.tab.key !== tab.key) replayCalls.update(member.tab.key, () => id);
+    let result: SequenceResult | null = null;
+    let error: string | null = null;
+    try {
+      result = await run<SequenceResult>(sequenceArgs(to, over, members.length - 1, options), {
+        stdin: textBytes(members[0].text, members[0].tab.binary),
+        requestFiles: members.slice(1).map((m) => textBytes(m.text, m.tab.binary)),
+        call: id,
+        project,
+      });
+    } catch (e: any) {
+      error = failureText(e, "sequence");
+      // A sequence that stopped early still lists every request: what each got, or why not.
+      if (Array.isArray(e.data?.results)) result = e.data as SequenceResult;
+    }
+    const titles = members.map((m) => m.tab.title);
+    members.forEach((member, index) => {
+      if (!endCall(member.tab.key, id)) return;
+      const outcome = result ? tabOutcome(result, index, titles, error ?? undefined) : null;
+      const entry: Sent = {
+        raw: member.raw, sent: member.text, encoded: member.encoded, labels,
+        result: outcome?.result ?? null, error: outcome ? outcome.error : error,
+        ...(result ? { sequence: { result, index } } : {}),
+      };
+      sentByTab.update(member.tab.key, (s) => ({ list: [...s.list, entry], at: s.list.length }));
+    });
+    // Stopped by the user, the tabs say so; any other stop gets a toast too.
+    const stopped = result && result.stopped?.cause !== "cancelled" && stopText(result, titles);
+    if (stopped) app.toast(`The group stopped: ${stopped}`, "error");
+    if (result?.platform_auth_warning) app.toast(result.platform_auth_warning, "info");
+  };
+
   // Opens one raced response in the response pane (`history show`). The race's entry is found by
   // its result (the list may have grown since), and the response only lands if that row is
   // still the one open in it.
@@ -416,11 +508,17 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
 
   // Only while Replay shows (its where), and in the editor too.
   const sendKey = useKeyLabel("replay.send");
+  const inOrderDisabled: string | false = busy ? "Sending…" : sequenceProblem(groupTabs.length) ?? false;
   useActions([
     { ...SEND, disabled: busy ? "Sending…" : false, run: send },
+    ...CONNECTIONS.map((over) => ({
+      ...IN_ORDER[over],
+      disabled: inOrderDisabled,
+      run: () => sendInOrder(over),
+    })),
     {
       ...STOP,
-      title: racing ? "Stop the race" : STOP.title,
+      title: racing ? "Stop the race" : sequencing ? "Stop the group sent in order" : STOP.title,
       disabled: busy ? false : "Nothing is being sent",
       run: () => stopCall(tab.key, cancelCli),
     },
@@ -452,7 +550,7 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
     <div className="col fill">
       <div className="toolbar">
         <button className="btn primary" disabled={busy} onClick={send} title={withKey("Send", sendKey)}>
-          {busy && !racing ? "Sending…" : "Send"}
+          {busy && !racing && !sequencing ? "Sending…" : "Send"}
         </button>
         {busy && (
           <button
@@ -461,6 +559,8 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
             title={
               racing
                 ? "Stop the race. Its requests may already have reached the server; if they went out, history has every copy as cancelled (on Windows, as sent with no response recorded)."
+                : sequencing
+                ? "Stop the group sent in order. The request going out may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded). The requests after it aren't sent."
                 : "Stop waiting for this request. It may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded)."
             }
           >
@@ -469,13 +569,31 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
         )}
         <div
           className="race-ctl"
-          title={`Send each of ${raceTabs.length} tabs ${raceCount || "N"} times at once, with the active tab's options, to look for race conditions: ${plannedTechnique(line, groupHttp2)}. HTTP/2 (the option, or a request line ending in HTTP/2) uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}
+          title={`Send each of ${groupTabs.length} tabs ${raceCount || "N"} times at once, with the active tab's options, to look for race conditions: ${plannedTechnique(line, groupHttp2)}. HTTP/2 (the option, or a request line ending in HTTP/2) uses the single-packet attack (up to ${RACE_MAX_HTTP2}).`}
         >
           <button className="btn" disabled={busy} onClick={race}>
-            {racing ? "Racing…" : raceTabs.length > 1 ? `Race ${raceTabs.length} tabs` : "Race"}
+            {racing ? "Racing…" : groupTabs.length > 1 ? `Race ${groupTabs.length} tabs` : "Race"}
           </button>
           <span className="label">×</span>
-          <input className="input mono" type="number" aria-label="Race count" min={raceTabs.length > 1 ? 1 : RACE_MIN} max={groupMax} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+          <input className="input mono" type="number" aria-label="Race count" min={groupTabs.length > 1 ? 1 : RACE_MIN} max={groupMax} style={{ width: 64 }} value={raceCount} onChange={(e) => setRaceCount(e.target.value)} />
+        </div>
+        <div
+          className="race-ctl"
+          title={
+            sequenceProblem(groupTabs.length) ??
+            `Send the ${groupTabs.length} tabs one after another, left to right, each once the one before is answered, with the active tab's options: over one keep-alive connection (${groupHttp2 ? "HTTP/2, from the option or a request line" : "HTTP/1.1; HTTP/2 with the option or a request line ending in HTTP/2"}), or a new connection each. Stops at the first request that fails, or that the server closes the connection before.`
+          }
+        >
+          <button className="btn" disabled={busy || groupTabs.length < 2} onClick={() => sendInOrder(inOrderOver)}>
+            {sequencing ? "Sending in order…" : groupTabs.length > 1 ? `Send ${groupTabs.length} tabs in order` : "Send in order"}
+          </button>
+          <select className="input" aria-label="Send in order over" value={inOrderOver} disabled={busy} onChange={(e) => setInOrderOver(parseConnections(e.target.value))}>
+            {CONNECTIONS.map((c) => (
+              <option key={c} value={c}>
+                over {connectionsLabel(c)}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="seg">
           <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
@@ -552,6 +670,11 @@ function RepeaterTabView({ tab, raceSelected }: { tab: RepeaterTab; raceSelected
             <span className="muted" title={summary.baseline == null ? undefined : `Compared with the most common result: ${shapeLabel(raced.result.results[summary.baseline])} (first at #${summary.baseline + 1})`}>
               {summary.spread == null ? "no responses" : `spread ${summary.spread} ms`} · {summary.differing ? `${summary.differing} differ from the most common` : "all alike"}
               {summary.errors ? ` · ${summary.errors} failed` : ""}
+            </span>
+          )}
+          {current?.sequence && (
+            <span className="tag" title={sequenceSummary(current.sequence.result)}>
+              {sequenceTag(current.sequence.result, current.sequence.index)}
             </span>
           )}
           {r?.response && (
