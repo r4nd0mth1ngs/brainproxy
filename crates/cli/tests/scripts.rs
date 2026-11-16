@@ -721,6 +721,13 @@ fn a_request_script_blocks_or_answers_in_every_engine_and_nothing_reaches_the_ta
     let (code, v) = env.run(&["send", "--url", &url, "--race", "2"]);
     assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
     assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], before);
+    // Nor is a sequence: it is checked as a whole before its first request goes out.
+    for how in ["single", "separate"] {
+        let (code, v) = env.run(&["send", "--url", &url, "--sequence", how]);
+        assert_eq!((code, v["error"]["kind"].as_str()), (7, Some("blocked")), "{v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("request 0 of the sequence"), "{v}");
+    }
+    assert_eq!(env.rows("SELECT count(*) FROM history")[0][0], before);
     untouched("send");
     let rows = env.rows("SELECT path, status, edited_by FROM history WHERE source = 'send' ORDER BY id");
     assert_eq!(rows.len(), 2, "{rows:?}");

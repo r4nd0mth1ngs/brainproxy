@@ -32,6 +32,7 @@ pub mod rules;
 pub mod sandbox;
 pub mod scan;
 pub mod sent;
+pub mod sequence;
 pub mod session;
 pub mod sign;
 pub mod sign_script;

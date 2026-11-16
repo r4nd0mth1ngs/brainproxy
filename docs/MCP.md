@@ -196,10 +196,11 @@ Some arguments need a person, so a command run for a tool call (the server sets
   call's `stdin` (`request: "-"`). Like `findings_retest`, it sends only GET, HEAD and OPTIONS
   unless `allow_unsafe`, to the scope's targets only, and its requests are recorded as the
   agent's (origin `mcp`, source `retest`).
-- `send` with an `also` file other than `-`: a race group member is sent and recorded as it is
-  (and a request line that doesn't parse is quoted in the error), so it could send any file the
-  server can read to a target and have it read back from history. An agent races a group of two
-  with the primary as `url` and the other request as the call's `stdin` (`also: ["-"]`).
+- `send` with an `also` file other than `-`: a race or sequence group member is sent and
+  recorded as it is (and a request line that doesn't parse is quoted in the error), so it could
+  send any file the server can read to a target and have it read back from history. An agent
+  races a group of two, or sends it in order (`sequence: "single"` or `"separate"`), with the
+  primary as `url` and the other request as the call's `stdin` (`also: ["-"]`).
 - `rules_test` and `rules_import` with a `file` other than `-`: the tester shows the message it
   was given, so a file could be read back, and an import's rules come from the agent anyway. The
   message, or the rules' JSON, is the call's `stdin`; `rules_test` also takes `history`. Neither
@@ -249,7 +250,7 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - `findings_add` with `replace_text`: the description and solution findings of the same title
   share may be a person's. A different one is refused (`conflict`) without it, so an agent
   leaves them out or uses another title.
-- `send` and `ws_send` with `no_store` (races too), and `fuzz_run` with `store` `none` or
+- `send` and `ws_send` with `no_store` (races and sequences too), and `fuzz_run` with `store` `none` or
   `matches`: what an agent sends is always recorded in full, so a person can see what was sent
   on their behalf. A person can keep a send's content out of history from the app or a
   terminal; it still gets a row. These are the only options of a sending command that keep
@@ -267,7 +268,7 @@ Some arguments need a person, so a command run for a tool call (the server sets
   body, including a `verbatim` body with no framing that starts with a request line, or framing
   servers may read differently: Content-Length twice with different values, or with
   Transfer-Encoding), is refused (`out_of_scope`) as it goes on the wire, after a session or signer changed it;
-  `send` (races too), `fuzz_run` (also for payloads with raw line breaks into the head),
+  `send` (races and sequences too), `fuzz_run` (also for payloads with raw line breaks into the head),
   `ws_send`, `scan_active` (for its base requests: a rule's own Host is its test),
   `auth_login`, `auth_status`, `auth_macro_run` and `intercept_forward` (for hosts an edit
   brings in) send it when `host_header_test` is set, so request smuggling tests (CL.TE, TE.CL, a

@@ -290,6 +290,11 @@ brainproxy send req.http --race 20 --http2
 # race-pos:I/N, and race-partial when not every final frame fitted in the one packet
 brainproxy history list --tag race:RACE_ID
 
+# A group in order, each request once the one before is answered: over one keep-alive
+# connection (request smuggling, connection state) or a new connection each
+brainproxy send attack.http --also normal.http --sequence single
+brainproxy send login.http --also cart.http --sequence separate
+
 # HTTP/2 (ALPN h2; h2c prior knowledge for http://) on send, fuzz, crawl, scan active.
 # Recorded as "GET /x HTTP/2"; such a request is re-sent over HTTP/2 automatically.
 brainproxy send --http2 --url https://target.test/

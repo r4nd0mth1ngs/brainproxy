@@ -96,14 +96,15 @@ export function sendsInFlight(key?: number): number {
  * nothing went out, hence "may" and "if".
  */
 export function stoppedText(kind: SendKind): string {
+  if (kind === "sequence") return "Stopped: the request going out may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded), and the requests after it weren't sent";
   if (kind === "race") return "Stopped: the race's requests may already have reached the server; if they went out, history has every copy as cancelled (on Windows, as sent with no response recorded), tagged with the race";
   return kind === "http"
     ? "Stopped: the request may already have reached the server; if it went out, history has it as cancelled (on Windows, as sent with no response recorded)"
     : "Stopped: the handshake and messages may already have reached the server; history has what was sent up to then, the connection closed as cancelled (on Windows, left open)";
 }
 
-/** What a tab sends: an HTTP request, a race of copies of one, or a WebSocket conversation. */
-export type SendKind = "http" | "race" | "ws";
+/** What a tab sends: an HTTP request, a race of copies of one, a group in order, or a WebSocket conversation. */
+export type SendKind = "http" | "race" | "sequence" | "ws";
 
 /**
  * What a failed send says: the stopped text when it was stopped (with what the CLI said, when

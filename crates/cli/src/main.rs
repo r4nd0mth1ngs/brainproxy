@@ -29,6 +29,7 @@ mod request_args;
 mod retest_cmd;
 mod scan_cmd;
 mod sent;
+mod sequence;
 mod sse_cmd;
 mod update_cmd;
 mod verify_cmd;
@@ -261,8 +262,9 @@ struct SendArgs {
     #[command(flatten)]
     req: request_args::RequestArgs,
 
-    /// Additional raw request file in the race group. Repeatable; '-' reads stdin once.
-    /// Defaults --race to 1. All requests must resolve to the same origin.
+    /// Additional raw request file in the group: raced (--race), or sent after the primary in
+    /// order (--sequence). Repeatable; '-' reads stdin once. Without --sequence, defaults --race
+    /// to 1. All requests must resolve to the same origin.
     #[arg(long, value_name = "FILE")]
     also: Vec<String>,
 
@@ -272,6 +274,14 @@ struct SendArgs {
     /// Rows are tagged race:ID, race-sync:..., race-pos:I/N (and race-partial).
     #[arg(long, value_name = "N")]
     race: Option<usize>,
+    /// Send the group in order (the request, then each --also), each request once the one
+    /// before it is answered. single: over one keep-alive connection (one HTTP/2 connection with
+    /// --http2 or a request line saying HTTP/2). separate: over a new connection each. Stops at
+    /// the first request that fails, or that the one connection can't carry because the server
+    /// closed it (or said it would), and says how far it got. Rows are tagged sequence:ID,
+    /// sequence-conn:single|separate and sequence-pos:I/N.
+    #[arg(long, value_enum, value_name = "CONNECTION", conflicts_with_all = ["race", "raw", "show_request"])]
+    sequence: Option<SequenceArg>,
     /// Send with this auth profile's session (cookies/headers; re-login if logged out).
     #[arg(long, value_name = "NAME")]
     auth: Option<String>,
@@ -290,14 +300,32 @@ struct SendArgs {
     raw: bool,
     /// Seconds to read an event stream (a text/event-stream response, which may never end)
     /// before stopping, from its head (at most 86400, a day). What arrived is the response.
-    /// Not with a race, which reads whole responses.
-    #[arg(long, default_value_t = 5.0, value_name = "SECONDS", conflicts_with_all = ["race", "also"])]
+    /// Not with a race or a sequence, which read whole responses.
+    #[arg(long, default_value_t = 5.0, value_name = "SECONDS", conflicts_with_all = ["race", "also", "sequence"])]
     stream_wait: f64,
     /// Stop reading an event stream once this many events have arrived (events that arrive
-    /// together with the last one are read too). Not with a race.
+    /// together with the last one are read too). Not with a race or a sequence.
     #[arg(long, default_value_t = 100, value_name = "N", value_parser = clap::value_parser!(u32).range(1..),
-        conflicts_with_all = ["race", "also"])]
+        conflicts_with_all = ["race", "also", "sequence"])]
     max_events: u32,
+}
+
+/// How `send --sequence` carries the group's requests.
+#[derive(Clone, Copy, ValueEnum)]
+enum SequenceArg {
+    /// One keep-alive connection for every request.
+    Single,
+    /// A new connection for each request.
+    Separate,
+}
+
+impl SequenceArg {
+    fn connections(self) -> brainproxy_core::sequence::Connections {
+        match self {
+            SequenceArg::Single => brainproxy_core::sequence::Connections::Single,
+            SequenceArg::Separate => brainproxy_core::sequence::Connections::Separate,
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -776,7 +804,15 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
     if stdin_count > 1 {
         return Err(Error::InvalidInput("stdin may be read only once across the primary request and --also".into()));
     }
-    let primary = args.req.prepare(None)?;
+    let mut primary = args.req.prepare(None)?;
+    // A request built from --url says Connection: close (one request, one connection). Over the
+    // connection a sequence keeps, it says keep-alive instead, unless -H or --remove-header set it.
+    if matches!(args.sequence, Some(SequenceArg::Single))
+        && args.req.url.is_some()
+        && !args.req.names_header("connection")
+    {
+        primary.0 = primary.0.set_header("Connection", "keep-alive");
+    }
     let mut group = vec![primary];
     for file in &args.also {
         let mut input = args.req.clone();
@@ -786,10 +822,12 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         input.scheme = group[0].1.scheme.clone();
         group.push(input.prepare(None)?);
     }
-    let count = args.race.or_else(|| (!args.also.is_empty()).then_some(1));
-    if count.is_some() {
-        // A race goes over TCP: a recorded HTTP/3 request (its request line) goes as HTTP/1.1, or
-        // as HTTP/2 with --http2, not with an HTTP/3 line a TCP server would refuse.
+    let count = args.race.or_else(|| (!args.also.is_empty() && args.sequence.is_none()).then_some(1));
+    // What the group is called in errors.
+    let group_name = if args.sequence.is_some() { "sequence" } else { "race" };
+    if count.is_some() || args.sequence.is_some() {
+        // A race or sequence goes over TCP: a recorded HTTP/3 request (its request line) goes as
+        // HTTP/1.1, or as HTTP/2 with --http2, not with an HTTP/3 line a TCP server would refuse.
         for (req, _) in group.iter_mut() {
             *req = brainproxy_core::http::client::tcp_form(req, args.req.http2).into_owned();
         }
@@ -806,6 +844,9 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
                     .into(),
             ));
         }
+    }
+    if args.sequence.is_some() {
+        sequence::check(group.len(), args.req.http3)?;
     }
     let guard = project_guard(project)?;
     if !(0.0..=ws_cmd::MAX_WAIT_SECS).contains(&args.stream_wait) {
@@ -840,17 +881,21 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         }
     }
     // A request rule's script that blocked or answered a request: nothing of it is sent. A race
-    // sends its requests together, so one it stopped stops the race, before any row is written.
+    // sends its requests together, so one it stopped stops the race, before any row is written;
+    // a sequence is checked as a whole the same way.
     if let Some((i, stopped)) = ruled.iter().enumerate().find_map(|(i, r)| Some((i, r.stopped.as_ref()?))) {
-        if count.is_some() {
-            return Err(Error::Blocked(format!("request {i} of the race: {}; nothing was sent", stopped.message())));
+        if count.is_some() || args.sequence.is_some() {
+            return Err(Error::Blocked(format!(
+                "request {i} of the {group_name}: {}; nothing was sent",
+                stopped.message()
+            )));
         }
     }
     let target = group[0].1.clone();
     for (i, (_, other)) in group.iter().enumerate().skip(1) {
         if other != &target {
             return Err(Error::InvalidInput(format!(
-                "race group requires the same origin: request 0 is {}, request {i} is {}",
+                "{group_name} group requires the same origin: request 0 is {}, request {i} is {}",
                 target.origin(),
                 other.origin()
             )));
@@ -867,6 +912,11 @@ fn send(project: &Path, mut args: SendArgs, out: &Out) -> Result<(), Error> {
         s.keep_no_content();
     }
     let client = Client::new(send_opts);
+    if let Some(how) = args.sequence {
+        let requests = group.into_iter().map(|(req, _)| req).collect();
+        let setup = sequence::Setup { rules: rules.as_ref(), ruled: &ruled, client, session, host_warning };
+        return sequence::send(project, &args, requests, target, setup, how.connections(), h2, out);
+    }
     if let Some(n) = count {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
         let mut requests = Vec::with_capacity(group.len());

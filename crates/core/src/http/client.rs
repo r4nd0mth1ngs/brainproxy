@@ -1427,25 +1427,44 @@ fn stale(e: &Error) -> bool {
 
 /// Whether the connection can't be reused after this exchange.
 pub fn close_after(request: &[u8], response: &[u8], method: &str) -> bool {
-    let req_close = RawRequest::from_bytes(request.to_vec())
-        .head()
-        .map(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")))
-        .unwrap_or(true);
     // More than one message went out (pipelined or smuggled, or a body longer than its
-    // Content-Length): the server's other answers may still arrive, and the next request
-    // on this connection would read them.
-    if req_close || !one_message(request) {
-        return true;
+    // Content-Length), or the head isn't one: the server's other answers may still arrive,
+    // and the next request on this connection would read them.
+    !one_message(request) || connection_ends(request, response, method).is_some()
+}
+
+/// Why the server takes no further request on this HTTP/1 connection after answering `request`
+/// with `response`, if it doesn't: one of them said `Connection: close`, the server switched
+/// protocols, or the response's body ran (or was cut short) to the connection's close. Unlike
+/// [`close_after`], a request that carries more than one message doesn't count: over a
+/// connection kept for a sequence, the answers to the rest are read as the next responses.
+pub fn connection_ends(request: &[u8], response: &[u8], method: &str) -> Option<&'static str> {
+    let closes = |v: &str| v.eq_ignore_ascii_case("close");
+    let (head, _) = crate::http::request::split_head_body(request);
+    let asked = RawRequest::from_bytes(head.to_vec())
+        .head()
+        .is_ok_and(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && closes(v)));
+    if asked {
+        return Some("the request said Connection: close");
     }
-    let Ok(h) = parse_response_head(final_response(response)) else { return true };
-    h.status == 101
-        || cut_short(response, method)
-        || h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
-        || (h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")))
-        || (h.header("content-length").is_none()
-            && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-            && !method.eq_ignore_ascii_case("HEAD")
-            && !matches!(h.status, 100..=199 | 204 | 304))
+    let Ok(h) = parse_response_head(final_response(response)) else { return Some("its response isn't HTTP") };
+    let framed = h.header("content-length").is_some()
+        || h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+        || method.eq_ignore_ascii_case("HEAD")
+        || matches!(h.status, 100..=199 | 204 | 304);
+    if h.status == 101 {
+        Some("it switched protocols (101)")
+    } else if cut_short(response, method) {
+        Some("it closed the connection before the whole body arrived")
+    } else if h.header("connection").is_some_and(closes) {
+        Some("the response said Connection: close")
+    } else if h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")) {
+        Some("the response is HTTP/1.0 without Connection: keep-alive")
+    } else if !framed {
+        Some("the response's body ran to the connection's close (no Content-Length or chunked encoding)")
+    } else {
+        None
+    }
 }
 
 /// Whether `request` is exactly one HTTP/1 message: its body is all its framing says.

@@ -159,6 +159,7 @@ fn protocol_and_tool_list() {
     assert_eq!(props["headers"]["type"], "array");
     assert_eq!(props["also"]["type"], "array");
     assert_eq!(props["also"]["items"]["type"], "string");
+    assert_eq!(props["sequence"]["enum"], json!(["single", "separate"]), "{}", props["sequence"]);
     assert_eq!(props["max_body"]["type"], "integer");
     assert_eq!(props["no_store"]["type"], "boolean");
     assert!(props.get("project").is_none() && props.get("format").is_none());
