@@ -149,6 +149,18 @@ pub(crate) fn saved_name<'a>(what: &str, name: &'a str) -> Result<&'a str> {
     Ok(name)
 }
 
+const BUMP_SETTINGS_VERSION: &str = "INSERT INTO meta (key, value) VALUES ('settings_version', '1')
+     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1";
+
+/// A record's revision for an edit's `--if-revision`: a fingerprint of it as stored (16 hex
+/// digits of the SHA-256 of its JSON), which changes whenever any of it does. Unlike a counter
+/// it needs nothing stored, and an older brainproxy that changes the record changes it too.
+pub fn revision<T: Serialize + ?Sized>(record: &T) -> String {
+    use sha2::{Digest, Sha256};
+    let json = serde_json::to_vec(record).unwrap_or_default();
+    hex::encode(&Sha256::digest(&json)[..8])
+}
+
 /// Logs that setting `key` was saved by this process's origin, on `conn` (inside the caller's
 /// transaction when it has one).
 pub(crate) fn log_setting_change(conn: &Connection, key: &str) -> Result<()> {
@@ -1080,6 +1092,42 @@ impl Store {
         self.bump_settings_version()
     }
 
+    /// A JSON setting (its default when unset) with its text as stored, for [`Store::swap_setting`].
+    pub fn setting_as_stored<T: serde::de::DeserializeOwned + Default>(
+        &self,
+        key: &str,
+    ) -> Result<(Option<String>, T)> {
+        let stored = self.meta_get(&format!("setting.{key}"))?;
+        let value = match &stored {
+            Some(v) => serde_json::from_str(v).map_err(|e| Error::InvalidInput(format!("setting {key}: {e}")))?,
+            None => T::default(),
+        };
+        Ok((stored, value))
+    }
+
+    /// [`Store::set_setting`], only if the setting still holds `expected` (its text as
+    /// [`Store::setting_as_stored`] read it; `None`: unset), in one write transaction. Returns
+    /// whether it was written: false when another process saved the setting in between, whose
+    /// change a write over it would lose.
+    pub fn swap_setting<T: Serialize>(&mut self, key: &str, expected: Option<&str>, value: &T) -> Result<bool> {
+        let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let meta_key = format!("setting.{key}");
+        let tx = self.write_tx()?;
+        let now: Option<String> =
+            tx.query_row("SELECT value FROM meta WHERE key = ?1", [&meta_key], |r| r.get(0)).optional()?;
+        if now.as_deref() != expected {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![meta_key, json],
+        )?;
+        log_setting_change(&tx, key)?;
+        tx.execute(BUMP_SETTINGS_VERSION, [])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// The project's schema version: the one the newest build to open it migrated it to.
     pub fn schema_version(&self) -> Result<i64> {
         Ok(self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
@@ -1103,11 +1151,7 @@ impl Store {
 
     /// Makes running proxies reload their settings.
     pub fn bump_settings_version(&self) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('settings_version', '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [],
-        )?;
+        self.conn.execute(BUMP_SETTINGS_VERSION, [])?;
         Ok(())
     }
 
@@ -2863,5 +2907,29 @@ mod tests {
         sample(&s);
         assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o755);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_setting_saved_meanwhile_is_not_written_over() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (none, empty): (Option<String>, Vec<u32>) = s.setting_as_stored("x").unwrap();
+        assert!(none.is_none() && empty.is_empty());
+        assert!(s.swap_setting("x", None, &[1]).unwrap());
+        let (read, _): (Option<String>, Vec<u32>) = s.setting_as_stored("x").unwrap();
+        // Another process saves it after it was read: a write from what was read is refused,
+        // and running proxies have nothing new to reload.
+        s.set_setting("x", &[2]).unwrap();
+        let version = s.settings_version().unwrap();
+        assert!(!s.swap_setting("x", read.as_deref(), &[3]).unwrap());
+        assert!(!s.swap_setting("x", None, &[3]).unwrap());
+        assert_eq!(s.setting::<Vec<u32>>("x").unwrap(), [2]);
+        assert_eq!(s.settings_version().unwrap(), version);
+        let (read, _): (Option<String>, Vec<u32>) = s.setting_as_stored("x").unwrap();
+        assert!(s.swap_setting("x", read.as_deref(), &[3]).unwrap());
+        assert_eq!(s.settings_version().unwrap(), version + 1);
+        assert_eq!(s.setting::<Vec<u32>>("x").unwrap(), [3]);
+        // A revision is short, and tells records apart.
+        assert_eq!(revision(&[1]).len(), 16);
+        assert_ne!(revision(&[1]), revision(&[2]));
     }
 }

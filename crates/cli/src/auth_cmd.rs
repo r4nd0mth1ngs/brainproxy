@@ -145,6 +145,42 @@ pub enum MacroCmd {
         #[arg(long)]
         host_header_test: bool,
     },
+    /// Change a macro in place: its steps, its extractors, or both. It keeps its name and its
+    /// place among the profile's macros, and session rules that run it go on running it.
+    #[command(after_help = "--step replaces the steps, in order. It takes what `auth macro add` takes, and \
+        step:N for the macro's step N as it is (with its extractors, unless --extract or --no-extract is \
+        given): reorder with --step step:2 --step step:1, add a step with --step step:1 --step 42. --extract \
+        replaces every extractor (STEP is a step of the edited macro) and --no-extract removes them all; \
+        without them, steps kept with step:N keep theirs. The macro is checked as `auth macro add` checks one: \
+        a step's Host the scope doesn't list is refused through MCP without --host-header-test, unless the \
+        macro already sent that one. A changed macro records whoever edited it as its origin. --if-revision \
+        takes the macro's revision from `auth macro show` and refuses (kind conflict) a macro changed since.")]
+    Edit {
+        profile: String,
+        /// Macro name.
+        name: String,
+        /// A step: history id, FILE, ORIGIN=FILE, or step:N (the macro's step N). Repeatable, in
+        /// order; replaces the steps. Through MCP a FILE only in the project's folder.
+        #[arg(long = "step")]
+        steps: Vec<String>,
+        /// STEP:VAR=KIND:EXPR. Repeatable; replaces every extractor.
+        #[arg(long = "extract", conflicts_with = "no_extract")]
+        extract: Vec<String>,
+        /// Remove every extractor.
+        #[arg(long)]
+        no_extract: bool,
+        /// Scheme for FILE steps whose request line has no absolute URL.
+        #[arg(long, default_value = "https")]
+        scheme: String,
+        /// As for `auth macro add`: a step's Host header deliberately names a host the scope
+        /// doesn't list.
+        #[arg(long)]
+        host_header_test: bool,
+        /// Edit only if the macro is still at this revision (from `auth macro show`, or an
+        /// earlier edit); otherwise fail with a conflict and change nothing.
+        #[arg(long, value_name = "REV")]
+        if_revision: Option<String>,
+    },
     /// The profile's macros.
     List { profile: String },
     /// One macro with its requests and extractors.
@@ -1478,7 +1514,19 @@ fn macro_summary(m: &Macro) -> serde_json::Value {
         "vars": m.vars(),
         "requests": m.steps.iter().map(step_line).collect::<Vec<_>>(),
         "origin": m.origin,
+        "revision": brainproxy_core::store::revision(m),
     })
+}
+
+/// The step `step:N` of `auth macro edit --step` keeps: N, from 1; None for another spec.
+fn kept_step(spec: &str) -> Result<Option<usize>, Error> {
+    match spec.trim().strip_prefix("step:") {
+        None => Ok(None),
+        Some(n) => match n.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => Err(Error::InvalidInput(format!("--step {spec:?}: step:N names a step of the macro, from 1"))),
+        },
+    }
 }
 
 /// "METHOD URL" of a macro step.
@@ -1627,6 +1675,87 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                 )
             });
         }
+        MacroCmd::Edit { profile, name, steps, extract, no_extract, scheme, host_header_test, if_revision } => {
+            store.auth_profile(&profile)?;
+            // Saved only if nobody else changed the profile's macros and rules meanwhile.
+            let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
+            let i = h
+                .macros
+                .iter()
+                .position(|m| m.name == name)
+                .ok_or_else(|| Error::NotFound(format!("macro {name:?} of profile {profile:?}")))?;
+            let old = h.macros[i].clone();
+            if let Some(want) = if_revision.as_deref() {
+                let now = brainproxy_core::store::revision(&old);
+                if want != now {
+                    return Err(Error::Conflict(format!(
+                        "macro {name:?} is at revision {now}, not {want}: it was changed elsewhere meanwhile; show \
+                         it again"
+                    )));
+                }
+            }
+            if steps.is_empty() && extract.is_empty() && !no_extract {
+                return Err(Error::InvalidInput("auth macro edit: give --step, --extract or --no-extract".into()));
+            }
+            let mut m = old.clone();
+            if !steps.is_empty() {
+                let n = old.steps.len();
+                m.steps = steps
+                    .iter()
+                    .map(|spec| match kept_step(spec)? {
+                        Some(k) => old.steps.get(k.wrapping_sub(1)).cloned().ok_or_else(|| {
+                            Error::InvalidInput(format!("--step {spec:?}: the macro has steps 1 to {n}"))
+                        }),
+                        None => read_step(project, &store, spec, &scheme),
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            if no_extract || !extract.is_empty() {
+                for s in &mut m.steps {
+                    s.extract.clear();
+                }
+            }
+            for spec in &extract {
+                let (step, x) = parse_extract(spec)?;
+                let n = m.steps.len();
+                let s = step
+                    .checked_sub(1)
+                    .and_then(|i| m.steps.get_mut(i))
+                    .ok_or_else(|| Error::InvalidInput(format!("--extract {spec:?}: the macro has steps 1 to {n}")))?;
+                s.extract.push(x);
+            }
+            // Checked as `auth macro add` checks the macro it replaces.
+            let guard = store.guard()?;
+            let was = macro_host(&guard, &old);
+            let host_warning = match macro_host(&guard, &m).filter(|(_, h)| was.as_ref().map(|o| &o.1) != Some(h)) {
+                Some((step, host)) => {
+                    let what = format!("macro {name} step {step}");
+                    crate::mcp::check_host_setting(&what, Some(host), host_header_test, out)?
+                }
+                None => None,
+            };
+            let changed = m != old;
+            if changed {
+                h.macros[i] = m;
+                store.auth_save_handling_if(&profile, stored.as_deref(), &h)?;
+            }
+            let saved = store.auth_handling(&profile)?.macros.into_iter().find(|x| x.name == name);
+            let saved = saved.ok_or_else(|| Error::Conflict(format!("macro {name:?} was removed meanwhile")))?;
+            let revision = brainproxy_core::store::revision(&saved);
+            let mut data = json!({
+                "profile": profile,
+                "macro": macro_summary(&saved),
+                "changed": changed,
+                "revision": revision,
+            });
+            if let Some(w) = host_warning {
+                data["host_warning"] = json!(w);
+            }
+            out.ok(data, || {
+                let what = if changed { "edited" } else { "unchanged" };
+                format!("macro {name:?} of {profile} {what} ({} steps)", saved.steps.len())
+            });
+        }
         MacroCmd::List { profile } => {
             store.auth_profile(&profile)?;
             let items: Vec<_> = store.auth_handling(&profile)?.macros.iter().map(macro_summary).collect();
@@ -1647,7 +1776,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                 .iter()
                 .find(|m| m.name == name)
                 .ok_or_else(|| Error::NotFound(format!("macro {name:?} of profile {profile:?}")))?;
-            let data = json!({"profile": profile, "macro": m});
+            let data = json!({"profile": profile, "macro": m, "revision": brainproxy_core::store::revision(m)});
             out.ok(data.clone(), || serde_json::to_string_pretty(&data).unwrap_or_default());
         }
         MacroCmd::Run { profile, name, net } => {

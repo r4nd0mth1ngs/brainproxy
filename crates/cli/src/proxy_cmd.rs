@@ -441,6 +441,33 @@ pub struct RuleOptions {
     pub script_sha256: Option<String>,
 }
 
+/// `rules edit`'s flags of [`RuleOptions`]: the same names, each changing only when given.
+#[derive(clap::Args, Clone, Default)]
+pub struct RuleChanges {
+    /// As for `rules add`: regex, literal or whole.
+    #[arg(long, value_parser = MatchKind::ALL.to_vec())]
+    pub match_kind: Option<String>,
+    /// As for `rules add`; empty removes the name (and the action with it).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// As for `rules add`: set, add or remove.
+    #[arg(long, value_parser = RuleAction::ALL.to_vec())]
+    pub action: Option<String>,
+    /// As for `rules add`, in place of the engines it lists.
+    #[arg(long, value_delimiter = ',', value_parser = Engine::ALL.to_vec())]
+    pub applies_to: Option<Vec<String>>,
+    /// As for `rules add`; empty removes the condition.
+    #[arg(long)]
+    pub host: Option<String>,
+    /// As for `rules add`: a script file makes the replacement, pinned again by its sha256. Not
+    /// offered through MCP.
+    #[arg(long, value_name = "FILE", conflicts_with = "replace")]
+    pub script: Option<PathBuf>,
+    /// The sha256 the script file must have: the one of the text you read.
+    #[arg(long, value_name = "HEX", requires = "script")]
+    pub script_sha256: Option<String>,
+}
+
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum MessageArg {
     Request,
@@ -481,6 +508,40 @@ pub enum RulesCmd {
         /// Host-header test. Through MCP such a rule is refused without it.
         #[arg(long)]
         host_header_test: bool,
+    },
+    /// Change a rule in place: only the fields given change, and it keeps its id and its place in
+    /// the list. The flags are those of `rules add`.
+    #[command(after_help = "An empty --name, --host or --comment removes it (with the name goes the \
+        --action). --replace makes the replacement text again, in place of a script; --script makes \
+        a script make it. The rule is checked as `rules add` checks one. An edit that changes what the rule \
+        does (anything but its comment) records whoever made it as the rule's origin, as `rules enable` does, \
+        and takes --host-header-test from this command; a comment alone keeps both, and --host-header-test \
+        alone marks the rule as a Host-header test. --if-revision takes the \
+        rule's revision from `rules list` (revisions) and refuses (kind conflict) a rule changed since. \
+        Through MCP a script rule's workings can't be changed, nor a request rule's that is on, and --script \
+        is refused.")]
+    Edit {
+        id: u32,
+        #[arg(long, value_parser = RuleLocation::ALL.to_vec())]
+        location: Option<String>,
+        /// What to match, as for `rules add`.
+        #[arg(long = "match")]
+        pattern: Option<String>,
+        /// The replacement text, as for `rules add` (in place of a script, if the rule has one).
+        #[arg(long, conflicts_with = "script")]
+        replace: Option<String>,
+        #[command(flatten)]
+        changes: RuleChanges,
+        /// A comment; empty removes it.
+        #[arg(long)]
+        comment: Option<String>,
+        /// As for `rules add`: the rule puts a host the scope doesn't list in the Host header.
+        #[arg(long)]
+        host_header_test: bool,
+        /// Edit only if the rule is still at this revision (from `rules list`, or an earlier edit);
+        /// otherwise fail with a conflict and change nothing.
+        #[arg(long, value_name = "REV")]
+        if_revision: Option<String>,
     },
     Remove {
         id: u32,
@@ -2371,20 +2432,98 @@ fn rule_from(
     })
 }
 
+/// What a rule does: all of it but its comment and who answers for it. An edit that changes
+/// this is checked as an add is, and makes the editor answer for the rule.
+fn workings(rule: &Rule) -> Rule {
+    Rule { comment: None, origin: None, host_header_test: false, ..rule.clone() }
+}
+
+/// `old` with `rules edit`'s flags applied, not yet checked; and whether a script was pinned.
+fn edited_rule(
+    old: &Rule,
+    location: Option<String>,
+    pattern: Option<String>,
+    replace: Option<String>,
+    c: RuleChanges,
+    comment: Option<String>,
+) -> Result<(Rule, bool), Error> {
+    let mut r = old.clone();
+    if let Some(l) = location {
+        r.location = RuleLocation::parse(&l)?;
+    }
+    if let Some(p) = pattern {
+        r.pattern = p;
+    }
+    if let Some(t) = replace {
+        r.replace = t;
+        r.replacer = ReplaceKind::Text;
+        r.script = None;
+    }
+    if let Some(k) = c.match_kind {
+        r.matcher = MatchKind::parse(&k)?;
+    }
+    match c.name {
+        // An action acts on the named header or parameter: without a name it has nothing.
+        Some(n) if n.is_empty() => {
+            r.name = None;
+            r.action = None;
+        }
+        Some(n) => r.name = Some(n),
+        None => {}
+    }
+    if let Some(a) = c.action {
+        r.action = Some(RuleAction::parse(&a)?);
+    }
+    if let Some(list) = c.applies_to {
+        r.applies_to.clear();
+        for e in &list {
+            let e = Engine::parse(e)?;
+            if !r.applies_to.contains(&e) {
+                r.applies_to.push(e);
+            }
+        }
+    }
+    if let Some(h) = c.host {
+        r.host = Some(h).filter(|h| !h.is_empty());
+    }
+    let pinned = match &c.script {
+        Some(file) => {
+            crate::mcp::check_script("--script")?;
+            r.script = Some(brainproxy_core::hooks::ScriptRef::pin(file, c.script_sha256.as_deref())?);
+            r.replacer = ReplaceKind::Script;
+            r.replace.clear();
+            true
+        }
+        None => false,
+    };
+    if let Some(t) = comment {
+        r.comment = Some(t).filter(|t| !t.is_empty());
+    }
+    Ok((r, pinned))
+}
+
+/// Each rule's revision by id, for `rules edit --if-revision`.
+fn rule_revisions(rules: &[Rule]) -> Value {
+    Value::Object(rules.iter().map(|r| (r.id.to_string(), json!(brainproxy_core::store::revision(r)))).collect())
+}
+
 pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     let mut store = Store::open(project)?;
-    let mut rules: Vec<Rule> = store.setting(RULES_KEY)?;
+    // Saved only if nobody else saved them meanwhile, so neither change is lost.
+    let (stored, mut rules): (Option<String>, Vec<Rule>) = store.setting_as_stored(RULES_KEY)?;
     let find = |rules: &mut Vec<Rule>, id: u32| -> Result<usize, Error> {
         rules.iter().position(|r| r.id == id).ok_or_else(|| Error::NotFound(format!("rule {id}")))
     };
     let mut host_warning = None;
-    // Rules switched on or off by this command.
+    // Rules switched on or off, or changed, by this command.
     let mut touched = Vec::new();
+    let mut edited = None;
     match cmd {
         RulesCmd::List => {
             let skipped = skipped_rules(&rules);
             let failures = rule_failures(&store, &rules);
-            let data = json!({"rules": rules, "skipped": skipped, "failures": failures});
+            let data =
+                json!({"rules": rules, "skipped": skipped, "failures": failures, "revisions": rule_revisions(&rules)});
             out.ok(data, || {
                 let mut text = serde_json::to_string_pretty(&rules).unwrap_or_default();
                 for s in skipped.as_array().into_iter().flatten() {
@@ -2473,6 +2612,64 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
                 rules.push(rule);
             }
         }
+        RulesCmd::Edit { id, location, pattern, replace, changes, comment, host_header_test, if_revision } => {
+            let i = find(&mut rules, id)?;
+            if let Some(want) = if_revision.as_deref() {
+                let now = brainproxy_core::store::revision(&rules[i]);
+                if want != now {
+                    return Err(Error::Conflict(format!(
+                        "rule {id} is at revision {now}, not {want}: it was changed elsewhere meanwhile; list the \
+                         rules again"
+                    )));
+                }
+            }
+            let given = location.is_some()
+                || pattern.is_some()
+                || replace.is_some()
+                || comment.is_some()
+                || changes.match_kind.is_some()
+                || changes.name.is_some()
+                || changes.action.is_some()
+                || changes.applies_to.is_some()
+                || changes.host.is_some()
+                || changes.script.is_some()
+                || host_header_test;
+            if !given {
+                return Err(Error::InvalidInput(
+                    "rules edit: give what to change (--match, --replace, --comment, ...)".into(),
+                ));
+            }
+            let old = rules[i].clone();
+            let (mut rule, pinned) = edited_rule(&old, location, pattern, replace, changes, comment)?;
+            // --host-header-test alone marks a rule as a Host-header test, which is a change of
+            // what it may send.
+            if workings(&rule) != workings(&old) || (host_header_test && !old.host_header_test) {
+                // An agent may change neither a guard nor a script a person chose to run.
+                if is_guard(&old) {
+                    crate::mcp::check_guard(&format!(
+                        "rules edit {id}: changing request rule {id}, which is on, could switch it off"
+                    ))?;
+                }
+                if old.script.is_some() || rule.script.is_some() {
+                    crate::mcp::check_script(&format!("rules edit {id}: a script rule"))?;
+                }
+                brainproxy_core::proxy::config::validate_rule(&rule)?;
+                if pinned {
+                    brainproxy_core::rules::verify_script(&rule)?;
+                }
+                // Whoever changes what a rule does answers for what it changes from then on, as
+                // whoever turns one on does: an agent's edit to a person's rule is the agent's.
+                rule.origin = Some(brainproxy_core::provenance::origin().to_string());
+                rule.host_header_test = host_header_test;
+                // A disabled rule changes nothing; enabling it is checked.
+                if rule.enabled {
+                    host_warning = check_rule_host(&store, &rule, host_header_test, out)?;
+                }
+                touched.push(id);
+            }
+            rules[i] = rule;
+            edited = Some(i);
+        }
         RulesCmd::Remove { id } => {
             let i = find(&mut rules, id)?;
             if is_guard(&rules[i]) {
@@ -2511,11 +2708,26 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             rules.clear();
         }
     }
-    store.set_setting(RULES_KEY, &rules)?;
+    if !store.swap_setting(RULES_KEY, stored.as_deref(), &rules)? {
+        return Err(Error::Conflict(
+            "the rules were saved elsewhere meanwhile (another process changed them); nothing was changed: run \
+             it again"
+                .into(),
+        ));
+    }
     // What a rule's script last failed on says nothing of a rule that is gone, or that was
-    // switched off or on since.
+    // switched off or on, or changed, since.
     brainproxy_core::rules::forget_failures(&store, |id| rules.iter().any(|r| r.id == id) && !touched.contains(&id))?;
-    let mut data = json!({"rules": rules, "skipped": skipped_rules(&rules), "failures": rule_failures(&store, &rules)});
+    let mut data = json!({
+        "rules": rules,
+        "skipped": skipped_rules(&rules),
+        "failures": rule_failures(&store, &rules),
+        "revisions": rule_revisions(&rules),
+    });
+    if let Some(i) = edited {
+        data["rule"] = json!(rules[i]);
+        data["revision"] = json!(brainproxy_core::store::revision(&rules[i]));
+    }
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
     }
