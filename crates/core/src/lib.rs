@@ -28,6 +28,7 @@ pub mod oob;
 pub mod provenance;
 pub mod proxy;
 pub mod race;
+pub mod rule_presets;
 pub mod rules;
 pub mod sandbox;
 pub mod scan;

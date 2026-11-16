@@ -1,5 +1,6 @@
-// Settings › Match & replace: the rules, an editor for a new one, and a tester that tries rules
-// on a pasted message or a history row without sending anything (`rules test`).
+// Settings › Match & replace: the rules, an editor for a new one, response presets that add
+// ready-made rules, and a tester that tries rules on a pasted message or a history row without
+// sending anything (`rules test`).
 
 import { useEffect, useState } from "react";
 import { bodyText, inTauri, isBinary, textBytes } from "../api";
@@ -26,6 +27,7 @@ import {
   importSummary,
   isNamed,
   isRequestRule,
+  isResponseRule,
   isScripted,
   scriptQuestion,
   skippedReason,
@@ -43,6 +45,7 @@ import {
   type TestResult,
   type TestWhat,
 } from "./matchReplace.ts";
+import { presetArgs, presetLabel, presetNote, type Preset, type PresetAdded } from "./rulePresets.ts";
 
 const GROUPS = ["Request", "Response", "WebSocket"];
 
@@ -62,6 +65,8 @@ export function MatchReplace() {
   const [selected, setSelected] = useState<number | null>(null);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const set = (d: Partial<Draft>) => setDraft((old) => ({ ...old, ...d }));
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [presetName, setPresetName] = useState("");
 
   // Every rules command that changes them answers with the full list.
   const apply = async (args: string[], input?: string) => {
@@ -74,7 +79,17 @@ export function MatchReplace() {
   };
   useEffect(() => {
     apply(["rules", "list"]);
+    exec<{ presets: Preset[] }>(["rules", "presets", "list"]).then((d) => {
+      if (d) setPresets(d.presets);
+      if (d?.presets.length) setPresetName(d.presets[0].name);
+    });
   }, []);
+  const preset = presets.find((p) => p.name === presetName);
+  const addPreset = async () => {
+    if (!preset) return;
+    const d = await apply(presetArgs(preset.name));
+    if (d) app.toast(presetNote(preset, d as PresetAdded));
+  };
 
   const problem = draftProblem(draft);
   const add = async () => {
@@ -246,6 +261,17 @@ export function MatchReplace() {
           </label>
         ))}
         <input className="input mono" style={{ width: 170 }} placeholder="host regex (any host)" aria-label="Host regex" value={draft.host} onChange={(e) => set({ host: e.target.value })} />
+        {isResponseRule(draft.location) && (
+          <input
+            className="input mono"
+            style={{ width: 170 }}
+            placeholder="content type (any)"
+            title="Only for responses whose Content-Type matches, as they came (none: empty text)"
+            aria-label="Content type regex"
+            value={draft.contentType}
+            onChange={(e) => set({ contentType: e.target.value })}
+          />
+        )}
         <input className="input" placeholder="comment" aria-label="Comment" value={draft.comment} onChange={(e) => set({ comment: e.target.value })} />
         <label className="check">
           <input type="checkbox" checked={draft.disabled} onChange={(e) => set({ disabled: e.target.checked })} /> disabled
@@ -273,6 +299,22 @@ export function MatchReplace() {
           </button>
         </div>
       </div>
+      {presets.length > 0 && (
+        <div className="toolbar">
+          <span className="muted">Response preset</span>
+          <select className="input" aria-label="Response preset" value={presetName} onChange={(e) => setPresetName(e.target.value)}>
+            {presets.map((p) => (
+              <option key={p.name} value={p.name} title={p.description}>
+                {presetLabel(p, rules)}
+              </option>
+            ))}
+          </select>
+          <button className="btn" disabled={!preset} title="Adds its rules, for the responses the proxy relays, as ordinary rules you can switch off or remove" onClick={addPreset}>
+            Add preset
+          </button>
+          {preset && <span className="muted">{preset.description}</span>}
+        </div>
+      )}
       <Split id="rules" dir="col" initial={0.45}>
         <DataTable
           rows={rules}

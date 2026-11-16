@@ -15,6 +15,7 @@ use brainproxy_core::proxy::config::{
     RULE_IDS, SCOPE_KEY,
 };
 use brainproxy_core::proxy::{CertAuthority, ProxyOptions, ProxyState, STATE_KEY};
+use brainproxy_core::rule_presets;
 use brainproxy_core::rules::{Engine, MatchKind, ReplaceKind, RuleAction};
 use brainproxy_core::store::{HistoryFilter, Store};
 use brainproxy_core::{codec, Error};
@@ -416,6 +417,11 @@ pub struct RuleOptions {
     /// Only for targets whose host matches this regex (case-insensitive).
     #[arg(long)]
     pub host: Option<String>,
+    /// Only for responses whose Content-Type matches this regex (case-insensitive; a response
+    /// without one is matched as empty text), as the response came, whatever a rule before this
+    /// one rewrites. With status, response-header and response-body only.
+    #[arg(long)]
+    pub content_type: Option<String>,
     /// Have a script make the replacement, in place of --replace: a JavaScript file that defines
     /// `replace(match, ctx)`. It is called for the matches of each message (match.text, and with
     /// a regex match.groups and match.named; ctx has the location, engine, host and the request
@@ -555,6 +561,40 @@ pub enum RulesCmd {
         #[arg(long)]
         host_header_test: bool,
     },
+    /// Response modification presets: ready-made rules that unhide or enable form fields, remove
+    /// length limits, form validation, scripts or plugins, or remove a cookie flag, in the
+    /// responses the proxy relays.
+    #[command(subcommand)]
+    Presets(PresetsCmd),
+}
+
+#[derive(Subcommand)]
+pub enum PresetsCmd {
+    /// List the presets, each with the rules it adds.
+    List,
+    /// Add presets' rules. They are ordinary rules for the responses the proxy relays, each with a
+    /// comment that names its preset, so they list, switch on and off and are removed like any
+    /// other. The HTML presets apply only to responses whose Content-Type is HTML, the cookie ones
+    /// to Set-Cookie headers. A rule the project already has (the same place, match, replacement
+    /// and conditions, on or off) isn't added again: `present` lists those, `added` the new ones.
+    Add {
+        /// The presets to add; `rules presets list` says what each does.
+        #[arg(required = true, value_parser = preset_names())]
+        preset: Vec<String>,
+        /// Only for targets whose host matches this regex (case-insensitive).
+        #[arg(long)]
+        host: Option<String>,
+        /// Add the rules disabled.
+        #[arg(long)]
+        disabled: bool,
+    },
+}
+
+/// The presets `rules presets add` takes, with their titles for `--help`.
+fn preset_names() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(
+        rule_presets::PRESETS.iter().map(|p| clap::builder::PossibleValue::new(p.name).help(p.title)),
+    )
 }
 
 #[derive(Subcommand)]
@@ -2365,6 +2405,7 @@ fn rule_from(
         action: options.action.as_deref().map(RuleAction::parse).transpose()?,
         applies_to,
         host: options.host.filter(|h| !h.is_empty()),
+        content_type: options.content_type.filter(|t| !t.is_empty()),
         origin: Some(brainproxy_core::provenance::origin().to_string()),
         host_header_test,
         ..Rule::new(0, RuleLocation::parse(location)?, &pattern, &replace)
@@ -2380,6 +2421,8 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     let mut host_warning = None;
     // Rules switched on or off by this command.
     let mut touched = Vec::new();
+    // What `rules presets add` added, and the rules it found there already.
+    let mut from_presets: Option<(Vec<u32>, Vec<u32>)> = None;
     match cmd {
         RulesCmd::List => {
             let skipped = skipped_rules(&rules);
@@ -2510,6 +2553,52 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             }
             rules.clear();
         }
+        RulesCmd::Presets(PresetsCmd::List) => {
+            let presets: Vec<Value> = rule_presets::PRESETS
+                .iter()
+                .map(
+                    |p| json!({"name": p.name, "title": p.title, "description": p.description, "rules": p.rules(None)}),
+                )
+                .collect();
+            out.ok(json!({"presets": presets}), || {
+                let lines: Vec<String> = rule_presets::PRESETS
+                    .iter()
+                    .map(|p| format!("{:<24} {}\n{:<24} {}", p.name, p.title, "", p.description))
+                    .collect();
+                lines.join("\n")
+            });
+            return Ok(());
+        }
+        RulesCmd::Presets(PresetsCmd::Add { preset, host, disabled }) => {
+            let mut picked: Vec<&str> = Vec::new();
+            for name in &preset {
+                if !picked.contains(&name.as_str()) {
+                    picked.push(name);
+                }
+            }
+            // Every rule is checked before any is saved: a bad --host leaves the rules as they were.
+            let mut new = Vec::new();
+            for name in picked {
+                for rule in rule_presets::preset(name)?.rules(host.as_deref()) {
+                    brainproxy_core::proxy::config::validate_rule(&rule)
+                        .map_err(|e| Error::InvalidInput(format!("preset {name}: {e}")))?;
+                    new.push(rule);
+                }
+            }
+            let (mut added, mut present) = (Vec::new(), Vec::new());
+            for mut rule in new {
+                if let Some(there) = rules.iter().find(|r| rule_presets::same_rule(r, &rule)) {
+                    present.push(there.id);
+                    continue;
+                }
+                rule.enabled = !disabled;
+                rule.origin = Some(brainproxy_core::provenance::origin().to_string());
+                rule.id = store.next_id(RULE_IDS, rules.iter().map(|r| r.id).max().unwrap_or(0))?;
+                added.push(rule.id);
+                rules.push(rule);
+            }
+            from_presets = Some((added, present));
+        }
     }
     store.set_setting(RULES_KEY, &rules)?;
     // What a rule's script last failed on says nothing of a rule that is gone, or that was
@@ -2519,7 +2608,30 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
     if let Some(w) = host_warning {
         data["host_warning"] = json!(w);
     }
-    out.ok(data, || serde_json::to_string_pretty(&rules).unwrap_or_default());
+    if let Some((added, present)) = &from_presets {
+        data["added"] = json!(added);
+        data["present"] = json!(present);
+    }
+    out.ok(data, || match &from_presets {
+        Some((added, present)) => {
+            let ids = |ids: &[u32]| ids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+            let mut text = match added.len() {
+                0 => "no rules added".to_string(),
+                1 => format!("added rule {}", ids(added)),
+                _ => format!("added rules {}", ids(added)),
+            };
+            if !present.is_empty() {
+                let off: Vec<u32> =
+                    rules.iter().filter(|r| present.contains(&r.id) && !r.enabled).map(|r| r.id).collect();
+                text.push_str(&format!("; there already: {}", ids(present)));
+                if !off.is_empty() {
+                    text.push_str(&format!(" (switched off: {}; `rules enable ID` switches one on)", ids(&off)));
+                }
+            }
+            text
+        }
+        None => serde_json::to_string_pretty(&rules).unwrap_or_default(),
+    });
     Ok(())
 }
 
