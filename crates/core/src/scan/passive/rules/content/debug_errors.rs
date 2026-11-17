@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use regex::{Regex, RegexSet};
 
-use super::common::{data_lines, is_javascript, is_text};
+use super::common::{data_lines, generic_in_data, is_javascript, is_source_map, is_text};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -54,15 +54,17 @@ impl PassiveRule for DebugErrors {
     }
 
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
-        if msg.resp_body.is_empty() || !is_text(msg) || is_javascript(msg) {
+        // Diverges from ZAP: source maps (library code in strings) aren't read, and a generic
+        // phrase in JSON data (a hint, a translation) isn't taken for an error message.
+        if msg.resp_body.is_empty() || !is_text(msg) || is_javascript(msg) || is_source_map(msg) {
             return;
         }
         let body = msg.body();
         // The first message in file order that occurs anywhere wins.
-        if let Some(i) = SET.matches(body).iter().next() {
-            if let Some(m) = REGEXES[i].find(body) {
-                out.push(ALERT.raise("", m.as_str()));
-            }
+        let found =
+            SET.matches(body).iter().filter_map(|i| REGEXES[i].find(body)).find(|m| !generic_in_data(msg, m.as_str()));
+        if let Some(m) = found {
+            out.push(ALERT.raise("", m.as_str()));
         }
     }
 }
@@ -80,6 +82,22 @@ mod tests {
         assert_eq!(f.len(), 1);
         // "Internal Server Error" precedes "PHP Warning" in the file.
         assert_eq!(f[0].evidence, "internal server error");
+    }
+
+    /// Juice Shop's /api/Hints and an Angular translation file have "Internal Server Error" in
+    /// their text; a source map has library code. None of them is an error page.
+    #[test]
+    fn ignores_generic_phrases_in_json_data_and_source_maps() {
+        let json = |status: u16, body: &str| {
+            msg("https://a.test/api/Hints").status(status).header("Content-Type", "application/json").body(body)
+        };
+        let hint = r#"{"data":[{"text":"500 Internal Server Error is always an interesting status code"}]}"#;
+        assert!(json(200, hint).scan(&DebugErrors).is_empty());
+        assert_eq!(json(500, hint).scan(&DebugErrors).len(), 1);
+        // A specific message still counts in data.
+        assert_eq!(json(200, r#"{"e":"PHP Warning: x"}"#).scan(&DebugErrors)[0].evidence, "PHP Warning");
+        let map = msg("https://a.test/main.js.map").header("Content-Type", "application/json");
+        assert!(map.body(r#"{"version":3,"sourcesContent":["throw 'PHP Warning'"]}"#).scan(&DebugErrors).is_empty());
     }
 
     #[test]

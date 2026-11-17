@@ -41,6 +41,39 @@ pub fn is_image(msg: &Message) -> bool {
         )
 }
 
+/// A source map: its `sourcesContent` holds library code, error strings included.
+pub fn is_source_map(msg: &Message) -> bool {
+    path_ends_with(msg, &[".map"]) || msg.resp_body.starts_with(br#"{"version":3,"#)
+}
+
+/// Phrases of the error-message lists that ordinary text has as often as an error page: a
+/// hint, a translation, a help text. In data an app serves (a 2xx JSON body) only the
+/// specific signatures count (a driver's message, a stack trace format).
+const GENERIC_ERROR_PHRASES: &[&str] = &[
+    "internal server error",
+    "internal error",
+    "error occurred while processing request",
+    "error report",
+    "custom error message",
+    "type mismatch",
+    "parent directory",
+    "invalid query",
+    "invalid parameter type",
+    "is not allowed to access",
+    "data source=",
+    "can't find record in",
+    "unknown table",
+    "syntaxerror: unexpected token",
+    "under construction",
+    "there seems to have been a problem with the",
+];
+
+/// Whether the error list's `phrase` doesn't count in `msg`: it is one of
+/// [`GENERIC_ERROR_PHRASES`] and the body is JSON data, not an error page.
+pub fn generic_in_data(msg: &Message, phrase: &str) -> bool {
+    msg.is_success() && msg.is_json() && GENERIC_ERROR_PHRASES.iter().any(|g| g.eq_ignore_ascii_case(phrase))
+}
+
 const VOID_ELEMENTS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
 

@@ -143,3 +143,8 @@ noise on modern applications:
   `/items/…`) and the bodies of scripts and stylesheets, whose numbers are ids and constants.
 - **Session ID in URL Rewrite (3-1)** ignores `sid` in an Engine.IO (socket.io) URL, one
   with `EIO` and `transport` parameters: it identifies the transport, not a login.
+- **Application Error Disclosure (90022)** and **Debug Error Messages (10023)** skip source
+  maps, and in JSON data (a 2xx JSON body: hints, translations) ignore generic phrases such
+  as "Internal Server Error", "internal error" or "is not allowed to access"; a driver's
+  message or another specific signature still counts there. 90022 raises nothing for a 500
+  with an empty body.
