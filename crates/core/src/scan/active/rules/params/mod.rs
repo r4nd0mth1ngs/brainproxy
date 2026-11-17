@@ -152,8 +152,51 @@ mod e2e {
                 "view.jsp" => ok("text/plain", "the source of view.jsp".into()),
                 _ => not_found,
             },
+            // Redirects to any URL that mentions an allowed site anywhere in it.
+            "/go" => {
+                let to = param("to");
+                if to.contains("allowed.test") {
+                    format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    ok("text/plain", "not allowed".into())
+                }
+            }
             _ => not_found,
         }
+    }
+
+    /// One stored finding: alert ref, method, URL, param, evidence, and its row's response.
+    type Stored = (String, String, String, String, String, Vec<u8>);
+
+    /// [`scan_targets`] for `paths`, with the findings it stored.
+    async fn scan_stored(name: &str, port: u16, paths: &[&str], rules: Vec<u32>) -> (ActiveSummary, Vec<Stored>) {
+        let targets = paths
+            .iter()
+            .map(|p| {
+                let (request, response) = fetch(port, p);
+                let target = Target::from_url(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+                ScanTarget { history_id: None, target, request, response, duration_ms: None }
+            })
+            .collect();
+        let project = std::env::temp_dir().join(format!("bp-params-{name}-{}.bpdb", std::process::id()));
+        let s = scan_project(&project, targets, PointOptions::default(), Some(rules)).await;
+        let store = crate::store::Store::open(&project).unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT f.alert_ref, f.method, f.url, f.param, f.evidence, h.response
+                 FROM findings f JOIN history h ON h.id = f.history_id ORDER BY f.id",
+            )
+            .unwrap();
+        let found = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<Result<Vec<Stored>, _>>()
+            .unwrap();
+        drop(stmt);
+        drop(store);
+        let _ = std::fs::remove_file(&project);
+        (s, found)
     }
 
     fn spawn_app() -> u16 {
@@ -203,7 +246,19 @@ mod e2e {
         rules: Option<Vec<u32>>,
     ) -> ActiveSummary {
         let project = std::env::temp_dir().join(format!("bp-params-{name}-{}.bpdb", std::process::id()));
+        let summary = scan_project(&project, targets, points, rules).await;
         let _ = std::fs::remove_file(&project);
+        summary
+    }
+
+    /// Scans into a new project at `project`, kept for the caller to read.
+    async fn scan_project(
+        project: &std::path::Path,
+        targets: Vec<ScanTarget>,
+        points: PointOptions,
+        rules: Option<Vec<u32>>,
+    ) -> ActiveSummary {
+        let _ = std::fs::remove_file(project);
         let guard =
             Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }])
                 .unwrap();
@@ -225,9 +280,7 @@ mod e2e {
             check_methods: vec![],
             prune: false,
         };
-        let summary = run(&project, targets, cfg, JobControl::default()).await.unwrap();
-        let _ = std::fs::remove_file(&project);
-        summary
+        run(project, targets, cfg, JobControl::default()).await.unwrap()
     }
 
     /// Reflects the request unescaped: the decoded path, or a body as the app would read
@@ -364,5 +417,19 @@ mod e2e {
         .await;
         assert!(s.raised.is_empty(), "false positives: {s:?}");
         assert!(s.requests > 20, "the rules did attack: {s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_evidence_is_what_the_response_says() {
+        let port = spawn_app();
+        // Only the payload that keeps the original value gets past the allow list.
+        let (s, found) = scan_stored("redirect", port, &["/go?to=https://allowed.test/home"], vec![20019]).await;
+        assert_eq!(s.raised.get("20019-1"), Some(&1), "{s:?}");
+        let (_, _, _, param, evidence, response) = &found[0];
+        assert_eq!(param, "to");
+        assert!(!evidence.contains("@@@"), "the placeholder, not the URL: {evidence}");
+        assert!(evidence.ends_with("/?https://allowed.test/home"), "{evidence}");
+        let response = String::from_utf8_lossy(response);
+        assert!(response.contains(evidence.as_str()), "findings verify looks for it there: {response}");
     }
 }
