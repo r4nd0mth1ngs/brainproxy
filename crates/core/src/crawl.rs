@@ -92,8 +92,11 @@ pub struct CrawlSummary {
     pub by_status: BTreeMap<String, usize>,
     pub depth_reached: usize,
     pub forms_submitted: usize,
+    /// At most 200; `endpoint_count` has the total.
     pub endpoints: Vec<Endpoint>,
     pub endpoint_count: usize,
+    /// `endpoints` lists only the first 200.
+    pub endpoints_truncated: bool,
     /// Responses that were a copy of the site's answer to any unknown path (its catch-all
     /// page, such as a single-page app's index.html), after the first: not counted as
     /// endpoints, and their links aren't read again.
@@ -464,6 +467,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     let mut eps: Vec<Endpoint> = endpoints.into_iter().collect();
     eps.sort();
     summary.endpoint_count = eps.len();
+    summary.endpoints_truncated = eps.len() > 200;
     eps.truncate(200);
     summary.endpoints = eps;
     summary.unconfirmed_count = unconfirmed.len();

@@ -102,11 +102,14 @@ pub struct BrowserCrawlSummary {
     pub forms_submitted: usize,
     /// Distinct DOM states explored.
     pub states: usize,
+    /// At most 200; `endpoint_count` has the total.
     pub endpoints: Vec<Endpoint>,
     pub endpoint_count: usize,
-    /// XHR and fetch() calls.
+    pub endpoints_truncated: bool,
+    /// XHR and fetch() calls, at most 200; `api_call_count` has the total.
     pub api_calls: Vec<Endpoint>,
     pub api_call_count: usize,
+    pub api_calls_truncated: bool,
     /// Elements not clicked and links not followed because they look destructive (logout, delete, ...).
     pub not_clicked: Vec<String>,
     pub not_clicked_count: usize,
@@ -275,11 +278,13 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
     let mut eps: Vec<Endpoint> = stats.endpoints.into_iter().collect();
     eps.sort();
     s.endpoint_count = eps.len();
+    s.endpoints_truncated = eps.len() > 200;
     eps.truncate(200);
     s.endpoints = eps;
     let mut api: Vec<Endpoint> = stats.api_calls.into_iter().collect();
     api.sort();
     s.api_call_count = api.len();
+    s.api_calls_truncated = api.len() > 200;
     api.truncate(200);
     s.api_calls = api;
     s.blocked_requests = stats.blocked;

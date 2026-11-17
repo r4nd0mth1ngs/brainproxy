@@ -755,6 +755,29 @@ fn crawl_lists_script_routes_it_cant_get_instead_of_counting_them() {
     );
 }
 
+/// `/` links to 205 pages, each different.
+fn many_route(line: &str) -> (&'static str, &'static str, String) {
+    let path = line.split(' ').nth(1).unwrap_or("/");
+    let body = if path == "/" { (0..205).map(|i| format!("<a href=/p/{i}>{i}</a>")).collect() } else { path.into() };
+    ("200 OK", "text/html", body)
+}
+
+#[test]
+fn crawl_says_when_its_endpoint_list_is_cut() {
+    let (port, _) = serve_routes(many_route);
+    let project = tmp_project("crawlmany");
+    let site = format!("http://127.0.0.1:{port}/");
+    let (code, v) = run(&["crawl", &site, "--no-robots", "--no-sitemap", "-c", "20"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["endpoint_count"], 206, "{v}");
+    assert_eq!(v["data"]["endpoints"].as_array().unwrap().len(), 200, "{v}");
+    assert_eq!(v["data"]["endpoints_truncated"], true, "{v}");
+    // scan active --crawl reports the total too (robots.txt and sitemap.xml included).
+    let (code, v) = run(&["scan", "active", &site, "--crawl", "--rules", "40018", "--no-oob"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["crawl"]["endpoints"], 208, "{v}");
+}
+
 #[test]
 fn scan_active_crawl_attacks_what_the_crawl_finds() {
     let port = serve_site();

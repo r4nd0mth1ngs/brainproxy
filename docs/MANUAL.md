@@ -2285,6 +2285,10 @@ Crawl and active-scan scope and safety flags:
   time-based ones get the wait they need. When several templates send the same GET or HEAD
   request, it's sent once and they share the response.
 - The crawler submits at most 200 forms per page.
+- A crawl's summary lists at most 200 `endpoints` (and a browser crawl at most 200
+  `api_calls`); `endpoint_count` and `api_call_count` are the totals, and
+  `endpoints_truncated` and `api_calls_truncated` say when the list was cut. All of them
+  are in history either way.
 - Catch-all pages: before crawling, the plain crawler requests one path that can't exist
   beside each seed (`brainproxy-` and 16 random hex digits; it is in history and counts
   towards `--max-pages`, and is left out when `--max-pages` only covers the seeds). A
