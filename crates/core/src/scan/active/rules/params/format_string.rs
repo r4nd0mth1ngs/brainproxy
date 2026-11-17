@@ -1,7 +1,12 @@
 //! Ported from ZAP FormatStringScanRule (ascanrules, Apache License 2.0).
 //!
 //! ZAP only runs this rule when the C technology is in scope; brainproxy has no
-//! technology filter, so it always runs.
+//! technology filter, so it always runs. Because of that, unlike ZAP, a 500 counts
+//! only when the format conversions cause it (`conversions_break_it`): it must
+//! repeat, and neither a plain value of the same length nor the same length of
+//! escaped percent signs (`%%`, a literal `%` to printf) may give a 500. A
+//! `URIError` from decoding `%` twice, a validator that rejects `%`, or a page
+//! that failed for an unrelated reason fails one of those.
 
 use super::common;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
@@ -40,6 +45,26 @@ pub(crate) fn initial_attack() -> String {
 /// Verification: `%x` only.
 pub(crate) fn second_attack() -> String {
     format!("{INITIAL}{}\n", "%x".repeat(10))
+}
+
+/// A value the shape of `attack` that a format function prints harmlessly: the
+/// same number of characters after the prefix, as letters or as `%%`.
+fn controls(attack: &str) -> [String; 2] {
+    let n = attack.len().saturating_sub(INITIAL.len() + 1);
+    [format!("{INITIAL}{}\n", "a".repeat(n)), format!("{INITIAL}{}\n", "%%".repeat(n.div_ceil(2)))]
+}
+
+/// Not in ZAP: the 500 `attack` got repeats, and its controls are not a 500.
+async fn conversions_break_it(cx: &Cx, attack: &str) -> bool {
+    if !common::send_following(cx, attack).await.is_ok_and(|r| r.status == 500) {
+        return false;
+    }
+    for control in controls(attack) {
+        if cx.stopped() || !common::send_following(cx, &control).await.is_ok_and(|r| r.status != 500) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Microsoft positional format strings.
@@ -84,13 +109,19 @@ impl ActiveRule for FormatString {
             if initial.status == 500 {
                 return;
             }
-            let initial_len = initial.body.len();
             let attack = initial_attack();
             let Ok(resp) = common::send_following(cx, &attack).await else { return };
             if resp.status == 500 {
+                if !conversions_break_it(cx, &attack).await {
+                    return;
+                }
                 let second = second_attack();
                 let Ok(verify) = common::send_following(cx, &second).await else { return };
-                if verify.body.len() > initial_len + 20 && verify.status == 200 {
+                // Against a plain value of the same length, not `ZAP`: a page that
+                // echoes or stores the value is longer for any long value.
+                let [plain, _] = controls(&second);
+                let Ok(plain) = common::send_following(cx, &plain).await else { return };
+                if verify.body.len() > plain.body.len() + 20 && verify.status == 200 {
                     cx.report(ALERT.raise(param, "").attack(second).other_info(ERROR2), &verify);
                 } else {
                     cx.report(ALERT.raise(param, "").attack(attack).other_info(ERROR1), &resp);
@@ -102,7 +133,7 @@ impl ActiveRule for FormatString {
             }
             let ms = microsoft_attack();
             let Ok(resp) = common::send_following(cx, &ms).await else { return };
-            if resp.status == 500 {
+            if resp.status == 500 && conversions_break_it(cx, &ms).await {
                 cx.report(ALERT.raise(param, "").attack(ms).other_info(ERROR3), &resp);
             }
         })
@@ -121,5 +152,8 @@ mod tests {
         let ms = microsoft_attack();
         assert!(ms.starts_with("ZAP %1!s%2!s"));
         assert!(ms.ends_with("%40!n\n"));
+        let [plain, escaped] = controls(&second_attack());
+        assert_eq!(plain, format!("ZAP{}\n", "a".repeat(20)));
+        assert_eq!(escaped, format!("ZAP{}\n", "%%".repeat(10)));
     }
 }

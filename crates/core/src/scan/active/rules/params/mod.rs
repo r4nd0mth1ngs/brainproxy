@@ -98,6 +98,29 @@ mod e2e {
                 let q: String = param("q").chars().filter(|c| !"<>%".contains(*c)).collect();
                 ok("text/html", format!("Hello {q}<html><body><p>{q}</p></body></html>"))
             }
+            // A C program printing the value as its format: `%n` crashes it, `%x` prints a
+            // word of the stack, `%%` a percent sign.
+            "/printf" => {
+                let q = param("q").replace("%%", "%");
+                if q.contains("%n") {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    ok("text/html", format!("<p>{}</p>", q.replace("%x", "bfffe3c4")))
+                }
+            }
+            // Decodes the value again, as `decodeURIComponent` does: any `%` not followed by
+            // two hex digits is a 500 (URIError). It also echoes the value.
+            "/uri" => {
+                let q = param("q");
+                let bad = q
+                    .match_indices('%')
+                    .any(|(i, _)| !q.get(i + 1..i + 3).is_some_and(|h| h.chars().all(|c| c.is_ascii_hexdigit())));
+                if bad {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    ok("text/html", format!("<p>{}</p>", escape(&q)))
+                }
+            }
             "/comment-data" => {
                 sign(&mut GUESTBOOK_DATA.lock().unwrap(), param("text"));
                 ok("text/html", "<p>saved</p>".into())
@@ -387,6 +410,16 @@ mod e2e {
         let s = scan("xss-fullwidth", port, &["/xss-fullwidth?q=hi"], Some(vec![40012])).await;
         assert!(s.raised.is_empty(), "{s:?}");
         assert!(s.requests > 10, "the rule did attack: {s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn format_string_needs_the_conversions_to_cause_the_500() {
+        let port = spawn_app();
+        let s = scan("fmt", port, &["/printf?q=hi"], Some(vec![30002])).await;
+        assert_eq!(s.raised.get("30002"), Some(&1), "{s:?}");
+        // A 500 for any stray `%` (and `%%`) is not a format string error.
+        let s = scan("fmt-uri", port, &["/uri?q=hi"], Some(vec![30002])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

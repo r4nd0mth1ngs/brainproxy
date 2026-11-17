@@ -199,6 +199,12 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   shows matching text for the command's words isn't reported. PowerShell output is
   recognised by the description `get-help` prints, not by the words "cmdlet",
   "Get-Help" or "Get-Alias" (ZAP), which any PowerShell documentation page has.
+- **Format String Error (30002)** runs without ZAP's C technology filter, so a 500 counts
+  only when the format conversions cause it: the 500 must repeat, and neither a plain
+  value of the same length nor the same length of `%%` (a literal `%` to printf) may give
+  one. A `URIError` from decoding `%` twice, a validator that rejects `%`, or a page that
+  failed for another reason isn't reported. The `%x` follow-up is compared with a plain
+  value of the same length, so a page that echoes or stores the value doesn't pass it.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.
