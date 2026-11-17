@@ -144,14 +144,14 @@ fn text(body: &[u8]) -> Option<String> {
     std::str::from_utf8(body).ok().map(str::to_string)
 }
 
-/// Removes chunked framing and content encoding (gzip, deflate, br). If decoding
+/// Removes chunked framing and content encoding (gzip, deflate, br, zstd). If decoding
 /// fails, returns the bytes as they were.
 pub fn decode_body(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
     decode(headers, body).0
 }
 
 /// The body with chunked framing and every content coding removed, or None when a
-/// coding couldn't be decoded (zstd, compress, a corrupt stream): then the body can't be
+/// coding couldn't be decoded (compress, a corrupt stream): then the body can't be
 /// sent on without its Content-Encoding.
 pub fn decode_body_fully(headers: &[(String, String)], body: &[u8]) -> Option<Vec<u8>> {
     let (out, all) = decode(headers, body);
@@ -170,6 +170,8 @@ fn decode(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, bool) {
                 "deflate" => read_limited(flate2::read::ZlibDecoder::new(&out[..]))
                     .or_else(|| read_limited(flate2::read::DeflateDecoder::new(&out[..]))),
                 "br" => read_limited(brotli_decompressor::Decompressor::new(&out[..], 4096)),
+                // A frame header that doesn't parse is a body that isn't zstd.
+                "zstd" => ruzstd::decoding::StreamingDecoder::new(&out[..]).ok().and_then(read_limited),
                 _ => None,
             };
             match decoded {
@@ -259,6 +261,26 @@ mod tests {
         assert_eq!(decode_body_fully(&headers, &cut), None);
         // Bytes that aren't gzip at all stay as they are.
         assert_eq!(decode_body(&headers, b"plain"), b"plain");
+    }
+
+    /// Browsers offer zstd, and Cloudflare, nginx and Caddy answer with it: an undecoded body
+    /// is bytes no passive rule or search can read.
+    #[test]
+    fn a_zstd_body_is_decoded() {
+        // `printf '<html><title>listing directory /ftp</title></html>' | zstd -19 -c`
+        let body = hex::decode(
+            "28b52ffd04689101003c68746d6c3e3c7469746c653e6c697374696e67206469726563746f7279202f6674703c2f7469746c653e3c2f68746d6c3ee4ff170a",
+        )
+        .unwrap();
+        let headers = vec![("Content-Encoding".to_string(), "zstd".to_string())];
+        let html = b"<html><title>listing directory /ftp</title></html>".as_slice();
+        assert_eq!(decode_body(&headers, &body), html);
+        assert_eq!(decode_body_fully(&headers, &body).as_deref(), Some(html));
+        // Cut short, it is as far as it came, and not all of it.
+        assert_eq!(decode_body_fully(&headers, &body[..body.len() - 4]), None);
+        // Not zstd at all: left as it is.
+        assert_eq!(decode_body(&headers, b"plain"), b"plain");
+        assert_eq!(decode_body_fully(&headers, b"plain"), None);
     }
 
     #[test]

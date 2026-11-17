@@ -8,8 +8,10 @@ solutions, and references are ZAP's.
 Rules run automatically on proxy traffic and `send` results (sources are configurable with
 `brainproxy scan sources`), and before every `findings` command. `brainproxy scan rules`
 lists them; `scan disable ID` / `scan enable ID` switch them.
+Rules read response bodies decoded: chunked framing and `Content-Encoding` gzip, deflate,
+br and zstd are removed when the exchange is recorded.
 
-brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
+brainproxy's 9 own rules use IDs from 100000 so they never clash with ZAP's:
 **100001 PHP2Shell** (CVE-2026-109618, CVE-2026-109619) flags a PHP version from
 `X-Powered-By` or `Server` that has no fix (5.4 to 8.1, and 8.2 to 8.5 before 8.2.35,
 8.3.36, 8.4.27, 8.5.12, including their -dev, beta and RC builds). It only reads the reported version: distributions back-port fixes
@@ -21,6 +23,33 @@ tokens are samples in the code) one with `alg: none` (100008-2, high), one with 
 `exp` (100008-3, low), and one with a claim named like a secret, such as `password`,
 `client_secret`, `ssn` or `card_number` (100008-4, low). Tokens only the client sends are
 left to the active rule 100007, so a token isn't reported again on every request.
+**100020 Password Hash in Response** reports a hex digest (MD5, SHA-1, SHA-2) in a field
+named like a password (`password`, `passwordHash`, `pwd`, `hash`; not a reset token, salt
+or policy), once per field name (100020-1, high), and an Argon2 or Django PBKDF2 hash
+anywhere (100020-2, high). It reads text responses but not scripts, stylesheets or source
+maps, whose values are samples.
+**100021 Secrets in Response** reads scripts (also one served as `text/plain` or
+`application/octet-stream`, by its `.js` path), JSON, HTML and other text for credentials:
+a PEM private key with its body (high), and AWS access key IDs (medium), Stripe live secret
+keys, Slack tokens, GitHub tokens (high), Slack webhooks (medium) and Google API keys (low,
+as browser keys are often public on purpose) (100021-1, evidence the key, or a private key's
+header line). Keys whose random part is a placeholder (`EXAMPLE`, `xxxx`, little variety)
+don't count. 100021-2 (medium, low confidence) reports a literal assigned to a name like
+`password`, `secret`, `apiKey` or `auth_token` (``testingPassword=`IamUsedForTesting` ``),
+once per name; labels, messages, field names, constants, templates and placeholders (values
+with spaces, `password`, `changeme`, `currentPassword`, `SECRET_KEY`, `${pw}`) don't count.
+Source maps are skipped: their sources hold test fixtures.
+**100022 API Description Exposed** reports an OpenAPI or Swagger description (JSON or
+YAML with `openapi: 3.x` or `swagger: 2.0` and its `paths`, or one embedded in
+swagger-ui-express's init script; 100022-1, low) and a Swagger UI or ReDoc page (100022-2,
+info). **100023 Prometheus Metrics Exposed** (low) reports a plain-text Prometheus or
+OpenMetrics page (`# HELP` and `# TYPE` lines), not a page that shows the format as an
+example. **100024 Source Map Exposed** reports a served source map (with its `mappings`),
+low when it carries the source code (`sourcesContent`) and info otherwise, with the source
+files it names; a single-page app's index page answering a `.map` URL isn't one. **100025
+JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, `jsonp` or
+`jsoncallback` query parameter names (low when the request carried a cookie or
+`Authorization`, info otherwise). These are found per URL; issues group them by host.
 
 ## Rules
 
@@ -82,6 +111,12 @@ left to the active rule 100007, so a token isn't reported again on every request
 | 100001 | PHP2Shell PHP Remote Code Execution (Indicative) | high | 100001 |
 | 100005 | HTTP/3 Offered (Alt-Svc) | info | 100005 |
 | 100008 | JWT Issues | high | 100008-1, 100008-2, 100008-3, 100008-4 |
+| 100020 | Password Hash in Response | high | 100020-1, 100020-2 |
+| 100021 | Secrets in Response | high | 100021-1, 100021-2 |
+| 100022 | API Description Exposed | low | 100022-1, 100022-2 |
+| 100023 | Prometheus Metrics Exposed | low | 100023 |
+| 100024 | Source Map Exposed | low | 100024 |
+| 100025 | JSONP Endpoint | low | 100025 |
 
 Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 
@@ -108,8 +143,7 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   cookie domains) are handled gracefully instead of aborting the scan of that message.
 - **Accidental bugs** are not copied: Timestamp Disclosure (10096) uses the intended
   64-bit range check, and the never-matching LanMan hash pattern is omitted.
-- **Evidence formatting:** raw header blocks are rebuilt as `Name: value` lines, and the
-  status-500 evidence of 90022 is always `HTTP/1.1 500 Internal Server Error`.
+- **Evidence formatting:** raw header blocks are rebuilt as `Name: value` lines.
 - **Charset Mismatch (90011)** doesn't alert on an XML declaration without `encoding` (ZAP
   reports `null`; such documents are UTF-8 by default), and only looks at a leading XML
   declaration instead of Jericho's XML detection.
@@ -158,3 +192,33 @@ noise on modern applications:
 - **PII Disclosure (10062)** is Medium at low confidence (ZAP: High, Medium) for a card
   number with no label such as `card`, `credit`, `cc` or `pan` in the 40 characters before
   it: one number in ten passes the Luhn check, so ids and order numbers did.
+
+### More coverage
+
+Some ported rules also look for what today's stacks produce, which ZAP's lists (from the
+PHP, ASP and JDBC era) don't have. The patterns are brainproxy's own, kept out of ZAP's
+data files:
+
+- **Application Error Disclosure (90022)** also knows Node.js, Python, Java and .NET stack
+  traces, Go panics, PHP fatal errors, SQLite, MySQL (Node driver), Sequelize and MongoDB
+  errors, and the ASP.NET, Django debug and Spring Boot (Whitelabel, Low) error pages, and
+  reports the first of them as the evidence, at Medium. It reads a 500's body too (ZAP
+  stops at the status): a stack trace or a specific message there is the evidence, and
+  `HTTP/1.1 500 Internal Server Error` (Low) is left for a 500 with only generic text. A
+  stack trace in a 2xx HTML page doesn't count, as it is usually an example in
+  documentation; a Node.js trace needs two frames.
+- **In Page Banner Information Leak (10009)** also reports an Express version in an error
+  page (`Express ^4.22.1`).
+- **Directory Browsing (10033)** also knows the listings of Express `serve-index`, Python's
+  `http.server`, Tomcat and Go's `http.FileServer`, and names nginx's autoindex (ZAP: Apache,
+  and not at all for `/`). A listing's title counts only with the listing's own markup, so
+  an article titled "Directory listing for ..." doesn't.
+- **Hash Disclosure (10097)** reports BCrypt hashes written `$2b$` and `$2y$` at any cost
+  (ZAP: only `$2y$05$`), as Node's and Python's bcrypt and PHP's `password_hash` write them.
+- **Vulnerable JS Library (10003)** reports every vulnerable library of a script or page,
+  each with the library's name as the parameter (ZAP: the first one only). Retire.js
+  patterns that use a backreference or a look-around, which the regex engine lacks, are
+  rewritten instead of dropped, so a minified jQuery or lodash build without its licence
+  comment is still recognised; a pattern that still doesn't compile is skipped with a
+  warning on stderr. A `.js` file served as `text/plain` or `application/octet-stream`
+  (object stores, some CDNs) is read too.

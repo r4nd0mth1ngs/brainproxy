@@ -29,13 +29,16 @@ static ALERTS: [&AlertDef; 1] = [&ALERT];
 const OTHER: &str = "There is a chance that the highlight in the finding is on a value in the headers, versus the \
     actual matched string in the response body.";
 
-/// Tomcat, Apache, nginx, Jetty, Squid, in ZAP's order.
-const PATTERNS: [&str; 5] = [
+/// Tomcat, Apache, nginx, Jetty, Squid, in ZAP's order. Diverges from ZAP: Express, last,
+/// as an error page built with its error handler names it (`App (Express ^4.22.1)`);
+/// case-sensitive and with a full version, so prose about "express" doesn't count.
+const PATTERNS: [&str; 6] = [
     r"(?i)Tomcat/[0-9]\.[0-9]\.[0-9]{1,2}",
     r"(?i)Apache/[0-9]\.[0-9]\.[0-9]{1,2}",
     r"(?i)nginx/[0-9]\.[0-9]{1,2}\.[0-9]{1,2}",
     r"(?i)Jetty://[0-9]\.[0-9]{1,2}",
     r"(?i)squid/[0-9]\.[0-9]{1,2}",
+    r"\bExpress [\^~]?[0-9]{1,2}\.[0-9]{1,3}\.[0-9]{1,3}\b",
 ];
 
 static SET: LazyLock<RegexSet> = LazyLock::new(|| RegexSet::new(PATTERNS).unwrap());
@@ -83,6 +86,17 @@ mod tests {
             .scan(&InPageBanner);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].evidence, "Apache/2.4.41");
+    }
+
+    /// Express's error handler page names the framework and its version range.
+    #[test]
+    fn flags_express_version_in_error_page() {
+        let page = "<h1>OWASP Juice Shop (Express ^4.22.1)</h1><h2><em>500</em> Error</h2>";
+        let f = msg("https://a.test/rest/x").status(500).html(page).scan(&InPageBanner);
+        assert_eq!(f[0].evidence, "Express ^4.22.1");
+        assert!(msg("https://a.test/").html(page).scan(&InPageBanner).is_empty());
+        let prose = "<p>Built with Express 4 and Angular.</p>";
+        assert!(msg("https://a.test/").status(404).html(prose).scan(&InPageBanner).is_empty());
     }
 
     #[test]

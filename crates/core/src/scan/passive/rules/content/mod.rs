@@ -6,6 +6,7 @@ pub(crate) mod common;
 mod cross_domain_script;
 pub(crate) mod debug_errors;
 mod directory_browsing;
+mod exposure;
 mod hash_disclosure;
 mod in_page_banner;
 mod jsf_viewstate;
@@ -13,9 +14,11 @@ mod jso;
 mod jwt;
 mod link_target;
 mod modern_app;
+mod password_hash;
 mod pii;
 mod polyfill_cdn;
 mod private_address;
+mod secrets;
 mod sri_missing;
 mod suspicious_comments;
 mod timestamp;
@@ -46,5 +49,11 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(jsf_viewstate::InsecureJsfViewState),
         Box::new(vulnerable_js::VulnerableJs),
         Box::new(jwt::JwtIssues),
+        Box::new(password_hash::PasswordHash),
+        Box::new(secrets::Secrets),
+        Box::new(exposure::ApiDocs),
+        Box::new(exposure::PrometheusMetrics),
+        Box::new(exposure::SourceMap),
+        Box::new(exposure::JsonpEndpoint),
     ]
 }

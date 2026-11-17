@@ -71,7 +71,17 @@ const GENERIC_ERROR_PHRASES: &[&str] = &[
 /// Whether the error list's `phrase` doesn't count in `msg`: it is one of
 /// [`GENERIC_ERROR_PHRASES`] and the body is JSON data, not an error page.
 pub fn generic_in_data(msg: &Message, phrase: &str) -> bool {
-    msg.is_success() && msg.is_json() && GENERIC_ERROR_PHRASES.iter().any(|g| g.eq_ignore_ascii_case(phrase))
+    msg.is_success() && msg.is_json() && is_generic_phrase(phrase)
+}
+
+/// Whether the error list's `phrase` is one of [`GENERIC_ERROR_PHRASES`].
+pub fn is_generic_phrase(phrase: &str) -> bool {
+    GENERIC_ERROR_PHRASES.iter().any(|g| g.eq_ignore_ascii_case(phrase))
+}
+
+/// `s` cut to at most `n` characters (on a character boundary).
+pub fn cut_chars(s: &str, n: usize) -> &str {
+    s.char_indices().nth(n).map_or(s, |(i, _)| &s[..i])
 }
 
 const VOID_ELEMENTS: &[&str] =
