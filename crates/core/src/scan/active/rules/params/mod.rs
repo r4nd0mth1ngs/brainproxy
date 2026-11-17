@@ -217,6 +217,9 @@ mod e2e {
             "/xpath-safe-clock" => xpath_rows(|e| e.0 == param("id"), &clock()),
             // Safe: the value is read and ignored, as the Benchmark's safe pages do.
             "/xpath-ignored" => xpath_page("@emplid='3'", ""),
+            // SQL injection, not XPath: `' and '1'='1` works the same in SQL (SQLite here).
+            "/sql" => sql_page(&format!("id='{}'", param("id"))),
+            "/sqlnum" => sql_page(&format!("id={}", param("id"))),
             // Writes what it is sent to the file `name` names (here: notes which file).
             "/upload" => {
                 WRITTEN.lock().unwrap().push(param("name"));
@@ -270,7 +273,26 @@ mod e2e {
         xpath_rows(|e| xpath_eval(predicate, e.0) == Some(true), extra)
     }
 
-    /// An XPath predicate of `@emplid`, string and number literals, `=`, `and` and `or`.
+    /// The employees `WHERE <condition>` selects, from SQLite; SQL that doesn't run is a 500.
+    fn sql_page(condition: &str) -> String {
+        let rows = (|| {
+            let db = rusqlite::Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE emp (id TEXT, name TEXT)")?;
+            for (id, name) in EMPLOYEES {
+                db.execute("INSERT INTO emp VALUES (?1, ?2)", [id, name])?;
+            }
+            let mut st = db.prepare(&format!("SELECT id FROM emp WHERE {condition}"))?;
+            let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(ids)
+        })();
+        let Ok(ids) = rows else {
+            let body = "Error processing request.";
+            return format!("HTTP/1.1 500 Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        };
+        xpath_rows(|e| ids.iter().any(|id| id == e.0), "")
+    }
+
+    /// An XPath predicate of `@emplid`, `count(/*)`, string and number literals, `=`, `and` and `or`.
     fn xpath_eval(predicate: &str, emplid: &str) -> Option<bool> {
         #[derive(Debug, PartialEq)]
         enum Tok {
@@ -294,6 +316,8 @@ mod e2e {
                 toks.push(match word {
                     "@emplid" => Tok::Str(emplid.to_string()),
                     "and" | "or" => Tok::Op(word.to_string()),
+                    // A document has one root element.
+                    "count(/*)" => Tok::Num(1.0),
                     w => Tok::Num(w.parse().ok()?),
                 });
                 rest = &rest[end..];
@@ -603,6 +627,16 @@ mod e2e {
         assert!(s.requests > 5 * 10, "the rule did attack: {s:?}");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_injection_is_not_xpath_injection() {
+        let port = spawn_app();
+        // The always-true and always-false pairs pass on these, as they do on XPath pages.
+        let paths = ["/sql?id=2", "/sql?id=9", "/sqlnum?id=2"];
+        let s = scan("xpathsql", port, &paths, Some(vec![90021])).await;
+        assert!(s.raised.is_empty(), "SQL injection reported as XPath injection: {s:?}");
+        assert!(s.requests > 3 * 10, "the rule did attack: {s:?}");
+    }
+
     #[test]
     fn xpath_helper() {
         assert_eq!(xpath_eval("@emplid='2'", "2"), Some(true));
@@ -612,6 +646,8 @@ mod e2e {
         assert_eq!(xpath_eval("@emplid=\"2\" or \"1\"=\"2\"", "3"), Some(false));
         assert_eq!(xpath_eval("@emplid='2''", "2"), None);
         assert_eq!(xpath_eval("@emplid=2'", "2"), None);
+        assert_eq!(xpath_eval("@emplid='9' or count(/*)=1 or '1'='2'", "2"), Some(true));
+        assert_eq!(xpath_eval("@emplid='2' and count(/*)=0 and '1'='1'", "2"), Some(false));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -10,6 +10,11 @@
 //! other changes it (`differential`, which also sends a pair that passes a second time).
 //! Single quotes at LOW; double quotes and numeric comparisons (`2 and 1=1`) from MEDIUM, the
 //! numeric ones at MEDIUM only for a numeric original value.
+//!
+//! `' and '1'='1` reads the same way in SQL, so a pair that passes is confirmed with one SQL
+//! can't evaluate: the same conditions with the root element counted (`count(/*)=1`, always
+//! true in XPath, against `count(/*)=0`). In SQL `/*` opens a comment and `count(` is never
+//! closed, so both values are the same syntax error and give the same page.
 
 use super::common;
 use crate::scan::active::rules::differential::{Differential, Kept};
@@ -90,8 +95,17 @@ fn pair(orig: &str, quote: &str, op: &str) -> (String, String) {
     (format!("{orig}{q} {op} {q}1{q}={q}1"), format!("{orig}{q} {op} {q}1{q}={q}2"))
 }
 
-/// The pairs to try, by strength: single quotes, then double quotes and numbers.
-fn pairs(orig: &str, strength: Strength) -> Vec<(String, String)> {
+/// The XPath-only pair confirming `pair(orig, quote, op)`: the condition is whether the
+/// document has a root element, and a comparison that leaves the result as it is (true after
+/// `and`, false after `or`) takes the template's closing quote.
+fn xpath_pair(orig: &str, quote: &str, op: &str) -> (String, String) {
+    let q = quote;
+    let rest = if op == "and" { format!("{q}1{q}={q}1") } else { format!("{q}1{q}={q}2") };
+    (format!("{orig}{q} {op} count(/*)=1 {op} {rest}"), format!("{orig}{q} {op} count(/*)=0 {op} {rest}"))
+}
+
+/// The quotes and operators to try, by strength: single quotes, then double quotes and numbers.
+fn pairs(orig: &str, strength: Strength) -> Vec<(&'static str, &'static str)> {
     let numeric = !orig.is_empty() && orig.parse::<f64>().is_ok();
     let mut quotes = vec!["'"];
     if by_strength(strength, [false, true, true, true]) {
@@ -100,17 +114,18 @@ fn pairs(orig: &str, strength: Strength) -> Vec<(String, String)> {
             quotes.push("");
         }
     }
-    quotes.into_iter().flat_map(|q| ["and", "or"].map(|op| pair(orig, q, op))).collect()
+    quotes.into_iter().flat_map(|q| ["and", "or"].map(|op| (q, op))).collect()
 }
 
-fn boolean_info(t: &str, f: &str, kept: Kept) -> String {
+fn boolean_info(t: &str, f: &str, xt: &str, kept: Kept) -> String {
     let how = match kept {
         Kept::ByTrue => "kept the original page and the FALSE one",
         Kept::ByFalse => "changed the original page and the FALSE one",
     };
     format!(
-        "The TRUE condition [{t}] {how} [{f}] did the opposite, so the value is evaluated as part of an XPath \
-         expression. Taken as plain values, the two would give the same page."
+        "The TRUE condition [{t}] {how} [{f}] did the opposite, and so did the XPath-only [{xt}], so the value is \
+         evaluated as part of an XPath expression. Taken as plain values, the two would give the same page; in SQL, \
+         the XPath-only pair is a syntax error both ways."
     )
 }
 
@@ -155,18 +170,27 @@ impl ActiveRule for XpathInjection {
             }
             let Some(diff) = Differential::new(cx).await else { return };
             let orig = cx.point().value.clone();
-            for (t, f) in pairs(&orig, cx.strength()) {
+            for (q, op) in pairs(&orig, cx.strength()) {
                 if cx.stopped() {
                     return;
                 }
-                if let Some((kept, resp)) = diff.test(&t, &f).await {
-                    let finding = ALERT
-                        .raise(cx.point().name.clone(), "")
-                        .attack(t.clone())
-                        .confidence(Confidence::Medium)
-                        .other_info(boolean_info(&t, &f, kept));
-                    cx.report(finding, &resp);
+                let (t, f) = pair(&orig, q, op);
+                let Some((kept, _)) = diff.test(&t, &f).await else { continue };
+                if cx.stopped() {
                     return;
+                }
+                // SQL, which reads the first pair the same way, stops here.
+                let (xt, xf) = xpath_pair(&orig, q, op);
+                if let Some((xkept, resp)) = diff.test(&xt, &xf).await {
+                    if xkept == kept {
+                        let finding = ALERT
+                            .raise(cx.point().name.clone(), "")
+                            .attack(xt.clone())
+                            .confidence(Confidence::Medium)
+                            .other_info(boolean_info(&t, &f, &xt, kept));
+                        cx.report(finding, &resp);
+                        return;
+                    }
                 }
             }
         })
@@ -193,11 +217,17 @@ mod tests {
     fn boolean_pairs() {
         assert_eq!(pair("2", "'", "and"), ("2' and '1'='1".into(), "2' and '1'='2".into()));
         assert_eq!(pair("2", "", "or"), ("2 or 1=1".into(), "2 or 1=2".into()));
+        assert_eq!(
+            xpath_pair("2", "'", "and"),
+            ("2' and count(/*)=1 and '1'='1".into(), "2' and count(/*)=0 and '1'='1".into())
+        );
+        assert_eq!(xpath_pair("9", "\"", "or").0, "9\" or count(/*)=1 or \"1\"=\"2");
+        assert_eq!(xpath_pair("2", "", "and").1, "2 and count(/*)=0 and 1=1");
         assert_eq!(pairs("bob", Strength::Low).len(), 2);
         // Numbers for a numeric value from MEDIUM, for any value from HIGH.
         assert_eq!(pairs("bob", Strength::Medium).len(), 4);
         assert_eq!(pairs("2", Strength::Medium).len(), 6);
         assert_eq!(pairs("bob", Strength::High).len(), 6);
-        assert_eq!(pairs("bob", Strength::Medium)[2].0, "bob\" and \"1\"=\"1");
+        assert_eq!(pairs("bob", Strength::Medium)[2], ("\"", "and"));
     }
 }

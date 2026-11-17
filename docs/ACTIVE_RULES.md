@@ -241,6 +241,12 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   adds an always-true and an always-false comparison, ANDed and then ORed:
   `2' and '1'='1` / `2' and '1'='2`, then `or`. Single quotes at LOW; double quotes, and
   numbers (`2 and 1=1`) for a numeric value, from MEDIUM; numbers for any value from HIGH.
+  SQL reads that pair the same way, so a pair that passes is confirmed with one only XPath
+  can evaluate, which must give the same answer: the root element counted,
+  `2' and count(/*)=1 and '1'='1` / `2' and count(/*)=0 and '1'='1` (and the same with
+  `or`, double quotes or numbers). In SQL `/*` opens a comment, so both are the same syntax
+  error and an SQL injection isn't reported as XPath injection. The finding's attack is the
+  XPath-only value.
 - **Boolean differential** (40015 and 90021): pages are compared by the words they contain,
   with the values sent stripped out, also escaped or entity-encoded (a page that echoes the
   whole query, encoded, echoes the attack too). The original page is requested twice first:
