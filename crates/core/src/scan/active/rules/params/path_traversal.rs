@@ -103,40 +103,51 @@ const INFO: &str =
 alert!(ALERT_1, "6-1");
 alert!(ALERT_2, "6-2");
 alert!(ALERT_3, "6-3");
-alert!(ALERT_4, "6-4");
 
-static ALERTS: [&AlertDef; 4] = [&ALERT_1, &ALERT_2, &ALERT_3, &ALERT_4];
+static ALERTS: [&AlertDef; 3] = [&ALERT_1, &ALERT_2, &ALERT_3];
 
+// The files read are ones nothing can overwrite. A sink that *writes* to the path it is given
+// (a servlet saving an upload under the name sent, say) opens the target for writing, which
+// truncates it: ZAP's /etc/passwd emptied the OWASP Benchmark container's, running as root. So:
+// - *nix: /proc/version, which the kernel makes up on every read; opening it for writing
+//   truncates nothing, and writing to it fails, even as root.
+// - Windows: kernel32.dll in System32, owned by TrustedInstaller (Administrators and SYSTEM may
+//   only read it) and mapped as an image into every process, which no one may then open for
+//   writing.
+// The directory listings (check 3) can't be written to at all. ZAP's J2EE check (6-4, the app's
+// own WEB-INF/web.xml, which a write sink could replace) isn't run, for the same reason.
+// What it gives up: *nix systems without a Linux /proc (BSDs, macOS) are found only by their
+// directory listing.
 const WIN_DIR_EVIDENCE: &str = "Windows";
 pub(crate) const WIN_LOCAL_FILE_TARGETS: &[&str] = &[
-    "c:/Windows/system.ini",
-    "../../../../../../../../../../../../../../../../Windows/system.ini",
-    "c:\\Windows\\system.ini",
-    "..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\Windows\\system.ini",
-    "/../../../../../../../../../../../../../../../../Windows/system.ini",
-    "\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\Windows\\system.ini",
-    "Windows/system.ini",
-    "Windows\\system.ini",
-    "file:///c:/Windows/system.ini",
-    "file:///c:\\Windows\\system.ini",
-    "file:\\\\\\c:\\Windows\\system.ini",
-    "file:\\\\\\c:/Windows/system.ini",
-    "d:\\Windows\\system.ini",
-    "d:/Windows/system.ini",
-    "file:///d:/Windows/system.ini",
-    "file:///d:\\Windows\\system.ini",
-    "file:\\\\\\d:\\Windows\\system.ini",
-    "file:\\\\\\d:/Windows/system.ini",
+    "c:/Windows/System32/kernel32.dll",
+    "../../../../../../../../../../../../../../../../Windows/System32/kernel32.dll",
+    "c:\\Windows\\System32\\kernel32.dll",
+    "..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\Windows\\System32\\kernel32.dll",
+    "/../../../../../../../../../../../../../../../../Windows/System32/kernel32.dll",
+    "\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\Windows\\System32\\kernel32.dll",
+    "Windows/System32/kernel32.dll",
+    "Windows\\System32\\kernel32.dll",
+    "file:///c:/Windows/System32/kernel32.dll",
+    "file:///c:\\Windows\\System32\\kernel32.dll",
+    "file:\\\\\\c:\\Windows\\System32\\kernel32.dll",
+    "file:\\\\\\c:/Windows/System32/kernel32.dll",
+    "d:\\Windows\\System32\\kernel32.dll",
+    "d:/Windows/System32/kernel32.dll",
+    "file:///d:/Windows/System32/kernel32.dll",
+    "file:///d:\\Windows\\System32\\kernel32.dll",
+    "file:\\\\\\d:\\Windows\\System32\\kernel32.dll",
+    "file:\\\\\\d:/Windows/System32/kernel32.dll",
 ];
 
 const NIX_DIR_EVIDENCE: &str = "etc";
 pub(crate) const NIX_LOCAL_FILE_TARGETS: &[&str] = &[
-    "/etc/passwd",
-    "../../../../../../../../../../../../../../../../etc/passwd",
-    "/../../../../../../../../../../../../../../../../etc/passwd",
-    "etc/passwd",
-    "file:///etc/passwd",
-    "file:\\\\\\etc/passwd",
+    "/proc/version",
+    "../../../../../../../../../../../../../../../../proc/version",
+    "/../../../../../../../../../../../../../../../../proc/version",
+    "proc/version",
+    "file:///proc/version",
+    "file:\\\\\\proc/version",
 ];
 
 const WIN_LOCAL_DIR_TARGETS: &[&str] = &[
@@ -164,10 +175,11 @@ const NIX_LOCAL_DIR_TARGETS: &[&str] = &[
     "file:///",
 ];
 
-static WIN_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[drivers\]").unwrap());
-// Dot used to match 'x' or '!' (used in AIX).
-static NIX_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"root:.:0:0").unwrap());
-static WAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</web-app>").unwrap());
+// The DOS stub every PE file starts with.
+static WIN_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"This program cannot be run in DOS mode").expect("static regex"));
+static NIX_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Linux version \d+\.\d+\S* \(").expect("static regex"));
 static PROGRAM_FILES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)Program\sFiles").unwrap());
 // Java's `\W` is ASCII-only: `(?:^|\W)name(?:\W|$)`.
 static NIX_DIRS: LazyLock<[Regex; 5]> = LazyLock::new(|| {
@@ -205,18 +217,17 @@ fn contents_to_match(resp: &Response) -> String {
     }
 }
 
-/// Request counts per strength: (nix, win, nix dir, win dir, WEB-INF depth, null byte).
-fn counts(strength: Strength) -> (usize, usize, usize, usize, usize, bool) {
+/// Request counts per strength: (nix, win, nix dir, win dir, null byte).
+fn counts(strength: Strength) -> (usize, usize, usize, usize, bool) {
     match strength {
-        Strength::Low => (2, 2, 1, 1, 0, false),
-        Strength::Medium => (2, 4, 2, 2, 1, false),
-        Strength::High => (4, 8, 3, 4, 2, false),
+        Strength::Low => (2, 2, 1, 1, false),
+        Strength::Medium => (2, 4, 2, 2, false),
+        Strength::High => (4, 8, 3, 4, false),
         Strength::Insane => (
             NIX_LOCAL_FILE_TARGETS.len(),
             WIN_LOCAL_FILE_TARGETS.len(),
             NIX_LOCAL_DIR_TARGETS.len(),
             WIN_LOCAL_DIR_TARGETS.len(),
-            4,
             true,
         ),
     }
@@ -243,7 +254,7 @@ impl ActiveRule for PathTraversal {
 
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
         Box::pin(async move {
-            let (nix, win, nix_dir, win_dir, depth, null_byte) = counts(cx.strength());
+            let (nix, win, nix_dir, win_dir, null_byte) = counts(cx.strength());
             let value = &cx.point().value;
             let extension = if null_byte { value.rfind('.').map(|i| &value[i..]) } else { None };
             let base = contents_to_match(cx.base_response());
@@ -295,19 +306,6 @@ impl ActiveRule for PathTraversal {
                     return;
                 }
             }
-            // Check 4: well known J2EE files with increasing ../ prefixes.
-            let war = Matcher::Pattern(&WAR_PATTERN);
-            let mut sslash = "WEB-INF/web.xml".to_string();
-            let mut bslash = sslash.replace('/', "\\");
-            for _ in 0..depth {
-                for v in [sslash.clone(), bslash.clone(), format!("/{sslash}"), format!("\\{bslash}")] {
-                    if check.send(&v, war, &ALERT_4).await {
-                        return;
-                    }
-                }
-                sslash = format!("../{sslash}");
-                bslash = format!("..\\{bslash}");
-            }
         })
     }
 }
@@ -349,28 +347,54 @@ mod tests {
     #[test]
     fn request_counts_per_strength() {
         let total = |s| {
-            let (n, w, nd, wd, d, _) = counts(s);
-            n + w + nd + wd + d * 4
+            let (n, w, nd, wd, _) = counts(s);
+            n + w + nd + wd
         };
-        // ZAP's documented totals per parameter (7, 15, 28) less check 5's random value.
+        // ZAP's totals per parameter (7, 15, 28) less check 5's random value and the J2EE
+        // check's web.xml requests (0, 4, 8).
         assert_eq!(total(Strength::Low), 6);
-        assert_eq!(total(Strength::Medium), 14);
-        assert_eq!(total(Strength::High), 27);
+        assert_eq!(total(Strength::Medium), 10);
+        assert_eq!(total(Strength::High), 19);
         assert_eq!(WIN_LOCAL_FILE_TARGETS.len(), 18);
         assert_eq!(WIN_LOCAL_DIR_TARGETS.len(), 15);
-        assert_eq!(NIX_LOCAL_FILE_TARGETS[5], r"file:\\\etc/passwd");
+        assert_eq!(NIX_LOCAL_FILE_TARGETS[5], r"file:\\\proc/version");
+    }
+
+    /// The file a sink opens for a target: no `file:` scheme, drive or `..`, `/` separators.
+    fn resolved(target: &str) -> String {
+        let path = target.strip_prefix("file:").unwrap_or(target).replace('\\', "/");
+        let path = path.trim_start_matches('/');
+        let path = path.get(1..2).filter(|c| *c == ":").map_or(path, |_| path.get(2..).unwrap_or(""));
+        path.split('/').filter(|s| !s.is_empty() && *s != "." && *s != "..").collect::<Vec<_>>().join("/")
+    }
+
+    #[test]
+    fn nothing_sent_names_a_file_a_write_could_clobber() {
+        // A sink that writes where it is told truncates what it opens: these must be a file no
+        // one can write (procfs, a protected system DLL in use) or a directory.
+        for t in NIX_LOCAL_FILE_TARGETS.iter().chain(WIN_LOCAL_FILE_TARGETS) {
+            let file = resolved(t);
+            assert!(
+                file == "proc/version" || file.eq_ignore_ascii_case("Windows/System32/kernel32.dll"),
+                "{t} opens {file}"
+            );
+        }
+        for t in NIX_LOCAL_DIR_TARGETS.iter().chain(WIN_LOCAL_DIR_TARGETS) {
+            assert!(t.ends_with('/') || t.ends_with('\\'), "{t} is a directory");
+            assert_eq!(resolved(t), "", "{t} is the root");
+        }
+        assert_eq!(resolved(r"file:\\\c:\Windows\System32\kernel32.dll"), "Windows/System32/kernel32.dll");
+        assert_eq!(resolved("../../etc/passwd"), "etc/passwd");
     }
 
     #[test]
     fn matchers() {
         let p = Matcher::Pattern(&NIX_PATTERN);
-        assert_eq!(p.find("root:x:0:0:root:/root:/bin/bash").as_deref(), Some("root:x:0:0"));
-        assert_eq!(p.find("root:!:0:0").as_deref(), Some("root:!:0:0"));
-        assert!(p.find("root:xx:0:0").is_none());
-        assert_eq!(
-            Matcher::Pattern(&WIN_PATTERN).find("; for 16-bit app support\n[drivers]\nwave=mmdrv.dll").as_deref(),
-            Some("[drivers]")
-        );
+        let version = "Linux version 6.8.0-45-generic (buildd@lcy02-amd64-075) (x86_64-linux-gnu-gcc-13) #45-Ubuntu";
+        assert_eq!(p.find(version).as_deref(), Some("Linux version 6.8.0-45-generic ("));
+        assert!(p.find("Runs on Linux version 6 and later").is_none());
+        let pe = "MZ\u{90}\0\u{3}\0\0\0\u{4}\0\0\0\u{ff}\u{ff}\0\0!This program cannot be run in DOS mode.\r\r\n$";
+        assert_eq!(Matcher::Pattern(&WIN_PATTERN).find(pe).as_deref(), Some("This program cannot be run in DOS mode"));
         let listing = "bin\nboot\ndev\netc\nhome\nproc\ntmp\nusr";
         assert_eq!(Matcher::NixDirs.find(listing).as_deref(), Some("etc"));
         assert!(Matcher::NixDirs.find("bin boot etcetera home proc tmp").is_none());

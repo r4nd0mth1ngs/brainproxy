@@ -834,7 +834,10 @@ attack type, and pick payloads:
   traffic is passively scanned, or run the passive scan again.
 
 Passive rules run automatically on everything recorded. Active scans send real attack
-requests that can change data: prefer a test environment.
+requests that can change data: prefer a test environment. The path traversal rule names
+only files no write can damage (`/proc/version`, Windows' `kernel32.dll`, directories), so
+a parameter that writes to the path it is given doesn't overwrite a system file; see
+[ACTIVE_RULES.md](ACTIVE_RULES.md).
 By default an active scan only replays GET, HEAD, OPTIONS and POST requests from history;
 DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
 you include them. POST stays on because a scan misses too much without it, but it isn't

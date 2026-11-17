@@ -73,7 +73,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | ID | Rule | Scope | Max risk | Alert refs |
 |---|---|---|---|---|
 | 0 | Directory Browsing | page | medium | 0 |
-| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3, 6-4 |
+| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3 |
 | 7 | Remote File Inclusion | param | high | 7 |
 | 10045 | Source Code Disclosure - /WEB-INF Folder | host | high | 10045-1 |
 | 10047 | HTTPS Content Available via HTTP | page | low | 10047 |
@@ -195,6 +195,17 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   parameter that takes a name from a list gives, and a probe that would overwrite the app's
   own script where the path is written to. It found nothing real on the OWASP Benchmark and
   raised 15 false reports. The other checks report file contents only.
+- **Path Traversal (6) reads only files nothing can overwrite.** A parameter that names a
+  file the app *writes* (an upload saved under the name sent) truncates whatever it is given:
+  ZAP's `/etc/passwd` emptied the OWASP Benchmark container's. So the *nix check reads
+  `/proc/version` (made up by the kernel on every read; writing it fails, even as root,
+  evidence `Linux version …`), and the Windows check `Windows\System32\kernel32.dll` (owned by
+  TrustedInstaller and in use by every process, so not even SYSTEM may open it for writing;
+  evidence the PE header's `This program cannot be run in DOS mode`). The directory listings
+  can't be written to. ZAP's J2EE check (6-4, the app's own `WEB-INF/web.xml`, which a write
+  could replace) isn't run. What this gives up: *nix servers without a Linux `/proc` (BSDs,
+  macOS) are found only by a directory listing, and `web.xml` read through a parameter that
+  can't leave the web app's folder isn't found.
 - **Redirects followed:** a rule that follows redirects (as ZAP does) still files its
   finding under the request it attacked, with that request's own response, not under the
   page the redirect led to. When that response doesn't show the evidence itself (a POST

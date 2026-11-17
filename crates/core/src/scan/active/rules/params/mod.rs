@@ -65,6 +65,9 @@ mod e2e {
 
     static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    /// The files `/upload` was told to write.
+    static WRITTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
     /// What `/save` stored last, for `/saved` to show.
     static SAVED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -93,8 +96,9 @@ mod e2e {
                 let name = param("name");
                 if name == "readme.txt" {
                     ok("text/plain", "read me".into())
-                } else if name.ends_with("etc/passwd") {
-                    ok("text/plain", "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1::/:/bin/false\n".into())
+                } else if name.ends_with("proc/version") {
+                    let file = "Linux version 6.1.0-18-amd64 (debian-kernel@lists.debian.org) (gcc-12) #1 SMP\n";
+                    ok("text/plain", file.into())
                 } else {
                     not_found
                 }
@@ -155,6 +159,11 @@ mod e2e {
                 "view.jsp" => ok("text/plain", "the source of view.jsp".into()),
                 _ => not_found,
             },
+            // Writes what it is sent to the file `name` names (here: notes which file).
+            "/upload" => {
+                WRITTEN.lock().unwrap().push(param("name"));
+                ok("text/plain", "saved".into())
+            }
             "/save" => {
                 *SAVED.lock().unwrap() = param("u");
                 "HTTP/1.1 302 Found\r\nLocation: /saved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
@@ -443,6 +452,28 @@ mod e2e {
         .await;
         assert!(s.raised.is_empty(), "false positives: {s:?}");
         assert!(s.requests > 20, "the rules did attack: {s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn path_traversal_names_no_file_a_write_would_clobber() {
+        let port = spawn_app();
+        let s = scan("upload", port, &["/upload?name=report.txt"], Some(vec![6])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+        let written = WRITTEN.lock().unwrap().clone();
+        assert!(written.len() > 5, "the rule attacked: {written:?}");
+        // On the OWASP Benchmark, a servlet like this one emptied /etc/passwd.
+        for name in &written {
+            let n = name.replace('\\', "/").to_ascii_lowercase();
+            let clobbers = ["passwd", "system.ini", "win.ini", "web.xml", "upload"];
+            assert!(!clobbers.iter().any(|c| n.contains(c)), "{name}");
+            assert!(
+                n == "report.txt"
+                    || n.ends_with("proc/version")
+                    || n.ends_with("system32/kernel32.dll")
+                    || n.ends_with('/'),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
