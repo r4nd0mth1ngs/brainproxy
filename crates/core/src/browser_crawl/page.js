@@ -379,6 +379,12 @@
     }
     return true;
   };
+  // Whether an empty field is still disabled: a form that opens it once others are answered
+  // may be waiting for a lookup it starts a moment after the last keystroke.
+  bp.locked = () =>
+    [...document.querySelectorAll("input:disabled,textarea:disabled,select:disabled")]
+      .slice(0, 200)
+      .some((el) => !el.value && !/^(hidden|submit|button|image|reset)$/i.test(el.type) && visible(el));
   // A combobox or listbox to choose in: where to click it to open it (a listbox's options are
   // already there). It counts as chosen from now on, so a box that never opens isn't retried.
   bp.openField = (i) => {

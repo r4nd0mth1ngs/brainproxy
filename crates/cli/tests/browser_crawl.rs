@@ -94,12 +94,17 @@ function render() {
       fetch(api('feedback') + '?captcha=' + f.cap.value + '&rating=' + f.rating.value);
     });
   } else if (route === '/forgot') {
-    // Staged: the answer and new password fields open once the e-mail has been looked up.
+    // Staged: the answer and new password fields open once the e-mail has been looked up, a
+    // second after the last keystroke.
     view.innerHTML = '<form id="p"><input name="email" type="email"><input name="answer" disabled>' +
       '<input name="pw" type="password" disabled><button id="change" disabled>Change</button></form>';
     const f = document.getElementById('p');
-    f.email.addEventListener('change', () => fetch(api('question') + '?email=' + encodeURIComponent(f.email.value))
-      .then((r) => r.json()).then(() => { f.answer.disabled = false; f.pw.disabled = false; }));
+    let lookup;
+    f.email.addEventListener('input', () => {
+      clearTimeout(lookup);
+      lookup = setTimeout(() => fetch(api('question') + '?email=' + encodeURIComponent(f.email.value))
+        .then((r) => r.json()).then(() => { f.answer.disabled = false; f.pw.disabled = false; }), 1000);
+    });
     f.addEventListener('input', () => {
       document.getElementById('change').disabled = !(f.email.value && f.answer.value && f.pw.value);
     });

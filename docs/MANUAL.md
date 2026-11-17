@@ -805,7 +805,8 @@ attack type, and pick payloads:
   slider is moved to its maximum; a field labelled like a captcha's answer gets the sum of
   an arithmetic captcha shown beside it (`What is 3+4*2 ?`); and when answering some fields
   opens others (a security question after the e-mail is looked up), those are filled too
-  (up to three rounds). Each distinct page state is explored once. It is slower than the plain crawl.
+  (up to three rounds; while an empty field stays disabled, each round waits a further 1.2
+  seconds for a lookup the page starts a moment after the last keystroke). Each distinct page state is explored once. It is slower than the plain crawl.
   - **What it won't do:** click elements or follow links labelled like *log out*,
     *delete*, *remove*, *reset* or *unsubscribe* (the summary lists them under
     `not_clicked`), answer *OK* to a confirmation dialog, open pop-ups or downloads,

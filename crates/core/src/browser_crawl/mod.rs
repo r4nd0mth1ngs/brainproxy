@@ -72,6 +72,8 @@ const MAX_TIMEOUTS: usize = 3;
 const FILL_ROUNDS: usize = 3;
 /// Comboboxes and listboxes chosen in per round.
 const MAX_CHOICES: usize = 10;
+/// How long a form with a locked field gets after filling, for a lookup it debounces.
+const DEBOUNCE_WAIT: Duration = Duration::from_millis(1200);
 
 #[derive(Clone)]
 pub struct BrowserCrawlConfig {
@@ -716,6 +718,13 @@ impl<'a> Explorer<'a> {
             }
             changed = true;
             self.settle().await;
+            // A lookup the page starts a moment after the last keystroke (debounced) hasn't gone
+            // out yet when the page first looks settled: with a field still locked, it gets
+            // that moment.
+            if self.eval("window.__bp ? __bp.locked() : false").await? == json!(true) {
+                tokio::time::sleep(DEBOUNCE_WAIT).await;
+                self.settle().await;
+            }
         }
         Ok(changed)
     }
