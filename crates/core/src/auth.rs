@@ -1232,7 +1232,7 @@ impl AuthSession {
     /// ([`placeholder`]) that the client fills in on the wire, so no record of the
     /// request holds the secret. Cookies the session knows replace the request's
     /// values (stale captures), except cookies named in `keep`, which are left as
-    /// the caller set them (e.g. a cookie being attacked or fuzzed).
+    /// the caller set them (e.g. a cookie being attacked or fuzzed), or left out.
     pub fn apply(&self, raw: &[u8], keep: &[&str]) -> Vec<u8> {
         self.apply_keeping(raw, keep, &[])
     }
@@ -1264,7 +1264,8 @@ impl AuthSession {
                     merged.push((k.clone(), v.clone()));
                 }
             }
-            for k in &session {
+            // A kept cookie the request doesn't have stays out of it, as the caller left it.
+            for k in session.iter().filter(|k| !keep.contains(&k.as_str())) {
                 if !merged.iter().any(|(n, _)| n == k) {
                     merged.push((k.clone(), ph(&format!("cookie:{k}"))));
                 }

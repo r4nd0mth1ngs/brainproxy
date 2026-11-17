@@ -56,9 +56,14 @@ These use IDs from 100000, so they never clash with ZAP's.
     signed again (100007-5, *Expiry Not Enforced*);
   - MEDIUM and above: a `kid` of `../../../../../../../../dev/null` signed with an empty key
     (100007-6, when the token has a `kid`); for an RS or PS token, HS256 signed with the
-    origin's RSA public key as the secret (100007-7, *Algorithm Confusion*), the key taken
-    from `/.well-known/jwks.json`, `/jwks.json` or the same-origin `jwks_uri` of
-    `/.well-known/openid-configuration`, in four PEM forms; and with `oob start`, a `jku`
+    origin's RSA public key as the secret (100007-7, *Algorithm Confusion*). Keys are
+    looked for, up to four: PEM public keys in responses recorded from the origin (found
+    through history's full-text index, no request); then, with at most 8 requests, the
+    `.pem` and `.pub` files history requested from the origin or links to (up to 3, such as a
+    directory listing's `jwt.pub`), `/.well-known/jwks.json`, `/jwks.json`,
+    `/.well-known/openid-configuration` (and its same-origin `jwks_uri`), `/jwt.pub`,
+    `/public.pem` and `/publickey.pem`. A JWKS key is tried in four PEM forms, a key file as
+    it was found, with and without a final newline; and with `oob start`, a `jku`
     and an `x5u` naming the listener (100007-8 when the server calls it).
 
   The payload is never changed except `exp` in the expiry test, so a forged token claims
@@ -69,8 +74,10 @@ These use IDs from 100000, so they never clash with ZAP's.
   token behind it from the project's session values, as sending does, and keeps the
   placeholder in every request on record. Such a token's signature stays a secret: the
   changed-signature and `jku`/`x5u` tests use a made-up signature instead of the real one,
-  and a weak-secret finding doesn't quote the token. The passive rule 100008 reports what
-  traffic shows without sending anything.
+  and a weak-secret finding doesn't quote the token. A cookie the server sets to a token in
+  answer to a forged one (an accepted token handed back) is kept off the rule's later
+  requests, so the session doesn't send it with every forged token after. The passive rule
+  100008 reports what traffic shows without sending anything.
 
 ## Rules
 
