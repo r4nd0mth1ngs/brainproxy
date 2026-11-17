@@ -112,6 +112,12 @@ pub fn sign(dir: &Path, key: &str) -> Result<(String, usize)> {
         }
         files.insert(rel, sha256_hex(&std::fs::read(&f)?));
     }
+    // A template that doesn't load would be dropped on every user's machine at update;
+    // one that loads but can't run as written must not be signed at all.
+    let opts = super::LoadOptions { any_inputs: true, oob: true, build_regexes: true, ..Default::default() };
+    if let Some(s) = super::load(&[dir.to_path_buf()], &opts)?.skipped.first() {
+        return Err(Error::InvalidInput(format!("{}: {} ({}); not signed", s.file.display(), s.reason, s.kind)));
+    }
     let list = FeedList { version: 1, files };
     let mut bytes = serde_json::to_vec_pretty(&list).map_err(|e| Error::Protocol(e.to_string()))?;
     bytes.push(b'\n');
@@ -196,7 +202,7 @@ pub(crate) async fn update_with(home: &Path, source: Source, keys: &[&str]) -> R
         m.signed_by = id;
         m.templates = list.files.keys().filter(|p| !p.starts_with("helpers/")).count();
         m.helpers = list.files.len() - m.templates;
-        let (stored, skipped) = keep_loadable(&staging)?;
+        let (stored, skipped) = keep_loadable(&staging, true)?;
         m.stored = stored;
         m.skipped = skipped;
         m.changes = Some(changes(&brainproxy_dir(home), &staging)?);

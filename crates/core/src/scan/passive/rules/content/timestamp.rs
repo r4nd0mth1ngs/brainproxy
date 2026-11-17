@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use time::OffsetDateTime;
 
-use super::common::is_font;
+use super::common::{is_css, is_font, is_javascript};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -70,18 +70,37 @@ fn format_ts(ts: i64) -> String {
     }
 }
 
+/// The most other matches a finding's other info lists.
+const MORE: usize = 5;
+
+/// One finding for `text` (a header's value or the body), with its first timestamp as
+/// evidence. Diverges from ZAP, which raises one per match: a bundle or a list of records
+/// raised hundreds from one response, each counted as a hit.
 fn scan_text(name: &str, text: &str, (start, stop): (i64, i64), out: &mut Vec<Finding>) {
-    for m in PATTERN.find_iter(text) {
-        if text.as_bytes().get(m.end()) == Some(&b'%') {
-            continue;
+    let mut found = PATTERN.find_iter(text).filter_map(|m| {
+        if text.as_bytes().get(m.end()) == Some(&b'%') || in_url(text, m.start()) {
+            return None;
         }
-        let Ok(ts) = m.as_str().parse::<i64>() else { continue };
-        if ts < start || ts > stop {
-            continue;
-        }
-        let other = format!("{}, which evaluates to: {}.", m.as_str(), format_ts(ts));
-        out.push(ALERT.raise(name, m.as_str()).other_info(other));
+        let ts = m.as_str().parse::<i64>().ok().filter(|ts| (start..=stop).contains(ts))?;
+        Some((m.as_str(), ts))
+    });
+    let Some((first, ts)) = found.next() else { return };
+    let mut other = format!("{first}, which evaluates to: {}.", format_ts(ts));
+    let rest: Vec<&str> = found.map(|(m, _)| m).collect();
+    if !rest.is_empty() {
+        let shown = rest.iter().take(MORE).copied().collect::<Vec<_>>().join(", ");
+        let more = rest.len().saturating_sub(MORE);
+        other += &format!("\nAlso: {shown}{}.", if more > 0 { format!(" and {more} more") } else { String::new() });
     }
+    out.push(ALERT.raise(name, first).other_info(other));
+}
+
+/// Whether the number at `at` is part of a URL (`/item/1700000000`, `?id=1969196030`): ids
+/// in links, not times. Looks back over the token it is in, to whitespace, a quote or a bracket.
+fn in_url(text: &str, at: usize) -> bool {
+    let token_start = text[..at].rfind(|c: char| c.is_whitespace() || "\"'`<>()[]{},".contains(c)).map_or(0, |i| i + 1);
+    let token = &text[token_start..at];
+    token.contains('/') || token.contains('?') || token.contains('&')
 }
 
 pub struct Timestamp;
@@ -109,7 +128,11 @@ impl PassiveRule for Timestamp {
                 scan_text(k, v, r, out);
             }
         }
-        scan_text("", msg.body(), r, out);
+        // Diverges from ZAP: numbers in scripts and stylesheets are build constants, ids and
+        // sizes (a gas fee of 1500000000), not times the server disclosed.
+        if !is_javascript(msg) && !is_css(msg) {
+            scan_text("", msg.body(), r, out);
+        }
     }
 }
 
@@ -135,6 +158,31 @@ mod tests {
         assert_eq!(f[1].param, "");
         assert!(f[1].other_info.starts_with(&format!("{ts}, which evaluates to: ")));
         assert_eq!(format_ts(1704114087), "2024-01-01 13:01:27");
+    }
+
+    /// One finding per response part however many numbers it has (520 hits came from one
+    /// bundle), and none for ids in URLs or for constants in scripts.
+    #[test]
+    fn one_finding_per_part_and_not_ids_in_urls_or_scripts() {
+        let ts = |d: i64| (now() - d).to_string();
+        let records: String = (1..=8).map(|d| format!("{{\"t\":{}}},", ts(d * 60))).collect();
+        let f = msg("https://a.test/").header("Content-Type", "application/json").body(&records).scan(&Timestamp);
+        assert_eq!((f.len(), f[0].evidence.as_str()), (1, ts(60).as_str()));
+        assert!(f[0].other_info.contains("and 2 more"), "{}", f[0].other_info);
+
+        let steam = format!(
+            r#"{{"url":"https://store.test/app?id={a}","img":"/items/{a}/x.png","next":"?p=1&since={a}"}}"#,
+            a = ts(1)
+        );
+        assert!(msg("https://a.test/")
+            .header("Content-Type", "application/json")
+            .body(&steam)
+            .scan(&Timestamp)
+            .is_empty());
+        let js = format!("const fee = z.from(\"{}\");", ts(1));
+        assert!(msg("https://a.test/c.js").body(&js).scan(&Timestamp).is_empty());
+        let js = msg("https://a.test/c").header("Content-Type", "text/javascript").body(&js);
+        assert!(js.scan(&Timestamp).is_empty());
     }
 
     #[test]

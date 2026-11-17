@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use regex::{Regex, RegexSet};
 
-use super::common::{is_css, is_javascript, xml_unescape};
+use super::common::{generic_in_data, is_css, is_javascript, is_source_map, xml_unescape};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -102,13 +102,19 @@ impl PassiveRule for ApplicationError {
             return;
         }
         if msg.status == 500 {
-            out.push(ALERT.raise("", "HTTP/1.1 500 Internal Server Error").risk(Risk::Low));
+            // Diverges from ZAP: an empty 500 discloses nothing.
+            if !msg.resp_body.is_empty() {
+                out.push(ALERT.raise("", "HTTP/1.1 500 Internal Server Error").risk(Risk::Low));
+            }
             return;
         }
+        // Diverges from ZAP, which also reads source maps (library code in strings) and
+        // takes "Internal Server Error" in a hint or a translation file for an error page.
         if msg.status == 404
             || msg.content_type().contains("application/wasm")
             || is_javascript(msg)
             || is_css(msg)
+            || is_source_map(msg)
             || msg.resp_body.is_empty()
         {
             return;
@@ -116,7 +122,7 @@ impl PassiveRule for ApplicationError {
         let body = msg.body();
         let m = &*MATCHER;
         // All literal strings first, then the regexes; first in file order wins.
-        if let Some(i) = m.string_set.matches(body).iter().next() {
+        if let Some(i) = m.string_set.matches(body).iter().find(|&i| !generic_in_data(msg, &m.strings[i])) {
             out.push(ALERT.raise("", m.strings[i].as_str()));
         } else if let Some(i) = m.regex_set.matches(body).iter().next() {
             if let Some(found) = m.regexes[i].find(body) {
@@ -156,6 +162,27 @@ mod tests {
     fn status_500_is_low() {
         let f = msg("https://a.test/").status(500).html("oops").scan(&ApplicationError);
         assert_eq!((f.len(), f[0].risk), (1, Risk::Low));
+    }
+
+    /// A hint's or a translation's "Internal Server Error" in JSON data isn't an error page
+    /// (it raised a Medium on Juice Shop's /api/Hints), nor is a source map's library code,
+    /// nor an empty 500.
+    #[test]
+    fn ignores_generic_phrases_in_json_data_source_maps_and_empty_500s() {
+        let json = |path: &str, body: &str| {
+            msg(&format!("https://a.test{path}")).header("Content-Type", "application/json; charset=utf-8").body(body)
+        };
+        let hint = r#"{"data":[{"text":"500 Internal Server Error is always an interesting status code"}]}"#;
+        assert!(json("/api/Hints", hint).scan(&ApplicationError).is_empty());
+        let i18n = r#"{"ERR":"Internal Server Error","DENIED":"You are not allowed to access this"}"#;
+        assert!(json("/assets/i18n/en.json", i18n).scan(&ApplicationError).is_empty());
+        let f = json("/api/x", r#"{"e":"You have an error in your SQL syntax"}"#).scan(&ApplicationError);
+        assert_eq!(f[0].evidence, "You have an error in your SQL syntax");
+        let map = json("/main.js.map", r#"{"version":3,"sourcesContent":["throw new Error('internal error')"]}"#);
+        assert!(map.scan(&ApplicationError).is_empty());
+        assert!(msg("https://a.test/rest/country-mapping").status(500).scan(&ApplicationError).is_empty());
+        // The same text in an HTML page is still one.
+        assert_eq!(msg("https://a.test/").html(hint).scan(&ApplicationError).len(), 1);
     }
 
     #[test]

@@ -16,7 +16,8 @@ brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
 without changing it, and a server that hides its version isn't flagged.
 **100008 JWT Issues** reads JSON Web Tokens in traffic: a token in the query string
 (100008-1, low), and for tokens the server hands out (in a response's headers, such as
-`Set-Cookie` or `Location`, or its body) one with `alg: none` (100008-2, high), one with no
+`Set-Cookie` or `Location`, or its body, unless the body is a script or a source map, whose
+tokens are samples in the code) one with `alg: none` (100008-2, high), one with no
 `exp` (100008-3, low), and one with a claim named like a secret, such as `password`,
 `client_secret`, `ssn` or `card_number` (100008-4, low). Tokens only the client sends are
 left to the active rule 100007, so a token isn't reported again on every request.
@@ -40,7 +41,7 @@ left to the active rule 100007, so a token isn't reported again on every request
 | 10024 | Information Disclosure - Sensitive Information in URL | info | 10024 |
 | 10025 | Information Disclosure - Sensitive Information in HTTP Referrer Header | info | 10025 |
 | 10027 | Information Disclosure - Suspicious Comments | info | 10027 |
-| 10028 | Off-site Redirect | high | 10028 |
+| 10028 | Off-site Redirect | medium | 10028 |
 | 10029 | Cookie Poisoning | info | 10029 |
 | 10030 | User Controllable Charset | info | 10030 |
 | 10031 | User Controllable HTML Element Attribute (Potential XSS) | info | 10031 |
@@ -92,7 +93,7 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   10035-4, 10032-4, 90011-3, the low-confidence SHA/MD5 patterns of 10097). There is no threshold setting yet.
 - **ZAP configuration and contexts** (trusted domains, cookie/CSRF ignore lists, scope
   checks, custom error pages, BIN list lookups) are not used; lists are empty and PII
-  findings stay at Medium confidence.
+  findings stay at Medium confidence at most.
 - **Content Security Policy (10055)** uses brainproxy's own CSP parser and evaluator, not
   the htmlunit-csp library. It reproduces nearly all of ZAP's own CSP unit-test
   expectations; some parser notice texts are brainproxy's wording.
@@ -117,3 +118,43 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
 - **Findings are de-duplicated:** the same alert, method, URL (without its query) and
   parameter is one finding with a `hits` count; the first evidence is kept. ZAP lists each
   differing evidence separately (for example two `Server` headers in one response).
+
+### Less noise
+
+Some rules are deliberately stricter or rated lower than ZAP's, where ZAP's output is mostly
+noise on modern applications:
+
+- **Cross-Domain Misconfiguration (10098)** rates `Access-Control-Allow-Origin: *` Low (ZAP:
+  Medium), since a wildcard can't carry credentials, and skips fonts, images, stylesheets,
+  audio and video. It also raises Medium (low confidence) when a response allows the
+  request's `Origin` of another site, or `null`, with `Access-Control-Allow-Credentials: true`,
+  which ZAP's passive rule doesn't look at; the active CORS rule (40040) confirms it.
+- **Strict-Transport-Security Header (10035-1)** isn't raised on a `304 Not Modified`,
+  which ZAP counts as a redirect: a revalidation needn't repeat the full response's headers.
+- **Sub Resource Integrity Attribute Missing (90003)** reads only HTML pages (ZAP: any
+  body, so a tag inside a JS bundle's string counted), and leaves a script from another
+  host without `integrity` to Cross-Domain JavaScript Source File Inclusion (10017), which
+  reports the same element; 90003 keeps stylesheets, preloads and the scripts 10017
+  doesn't count.
+- **Obsolete CSP Header (10038-2)** isn't raised: the CSP rule's 10055-1 and 10055-2 report
+  `X-Content-Security-Policy` and `X-WebKit-CSP` with their values.
+- **Timestamp Disclosure (10096)** raises one finding per header and one for the body, with
+  the first timestamp as evidence and the others in the other info (ZAP: one per match, so
+  a single response could add hundreds of hits). It skips numbers inside URLs (`?id=…`,
+  `/items/…`) and the bodies of scripts and stylesheets, whose numbers are ids and constants.
+- **Session ID in URL Rewrite (3-1)** ignores `sid` in an Engine.IO (socket.io) URL, one
+  with `EIO` and `transport` parameters: it identifies the transport, not a login.
+- **Application Error Disclosure (90022)** and **Debug Error Messages (10023)** skip source
+  maps, and in JSON data (a 2xx JSON body: hints, translations) ignore generic phrases such
+  as "Internal Server Error", "internal error" or "is not allowed to access"; a driver's
+  message or another specific signature still counts there. 90022 raises nothing for a 500
+  with an empty body.
+- **Off-site Redirect (10028)** is Medium (ZAP: High), since one sighting can't tell a
+  parameter that redirects anywhere from an allow-list, and gives the `Location` value as
+  evidence (ZAP: none).
+- **Anti-clickjacking (10020-1)** and **CSP Header Not Set (10038-1)** skip a text/html body
+  without any markup (socket.io answers a POST with `ok`): there is no page to frame or
+  script to restrict.
+- **PII Disclosure (10062)** is Medium at low confidence (ZAP: High, Medium) for a card
+  number with no label such as `card`, `credit`, `cc` or `pan` in the 40 characters before
+  it: one number in ten passes the Luhn check, so ids and order numbers did.

@@ -184,7 +184,12 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
         ChecksCmd::Validate { paths, limit, check_vars } => {
             let paths =
                 paths.iter().map(|p| local_template(project, "checks validate", p)).collect::<Result<Vec<_>, _>>()?;
-            let opts = checks::LoadOptions { vars: check_vars, oob: oob_running(project), ..Default::default() };
+            let opts = checks::LoadOptions {
+                vars: check_vars,
+                oob: oob_running(project),
+                build_regexes: true,
+                ..Default::default()
+            };
             let loaded = checks::load(&paths, &opts)?;
             let files: Vec<_> = loaded
                 .checks

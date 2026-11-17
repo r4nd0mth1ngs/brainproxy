@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use super::common::{is_javascript, is_source_map};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 const REFS: &[&str] = &[
@@ -156,7 +157,11 @@ impl PassiveRule for JwtIssues {
         }
         // Tokens the server hands out: in its headers (Set-Cookie, Location) or its body.
         let mut text: String = msg.resp_headers.iter().map(|(k, v)| format!("{k}: {v}\n")).collect();
-        text.push_str(msg.body());
+        // A token in a script or a source map is an example or a fixture in the code
+        // (jwt.io's sample in a vendor bundle), not one the server issued.
+        if !is_javascript(msg) && !is_source_map(msg) {
+            text.push_str(msg.body());
+        }
         let issued = tokens(&text);
         if let Some((token, ..)) = issued
             .iter()
@@ -215,5 +220,19 @@ mod tests {
         let t = jwt(r#"{"alg":"none"}"#, r#"{"sub":"a"}"#);
         let f = msg("https://a.test/").req_header("Authorization", &format!("Bearer {t}")).scan(&JwtIssues);
         assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// A sample token in a bundle or source map wasn't issued; one in a script's headers was.
+    #[test]
+    fn tokens_in_scripts_are_not_issued() {
+        let t = jwt(r#"{"alg":"HS256"}"#, r#"{"sub":"1234567890","name":"John Doe"}"#);
+        let body = format!("const sample = \"{t}\";");
+        assert!(msg("https://a.test/main.js").body(&body).scan(&JwtIssues).is_empty());
+        let typed = msg("https://a.test/chunk").header("Content-Type", "text/javascript; charset=utf-8");
+        assert!(typed.body(&body).scan(&JwtIssues).is_empty());
+        let map = msg("https://a.test/main.js.map").body(&format!(r#"{{"version":3,"sourcesContent":["{t}"]}}"#));
+        assert!(map.scan(&JwtIssues).is_empty());
+        let header = msg("https://a.test/main.js").header("Set-Cookie", &format!("token={t}"));
+        assert_eq!(header.scan(&JwtIssues).len(), 1);
     }
 }

@@ -2,7 +2,7 @@
 
 pub(crate) mod application_error;
 mod charset_mismatch;
-mod common;
+pub(crate) mod common;
 mod cross_domain_script;
 pub(crate) mod debug_errors;
 mod directory_browsing;

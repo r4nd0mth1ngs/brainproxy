@@ -1,6 +1,6 @@
 //! Ported from ZAP AntiClickjackingScanRule (pscanrules, Apache License 2.0).
 
-use super::common::{header_values, is_error, is_redirect, meta_http_equiv, zap_is_text};
+use super::common::{has_markup, header_values, is_error, is_redirect, meta_http_equiv, zap_is_text};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 const TAGS: &[&str] = &["OWASP_2025_A02", "OWASP_2021_A05", "OWASP_2017_A06", "WSTG-v42-CLNT-09", "SYSTEMIC"];
@@ -101,7 +101,10 @@ impl PassiveRule for AntiClickjacking {
         }
         let xfo: Vec<&str> = header_values(msg, HEADER).collect();
         if xfo.is_empty() {
-            out.push(MISSING.raise(HEADER, ""));
+            // Diverges from ZAP: a text/html body without markup isn't a page to frame.
+            if has_markup(msg) {
+                out.push(MISSING.raise(HEADER, ""));
+            }
         } else {
             for v in &xfo {
                 let lv = v.to_lowercase();
@@ -159,5 +162,12 @@ mod tests {
             .scan(&AntiClickjacking)
             .is_empty());
         assert!(msg("https://a.test/").html("").scan(&AntiClickjacking).is_empty());
+    }
+
+    /// socket.io answers a POST with `ok` as text/html: nothing there to frame.
+    #[test]
+    fn ignores_html_without_markup() {
+        let ok = msg("https://a.test/socket.io/?EIO=4&transport=polling").method("POST").html("ok");
+        assert!(ok.scan(&AntiClickjacking).is_empty());
     }
 }

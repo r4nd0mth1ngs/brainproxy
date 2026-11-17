@@ -305,6 +305,10 @@ pub struct LoadOptions {
     /// An OOB listener is available: `{{interactsh-url}}` and interactsh
     /// matchers are supported (else such templates are unsupported).
     pub oob: bool,
+    /// Compile every matcher and extractor regex now, so one too big to build is a load
+    /// error rather than a matcher that never matches. Slow for large template sets
+    /// (some patterns take seconds), so only `checks validate` and the passive checks do it.
+    pub build_regexes: bool,
 }
 
 const NEEDS_OOB: &str = "interactsh (out-of-band): needs an OOB listener (brainproxy oob start)";
@@ -550,7 +554,7 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
     };
     let mut blocks = Vec::new();
     for b in blocks_v {
-        blocks.push(compile_block(b, rule_scope, passive, file, root)?);
+        blocks.push(compile_block(b, rule_scope, passive, file, root, opts.build_regexes)?);
     }
     if blocks.is_empty() {
         return invalid("no requests");
@@ -663,6 +667,7 @@ fn compile_block(
     passive: bool,
     file: &Path,
     root: Option<&Path>,
+    build_regexes: bool,
 ) -> std::result::Result<Block, Problem> {
     let Some(obj) = b.as_object() else { return invalid("request block is not a mapping") };
     for k in obj.keys() {
@@ -738,11 +743,11 @@ fn compile_block(
     };
     let mut matchers = Vec::new();
     for m in b.get("matchers").and_then(Value::as_array).into_iter().flatten() {
-        matchers.push(compile_matcher(m)?);
+        matchers.push(compile_matcher(m, build_regexes)?);
     }
     let mut extractors = Vec::new();
     for e in b.get("extractors").and_then(Value::as_array).into_iter().flatten() {
-        let e = compile_extractor(e)?;
+        let e = compile_extractor(e, build_regexes)?;
         // Extractors over interactions only print the caller's address, which the
         // correlated finding shows anyway.
         let oob = match &e.kind {
@@ -887,12 +892,18 @@ fn part_named(p: &str) -> std::result::Result<Part, Problem> {
 #[derive(Debug, Clone)]
 pub(crate) struct Regexes {
     src: Vec<String>,
-    compiled: std::sync::Arc<std::sync::OnceLock<Vec<Regex>>>,
+    compiled: std::sync::Arc<std::sync::OnceLock<Option<Vec<Regex>>>>,
 }
 
 impl Regexes {
-    pub fn get(&self) -> &[Regex] {
-        self.compiled.get_or_init(|| self.src.iter().filter_map(|r| dsl::build_regex(r)).collect())
+    /// The compiled patterns, or None when one of them didn't build (a size limit the
+    /// load-time check can't see). Callers treat that as no match, whatever `negative`
+    /// or `condition: and` say: with a pattern missing, `and` over the rest or `negative`
+    /// over nothing would match every response.
+    pub fn get(&self) -> Option<&[Regex]> {
+        self.compiled
+            .get_or_init(|| self.src.iter().map(|r| dsl::build_regex(r)).collect::<Option<Vec<_>>>())
+            .as_deref()
     }
 
     pub fn len(&self) -> usize {
@@ -900,18 +911,34 @@ impl Regexes {
     }
 }
 
-fn compile_regexes(v: &Value) -> std::result::Result<Regexes, Problem> {
+/// `matcher`: the patterns decide whether a check fires, so one that matches the empty
+/// string (and so every response) is refused; an extractor's may.
+fn compile_regexes(v: &Value, matcher: bool, build: bool) -> std::result::Result<Regexes, Problem> {
     let src = list(v.get("regex"));
+    let mut built = Vec::new();
     for r in &src {
-        // Lookaround and backreferences (RE2 lacks them too) fail here.
-        if regex_syntax::ast::parse::Parser::new().parse(r).is_err() {
-            return unsupported("regex syntax (lookaround/backreference)");
+        let empty = dsl::check_regex(r).map_err(|e| match e {
+            dsl::ParseError::Unsupported(r) => Problem::Unsupported(r),
+            dsl::ParseError::Invalid(r) => Problem::Invalid(r),
+        })?;
+        if matcher && empty {
+            return invalid(format!("regex {r:?} matches the empty string, so it matches every response"));
+        }
+        if build {
+            match dsl::try_build_regex(r) {
+                Ok(re) => built.push(re),
+                Err(e) => return invalid(format!("regex {r:?} doesn't compile: {}", dsl::regex_error(&e.to_string()))),
+            }
         }
     }
-    Ok(Regexes { src, compiled: Default::default() })
+    let compiled = std::sync::Arc::new(std::sync::OnceLock::new());
+    if build {
+        let _ = compiled.set(Some(built));
+    }
+    Ok(Regexes { src, compiled })
 }
 
-fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
+fn compile_matcher(m: &Value, build_regexes: bool) -> std::result::Result<Matcher, Problem> {
     let Some(obj) = m.as_object() else { return invalid("matcher is not a mapping") };
     for k in obj.keys() {
         if !MATCHER_KEYS.contains(&k.as_str()) {
@@ -936,7 +963,7 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
             }
             MatchKind::Word(words)
         }
-        "regex" => MatchKind::Regex(compile_regexes(m)?),
+        "regex" => MatchKind::Regex(compile_regexes(m, true, build_regexes)?),
         "status" => MatchKind::Status(
             list(m.get("status"))
                 .iter()
@@ -973,6 +1000,15 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
     if empty {
         return invalid("matcher without values");
     }
+    // Every text contains the empty word.
+    let blank = match &kind {
+        MatchKind::Word(v) => v.iter().any(String::is_empty),
+        MatchKind::Binary(v) => v.iter().any(Vec::is_empty),
+        _ => false,
+    };
+    if blank {
+        return invalid("an empty word matches every response");
+    }
     let and = match m.get("condition").and_then(Value::as_str).unwrap_or("or") {
         "and" => true,
         "or" => false,
@@ -997,11 +1033,11 @@ fn compile_matcher(m: &Value) -> std::result::Result<Matcher, Problem> {
     })
 }
 
-fn compile_extractor(e: &Value) -> std::result::Result<Extractor, Problem> {
+fn compile_extractor(e: &Value, build_regexes: bool) -> std::result::Result<Extractor, Problem> {
     let kind = match e.get("type").and_then(Value::as_str).unwrap_or("") {
         "regex" => {
             let group = e.get("group").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let res = compile_regexes(e)?;
+            let res = compile_regexes(e, false, build_regexes)?;
             if res.len() == 0 {
                 return invalid("regex extractor without regex");
             }

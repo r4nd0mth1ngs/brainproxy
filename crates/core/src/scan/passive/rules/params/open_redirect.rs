@@ -6,7 +6,9 @@ use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 static ALERT: AlertDef = AlertDef {
     alert_ref: "10028",
     name: "Off-site Redirect",
-    risk: Risk::High,
+    // ZAP: High. One sighting of a parameter that names the target can't tell redirecting
+    // anywhere from an allow-list (Juice Shop answers other hosts with 406).
+    risk: Risk::Medium,
     confidence: Confidence::Medium,
     cwe: 601,
     wasc: 38,
@@ -37,6 +39,9 @@ const POST_TEXT: &str = "An open redirect controlled by POST parameters was dete
      serious issue, you should try resending that request as a GET, with the POST parameter included as a query \
      string parameter. For example: https://nottrusted.com/page?url=https://lookout.net.\n\nThe 301 or 302 response \
      to a request for the following URL appeared to contain user input in the location header:\n\n";
+
+const CONFIRM: &str = "Seen passively: the parameter may only accept hosts on an allow-list. Send the request \
+     with a host of your own in it to confirm that any host is followed.";
 
 pub struct UserControlledOpenRedirect;
 
@@ -85,10 +90,12 @@ impl PassiveRule for UserControlledOpenRedirect {
             }
             if domain.is_some_and(|d| eq_ic(value, d)) || value.contains(loc) {
                 let info = format!(
-                    "{intro}{}\n\nThe user input found was:\n\n{name}={value}\n\nThe context was:\n\n{loc}",
+                    "{intro}{}\n\nThe user input found was:\n\n{name}={value}\n\nThe context was:\n\n{loc}\n\n\
+                     {CONFIRM}",
                     msg.url
                 );
-                out.push(ALERT.raise(name.clone(), "").other_info(info));
+                // ZAP gives no evidence; the Location value is what a reader looks for.
+                out.push(ALERT.raise(name.clone(), loc).other_info(info));
             }
         }
     }
@@ -107,8 +114,11 @@ mod tests {
             .scan(&UserControlledOpenRedirect);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].param, "url");
+        // The Location value is the evidence (it was empty), at Medium (ZAP: High).
+        assert_eq!((f[0].evidence.as_str(), f[0].risk), ("https://evil.test/x", Risk::Medium));
         assert!(f[0].other_info.starts_with(GET_TEXT));
-        assert!(f[0].other_info.ends_with("url=https://evil.test/x\n\nThe context was:\n\nhttps://evil.test/x"));
+        let context = "url=https://evil.test/x\n\nThe context was:\n\nhttps://evil.test/x\n\n";
+        assert!(f[0].other_info.ends_with(&format!("{context}{CONFIRM}")));
     }
 
     #[test]

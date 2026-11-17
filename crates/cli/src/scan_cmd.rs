@@ -849,6 +849,12 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                         ),
                     };
                 }
+                if let Some(p) = &stats.checks_problem {
+                    text += &format!("\nwarning: {p}");
+                }
+                for id in &stats.failed_checks {
+                    text += &format!("\nwarning: passive check {id} failed on an exchange and found nothing there");
+                }
                 text
             });
         }

@@ -128,7 +128,7 @@ fn template_inputs() {
     let opts = |vars: &[(&str, &str)], any| LoadOptions {
         vars: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         any_inputs: any,
-        oob: false,
+        ..Default::default()
     };
     let reason = |o: &LoadOptions| match parse(t, Path::new("t.yaml"), None, o) {
         Err((_, Problem::Unsupported(r))) => r,
@@ -773,4 +773,56 @@ fn body_hex_sends_bytes() {
 fn a_timeout_that_is_not_a_number_is_invalid() {
     let t = "id: x\ninfo: {severity: low}\nhttp:\n  - raw:\n      - |\n        @timeout: nan\n        GET / HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: status\n        status: [200]\n";
     assert!(invalid_reason(t).contains("@timeout"), "{}", invalid_reason(t));
+}
+
+/// A matcher that would match every response is refused when it loads: before, a pattern that
+/// didn't build dropped out, so `condition: and` over the rest (or `negative` over nothing)
+/// matched every exchange, and an empty word or pattern matched every text.
+#[test]
+fn matchers_that_match_everything_do_not_load() {
+    let t = |matcher: &str| {
+        format!("id: p\ninfo: {{severity: low}}\nscope: passive\nhttp:\n  - matchers:\n      - {matcher}\n")
+    };
+    for (matcher, why) in [
+        (r"{type: regex, condition: and, regex: ['\p{Foo}', 'x']}", "doesn't compile"),
+        (r"{type: regex, negative: true, regex: ['\p{Foo}']}", "doesn't compile"),
+        ("{type: regex, regex: ['']}", "empty string"),
+        ("{type: regex, regex: ['a*|b']}", "empty string"),
+        ("{type: word, words: ['']}", "empty word"),
+        ("{type: word, condition: and, words: [x, '']}", "empty word"),
+        ("{type: binary, binary: ['']}", "empty word"),
+        (r#"{type: dsl, dsl: ['regex("\\p{Foo}", body)']}"#, "doesn't compile"),
+    ] {
+        let reason = invalid_reason(&t(matcher));
+        assert!(reason.contains(why), "{matcher}: {reason}");
+    }
+    // An extractor's pattern may match nothing.
+    let extract = "id: p\ninfo: {severity: low}\nscope: passive\nhttp:\n  - extractors:\n      - {type: regex, regex: ['v(\\d*)'], group: 1}\n";
+    assert!(parse(extract, Path::new("t.yaml"), None, &LoadOptions::default()).is_ok());
+
+    // Too big to build is only seen by building it, which `checks validate` and the passive
+    // checks do; elsewhere such a matcher matches nothing, `negative` or not.
+    let big = t(r"{type: regex, negative: true, regex: ['(?:\pL){1,5000}']}");
+    let opts = LoadOptions { build_regexes: true, ..Default::default() };
+    match parse(&big, Path::new("t.yaml"), None, &opts) {
+        Err((_, Problem::Invalid(r))) => assert!(r.contains("doesn't compile"), "{r}"),
+        _ => panic!("a pattern too big to build loaded"),
+    }
+    assert_eq!(passive_hits(&passive_check(&big), "GET / HTTP/1.1\r\n", 200, &[("X", "1")]), 0);
+}
+
+#[test]
+fn a_feed_with_a_template_that_does_not_load_is_not_signed() {
+    let dir = std::env::temp_dir().join(format!("bp-feed-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("passive")).unwrap();
+    std::fs::write(
+        dir.join("passive/all.yaml"),
+        "id: all\ninfo: {severity: low}\nscope: passive\nhttp:\n  - matchers: [{type: word, words: ['']}]\n",
+    )
+    .unwrap();
+    let e = feed::sign(&dir, TEST_KEY).unwrap_err().to_string();
+    assert!(e.contains("all.yaml") && e.contains("not signed"), "{e}");
+    assert!(!dir.join("feed.sig").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

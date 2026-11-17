@@ -1,6 +1,6 @@
 //! Ported from ZAP ContentSecurityPolicyMissingScanRule (pscanrules, Apache License 2.0).
 
-use super::common::{is_redirect, meta_http_equiv};
+use super::common::{has_markup, is_redirect, meta_http_equiv};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 const TAGS: &[&str] = &["OWASP_2025_A02", "OWASP_2021_A05", "OWASP_2017_A06", "SYSTEMIC"];
@@ -94,14 +94,16 @@ impl PassiveRule for CspMissing {
         if !msg.is_html() || is_redirect(msg.status) {
             return;
         }
-        if msg.resp_header("Content-Security-Policy").is_none()
+        // Diverges from ZAP: a text/html body without markup can't run a script to restrict.
+        if has_markup(msg)
+            && msg.resp_header("Content-Security-Policy").is_none()
             && meta_http_equiv(msg.body(), "Content-Security-Policy").is_none()
         {
             out.push(MISSING.raise("", ""));
         }
-        if msg.resp_header("X-Content-Security-Policy").is_some() || msg.resp_header("X-WebKit-CSP").is_some() {
-            out.push(OBSOLETE.raise("", ""));
-        }
+        // Diverges from ZAP: OBSOLETE (10038-2) isn't raised, since the CSP rule's 10055-1/-2
+        // report the same obsolete headers with their values. It stays listed so findings
+        // recorded before still have their texts.
         if msg.resp_header("Content-Security-Policy-Report-Only").is_some() {
             out.push(REPORT_ONLY.raise("", ""));
         }
@@ -126,7 +128,15 @@ mod tests {
             .header("X-WebKit-CSP", "default-src 'self'")
             .header("Content-Security-Policy-Report-Only", "default-src 'self'")
             .scan(&CspMissing);
-        assert_eq!(refs(&f), ["10038-1", "10038-2", "10038-3"]);
+        // The obsolete header is the CSP rule's 10055-2, not reported twice.
+        assert_eq!(refs(&f), ["10038-1", "10038-3"]);
+    }
+
+    /// socket.io answers a POST with `ok` as text/html: not a page that runs scripts.
+    #[test]
+    fn ignores_html_without_markup() {
+        let ok = msg("https://a.test/socket.io/?EIO=4&transport=polling").method("POST").html("ok");
+        assert!(ok.scan(&CspMissing).is_empty());
     }
 
     #[test]
