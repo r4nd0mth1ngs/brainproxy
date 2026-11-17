@@ -193,6 +193,12 @@ those skips 40014. Prime and Spider never raise alerts themselves.
     first and names the database (Medium confidence), and the bare 500 (Low confidence)
     is reported only when no other check (error message, expression, boolean, UNION,
     ORDER BY) found the parameter.
+- **Remote OS Command Injection (90020)** sends a control before it reports: the same
+  attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
+  `;#get-help`). The output must not come back for it, so a search or help page that
+  shows matching text for the command's words isn't reported. PowerShell output is
+  recognised by the description `get-help` prints, not by the words "cmdlet",
+  "Get-Help" or "Get-Alias" (ZAP), which any PowerShell documentation page has.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.

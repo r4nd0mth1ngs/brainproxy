@@ -243,14 +243,29 @@ fn handle(path: &str, query: &str) -> String {
             }
             html("<p>item</p>")
         }
-        // Shell command output in the page.
+        // Shell command output in the page; a `#` comments the command out.
         "/ping" => {
             let host = param("host");
-            if host.contains("cat /etc/passwd") {
+            if host.contains("cat /etc/passwd") && !host.contains("#cat") {
                 html("PING ok\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1::/usr/sbin")
             } else {
                 html("PING ok")
             }
+        }
+        // Safe: a documentation search, every word of the query in the article.
+        "/docs" => {
+            const ARTICLES: [&str; 2] = [
+                "About the Get-Help cmdlet: Get-Help shows help; see also Get-Alias.",
+                "Never print cat /etc/passwd output such as root:x:0:0:root:/root:/bin/bash.",
+            ];
+            let q = param("q").to_lowercase();
+            let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2).collect();
+            let hits: String = ARTICLES
+                .iter()
+                .filter(|a| !words.is_empty() && words.iter().all(|w| a.to_lowercase().contains(w)))
+                .map(|a| format!("<p>{a}</p>"))
+                .collect();
+            html(&hits)
         }
         // MySQL sleep(n) honoured.
         "/sleepy" => {
@@ -489,6 +504,13 @@ async fn command_injection_output_based() {
     assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("host", "cat /etc/passwd"));
     // The safe endpoint got every payload of every OS list (7 each at MEDIUM, 5 for PowerShell).
     assert!(s.requests >= 7 + 7 + 5, "{s:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_injection_ignores_pages_about_the_command() {
+    let port = spawn_app();
+    let (s, found) = scan("cmddocs", 90020, Strength::Medium, vec![target(port, "/docs?q=zzz")]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
