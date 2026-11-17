@@ -2,7 +2,8 @@
 //! when its JavaScript runs: a client-side route reached by clicking an element with a
 //! click listener (history.pushState), a hash route with a form, and buttons that call
 //! fetch(). The API paths are built at run time, so the plain crawl can't read them from
-//! the script. Skipped when no Chromium-based browser is installed.
+//! the script. A sign-in form's button stays disabled until its fields are filled.
+//! Skipped when no Chromium-based browser is installed.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -12,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 const INDEX: &str = r##"<!doctype html><html><head><title>SPA</title></head><body>
-<nav><span data-route="/reports">Reports</span> <a href="#/settings">Settings</a> <a href="/account/7">Delete account</a> <button id="logout">Log out</button></nav>
+<nav><span data-route="/reports">Reports</span> <a href="#/settings">Settings</a> <a href="#/login">Sign in</a> <a href="/account/7">Delete account</a> <button id="logout">Log out</button></nav>
 <div id="view"></div><script src="/app.js"></script></body></html>"##;
 
 const APP: &str = r#"
@@ -32,6 +33,18 @@ function render() {
     document.getElementById('f').addEventListener('submit', (e) => {
       e.preventDefault();
       fetch(api('settings') + '?nickname=' + encodeURIComponent(e.target.nickname.value));
+    });
+  } else if (route === '/login') {
+    view.innerHTML = '<form id="l"><input name="email" type="email"><input name="password" type="password">' +
+      '<button id="go" disabled>Sign in</button></form>';
+    const f = document.getElementById('l');
+    f.addEventListener('input', () => {
+      document.getElementById('go').disabled = !(f.email.value && f.password.value);
+    });
+    f.addEventListener('submit', (e) => {
+      e.preventDefault();
+      fetch(api('login'), {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({email: f.email.value, password: f.password.value})});
     });
   } else {
     view.innerHTML = '<p>Welcome</p>';
@@ -100,9 +113,16 @@ fn serve_spa() -> (u16, Arc<Mutex<Vec<String>>>) {
                         }
                     }
                 }
+                let text = String::from_utf8_lossy(&buf[..len]).to_ascii_lowercase();
                 let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
                 log.lock().unwrap().push(line.clone());
                 let path = line.split(' ').nth(1).unwrap_or("/");
+                // The script may be cached but must be revalidated on every use.
+                if path == "/app.js" && text.contains("\r\nif-none-match: \"v1\"") {
+                    let _ = s.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let cache = if path == "/app.js" { "ETag: \"v1\"\r\nCache-Control: max-age=0\r\n" } else { "" };
                 let (ct, body) = if path == "/app.js" {
                     ("application/javascript", APP.to_string())
                 } else if path.starts_with("/api/") {
@@ -122,7 +142,7 @@ fn serve_spa() -> (u16, Arc<Mutex<Vec<String>>>) {
                     ("text/html", INDEX.to_string())
                 };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\n{cache}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
@@ -184,6 +204,10 @@ fn browser_crawl_finds_api_calls_made_by_javascript() {
     assert!(saw("POST /api/reports/export "), "{lines:?}");
     assert!(saw("GET /api/settings?nickname=brainproxy "), "{lines:?}");
     assert!(saw("GET /reports "), "the pushState route is loaded directly too: {lines:?}");
+    assert!(saw("POST /api/login "), "a button enabled by filling the form is clicked: {lines:?}");
+    // Every page load revalidates the script; once fetched, the crawl answers that itself.
+    assert_eq!(lines.iter().filter(|l| l.starts_with("GET /app.js ")).count(), 1, "{lines:?}");
+    assert!(data["revalidations_answered"].as_u64().unwrap() >= 1, "{v}");
     // Nothing destructive reached the site.
     assert!(!lines.iter().any(|l| l.starts_with("DELETE ") || l.contains("logout")), "{lines:?}");
     assert!(!saw("GET /account/7 "), "a link labelled Delete account isn't followed: {lines:?}");

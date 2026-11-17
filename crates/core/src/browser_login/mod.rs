@@ -720,6 +720,7 @@ impl AuthSession {
                 source: "auth",
                 tap: Some(tap.clone()),
                 no_store: self.no_store.load(std::sync::atomic::Ordering::SeqCst),
+                answer_revalidations: false,
             },
             save,
         )

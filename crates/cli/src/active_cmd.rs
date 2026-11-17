@@ -640,7 +640,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 let crawl_started = std::time::Instant::now();
                 let c = rt.block_on(brainproxy_core::crawl::crawl(project, crawl_cfg.clone(), ctl.clone()))?;
                 crawled =
-                    json!({"requests": c.requests, "endpoints": c.endpoints.len(), "depth_reached": c.depth_reached});
+                    json!({"requests": c.requests, "endpoints": c.endpoint_count, "depth_reached": c.depth_reached});
                 if let (Some(path), false) = (browser, ctl.stopped()) {
                     let avoid = crate::crawl_cmd::avoid_patterns(&[], false)?;
                     // --max-minutes covers the two crawls together.

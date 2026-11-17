@@ -7,8 +7,9 @@
 //! Exploring works like a person would: load a URL, wait until the network and the DOM
 //! have been quiet for a moment (bounded), then note the links (client-side routes from
 //! history.pushState and hash routes too), and try each clickable element: buttons,
-//! elements with click handlers, menu items. Before each click the visible fields are
-//! filled with the spider's test values, so clicking a submit button sends the form.
+//! elements with click handlers, menu items. The visible fields are filled with the
+//! spider's test values before a state is read (so a submit button that waits for valid
+//! fields is enabled) and again before each click, so clicking a submit button sends the form.
 //! Each resulting DOM state is keyed on its shape (address with ids masked, the set of
 //! clickable elements, links and forms) and explored only once, which keeps lists, pagers
 //! and repeated menus from multiplying the work. To try a click the crawler returns to
@@ -95,6 +96,9 @@ pub struct BrowserCrawlSummary {
     pub tab_restarts: usize,
     /// Requests the browser made (all recorded, source crawl-browser).
     pub requests: usize,
+    /// The browser's revalidations of scripts, styles, images and fonts already fetched in
+    /// this crawl, answered 304 by the crawl itself: not sent, not recorded.
+    pub revalidations_answered: usize,
     pub by_status: BTreeMap<String, usize>,
     pub depth_reached: usize,
     pub pages_loaded: usize,
@@ -102,11 +106,14 @@ pub struct BrowserCrawlSummary {
     pub forms_submitted: usize,
     /// Distinct DOM states explored.
     pub states: usize,
+    /// At most 200; `endpoint_count` has the total.
     pub endpoints: Vec<Endpoint>,
     pub endpoint_count: usize,
-    /// XHR and fetch() calls.
+    pub endpoints_truncated: bool,
+    /// XHR and fetch() calls, at most 200; `api_call_count` has the total.
     pub api_calls: Vec<Endpoint>,
     pub api_call_count: usize,
+    pub api_calls_truncated: bool,
     /// Elements not clicked and links not followed because they look destructive (logout, delete, ...).
     pub not_clicked: Vec<String>,
     pub not_clicked_count: usize,
@@ -237,6 +244,7 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
             source: "crawl-browser",
             tap: None,
             no_store: false,
+            answer_revalidations: true,
         },
         save,
     )
@@ -270,16 +278,19 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
     let (new_findings, record_errors) = crate::crawl::join_writer(writer).await?;
     let mut s = explored?;
     s.requests = stats.requests;
+    s.revalidations_answered = stats.revalidations_answered;
     s.by_status = stats.by_status;
     s.errors += stats.errors;
     let mut eps: Vec<Endpoint> = stats.endpoints.into_iter().collect();
     eps.sort();
     s.endpoint_count = eps.len();
+    s.endpoints_truncated = eps.len() > 200;
     eps.truncate(200);
     s.endpoints = eps;
     let mut api: Vec<Endpoint> = stats.api_calls.into_iter().collect();
     api.sort();
     s.api_call_count = api.len();
+    s.api_calls_truncated = api.len() > 200;
     api.truncate(200);
     s.api_calls = api;
     s.blocked_requests = stats.blocked;
@@ -411,6 +422,11 @@ impl<'a> Explorer<'a> {
             }
             if a.submits {
                 self.summary.forms_submitted += 1;
+            }
+            // Fields are filled before the state is read: many forms keep their submit button
+            // disabled until they are valid, and a disabled button isn't listed to be clicked.
+            if self.fill().await.unwrap_or(false) {
+                self.settle().await;
             }
             match self.eval("window.__bp ? __bp.snapshot() : null").await {
                 Ok(v) if !v.is_null() => {
@@ -622,16 +638,18 @@ impl<'a> Explorer<'a> {
         Ok(true)
     }
 
-    /// Gives empty fields the spider's test values (required boxes ticked, a select's first value).
-    async fn fill(&self) -> Result<()> {
+    /// Gives empty fields the spider's test values (required boxes ticked, a select's first
+    /// value). True when it changed any.
+    async fn fill(&self) -> Result<bool> {
         let mut fields: Vec<Field> =
             serde_json::from_value(self.eval("window.__bp ? __bp.fields() : []").await?).unwrap_or_default();
         fields.truncate(200);
         let pairs: Vec<Value> = fields.iter().filter_map(|f| fill_value(f).map(|v| json!([f.i, v]))).collect();
-        if !pairs.is_empty() {
-            self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
+        if pairs.is_empty() {
+            return Ok(false);
         }
-        Ok(())
+        self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
+        Ok(true)
     }
 
     /// Queues a page load of `raw` if it is in scope and new.

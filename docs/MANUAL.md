@@ -757,7 +757,9 @@ attack type, and pick payloads:
   - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
     and URL paths mentioned in page text or scripts (error pages included), including template
-    literals such as `` `/api/users/${id}` `` and the code-split chunks a bundle loads later
+    literals such as `` `/api/users/${id}` `` or `` `${this.host}/rest/items` `` (after a base
+    URL, a path is taken only when it has a word in it and doesn't start with another
+    value, as in `` `${base}/${id}/reviews` ``) and the code-split chunks a bundle loads later
     (`import("./About-x.js")`, `"assets/About-x.js"`); placeholder values such as `?key=…`,
     `/users/{id}` or `${id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them,
@@ -793,7 +795,8 @@ attack type, and pick payloads:
   explored the way a person would: it waits for each page to settle, follows links and
   client-side routes, clicks buttons, menus and other clickable elements, fills fields
   with test values and submits forms, and records the API calls (XHR, fetch) this
-  triggers. Each distinct page state is explored once. It is slower than the plain crawl.
+  triggers. Fields are filled before a page state is read, so a submit button that stays
+  disabled until the form is valid (a sign-in or register form) is clicked too. Each distinct page state is explored once. It is slower than the plain crawl.
   - **What it won't do:** click elements or follow links labelled like *log out*,
     *delete*, *remove*, *reset* or *unsubscribe* (the summary lists them under
     `not_clicked`), answer *OK* to a confirmation dialog, open pop-ups or downloads,
@@ -805,7 +808,11 @@ attack type, and pick payloads:
     `crawl-browser`, and the browser's own background features (updates, sync, safe
     browsing, WebRTC) are off. It uses a fresh temporary profile, removed afterwards, so
     nothing from your normal browser is used; with a login profile, the session is added
-    to every request on the site and renewed when lost.
+    to every request on the site and renewed when lost. The crawl reloads pages to get back
+    to a state; when the browser then asks whether a script, style, image or font it
+    already fetched in this crawl has changed (a conditional GET), the crawl's proxy
+    answers 304 itself, so that request isn't sent or recorded. The summary counts them in
+    `revalidations_answered`.
   - **Limits:** depth, max pages (page loads, clicks and form submissions, counting the
     reloads and clicks needed to get back to a page state), rate, path
     prefix and the site's origin apply as for the plain crawl, and it stops after 30
@@ -2311,6 +2318,27 @@ Crawl and active-scan scope and safety flags:
   time-based ones get the wait they need. When several templates send the same GET or HEAD
   request, it's sent once and they share the response.
 - The crawler submits at most 200 forms per page.
+- A crawl's summary lists at most 200 `endpoints` (and a browser crawl at most 200
+  `api_calls`); `endpoint_count` and `api_call_count` are the totals, and
+  `endpoints_truncated` and `api_calls_truncated` say when the list was cut. All of them
+  are in history either way.
+- Catch-all pages: before crawling, the plain crawler requests one path that can't exist
+  beside each seed (`brainproxy-` and 16 random hex digits; it is in history and counts
+  towards `--max-pages`, and is left out when `--max-pages` only covers the seeds). A
+  single-page app (or a soft-404 site) answers it with the same page it gives every unknown
+  path. A later response with exactly that status and body is read once, for its links; the
+  other copies are not counted as endpoints and their links aren't read again, so relative
+  links on an index.html served at `/a/b` don't multiply. The summary counts them in
+  `fallback_pages`. A catch-all page that changes with each request (it echoes the path or
+  carries a nonce) isn't recognised.
+- Paths read from scripts: when the code beside a path shows another method
+  (`http.post(`…`)`, `.put(`, `.patch(`, `.delete(`, or `method: "POST"` / `type: "PUT"` in
+  the call's options), the plain crawler doesn't send it, as a GET would only fail and the
+  body is unknown. It is listed under `unconfirmed_endpoints` (`method`, `path`, `params`,
+  `reason`; at most 200, `unconfirmed_count` has the total) instead. So is a path read from a
+  script or page text that answers a GET with 405 or a 5xx: it isn't counted as an
+  endpoint, and the error page's links (stack-trace paths) aren't followed. The request is
+  still in history.
 - `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
   bounds its crawl too, with `--browser` both crawls together).
 - `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl
