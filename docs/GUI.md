@@ -517,6 +517,13 @@ a write-up typed for an issue are kept while other findings are opened, until sa
 an *unsaved note*. They last as long as the window. The report preview holds the same findings
 as the saved report (`--limit 500`, `REPORT_LIMIT` in `views/reportSpec.ts`).
 
+The request pane marks where the finding is (`findingRanges` in `views/payloadMarks.ts`): an
+active finding's payload, found as Replay finds it (what the attack changed against the request
+the scan started from, read with `history show`, else the payload as typed, percent-encoded or
+JSON-escaped), else the name of the parameter it was found in (a query or form field, a JSON
+key, a header or a cookie). The pane's title says which is marked; the response pane searches
+for the evidence, as before.
+
 ### New finding
 
 The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findings add`: title,

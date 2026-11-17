@@ -200,3 +200,44 @@ export function marksFromSaved(v: unknown): Mark[] | undefined {
     .map((m) => ({ at: m.at, text: m.text }));
   return marks.length ? capped(marks) : undefined;
 }
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Where a parameter is named in a request: a query or form field (`name=`), a JSON key
+ * (`"name":`), a header (`Name:`) or a cookie (`name=` after `Cookie:`'s `; `). Its name only.
+ */
+export function paramMarks(raw: string, param: string): Mark[] {
+  const text = lf(raw);
+  const name = param.trim();
+  if (!name) return [];
+  const n = escapeRe(name);
+  const found = new Map<number, Mark>();
+  const patterns = [
+    // A field: after the path's ?, an &, a ; (matrix and cookie), a space, or a body's start.
+    new RegExp(`(?<=[?&;\\s]|\\n\\n|^)${n}(?==)`, "g"),
+    new RegExp(`(?<=")${n}(?="\\s*:)`, "g"),
+    new RegExp(`(?<=^|\\n)${n}(?=\\s*:)`, "gi"),
+  ];
+  for (const re of patterns) for (const m of text.matchAll(re)) found.set(m.index, { at: m.index, text: m[0] });
+  return capped([...found.values()].sort((x, y) => x.at - y.at));
+}
+
+/**
+ * What a finding's request pane highlights: the attack's payload (found against the request the
+ * scan started from, when there is one), else the parameter it was found in. Ranges are as
+ * `HttpView` takes them, line breaks as \n.
+ */
+export function findingRanges(raw: string, attack: string, param: string, baseRaw?: string | null): FindingRanges {
+  const text = lf(raw);
+  const payload = attack ? markRanges(text, payloadMarks(text, attack, baseRaw)) : [];
+  if (payload.length) return { ranges: payload, marked: "payload" };
+  const named = markRanges(text, paramMarks(text, param));
+  return { ranges: named, marked: named.length ? "parameter" : null };
+}
+
+/** What `findingRanges` found, and which it is. */
+export interface FindingRanges {
+  ranges: [number, number][];
+  marked: "payload" | "parameter" | null;
+}

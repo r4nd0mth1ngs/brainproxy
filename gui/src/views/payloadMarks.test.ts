@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changedSpans, encodedForms, isPayloadPart, markRanges, marksFromSaved, MAX_MARKS, payloadMarks } from "./payloadMarks.ts";
+import { changedSpans, encodedForms, findingRanges, isPayloadPart, markRanges, marksFromSaved, MAX_MARKS, paramMarks, payloadMarks } from "./payloadMarks.ts";
 
 const texts = (raw: string, marks: { at: number; text: string }[]) => marks.map((m) => raw.replace(/\r\n/g, "\n").slice(m.at, m.at + m.text.length));
 
@@ -72,4 +72,29 @@ test("saved marks are checked", () => {
   assert.equal(marksFromSaved([]), undefined);
   assert.deepEqual(marksFromSaved([{ at: 1, text: "x", extra: 1 }, { at: -1, text: "y" }, { at: 2 }, null]), [{ at: 1, text: "x" }]);
   assert.equal(marksFromSaved(Array.from({ length: 50 }, (_, i) => ({ at: i, text: "x" })))!.length, MAX_MARKS);
+});
+
+const slices = (raw: string, r: { ranges: [number, number][] }) => r.ranges.map(([s, e]) => raw.replace(/\r\n/g, "\n").slice(s, e));
+
+test("a finding's request pane marks the attack's payload, against the baseline when there is one", () => {
+  const base = "GET /item?q=hi HTTP/1.1\r\nHost: a.test\r\n\r\n";
+  const attack = "GET /item?q=%27%20OR%201%3D1 HTTP/1.1\r\nHost: a.test\r\n\r\n";
+  assert.deepEqual(slices(attack, findingRanges(attack, "' OR 1=1", "q", base)), ["%27%20OR%201%3D1"]);
+  assert.deepEqual(slices(attack, findingRanges(attack, "' OR 1=1", "q")), ["%27%20OR%201%3D1"]);
+  assert.equal(findingRanges(attack, "' OR 1=1", "q").marked, "payload");
+});
+
+test("without an attack, or one not in the request, the parameter's name is marked", () => {
+  const req = "POST /login?next=/ HTTP/1.1\r\nHost: a.test\r\nCookie: sid=1; token=2\r\nX-Token: t\r\n\r\nuser=a&token=b";
+  assert.deepEqual(slices(req, findingRanges(req, "", "token")), ["token", "token"]);
+  assert.deepEqual(slices(req, findingRanges(req, "zzz", "next")), ["next"]);
+  assert.equal(findingRanges(req, "zzz", "next").marked, "parameter");
+  assert.deepEqual(slices(req, findingRanges(req, "", "x-token")), ["X-Token"]);
+  const json = 'POST /api HTTP/1.1\r\nHost: a.test\r\n\r\n{"id": 1, "name": "id"}';
+  assert.deepEqual(slices(json, findingRanges(json, "", "id")), ["id"]);
+  // A name inside another isn't it; nothing at all when there's no parameter.
+  assert.deepEqual(paramMarks("GET /?userid=1 HTTP/1.1\n\n", "id"), []);
+  assert.deepEqual(findingRanges(req, "", ""), { ranges: [], marked: null });
+  // A name with regex characters is taken as written.
+  assert.deepEqual(slices("GET /?a[b]=1 HTTP/1.1\n\n", findingRanges("GET /?a[b]=1 HTTP/1.1\n\n", "", "a[b]")), ["a[b]"]);
 });

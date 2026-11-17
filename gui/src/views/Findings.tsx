@@ -44,12 +44,13 @@ import { afterMark, draftOf, dropDraft, NEXT_FINDING, PREVIOUS_FINDING, stepFind
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
-import { payloadMarks } from "./payloadMarks.ts";
+import { findingRanges, type FindingRanges, payloadMarks } from "./payloadMarks.ts";
 import type { Verify } from "./verifyFinding.ts";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
 
 const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
+const NO_RANGES: FindingRanges = { ranges: [], marked: null };
 const RANK: Record<Risk, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 const LIVE_STATES = STATES.map((s) => s.id).join(",");
 
@@ -254,6 +255,24 @@ export function FindingsView({ active }: { active: boolean }) {
       if (grew) run<Trail>(["findings", "trail", String(id)]).then((tr) => live() && setTrail(tr), () => {});
     }, () => {});
   };
+  // The attack in the request pane: its payload, located against the request the scan started
+  // from where there is one, else the parameter it was found in (payloadMarks.ts).
+  const [reqRanges, setReqRanges] = useState<FindingRanges>(NO_RANGES);
+  const attack = finding?.attack ?? "";
+  const param = finding?.param ?? "";
+  const baseId = finding?.base_history_id ?? null;
+  useEffect(() => {
+    setReqRanges(NO_RANGES);
+    if (!entry || isBinary(entry.request)) return;
+    let live = true;
+    const raw = bodyText(entry.request);
+    const base = attack && baseId != null ? historyRequest(baseId).then((b) => (b.binary ? null : b.raw), () => null) : Promise.resolve(null);
+    base.then((b) => live && setReqRanges(findingRanges(raw, attack, param, b)));
+    return () => {
+      live = false;
+    };
+  }, [entry, attack, param, baseId]);
+
   // Only on a poll: opening a finding reads it in full (above).
   useEffect(() => {
     if (selected != null && finding?.id === selected) reloadDetail(selected);
@@ -880,7 +899,13 @@ export function FindingsView({ active }: { active: boolean }) {
               )}
             </div>
             <Split id="finding-msg" dir="row">
-              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="No recorded request" />
+              <HttpView
+                title={reqRanges.marked ? `Request · ${reqRanges.marked} marked` : "Request"}
+                value={entry ? bodyText(entry.request) : ""}
+                binary={isBinary(entry?.request)}
+                placeholder="No recorded request"
+                ranges={reqRanges.ranges}
+              />
               <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder="" highlight={finding.evidence} />
             </Split>
           </Split>
