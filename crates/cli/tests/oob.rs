@@ -308,6 +308,37 @@ fn oob_confirms_ssrf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn remote_file_include_sends_the_target_only_to_the_listener() {
+    let (dir, project) = setup("rfi");
+    let app = spawn_app();
+    let url = format!("http://127.0.0.1:{app}/fetch?url=home");
+
+    // Without a listener it would have to name a third party: nothing is sent.
+    let (code, v) = run(&["scan", "active", &url, "--rules", "7"], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["requests"], 0, "{v}");
+
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["scan", "active", &url, "--rules", "7", "--oob-wait", "5"], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["raised"]["7"], 1, "the http:// prefix was fetched: {v}");
+    let (code, v) = run(&["query", "SELECT url FROM history WHERE source = 'scan'"], &project);
+    assert_eq!(code, 0, "{v}");
+    let rows = v["data"]["rows"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{v}");
+    for row in rows {
+        let sent = url_decode(row[0].as_str().unwrap());
+        assert!(sent.contains("/fetch?url=") && sent.contains("127.0.0.1"), "only the listener: {sent}");
+        assert!(!sent.contains("google"), "{sent}");
+    }
+
+    let (code, v) = run(&["oob", "stop"], &project);
+    assert_eq!(code, 0, "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn listener_in_another_namespace_is_not_taken_for_dead() {

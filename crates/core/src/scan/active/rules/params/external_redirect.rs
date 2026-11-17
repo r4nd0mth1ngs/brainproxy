@@ -87,9 +87,13 @@ const REASON_JAVASCRIPT: &str =
 
 const ORIGINAL_VALUE_PLACEHOLDER: &str = "@@@original@@@";
 
-/// A random host under owasp.org, so a match cannot be a coincidence.
+/// A random host, so a match cannot be a coincidence, under `.invalid` (RFC 6761), which no
+/// name resolves in. ZAP's is under owasp.org: a parameter that the target *fetches* (an image
+/// URL) then made the target call a host the engagement never named. A redirect only has to
+/// name the host for the browser, so detection is the same; an app that checks the host
+/// resolves before redirecting is the one that is no longer found.
 pub(crate) static REDIRECT_SITE: LazyLock<String> =
-    LazyLock::new(|| format!("{}.owasp.org", crate::scan::active::rand_u64() >> 1));
+    LazyLock::new(|| format!("{}.redirect.invalid", crate::scan::active::rand_u64() >> 1));
 
 static JS_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     let site = format!("https?://{}", *REDIRECT_SITE);
@@ -297,6 +301,12 @@ mod tests {
         assert!(check_payload(Some(&format!("HTTPS://{s}/x"))));
         assert!(!check_payload(Some(&format!("https://{s}.evil.test/"))));
         assert!(!check_payload(Some(&format!("//{s}"))));
+        // No payload names a host that resolves: the target may fetch what it is given.
+        for (payload, _, url) in payloads() {
+            let host = payload.replace("%2e", ".");
+            assert!(host.contains(".redirect.invalid") && url.contains("redirect"), "{payload}");
+            assert!(!payload.contains("owasp.org"), "{payload}");
+        }
         assert_eq!(payloads().len(), 14);
         assert_eq!(payload_count(Strength::Medium), 9);
     }

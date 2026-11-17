@@ -164,6 +164,17 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   interaction goes to other info. Log4Shell puts the token in the JNDI path instead of
   `abc`, skips the DNS-only patterns in host mode, and has no Java technology filter. XXE's
   check #1 (ZAP's own callback service) is covered by check #2 and not run separately.
+- **No third-party hosts in payloads.** The scope guard covers brainproxy's own connections,
+  not what a target does with a URL it is sent, so no payload names a host outside the
+  engagement for the target to fetch:
+  - **Remote File Inclusion (7)** sends the OOB listener's URL instead of ZAP's
+    `www.google.com`, and the target fetching it raises the alert; without a listener it
+    sends nothing. The listener answers with an empty body, so it shows the URL was fetched,
+    not that its content was included, and the same fetch is also SSRF (40046).
+  - **External Redirect (20019)** redirects to a random host under `.invalid` (which never
+    resolves) instead of ZAP's under `owasp.org`. A browser only has to be sent there, so
+    redirects are found as before; an app that checks the host resolves before redirecting
+    isn't.
 - **Timing rules** port ZAP's TimingUtils regression; the sleep time is fixed at ZAP's
   default of 5 seconds. A passing high/low sequence is run a second time and must pass
   again (all time based rules: SQL 40019-40027, command injection 90037, MongoDB 90039,
