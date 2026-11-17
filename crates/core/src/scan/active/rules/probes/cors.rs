@@ -9,8 +9,10 @@
 //! a server can answer other origins with its trusted one and still accept `null`; origins
 //! built on the host keep the port after the changed name, so they are valid URLs (ZAP
 //! writes `a.test:8080.x.com`), and are left out where an IP address makes them invalid;
-//! and the evidence is rebuilt from the header values, so it
-//! doesn't depend on how the server cases them.
+//! the evidence is rebuilt from the header values, so it doesn't depend on how the
+//! server cases them; an origin allowed without credentials (40040-2) is Low, not
+//! Medium, as passive 10098 rates a wildcard; and 40040-2 and 40040-3 are raised once
+//! per scheme://host:port in a scan, not once per page.
 
 use crate::http::RawRequest;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
@@ -45,10 +47,14 @@ static INFO: AlertDef = AlertDef {
     tags: TAGS,
 };
 
-static MEDIUM: AlertDef = AlertDef {
+/// Any origin may read, without the user's credentials.
+static ANY_ORIGIN: AlertDef = AlertDef {
     alert_ref: "40040-2",
     name: "CORS Misconfiguration",
-    risk: Risk::Medium,
+    // ZAP: Medium. Without credentials a browser sends no cookies or HTTP
+    // authentication, so another site reads only what anyone who can reach the server
+    // can; passive 10098 rates a wildcard Low too.
+    risk: Risk::Low,
     confidence: Confidence::High,
     cwe: 942,
     wasc: 14,
@@ -58,7 +64,8 @@ static MEDIUM: AlertDef = AlertDef {
     tags: TAGS,
 };
 
-static HIGH: AlertDef = AlertDef {
+/// Any origin may read, with the user's credentials.
+static WITH_CREDENTIALS: AlertDef = AlertDef {
     alert_ref: "40040-3",
     name: "CORS Misconfiguration",
     risk: Risk::High,
@@ -71,7 +78,7 @@ static HIGH: AlertDef = AlertDef {
     tags: TAGS,
 };
 
-static ALERTS: [&AlertDef; 3] = [&INFO, &MEDIUM, &HIGH];
+static ALERTS: [&AlertDef; 3] = [&INFO, &ANY_ORIGIN, &WITH_CREDENTIALS];
 
 /// `host[:port]` as host and `:port` (empty without one); an IPv6 host stays in its brackets.
 fn split_port(authority: &str) -> (&str, &str) {
@@ -107,12 +114,12 @@ fn assess(acao: &str, acac: Option<&str>, random: &str, https: bool) -> &'static
     if acao.contains(',') {
         &INFO
     } else if acao.trim() == "*" {
-        &MEDIUM
+        &ANY_ORIGIN
     } else if acao.contains(random) || acao.trim() == "null" || (https && acao.contains("http:")) {
         if acac.is_some_and(|v| v.trim() == "true") {
-            &HIGH
+            &WITH_CREDENTIALS
         } else {
-            &MEDIUM
+            &ANY_ORIGIN
         }
     } else {
         &INFO
@@ -170,7 +177,12 @@ impl ActiveRule for Cors {
                     .raise("", evidence(&acao, acac))
                     .attack(format!("Origin: {}", origin.as_deref().unwrap_or("")));
                 if alert.risk != Risk::Info {
-                    cx.report(finding, &resp);
+                    // CORS headers usually come from one middleware for the whole host,
+                    // so the same answer on every page is one finding, not one per page.
+                    // The probes still run on each page: one may allow credentials.
+                    if cx.once(&format!("40040|{}|{}", alert.alert_ref, target.origin())) {
+                        cx.report(finding, &resp);
+                    }
                     return;
                 }
                 info.get_or_insert((finding, resp));
@@ -238,6 +250,16 @@ mod tests {
         assert_eq!(refs("http://a.test", Some("true"), false), "40040-1", "its own origin");
         assert_eq!(refs("https://a.test", None, true), "40040-1");
         assert_eq!(refs("https://nullsoft.test", Some("true"), true), "40040-1");
+    }
+
+    #[test]
+    fn without_credentials_is_low() {
+        // What passive 10098 rates a wildcard: any page can read it, but never with the
+        // user's cookies, so only what's public to the network is exposed.
+        assert_eq!(assess("*", None, "rnd", false).risk, Risk::Low);
+        assert_eq!(assess("http://rnd.com", None, "rnd", false).risk, Risk::Low, "the same as a wildcard");
+        assert_eq!(assess("null", Some("false"), "rnd", false).risk, Risk::Low);
+        assert_eq!(assess("http://rnd.com", Some("true"), "rnd", false).risk, Risk::High);
     }
 
     #[test]

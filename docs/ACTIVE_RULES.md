@@ -225,6 +225,14 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   during find command", Mongoose's `CastError`) as well as ZAP's Java ones; an error
   counts only when a plain random value doesn't bring it, so a type check that rejects
   every id that isn't an ObjectId isn't reported.
+- **CORS (40040)** rates an origin that any site may use without credentials
+  (`Access-Control-Allow-Origin: *`, or a reflected or `null` origin without
+  `Access-Control-Allow-Credentials: true`) Low (40040-2; ZAP: Medium), as passive 10098
+  rates a wildcard: the browser sends no cookies with it, so another site reads only what
+  anyone who can reach the server can. With credentials it stays High (40040-3). Both are
+  raised once per scheme://host:port in a scan, since CORS headers usually come from one
+  middleware for the whole host; every page is still probed, so a page that allows
+  credentials is found after one that doesn't.
 - **Remote OS Command Injection (90020)** sends a control before it reports: the same
   attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
   `;#get-help`). The output must not come back for it, so a search or help page that
