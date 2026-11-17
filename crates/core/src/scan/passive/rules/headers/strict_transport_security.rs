@@ -190,6 +190,10 @@ impl PassiveRule for StrictTransportSecurity {
         if msg.is_https() {
             let sts: Vec<&str> = header_values(msg, HSTS).collect();
             match sts.as_slice() {
+                // Not on a 304, which ZAP counts as a redirect without a safe Location: it
+                // answers a revalidation and needn't repeat the 200's headers (RFC 9110
+                // 15.4.5), so it says nothing of whether the page sends the header.
+                [] if msg.status == 304 => {}
                 [] => {
                     if !(is_redirect(msg.status) && is_safe_redirect(msg)) {
                         out.push(MISSING.raise("", ""));
@@ -260,6 +264,14 @@ mod tests {
         assert_eq!(r("https://a.test:8443/login"), 1);
         assert_eq!(r("http://a.test/login"), 1);
         assert_eq!(msg("https://a.test/").status(302).scan(&StrictTransportSecurity).len(), 1);
+    }
+
+    /// A 304 without the header isn't a missing header (it counted as a redirect to nowhere).
+    #[test]
+    fn not_modified_is_not_missing_the_header() {
+        assert!(msg("https://a.test/app.js").status(304).scan(&StrictTransportSecurity).is_empty());
+        let bad = msg("https://a.test/").status(304).header(HSTS, "max-age=0").scan(&StrictTransportSecurity);
+        assert_eq!(refs(&bad), ["10035-2"]);
     }
 
     #[test]

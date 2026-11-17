@@ -128,3 +128,5 @@ noise on modern applications:
   audio and video. It also raises Medium (low confidence) when a response allows the
   request's `Origin` of another site, or `null`, with `Access-Control-Allow-Credentials: true`,
   which ZAP's passive rule doesn't look at; the active CORS rule (40040) confirms it.
+- **Strict-Transport-Security Header (10035-1)** isn't raised on a `304 Not Modified`,
+  which ZAP counts as a redirect: a revalidation needn't repeat the full response's headers.
