@@ -73,7 +73,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | ID | Rule | Scope | Max risk | Alert refs |
 |---|---|---|---|---|
 | 0 | Directory Browsing | page | medium | 0 |
-| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3, 6-4, 6-5 |
+| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3, 6-4 |
 | 7 | Remote File Inclusion | param | high | 7 |
 | 10045 | Source Code Disclosure - /WEB-INF Folder | host | high | 10045-1 |
 | 10047 | HTTPS Content Available via HTTP | page | low | 10047 |
@@ -190,6 +190,11 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.
+- **Path Traversal (6)** doesn't run ZAP's check 5 (alert 6-5), which sends the URL's own
+  file name and reports a 200 where a random value got none: the status alone, which any
+  parameter that takes a name from a list gives, and a probe that would overwrite the app's
+  own script where the path is written to. It found nothing real on the OWASP Benchmark and
+  raised 15 false reports. The other checks report file contents only.
 - **Redirects followed:** a rule that follows redirects (as ZAP does) still files its
   finding under the request it attacked, with that request's own response, not under the
   page the redirect led to. When that response doesn't show the evidence itself (a POST

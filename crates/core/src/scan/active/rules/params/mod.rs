@@ -384,7 +384,7 @@ mod e2e {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn path_traversal_own_file_name_comes_from_the_probe() {
+    async fn path_traversal_needs_file_contents_not_a_status() {
         let port = spawn_app();
         let target = |path: &str| {
             let (request, response) = fetch(port, path);
@@ -392,21 +392,18 @@ mod e2e {
             ScanTarget { history_id: None, target, request, response, duration_ms: None }
         };
         let opts = PointOptions { path: true, ..Default::default() };
-
-        // A last segment is never attacked with its own value, with or without a slash.
-        let s = scan_targets("own-status", vec![target("/own/status")], opts.clone(), Some(vec![6])).await;
-        assert!(s.raised.is_empty(), "{s:?}");
-        let s = scan_targets("own-clock", vec![target("/own/clock")], opts.clone(), Some(vec![6])).await;
-        assert!(s.raised.is_empty(), "{s:?}");
-
-        // A query parameter that reads the script is still found; the path segment is not.
-        let s = scan_targets("own-view", vec![target("/view?page=home")], opts.clone(), Some(vec![6])).await;
-        assert_eq!(s.raised.get("6-5"), Some(&1), "{s:?}");
-        assert_eq!(s.raised.len(), 1, "{s:?}");
-        // Also when the value is already the script's name and the attack is the original page.
-        let s = scan_targets("own-jsp", vec![target("/view.jsp?file=view.jsp")], opts, Some(vec![6])).await;
-        assert_eq!(s.raised.get("6-5"), Some(&1), "{s:?}");
-        assert_eq!(s.raised.len(), 1, "{s:?}");
+        // Each answers 200 for the URL's own file name and 404 for anything else. Nothing shows
+        // a file was read: a route segment, a name from a fixed list, and (the OWASP Benchmark's
+        // false reports) a value that already was the file name, the attack resending it.
+        for (name, path) in [
+            ("own-status", "/own/status"),
+            ("own-clock", "/own/clock"),
+            ("own-view", "/view?page=home"),
+            ("own-jsp", "/view.jsp?file=view.jsp"),
+        ] {
+            let s = scan_targets(name, vec![target(path)], opts.clone(), Some(vec![6])).await;
+            assert!(s.raised.is_empty(), "{path}: {s:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -2,14 +2,22 @@
 //!
 //! brainproxy has no technology filter, so every check runs (ZAP's default, where
 //! all technologies are in scope). `isPage200` is a plain status check.
+//!
+//! ZAP's check 5 (alert 6-5) isn't run. It sends the URL's own file name and reports a 200
+//! without "error" in it after a random value didn't get one: the status alone, rated high.
+//! That is what any parameter that takes a name from a fixed list does (`?view=products`), and
+//! where the value already was the file name it resent the original request: on the OWASP
+//! Benchmark it raised 15 false reports and no true one in 1,639 tests. Nothing in such a
+//! response shows a file was read, and the probe names the app's own script, which a sink that
+//! writes to the path (PHP resolves it next to the script) would overwrite. The checks that
+//! remain report file contents only.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use super::common;
-use crate::http::RawRequest;
-use crate::scan::active::{points, ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
+use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
 use crate::scan::passive::util::decode_entities;
 use crate::scan::{AlertDef, Confidence, Risk};
 
@@ -96,11 +104,8 @@ alert!(ALERT_1, "6-1");
 alert!(ALERT_2, "6-2");
 alert!(ALERT_3, "6-3");
 alert!(ALERT_4, "6-4");
-alert!(ALERT_5, "6-5");
 
-static ALERTS: [&AlertDef; 5] = [&ALERT_1, &ALERT_2, &ALERT_3, &ALERT_4, &ALERT_5];
-
-const NON_EXISTANT_FILENAME: &str = "thishouldnotexistandhopefullyitwillnot";
+static ALERTS: [&AlertDef; 4] = [&ALERT_1, &ALERT_2, &ALERT_3, &ALERT_4];
 
 const WIN_DIR_EVIDENCE: &str = "Windows";
 pub(crate) const WIN_LOCAL_FILE_TARGETS: &[&str] = &[
@@ -159,13 +164,10 @@ const NIX_LOCAL_DIR_TARGETS: &[&str] = &[
     "file:///",
 ];
 
-const LOCAL_FILE_RELATIVE_PREFIXES: &[&str] = &["", "/", "\\"];
-
 static WIN_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[drivers\]").unwrap());
 // Dot used to match 'x' or '!' (used in AIX).
 static NIX_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"root:.:0:0").unwrap());
 static WAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</web-app>").unwrap());
-static ERROR_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)Exception|Error").unwrap());
 static PROGRAM_FILES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)Program\sFiles").unwrap());
 // Java's `\W` is ASCII-only: `(?:^|\W)name(?:\W|$)`.
 static NIX_DIRS: LazyLock<[Regex; 5]> = LazyLock::new(|| {
@@ -218,11 +220,6 @@ fn counts(strength: Strength) -> (usize, usize, usize, usize, usize, bool) {
             true,
         ),
     }
-}
-
-/// `URI.getName()`: the last path segment.
-fn url_file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or("")
 }
 
 pub struct PathTraversal;
@@ -311,30 +308,6 @@ impl ActiveRule for PathTraversal {
                 sslash = format!("../{sslash}");
                 bslash = format!("..\\{bslash}");
             }
-
-            // Check 5 (LOW and MEDIUM threshold): the URL's own file name as the value,
-            // when a random value does not give a 200 (or gives an error page).
-            let Ok(resp) = common::send_following(cx, NON_EXISTANT_FILENAME).await else { return };
-            // The name comes from the probe's URL, as in ZAP: a URL path's last segment holds
-            // the random value there, so its own value is never sent as an attack.
-            let probe = points::inject(cx.base_request(), cx.point(), NON_EXISTANT_FILENAME, true);
-            let probe_target = RawRequest::from_bytes(probe).head().map(|h| h.target).unwrap_or_default();
-            let file_name = url_file_name(probe_target.split('?').next().unwrap_or(""));
-            if file_name.is_empty() || (resp.status == 200 && !ERROR_PATTERN.is_match(resp.body_str())) {
-                return;
-            }
-            for prefix in LOCAL_FILE_RELATIVE_PREFIXES {
-                if cx.stopped() {
-                    return;
-                }
-                let attack = format!("{prefix}{file_name}");
-                let Ok(resp) = common::send_following(cx, &attack).await else { continue };
-                if resp.status == 200 && !ERROR_PATTERN.is_match(resp.body_str()) {
-                    let f = ALERT_5.raise(cx.point().name.clone(), "").attack(attack).confidence(Confidence::Low);
-                    cx.report(f, &resp);
-                    return;
-                }
-            }
         })
     }
 }
@@ -377,12 +350,12 @@ mod tests {
     fn request_counts_per_strength() {
         let total = |s| {
             let (n, w, nd, wd, d, _) = counts(s);
-            n + w + nd + wd + d * 4 + 1
+            n + w + nd + wd + d * 4
         };
-        // ZAP's documented totals per parameter (excluding the final url-filename check).
-        assert_eq!(total(Strength::Low), 7);
-        assert_eq!(total(Strength::Medium), 15);
-        assert_eq!(total(Strength::High), 28);
+        // ZAP's documented totals per parameter (7, 15, 28) less check 5's random value.
+        assert_eq!(total(Strength::Low), 6);
+        assert_eq!(total(Strength::Medium), 14);
+        assert_eq!(total(Strength::High), 27);
         assert_eq!(WIN_LOCAL_FILE_TARGETS.len(), 18);
         assert_eq!(WIN_LOCAL_DIR_TARGETS.len(), 15);
         assert_eq!(NIX_LOCAL_FILE_TARGETS[5], r"file:\\\etc/passwd");
@@ -406,14 +379,12 @@ mod tests {
     }
 
     #[test]
-    fn other_info_and_file_names() {
+    fn other_info() {
         let info = INFO.replace("{0}", "etc").replace("{1}", NIX_MATCHES);
         assert_eq!(
             info,
             "While the evidence field indicates etc, the rule actually checked that the response contains matches for \
              all of the following: proc, etc, boot, tmp, home."
         );
-        assert_eq!(url_file_name("/a/b/view.jsp"), "view.jsp");
-        assert_eq!(url_file_name("/a/"), "");
     }
 }
