@@ -8,11 +8,16 @@
 //! looks for them on the sink pages. Behaviour is
 //! ZAP's at the MEDIUM alert threshold: attacks are looked for anywhere on the sink page, and
 //! PUT requests are skipped. The attack stops after its first alert.
+//!
+//! Unlike ZAP, the sink page's type decides the alert on every path, not only the
+//! one outside tags: High (40014-1) only where a browser renders the page as HTML
+//! (`renders_as_html`), the Low JSON weakness (40014-2) for JSON, and Low (40014-3,
+//! High in ZAP) for any other type, which a browser shows as text.
 
 use std::sync::Arc;
 
 use super::common::{self, HtmlContext, HtmlContextAnalyser, EYE_CATCHER};
-use super::cross_site_scripting::{XSS_DESCRIPTION, XSS_REFERENCES, XSS_SOLUTION};
+use super::cross_site_scripting::{renders_as_html, XSS_DESCRIPTION, XSS_REFERENCES, XSS_SOLUTION};
 use crate::scan::active::source_sink::Sink;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, PointKind, Response, RuleScope};
 use crate::scan::{AlertDef, Confidence, Finding, Risk};
@@ -51,7 +56,7 @@ static JSON: AlertDef = AlertDef {
 static NOT_HTML_ALERT: AlertDef = AlertDef {
     alert_ref: "40014-3",
     name: "Cross Site Scripting (Persistent)",
-    risk: Risk::High,
+    risk: Risk::Low,
     confidence: Confidence::Low,
     cwe: 79,
     wasc: 8,
@@ -174,14 +179,26 @@ impl Pxss<'_> {
         self.cx.report(f, resp);
     }
 
+    /// The attack was found on the sink page `resp`: the High alert if a browser
+    /// renders that page as HTML, the weaker non-HTML alerts otherwise.
+    fn report_found(&self, attack: &str, evidence: &str, other_info: &str, resp: &Response) {
+        if renders_as_html(resp) {
+            self.report(&ALERT, attack, evidence, other_info, resp);
+        } else if resp.content_type().contains("json") {
+            self.report(&JSON, GENERIC_SCRIPT_ALERT, "", NOT_HTML, resp);
+        } else {
+            self.report(&NOT_HTML_ALERT, attack, attack, NOT_HTML, resp);
+        }
+    }
+
     /// The common alert: the attack as found, with the source URL as other info.
     fn raise(&self, ctx: &HtmlContext) {
-        self.report(&ALERT, &ctx.target, "", &self.other_info, &ctx.resp);
+        self.report_found(&ctx.target, "", &self.other_info, &ctx.resp);
     }
 
     /// The alert variant ZAP raises with the attack as evidence and no other info.
     fn raise_evidence(&self, ctx: &HtmlContext) {
-        self.report(&ALERT, &ctx.target, &ctx.target, "", &ctx.resp);
+        self.report_found(&ctx.target, &ctx.target, "", &ctx.resp);
     }
 
     /// performAttack: stores `attack` through the parameter, re-reads the sink page and
@@ -302,7 +319,7 @@ impl Pxss<'_> {
                     let encoded = common::url_encode(GENERIC_SCRIPT_ALERT);
                     if let Some(c3) = self.perform(sink, &encoded, true, false).await.filter(|c| !c.is_empty()) {
                         let attack = common::url_encode(&common::url_encode(&c3[0].target));
-                        self.report(&ALERT, &attack, GENERIC_SCRIPT_ALERT, "", &c3[0].resp);
+                        self.report_found(&attack, GENERIC_SCRIPT_ALERT, "", &c3[0].resp);
                         return Outcome::Found;
                     }
                     return Outcome::Stop;
@@ -339,13 +356,7 @@ impl Pxss<'_> {
                     return Outcome::Stop;
                 };
                 let Some(c) = c2.iter().find(|c| c.parent_tag().is_some()) else { return Outcome::Next };
-                if common::is_html(&c.resp) {
-                    self.report(&ALERT, &c.target, &c.target, "", &c2[0].resp);
-                } else if c.resp.content_type().contains("json") {
-                    self.report(&JSON, GENERIC_SCRIPT_ALERT, "", NOT_HTML, &c2[0].resp);
-                } else {
-                    self.report(&NOT_HTML_ALERT, &c.target, &c.target, NOT_HTML, &c2[0].resp);
-                }
+                self.report_found(&c.target, &c.target, "", &c2[0].resp);
                 Outcome::Found
             }
         }

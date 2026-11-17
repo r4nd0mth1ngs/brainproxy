@@ -63,6 +63,9 @@ mod e2e {
     /// Guestbooks for the persistent XSS tests: (raw, escaped), the last 20 entries each.
     static GUESTBOOK: std::sync::Mutex<(Vec<String>, Vec<String>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
 
+    /// The guestbook served as JSON and as plain text, entries unescaped.
+    static GUESTBOOK_DATA: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
     static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn sign(book: &mut Vec<String>, text: String) {
@@ -86,6 +89,50 @@ mod e2e {
         match path {
             "/xss" => ok("text/html", format!("<html><body><p>Hello {}</p></body></html>", param("q"))),
             "/xss-safe" => ok("text/html", format!("<html><body><p>Hello {}</p></body></html>", escape(&param("q")))),
+            // Markup in a JSON string or a text page, unescaped: no browser renders it.
+            "/xss-json" => ok("application/json", format!("{{\"html\":\"<p>Hello {}</p>\"}}", param("q"))),
+            "/xss-text" => ok("text/plain; charset=utf-8", format!("<p>Hello {}</p>", param("q"))),
+            // Strips ASCII brackets (and `%`), but echoes full-width ones as they came, which
+            // no browser reads as markup. The value is shown outside tags and in a paragraph.
+            "/xss-fullwidth" => {
+                let q: String = param("q").chars().filter(|c| !"<>%".contains(*c)).collect();
+                ok("text/html", format!("Hello {q}<html><body><p>{q}</p></body></html>"))
+            }
+            // A C program printing the value as its format: `%n` crashes it, `%x` prints a
+            // word of the stack, `%%` a percent sign.
+            "/printf" => {
+                let q = param("q").replace("%%", "%");
+                if q.contains("%n") {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    ok("text/html", format!("<p>{}</p>", q.replace("%x", "bfffe3c4")))
+                }
+            }
+            // Decodes the value again, as `decodeURIComponent` does: any `%` not followed by
+            // two hex digits is a 500 (URIError). It also echoes the value.
+            "/uri" => {
+                let q = param("q");
+                let bad = q
+                    .match_indices('%')
+                    .any(|(i, _)| !q.get(i + 1..i + 3).is_some_and(|h| h.chars().all(|c| c.is_ascii_hexdigit())));
+                if bad {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    ok("text/html", format!("<p>{}</p>", escape(&q)))
+                }
+            }
+            "/comment-data" => {
+                sign(&mut GUESTBOOK_DATA.lock().unwrap(), param("text"));
+                ok("text/html", "<p>saved</p>".into())
+            }
+            "/comments-json" | "/comments-text" => {
+                let items: String = GUESTBOOK_DATA.lock().unwrap().iter().map(|e| format!("<li>{e}</li>")).collect();
+                if path == "/comments-json" {
+                    ok("application/json", format!("{{\"html\":\"<ul>{items}</ul>\"}}"))
+                } else {
+                    ok("text/plain", format!("<ul>{items}</ul>"))
+                }
+            }
             "/file" => {
                 let name = param("name");
                 if name == "readme.txt" {
@@ -477,6 +524,44 @@ mod e2e {
         assert_eq!(xpath_eval("@emplid=\"2\" or \"1\"=\"2\"", "3"), Some(false));
         assert_eq!(xpath_eval("@emplid='2''", "2"), None);
         assert_eq!(xpath_eval("@emplid=2'", "2"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xss_in_a_response_no_browser_renders_as_html() {
+        let port = spawn_app();
+        // Reflected: not reported at all, as ZAP does at MEDIUM.
+        let s = scan("xss-data", port, &["/xss-json?q=hi", "/xss-text?q=hi"], Some(vec![40012])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+        // Persistent: the weak JSON alert, never the High one.
+        let s = scan("pxss-json", port, &["/comment-data?text=hi", "/comments-json"], Some(vec![40014])).await;
+        assert_eq!(s.raised.get("40014-2"), Some(&1), "{s:?}");
+        assert_eq!(s.raised.len(), 1, "{s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xss_full_width_brackets_echoed_are_not_xss() {
+        let port = spawn_app();
+        let s = scan("xss-fullwidth", port, &["/xss-fullwidth?q=hi"], Some(vec![40012])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+        assert!(s.requests > 10, "the rule did attack: {s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn format_string_needs_the_conversions_to_cause_the_500() {
+        let port = spawn_app();
+        let s = scan("fmt", port, &["/printf?q=hi"], Some(vec![30002])).await;
+        assert_eq!(s.raised.get("30002"), Some(&1), "{s:?}");
+        // A 500 for any stray `%` (and `%%`) is not a format string error.
+        let s = scan("fmt-uri", port, &["/uri?q=hi"], Some(vec![30002])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persistent_xss_in_plain_text_is_low_risk() {
+        let port = spawn_app();
+        let s = scan("pxss-text", port, &["/comment-data?text=hi", "/comments-text"], Some(vec![40014])).await;
+        assert_eq!(s.raised.get("40014-3"), Some(&1), "{s:?}");
+        assert_eq!(s.raised.len(), 1, "{s:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

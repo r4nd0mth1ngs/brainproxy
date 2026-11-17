@@ -187,8 +187,26 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   - (HQL Injection 100003 and NoSQL Injection - MongoDB 40033 do the same for their error
     messages;)
   - the HTTP 500 check runs for quotes only, and the 500 must repeat and go away when
-    each quote is doubled (an escaped quote in an SQL string): input validation and
-    type errors (`true'` in a JSON boolean) reject both.
+    each quote is doubled inside a value (`x''y`, an escaped quote in an SQL string):
+    input validation and type errors (`true'` in a JSON boolean) reject both. The
+    doubled quotes are never sent alone, because `""` is a valid quoted cookie value
+    that a server rejecting `"` in a cookie accepts;
+  - a bare 500 is the last resort: a database error message in the 500 page is matched
+    first and names the database (Medium confidence), and the bare 500 (Low confidence)
+    is reported only when no other check (error message, expression, boolean, UNION,
+    ORDER BY) found the parameter.
+- **Remote OS Command Injection (90020)** sends a control before it reports: the same
+  attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
+  `;#get-help`). The output must not come back for it, so a search or help page that
+  shows matching text for the command's words isn't reported. PowerShell output is
+  recognised by the description `get-help` prints, not by the words "cmdlet",
+  "Get-Help" or "Get-Alias" (ZAP), which any PowerShell documentation page has.
+- **Format String Error (30002)** runs without ZAP's C technology filter, so a 500 counts
+  only when the format conversions cause it: the 500 must repeat, and neither a plain
+  value of the same length nor the same length of `%%` (a literal `%` to printf) may give
+  one. A `URIError` from decoding `%` twice, a validator that rejects `%`, or a page that
+  failed for another reason isn't reported. The `%x` follow-up is compared with a plain
+  value of the same length, so a page that echoes or stores the value doesn't pass it.
 - **LDAP Injection (40015)** keeps ZAP's id, alert texts and error attack (every filter
   metacharacter), and checks differently:
   - *Error based* (40015-1, high confidence): only messages an LDAP library or server
@@ -236,6 +254,13 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **Persistent XSS (40014)** follows ZAP's MEDIUM threshold (attacks are looked for anywhere
   on the sink page; PUT requests are skipped) and stops at the first alert per parameter.
   Sinks are the target requests themselves, re-sent, rather than ZAP's temporary history.
+- **XSS and the response type.** Reflected XSS (40012) reports an attack only in a response
+  a browser renders as markup: an HTML or SVG Content-Type, or none without
+  `X-Content-Type-Options: nosniff`. A reflection in JSON, plain text or any other type is
+  not reported, whichever attack found it (ZAP checks the type on some paths only). For
+  Persistent XSS (40014) the sink page's type picks the alert on every path: 40014-1 (High)
+  for HTML, 40014-2 (Low, JSON weakness) for JSON, and 40014-3 (Low risk, High in ZAP) for
+  other types, which a browser shows as text.
 - **Heartbleed (20015)** opens its raw TCP connection through the guarded client
   (`Cx::connect_raw`), so the engagement scope applies; the heartbeat response is only
   measured (more than 3 bytes back means vulnerable), never stored. Port 80 is tested on

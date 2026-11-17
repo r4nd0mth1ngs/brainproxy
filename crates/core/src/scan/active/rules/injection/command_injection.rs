@@ -1,4 +1,12 @@
 //! Ported from ZAP CommandInjectionScanRule (ascanrules, Apache License 2.0).
+//!
+//! Differences from ZAP, against false positives:
+//! - The output found must go away when the same attack is sent with its command
+//!   commented out (`commented`): a search or help page that shows matching text
+//!   for the words of the command shows it for the commented attack too.
+//! - PowerShell's output is recognised by the text `get-help` prints
+//!   (`PS_CTRL`), not by the words "cmdlet", "Get-Help" or "Get-Alias", which any
+//!   PowerShell documentation page has.
 
 use std::sync::LazyLock;
 
@@ -98,9 +106,12 @@ const NULL: &str = "\0";
 /// `root:.:0:0` (the dot matches 'x' or '!', used in AIX).
 static NIX_CTRL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"root:.:0:0").unwrap());
 static WIN_CTRL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[fonts\]").unwrap());
-/// Java `(?:\sGet-Help)(?i)|cmdlet|get-alias`: the inline flag makes only the
-/// alternatives after it case-insensitive.
-static PS_CTRL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\sGet-Help|(?i:cmdlet|get-alias)").unwrap());
+/// The short description `get-help` prints without arguments (Windows PowerShell
+/// 5 and PowerShell 7), under its section heading. ZAP's
+/// `(?:\sGet-Help)(?i)|cmdlet|get-alias` matches any page about PowerShell.
+static PS_CTRL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)SHORT DESCRIPTION\s+Displays help about (?:Windows )?PowerShell cmdlets and concepts").unwrap()
+});
 
 /// *nix payloads in ZAP's order (one random uninitialised variable per run, as ZAP
 /// computes it once per class load).
@@ -218,10 +229,8 @@ impl ActiveRule for CommandInjection {
             let max = PS_PAYLOADS.len().max(NIX_PAYLOADS.len()).max(WIN_PAYLOADS.len());
             let target_count = by_strength(cx.strength(), [3, 7, 13, max]);
             // All OS technologies are in scope: *nix, then Windows cmd, then PowerShell.
-            for (payloads, ctrl) in
-                [(&*NIX_PAYLOADS, &*NIX_CTRL), (&*WIN_PAYLOADS, &*WIN_CTRL), (&*PS_PAYLOADS, &*PS_CTRL)]
-            {
-                if cx.stopped() || test_injection(cx, target_count, payloads, ctrl).await {
+            for os in [&NIX, &WIN, &PS] {
+                if cx.stopped() || test_injection(cx, target_count, os).await {
                     return;
                 }
             }
@@ -229,8 +238,31 @@ impl ActiveRule for CommandInjection {
     }
 }
 
-/// Feedback based check: the payload's output must show up in the response.
-async fn test_injection(cx: &Cx, target_count: usize, payloads: &[String], ctrl: &Regex) -> bool {
+/// One shell's payloads, the pattern its command's output matches, and how to
+/// comment the command out.
+struct Os {
+    payloads: &'static LazyLock<Vec<String>>,
+    ctrl: &'static LazyLock<Regex>,
+    /// The first word of the test command, where the comment goes.
+    command: &'static str,
+    comment: &'static str,
+}
+
+static NIX: Os = Os { payloads: &NIX_PAYLOADS, ctrl: &NIX_CTRL, command: "cat", comment: "#" };
+static WIN: Os = Os { payloads: &WIN_PAYLOADS, ctrl: &WIN_CTRL, command: "type", comment: "rem " };
+static PS: Os = Os { payloads: &PS_PAYLOADS, ctrl: &PS_CTRL, command: PS_TEST_CMD, comment: "#" };
+
+/// The payload with its command commented out: the same words reach the
+/// application, but a shell runs nothing.
+fn commented(payload: &str, os: &Os) -> Option<String> {
+    let at = payload.find(os.command)?;
+    Some(format!("{}{}{}", &payload[..at], os.comment, &payload[at..]))
+}
+
+/// Feedback based check: the payload's output must show up in the response, and
+/// not for the same payload with its command commented out.
+async fn test_injection(cx: &Cx, target_count: usize, os: &Os) -> bool {
+    let ctrl: &Regex = os.ctrl;
     // ZAP skips every payload whose pattern already matches the original response;
     // all payloads of a list share one pattern.
     if ctrl.is_match(cx.base_response().body_str()) {
@@ -238,8 +270,9 @@ async fn test_injection(cx: &Cx, target_count: usize, payloads: &[String], ctrl:
     }
     let (param, value) = point(cx);
     let mut first = true;
-    for payload in payloads.iter().take(target_count) {
-        let attack = if first { payload.clone() } else { format!("{value}{payload}") };
+    for payload in os.payloads.iter().take(target_count) {
+        let prefix = if first { "" } else { value.as_str() };
+        let attack = format!("{prefix}{payload}");
         first = false;
         let Ok(resp) = cx.send_payload(&attack).await else {
             if cx.stopped() {
@@ -247,9 +280,12 @@ async fn test_injection(cx: &Cx, target_count: usize, payloads: &[String], ctrl:
             }
             continue;
         };
-        let body = resp.body_str();
-        let content = if resp.content_type().contains("html") { unescape_html4(body) } else { body.to_string() };
-        if let Some(m) = ctrl.find(&content) {
+        if let Some(m) = ctrl.find(&content(&resp)) {
+            let Some(control) = commented(payload, os) else { continue };
+            let Ok(control_resp) = cx.send_payload(&format!("{prefix}{control}")).await else { continue };
+            if ctrl.is_match(&content(&control_resp)) {
+                continue;
+            }
             let finding = ALERT.raise(param, m.as_str()).attack(attack.clone()).other_info(other_info(&attack));
             cx.report(finding, &resp);
             return true;
@@ -259,6 +295,16 @@ async fn test_injection(cx: &Cx, target_count: usize, payloads: &[String], ctrl:
         }
     }
     false
+}
+
+/// The body as text, HTML entities resolved in HTML.
+fn content(resp: &crate::scan::active::Response) -> String {
+    let body = resp.body_str();
+    if resp.content_type().contains("html") {
+        unescape_html4(body)
+    } else {
+        body.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -284,10 +330,28 @@ mod tests {
         assert!(NIX_CTRL.is_match("root:!:0:0::/:/usr/bin/ksh"));
         assert!(!NIX_CTRL.is_match("root:xx:0:0"));
         assert!(WIN_CTRL.is_match("; for 16-bit app support\n[fonts]\n[extensions]"));
-        assert!(PS_CTRL.is_match("NAME\n    Get-Help"));
-        assert!(!PS_CTRL.is_match("NAME\n    get-help"));
-        assert!(PS_CTRL.is_match("about the CMDLET"));
-        assert!(PS_CTRL.is_match("Get-Alias"));
+        assert!(PS_CTRL.is_match(
+            "TOPIC\n    Windows PowerShell Help System\n\nSHORT DESCRIPTION\n    Displays help about Windows \
+             PowerShell cmdlets and concepts."
+        ));
+        assert!(PS_CTRL.is_match("SHORT DESCRIPTION\r\n  Displays help about PowerShell cmdlets and concepts."));
+        // Documentation about PowerShell is not its output.
+        assert!(!PS_CTRL.is_match("About the Get-Help cmdlet: Get-Help and Get-Alias"));
+    }
+
+    #[test]
+    fn commented_attacks() {
+        assert_eq!(commented(";cat /etc/passwd;", &NIX).as_deref(), Some(";#cat /etc/passwd;"));
+        assert_eq!(commented(&NIX_PAYLOADS[12], &NIX).map(|c| c.starts_with("&#cat$")), Some(true));
+        assert_eq!(
+            commented("\"&type %SYSTEMROOT%\\win.ini&\"", &WIN).as_deref(),
+            Some("\"&rem type %SYSTEMROOT%\\win.ini&\"")
+        );
+        assert_eq!(commented(";get-help #", &PS).as_deref(), Some(";#get-help #"));
+        // Every payload has its command to comment out.
+        for os in [&NIX, &WIN, &PS] {
+            assert!(os.payloads.iter().all(|p| commented(p, os).is_some()));
+        }
     }
 
     #[test]

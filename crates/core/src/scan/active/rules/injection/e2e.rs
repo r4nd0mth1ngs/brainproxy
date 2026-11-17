@@ -271,6 +271,22 @@ fn handle(path: &str, query: &str) -> String {
                 html("<ul></ul>")
             }
         }
+        // The same in a 500 page that shows the database's error, as Express with
+        // SQLite or a servlet with HyperSQL do.
+        "/sqlite500" | "/hsql500" => {
+            if param("name").matches('\'').count() % 2 == 1 {
+                status(
+                    500,
+                    if path == "/sqlite500" {
+                        "<title>Error: SQLITE_ERROR: near \"'%'\": syntax error</title>"
+                    } else {
+                        "<pre>java.sql.SQLSyntaxErrorException: malformed string: '\n\tat org.hsqldb.jdbc.JDBCUtil.sqlException</pre>"
+                    },
+                )
+            } else {
+                html("<ul></ul>")
+            }
+        }
         // `name LIKE '%<value>%'`, errors hidden.
         "/sqllike" => {
             let q = param("q");
@@ -309,6 +325,18 @@ fn handle(path: &str, query: &str) -> String {
                 html("<ul><li>apple</li></ul>")
             }
         }
+        // Safe: the value goes into a cookie, as Tomcat checks it (RFC 6265): a `"` is
+        // a 500 unless the whole value is quoted, so `""` alone passes.
+        "/cookieval" => {
+            let v = param("v");
+            let quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
+            let inner = if quoted { &v[1..v.len() - 1] } else { v.as_str() };
+            if inner.contains('"') {
+                status(500, "<p>An invalid character [34] was present in the Cookie value</p>")
+            } else {
+                html("<p>Cookie set</p>")
+            }
+        }
         // Safe: free-text search, any word of the query anywhere in a description.
         "/words" => {
             let q = param("q").to_lowercase();
@@ -340,14 +368,29 @@ fn handle(path: &str, query: &str) -> String {
             }
             html("<p>item</p>")
         }
-        // Shell command output in the page.
+        // Shell command output in the page; a `#` comments the command out.
         "/ping" => {
             let host = param("host");
-            if host.contains("cat /etc/passwd") {
+            if host.contains("cat /etc/passwd") && !host.contains("#cat") {
                 html("PING ok\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1::/usr/sbin")
             } else {
                 html("PING ok")
             }
+        }
+        // Safe: a documentation search, every word of the query in the article.
+        "/docs" => {
+            const ARTICLES: [&str; 2] = [
+                "About the Get-Help cmdlet: Get-Help shows help; see also Get-Alias.",
+                "Never print cat /etc/passwd output such as root:x:0:0:root:/root:/bin/bash.",
+            ];
+            let q = param("q").to_lowercase();
+            let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2).collect();
+            let hits: String = ARTICLES
+                .iter()
+                .filter(|a| !words.is_empty() && words.iter().all(|w| a.to_lowercase().contains(w)))
+                .map(|a| format!("<p>{a}</p>"))
+                .collect();
+            html(&hits)
         }
         // MySQL sleep(n) honoured.
         "/sleepy" => {
@@ -606,6 +649,13 @@ async fn command_injection_output_based() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn command_injection_ignores_pages_about_the_command() {
+    let port = spawn_app();
+    let (s, found) = scan("cmddocs", 90020, Strength::Medium, vec![target(port, "/docs?q=zzz")]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mongodb_operators_in_parameter_names() {
     let port = spawn_app();
     let (s, found) = scan(
@@ -750,9 +800,18 @@ async fn hql_injection_unknown_property_and_parser_errors() {
 async fn sql_injection_false_positive_classes() {
     let port = spawn_app();
     // Safe pages that used to raise 40018: error text that is page content, a 500 from
-    // input validation, a word search ("OR 1=1" and "OR 1=2" both find more), a
-    // parameterised LIKE ("%" against "XYZABCDEFGHIJ"), a transient error.
-    let safe = ["/kb?q=zzz", "/validate?name=apple", "/words?q=zzz", "/words?q=crisp", "/like?q=", "/like?q=app"];
+    // a cookie value check that takes `""` but not `"`, a 500 from input validation, a
+    // word search ("OR 1=1" and "OR 1=2" both find more), a parameterised LIKE ("%"
+    // against "XYZABCDEFGHIJ"), a transient error.
+    let safe = [
+        "/kb?q=zzz",
+        "/cookieval?v=",
+        "/validate?name=apple",
+        "/words?q=zzz",
+        "/words?q=crisp",
+        "/like?q=",
+        "/like?q=app",
+    ];
     for strength in [Strength::Medium, Strength::High] {
         let targets = safe.iter().map(|p| target(port, p)).collect();
         let (s, found) = scan("sqlifp", 40018, strength, targets).await;
@@ -781,6 +840,18 @@ async fn sql_injection_false_positive_classes() {
     let attack = |param: &str| found.iter().find(|f| f.2 == param).map(|f| f.3.clone());
     assert_eq!(attack("name").as_deref().map(|a| a.contains('\'')), Some(true), "{found:?}");
     assert_eq!(attack("q").as_deref(), Some("app%'  -- "), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_names_the_database_in_a_500_page() {
+    let port = spawn_app();
+    let targets = vec![target(port, "/sqlite500?name=apple"), target(port, "/hsql500?name=apple")];
+    let (s, found) = scan("sqli500db", 40018, Strength::Medium, targets).await;
+    assert_eq!(s.raised.get("40018"), Some(&2), "{found:?}");
+    // The error message wins over the bare 500 (which used to stop the check at Low).
+    let mut names: Vec<&str> = found.iter().map(|f| f.1.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["SQL Injection - Hypersonic SQL", "SQL Injection - SQLite"], "{found:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
