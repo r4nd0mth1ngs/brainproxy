@@ -710,6 +710,51 @@ fn crawl_reads_a_single_page_apps_fallback_page_once() {
     assert_eq!(paths, ["/", "/api/items", "/main.js"], "{v}");
 }
 
+/// A bundle that posts to one route and gets another that only answers POST.
+fn api_route(line: &str) -> (&'static str, &'static str, String) {
+    let path = line.split(' ').nth(1).unwrap_or("/");
+    match path {
+        "/" => ("200 OK", "text/html", r#"<script src="/main.js"></script>"#.into()),
+        "/main.js" => (
+            "200 OK",
+            "application/javascript",
+            r#"this.http.post(`${this.host}/rest/user/login`, e); fetch("/api/feedback"); fetch("/api/items")"#.into(),
+        ),
+        "/api/items" => ("200 OK", "application/json", "[]".into()),
+        "/api/feedback" => (
+            "500 Internal Server Error",
+            "text/html",
+            "<pre>TypeError: x is undefined<br> at /app/build/routes/feedback.js:21:5</pre>".into(),
+        ),
+        _ => ("404 Not Found", "text/plain", "no".into()),
+    }
+}
+
+#[test]
+fn crawl_lists_script_routes_it_cant_get_instead_of_counting_them() {
+    let (port, seen) = serve_routes(api_route);
+    let project = tmp_project("crawlmethods");
+    run(&["engagement", "start", "--target", "127.0.0.1"], &project, None);
+    let site = format!("http://127.0.0.1:{port}/");
+    let (code, v) = run(&["crawl", &site, "--no-robots", "--no-sitemap"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let lines = seen.lock().unwrap().clone();
+    // A route the script posts to isn't sent as GET, and the 500's stack trace isn't followed.
+    assert!(!lines.iter().any(|l| l.contains("/rest/user/login") || l.contains("feedback.js")), "{lines:?}");
+    let paths: Vec<&str> =
+        v["data"]["endpoints"].as_array().unwrap().iter().filter_map(|e| e["path"].as_str()).collect();
+    assert_eq!(paths, ["/", "/api/items", "/main.js"], "{v}");
+    assert_eq!(v["data"]["unconfirmed_count"], 2, "{v}");
+    assert_eq!(
+        v["data"]["unconfirmed_endpoints"],
+        serde_json::json!([
+            {"method": "GET", "path": "/api/feedback", "params": [], "reason": "GET answered 500"},
+            {"method": "POST", "path": "/rest/user/login", "params": [], "reason": "POST in the script; not requested"},
+        ]),
+        "{v}"
+    );
+}
+
 #[test]
 fn scan_active_crawl_attacks_what_the_crawl_finds() {
     let port = serve_site();

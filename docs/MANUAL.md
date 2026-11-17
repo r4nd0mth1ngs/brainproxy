@@ -2294,6 +2294,14 @@ Crawl and active-scan scope and safety flags:
   links on an index.html served at `/a/b` don't multiply. The summary counts them in
   `fallback_pages`. A catch-all page that changes with each request (it echoes the path or
   carries a nonce) isn't recognised.
+- Paths read from scripts: when the code beside a path shows another method
+  (`http.post(`…`)`, `.put(`, `.patch(`, `.delete(`, or `method: "POST"` / `type: "PUT"` in
+  the call's options), the plain crawler doesn't send it, as a GET would only fail and the
+  body is unknown. It is listed under `unconfirmed_endpoints` (`method`, `path`, `params`,
+  `reason`; at most 200, `unconfirmed_count` has the total) instead. So is a path read from a
+  script or page text that answers a GET with 405 or a 5xx: it isn't counted as an
+  endpoint, and the error page's links (stack-trace paths) aren't followed. The request is
+  still in history.
 - `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
   bounds its crawl too, with `--browser` both crawls together).
 - `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl

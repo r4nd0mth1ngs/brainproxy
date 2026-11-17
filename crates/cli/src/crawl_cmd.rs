@@ -200,6 +200,14 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
                 params.join(",")
             ));
         }
+        for e in summary["unconfirmed_endpoints"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  {:<6} {} (unconfirmed: {})",
+                e["method"].as_str().unwrap_or(""),
+                e["path"].as_str().unwrap_or(""),
+                e["reason"].as_str().unwrap_or("")
+            ));
+        }
         lines.join("\n")
     });
     Ok(())

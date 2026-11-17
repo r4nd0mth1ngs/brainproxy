@@ -77,6 +77,15 @@ pub struct Endpoint {
     pub params: Vec<String>,
 }
 
+/// A path a script or page names, with the method the code uses if it shows one.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Unconfirmed {
+    pub method: String,
+    pub path: String,
+    pub params: Vec<String>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct CrawlSummary {
     pub requests: usize,
@@ -89,6 +98,10 @@ pub struct CrawlSummary {
     /// page, such as a single-page app's index.html), after the first: not counted as
     /// endpoints, and their links aren't read again.
     pub fallback_pages: usize,
+    /// Paths found only in scripts or page text that aren't endpoints yet: a method other
+    /// than GET is written beside them (not requested), or a GET answered 405 or 5xx.
+    pub unconfirmed_endpoints: Vec<Unconfirmed>,
+    pub unconfirmed_count: usize,
     pub out_of_scope_hosts: Vec<String>,
     pub errors: usize,
     /// Exchanges that could not be saved to the project (e.g. too large).
@@ -291,11 +304,23 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     // Origins whose catch-all page has been read once.
     let mut fallback_read: HashSet<String> = HashSet::new();
 
-    // Breadth first: a FIFO of (request, depth), with up to `concurrency` fetches in flight.
-    let mut queue: VecDeque<(Req, usize)> = VecDeque::new();
-    let push = |req: Req, depth: usize, queue: &mut VecDeque<(Req, usize)>, seen: &mut HashSet<Req>| {
+    let mut unconfirmed: BTreeMap<(String, String), Unconfirmed> = BTreeMap::new();
+    let mut unconfirm = |method: &str, u: &Url, reason: String| {
+        let ep = endpoint(&Req { method: method.into(), url: String::new(), body: None }, u);
+        unconfirmed.entry((ep.method.clone(), ep.path.clone())).or_insert(Unconfirmed {
+            method: ep.method,
+            path: ep.path,
+            params: ep.params,
+            reason,
+        });
+    };
+
+    // Breadth first: a FIFO of (request, depth, whether its URL was guessed from text), with up
+    // to `concurrency` fetches in flight.
+    let mut queue: VecDeque<(Req, usize, bool)> = VecDeque::new();
+    let push = |req: Req, depth: usize, guessed: bool, queue: &mut VecDeque<_>, seen: &mut HashSet<Req>| {
         if seen.insert(req.clone()) {
-            queue.push_back((req, depth));
+            queue.push_back((req, depth, guessed));
         }
     };
     // The seeds, robots.txt and sitemap.xml pass the same filters (--path-prefix, --exclude)
@@ -314,7 +339,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             start.push(origin.clone());
         }
         for u in start.iter().filter(|u| scope.allows(u)) {
-            push(Req { method: "GET".into(), url: strip_fragment(u), body: None }, 0, &mut queue, &mut seen);
+            push(Req { method: "GET".into(), url: strip_fragment(u), body: None }, 0, false, &mut queue, &mut seen);
         }
     }
 
@@ -322,7 +347,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     loop {
         // Start fetches up to the limit, within the page budget and per-path cap.
         while running.len() < cfg.concurrency.max(1) && !ctl.stopped() {
-            let Some((req, depth)) = queue.pop_front() else { break };
+            let Some((req, depth, guessed)) = queue.pop_front() else { break };
             if sent >= cfg.max_pages || cfg.max_duration.is_some_and(|d| started.elapsed() >= d) {
                 summary.limit_reached = true;
                 queue.clear();
@@ -353,11 +378,11 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                     return None;
                 }
                 let result = fetch(&client, &rows, auth.as_deref(), &jar, &req, &headers).await;
-                Some((req, depth, result))
+                Some((req, depth, guessed, result))
             });
         }
         let Some(done) = running.join_next().await else { break };
-        let Ok(Some((req, depth, (target, raw_req, recorded, outcome)))) = done else { continue };
+        let Ok(Some((req, depth, guessed, (target, raw_req, recorded, outcome)))) = done else { continue };
         summary.requests += 1;
         match outcome {
             Err(e) => failed(&mut summary, &mut out_of_scope, &save, (&target, &raw_req, recorded), &e),
@@ -372,12 +397,17 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                     // The first copy is read: a seed is often the app's own page.
                     let copy = fallbacks.get(&origin) == Some(&(head.status, body_hash(&body)))
                         && !fallback_read.insert(origin);
+                    // A path read from a script may take another method: a GET it refuses or fails
+                    // on isn't a page, and the error page's stack trace isn't a list of links.
+                    let refused = guessed && req.method == "GET" && (head.status == 405 || head.status >= 500);
                     if copy {
                         summary.fallback_pages += 1;
+                    } else if refused {
+                        unconfirm("GET", page, format!("GET answered {}", head.status));
                     } else {
                         endpoints.insert(endpoint(&req, page));
                     }
-                    let found = if depth < cfg.max_depth && !copy {
+                    let found = if depth < cfg.max_depth && !copy && !refused {
                         extract(page, &head.headers, &body, cfg.submit_forms)
                     } else {
                         vec![]
@@ -396,12 +426,19 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                         if is_static(&u) {
                             continue;
                         }
+                        // Sent as GET it would only fail, and sent as written it would need a
+                        // body the crawler can't know: listed instead.
+                        if let Some(m) = f.hint {
+                            unconfirm(m, &u, format!("{m} in the script; not requested"));
+                            continue;
+                        }
                         if f.form {
                             summary.forms_submitted += 1;
                         }
                         push(
                             Req { method: f.method, url: strip_fragment(&u), body: f.body },
                             depth + 1,
+                            f.guessed,
                             &mut queue,
                             &mut seen,
                         );
@@ -429,6 +466,8 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     summary.endpoint_count = eps.len();
     eps.truncate(200);
     summary.endpoints = eps;
+    summary.unconfirmed_count = unconfirmed.len();
+    summary.unconfirmed_endpoints = unconfirmed.into_values().take(200).collect();
     let mut oos: Vec<String> = out_of_scope.into_iter().collect();
     oos.sort();
     summary.out_of_scope_hosts = oos;
@@ -671,6 +710,16 @@ struct Found {
     url: String,
     body: Option<String>,
     form: bool,
+    /// Read from a script or page text rather than a link, form or header.
+    guessed: bool,
+    /// The method the script uses for it, when that isn't GET.
+    hint: Option<&'static str>,
+}
+
+impl Found {
+    fn get(url: &Url, guessed: bool) -> Found {
+        Found { method: "GET".into(), url: url.to_string(), body: None, form: false, guessed, hint: None }
+    }
 }
 
 /// Links and form submissions found in a response.
@@ -687,7 +736,7 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
             return;
         }
         if let Ok(u) = base.join(href) {
-            out.push(Found { method: "GET".into(), url: u.to_string(), body: None, form: false });
+            out.push(Found::get(&u, false));
         }
     };
     for (k, v) in headers {
@@ -744,7 +793,10 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
             // After an interpolation, minified code joins anything with "/" (`${a}/${b}`): only
             // a path with a word in it is taken.
             if !c[2].starts_with("//") && (c[1].is_empty() || has_word(&c[2])) {
-                link(page, &c[2], &mut out);
+                if let Ok(u) = page.join(&c[2]) {
+                    let whole = c.get(0).map_or(0..0, |m| m.range());
+                    out.push(Found { hint: method_hint(&text, whole), ..Found::get(&u, true) });
+                }
             }
         }
         chunk_links(page, &text, &mut out);
@@ -792,6 +844,35 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
     out
 }
 
+/// The method a script sends `at` (a quoted path in `text`) with, when it says and it isn't
+/// GET: `http.post(`…`, b)`, `$.ajax("/x", {type: "PUT"})`, `fetch("/x", {method: "POST"})`.
+fn method_hint(text: &str, at: std::ops::Range<usize>) -> Option<&'static str> {
+    // The call's opening, with nothing between it and the path that ends an expression.
+    static BEFORE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\.(post|put|patch|delete)\s*\(\s*[^;()]{0,80}$").unwrap());
+    // The options object right after the path, in the same call.
+    static AFTER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)^[^;()]{0,100}?\b(?:method|type)\s*:\s*["'`](post|put|patch|delete)["'`]"#).unwrap()
+    });
+    let before = window(text, at.start.saturating_sub(100), at.start);
+    let after = window(text, at.end, at.end.saturating_add(150));
+    let m = BEFORE.captures(before).or_else(|| AFTER.captures(after))?;
+    ["POST", "PUT", "PATCH", "DELETE"].into_iter().find(|v| v.eq_ignore_ascii_case(&m[1]))
+}
+
+/// `text[from..to]`, both ends moved inwards to char boundaries.
+fn window(text: &str, from: usize, to: usize) -> &str {
+    let to = to.min(text.len());
+    let (mut from, mut to) = (from.min(to), to);
+    while !text.is_char_boundary(from) {
+        from += 1;
+    }
+    while to > from && !text.is_char_boundary(to) {
+        to -= 1;
+    }
+    text.get(from..to).unwrap_or("")
+}
+
 /// Two letters in a row outside the `{x}` placeholders: `/rest/items`, not `/{x}` or `/0/1`.
 fn has_word(path: &str) -> bool {
     path.replace("{x}", "/").as_bytes().windows(2).any(|w| w[0].is_ascii_alphabetic() && w[1].is_ascii_alphabetic())
@@ -820,7 +901,7 @@ fn chunk_links(script: &Url, text: &str, out: &mut Vec<Found>) {
             continue;
         };
         if let Ok(u) = joined {
-            out.push(Found { method: "GET".into(), url: u.to_string(), body: None, form: false });
+            out.push(Found::get(&u, false));
         }
     }
 }
@@ -839,7 +920,7 @@ fn text_links(base: &Url, text: &str, out: &mut Vec<Found>) {
             continue;
         }
         if let Ok(u) = base.join(raw) {
-            out.push(Found { method: "GET".into(), url: u.to_string(), body: None, form: false });
+            out.push(Found::get(&u, true));
         }
     }
 }
@@ -911,11 +992,11 @@ fn form_requests(html: &str, all: &[Tag], base: &Url) -> Vec<Found> {
         let encoded =
             fields.iter().map(|(k, v)| format!("{}={}", form_encode(k), form_encode(v))).collect::<Vec<_>>().join("&");
         if method == "POST" {
-            out.push(Found { method: "POST".into(), url: action.to_string(), body: Some(encoded), form: true });
+            out.push(Found { body: Some(encoded), form: true, method: "POST".into(), ..Found::get(&action, false) });
         } else {
             let mut u = action.clone();
             u.set_query(if encoded.is_empty() { None } else { Some(&encoded) });
-            out.push(Found { method: "GET".into(), url: u.to_string(), body: None, form: true });
+            out.push(Found { form: true, ..Found::get(&u, false) });
         }
     }
     out
@@ -1030,6 +1111,35 @@ mod tests {
         );
         // A chunk folder that isn't the script's own: from the origin's root.
         assert_eq!(urls("https://a.test/static/main.js", r#"["js/chunk-1.js"]"#), ["https://a.test/js/chunk-1.js"]);
+    }
+
+    /// The method a bundle calls a path with, so a POST-only route isn't sent as GET.
+    #[test]
+    fn script_paths_carry_the_method_the_code_uses() {
+        let h = vec![("Content-Type".to_string(), "text/javascript".to_string())];
+        let js = r#"this.http.post(`${this.host}/rest/user/login`, e); this.http.get(this.host + "/api/Users");
+            fetch("/api/feedback", {headers: {a: 1}, method: "PUT"}); $.ajax("/old", {type: 'patch'});
+            n.delete(this.host + "/api/Cards/" + id); a.post(x); fetch("/api/after"); y = {method: "POST"};
+            fetch("ünï/x".length, "/api/wide")"#;
+        let found = extract(&Url::parse("https://a.test/main.js").unwrap(), &h, js.as_bytes(), false);
+        let hints: Vec<(&str, Option<&str>)> = found.iter().map(|f| (f.url.as_str(), f.hint)).collect();
+        assert_eq!(
+            hints,
+            [
+                ("https://a.test/rest/user/login", Some("POST")),
+                ("https://a.test/api/Users", None),
+                ("https://a.test/api/feedback", Some("PUT")),
+                ("https://a.test/old", Some("PATCH")),
+                ("https://a.test/api/Cards/", Some("DELETE")),
+                ("https://a.test/api/after", None),
+                ("https://a.test/api/wide", None),
+            ]
+        );
+        assert!(found.iter().all(|f| f.guessed && f.method == "GET"));
+        // Windows cut inside a character move to its boundary.
+        assert_eq!(window("aéb", 2, 3), "");
+        assert_eq!(window("aéb", 0, 2), "a");
+        assert_eq!(window("aéb", 5, 9), "");
     }
 
     #[test]
