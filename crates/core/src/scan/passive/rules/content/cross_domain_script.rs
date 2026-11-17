@@ -1,7 +1,7 @@
 //! Ported from ZAP CrossDomainScriptInclusionScanRule (pscanrules, Apache License 2.0).
 
 use super::common::{element_source, is_other_domain};
-use crate::scan::passive::util::tags;
+use crate::scan::passive::util::{tags, Tag};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -40,16 +40,17 @@ impl PassiveRule for CrossDomainScript {
             return;
         }
         let html = msg.body();
-        for t in tags(html).iter().filter(|t| t.name == "script") {
-            let Some(src) = t.attr("src") else { continue };
-            if !is_other_domain(&msg.host, src) {
-                continue;
-            }
-            if t.attr("integrity").is_none_or(|i| i.trim().is_empty()) {
-                out.push(ALERT.raise(src, element_source(html, t)));
-            }
+        for t in tags(html).iter().filter(|t| t.name == "script" && reported_by_10017(&msg.host, t)) {
+            out.push(ALERT.raise(t.attr("src").unwrap_or_default(), element_source(html, t)));
         }
     }
+}
+
+/// Whether this rule raises the `<script>` tag of an HTML page served from `host`: its `src`
+/// is on another host and it has no usable `integrity`. Rule 90003 leaves these to it.
+pub(super) fn reported_by_10017(host: &str, t: &Tag) -> bool {
+    t.attr("src").is_some_and(|src| is_other_domain(host, src))
+        && t.attr("integrity").is_none_or(|i| i.trim().is_empty())
 }
 
 #[cfg(test)]

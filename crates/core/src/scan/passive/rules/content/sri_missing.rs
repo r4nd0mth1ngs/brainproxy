@@ -1,6 +1,7 @@
 //! Ported from ZAP SubResourceIntegrityAttributeScanRule (pscanrules, Apache License 2.0).
 
 use super::common::{element_source, uri_has_illegal_chars};
+use super::cross_domain_script::reported_by_10017;
 use crate::scan::passive::util::{find_ci, tags, url_host};
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
@@ -54,13 +55,22 @@ impl PassiveRule for SriMissing {
     }
 
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
+        // Diverges from ZAP, which parses every response: a `<script>` in a string of a JS
+        // bundle, JSON or a source map isn't an element of a page.
+        if !msg.is_html() {
+            return;
+        }
         let html = msg.body();
-        // ZAP parses every response; skip the tokenizer when no candidate tag exists.
+        // Skip the tokenizer when no candidate tag exists.
         if find_ci(html, "<script", 0).is_none() && find_ci(html, "<link", 0).is_none() {
             return;
         }
         for t in tags(html) {
             let url = match t.name.as_str() {
+                // Diverges from ZAP: a script 10017 (Cross-Domain JavaScript Source File
+                // Inclusion) reports, which it does for the same missing integrity, is left
+                // to it rather than reported twice.
+                "script" if reported_by_10017(&msg.host, &t) => continue,
                 "script" => t.attr("src"),
                 "link" => {
                     let relevant = t.attr("rel").is_none_or(|rel| {
@@ -94,9 +104,22 @@ mod tests {
         let html = r#"<link rel="stylesheet" href="https://cdn.test/a.css"><script src="https://cdn.test/b.js"></script>
             <link rel="icon" href="https://cdn.test/i.png">"#;
         let f = msg("https://a.test/").html(html).scan(&SriMissing);
-        assert_eq!(f.len(), 2);
+        // The script is 10017's (Cross-Domain JavaScript Source File Inclusion), raised once.
+        assert_eq!(f.len(), 1);
         assert_eq!(f[0].evidence, r#"<link rel="stylesheet" href="https://cdn.test/a.css">"#);
-        assert_eq!(f[1].evidence, r#"<script src="https://cdn.test/b.js"></script>"#);
+        let script = r#"<script src="https://cdn.test/b.js"></script>"#;
+        let both = |rule: &dyn PassiveRule| msg("https://a.test/").html(script).scan(rule).len();
+        assert_eq!((both(&SriMissing), both(&super::super::cross_domain_script::CrossDomainScript)), (0, 1));
+    }
+
+    /// Only a page has elements: a tag inside a JS bundle's or JSON's string isn't one.
+    #[test]
+    fn ignores_tags_in_scripts_and_data() {
+        let tag = r#"<link rel="stylesheet" href="https://cdn.test/a.css">"#;
+        for ct in ["application/javascript", "application/json"] {
+            let m = msg("https://a.test/x").header("Content-Type", ct).body(&format!("var t = '{tag}';"));
+            assert!(m.scan(&SriMissing).is_empty(), "{ct}");
+        }
     }
 
     #[test]

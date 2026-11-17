@@ -99,9 +99,9 @@ impl PassiveRule for CspMissing {
         {
             out.push(MISSING.raise("", ""));
         }
-        if msg.resp_header("X-Content-Security-Policy").is_some() || msg.resp_header("X-WebKit-CSP").is_some() {
-            out.push(OBSOLETE.raise("", ""));
-        }
+        // Diverges from ZAP: OBSOLETE (10038-2) isn't raised, since the CSP rule's 10055-1/-2
+        // report the same obsolete headers with their values. It stays listed so findings
+        // recorded before still have their texts.
         if msg.resp_header("Content-Security-Policy-Report-Only").is_some() {
             out.push(REPORT_ONLY.raise("", ""));
         }
@@ -126,7 +126,8 @@ mod tests {
             .header("X-WebKit-CSP", "default-src 'self'")
             .header("Content-Security-Policy-Report-Only", "default-src 'self'")
             .scan(&CspMissing);
-        assert_eq!(refs(&f), ["10038-1", "10038-2", "10038-3"]);
+        // The obsolete header is the CSP rule's 10055-2, not reported twice.
+        assert_eq!(refs(&f), ["10038-1", "10038-3"]);
     }
 
     #[test]

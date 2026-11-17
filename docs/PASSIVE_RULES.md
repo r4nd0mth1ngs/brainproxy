@@ -130,3 +130,10 @@ noise on modern applications:
   which ZAP's passive rule doesn't look at; the active CORS rule (40040) confirms it.
 - **Strict-Transport-Security Header (10035-1)** isn't raised on a `304 Not Modified`,
   which ZAP counts as a redirect: a revalidation needn't repeat the full response's headers.
+- **Sub Resource Integrity Attribute Missing (90003)** reads only HTML pages (ZAP: any
+  body, so a tag inside a JS bundle's string counted), and leaves a script from another
+  host without `integrity` to Cross-Domain JavaScript Source File Inclusion (10017), which
+  reports the same element; 90003 keeps stylesheets, preloads and the scripts 10017
+  doesn't count.
+- **Obsolete CSP Header (10038-2)** isn't raised: the CSP rule's 10055-1 and 10055-2 report
+  `X-Content-Security-Policy` and `X-WebKit-CSP` with their values.
