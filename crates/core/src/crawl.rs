@@ -734,12 +734,17 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
         // `${…}` becomes a placeholder, filled in like `{id}`.
         static INTERPOLATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{[^{}`]{0,100}\}").unwrap());
         let text = INTERPOLATION.replace_all(&text, "{x}");
-        // Quoted absolute paths in scripts, e.g. fetch("/api/items").
-        static PATHS: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r#"["'`](/[A-Za-z0-9_\-./{}:~%]{1,150}(?:\?[^"'`\s]{0,200})?)["'`]"#).unwrap());
+        // Quoted absolute paths in scripts, e.g. fetch("/api/items"), also after a base URL
+        // interpolated first (`${this.host}/rest/items`), which is where Angular services keep
+        // theirs. A concatenated base (`host + "/api/x"`) leaves the path quoted on its own.
+        static PATHS: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"["'`]((?:\{x\})*)(/[A-Za-z0-9_\-./{}:~%]{1,150}(?:\?[^"'`\s]{0,200})?)["'`]"#).unwrap()
+        });
         for c in PATHS.captures_iter(&text) {
-            if !c[1].starts_with("//") {
-                link(page, &c[1], &mut out);
+            // After an interpolation, minified code joins anything with "/" (`${a}/${b}`): only
+            // a path with a word in it is taken.
+            if !c[2].starts_with("//") && (c[1].is_empty() || has_word(&c[2])) {
+                link(page, &c[2], &mut out);
             }
         }
         chunk_links(page, &text, &mut out);
@@ -785,6 +790,11 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
     static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->|<[^>]*>").unwrap());
     text_links(&base, &decode_entities(&TAG.replace_all(&text, " ")), &mut out);
     out
+}
+
+/// Two letters in a row outside the `{x}` placeholders: `/rest/items`, not `/{x}` or `/0/1`.
+fn has_word(path: &str) -> bool {
+    path.replace("{x}", "/").as_bytes().windows(2).any(|w| w[0].is_ascii_alphabetic() && w[1].is_ascii_alphabetic())
 }
 
 /// Scripts a bundle loads later by a relative path: the code-split chunks of each route, where
@@ -994,6 +1004,8 @@ mod tests {
             out
         };
         let bundle = r#"a.get(`/api/users/${e.id}/posts?page=${n}`); fetch(`/api/items`);
+            this.http.get(`${this.hostServer}/rest/products/search?q=${q}`); h.post(this.host + "/api/login", b);
+            this.http.put(`${this.host}/rest/basket/${id}/checkout`, {}); u = `${a}/${b}`; v = `${a}/${n}/0`;
             const r = [{path:"/about",component:()=>t(()=>import("./About-x1.js"),__vite__mapDeps([0,1]))}];
             const d = ["assets/About-x1.js","assets/About-x1.css","assets/vendor-y2.mjs"];
             throw Error("see index.js"); x = "https://cdn.test/lib.js"; y = `${a}${b}.js`"#;
@@ -1002,10 +1014,13 @@ mod tests {
             [
                 "https://a.test/about",
                 "https://a.test/api/items",
+                "https://a.test/api/login",
                 "https://a.test/api/users/1/posts?page=1",
                 "https://a.test/assets/About-x1.js",
                 "https://a.test/assets/About-x1.js",
                 "https://a.test/assets/vendor-y2.mjs",
+                "https://a.test/rest/basket/1/checkout",
+                "https://a.test/rest/products/search?q=brainproxy",
             ]
         );
         // Served under a path: chunks stay under it.
