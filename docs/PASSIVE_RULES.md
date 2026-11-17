@@ -213,3 +213,10 @@ data files:
   an article titled "Directory listing for ..." doesn't.
 - **Hash Disclosure (10097)** reports BCrypt hashes written `$2b$` and `$2y$` at any cost
   (ZAP: only `$2y$05$`), as Node's and Python's bcrypt and PHP's `password_hash` write them.
+- **Vulnerable JS Library (10003)** reports every vulnerable library of a script or page,
+  each with the library's name as the parameter (ZAP: the first one only). Retire.js
+  patterns that use a backreference or a look-around, which the regex engine lacks, are
+  rewritten instead of dropped, so a minified jQuery or lodash build without its licence
+  comment is still recognised; a pattern that still doesn't compile is skipped with a
+  warning on stderr. A `.js` file served as `text/plain` or `application/octet-stream`
+  (object stores, some CDNs) is read too.
