@@ -21,8 +21,8 @@
 //!   the "OR" form of the LIKE pairs, which repeats the "AND true" value.
 //! - Error based: the error characters after a random value must bring an error
 //!   of the same RDBMS too (`error_persists`); the HTTP 500 check runs for quotes
-//!   only, and needs the 500 again and none with the quotes doubled
-//!   (`quote_breaks_query`).
+//!   only, and needs the 500 again and none with the quotes doubled inside a
+//!   value (`quote_breaks_query`).
 //! - A bare HTTP 500 is the weakest proof, so it is a last resort: it is reported
 //!   (at Low confidence) only when no database error message and none of the
 //!   comparison checks found anything (`pending_500`).
@@ -638,12 +638,20 @@ impl Scan<'_> {
     /// value with each quote doubled (an escaped quote inside an SQL string) is
     /// not a 500. Input validation, a type conversion (a JSON boolean sent
     /// `true'`) or a broken template rejects both.
+    ///
+    /// The doubled quotes go between two letters (`x''y`), never on their own:
+    /// `""` alone is a valid quoted cookie value (RFC 6265), so a server that
+    /// rejects a lone `"` in a cookie with a 500 accepts it, while `x""y` is as
+    /// invalid to a cookie parser, a number parser or a format check as `"` was.
+    /// Inside an SQL string both are an escaped quote, so a real injection still
+    /// takes it. (Requiring a database error message instead would lose
+    /// injections behind pages that hide their errors.)
     async fn quote_breaks_query(&self, prefix: &str, err: &str) -> bool {
         let Some(again) = self.send(&format!("{prefix}{err}")).await else { return false };
         if again.status != 500 {
             return false;
         }
-        let balanced = format!("{prefix}{}", err.replace('\'', "''").replace('"', "\"\""));
+        let balanced = format!("{prefix}x{}y", err.replace('\'', "''").replace('"', "\"\""));
         self.send(&balanced).await.is_some_and(|r| r.status != 500)
     }
 

@@ -200,6 +200,18 @@ fn handle(path: &str, query: &str) -> String {
                 html("<ul><li>apple</li></ul>")
             }
         }
+        // Safe: the value goes into a cookie, as Tomcat checks it (RFC 6265): a `"` is
+        // a 500 unless the whole value is quoted, so `""` alone passes.
+        "/cookieval" => {
+            let v = param("v");
+            let quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
+            let inner = if quoted { &v[1..v.len() - 1] } else { v.as_str() };
+            if inner.contains('"') {
+                status(500, "<p>An invalid character [34] was present in the Cookie value</p>")
+            } else {
+                html("<p>Cookie set</p>")
+            }
+        }
         // Safe: free-text search, any word of the query anywhere in a description.
         "/words" => {
             let q = param("q").to_lowercase();
@@ -624,9 +636,18 @@ async fn hql_injection_unknown_property_and_parser_errors() {
 async fn sql_injection_false_positive_classes() {
     let port = spawn_app();
     // Safe pages that used to raise 40018: error text that is page content, a 500 from
-    // input validation, a word search ("OR 1=1" and "OR 1=2" both find more), a
-    // parameterised LIKE ("%" against "XYZABCDEFGHIJ"), a transient error.
-    let safe = ["/kb?q=zzz", "/validate?name=apple", "/words?q=zzz", "/words?q=crisp", "/like?q=", "/like?q=app"];
+    // a cookie value check that takes `""` but not `"`, a 500 from input validation, a
+    // word search ("OR 1=1" and "OR 1=2" both find more), a parameterised LIKE ("%"
+    // against "XYZABCDEFGHIJ"), a transient error.
+    let safe = [
+        "/kb?q=zzz",
+        "/cookieval?v=",
+        "/validate?name=apple",
+        "/words?q=zzz",
+        "/words?q=crisp",
+        "/like?q=",
+        "/like?q=app",
+    ];
     for strength in [Strength::Medium, Strength::High] {
         let targets = safe.iter().map(|p| target(port, p)).collect();
         let (s, found) = scan("sqlifp", 40018, strength, targets).await;

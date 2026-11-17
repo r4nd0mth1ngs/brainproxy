@@ -185,8 +185,10 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   - (HQL Injection 100003 and NoSQL Injection - MongoDB 40033 do the same for their error
     messages;)
   - the HTTP 500 check runs for quotes only, and the 500 must repeat and go away when
-    each quote is doubled (an escaped quote in an SQL string): input validation and
-    type errors (`true'` in a JSON boolean) reject both;
+    each quote is doubled inside a value (`x''y`, an escaped quote in an SQL string):
+    input validation and type errors (`true'` in a JSON boolean) reject both. The
+    doubled quotes are never sent alone, because `""` is a valid quoted cookie value
+    that a server rejecting `"` in a cookie accepts;
   - a bare 500 is the last resort: a database error message in the 500 page is matched
     first and names the database (Medium confidence), and the bare 500 (Low confidence)
     is reported only when no other check (error message, expression, boolean, UNION,
