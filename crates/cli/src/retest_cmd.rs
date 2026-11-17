@@ -269,10 +269,14 @@ fn evidence_header(response: &[u8], evidence: &str) -> Option<String> {
 /// report it gone.
 fn rescan_hint(id: i64, f: &Value) -> String {
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    let what = match f["alert_ref"].as_str().unwrap_or_default().strip_prefix("check:") {
+    let mut what = match f["alert_ref"].as_str().unwrap_or_default().strip_prefix("check:") {
         Some(check) => format!("--checks SOURCE --check-ids={}", quote(check)),
         None => format!("--rules={}", f["rule_id"].as_i64().unwrap_or(0)),
     };
+    // Found on a name: a scan that leaves names alone can't find it again.
+    if f["param"].as_str().is_some_and(|p| p.starts_with("name:")) {
+        what.push_str(" --inject-names");
+    }
     let method = quote(f["method"].as_str().unwrap_or("GET"));
     let (target, aside) = match f["base_history_id"].as_i64() {
         Some(base) => (format!("--history-id {base} --include-methods {method}"), String::new()),
@@ -447,5 +451,8 @@ mod tests {
             "{hint}"
         );
         assert!(hint.contains("(q among them)") && !hint.contains("apple"), "{hint}");
+        let f = json!({"alert_ref": "40012", "rule_id": 40012, "method": "GET", "param": "name:q",
+            "url": "http://shop.test/search?x=1", "base_history_id": 7});
+        assert!(rescan_hint(3, &f).contains("--rules=40012 --inject-names`"), "{}", rescan_hint(3, &f));
     }
 }

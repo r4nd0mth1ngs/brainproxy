@@ -771,6 +771,18 @@ attack type, and pick payloads:
     attacked once per site and method. XML and multipart bodies are attacked by default, including the file name of
     an upload but not its content. For single-page apps, tick *Run JavaScript (browser)* (see
     below).
+    Names are attacked too at strength high and insane (`scan active --inject-names` at any
+    strength, `--no-inject-names` to stop it): the names of query and form parameters, JSON keys,
+    cookies (with `--cookies`) and the `--inject-header` headers a request has (not `Host`,
+    `Content-Length`, `Transfer-Encoding`, `Content-Type`, `Connection` or `Cookie`), for code
+    that reads its input from a name, as one walking `getParameterNames` or `getHeaderNames`
+    does. The value stays and the name carries the payload, escaped for its place; a header
+    name keeps only the characters a header name may hold and percent-encodes the rest, so the
+    request stays well-formed. A finding on a name has `name:` and the name as its parameter
+    (`name:q`, `name:user.id` for a JSON key), and `findings verify` sends it against the request
+    with the name as it was. It roughly doubles the insertion points, so the requests too. The
+    result's `inject_names` says whether names were attacked; a scan policy can set it
+    (`scan policy save NAME --inject-names on|off|auto`).
     The crawl stays on the site URLs' origins (scheme, host and port); an `http://` site
     also covers `https://` on port 443 of the same host, since sites redirect there.
   - **Audit everything recorded:** attacks all traffic already in the project.
@@ -2463,7 +2475,9 @@ Crawl and active-scan scope and safety flags:
   | `standard` | `--strength high --crawl-depth 5 --crawl-max-pages 500 --cookies --url-path` |
   | `thorough` | `--strength insane --crawl-depth 8 --crawl-max-pages 1500 --cookies --url-path` |
 
-  The guided Thorough scan also adds `--browser` when a browser is installed.
+  The guided Thorough scan also adds `--browser` when a browser is installed. Standard and
+  Thorough attack parameter and header names too, as every scan at high strength and above does
+  unless `--no-inject-names` is given.
 
 Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles above):
 
@@ -2936,7 +2950,9 @@ brainproxy scan active https://app.acme.test/ --crawl --policy api
   stays off. Rules the turned-on ones depend on (the persistent XSS rule's Prime and Spider)
   run with them unless the policy turns them off.
 - `save` builds on `--from POLICY` or `--json` (inline, or `-` for stdin), then applies the
-  flags: `--strength`, `--threshold`, `--others`, `--reset IDS` (the rules take the policy's
+  flags: `--strength`, `--threshold`, `--others`, `--inject-names on|off|auto` (whether its
+  scans attack parameter, key, cookie and header names; `auto`, the default, does at strength
+  high and insane; `scan active --inject-names` or `--no-inject-names` win), `--reset IDS` (the rules take the policy's
   settings again), `--enable`, `--disable`, `--rule-strength ID=S`, `--rule-threshold ID=T`.
   Saving a name that exists replaces it. `--json` refuses a field it doesn't know.
 - A policy saved by a newer brainproxy that this one can't read is listed under `unreadable`
@@ -2949,7 +2965,7 @@ brainproxy scan active https://app.acme.test/ --crawl --policy api
 `--rules` runs the rules it names instead of the policy's; `--exclude-rules` skips rules as well
 as those the policy turns off. With `--preset`, the policy's strength wins over the preset's;
 the preset still sets the crawl. `--threshold` also works without a policy. The result's
-`policy` says what applied: `name`, `strength`, `threshold`, `rule_strengths`,
+`policy` says what applied: `name`, `strength`, `threshold`, `inject_names`, `rule_strengths`,
 `rule_thresholds`, `rules` (the ported rules that ran, once the rules they depend on are
 resolved), `exclude_rules`, and `flags_over_policy` (the flags given as well). A policy picked
 in the app that was removed since stays picked, and the scan refuses to start rather than run

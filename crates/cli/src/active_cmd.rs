@@ -11,7 +11,7 @@ use brainproxy_core::auth::AuthSession;
 use brainproxy_core::checks;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
 use brainproxy_core::rules::{Engine, EngineRules};
-use brainproxy_core::scan::active::policy::Policy;
+use brainproxy_core::scan::active::policy::{self, Policy};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget};
 use brainproxy_core::scan::compare::ScanScope;
 use brainproxy_core::scan::findings_db::FindingFilter;
@@ -161,6 +161,14 @@ pub struct ActiveArgs {
     /// Also inject into this request header (e.g. User-Agent). Repeatable.
     #[arg(long = "inject-header")]
     inject_headers: Vec<String>,
+    /// Also attack the names of the parameters, JSON keys, cookies (with --cookies) and headers
+    /// (of --inject-header) the scan attacks, for code that reads input from a name. On by default
+    /// at strength high and insane, or as --policy says; roughly doubles the requests.
+    #[arg(long, conflicts_with = "no_inject_names")]
+    inject_names: bool,
+    /// Don't attack names, whatever the strength or --policy say.
+    #[arg(long)]
+    no_inject_names: bool,
     /// A base request (a URL's, an API item's, a recorded one) deliberately names a host the
     /// scope doesn't list in its Host header, for a Host-header test. Through MCP such a request
     /// isn't attacked without it. Rules that set a Host of their own need no flag.
@@ -486,6 +494,19 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         host: brainproxy_core::http::client::HostPolicy::for_process(args.host_header_test),
         stream: Default::default(),
     };
+    let applied = crate::policy_cmd::apply(
+        policy.as_ref().map(|(n, p)| (n.as_str(), p)),
+        args.strength,
+        args.preset().map(|p| p.strength),
+        args.threshold,
+        &args.rules,
+        &args.exclude_rules,
+    );
+    let names = match (args.inject_names, args.no_inject_names) {
+        (true, _) => true,
+        (_, true) => false,
+        _ => applied.inject_names.unwrap_or_else(|| policy::names_by_default(applied.strength)),
+    };
     let point_opts = PointOptions {
         query: !args.no_query,
         form: !args.no_form,
@@ -495,6 +516,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         path: args.url_path(),
         cookies: args.cookies(),
         headers: args.inject_headers.clone(),
+        names,
     };
     let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send)?;
     let api_import = match &args.api {
@@ -523,14 +545,6 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     } else {
         Some(select_targets(project, &Selection::from_args(&args), &send, &point_opts, auth.as_deref())?)
     };
-    let applied = crate::policy_cmd::apply(
-        policy.as_ref().map(|(n, p)| (n.as_str(), p)),
-        args.strength,
-        args.preset().map(|p| p.strength),
-        args.threshold,
-        &args.rules,
-        &args.exclude_rules,
-    );
     let policy_shown = applied.shown.clone();
     let cfg = ActiveConfig {
         strength: applied.strength,
@@ -699,6 +713,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             ..Default::default()
         })?;
         let mut v = json!(summary);
+        v["inject_names"] = json!(names);
         if let Some(p) = &policy_shown {
             v["policy"] = p.clone();
         }

@@ -131,7 +131,11 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 100007 | JWT Weaknesses | page | high | 100007-1, 100007-2, 100007-3, 100007-4, 100007-5, 100007-6, 100007-7, 100007-8 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
-headers and URL path segments when enabled), `page` once per target request, `host` once per scheme://host:port.
+headers and URL path segments when enabled; the names of parameters, JSON keys, cookies and
+headers at strength high and insane or with `--inject-names`), `page` once per target request,
+`host` once per scheme://host:port. On a name point a rule's payload replaces the name and the
+value stays; the finding's parameter is `name:` and the name. Rules that rewrite a parameter
+their own way (the MongoDB rules' `a[$ne]=` and operator objects) leave names alone.
 
 Every rule in ZAP's `ascanrules` add-on is ported (`zap-sync.json` lists the two
 `pscanrules` rules that aren't). From `ascanrulesBeta` so far: CORS (40040), Server Side

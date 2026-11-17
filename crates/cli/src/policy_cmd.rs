@@ -55,6 +55,10 @@ pub struct PolicyFlags {
     /// those --enable names.
     #[arg(long, value_parser = ["on", "off"])]
     others: Option<String>,
+    /// Whether scans with the policy attack parameter, JSON key, cookie and header names too
+    /// (`scan active --inject-names`); `auto` [default] does at strength high and insane.
+    #[arg(long, value_enum)]
+    inject_names: Option<NamesArg>,
     /// Turn these rule ids on (comma-separated).
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     enable: Vec<u32>,
@@ -70,6 +74,13 @@ pub struct PolicyFlags {
     /// Drop these rules' own settings, so they take the policy's (applied before the flags above).
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     reset: Vec<u32>,
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
+pub enum NamesArg {
+    On,
+    Off,
+    Auto,
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
@@ -129,6 +140,13 @@ impl PolicyFlags {
         if let Some(o) = &self.others {
             p.enabled = o == "on";
         }
+        if let Some(n) = self.inject_names {
+            p.inject_names = match n {
+                NamesArg::On => Some(true),
+                NamesArg::Off => Some(false),
+                NamesArg::Auto => None,
+            };
+        }
         if let Some(id) = self.enable.iter().find(|id| self.disable.contains(id)) {
             return Err(Error::InvalidInput(format!("rule {id} is both in --enable and --disable")));
         }
@@ -163,7 +181,7 @@ fn read_json(given: &str) -> Result<Policy, Error> {
     let unknown = |v: &Value, known: &[&str]| -> Option<String> {
         v.as_object()?.keys().find(|k| !known.contains(&k.as_str())).cloned()
     };
-    let mut bad = unknown(&v, &["enabled", "strength", "threshold", "rules"]);
+    let mut bad = unknown(&v, &["enabled", "strength", "threshold", "inject_names", "rules"]);
     for r in v["rules"].as_object().into_iter().flat_map(|m| m.values()) {
         bad = bad.or_else(|| unknown(r, &["enabled", "strength", "threshold"]));
     }
@@ -180,6 +198,7 @@ fn summary(name: &str, p: &Policy) -> Value {
         "enabled": p.enabled,
         "strength": p.strength,
         "threshold": p.threshold,
+        "inject_names": p.inject_names,
         "rules": p.rules,
         "rules_enabled": p.enabled_rules().len(),
         "rules_disabled": p.disabled().len(),
@@ -298,6 +317,8 @@ pub struct Applied {
     pub exclude_rules: Vec<u32>,
     /// The result's `policy`; None without --policy.
     pub shown: Option<Value>,
+    /// The policy's `inject_names`.
+    pub inject_names: Option<bool>,
 }
 
 /// Explicit flags win over the policy: --strength and --threshold apply to every rule (their
@@ -323,6 +344,7 @@ pub fn apply(
             rules: flag_rules,
             exclude_rules: exclude_rules.to_vec(),
             shown: None,
+            inject_names: None,
         };
     };
     let mut tuning = p.tuning();
@@ -366,6 +388,7 @@ pub fn apply(
         "name": name,
         "strength": strength,
         "threshold": tuning.threshold,
+        "inject_names": p.inject_names,
         "rule_strengths": rule_strengths,
         "rule_thresholds": rule_thresholds,
         "flags_over_policy": overridden,
@@ -373,7 +396,7 @@ pub fn apply(
     // The ported rules that run, once dependencies are resolved: what a comparison covers.
     shown["rules"] = json!(active::selected_rule_ids(sel.as_deref(), &exclude));
     shown["exclude_rules"] = json!(exclude);
-    Applied { strength, tuning, rules: sel, exclude_rules: exclude, shown: Some(shown) }
+    Applied { strength, tuning, rules: sel, exclude_rules: exclude, shown: Some(shown), inject_names: p.inject_names }
 }
 
 #[cfg(test)]

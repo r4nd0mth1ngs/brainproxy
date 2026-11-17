@@ -79,14 +79,30 @@ pub struct Policy {
     pub enabled: bool,
     pub strength: Strength,
     pub threshold: Threshold,
+    /// Whether parameter, key, cookie and header names are attacked too
+    /// (`PointOptions::names`); None leaves it to the strength (see [`names_by_default`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inject_names: Option<bool>,
     /// Per rule id.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub rules: BTreeMap<u32, RuleSetting>,
 }
 
+/// Whether a scan at `strength` attacks names when nothing says: at high and insane, which ask
+/// for more requests to find more. Names roughly double the insertion points.
+pub fn names_by_default(strength: Strength) -> bool {
+    strength >= Strength::High
+}
+
 impl Default for Policy {
     fn default() -> Self {
-        Self { enabled: true, strength: Strength::Medium, threshold: Threshold::Low, rules: BTreeMap::new() }
+        Self {
+            enabled: true,
+            strength: Strength::Medium,
+            threshold: Threshold::Low,
+            inject_names: None,
+            rules: BTreeMap::new(),
+        }
     }
 }
 
@@ -334,6 +350,16 @@ mod tests {
         assert!(p.enabled && p.strength == Strength::High && p.threshold == Threshold::Low);
         assert_eq!(p.rules[&40018].threshold, Some(Threshold::High));
         assert!(serde_json::from_str::<Policy>(r#"{"threshold": "off"}"#).is_err());
+        assert_eq!(p.inject_names, None);
+        let named: Policy = serde_json::from_str(r#"{"inject_names": true}"#).unwrap();
+        assert_eq!(named.inject_names, Some(true));
+        assert!(!serde_json::to_string(&p).unwrap().contains("inject_names"), "left out when unset");
+    }
+
+    #[test]
+    fn names_are_attacked_by_default_at_high_strength_and_above() {
+        assert!(!names_by_default(Strength::Low) && !names_by_default(Strength::Medium));
+        assert!(names_by_default(Strength::High) && names_by_default(Strength::Insane));
     }
 
     /// A policy this build can't read doesn't stop the others being used, saved or removed,
