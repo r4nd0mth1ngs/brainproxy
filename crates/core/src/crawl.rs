@@ -795,8 +795,10 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
         });
         for c in PATHS.captures_iter(&text) {
             // After an interpolation, minified code joins anything with "/" (`${a}/${b}`): only
-            // a path with a word in it is taken.
-            if !c[2].starts_with("//") && (c[1].is_empty() || has_word(&c[2])) {
+            // a path with a word in it is taken. One that starts with another value
+            // (`${this.host}/${id}/reviews`) has a base that holds a path of its own, unknown here.
+            let after_base = || has_word(&c[2]) && !c[2].starts_with("/{x}");
+            if !c[2].starts_with("//") && (c[1].is_empty() || after_base()) {
                 if let Ok(u) = page.join(&c[2]) {
                     let whole = c.get(0).map_or(0..0, |m| m.range());
                     out.push(Found { hint: method_hint(&text, whole), ..Found::get(&u, true) });
@@ -1091,6 +1093,7 @@ mod tests {
         let bundle = r#"a.get(`/api/users/${e.id}/posts?page=${n}`); fetch(`/api/items`);
             this.http.get(`${this.hostServer}/rest/products/search?q=${q}`); h.post(this.host + "/api/login", b);
             this.http.put(`${this.host}/rest/basket/${id}/checkout`, {}); u = `${a}/${b}`; v = `${a}/${n}/0`;
+            w = `${this.host}/${id}/reviews`;
             const r = [{path:"/about",component:()=>t(()=>import("./About-x1.js"),__vite__mapDeps([0,1]))}];
             const d = ["assets/About-x1.js","assets/About-x1.css","assets/vendor-y2.mjs"];
             throw Error("see index.js"); x = "https://cdn.test/lib.js"; y = `${a}${b}.js`"#;

@@ -758,7 +758,8 @@ attack type, and pick payloads:
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
     and URL paths mentioned in page text or scripts (error pages included), including template
     literals such as `` `/api/users/${id}` `` or `` `${this.host}/rest/items` `` (after a base
-    URL, a path is taken only when it has a word in it) and the code-split chunks a bundle loads later
+    URL, a path is taken only when it has a word in it and doesn't start with another
+    value, as in `` `${base}/${id}/reviews` ``) and the code-split chunks a bundle loads later
     (`import("./About-x.js")`, `"assets/About-x.js"`); placeholder values such as `?key=…`,
     `/users/{id}` or `${id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them,
