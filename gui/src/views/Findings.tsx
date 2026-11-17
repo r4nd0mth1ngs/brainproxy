@@ -56,6 +56,7 @@ import {
   withDismissed,
   withDraft,
 } from "./findingsTriage.ts";
+import { heldNote, loadAll, type ListPage, type Loaded } from "./findingsPages.ts";
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
@@ -98,8 +99,8 @@ interface Group {
 export function FindingsView({ active }: { active: boolean }) {
   const app = useApp();
   // Every triage state but removed: removed findings added by hand stay in the project for
-  // comparisons, not in the list (nor in the limit).
-  const [data, refresh] = usePoll<{ items: FindingItem[] }>(() => run(["findings", "list", "--all", "--state", LIVE_STATES, "--limit", "10000"]), 5000, active);
+  // comparisons, not in the list. Read in pages, so a big project isn't cut short unseen.
+  const [data, refresh] = usePoll<Loaded>(() => loadAll((args) => run<ListPage>(args), LIVE_STATES), 5000, active);
   const [risks, setRisks] = useState(new Set<Risk>(RISKS));
   const [hideFp, setHideFp] = useState(true);
   const [filter, setFilter] = useState<FindingFilter>(NO_FILTER);
@@ -630,6 +631,11 @@ export function FindingsView({ active }: { active: boolean }) {
           <span className="muted">
             {groups.length} issue{groups.length === 1 ? "" : "s"} · {shown.length} finding{shown.length === 1 ? "" : "s"}
           </span>
+          {heldNote(data) && (
+            <span className="warn-text" role="status">
+              {heldNote(data)}
+            </span>
+          )}
           <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
             New finding…
           </button>
