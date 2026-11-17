@@ -74,7 +74,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
+    ("kind", "TEXT", "created, state, note, suggested (`findings mark --suggest`: old is the state then, new the state suggested, text the note), retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
     ("old", "TEXT", "Value before (a state, a note, an issue id; for edited, the changed fields as JSON)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
@@ -214,6 +214,47 @@ impl Retest {
             Retest::NotReproduced => "not_reproduced",
         }
     }
+
+    /// The state a finding in `state` moves to after this outcome, if any.
+    pub fn moves(self, state: &str) -> Option<&'static str> {
+        after_retest(state, self)
+    }
+}
+
+/// Who last set an issue's own `kind` of field (title, cvss), by its timeline.
+pub(crate) fn last_set_by(conn: &Connection, issue: i64, kind: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT origin FROM finding_events WHERE issue_id = ?1 AND finding_id IS NULL AND kind = ?2
+             ORDER BY id DESC LIMIT 1",
+        )?
+        .query_row(params![issue, kind], |r| r.get(0))
+        .optional()?
+        .flatten())
+}
+
+/// Under an MCP tool call, refuses to merge or split an issue a person arranged (moved findings
+/// into or out of it) or described (gave it a title, a rating or a write-up, or reviewed one):
+/// its findings would leave what the person said about them, or others would join it.
+fn agent_may_rearrange(conn: &Connection, issue: i64) -> Result<()> {
+    if crate::provenance::origin() != "mcp" {
+        return Ok(());
+    }
+    let by: Option<String> = conn
+        .query_row(
+            "SELECT origin FROM finding_events WHERE origin IN ('gui', 'cli')
+                AND ((kind = 'moved' AND (old = ?1 OR new = ?1))
+                    OR (finding_id IS NULL AND issue_id = ?2 AND kind IN ('title', 'cvss', 'narrative', 'reviewed')))
+             ORDER BY id DESC LIMIT 1",
+            params![issue.to_string(), issue],
+            |r| r.get(0),
+        )
+        .optional()?;
+    crate::provenance::agent_may_change(
+        &format!("issue {issue} (its findings, title, CVSS rating or write-up)"),
+        by.as_deref(),
+        "leave a suggestion on its findings for a person instead (`findings mark ID --suggest --note ...`)",
+    )
 }
 
 /// Triage states a retest outcome moves: a fixed finding still there is open again, and one
@@ -355,9 +396,11 @@ impl Store {
     pub fn issues_merge(&mut self, into: i64, from: &[i64]) -> Result<usize> {
         let tx = self.write_tx()?;
         exists(&tx, into)?;
+        agent_may_rearrange(&tx, into)?;
         let mut moved = 0;
         for &issue in from.iter().filter(|&&i| i != into) {
             exists(&tx, issue)?;
+            agent_may_rearrange(&tx, issue)?;
             let ids: Vec<i64> = {
                 let mut stmt = tx.prepare("SELECT id FROM findings WHERE issue_id = ?1")?;
                 let ids = stmt.query_map([issue], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
@@ -398,9 +441,14 @@ impl Store {
             }
         }
         let (old, alert_ref, host) = from.expect("at least one finding");
+        agent_may_rearrange(&tx, old)?;
         let title = title.map(str::trim).filter(|t| !t.is_empty());
         tx.execute("INSERT INTO issues (alert_ref, host, title) VALUES (?1, ?2, ?3)", params![alert_ref, host, title])?;
         let new = tx.last_insert_rowid();
+        // The title is on the new issue's timeline, so who gave it is known.
+        if title.is_some() {
+            record(&tx, &Event { issue: Some(new), kind: "title", new: title, ..Default::default() })?;
+        }
         move_findings(&tx, findings, old, new)?;
         tx.commit()?;
         Ok(new)
@@ -414,6 +462,11 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("issue {id}")))?;
         let title = Some(title.trim()).filter(|t| !t.is_empty());
+        crate::provenance::agent_may_change(
+            &format!("issue {id}'s title"),
+            last_set_by(&tx, id, "title")?.as_deref(),
+            "leave a suggestion on one of its findings for a person instead (`findings mark ID --suggest --note ...`)",
+        )?;
         tx.execute("UPDATE issues SET title = ?1 WHERE id = ?2", params![title, id])?;
         record(&tx, &Event { issue: Some(id), kind: "title", old: old.as_deref(), new: title, ..Default::default() })?;
         tx.commit()?;
@@ -434,12 +487,17 @@ impl Store {
         mark: bool,
     ) -> Result<String> {
         let tx = self.write_tx()?;
-        let (state, last): (String, Option<i64>) = tx
-            .query_row("SELECT state, last_history_id FROM findings WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+        let (state, last, state_by): (String, Option<i64>, Option<String>) = tx
+            .query_row("SELECT state, last_history_id, state_origin FROM findings WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
+        // An agent's retest records its outcome but doesn't move a state a person set, except
+        // retest_pending: a person who set that asked for the retest.
+        let held = crate::provenance::origin() == "mcp"
+            && crate::provenance::by_a_person(state_by.as_deref())
+            && state != "retest_pending";
         // A sighting recorded after the retest's request (history ids grow) is newer proof
         // that it is there: a "not reproduced" from before it doesn't mark it fixed.
         let outdated = outcome == Retest::NotReproduced && matches!((last, history_id), (Some(l), Some(h)) if l > h);
@@ -460,7 +518,7 @@ impl Store {
         if let (Retest::StillPresent, Some(h), true) = (outcome, history_id, mark) {
             tx.execute("UPDATE findings SET hits = hits + 1, last_history_id = ?1 WHERE id = ?2", params![h, id])?;
         }
-        let after = match after_retest(&state, outcome).filter(|_| mark && !outdated) {
+        let after = match after_retest(&state, outcome).filter(|_| mark && !outdated && !held) {
             Some(next) => {
                 let cause = format!("retest: {}", outcome.as_str().replace('_', " "));
                 crate::scan::findings_db::mark_with(&tx, id, Some(next), None, Some((&cause, history_id)))?;
@@ -795,7 +853,7 @@ mod tests {
         assert!(p["open"]["instances"]["low"].as_i64().unwrap() >= 3);
         assert_eq!(p["hosts"][0]["host"], "a.test");
         let ids = s.issue_finding_ids(xpb(&s)[0]["id"].as_i64().unwrap()).unwrap();
-        s.findings_mark(&ids, Some("accepted_risk"), None).unwrap();
+        s.findings_mark(&ids, Some("accepted_risk"), None, None).unwrap();
         let p = s.posture().unwrap();
         assert_eq!(p["open"]["issues"]["low"], 1);
         assert_eq!(p["by_state"]["accepted_risk"], ids.len());

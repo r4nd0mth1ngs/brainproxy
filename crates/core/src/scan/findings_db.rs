@@ -149,10 +149,28 @@ pub(crate) fn mark_with(
     if let Some(s) = state.filter(|s| !STATES.contains(s)) {
         return Err(Error::InvalidInput(format!("unknown state {s:?}: one of {}", STATES.join(", "))));
     }
-    let before: Option<(String, Option<String>)> = conn
-        .prepare_cached("SELECT state, note FROM findings WHERE id = ?1 AND state != 'removed'")?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+    type Before = (String, Option<String>, Option<String>, Option<String>);
+    let before: Option<Before> = conn
+        .prepare_cached(
+            "SELECT state, note, state_origin, note_origin FROM findings WHERE id = ?1 AND state != 'removed'",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
+    // A retest's outcome (`cause`) is held back by the retest itself (`finding_retested`).
+    if let Some((old_state, old_note, state_by, note_by)) = before.as_ref().filter(|_| cause.is_none()) {
+        let instead = format!(
+            "suggest the change with `findings mark {id} --suggest` and the same --state or --note, for a person \
+             to decide"
+        );
+        if state.is_some_and(|s| s != old_state) {
+            let what = format!("finding {id}'s state ({})", old_state.replace('_', " "));
+            crate::provenance::agent_may_change(&what, state_by.as_deref(), &instead)?;
+        }
+        let shown = |n: Option<&str>| n.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        if note.is_some() && shown(note) != shown(old_note.as_deref()) {
+            crate::provenance::agent_may_change(&format!("finding {id}'s note"), note_by.as_deref(), &instead)?;
+        }
+    }
     // The state it already has is no change: who changed it and when stay as they were, so the
     // timeline and `state_changed_at` (what a later sighting of a fixed finding is compared
     // with) keep telling the truth. Decided by the row as the UPDATE finds it, so a scanner
@@ -176,7 +194,7 @@ pub(crate) fn mark_with(
             None => Error::NotFound(format!("finding {id}")),
         });
     }
-    let (old_state, old_note) = before.unwrap_or_default();
+    let (old_state, old_note, ..) = before.unwrap_or_default();
     let event = |kind, old: Option<&str>, new: Option<&str>, text: Option<&str>, history_id: Option<i64>| {
         crate::scan::issues::record(
             conn,
@@ -193,6 +211,13 @@ pub(crate) fn mark_with(
         }
     }
     Ok(())
+}
+
+/// A finding's state as stored (`removed` included).
+fn current_state(conn: &rusqlite::Connection, id: i64) -> Result<String> {
+    conn.query_row("SELECT state FROM findings WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("finding {id}")))
 }
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
@@ -849,10 +874,62 @@ impl Store {
 
     /// Triages several findings at once: all of them change, or none does (an unknown or
     /// removed one fails the whole call).
-    pub fn findings_mark(&mut self, ids: &[i64], state: Option<&str>, note: Option<&str>) -> Result<()> {
+    ///
+    /// With `if_state`, each finding must still be in that state (compare and swap): a finding
+    /// someone else triaged since it was read fails the call, rather than being overwritten.
+    pub fn findings_mark(
+        &mut self,
+        ids: &[i64],
+        state: Option<&str>,
+        note: Option<&str>,
+        if_state: Option<&str>,
+    ) -> Result<()> {
         let tx = self.write_tx()?;
         for &id in ids {
+            if let Some(want) = if_state {
+                let now = current_state(&tx, id)?;
+                if now != want {
+                    return Err(Error::Conflict(format!(
+                        "finding {id} is {now}, not {want} (--if-state): it was changed since it was read; read it \
+                         again, then decide"
+                    )));
+                }
+            }
             mark_one(&tx, id, state, note)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Puts a suggested state and/or note on each finding's timeline (an event of kind
+    /// `suggested`: old is its state then, new the state suggested, text the note) and changes
+    /// nothing else: how an agent proposes a change to a finding a person triaged, which it
+    /// may not change itself. Anyone may suggest. All of them, or none.
+    pub fn findings_suggest(&mut self, ids: &[i64], state: Option<&str>, note: Option<&str>) -> Result<()> {
+        if let Some(s) = state.filter(|s| !STATES.contains(s)) {
+            return Err(Error::InvalidInput(format!("unknown state {s:?}: one of {}", STATES.join(", "))));
+        }
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        if state.is_none() && note.is_none() {
+            return Err(Error::InvalidInput("a suggestion needs --state and/or a --note".into()));
+        }
+        let tx = self.write_tx()?;
+        for &id in ids {
+            let now = current_state(&tx, id)?;
+            if now == REMOVED {
+                return Err(Error::Conflict(format!("finding {id} was removed")));
+            }
+            crate::scan::issues::record(
+                &tx,
+                &crate::scan::issues::Event {
+                    finding: Some(id),
+                    kind: "suggested",
+                    old: Some(&now),
+                    new: state,
+                    text: note,
+                    ..Default::default()
+                },
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -2168,9 +2245,12 @@ mod tests {
         let live: Vec<i64> =
             s.findings_list(&FindingFilter::default(), 10).unwrap().iter().filter_map(|v| v["id"].as_i64()).collect();
         let other = *live.iter().find(|&&f| f != scanner).unwrap();
-        assert!(matches!(s.findings_mark(&[other, scanner, id], Some("confirmed"), None), Err(Error::Conflict(_))));
+        assert!(matches!(
+            s.findings_mark(&[other, scanner, id], Some("confirmed"), None, None),
+            Err(Error::Conflict(_))
+        ));
         assert_eq!(s.finding_get(other).unwrap()["state"], "open");
-        s.findings_mark(&[other, scanner], Some("false_positive"), Some("both noise")).unwrap();
+        s.findings_mark(&[other, scanner], Some("false_positive"), Some("both noise"), None).unwrap();
         for f in [other, scanner] {
             let v = s.finding_get(f).unwrap();
             assert_eq!((v["state"].as_str(), v["note"].as_str()), (Some("false_positive"), Some("both noise")));
@@ -2635,7 +2715,7 @@ mod tests {
             ))
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        s.findings_mark(&[id], Some("fixed"), Some("checked")).unwrap();
+        s.findings_mark(&[id], Some("fixed"), Some("checked"), None).unwrap();
         let f = s.finding_get(id).unwrap();
         assert_eq!((f["state_changed_at"].clone(), f["note"].as_str()), (marked, Some("checked")));
         crate::scan::passive::scan_pending(&mut s).unwrap();

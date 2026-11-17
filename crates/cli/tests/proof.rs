@@ -192,3 +192,109 @@ fn narratives_trails_repro_tickets_and_exports() {
     assert_eq!(ddf["endpoints"][0]["port"], port);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// An agent's call that must fail as a conflict, and leave things as they were.
+fn agent_refused(project: &Path, args: &[&str], stdin: Option<&str>) -> Value {
+    let (code, v) = run_as(project, args, stdin, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{args:?}: {v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("set by a person"), "{v}");
+    v
+}
+
+fn agent_ok(project: &Path, args: &[&str], stdin: Option<&str>) -> Value {
+    let (code, v) = run_as(project, args, stdin, true);
+    assert_eq!(code, 0, "{args:?}: {v}");
+    v["data"].clone()
+}
+
+#[test]
+fn an_agent_cannot_undo_what_a_person_decided() {
+    let port = serve();
+    let (dir, project) = setup("guard");
+    ok(&project, &["send", "--url", &format!("http://127.0.0.1:{port}/a")]);
+    let issues = ok(&project, &["findings", "issues"])["issues"].as_array().unwrap().clone();
+    assert!(issues.len() >= 3, "{issues:?}");
+    let first =
+        |i: &Value| ok(&project, &["findings", "issue", "show", &i["id"].to_string()])["findings"][0]["id"].to_string();
+    let (mine, theirs, spare) = (&issues[0], &issues[1], &issues[2]);
+    let (mine_id, theirs_id, spare_id) = (mine["id"].to_string(), theirs["id"].to_string(), spare["id"].to_string());
+    let (f, g) = (first(mine), first(theirs));
+
+    // A person's false positive and note stand: an agent can neither flip nor clear them.
+    ok(&project, &["findings", "mark", &f, "--state", "false_positive", "--note", "Human: a decoy banner"]);
+    agent_refused(&project, &["findings", "mark", &f, "--state", "confirmed"], None);
+    agent_refused(&project, &["findings", "mark", &f, "--note", ""], None);
+    agent_refused(&project, &["findings", "mark", "--issue", &mine_id, "--state", "accepted_risk"], None);
+    let shown = ok(&project, &["findings", "show", &f]);
+    assert_eq!(
+        (shown["state"].as_str(), shown["note"].as_str()),
+        (Some("false_positive"), Some("Human: a decoy banner"))
+    );
+    // It suggests instead, which changes nothing but the timeline.
+    let s = agent_ok(
+        &project,
+        &["findings", "mark", &f, "--suggest", "--state", "confirmed", "--note", "It is real"],
+        None,
+    );
+    assert_eq!(s["suggested"], true, "{s}");
+    assert_eq!(ok(&project, &["findings", "show", &f])["state"], "false_positive");
+    let events = ok(&project, &["findings", "timeline", &f])["events"].as_array().unwrap().clone();
+    let last = events.last().unwrap();
+    assert_eq!(
+        (last["kind"].as_str(), last["new"].as_str(), last["text"].as_str(), last["origin"].as_str()),
+        (Some("suggested"), Some("confirmed"), Some("It is real"), Some("mcp")),
+        "{events:?}"
+    );
+
+    // An agent changes what an agent or the scanner set, and a person changes anything.
+    agent_ok(&project, &["findings", "mark", &g, "--state", "confirmed", "--note", "agent: checked"], None);
+    agent_ok(&project, &["findings", "mark", &g, "--state", "open", "--note", "agent: on second look"], None);
+    ok(&project, &["findings", "mark", &g, "--state", "fixed", "--note", ""]);
+
+    // Compare and swap: a state changed since it was read isn't overwritten.
+    let (code, v) =
+        run_as(&project, &["findings", "mark", &g, "--state", "open", "--if-state", "confirmed"], None, false);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("conflict")), "{v}");
+    assert_eq!(ok(&project, &["findings", "show", &g])["state"], "fixed");
+    ok(&project, &["findings", "mark", &g, "--state", "retest_pending", "--if-state", "fixed"]);
+
+    // An agent's retest records its outcome but leaves a person's state; a person's
+    // retest_pending is a request for one, so that moves.
+    ok(&project, &["findings", "mark", &g, "--state", "fixed"]);
+    let r = agent_ok(&project, &["findings", "retest", &g], None);
+    assert_eq!((r["outcome"].as_str(), r["state"].as_str()), (Some("still_present"), Some("fixed")), "{r}");
+    assert!(r["state_kept"].is_string(), "{r}");
+    ok(&project, &["findings", "mark", &g, "--state", "retest_pending"]);
+    let r = agent_ok(&project, &["findings", "retest", &g], None);
+    assert_eq!(r["state"], "open", "{r}");
+
+    // A person's write-up, reviewed or not, and the summary.
+    ok(&project, &["findings", "issue", "narrative", &mine_id, "--text", "Written by a person."]);
+    agent_refused(&project, &["findings", "issue", "narrative", &mine_id, "--file", "-"], Some("Agent text"));
+    agent_ok(&project, &["findings", "issue", "narrative", &theirs_id, "--file", "-"], Some("Agent draft."));
+    agent_ok(&project, &["findings", "issue", "narrative", &theirs_id, "--file", "-"], Some("Agent draft, again."));
+    let hash =
+        ok(&project, &["findings", "issue", "show", &theirs_id])["narrative"]["hash"].as_str().unwrap().to_string();
+    ok(&project, &["findings", "issue", "review", &theirs_id, "--hash", &hash]);
+    agent_refused(&project, &["findings", "issue", "narrative", &theirs_id, "--file", "-"], Some(""));
+    let n = ok(&project, &["findings", "issue", "show", &theirs_id])["narrative"].clone();
+    assert!(n["text"] == "Agent draft, again." && n["reviewed_at"].is_string(), "{n}");
+    ok(&project, &["report-summary", "set", "--text", "A person's summary."]);
+    agent_refused(&project, &["report-summary", "set", "--file", "-"], Some("An agent's summary."));
+    assert_eq!(ok(&project, &["report-summary", "show"])["summary"]["text"], "A person's summary.");
+
+    // An issue's rating, title and arrangement.
+    let vector = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N";
+    ok(&project, &["findings", "issue", "cvss", &mine_id, vector]);
+    agent_refused(&project, &["findings", "issue", "cvss", &mine_id, ""], None);
+    agent_ok(&project, &["findings", "issue", "cvss", &spare_id, vector], None);
+    agent_ok(&project, &["findings", "issue", "cvss", &spare_id, ""], None);
+    ok(&project, &["findings", "issue", "title", &mine_id, "Banner"]);
+    agent_refused(&project, &["findings", "issue", "title", &mine_id, "Agent title"], None);
+    assert_eq!(ok(&project, &["findings", "issue", "show", &mine_id])["title"], "Banner");
+    agent_refused(&project, &["findings", "issue", "merge", &spare_id, &mine_id], None);
+    agent_refused(&project, &["findings", "issue", "split", &f], None);
+    agent_ok(&project, &["findings", "issue", "title", &spare_id, "Agent's own"], None);
+    agent_ok(&project, &["findings", "issue", "title", &spare_id, ""], None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

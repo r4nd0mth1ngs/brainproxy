@@ -31,6 +31,26 @@ pub fn origin() -> &'static str {
     }
 }
 
+/// A person (the desktop app or the command line) set this, as opposed to an agent, the
+/// scanner, or someone unknown.
+pub fn by_a_person(origin: Option<&str>) -> bool {
+    matches!(origin, Some("gui" | "cli"))
+}
+
+/// Under an MCP tool call, refuses to change or clear `what` when a person set it last
+/// (`by`): an agent's later edit would quietly undo a person's decision (a false positive
+/// confirmed, a reviewed write-up sent back to draft and so out of reports). `instead` says
+/// what the agent can do. An agent changes its own work, and a person changes anything.
+pub fn agent_may_change(what: &str, by: Option<&str>, instead: &str) -> crate::error::Result<()> {
+    if origin() == "mcp" && by_a_person(by) {
+        return Err(crate::error::Error::Conflict(format!(
+            "{what} was set by a person ({}), so an agent can't change or clear it; {instead}",
+            describe(by)
+        )));
+    }
+    Ok(())
+}
+
 /// Makes a child process record the same origin as this one. Children inherit the
 /// environment anyway; this keeps it true if that ever changes.
 pub fn pass_on(cmd: &mut std::process::Command) {

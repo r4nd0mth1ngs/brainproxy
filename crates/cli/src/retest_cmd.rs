@@ -208,6 +208,13 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
     }
     let outcome = if found { Retest::StillPresent } else { Retest::NotReproduced };
     let state = store.finding_retested(a.id, outcome, Some(row), &detail, !a.no_mark)?;
+    let previous = f["state"].as_str().unwrap_or_default();
+    // An agent's retest leaves a state a person set (but retest_pending) as it was: say so.
+    let kept = !a.no_mark
+        && crate::mcp::in_tool_call()
+        && brainproxy_core::provenance::by_a_person(f["state_origin"].as_str())
+        && previous != "retest_pending"
+        && outcome.moves(previous).is_some();
     let data = json!({
         "id": a.id,
         "outcome": outcome.as_str(),
@@ -215,13 +222,15 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         "previous_state": f["state"],
         "history_id": row,
         "request": detail,
+        "state_kept": kept.then_some("a person set its state; an agent's retest records the outcome only"),
     });
     out.ok(data, || {
         let said = match outcome {
             Retest::StillPresent => "still present",
             Retest::NotReproduced => "not reproduced",
         };
-        format!("finding {}: {said} (now {})", a.id, state.replace('_', " "))
+        let kept = if kept { "; a person set its state, so it is kept" } else { "" };
+        format!("finding {}: {said} (now {}{kept})", a.id, state.replace('_', " "))
     });
     Ok(())
 }

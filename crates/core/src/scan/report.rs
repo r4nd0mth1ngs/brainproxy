@@ -3070,7 +3070,7 @@ mod tests {
         passive::scan_pending(&mut s).unwrap();
         let ids: Vec<i64> =
             s.findings_list(&FindingFilter::default(), 50).unwrap().iter().map(|f| f["id"].as_i64().unwrap()).collect();
-        s.findings_mark(&ids, Some("fixed"), None).unwrap();
+        s.findings_mark(&ids, Some("fixed"), None, None).unwrap();
         // The fixed findings are out of the list (the default state), but in the letter.
         let opts = ReportOptions {
             layout: Layout { preset: Preset::Retest, since: Some("2000-01-01".into()), ..Default::default() },

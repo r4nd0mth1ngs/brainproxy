@@ -102,7 +102,22 @@ for its own draft. (`connection review`, `browser open` and the `scan script` co
 out too; see below.)
 `findings_mark` marks the findings an agent names: `id` takes one id or a list, and `issue`
 every finding of an issue, all of them or none. `from` (marking every finding that matches a
-file's) is refused, so an agent marks findings by id, with a note.
+file's) is refused, so an agent marks findings by id, with a note. `if_state` makes the call
+fail (`conflict`) when a finding is no longer in the state the agent read, so a decision made
+meanwhile isn't overwritten.
+
+**A person's decisions are read-only to an agent.** What a person (the app or a terminal) set
+last can't be changed or cleared through MCP; the call fails with kind `conflict` and nothing
+changes (all of the findings, or none). That covers a finding's state and note
+(`findings_mark`), an issue's write-up once a person wrote or reviewed it
+(`findings_issue_narrative`, which would otherwise send it back to draft and so out of
+reports), the executive summary (`report_summary_set`), an issue's CVSS rating and title, and
+merging or splitting an issue a person arranged or described. An agent's retest
+(`findings_retest`) records its outcome but leaves a state a person set (`state_kept` says so),
+except `retest_pending`, which asks for the retest. Instead, `findings_mark` with `suggest`
+puts the agent's state and/or note on the finding's timeline (kind `suggested`, origin `mcp`)
+for the person to decide, and changes nothing else. An agent still changes what it or a scanner
+set, and a person changes anything.
 
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it
@@ -197,8 +212,8 @@ Some arguments need a person, so a command run for a tool call (the server sets
   `replace_text` is refused for both, since a write-up findings share may be a person's.
 - `findings_edit` of a finding the agent didn't add (its `origin` isn't `mcp`), or one a person
   has changed since (its state, note or fields, a ticket, a move between issues, or its issue's
-  write-up, title or review): an agent edits only its own findings, and marks a person's with a
-  note (`findings_mark`) instead. Each edit is on the finding's timeline with origin `mcp` and the
+  write-up, title or review): an agent edits only its own findings, and suggests a change to a
+  person's (`findings_mark` with `suggest`) instead. Each edit is on the finding's timeline with origin `mcp` and the
   values before and after, and `findings_trail` lists it.
 - What an edit changes is checked as an add would be, and the editor answers for it:
   `rules_edit` that changes what a rule does records `mcp` as its origin (a comment alone
@@ -346,7 +361,7 @@ an agent's changes to proxied traffic are recorded on their own:
   `edited_by: [{"by": "mcp", "intercept": ID}]` on its history row.
 - `rules_add`, `rules_presets_add` (and `rules_enable` of a disabled rule) give the rule origin
   `mcp`; a request the rule changes gets `edited_by: [{"by": "mcp", "rule": ID}]`.
-- `findings_mark` with a note sets `note_origin`; `history_note` and `history_tag` set
+- `findings_mark` with a note sets `note_origin` (and refuses to change a person's; see above); `history_note` and `history_tag` set
   `note_origin` and `tags_origin`.
 - `scan_passive` with `rescan` keeps every finding's state, note and origins, and keeps a
   triaged finding it doesn't find again (with 0 hits), so it can't erase a person's triage.

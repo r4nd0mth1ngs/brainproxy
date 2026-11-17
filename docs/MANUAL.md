@@ -2965,10 +2965,19 @@ Findings are records with a history, not just rows:
 - **States:** `open`, `confirmed`, `false_positive`, `accepted_risk`, `retest_pending` and
   `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). Marking
   a finding with the state it already has changes nothing: who changed it and when stay as
-  they were. `findings list` and `report` show work still to do by default: open, confirmed
-  and retest pending.
+  they were. `--if-state STATE` changes only findings still in that state: if any has been
+  changed since you read it, the call fails (kind `conflict`) and nothing changes. `--suggest`
+  records the given `--state` and/or `--note` as a suggestion on each finding's timeline (kind
+  `suggested`) and changes nothing else. `findings list` and `report` show work still to do by
+  default: open, confirmed and retest pending.
+- **A person's decisions stay a person's:** through MCP an agent can't change or clear what a
+  person set last: a finding's state or note, an issue's write-up once a person wrote or
+  reviewed it, the executive summary, an issue's CVSS rating or title, or the findings of an
+  issue a person arranged (merge, split). The call fails with kind `conflict`; the agent
+  suggests instead (`findings mark ID --suggest`). An agent's retest records its outcome
+  without moving a state a person set, unless that state is `retest_pending`.
   A fixed finding a scanner sees again goes back to open, with a `regressed` event.
-- **Timeline** (`findings timeline ID`): created, state and note changes, retests, moves
+- **Timeline** (`findings timeline ID`): created, state and note changes, suggestions, retests, moves
   between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
   afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets

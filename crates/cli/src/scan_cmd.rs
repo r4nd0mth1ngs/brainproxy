@@ -284,7 +284,10 @@ pub enum FindingsCmd {
         report's fingerprint when it has one, so a redacted report still matches). Each match gets \
         --state when given, else the file's mark where it is confirmed, false_positive or \
         accepted_risk. Removed findings are left as they are. Refused through MCP: an agent marks \
-        findings by id, with a note.")]
+        findings by id, with a note. Through MCP an agent can't change or clear a state or note a person \
+        set last (kind conflict); --suggest puts its proposal on the finding's timeline (kind suggested) \
+        for the person to decide, and changes nothing. --if-state refuses (kind conflict) when any of the \
+        findings is no longer in that state, so a decision made meanwhile isn't overwritten.")]
     Mark {
         /// One or more finding ids. (Named `id`, so an agent's `{"id": 5}` keeps working.)
         #[arg(value_name = "ID", required_unless_present_any = ["issue", "from"], conflicts_with = "from", num_args = 1..)]
@@ -301,6 +304,14 @@ pub enum FindingsCmd {
         /// Mark the findings that match those of FILE (see below).
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
+        /// Change only findings still in this state (as read): any other fails the call (kind
+        /// conflict) and nothing changes.
+        #[arg(long, value_enum, value_name = "STATE", conflicts_with = "from")]
+        if_state: Option<StateArg>,
+        /// Suggest --state and/or --note instead of setting them: the suggestion goes on each
+        /// finding's timeline for a person to decide, and nothing else changes.
+        #[arg(long, conflicts_with_all = ["from", "if_state"])]
+        suggest: bool,
     },
     /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
@@ -1413,7 +1424,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let f = store.finding_get(id)?;
             out.ok(f.clone(), || serde_json::to_string_pretty(&f).unwrap_or_default());
         }
-        FindingsCmd::Mark { id: mut ids, issue, state, note, from } => {
+        FindingsCmd::Mark { id: mut ids, issue, state, note, from, if_state, suggest } => {
             let state = state.map(StateArg::as_str);
             if let Some(path) = from {
                 return mark_from(&store, &path, state, note.as_deref(), out);
@@ -1426,7 +1437,15 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             }
             ids.sort_unstable();
             ids.dedup();
-            store.findings_mark(&ids, state, note.as_deref())?;
+            if suggest {
+                store.findings_suggest(&ids, state, note.as_deref())?;
+                let n = ids.len();
+                out.ok(json!({"ids": ids, "suggested": true, "state": state, "note": note}), || {
+                    format!("suggested on {n} finding(s); nothing changed")
+                });
+                return Ok(());
+            }
+            store.findings_mark(&ids, state, note.as_deref(), if_state.map(StateArg::as_str))?;
             // `note` is as given: "" when it was cleared, null when it was left alone.
             match ids.as_slice() {
                 [id] => out.ok(json!({"id": id, "ids": ids, "state": state, "note": note}), || {
