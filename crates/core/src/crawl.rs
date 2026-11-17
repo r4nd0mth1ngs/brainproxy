@@ -786,8 +786,7 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
     if ct.contains("javascript") || ct.contains("json") {
         // Template literals, as compiled apps write their API calls (`/api/users/${id}`): each
         // `${…}` becomes a placeholder, filled in like `{id}`.
-        static INTERPOLATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{[^{}`]{0,100}\}").unwrap());
-        let text = INTERPOLATION.replace_all(&text, "{x}");
+        let (text, _) = interpolate(&text);
         // Quoted absolute paths in scripts, e.g. fetch("/api/items"), also after a base URL
         // interpolated first (`${this.host}/rest/items`), which is where Angular services keep
         // theirs. A concatenated base (`host + "/api/x"`) leaves the path quoted on its own.
@@ -795,15 +794,31 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
             Regex::new(r#"["'`]((?:\{x\})*)(/[A-Za-z0-9_\-./{}:~%]{1,150}(?:\?[^"'`\s]{0,200})?)["'`]"#).unwrap()
         });
         for c in PATHS.captures_iter(&text) {
-            // After an interpolation, minified code joins anything with "/" (`${a}/${b}`): only
-            // a path with a word in it is taken. One that starts with another value
-            // (`${this.host}/${id}/reviews`) has a base that holds a path of its own, unknown here.
-            let after_base = || has_word(&c[2]) && !c[2].starts_with("/{x}");
-            if !c[2].starts_with("//") && (c[1].is_empty() || after_base()) {
-                if let Ok(u) = page.join(&c[2]) {
-                    let whole = c.get(0).map_or(0..0, |m| m.range());
-                    out.push(Found { hint: method_hint(&text, whole), ..Found::get(&u, true) });
-                }
+            let (Some(whole), Some(lead)) = (c.get(0), c.get(1)) else { continue };
+            let path = &c[2];
+            // Minified code joins anything with "/" (`${a}/${b}`, `len + "/160"`, a parse
+            // table's `O'/SQ` between two different quote characters): only a path with a word
+            // in it, quoted alike at both ends, with a query of `name=value` pairs, is taken.
+            let quoted_alike = whole.as_str().bytes().next() == whole.as_str().bytes().last();
+            let query_ok = path.split_once('?').is_none_or(|(_, q)| {
+                q.is_empty() || q.split('&').all(|p| p.contains('=') && !p.contains(['<', '>', '!', '?']))
+            });
+            if path.starts_with("//")
+                || !has_word(path)
+                || !quoted_alike
+                || !query_ok
+                || string_argument(&text, whole.start())
+            {
+                continue;
+            }
+            // One that starts with another value (`${this.host}/${id}/reviews`) has a base that
+            // holds a path of its own, unknown here.
+            if !lead.as_str().is_empty() && path.starts_with("/{x}") {
+                continue;
+            }
+            let joined = path;
+            if let Ok(u) = page.join(joined) {
+                out.push(Found { hint: method_hint(&text, whole.range()), ..Found::get(&u, true) });
             }
         }
         chunk_links(page, &text, &mut out);
@@ -880,6 +895,30 @@ fn window(text: &str, from: usize, to: usize) -> &str {
     text.get(from..to).unwrap_or("")
 }
 
+/// `text` with each template literal's `${…}` replaced by the placeholder `{x}` (filled in like
+/// `{id}`), and where each placeholder starts in the result with the expression it replaced.
+fn interpolate(text: &str) -> (String, Vec<(usize, String)>) {
+    static INTERPOLATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{([^{}`]{0,100})\}").unwrap());
+    let (mut out, mut exprs, mut last) = (String::with_capacity(text.len()), Vec::new(), 0);
+    for c in INTERPOLATION.captures_iter(text) {
+        let (Some(m), Some(expr)) = (c.get(0), c.get(1)) else { continue };
+        out.push_str(&text[last..m.start()]);
+        exprs.push((out.len(), expr.as_str().to_string()));
+        out.push_str("{x}");
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    (out, exprs)
+}
+
+/// Whether the string at `at` is an argument of a string method (`url.replace("/v3/", "/ws/v3/")`,
+/// `s.split("/")`): text being edited, not a path the app requests.
+fn string_argument(text: &str, at: usize) -> bool {
+    static CALL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\.(?:replace|replaceAll|split|join)\(\s*(?:[^,()]{0,80},\s*)?$").unwrap());
+    CALL.is_match(window(text, at.saturating_sub(100), at))
+}
+
 /// Two letters in a row outside the `{x}` placeholders: `/rest/items`, not `/{x}` or `/0/1`.
 fn has_word(path: &str) -> bool {
     path.replace("{x}", "/").as_bytes().windows(2).any(|w| w[0].is_ascii_alphabetic() && w[1].is_ascii_alphabetic())
@@ -922,14 +961,26 @@ fn text_links(base: &Url, text: &str, out: &mut Vec<Found>) {
         .unwrap()
     });
     for c in URLS.captures_iter(text).take(200) {
-        let raw = c[1].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-        if raw.starts_with("//") || raw.len() < 2 {
+        let Some(m) = c.get(1) else { continue };
+        let raw = m.as_str().trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        if raw.starts_with("//") || raw.len() < 2 || stack_frame(raw, &text[m.end()..]) {
             continue;
         }
         if let Ok(u) = base.join(raw) {
             out.push(Found::get(&u, true));
         }
     }
+}
+
+/// Whether `path` (followed by `after`) names a source file in a stack trace rather than a
+/// page: `/app/x.js:68:18` (Node, Ruby's `x.rb:12:in`), `File "/app/x.py", line 12` (Python),
+/// `/var/www/x.php(12)` or `/var/www/x.php on line 7` (PHP).
+fn stack_frame(path: &str, after: &str) -> bool {
+    static LINE_COL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\.[A-Za-z][A-Za-z0-9]{0,9}:\d+(?::\d+)?(?::in)?$").unwrap());
+    static LINE_AFTER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"^(?:\(\d+\)|"?,? line \d|"?\s+on line \d)"#).unwrap());
+    LINE_COL.is_match(path) || LINE_AFTER.is_match(after)
 }
 
 fn refresh_url(v: &str) -> Option<String> {
@@ -1119,6 +1170,42 @@ mod tests {
         );
         // A chunk folder that isn't the script's own: from the origin's root.
         assert_eq!(urls("https://a.test/static/main.js", r#"["js/chunk-1.js"]"#), ["https://a.test/js/chunk-1.js"]);
+    }
+
+    /// Strings in real minified bundles (an Angular app, ethers, a lezer parse table) that look
+    /// like paths but aren't: character counters, derivation paths, string-replace arguments,
+    /// a bare interpolation and the text between two different quote characters.
+    #[test]
+    fn minified_code_that_only_looks_like_paths_is_skipped() {
+        let h = vec![("Content-Type".to_string(), "application/javascript".to_string())];
+        let js = r#"wi$1(4),ff(``,s.value?.length||0,`/160`),wi$1(),Ri$1(n.feedbackControl);ff(``,d.value?.length||0,`/20`);
+            ff(``,t.challenge().codingChallengeStatus,`/2`);an=`m/44'/60'/0'/0/0`;x=`m/44'/60'/${r}'/0/0`;
+            let o=i.url.replace(/^http/i,`ws`).replace(`/v3/`,`/ws/v3/`);get(t){return this.http.get(`${this.host}/${t}`)}
+            let e=`/${r}`;i=e.startsWith(`//`)?`/.${e}`:e;
+            p="O'/SQ`O<<JQO'/_Q?MtO<<JQOOQO<<Hy<<HyOOQ!0LfAN?fAN?f";q="OG27WO'/pQ`OG27WO'/xQ?MtO<<JgO'0VQ?MvO1G2";
+            fetch(`/api/Feedbacks`);r=this.router.navigate([`/2fa/enter`])"#;
+        let found = extract(&Url::parse("http://a.test/main.js").unwrap(), &h, js.as_bytes(), false);
+        let urls: Vec<&str> = found.iter().map(|f| f.url.as_str()).collect();
+        assert_eq!(urls, ["http://a.test/api/Feedbacks", "http://a.test/2fa/enter"]);
+    }
+
+    /// An error page's stack trace names server files, not links (Express's 403 page).
+    #[test]
+    fn stack_trace_paths_are_not_links() {
+        let page = Url::parse("http://a.test/ftp/coupons_2013.md.bak").unwrap();
+        let headers = vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())];
+        let html = r#"<h2><em>403</em> Error: Only .md and .pdf files are allowed!</h2><ul id="stacktrace">
+            <li> &nbsp; &nbsp;at verify (/juice-shop/build/routes/fileServer.js:68:18)</li>
+            <li> &nbsp; &nbsp;at /juice-shop/build/routes/fileServer.js:52:13</li>
+            <li> &nbsp; &nbsp;at Layer.handle [as handle_request] (/juice-shop/node_modules/express/lib/router/layer.js:95:5)</li>
+            <li> &nbsp; &nbsp;at FSReqCallback.oncomplete (node:fs:199:5)</li></ul>
+            <pre>File "/srv/app/views.py", line 12, in index
+            #0 /var/www/html/index.php(12): run()
+            Warning: x in /var/www/html/lib.php on line 7
+            /app/lib/x.rb:12:in `call'</pre><p>See /help for more.</p>"#;
+        let found = extract(&page, &headers, html.as_bytes(), false);
+        let urls: Vec<&str> = found.iter().map(|f| f.url.as_str()).collect();
+        assert_eq!(urls, ["http://a.test/help"]);
     }
 
     /// The method a bundle calls a path with, so a POST-only route isn't sent as GET.

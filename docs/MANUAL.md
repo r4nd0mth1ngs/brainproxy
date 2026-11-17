@@ -757,9 +757,9 @@ attack type, and pick payloads:
   - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
     and URL paths mentioned in page text or scripts (error pages included), including template
-    literals such as `` `/api/users/${id}` `` or `` `${this.host}/rest/items` `` (after a base
-    URL, a path is taken only when it has a word in it and doesn't start with another
-    value, as in `` `${base}/${id}/reviews` ``) and the code-split chunks a bundle loads later
+    literals such as `` `/api/users/${id}` `` or `` `${this.host}/rest/items` `` (a path is
+    taken only when it has a word in it, and after a base URL only when it doesn't start
+    with another value, as in `` `${base}/${id}/reviews` ``) and the code-split chunks a bundle loads later
     (`import("./About-x.js")`, `"assets/About-x.js"`); placeholder values such as `?key=…`,
     `/users/{id}` or `${id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them,
@@ -2337,8 +2337,13 @@ Crawl and active-scan scope and safety flags:
   body is unknown. It is listed under `unconfirmed_endpoints` (`method`, `path`, `params`,
   `reason`; at most 200, `unconfirmed_count` has the total) instead. So is a path read from a
   script or page text that answers a GET with 405 or a 5xx: it isn't counted as an
-  endpoint, and the error page's links (stack-trace paths) aren't followed. The request is
-  still in history.
+  endpoint, and the error page's links aren't followed. The request is still in history.
+- Paths that only look like links aren't requested: a source file named in a stack trace on
+  any page (`/app/routes/x.js:68:18`, `File "/app/x.py", line 12`, `/var/www/x.php(12)` or
+  `… on line 7`), and, in scripts, a quoted path without two letters in a row (`"/160"`,
+  `` `/${id}` ``, `"m/44'/60'/0'/0/0"`), one between two different quote characters, one whose
+  query isn't `name=value` pairs, and the arguments of `.replace(`, `.replaceAll(`, `.split(`
+  and `.join(`.
 - `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
   bounds its crawl too, with `--browser` both crawls together).
 - `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl
