@@ -108,6 +108,13 @@ fn extract_text(html: &str) -> String {
     decoded.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Words before a number that say it is a card's: `card`, `credit`, `cc`, `ccnum`, `pan`.
+static CARD_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)card|credit|(?:\b|_)cc(?:_?num(?:ber)?)?(?:\b|_)|(?:\b|_)pan(?:\b|_)").unwrap());
+
+/// How many characters before a number a label is looked for.
+const LABEL_DISTANCE: usize = 40;
+
 /// ZAP's isSci: the context looks like a float in exponent notation.
 fn is_sci(containing: &str) -> bool {
     if !containing.contains(['e', 'E']) {
@@ -138,7 +145,11 @@ fn scan_text(text: &str, out: &mut Vec<Finding>) {
                 break;
             }
             if is_valid_luhn(&candidate) && !is_sci(&containing) {
-                out.push(ALERT.raise("", original).other_info(format!("Credit Card Type detected: {name}")));
+                let f = ALERT.raise("", original).other_info(format!("Credit Card Type detected: {name}"));
+                // Diverges from ZAP: one number in ten passes Luhn, so without a label that
+                // says card (an id, an order number) it is Medium at low confidence.
+                let labelled = CARD_LABEL.is_match(&text[chars_back(text, g.start(), LABEL_DISTANCE)..g.start()]);
+                out.push(if labelled { f } else { f.risk(Risk::Medium).confidence(Confidence::Low) });
             }
         }
     }
@@ -210,6 +221,19 @@ mod tests {
         assert_eq!(f[1].other_info, "Credit Card Type detected: Mastercard");
         let f = msg("https://a.test/").header("Content-Type", "application/json").body(r#"{"cc":"378282246310005"}"#);
         assert_eq!(f.scan(&Pii)[0].other_info, "Credit Card Type detected: American Express");
+    }
+
+    /// A Luhn-valid id in JSON was High; without a card label it is Medium at low confidence.
+    #[test]
+    fn unlabelled_numbers_are_medium_low() {
+        let json =
+            |b: &str| msg("https://a.test/api/Orders").header("Content-Type", "application/json").body(b).scan(&Pii);
+        let f = json(r#"{"id":4111111111111111,"total":3}"#);
+        assert_eq!((f.len(), f[0].risk, f[0].confidence), (1, Risk::Medium, Confidence::Low));
+        for labelled in [r#"{"cardNumber":"4111111111111111"}"#, r#"{"cc_number":"4111111111111111"}"#] {
+            let f = json(labelled);
+            assert_eq!((f[0].risk, f[0].confidence), (Risk::High, Confidence::Medium), "{labelled}");
+        }
     }
 
     #[test]

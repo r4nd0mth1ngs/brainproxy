@@ -16,7 +16,8 @@ brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
 without changing it, and a server that hides its version isn't flagged.
 **100008 JWT Issues** reads JSON Web Tokens in traffic: a token in the query string
 (100008-1, low), and for tokens the server hands out (in a response's headers, such as
-`Set-Cookie` or `Location`, or its body) one with `alg: none` (100008-2, high), one with no
+`Set-Cookie` or `Location`, or its body, unless the body is a script or a source map, whose
+tokens are samples in the code) one with `alg: none` (100008-2, high), one with no
 `exp` (100008-3, low), and one with a claim named like a secret, such as `password`,
 `client_secret`, `ssn` or `card_number` (100008-4, low). Tokens only the client sends are
 left to the active rule 100007, so a token isn't reported again on every request.
@@ -92,7 +93,7 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   10035-4, 10032-4, 90011-3, the low-confidence SHA/MD5 patterns of 10097). There is no threshold setting yet.
 - **ZAP configuration and contexts** (trusted domains, cookie/CSRF ignore lists, scope
   checks, custom error pages, BIN list lookups) are not used; lists are empty and PII
-  findings stay at Medium confidence.
+  findings stay at Medium confidence at most.
 - **Content Security Policy (10055)** uses brainproxy's own CSP parser and evaluator, not
   the htmlunit-csp library. It reproduces nearly all of ZAP's own CSP unit-test
   expectations; some parser notice texts are brainproxy's wording.
@@ -154,3 +155,6 @@ noise on modern applications:
 - **Anti-clickjacking (10020-1)** and **CSP Header Not Set (10038-1)** skip a text/html body
   without any markup (socket.io answers a POST with `ok`): there is no page to frame or
   script to restrict.
+- **PII Disclosure (10062)** is Medium at low confidence (ZAP: High, Medium) for a card
+  number with no label such as `card`, `credit`, `cc` or `pan` in the 40 characters before
+  it: one number in ten passes the Luhn check, so ids and order numbers did.
