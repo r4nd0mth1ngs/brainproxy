@@ -9,6 +9,7 @@ import {
   trailLine,
   groupKey,
   hostsOf,
+  inView,
   MARK_BATCH,
   markCommands,
   matchesFinding,
@@ -18,6 +19,7 @@ import {
   recordTicketCommand,
   reproCommand,
   retestCommand,
+  riskCounts,
   STATES,
   ticketCommand,
   ticketLinkProblem,
@@ -144,6 +146,24 @@ test("a filed ticket's link is an http(s) URL, recorded as one argument", () => 
   assert.equal(ticketLinkProblem(`https://a.test/${"x".repeat(2000)}`), "Give the ticket's http(s) link.");
   assert.deepEqual(recordTicketCommand(7, "github", " https://github.com/o/r/issues/4 "), ["findings", "ticket", "7", "--to", "github", "--record=https://github.com/o/r/issues/4"]);
   assert.deepEqual(recordTicketCommand(7, "jira", "https://x.test/--force"), ["findings", "ticket", "7", "--to", "jira", "--record=https://x.test/--force"]);
+});
+
+test("the risk chips count what the list would show: closed, filtered and compared ones are left out", () => {
+  const items = [
+    item({ id: 1, risk: "high" }),
+    item({ id: 2, risk: "high", state: "false_positive" }),
+    item({ id: 3, risk: "low", host: "other.test" }),
+    item({ id: 4, risk: "low" }),
+  ];
+  const view = { hideClosed: true, filter: NO_FILTER };
+  assert.deepEqual(riskCounts(items, view), { high: 1, low: 2 });
+  // With Hide closed off, the closed ones count too.
+  assert.deepEqual(riskCounts(items, { ...view, hideClosed: false }), { high: 2, low: 2 });
+  assert.deepEqual(riskCounts(items, { ...view, filter: { ...NO_FILTER, host: "other.test" } }), { low: 1 });
+  const seen = new Map([[1, "new"], [4, "still"]]);
+  assert.deepEqual(riskCounts(items, { ...view, compare: { seen, want: "new" } }), { high: 1 });
+  assert.equal(inView(items[1], view), false);
+  assert.equal(inView(items[2], { ...view, compare: { seen, want: "new" } }), false);
 });
 
 test("a repro pack replaces a file only when the save dialog asked about it", () => {

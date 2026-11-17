@@ -199,7 +199,7 @@ defaults, in local storage (`shortcuts`), like the theme and Recent.
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable; *Keep only attack requests that back a finding*, a project setting) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules (the last passive source can't be switched off; a passive check written as a script is listed as `script:NAME` and switched on and off like the others; a passive scan's toast says when one failed: `views/scriptChecks.ts`; *Add script check…* and the script checks list (`views/ScriptChecks.tsx`) test a file on a history row, add it pinned by the sha256 the test read, name a changed file again, and remove one after a confirmation), saved scan policies (per-rule on/off, strength and threshold; picked in new scan) | `job *`, `scan active/passive/rules/enable/disable/sources/prune`, `scan script list/test/add [--sha256]/remove`, `scan policy list/show/save/remove`, `scan active --policy`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, a SQL condition, or the requests sent from Traffic), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict, rows with an issue only by default, static assets and skip paths hidden behind a box, and what a run left out next to the legend; the project's skip paths edited in place; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background` (with `--history-id`, and the opt-ins asked for, for requests from Traffic; `--include-static`), `authz list/matrix --all/results`, `authz skip list/set`, `job status/stop`, `history show`, `proxy status/start/restart --authz`, `proxy setup show` (a proxy that is off) |
-| Results | Findings | Issues grouped by type and risk, detail, evidence, triage; *New finding…* for an issue found by hand (also *Create finding…* from Traffic and Replay), which can be edited in place (*Edit…*, below) and removed again; *Ticket ▾* copies a finding written up for GitHub (Markdown) or Jira (its `{noformat}` description) and records the link of a ticket filed for it; *Repro pack…* saves `findings repro`'s JSON; *Compare with/without payload* (below); **Report…** (`views/ReportBuilder.tsx`, `views/reportSpec.ts`): audience, sections, branding and format (HTML, PDF, Word, Markdown, JSON, CSV, SARIF, DefectDojo) with a live HTML preview, which findings (triage state, minimum risk and confidence, source, a host with findings), secrets masked unless *Quote secrets as recorded* is confirmed, more values to mask, drafts in or out, saved layouts (save, load, delete after a confirmation), and the executive summary (write, clear, *Mark reviewed* for the text on screen) | `findings list/show/mark/add/edit/remove`, `findings edit ID --input-json [--replace-text] --if-revision REV`, `findings verify ID [--allow-unsafe]`, `findings ticket --to github\|jira [--record URL]`, `findings repro --output --force`, `report KIND --output --force` (with `--risk/--confidence/--state/--source/--host`, `--mask` or `--no-redact`, `--drafts`), `report-profile list/save/remove`, `report-summary show/set --file=-/review`, `query` (the hosts with findings) |
+| Results | Findings | Issues grouped by type and risk, detail, evidence, triage from the keyboard (below); *New finding…* for an issue found by hand (also *Create finding…* from Traffic and Replay), which can be edited in place (*Edit…*, below) and removed again; *Ticket ▾* copies a finding written up for GitHub (Markdown) or Jira (its `{noformat}` description) and records the link of a ticket filed for it; *Repro pack…* saves `findings repro`'s JSON; *Compare with/without payload* (below); **Report…** (`views/ReportBuilder.tsx`, `views/reportSpec.ts`): audience, sections, branding and format (HTML, PDF, Word, Markdown, JSON, CSV, SARIF, DefectDojo) with a live HTML preview, which findings (triage state, minimum risk and confidence, source, a host with findings), secrets masked unless *Quote secrets as recorded* is confirmed, more values to mask, drafts in or out, *Say who recorded and triaged each finding (internal)* (`--provenance`, off by default: which client, and each agent's trail, are for an internal review), how many findings the report holds when the limit cuts it and how many its state filter leaves out, by state and by who set it (a person, an agent, the scanner; from `report json`'s `summary.left_out`), saved layouts (save, load, delete after a confirmation), and the executive summary (write, clear, *Mark reviewed* for the text on screen) | `findings list --all --limit --offset` (in pages), `findings show/mark/add/edit/remove/timeline/trail`, `findings mark ID... --state` (bulk, in batches of 500), `findings mark ID --note`, `findings mark ID --state --note --if-state` (accepting a suggestion), `findings retest ID [--allow-unsafe]`, `findings issue show/narrative/review`, `history show`, `findings edit ID --input-json [--replace-text] --if-revision REV`, `findings verify ID [--allow-unsafe]`, `findings ticket --to github\|jira [--record URL]`, `findings repro --output --force`, `report KIND --output --force` and `report html --max-evidence` (the preview), both `--limit 500` (with `--risk/--confidence/--state/--source/--host`, `--mask` or `--no-redact`, `--drafts`, `--provenance`), `report json --limit 1 --no-evidence` (what is left out), `report-profile list/save/remove`, `report-summary show/set --file=-/review`, `query` (the hosts with findings) |
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps, including gzip, zlib, and raw deflate (Brotli decodes only). **Smart decode** finds the layers (URL, Base64, hex, HTML, JWT, gzip, zlib) and puts them in as steps to check or change, stopping at JSON; its note says if the 8-layer limit or a decompression bomb stopped it | `encode`, `decode`, `hash`; Smart decode: `decode auto -` (its `steps` and `stopped`) |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
@@ -493,6 +493,50 @@ logic in `views/replayTabs.ts`:
   marked untrusted, since requests often come from the target's traffic; `summary` and
   `index` page through a set larger than the server's output cap.
 
+### Triage
+
+Findings is worked through from the keyboard (`views/findingsTriage.ts`, registered with
+`useActions` so the palette and Settings › Keyboard list and rebind them): **J** / **K** open the
+next or previous finding the list shows (its group opens and it scrolls into view), and **C**
+confirmed, **F** false positive, **A** accepted risk, **Shift+F** fixed, **R** retest pending
+and **O** open mark the open finding (`findings mark ID --state`) and then open the next one
+(the previous one at the end of the list), worked out before the mark so *Hide closed* taking
+the marked one away doesn't lose the place. The keys apply only in Findings and not while typing
+in the note, write-up or search. The buttons mark without moving on. The risk toggles and the
+state buttons are named groups whose pressed button says so (`aria-pressed`), a group row says
+whether it is open (`aria-expanded`), and the open finding is `aria-current`.
+
+The list is read in pages of 5,000 (`findings list --all --state ... --limit --offset`, until
+`truncated` is false; `loadAll` in `views/findingsPages.ts`), each finding kept once if one
+added meanwhile shifts a page, up to 50,000; past that the toolbar says how many of the `total`
+it shows. The risk chips count the findings the list would show with that risk on: the same search,
+source, host, *Hide closed* and scan comparison (`inView`, `riskCounts` in
+`views/findingsFilter.ts`); the toolbar gives issues and findings. The open finding follows the
+list's 5-second poll: its state, note, timeline, write-up and request are read again
+(`findings show`, `findings timeline`, `findings issue show`), so a change from an agent, a
+rescan, a retest or a bulk mark shows without opening it again. A note typed for a finding and
+a write-up typed for an issue are kept while other findings are opened, until saved
+(`draftOf`, `withDraft`, `dropDraft` in `views/findingsTriage.ts`); the list tags a finding with
+an *unsaved note*. They last as long as the window. The report preview holds the same findings
+as the saved report (`--limit 500`, `REPORT_LIMIT` in `views/reportSpec.ts`).
+
+The request pane marks where the finding is (`findingRanges` in `views/payloadMarks.ts`): an
+active finding's payload, found as Replay finds it (what the attack changed against the request
+the scan started from, read with `history show`, else the payload as typed, percent-encoded or
+JSON-escaped), else the name of the parameter it was found in (a query or form field, a JSON
+key, a header or a cookie). The pane's title says which is marked; the response pane searches
+for the evidence, as before.
+
+An agent can't change a state or note a person set; it suggests one (`findings mark ID
+--suggest`, a `suggested` event). The open finding shows each suggestion still waiting in a
+dashed box above its write-up, with who made it and when, and the timeline shows suggestions in
+italics. **Accept** applies it as the person's own decision: `findings mark ID --state S
+--note=N --if-state SHOWN`, where SHOWN is the state on screen, so a change made meanwhile is
+refused (kind `conflict`) rather than overwritten; replacing a note the finding already has asks
+first. **Dismiss** hides it and changes nothing on the finding. A suggestion stops waiting once
+the finding's state or note changed after it (`pendingSuggestions` and `acceptCommand` in
+`views/findingsTriage.ts`).
+
 ### New finding
 
 The form (`views/NewFinding.tsx`, logic in `views/manualFinding.ts`) runs `findings add`: title,
@@ -737,6 +781,7 @@ arrays whole), so change both when the window changes. The icons are in
   copied project, and a saved search for a secret stays in the webview's storage until it is
   deleted. *Save as…* on a temporary engagement copies them to the saved file (and says so if
   it can't); discarding one leaves its (unused) entry behind.
-- A finding added by hand can't be edited: mark it like any other, or remove it and add it
-  again (a new finding, with a new id and an open state; the removed one stays as `removed`).
+- Dismissed suggestions are remembered by the app (localStorage, per project path, the
+  timeline event ids), not in the project: another machine, or the command line, still sees
+  them as waiting until the finding's state or note changes.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

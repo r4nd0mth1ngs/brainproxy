@@ -2830,6 +2830,20 @@ button.chip {
   font-size: 12px;
   line-height: 1.6;
 }
+/* An agent's suggestion (findings mark --suggest): a proposal, not a decision. */
+.timeline li.suggested {
+  font-style: italic;
+  color: var(--medium);
+}
+.suggestion {
+  margin: 8px 0 12px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+}
+.suggestion p {
+  margin: 0 0 4px;
+}
 /* Posture: what each scan found new and no longer found. */
 .trend {
   display: flex;
