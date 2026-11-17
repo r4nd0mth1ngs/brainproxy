@@ -37,6 +37,17 @@ don't count. 100021-2 (medium, low confidence) reports a literal assigned to a n
 once per name; labels, messages, field names, constants, templates and placeholders (values
 with spaces, `password`, `changeme`, `currentPassword`, `SECRET_KEY`, `${pw}`) don't count.
 Source maps are skipped: their sources hold test fixtures.
+**100022 API Description Exposed** reports an OpenAPI or Swagger description (JSON or
+YAML with `openapi: 3.x` or `swagger: 2.0` and its `paths`, or one embedded in
+swagger-ui-express's init script; 100022-1, low) and a Swagger UI or ReDoc page (100022-2,
+info). **100023 Prometheus Metrics Exposed** (low) reports a plain-text Prometheus or
+OpenMetrics page (`# HELP` and `# TYPE` lines), not a page that shows the format as an
+example. **100024 Source Map Exposed** reports a served source map (with its `mappings`),
+low when it carries the source code (`sourcesContent`) and info otherwise, with the source
+files it names; a single-page app's index page answering a `.map` URL isn't one. **100025
+JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, `jsonp` or
+`jsoncallback` query parameter names (low when the request carried a cookie or
+`Authorization`, info otherwise). These are found per URL; issues group them by host.
 
 ## Rules
 
@@ -100,6 +111,10 @@ Source maps are skipped: their sources hold test fixtures.
 | 100008 | JWT Issues | high | 100008-1, 100008-2, 100008-3, 100008-4 |
 | 100020 | Password Hash in Response | high | 100020-1, 100020-2 |
 | 100021 | Secrets in Response | high | 100021-1, 100021-2 |
+| 100022 | API Description Exposed | low | 100022-1, 100022-2 |
+| 100023 | Prometheus Metrics Exposed | low | 100023 |
+| 100024 | Source Map Exposed | low | 100024 |
+| 100025 | JSONP Endpoint | low | 100025 |
 
 Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 
