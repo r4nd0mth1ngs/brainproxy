@@ -366,6 +366,11 @@ fn a_whole_issue_s_decision_reaches_its_new_instances_and_an_agent_keeps_it() {
     // The default report leaves both out, and says so.
     let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
     assert!(md.contains("2 false positive"), "{md}");
+    // Several states at once: these two, and no other.
+    let r = ok(&project, &["report", "json", "--state", "confirmed,false_positive", "--alert", "10037"]);
+    assert_eq!((r["summary"]["total"].as_u64(), r["issues"].as_array().map(Vec::len)), (Some(2), Some(1)), "{r}");
+    let (code, v) = run_as(&project, &["report", "json", "--state", "confirmed,bogus"], None, false);
+    assert_eq!(code, 2, "{v}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -3155,7 +3155,31 @@ no longer found, retests), `list` (the table of issues), `issues` (a section per
 finding, with masked secrets still masked), `retest` (fixed, still there, back after a fix
 and awaiting a retest since `--since DAY`, default the last 30 days, each with the retest
 request as proof), `about`. `evidence` and `reproduce` sit in the issue sections, so
-either brings `issues` with it. The curl lines send the request as recorded
+either brings `issues` with it.
+
+The Markdown, HTML, PDF and Word reports go by issue, not by alert type: each issue (as
+`findings issues` lists it, split and merged as testers arranged it) has one section under its
+own title (`findings issue title`, `findings issue split --title`; else the alert's name, which
+the section then names beside the rule), its CVSS rating and its write-up, the alert's
+description and solution once, a table of every place it was found (finding, address,
+parameter, evidence or attack, confidence, state, sightings), and one exchange as the proof:
+the finding a person confirmed, else the riskiest and surest, else the most seen. The curl
+line under `reproduce` is that finding's. Notes, ratings, tickets and agent trails of the
+other findings follow it in short. A header missing on 40 pages is one table and one
+exchange, not 40. Issues are ordered by risk (a person's rating where there is one), then
+CVSS score, then places. `report json` keeps `alerts` as it was (every finding with its own
+exchanges) and adds `issues` (`issue_id`, `alert_ref`, `title`, `titled`, `risk`,
+`confidence`, `hosts`, `cvss`, `narrative`, `proof`: a finding id, `instances`: finding ids),
+and each finding gets `issue_title`. SARIF results carry `issueId` and `issueTitle` in their
+properties, `report csv` adds `issue_title`, `scanner_risk` and `rating_reason` columns at the
+end, `report junit` and `report defectdojo` name findings by their issue's title.
+
+*Fix these first* lists up to ten issues that are still work to do (a finding of theirs isn't
+a false positive, accepted risk or fixed), rated medium or worse by risk or CVSS, and either
+confirmed by a person or found with at least medium confidence: confirmed ones first within a
+risk, then the surer, then those in more places. `--state` takes several states separated by
+commas (`--state confirmed` for a client report of what you checked, `--state
+confirmed,accepted_risk`); the states it leaves out are still counted at the top. The curl lines send the request as recorded
 (`--globoff --path-as-is`, the URL after `--url`, the recorded `Host`), masked secrets still masked.
 
 Branding: `--company NAME` on the cover, `--accent #rrggbb` for the cover and headings,

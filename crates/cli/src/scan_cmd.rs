@@ -816,7 +816,7 @@ pub const STATE_VALUES: [&str; 11] = [
 /// `--state` where several states pick findings (`findings list`, `findings issues`): each of
 /// the comma-separated values must be one of [`STATE_VALUES`], refused as `report` refuses one.
 #[derive(Clone)]
-struct StatesParser;
+pub(crate) struct StatesParser;
 
 impl clap::builder::TypedValueParser for StatesParser {
     type Value = String;

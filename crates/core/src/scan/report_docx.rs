@@ -6,8 +6,9 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 
 use super::{
-    curl, day, first_sentence, http_text, left_out_text, narrative_title, redaction_text, risk_title, trail_text,
-    Report, RetestRow, RISKS,
+    by_id, curl, day, first_sentence, fix_first, group_of, has_remarks, http_text, instances_of, left_out_text,
+    narrative_heading, proof_of, rated_text, redaction_text, risk_title, short, shown_evidence, trail_text, Report,
+    RetestRow, RISKS,
 };
 use crate::scan::layout::Section;
 
@@ -163,13 +164,14 @@ pub fn render(r: &Report) -> Vec<u8> {
         d.text(&t);
     }
     d.text(&redaction_text(r));
+    let idx = by_id(r);
     if layout.has(Section::FixFirst) {
-        let urgent: Vec<_> =
-            r.alerts.iter().filter(|g| matches!(g.risk.as_str(), "critical" | "high" | "medium")).take(10).collect();
+        let urgent = fix_first(r, &idx);
         if !urgent.is_empty() {
             d.heading(2, "Fix these first");
-            for (i, g) in urgent.iter().enumerate() {
-                d.labelled(&format!("{}. {} ({}):", i + 1, g.name, risk_title(&g.risk)), first_sentence(&g.solution));
+            for (i, (_, sec)) in urgent.iter().enumerate() {
+                let solution = group_of(&idx, sec).map_or("", |g| first_sentence(&g.solution));
+                d.labelled(&format!("{}. {} ({}):", i + 1, sec.title, risk_title(&sec.risk)), solution);
             }
         }
     }
@@ -230,32 +232,38 @@ pub fn render(r: &Report) -> Vec<u8> {
             }
         }
     }
-    if layout.has(Section::List) && !r.alerts.is_empty() {
+    if layout.has(Section::List) && !r.issues.is_empty() {
         d.heading(1, "All issues");
         let rows: Vec<Vec<String>> = r
-            .alerts
+            .issues
             .iter()
             .enumerate()
-            .map(|(i, g)| {
+            .map(|(i, sec)| {
                 vec![
                     (i + 1).to_string(),
-                    g.name.clone(),
-                    risk_title(&g.risk).to_string(),
-                    g.cvss.as_ref().map(|c| format!("{:.1}", c.score)).unwrap_or_else(|| "–".into()),
-                    g.instances.len().to_string(),
+                    sec.title.clone(),
+                    risk_title(&sec.risk).to_string(),
+                    sec.cvss.as_ref().map(|c| format!("{:.1}", c.score)).unwrap_or_else(|| "–".into()),
+                    sec.instances.len().to_string(),
                 ]
             })
             .collect();
         d.table(&["#", "Issue", "Risk", "CVSS", "Places"], &rows);
     }
     if layout.has(Section::Issues) {
-        for (i, g) in r.alerts.iter().enumerate() {
-            d.heading(1, &format!("{}. {} ({})", i + 1, g.name, risk_title(&g.risk)));
-            if let Some(c) = &g.cvss {
+        for (i, sec) in r.issues.iter().enumerate() {
+            let Some(g) = group_of(&idx, sec) else { continue };
+            let insts = instances_of(&idx, sec);
+            let proof = proof_of(&idx, sec);
+            d.heading(1, &format!("{}. {} ({})", i + 1, sec.title, risk_title(&sec.risk)));
+            if sec.titled {
+                d.labelled("Alert:", &format!("{} ({})", g.name, g.alert_ref));
+            }
+            if let Some(c) = &sec.cvss {
                 d.labelled("CVSS 4.0:", &format!("{:.1} ({}) {}", c.score, c.severity, c.vector));
             }
-            for n in &g.narratives {
-                d.heading(2, &narrative_title(g, n));
+            if let Some(n) = &sec.narrative {
+                d.heading(2, &narrative_heading(n));
                 d.text(&n.narrative.text);
                 d.para("Subtitle", &n.narrative.credit());
             }
@@ -265,34 +273,40 @@ pub fn render(r: &Report) -> Vec<u8> {
                     d.text(text);
                 }
             }
-            d.heading(2, &format!("Where it was found ({})", g.instances.len()));
-            let rows: Vec<Vec<String>> = g
-                .instances
+            d.heading(2, &format!("Where it was found ({})", insts.len()));
+            let rows: Vec<Vec<String>> = insts
                 .iter()
                 .map(|inst| {
                     vec![
                         format!("{} {}", inst.method, inst.url),
                         inst.param.clone(),
+                        short(shown_evidence(inst), 120),
                         inst.confidence.clone(),
                         inst.state.replace('_', " "),
                     ]
                 })
                 .collect();
-            d.table(&["Address", "Field", "Certainty", "State"], &rows);
+            d.table(&["Address", "Field", "Evidence", "Certainty", "State"], &rows);
             if layout.has(Section::Reproduce) {
-                let lines: Vec<String> = g.instances.iter().filter_map(|i| i.request.as_ref().map(curl)).collect();
-                if !lines.is_empty() {
+                if let Some(req) = proof.and_then(|p| p.request.as_ref()) {
                     d.heading(2, "How to reproduce");
-                    d.code(&lines.join("\n\n"));
+                    d.code(&curl(req));
                 }
             }
             if layout.has(Section::Evidence) {
-                for inst in &g.instances {
-                    d.heading(3, &format!("Finding #{}: {} {}", inst.id, inst.method, inst.url));
-                    for (k, v) in [("Evidence:", &inst.evidence), ("Attack:", &inst.attack)] {
-                        if !v.is_empty() {
-                            d.labelled(k, v);
+                let others = insts.iter().filter(|i| Some(i.id) != proof.map(|p| p.id) && has_remarks(i));
+                for (n, inst) in proof.into_iter().map(|p| (true, p)).chain(others.map(|i| (false, *i))) {
+                    let what = if n { "Proof: finding" } else { "Finding" };
+                    d.heading(3, &format!("{what} #{}: {} {}", inst.id, inst.method, inst.url));
+                    if n {
+                        for (k, v) in [("Evidence:", &inst.evidence), ("Attack:", &inst.attack)] {
+                            if !v.is_empty() {
+                                d.labelled(k, v);
+                            }
                         }
+                    }
+                    if let Some(t) = rated_text(inst, r.provenance) {
+                        d.labelled("Rating:", &t);
                     }
                     if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                         d.labelled("Note:", n);
@@ -303,7 +317,7 @@ pub fn render(r: &Report) -> Vec<u8> {
                     for t in &inst.tickets {
                         d.labelled(&format!("Ticket ({}):", t.tracker), &t.url);
                     }
-                    if let Some(req) = &inst.request {
+                    if let Some(req) = inst.request.as_ref().filter(|_| n) {
                         d.code(&http_text(req, inst.response.as_ref()));
                     }
                 }
@@ -462,11 +476,11 @@ fn zip(files: &[(&str, &str)]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// The entries of a zip, read back by inflating each local file.
-    fn unzip(z: &[u8]) -> Vec<(String, String)> {
+    pub(in crate::scan) fn unzip(z: &[u8]) -> Vec<(String, String)> {
         use std::io::Read;
         let mut out = Vec::new();
         let mut at = 0;
