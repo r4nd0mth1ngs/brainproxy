@@ -639,6 +639,14 @@ impl Vault {
         self.0.lock().unwrap().entries.insert(ph, entry);
     }
 
+    /// The value behind a session placeholder that belongs in one header (a cookie, the
+    /// token, a static header), for a scan rule that attacks the credential itself. Never a
+    /// password, macro value or query key, which may only be filled in as a request goes out.
+    pub(crate) fn session_value(&self, ph: &str) -> Option<String> {
+        let inner = self.0.lock().unwrap();
+        inner.entries.get(ph).filter(|e| e.header.is_some()).map(|e| e.value.clone())
+    }
+
     /// Lets an anywhere value (password, macro value) also go to `origin`.
     pub(crate) fn allow(&self, ph: &str, origin: &str) {
         if let Some(e) = self.0.lock().unwrap().entries.get_mut(ph) {
@@ -1224,7 +1232,7 @@ impl AuthSession {
     /// ([`placeholder`]) that the client fills in on the wire, so no record of the
     /// request holds the secret. Cookies the session knows replace the request's
     /// values (stale captures), except cookies named in `keep`, which are left as
-    /// the caller set them (e.g. a cookie being attacked or fuzzed).
+    /// the caller set them (e.g. a cookie being attacked or fuzzed), or left out.
     pub fn apply(&self, raw: &[u8], keep: &[&str]) -> Vec<u8> {
         self.apply_keeping(raw, keep, &[])
     }
@@ -1256,7 +1264,8 @@ impl AuthSession {
                     merged.push((k.clone(), v.clone()));
                 }
             }
-            for k in &session {
+            // A kept cookie the request doesn't have stays out of it, as the caller left it.
+            for k in session.iter().filter(|k| !keep.contains(&k.as_str())) {
                 if !merged.iter().any(|(n, _)| n == k) {
                     merged.push((k.clone(), ph(&format!("cookie:{k}"))));
                 }

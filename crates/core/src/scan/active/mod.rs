@@ -246,6 +246,8 @@ enum Report {
 }
 
 struct Shared {
+    /// The project file, for a rule that reads what history holds (read-only).
+    project: std::path::PathBuf,
     client: Client,
     /// With HTTP/3 asked for, a client that sends over TCP only, for comparing the two
     /// ([`Cx::send_tcp`]); otherwise `client` already does.
@@ -384,6 +386,19 @@ impl Cx {
         }
         out.push_str("\r\n");
         out.into_bytes()
+    }
+
+    /// The current value behind a session placeholder (`«auth:NAME:token»`, a cookie's or
+    /// a header's) in the base request, as the client fills it in when sending. For a rule
+    /// that attacks the credential; it must not put the value on record.
+    pub(crate) fn session_value(&self, placeholder: &str) -> Option<String> {
+        self.shared.client.options().guard.as_ref()?.vault.session_value(placeholder)
+    }
+
+    /// The project file the scan records into. A rule may read history from it, read-only:
+    /// the scan's recorder writes to it at the same time.
+    pub(crate) fn project(&self) -> &Path {
+        &self.shared.project
     }
 
     /// Sends a raw request to the base target.
@@ -1143,6 +1158,7 @@ pub async fn run(
         })
         .collect();
     let shared = Arc::new(Shared {
+        project: project.to_path_buf(),
         client,
         tcp,
         rows,

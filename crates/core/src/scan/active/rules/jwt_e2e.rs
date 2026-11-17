@@ -32,6 +32,44 @@ fn pem() -> String {
     super::jwt::rsa_pems(&jwk).remove(0)
 }
 
+/// A key file that isn't in the JWKS, as a server reads it (no final newline), for each
+/// path whose server signs with one: one at a common path, one in a directory a recorded
+/// listing links to (labelled as Juice Shop's is), one only ever seen inside a recorded
+/// JSON response.
+fn key_file(path: &str) -> Option<String> {
+    let (n, label) = match path {
+        "/confusion-common" => (0x11, "PUBLIC KEY"),
+        "/confusion-listed" => (0x22, "RSA PUBLIC KEY"),
+        "/confusion-seen" => (0x33, "PUBLIC KEY"),
+        _ => return None,
+    };
+    let mut jwk = Map::new();
+    jwk.insert("kty".into(), "RSA".into());
+    jwk.insert("e".into(), "AQAB".into());
+    jwk.insert("n".into(), URL_SAFE_NO_PAD.encode([&[0xc5, n][..], &N[2..]].concat()).into());
+    let pem = super::jwt::rsa_pems(&jwk).remove(1);
+    Some(pem.replace("BEGIN PUBLIC KEY", &format!("BEGIN {label}")).replace("END PUBLIC KEY", &format!("END {label}")))
+}
+
+/// What the project's history holds before the scan, for `path`: (request path, response).
+fn recorded(path: &str) -> Vec<(&'static str, String)> {
+    match path {
+        "/confusion-listed" => vec![(
+            "/encryptionkeys/",
+            page(
+                "200 OK",
+                r#"<ul><li><a href="jwt.pub">jwt.pub</a></li><li><a href="premium.key">k</a></li></ul>"#,
+                "text/html",
+            ),
+        )],
+        "/confusion-seen" => {
+            let body = json!({"publicKey": key_file(path).unwrap()}).to_string();
+            vec![("/api/config", page("200 OK", &body, "application/json"))]
+        }
+        _ => vec![],
+    }
+}
+
 fn b64(v: &Value) -> String {
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
 }
@@ -53,9 +91,13 @@ fn issued(path: &str) -> String {
         "/weak" | "/weak-noexp" => hs256(b"secret", &json!({"alg": "HS256", "typ": "JWT"}), &payload),
         "/kid" => hs256(STRONG, &json!({"alg": "HS256", "typ": "JWT", "kid": "k1"}), &payload),
         "/expired" => hs256(STRONG, &json!({"alg": "HS256", "typ": "JWT"}), &json!({"sub": "alice", "exp": 1})),
-        "/confusion" => format!(
+        "/confusion" | "/confusion-common" | "/confusion-listed" | "/confusion-seen" | "/confusion-cookie" => format!(
             "{}.{}.{}",
-            b64(&json!({"alg": "RS256", "typ": "JWT", "kid": "k1"})),
+            b64(&if path == "/confusion" {
+                json!({"alg": "RS256", "typ": "JWT", "kid": "k1"})
+            } else {
+                json!({"alg": "RS256", "typ": "JWT"})
+            }),
             b64(&payload),
             URL_SAFE_NO_PAD.encode(RSA_SIG)
         ),
@@ -96,8 +138,9 @@ fn accepts(path: &str, token: &str) -> bool {
             let kid = header.get("kid").and_then(Value::as_str).unwrap_or("");
             safe(if kid.ends_with("dev/null") { b"" } else { STRONG })
         }
-        "/confusion" => match alg {
-            "HS256" => hmac_ok(pem().as_bytes(), token) && live,
+        "/confusion-cookie" => alg.eq_ignore_ascii_case("none") || accepts("/confusion-common", token),
+        "/confusion" | "/confusion-common" | "/confusion-listed" | "/confusion-seen" => match alg {
+            "HS256" => hmac_ok(key_file(path).unwrap_or_else(pem).as_bytes(), token) && live,
             "RS256" => URL_SAFE_NO_PAD.decode(parts[2]).is_ok_and(|s| s == RSA_SIG) && live,
             _ => false,
         },
@@ -117,6 +160,12 @@ fn handle(req: &str) -> String {
     if path == "/.well-known/jwks.json" {
         return page("200 OK", &jwks().to_string(), "application/json");
     }
+    if path == "/jwt.pub" {
+        return page("200 OK", &key_file("/confusion-common").unwrap(), "application/octet-stream");
+    }
+    if path == "/encryptionkeys/jwt.pub" {
+        return page("200 OK", &key_file("/confusion-listed").unwrap(), "application/octet-stream");
+    }
     let token = req
         .lines()
         .find_map(|l| l.strip_prefix("Authorization: Bearer ").or_else(|| l.strip_prefix("authorization: Bearer ")))
@@ -129,6 +178,25 @@ fn handle(req: &str) -> String {
     // fails on a token it can't decode (Juice Shop's /rest/user/whoami).
     if path == "/whoami" {
         return page("200 OK", "{\"user\":{}}", "application/json");
+    }
+    if path == "/confusion-cookie" {
+        let cookie = req.lines().find_map(|l| l.strip_prefix("Cookie: token=")).map(str::trim);
+        if cookie.is_some_and(|c| c != token) {
+            return page(
+                "401 Unauthorized",
+                "{\"message\":\"Cannot read properties of undefined\"}",
+                "application/json",
+            );
+        }
+        // As Juice Shop does, only for a token it didn't issue.
+        if accepts(path, token) && token != issued(path) {
+            let body = "<html><body><h1>Welcome alice</h1><ul><li>order 1</li><li>order 2</li></ul></body></html>";
+            return format!(
+                "HTTP/1.1 200 OK\r\nSet-Cookie: token={token}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
     }
     if path == "/ignores" || accepts(path, token) {
         page(
@@ -157,14 +225,31 @@ fn spawn_app() -> u16 {
     port
 }
 
-fn target(port: u16, path: &str) -> ScanTarget {
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        issued(path)
-    )
-    .into_bytes();
+/// How the base request carries its token.
+#[derive(Clone, Copy, PartialEq)]
+enum Carried {
+    /// As recorded through the proxy or with a literal header.
+    Literal,
+    /// As `send --auth` records it: a placeholder the vault fills in as it goes out.
+    Placeholder,
+    /// [`Carried::Placeholder`], scanned with `--auth`: the session sends every request.
+    Session,
+}
+
+fn target(port: u16, path: &str, carried: Carried) -> ScanTarget {
+    let line = |token: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    };
+    let wire = line(&issued(path));
+    let req = match carried {
+        Carried::Literal => wire.clone(),
+        Carried::Placeholder | Carried::Session => line(&crate::auth::placeholder("alice", "token")),
+    };
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.write_all(&req).unwrap();
+    s.write_all(&wire).unwrap();
     let mut response = Vec::new();
     s.read_to_end(&mut response).unwrap();
     ScanTarget {
@@ -178,8 +263,53 @@ fn target(port: u16, path: &str) -> ScanTarget {
 
 /// The alert refs the rule raises for `path`, sorted, and how many requests it sent.
 async fn scan(port: u16, path: &str, strength: Strength) -> (Vec<String>, u64) {
+    let (refs, requests, _) = scan_carried(port, path, strength, Carried::Literal).await;
+    (refs, requests)
+}
+
+/// [`scan`], also returning every text and blob value the project holds afterwards.
+async fn scan_carried(port: u16, path: &str, strength: Strength, carried: Carried) -> (Vec<String>, u64, Vec<String>) {
     let guard =
         Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "bp-jwt-{}-{}-{}",
+        path.trim_start_matches('/'),
+        std::process::id(),
+        crate::scan::active::rand_u64()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("project.db");
+    let mut session = None;
+    if carried != Carried::Literal {
+        // A profile that logged in earlier: the vault holds its token, as a command's guard would.
+        let store = crate::store::Store::open(&db).unwrap();
+        let profile = crate::auth::AuthProfile {
+            name: "alice".into(),
+            login_url: Some(format!("http://127.0.0.1:{port}/login")),
+            token_regex: Some(r#""token":"([^"]+)""#.into()),
+            token_header: Some("Authorization: Bearer {{token}}".into()),
+            ..Default::default()
+        };
+        store.auth_save_profile(&profile).unwrap();
+        let state = crate::auth::SessionState { token: Some(issued(path)), logged_in: true, ..Default::default() };
+        store.auth_save_state("alice", &state).unwrap();
+        store.auth_fill_vault(&guard.vault).unwrap();
+        if carried == Carried::Session {
+            let client = crate::http::Client::new(SendOptions { guard: Some(guard.clone()), ..Default::default() });
+            session = Some(std::sync::Arc::new(crate::auth::AuthSession::new(&db, profile, state, client).unwrap()));
+        }
+    }
+    let recorded = recorded(path);
+    if !recorded.is_empty() {
+        let store = crate::store::Store::open(&db).unwrap();
+        let origin = Target::from_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        for (at, resp) in recorded {
+            let req = format!("GET {at} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+            let capture =
+                crate::capture::Capture::new("proxy", &origin, req.as_bytes(), Some(resp.as_bytes()), None, None);
+            store.record(&capture).unwrap();
+        }
+    }
     let cfg = ActiveConfig {
         strength,
         tuning: Default::default(),
@@ -192,28 +322,43 @@ async fn scan(port: u16, path: &str, strength: Strength) -> (Vec<String>, u64) {
         no_rules: false,
         checks: vec![],
         max_duration: None,
-        auth: None,
+        auth: session,
         oob: None,
         oob_wait: Duration::ZERO,
         check_methods: vec![],
         prune: false,
     };
-    let dir = std::env::temp_dir().join(format!(
-        "bp-jwt-{}-{}-{}",
-        path.trim_start_matches('/'),
-        std::process::id(),
-        crate::scan::active::rand_u64()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("project.db");
-    let summary = run(&db, vec![target(port, path)], cfg, JobControl::default()).await.unwrap();
+    let summary = run(&db, vec![target(port, path, carried)], cfg, JobControl::default()).await.unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     let mut st = conn.prepare("SELECT alert_ref FROM findings ORDER BY alert_ref").unwrap();
     let refs: Vec<String> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     drop(st);
+    let mut values = Vec::new();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'auth!_%' ESCAPE '!'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for t in tables {
+        let mut st = conn.prepare(&format!("SELECT * FROM \"{t}\"")).unwrap();
+        let n = st.column_count();
+        let mut rows = st.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..n {
+                match row.get_ref(i).unwrap() {
+                    rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+                        values.push(String::from_utf8_lossy(b).into_owned())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
-    (refs, summary.requests)
+    (refs, summary.requests, values)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -231,10 +376,46 @@ async fn each_weakness_is_found_and_only_it() {
         ("/weak-noexp", Strength::Medium, vec!["100007-4", "100007-5"]),
         ("/kid", Strength::Medium, vec!["100007-6"]),
         ("/confusion", Strength::Medium, vec!["100007-7"]),
+        // Keys not in a JWKS: at a common path, at a path a recorded listing links to, and
+        // seen only inside a recorded response.
+        ("/confusion-common", Strength::Medium, vec!["100007-7"]),
+        ("/confusion-listed", Strength::Medium, vec!["100007-7"]),
+        ("/confusion-seen", Strength::Medium, vec!["100007-7"]),
     ] {
         let (refs, _) = scan(port, path, strength).await;
         assert_eq!(refs, want, "{path}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_behind_an_auth_placeholder_is_attacked_and_stays_off_the_record() {
+    let port = spawn_app();
+    for (path, want) in [
+        ("/safe", vec![]),
+        ("/noverify", vec!["100007-1"]),
+        ("/none", vec!["100007-2"]),
+        ("/weak-noexp", vec!["100007-4", "100007-5"]),
+        ("/confusion", vec!["100007-7"]),
+    ] {
+        let (refs, _, values) = scan_carried(port, path, Strength::Medium, Carried::Placeholder).await;
+        assert_eq!(refs, want, "{path}");
+        // Outside the profile's own session (the auth tables), neither the token nor its
+        // signature (which a forged token with the signature kept, or one bit of it changed,
+        // would give away) is written anywhere.
+        let token = issued(path);
+        let signature = token.rsplit('.').next().unwrap();
+        let leaked: Vec<&String> = values.iter().filter(|v| v.contains(signature)).collect();
+        assert!(leaked.is_empty(), "{path}: {leaked:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_auth_a_cookie_set_for_a_forged_token_does_not_spoil_the_next_tests() {
+    let port = spawn_app();
+    // The server answers `alg: none` with a cookie holding that token, which the session would
+    // otherwise send with every later forged token, and which the server reads first.
+    let (refs, _, _) = scan_carried(port, "/confusion-cookie", Strength::Medium, Carried::Session).await;
+    assert_eq!(refs, ["100007-2", "100007-7"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
