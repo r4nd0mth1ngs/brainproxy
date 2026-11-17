@@ -12,6 +12,10 @@ import {
   CONFIDENCES,
   DEFAULT_SPEC,
   FORMATS,
+  heldText,
+  type LeftOut,
+  leftOutCommand,
+  leftOutText,
   PRESET_SECTIONS,
   PRESETS,
   previewCommand,
@@ -46,6 +50,9 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [preview, setPreview] = useState("");
   const [previewError, setPreviewError] = useState<string | null>(null);
+  // How many findings the report holds, and what its state filter leaves out (and who set it).
+  const [held, setHeld] = useState("");
+  const [leftOut, setLeftOut] = useState("");
   const [busy, setBusy] = useState(false);
   const [profileName, setProfileName] = useState("");
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -94,13 +101,18 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
     if (problem) return;
     let live = true;
     const t = setTimeout(() => {
-      run<{ content: string }>(previewCommand(spec)).then(
+      run<{ content: string } & ReportWritten>(previewCommand(spec)).then(
         (r) => {
           if (!live) return;
           setPreview(r.content);
+          setHeld(heldText(r));
           setPreviewError(null);
         },
         (e) => live && setPreviewError(e.message),
+      );
+      run<{ summary: { left_out?: LeftOut[] } }>(leftOutCommand(spec)).then(
+        (r) => live && setLeftOut(leftOutText(r.summary.left_out ?? [])),
+        () => live && setLeftOut(""),
       );
     }, 400);
     return () => {
@@ -349,6 +361,14 @@ export function ReportBuilder({ name, onClose }: { name: string; onClose: () => 
                 </option>
               ))}
             </select>
+          </label>
+          {(held || leftOut) && (
+            <p className="muted small" role="status">
+              {[held, leftOut].filter(Boolean).join(" ")}
+            </p>
+          )}
+          <label className="check" title="Which client recorded and triaged each finding (the desktop app or the command line), and each agent's trail: for an internal review, not a client">
+            <input type="checkbox" checked={spec.provenance} onChange={(e) => set({ provenance: e.target.checked })} /> Say who recorded and triaged each finding (internal)
           </label>
           <h3>Secrets</h3>
           <label className="check" title="Session cookies, credentials and tokens as recorded; by default they're shown as [redacted]">

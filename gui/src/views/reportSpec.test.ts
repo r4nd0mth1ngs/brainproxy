@@ -8,6 +8,9 @@ import {
   maskValues,
   PRESET_SECTIONS,
   previewCommand,
+  heldText,
+  leftOutCommand,
+  leftOutText,
   REPORT_LIMIT,
   profileSaveCommand,
   REPORT_SOURCES,
@@ -120,4 +123,30 @@ test("the executive summary goes on stdin and is reviewed by its hash", () => {
   assert.deepEqual(reportHostsCommand().slice(2), ["--limit", "5000"]);
   assert.match(reportHostsCommand()[1], /^SELECT DISTINCT host FROM findings/);
   assert.deepEqual(summaryReviewCommand("ab12"), ["report-summary", "review", "--hash=ab12"]);
+});
+
+test("who recorded each finding goes in only when asked, for an internal report", () => {
+  assert.ok(!contentArgs(DEFAULT_SPEC).includes("--provenance"));
+  const spec = { ...DEFAULT_SPEC, provenance: true };
+  assert.ok(reportCommand(spec, "/r.html").includes("--provenance"));
+  assert.ok(previewCommand(spec).includes("--provenance"));
+  assert.ok(!profileSaveCommand("x", spec).includes("--provenance"));
+});
+
+test("the findings left out by their state are counted with the report's own filters", () => {
+  const spec = { ...DEFAULT_SPEC, filter: { ...DEFAULT_SPEC.filter, risk: "high" as const } };
+  assert.deepEqual(leftOutCommand(spec), ["report", "json", "--risk=high", "--limit=1", "--no-evidence"]);
+  assert.equal(leftOutText([]), "");
+  assert.equal(
+    leftOutText([
+      { state: "false_positive", origin: "gui", count: 1 },
+      { state: "false_positive", origin: "cli", count: 1 },
+      { state: "false_positive", origin: "mcp", count: 1 },
+      { state: "fixed", origin: null, count: 1 },
+    ]),
+    "4 findings left out by their state: 3 false positive (2 by a person, 1 by an agent), 1 fixed (1 by whom is unknown).",
+  );
+  assert.equal(leftOutText([{ state: "accepted_risk", origin: "scanner", count: 1 }]), "1 finding left out by its state: 1 accepted risk (1 by the scanner).");
+  assert.equal(heldText({ total: 812, included: 500, truncated: true }), "The report holds 500 of 812 matching findings, the riskiest first.");
+  assert.equal(heldText({ total: 12, included: 12, truncated: false }), "");
 });

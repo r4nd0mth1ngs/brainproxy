@@ -99,6 +99,9 @@ export interface ReportSpec {
   keepSecrets: boolean;
   /** More values to mask, one per line. */
   mask: string;
+  /** Say in full which client recorded and triaged each finding, and each agent's trail
+   * (`--provenance`): for an internal review, not a client. */
+  provenance: boolean;
 }
 
 export const DEFAULT_SPEC: ReportSpec = {
@@ -115,6 +118,7 @@ export const DEFAULT_SPEC: ReportSpec = {
   drafts: false,
   keepSecrets: false,
   mask: "",
+  provenance: false,
 };
 
 /** The values to mask: one per line, trimmed. */
@@ -138,6 +142,7 @@ export function contentArgs(spec: ReportSpec): string[] {
   if (f.source) out.push(`--source=${f.source}`);
   if (f.host.trim()) out.push(`--host=${f.host.trim()}`);
   if (spec.drafts) out.push("--drafts");
+  if (spec.provenance) out.push("--provenance");
   if (spec.keepSecrets) out.push("--no-redact");
   else out.push(...maskValues(spec.mask).map((v) => `--mask=${v}`));
   return out;
@@ -225,6 +230,47 @@ export interface ReportWritten {
   included: number;
   truncated: boolean;
   redacted: number | null;
+}
+
+/** The command that counts what the report's filters leave out by state: the JSON report's
+ * summary, with one finding and no evidence, as the counts don't depend on either. */
+export function leftOutCommand(spec: ReportSpec): string[] {
+  return ["report", "json", ...contentArgs(spec), "--limit=1", "--no-evidence"];
+}
+
+/** A state the report leaves out, and who set it (`summary.left_out`). */
+export interface LeftOut {
+  state: string;
+  /** gui, cli, mcp or scanner; null when unknown. */
+  origin: string | null;
+  count: number;
+}
+
+const WHO: Record<string, string> = { gui: "by a person", cli: "by a person", mcp: "by an agent", scanner: "by the scanner" };
+const STATE_WORDS: Record<string, string> = { false_positive: "false positive", accepted_risk: "accepted risk", fixed: "fixed" };
+
+/** The findings the state filter leaves out, in words ("3 left out by their state: 2 false
+ * positive (1 by a person, 1 by an agent), 1 fixed (1 by a person)"), or "" for none. */
+export function leftOutText(rows: LeftOut[]): string {
+  const total = rows.reduce((n, r) => n + r.count, 0);
+  if (!total) return "";
+  const states = [...new Set(rows.map((r) => r.state))];
+  const parts = states.map((state) => {
+    const of = rows.filter((r) => r.state === state);
+    const by = new Map<string, number>();
+    for (const r of of) {
+      const w = (r.origin && WHO[r.origin]) || "by whom is unknown";
+      by.set(w, (by.get(w) ?? 0) + r.count);
+    }
+    const n = of.reduce((k, r) => k + r.count, 0);
+    return `${n} ${STATE_WORDS[state] ?? state.replace(/_/g, " ")} (${[...by].map(([w, k]) => `${k} ${w}`).join(", ")})`;
+  });
+  return `${total} finding${total === 1 ? "" : "s"} left out by ${total === 1 ? "its" : "their"} state: ${parts.join(", ")}.`;
+}
+
+/** How many findings the report holds, when it can't hold every one that matches; else "". */
+export function heldText(r: Pick<ReportWritten, "total" | "included" | "truncated">): string {
+  return r.truncated ? `The report holds ${r.included} of ${r.total} matching findings, the riskiest first.` : "";
 }
 
 /** The toast after a report is saved. */
