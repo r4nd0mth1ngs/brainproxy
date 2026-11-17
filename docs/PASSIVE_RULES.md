@@ -108,8 +108,7 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   cookie domains) are handled gracefully instead of aborting the scan of that message.
 - **Accidental bugs** are not copied: Timestamp Disclosure (10096) uses the intended
   64-bit range check, and the never-matching LanMan hash pattern is omitted.
-- **Evidence formatting:** raw header blocks are rebuilt as `Name: value` lines, and the
-  status-500 evidence of 90022 is always `HTTP/1.1 500 Internal Server Error`.
+- **Evidence formatting:** raw header blocks are rebuilt as `Name: value` lines.
 - **Charset Mismatch (90011)** doesn't alert on an XML declaration without `encoding` (ZAP
   reports `null`; such documents are UTF-8 by default), and only looks at a leading XML
   declaration instead of Jericho's XML detection.
@@ -158,3 +157,20 @@ noise on modern applications:
 - **PII Disclosure (10062)** is Medium at low confidence (ZAP: High, Medium) for a card
   number with no label such as `card`, `credit`, `cc` or `pan` in the 40 characters before
   it: one number in ten passes the Luhn check, so ids and order numbers did.
+
+### More coverage
+
+Some ported rules also look for what today's stacks produce, which ZAP's lists (from the
+PHP, ASP and JDBC era) don't have. The patterns are brainproxy's own, kept out of ZAP's
+data files:
+
+- **Application Error Disclosure (90022)** also knows Node.js, Python, Java and .NET stack
+  traces, Go panics, PHP fatal errors, SQLite, MySQL (Node driver), Sequelize and MongoDB
+  errors, and the ASP.NET, Django debug and Spring Boot (Whitelabel, Low) error pages, and
+  reports the first of them as the evidence, at Medium. It reads a 500's body too (ZAP
+  stops at the status): a stack trace or a specific message there is the evidence, and
+  `HTTP/1.1 500 Internal Server Error` (Low) is left for a 500 with only generic text. A
+  stack trace in a 2xx HTML page doesn't count, as it is usually an example in
+  documentation; a Node.js trace needs two frames.
+- **In Page Banner Information Leak (10009)** also reports an Express version in an error
+  page (`Express ^4.22.1`).
