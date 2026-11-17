@@ -263,6 +263,22 @@ fn handle(path: &str, query: &str) -> String {
             };
             html(if rows { "<ul><li>apple: 3</li></ul>" } else { "<ul></ul>" })
         }
+        // A login, `WHERE email = '<value>'`: no row is a 401, a row logs in. For an
+        // unknown email only "OR true" changes the answer.
+        "/sqllogin" => {
+            let email = param("email");
+            let row = match email.split_once('\'') {
+                None => email == "admin",
+                Some((head, tail)) if tail.starts_with(" AND '1'='1'") => head == "admin",
+                Some((_, tail)) if tail.starts_with(" OR '1'='1'") => true,
+                Some(_) => false,
+            };
+            if row {
+                html("<p>token: abc</p>")
+            } else {
+                status(401, "<p>Invalid email or password.</p>")
+            }
+        }
         // String column in a 500 page for broken SQL: an unbalanced quote breaks it.
         "/sql500" => {
             if param("name").matches('\'').count() % 2 == 1 {
@@ -570,10 +586,10 @@ fn project(name: &str) -> PathBuf {
     dir.join("project.db")
 }
 
-type Found = Vec<(String, String, String, String)>;
+type Found = Vec<(String, String, String, String, String)>;
 
 /// Runs one rule over `targets`; returns the summary and the stored findings
-/// (alert ref, name, param, attack).
+/// (alert ref, name, param, attack, and the stored request's URL and body).
 async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget>) -> (ActiveSummary, Found) {
     scan_points(name, rule, strength, PointOptions::default(), targets).await
 }
@@ -608,9 +624,17 @@ async fn scan_points(
     let path = project(name);
     let summary = run(&path, targets, cfg, JobControl::default()).await.unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
-    let mut st = conn.prepare("SELECT alert_ref, name, param, attack FROM findings ORDER BY id").unwrap();
-    let found =
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(|r| r.unwrap()).collect();
+    let mut st = conn
+        .prepare(
+            "SELECT f.alert_ref, f.name, f.param, f.attack, h.url || ' ' || COALESCE(h.req_body_text, '') \
+             FROM findings f JOIN history h ON h.id = f.history_id ORDER BY f.id",
+        )
+        .unwrap();
+    let found = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
     drop(st);
     drop(conn);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -635,6 +659,18 @@ async fn sql_injection_error_expression_and_boolean_based() {
     assert_eq!((expr.2.as_str(), expr.3.as_str()), ("id", "3-2"));
     let boolean = found.iter().find(|f| f.2 == "name").expect("boolean based finding");
     assert_eq!((boolean.1.as_str(), boolean.3.as_str()), ("SQL Injection", "apple' AND '1'='1' -- "));
+}
+
+/// `findings verify` replays the stored request: for an "OR true" finding it must be
+/// the "OR true" request, or the replay gives the original answer and no difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_or_true_stores_the_or_true_request() {
+    let port = spawn_app();
+    let (s, found) = scan("sqllogin", 40018, Strength::Medium, vec![target(port, "/sqllogin?email=nobody")]).await;
+    assert_eq!(s.raised.get("40018"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "nobody' OR '1'='1' -- ");
+    let sent = url_decode(&found[0].4).replace('+', " ");
+    assert!(sent.contains("nobody' OR '1'='1' -- "), "{sent}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

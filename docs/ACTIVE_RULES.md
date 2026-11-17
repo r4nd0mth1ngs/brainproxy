@@ -189,7 +189,8 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   - values echoed with the quote escapes frameworks use (`&#39;`, `&#x27;`) or JSON
     escaped are stripped before comparing, as ZAP strips URL and its own HTML encoding;
   - "OR 1=1" findings need "OR 1=2" to keep the original page (free-text searches
-    match words of both);
+    match words of both). They store the "OR 1=1" request and response (ZAP stores the
+    "AND 1=1" one), so `findings verify` replays the attack the finding names;
   - the bare LIKE pair (`%` against `XYZABCDEFGHIJ`) isn't sent: a parameterised
     `LIKE` with unescaped wildcards answers it the same way. The quoted LIKE pairs
     (`%'  -- `) still find concatenated LIKE clauses;

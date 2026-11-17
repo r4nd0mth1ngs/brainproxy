@@ -16,7 +16,8 @@
 //! - Echoed values are also stripped in the HTML escapes frameworks use for
 //!   quotes (`&#39;`, `&#x27;`) and JSON escaped (`common::strip_off`).
 //! - "OR true" findings need "OR false" to give the original page
-//!   (`SQL_LOGIC_OR_FALSE`): word searches show more for both.
+//!   (`SQL_LOGIC_OR_FALSE`): word searches show more for both. They store the
+//!   "OR true" exchange, where ZAP stores the "AND true" one.
 //! - The bare LIKE pair ("%" / "XYZABCDEFGHIJ") is not sent (`BARE_LIKE`), nor
 //!   the "OR" form of the LIKE pairs, which repeats the "AND true" value.
 //! - Error based: the error characters after a random value must bring an error
@@ -770,9 +771,12 @@ impl Scan<'_> {
                 {
                     continue;
                 }
-                // As ZAP: the evidence message is the "AND true" one.
+                // As ZAP: the evidence message is the "AND true" one. Unlike ZAP, the
+                // stored exchange is the "OR true" one the attack names: `findings
+                // verify` replays it, and the "AND true" request answers like the
+                // original, so the replay would show no difference.
                 let info = format!("{}\n{DATA_NOT_EXISTS}", boolean_based_info(&and_true, &or_true, ""));
-                self.report(&ALERT, "", &or_true, info, &resp);
+                self.report(&ALERT, "", &or_true, info, &or_resp);
                 break;
             }
         }
