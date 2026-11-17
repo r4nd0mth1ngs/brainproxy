@@ -17,6 +17,7 @@ mod password_hash;
 mod pii;
 mod polyfill_cdn;
 mod private_address;
+mod secrets;
 mod sri_missing;
 mod suspicious_comments;
 mod timestamp;
@@ -48,5 +49,6 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(vulnerable_js::VulnerableJs),
         Box::new(jwt::JwtIssues),
         Box::new(password_hash::PasswordHash),
+        Box::new(secrets::Secrets),
     ]
 }

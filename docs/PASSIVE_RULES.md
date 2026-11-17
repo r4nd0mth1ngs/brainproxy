@@ -26,6 +26,17 @@ named like a password (`password`, `passwordHash`, `pwd`, `hash`; not a reset to
 or policy), once per field name (100020-1, high), and an Argon2 or Django PBKDF2 hash
 anywhere (100020-2, high). It reads text responses but not scripts, stylesheets or source
 maps, whose values are samples.
+**100021 Secrets in Response** reads scripts (also one served as `text/plain` or
+`application/octet-stream`, by its `.js` path), JSON, HTML and other text for credentials:
+a PEM private key with its body (high), and AWS access key IDs (medium), Stripe live secret
+keys, Slack tokens, GitHub tokens (high), Slack webhooks (medium) and Google API keys (low,
+as browser keys are often public on purpose) (100021-1, evidence the key, or a private key's
+header line). Keys whose random part is a placeholder (`EXAMPLE`, `xxxx`, little variety)
+don't count. 100021-2 (medium, low confidence) reports a literal assigned to a name like
+`password`, `secret`, `apiKey` or `auth_token` (``testingPassword=`IamUsedForTesting` ``),
+once per name; labels, messages, field names, constants, templates and placeholders (values
+with spaces, `password`, `changeme`, `currentPassword`, `SECRET_KEY`, `${pw}`) don't count.
+Source maps are skipped: their sources hold test fixtures.
 
 ## Rules
 
@@ -88,6 +99,7 @@ maps, whose values are samples.
 | 100005 | HTTP/3 Offered (Alt-Svc) | info | 100005 |
 | 100008 | JWT Issues | high | 100008-1, 100008-2, 100008-3, 100008-4 |
 | 100020 | Password Hash in Response | high | 100020-1, 100020-2 |
+| 100021 | Secrets in Response | high | 100021-1, 100021-2 |
 
 Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 
