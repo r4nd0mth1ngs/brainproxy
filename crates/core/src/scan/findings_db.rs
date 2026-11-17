@@ -102,7 +102,8 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     (
         "state_origin",
         "TEXT",
-        "gui, cli or mcp: who last changed state with `findings mark` (or `findings remove`); NULL if never changed",
+        "gui, cli or mcp: who last changed state with `findings mark` (or `findings remove`); scanner when a scanner \
+         saw a fixed finding again and opened it; NULL if never changed",
     ),
     ("state_changed_at", "TEXT", "UTC time of the last state change; NULL if never changed"),
     ("note_origin", "TEXT", "gui, cli or mcp: who last set the note with `findings mark --note`; NULL if never set"),
@@ -149,10 +150,28 @@ pub(crate) fn mark_with(
     if let Some(s) = state.filter(|s| !STATES.contains(s)) {
         return Err(Error::InvalidInput(format!("unknown state {s:?}: one of {}", STATES.join(", "))));
     }
-    let before: Option<(String, Option<String>)> = conn
-        .prepare_cached("SELECT state, note FROM findings WHERE id = ?1 AND state != 'removed'")?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+    type Before = (String, Option<String>, Option<String>, Option<String>);
+    let before: Option<Before> = conn
+        .prepare_cached(
+            "SELECT state, note, state_origin, note_origin FROM findings WHERE id = ?1 AND state != 'removed'",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
+    // A retest's outcome (`cause`) is held back by the retest itself (`finding_retested`).
+    if let Some((old_state, old_note, state_by, note_by)) = before.as_ref().filter(|_| cause.is_none()) {
+        let instead = format!(
+            "suggest the change with `findings mark {id} --suggest` and the same --state or --note, for a person \
+             to decide"
+        );
+        if state.is_some_and(|s| s != old_state) {
+            let what = format!("finding {id}'s state ({})", old_state.replace('_', " "));
+            crate::provenance::agent_may_change(&what, state_by.as_deref(), &instead)?;
+        }
+        let shown = |n: Option<&str>| n.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        if note.is_some() && shown(note) != shown(old_note.as_deref()) {
+            crate::provenance::agent_may_change(&format!("finding {id}'s note"), note_by.as_deref(), &instead)?;
+        }
+    }
     // The state it already has is no change: who changed it and when stay as they were, so the
     // timeline and `state_changed_at` (what a later sighting of a fixed finding is compared
     // with) keep telling the truth. Decided by the row as the UPDATE finds it, so a scanner
@@ -176,7 +195,7 @@ pub(crate) fn mark_with(
             None => Error::NotFound(format!("finding {id}")),
         });
     }
-    let (old_state, old_note) = before.unwrap_or_default();
+    let (old_state, old_note, ..) = before.unwrap_or_default();
     let event = |kind, old: Option<&str>, new: Option<&str>, text: Option<&str>, history_id: Option<i64>| {
         crate::scan::issues::record(
             conn,
@@ -193,6 +212,13 @@ pub(crate) fn mark_with(
         }
     }
     Ok(())
+}
+
+/// A finding's state as stored (`removed` included).
+fn current_state(conn: &rusqlite::Connection, id: i64) -> Result<String> {
+    conn.query_row("SELECT state FROM findings WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("finding {id}")))
 }
 
 /// What makes two findings the same issue. The URL keeps scheme, host and port (two
@@ -635,7 +661,9 @@ impl Store {
             // not hide behind the low. Read first so a change goes on the timeline.
             let mut risk_before = tx.prepare_cached("SELECT risk FROM findings WHERE dedupe = ?1")?;
             // A finding marked fixed that is seen again is open again, when what saw it was
-            // recorded after it was marked: a rescan of older traffic doesn't reopen it.
+            // recorded after it was marked: a rescan of older traffic doesn't reopen it. The
+            // scanner made that change, not whoever started the process (an agent that started
+            // the proxy, say), so it is recorded as the scanner's.
             let mut reopen = tx.prepare_cached(
                 "UPDATE findings SET state = 'open', state_origin = ?2,
                     state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -701,11 +729,12 @@ impl Store {
                         },
                     )?;
                 }
-                if reopen.execute(params![id, crate::provenance::origin(), msg.history_id])? > 0 {
+                if reopen.execute(params![id, crate::provenance::SCANNER, msg.history_id])? > 0 {
                     crate::scan::issues::record(
                         &tx,
                         &crate::scan::issues::Event {
                             finding: Some(id),
+                            origin: Some(crate::provenance::SCANNER),
                             kind: "regressed",
                             old: Some("fixed"),
                             new: Some("open"),
@@ -756,12 +785,32 @@ impl Store {
 
     /// Individual findings (one row per instance).
     pub fn findings_list(&self, filter: &FindingFilter, limit: usize) -> Result<Vec<Value>> {
+        self.findings_page(filter, limit, 0)
+    }
+
+    /// How many findings match `filter`.
+    pub fn findings_count(&self, filter: &FindingFilter) -> Result<usize> {
         let (where_sql, args) = filter.sql();
+        let n: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM findings WHERE {where_sql}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// [`Store::findings_list`] from the `offset`th match on, in the same order.
+    pub fn findings_page(&self, filter: &FindingFilter, limit: usize, offset: usize) -> Result<Vec<Value>> {
+        let (where_sql, args) = filter.sql();
+        // SQLite's LIMIT is a signed 64-bit integer: a larger one would be read as negative
+        // (no limit), which is what it means anyway, but say so rather than wrap.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
                 hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
                 issue_id
-             FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit}"
+             FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit} OFFSET {offset}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
@@ -849,10 +898,62 @@ impl Store {
 
     /// Triages several findings at once: all of them change, or none does (an unknown or
     /// removed one fails the whole call).
-    pub fn findings_mark(&mut self, ids: &[i64], state: Option<&str>, note: Option<&str>) -> Result<()> {
+    ///
+    /// With `if_state`, each finding must still be in that state (compare and swap): a finding
+    /// someone else triaged since it was read fails the call, rather than being overwritten.
+    pub fn findings_mark(
+        &mut self,
+        ids: &[i64],
+        state: Option<&str>,
+        note: Option<&str>,
+        if_state: Option<&str>,
+    ) -> Result<()> {
         let tx = self.write_tx()?;
         for &id in ids {
+            if let Some(want) = if_state {
+                let now = current_state(&tx, id)?;
+                if now != want {
+                    return Err(Error::Conflict(format!(
+                        "finding {id} is {now}, not {want} (--if-state): it was changed since it was read; read it \
+                         again, then decide"
+                    )));
+                }
+            }
             mark_one(&tx, id, state, note)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Puts a suggested state and/or note on each finding's timeline (an event of kind
+    /// `suggested`: old is its state then, new the state suggested, text the note) and changes
+    /// nothing else: how an agent proposes a change to a finding a person triaged, which it
+    /// may not change itself. Anyone may suggest. All of them, or none.
+    pub fn findings_suggest(&mut self, ids: &[i64], state: Option<&str>, note: Option<&str>) -> Result<()> {
+        if let Some(s) = state.filter(|s| !STATES.contains(s)) {
+            return Err(Error::InvalidInput(format!("unknown state {s:?}: one of {}", STATES.join(", "))));
+        }
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        if state.is_none() && note.is_none() {
+            return Err(Error::InvalidInput("a suggestion needs --state and/or a --note".into()));
+        }
+        let tx = self.write_tx()?;
+        for &id in ids {
+            let now = current_state(&tx, id)?;
+            if now == REMOVED {
+                return Err(Error::Conflict(format!("finding {id} was removed")));
+            }
+            crate::scan::issues::record(
+                &tx,
+                &crate::scan::issues::Event {
+                    finding: Some(id),
+                    kind: "suggested",
+                    old: Some(&now),
+                    new: state,
+                    text: note,
+                    ..Default::default()
+                },
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -2168,9 +2269,12 @@ mod tests {
         let live: Vec<i64> =
             s.findings_list(&FindingFilter::default(), 10).unwrap().iter().filter_map(|v| v["id"].as_i64()).collect();
         let other = *live.iter().find(|&&f| f != scanner).unwrap();
-        assert!(matches!(s.findings_mark(&[other, scanner, id], Some("confirmed"), None), Err(Error::Conflict(_))));
+        assert!(matches!(
+            s.findings_mark(&[other, scanner, id], Some("confirmed"), None, None),
+            Err(Error::Conflict(_))
+        ));
         assert_eq!(s.finding_get(other).unwrap()["state"], "open");
-        s.findings_mark(&[other, scanner], Some("false_positive"), Some("both noise")).unwrap();
+        s.findings_mark(&[other, scanner], Some("false_positive"), Some("both noise"), None).unwrap();
         for f in [other, scanner] {
             let v = s.finding_get(f).unwrap();
             assert_eq!((v["state"].as_str(), v["note"].as_str()), (Some("false_positive"), Some("both noise")));
@@ -2635,7 +2739,7 @@ mod tests {
             ))
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        s.findings_mark(&[id], Some("fixed"), Some("checked")).unwrap();
+        s.findings_mark(&[id], Some("fixed"), Some("checked"), None).unwrap();
         let f = s.finding_get(id).unwrap();
         assert_eq!((f["state_changed_at"].clone(), f["note"].as_str()), (marked, Some("checked")));
         crate::scan::passive::scan_pending(&mut s).unwrap();
@@ -2644,6 +2748,11 @@ mod tests {
         let kinds: Vec<String> =
             s.finding_events(id).unwrap().iter().map(|e| e["kind"].as_str().unwrap().into()).collect();
         assert_eq!(kinds, ["created", "state", "note", "regressed"]);
+        // The scanner reopened it, whoever started the process that scanned.
+        let f = s.finding_get(id).unwrap();
+        assert_eq!(f["state_origin"], crate::provenance::SCANNER, "{f}");
+        let last = s.finding_events(id).unwrap().pop().unwrap();
+        assert_eq!((last["origin"].as_str(), last["by"].as_str()), (Some("scanner"), Some("by the scanner")));
     }
 
     #[test]

@@ -17,6 +17,10 @@ pub const MCP_ENV: &str = "BRAINPROXY_MCP_CALL";
 /// Set to `gui` by the desktop app (and its development bridge) on the commands it runs.
 pub const CLIENT_ENV: &str = "BRAINPROXY_CLIENT";
 
+/// The origin of a change a scanner made by itself, whoever started the process it ran in: a
+/// fixed finding seen again and so opened again.
+pub const SCANNER: &str = "scanner";
+
 /// The origins a record can have; rows from before schema v13 have none ("unknown").
 pub const ORIGINS: &[&str] = &["gui", "cli", "mcp"];
 
@@ -29,6 +33,26 @@ pub fn origin() -> &'static str {
     } else {
         "cli"
     }
+}
+
+/// A person (the desktop app or the command line) set this, as opposed to an agent, the
+/// scanner, or someone unknown.
+pub fn by_a_person(origin: Option<&str>) -> bool {
+    matches!(origin, Some("gui" | "cli"))
+}
+
+/// Under an MCP tool call, refuses to change or clear `what` when a person set it last
+/// (`by`): an agent's later edit would quietly undo a person's decision (a false positive
+/// confirmed, a reviewed write-up sent back to draft and so out of reports). `instead` says
+/// what the agent can do. An agent changes its own work, and a person changes anything.
+pub fn agent_may_change(what: &str, by: Option<&str>, instead: &str) -> crate::error::Result<()> {
+    if origin() == "mcp" && by_a_person(by) {
+        return Err(crate::error::Error::Conflict(format!(
+            "{what} was set by a person ({}), so an agent can't change or clear it; {instead}",
+            describe(by)
+        )));
+    }
+    Ok(())
 }
 
 /// Makes a child process record the same origin as this one. Children inherit the
@@ -53,6 +77,7 @@ pub fn describe(origin: Option<&str>) -> &'static str {
         Some("mcp") => "via MCP (an agent)",
         Some("gui") => "from the desktop app",
         Some("cli") => "from the command line",
+        Some(SCANNER) => "by the scanner",
         _ => "from an unknown origin (recorded before brainproxy kept it)",
     }
 }

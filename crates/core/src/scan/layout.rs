@@ -333,6 +333,11 @@ impl Store {
             .query_row("SELECT cvss_vector FROM issues WHERE id = ?1", [id], |r| r.get(0))
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("issue {id}")))?;
+        crate::provenance::agent_may_change(
+            &format!("issue {id}'s CVSS rating"),
+            crate::scan::issues::last_set_by(&tx, id, "cvss")?.as_deref(),
+            "leave a suggestion on one of its findings for a person instead (`findings mark ID --suggest --note ...`)",
+        )?;
         let (vector, score) = match &parsed {
             Some(c) => (Some(c.vector()), Some(c.score())),
             None => (None, None),

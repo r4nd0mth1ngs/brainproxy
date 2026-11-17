@@ -63,7 +63,7 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
     let history_id = f["last_history_id"].as_i64().or(f["history_id"].as_i64());
     match source.as_str() {
         "passive" => {}
-        "active" => return Err(Error::InvalidInput(rescan_hint(a.id, &f, history_id))),
+        "active" => return Err(Error::InvalidInput(rescan_hint(a.id, &f))),
         "manual" => {
             return Err(Error::InvalidInput(format!(
                 "finding {} was added by hand: test it again by hand, then `findings mark {} --state fixed` \
@@ -208,6 +208,13 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
     }
     let outcome = if found { Retest::StillPresent } else { Retest::NotReproduced };
     let state = store.finding_retested(a.id, outcome, Some(row), &detail, !a.no_mark)?;
+    let previous = f["state"].as_str().unwrap_or_default();
+    // An agent's retest leaves a state a person set (but retest_pending) as it was: say so.
+    let kept = !a.no_mark
+        && crate::mcp::in_tool_call()
+        && brainproxy_core::provenance::by_a_person(f["state_origin"].as_str())
+        && previous != "retest_pending"
+        && outcome.moves(previous).is_some();
     let data = json!({
         "id": a.id,
         "outcome": outcome.as_str(),
@@ -215,13 +222,15 @@ pub fn retest(project: &Path, a: RetestArgs, out: &Out) -> Result<(), Error> {
         "previous_state": f["state"],
         "history_id": row,
         "request": detail,
+        "state_kept": kept.then_some("a person set its state; an agent's retest records the outcome only"),
     });
     out.ok(data, || {
         let said = match outcome {
             Retest::StillPresent => "still present",
             Retest::NotReproduced => "not reproduced",
         };
-        format!("finding {}: {said} (now {})", a.id, state.replace('_', " "))
+        let kept = if kept { "; a person set its state, so it is kept" } else { "" };
+        format!("finding {}: {said} (now {}{kept})", a.id, state.replace('_', " "))
     });
     Ok(())
 }
@@ -254,23 +263,41 @@ fn evidence_header(response: &[u8], evidence: &str) -> Option<String> {
     })
 }
 
-/// How to retest an active finding: run its rule or check again, as a scan.
-fn rescan_hint(id: i64, f: &Value, history_id: Option<i64>) -> String {
+/// How to retest an active finding: run its rule or check again, as a scan of the request the
+/// attack was built from. Not of the finding's URL, which is the attack's (`?q=apple%27`): a
+/// scan that starts from the payload doesn't see the injection it is looking for, and would
+/// report it gone.
+fn rescan_hint(id: i64, f: &Value) -> String {
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let what = match f["alert_ref"].as_str().unwrap_or_default().strip_prefix("check:") {
         Some(check) => format!("--checks SOURCE --check-ids={}", quote(check)),
         None => format!("--rules={}", f["rule_id"].as_i64().unwrap_or(0)),
     };
-    // The URL comes from the target: quoted, so the command can be pasted as it is.
-    let url = quote(f["url"].as_str().unwrap_or_default());
-    let target = match history_id {
-        Some(_) => format!("{url} --include-methods {}", quote(f["method"].as_str().unwrap_or("GET"))),
-        None => url,
+    let method = quote(f["method"].as_str().unwrap_or("GET"));
+    let (target, aside) = match f["base_history_id"].as_i64() {
+        Some(base) => (format!("--history-id {base} --include-methods {method}"), String::new()),
+        // From before brainproxy kept the baseline: the URL without the attack's query.
+        None => {
+            let url = f["url"].as_str().unwrap_or_default();
+            let (bare, query) = url.split_once('?').map_or((url, false), |(b, _)| (b, true));
+            let param = f["param"].as_str().unwrap_or_default();
+            let aside = if query {
+                format!(
+                    "; the finding's URL carries the attack, so add its query back with ordinary values{}, or name \
+                     the request it came from with --history-id",
+                    if param.is_empty() { String::new() } else { format!(" ({param} among them)") }
+                )
+            } else {
+                String::new()
+            };
+            // The URL comes from the target: quoted, so the command can be pasted as it is.
+            (format!("{} --include-methods {method}", quote(bare)), aside)
+        }
     };
     format!(
         "finding {id} came from an active scan, whose evidence is an attack, not the request it started \
-         from: retest it by scanning again (`scan active {target} {what}`), and mark it retest_pending \
-         meanwhile; a completed scan that covers it and doesn't find it lists it as gone"
+         from: retest it by scanning that request again (`scan active {target} {what}`){aside}, and mark it \
+         retest_pending meanwhile; a completed scan that covers it and doesn't find it lists it as gone"
     )
 }
 
@@ -397,5 +424,28 @@ impl Resender {
         if let Some(s) = &self.session {
             let _ = s.save();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_active_findings_retest_scans_the_request_the_attack_came_from() {
+        let f = json!({"alert_ref": "40018", "rule_id": 40018, "method": "GET", "param": "q",
+            "url": "http://shop.test/search?q=apple%27", "base_history_id": 7});
+        let hint = rescan_hint(3, &f);
+        assert!(hint.contains("`scan active --history-id 7 --include-methods 'GET' --rules=40018`"), "{hint}");
+        assert!(!hint.contains("apple"), "{hint}");
+        // No baseline recorded: the URL without the attack, and what to add back.
+        let f = json!({"alert_ref": "40018", "rule_id": 40018, "method": "GET", "param": "q",
+            "url": "http://shop.test/search?q=apple%27"});
+        let hint = rescan_hint(3, &f);
+        assert!(
+            hint.contains("`scan active 'http://shop.test/search' --include-methods 'GET' --rules=40018`"),
+            "{hint}"
+        );
+        assert!(hint.contains("(q among them)") && !hint.contains("apple"), "{hint}");
     }
 }

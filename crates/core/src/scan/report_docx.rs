@@ -311,9 +311,10 @@ pub fn render(r: &Report) -> Vec<u8> {
         }
     }
     if (layout.has(Section::Issues) || layout.has(Section::List)) && !r.agent_false_positives.is_empty() {
-        d.heading(1, "Marked false positive by an agent");
+        d.heading(1, "Left out by an agent");
         d.text(
-            "These findings were marked false positive via MCP (an agent), not by a person, and are left out above.",
+            "These findings were marked false positive, accepted risk or fixed via MCP (an agent), not by a person, \
+             and are left out above.",
         );
         let rows: Vec<Vec<String>> = r
             .agent_false_positives
@@ -329,7 +330,7 @@ pub fn render(r: &Report) -> Vec<u8> {
                         h.url,
                         if h.param.is_empty() { String::new() } else { format!(" [{}]", h.param) }
                     ),
-                    h.state_changed_at.clone().unwrap_or_default(),
+                    format!("{} {}", h.state.replace('_', " "), h.state_changed_at.as_deref().unwrap_or_default()),
                     h.note.clone().unwrap_or_default(),
                 ]
             })

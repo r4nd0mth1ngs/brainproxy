@@ -168,6 +168,20 @@ impl Store {
         check_text(text)?;
         let text = Some(text.trim()).filter(|t| !t.is_empty());
         let tx = self.write_tx()?;
+        // A reviewed text is a person's, whoever drafted it: replacing it would send it back to
+        // draft, and so out of reports.
+        let by: Option<(Option<String>, Option<String>)> = tx
+            .query_row("SELECT narrative_origin, reviewed_origin FROM issues WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if let Some((wrote, reviewed)) = by {
+            crate::provenance::agent_may_change(
+                &format!("issue {id}'s write-up"),
+                reviewed.or(wrote).as_deref(),
+                "leave a suggestion on one of its findings for a person instead (`findings mark ID --suggest --note ...`)",
+            )?;
+        }
         let n = tx.execute(
             "UPDATE issues SET narrative = ?1, narrative_origin = ?2,
                 narrative_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reviewed_origin = NULL, reviewed_at = NULL
@@ -229,6 +243,13 @@ impl Store {
     pub fn summary_set(&self, text: &str) -> Result<()> {
         check_text(text)?;
         let text = Some(text.trim()).filter(|t| !t.is_empty());
+        if let Some(n) = self.summary()? {
+            crate::provenance::agent_may_change(
+                "the executive summary",
+                n.reviewed_origin.or(n.origin).as_deref(),
+                "a person writes it; put what you found in notes on the findings instead",
+            )?;
+        }
         record(&self.conn, &Event { kind: "summary", text, ..Default::default() })?;
         match text {
             None => self.meta_set(SUMMARY_KEY, None),

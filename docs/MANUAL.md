@@ -1279,6 +1279,7 @@ echo '{"tabs":[{"title":"search","target":"https://app.acme.test","request":"GET
     | brainproxy replay tabs save --append                # adds a tab (replaces them without --append); sends nothing
 
 brainproxy findings list                  # one group per alert type, riskiest first; --limit N keeps N (truncated: true when more)
+brainproxy findings list --all --issue 4 --limit 50 --offset 50   # one row per finding of issue 4, the second page
 brainproxy findings show 12
 brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param id \
     --description-file idor.md                # an issue found by hand; nothing is sent
@@ -2122,19 +2123,27 @@ brainproxy proxy status                      # recording_last_change, recording_
 
 Findings have an `origin` too (who added them: the proxy's passive scan, a scan job,
 `findings add`, ...), and `state_origin` and `state_changed_at` say who last changed the state
-with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. `note_origin` and
+with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. A fixed finding a scanner
+sees again and opens is `scanner`'s, whoever started the proxy or scan. `note_origin` and
 `note_changed_at` do the same for the note. `findings list` and `findings show` include
 them. The description and solution a title added by hand shares keep who wrote them
 (`description_origin` and `solution_origin` in `findings show` and the `finding_types`
 table): whoever gave the text first, filled it in when it was left blank, or replaced it.
 Reports carry a finding's origins in every format:
 
-- JSON: each instance has `state_origin`, `state_changed_at`, `note_origin`,
+- JSON: each instance has `origin`, `state_origin`, `state_changed_at`, `note_origin`,
   `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
-- Markdown and HTML say it in words on each finding. In HTML a finding a person confirmed
-  (from the app or the command line) is tagged **confirmed**, one an agent confirmed
-  **confirmed via MCP (an agent)**. A finding added with `findings add` is tagged **found by
-  hand**, or **added via MCP (an agent)** when an agent added it.
+- Markdown and HTML say it in words on each finding: a scanner's finding is "found by the
+  passive scanner" (or the active scanner, or access-control testing), and one added with
+  `findings add` "added by hand", or "added via MCP (an agent)" when an agent added it. A state
+  or note says whether a person, an agent or the scanner set it. In HTML a finding a person
+  confirmed is tagged **confirmed**, one an agent confirmed **confirmed via MCP (an agent)**,
+  and one added by hand **found by hand** or **added via MCP (an agent)**.
+- Which client did it (the desktop app or the command line, and which one ran the scanner) and
+  each agent's trail are for an internal review, not a client: `report --provenance` adds
+  them ("found by the passive scanner (run from the command line)", "confirmed from the desktop
+  app at ...", "Agent trail: ..."). Without it the JSON's raw origin fields stay, and an
+  instance has no `agent_trail`.
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
 
@@ -2160,11 +2169,15 @@ code scanning shows it as dismissed rather than open.
 first, `unchanged` for what it found again. `lastHistoryId` and `lastSeen` give the latest
 sighting.
 
-False positives are left out of a report by default. The report counts them by who marked
-them (`summary.false_positives_left_out`), and lists the ones an agent marked
-(`agent_false_positives`; a "Marked false positive by an agent" section in Markdown and HTML,
-`agentFalsePositives` in SARIF run properties), so an agent can't make a finding vanish
-from a report unseen.
+False positives, accepted risks and fixed findings are left out of a report by default (and
+any of them a `--state` leaves out). The report says so at the top ("3 findings are left out of
+this report by their state: 2 accepted risk (1 by a person, 1 via MCP (an agent)), 1 fixed (1
+by a person)"), counts them by state and by who set it (`summary.left_out`: `state`, `origin`,
+`count`; `summary.false_positives_left_out` keeps the false positives alone, by origin), and
+lists the ones an agent left out (`agent_false_positives`, which despite its name holds every
+such state, each with its `state`; a "Left out by an agent" section in Markdown, HTML and Word,
+`agentFalsePositives` in SARIF run properties), so an agent can't make a finding vanish from a
+report unseen.
 
 `scan passive --rescan` rescans all history and keeps what people decided: a finding found
 again keeps its id, state, note, origin and who set them. One not found again (its rule was
@@ -2965,10 +2978,24 @@ Findings are records with a history, not just rows:
 - **States:** `open`, `confirmed`, `false_positive`, `accepted_risk`, `retest_pending` and
   `fixed` (`findings mark --state`; `--issue ISSUE` marks every finding of an issue). Marking
   a finding with the state it already has changes nothing: who changed it and when stay as
-  they were. `findings list` and `report` show work still to do by default: open, confirmed
-  and retest pending.
-  A fixed finding a scanner sees again goes back to open, with a `regressed` event.
-- **Timeline** (`findings timeline ID`): created, state and note changes, retests, moves
+  they were. `--if-state STATE` changes only findings still in that state: if any has been
+  changed since you read it, the call fails (kind `conflict`) and nothing changes. `--suggest`
+  records the given `--state` and/or `--note` as a suggestion on each finding's timeline (kind
+  `suggested`) and changes nothing else. `findings list` and `report` show work still to do by
+  default: open, confirmed and retest pending.
+- **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
+  with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows
+  returned and `truncated` says more are left, so the next page is `--offset` plus `--limit`.
+  `--issue ISSUE` lists one issue's findings.
+- **A person's decisions stay a person's:** through MCP an agent can't change or clear what a
+  person set last: a finding's state or note, an issue's write-up once a person wrote or
+  reviewed it, the executive summary, an issue's CVSS rating or title, or the findings of an
+  issue a person arranged (merge, split). The call fails with kind `conflict`; the agent
+  suggests instead (`findings mark ID --suggest`). An agent's retest records its outcome
+  without moving a state a person set, unless that state is `retest_pending`.
+  A fixed finding a scanner sees again goes back to open, with a `regressed` event; both are
+  recorded with origin `scanner`, not the client that started the proxy or scan.
+- **Timeline** (`findings timeline ID`): created, state and note changes, suggestions, retests, moves
   between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
   afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets
@@ -2987,7 +3014,7 @@ Findings are records with a history, not just rows:
   reproduced" older than the finding's latest sighting is recorded but marks nothing. Only GET, HEAD and OPTIONS
   are sent unless `--allow-unsafe`. An active finding's evidence is the attack, not the request
   the scan started from, and its rule may send other methods, so it is retested by scanning
-  again: the error gives the `scan active` command. Findings added by hand are retested by
+  again: the error gives the `scan active` command, which starts from the request the attack was built from (`--history-id`), not the attack. Findings added by hand are retested by
   hand, access-control findings with `authz run`.
 - **Verify** (`findings verify ID [--repeat N] [--auth PROFILE] [--allow-unsafe] [--request FILE]`):
   sends an active finding's request without and with its payload, now, and says what differs,
@@ -3088,9 +3115,9 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
 - **Agent trail** (`findings trail ID`): for a finding an agent added, changed, re-raised in
   its own traffic, or whose issue it changed (write-up, title, CVSS), the requests it sent to
   that host (from half an hour before its first such act until its last), its changes, and the
-  first change a person made to the finding or its issue after them. Reports say it on each
-  such finding ("agent's work reviewed" or "not reviewed"), with the request range in the
-  technical details.
+  first change a person made to the finding or its issue after them. Reports written with
+  `--provenance` say it on each such finding ("agent's work reviewed" or "not reviewed"), with
+  the request range in the technical details.
 - **Repro pack** (`findings repro ID [--output FILE [--force]] [--no-redact | --mask VALUE]`):
   the request (secrets masked), a curl command, the response around the evidence, what the rule looks for, and the
   command that checks it again (for an active finding on anything but a plain GET, the scan

@@ -164,11 +164,19 @@ pub enum FindingsCmd {
         /// One row per instance instead of grouping.
         #[arg(long)]
         all: bool,
+        /// Only the findings of this issue (`findings issues`).
+        #[arg(long, value_name = "ISSUE")]
+        issue: Option<i64>,
         /// Example URLs per group.
         #[arg(long, default_value_t = 3)]
         examples: usize,
+        /// Most rows (instances with --all, else alert types) to return; `total` counts them
+        /// all and `truncated` says more are left.
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Skip this many rows first, to page through: the next page starts at offset + limit.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Compare findings with a baseline (new, unchanged, fixed) and optionally fail on a risk (exit code 5).
     #[command(
@@ -284,7 +292,10 @@ pub enum FindingsCmd {
         report's fingerprint when it has one, so a redacted report still matches). Each match gets \
         --state when given, else the file's mark where it is confirmed, false_positive or \
         accepted_risk. Removed findings are left as they are. Refused through MCP: an agent marks \
-        findings by id, with a note.")]
+        findings by id, with a note. Through MCP an agent can't change or clear a state or note a person \
+        set last (kind conflict); --suggest puts its proposal on the finding's timeline (kind suggested) \
+        for the person to decide, and changes nothing. --if-state refuses (kind conflict) when any of the \
+        findings is no longer in that state, so a decision made meanwhile isn't overwritten.")]
     Mark {
         /// One or more finding ids. (Named `id`, so an agent's `{"id": 5}` keeps working.)
         #[arg(value_name = "ID", required_unless_present_any = ["issue", "from"], conflicts_with = "from", num_args = 1..)]
@@ -301,6 +312,14 @@ pub enum FindingsCmd {
         /// Mark the findings that match those of FILE (see below).
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
+        /// Change only findings still in this state (as read): any other fails the call (kind
+        /// conflict) and nothing changes.
+        #[arg(long, value_enum, value_name = "STATE", conflicts_with = "from")]
+        if_state: Option<StateArg>,
+        /// Suggest --state and/or --note instead of setting them: the suggestion goes on each
+        /// finding's timeline for a person to decide, and nothing else changes.
+        #[arg(long, conflicts_with_all = ["from", "if_state"])]
+        suggest: bool,
     },
     /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
@@ -1344,7 +1363,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let p = store.posture()?;
             out.ok(p.clone(), || serde_json::to_string_pretty(&p).unwrap_or_default());
         }
-        FindingsCmd::List { risk, confidence, host, alert, state, source, all, examples, limit } => {
+        FindingsCmd::List { risk, confidence, host, alert, state, source, issue, all, examples, limit, offset } => {
             let filter = FindingFilter {
                 min_risk: risk.map(RiskArg::get),
                 min_confidence: confidence.map(|c| c.get()),
@@ -1353,12 +1372,16 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 state,
                 source,
                 ids: None,
-                issue: None,
+                issue,
                 examples,
             };
             if all {
-                let items = store.findings_list(&filter, limit)?;
-                out.ok(json!({"count": items.len(), "items": items}), || {
+                let items = store.findings_page(&filter, limit, offset)?;
+                let total = store.findings_count(&filter)?;
+                let truncated = offset.saturating_add(items.len()) < total;
+                let data = json!({"count": items.len(), "items": items, "total": total, "offset": offset,
+                    "truncated": truncated});
+                out.ok(data, || {
                     items
                         .iter()
                         .map(|f| {
@@ -1383,14 +1406,17 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                     let n = by_risk.get(&r).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
                     by_risk.insert(r, json!(n));
                 }
-                // The counts are of every alert type; only the list is cut at --limit.
+                // The counts are of every alert type; only the list is cut at --offset and --limit.
                 let alert_types = groups.len();
-                groups.truncate(limit);
+                let groups: Vec<serde_json::Value> = groups.drain(..).skip(offset).take(limit).collect();
                 let data = json!({
                     "alert_types": alert_types,
                     "by_risk": by_risk,
                     "groups": groups,
-                    "truncated": alert_types > groups.len(),
+                    "count": groups.len(),
+                    "total": alert_types,
+                    "offset": offset,
+                    "truncated": offset.saturating_add(groups.len()) < alert_types,
                 });
                 out.ok(data, || {
                     groups
@@ -1413,7 +1439,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let f = store.finding_get(id)?;
             out.ok(f.clone(), || serde_json::to_string_pretty(&f).unwrap_or_default());
         }
-        FindingsCmd::Mark { id: mut ids, issue, state, note, from } => {
+        FindingsCmd::Mark { id: mut ids, issue, state, note, from, if_state, suggest } => {
             let state = state.map(StateArg::as_str);
             if let Some(path) = from {
                 return mark_from(&store, &path, state, note.as_deref(), out);
@@ -1426,7 +1452,15 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             }
             ids.sort_unstable();
             ids.dedup();
-            store.findings_mark(&ids, state, note.as_deref())?;
+            if suggest {
+                store.findings_suggest(&ids, state, note.as_deref())?;
+                let n = ids.len();
+                out.ok(json!({"ids": ids, "suggested": true, "state": state, "note": note}), || {
+                    format!("suggested on {n} finding(s); nothing changed")
+                });
+                return Ok(());
+            }
+            store.findings_mark(&ids, state, note.as_deref(), if_state.map(StateArg::as_str))?;
             // `note` is as given: "" when it was cleared, null when it was left alone.
             match ids.as_slice() {
                 [id] => out.ok(json!({"id": id, "ids": ids, "state": state, "note": note}), || {
