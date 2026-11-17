@@ -2,7 +2,8 @@
 //! when its JavaScript runs: a client-side route reached by clicking an element with a
 //! click listener (history.pushState), a hash route with a form, and buttons that call
 //! fetch(). The API paths are built at run time, so the plain crawl can't read them from
-//! the script. Skipped when no Chromium-based browser is installed.
+//! the script. A sign-in form's button stays disabled until its fields are filled.
+//! Skipped when no Chromium-based browser is installed.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -12,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 const INDEX: &str = r##"<!doctype html><html><head><title>SPA</title></head><body>
-<nav><span data-route="/reports">Reports</span> <a href="#/settings">Settings</a> <a href="/account/7">Delete account</a> <button id="logout">Log out</button></nav>
+<nav><span data-route="/reports">Reports</span> <a href="#/settings">Settings</a> <a href="#/login">Sign in</a> <a href="/account/7">Delete account</a> <button id="logout">Log out</button></nav>
 <div id="view"></div><script src="/app.js"></script></body></html>"##;
 
 const APP: &str = r#"
@@ -32,6 +33,18 @@ function render() {
     document.getElementById('f').addEventListener('submit', (e) => {
       e.preventDefault();
       fetch(api('settings') + '?nickname=' + encodeURIComponent(e.target.nickname.value));
+    });
+  } else if (route === '/login') {
+    view.innerHTML = '<form id="l"><input name="email" type="email"><input name="password" type="password">' +
+      '<button id="go" disabled>Sign in</button></form>';
+    const f = document.getElementById('l');
+    f.addEventListener('input', () => {
+      document.getElementById('go').disabled = !(f.email.value && f.password.value);
+    });
+    f.addEventListener('submit', (e) => {
+      e.preventDefault();
+      fetch(api('login'), {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({email: f.email.value, password: f.password.value})});
     });
   } else {
     view.innerHTML = '<p>Welcome</p>';
@@ -184,6 +197,7 @@ fn browser_crawl_finds_api_calls_made_by_javascript() {
     assert!(saw("POST /api/reports/export "), "{lines:?}");
     assert!(saw("GET /api/settings?nickname=brainproxy "), "{lines:?}");
     assert!(saw("GET /reports "), "the pushState route is loaded directly too: {lines:?}");
+    assert!(saw("POST /api/login "), "a button enabled by filling the form is clicked: {lines:?}");
     // Nothing destructive reached the site.
     assert!(!lines.iter().any(|l| l.starts_with("DELETE ") || l.contains("logout")), "{lines:?}");
     assert!(!saw("GET /account/7 "), "a link labelled Delete account isn't followed: {lines:?}");

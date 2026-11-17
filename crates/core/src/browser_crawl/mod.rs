@@ -7,8 +7,9 @@
 //! Exploring works like a person would: load a URL, wait until the network and the DOM
 //! have been quiet for a moment (bounded), then note the links (client-side routes from
 //! history.pushState and hash routes too), and try each clickable element: buttons,
-//! elements with click handlers, menu items. Before each click the visible fields are
-//! filled with the spider's test values, so clicking a submit button sends the form.
+//! elements with click handlers, menu items. The visible fields are filled with the
+//! spider's test values before a state is read (so a submit button that waits for valid
+//! fields is enabled) and again before each click, so clicking a submit button sends the form.
 //! Each resulting DOM state is keyed on its shape (address with ids masked, the set of
 //! clickable elements, links and forms) and explored only once, which keeps lists, pagers
 //! and repeated menus from multiplying the work. To try a click the crawler returns to
@@ -417,6 +418,11 @@ impl<'a> Explorer<'a> {
             if a.submits {
                 self.summary.forms_submitted += 1;
             }
+            // Fields are filled before the state is read: many forms keep their submit button
+            // disabled until they are valid, and a disabled button isn't listed to be clicked.
+            if self.fill().await.unwrap_or(false) {
+                self.settle().await;
+            }
             match self.eval("window.__bp ? __bp.snapshot() : null").await {
                 Ok(v) if !v.is_null() => {
                     let snap = serde_json::from_value::<Snapshot>(v).unwrap_or_default().bounded();
@@ -627,16 +633,18 @@ impl<'a> Explorer<'a> {
         Ok(true)
     }
 
-    /// Gives empty fields the spider's test values (required boxes ticked, a select's first value).
-    async fn fill(&self) -> Result<()> {
+    /// Gives empty fields the spider's test values (required boxes ticked, a select's first
+    /// value). True when it changed any.
+    async fn fill(&self) -> Result<bool> {
         let mut fields: Vec<Field> =
             serde_json::from_value(self.eval("window.__bp ? __bp.fields() : []").await?).unwrap_or_default();
         fields.truncate(200);
         let pairs: Vec<Value> = fields.iter().filter_map(|f| fill_value(f).map(|v| json!([f.i, v]))).collect();
-        if !pairs.is_empty() {
-            self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
+        if pairs.is_empty() {
+            return Ok(false);
         }
-        Ok(())
+        self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
+        Ok(true)
     }
 
     /// Queues a page load of `raw` if it is in scope and new.

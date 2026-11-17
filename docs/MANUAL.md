@@ -794,7 +794,8 @@ attack type, and pick payloads:
   explored the way a person would: it waits for each page to settle, follows links and
   client-side routes, clicks buttons, menus and other clickable elements, fills fields
   with test values and submits forms, and records the API calls (XHR, fetch) this
-  triggers. Each distinct page state is explored once. It is slower than the plain crawl.
+  triggers. Fields are filled before a page state is read, so a submit button that stays
+  disabled until the form is valid (a sign-in or register form) is clicked too. Each distinct page state is explored once. It is slower than the plain crawl.
   - **What it won't do:** click elements or follow links labelled like *log out*,
     *delete*, *remove*, *reset* or *unsubscribe* (the summary lists them under
     `not_clicked`), answer *OK* to a confirmation dialog, open pop-ups or downloads,
