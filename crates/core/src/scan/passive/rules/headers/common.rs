@@ -58,6 +58,13 @@ pub fn zap_is_text(msg: &Message) -> bool {
     ["text", "html", "xml", "json", "javascript"].iter().any(|t| ct.contains(t))
 }
 
+/// Whether an HTML response is text without markup (socket.io answers a POST with `ok` as
+/// text/html): it can't be framed into anything or run a script, so headers that guard a
+/// page say nothing about it. An empty body is left to each rule, as ZAP does.
+pub fn has_markup(msg: &Message) -> bool {
+    msg.resp_body.is_empty() || msg.resp_body.contains(&b'<')
+}
+
 pub fn is_redirect(status: u16) -> bool {
     (300..=399).contains(&status)
 }

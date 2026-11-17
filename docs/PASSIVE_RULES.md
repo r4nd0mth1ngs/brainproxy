@@ -151,3 +151,6 @@ noise on modern applications:
 - **Off-site Redirect (10028)** is Medium (ZAP: High), since one sighting can't tell a
   parameter that redirects anywhere from an allow-list, and gives the `Location` value as
   evidence (ZAP: none).
+- **Anti-clickjacking (10020-1)** and **CSP Header Not Set (10038-1)** skip a text/html body
+  without any markup (socket.io answers a POST with `ok`): there is no page to frame or
+  script to restrict.
