@@ -113,7 +113,15 @@ impl PassiveRule for InfoSessionIdUrl {
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
         let mut found = false;
         if msg.query.is_some() {
-            for (name, value) in url_params(msg) {
+            let params = url_params(msg);
+            // Diverges from ZAP: Engine.IO (socket.io) names its connection `sid`
+            // (`?EIO=4&transport=polling&sid=…`). It identifies a transport, not a login, and
+            // has to be in the URL of every polling request.
+            let engine_io = ["EIO", "transport"].iter().all(|k| params.iter().any(|(n, _)| n == k));
+            for (name, value) in params {
+                if engine_io && name.eq_ignore_ascii_case("sid") {
+                    continue;
+                }
                 if SESSION_IDS.contains(&name.to_lowercase().as_str())
                     && value.encode_utf16().count() > SESSION_TOKEN_MIN_LENGTH
                 {
@@ -169,6 +177,15 @@ mod tests {
         assert_eq!(f.len(), 2);
         assert_eq!((f[0].def.alert_ref, f[0].evidence.as_str()), ("3-2", "jsessionid=1A530637289A03B0"));
         assert_eq!((f[1].def.alert_ref, f[1].evidence.as_str(), f[1].risk), ("3-3", "ext.test", Risk::Low));
+    }
+
+    /// Engine.IO's `sid` is a transport's id, needed in every polling URL; elsewhere `sid` counts.
+    #[test]
+    fn ignores_the_engine_io_transport_id() {
+        let url = "https://a.test/socket.io/?EIO=4&transport=polling&t=kfy8l70u&sid=qRsOpk9ByPGILypkAAAA";
+        assert!(msg(url).scan(&InfoSessionIdUrl).is_empty());
+        let f = msg("https://a.test/app?transport=x&sid=qRsOpk9ByPGILypkAAAA").scan(&InfoSessionIdUrl);
+        assert_eq!(f.len(), 1);
     }
 
     #[test]

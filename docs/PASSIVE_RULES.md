@@ -141,3 +141,5 @@ noise on modern applications:
   the first timestamp as evidence and the others in the other info (ZAP: one per match, so
   a single response could add hundreds of hits). It skips numbers inside URLs (`?id=…`,
   `/items/…`) and the bodies of scripts and stylesheets, whose numbers are ids and constants.
+- **Session ID in URL Rewrite (3-1)** ignores `sid` in an Engine.IO (socket.io) URL, one
+  with `EIO` and `transport` parameters: it identifies the transport, not a login.
