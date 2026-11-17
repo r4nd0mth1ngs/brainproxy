@@ -8,6 +8,8 @@ solutions, and references are ZAP's.
 Rules run automatically on proxy traffic and `send` results (sources are configurable with
 `brainproxy scan sources`), and before every `findings` command. `brainproxy scan rules`
 lists them; `scan disable ID` / `scan enable ID` switch them.
+Rules read response bodies decoded: chunked framing and `Content-Encoding` gzip, deflate,
+br and zstd are removed when the exchange is recorded.
 
 brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
 **100001 PHP2Shell** (CVE-2026-109618, CVE-2026-109619) flags a PHP version from

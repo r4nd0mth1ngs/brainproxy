@@ -22,6 +22,8 @@ rusqlite = { version = "0.41", features = ["bundled", "functions", "hooks"] }
 regex = "1"
 flate2 = "1"
 brotli-decompressor = "6"
+# Pure Rust zstd decoder (no C build), for bodies sent with Content-Encoding: zstd.
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 base64 = "0.23"
 hex = "0.4"
 percent-encoding = "2"
