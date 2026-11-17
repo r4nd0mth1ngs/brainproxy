@@ -2,9 +2,19 @@
 //!
 //! ZAP's optional custom error strings (the "XPath-Errors" payload category of the
 //! Custom Payloads add-on) are not supported; the default list is used.
+//!
+//! Not in ZAP: when no error shows, a boolean check (medium confidence). The value is closed
+//! and an always-true and an always-false comparison are added, each ANDed and then ORed
+//! (`2' and '1'='1` / `2' and '1'='2`, then `or`): read as data both are unknown values and
+//! give the same page; built into an XPath predicate, one keeps the original page and the
+//! other changes it (`differential`, which also sends a pair that passes a second time).
+//! Single quotes at LOW; double quotes and numeric comparisons (`2 and 1=1`) from MEDIUM, the
+//! numeric ones at MEDIUM only for a numeric original value.
 
 use super::common;
-use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope};
+use crate::scan::active::rules::differential::{Differential, Kept};
+use crate::scan::active::rules::injection::common::by_strength;
+use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -73,6 +83,37 @@ pub(crate) const DEFAULT_ERRORS: [&str; 29] = [
     "Expression must evaluate to a node-set.",
 ];
 
+/// The always-true and always-false values for `orig` closed with `quote` (none: a number),
+/// joined with `op` (`and` or `or`).
+fn pair(orig: &str, quote: &str, op: &str) -> (String, String) {
+    let q = quote;
+    (format!("{orig}{q} {op} {q}1{q}={q}1"), format!("{orig}{q} {op} {q}1{q}={q}2"))
+}
+
+/// The pairs to try, by strength: single quotes, then double quotes and numbers.
+fn pairs(orig: &str, strength: Strength) -> Vec<(String, String)> {
+    let numeric = !orig.is_empty() && orig.parse::<f64>().is_ok();
+    let mut quotes = vec!["'"];
+    if by_strength(strength, [false, true, true, true]) {
+        quotes.push("\"");
+        if numeric || by_strength(strength, [false, false, true, true]) {
+            quotes.push("");
+        }
+    }
+    quotes.into_iter().flat_map(|q| ["and", "or"].map(|op| pair(orig, q, op))).collect()
+}
+
+fn boolean_info(t: &str, f: &str, kept: Kept) -> String {
+    let how = match kept {
+        Kept::ByTrue => "kept the original page and the FALSE one",
+        Kept::ByFalse => "changed the original page and the FALSE one",
+    };
+    format!(
+        "The TRUE condition [{t}] {how} [{f}] did the opposite, so the value is evaluated as part of an XPath \
+         expression. Taken as plain values, the two would give the same page."
+    )
+}
+
 /// The first error found in `response` that is not in `original`.
 pub(crate) fn new_error(response: &str, original: &str) -> Option<&'static str> {
     DEFAULT_ERRORS.into_iter().find(|e| response.contains(e) && !original.contains(e))
@@ -112,6 +153,22 @@ impl ActiveRule for XpathInjection {
                     return;
                 }
             }
+            let Some(diff) = Differential::new(cx).await else { return };
+            let orig = cx.point().value.clone();
+            for (t, f) in pairs(&orig, cx.strength()) {
+                if cx.stopped() {
+                    return;
+                }
+                if let Some((kept, resp)) = diff.test(&t, &f).await {
+                    let finding = ALERT
+                        .raise(cx.point().name.clone(), "")
+                        .attack(t.clone())
+                        .confidence(Confidence::Medium)
+                        .other_info(boolean_info(&t, &f, kept));
+                    cx.report(finding, &resp);
+                    return;
+                }
+            }
         })
     }
 }
@@ -130,5 +187,17 @@ mod tests {
         // Order matters: the first matching error is the evidence.
         assert_eq!(new_error("libxml2 library function failed", ""), Some("libxml2 library function failed"));
         assert_eq!(new_error("all good", ""), None);
+    }
+
+    #[test]
+    fn boolean_pairs() {
+        assert_eq!(pair("2", "'", "and"), ("2' and '1'='1".into(), "2' and '1'='2".into()));
+        assert_eq!(pair("2", "", "or"), ("2 or 1=1".into(), "2 or 1=2".into()));
+        assert_eq!(pairs("bob", Strength::Low).len(), 2);
+        // Numbers for a numeric value from MEDIUM, for any value from HIGH.
+        assert_eq!(pairs("bob", Strength::Medium).len(), 4);
+        assert_eq!(pairs("2", Strength::Medium).len(), 6);
+        assert_eq!(pairs("bob", Strength::High).len(), 6);
+        assert_eq!(pairs("bob", Strength::Medium)[2].0, "bob\" and \"1\"=\"1");
     }
 }

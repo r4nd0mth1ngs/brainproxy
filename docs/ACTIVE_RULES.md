@@ -207,7 +207,12 @@ those skips 40014. Prime and Spider never raise alerts themselves.
     nothing at first, and at HIGH and INSANE two and three parentheses deep. See *Boolean
     differential* below.
   - Like ZAP, it skips pages whose original answer is a 4xx or 5xx, and URL path segments.
-- **Boolean differential** (40015): pages are compared by the words they contain,
+- **XPath Injection (90021)** also has a boolean check, not in ZAP, for apps that hide
+  XPath errors (medium confidence; the error check stays high). It closes the value and
+  adds an always-true and an always-false comparison, ANDed and then ORed:
+  `2' and '1'='1` / `2' and '1'='2`, then `or`. Single quotes at LOW; double quotes, and
+  numbers (`2 and 1=1`) for a numeric value, from MEDIUM; numbers for any value from HIGH.
+- **Boolean differential** (40015 and 90021): pages are compared by the words they contain,
   with the values sent stripped out, also escaped or entity-encoded (a page that echoes the
   whole query, encoded, echoes the attack too). The original page is requested twice first:
   how much it changes by itself is the noise (when the two differ less with every word that
