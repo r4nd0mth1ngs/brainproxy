@@ -59,8 +59,9 @@ pub struct CrawlConfig {
 pub const DEFAULT_EXCLUDE: &str = r"(?i)(log|sign)[-_]?out|/logoff";
 
 const STATIC_EXT: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "tif", "tiff", "woff", "woff2", "ttf", "eot", "otf",
-    "mp3", "mp4", "webm", "avi", "mov", "pdf", "zip", "gz", "tar", "rar", "7z", "exe", "dmg", "iso", "css", "map",
+    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "bmp", "tif", "tiff", "woff", "woff2", "ttf", "eot",
+    "otf", "mp3", "mp4", "webm", "avi", "mov", "pdf", "zip", "gz", "tar", "rar", "7z", "exe", "dmg", "iso", "css",
+    "map",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1215,6 +1216,14 @@ mod tests {
         );
         jar.observe(&login, b"HTTP/1.1 200 OK\r\nSet-Cookie: dev=; Path=/; Max-Age=0\r\n\r\n");
         assert_eq!(names(&jar, "http://a.test/"), ["dom"]);
+    }
+
+    #[test]
+    fn images_fonts_and_styles_are_static() {
+        for p in ["/a.png", "/img/x-1x.AVIF", "/f.woff2", "/s.css"] {
+            assert!(is_static(&Url::parse(&format!("https://a.test{p}")).unwrap()), "{p}");
+        }
+        assert!(!is_static(&Url::parse("https://a.test/main.js").unwrap()));
     }
 
     #[test]
