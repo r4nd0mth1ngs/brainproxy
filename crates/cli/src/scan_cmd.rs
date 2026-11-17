@@ -216,6 +216,10 @@ pub enum FindingsCmd {
     /// Show, split, merge, or rename an issue.
     #[command(subcommand)]
     Issue(IssueCmd),
+    /// Suppression rules: an alert on a host (under a path, of a parameter) is a false positive
+    /// wherever a scan finds it, now and later.
+    #[command(subcommand)]
+    Suppress(SuppressCmd),
     /// A finding's timeline: found, triaged, noted, retested, moved between issues, seen again
     /// after it was fixed, removed; each with who did it and when.
     Timeline { id: i64 },
@@ -301,6 +305,9 @@ pub enum FindingsCmd {
         #[arg(value_name = "ID", required_unless_present_any = ["issue", "from"], conflicts_with = "from", num_args = 1..)]
         id: Vec<i64>,
         /// Every finding of this issue (`findings issues`), as well as any IDs given. Repeatable.
+        /// Marked false_positive or accepted_risk this way, the state is the issue's decision:
+        /// findings of the issue found later arrive in it, with the note; another state given
+        /// to the whole issue ends the decision. Findings marked by id leave it as it is.
         #[arg(long, value_name = "ISSUE", conflicts_with = "from")]
         issue: Vec<i64>,
         #[arg(long, value_enum)]
@@ -320,6 +327,34 @@ pub enum FindingsCmd {
         /// finding's timeline for a person to decide, and nothing else changes.
         #[arg(long, conflicts_with_all = ["from", "if_state"])]
         suggest: bool,
+    },
+    /// Rate scanner findings yourself: a risk and/or confidence in place of the scanner's, with
+    /// a reason. Lists, filters, reports and gates use it. Or give them the scanner's back.
+    #[command(after_help = "The scanner's own rating is kept beside the person's (rated.scanner_risk and \
+        rated.scanner_confidence in `findings list --all`; scanner_risk in `findings show`), and goes on \
+        being raised by higher sightings, so --clear gives back what the scanner rates now. Each change is \
+        on the finding's timeline (kind rated: old and new are risk/confidence, text the reason). With \
+        --issue the whole issue is rated: its findings found later take the rating too (`findings issues` \
+        gives rating); --clear --issue ends that. Findings added by hand have their own risk \
+        (`findings edit --risk`) and are refused by id, skipped with --issue. Refused through MCP: \
+        rating is a person's call; an agent suggests one (`findings mark ID --suggest --note ...`).")]
+    Rate {
+        /// Finding ids.
+        #[arg(value_name = "ID", required_unless_present = "issue")]
+        id: Vec<i64>,
+        /// Every scanner finding of this issue, and those it gets later. Repeatable.
+        #[arg(long, value_name = "ISSUE")]
+        issue: Vec<i64>,
+        #[arg(long, value_enum, required_unless_present_any = ["confidence", "clear"])]
+        risk: Option<RiskArg>,
+        #[arg(long, value_enum)]
+        confidence: Option<crate::report_cmd::ConfidenceArg>,
+        /// Why (required unless --clear).
+        #[arg(long, required_unless_present = "clear")]
+        reason: Option<String>,
+        /// Give them the scanner's rating back.
+        #[arg(long, conflicts_with_all = ["risk", "confidence", "reason"])]
+        clear: bool,
     },
     /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
@@ -403,6 +438,48 @@ pub enum IssueCmd {
         /// text changed since isn't approved in its place.
         #[arg(long)]
         hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SuppressCmd {
+    /// Add a rule. The findings it matches that are open and nobody triaged become false
+    /// positives at once, and so does each one a scanner finds later.
+    #[command(after_help = "A matching finding is stored as usual and marked false_positive, with the \
+        reason as its note (unless it has one), suppressed_by naming the rule, and a state event on its \
+        timeline (\"suppressed by rule N: reason\"), all recorded as the person who added the rule set them. \
+        So it stays out of `findings list` and reports by default (which count it among the false \
+        positives left out), out of `findings compare --fail-on`, and survives a rescan, while `--state \
+        all` still shows it. Findings added by hand and findings a person or agent triaged are left as \
+        they are. --alert matches an alert ref or a rule id (10020 or 10020-1), --host the finding's \
+        host exactly, --path-prefix the start of its URL's path, --param its parameter exactly. Refused \
+        through MCP: an agent suggests marks on findings instead (`findings mark ID --suggest`).")]
+    Add {
+        /// Alert ref or rule id, e.g. 10020 or 10020-1.
+        #[arg(long)]
+        alert: String,
+        /// The host, e.g. app.test.
+        #[arg(long)]
+        host: String,
+        /// Only findings whose URL path starts with this, e.g. /static/.
+        #[arg(long, value_name = "PATH")]
+        path_prefix: Option<String>,
+        /// Only findings of this parameter, header or cookie.
+        #[arg(long)]
+        param: Option<String>,
+        /// Why these are false positives; each finding it marks gets it as its note.
+        #[arg(long)]
+        reason: String,
+    },
+    /// The rules, with how many findings each has marked that are still false positives by it.
+    List,
+    /// Remove a rule: findings found later are no longer marked by it. Refused through MCP.
+    Remove {
+        id: i64,
+        /// Also open again the findings it marked that are still false positives by it
+        /// (otherwise they keep the state).
+        #[arg(long)]
+        reopen: bool,
     },
 }
 
@@ -739,7 +816,7 @@ pub const STATE_VALUES: [&str; 11] = [
 /// `--state` where several states pick findings (`findings list`, `findings issues`): each of
 /// the comma-separated values must be one of [`STATE_VALUES`], refused as `report` refuses one.
 #[derive(Clone)]
-struct StatesParser;
+pub(crate) struct StatesParser;
 
 impl clap::builder::TypedValueParser for StatesParser {
     type Value = String;
@@ -1342,6 +1419,94 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 out.ok(json!({"id": id, "title": shown}), || format!("issue {id} is now {shown}"));
             }
         },
+        FindingsCmd::Rate { id, issue, risk, confidence, reason, clear } => {
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "findings rate is refused through MCP: rating a finding is a person's call; suggest one with \
+                     `findings mark ID --suggest --note ...`"
+                        .into(),
+                ));
+            }
+            let reason = reason.unwrap_or_default();
+            let rating = brainproxy_core::scan::findings_db::Rating {
+                risk: risk.map(|r| r.get().as_str()),
+                confidence: confidence.map(|c| c.get().as_str()),
+                reason: &reason,
+            };
+            let changed = store.findings_rate(&id, &issue, (!clear).then_some(&rating))?;
+            let n = changed.len();
+            let mut data = json!({"ids": changed, "issues": issue, "cleared": clear});
+            if !clear {
+                data["risk"] = json!(rating.risk);
+                data["confidence"] = json!(rating.confidence);
+                data["reason"] = json!(reason);
+            }
+            out.ok(data, || {
+                if clear {
+                    format!("{n} finding(s) have the scanner's rating again")
+                } else {
+                    format!("rated {n} finding(s)")
+                }
+            });
+        }
+        FindingsCmd::Suppress(cmd) => match cmd {
+            SuppressCmd::Add { alert, host, path_prefix, param, reason } => {
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings suppress add is refused through MCP: a person decides what is suppressed; \
+                         suggest marks on the findings instead (`findings mark ID --suggest --state false_positive \
+                         --note ...`)"
+                            .into(),
+                    ));
+                }
+                let rule = brainproxy_core::scan::findings_db::Suppression {
+                    alert,
+                    host,
+                    path_prefix: path_prefix.unwrap_or_default(),
+                    param,
+                    reason,
+                };
+                let (id, marked) = store.suppression_add(&rule)?;
+                out.ok(json!({"id": id, "marked": marked}), || {
+                    format!("added suppression rule {id}; it marked {marked} finding(s) false positive")
+                });
+            }
+            SuppressCmd::List => {
+                let rules = store.suppressions_list()?;
+                out.ok(json!({"count": rules.len(), "suppressions": rules}), || {
+                    if rules.is_empty() {
+                        return "no suppression rules".into();
+                    }
+                    rules
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{:>4}  {:<10} {} {}{}  {} finding(s)  {}",
+                                r["id"],
+                                r["alert_ref"].as_str().unwrap_or(""),
+                                r["host"].as_str().unwrap_or(""),
+                                r["path_prefix"].as_str().unwrap_or(""),
+                                r["param"].as_str().map(|p| format!(" param {p}")).unwrap_or_default(),
+                                r["findings"],
+                                crate::output::escape_lines(r["reason"].as_str().unwrap_or(""))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+            }
+            SuppressCmd::Remove { id, reopen } => {
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings suppress remove is refused through MCP: a person's rule stays theirs".into(),
+                    ));
+                }
+                let reopened = store.suppression_remove(id, reopen)?;
+                out.ok(json!({"id": id, "reopened": reopened}), || {
+                    format!("removed suppression rule {id}; {reopened} finding(s) open again")
+                });
+            }
+        },
         FindingsCmd::Timeline { id } => {
             let events = store.finding_events(id)?;
             out.ok(json!({"id": id, "events": events}), || {
@@ -1453,29 +1618,35 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             if state.is_none() && note.is_none() {
                 return Err(Error::InvalidInput("give --state and/or --note".into()));
             }
+            if !suggest {
+                let ids =
+                    store.findings_mark_issues(&ids, &issue, state, note.as_deref(), if_state.map(StateArg::as_str))?;
+                // `note` is as given: "" when it was cleared, null when it was left alone.
+                let mut data = json!({"ids": ids, "state": state, "note": note});
+                if let [id] = ids.as_slice() {
+                    data["id"] = json!(id);
+                }
+                if !issue.is_empty() {
+                    data["issues"] = json!(issue);
+                }
+                let n = ids.len();
+                out.ok(data, || match (ids.as_slice(), issue.is_empty()) {
+                    ([id], true) => format!("updated finding {id}"),
+                    (_, true) => format!("updated {n} findings"),
+                    (_, false) => format!("updated {n} finding(s) of issue(s) {issue:?}"),
+                });
+                return Ok(());
+            }
             for i in issue {
                 ids.extend(store.issue_finding_ids(i)?);
             }
             ids.sort_unstable();
             ids.dedup();
-            if suggest {
-                store.findings_suggest(&ids, state, note.as_deref())?;
-                let n = ids.len();
-                out.ok(json!({"ids": ids, "suggested": true, "state": state, "note": note}), || {
-                    format!("suggested on {n} finding(s); nothing changed")
-                });
-                return Ok(());
-            }
-            store.findings_mark(&ids, state, note.as_deref(), if_state.map(StateArg::as_str))?;
-            // `note` is as given: "" when it was cleared, null when it was left alone.
-            match ids.as_slice() {
-                [id] => out.ok(json!({"id": id, "ids": ids, "state": state, "note": note}), || {
-                    format!("updated finding {id}")
-                }),
-                _ => out.ok(json!({"ids": ids, "state": state, "note": note}), || {
-                    format!("updated {} findings", ids.len())
-                }),
-            }
+            store.findings_suggest(&ids, state, note.as_deref())?;
+            let n = ids.len();
+            out.ok(json!({"ids": ids, "suggested": true, "state": state, "note": note}), || {
+                format!("suggested on {n} finding(s); nothing changed")
+            });
         }
         FindingsCmd::Add(args) => {
             let f = args.finding()?;

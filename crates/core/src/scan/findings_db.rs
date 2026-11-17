@@ -109,6 +109,22 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("note_origin", "TEXT", "gui, cli or mcp: who last set the note with `findings mark --note`; NULL if never set"),
     ("note_changed_at", "TEXT", "UTC time the note was last set"),
     ("issue_id", "INTEGER", "The issue (root cause: alert type and host) it is an instance of; join issues"),
+    (
+        "suppressed_by",
+        "INTEGER",
+        "The suppression rule (suppressions.id, `findings suppress`) that marked it a false positive; NULL when none \
+         did, or once its state was changed since",
+    ),
+    (
+        "scanner_risk",
+        "TEXT",
+        "While a person's rating (`findings rate`) holds: the scanner's own risk (risk is the person's); NULL otherwise",
+    ),
+    ("scanner_risk_level", "INTEGER", "scanner_risk as a level"),
+    ("scanner_confidence", "TEXT", "While a person's rating holds: the scanner's own confidence"),
+    ("rated_reason", "TEXT", "Why a person rated it"),
+    ("rated_origin", "TEXT", "gui or cli: who rated it; NULL when the scanner's rating stands"),
+    ("rated_at", "TEXT", "When it was rated"),
 ];
 
 /// Column documentation for the alert types.
@@ -180,6 +196,7 @@ pub(crate) fn mark_with(
         "UPDATE findings SET state = COALESCE(?1, state),
             note = CASE WHEN ?2 IS NULL THEN note ELSE NULLIF(?2, '') END,
             state_origin = CASE WHEN ?1 IS NULL OR ?1 = state THEN state_origin ELSE ?4 END,
+            suppressed_by = CASE WHEN ?1 IS NULL OR ?1 = state THEN suppressed_by ELSE NULL END,
             state_changed_at = CASE WHEN ?1 IS NULL OR ?1 = state THEN state_changed_at
                 ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
             note_origin = CASE WHEN ?2 IS NULL THEN note_origin ELSE ?4 END,
@@ -212,6 +229,264 @@ pub(crate) fn mark_with(
         }
     }
     Ok(())
+}
+
+/// A person's rating of scanner findings: a risk and/or a confidence (the one left out stays
+/// as it is), and why.
+#[derive(Debug, Clone, Copy)]
+pub struct Rating<'a> {
+    pub risk: Option<&'a str>,
+    pub confidence: Option<&'a str>,
+    pub reason: &'a str,
+}
+
+/// "medium/high": a risk and confidence, as a rating event records them.
+fn rating_text(risk: &str, confidence: &str) -> String {
+    format!("{risk}/{confidence}")
+}
+
+/// Rates a scanner finding as a person sees it: `risk` and/or `confidence` (the one left out
+/// stays) in place of the scanner's, which is kept beside it (scanner_risk, scanner_confidence)
+/// while the rating holds, with `reason`, by `origin`, and a `rated` event on its timeline
+/// (`text`, else the reason). Lists, filters, reports and gates use the rating. A finding
+/// added by hand has its own risk to edit. Returns whether anything changed.
+pub(crate) fn rate_one(
+    conn: &rusqlite::Connection,
+    id: i64,
+    rating: &Rating<'_>,
+    origin: &str,
+    text: Option<&str>,
+    history_id: Option<i64>,
+) -> Result<bool> {
+    let Rating { risk, confidence, reason } = *rating;
+    type Row = (String, String, String, String, Option<String>, Option<String>);
+    let (source, state, old_risk, old_confidence, old_reason, rated_by): Row = conn
+        .prepare_cached(
+            "SELECT source, state, risk, confidence, rated_reason, rated_origin FROM findings WHERE id = ?1",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
+    if source == MANUAL_SOURCE {
+        return Err(Error::InvalidInput(format!(
+            "finding {id} was added by hand: its risk and confidence are its own (`findings edit {id} --risk ...`)"
+        )));
+    }
+    if state == REMOVED {
+        return Err(Error::Conflict(format!("finding {id} was removed")));
+    }
+    let new_risk = risk.unwrap_or(&old_risk);
+    let new_confidence = confidence.unwrap_or(&old_confidence);
+    let level = Risk::parse(new_risk).ok_or_else(|| Error::InvalidInput(format!("unknown risk {new_risk:?}")))?.level();
+    if Confidence::parse(new_confidence).is_none() {
+        return Err(Error::InvalidInput(format!("unknown confidence {new_confidence:?}")));
+    }
+    if rated_by.is_some()
+        && new_risk == old_risk
+        && new_confidence == old_confidence
+        && old_reason.as_deref() == Some(reason)
+    {
+        return Ok(false);
+    }
+    conn.prepare_cached(
+        "UPDATE findings SET
+            scanner_risk = CASE WHEN rated_origin IS NULL THEN risk ELSE scanner_risk END,
+            scanner_risk_level = CASE WHEN rated_origin IS NULL THEN risk_level ELSE scanner_risk_level END,
+            scanner_confidence = CASE WHEN rated_origin IS NULL THEN confidence ELSE scanner_confidence END,
+            risk = ?2, risk_level = ?3, confidence = ?4, rated_reason = ?5, rated_origin = ?6,
+            rated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?1",
+    )?
+    .execute(params![id, new_risk, level, new_confidence, reason, origin])?;
+    crate::scan::issues::record(
+        conn,
+        &crate::scan::issues::Event {
+            origin: Some(origin),
+            finding: Some(id),
+            kind: "rated",
+            old: Some(&rating_text(&old_risk, &old_confidence)),
+            new: Some(&rating_text(new_risk, new_confidence)),
+            text: Some(text.unwrap_or(reason)),
+            history_id,
+            ..Default::default()
+        },
+    )?;
+    Ok(true)
+}
+
+/// Gives a rated finding the scanner's rating back (the highest its sightings gave since).
+/// Returns whether it was rated.
+fn unrate_one(conn: &rusqlite::Connection, id: i64) -> Result<bool> {
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT risk, confidence, scanner_risk, scanner_confidence FROM findings
+             WHERE id = ?1 AND rated_origin IS NOT NULL",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((risk, confidence, scanner_risk, scanner_confidence)) = row else {
+        return Ok(false);
+    };
+    conn.execute(
+        "UPDATE findings SET risk = scanner_risk, risk_level = scanner_risk_level, confidence = scanner_confidence,
+            scanner_risk = NULL, scanner_risk_level = NULL, scanner_confidence = NULL,
+            rated_reason = NULL, rated_origin = NULL, rated_at = NULL
+         WHERE id = ?1",
+        [id],
+    )?;
+    crate::scan::issues::record(
+        conn,
+        &crate::scan::issues::Event {
+            finding: Some(id),
+            kind: "rated",
+            old: Some(&rating_text(&risk, &confidence)),
+            new: Some(&rating_text(&scanner_risk, &scanner_confidence)),
+            text: Some("the scanner's rating again"),
+            ..Default::default()
+        },
+    )?;
+    Ok(true)
+}
+
+/// A finding's rating as lists show it: null when the scanner's stands.
+fn rated_json(
+    reason: Option<String>,
+    origin: Option<String>,
+    at: Option<String>,
+    scanner_risk: Option<String>,
+    scanner_confidence: Option<String>,
+) -> Value {
+    match origin {
+        None => Value::Null,
+        Some(o) => json!({
+            "scanner_risk": scanner_risk,
+            "scanner_confidence": scanner_confidence,
+            "reason": reason,
+            "by": crate::provenance::describe(Some(&o)),
+            "origin": o,
+            "at": at,
+        }),
+    }
+}
+
+/// Column documentation for the suppression rules (`findings suppress`).
+pub const SUPPRESSION_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Rule id"),
+    ("time", "TEXT", "When it was added"),
+    ("alert_ref", "TEXT", "Alert ref or rule id it matches (findings.alert_ref, or findings.rule_id as text)"),
+    ("host", "TEXT", "Host it matches (findings.host, lowercase)"),
+    ("path_prefix", "TEXT", "Only findings whose URL path starts with this; '' for any path"),
+    ("param", "TEXT", "Only findings of this parameter, header or cookie; NULL for any"),
+    ("reason", "TEXT", "Why: the note of each finding it marks"),
+    ("origin", "TEXT", "Who added it: gui or cli (agents can't)"),
+];
+
+/// A suppression rule to add: findings of `alert` on `host` (under `path_prefix`, of `param`)
+/// are false positives, for `reason`, now and whenever a scanner finds one again.
+#[derive(Debug, Clone, Default)]
+pub struct Suppression {
+    pub alert: String,
+    pub host: String,
+    pub path_prefix: String,
+    pub param: Option<String>,
+    pub reason: String,
+}
+
+/// A stored rule, as matching needs it.
+struct Rule {
+    id: i64,
+    path_prefix: String,
+    param: Option<String>,
+    reason: String,
+    origin: Option<String>,
+}
+
+impl Rule {
+    fn matches(&self, url: &str, param: &str) -> bool {
+        if self.param.as_deref().is_some_and(|p| p != param) {
+            return false;
+        }
+        if self.path_prefix.is_empty() {
+            return true;
+        }
+        url::Url::parse(&identity_url(url)).is_ok_and(|u| u.path().starts_with(&self.path_prefix))
+    }
+}
+
+/// The rules for `alert_ref` (or its rule id) on `host`, oldest first.
+fn rules_for(conn: &rusqlite::Connection, alert_ref: &str, rule_id: i64, host: &str) -> Result<Vec<Rule>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, path_prefix, param, reason, origin FROM suppressions
+         WHERE (alert_ref = ?1 OR alert_ref = CAST(?2 AS TEXT)) AND host = lower(?3) ORDER BY id",
+    )?;
+    let rules = stmt
+        .query_map(params![alert_ref, rule_id, host], |r| {
+            Ok(Rule { id: r.get(0)?, path_prefix: r.get(1)?, param: r.get(2)?, reason: r.get(3)?, origin: r.get(4)? })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rules)
+}
+
+/// Marks an open finding nobody triaged a false positive by `rule`, as the rule's author set
+/// it (an agent can't undo it either), with the reason as its note when it has none, and a
+/// state event that names the rule. Returns whether it changed.
+fn suppress_by(conn: &rusqlite::Connection, finding: i64, rule: &Rule, history_id: Option<i64>) -> Result<bool> {
+    let n = conn
+        .prepare_cached(
+            "UPDATE findings SET state = 'false_positive', state_origin = ?2, suppressed_by = ?3,
+                state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                note_origin = CASE WHEN note IS NULL THEN ?2 ELSE note_origin END,
+                note_changed_at = CASE WHEN note IS NULL THEN strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    ELSE note_changed_at END,
+                note = COALESCE(note, ?4)
+             WHERE id = ?1 AND state = 'open' AND source != ?5
+                AND (state_origin IS NULL OR state_origin = ?6)",
+        )?
+        .execute(params![finding, rule.origin, rule.id, rule.reason, MANUAL_SOURCE, crate::provenance::SCANNER])?;
+    if n == 0 {
+        return Ok(false);
+    }
+    let text = format!("suppressed by rule {}: {}", rule.id, rule.reason);
+    crate::scan::issues::record(
+        conn,
+        &crate::scan::issues::Event {
+            origin: rule.origin.as_deref(),
+            finding: Some(finding),
+            kind: "state",
+            old: Some("open"),
+            new: Some("false_positive"),
+            text: Some(&text),
+            history_id,
+            ..Default::default()
+        },
+    )?;
+    Ok(true)
+}
+
+/// A new finding a scanner found, matched against the suppression rules: the first (oldest)
+/// that matches marks it. Returns whether one did.
+pub(crate) fn suppress_new(conn: &rusqlite::Connection, finding: i64, history_id: Option<i64>) -> Result<bool> {
+    let (alert_ref, rule_id, host, url, param): (String, i64, String, String, String) = conn
+        .prepare_cached("SELECT alert_ref, rule_id, host, url, param FROM findings WHERE id = ?1")?
+        .query_row([finding], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+    for rule in rules_for(conn, &alert_ref, rule_id, &host)? {
+        if rule.matches(&url, &param) {
+            return suppress_by(conn, finding, &rule, history_id);
+        }
+    }
+    Ok(false)
+}
+
+/// The findings of an issue that aren't removed; an issue with none is not found.
+fn issue_ids(conn: &rusqlite::Connection, issue: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached("SELECT id FROM findings WHERE issue_id = ?1 AND state != ?2 ORDER BY id")?;
+    let ids: Vec<i64> =
+        stmt.query_map(params![issue, REMOVED], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    if ids.is_empty() {
+        return Err(Error::NotFound(format!("issue {issue} (or it has no findings)")));
+    }
+    Ok(ids)
 }
 
 /// A finding's state as stored (`removed` included).
@@ -648,9 +923,14 @@ impl Store {
                     base_history_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id,
-                    risk = CASE WHEN hits = 0 OR excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
-                    risk_level = CASE WHEN hits = 0 THEN excluded.risk_level
-                        ELSE max(risk_level, excluded.risk_level) END
+                    risk = CASE WHEN rated_origin IS NOT NULL THEN risk
+                        WHEN hits = 0 OR excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
+                    risk_level = CASE WHEN rated_origin IS NOT NULL THEN risk_level WHEN hits = 0 THEN excluded.risk_level
+                        ELSE max(risk_level, excluded.risk_level) END,
+                    scanner_risk = CASE WHEN rated_origin IS NULL THEN scanner_risk
+                        WHEN hits = 0 OR excluded.risk_level > scanner_risk_level THEN excluded.risk ELSE scanner_risk END,
+                    scanner_risk_level = CASE WHEN rated_origin IS NULL THEN scanner_risk_level
+                        WHEN hits = 0 THEN excluded.risk_level ELSE max(scanner_risk_level, excluded.risk_level) END
                  RETURNING id, risk",
             )?;
             // A finding's risk is the highest any of its sightings gave since a rescan started
@@ -658,7 +938,9 @@ impl Store {
             // rates it afresh, so a rule that rated something too high, then was fixed, lowers
             // it. Not simply the latest rating: one key can be rated differently at once (a
             // library file served old and new under two query strings), and the high one must
-            // not hide behind the low. Read first so a change goes on the timeline.
+            // not hide behind the low. Read first so a change goes on the timeline. A person's
+            // rating (`findings rate`) stays the finding's risk; the scanner's own goes on beside
+            // it in scanner_risk, for when the rating is cleared.
             let mut risk_before = tx.prepare_cached("SELECT risk FROM findings WHERE dedupe = ?1")?;
             // A finding marked fixed that is seen again is open again, when what saw it was
             // recorded after it was marked: a rescan of older traffic doesn't reopen it. The
@@ -713,7 +995,7 @@ impl Store {
                 )?;
                 if id > before && created.insert(id) {
                     new += 1;
-                    crate::scan::issues::created(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
+                    crate::scan::issues::found(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
                     continue;
                 }
                 if let Some(old) = old_risk.as_deref().filter(|old| *old != now_risk) {
@@ -809,7 +1091,7 @@ impl Store {
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
                 hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
-                issue_id
+                issue_id, suppressed_by, rated_reason, rated_origin, rated_at, scanner_risk, scanner_confidence
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit} OFFSET {offset}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -835,6 +1117,9 @@ impl Store {
                 "note_changed_at": r.get::<_, Option<String>>(17)?,
                 "source": r.get::<_, String>(18)?,
                 "issue_id": r.get::<_, Option<i64>>(19)?,
+                "suppressed_by": r.get::<_, Option<i64>>(20)?,
+                // A person's rating in place of the scanner's (`findings rate`); null when none.
+                "rated": rated_json(r.get(21)?, r.get(22)?, r.get(23)?, r.get(24)?, r.get(25)?),
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -923,6 +1208,219 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Adds a suppression rule and applies it to the findings it matches that are open and
+    /// nobody triaged (a person's decision stays theirs). A person adds rules: under an MCP
+    /// tool call it is refused. Returns the rule's id and how many findings it marked.
+    pub fn suppression_add(&mut self, s: &Suppression) -> Result<(i64, usize)> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "a suppression rule is a person's decision about findings not yet seen; suggest marking the \
+                 findings instead (`findings mark ID --suggest --state false_positive --note ...`)"
+                    .into(),
+            ));
+        }
+        let alert = s.alert.trim();
+        let host = s.host.trim().to_ascii_lowercase();
+        let reason = s.reason.trim();
+        let prefix = s.path_prefix.trim();
+        if alert.is_empty() {
+            return Err(Error::InvalidInput("give the alert ref or rule id it suppresses (--alert)".into()));
+        }
+        if host.is_empty() || host.contains(['/', ' ']) {
+            return Err(Error::InvalidInput(format!("--host {host:?}: give a host name, such as app.test")));
+        }
+        if reason.is_empty() {
+            return Err(Error::InvalidInput("give the reason (--reason): it is the note of each finding".into()));
+        }
+        if !prefix.is_empty() && !prefix.starts_with('/') {
+            return Err(Error::InvalidInput(format!("--path-prefix {prefix:?}: a path starts with /")));
+        }
+        let tx = self.write_tx()?;
+        tx.execute(
+            "INSERT INTO suppressions (alert_ref, host, path_prefix, param, reason, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![alert, host, prefix, s.param, reason, crate::provenance::origin()],
+        )?;
+        let id = tx.last_insert_rowid();
+        let rule = Rule {
+            id,
+            path_prefix: prefix.to_string(),
+            param: s.param.clone(),
+            reason: reason.to_string(),
+            origin: Some(crate::provenance::origin().to_string()),
+        };
+        let found: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, url, param FROM findings WHERE (alert_ref = ?1 OR CAST(rule_id AS TEXT) = ?1)
+                    AND host = ?2 AND state = 'open' ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![alert, host], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut marked = 0;
+        for (finding, url, param) in found {
+            if rule.matches(&url, &param) && suppress_by(&tx, finding, &rule, None)? {
+                marked += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((id, marked))
+    }
+
+    /// The suppression rules, oldest first, with how many findings each marked that are still
+    /// false positives by it.
+    pub fn suppressions_list(&self) -> Result<Vec<Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.time, s.alert_ref, s.host, s.path_prefix, s.param, s.reason, s.origin,
+                (SELECT count(*) FROM findings f WHERE f.suppressed_by = s.id AND f.state = 'false_positive')
+             FROM suppressions s ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let origin: Option<String> = r.get(7)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "time": r.get::<_, String>(1)?,
+                "alert_ref": r.get::<_, String>(2)?,
+                "host": r.get::<_, String>(3)?,
+                "path_prefix": r.get::<_, String>(4)?,
+                "param": r.get::<_, Option<String>>(5)?,
+                "reason": r.get::<_, String>(6)?,
+                "by": crate::provenance::describe(origin.as_deref()),
+                "origin": origin,
+                "findings": r.get::<_, i64>(8)?,
+            }))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Removes a suppression rule: findings found later are no longer marked by it. With
+    /// `reopen`, the findings it marked that are still false positives by it are open again;
+    /// otherwise they keep the state. Refused under an MCP tool call, like adding one. Returns
+    /// how many findings were opened again.
+    pub fn suppression_remove(&mut self, id: i64, reopen: bool) -> Result<usize> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "a suppression rule is a person's decision; an agent can't remove it (suggest reopening its \
+                 findings with `findings mark ID --suggest --state open`)"
+                    .into(),
+            ));
+        }
+        let tx = self.write_tx()?;
+        if tx.execute("DELETE FROM suppressions WHERE id = ?1", [id])? == 0 {
+            return Err(Error::NotFound(format!("suppression rule {id}")));
+        }
+        let mut reopened = 0;
+        if reopen {
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM findings WHERE suppressed_by = ?1 AND state = 'false_positive' ORDER BY id",
+                )?;
+                let rows = stmt.query_map([id], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let cause = format!("suppression rule {id} removed");
+            for f in ids {
+                mark_with(&tx, f, Some("open"), None, Some((&cause, None)))?;
+                reopened += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(reopened)
+    }
+
+    /// Rates findings as a person sees them (`rating`), or with `None` gives them the scanner's
+    /// rating back: `ids` and the scanner findings of each of `issues`, all or none. An issue
+    /// rated as a whole keeps the rating for the findings it gets later. A person does this:
+    /// under an MCP tool call it is refused. Returns the findings changed.
+    pub fn findings_rate(&mut self, ids: &[i64], issues: &[i64], rating: Option<&Rating<'_>>) -> Result<Vec<i64>> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "rating a finding is a person's call; suggest one on the finding instead (`findings mark ID \
+                 --suggest --note ...`)"
+                    .into(),
+            ));
+        }
+        if let Some(r) = rating {
+            if r.risk.is_none() && r.confidence.is_none() {
+                return Err(Error::InvalidInput("give --risk and/or --confidence (or --clear)".into()));
+            }
+            if r.reason.trim().is_empty() {
+                return Err(Error::InvalidInput("give the reason for the rating (--reason)".into()));
+            }
+        }
+        let tx = self.write_tx()?;
+        let mut all: Vec<i64> = ids.to_vec();
+        for &issue in issues {
+            let ids = issue_ids(&tx, issue)?;
+            let mut stmt = tx.prepare_cached("SELECT source FROM findings WHERE id = ?1")?;
+            for id in ids {
+                // A finding added by hand to the issue keeps the risk it was given.
+                if stmt.query_row([id], |r| r.get::<_, String>(0))? != MANUAL_SOURCE {
+                    all.push(id);
+                }
+            }
+        }
+        all.sort_unstable();
+        all.dedup();
+        let origin = crate::provenance::origin();
+        let mut changed = Vec::new();
+        for &id in &all {
+            let done = match rating {
+                Some(r) => rate_one(&tx, id, &Rating { reason: r.reason.trim(), ..*r }, origin, None, None)?,
+                None => {
+                    current_state(&tx, id)?;
+                    unrate_one(&tx, id)?
+                }
+            };
+            if done {
+                changed.push(id);
+            }
+        }
+        for &issue in issues {
+            crate::scan::issues::set_rating(&tx, issue, rating)?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// [`Store::findings_mark`] for `ids` and every finding of `issues`, as one change. Each
+    /// issue marked as a whole takes the state as its decision when it is false positive or
+    /// accepted risk, so the instances it gets later arrive in that state too; another state
+    /// ends its decision. Findings marked by id leave their issue's decision as it is: that is
+    /// a decision about those instances only.
+    pub fn findings_mark_issues(
+        &mut self,
+        ids: &[i64],
+        issues: &[i64],
+        state: Option<&str>,
+        note: Option<&str>,
+        if_state: Option<&str>,
+    ) -> Result<Vec<i64>> {
+        let tx = self.write_tx()?;
+        let mut all: Vec<i64> = ids.to_vec();
+        for &issue in issues {
+            all.extend(issue_ids(&tx, issue)?);
+        }
+        all.sort_unstable();
+        all.dedup();
+        for &id in &all {
+            if let Some(want) = if_state {
+                let now = current_state(&tx, id)?;
+                if now != want {
+                    return Err(Error::Conflict(format!(
+                        "finding {id} is {now}, not {want} (--if-state): it was changed since it was read; read it \
+                         again, then decide"
+                    )));
+                }
+            }
+            mark_one(&tx, id, state, note)?;
+        }
+        for &issue in issues {
+            crate::scan::issues::decide(&tx, issue, state, note)?;
+        }
+        tx.commit()?;
+        Ok(all)
     }
 
     /// Puts a suggested state and/or note on each finding's timeline (an event of kind
@@ -2503,6 +3001,104 @@ mod tests {
     fn xpb(s: &Store) -> Vec<Value> {
         let all = FindingFilter { alert_ref: Some("10037".into()), state: Some("all".into()), ..Default::default() };
         s.findings_list(&all, 100).unwrap()
+    }
+
+    #[test]
+    fn a_person_s_rating_holds_over_sightings_and_reaches_an_issue_s_new_instances() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        let x = xpb(&s)[0].clone();
+        let (id, scanner) = (x["id"].as_i64().unwrap(), x["risk"].as_str().unwrap().to_string());
+        let up = Rating { risk: Some("high"), confidence: Some("high"), reason: "leaks the exact build" };
+        assert!(matches!(
+            s.findings_rate(&[id], &[], Some(&Rating { risk: None, confidence: None, reason: "x" })),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            s.findings_rate(&[id], &[], Some(&Rating { reason: " ", ..up })),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(s.findings_rate(&[id], &[], Some(&up)).unwrap(), [id]);
+        // Rated the same again: nothing changes, nothing goes on the timeline.
+        assert!(s.findings_rate(&[id], &[], Some(&up)).unwrap().is_empty());
+        let rated = |s: &Store| xpb(s).into_iter().find(|f| f["id"] == id).unwrap();
+        let f = rated(&s);
+        assert_eq!((f["risk"].as_str(), f["confidence"].as_str()), (Some("high"), Some("high")));
+        assert_eq!(f["rated"]["scanner_risk"].as_str(), Some(scanner.as_str()), "{f}");
+        // A filter and the order go by the rating.
+        let high = FindingFilter { min_risk: Some(Risk::High), ..Default::default() };
+        assert_eq!(s.findings_list(&high, 10).unwrap().len(), 1);
+        // Seen again: the scanner's rating goes on beside it, the person's stays.
+        seen_at(&mut s, "/x");
+        assert_eq!(rated(&s)["risk"], "high");
+        let events: Vec<Value> = s.finding_events(id).unwrap().into_iter().filter(|e| e["kind"] == "rated").collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0]["new"].as_str(), events[0]["text"].as_str()), (Some("high/high"), Some(up.reason)));
+        // Cleared, the scanner's rating is back.
+        assert_eq!(s.findings_rate(&[id], &[], None).unwrap(), [id]);
+        let f = rated(&s);
+        assert_eq!((f["risk"].as_str(), f["rated"].is_null()), (Some(scanner.as_str()), true), "{f}");
+        // Rated as a whole issue, a new instance arrives rated, by the person who rated it.
+        let issue = f["issue_id"].as_i64().unwrap();
+        let down = Rating { risk: Some("info"), confidence: None, reason: "internal host" };
+        s.findings_rate(&[], &[issue], Some(&down)).unwrap();
+        assert_eq!(s.issue_get(issue).unwrap()["rating"]["risk"], "info");
+        seen_at(&mut s, "/y");
+        let y = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/y")).unwrap();
+        assert_eq!((y["risk"].as_str(), y["rated"]["origin"].as_str()), (Some("info"), Some("cli")), "{y}");
+        s.findings_rate(&[], &[issue], None).unwrap();
+        assert!(s.issue_get(issue).unwrap()["rating"].is_null());
+        seen_at(&mut s, "/z");
+        let z = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/z")).unwrap();
+        assert!(z["rated"].is_null(), "{z}");
+    }
+
+    #[test]
+    fn suppression_rules_mark_what_they_match_now_and_later() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        seen_at(&mut s, "/static/a.js");
+        let state_of = |s: &Store, path: &str| -> (String, Option<i64>, Option<String>) {
+            let f = xpb(s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with(path)).unwrap();
+            let full = s.finding_get(f["id"].as_i64().unwrap()).unwrap();
+            (f["state"].as_str().unwrap().into(), f["suppressed_by"].as_i64(), full["note"].as_str().map(Into::into))
+        };
+        // A triaged finding is a person's decision: the rule leaves it.
+        let x = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/x")).unwrap();
+        s.finding_mark(x["id"].as_i64().unwrap(), Some("confirmed"), None).unwrap();
+        let bad = Suppression { alert: "10037".into(), host: "app.test".into(), ..Default::default() };
+        assert!(matches!(s.suppression_add(&bad), Err(Error::InvalidInput(_))), "a reason is needed");
+        let rule = Suppression {
+            alert: "10037".into(),
+            host: "APP.test".into(),
+            path_prefix: "/static/".into(),
+            param: None,
+            reason: "static files are served by the CDN".into(),
+        };
+        let (id, marked) = s.suppression_add(&rule).unwrap();
+        assert_eq!(marked, 1);
+        assert_eq!(state_of(&s, "/static/a.js"), ("false_positive".into(), Some(id), Some(rule.reason.clone())));
+        assert_eq!(state_of(&s, "/x").0, "confirmed");
+        // Found later: marked on arrival, as the rule's author set it, and the timeline says why.
+        seen_at(&mut s, "/static/b.js");
+        seen_at(&mut s, "/y");
+        assert_eq!(state_of(&s, "/static/b.js").0, "false_positive");
+        assert_eq!(state_of(&s, "/y").0, "open");
+        let b = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/static/b.js")).unwrap();
+        assert_eq!(b["state_origin"], "cli");
+        let last = s.finding_events(b["id"].as_i64().unwrap()).unwrap().pop().unwrap();
+        assert_eq!(last["text"], format!("suppressed by rule {id}: static files are served by the CDN"));
+        let list = s.suppressions_list().unwrap();
+        assert_eq!((list[0]["host"].as_str(), list[0]["findings"].as_i64()), (Some("app.test"), Some(2)));
+        // A person who changes one's state takes it from the rule.
+        s.finding_mark(b["id"].as_i64().unwrap(), Some("confirmed"), None).unwrap();
+        assert_eq!(state_of(&s, "/static/b.js"), ("confirmed".into(), None, Some(rule.reason.clone())));
+        // Removed with --reopen, what it still holds is open again; later sightings aren't marked.
+        assert_eq!(s.suppression_remove(id, true).unwrap(), 1);
+        assert_eq!(state_of(&s, "/static/a.js").0, "open");
+        seen_at(&mut s, "/static/c.js");
+        assert_eq!(state_of(&s, "/static/c.js").0, "open");
+        assert!(matches!(s.suppression_remove(id, false), Err(Error::NotFound(_))));
     }
 
     #[test]

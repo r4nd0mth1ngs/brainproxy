@@ -1239,7 +1239,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 195 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 199 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -3025,6 +3025,48 @@ Findings are records with a history, not just rows:
   records the given `--state` and/or `--note` as a suggestion on each finding's timeline (kind
   `suggested`) and changes nothing else. `findings list` and `report` show work still to do by
   default: open, confirmed and retest pending.
+- **Decisions that stick:** `findings mark --issue ISSUE --state false_positive` (or
+  `accepted_risk`) is the issue's decision, not only its findings': a finding of the issue
+  found later (a new page with the same banner) arrives in that state, with the decision's
+  note, recorded as set by whoever made the decision, and a `state` event on its timeline
+  saying `inherited from issue N, marked ... by ...`. Any other state given to the whole issue
+  ends the decision (an event of kind `decision` on the issue's timeline records each change).
+  Findings marked by id are a decision about those instances only and leave the issue's as it
+  is. `fixed` is never inherited: a finding seen again after a fix is open again, as before.
+  `findings issues` and `findings issue show` give `decision` (`state`, `note`, `origin`,
+  `by`, `at`; null when there is none). Through MCP an agent can't change or end a person's
+  decision.
+- **Suppression rules** (`findings suppress add --alert A --host H [--path-prefix /static/]
+  [--param P] --reason R`, `findings suppress list`, `findings suppress remove ID [--reopen]`):
+  an alert on a host, maybe only under a path or for one parameter, is a false positive
+  wherever a scan finds it, now and later. Matching findings are still stored, so nothing is
+  lost: they are marked `false_positive` (not a state of their own, so lists, reports,
+  `findings compare --fail-on` and rescans treat them as every false positive), with the
+  reason as their note, `suppressed_by` naming the rule, and a `state` event (`suppressed by
+  rule N: reason`), recorded as set by the person who added the rule. `add` marks the open
+  findings nobody triaged at once (`marked` counts them); findings added by hand and findings
+  someone triaged are left alone. A finding whose state is changed afterwards is no longer
+  the rule's. `list` gives each rule with `findings`, how many it still holds. `remove` stops
+  it marking new findings; `--reopen` also opens again those it still holds. Reports count
+  them among the false positives left out ("N of them by suppression rules",
+  `summary.suppressed` in JSON). Through MCP `add` and `remove` are refused: a rule decides
+  about findings nobody has seen yet, so a person makes it; an agent suggests marks on
+  findings instead.
+- **Your own rating** (`findings rate ID... | --issue ISSUE [--risk R] [--confidence C]
+  --reason TEXT`, `findings rate ... --clear`): a scanner finding rated as you see it, such as
+  a missing header on an internal host down to low, or a confirmed injection up to critical.
+  The rating is the finding's `risk` and `confidence` from then on, so `findings list`, its
+  filters and order, `findings issues`, reports, "Fix these first" and `findings compare
+  --fail-on` all use it; a later sighting doesn't change it. The scanner's own rating is kept
+  beside it (`rated` in `findings list --all`: `scanner_risk`, `scanner_confidence`, `reason`,
+  `by`, `at`; `scanner_risk` and `rated_*` in `findings show`; `rated` on each instance of
+  `report json`) and goes on being raised by higher sightings, so `--clear` gives back what the
+  scanner says now. Reports print the rating next to the scanner's ("rated low ... by a person,
+  the scanner said medium ...: reason"). Each change is a `rated` event on the timeline.
+  `--issue` rates every scanner finding of the issue, and the findings it gets later arrive
+  rated too (`rating` in `findings issues`); `--clear --issue` ends that. Findings added by hand
+  keep the risk they were given (`findings edit --risk`). Refused through MCP: an agent
+  suggests a rating with `findings mark ID --suggest --note ...`.
 - **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
   with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows
   returned and `truncated` says more are left, so the next page is `--offset` plus `--limit`.
@@ -3039,7 +3081,7 @@ Findings are records with a history, not just rows:
   recorded with origin `scanner`, not the client that started the proxy or scan.
 - **Timeline** (`findings timeline ID`): created, state and note changes, suggestions, retests, moves
   between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
-  afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
+  afresh), a person's ratings (`rated`), states taken from an issue's decision or a suppression rule (a `state` event saying which) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets
   a timeline built from what its findings already recorded.
 - **Retest** (`findings retest ID [--auth PROFILE]`): a passive finding's latest request is
@@ -3113,7 +3155,31 @@ no longer found, retests), `list` (the table of issues), `issues` (a section per
 finding, with masked secrets still masked), `retest` (fixed, still there, back after a fix
 and awaiting a retest since `--since DAY`, default the last 30 days, each with the retest
 request as proof), `about`. `evidence` and `reproduce` sit in the issue sections, so
-either brings `issues` with it. The curl lines send the request as recorded
+either brings `issues` with it.
+
+The Markdown, HTML, PDF and Word reports go by issue, not by alert type: each issue (as
+`findings issues` lists it, split and merged as testers arranged it) has one section under its
+own title (`findings issue title`, `findings issue split --title`; else the alert's name, which
+the section then names beside the rule), its CVSS rating and its write-up, the alert's
+description and solution once, a table of every place it was found (finding, address,
+parameter, evidence or attack, confidence, state, sightings), and one exchange as the proof:
+the finding a person confirmed, else the riskiest and surest, else the most seen. The curl
+line under `reproduce` is that finding's. Notes, ratings, tickets and agent trails of the
+other findings follow it in short. A header missing on 40 pages is one table and one
+exchange, not 40. Issues are ordered by risk (a person's rating where there is one), then
+CVSS score, then places. `report json` keeps `alerts` as it was (every finding with its own
+exchanges) and adds `issues` (`issue_id`, `alert_ref`, `title`, `titled`, `risk`,
+`confidence`, `hosts`, `cvss`, `narrative`, `proof`: a finding id, `instances`: finding ids),
+and each finding gets `issue_title`. SARIF results carry `issueId` and `issueTitle` in their
+properties, `report csv` adds `issue_title`, `scanner_risk` and `rating_reason` columns at the
+end, `report junit` and `report defectdojo` name findings by their issue's title.
+
+*Fix these first* lists up to ten issues that are still work to do (a finding of theirs isn't
+a false positive, accepted risk or fixed), rated medium or worse by risk or CVSS, and either
+confirmed by a person or found with at least medium confidence: confirmed ones first within a
+risk, then the surer, then those in more places. `--state` takes several states separated by
+commas (`--state confirmed` for a client report of what you checked, `--state
+confirmed,accepted_risk`); the states it leaves out are still counted at the top. The curl lines send the request as recorded
 (`--globoff --path-as-is`, the URL after `--url`, the recorded `Host`), masked secrets still masked.
 
 Branding: `--company NAME` on the cover, `--accent #rrggbb` for the cover and headings,

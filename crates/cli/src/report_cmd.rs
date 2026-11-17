@@ -41,10 +41,11 @@ pub struct ReportArgs {
     /// Only findings from this scanner, or those added by hand (manual).
     #[arg(long, value_parser = ["passive", "active", "authz", "manual"])]
     source: Option<String>,
-    /// Triage state to include (default: work still to do, i.e. open, confirmed and retest
+    /// Triage states to include, one or several separated by commas, e.g. confirmed or
+    /// confirmed,accepted_risk (default: work still to do, i.e. open, confirmed and retest
     /// pending: false positives, accepted risks, fixed findings and removed findings added by
-    /// hand are left out; all includes them).
-    #[arg(long, value_parser = crate::scan_cmd::STATE_VALUES)]
+    /// hand are left out, and counted; all includes them).
+    #[arg(long, value_parser = crate::scan_cmd::StatesParser)]
     state: Option<String>,
     #[arg(long)]
     host: Option<String>,

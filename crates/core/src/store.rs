@@ -18,7 +18,7 @@ use crate::http::{Exchange, Target};
 
 /// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
 /// one started by an older build.
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
 pub const PRUNE_CHUNK: usize = 500;
@@ -120,6 +120,32 @@ CREATE TABLE IF NOT EXISTS setting_changes (id INTEGER PRIMARY KEY AUTOINCREMENT
 const SCHEMA_V21: &str = "
 ALTER TABLE findings ADD COLUMN base_history_id INTEGER;
 ALTER TABLE oob_payloads ADD COLUMN base_history_id INTEGER;
+";
+
+/// v22: triage that outlives the findings it was made on. An issue's decision (a whole issue
+/// marked false positive or accepted risk), which its new instances inherit; suppression rules
+/// (an alert on a host, maybe under a path or for a parameter) that mark what they match a
+/// false positive, and on each finding the rule that did; a person's own rating of a scanner
+/// finding (risk, confidence) in place of the scanner's, kept beside it, and an issue's, which
+/// its new instances take.
+const SCHEMA_V22: &str = "
+ALTER TABLE findings ADD COLUMN scanner_risk TEXT;
+ALTER TABLE findings ADD COLUMN scanner_risk_level INTEGER;
+ALTER TABLE findings ADD COLUMN scanner_confidence TEXT;
+ALTER TABLE findings ADD COLUMN rated_reason TEXT;
+ALTER TABLE findings ADD COLUMN rated_origin TEXT;
+ALTER TABLE findings ADD COLUMN rated_at TEXT;
+ALTER TABLE issues ADD COLUMN rating_risk TEXT;
+ALTER TABLE issues ADD COLUMN rating_confidence TEXT;
+ALTER TABLE issues ADD COLUMN rating_reason TEXT;
+ALTER TABLE issues ADD COLUMN rating_origin TEXT;
+ALTER TABLE issues ADD COLUMN rating_at TEXT;
+ALTER TABLE issues ADD COLUMN decision TEXT;
+ALTER TABLE issues ADD COLUMN decision_note TEXT;
+ALTER TABLE issues ADD COLUMN decision_origin TEXT;
+ALTER TABLE issues ADD COLUMN decision_at TEXT;
+ALTER TABLE findings ADD COLUMN suppressed_by INTEGER;
+CREATE TABLE IF NOT EXISTS suppressions (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), alert_ref TEXT NOT NULL, host TEXT NOT NULL, path_prefix TEXT NOT NULL DEFAULT '', param TEXT, reason TEXT NOT NULL, origin TEXT);
 ";
 
 /// Column documentation for the log of setting changes.
@@ -770,6 +796,9 @@ impl Store {
         }
         if version < 21 {
             add_missing_columns(&self.conn, SCHEMA_V21)?;
+        }
+        if version < 22 {
+            add_missing_columns(&self.conn, SCHEMA_V22)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

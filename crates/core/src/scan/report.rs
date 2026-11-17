@@ -104,7 +104,12 @@ pub struct Report {
     pub scope: Option<ScopeSpec>,
     pub filters: Value,
     pub summary: Summary,
+    /// The findings by alert type, each with every instance and its evidence.
     pub alerts: Vec<AlertGroup>,
+    /// The same findings by issue, as the Markdown, HTML and Word reports show them: one
+    /// title, write-up and proof per issue, and where it was found. Instances are named by id
+    /// (`alerts[].instances[].id`).
+    pub issues: Vec<IssueSection>,
     /// Findings an agent marked false positive, accepted risk or fixed that the state filter
     /// leaves out (at most [`MAX_AGENT_FALSE_POSITIVES`]), so a reader sees what an agent hid.
     /// (The name is from when only false positives were listed.)
@@ -203,6 +208,8 @@ pub struct Summary {
     /// Every finding matching the other filters that the state filter leaves out because it
     /// was dismissed (false positive, accepted risk or fixed), by state and by who set it.
     pub left_out: Vec<StateCount>,
+    /// Of the false positives left out, how many a suppression rule (`findings suppress`) marked.
+    pub suppressed: usize,
     /// How many places a secret was masked in; None when the report isn't redacted.
     pub redacted: Option<usize>,
 }
@@ -249,6 +256,33 @@ pub struct AlertGroup {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub narratives: Vec<IssueNarrative>,
     pub instances: Vec<Instance>,
+}
+
+/// One issue (a root cause: an alert type on a host, as testers split or merged it) as a report
+/// shows it: its own title, its write-up, one finding whose exchange stands as the proof for
+/// all, and the findings (places) it was seen at.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueSection {
+    pub issue_id: Option<i64>,
+    /// The alert type of its first finding, whose description and solution it shows.
+    pub alert_ref: String,
+    /// The title a tester gave it (`findings issue title`, `findings issue split --title`),
+    /// else the alert's name.
+    pub title: String,
+    pub titled: bool,
+    /// Highest risk and confidence among its findings (a person's rating where there is one).
+    pub risk: String,
+    pub confidence: String,
+    pub hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cvss: Option<CvssRating>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<IssueNarrative>,
+    /// The finding whose exchange is shown as the proof: one a person confirmed, else the
+    /// riskiest and surest, else the most seen, among those with a recorded exchange.
+    pub proof: Option<i64>,
+    /// Its findings in the report, riskiest first.
+    pub instances: Vec<i64>,
 }
 
 /// An issue's write-up in a report.
@@ -333,6 +367,10 @@ pub struct Instance {
     /// The issue (alert type and host, or hosts once merged) it is an instance of, and that
     /// issue's CVSS rating.
     pub issue_id: Option<i64>,
+    /// Its issue's title: the one a tester gave it, else the alert's name.
+    pub issue_title: String,
+    #[serde(skip)]
+    pub issue_titled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvss: Option<CvssRating>,
     /// When an agent added or changed it: what it sent and whether a person looked after.
@@ -341,6 +379,20 @@ pub struct Instance {
     /// Tickets filed for it (`findings ticket --record`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tickets: Vec<Ticket>,
+    /// A person's rating in place of the scanner's (`findings rate`): `risk` and `confidence`
+    /// are the person's, this says what the scanner said and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rated: Option<Rated>,
+}
+
+/// A person's rating of a finding, beside the scanner's.
+#[derive(Debug, Clone, Serialize)]
+pub struct Rated {
+    pub scanner_risk: String,
+    pub scanner_confidence: String,
+    pub reason: String,
+    pub origin: Option<String>,
+    pub at: Option<String>,
 }
 
 impl Instance {
@@ -467,6 +519,182 @@ fn added_text(inst: &Instance, full: bool) -> String {
     }
 }
 
+/// A risk's level: 4 critical to 0 info (and anything unknown).
+fn risk_level(risk: &str) -> usize {
+    RISKS.iter().position(|r| *r == risk).map_or(0, |p| RISKS.len() - 1 - p)
+}
+
+/// A confidence's rank: 2 high, 1 medium, 0 low.
+fn confidence_rank(c: &str) -> u8 {
+    match c {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+/// Whether a person confirmed it (an agent's confirmation isn't a tester's).
+fn person_confirmed(i: &Instance) -> bool {
+    i.state == "confirmed" && provenance::by_a_person(i.state_origin.as_deref())
+}
+
+/// The findings by issue, riskiest first (by risk, then CVSS score, then places), each with
+/// the finding whose exchange stands as its proof.
+fn issue_sections(groups: &[AlertGroup]) -> Vec<IssueSection> {
+    let mut out: Vec<IssueSection> = Vec::new();
+    let mut members: Vec<Vec<&Instance>> = Vec::new();
+    for g in groups {
+        for inst in &g.instances {
+            let at = out
+                .iter()
+                .position(|s| s.issue_id == inst.issue_id && (inst.issue_id.is_some() || s.alert_ref == g.alert_ref));
+            let at = match at {
+                Some(at) => at,
+                None => {
+                    out.push(IssueSection {
+                        issue_id: inst.issue_id,
+                        alert_ref: g.alert_ref.clone(),
+                        title: if inst.issue_title.is_empty() { g.name.clone() } else { inst.issue_title.clone() },
+                        titled: inst.issue_titled,
+                        risk: inst.risk.clone(),
+                        confidence: inst.confidence.clone(),
+                        hosts: Vec::new(),
+                        cvss: inst.cvss.clone(),
+                        narrative: g.narratives.iter().find(|n| Some(n.issue_id) == inst.issue_id).cloned(),
+                        proof: None,
+                        instances: Vec::new(),
+                    });
+                    members.push(Vec::new());
+                    out.len() - 1
+                }
+            };
+            let sec = &mut out[at];
+            sec.instances.push(inst.id);
+            if risk_level(&inst.risk) > risk_level(&sec.risk) {
+                sec.risk = inst.risk.clone();
+            }
+            if confidence_rank(&inst.confidence) > confidence_rank(&sec.confidence) {
+                sec.confidence = inst.confidence.clone();
+            }
+            if !sec.hosts.contains(&inst.host) {
+                sec.hosts.push(inst.host.clone());
+            }
+            members[at].push(inst);
+        }
+    }
+    for (sec, insts) in out.iter_mut().zip(&members) {
+        sec.hosts.sort();
+        // A person's confirmation first, then the riskiest and surest, then the most seen.
+        sec.proof = insts
+            .iter()
+            .max_by_key(|i| {
+                (
+                    i.request.is_some(),
+                    person_confirmed(i),
+                    risk_level(&i.risk),
+                    confidence_rank(&i.confidence),
+                    i.hits,
+                    std::cmp::Reverse(i.id),
+                )
+            })
+            .map(|i| i.id);
+    }
+    let score = |s: &IssueSection| s.cvss.as_ref().map_or(0.0, |c| c.score);
+    out.sort_by(|a, b| {
+        risk_level(&b.risk)
+            .cmp(&risk_level(&a.risk))
+            .then(score(b).total_cmp(&score(a)))
+            .then(b.instances.len().cmp(&a.instances.len()))
+    });
+    out
+}
+
+/// A report's findings by id, with their alert types, for the sections that show them by issue.
+type ById<'a> = std::collections::HashMap<i64, (&'a AlertGroup, &'a Instance)>;
+
+fn by_id(r: &Report) -> ById<'_> {
+    r.alerts.iter().flat_map(|g| g.instances.iter().map(move |i| (i.id, (g, i)))).collect()
+}
+
+/// An issue's alert type (its first finding's), for its description and solution.
+fn group_of<'a>(idx: &ById<'a>, sec: &IssueSection) -> Option<&'a AlertGroup> {
+    sec.instances.first().and_then(|id| idx.get(id)).map(|(g, _)| *g)
+}
+
+fn instances_of<'a>(idx: &ById<'a>, sec: &IssueSection) -> Vec<&'a Instance> {
+    sec.instances.iter().filter_map(|id| idx.get(id)).map(|(_, i)| *i).collect()
+}
+
+fn proof_of<'a>(idx: &ById<'a>, sec: &IssueSection) -> Option<&'a Instance> {
+    sec.proof.and_then(|id| idx.get(&id)).map(|(_, i)| *i)
+}
+
+/// The issues to fix first, with their place in the report: at most ten that are still work
+/// to do (some finding not dismissed), rated medium or worse (by risk or CVSS), and either a
+/// person confirmed one of their findings or the scanner is at least fairly sure. Confirmed
+/// ones come first within a risk, then the surer, then those seen in more places.
+fn fix_first<'a>(r: &'a Report, idx: &ById<'_>) -> Vec<(usize, &'a IssueSection)> {
+    // Risk level, confirmed by a person, confidence, places still to fix: higher first.
+    type Rank = (usize, bool, u8, usize);
+    let mut ranked: Vec<(usize, &IssueSection, Rank)> = r
+        .issues
+        .iter()
+        .enumerate()
+        .filter_map(|(n, sec)| {
+            let live: Vec<&Instance> = instances_of(idx, sec)
+                .into_iter()
+                .filter(|i| !DISMISSED.contains(&i.state.as_str()) && i.state != "removed")
+                .collect();
+            let confirmed = live.iter().any(|i| person_confirmed(i));
+            let level = risk_level(&sec.risk).max(sec.cvss.as_ref().map_or(0, |c| risk_level(c.severity)));
+            let sure = confidence_rank(&sec.confidence);
+            (!live.is_empty() && level >= 2 && (sure > 0 || confirmed)).then_some((
+                n,
+                sec,
+                (level, confirmed, sure, live.len()),
+            ))
+        })
+        .collect();
+    ranked.sort_by_key(|a| std::cmp::Reverse(a.2));
+    ranked.into_iter().take(10).map(|(n, sec, _)| (n, sec)).collect()
+}
+
+/// A cut-down text for a table cell, on a character boundary.
+fn short(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// What shows a finding at its place: the attack for an active finding, else the evidence.
+fn shown_evidence(i: &Instance) -> &str {
+    if i.attack.is_empty() {
+        &i.evidence
+    } else {
+        &i.attack
+    }
+}
+
+/// Whether a finding has something of its own to say beyond the issue's table row.
+fn has_remarks(i: &Instance) -> bool {
+    i.note.as_deref().is_some_and(|n| !n.is_empty())
+        || i.rated.is_some()
+        || !i.tickets.is_empty()
+        || i.agent_trail.is_some()
+        || i.history_ids.len() > 1
+        || i.cwe.is_some()
+}
+
+/// An issue's write-up heading.
+fn narrative_heading(n: &IssueNarrative) -> String {
+    if n.narrative.reviewed() {
+        "Write-up".into()
+    } else {
+        "Write-up (draft, not reviewed)".into()
+    }
+}
+
 /// Builds a report from the project's findings.
 pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     if opts.limit == 0 {
@@ -495,7 +723,9 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             f.alert_ref, f.rule_id, f.name, f.cwe, f.wasc,
             coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]'),
             f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at,
-            f.last_history_id, h.time, f.issue_id, i.cvss_vector, i.cvss_score
+            f.last_history_id, h.time, f.issue_id, i.cvss_vector, i.cvss_score,
+            f.rated_origin, f.scanner_risk, f.scanner_confidence, f.rated_reason, f.rated_at,
+            COALESCE(i.title, f.name), i.title IS NOT NULL
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
             LEFT JOIN history h ON h.id = coalesce(f.last_history_id, f.history_id)
             LEFT JOIN issues i ON i.id = f.issue_id
@@ -545,9 +775,21 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             agent_trail: None,
             tickets: Vec::new(),
             issue_id: r.get(32)?,
+            issue_title: r.get(40)?,
+            issue_titled: r.get(41)?,
             cvss: match (r.get::<_, Option<String>>(33)?, r.get::<_, Option<f64>>(34)?) {
                 (Some(vector), Some(score)) => Some(CvssRating { vector, score, severity: cvss::severity(score) }),
                 _ => None,
+            },
+            rated: match r.get::<_, Option<String>>(35)? {
+                Some(origin) => Some(Rated {
+                    scanner_risk: r.get::<_, Option<String>>(36)?.unwrap_or_default(),
+                    scanner_confidence: r.get::<_, Option<String>>(37)?.unwrap_or_default(),
+                    reason: r.get::<_, Option<String>>(38)?.unwrap_or_default(),
+                    origin: Some(origin),
+                    at: r.get(39)?,
+                }),
+                None => None,
             },
         };
         let alert_ref: String = r.get(16)?;
@@ -697,6 +939,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     };
     let mut left_out: Vec<StateCount> = Vec::new();
     let mut agent_false_positives = Vec::new();
+    let mut suppressed = 0;
     if !dismissed.is_empty() {
         let hidden = FindingFilter { state: Some(dismissed.join(",")), ..opts.filter.clone() };
         let (h_where, h_args) = hidden.sql();
@@ -709,6 +952,14 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                 Ok(StateCount { state: r.get(0)?, origin: r.get(1)?, count: r.get::<_, i64>(2)? as usize })
             })?
             .collect::<std::result::Result<_, _>>()?;
+        let n: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM findings WHERE {h_where} AND state = 'false_positive' AND suppressed_by IS NOT NULL"
+            ),
+            rusqlite::params_from_iter(h_args.iter()),
+            |r| r.get(0),
+        )?;
+        suppressed = usize::try_from(n).unwrap_or(0);
         let mut stmt = conn.prepare(&format!(
             "SELECT id, state, name, risk, method, url, param, state_changed_at, note FROM findings
              WHERE {h_where} AND state_origin = 'mcp' ORDER BY risk_level DESC, id LIMIT {MAX_AGENT_FALSE_POSITIVES}"
@@ -758,6 +1009,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
         redact_findings(red, &mut groups, &mut agent_false_positives, retest.as_mut(), summary_narrative.as_mut());
     }
 
+    let issues = issue_sections(&groups);
     let generated: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
     let f = &opts.filter;
     let mut filters = json!({
@@ -785,9 +1037,11 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             by_risk,
             false_positives_left_out,
             left_out,
+            suppressed,
             redacted: None,
         },
         alerts: groups,
+        issues,
         agent_false_positives,
         posture,
         retest,
@@ -846,6 +1100,13 @@ fn scrub_the_rest(red: &mut Redactor, r: &mut Report) {
         for i in g.instances.iter_mut() {
             red.scrub(&mut i.host);
             red.scrub(&mut i.state_text);
+        }
+    }
+    for sec in r.issues.iter_mut() {
+        red.scrub(&mut sec.title);
+        sec.hosts.iter_mut().for_each(|h| red.scrub(h));
+        if let Some(n) = sec.narrative.as_mut() {
+            red.scrub(&mut n.host);
         }
     }
 }
@@ -949,6 +1210,13 @@ fn redact_findings(
             for i in g.instances.iter_mut() {
                 if let Some(n) = i.note.as_mut() {
                     pass(red, n);
+                }
+                // A tester's title, or a title added by hand as the alert's name.
+                if i.issue_titled || i.source == MANUAL_SOURCE {
+                    pass(red, &mut i.issue_title);
+                }
+                if let Some(r) = i.rated.as_mut() {
+                    pass(red, &mut r.reason);
                 }
                 for t in i.tickets.iter_mut() {
                     pass(red, &mut t.url);
@@ -1123,7 +1391,10 @@ fn left_out_text(r: &Report) -> Option<String> {
                 None => by.push((w, c.count)),
             }
         }
-        let by: Vec<String> = by.iter().map(|(w, k)| format!("{k} {w}")).collect();
+        let mut by: Vec<String> = by.iter().map(|(w, k)| format!("{k} {w}")).collect();
+        if state == "false_positive" && r.summary.suppressed > 0 {
+            by.push(format!("{} of them by suppression rules", r.summary.suppressed));
+        }
         parts.push(format!("{n} {} ({})", state.replace('_', " "), by.join(", ")));
     }
     Some(format!(
@@ -1381,20 +1652,21 @@ fn markdown(r: &Report) -> String {
             md_escape(&n.credit())
         );
     }
+    let idx = by_id(r);
     if layout.has(Section::FixFirst) {
-        let urgent: Vec<_> =
-            r.alerts.iter().filter(|g| matches!(g.risk.as_str(), "critical" | "high" | "medium")).take(10).collect();
+        let urgent = fix_first(r, &idx);
         if !urgent.is_empty() {
             s.push_str("## Fix these first\n\n");
-            for (i, g) in urgent.iter().enumerate() {
+            for (i, (_, sec)) in urgent.iter().enumerate() {
+                let Some(g) = group_of(&idx, sec) else { continue };
+                let n = sec.instances.len();
                 let _ = writeln!(
                     s,
-                    "{}. **{}** ({}, {} place{}): {}",
+                    "{}. **{}** ({}, {n} place{}): {}",
                     i + 1,
-                    md_name(g),
-                    risk_title(&g.risk),
-                    g.instances.len(),
-                    if g.instances.len() == 1 { "" } else { "s" },
+                    md_issue_title(sec, g),
+                    risk_title(&sec.risk),
+                    if n == 1 { "" } else { "s" },
                     md_escape(first_sentence(&g.solution))
                 );
             }
@@ -1407,34 +1679,47 @@ fn markdown(r: &Report) -> String {
     if let Some(l) = r.retest.as_ref().filter(|_| layout.has(Section::Retest)) {
         md_retest(&mut s, l);
     }
-    if r.alerts.is_empty() {
+    if r.issues.is_empty() {
         s.push_str("No findings match the filters.\n");
         md_agent_false_positives(&mut s, r);
         return s;
     }
     if layout.has(Section::List) {
         // A CVSS column only when a tester rated something.
-        let rated = r.alerts.iter().any(|g| g.cvss.is_some());
+        let rated = r.issues.iter().any(|sec| sec.cvss.is_some());
         s.push_str(if rated {
-            "| # | Risk | Alert | CVSS | Instances |\n|---:|---|---|---:|---:|\n"
+            "| # | Risk | Issue | CVSS | Places |\n|---:|---|---|---:|---:|\n"
         } else {
-            "| # | Risk | Alert | Instances |\n|---:|---|---|---:|\n"
+            "| # | Risk | Issue | Places |\n|---:|---|---|---:|\n"
         });
-        for (i, g) in r.alerts.iter().enumerate() {
-            let cvss = match (&g.cvss, rated) {
+        for (i, sec) in r.issues.iter().enumerate() {
+            let Some(g) = group_of(&idx, sec) else { continue };
+            let cvss = match (&sec.cvss, rated) {
                 (Some(c), _) => format!(" {:.1} |", c.score),
                 (None, true) => " – |".into(),
                 (None, false) => String::new(),
             };
-            let _ =
-                writeln!(s, "| {} | {} | {} |{cvss} {} |", i + 1, risk_title(&g.risk), md_name(g), g.instances.len());
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} |{cvss} {} |",
+                i + 1,
+                risk_title(&sec.risk),
+                md_issue_title(sec, g),
+                sec.instances.len()
+            );
         }
         s.push('\n');
     }
-    for (i, g) in r.alerts.iter().enumerate().filter(|_| layout.has(Section::Issues)) {
-        let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_name(g), risk_title(&g.risk));
+    for (i, sec) in r.issues.iter().enumerate().filter(|_| layout.has(Section::Issues)) {
+        let Some(g) = group_of(&idx, sec) else { continue };
+        let insts = instances_of(&idx, sec);
+        let proof = proof_of(&idx, sec);
+        let _ = writeln!(s, "## {}. {} ({})\n", i + 1, md_issue_title(sec, g), risk_title(&sec.risk));
         let mut meta = vec![format!("**Alert:** `{}`", g.alert_ref)];
-        if let Some(c) = &g.cvss {
+        if sec.titled {
+            meta[0].push_str(&format!(" ({})", md_name(g)));
+        }
+        if let Some(c) = &sec.cvss {
             meta.push(format!("**CVSS 4.0:** {:.1} ({}) `{}`", c.score, c.severity, c.vector));
         }
         if let Some(c) = g.cwe {
@@ -1443,12 +1728,14 @@ fn markdown(r: &Report) -> String {
         if let Some(w) = g.wasc {
             meta.push(format!("**WASC:** {w}"));
         }
+        let hosts: Vec<String> = sec.hosts.iter().map(|h| md_code(h)).collect();
+        meta.push(format!("**Host{}:** {}", if hosts.len() == 1 { "" } else { "s" }, hosts.join(", ")));
         let _ = writeln!(s, "{}\n", meta.join(" · "));
-        for n in &g.narratives {
+        if let Some(n) = &sec.narrative {
             let _ = writeln!(
                 s,
                 "### {}\n\n{}\n\n_{}_\n",
-                md_escape(&narrative_title(g, n)),
+                narrative_heading(n),
                 md_no_html(n.narrative.text.trim()),
                 md_escape(&n.narrative.credit())
             );
@@ -1469,78 +1756,154 @@ fn markdown(r: &Report) -> String {
             s.push('\n');
         }
         if layout.has(Section::Reproduce) {
-            let lines: Vec<String> = g.instances.iter().filter_map(|i| i.request.as_ref().map(curl)).collect();
-            if !lines.is_empty() {
-                let _ = writeln!(s, "### How to reproduce\n\n{}", md_block(&lines.join("\n\n"), "sh"));
+            if let Some(req) = proof.and_then(|p| p.request.as_ref()) {
+                let _ = writeln!(s, "### How to reproduce\n\n{}", md_block(&curl(req), "sh"));
             }
         }
-        let _ = writeln!(s, "### Instances ({})\n", g.instances.len());
-        for inst in &g.instances {
-            let _ = writeln!(s, "#### {} {}\n", inst.method, md_code(&inst.url));
-            if !layout.has(Section::Evidence) {
-                continue;
-            }
+        // Every place once, in a table: the same evidence isn't repeated for each.
+        let _ = writeln!(
+            s,
+            "### Affected locations ({})\n\n| Finding | Address | Parameter | Evidence | Confidence | State | Seen |\n\
+             |---:|---|---|---|---|---|---:|",
+            insts.len()
+        );
+        for inst in &insts {
+            let cell = |t: &str| if t.is_empty() { "–".to_string() } else { md_cell(&short(t, 120)) };
             let _ = writeln!(
                 s,
-                "- Finding #{} · {} · confidence {} · {} · seen {}× · {}",
+                "| #{} | {} | {} | {} | {}{} | {} | {}× |",
                 inst.id,
-                inst.source,
+                md_cell(&format!("{} {}", inst.method, inst.url)),
+                cell(&inst.param),
+                cell(shown_evidence(inst)),
                 inst.confidence,
-                inst.state_text,
-                inst.hits,
-                added_text(inst, r.provenance)
+                if inst.rated.is_some() { " (rated)" } else { "" },
+                inst.state.replace('_', " "),
+                inst.hits
             );
-            if !inst.param.is_empty() {
-                let _ = writeln!(s, "- Parameter: {}", md_code(&inst.param));
+        }
+        s.push('\n');
+        if !layout.has(Section::Evidence) {
+            continue;
+        }
+        if let Some(inst) = proof {
+            let _ = writeln!(
+                s,
+                "### Proof: finding #{} at {}\n",
+                inst.id,
+                md_code(&format!("{} {}", inst.method, inst.url))
+            );
+            if insts.len() > 1 {
+                let _ = writeln!(
+                    s,
+                    "One exchange for the {} places above; each finding's own is in the JSON report.\n",
+                    insts.len()
+                );
             }
-            if !inst.evidence.is_empty() {
-                let _ = writeln!(s, "- Evidence: {}", md_code(&inst.evidence));
-            }
-            if !inst.attack.is_empty() {
-                let _ = writeln!(s, "- Attack: {}", md_code(&inst.attack));
-            }
-            if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
-                let _ = writeln!(s, "- Note ({}): {}", note_by(inst, r.provenance), md_code(n));
-            }
-            if let Some(c) = inst.cwe {
-                let _ = writeln!(s, "- CWE: [{c}]({})", cwe_url(c));
-            }
-            if inst.history_ids.len() > 1 {
-                let _ = writeln!(s, "- History: {}", history_list(&inst.history_ids));
-            }
-            if let Some(t) = latest_text(inst) {
-                let _ = writeln!(s, "- {t}");
-            }
-            if let Some(t) = &inst.agent_trail {
-                let _ = writeln!(s, "- Agent trail: {}", trail_text(t));
-            }
-            for t in &inst.tickets {
-                let _ = writeln!(s, "- Ticket ({}): <{}>", t.tracker, t.url.replace(['<', '>', ' '], ""));
+            md_instance(&mut s, inst, r.provenance);
+        }
+        let others: Vec<&&Instance> =
+            insts.iter().filter(|i| Some(i.id) != proof.map(|p| p.id) && has_remarks(i)).collect();
+        if !others.is_empty() {
+            s.push_str("### Notes on other places\n\n");
+            for inst in others {
+                let _ = writeln!(s, "- Finding #{} at {}", inst.id, md_code(&format!("{} {}", inst.method, inst.url)));
+                for line in md_remarks(inst, r.provenance) {
+                    let _ = writeln!(s, "  - {line}");
+                }
             }
             s.push('\n');
-            if !inst.other_info.is_empty() {
-                let _ = writeln!(s, "Other info:\n\n{}", md_block(&inst.other_info, "text"));
-            }
-            if let Some(req) = &inst.request {
-                let _ = writeln!(
-                    s,
-                    "<details><summary>Request and response (history #{})</summary>\n\n{}\n</details>\n",
-                    inst.history_id.unwrap_or(0),
-                    md_block(&http_text(req, inst.response.as_ref()), "http")
-                );
-            }
-            if let Some(ex) = &inst.latest {
-                let _ = writeln!(
-                    s,
-                    "<details><summary>Latest sighting (history #{})</summary>\n\n{}\n</details>\n",
-                    inst.last_history_id.unwrap_or(0),
-                    md_block(&http_text(&ex.request, ex.response.as_ref()), "http")
-                );
-            }
         }
     }
     md_agent_false_positives(&mut s, r);
     s
+}
+
+/// An issue's title for a heading or table cell: a tester's is plain text.
+fn md_issue_title(sec: &IssueSection, g: &AlertGroup) -> String {
+    if sec.titled || is_manual(g) {
+        md_escape(&sec.title.replace(['\r', '\n'], " "))
+    } else {
+        md_text(&sec.title)
+    }
+}
+
+/// Text from the target in a table cell: a code span, its pipes escaped as GFM tables need.
+fn md_cell(s: &str) -> String {
+    md_code(s).replace('|', "\\|")
+}
+
+/// What a finding has to say of its own: its note, rating, links, tickets and agent trail.
+fn md_remarks(inst: &Instance, full: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(t) = rated_text(inst, full) {
+        lines.push(format!("Rating: {}", md_escape(&t)));
+    }
+    if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
+        lines.push(format!("Note ({}): {}", note_by(inst, full), md_code(n)));
+    }
+    if let Some(c) = inst.cwe {
+        lines.push(format!("CWE: [{c}]({})", cwe_url(c)));
+    }
+    if inst.history_ids.len() > 1 {
+        lines.push(format!("History: {}", history_list(&inst.history_ids)));
+    }
+    if let Some(t) = &inst.agent_trail {
+        lines.push(format!("Agent trail: {}", trail_text(t)));
+    }
+    for t in &inst.tickets {
+        lines.push(format!("Ticket ({}): <{}>", t.tracker, t.url.replace(['<', '>', ' '], "")));
+    }
+    lines
+}
+
+/// One finding in full: what it is, who found and triaged it, and its exchanges.
+fn md_instance(s: &mut String, inst: &Instance, full: bool) {
+    let _ = writeln!(
+        s,
+        "- Finding #{} · {} · confidence {} · {} · seen {}× · {}",
+        inst.id,
+        inst.source,
+        inst.confidence,
+        inst.state_text,
+        inst.hits,
+        added_text(inst, full)
+    );
+    if !inst.param.is_empty() {
+        let _ = writeln!(s, "- Parameter: {}", md_code(&inst.param));
+    }
+    if !inst.evidence.is_empty() {
+        let _ = writeln!(s, "- Evidence: {}", md_code(&inst.evidence));
+    }
+    if !inst.attack.is_empty() {
+        let _ = writeln!(s, "- Attack: {}", md_code(&inst.attack));
+    }
+    for line in md_remarks(inst, full) {
+        let _ = writeln!(s, "- {line}");
+    }
+    if let Some(t) = latest_text(inst) {
+        let _ = writeln!(s, "- {t}");
+    }
+    s.push('\n');
+    if !inst.other_info.is_empty() {
+        let _ = writeln!(s, "Other info:\n\n{}", md_block(&inst.other_info, "text"));
+    }
+    if let Some(req) = &inst.request {
+        let _ = writeln!(
+            s,
+            "<details><summary>Request and response (history #{})</summary>\n\n{}\n</details>\n",
+            inst.history_id.unwrap_or(0),
+            md_block(&http_text(req, inst.response.as_ref()), "http")
+        );
+    }
+    if let Some(ex) = &inst.latest {
+        let _ = writeln!(
+            s,
+            "<details><summary>Latest sighting (history #{})</summary>\n\n{}\n</details>\n",
+            inst.last_history_id.unwrap_or(0),
+            md_block(&http_text(&ex.request, ex.response.as_ref()), "http")
+        );
+    }
 }
 
 /// The posture section in Markdown.
@@ -1635,6 +1998,21 @@ fn latest_text(inst: &Instance) -> Option<String> {
     let last = inst.latest_id()?;
     let when = inst.last_seen.as_deref().map(|t| format!(" on {}", day(t))).unwrap_or_default();
     Some(format!("First seen {}; last seen in history #{last}{when}", day(&inst.time)))
+}
+
+/// A person's rating in words: "rated low (confidence high) by a person, the scanner said
+/// medium (confidence medium): behind a login".
+fn rated_text(inst: &Instance, full: bool) -> Option<String> {
+    let r = inst.rated.as_ref()?;
+    Some(format!(
+        "rated {} (confidence {}) {}, the scanner said {} (confidence {}): {}",
+        inst.risk,
+        inst.confidence,
+        who(r.origin.as_deref(), full),
+        r.scanner_risk,
+        r.scanner_confidence,
+        r.reason
+    ))
 }
 
 /// Who wrote a finding's note, in words.
@@ -1891,28 +2269,24 @@ fn html(r: &Report) -> String {
     if r.summary.redacted.is_none() {
         let _ = writeln!(s, "<p class=\"note\"><strong>{}</strong></p>", esc(&redaction_text(r)));
     }
-    let urgent: Vec<(usize, &AlertGroup)> = r
-        .alerts
-        .iter()
-        .enumerate()
-        .filter(|(_, g)| matches!(g.risk.as_str(), "critical" | "high" | "medium"))
-        .take(10)
-        .collect();
+    let idx = by_id(r);
+    let urgent = fix_first(r, &idx);
     // Links go to the issue sections, when there are any.
     let issues = layout.has(Section::Issues);
     let anchor =
         |i: usize, name: &str| if issues { format!("<a href=\"#a{}\">{}</a>", i + 1, esc(name)) } else { esc(name) };
     if layout.has(Section::FixFirst) && !urgent.is_empty() {
         s.push_str("<h3>Fix these first</h3><ol class=\"fixfirst\">");
-        for (i, g) in urgent {
-            let n = g.instances.len();
+        for (i, sec) in urgent {
+            let Some(g) = group_of(&idx, sec) else { continue };
+            let n = sec.instances.len();
             let _ = write!(
                 s,
                 "<li>{} <span class=\"badge {}\">{}</span> \
                  <span class=\"muted\">· {n} place{}</span><br>{}</li>",
-                anchor(i, &g.name),
-                g.risk,
-                risk_title(&g.risk),
+                anchor(i, &sec.title),
+                sec.risk,
+                risk_title(&sec.risk),
                 if n == 1 { "" } else { "s" },
                 esc(first_sentence(&g.solution))
             );
@@ -1928,15 +2302,15 @@ fn html(r: &Report) -> String {
     }
 
     // ---- All issues, most serious first.
-    let rated = r.alerts.iter().any(|g| g.cvss.is_some());
-    if layout.has(Section::List) && !r.alerts.is_empty() {
+    let rated = r.issues.iter().any(|sec| sec.cvss.is_some());
+    if layout.has(Section::List) && !r.issues.is_empty() {
         let _ = writeln!(
             s,
             "<h2>All issues</h2>\n<table><thead><tr><th class=\"n\">#</th><th>Issue</th><th>Risk</th>{}<th class=\"n\">Places</th></tr></thead><tbody>",
             if rated { "<th class=\"n\">CVSS</th>" } else { "" }
         );
-        for (i, g) in r.alerts.iter().enumerate() {
-            let cvss = match (&g.cvss, rated) {
+        for (i, sec) in r.issues.iter().enumerate() {
+            let cvss = match (&sec.cvss, rated) {
                 (Some(c), _) => format!("<td class=\"n\">{:.1}</td>", c.score),
                 (None, true) => "<td class=\"n muted\">–</td>".to_string(),
                 (None, false) => String::new(),
@@ -1945,25 +2319,28 @@ fn html(r: &Report) -> String {
                 s,
                 "<tr><td class=\"n\">{}</td><td>{}</td><td><span class=\"badge {}\">{}</span></td>{cvss}<td class=\"n\">{}</td></tr>",
                 i + 1,
-                anchor(i, &g.name),
-                g.risk,
-                risk_title(&g.risk),
-                g.instances.len()
+                anchor(i, &sec.title),
+                sec.risk,
+                risk_title(&sec.risk),
+                sec.instances.len()
             );
         }
         s.push_str("</tbody></table>\n");
     }
-    for (i, g) in r.alerts.iter().enumerate().filter(|_| issues) {
+    for (i, sec) in r.issues.iter().enumerate().filter(|_| issues) {
+        let Some(g) = group_of(&idx, sec) else { continue };
+        let insts = instances_of(&idx, sec);
+        let proof = proof_of(&idx, sec);
         let _ = writeln!(
             s,
             "<section class=\"issue\"><h2 id=\"a{}\">{}. {} <span class=\"badge {}\">{}</span></h2>",
             i + 1,
             i + 1,
-            esc(&g.name),
-            g.risk,
-            risk_title(&g.risk)
+            esc(&sec.title),
+            sec.risk,
+            risk_title(&sec.risk)
         );
-        if let Some(c) = &g.cvss {
+        if let Some(c) = &sec.cvss {
             let _ = writeln!(
                 s,
                 "<p class=\"cvss\"><strong>CVSS 4.0 {:.1}</strong> ({}) <code>{}</code></p>",
@@ -1972,11 +2349,11 @@ fn html(r: &Report) -> String {
                 esc(&c.vector)
             );
         }
-        for n in &g.narratives {
+        if let Some(n) = &sec.narrative {
             let _ = writeln!(
                 s,
                 "<h3>{}</h3><div class=\"narrative\"><p>{}</p><p class=\"muted\">{}</p></div>",
-                esc(&narrative_title(g, n)),
+                esc(&narrative_heading(n)),
                 paragraphs(&n.narrative.text),
                 esc(&n.narrative.credit())
             );
@@ -1986,11 +2363,12 @@ fn html(r: &Report) -> String {
                 let _ = writeln!(s, "<h3>{h}</h3><p>{}</p>", paragraphs(text));
             }
         }
-        let _ = writeln!(s, "<h3>Where it was found ({})</h3>", g.instances.len());
+        let _ = writeln!(s, "<h3>Where it was found ({})</h3>", insts.len());
         s.push_str(
-            "<table class=\"where\"><thead><tr><th>Address</th><th>Field</th><th>Certainty</th></tr></thead><tbody>",
+            "<table class=\"where\"><thead><tr><th>Address</th><th>Field</th><th>Evidence</th><th>Certainty</th>\
+             </tr></thead><tbody>",
         );
-        for inst in &g.instances {
+        for inst in &insts {
             // Only a person's confirmation reads as checked by the tester.
             let mut state = match inst.state.as_str() {
                 "confirmed" if provenance::by_a_person(inst.state_origin.as_deref()) => {
@@ -2021,34 +2399,43 @@ fn html(r: &Report) -> String {
                     " <span class=\"tag\">agent's work not reviewed</span>"
                 });
             }
-            let _ = write!(
-                s,
-                "<tr><td><code>{} {}</code>{state}</td><td>{}</td><td>{}</td></tr>",
-                esc(&inst.method),
-                esc(&inst.url),
-                if inst.param.is_empty() {
+            if inst.rated.is_some() {
+                let _ = write!(state, " <span class=\"tag\">rated {} by a person</span>", esc(&inst.risk));
+            }
+            let code = |t: &str| {
+                if t.is_empty() {
                     "<span class=\"muted\">–</span>".to_string()
                 } else {
-                    format!("<code>{}</code>", esc(&inst.param))
-                },
+                    format!("<code>{}</code>", esc(&short(t, 120)))
+                }
+            };
+            let _ = write!(
+                s,
+                "<tr><td><code>{} {}</code>{state}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&inst.method),
+                esc(&inst.url),
+                code(&inst.param),
+                code(shown_evidence(inst)),
                 esc(&inst.confidence)
             );
         }
         s.push_str("</tbody></table>\n");
 
         if layout.has(Section::Reproduce) {
-            let lines: Vec<String> = g.instances.iter().filter_map(|i| i.request.as_ref().map(curl)).collect();
-            if !lines.is_empty() {
-                let _ = writeln!(s, "<h3>How to reproduce</h3><pre>{}</pre>", esc(&lines.join("\n\n")));
+            if let Some(req) = proof.and_then(|p| p.request.as_ref()) {
+                let _ = writeln!(s, "<h3>How to reproduce</h3><pre>{}</pre>", esc(&curl(req)));
             }
         }
         if !layout.has(Section::Evidence) {
             s.push_str("</section>\n");
             continue;
         }
-        // Everything a developer needs to reproduce it, folded away.
+        // Everything a developer needs to reproduce it, folded away: one exchange for the issue.
         s.push_str("<details class=\"tech\"><summary>Technical details</summary>");
         let mut meta = vec![format!("Rule <code>{}</code>", esc(&g.alert_ref))];
+        if sec.titled {
+            meta.push(esc(&g.name));
+        }
         if let Some(c) = g.cwe {
             meta.push(format!("CWE {}", link(&cwe_url(c), &c.to_string())));
         }
@@ -2063,70 +2450,19 @@ fn html(r: &Report) -> String {
             }
             s.push_str("</ul>\n");
         }
-        for inst in &g.instances {
-            let _ = write!(
-                s,
-                "<div class=\"inst\"><div><strong>{}</strong> <code>{}</code></div><dl>",
-                esc(&inst.method),
-                esc(&inst.url)
-            );
-            let mut row = |k: &str, v: String| {
-                let _ = write!(s, "<dt>{k}</dt><dd>{v}</dd>");
-            };
-            row(
-                "Finding",
-                format!("#{} · {} · {}× seen · {}", inst.id, esc(&inst.source), inst.hits, esc(&inst.state)),
-            );
-            row("Origin", esc(&added_text(inst, r.provenance)));
-            if inst.state_origin.is_some() || inst.state != "open" {
-                row("State", esc(&inst.state_text));
-            }
-            for (k, v) in [("Parameter", &inst.param), ("Evidence", &inst.evidence), ("Attack", &inst.attack)] {
-                if !v.is_empty() {
-                    row(k, format!("<code>{}</code>", esc(v)));
-                }
-            }
-            if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
-                row("Note", format!("{} <span class=\"muted\">({})</span>", esc(n), esc(&note_by(inst, r.provenance))));
-            }
-            if let Some(c) = inst.cwe {
-                row("CWE", link(&cwe_url(c), &c.to_string()));
-            }
-            if inst.history_ids.len() > 1 {
-                row("History", history_list(&inst.history_ids));
-            }
-            if let Some(t) = latest_text(inst) {
-                row("Seen", esc(&t));
-            }
-            if let Some(t) = &inst.agent_trail {
-                row("Agent trail", esc(&trail_text(t)));
-            }
-            if !inst.tickets.is_empty() {
-                let links: Vec<String> =
-                    inst.tickets.iter().map(|t| link(&t.url, &format!("{} ticket", t.tracker))).collect();
-                row("Tickets", links.join(", "));
-            }
-            s.push_str("</dl>");
-            if !inst.other_info.is_empty() {
-                let _ = write!(s, "<pre>{}</pre>", esc(&inst.other_info));
-            }
-            if let Some(req) = &inst.request {
+        if let Some(inst) = proof {
+            if insts.len() > 1 {
                 let _ = write!(
                     s,
-                    "<details><summary>Request and response (history #{})</summary><pre>{}</pre></details>",
-                    inst.history_id.unwrap_or(0),
-                    esc(&http_text(req, inst.response.as_ref()))
+                    "<p class=\"muted\">The proof: one exchange for the {} places above; each finding's own is \
+                     in the JSON report.</p>",
+                    insts.len()
                 );
             }
-            if let Some(ex) = &inst.latest {
-                let _ = write!(
-                    s,
-                    "<details><summary>Latest sighting (history #{})</summary><pre>{}</pre></details>",
-                    inst.last_history_id.unwrap_or(0),
-                    esc(&http_text(&ex.request, ex.response.as_ref()))
-                );
-            }
-            s.push_str("</div>\n");
+            html_instance(&mut s, inst, r.provenance, true);
+        }
+        for inst in insts.iter().filter(|i| Some(i.id) != proof.map(|p| p.id) && has_remarks(i)) {
+            html_instance(&mut s, inst, r.provenance, false);
         }
         s.push_str("</details></section>\n");
     }
@@ -2413,17 +2749,6 @@ fn trail_text(t: &TrailSummary) -> String {
 }
 
 /// A write-up's heading line: "Write-up" or "Write-up for HOST", "(draft)" when unreviewed.
-fn narrative_title(g: &AlertGroup, n: &IssueNarrative) -> String {
-    let mut t = "Write-up".to_string();
-    if g.narratives.len() > 1 {
-        t.push_str(&format!(" for {}", n.host));
-    }
-    if !n.narrative.reviewed() {
-        t.push_str(" (draft, not reviewed)");
-    }
-    t
-}
-
 /// A shell word in single quotes.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -2455,6 +2780,77 @@ fn curl(req: &HttpRequest) -> String {
 }
 
 /// The posture section: open issues by risk, recent scans, retests.
+/// One finding in the technical details: in `full` (the issue's proof) with its other info and
+/// exchanges, otherwise only what it says of its own (note, rating, tickets, trail).
+fn html_instance(s: &mut String, inst: &Instance, full_provenance: bool, full: bool) {
+    let _ = write!(
+        s,
+        "<div class=\"inst\"><div><strong>{}</strong> <code>{}</code></div><dl>",
+        esc(&inst.method),
+        esc(&inst.url)
+    );
+    let mut row = |k: &str, v: String| {
+        let _ = write!(s, "<dt>{k}</dt><dd>{v}</dd>");
+    };
+    row("Finding", format!("#{} · {} · {}× seen · {}", inst.id, esc(&inst.source), inst.hits, esc(&inst.state)));
+    if full {
+        row("Origin", esc(&added_text(inst, full_provenance)));
+        if inst.state_origin.is_some() || inst.state != "open" {
+            row("State", esc(&inst.state_text));
+        }
+        for (k, v) in [("Parameter", &inst.param), ("Evidence", &inst.evidence), ("Attack", &inst.attack)] {
+            if !v.is_empty() {
+                row(k, format!("<code>{}</code>", esc(v)));
+            }
+        }
+    }
+    if let Some(t) = rated_text(inst, full_provenance) {
+        row("Rating", esc(&t));
+    }
+    if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
+        row("Note", format!("{} <span class=\"muted\">({})</span>", esc(n), esc(&note_by(inst, full_provenance))));
+    }
+    if let Some(c) = inst.cwe {
+        row("CWE", link(&cwe_url(c), &c.to_string()));
+    }
+    if inst.history_ids.len() > 1 {
+        row("History", history_list(&inst.history_ids));
+    }
+    if let Some(t) = latest_text(inst).filter(|_| full) {
+        row("Seen", esc(&t));
+    }
+    if let Some(t) = &inst.agent_trail {
+        row("Agent trail", esc(&trail_text(t)));
+    }
+    if !inst.tickets.is_empty() {
+        let links: Vec<String> = inst.tickets.iter().map(|t| link(&t.url, &format!("{} ticket", t.tracker))).collect();
+        row("Tickets", links.join(", "));
+    }
+    s.push_str("</dl>");
+    if full {
+        if !inst.other_info.is_empty() {
+            let _ = write!(s, "<pre>{}</pre>", esc(&inst.other_info));
+        }
+        if let Some(req) = &inst.request {
+            let _ = write!(
+                s,
+                "<details><summary>Request and response (history #{})</summary><pre>{}</pre></details>",
+                inst.history_id.unwrap_or(0),
+                esc(&http_text(req, inst.response.as_ref()))
+            );
+        }
+        if let Some(ex) = &inst.latest {
+            let _ = write!(
+                s,
+                "<details><summary>Latest sighting (history #{})</summary><pre>{}</pre></details>",
+                inst.last_history_id.unwrap_or(0),
+                esc(&http_text(&ex.request, ex.response.as_ref()))
+            );
+        }
+    }
+    s.push_str("</div>\n");
+}
+
 fn html_posture(s: &mut String, p: &Value) {
     s.push_str("<h2>Posture</h2>\n<div class=\"cards\">");
     for risk in RISKS {
@@ -2674,6 +3070,8 @@ fn sarif(r: &Report) -> Value {
                 "partialFingerprints": {"brainproxy/v3": inst.fingerprint},
                 "properties": {
                     "findingId": inst.id,
+                    "issueId": inst.issue_id,
+                    "issueTitle": inst.issue_title,
                     "source": inst.source,
                     "risk": inst.risk,
                     "confidence": inst.confidence,
@@ -3361,6 +3759,93 @@ mod tests {
             assert!(md.contains(&g.name), "{} missing", g.name);
         }
         assert!(md.contains("```http\nGET http://app.test/a?q=1"));
+    }
+
+    /// A store where one missing-header issue is seen on `pages` pages of app.test.
+    fn store_with_pages(pages: usize) -> Store {
+        let mut s = Store::open_in_memory().unwrap();
+        let target = Target { scheme: "http".into(), host: "app.test".into(), port: 80 };
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 4\r\n\r\nhi!!";
+        for n in 0..pages {
+            let req = format!("GET /p{n} HTTP/1.1\r\nHost: app.test\r\n\r\n");
+            s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp), Some(5), None)).unwrap();
+        }
+        passive::scan_pending(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn reports_go_by_issue_with_one_proof_and_its_titles() {
+        let mut s = store_with_pages(5);
+        let xpb = FindingFilter { alert_ref: Some("10037".into()), ..Default::default() };
+        let ids: Vec<i64> = s.findings_list(&xpb, 100).unwrap().iter().map(|f| f["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids.len(), 5);
+        let opts = ReportOptions { filter: xpb.clone(), ..Default::default() };
+        let r = build(&s, &opts).unwrap();
+        assert_eq!(r.issues.len(), 1);
+        assert_eq!((r.issues[0].instances.len(), r.issues[0].proof.is_some()), (5, true));
+        // One exchange for the five places, and a table that lists them all.
+        let md = render(&r, ReportKind::Markdown);
+        assert_eq!(md.matches("Request and response (history").count(), 1, "{md}");
+        assert!(md.contains("### Affected locations (5)"), "{md}");
+        for n in 0..5 {
+            assert!(md.contains(&format!("http://app.test/p{n}")), "{md}");
+        }
+        let html = render(&r, ReportKind::Html);
+        assert_eq!(html.matches("Request and response (history").count(), 1);
+        // The JSON keeps every instance's exchange, as before.
+        assert!(r.alerts[0].instances.iter().all(|i| i.request.is_some()));
+
+        // A tester splits two findings off under a title and names the rest: two issues, each
+        // under its title, in every format.
+        let new = s.issue_split(&ids[..2], Some("Banner on the admin pages")).unwrap();
+        let old = s.findings_list(&xpb, 1).unwrap()[0]["issue_id"].as_i64().unwrap();
+        let old = if old == new { s.findings_list(&xpb, 100).unwrap()[4]["issue_id"].as_i64().unwrap() } else { old };
+        s.issue_set_title(old, "Banner on the shop").unwrap();
+        let r = build(&s, &opts).unwrap();
+        let titles: Vec<&str> = r.issues.iter().map(|sec| sec.title.as_str()).collect();
+        assert_eq!(titles, ["Banner on the shop", "Banner on the admin pages"], "more places first");
+        assert!(r.issues.iter().all(|sec| sec.titled));
+        for kind in [ReportKind::Markdown, ReportKind::Html, ReportKind::Csv, ReportKind::Sarif, ReportKind::DefectDojo]
+        {
+            let out = render(&r, kind);
+            for t in &titles {
+                assert!(out.contains(t), "{} lacks {t}", kind.as_str());
+            }
+        }
+        let parts = docx::tests::unzip(&render_docx(&r));
+        let xml = &parts.iter().find(|(n, _)| n == "word/document.xml").unwrap().1;
+        assert!(titles.iter().all(|t| xml.contains(t)), "docx");
+        let json: Value = serde_json::from_str(&render(&r, ReportKind::Json)).unwrap();
+        assert_eq!(json["issues"].as_array().unwrap().len(), 2);
+        assert_eq!(json["alerts"][0]["instances"].as_array().unwrap().len(), 5, "alerts keep every instance");
+        assert!(json["alerts"][0]["instances"][0]["issue_title"].is_string());
+    }
+
+    #[test]
+    fn fix_these_first_goes_by_triage_and_confidence() {
+        let mut s = store_with_pages(1);
+        // The banner is low; rated medium it qualifies, unless dismissed or doubtful.
+        let f = s.findings_list(&FindingFilter { alert_ref: Some("10037".into()), ..Default::default() }, 1).unwrap();
+        let id = f[0]["id"].as_i64().unwrap();
+        let fix = |s: &Store, state: Option<&str>| -> String {
+            let filter = FindingFilter { state: state.map(str::to_string), ..Default::default() };
+            let r = build(s, &ReportOptions { filter, ..Default::default() }).unwrap();
+            let md = render(&r, ReportKind::Markdown);
+            md.split("## Fix these first")
+                .nth(1)
+                .map(|t| t.split("\n## ").next().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        assert!(!fix(&s, None).contains("X-Powered-By"));
+        let medium = crate::scan::findings_db::Rating { risk: Some("medium"), confidence: Some("low"), reason: "r" };
+        s.findings_rate(&[id], &[], Some(&medium)).unwrap();
+        assert!(!fix(&s, None).contains("X-Powered-By"), "a doubtful finding isn't a priority");
+        s.finding_mark(id, Some("confirmed"), None).unwrap();
+        assert!(fix(&s, None).contains("X-Powered-By"), "a person confirmed it");
+        s.finding_mark(id, Some("false_positive"), None).unwrap();
+        assert!(!fix(&s, Some("all")).contains("X-Powered-By"), "dismissed is no priority");
     }
 
     #[test]

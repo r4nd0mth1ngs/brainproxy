@@ -98,7 +98,12 @@ one `false_positive` with a note instead; the command refuses a tool call too); 
 refuses a tool call too); and `scan policy remove`, since a saved scan policy may be a
 person's (the command refuses a tool call too); and `findings issue review` and
 `report-summary review`, since a person reviews what an agent drafted and an agent can't vouch
-for its own draft. (`connection review`, `browser open` and the `scan script` commands are left
+for its own draft; and `findings suppress add` and `findings suppress remove`, since a
+suppression rule decides about findings nobody has seen yet (an agent reads the rules with
+`findings_suppress_list`, and suggests marks on findings instead; both commands refuse a tool
+call too); and `findings rate`, since a risk or confidence in place of the scanner's is a
+person's call (an agent suggests one with `findings_mark` and `suggest`; the command refuses a
+tool call too). (`connection review`, `browser open` and the `scan script` commands are left
 out too; see below.)
 `findings_list` returns a page: `limit` rows from `offset` on, with `total` and `truncated`,
 so an agent works through a large project page by page (`issue` lists one issue's findings).
@@ -113,7 +118,9 @@ last can't be changed or cleared through MCP; the call fails with kind `conflict
 changes (all of the findings, or none). That covers a finding's state and note
 (`findings_mark`), an issue's write-up once a person wrote or reviewed it
 (`findings_issue_narrative`, which would otherwise send it back to draft and so out of
-reports), the executive summary (`report_summary_set`), an issue's CVSS rating and title, and
+reports), the executive summary (`report_summary_set`), an issue's CVSS rating and title, an
+issue's decision (`findings_mark` with `issue` and a false positive or accepted risk, which the
+issue's new instances inherit, as set by the person who decided), and
 merging or splitting an issue a person arranged or described. An agent's retest
 (`findings_retest`) records its outcome but leaves a state a person set (`state_kept` says so),
 except `retest_pending`, which asks for the retest. Instead, `findings_mark` with `suggest`

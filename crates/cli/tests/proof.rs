@@ -334,3 +334,94 @@ fn findings_list_pages_and_says_how_many_there_are() {
     assert_eq!(grouped["truncated"].as_bool(), Some(types > 2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_whole_issue_s_decision_reaches_its_new_instances_and_an_agent_keeps_it() {
+    let port = serve();
+    let (dir, project) = setup("carry");
+    let base = format!("http://127.0.0.1:{port}");
+    ok(&project, &["send", "--url", &format!("{base}/a")]);
+    let issue = |project: &Path| -> Value {
+        ok(project, &["findings", "issues", "--state", "all", "--alert", "10037"])["issues"][0].clone()
+    };
+    let id = issue(&project)["id"].to_string();
+    ok(&project, &["findings", "mark", "--issue", &id, "--state", "false_positive", "--note", "decoy banner"]);
+    let d = issue(&project)["decision"].clone();
+    assert_eq!((d["state"].as_str(), d["origin"].as_str()), (Some("false_positive"), Some("cli")), "{d}");
+    // A new page of the same issue arrives false positive, as the person decided it.
+    ok(&project, &["send", "--url", &format!("{base}/b")]);
+    let all = ok(&project, &["findings", "list", "--all", "--state", "all", "--issue", &id])["items"].clone();
+    let items = all.as_array().unwrap();
+    assert_eq!(items.len(), 2, "{all}");
+    for f in items {
+        assert_eq!((f["state"].as_str(), f["state_origin"].as_str()), (Some("false_positive"), Some("cli")), "{f}");
+    }
+    // So an agent can't reopen the new one, nor end the decision.
+    let newest = items.iter().map(|f| f["id"].as_i64().unwrap()).max().unwrap().to_string();
+    agent_refused(&project, &["findings", "mark", &newest, "--state", "open"], None);
+    agent_refused(&project, &["findings", "mark", "--issue", &id, "--state", "open"], None);
+    let events = ok(&project, &["findings", "timeline", &newest])["events"].clone();
+    let last = events.as_array().unwrap().last().unwrap().clone();
+    assert!(last["text"].as_str().unwrap().starts_with(&format!("inherited from issue {id}")), "{last}");
+    // The default report leaves both out, and says so.
+    let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
+    assert!(md.contains("2 false positive"), "{md}");
+    // Several states at once: these two, and no other.
+    let r = ok(&project, &["report", "json", "--state", "confirmed,false_positive", "--alert", "10037"]);
+    assert_eq!((r["summary"]["total"].as_u64(), r["issues"].as_array().map(Vec::len)), (Some(2), Some(1)), "{r}");
+    let (code, v) = run_as(&project, &["report", "json", "--state", "confirmed,bogus"], None, false);
+    assert_eq!(code, 2, "{v}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn suppression_rules_are_a_person_s_and_reports_say_what_they_left_out() {
+    let port = serve();
+    let (dir, project) = setup("suppress");
+    let base = format!("http://127.0.0.1:{port}");
+    ok(&project, &["send", "--url", &format!("{base}/static/a.js")]);
+    let rule = ["findings", "suppress", "add", "--alert", "10037", "--host", "127.0.0.1", "--path-prefix", "/static/"];
+    let mut by_agent = rule.to_vec();
+    by_agent.extend(["--reason", "agent thinks so"]);
+    let (code, v) = run_as(&project, &by_agent, None, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let mut by_person = rule.to_vec();
+    by_person.extend(["--reason", "served by the CDN"]);
+    let added = ok(&project, &by_person);
+    assert_eq!(added["marked"], 1, "{added}");
+    let id = added["id"].to_string();
+    ok(&project, &["send", "--url", &format!("{base}/static/b.js")]);
+    ok(&project, &["send", "--url", &format!("{base}/page")]);
+    let listed = agent_ok(&project, &["findings", "suppress", "list"], None);
+    assert_eq!(listed["suppressions"][0]["findings"], 2, "{listed}");
+    let (code, v) = run_as(&project, &["findings", "suppress", "remove", &id], None, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let open = ok(&project, &["findings", "list", "--all", "--alert", "10037"])["items"].clone();
+    assert_eq!(open.as_array().unwrap().len(), 1, "only /page is open work: {open}");
+    let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
+    assert!(md.contains("2 of them by suppression rules"), "{md}");
+    assert_eq!(ok(&project, &["findings", "suppress", "remove", &id, "--reopen"])["reopened"], 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_person_rates_a_scanner_finding_and_reports_use_it() {
+    let port = serve();
+    let (dir, project) = setup("rate");
+    ok(&project, &["send", "--url", &format!("http://127.0.0.1:{port}/a")]);
+    let f = ok(&project, &["findings", "list", "--all", "--alert", "10037"])["items"][0].clone();
+    let id = f["id"].to_string();
+    let rate = ["findings", "rate", &id, "--risk", "high", "--reason", "exact framework build"];
+    let (code, v) = run_as(&project, &rate, None, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let (code, v) = run_as(&project, &["findings", "rate", &id, "--risk", "high"], None, false);
+    assert_eq!(code, 2, "a reason is needed: {v}");
+    assert_eq!(ok(&project, &rate)["ids"][0].to_string(), id);
+    let shown = ok(&project, &["findings", "list", "--all", "--risk", "high"])["items"][0].clone();
+    assert_eq!((shown["risk"].as_str(), shown["rated"]["scanner_risk"].as_str()), (Some("high"), f["risk"].as_str()));
+    let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
+    assert!(md.contains("Rating: rated high") && md.contains("exact framework build"), "{md}");
+    ok(&project, &["findings", "rate", &id, "--clear"]);
+    assert_eq!(ok(&project, &["findings", "show", &id])["risk"], f["risk"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -36,7 +36,7 @@ fn csv_field(s: &str) -> String {
 pub fn csv(r: &Report) -> String {
     let mut out = String::from(
         "finding_id,issue_id,fingerprint,alert_ref,name,risk,cvss_score,cvss_vector,confidence,state,source,host,\
-         method,url,param,cwe,first_seen,last_seen,hits,note,tickets\r\n",
+         method,url,param,cwe,first_seen,last_seen,hits,note,tickets,issue_title,scanner_risk,rating_reason\r\n",
     );
     for (g, i) in rows(r) {
         let fields = [
@@ -61,6 +61,9 @@ pub fn csv(r: &Report) -> String {
             i.hits.to_string(),
             i.note.clone().unwrap_or_default(),
             i.tickets.iter().map(|t| t.url.as_str()).collect::<Vec<_>>().join(" "),
+            i.issue_title.clone(),
+            i.rated.as_ref().map(|r| r.scanner_risk.clone()).unwrap_or_default(),
+            i.rated.as_ref().map(|r| r.reason.clone()).unwrap_or_default(),
         ];
         let line: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
         out.push_str(&line.join(","));
@@ -121,7 +124,7 @@ pub fn junit(r: &Report) -> String {
             if active(&i.state) {
                 let mut detail = format!(
                     "{}\nRisk: {}, confidence {}, {}.",
-                    g.name,
+                    i.issue_title,
                     i.risk,
                     i.confidence,
                     i.state.replace('_', " ")
@@ -136,7 +139,7 @@ pub fn junit(r: &Report) -> String {
                     out,
                     "<failure type=\"{}\" message=\"{}\">{}</failure>",
                     xml(&i.risk),
-                    xml(&format!("{} ({})", g.name, risk_title(&i.risk))),
+                    xml(&format!("{} ({})", i.issue_title, risk_title(&i.risk))),
                     xml(&detail)
                 );
             } else {
@@ -198,8 +201,18 @@ pub fn defectdojo(r: &Report) -> String {
                 let _ = write!(description, "\n\n**Note** ({by}): {}", md_no_html(n));
             }
             let _ = write!(description, "\n\nbrainproxy finding #{} ({}).", i.id, i.source);
+            if let Some(t) = &i.rated {
+                let _ = write!(
+                    description,
+                    "\n\n**Rated** {} by a person (the scanner said {}): {}",
+                    i.risk,
+                    t.scanner_risk,
+                    md_no_html(&t.reason)
+                );
+            }
             let mut f = json!({
-                "title": g.name,
+                // The issue's title: a tester's own, or the alert's name.
+                "title": i.issue_title,
                 "description": description,
                 "severity": match i.risk.as_str() {
                     "critical" => "Critical",
