@@ -84,7 +84,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | ID | Rule | Scope | Max risk | Alert refs |
 |---|---|---|---|---|
 | 0 | Directory Browsing | page | medium | 0 |
-| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3 |
+| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3, 6-6, 6-7 |
 | 7 | Remote File Inclusion | param | high | 7 |
 | 10045 | Source Code Disclosure - /WEB-INF Folder | host | high | 10045-1 |
 | 10047 | HTTPS Content Available via HTTP | page | low | 10047 |
@@ -142,7 +142,11 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 100007 | JWT Weaknesses | page | high | 100007-1, 100007-2, 100007-3, 100007-4, 100007-5, 100007-6, 100007-7, 100007-8 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
-headers and URL path segments when enabled), `page` once per target request, `host` once per scheme://host:port.
+headers and URL path segments when enabled; the names of parameters, JSON keys, cookies and
+headers at strength high and insane or with `--inject-names`), `page` once per target request,
+`host` once per scheme://host:port. On a name point a rule's payload replaces the name and the
+value stays; the finding's parameter is `name:` and the name. Rules that rewrite a parameter
+their own way (the MongoDB rules' `a[$ne]=` and operator objects) leave names alone.
 
 Every rule in ZAP's `ascanrules` add-on is ported (`zap-sync.json` lists the two
 `pscanrules` rules that aren't). From `ascanrulesBeta` so far: CORS (40040), Server Side
@@ -314,6 +318,25 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   could replace) isn't run. What this gives up: *nix servers without a Linux `/proc` (BSDs,
   macOS) are found only by a directory listing, and `web.xml` read through a parameter that
   can't leave the web app's folder isn't found.
+- **Path Traversal (6) also finds paths it can't read through** (brainproxy's own checks,
+  after ZAP's): a page that only says whether a file exists, opens it without showing it, or
+  shows only an error. Neither reads a file; each compares answers, with every value it sent
+  taken out of each answer (such pages often show the path), and sends each side twice.
+  - **6-6, medium confidence:** a directory every system has at its root, reached with `../`
+    (`../../…/etc`; from medium strength also `/etc` and `..\..\…\Windows`, at high
+    `C:\Windows`), gets another answer than the same name under a directory that doesn't exist
+    (`../../…/RANDOM/etc`), and a second directory (`usr`, `Users`) gets the first answer again. The value left the directory the
+    app meant.
+  - **6-7, low confidence:** the original value and `./value` get the same answer, while
+    `./RANDOM/value` and `RANDOM/../value` get another, the same for both. The value is a path
+    the file system resolves as given, not cleaned (`a/../b` read as `b`) or cut to a file name
+    first; whether `../` gets out isn't shown. It needs a value of 3 characters or more that
+    doesn't start with `/`, `\` or `.`. Windows resolves `RANDOM\..\value` by its text, so
+    6-7 finds nothing on Windows servers.
+  - Both stay safe where the path is written to: every path is a directory, the file the
+    original value already names, or under a directory that doesn't exist, where nothing can
+    be created. They add 2 requests per form tried (one at low strength, three at medium, four
+    at high) and 2 for 6-7 to a parameter that isn't a path, and up to 5 when it is.
 - **Redirects followed:** a rule that follows redirects (as ZAP does) still files its
   finding under the request it attacked, with that request's own response, not under the
   page the redirect led to. When that response doesn't show the evidence itself (a POST

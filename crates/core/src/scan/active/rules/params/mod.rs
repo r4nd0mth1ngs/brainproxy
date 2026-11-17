@@ -721,11 +721,22 @@ mod e2e {
             let n = name.replace('\\', "/").to_ascii_lowercase();
             let clobbers = ["passwd", "system.ini", "win.ini", "web.xml", "upload"];
             assert!(!clobbers.iter().any(|c| n.contains(c)), "{name}");
+            let segments: Vec<&str> = n.split('/').collect();
+            let (last, dirs) = segments.split_last().unwrap();
+            // A directory at the root (`../../etc`, `c:/windows`), which can't be opened for writing.
+            let root_dir =
+                ["etc", "usr", "windows", "users"].contains(last) && dirs.iter().all(|d| ["", "..", "c:"].contains(d));
+            // Under a directory that doesn't exist (the existence checks' random one), where
+            // nothing can be created.
+            let under_missing = dirs.iter().any(|d| d.len() == 12 && d.bytes().all(|b| b.is_ascii_hexdigit()));
             assert!(
                 n == "report.txt"
+                    || n == "./report.txt"
                     || n.ends_with("proc/version")
                     || n.ends_with("system32/kernel32.dll")
-                    || n.ends_with('/'),
+                    || n.ends_with('/')
+                    || root_dir
+                    || under_missing,
                 "{name}"
             );
         }

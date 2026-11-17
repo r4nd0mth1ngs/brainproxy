@@ -150,7 +150,8 @@ pub(crate) fn remove_point(raw: &[u8], point: &InsertionPoint) -> Vec<u8> {
                 .collect();
             head = format!("{}\r\n\r\n", lines.join("\r\n"));
         }
-        PointKind::Header | PointKind::Multipart | PointKind::Xml | PointKind::Path => {}
+        // A name replaced by the marker is a request without that name.
+        PointKind::Header | PointKind::Multipart | PointKind::Xml | PointKind::Path | PointKind::Name => {}
     }
     RawRequest::from_bytes([head.as_bytes(), &body].concat()).update_content_length().into_bytes()
 }

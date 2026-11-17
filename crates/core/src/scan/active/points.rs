@@ -1,7 +1,9 @@
 //! Insertion points: the places in a request where a rule can put a value
 //! (ZAP "variants"). Query and form parameters, JSON and XML values and multipart
 //! fields are used by default; cookies, selected headers and URL path segments are
-//! opt-in, like ZAP's defaults.
+//! opt-in, like ZAP's defaults. So are the names of parameters, JSON keys, cookies and
+//! headers (`PointOptions::names`): an application that reads its input from a name
+//! (`getParameterNames`, `getHeaderNames`) is attacked there.
 
 use std::ops::Range;
 
@@ -34,6 +36,8 @@ pub enum PointKind {
     Multipart,
     Xml,
     Path,
+    /// The name of a query or form parameter, a JSON key, a cookie or a header; its value stays.
+    Name,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +53,18 @@ enum Loc {
     FileName(Range<usize>),
     /// Index of the segment in the path split on `/`.
     Segment(usize),
+    Name(NameLoc),
+}
+
+/// Where a name is: the pair, key, cookie or header whose name it is.
+#[derive(Debug, Clone, PartialEq)]
+enum NameLoc {
+    Query(usize),
+    Form(usize),
+    /// The path to the key's value: its last step is the key.
+    Json(Vec<JsonKey>),
+    Cookie(usize),
+    Header(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,9 +78,10 @@ pub struct InsertionPoint {
     pub kind: PointKind,
     /// Parameter name (decoded); for JSON, a path like `user.tags[0]`; for XML, one
     /// like `order.item[1].@id`; for a multipart file, `field.filename`; for a URL
-    /// path, `path[1]` (the segment's position).
+    /// path, `path[1]` (the segment's position). A name point is `name:` and the name (a
+    /// JSON key's path), so a finding says it was the name that was attacked.
     pub name: String,
-    /// Original value (decoded).
+    /// Original value (decoded); for a name point, the name.
     pub value: String,
     loc: Loc,
 }
@@ -90,6 +107,9 @@ pub struct PointOptions {
     pub cookies: bool,
     /// Header names to inject into (e.g. User-Agent, Referer).
     pub headers: Vec<String>,
+    /// Also attack the names of the query and form parameters, JSON keys, cookies (with
+    /// `cookies`) and headers (of `headers`, those the request has) that the other options select.
+    pub names: bool,
 }
 
 impl Default for PointOptions {
@@ -103,9 +123,14 @@ impl Default for PointOptions {
             path: false,
             cookies: false,
             headers: Vec::new(),
+            names: false,
         }
     }
 }
+
+/// Headers whose name isn't attacked, even when named: the request would no longer reach its
+/// target or be read whole.
+const FIXED_HEADERS: &[&str] = &["host", "content-length", "transfer-encoding", "content-type", "connection", "cookie"];
 
 fn split_target(head: &str) -> (&str, &str, &str) {
     // "METHOD target VERSION"
@@ -297,7 +322,89 @@ pub fn points(raw: &[u8], opts: &PointOptions) -> Vec<InsertionPoint> {
             });
         }
     }
+    if opts.names {
+        name_points(raw, opts, &mut out);
+    }
     out
+}
+
+/// A name point, `name:` and the name, so a finding's parameter says what was attacked.
+fn name_point(shown: &str, name: &str, loc: NameLoc) -> InsertionPoint {
+    InsertionPoint {
+        kind: PointKind::Name,
+        name: format!("name:{shown}"),
+        value: name.to_string(),
+        loc: Loc::Name(loc),
+    }
+}
+
+/// The names of what `opts` selects, after its values (whose places don't move).
+fn name_points(raw: &[u8], opts: &PointOptions, out: &mut Vec<InsertionPoint>) {
+    let (head, body) = split_head_body(raw);
+    let head = String::from_utf8_lossy(head);
+    let (_, target, _) = split_target(&head);
+    if let Some((_, q)) = target.split_once('?').filter(|_| opts.query) {
+        for (i, (k, v)) in pairs(q).into_iter().enumerate() {
+            if !k.is_empty() && !crate::auth::is_query_key_placeholder(v) {
+                let k = url_decode(k);
+                out.push(name_point(&k, &k, NameLoc::Query(i)));
+            }
+        }
+    }
+    let ct = content_type(raw);
+    if opts.form && ct.contains("application/x-www-form-urlencoded") {
+        for (i, (k, _)) in pairs(&String::from_utf8_lossy(body)).into_iter().enumerate() {
+            if !k.is_empty() {
+                let k = url_decode(k);
+                out.push(name_point(&k, &k, NameLoc::Form(i)));
+            }
+        }
+    }
+    if opts.json && ct.contains("json") {
+        if let Ok(v) = serde_json::from_slice::<Value>(body) {
+            json_keys(&v, &mut Vec::new(), out);
+        }
+    }
+    let Ok(h) = RawRequest::from_bytes(raw.to_vec()).head() else { return };
+    if opts.cookies {
+        let cookies = h.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("cookie"));
+        for (i, c) in cookies.flat_map(|(_, v)| v.split(';')).enumerate() {
+            let name = c.split_once('=').map_or(c, |(k, _)| k).trim();
+            if !name.is_empty() {
+                out.push(name_point(name, name, NameLoc::Cookie(i)));
+            }
+        }
+    }
+    for name in &opts.headers {
+        if FIXED_HEADERS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        if let Some((k, _)) = h.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            out.push(name_point(k, k, NameLoc::Header(k.clone())));
+        }
+    }
+}
+
+/// Every key of every object, by the path to its value.
+fn json_keys(v: &Value, path: &mut Vec<JsonKey>, out: &mut Vec<InsertionPoint>) {
+    match v {
+        Value::Object(m) => {
+            for (k, child) in m {
+                path.push(JsonKey::Field(k.clone()));
+                out.push(name_point(&json_path(path), k, NameLoc::Json(path.clone())));
+                json_keys(child, path, out);
+                path.pop();
+            }
+        }
+        Value::Array(a) => {
+            for (i, child) in a.iter().enumerate() {
+                path.push(JsonKey::Index(i));
+                json_keys(child, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 fn json_leaves(v: &Value, path: &mut Vec<JsonKey>, out: &mut Vec<InsertionPoint>) {
@@ -687,6 +794,7 @@ pub fn inject(raw: &[u8], point: &InsertionPoint, value: &str, encode: bool) -> 
             out.extend_from_slice(&raw[line_end..]);
             out
         }
+        (PointKind::Name, Loc::Name(at)) => return inject_name(raw, at, value, encode),
         (kind, Loc::Body(range) | Loc::FileName(range)) if body.get(range.clone()).is_some() => {
             let escaped = match (&point.loc, kind) {
                 _ if !encode => value.to_string(),
@@ -699,6 +807,108 @@ pub fn inject(raw: &[u8], point: &InsertionPoint, value: &str, encode: bool) -> 
         _ => raw.to_vec(),
     };
     RawRequest::from_bytes(out).update_content_length().into_bytes()
+}
+
+/// The request with the name at `at` set to `value`, escaped as `inject` escapes a value there
+/// (a cookie name's `=` too). A header name is always reduced to a header name's characters,
+/// the others percent-encoded, so the request stays one header longer; an empty one drops it.
+fn inject_name(raw: &[u8], at: &NameLoc, value: &str, encode: bool) -> Vec<u8> {
+    let (raw_head, body) = split_head_body(raw);
+    let head = String::from_utf8_lossy(raw_head).into_owned();
+    let form = |v: &str| if encode { form_encode(v) } else { v.to_string() };
+    let rename = |pair: &str| match pair.split_once('=') {
+        Some((_, v)) => format!("{}={v}", form(value)),
+        None => form(value),
+    };
+    let out = match at {
+        NameLoc::Query(i) => {
+            let (method, target, version) = split_target(&head);
+            let Some((path, q)) = target.split_once('?') else { return raw.to_vec() };
+            let new_q = map_pair(q, *i, rename);
+            let line_end = find(raw, b"\r\n").unwrap_or(raw.len());
+            [format!("{method} {path}?{new_q} {version}").as_bytes(), &raw[line_end..]].concat()
+        }
+        NameLoc::Form(i) => {
+            let new_b = map_pair(&String::from_utf8_lossy(body), *i, rename);
+            [head.as_bytes(), new_b.as_bytes()].concat()
+        }
+        NameLoc::Json(path) => {
+            let Ok(mut v) = serde_json::from_slice::<Value>(body) else { return raw.to_vec() };
+            let Some((JsonKey::Field(key), parent)) = path.split_last() else { return raw.to_vec() };
+            if let Some(Value::Object(m)) = json_slot(&mut v, parent) {
+                // Rebuilt, so the key keeps its place among the others.
+                *m = std::mem::take(m)
+                    .into_iter()
+                    .map(|(k, child)| if k == *key { (value.to_string(), child) } else { (k, child) })
+                    .collect();
+            }
+            [head.as_bytes(), serde_json::to_string(&v).unwrap_or_default().as_bytes()].concat()
+        }
+        NameLoc::Cookie(idx) => {
+            let name = if encode { cookie_encode(value).replace('=', "%3D") } else { value.to_string() };
+            let mut n = 0;
+            let lines: Vec<String> = head
+                .trim_end_matches("\r\n")
+                .split("\r\n")
+                .map(|line| {
+                    let Some((k, v)) = line.split_once(':') else { return line.to_string() };
+                    if !k.trim().eq_ignore_ascii_case("cookie") {
+                        return line.to_string();
+                    }
+                    let parts: Vec<String> = v
+                        .split(';')
+                        .map(|c| {
+                            let this = n;
+                            n += 1;
+                            match c.split_once('=') {
+                                Some((_, v)) if this == *idx => format!("{name}={v}"),
+                                None if this == *idx => name.clone(),
+                                _ => c.trim().to_string(),
+                            }
+                        })
+                        .collect();
+                    format!("{k}: {}", parts.join("; "))
+                })
+                .collect();
+            [lines.join("\r\n").as_bytes(), b"\r\n\r\n", body].concat()
+        }
+        NameLoc::Header(header) => {
+            let name = header_name_encode(value);
+            let mut done = false;
+            let lines: Vec<String> = head
+                .trim_end_matches("\r\n")
+                .split("\r\n")
+                .enumerate()
+                .filter_map(|(n, line)| match line.split_once(':') {
+                    Some((k, v)) if n > 0 && !done && k.trim().eq_ignore_ascii_case(header) => {
+                        done = true;
+                        (!name.is_empty()).then(|| format!("{name}:{v}"))
+                    }
+                    _ => Some(line.to_string()),
+                })
+                .collect();
+            [lines.join("\r\n").as_bytes(), b"\r\n\r\n", body].concat()
+        }
+    };
+    RawRequest::from_bytes(out).update_content_length().into_bytes()
+}
+
+/// A header name of `s`: RFC 9110 token characters kept, every other byte percent-encoded.
+fn header_name_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `s` with pair `index` (split on `&`) replaced by what `f` makes of it.
+fn map_pair(s: &str, index: usize, f: impl Fn(&str) -> String) -> String {
+    s.split('&').enumerate().map(|(i, p)| if i == index { f(p) } else { p.to_string() }).collect::<Vec<_>>().join("&")
 }
 
 /// The request with the query or form pair of `point` renamed to `name` and set to
@@ -1067,6 +1277,70 @@ mod tests {
         );
         // A segment that looks the same under another parent is another place.
         assert_eq!(keys(b"GET /b/x HTTP/1.1\r\nHost: h\r\n\r\n"), [some("/b"), some("/b/x")]);
+    }
+
+    #[test]
+    fn names_are_points_when_asked() {
+        let raw = b"POST /p?a=1&flag HTTP/1.1\r\nHost: h\r\nX-Id: 7\r\nCookie: s=1; t=2\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\nc=3&d=4";
+        let opts = PointOptions { cookies: true, headers: vec!["X-Id".into(), "Host".into()], ..Default::default() };
+        assert!(points(raw, &opts).iter().all(|p| p.kind != PointKind::Name), "off by default");
+        let named = PointOptions { names: true, ..opts.clone() };
+        let all = points(raw, &named);
+        // Values keep their places; names follow.
+        assert_eq!(all.iter().take_while(|p| p.kind != PointKind::Name).count(), points(raw, &opts).len());
+        let names: Vec<_> = all.iter().filter(|p| p.kind == PointKind::Name).collect();
+        let shown: Vec<(&str, &str)> = names.iter().map(|p| (p.name.as_str(), p.value.as_str())).collect();
+        assert_eq!(
+            shown,
+            [
+                ("name:a", "a"),
+                ("name:flag", "flag"),
+                ("name:c", "c"),
+                ("name:d", "d"),
+                ("name:s", "s"),
+                ("name:t", "t"),
+                ("name:X-Id", "X-Id")
+            ]
+        );
+        let out = s(inject(raw, names[0], "a' x", true));
+        assert!(out.starts_with("POST /p?a%27+x=1&flag HTTP/1.1\r\n"), "{out}");
+        let out = s(inject(raw, names[1], "f'", true));
+        assert!(out.starts_with("POST /p?a=1&f%27 HTTP/1.1\r\n"), "{out}");
+        let out = s(inject(raw, names[3], "d d", true));
+        assert!(out.ends_with("\r\n\r\nc=3&d+d=4") && out.contains("Content-Length: 9\r\n"), "{out}");
+        let out = s(inject(raw, names[5], "t=;", true));
+        assert!(out.contains("Cookie: s=1; t%3D%3B=2\r\n"), "{out}");
+        let out = s(inject(raw, names[6], "X'\r\nEvil: 1", false));
+        assert!(out.contains("\r\nX'%0D%0AEvil%3A%201: 7\r\nCookie"), "{out}");
+        assert!(!s(inject(raw, names[6], "", true)).contains(": 7\r\nCookie"), "an empty name drops the header");
+    }
+
+    #[test]
+    fn json_keys_are_renamed_in_place() {
+        let body = r#"{"user":{"id":5,"tags":[{"k":1}]},"z":1}"#;
+        let raw = format!(
+            "POST /j HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let opts = PointOptions { names: true, ..Default::default() };
+        let names: Vec<InsertionPoint> =
+            points(&raw, &opts).into_iter().filter(|p| p.kind == PointKind::Name).collect();
+        let shown: Vec<(&str, &str)> = names.iter().map(|p| (p.name.as_str(), p.value.as_str())).collect();
+        assert_eq!(
+            shown,
+            [
+                ("name:user", "user"),
+                ("name:user.id", "id"),
+                ("name:user.tags", "tags"),
+                ("name:user.tags[0].k", "k"),
+                ("name:z", "z")
+            ]
+        );
+        let out = s(inject(&raw, &names[1], "i\"d", true));
+        assert!(out.ends_with(r#"{"user":{"i\"d":5,"tags":[{"k":1}]},"z":1}"#), "{out}");
+        let out = s(inject(&raw, &names[3], "q", true));
+        assert!(out.ends_with(r#"{"user":{"id":5,"tags":[{"q":1}]},"z":1}"#), "{out}");
     }
 
     #[test]
