@@ -146,6 +146,22 @@ fn handle(path: &str, query: &str) -> String {
                 html("<ul></ul>")
             }
         }
+        // The same in a 500 page that shows the database's error, as Express with
+        // SQLite or a servlet with HyperSQL do.
+        "/sqlite500" | "/hsql500" => {
+            if param("name").matches('\'').count() % 2 == 1 {
+                status(
+                    500,
+                    if path == "/sqlite500" {
+                        "<title>Error: SQLITE_ERROR: near \"'%'\": syntax error</title>"
+                    } else {
+                        "<pre>java.sql.SQLSyntaxErrorException: malformed string: '\n\tat org.hsqldb.jdbc.JDBCUtil.sqlException</pre>"
+                    },
+                )
+            } else {
+                html("<ul></ul>")
+            }
+        }
         // `name LIKE '%<value>%'`, errors hidden.
         "/sqllike" => {
             let q = param("q");
@@ -639,6 +655,18 @@ async fn sql_injection_false_positive_classes() {
     let attack = |param: &str| found.iter().find(|f| f.2 == param).map(|f| f.3.clone());
     assert_eq!(attack("name").as_deref().map(|a| a.contains('\'')), Some(true), "{found:?}");
     assert_eq!(attack("q").as_deref(), Some("app%'  -- "), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_names_the_database_in_a_500_page() {
+    let port = spawn_app();
+    let targets = vec![target(port, "/sqlite500?name=apple"), target(port, "/hsql500?name=apple")];
+    let (s, found) = scan("sqli500db", 40018, Strength::Medium, targets).await;
+    assert_eq!(s.raised.get("40018"), Some(&2), "{found:?}");
+    // The error message wins over the bare 500 (which used to stop the check at Low).
+    let mut names: Vec<&str> = found.iter().map(|f| f.1.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["SQL Injection - Hypersonic SQL", "SQL Injection - SQLite"], "{found:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -23,6 +23,9 @@
 //!   of the same RDBMS too (`error_persists`); the HTTP 500 check runs for quotes
 //!   only, and needs the 500 again and none with the quotes doubled
 //!   (`quote_breaks_query`).
+//! - A bare HTTP 500 is the weakest proof, so it is a last resort: it is reported
+//!   (at Low confidence) only when no database error message and none of the
+//!   comparison checks found anything (`pending_500`).
 
 use std::sync::{LazyLock, OnceLock};
 
@@ -214,6 +217,8 @@ static RDBMS: [Rdbms; 17] = [
         errors: &[
             r#"near ".+": syntax error"#,
             r"SQLITE_ERROR",
+            r"\QSQLiteException\E",
+            r"\Qsqlite3.OperationalError\E",
             r"\QSELECTs to the left and right of UNION do not have the same number of result columns\E",
         ],
         union_errors: &[r"\QSELECTs to the left and right of UNION do not have the same number of result columns\E"],
@@ -446,6 +451,7 @@ impl ActiveRule for SqlInjection {
                 orig,
                 lim: limits(cx.strength()),
                 found: false,
+                pending_500: Vec::new(),
                 refreshed: None,
                 base_hits: OnceLock::new(),
                 n_error: 0,
@@ -466,6 +472,9 @@ impl ActiveRule for SqlInjection {
                     _ => s.order_by_based().await,
                 }
             }
+            if !s.found && !cx.stopped() {
+                s.bare_500().await;
+            }
         })
     }
 }
@@ -477,6 +486,10 @@ struct Scan<'a> {
     orig: String,
     lim: Limits,
     found: bool,
+    /// Quote attacks that got a 500 without a database error message, as
+    /// (prefix, error characters, value sent, response), checked by `bare_500`
+    /// once every stronger check has had its turn.
+    pending_500: Vec<(String, &'static str, String, Response)>,
     /// The original request re-sent before the comparison checks.
     refreshed: Option<Response>,
     /// Per RDBMS, which error patterns match the original response.
@@ -532,26 +545,15 @@ impl Scan<'_> {
                 let Some(resp) = self.send(&value).await else { continue };
                 self.n_error += 1;
 
-                // Only for quotes, unlike ZAP: see `quote_breaks_query`.
-                if resp.status == 500 && base_status != 500 && err.contains(['\'', '"']) {
-                    // Make sure the service doesn't answer 500 for any invalid value.
-                    let safe = self.send("S4feV4lu3").await;
-                    if safe.is_some_and(|s| s.status != 500) && self.quote_breaks_query(prefix, err).await {
-                        let finding = ALERT
-                            .raise(self.param.clone(), resp.status_line.clone())
-                            .attack(value.clone())
-                            .confidence(Confidence::Low);
-                        self.cx.report(finding, &resp);
-                        self.found = true;
-                        continue;
-                    }
-                }
-
+                // The database's own error message first: a 500 page often carries
+                // one, and it names the database at Medium confidence.
+                let mut named = false;
                 for (i, rdbms) in RDBMS.iter().enumerate() {
                     if self.cx.stopped() {
                         return;
                     }
                     let Some((j, evidence)) = self.specific_error(i, &resp) else { continue };
+                    named = true;
                     if self.error_persists(i, err).await {
                         self.report(
                             rdbms.alert,
@@ -562,6 +564,11 @@ impl Scan<'_> {
                         );
                     }
                     break;
+                }
+
+                // Only for quotes, unlike ZAP: see `quote_breaks_query`.
+                if !self.found && !named && resp.status == 500 && base_status != 500 && err.contains(['\'', '"']) {
+                    self.pending_500.push((prefix.to_string(), err, value, resp));
                 }
             }
         }
@@ -599,6 +606,31 @@ impl Scan<'_> {
         match self.send(&control).await {
             Some(resp) => self.specific_error(i, &resp).is_some(),
             None => false,
+        }
+    }
+
+    /// The last resort: a quote attack's 500 with no database error message in
+    /// it, reported at Low confidence when its controls pass.
+    async fn bare_500(&mut self) {
+        let pending = std::mem::take(&mut self.pending_500);
+        if pending.is_empty() {
+            return;
+        }
+        // Make sure the service doesn't answer 500 for any invalid value.
+        if !self.send("S4feV4lu3").await.is_some_and(|s| s.status != 500) {
+            return;
+        }
+        for (prefix, err, value, resp) in pending {
+            if self.cx.stopped() {
+                return;
+            }
+            if self.quote_breaks_query(&prefix, err).await {
+                let finding =
+                    ALERT.raise(self.param.clone(), resp.status_line.clone()).attack(value).confidence(Confidence::Low);
+                self.cx.report(finding, &resp);
+                self.found = true;
+                return;
+            }
         }
     }
 
@@ -912,6 +944,12 @@ mod tests {
         assert_eq!(find("[Microsoft][ODBC SQL Server Driver]").map(|f| f.0), Some("Microsoft SQL Server"));
         assert_eq!(find("SQLSTATE[HY000]").map(|f| f.0), Some("Oracle"));
         assert_eq!(find("Error: near \"'\": syntax error").map(|f| f.0), Some("SQLite"));
+        assert_eq!(find("System.Data.SQLite.SQLiteException: SQL logic error").map(|f| f.0), Some("SQLite"));
+        assert_eq!(find("sqlite3.OperationalError: unrecognized token").map(|f| f.0), Some("SQLite"));
+        assert_eq!(
+            find("java.sql.SQLSyntaxErrorException: malformed string: ' at org.hsqldb.jdbc.JDBCUtil").map(|f| f.0),
+            Some("Hypersonic SQL")
+        );
         assert_eq!(find("ERROR: syntax error at or near \"'\"").map(|f| f.0), Some("PostgreSQL"));
         // Literal dots and brackets are not regex syntax.
         assert_eq!(find("hSqlX"), None);

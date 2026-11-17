@@ -186,7 +186,11 @@ those skips 40014. Prime and Spider never raise alerts themselves.
     messages;)
   - the HTTP 500 check runs for quotes only, and the 500 must repeat and go away when
     each quote is doubled (an escaped quote in an SQL string): input validation and
-    type errors (`true'` in a JSON boolean) reject both.
+    type errors (`true'` in a JSON boolean) reject both;
+  - a bare 500 is the last resort: a database error message in the 500 page is matched
+    first and names the database (Medium confidence), and the bare 500 (Low confidence)
+    is reported only when no other check (error message, expression, boolean, UNION,
+    ORDER BY) found the parameter.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.
