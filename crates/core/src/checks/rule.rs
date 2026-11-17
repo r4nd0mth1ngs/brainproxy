@@ -567,7 +567,7 @@ pub fn interaction_matches(check: &serde_json::Value, protocol: &str, remote: &s
         })
     };
     let hit = |src: &serde_json::Value| -> bool {
-        let Ok(m) = super::compile_matcher(src) else { return false };
+        let Ok(m) = super::compile_matcher(src, false) else { return false };
         let hit = match &m.kind {
             MatchKind::Dsl(exprs) => {
                 let env = |n: &str| field(n).map(Value::Str).or_else(|| values.get(n).cloned());
@@ -760,6 +760,12 @@ fn dsl_value(env: &Env, seen: &[Response], vars: &HashMap<String, String>, name:
 /// Whether the matcher matches, with evidence when it does.
 fn matches(env: &Env, seen: &[Response], m: &Matcher, vars: &HashMap<String, String>) -> (bool, Option<String>) {
     let Some(resp) = seen.last() else { return (false, None) };
+    // A pattern that didn't build fails the matcher closed, `negative` or not.
+    if let MatchKind::Regex(res) = &m.kind {
+        if res.get().is_none() {
+            return (false, None);
+        }
+    }
     let (hit, evidence) = match &m.kind {
         MatchKind::Dsl(exprs) => {
             let lookup = |name: &str| dsl_value(env, seen, vars, name);
@@ -788,7 +794,8 @@ fn text_match(m: &Matcher, text: &str, vars: &HashMap<String, String>) -> (bool,
             for w in words {
                 let w = subst(w, vars).unwrap_or_else(|| w.clone());
                 let w = if m.case_insensitive { w.to_lowercase() } else { w };
-                if hay.contains(&w) {
+                // A placeholder filled with nothing leaves a word every text contains.
+                if !w.is_empty() && hay.contains(&w) {
                     found.get_or_insert(w);
                 } else {
                     all = false;
@@ -797,7 +804,7 @@ fn text_match(m: &Matcher, text: &str, vars: &HashMap<String, String>) -> (bool,
             (if m.and { all } else { found.is_some() }, found)
         }
         MatchKind::Regex(res) => {
-            let res = res.get();
+            let Some(res) = res.get() else { return (false, None) };
             let found: Vec<String> = res.iter().filter_map(|r| r.find(text).map(|x| x.as_str().to_string())).collect();
             (if m.and { found.len() == res.len() } else { !found.is_empty() }, found.into_iter().next())
         }
@@ -835,7 +842,7 @@ fn extract(env: &Env, seen: &[Response], e: &Extractor, vars: &HashMap<String, S
         }
         ExtractKind::Regex(res, group) => {
             let text = part_text(env, seen, &e.part);
-            for r in res.get() {
+            for r in res.get().unwrap_or_default() {
                 for c in r.captures_iter(&text).take(20) {
                     if let Some(g) = c.get(*group) {
                         out.push(g.as_str().to_string());

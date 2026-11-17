@@ -2171,6 +2171,9 @@ again keeps its id, state, note, origin and who set them. One not found again (i
 turned off, say) is removed, unless it was triaged (its state was changed or it has a note)
 or has other records (a retest, a move to another issue, a ticket, or a title, rating or
 write-up on its issue): that one is kept with `hits` 0. The result counts `removed` and `kept_not_found`.
+The findings of a passive check that didn't load or failed on an exchange stay as they
+are; `checks_problem` says why feed checks didn't run, and `failed_checks` lists those that
+failed (see [CHECKS.md](CHECKS.md)).
 
 The app sets `BRAINPROXY_CLIENT=gui` on the commands it runs; the MCP server sets
 `BRAINPROXY_MCP_CALL`, which wins over it, and an agent can set neither.

@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::hooks::{with_bytes, Hook, HookKind, ScriptFinding, ScriptRef};
+use crate::scan::active::Response;
 use crate::scan::{AlertDef, Finding, Message, PassiveRule};
 use crate::store::Store;
 
@@ -117,21 +118,94 @@ pub fn use_checks_from(home: &Path) {
     let _ = CHECK_HOME.set(home.to_path_buf());
 }
 
-/// The passive checks, loaded on first use (templates that don't load are left out,
-/// as `checks list` reports them).
-pub fn checks() -> &'static [crate::checks::PassiveCheck] {
-    static CHECKS: OnceLock<Vec<crate::checks::PassiveCheck>> = OnceLock::new();
-    CHECKS.get_or_init(|| {
-        let Some(home) = CHECK_HOME.get() else { return Vec::new() };
-        let dirs: Vec<PathBuf> = [crate::checks::brainproxy_dir(home), crate::checks::local_dir(home)]
-            .into_iter()
-            .filter(|d| d.is_dir())
-            .collect();
-        match crate::checks::load(&dirs, &Default::default()) {
-            Ok(loaded) => crate::checks::into_passive(loaded.checks),
-            Err(_) => Vec::new(),
-        }
+/// The passive checks of the feed and the local folder, and what kept some of them out.
+struct PassiveChecks {
+    checks: Vec<crate::checks::PassiveCheck>,
+    /// Why some or all of them don't run.
+    problem: Option<String>,
+    /// Alert-ref prefixes of the checks that didn't load: a rescan keeps their findings,
+    /// which nothing could find again.
+    unloaded: Vec<String>,
+}
+
+fn loaded_checks() -> &'static PassiveChecks {
+    static CHECKS: OnceLock<PassiveChecks> = OnceLock::new();
+    CHECKS.get_or_init(|| match CHECK_HOME.get() {
+        Some(home) => load_checks(home),
+        None => PassiveChecks { checks: Vec::new(), problem: None, unloaded: Vec::new() },
     })
+}
+
+fn load_checks(home: &Path) -> PassiveChecks {
+    let none = PassiveChecks { checks: Vec::new(), problem: None, unloaded: Vec::new() };
+    let feed = crate::checks::brainproxy_dir(home);
+    let dirs: Vec<PathBuf> =
+        [feed.clone(), crate::checks::local_dir(home)].into_iter().filter(|d| d.is_dir()).collect();
+    // Built now, not on first match: a pattern that can't be built is a load error here,
+    // never a matcher that quietly drops out.
+    let opts = crate::checks::LoadOptions { build_regexes: true, ..Default::default() };
+    let loaded = match crate::checks::load(&dirs, &opts) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            let problem = format!("the passive checks couldn't be loaded, so none ran: {e}");
+            eprintln!("brainproxy: {problem}");
+            return PassiveChecks { problem: Some(problem), unloaded: vec![CHECK_PREFIX.into()], ..none };
+        }
+    };
+    // Every feed template loaded when it was stored. One that is invalid now (a newer build
+    // is stricter) is worth saying; the local folder's, and the feed's active ones, may only
+    // need inputs or a listener.
+    let skipped: Vec<_> = loaded.skipped.iter().filter(|s| s.kind == "invalid" && s.file.starts_with(&feed)).collect();
+    let problem = skipped.first().map(|s| {
+        let problem = format!(
+            "{} template(s) of the brainproxy feed didn't load and didn't run (`checks list --skipped`), first {}: {}",
+            skipped.len(),
+            s.file.display(),
+            s.reason
+        );
+        eprintln!("brainproxy: {problem}");
+        problem
+    });
+    // A rescan keeps the findings of a check it can't run; without an id, every check's.
+    let unloaded = match skipped.iter().any(|s| s.id.is_none()) {
+        true => vec![CHECK_PREFIX.into()],
+        false => skipped.iter().filter_map(|s| s.id.as_ref()).map(|id| format!("{CHECK_PREFIX}{id}")).collect(),
+    };
+    PassiveChecks { checks: crate::checks::into_passive(loaded.checks), problem, unloaded }
+}
+
+/// The alert refs of declarative checks start with this.
+const CHECK_PREFIX: &str = "check:";
+
+/// The passive checks, loaded on first use (templates that don't load are left out,
+/// as `checks list` reports them, and [`checks_problem`] says so).
+pub fn checks() -> &'static [crate::checks::PassiveCheck] {
+    &loaded_checks().checks
+}
+
+/// Why some or all passive checks of the feed don't run, if they don't.
+pub fn checks_problem() -> Option<&'static str> {
+    loaded_checks().problem.as_deref()
+}
+
+/// Passive checks that panicked on some exchange (their findings there are lost).
+static CHECK_PANICS: Mutex<std::collections::BTreeSet<String>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Runs one passive check, which may not take the scan down with it (see `builtin_findings`).
+fn run_check(c: &crate::checks::PassiveCheck, host: &str, request: &str, resp: &Response, out: &mut Vec<Finding>) {
+    let mut found = Vec::new();
+    let ran =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.scan(host, request, resp, &mut found))).is_ok();
+    if ran {
+        out.append(&mut found);
+    } else if CHECK_PANICS.lock().unwrap_or_else(|e| e.into_inner()).insert(c.id().to_string()) {
+        eprintln!("brainproxy: passive check {} failed on an exchange and found nothing there", c.id());
+    }
+}
+
+/// The passive checks that failed on an exchange so far in this process.
+fn failed_checks() -> Vec<String> {
+    CHECK_PANICS.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
 }
 
 /// A script check that failed on an exchange, or couldn't be loaded: what it would have found
@@ -381,14 +455,14 @@ fn builtin_findings(msg: &Message, settings: &PassiveSettings) -> Vec<Finding> {
     }
     let checks: Vec<_> = checks().iter().filter(|c| !settings.disabled_checks.iter().any(|d| d == c.id())).collect();
     if !checks.is_empty() && msg.status != 0 {
-        let resp = crate::scan::active::Response::recorded(msg.status, msg.resp_headers.clone(), msg.resp_body.clone());
+        let resp = Response::recorded(msg.status, msg.resp_headers.clone(), msg.resp_body.clone());
         let query = msg.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default();
         let mut request = format!("{} {}{query} HTTP/1.1\r\n", msg.method, msg.path);
         for (k, v) in &msg.req_headers {
             request.push_str(&format!("{k}: {v}\r\n"));
         }
         for c in checks {
-            c.scan(&msg.host, &request, &resp, &mut out);
+            run_check(c, &msg.host, &request, &resp, &mut out);
         }
     }
     out
@@ -413,6 +487,13 @@ pub struct ScanStats {
     /// first few different failures).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failed_scripts: Vec<String>,
+    /// Why some or all passive checks of the feed didn't run: what they would have found
+    /// isn't in the findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checks_problem: Option<String>,
+    /// Passive checks (feed or local, by id) that failed on an exchange and found nothing there.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_checks: Vec<String>,
 }
 
 /// History rows completed after the scanner passed them and not scanned again yet (a JSON
@@ -440,6 +521,7 @@ pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
     let settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
     let mut last: i64 = store.meta_get(WATERMARK_KEY)?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut stats = ScanStats { last_id: last, ..Default::default() };
+    stats.checks_problem = checks_problem().map(str::to_string);
     let late: Vec<i64> = store.meta_get(LATE_KEY)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     if !late.is_empty() {
         // Taken off the list first: a row that fails to scan mustn't fail every scan after.
@@ -476,6 +558,7 @@ pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
     stats.last_id = last;
     stats.script_errors = scripts.errors();
     stats.failed_scripts = scripts.failed();
+    stats.failed_checks = failed_checks();
     Ok(stats)
 }
 
@@ -512,11 +595,17 @@ pub fn rescan(store: &mut Store) -> Result<ScanStats> {
             })
             .collect()
     };
-    let unloaded = kept(script_problems(&settings).into_iter().map(|(name, _)| name).collect());
+    // So can a declarative check that didn't load or failed on the way.
+    let checks = |refs: Vec<String>| -> Vec<String> {
+        refs.into_iter().flat_map(|r| [format!("{SCRIPT_ANSWER_PREFIX}{r}"), r]).collect()
+    };
+    let mut unloaded = kept(script_problems(&settings).into_iter().map(|(name, _)| name).collect());
+    unloaded.extend(checks(loaded_checks().unloaded.clone()));
     let before = store.findings_rescan_start("passive", &unloaded)?;
     store.meta_set(WATERMARK_KEY, None)?;
     let mut stats = scan_pending(store)?;
-    let failed = kept(stats.failed_scripts.clone());
+    let mut failed = kept(stats.failed_scripts.clone());
+    failed.extend(checks(stats.failed_checks.iter().map(|id| format!("{CHECK_PREFIX}{id}")).collect()));
     let (removed, kept) = store.findings_rescan_finish("passive", &failed)?;
     stats.new_findings = store.findings_count_after("passive", before)?;
     stats.removed = Some(removed);
@@ -846,5 +935,26 @@ mod tests {
         assert!(next.new_findings > 0 && findings(&store) > before, "{next:?}");
         // Once: the list is empty again.
         assert_eq!(scan_pending(&mut store).unwrap().scanned, 0);
+    }
+
+    /// A feed check that no longer loads is said, and a rescan keeps its findings; before, it
+    /// vanished without a word and a rescan removed what it had found.
+    #[test]
+    fn a_feed_check_that_does_not_load_is_reported() {
+        let home = std::env::temp_dir().join(format!("bp-passive-checks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let feed = crate::checks::brainproxy_dir(&home).join("passive");
+        std::fs::create_dir_all(&feed).unwrap();
+        let check = |id: &str, word: &str| {
+            format!("id: {id}\ninfo: {{severity: low}}\nscope: passive\nhttp:\n  - matchers: [{{type: word, words: ['{word}']}}]\n")
+        };
+        std::fs::write(feed.join("good.yaml"), check("good", "x")).unwrap();
+        std::fs::write(feed.join("bad.yaml"), check("bad", "")).unwrap();
+        let loaded = load_checks(&home);
+        assert_eq!(loaded.checks.iter().map(|c| c.id()).collect::<Vec<_>>(), ["good"]);
+        let problem = loaded.problem.unwrap_or_default();
+        assert!(problem.contains("1 template(s)") && problem.contains("bad.yaml"), "{problem}");
+        assert_eq!(loaded.unloaded, ["check:bad"]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

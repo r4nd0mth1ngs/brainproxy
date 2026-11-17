@@ -154,7 +154,7 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
         std::fs::remove_dir_all(&staging)?;
         return Err(Error::NotFound("no HTTP templates (http/*.yaml) in the source".into()));
     }
-    let (stored, skipped) = keep_loadable(&staging)?;
+    let (stored, skipped) = keep_loadable(&staging, false)?;
     m.stored = stored;
     m.skipped = skipped;
     m.repository = repository;
@@ -170,8 +170,8 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
 /// can run (payload files resolve against the staging root, later the store).
 /// Templates needing inputs or an OOB listener stay: `--check-var` and `oob start`
 /// enable them at scan time. Returns the count kept and the skip reasons.
-pub(super) fn keep_loadable(staging: &Path) -> Result<(usize, Vec<(String, usize)>)> {
-    let opts = super::LoadOptions { any_inputs: true, oob: true, ..Default::default() };
+pub(super) fn keep_loadable(staging: &Path, build_regexes: bool) -> Result<(usize, Vec<(String, usize)>)> {
+    let opts = super::LoadOptions { any_inputs: true, oob: true, build_regexes, ..Default::default() };
     let loaded = super::load(&[staging.to_path_buf()], &opts)?;
     for s in &loaded.skipped {
         let _ = std::fs::remove_file(&s.file);

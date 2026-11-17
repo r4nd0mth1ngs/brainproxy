@@ -105,6 +105,13 @@ Request blocks:
   one response header (`content_type`), or a numbered part (`body_2`). Placeholders in a
   DSL expression's strings are filled before it is evaluated (`contains(body,
   '{{randstr}}')`); one without a value stays as written.
+- A matcher that would match every response is invalid: an empty word or binary value,
+  a regex that matches the empty string (`''`, `a*`), or a regex that doesn't compile
+  (an unknown Unicode class such as `\p{Foo}`). Without the last rule a pattern that
+  dropped out would leave `condition: and` checking the rest, or `negative` checking
+  nothing. A regex too big to build is only found by building it, which `checks
+  validate`, `checks feed sign`, the feed's update and the passive scanner do; elsewhere
+  such a matcher matches nothing, `negative` or not.
 - `extractors`: `regex` (with `group`), `kval`, `dsl`, and `json` with jq paths
   (`.a.b`, `.a[0]`, `.["k"]`, `.items[]`, and pipes of these; no `select`, `..`, or
   operators); `internal: true` extractors feed later requests as `{{name}}`, and named
@@ -263,6 +270,10 @@ active check sees its response, plus the part (and DSL variable) `request_header
 Passive checks come from the `brainproxy` and `local` stores; `scan active` ignores them.
 `scan rules` lists them with the passive rules (by check id), and `scan disable <check
 id>` / `scan enable <check id>` switch one off or on for the project, as for rules.
+A feed template that no longer loads (a newer brainproxy is stricter), or a store that
+can't be read, is said on stderr and in `checks_problem` of `scan passive`'s output; a
+check that fails on an exchange finds nothing there and is listed in `failed_checks`.
+A passive rescan keeps the findings of such checks rather than removing them.
 
 ## The brainproxy feed
 
@@ -290,7 +301,7 @@ Publishing a check (maintainers):
 
 ```sh
 brainproxy checks validate feed/                                  # loads?
-brainproxy checks feed sign feed --key ~/.config/brainproxy-feed/signing.key
+brainproxy checks feed sign feed --key ~/.config/brainproxy-feed/signing.key   # refuses a template that doesn't load
 brainproxy checks feed verify feed                                # what users will check
 ```
 

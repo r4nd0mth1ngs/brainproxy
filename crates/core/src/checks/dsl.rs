@@ -101,7 +101,33 @@ impl LazyRegex {
 /// (ASCII only, as in Nuclei). Rust's Unicode versions are also far bigger: the
 /// 690 patterns of credentials-disclosure.yaml took ~750 MB compiled.
 pub(crate) fn build_regex(src: &str) -> Option<Regex> {
-    regex::RegexBuilder::new(&ascii_perl_classes(src)).size_limit(1 << 22).build().ok()
+    try_build_regex(src).ok()
+}
+
+/// [`build_regex`], with why it failed.
+pub(crate) fn try_build_regex(src: &str) -> std::result::Result<Regex, regex::Error> {
+    regex::RegexBuilder::new(&ascii_perl_classes(src)).size_limit(1 << 22).build()
+}
+
+/// Checks a template regex when it loads, without compiling it (that can take seconds).
+/// Unsupported: what RE2 lacks too (lookaround, backreferences). Invalid: what
+/// [`build_regex`] would refuse later, such as an unknown Unicode class, so a broken
+/// pattern doesn't load and then silently drop out of its matcher. Returns whether the
+/// pattern can match the empty string, and so matches any text.
+pub(crate) fn check_regex(src: &str) -> PResult<bool> {
+    if regex_syntax::ast::parse::Parser::new().parse(src).is_err() {
+        return Err(ParseError::Unsupported("regex syntax (lookaround/backreference)".into()));
+    }
+    let hir = regex_syntax::ParserBuilder::new()
+        .build()
+        .parse(&ascii_perl_classes(src))
+        .map_err(|e| ParseError::Invalid(format!("regex {src:?} doesn't compile: {}", regex_error(&e.to_string()))))?;
+    Ok(hir.properties().minimum_len() == Some(0))
+}
+
+/// The gist of a regex error, whose text spans several lines with a caret drawing.
+pub(crate) fn regex_error(s: &str) -> String {
+    s.lines().rev().find_map(|l| l.strip_prefix("error: ")).unwrap_or(s).trim().to_string()
 }
 
 fn ascii_perl_classes(src: &str) -> String {
@@ -457,10 +483,7 @@ impl Parser {
                     _ => None,
                 };
                 if let Some(Expr::Lit(Value::Str(src))) = pattern {
-                    // Lookaround and backreferences (RE2 lacks them too) fail here.
-                    if regex_syntax::ast::parse::Parser::new().parse(src).is_err() {
-                        return Err(ParseError::Unsupported("regex syntax (lookaround/backreference)".into()));
-                    }
+                    check_regex(src)?;
                     re = LazyRegex(Some((src.clone(), Default::default())));
                 }
                 Ok(Expr::Call(f, args, re))
