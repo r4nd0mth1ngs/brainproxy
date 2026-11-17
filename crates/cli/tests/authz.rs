@@ -193,7 +193,7 @@ fn finds_the_readable_order_and_nothing_else() {
 
     let f = ok(&p, &["findings", "list", "--source", "authz"]);
     let text = f.to_string();
-    assert!(text.contains("Access Control Bypass") && text.contains("100003"), "{text}");
+    assert!(text.contains("Access Control Bypass") && text.contains("100009"), "{text}");
 
     let only = ok(&p, &["authz", "results", &run_id, "--verdict", "bypass"]);
     assert_eq!(only["results"].as_array().unwrap().len(), 1, "{only}");

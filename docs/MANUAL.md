@@ -3274,9 +3274,11 @@ A bypass is `high` confidence when the request names an object (a number, UUID, 
 id or email address) and the owner's values or username came back, `medium` when it names
 an object but only the similarity shows it, or when the path looks privileged (admin,
 users, roles, ...), and `low` otherwise: `/dashboard` may simply be the same for everyone.
-Medium and high bypasses are findings (source `authz`): *Access Control Bypass* (100003)
+Medium and high bypasses are findings (source `authz`): *Access Control Bypass* (100009)
 for another profile, *Protected Content Without Authentication* (100004) for the anonymous
-control. Low ones are only in the results, to review.
+control. Low ones are only in the results, to review. Builds up to 0.8.4 filed *Access
+Control Bypass* as 100003, the id of the active rule *HQL Injection*; opening a project
+moves those findings (and their issues) to 100009.
 
 Safety: from history only GET requests that carry credentials are replayed;
 `--include-methods POST,PUT` (or `all`) adds others, which then change data as another user,
