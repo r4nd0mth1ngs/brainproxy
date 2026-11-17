@@ -57,6 +57,13 @@ fn lookarounds_ok(text: &str, addr: &str, start: usize, end: usize) -> bool {
     }
 }
 
+/// Diverges from ZAP: `10.0.0.0/8` (a validator's or a network library's constant) names a
+/// range, not a host that discloses anything.
+fn is_cidr(text: &str, end: usize) -> bool {
+    let b = text.as_bytes();
+    b.get(end) == Some(&b'/') && b.get(end + 1).is_some_and(u8::is_ascii_digit)
+}
+
 pub struct PrivateAddress;
 
 impl PassiveRule for PrivateAddress {
@@ -88,7 +95,7 @@ impl PassiveRule for PrivateAddress {
                 continue;
             }
             pos = all.end().max(all.start() + 1);
-            if !addr.as_str().eq_ignore_ascii_case(&msg.host) {
+            if !addr.as_str().eq_ignore_ascii_case(&msg.host) && !is_cidr(body, all.end()) {
                 found.push(all.as_str());
             }
         }
@@ -120,5 +127,15 @@ mod tests {
         assert!(msg("https://a.test/").html(body).scan(&PrivateAddress).is_empty());
         assert!(msg("http://192.168.1.10/").html("at 192.168.1.10").scan(&PrivateAddress).is_empty());
         assert!(msg("https://a.test/").body("10.0.0.1").scan(&PrivateAddress).is_empty());
+    }
+
+    /// Range constants in a script are not addresses; a host next to them still is.
+    #[test]
+    fn ignores_cidr_ranges() {
+        let js = "const r = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'];";
+        let m = msg("https://a.test/v.js").header("Content-Type", "application/javascript");
+        assert!(m.body(js).scan(&PrivateAddress).is_empty());
+        let f = msg("https://a.test/").html("net 10.0.0.0/8, gateway 10.0.0.1").scan(&PrivateAddress);
+        assert_eq!(f[0].evidence, "10.0.0.1");
     }
 }
