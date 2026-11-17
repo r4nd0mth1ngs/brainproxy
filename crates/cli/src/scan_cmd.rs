@@ -452,13 +452,13 @@ pub enum SuppressCmd {
         positives left out), out of `findings compare --fail-on`, and survives a rescan, while `--state \
         all` still shows it. Findings added by hand and findings a person or agent triaged are left as \
         they are. --alert matches an alert ref or a rule id (10020 or 10020-1), --host the finding's \
-        host exactly, --path-prefix the start of its URL's path, --param its parameter exactly. Refused \
+        host exactly (with :PORT, only findings on that port), --path-prefix the start of its URL's path, --param its parameter exactly. Refused \
         through MCP: an agent suggests marks on findings instead (`findings mark ID --suggest`).")]
     Add {
         /// Alert ref or rule id, e.g. 10020 or 10020-1.
         #[arg(long)]
         alert: String,
-        /// The host, e.g. app.test.
+        /// The host, e.g. app.test, or with a port to match only that one, e.g. 127.0.0.1:3000.
         #[arg(long)]
         host: String,
         /// Only findings whose URL path starts with this, e.g. /static/.

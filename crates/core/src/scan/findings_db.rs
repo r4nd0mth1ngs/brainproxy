@@ -376,6 +376,7 @@ pub const SUPPRESSION_COLUMNS: &[(&str, &str, &str)] = &[
     ("time", "TEXT", "When it was added"),
     ("alert_ref", "TEXT", "Alert ref or rule id it matches (findings.alert_ref, or findings.rule_id as text)"),
     ("host", "TEXT", "Host it matches (findings.host, lowercase)"),
+    ("port", "INTEGER", "Only findings on this port (--host NAME:PORT); NULL for any"),
     ("path_prefix", "TEXT", "Only findings whose URL path starts with this; '' for any path"),
     ("param", "TEXT", "Only findings of this parameter, header or cookie; NULL for any"),
     ("reason", "TEXT", "Why: the note of each finding it marks"),
@@ -396,6 +397,7 @@ pub struct Suppression {
 /// A stored rule, as matching needs it.
 struct Rule {
     id: i64,
+    port: Option<u16>,
     path_prefix: String,
     param: Option<String>,
     reason: String,
@@ -407,22 +409,31 @@ impl Rule {
         if self.param.as_deref().is_some_and(|p| p != param) {
             return false;
         }
-        if self.path_prefix.is_empty() {
+        if self.path_prefix.is_empty() && self.port.is_none() {
             return true;
         }
-        url::Url::parse(&identity_url(url)).is_ok_and(|u| u.path().starts_with(&self.path_prefix))
+        url::Url::parse(&identity_url(url)).is_ok_and(|u| {
+            u.path().starts_with(&self.path_prefix) && self.port.is_none_or(|p| u.port_or_known_default() == Some(p))
+        })
     }
 }
 
 /// The rules for `alert_ref` (or its rule id) on `host`, oldest first.
 fn rules_for(conn: &rusqlite::Connection, alert_ref: &str, rule_id: i64, host: &str) -> Result<Vec<Rule>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, path_prefix, param, reason, origin FROM suppressions
+        "SELECT id, path_prefix, param, reason, origin, port FROM suppressions
          WHERE (alert_ref = ?1 OR alert_ref = CAST(?2 AS TEXT)) AND host = lower(?3) ORDER BY id",
     )?;
     let rules = stmt
         .query_map(params![alert_ref, rule_id, host], |r| {
-            Ok(Rule { id: r.get(0)?, path_prefix: r.get(1)?, param: r.get(2)?, reason: r.get(3)?, origin: r.get(4)? })
+            Ok(Rule {
+                id: r.get(0)?,
+                path_prefix: r.get(1)?,
+                param: r.get(2)?,
+                reason: r.get(3)?,
+                origin: r.get(4)?,
+                port: r.get(5)?,
+            })
         })?
         .collect::<std::result::Result<_, _>>()?;
     Ok(rules)
@@ -462,6 +473,24 @@ fn suppress_by(conn: &rusqlite::Connection, finding: i64, rule: &Rule, history_i
         },
     )?;
     Ok(true)
+}
+
+/// A suppression rule's `--host`: findings keep their host without the port, so `NAME:PORT`
+/// (or `[v6]:PORT`) becomes the name to match plus a port the URL must have.
+fn suppression_host(given: &str) -> Result<(String, Option<u16>)> {
+    let given = given.trim();
+    let bad = || Error::InvalidInput(format!("--host {given:?}: give a host name, such as app.test or 127.0.0.1:3000"));
+    if given.is_empty() || given.contains(['/', ' ', '@', '?', '#']) {
+        return Err(bad());
+    }
+    let parsed = url::Url::parse(&format!("http://{given}/")).map_err(|_| bad())?;
+    let host = url_host(&parsed).to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(bad());
+    }
+    let has_port = if given.starts_with('[') { given.contains("]:") } else { given.contains(':') };
+    // `port()` is None for http's default, so `NAME:80` reads back as no port: it was given.
+    Ok((host, has_port.then(|| parsed.port().unwrap_or(80))))
 }
 
 /// A new finding a scanner found, matched against the suppression rules: the first (oldest)
@@ -1222,14 +1251,11 @@ impl Store {
             ));
         }
         let alert = s.alert.trim();
-        let host = s.host.trim().to_ascii_lowercase();
+        let (host, port) = suppression_host(&s.host)?;
         let reason = s.reason.trim();
         let prefix = s.path_prefix.trim();
         if alert.is_empty() {
             return Err(Error::InvalidInput("give the alert ref or rule id it suppresses (--alert)".into()));
-        }
-        if host.is_empty() || host.contains(['/', ' ']) {
-            return Err(Error::InvalidInput(format!("--host {host:?}: give a host name, such as app.test")));
         }
         if reason.is_empty() {
             return Err(Error::InvalidInput("give the reason (--reason): it is the note of each finding".into()));
@@ -1239,12 +1265,14 @@ impl Store {
         }
         let tx = self.write_tx()?;
         tx.execute(
-            "INSERT INTO suppressions (alert_ref, host, path_prefix, param, reason, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![alert, host, prefix, s.param, reason, crate::provenance::origin()],
+            "INSERT INTO suppressions (alert_ref, host, path_prefix, param, reason, origin, port)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![alert, host, prefix, s.param, reason, crate::provenance::origin(), port],
         )?;
         let id = tx.last_insert_rowid();
         let rule = Rule {
             id,
+            port,
             path_prefix: prefix.to_string(),
             param: s.param.clone(),
             reason: reason.to_string(),
@@ -1273,7 +1301,7 @@ impl Store {
     pub fn suppressions_list(&self) -> Result<Vec<Value>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.time, s.alert_ref, s.host, s.path_prefix, s.param, s.reason, s.origin,
-                (SELECT count(*) FROM findings f WHERE f.suppressed_by = s.id AND f.state = 'false_positive')
+                (SELECT count(*) FROM findings f WHERE f.suppressed_by = s.id AND f.state = 'false_positive'), s.port
              FROM suppressions s ORDER BY s.id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1289,6 +1317,7 @@ impl Store {
                 "by": crate::provenance::describe(origin.as_deref()),
                 "origin": origin,
                 "findings": r.get::<_, i64>(8)?,
+                "port": r.get::<_, Option<u16>>(9)?,
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -3099,6 +3128,33 @@ mod tests {
         seen_at(&mut s, "/static/c.js");
         assert_eq!(state_of(&s, "/static/c.js").0, "open");
         assert!(matches!(s.suppression_remove(id, false), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn a_suppression_host_can_name_a_port() {
+        assert_eq!(suppression_host("App.test").unwrap(), ("app.test".into(), None));
+        assert_eq!(suppression_host("127.0.0.1:3300").unwrap(), ("127.0.0.1".into(), Some(3300)));
+        assert_eq!(suppression_host("app.test:80").unwrap(), ("app.test".into(), Some(80)));
+        assert_eq!(suppression_host("[::1]:8443").unwrap(), ("::1".into(), Some(8443)));
+        assert_eq!(suppression_host("[::1]").unwrap(), ("::1".into(), None));
+        for bad in ["", "app.test/x", "a b", "app.test:99999", "user@app.test"] {
+            assert!(matches!(suppression_host(bad), Err(Error::InvalidInput(_))), "{bad:?}");
+        }
+        // Findings are stored by host name; the port picks among them by their URL.
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        let url = xpb(&s)[0]["url"].as_str().unwrap().to_string();
+        let port = url::Url::parse(&url).unwrap().port_or_known_default().unwrap();
+        let host = url_host(&url::Url::parse(&url).unwrap());
+        let rule = |p: u16| Suppression {
+            alert: "10037".into(),
+            host: format!("{host}:{p}"),
+            reason: "noise".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.suppression_add(&rule(port.wrapping_add(1))).unwrap().1, 0, "another port");
+        assert_eq!(s.suppression_add(&rule(port)).unwrap().1, 1, "{url}");
+        assert_eq!(s.suppressions_list().unwrap()[1]["port"], port);
     }
 
     #[test]

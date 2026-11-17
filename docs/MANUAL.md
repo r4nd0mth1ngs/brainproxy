@@ -3081,7 +3081,9 @@ Findings are records with a history, not just rows:
   decision.
 - **Suppression rules** (`findings suppress add --alert A --host H [--path-prefix /static/]
   [--param P] --reason R`, `findings suppress list`, `findings suppress remove ID [--reopen]`):
-  an alert on a host, maybe only under a path or for one parameter, is a false positive
+  an alert on a host (`H` is a name such as `app.test`, or `127.0.0.1:3000` for that port
+  only; `list` gives the rule's `port`, null for any), maybe only under a path or for one
+  parameter, is a false positive
   wherever a scan finds it, now and later. Matching findings are still stored, so nothing is
   lost: they are marked `false_positive` (not a state of their own, so lists, reports,
   `findings compare --fail-on` and rescans treat them as every false positive), with the

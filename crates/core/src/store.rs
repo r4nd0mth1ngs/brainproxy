@@ -145,7 +145,8 @@ ALTER TABLE issues ADD COLUMN decision_note TEXT;
 ALTER TABLE issues ADD COLUMN decision_origin TEXT;
 ALTER TABLE issues ADD COLUMN decision_at TEXT;
 ALTER TABLE findings ADD COLUMN suppressed_by INTEGER;
-CREATE TABLE IF NOT EXISTS suppressions (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), alert_ref TEXT NOT NULL, host TEXT NOT NULL, path_prefix TEXT NOT NULL DEFAULT '', param TEXT, reason TEXT NOT NULL, origin TEXT);
+CREATE TABLE IF NOT EXISTS suppressions (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), alert_ref TEXT NOT NULL, host TEXT NOT NULL, path_prefix TEXT NOT NULL DEFAULT '', param TEXT, reason TEXT NOT NULL, origin TEXT, port INTEGER);
+ALTER TABLE suppressions ADD COLUMN port INTEGER;
 ";
 
 /// Column documentation for the log of setting changes.
