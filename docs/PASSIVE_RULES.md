@@ -137,3 +137,7 @@ noise on modern applications:
   doesn't count.
 - **Obsolete CSP Header (10038-2)** isn't raised: the CSP rule's 10055-1 and 10055-2 report
   `X-Content-Security-Policy` and `X-WebKit-CSP` with their values.
+- **Timestamp Disclosure (10096)** raises one finding per header and one for the body, with
+  the first timestamp as evidence and the others in the other info (ZAP: one per match, so
+  a single response could add hundreds of hits). It skips numbers inside URLs (`?id=…`,
+  `/items/…`) and the bodies of scripts and stylesheets, whose numbers are ids and constants.
