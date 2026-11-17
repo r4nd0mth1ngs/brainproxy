@@ -799,7 +799,13 @@ attack type, and pick payloads:
   client-side routes, clicks buttons, menus and other clickable elements, fills fields
   with test values and submits forms, and records the API calls (XHR, fetch) this
   triggers. Fields are filled before a page state is read, so a submit button that stays
-  disabled until the form is valid (a sign-in or register form) is clicked too. Each distinct page state is explored once. It is slower than the plain crawl.
+  disabled until the form is valid (a sign-in or register form) is clicked too. A combobox
+  or listbox that isn't a native `<select>` (ARIA `role="combobox"` or `role="listbox"`, such
+  as Angular Material's `mat-select`) is opened with a click and its first option picked; a
+  slider is moved to its maximum; a field labelled like a captcha's answer gets the sum of
+  an arithmetic captcha shown beside it (`What is 3+4*2 ?`); and when answering some fields
+  opens others (a security question after the e-mail is looked up), those are filled too
+  (up to three rounds). Each distinct page state is explored once. It is slower than the plain crawl.
   - **What it won't do:** click elements or follow links labelled like *log out*,
     *delete*, *remove*, *reset* or *unsubscribe* (the summary lists them under
     `not_clicked`), answer *OK* to a confirmation dialog, open pop-ups or downloads,
