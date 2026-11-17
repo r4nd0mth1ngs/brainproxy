@@ -639,6 +639,14 @@ impl Vault {
         self.0.lock().unwrap().entries.insert(ph, entry);
     }
 
+    /// The value behind a session placeholder that belongs in one header (a cookie, the
+    /// token, a static header), for a scan rule that attacks the credential itself. Never a
+    /// password, macro value or query key, which may only be filled in as a request goes out.
+    pub(crate) fn session_value(&self, ph: &str) -> Option<String> {
+        let inner = self.0.lock().unwrap();
+        inner.entries.get(ph).filter(|e| e.header.is_some()).map(|e| e.value.clone())
+    }
+
     /// Lets an anywhere value (password, macro value) also go to `origin`.
     pub(crate) fn allow(&self, ph: &str, origin: &str) {
         if let Some(e) = self.0.lock().unwrap().entries.get_mut(ph) {

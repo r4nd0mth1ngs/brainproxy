@@ -64,9 +64,13 @@ These use IDs from 100000, so they never clash with ZAP's.
   The payload is never changed except `exp` in the expiry test, so a forged token claims
   the same user as the real one. The attacks run once per origin, token place, algorithm
   and `kid`. With `--auth`, the session leaves the token's header, cookie or parameter as
-  the rule set it. A token the auth profile adds itself is a placeholder the client fills
-  in, so the rule doesn't see it: scan a recorded request that carries the token. The
-  passive rule 100008 reports what traffic shows without sending anything.
+  the rule set it. A request recorded with `--auth` carries an auth placeholder
+  (`«auth:NAME:token»`, or a cookie's or header's) instead of the token; the rule reads the
+  token behind it from the project's session values, as sending does, and keeps the
+  placeholder in every request on record. Such a token's signature stays a secret: the
+  changed-signature and `jku`/`x5u` tests use a made-up signature instead of the real one,
+  and a weak-secret finding doesn't quote the token. The passive rule 100008 reports what
+  traffic shows without sending anything.
 
 ## Rules
 

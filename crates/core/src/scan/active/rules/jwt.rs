@@ -2,7 +2,8 @@
 //! themselves run once per origin, token place and algorithm.
 //!
 //! It finds JWTs in the base request (a header such as `Authorization: Bearer`, a cookie, a
-//! query or body parameter) and:
+//! query or body parameter), also behind the auth placeholders a request recorded with
+//! `--auth` carries (`«auth:NAME:token»`, a cookie's or a header's), and:
 //!
 //! - cracks an HMAC signature (HS256/384/512) against a list of common secrets, offline:
 //!   nothing is sent;
@@ -19,9 +20,12 @@
 //!
 //! The payload is never changed except for `exp` in the expiry test, so a forged token
 //! claims the same identity as the real one. With `--auth`, the session leaves the token's
-//! header, cookie or parameter as the rule set it. A token the auth profile puts on itself is
-//! a placeholder the client fills in, so the rule doesn't see it: scan a recorded request that
-//! carries the token instead.
+//! header, cookie or parameter as the rule set it.
+//!
+//! A token behind a placeholder is read from the project's session values (as the client
+//! fills it in), and the requests on record keep the placeholder for the real token. Its
+//! signature is a secret: forged tokens never carry it (the changed-signature and `jku`/`x5u`
+//! tests use a made-up one) and a weak-secret finding doesn't quote the token.
 //!
 //! Attack ideas follow the SasanLabs OWASP ZAP JWT add-on (Apache License 2.0) and the
 //! WSTG's JWT testing guide; nothing is ported from them.
@@ -174,6 +178,10 @@ const SECRETS: &str = include_str!("data/jwt-secrets.txt");
 /// A JWT in three parts (the signature may be empty).
 static TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*").unwrap());
+
+/// An auth placeholder for a session value bound to one header: the token, a cookie, a header.
+static SESSION_PLACEHOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"«auth:[^:»\s]+:(?:token|cookie:[^»\s]+|header:[^»\s]+)»").unwrap());
 
 /// A token split into its parts, with its header and payload decoded.
 #[derive(Debug, Clone)]
@@ -369,6 +377,47 @@ fn locate(cx: &Cx, request: &[u8], token: &str) -> (String, Keep) {
     (label.unwrap_or_else(|| "JWT".into()), keep)
 }
 
+/// A token in the base request.
+struct Found {
+    jwt: Jwt,
+    /// The text in the request that stands for it: the token itself, or an auth placeholder.
+    from: String,
+    /// What `from` stands for: the token, or a header value holding it (`Bearer ...`).
+    value: String,
+    /// Behind a placeholder: the token is a secret the requests on record must not hold.
+    hidden: bool,
+}
+
+impl Found {
+    /// The base request with the token replaced by `token`.
+    fn request(&self, request: &[u8], token: &str) -> Vec<u8> {
+        with_token(request, &self.from, &self.value.replace(&self.jwt.raw, token))
+    }
+}
+
+/// The JWTs in the base request, each once: written in it, then behind its session placeholders.
+fn found(cx: &Cx, text: &str) -> Vec<Found> {
+    let mut out: Vec<Found> = Vec::new();
+    let mut add = |raw: &str, from: &str, value: &str, hidden: bool| {
+        if out.iter().any(|f| f.jwt.raw == raw) {
+            return;
+        }
+        if let Some(jwt) = Jwt::parse(raw) {
+            out.push(Found { jwt, from: from.to_string(), value: value.to_string(), hidden });
+        }
+    };
+    for m in TOKEN.find_iter(text) {
+        add(m.as_str(), m.as_str(), m.as_str(), false);
+    }
+    for m in SESSION_PLACEHOLDER.find_iter(text) {
+        let Some(value) = cx.session_value(m.as_str()) else { continue };
+        if let Some(t) = TOKEN.find(&value) {
+            add(t.as_str(), m.as_str(), &value, true);
+        }
+    }
+    out
+}
+
 /// The base request with every copy of `from` replaced by `to`.
 fn with_token(request: &[u8], from: &str, to: &str) -> Vec<u8> {
     let text = String::from_utf8_lossy(request).replace(from, to);
@@ -393,6 +442,7 @@ fn tries(strength: Strength) -> usize {
 struct Probe<'a> {
     cx: &'a Cx,
     request: &'a [u8],
+    found: &'a Found,
     jwt: &'a Jwt,
     keep: Keep,
     place: String,
@@ -407,7 +457,7 @@ impl Probe<'_> {
         if self.cx.stopped() {
             return None;
         }
-        let resp = self.cx.send_keeping(with_token(self.request, &self.jwt.raw, forged), &self.keep).await.ok()?;
+        let resp = self.cx.send_keeping(self.found.request(self.request, forged), &self.keep).await.ok()?;
         (same(&resp, &self.real) && !same(&resp, &self.absent)).then_some(resp)
     }
 
@@ -455,20 +505,32 @@ impl Probe<'_> {
         keys
     }
 
-    async fn run(&self, secret: Option<&str>) {
-        let jwt = self.jwt;
-        let strength = self.cx.strength();
-        // A changed signature: nothing below is worth sending once this is accepted.
-        let mut sig = jwt.signature.clone();
+    /// A signature that isn't the token's: one bit changed, or for a hidden token (whose
+    /// signature must not go on record) a made-up one of the same length.
+    fn wrong_signature(&self) -> Vec<u8> {
+        let mut sig = if self.found.hidden {
+            (0..self.jwt.signature.len()).map(|i| (i as u8).wrapping_mul(37) ^ 0x5a).collect()
+        } else {
+            self.jwt.signature.clone()
+        };
         match sig.last_mut() {
             Some(b) => *b ^= 0x01,
             None => sig.push(0x42),
         }
-        let flipped = format!("{}.{}", jwt.signing_input(), URL_SAFE_NO_PAD.encode(&sig));
+        sig
+    }
+
+    async fn run(&self, secret: Option<&str>) {
+        let jwt = self.jwt;
+        let strength = self.cx.strength();
+        // A changed signature: nothing below is worth sending once this is accepted.
+        let flipped = format!("{}.{}", jwt.signing_input(), URL_SAFE_NO_PAD.encode(self.wrong_signature()));
         if let Some(resp) = self.accepted(&flipped).await {
-            let other = "The token was sent with one bit of its signature changed and was answered like the \
-                real token, while the request without a token was answered differently."
-                .to_string();
+            let how = if self.found.hidden { "a made-up signature" } else { "one bit of its signature changed" };
+            let other = format!(
+                "The token was sent with {how} and was answered like the real token, while the request without a \
+                 token was answered differently."
+            );
             self.report(&NOT_VERIFIED, &flipped, other, &resp);
             return;
         }
@@ -539,16 +601,17 @@ impl Probe<'_> {
                 }
             }
         }
-        // jku and x5u naming the OOB listener; the original signature is kept.
+        // jku and x5u naming the OOB listener; the original signature is kept, unless it is
+        // hidden: a server fetches the URL before it checks the signature anyway.
         for field in ["jku", "x5u"] {
             if self.cx.stopped() {
                 return;
             }
             let Some(payload) = self.cx.oob_payload() else { return };
             let header = header_with(jwt, &[(field, Value::from(payload.url.clone()))]);
-            let forged =
-                format!("{}.{}.{}", b64_json(&header), jwt.payload_b64, URL_SAFE_NO_PAD.encode(&jwt.signature));
-            let request = with_token(self.request, &jwt.raw, &forged);
+            let sig = if self.found.hidden { self.wrong_signature() } else { jwt.signature.clone() };
+            let forged = format!("{}.{}.{}", b64_json(&header), jwt.payload_b64, URL_SAFE_NO_PAD.encode(sig));
+            let request = self.found.request(self.request, &forged);
             let resp = self.cx.send_keeping(request.clone(), &self.keep).await.ok();
             let finding = HEADER_URL
                 .raise(self.place.clone(), "")
@@ -582,26 +645,14 @@ impl ActiveRule for JwtWeaknesses {
         Box::pin(async move {
             let request = cx.base_request().to_vec();
             let text = String::from_utf8_lossy(&request).to_string();
-            let mut seen: Vec<&str> = Vec::new();
-            let tokens: Vec<Jwt> = TOKEN
-                .find_iter(&text)
-                .map(|m| m.as_str())
-                .filter(|t| {
-                    if seen.contains(t) {
-                        false
-                    } else {
-                        seen.push(t);
-                        true
-                    }
-                })
-                .filter_map(Jwt::parse)
-                .collect();
+            let tokens = found(cx, &text);
             let origin = cx.target().origin();
-            for jwt in &tokens {
+            for found in &tokens {
+                let jwt = &found.jwt;
                 if cx.stopped() {
                     return;
                 }
-                let (place, keep) = locate(cx, &request, &jwt.raw);
+                let (place, keep) = locate(cx, &request, &found.from);
                 let key = format!("100007|{origin}|{place}|{}|{}", jwt.alg(), jwt.kid().unwrap_or(""));
                 // Offline: the secret, once per origin, place and key.
                 let mut secret = None;
@@ -615,10 +666,8 @@ impl ActiveRule for JwtWeaknesses {
                                 format!("the secret \"{s}\"")
                             };
                             let other = format!("The {} signature verifies with {shown}.", jwt.alg());
-                            cx.report(
-                                WEAK_SECRET.raise(place.clone(), jwt.raw.clone()).other_info(other),
-                                cx.base_response(),
-                            );
+                            let evidence = if found.hidden { String::new() } else { jwt.raw.clone() };
+                            cx.report(WEAK_SECRET.raise(place.clone(), evidence).other_info(other), cx.base_response());
                         }
                     }
                 }
@@ -627,7 +676,7 @@ impl ActiveRule for JwtWeaknesses {
                 }
                 // Does this page depend on the token? The real token against none at all.
                 let Ok(real) = cx.send_keeping(request.clone(), &keep).await else { continue };
-                let Ok(absent) = cx.send_keeping(with_token(&request, &jwt.raw, ""), &keep).await else {
+                let Ok(absent) = cx.send_keeping(found.request(&request, ""), &keep).await else {
                     continue;
                 };
                 // A refused real token (it expired since it was recorded, say) would make every forged
@@ -635,7 +684,7 @@ impl ActiveRule for JwtWeaknesses {
                 if real.status >= 400 || same(&real, &absent) || !cx.once(&format!("{key}|attacked")) {
                     continue;
                 }
-                let probe = Probe { cx, request: &request, jwt, keep, place, real, absent };
+                let probe = Probe { cx, request: &request, found, jwt, keep, place, real, absent };
                 probe.run(secret.as_deref()).await;
             }
         })

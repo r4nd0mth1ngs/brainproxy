@@ -386,6 +386,13 @@ impl Cx {
         out.into_bytes()
     }
 
+    /// The current value behind a session placeholder (`«auth:NAME:token»`, a cookie's or
+    /// a header's) in the base request, as the client fills it in when sending. For a rule
+    /// that attacks the credential; it must not put the value on record.
+    pub(crate) fn session_value(&self, placeholder: &str) -> Option<String> {
+        self.shared.client.options().guard.as_ref()?.vault.session_value(placeholder)
+    }
+
     /// Sends a raw request to the base target.
     pub async fn send(&self, request: Vec<u8>) -> Result<Response> {
         let target = self.base.target.clone();

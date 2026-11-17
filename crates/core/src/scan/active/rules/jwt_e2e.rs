@@ -157,14 +157,29 @@ fn spawn_app() -> u16 {
     port
 }
 
-fn target(port: u16, path: &str) -> ScanTarget {
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        issued(path)
-    )
-    .into_bytes();
+/// How the base request carries its token.
+#[derive(Clone, Copy, PartialEq)]
+enum Carried {
+    /// As recorded through the proxy or with a literal header.
+    Literal,
+    /// As `send --auth` records it: a placeholder the vault fills in as it goes out.
+    Placeholder,
+}
+
+fn target(port: u16, path: &str, carried: Carried) -> ScanTarget {
+    let line = |token: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    };
+    let wire = line(&issued(path));
+    let req = match carried {
+        Carried::Literal => wire.clone(),
+        Carried::Placeholder => line(&crate::auth::placeholder("alice", "token")),
+    };
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.write_all(&req).unwrap();
+    s.write_all(&wire).unwrap();
     let mut response = Vec::new();
     s.read_to_end(&mut response).unwrap();
     ScanTarget {
@@ -178,8 +193,37 @@ fn target(port: u16, path: &str) -> ScanTarget {
 
 /// The alert refs the rule raises for `path`, sorted, and how many requests it sent.
 async fn scan(port: u16, path: &str, strength: Strength) -> (Vec<String>, u64) {
+    let (refs, requests, _) = scan_carried(port, path, strength, Carried::Literal).await;
+    (refs, requests)
+}
+
+/// [`scan`], also returning every text and blob value the project holds afterwards.
+async fn scan_carried(port: u16, path: &str, strength: Strength, carried: Carried) -> (Vec<String>, u64, Vec<String>) {
     let guard =
         Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "bp-jwt-{}-{}-{}",
+        path.trim_start_matches('/'),
+        std::process::id(),
+        crate::scan::active::rand_u64()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("project.db");
+    if carried == Carried::Placeholder {
+        // A profile that logged in earlier: the vault holds its token, as a command's guard would.
+        let store = crate::store::Store::open(&db).unwrap();
+        let profile = crate::auth::AuthProfile {
+            name: "alice".into(),
+            login_url: Some(format!("http://127.0.0.1:{port}/login")),
+            token_regex: Some(r#""token":"([^"]+)""#.into()),
+            token_header: Some("Authorization: Bearer {{token}}".into()),
+            ..Default::default()
+        };
+        store.auth_save_profile(&profile).unwrap();
+        let state = crate::auth::SessionState { token: Some(issued(path)), ..Default::default() };
+        store.auth_save_state("alice", &state).unwrap();
+        store.auth_fill_vault(&guard.vault).unwrap();
+    }
     let cfg = ActiveConfig {
         strength,
         tuning: Default::default(),
@@ -198,22 +242,37 @@ async fn scan(port: u16, path: &str, strength: Strength) -> (Vec<String>, u64) {
         check_methods: vec![],
         prune: false,
     };
-    let dir = std::env::temp_dir().join(format!(
-        "bp-jwt-{}-{}-{}",
-        path.trim_start_matches('/'),
-        std::process::id(),
-        crate::scan::active::rand_u64()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("project.db");
-    let summary = run(&db, vec![target(port, path)], cfg, JobControl::default()).await.unwrap();
+    let summary = run(&db, vec![target(port, path, carried)], cfg, JobControl::default()).await.unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     let mut st = conn.prepare("SELECT alert_ref FROM findings ORDER BY alert_ref").unwrap();
     let refs: Vec<String> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     drop(st);
+    let mut values = Vec::new();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'auth!_%' ESCAPE '!'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for t in tables {
+        let mut st = conn.prepare(&format!("SELECT * FROM \"{t}\"")).unwrap();
+        let n = st.column_count();
+        let mut rows = st.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..n {
+                match row.get_ref(i).unwrap() {
+                    rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+                        values.push(String::from_utf8_lossy(b).into_owned())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
-    (refs, summary.requests)
+    (refs, summary.requests, values)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -234,6 +293,28 @@ async fn each_weakness_is_found_and_only_it() {
     ] {
         let (refs, _) = scan(port, path, strength).await;
         assert_eq!(refs, want, "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_behind_an_auth_placeholder_is_attacked_and_stays_off_the_record() {
+    let port = spawn_app();
+    for (path, want) in [
+        ("/safe", vec![]),
+        ("/noverify", vec!["100007-1"]),
+        ("/none", vec!["100007-2"]),
+        ("/weak-noexp", vec!["100007-4", "100007-5"]),
+        ("/confusion", vec!["100007-7"]),
+    ] {
+        let (refs, _, values) = scan_carried(port, path, Strength::Medium, Carried::Placeholder).await;
+        assert_eq!(refs, want, "{path}");
+        // Outside the profile's own session (the auth tables), neither the token nor its
+        // signature (which a forged token with the signature kept, or one bit of it changed,
+        // would give away) is written anywhere.
+        let token = issued(path);
+        let signature = token.rsplit('.').next().unwrap();
+        let leaked: Vec<&String> = values.iter().filter(|v| v.contains(signature)).collect();
+        assert!(leaked.is_empty(), "{path}: {leaked:?}");
     }
 }
 
