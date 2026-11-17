@@ -38,6 +38,7 @@ import {
   ticketText,
   type Tracker,
 } from "./findingsFilter";
+import { afterMark, NEXT_FINDING, PREVIOUS_FINDING, stepFinding, TRIAGE_KEYS } from "./findingsTriage.ts";
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
@@ -137,6 +138,7 @@ export function FindingsView({ active }: { active: boolean }) {
   }, [data, risks, hideFp, comparing, seen, compare, filter]);
 
   const hosts = useMemo(() => hostsOf(data?.items ?? []), [data]);
+  const byId = useMemo(() => new Map((data?.items ?? []).map((f) => [f.id, f])), [data]);
   const shown = useMemo(() => groups.flatMap((g) => g.items.map((f) => f.id)), [groups]);
   const picked = useMemo(() => shown.filter((id) => checked.has(id)), [shown, checked]);
   const filtering = filter.text !== "" || filter.source !== "all" || filter.host !== "";
@@ -295,12 +297,24 @@ export function FindingsView({ active }: { active: boolean }) {
   const reloadEvents = (id: number) =>
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(id)]).then((t) => openId.current === id && setEvents(t.events), () => {});
 
-  const mark = async (state: string) => {
+  // Opens a finding, and its group so it shows in the list.
+  const select = (id: number | null) => {
+    if (id == null) return;
+    const f = byId.get(id);
+    if (f) setOpen((o) => (o.has(groupKey(f)) ? o : new Set(o).add(groupKey(f))));
+    setSelected(id);
+  };
+
+  // `advance`: then the next finding opens (from the keyboard), unless another was opened meanwhile.
+  const mark = async (state: string, advance = false) => {
     if (!finding) return;
+    const id = finding.id;
+    const next = advance ? afterMark(shown, id) : null;
     try {
-      await run(["findings", "mark", String(finding.id), "--state", state]);
-      setFinding((cur) => (cur?.id === finding.id ? { ...cur, state } : cur));
-      reloadEvents(finding.id);
+      await run(["findings", "mark", String(id), "--state", state]);
+      setFinding((cur) => (cur?.id === id ? { ...cur, state } : cur));
+      if (advance && openId.current === id && next != null) select(next);
+      else reloadEvents(id);
       refresh();
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -409,7 +423,12 @@ export function FindingsView({ active }: { active: boolean }) {
   // The report builder: audience, sections, branding, format, with a preview.
   const [reporting, setReporting] = useState(false);
   const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
+  const noFinding: string | false = finding ? false : "No finding is open";
+  const noList: string | false = shown.length ? false : "No findings are shown";
   useActions([
+    { ...NEXT_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, 1)) },
+    { ...PREVIOUS_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, -1)) },
+    ...TRIAGE_KEYS.map((k) => ({ ...k, hidden: !active, disabled: noFinding, run: () => mark(k.state, true) })),
     { id: "findings.new", title: "New finding…", group: "Findings", keywords: "write up manual issue", run: () => app.newFinding({}) },
     {
       id: "findings.report",
@@ -423,6 +442,12 @@ export function FindingsView({ active }: { active: boolean }) {
     },
   ]);
 
+  // The open finding stays in view as the keyboard moves through the list.
+  const tree = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (selected != null) tree.current?.querySelector(`[data-finding="${selected}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [selected, open]);
+
   const toggle = <T,>(set: Set<T>, v: T) => {
     const s = new Set(set);
     s.has(v) ? s.delete(v) : s.add(v);
@@ -432,9 +457,9 @@ export function FindingsView({ active }: { active: boolean }) {
   return (
     <div className="col fill">
       <div className="toolbar">
-        <div className="seg">
+        <div className="seg" role="group" aria-label="Risks shown">
           {RISKS.map((r) => (
-            <button key={r} className={risks.has(r) ? "on" : ""} onClick={() => setRisks(toggle(risks, r))}>
+            <button key={r} className={risks.has(r) ? "on" : ""} aria-pressed={risks.has(r)} onClick={() => setRisks(toggle(risks, r))}>
               <span className={`dot-risk risk-${r}`} /> {r} <span className="muted">{counts[r] ?? 0}</span>
             </button>
           ))}
@@ -518,7 +543,7 @@ export function FindingsView({ active }: { active: boolean }) {
         </div>
       )}
       <Split id="findings" dir="row" initial={0.34}>
-        <div className="tree">
+        <div className="tree" ref={tree}>
           {groups.length === 0 && (
             <div className="empty">
               {comparing
@@ -550,7 +575,7 @@ export function FindingsView({ active }: { active: boolean }) {
                       setChecked(next);
                     }}
                   />
-                  <button className="tree-group" onClick={() => setOpen(toggle(open, g.key))}>
+                  <button className="tree-group" aria-expanded={open.has(g.key) || filter.text !== ""} onClick={() => setOpen(toggle(open, g.key))}>
                     <span className="caret">{open.has(g.key) ? "▾" : "▸"}</span>
                     <span className={`dot-risk risk-${g.risk}`} />
                     <span className="grow ellipsis">
@@ -582,7 +607,12 @@ export function FindingsView({ active }: { active: boolean }) {
                         checked={checked.has(f.id)}
                         onChange={() => setChecked(toggle(checked, f.id))}
                       />
-                      <button className={`tree-item ${selected === f.id ? "on" : ""} ${CLOSED.has(f.state) ? "struck" : ""}`} onClick={() => setSelected(f.id)}>
+                      <button
+                        data-finding={f.id}
+                        className={`tree-item ${selected === f.id ? "on" : ""} ${CLOSED.has(f.state) ? "struck" : ""}`}
+                        aria-current={selected === f.id ? "true" : undefined}
+                        onClick={() => setSelected(f.id)}
+                      >
                         <span className="ellipsis">
                           {/* One rule can raise differently named alerts (e.g. 40018 for each database). */}
                           {f.name !== g.name && <span className="tree-subname">{f.name} · </span>}
@@ -610,9 +640,9 @@ export function FindingsView({ active }: { active: boolean }) {
                 </p>
               )}
               <div className="toolbar flat">
-                <div className="seg">
+                <div className="seg" role="group" aria-label="Triage state">
                   {STATES.map((s) => (
-                    <button key={s.id} className={finding.state === s.id ? "on" : ""} title={s.title} onClick={() => mark(s.id)}>
+                    <button key={s.id} className={finding.state === s.id ? "on" : ""} aria-pressed={finding.state === s.id} title={s.title} onClick={() => mark(s.id)}>
                       {s.label}
                     </button>
                   ))}
