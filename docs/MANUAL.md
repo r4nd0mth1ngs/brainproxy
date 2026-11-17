@@ -3335,7 +3335,7 @@ Each response gets a verdict:
 | --- | --- |
 | `enforced` | refused: an error status, a logged-out page, or a body saying access is denied |
 | `bypass` | the owner's data came back: most of the owner's private values (JSON values the anonymous response and the request don't contain), the owner's username, or a nearly identical response when there is nothing private to look for |
-| `public` | the anonymous control got the same response, so the page isn't protected |
+| `public` | the anonymous control got the same response, so the page isn't protected (a write is different, see below) |
 | `different` | a successful but different response, such as the identity's own data |
 | `inconclusive` | a successful response with nothing to compare: an empty body, `{}`, or a HEAD or OPTIONS request (tested only with `--include-methods HEAD,OPTIONS`). It says nothing about access, so check it by hand |
 
@@ -3345,7 +3345,15 @@ an object but only the similarity shows it, or when the path looks privileged (a
 users, roles, ...), and `low` otherwise: `/dashboard` may simply be the same for everyone.
 Medium and high bypasses are findings (source `authz`): *Access Control Bypass* (100009)
 for another profile, *Protected Content Without Authentication* (100004) for the anonymous
-control. Low ones are only in the results, to review. Builds up to 0.8.4 filed *Access
+control. Low ones are only in the results, to review.
+
+A request that changes state (POST, PUT, PATCH or DELETE, unless it is a GraphQL query, and
+any GraphQL mutation) made with credentials is never `public`: when the anonymous control
+gets a 2xx (not a logged-out page or a denial), its verdict is `bypass` and the finding is
+*Missing Authentication for a State-Changing Request* (100004-2), `medium` when the answer
+is like the owner's (or both are empty with the same status) and `low` when it differs.
+The other identities' successes are then `public`: the same root cause, reported once.
+Reads of public data stay `public`, with no finding. Builds up to 0.8.4 filed *Access
 Control Bypass* as 100003, the id of the active rule *HQL Injection*; opening a project
 moves those findings (and their issues) to 100009.
 

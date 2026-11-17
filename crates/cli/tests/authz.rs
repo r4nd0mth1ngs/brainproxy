@@ -1,6 +1,7 @@
 //! End-to-end test for `authz`: a local shop API where one order is readable by any
 //! logged-in user (the bug), another is checked properly, `/api/me` returns each user's
-//! own data, and `/public/info` needs no session.
+//! own data, `/public/info` needs no session, and `PUT /api/products/1` changes a product for
+//! anyone, logged in or not (missing authentication on a write).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -85,6 +86,10 @@ fn handle(mut s: TcpStream, logouts: &AtomicUsize, counter: &AtomicUsize, flaky:
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into()
         }
         ("/api/health", _) => json("200 OK", r#"{"status":"up"}"#.into()),
+        // The bug: anyone may change a product, with or without a session.
+        ("/api/products/1", _) if line.starts_with("PUT ") => {
+            json("200 OK", r#"{"id":1,"name":"Apple Juice","description":"changed"}"#.into())
+        }
         (_, None) => json("401 Unauthorized", r#"{"error":"login required"}"#.into()),
         // The bug: any logged-in user may read order 1.
         ("/api/orders/1", Some(_)) => json("200 OK", order(1, "alice")),
@@ -200,6 +205,36 @@ fn finds_the_readable_order_and_nothing_else() {
     let runs = ok(&p, &["authz", "list"]);
     assert_eq!(runs["runs"][0]["run_id"].as_i64().unwrap().to_string(), run_id, "{runs}");
     assert_eq!(runs["runs"][0]["state"], "completed", "{runs}");
+}
+
+#[test]
+fn a_write_that_succeeds_without_a_session_is_a_finding() {
+    let srv = Server::start();
+    let p = tmp_project("write");
+    let put = ["-X", "PUT", "-H", "Content-Type: application/json", "-d", r#"{"description":"changed"}"#];
+    ok(&p, &[&["send", "--url", &srv.url("/api/products/1"), "--auth", "alice"][..], &put].concat());
+    // Refused without a session, so not one.
+    ok(&p, &[&["send", "--url", &srv.url("/api/orders/3"), "--auth", "alice"][..], &put].concat());
+    ok(&p, &["send", "--url", &srv.url("/public/info"), "--auth", "alice"]);
+    let r = ok(&p, &["authz", "run", "--as", "bob", "--include-methods", "PUT"]);
+    assert_eq!(r["requests"], 3, "{r}");
+    assert_eq!(r["new_findings"], 1, "{r}");
+    let run_id = r["run_id"].as_i64().unwrap().to_string();
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    let anon = cell(&m, "/api/products/1", "anonymous");
+    assert_eq!((anon["verdict"].as_str(), anon["confidence"].as_str()), (Some("bypass"), Some("medium")), "{m}");
+    // Anyone may send it, so bob's success is the same root cause, not a second finding.
+    assert_eq!(cell(&m, "/api/products/1", "bob")["verdict"], "public", "{m}");
+    assert_eq!(cell(&m, "/api/orders/3", "anonymous")["verdict"], "enforced", "{m}");
+    // A read of public data stays quiet.
+    assert_eq!(cell(&m, "/public/info", "anonymous")["verdict"], "public", "{m}");
+    let f = ok(&p, &["findings", "list", "--source", "authz"]);
+    let text = f.to_string();
+    assert!(
+        text.contains("Missing Authentication for a State-Changing Request") && text.contains("100004-2"),
+        "{text}"
+    );
+    assert!(!text.contains("100009"), "{text}");
 }
 
 #[test]

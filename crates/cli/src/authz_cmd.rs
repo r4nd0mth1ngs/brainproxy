@@ -27,7 +27,8 @@ pub enum AuthzCmd {
     /// compare each response with the owner's (broken access control, IDOR).
     #[command(after_help = "Each request is re-sent as the identity that made it (twice: what changes between \
         the two is ignored), then without credentials, then as every --as identity. Verdicts: enforced \
-        (refused), bypass (the owner's data came back), public (also without a session), different (e.g. the \
+        (refused), bypass (the owner's data came back), public (also without a session; a POST, PUT, PATCH, DELETE or mutation made with credentials \
+        that succeeds without one is a bypass instead: missing authentication), different (e.g. the \
         identity's own data), inconclusive (nothing to compare: an empty body, or HEAD or OPTIONS). Bypasses of medium or high confidence are also findings (source authz). The \
         owner is found from the auth placeholders or session values in the request; --owner sets it. Only \
         GET requests that carry credentials are picked from history unless --include-methods or --history-id \
