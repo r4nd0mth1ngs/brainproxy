@@ -66,6 +66,15 @@ pub const ISSUE_COLUMNS: &[(&str, &str, &str)] = &[
     ("narrative_at", "TEXT", "When it was written"),
     ("reviewed_origin", "TEXT", "Who reviewed it (a person: gui or cli); NULL while a draft"),
     ("reviewed_at", "TEXT", "When it was reviewed"),
+    (
+        "decision",
+        "TEXT",
+        "false_positive or accepted_risk when the whole issue was marked so (`findings mark --issue`): its new \
+         instances arrive in that state; NULL when it was decided finding by finding, or not at all",
+    ),
+    ("decision_note", "TEXT", "The note given with the decision; new instances get it too"),
+    ("decision_origin", "TEXT", "Who made the decision: gui, cli or mcp"),
+    ("decision_at", "TEXT", "When the decision was made"),
 ];
 
 pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -74,7 +83,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp, or scanner (a fixed finding seen again: regressed); NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, suggested (`findings mark --suggest`: old is the state then, new the state suggested, text the note), retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
+    ("kind", "TEXT", "created, state, note, suggested (`findings mark --suggest`: old is the state then, new the state suggested, text the note), retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; decision (an issue's own: old and new are its decision before and after, text the note); a state event whose text starts \"inherited from issue\" is a new instance taking its issue's decision, by whoever made it; summary and summary_reviewed (the executive summary: no finding or issue)"),
     ("old", "TEXT", "Value before (a state, a note, an issue id; for edited, the changed fields as JSON)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
@@ -179,7 +188,8 @@ pub(crate) fn issue_for(conn: &Connection, alert_ref: &str, host: &str) -> Resul
     }
 }
 
-/// Puts a new finding in its issue and records that it was created.
+/// Puts a new finding in its issue and records that it was created. When the issue was
+/// decided as a whole (false positive or accepted risk), the finding takes that decision.
 pub(crate) fn created(
     conn: &Connection,
     finding: i64,
@@ -197,6 +207,124 @@ pub(crate) fn created(
             kind: "created",
             new: Some("open"),
             history_id,
+            ..Default::default()
+        },
+    )?;
+    inherit_decision(conn, finding, issue, history_id)
+}
+
+/// An issue's decision: the state its new instances arrive in, with its note and who made it.
+#[derive(Debug, Clone)]
+pub(crate) struct Decision {
+    pub state: String,
+    pub note: Option<String>,
+    pub origin: Option<String>,
+    pub at: Option<String>,
+}
+
+pub(crate) fn decision(conn: &Connection, issue: i64) -> Result<Option<Decision>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT decision, decision_note, decision_origin, decision_at FROM issues
+             WHERE id = ?1 AND decision IS NOT NULL",
+        )?
+        .query_row([issue], |r| Ok(Decision { state: r.get(0)?, note: r.get(1)?, origin: r.get(2)?, at: r.get(3)? }))
+        .optional()?)
+}
+
+/// A new instance of an issue decided as a whole takes the decision: its state and note, as
+/// set by whoever made the decision (so an agent can't undo a person's inherited decision
+/// either), with a state event that says where it came from. Otherwise every new page would
+/// raise a site-wide decision (a Server banner, a cookie flag) again as open work.
+fn inherit_decision(conn: &Connection, finding: i64, issue: i64, history_id: Option<i64>) -> Result<()> {
+    let Some(d) = decision(conn, issue)? else {
+        return Ok(());
+    };
+    let changed = conn
+        .prepare_cached(
+            "UPDATE findings SET state = ?1, state_origin = ?2,
+                state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                note = COALESCE(?3, note), note_origin = CASE WHEN ?3 IS NULL THEN note_origin ELSE ?2 END,
+                note_changed_at = CASE WHEN ?3 IS NULL THEN note_changed_at
+                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
+             WHERE id = ?4 AND state = 'open'",
+        )?
+        .execute(params![d.state, d.origin, d.note, finding])?;
+    if changed == 0 {
+        return Ok(());
+    }
+    let when = d.at.as_deref().map(|t| format!(" at {t}")).unwrap_or_default();
+    let mut text = format!(
+        "inherited from issue {issue}, marked {} {}{when}",
+        d.state.replace('_', " "),
+        crate::provenance::describe(d.origin.as_deref())
+    );
+    if let Some(n) = &d.note {
+        text.push_str(": ");
+        text.push_str(n);
+    }
+    record(
+        conn,
+        &Event {
+            origin: d.origin.as_deref(),
+            finding: Some(finding),
+            issue: Some(issue),
+            kind: "state",
+            old: Some("open"),
+            new: Some(&d.state),
+            text: Some(&text),
+            history_id,
+            ..Default::default()
+        },
+    )
+}
+
+/// States a whole issue can be decided as, for its new instances to inherit. Confirmed and
+/// retest pending are about the instances seen; fixed is undone by any new sighting.
+pub const DECISIONS: &[&str] = &["false_positive", "accepted_risk"];
+
+/// Records a whole issue marked `state` (with `note`): a false positive or accepted risk
+/// becomes its decision, which new instances inherit; any other state ends a decision. A note
+/// alone changes the decision's note. Under an MCP tool call a person's decision stays.
+pub(crate) fn decide(conn: &Connection, issue: i64, state: Option<&str>, note: Option<&str>) -> Result<()> {
+    let before = decision(conn, issue)?;
+    let note = note.map(str::trim).map(|n| Some(n).filter(|n| !n.is_empty()));
+    let (new_state, new_note) = match (state, &before) {
+        (Some(s), _) if DECISIONS.contains(&s) => {
+            let kept = before.as_ref().filter(|b| b.state == s).and_then(|b| b.note.clone());
+            (Some(s.to_string()), note.map_or(kept, |n| n.map(str::to_string)))
+        }
+        (Some(_), _) => (None, None),
+        (None, Some(b)) => (Some(b.state.clone()), note.map_or(b.note.clone(), |n| n.map(str::to_string))),
+        (None, None) => return Ok(()),
+    };
+    let old_state = before.as_ref().map(|b| b.state.clone());
+    let old_note = before.as_ref().and_then(|b| b.note.clone());
+    if new_state == old_state && new_note == old_note {
+        return Ok(());
+    }
+    if let Some(b) = &before {
+        crate::provenance::agent_may_change(
+            &format!("issue {issue}'s decision ({})", b.state.replace('_', " ")),
+            b.origin.as_deref(),
+            "suggest the change on its findings with `findings mark ID --suggest`, for a person to decide",
+        )?;
+    }
+    conn.execute(
+        "UPDATE issues SET decision = ?1, decision_note = ?2,
+            decision_origin = CASE WHEN ?1 IS NULL THEN NULL ELSE ?3 END,
+            decision_at = CASE WHEN ?1 IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
+         WHERE id = ?4",
+        params![new_state, new_note, crate::provenance::origin(), issue],
+    )?;
+    record(
+        conn,
+        &Event {
+            issue: Some(issue),
+            kind: "decision",
+            old: old_state.as_deref(),
+            new: new_state.as_deref(),
+            text: new_note.as_deref(),
             ..Default::default()
         },
     )
@@ -271,7 +399,8 @@ fn after_retest(state: &str, outcome: Retest) -> Option<&'static str> {
 
 /// What an issue's row says, counted over its findings (removed ones left out).
 const ISSUE_SELECT: &str = "SELECT i.id, i.alert_ref, i.host, COALESCE(i.title, max(f.name)) AS title,
-        i.title IS NOT NULL AS titled, max(f.risk_level) AS risk_level, count(f.id) AS instances,
+        i.title IS NOT NULL AS titled, i.decision, i.decision_note, i.decision_origin, i.decision_at,
+        max(f.risk_level) AS risk_level, count(f.id) AS instances,
         sum(f.hits) AS hits, min(f.time) AS first_seen,
         max(COALESCE((SELECT h.time FROM history h WHERE h.id = f.last_history_id), f.time)) AS last_seen,
         json_group_object(f.state, 1) AS states, group_concat(DISTINCT f.source) AS sources,
@@ -313,6 +442,20 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
             let score: f64 = r.get("cvss_score").unwrap_or(0.0);
             json!({"vector": v, "score": score, "severity": crate::scan::cvss::severity(score)})
         }),
+        // What new instances inherit (`findings mark --issue`); null when decided finding by finding.
+        "decision": match r.get::<_, Option<String>>("decision")? {
+            Some(state) => {
+                let origin: Option<String> = r.get("decision_origin")?;
+                json!({
+                    "state": state,
+                    "note": r.get::<_, Option<String>>("decision_note")?,
+                    "origin": origin,
+                    "by": crate::provenance::describe(origin.as_deref()),
+                    "at": r.get::<_, Option<String>>("decision_at")?,
+                })
+            }
+            None => Value::Null,
+        },
     }))
 }
 
@@ -734,6 +877,66 @@ mod tests {
         let events = s.finding_events(f).unwrap();
         assert_eq!(events[0]["kind"], "created");
         assert_eq!(events[0]["issue_id"], a["id"]);
+    }
+
+    fn seen(s: &mut Store, host: &str, path: &str) {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Powered-By: PHP/5.1\r\nContent-Length: 0\r\n\r\n";
+        let target = Target { scheme: "http".into(), host: host.into(), port: 80 };
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        s.record(&Capture::new("send", &target, req.as_bytes(), Some(resp), None, None)).unwrap();
+        passive::scan_pending(s).unwrap();
+    }
+
+    fn states(s: &Store, issue: i64) -> Vec<(String, Option<String>)> {
+        let f = FindingFilter { state: Some("all".into()), issue: Some(issue), ..Default::default() };
+        s.findings_list(&f, 100)
+            .unwrap()
+            .iter()
+            .map(|f| (f["state"].as_str().unwrap().to_string(), f["state_origin"].as_str().map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_issue_s_decision_reaches_its_new_instances() {
+        let mut s = store();
+        let issues = xpb(&s);
+        let a = issues.iter().find(|i| i["host"] == "a.test").unwrap()["id"].as_i64().unwrap();
+        let b = issues.iter().find(|i| i["host"] == "b.test").unwrap()["id"].as_i64().unwrap();
+        // Marked finding by finding: no decision, and a new instance is open work.
+        let one = s.issue_finding_ids(b).unwrap();
+        s.findings_mark(&one, Some("false_positive"), None, None).unwrap();
+        seen(&mut s, "b.test", "/new");
+        assert!(states(&s, b).contains(&("open".into(), None)), "{:?}", states(&s, b));
+        assert!(s.issue_get(b).unwrap()["decision"].is_null());
+        // Marked as a whole: a new instance arrives in that state, with the note, as set by
+        // whoever decided, and its timeline says where that came from.
+        s.findings_mark_issues(&[], &[a], Some("accepted_risk"), Some("decoy banner"), None).unwrap();
+        let d = s.issue_get(a).unwrap()["decision"].clone();
+        assert_eq!(
+            (d["state"].as_str(), d["note"].as_str(), d["origin"].as_str()),
+            (Some("accepted_risk"), Some("decoy banner"), Some("cli"))
+        );
+        seen(&mut s, "a.test", "/new");
+        assert_eq!(states(&s, a), vec![("accepted_risk".into(), Some("cli".into())); 3]);
+        let f = FindingFilter { state: Some("all".into()), issue: Some(a), ..Default::default() };
+        let newest = s.findings_list(&f, 100).unwrap().iter().map(|f| f["id"].as_i64().unwrap()).max().unwrap();
+        assert_eq!(s.finding_get(newest).unwrap()["note"], "decoy banner");
+        let last = s.finding_events(newest).unwrap().pop().unwrap();
+        assert_eq!(
+            (last["kind"].as_str(), last["new"].as_str(), last["origin"].as_str()),
+            (Some("state"), Some("accepted_risk"), Some("cli"))
+        );
+        assert!(
+            last["text"].as_str().unwrap().starts_with(&format!("inherited from issue {a}, marked accepted risk")),
+            "{last}"
+        );
+        let events = s.issue_get(a).unwrap()["events"].clone();
+        assert_eq!(events.as_array().unwrap().last().unwrap()["kind"], "decision");
+        // Another state for the whole issue ends the decision; fixed is never inherited.
+        s.findings_mark_issues(&[], &[a], Some("fixed"), None, None).unwrap();
+        assert!(s.issue_get(a).unwrap()["decision"].is_null());
+        seen(&mut s, "a.test", "/later");
+        assert!(states(&s, a).contains(&("open".into(), None)), "{:?}", states(&s, a));
     }
 
     #[test]

@@ -301,6 +301,9 @@ pub enum FindingsCmd {
         #[arg(value_name = "ID", required_unless_present_any = ["issue", "from"], conflicts_with = "from", num_args = 1..)]
         id: Vec<i64>,
         /// Every finding of this issue (`findings issues`), as well as any IDs given. Repeatable.
+        /// Marked false_positive or accepted_risk this way, the state is the issue's decision:
+        /// findings of the issue found later arrive in it, with the note; another state given
+        /// to the whole issue ends the decision. Findings marked by id leave it as it is.
         #[arg(long, value_name = "ISSUE", conflicts_with = "from")]
         issue: Vec<i64>,
         #[arg(long, value_enum)]
@@ -1453,29 +1456,35 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             if state.is_none() && note.is_none() {
                 return Err(Error::InvalidInput("give --state and/or --note".into()));
             }
+            if !suggest {
+                let ids =
+                    store.findings_mark_issues(&ids, &issue, state, note.as_deref(), if_state.map(StateArg::as_str))?;
+                // `note` is as given: "" when it was cleared, null when it was left alone.
+                let mut data = json!({"ids": ids, "state": state, "note": note});
+                if let [id] = ids.as_slice() {
+                    data["id"] = json!(id);
+                }
+                if !issue.is_empty() {
+                    data["issues"] = json!(issue);
+                }
+                let n = ids.len();
+                out.ok(data, || match (ids.as_slice(), issue.is_empty()) {
+                    ([id], true) => format!("updated finding {id}"),
+                    (_, true) => format!("updated {n} findings"),
+                    (_, false) => format!("updated {n} finding(s) of issue(s) {issue:?}"),
+                });
+                return Ok(());
+            }
             for i in issue {
                 ids.extend(store.issue_finding_ids(i)?);
             }
             ids.sort_unstable();
             ids.dedup();
-            if suggest {
-                store.findings_suggest(&ids, state, note.as_deref())?;
-                let n = ids.len();
-                out.ok(json!({"ids": ids, "suggested": true, "state": state, "note": note}), || {
-                    format!("suggested on {n} finding(s); nothing changed")
-                });
-                return Ok(());
-            }
-            store.findings_mark(&ids, state, note.as_deref(), if_state.map(StateArg::as_str))?;
-            // `note` is as given: "" when it was cleared, null when it was left alone.
-            match ids.as_slice() {
-                [id] => out.ok(json!({"id": id, "ids": ids, "state": state, "note": note}), || {
-                    format!("updated finding {id}")
-                }),
-                _ => out.ok(json!({"ids": ids, "state": state, "note": note}), || {
-                    format!("updated {} findings", ids.len())
-                }),
-            }
+            store.findings_suggest(&ids, state, note.as_deref())?;
+            let n = ids.len();
+            out.ok(json!({"ids": ids, "suggested": true, "state": state, "note": note}), || {
+                format!("suggested on {n} finding(s); nothing changed")
+            });
         }
         FindingsCmd::Add(args) => {
             let f = args.finding()?;

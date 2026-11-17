@@ -214,6 +214,17 @@ pub(crate) fn mark_with(
     Ok(())
 }
 
+/// The findings of an issue that aren't removed; an issue with none is not found.
+fn issue_ids(conn: &rusqlite::Connection, issue: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached("SELECT id FROM findings WHERE issue_id = ?1 AND state != ?2 ORDER BY id")?;
+    let ids: Vec<i64> =
+        stmt.query_map(params![issue, REMOVED], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    if ids.is_empty() {
+        return Err(Error::NotFound(format!("issue {issue} (or it has no findings)")));
+    }
+    Ok(ids)
+}
+
 /// A finding's state as stored (`removed` included).
 fn current_state(conn: &rusqlite::Connection, id: i64) -> Result<String> {
     conn.query_row("SELECT state FROM findings WHERE id = ?1", [id], |r| r.get(0))
@@ -923,6 +934,45 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// [`Store::findings_mark`] for `ids` and every finding of `issues`, as one change. Each
+    /// issue marked as a whole takes the state as its decision when it is false positive or
+    /// accepted risk, so the instances it gets later arrive in that state too; another state
+    /// ends its decision. Findings marked by id leave their issue's decision as it is: that is
+    /// a decision about those instances only.
+    pub fn findings_mark_issues(
+        &mut self,
+        ids: &[i64],
+        issues: &[i64],
+        state: Option<&str>,
+        note: Option<&str>,
+        if_state: Option<&str>,
+    ) -> Result<Vec<i64>> {
+        let tx = self.write_tx()?;
+        let mut all: Vec<i64> = ids.to_vec();
+        for &issue in issues {
+            all.extend(issue_ids(&tx, issue)?);
+        }
+        all.sort_unstable();
+        all.dedup();
+        for &id in &all {
+            if let Some(want) = if_state {
+                let now = current_state(&tx, id)?;
+                if now != want {
+                    return Err(Error::Conflict(format!(
+                        "finding {id} is {now}, not {want} (--if-state): it was changed since it was read; read it \
+                         again, then decide"
+                    )));
+                }
+            }
+            mark_one(&tx, id, state, note)?;
+        }
+        for &issue in issues {
+            crate::scan::issues::decide(&tx, issue, state, note)?;
+        }
+        tx.commit()?;
+        Ok(all)
     }
 
     /// Puts a suggested state and/or note on each finding's timeline (an event of kind

@@ -334,3 +334,37 @@ fn findings_list_pages_and_says_how_many_there_are() {
     assert_eq!(grouped["truncated"].as_bool(), Some(types > 2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_whole_issue_s_decision_reaches_its_new_instances_and_an_agent_keeps_it() {
+    let port = serve();
+    let (dir, project) = setup("carry");
+    let base = format!("http://127.0.0.1:{port}");
+    ok(&project, &["send", "--url", &format!("{base}/a")]);
+    let issue = |project: &Path| -> Value {
+        ok(project, &["findings", "issues", "--state", "all", "--alert", "10037"])["issues"][0].clone()
+    };
+    let id = issue(&project)["id"].to_string();
+    ok(&project, &["findings", "mark", "--issue", &id, "--state", "false_positive", "--note", "decoy banner"]);
+    let d = issue(&project)["decision"].clone();
+    assert_eq!((d["state"].as_str(), d["origin"].as_str()), (Some("false_positive"), Some("cli")), "{d}");
+    // A new page of the same issue arrives false positive, as the person decided it.
+    ok(&project, &["send", "--url", &format!("{base}/b")]);
+    let all = ok(&project, &["findings", "list", "--all", "--state", "all", "--issue", &id])["items"].clone();
+    let items = all.as_array().unwrap();
+    assert_eq!(items.len(), 2, "{all}");
+    for f in items {
+        assert_eq!((f["state"].as_str(), f["state_origin"].as_str()), (Some("false_positive"), Some("cli")), "{f}");
+    }
+    // So an agent can't reopen the new one, nor end the decision.
+    let newest = items.iter().map(|f| f["id"].as_i64().unwrap()).max().unwrap().to_string();
+    agent_refused(&project, &["findings", "mark", &newest, "--state", "open"], None);
+    agent_refused(&project, &["findings", "mark", "--issue", &id, "--state", "open"], None);
+    let events = ok(&project, &["findings", "timeline", &newest])["events"].clone();
+    let last = events.as_array().unwrap().last().unwrap().clone();
+    assert!(last["text"].as_str().unwrap().starts_with(&format!("inherited from issue {id}")), "{last}");
+    // The default report leaves both out, and says so.
+    let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
+    assert!(md.contains("2 false positive"), "{md}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -3025,6 +3025,17 @@ Findings are records with a history, not just rows:
   records the given `--state` and/or `--note` as a suggestion on each finding's timeline (kind
   `suggested`) and changes nothing else. `findings list` and `report` show work still to do by
   default: open, confirmed and retest pending.
+- **Decisions that stick:** `findings mark --issue ISSUE --state false_positive` (or
+  `accepted_risk`) is the issue's decision, not only its findings': a finding of the issue
+  found later (a new page with the same banner) arrives in that state, with the decision's
+  note, recorded as set by whoever made the decision, and a `state` event on its timeline
+  saying `inherited from issue N, marked ... by ...`. Any other state given to the whole issue
+  ends the decision (an event of kind `decision` on the issue's timeline records each change).
+  Findings marked by id are a decision about those instances only and leave the issue's as it
+  is. `fixed` is never inherited: a finding seen again after a fix is open again, as before.
+  `findings issues` and `findings issue show` give `decision` (`state`, `note`, `origin`,
+  `by`, `at`; null when there is none). Through MCP an agent can't change or end a person's
+  decision.
 - **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
   with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows
   returned and `truncated` says more are left, so the next page is `--offset` plus `--limit`.

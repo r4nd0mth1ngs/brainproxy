@@ -113,7 +113,9 @@ last can't be changed or cleared through MCP; the call fails with kind `conflict
 changes (all of the findings, or none). That covers a finding's state and note
 (`findings_mark`), an issue's write-up once a person wrote or reviewed it
 (`findings_issue_narrative`, which would otherwise send it back to draft and so out of
-reports), the executive summary (`report_summary_set`), an issue's CVSS rating and title, and
+reports), the executive summary (`report_summary_set`), an issue's CVSS rating and title, an
+issue's decision (`findings_mark` with `issue` and a false positive or accepted risk, which the
+issue's new instances inherit, as set by the person who decided), and
 merging or splitting an issue a person arranged or described. An agent's retest
 (`findings_retest`) records its outcome but leaves a state a person set (`state_kept` says so),
 except `retest_pending`, which asks for the retest. Instead, `findings_mark` with `suggest`

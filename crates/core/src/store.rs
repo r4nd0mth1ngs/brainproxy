@@ -18,7 +18,7 @@ use crate::http::{Exchange, Target};
 
 /// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
 /// one started by an older build.
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
 pub const PRUNE_CHUNK: usize = 500;
@@ -120,6 +120,15 @@ CREATE TABLE IF NOT EXISTS setting_changes (id INTEGER PRIMARY KEY AUTOINCREMENT
 const SCHEMA_V21: &str = "
 ALTER TABLE findings ADD COLUMN base_history_id INTEGER;
 ALTER TABLE oob_payloads ADD COLUMN base_history_id INTEGER;
+";
+
+/// v22: triage that outlives the findings it was made on. An issue's decision (a whole issue
+/// marked false positive or accepted risk), which its new instances inherit.
+const SCHEMA_V22: &str = "
+ALTER TABLE issues ADD COLUMN decision TEXT;
+ALTER TABLE issues ADD COLUMN decision_note TEXT;
+ALTER TABLE issues ADD COLUMN decision_origin TEXT;
+ALTER TABLE issues ADD COLUMN decision_at TEXT;
 ";
 
 /// Column documentation for the log of setting changes.
@@ -770,6 +779,9 @@ impl Store {
         }
         if version < 21 {
             add_missing_columns(&self.conn, SCHEMA_V21)?;
+        }
+        if version < 22 {
+            add_missing_columns(&self.conn, SCHEMA_V22)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
