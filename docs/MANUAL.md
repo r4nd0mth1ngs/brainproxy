@@ -757,9 +757,12 @@ attack type, and pick payloads:
   - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
     recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
     and URL paths mentioned in page text or scripts (error pages included), including template
-    literals such as `` `/api/users/${id}` `` or `` `${this.host}/rest/items` `` (after a base
-    URL, a path is taken only when it has a word in it and doesn't start with another
-    value, as in `` `${base}/${id}/reviews` ``) and the code-split chunks a bundle loads later
+    literals such as `` `/api/users/${id}` `` or `` `${this.host}/rest/items` `` (a path is
+    taken only when it has a word in it). When the script sets that base to a URL with a
+    path of its own (`host = this.hostServer + "/rest/products"`), a path after
+    `this.host` (`` `${this.host}/reviews` `` or `this.host + "/reviews"`) goes under it
+    (`/rest/products/reviews`); after another base, a path that starts with another value,
+    as in `` `${base}/${id}/reviews` ``, isn't taken. It also follows the code-split chunks a bundle loads later
     (`import("./About-x.js")`, `"assets/About-x.js"`); placeholder values such as `?key=…`,
     `/users/{id}` or `${id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them,
@@ -796,7 +799,14 @@ attack type, and pick payloads:
   client-side routes, clicks buttons, menus and other clickable elements, fills fields
   with test values and submits forms, and records the API calls (XHR, fetch) this
   triggers. Fields are filled before a page state is read, so a submit button that stays
-  disabled until the form is valid (a sign-in or register form) is clicked too. Each distinct page state is explored once. It is slower than the plain crawl.
+  disabled until the form is valid (a sign-in or register form) is clicked too. A combobox
+  or listbox that isn't a native `<select>` (ARIA `role="combobox"` or `role="listbox"`, such
+  as Angular Material's `mat-select`) is opened with a click and its first option picked; a
+  slider is moved to its maximum; a field labelled like a captcha's answer gets the sum of
+  an arithmetic captcha shown beside it (`What is 3+4*2 ?`); and when answering some fields
+  opens others (a security question after the e-mail is looked up), those are filled too
+  (up to three rounds; while an empty field stays disabled, each round waits a further 1.2
+  seconds for a lookup the page starts a moment after the last keystroke). Each distinct page state is explored once. It is slower than the plain crawl.
   - **What it won't do:** click elements or follow links labelled like *log out*,
     *delete*, *remove*, *reset* or *unsubscribe* (the summary lists them under
     `not_clicked`), answer *OK* to a confirmation dialog, open pop-ups or downloads,
@@ -808,7 +818,9 @@ attack type, and pick payloads:
     `crawl-browser`, and the browser's own background features (updates, sync, safe
     browsing, WebRTC) are off. It uses a fresh temporary profile, removed afterwards, so
     nothing from your normal browser is used; with a login profile, the session is added
-    to every request on the site and renewed when lost. The crawl reloads pages to get back
+    to every request on the site and renewed when lost, and what a browser login left in the
+    site's `localStorage` and `sessionStorage` is put back in its pages (see *Replay* under
+    one-time codes, browser logins and passkeys in auth profiles). The crawl reloads pages to get back
     to a state; when the browser then asks whether a script, style, image or font it
     already fetched in this crawl has changed (a conditional GET), the crawl's proxy
     answers 304 itself, so that request isn't sent or recorded. The summary counts them in
@@ -2337,8 +2349,13 @@ Crawl and active-scan scope and safety flags:
   body is unknown. It is listed under `unconfirmed_endpoints` (`method`, `path`, `params`,
   `reason`; at most 200, `unconfirmed_count` has the total) instead. So is a path read from a
   script or page text that answers a GET with 405 or a 5xx: it isn't counted as an
-  endpoint, and the error page's links (stack-trace paths) aren't followed. The request is
-  still in history.
+  endpoint, and the error page's links aren't followed. The request is still in history.
+- Paths that only look like links aren't requested: a source file named in a stack trace on
+  any page (`/app/routes/x.js:68:18`, `File "/app/x.py", line 12`, `/var/www/x.php(12)` or
+  `… on line 7`), and, in scripts, a quoted path without two letters in a row (`"/160"`,
+  `` `/${id}` ``, `"m/44'/60'/0'/0/0"`), one between two different quote characters, one whose
+  query isn't `name=value` pairs, and the arguments of `.replace(`, `.replaceAll(`, `.split(`
+  and `.join(`.
 - `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
   bounds its crawl too, with `--browser` both crawls together).
 - `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl
@@ -2559,7 +2576,16 @@ One-time codes, browser logins and passkeys in an auth profile:
 - **Replay.** `auth login NAME`, and every re-login of scans, the fuzzer, the crawler, the proxy
   and `send --auth NAME`, starts a headless browser (the first Chromium-based one of
   `browser list`), runs the steps, and takes the site's cookies and the token its pages send
-  (the header `token_header` names) into the session. The browser's only way out is a gateway
+  (the header `token_header` names) into the session. When the login ends on the site's own
+  page (the check URL's host, else the page it ended on), what that origin keeps in
+  `localStorage` and `sessionStorage` goes in the session too (at most 100 items of 64 KiB):
+  single-page apps keep their token there rather than in a cookie. It is session material
+  like a cookie: replaced at every login, masked in reports, and shown only by name
+  (`"storage": ["local:token"]` in `auth login` and `auth show`). `crawl --browser --auth NAME`
+  writes it back into every page of that origin before the page's own scripts run (a page
+  of another site, or a frame of one, gets nothing), and again with the new values after a
+  re-login, so the app's pages show the signed-in user. A header a page builds from it
+  (other than the profile's `token_header`) is recorded as the page sent it. The browser's only way out is a gateway
   that sends with the engagement-guarded client, as for `crawl --browser`: a page a step opens
   outside the scope is refused before the browser starts, a step that leads outside it ends
   the login with an out-of-scope error, and other hosts the pages ask for are refused one by

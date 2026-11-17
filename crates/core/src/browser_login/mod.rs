@@ -273,6 +273,59 @@ impl Passkey {
     }
 }
 
+/// A value the site keeps in the browser for `origin`: in localStorage, or in sessionStorage
+/// when `session`. Session material like a cookie: kept in the profile's session, masked in
+/// reports, never shown (only `area:key` is).
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct Stored {
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session: bool,
+    pub key: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for Stored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stored({} {})", self.origin, self.name())
+    }
+}
+
+impl Stored {
+    /// `local:key` or `session:key`, for display.
+    pub fn name(&self) -> String {
+        format!("{}:{}", if self.session { "session" } else { "local" }, self.key)
+    }
+}
+
+/// Items of a site's storage taken at most, and the longest key and value kept.
+const MAX_STORED: usize = 100;
+const MAX_STORED_KEY: usize = 1024;
+const MAX_STORED_VALUE: usize = 64 * 1024;
+/// What the page script reads: its origin and each storage's items.
+const READ_STORAGE: &str = "(() => { const out = [];     for (const [session, s] of [[false, () => localStorage], [true, () => sessionStorage]]) {       try { const st = s(); for (let i = 0; i < st.length && out.length < 200; i++) {         const k = st.key(i); out.push([session, k, st.getItem(k)]); } } catch (e) {} }     return [location.origin, out]; })()";
+
+/// The storage items `read` (what [`READ_STORAGE`] gave) holds for `origin`, within the limits.
+fn stored_items(read: &Value, origin: &str) -> Vec<Stored> {
+    if read[0].as_str() != Some(origin) {
+        return vec![];
+    }
+    let mut out: Vec<Stored> = Vec::new();
+    for item in read[1].as_array().into_iter().flatten() {
+        let (Some(session), Some(key), Some(value)) = (item[0].as_bool(), item[1].as_str(), item[2].as_str()) else {
+            continue;
+        };
+        if key.is_empty() || key.len() > MAX_STORED_KEY || value.len() > MAX_STORED_VALUE {
+            continue;
+        }
+        out.push(Stored { origin: origin.to_string(), session, key: key.to_string(), value: value.to_string() });
+        if out.len() >= MAX_STORED {
+            break;
+        }
+    }
+    out
+}
+
 pub(crate) fn lock_key(profile: &str) -> String {
     format!("auth.browser_login.{profile}")
 }
@@ -741,7 +794,7 @@ impl AuthSession {
         .await;
         let stats = gateway.stop().await;
         let _ = crate::crawl::join_writer(writer).await;
-        let (text, cookies) = outcome.map_err(|e| match stats.refused_hosts.iter().next() {
+        let (text, cookies, storage) = outcome.map_err(|e| match stats.refused_hosts.iter().next() {
             // What the scope refused on the way is most likely why a step found nothing.
             Some(host) if !matches!(e, Error::OutOfScope(_)) => Error::InvalidInput(format!(
                 "{e} ({host} is outside the engagement scope and was refused: add it to the scope if the login needs it)"
@@ -750,13 +803,16 @@ impl AuthSession {
         })?;
         let mut st = self.state.lock().unwrap();
         st.cookies = cookies;
+        st.storage = storage;
         if p.token_header.is_some() {
             st.token = tap.seen.lock().unwrap().clone();
         }
         Ok((text, None))
     }
 
-    /// The steps, in a tab of `chrome`. Gives the last page's text and the site's cookies.
+    /// The steps, in a tab of `chrome`. Gives the last page's text, the site's cookies, and
+    /// what the site keeps in the tab's localStorage and sessionStorage (when the login ended
+    /// on the site's own origin: a single-page app keeps its token there, not in a cookie).
     async fn replay(
         &self,
         chrome: &Chrome,
@@ -765,7 +821,7 @@ impl AuthSession {
         passkeys: &[Passkey],
         password: &str,
         tap: &LoginTap,
-    ) -> Result<(String, Vec<(String, String)>)> {
+    ) -> Result<(String, Vec<(String, String)>, Vec<Stored>)> {
         let p = &self.profile;
         chrome
             .call_timeout("Browser.getVersion", json!({}), None, Duration::from_secs(20))
@@ -820,8 +876,14 @@ impl AuthSession {
                 cookies.push((name.to_string(), value.to_string()));
             }
         }
+        // Another site's storage (a sign-in provider's) isn't the session's.
+        let origin = page.as_ref().filter(|u| site.as_deref().is_some_and(|s| u.host_str() == Some(s)));
+        let storage = match origin.map(|u| u.origin().ascii_serialization()) {
+            Some(o) if o.starts_with("http") => stored_items(&tab.eval(READ_STORAGE).await.unwrap_or_default(), &o),
+            _ => vec![],
+        };
         let text = tab.eval("window.__bpl ? __bpl.text() : ''").await.ok();
-        Ok((text.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(), cookies))
+        Ok((text.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(), cookies, storage))
     }
 
     /// Runs the recorded steps in `tab`, the start page first.
@@ -1036,6 +1098,28 @@ mod tests {
         let taken = tokio::time::timeout(Duration::from_secs(5), LoginLock::acquire(&project, "p")).await;
         assert!(taken.is_ok_and(|l| l.is_ok()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_is_taken_for_the_site_only_and_never_shown() {
+        let read = json!([
+            "https://a.test",
+            [
+                [false, "token", "eyJhbGciOi.x.y"],
+                [true, "tab", "1"],
+                [false, "", "x"],
+                [false, "big", "v".repeat(MAX_STORED_VALUE + 1)],
+                [false, 7, "x"]
+            ]
+        ]);
+        let items = stored_items(&read, "https://a.test");
+        let names: Vec<String> = items.iter().map(Stored::name).collect();
+        assert_eq!(names, ["local:token", "session:tab"]);
+        assert!(stored_items(&read, "https://idp.test").is_empty());
+        assert!(!format!("{:?}", items[0]).contains("eyJ"));
+        let state = crate::auth::SessionState { storage: items, ..Default::default() };
+        let secrets = crate::auth::AuthProfile::default().secret_values(&state);
+        assert!(secrets.contains(&"eyJhbGciOi.x.y".to_string()) && !secrets.contains(&"1".to_string()), "{secrets:?}");
     }
 
     #[test]

@@ -46,6 +46,72 @@ function render() {
       fetch(api('login'), {method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({email: f.email.value, password: f.password.value})});
     });
+  } else if (route === '/register') {
+    // Like Angular Material's select: a combobox whose inner trigger listens, and whose options
+    // are made in an overlay at the end of the page when it opens.
+    view.innerHTML = '<form id="r"><input name="email" type="email">' +
+      '<div id="q" role="combobox" aria-haspopup="listbox" aria-label="Security question" tabindex="0">' +
+      '<span class="trigger">Choose a question</span></div><button id="reg" disabled>Register</button></form>';
+    let question = '';
+    const f = document.getElementById('r');
+    const q = document.getElementById('q');
+    const check = () => { document.getElementById('reg').disabled = !(f.email.value && question); };
+    q.querySelector('.trigger').addEventListener('click', () => {
+      const panel = document.createElement('div');
+      panel.id = 'q-panel';
+      panel.setAttribute('role', 'listbox');
+      panel.innerHTML = '<div role="option" aria-disabled="true">Pick one</div>' +
+        '<div role="option" data-v="pet">Your first pet?</div><div role="option" data-v="city">Your city?</div>';
+      document.body.appendChild(panel);
+      q.setAttribute('aria-controls', 'q-panel');
+      panel.querySelectorAll('[data-v]').forEach((o) => o.addEventListener('click', () => {
+        question = o.dataset.v;
+        q.querySelector('.trigger').textContent = o.textContent;
+        panel.remove();
+        q.removeAttribute('aria-controls');
+        check();
+      }));
+    });
+    f.addEventListener('input', check);
+    f.addEventListener('submit', (e) => {
+      e.preventDefault();
+      fetch(api('register') + '?question=' + question);
+    });
+  } else if (route === '/contact') {
+    // A rating slider that must be moved (see-through, as Material draws its own over it), and
+    // an arithmetic captcha shown in the page.
+    view.innerHTML = '<form id="c"><textarea name="comment"></textarea><p>0/160</p>' +
+      '<input type="range" name="rating" min="0" max="5" value="0" style="opacity: 0">' +
+      '<label for="cap">What is <code>3+4*2</code> ?</label><input id="cap" aria-label="Result of the CAPTCHA">' +
+      '<button id="send" disabled>Send</button></form>';
+    const f = document.getElementById('c');
+    f.addEventListener('input', () => {
+      document.getElementById('send').disabled =
+        !(f.comment.value && Number(f.rating.value) > 0 && f.cap.value === '11');
+    });
+    f.addEventListener('submit', (e) => {
+      e.preventDefault();
+      fetch(api('feedback') + '?captcha=' + f.cap.value + '&rating=' + f.rating.value);
+    });
+  } else if (route === '/forgot') {
+    // Staged: the answer and new password fields open once the e-mail has been looked up, a
+    // second after the last keystroke.
+    view.innerHTML = '<form id="p"><input name="email" type="email"><input name="answer" disabled>' +
+      '<input name="pw" type="password" disabled><button id="change" disabled>Change</button></form>';
+    const f = document.getElementById('p');
+    let lookup;
+    f.email.addEventListener('input', () => {
+      clearTimeout(lookup);
+      lookup = setTimeout(() => fetch(api('question') + '?email=' + encodeURIComponent(f.email.value))
+        .then((r) => r.json()).then(() => { f.answer.disabled = false; f.pw.disabled = false; }), 1000);
+    });
+    f.addEventListener('input', () => {
+      document.getElementById('change').disabled = !(f.email.value && f.answer.value && f.pw.value);
+    });
+    f.addEventListener('submit', (e) => {
+      e.preventDefault();
+      fetch(api('password') + '?answer=' + f.answer.value);
+    });
   } else {
     view.innerHTML = '<p>Welcome</p>';
   }
@@ -234,6 +300,30 @@ fn browser_crawl_finds_api_calls_made_by_javascript() {
     let rows = h["data"]["items"].as_array().cloned().unwrap_or_default();
     let export = format!("{site}api/reports/export");
     assert!(rows.iter().any(|r| r["url"] == export.as_str() && r["method"] == "POST"), "{h}");
+}
+
+/// Forms a person can fill but the field filler alone can't: an ARIA combobox whose options
+/// appear only once it is opened, a slider, an arithmetic captcha, and a form whose fields open
+/// after its first field is answered.
+#[test]
+fn browser_crawl_fills_comboboxes_captchas_and_staged_forms() {
+    if !browser_available("browser_crawl_fills_comboboxes_captchas_and_staged_forms") {
+        return;
+    }
+    let (_dir, project) = test_project("browser-forms");
+    let (port, seen) = serve_spa();
+    let at = |r: &str| format!("http://127.0.0.1:{port}/#/{r}");
+    let (register, contact, forgot) = (at("register"), at("contact"), at("forgot"));
+    let args =
+        ["crawl", &register, &contact, &forgot, "--browser", "--depth", "2", "--max-pages", "40", "--max-minutes", "3"];
+    let (code, v) = run(&args, &project);
+    assert_eq!(code, 0, "{v}");
+    let lines = seen.lock().unwrap().clone();
+    let saw = |l: &str| lines.iter().any(|x| x.starts_with(l));
+    assert!(saw("GET /api/register?question=pet "), "the combobox's first option is picked: {lines:?}");
+    assert!(saw("GET /api/feedback?captcha=11&rating=5 "), "the captcha is solved: {lines:?}");
+    assert!(saw("GET /api/password?answer=brainproxy "), "the fields opened later are filled: {lines:?}");
+    assert!(v["data"]["forms_submitted"].as_u64().unwrap() >= 3, "{v}");
 }
 
 #[test]

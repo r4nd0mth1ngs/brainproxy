@@ -68,6 +68,12 @@ const MAX_URL: usize = 4096;
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 /// Commands timing out in a row before the tab is replaced by a fresh one.
 const MAX_TIMEOUTS: usize = 3;
+/// Rounds of filling a page's fields, for forms that open more fields once some are answered.
+const FILL_ROUNDS: usize = 3;
+/// Comboboxes and listboxes chosen in per round.
+const MAX_CHOICES: usize = 10;
+/// How long a form with a locked field gets after filling, for a lookup it debounces.
+const DEBOUNCE_WAIT: Duration = Duration::from_millis(1200);
 
 #[derive(Clone)]
 pub struct BrowserCrawlConfig {
@@ -206,6 +212,12 @@ struct Field {
     required: bool,
     checked: bool,
     options: Vec<String>,
+    /// A combobox or listbox (type `combobox` / `listbox`) already chosen in.
+    chosen: bool,
+    /// A slider's maximum.
+    max: String,
+    /// The sum of an arithmetic captcha shown beside the field.
+    answer: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,6 +363,9 @@ struct Explorer<'a> {
     not_clicked_count: usize,
     /// Where the tab is: the page loaded and the steps taken since.
     current: Option<(String, Vec<Step>)>,
+    /// The tab's script that puts the session's browser storage back, and the session's
+    /// generation it was made for.
+    storage_script: Option<(Option<String>, u64)>,
     summary: BrowserCrawlSummary,
 }
 
@@ -384,6 +399,7 @@ impl<'a> Explorer<'a> {
             not_clicked: BTreeSet::new(),
             not_clicked_count: 0,
             current: None,
+            storage_script: None,
             summary: BrowserCrawlSummary { mode: "browser".into(), ..Default::default() },
         }
     }
@@ -425,9 +441,7 @@ impl<'a> Explorer<'a> {
             }
             // Fields are filled before the state is read: many forms keep their submit button
             // disabled until they are valid, and a disabled button isn't listed to be clicked.
-            if self.fill().await.unwrap_or(false) {
-                self.settle().await;
-            }
+            let _ = self.fill().await;
             match self.eval("window.__bp ? __bp.snapshot() : null").await {
                 Ok(v) if !v.is_null() => {
                     let snap = serde_json::from_value::<Snapshot>(v).unwrap_or_default().bounded();
@@ -467,6 +481,40 @@ impl<'a> Explorer<'a> {
         let s = Some(self.session.as_str());
         self.chrome.call("Page.enable", json!({}), s).await?;
         self.chrome.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": PAGE_JS}), s).await?;
+        self.storage_script = None;
+        self.seed_storage().await
+    }
+
+    /// Puts what the login profile's site keeps in browser storage (a single-page app's token
+    /// in localStorage) into every document of the site the tab loads, before the page's own
+    /// scripts run, as the gateway puts the session's cookies on every request. Made again
+    /// when the session logs in again (a new generation), so the new values are the ones put.
+    async fn seed_storage(&mut self) -> Result<()> {
+        let Some(auth) = self.cfg.crawl.auth.as_deref() else { return Ok(()) };
+        let generation = auth.generation();
+        if self.storage_script.as_ref().is_some_and(|(_, g)| *g == generation) {
+            return Ok(());
+        }
+        let s = Some(self.session.as_str());
+        if let Some((Some(id), _)) = self.storage_script.take() {
+            let _ = self.chrome.call("Page.removeScriptToEvaluateOnNewDocument", json!({"identifier": id}), s).await;
+        }
+        let items: Vec<(String, bool, String, String)> = auth
+            .state()
+            .storage
+            .into_iter()
+            .filter(|i| Url::parse(&i.origin).is_ok_and(|u| self.scope.on_site(&u)))
+            .map(|i| (i.origin, i.session, i.key, i.value))
+            .collect();
+        let id = match items.is_empty() {
+            true => None,
+            false => {
+                let added =
+                    self.chrome.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": storage_js(&items)}), s);
+                added.await?["identifier"].as_str().map(str::to_string)
+            }
+        };
+        self.storage_script = Some((id, generation));
         Ok(())
     }
 
@@ -557,6 +605,7 @@ impl<'a> Explorer<'a> {
         if !self.spend() {
             return Ok(false);
         }
+        self.seed_storage().await?;
         let s = Some(self.session.as_str());
         self.chrome.call("Page.navigate", json!({"url": "about:blank"}), s).await?;
         let r = self.chrome.call("Page.navigate", json!({"url": url}), s).await?;
@@ -613,15 +662,7 @@ impl<'a> Explorer<'a> {
                 }
                 let (x, y) = (at["x"].as_f64().unwrap_or(0.0), at["y"].as_f64().unwrap_or(0.0));
                 if at["hit"].as_bool() == Some(true) {
-                    // A real mouse click: hover, press, release (menus that open on hover or
-                    // mousedown work as for a person).
-                    let s = Some(self.session.as_str());
-                    for (kind, button, buttons) in
-                        [("mouseMoved", "none", 0), ("mousePressed", "left", 1), ("mouseReleased", "left", 0)]
-                    {
-                        let ev = json!({"type": kind, "x": x, "y": y, "button": button, "buttons": buttons, "clickCount": 1});
-                        self.chrome.call("Input.dispatchMouseEvent", ev, s).await?;
-                    }
+                    self.mouse_click(x, y).await?;
                 } else if self.eval(&format!("__bp.click({key})")).await? != json!(true) {
                     return Ok(false);
                 }
@@ -638,18 +679,94 @@ impl<'a> Explorer<'a> {
         Ok(true)
     }
 
+    /// A real mouse click: hover, press, release (menus that open on hover or mousedown, and
+    /// listeners on an element's inner parts, work as for a person).
+    async fn mouse_click(&self, x: f64, y: f64) -> Result<()> {
+        let s = Some(self.session.as_str());
+        for (kind, button, buttons) in
+            [("mouseMoved", "none", 0), ("mousePressed", "left", 1), ("mouseReleased", "left", 0)]
+        {
+            let ev = json!({"type": kind, "x": x, "y": y, "button": button, "buttons": buttons, "clickCount": 1});
+            self.chrome.call("Input.dispatchMouseEvent", ev, s).await?;
+        }
+        Ok(())
+    }
+
     /// Gives empty fields the spider's test values (required boxes ticked, a select's first
-    /// value). True when it changed any.
+    /// value, a slider its maximum, a captcha its sum) and picks the first option of each
+    /// combobox and listbox. Some forms open more fields once the first are answered (a
+    /// security question after the e-mail is looked up), so it repeats while the page shows
+    /// new empty fields, settling in between. True when it changed any.
     async fn fill(&self) -> Result<bool> {
-        let mut fields: Vec<Field> =
-            serde_json::from_value(self.eval("window.__bp ? __bp.fields() : []").await?).unwrap_or_default();
-        fields.truncate(200);
-        let pairs: Vec<Value> = fields.iter().filter_map(|f| fill_value(f).map(|v| json!([f.i, v]))).collect();
-        if pairs.is_empty() {
+        let mut changed = false;
+        for _ in 0..FILL_ROUNDS {
+            let mut fields: Vec<Field> =
+                serde_json::from_value(self.eval("window.__bp ? __bp.fields() : []").await?).unwrap_or_default();
+            fields.truncate(200);
+            let pairs: Vec<Value> = fields.iter().filter_map(|f| fill_value(f).map(|v| json!([f.i, v]))).collect();
+            let mut now = false;
+            if !pairs.is_empty() {
+                self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
+                now = true;
+            }
+            let boxes = fields.iter().filter(|f| matches!(f.kind.as_str(), "combobox" | "listbox") && !f.chosen);
+            for f in boxes.take(MAX_CHOICES) {
+                now |= self.choose(f.i).await?;
+            }
+            if !now {
+                break;
+            }
+            changed = true;
+            self.settle().await;
+            // A lookup the page starts a moment after the last keystroke (debounced) hasn't gone
+            // out yet when the page first looks settled: with a field still locked, it gets
+            // that moment.
+            if self.eval("window.__bp ? __bp.locked() : false").await? == json!(true) {
+                tokio::time::sleep(DEBOUNCE_WAIT).await;
+                self.settle().await;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Opens combobox `i` of the last field list and clicks its first option (a listbox's
+    /// options are clicked directly). True when an option was clicked.
+    async fn choose(&self, i: usize) -> Result<bool> {
+        let at = self.eval(&format!("window.__bp ? __bp.openField({i}) : null")).await?;
+        if at.is_null() {
             return Ok(false);
         }
-        self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
+        if at["open"] != json!(true) {
+            if at["hit"] == json!(true) {
+                self.mouse_click(at["x"].as_f64().unwrap_or(0.0), at["y"].as_f64().unwrap_or(0.0)).await?;
+            } else if self.eval(&format!("__bp.clickField({i})")).await? != json!(true) {
+                return Ok(false);
+            }
+            // The options are made when the box opens, often behind an animation.
+            self.settle().await;
+        }
+        let option = self.eval(&format!("__bp.pickOption({i})")).await?;
+        if option.is_null() {
+            // Nothing to pick: close whatever opened, so it doesn't cover the page.
+            self.key("Escape", 27).await?;
+            return Ok(false);
+        }
+        if option["hit"] == json!(true) {
+            self.mouse_click(option["x"].as_f64().unwrap_or(0.0), option["y"].as_f64().unwrap_or(0.0)).await?;
+        } else if self.eval("__bp.clickOption()").await? != json!(true) {
+            return Ok(false);
+        }
         Ok(true)
+    }
+
+    /// Presses and releases a key, such as Escape.
+    async fn key(&self, key: &str, code: u32) -> Result<()> {
+        let s = Some(self.session.as_str());
+        for kind in ["keyDown", "keyUp"] {
+            let ev = json!({"type": kind, "key": key, "code": key, "windowsVirtualKeyCode": code});
+            self.chrome.call("Input.dispatchKeyEvent", ev, s).await?;
+        }
+        Ok(())
     }
 
     /// Queues a page load of `raw` if it is in scope and new.
@@ -786,6 +903,21 @@ impl<'a> Explorer<'a> {
     }
 }
 
+/// The script that writes `items` (origin, sessionStorage or not, key, value) into the storage
+/// of a document on that origin, and nowhere else: a frame or page of another site gets
+/// nothing. JSON is a JavaScript literal, so the values go in as data (with the line and
+/// paragraph separators escaped, which older JavaScript took for line breaks).
+fn storage_js(items: &[(String, bool, String, String)]) -> String {
+    let data = serde_json::to_string(items)
+        .unwrap_or_else(|_| "[]".into())
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    format!(
+        "(() => {{ for (const [origin, session, key, value] of {data}) {{ if (location.origin !== origin) continue; \
+         try {{ (session ? sessionStorage : localStorage).setItem(key, value); }} catch (e) {{}} }} }})();"
+    )
+}
+
 /// The value to type into a field, if it needs one.
 fn fill_value(f: &Field) -> Option<Value> {
     match (f.tag.as_str(), f.kind.as_str()) {
@@ -793,8 +925,11 @@ fn fill_value(f: &Field) -> Option<Value> {
             f.value.is_empty().then(|| f.options.iter().find(|o| !o.is_empty()).cloned()).flatten().map(Value::from)
         }
         (_, "checkbox" | "radio") => (f.required && !f.checked).then_some(Value::Bool(true)),
-        (_, "file" | "submit" | "button" | "image" | "reset" | "hidden" | "range" | "color") => None,
+        // A slider always has a value, but a form may wait for it to be moved (a rating).
+        (_, "range") => (!f.max.is_empty() && f.value != f.max).then(|| f.max.clone().into()),
+        (_, "file" | "submit" | "button" | "image" | "reset" | "hidden" | "color" | "combobox" | "listbox") => None,
         _ if !f.value.is_empty() => None,
+        _ if !f.answer.is_empty() => Some(f.answer.clone().into()),
         ("textarea", _) => Some(field_value(&f.name, "text", None).into()),
         _ => Some(field_value(&f.name, if f.kind.is_empty() { "text" } else { &f.kind }, None).into()),
     }
@@ -1111,6 +1246,18 @@ mod tests {
     }
 
     #[test]
+    fn storage_goes_only_to_its_origin_as_data() {
+        // A quote, a script end and a line separator (a line break in JavaScript before ES2019)
+        // stay inside the string.
+        let items =
+            [("https://a.test".to_string(), false, "token".to_string(), "x\"});alert(1)//\u{2028}".to_string())];
+        let js = storage_js(&items);
+        assert!(js.contains(r#"[["https://a.test",false,"token","x\"});alert(1)//\u2028"]]"#), "{js}");
+        assert!(js.contains("if (location.origin !== origin) continue;"), "{js}");
+        assert!(storage_js(&[]).contains("of []"));
+    }
+
+    #[test]
     fn fields_get_test_values() {
         let f = |tag: &str, kind: &str, name: &str, value: &str| Field {
             tag: tag.into(),
@@ -1131,5 +1278,15 @@ mod tests {
         assert_eq!(fill_value(&terms), None);
         terms.required = true;
         assert_eq!(fill_value(&terms), Some(json!(true)));
+        // A slider is moved to its maximum once; a captcha gets its sum; a combobox is chosen in.
+        let mut rating = f("input", "range", "rating", "0");
+        rating.max = "5".into();
+        assert_eq!(fill_value(&rating), Some(json!("5")));
+        rating.value = "5".into();
+        assert_eq!(fill_value(&rating), None);
+        let mut captcha = f("input", "text", "captchaControl", "");
+        captcha.answer = "20".into();
+        assert_eq!(fill_value(&captcha), Some(json!("20")));
+        assert_eq!(fill_value(&f("mat-select", "combobox", "question", "")), None);
     }
 }

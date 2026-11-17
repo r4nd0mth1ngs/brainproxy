@@ -400,6 +400,8 @@ impl AuthProfile {
         out.extend(st.token.iter().chain(&st.refresh_token).cloned());
         // Macro values are often tokens, but may be a user id or a name: only distinctive ones.
         out.extend(st.vars.iter().map(|v| v.value.clone()).filter(|v| crate::scan::redact::distinctive(v)));
+        // So is what a site keeps in browser storage: a token, or a language setting.
+        out.extend(st.storage.iter().map(|s| s.value.clone()).filter(|v| crate::scan::redact::distinctive(v)));
         out.retain(|v| !v.is_empty());
         out
     }
@@ -429,6 +431,10 @@ pub struct SessionState {
     pub refresh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_expires: Option<u64>,
+    /// What the site keeps in the browser's localStorage and sessionStorage after a browser
+    /// login (a single-page app's token), put back by the browser crawl.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage: Vec<crate::browser_login::Stored>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -1562,6 +1568,7 @@ impl AuthSession {
             let mut st = self.state.lock().unwrap();
             st.cookies.clear();
             st.token = None;
+            st.storage.clear();
             st.logged_in = false;
         }
         let mut history = Vec::new();
