@@ -212,7 +212,15 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   (`{"$eq":<original>}`, `name[$eq]=<original>`). The operator's answer may have another
   status than the original's (not a 5xx or 429), so a login that refuses the original
   password with a 401 and lets `{"$ne":"0"}` in is found; other info then says it may be an
-  authentication or authorisation bypass.
+  authentication or authorisation bypass. When `$eq` doesn't answer like the original
+  (MarsDB, NeDB and older Mongo-likes don't have it and answer with an error), `$in` with
+  the original value (`{"$in":[<original>]}`, `name[$in][]=<original>`) is the
+  counter-proof. Both match only what the original request matched, so on an update they
+  change nothing it wouldn't; the `$ne`, `$gt` and `$regex` attacks themselves can still
+  change every record they match. A counter-proof also counts when it is nearly the same
+  (JSON value by value) as the original sent again just after it, which the attack must
+  not be: an update that answers with the record before and after differs from its
+  recorded answer once the attack has changed the data.
 - **Remote OS Command Injection (90020)** sends a control before it reports: the same
   attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
   `;#get-help`). The output must not come back for it, so a search or help page that

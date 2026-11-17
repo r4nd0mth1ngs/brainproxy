@@ -10,6 +10,14 @@
 //!   or 429: a login that refuses the original password with a 401 and lets
 //!   `{"$ne":"0"}` in is the textbook case. ZAP needs the same status. The
 //!   counter-proof must then give the original's status and body.
+//! - When `$eq` doesn't answer like the original, `$in` with the original value is
+//!   tried (MarsDB, NeDB and older Mongo-likes have no `$eq`). Both match only what the
+//!   original matched, so on an update they change nothing the original request
+//!   wouldn't. A counter-proof may also answer like the original sent again just after
+//!   it, not only like the recorded answer: an update that shows the record before and
+//!   after differs from its recorded answer once the attack has changed the data. That
+//!   comparison is a similarity (`alike`), as other points and rules may be writing to
+//!   the same record meanwhile, and the attack must not be alike the original.
 //! - `name[$eq]=` is only the counter-proof. ZAP also attacks with an empty value, which
 //!   shows no more than the plain parameter can.
 //! - The not-handled error check stops at the first alert. ZAP raises one per payload.
@@ -22,6 +30,7 @@
 use serde_json::{json, Value};
 
 use super::common::{control_token, point};
+use crate::authz::compare::{similarity, Body, Noise};
 use crate::scan::active::points::{self, PointKind};
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
@@ -99,6 +108,41 @@ fn new_error(base: &str, attacked: &str) -> bool {
     ERRORS.iter().any(|e| !base.contains(e) && attacked.contains(e))
 }
 
+/// Nearly the same page: for the original sent again during a scan, which other
+/// insertion points and rules may be changing at the same time (an update's answer
+/// that shows the record before the update shows what they wrote).
+/// JSON is compared value by value (a word count can't tell one record from 29 in
+/// compact JSON).
+fn alike(a: &Response, b: &Response) -> bool {
+    a.status == b.status && similarity(&Body::parse(&a.raw), &Body::parse(&b.raw), &Noise::default()) >= 0.9
+}
+
+/// Sends the counter-proofs in order until one answers like the original: the
+/// recorded answer, or else the original sent again now (once, after them all), which
+/// `attack` must not be alike. False when none did or a request failed.
+async fn counter_proof(cx: &Cx, attack: &Response, proofs: Vec<Vec<u8>>) -> bool {
+    let base = cx.base_response();
+    let mut answers = Vec::new();
+    for proof in proofs {
+        if cx.stopped() {
+            return false;
+        }
+        let Ok(answer) = cx.send(proof).await else { return false };
+        if same_answer(&answer, base) {
+            return true;
+        }
+        // An unknown operator is an error; it says nothing either way.
+        if answer.status < 500 {
+            answers.push(answer);
+        }
+    }
+    if answers.is_empty() || cx.stopped() {
+        return false;
+    }
+    let Ok(now) = cx.send(cx.base_request().to_vec()).await else { return false };
+    !alike(attack, &now) && answers.iter().any(|answer| alike(answer, &now))
+}
+
 enum Step {
     /// Nothing found: try the next step.
     Next,
@@ -121,12 +165,11 @@ async fn all_data(cx: &Cx, param: &str, value: &str) -> Step {
         if !changed(&resp, base) {
             continue;
         }
-        let eq = format!("{param}[$eq]");
-        let Some(proof) = points::inject_named(cx.base_request(), cx.point(), &eq, value) else {
-            return Step::Next;
-        };
-        let Ok(proof) = cx.send(proof).await else { return Step::Done };
-        if same_answer(&proof, base) {
+        let proofs = [format!("{param}[$eq]"), format!("{param}[$in][]")]
+            .iter()
+            .filter_map(|n| points::inject_named(cx.base_request(), cx.point(), n, value))
+            .collect();
+        if counter_proof(cx, &resp, proofs).await {
             let attack = format!("{name}{injected}");
             cx.report(ALERT.raise(param, "").attack(attack).other_info(info(ALL_DATA_INFO, &resp, base)), &resp);
             return Step::Done;
@@ -172,10 +215,11 @@ async fn json_query(cx: &Cx, param: &str) {
             continue;
         }
         let name = format!("{operator}{operand}");
-        let proof = points::inject_json(cx.base_request(), cx.point(), |original: Value| json!({ "$eq": original }));
-        let Some(proof) = proof else { return };
-        let Ok(proof) = cx.send(proof).await else { return };
-        if same_answer(&proof, base) {
+        let proofs = [
+            points::inject_json(cx.base_request(), cx.point(), |original: Value| json!({ "$eq": original })),
+            points::inject_json(cx.base_request(), cx.point(), |original: Value| json!({ "$in": [original] })),
+        ];
+        if counter_proof(cx, &resp, proofs.into_iter().flatten().collect()).await {
             cx.report(ALERT.raise(param, "").attack(name).other_info(info(JSON_INFO, &resp, base)), &resp);
             return;
         }

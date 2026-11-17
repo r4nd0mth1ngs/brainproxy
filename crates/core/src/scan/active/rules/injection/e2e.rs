@@ -510,6 +510,7 @@ fn handle_json(path: &str, body: &str) -> String {
             html("<ul><li>mine</li><li>theirs</li></ul>")
         }
         "/mongojson" => html("<ul></ul>"),
+        "/marsdb" => marsdb_update(id),
         // `find({email, password})`: only the password is checked here, as an operator.
         "/mongologin" => {
             let pw = &v["password"];
@@ -524,6 +525,41 @@ fn handle_json(path: &str, body: &str) -> String {
         _ if *id == serde_json::json!(1) => html("<ul><li>mine</li></ul>"),
         _ => html("<ul></ul>"),
     }
+}
+
+/// Messages of the reviews `/marsdb` updates, by id.
+static REVIEWS: std::sync::Mutex<[(&str, &str); 3]> =
+    std::sync::Mutex::new([("r1", "old"), ("r2", "nice"), ("r3", "meh")]);
+
+/// An update by `{"id": <query>}` setting the message to "new", answered with the
+/// reviews before and after, as Juice Shop's review update on MarsDB: no `$eq`.
+fn marsdb_update(id: &serde_json::Value) -> String {
+    let matches: Box<dyn Fn(&str) -> bool> = match id {
+        serde_json::Value::String(s) => {
+            let s = s.clone();
+            Box::new(move |r| r == s)
+        }
+        v if v.get("$eq").is_some() => {
+            return status(500, r#"{"error":"Unrecognized operator: $eq"}"#);
+        }
+        v if v.get("$ne").is_some() || v.get("$gt").is_some() || v.get("$regex").is_some() => Box::new(|_| true),
+        v => {
+            let list: Vec<String> = v["$in"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Box::new(move |r| list.iter().any(|x| x == r))
+        }
+    };
+    let mut reviews = REVIEWS.lock().unwrap();
+    let (mut original, mut updated) = (Vec::new(), Vec::new());
+    for review in reviews.iter_mut().filter(|r| matches(r.0)) {
+        original.push(serde_json::json!({ "_id": review.0, "message": review.1 }));
+        review.1 = "new";
+        updated.push(serde_json::json!({ "_id": review.0, "message": review.1 }));
+    }
+    let body = serde_json::json!({ "modified": original.len(), "original": original, "updated": updated });
+    html(&body.to_string())
 }
 
 fn json_target(port: u16, path: &str, body: &str) -> ScanTarget {
@@ -754,6 +790,18 @@ async fn mongodb_login_bypass_changes_the_status() {
     assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
     assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("password", "$ne0"));
     assert!(found[0].4.contains(r#""password":{"$ne":"0"}"#), "{found:?}");
+}
+
+/// `$ne` updates every review; `$eq` is an error, so `$in` proves it. The original
+/// sent again answers like `$in`: both show the message the attack already wrote,
+/// which the recorded answer doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_operators_without_eq() {
+    let port = spawn_app();
+    let (s, found) =
+        scan("marsdb", 40033, Strength::Medium, vec![json_target(port, "/marsdb", r#"{"id":"r1"}"#)]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("id", "$ne0"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
