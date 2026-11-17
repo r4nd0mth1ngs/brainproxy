@@ -11,7 +11,7 @@ lists them; `scan disable ID` / `scan enable ID` switch them.
 Rules read response bodies decoded: chunked framing and `Content-Encoding` gzip, deflate,
 br and zstd are removed when the exchange is recorded.
 
-brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
+brainproxy's 9 own rules use IDs from 100000 so they never clash with ZAP's:
 **100001 PHP2Shell** (CVE-2026-109618, CVE-2026-109619) flags a PHP version from
 `X-Powered-By` or `Server` that has no fix (5.4 to 8.1, and 8.2 to 8.5 before 8.2.35,
 8.3.36, 8.4.27, 8.5.12, including their -dev, beta and RC builds). It only reads the reported version: distributions back-port fixes
