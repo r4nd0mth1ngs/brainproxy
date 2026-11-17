@@ -691,8 +691,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
             }
         }
         let store = Store::open(project)?;
+        // This scan's findings, not every active finding the project holds.
         let findings = store.findings_grouped(&FindingFilter {
             source: Some("active".into()),
+            ids: Some(summary.finding_ids.clone()),
             examples: 3,
             ..Default::default()
         })?;
@@ -703,6 +705,11 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         if !summary.below_threshold.is_empty() {
             v["threshold_hint"] = json!(
                 "below_threshold counts findings the rules' thresholds kept from being raised; a lower --threshold raises them."
+            );
+        }
+        if summary.failed_requests > 0 {
+            v["failed_requests_hint"] = json!(
+                "failed_requests went out and got no response (timed out, refused or reset): the rules found nothing there because they saw nothing. Check the target, then scan again, at a lower --rate or --concurrency if it was overloaded."
             );
         }
         v["skipped_out_of_scope"] = json!(skipped);
@@ -759,6 +766,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                 p["threshold"].as_str().unwrap_or(""),
                 flags.filter(|f| !f.is_empty()).map(|f| format!(" ({f} given as well)")).unwrap_or_default()
             ));
+        }
+        if let Some(n) = result["failed_requests"].as_u64().filter(|n| *n > 0) {
+            lines
+                .push(format!("  {n} requests got no response (timed out, refused or reset): nothing was found there"));
         }
         if let Some(below) = result["below_threshold"].as_object() {
             let n: u64 = below.values().filter_map(|v| v.as_u64()).sum();

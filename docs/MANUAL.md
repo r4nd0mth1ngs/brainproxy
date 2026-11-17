@@ -844,6 +844,14 @@ are attacked, the result says how many (`post_targets`) with a warning (`post_hi
 with JSON output or `--background` comes only once the scan is over. Text output warns before
 the attack starts, and the scan wizard says so on its last step.
 
+What `scan active` reports when it is done: `active_findings` groups the findings this scan
+raised, new or seen again (their ids are in `finding_ids`), not every active finding in the
+project (`findings list --source active` lists those). `errors` counts rule units that
+crashed; `failed_requests` counts attack requests that went out and got no response (timed
+out, refused or reset), with a `failed_requests_hint` when there are any. A target that stops
+answering finds nothing, so a scan with many failed requests is no clean bill of health: check
+the target and scan again, slower if it was overloaded.
+
 ### Access
 Access control across users: does the app let bob read alice's data? See
 [Access control across users](#access-control-across-users-authz) for how it works.
