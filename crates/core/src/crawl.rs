@@ -786,7 +786,8 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
     if ct.contains("javascript") || ct.contains("json") {
         // Template literals, as compiled apps write their API calls (`/api/users/${id}`): each
         // `${…}` becomes a placeholder, filled in like `{id}`.
-        let (text, _) = interpolate(&text);
+        let (text, interpolated) = interpolate(&text);
+        let bases = base_paths(&text);
         // Quoted absolute paths in scripts, e.g. fetch("/api/items"), also after a base URL
         // interpolated first (`${this.host}/rest/items`), which is where Angular services keep
         // theirs. A concatenated base (`host + "/api/x"`) leaves the path quoted on its own.
@@ -811,13 +812,25 @@ fn extract(page: &Url, headers: &[(String, String)], body: &[u8], forms: bool) -
             {
                 continue;
             }
-            // One that starts with another value (`${this.host}/${id}/reviews`) has a base that
-            // holds a path of its own, unknown here.
-            if !lead.as_str().is_empty() && path.starts_with("/{x}") {
-                continue;
-            }
-            let joined = path;
-            if let Ok(u) = page.join(joined) {
+            // The base before it: interpolated (`${this.host}/x`) or concatenated
+            // (`this.host + "/x"`). When the script sets that base to a URL with a path of its
+            // own (`host = hostServer + "/rest/products"`), the path goes under it.
+            let base = match lead.as_str() {
+                "" => concatenated_base(&text, whole.start()),
+                "{x}" => interpolated.binary_search_by_key(&lead.start(), |(at, _)| *at).ok().and_then(|i| {
+                    let name = interpolated[i].1.trim().strip_prefix("this.")?;
+                    Some(name.to_string())
+                }),
+                _ => None,
+            };
+            let joined = match base.and_then(|name| base_path(&bases, &name, whole.start())) {
+                Some(b) => format!("{}{path}", b.trim_end_matches('/')),
+                // A path that starts with another value (`${this.host}/${id}/reviews`) under an
+                // unknown base: where it goes isn't known.
+                None if !lead.as_str().is_empty() && path.starts_with("/{x}") => continue,
+                None => path.to_string(),
+            };
+            if let Ok(u) = page.join(&joined) {
                 out.push(Found { hint: method_hint(&text, whole.range()), ..Found::get(&u, true) });
             }
         }
@@ -909,6 +922,33 @@ fn interpolate(text: &str) -> (String, Vec<(usize, String)>) {
     }
     out.push_str(&text[last..]);
     (out, exprs)
+}
+
+/// Where a script sets a base URL that holds a path: `host = this.hostServer + "/rest/user"`,
+/// `this.host = `${base}/api``, or `host = "/api/v2"`: (position, name, path), in order.
+fn base_paths(text: &str) -> Vec<(usize, &str, &str)> {
+    static BASE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?:[{;,]|\bthis\.)\s*([A-Za-z_$][\w$]*)\s*=\s*(?:[A-Za-z_$][\w$.]*\s*\+\s*)?["'`](?:\{x\})?(/[A-Za-z0-9_\-./]*)["'`]"#,
+        )
+        .unwrap()
+    });
+    BASE.captures_iter(text)
+        .filter_map(|c| Some((c.get(0)?.start(), c.get(1)?.as_str(), c.get(2)?.as_str())))
+        .filter(|(_, _, path)| has_word(path))
+        .collect()
+}
+
+/// The path of the base `name` as last set before `at`. Minified classes set their fields before
+/// their methods, so the nearest one before is the class's own.
+fn base_path<'a>(bases: &[(usize, &str, &'a str)], name: &str, at: usize) -> Option<&'a str> {
+    bases.iter().rev().find(|(pos, n, _)| *pos < at && *n == name).map(|(_, _, p)| *p)
+}
+
+/// The property a quoted path at `at` is appended to: `this.host + "/x"` gives `host`.
+fn concatenated_base(text: &str, at: usize) -> Option<String> {
+    static CONCAT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bthis\.([A-Za-z_$][\w$]*)\s*\+\s*$").unwrap());
+    CONCAT.captures(window(text, at.saturating_sub(80), at)).map(|c| c[1].to_string())
 }
 
 /// Whether the string at `at` is an argument of a string method (`url.replace("/v3/", "/ws/v3/")`,
@@ -1206,6 +1246,40 @@ mod tests {
         let found = extract(&page, &headers, html.as_bytes(), false);
         let urls: Vec<&str> = found.iter().map(|f| f.url.as_str()).collect();
         assert_eq!(urls, ["http://a.test/help"]);
+    }
+
+    /// A service whose base URL holds a path of its own (`host = hostServer + "/rest/products"`)
+    /// calls `this.host + "/reviews"`: the path is joined to that base.
+    #[test]
+    fn template_paths_join_their_base_path() {
+        let h = vec![("Content-Type".to_string(), "application/javascript".to_string())];
+        let js = r#"class e{http=p(oD);hostServer=F$.hostServer;host=this.hostServer+`/rest/products`;
+            get(t){return this.http.get(`${this.host}/${t}/reviews`)}patch(t){return this.http.patch(this.host+`/reviews`,t)}}
+            class u{hostServer=F$.hostServer;host=`${this.hostServer}/rest/user/`;
+            dataExport(t){return this.http.post(`${this.host}/data-export`,t)}whoami(){return this.http.get(this.host+"/whoami")}}
+            class a{host=this.hostServer+`/api/Addresss`;goToProfilePage(){window.location.replace(F$.hostServer+`/profile`)}
+            other(){return this.http.get(`${this.other}/xy/z`)}}"#;
+        let found = extract(&Url::parse("http://a.test/main.js").unwrap(), &h, js.as_bytes(), false);
+        let got: Vec<(String, Option<&str>)> = found
+            .iter()
+            .map(|f| {
+                let mut u = Url::parse(&f.url).unwrap();
+                fill_placeholders(&mut u);
+                (u.path().to_string(), f.hint)
+            })
+            .collect();
+        let want = [
+            ("/rest/products", None),
+            ("/rest/products/1/reviews", None),
+            ("/rest/products/reviews", Some("PATCH")),
+            ("/rest/user/", None),
+            ("/rest/user/data-export", Some("POST")),
+            ("/rest/user/whoami", None),
+            ("/api/Addresss", None),
+            ("/profile", None),
+            ("/xy/z", None),
+        ];
+        assert_eq!(got, want.map(|(p, m)| (p.to_string(), m)));
     }
 
     /// The method a bundle calls a path with, so a POST-only route isn't sent as GET.
