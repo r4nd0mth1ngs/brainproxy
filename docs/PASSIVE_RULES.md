@@ -174,3 +174,7 @@ data files:
   documentation; a Node.js trace needs two frames.
 - **In Page Banner Information Leak (10009)** also reports an Express version in an error
   page (`Express ^4.22.1`).
+- **Directory Browsing (10033)** also knows the listings of Express `serve-index`, Python's
+  `http.server`, Tomcat and Go's `http.FileServer`, and names nginx's autoindex (ZAP: Apache,
+  and not at all for `/`). A listing's title counts only with the listing's own markup, so
+  an article titled "Directory listing for ..." doesn't.
