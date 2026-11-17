@@ -25,7 +25,9 @@
 //! - No technology filter: ZAP only runs this against targets it knows use MongoDB,
 //!   and by default assumes all do.
 //! - A MongoDB error for a quote or bracket counts only when the same characters
-//!   after a random value bring it too (a search page may quote the error).
+//!   after a random value bring it too (a search page may quote the error), and a
+//!   plain random value doesn't (a type check rejects any value).
+//! - Node's MongoDB driver and Mongoose errors are recognised as well as ZAP's Java ones.
 
 use serde_json::{json, Value};
 
@@ -77,8 +79,17 @@ const JSON_INFO: &str = "In some NodeJS based back end implementations, messages
 const ALL_DATA: [(&str, &str); 3] = [("[$ne]", ""), ("[$regex]", ".*"), ("[$gt]", "0")];
 const CRASH: [&str; 5] = ["\"", "'", "//", "});", ");"];
 const JSON_OPERATORS: [(&str, &str); 3] = [("$ne", "0"), ("$gt", ""), ("$regex", ".*")];
-/// Lower case: ZAP matches them case-insensitively.
-const ERRORS: [&str; 2] = ["runtimeexception: syntaxerror: unterminated string literal", "mongoresultexception"];
+/// Lower case: ZAP matches them case-insensitively. ZAP's two are the Java driver's;
+/// the others are Node's (the MongoDB driver before and since 4.0, the server's
+/// wrapper around a failed `$where` clause, Mongoose).
+const ERRORS: [&str; 6] = [
+    "runtimeexception: syntaxerror: unterminated string literal",
+    "mongoresultexception",
+    "mongoservererror",
+    "mongoerror:",
+    "executor error during find command",
+    "casterror: cast to",
+];
 
 fn same_answer(a: &Response, b: &Response) -> bool {
     a.status == b.status && a.body_str() == b.body_str()
@@ -193,6 +204,13 @@ async fn crash(cx: &Cx, param: &str) -> Step {
             if !new_error(base, again.body_str()) {
                 continue;
             }
+            // Nor in ZAP: a plain random value must not bring it, or it is a type check
+            // that rejects any value of the wrong shape (Mongoose's CastError for an id
+            // that isn't an ObjectId), not a query the characters broke.
+            let Ok(plain) = cx.send_payload(&control_token(false)).await else { return Step::Done };
+            if new_error(base, plain.body_str()) {
+                return Step::Next;
+            }
             let finding = ALERT.raise(param, "").attack(injected).other_info(CRASH_INFO).confidence(Confidence::Medium);
             cx.report(finding, &resp);
             return Step::Done;
@@ -276,5 +294,8 @@ mod tests {
         assert!(new_error("<p>ok</p>", "RuntimeException: SyntaxError: unterminated string literal"));
         assert!(!new_error("MongoResultException in the docs", "MongoResultException in the docs"));
         assert!(!new_error("<p>ok</p>", "<p>no error</p>"));
+        assert!(new_error("<p>ok</p>", "MongoError: unknown operator: $foo"));
+        assert!(new_error("<p>ok</p>", "{\"name\":\"MongoServerError\",\"code\":2}"));
+        assert!(new_error("<p>ok</p>", "CastError: Cast to ObjectId failed for value"));
     }
 }

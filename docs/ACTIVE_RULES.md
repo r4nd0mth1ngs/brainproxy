@@ -220,7 +220,11 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   change every record they match. A counter-proof also counts when it is nearly the same
   (JSON value by value) as the original sent again just after it, which the attack must
   not be: an update that answers with the record before and after differs from its
-  recorded answer once the attack has changed the data.
+  recorded answer once the attack has changed the data. Its error check knows Node's
+  errors (`MongoServerError`, `MongoError:`, a failed `$where` clause's "Executor error
+  during find command", Mongoose's `CastError`) as well as ZAP's Java ones; an error
+  counts only when a plain random value doesn't bring it, so a type check that rejects
+  every id that isn't an ObjectId isn't reported.
 - **Remote OS Command Injection (90020)** sends a control before it reports: the same
   attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
   `;#get-help`). The output must not come back for it, so a search or help page that

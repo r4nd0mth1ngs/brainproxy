@@ -444,6 +444,27 @@ fn handle(path: &str, query: &str) -> String {
                 html("<p>item</p>")
             }
         }
+        // Node's driver, a quote breaking a `$where` clause.
+        "/mongonode" => {
+            if param("id").contains('\'') {
+                status(
+                    500,
+                    "MongoServerError: Executor error during find command :: caused by :: SyntaxError: unterminated \
+                     string literal",
+                )
+            } else {
+                html("<p>item</p>")
+            }
+        }
+        // Safe: Mongoose rejects any id that isn't an ObjectId, quote or not.
+        "/mongocast" => {
+            let id = param("id");
+            if id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                html("<p>item</p>")
+            } else {
+                status(500, &format!("CastError: Cast to ObjectId failed for value \"{id}\" at path \"_id\""))
+            }
+        }
         // $where running JavaScript over 1,000 documents: sleep() takes milliseconds.
         "/mongosleep" => {
             let id = param("id");
@@ -760,6 +781,18 @@ async fn mongodb_unhandled_error_needs_more_than_low_strength() {
     assert_eq!(found[0].3, "'");
     let (s, _) = scan("mongoerrlow", 40033, Strength::Low, vec![target(port, "/mongocrash?id=1")]).await;
     assert!(s.raised.is_empty(), "{s:?}");
+}
+
+/// Node driver errors count; a cast error that any non-ObjectId value brings doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_node_errors() {
+    let port = spawn_app();
+    let (s, found) = scan("mongonode", 40033, Strength::Medium, vec![target(port, "/mongonode?id=1")]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "'");
+    let id = "/mongocast?id=5f1d7c2e9b1e8a3d4c6b2a10";
+    let (s, found) = scan("mongocast", 40033, Strength::Medium, vec![target(port, id)]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
