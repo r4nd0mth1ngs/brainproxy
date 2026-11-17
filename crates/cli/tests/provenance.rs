@@ -227,16 +227,23 @@ fn a_proxy_started_by_an_agent_records_mcp_and_each_client() {
     env.ok(&[(CLIENT, "gui")], &["findings", "mark", &id, "--state", "open"]);
     assert_eq!(env.ok(&[], &["findings", "show", &id])["state_origin"], "gui");
 
-    for (kind, needle) in [
-        ("markdown", "added via MCP (an agent)"),
-        ("html", "via MCP (an agent)"),
-        ("sarif", "\"origin\": \"mcp\""),
-        ("json", "\"origin\": \"mcp\""),
+    // A report says the scanner found it; which client ran the scanner only with --provenance.
+    for (kind, needle, full) in [
+        ("markdown", "found by the passive scanner (run via MCP (an agent))", true),
+        ("markdown", "· found by the passive scanner\n", false),
+        ("html", "found by the passive scanner (run via MCP (an agent))", true),
+        ("sarif", "\"origin\": \"mcp\"", false),
+        ("json", "\"origin\": \"mcp\"", false),
     ] {
         let out = Path::new(&env.home).with_extension(format!("report.{kind}"));
-        env.ok(&[], &["report", kind, "--output", out.to_str().unwrap()]);
+        let mut args = vec!["report", kind, "--output", out.to_str().unwrap(), "--force"];
+        if full {
+            args.push("--provenance");
+        }
+        env.ok(&[], &args);
         let text = std::fs::read_to_string(&out).unwrap();
-        assert!(text.contains(needle), "{kind}: {needle}");
+        assert!(text.contains(needle), "{kind}: {needle}: {text}");
+        assert!(full || !text.contains("from the command line"), "{kind}: {text}");
     }
 }
 
@@ -709,18 +716,27 @@ fn reports_say_who_triaged_each_finding() {
         md.contains(&format!("Finding #{by_agent} · ")) && md.contains("· confirmed via MCP (an agent) at "),
         "{md}"
     );
-    assert!(md.contains("· confirmed from the desktop app at "), "{md}");
-    assert!(md.contains("- Note (written from the desktop app at "), "{md}");
-    assert!(md.contains("1 finding marked false positive is left out of this report: 1 via MCP (an agent)."), "{md}");
-    assert!(md.contains("## Marked false positive by an agent") && md.contains(&format!("- #{hidden} ")), "{md}");
+    assert!(md.contains("· confirmed by a person at "), "{md}");
+    assert!(md.contains("- Note (written by a person at "), "{md}");
+    assert!(
+        md.contains("1 finding is left out of this report by its state: 1 false positive (1 via MCP (an agent))."),
+        "{md}"
+    );
+    assert!(md.contains("## Left out by an agent") && md.contains(&format!("- #{hidden} ")), "{md}");
+    // Which client a person used is for an internal report.
+    let out = env.project.with_extension("full.md");
+    env.ok(&[], &["report", "markdown", "--provenance", "--output", out.to_str().unwrap(), "--force"]);
+    let full = std::fs::read_to_string(&out).unwrap();
+    assert!(full.contains("· confirmed from the desktop app at "), "{full}");
+    assert!(full.contains("- Note (written from the desktop app at "), "{full}");
 
     let html = report("html");
     // The tag says who confirmed it; only a person's confirmation reads as the tester's.
     // Once on the finding, once where "About this report" explains it.
     assert_eq!(html.matches("<span class=\"tag\">confirmed via MCP (an agent)</span>").count(), 2, "{html}");
     assert!(html.contains("<span class=\"tag\">confirmed</span></td>"), "{html}");
-    assert!(html.contains("checked by the tester, from the desktop app or the command line"));
-    assert!(html.contains("<h2 id=\"agent-fp\">Marked false positive by an agent</h2>"));
+    assert!(html.contains("checked by a person"));
+    assert!(html.contains("<h2 id=\"agent-fp\">Left out by an agent</h2>"));
 
     let sarif: Value = serde_json::from_str(&report("sarif")).unwrap();
     let results = sarif["runs"][0]["results"].as_array().unwrap();
@@ -777,7 +793,8 @@ fn findings_added_by_hand_say_who_added_and_removed_them() {
         md.contains(&format!("Finding #{by_agent} · manual · ")) && md.contains("added via MCP (an agent)"),
         "{md}"
     );
-    assert!(md.contains("added from the desktop app"), "{md}");
+    assert!(md.contains("added by hand") && !md.contains("added from the desktop app"), "{md}");
+    assert!(report("markdown", &["--provenance"]).contains("added from the desktop app"));
     let html = report("html", &[]);
     let row = |path: &str| {
         let at = html.find(&format!("http://127.0.0.1:9/{path}</code>")).unwrap();
@@ -848,7 +865,7 @@ fn findings_added_by_hand_say_who_added_and_removed_them() {
         (f["removed"]["state"].as_str(), f["removed"]["state_origin"].as_str()),
         (Some("confirmed"), Some("gui"))
     );
-    let html = report("html", &["--state", "all"]);
+    let html = report("html", &["--state", "all", "--provenance"]);
     assert!(html.contains("<span class=\"tag\">removed from the desktop app</span>"), "{html}");
 }
 

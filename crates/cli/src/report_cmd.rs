@@ -81,6 +81,11 @@ pub struct ReportArgs {
     /// Include narratives nobody has reviewed yet, marked as drafts.
     #[arg(long)]
     drafts: bool,
+    /// Say in full how each finding was recorded and triaged (the desktop app or the command
+    /// line) and give each agent's trail: for an internal review. Without it a finding says
+    /// whether a scanner found it or it was added by hand, and what an agent did.
+    #[arg(long)]
+    provenance: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -415,6 +420,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
         mask: a.mask,
         layout,
         drafts: a.drafts,
+        provenance: a.provenance,
     };
     let r = report::build(&store, &opts)?;
     let kind_name = match a.kind {

@@ -141,7 +141,10 @@ fn narratives_trails_repro_tickets_and_exports() {
         t["agent_involved"] == true && t["requests_total"].as_i64().unwrap() >= 1 && t["reviewed_by"].is_null(),
         "{t}"
     );
-    assert!(html(&[]).contains("agent&#x27;s work not reviewed") || html(&[]).contains("agent's work not reviewed"));
+    // An agent's trail is internal: a report gives it with --provenance only.
+    let full = html(&["--provenance"]);
+    assert!(full.contains("agent&#x27;s work not reviewed") || full.contains("agent's work not reviewed"), "{full}");
+    assert!(!html(&[]).contains("Agent trail") && !html(&[]).contains("work not reviewed"));
     std::thread::sleep(std::time::Duration::from_millis(5));
     ok(&project, &["findings", "mark", &f, "--note", "Seen it myself"]);
     assert_eq!(ok(&project, &["findings", "trail", &f])["reviewed_by"], "from the command line");

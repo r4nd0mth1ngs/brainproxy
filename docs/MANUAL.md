@@ -2130,12 +2130,19 @@ them. The description and solution a title added by hand shares keep who wrote t
 table): whoever gave the text first, filled it in when it was left blank, or replaced it.
 Reports carry a finding's origins in every format:
 
-- JSON: each instance has `state_origin`, `state_changed_at`, `note_origin`,
+- JSON: each instance has `origin`, `state_origin`, `state_changed_at`, `note_origin`,
   `note_changed_at` and `state_text` ("confirmed via MCP (an agent) at ...").
-- Markdown and HTML say it in words on each finding. In HTML a finding a person confirmed
-  (from the app or the command line) is tagged **confirmed**, one an agent confirmed
-  **confirmed via MCP (an agent)**. A finding added with `findings add` is tagged **found by
-  hand**, or **added via MCP (an agent)** when an agent added it.
+- Markdown and HTML say it in words on each finding: a scanner's finding is "found by the
+  passive scanner" (or the active scanner, or access-control testing), and one added with
+  `findings add` "added by hand", or "added via MCP (an agent)" when an agent added it. A state
+  or note says whether a person, an agent or the scanner set it. In HTML a finding a person
+  confirmed is tagged **confirmed**, one an agent confirmed **confirmed via MCP (an agent)**,
+  and one added by hand **found by hand** or **added via MCP (an agent)**.
+- Which client did it (the desktop app or the command line, and which one ran the scanner) and
+  each agent's trail are for an internal review, not a client: `report --provenance` adds
+  them ("found by the passive scanner (run from the command line)", "confirmed from the desktop
+  app at ...", "Agent trail: ..."). Without it the JSON's raw origin fields stay, and an
+  instance has no `agent_trail`.
 - SARIF: `stateOrigin`, `stateChangedAt`, `stateText`, `noteOrigin`, `noteChangedAt` in each
   result's properties.
 
@@ -2161,11 +2168,15 @@ code scanning shows it as dismissed rather than open.
 first, `unchanged` for what it found again. `lastHistoryId` and `lastSeen` give the latest
 sighting.
 
-False positives are left out of a report by default. The report counts them by who marked
-them (`summary.false_positives_left_out`), and lists the ones an agent marked
-(`agent_false_positives`; a "Marked false positive by an agent" section in Markdown and HTML,
-`agentFalsePositives` in SARIF run properties), so an agent can't make a finding vanish
-from a report unseen.
+False positives, accepted risks and fixed findings are left out of a report by default (and
+any of them a `--state` leaves out). The report says so at the top ("3 findings are left out of
+this report by their state: 2 accepted risk (1 by a person, 1 via MCP (an agent)), 1 fixed (1
+by a person)"), counts them by state and by who set it (`summary.left_out`: `state`, `origin`,
+`count`; `summary.false_positives_left_out` keeps the false positives alone, by origin), and
+lists the ones an agent left out (`agent_false_positives`, which despite its name holds every
+such state, each with its `state`; a "Left out by an agent" section in Markdown, HTML and Word,
+`agentFalsePositives` in SARIF run properties), so an agent can't make a finding vanish from a
+report unseen.
 
 `scan passive --rescan` rescans all history and keeps what people decided: a finding found
 again keeps its id, state, note, origin and who set them. One not found again (its rule was
@@ -3099,9 +3110,9 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
 - **Agent trail** (`findings trail ID`): for a finding an agent added, changed, re-raised in
   its own traffic, or whose issue it changed (write-up, title, CVSS), the requests it sent to
   that host (from half an hour before its first such act until its last), its changes, and the
-  first change a person made to the finding or its issue after them. Reports say it on each
-  such finding ("agent's work reviewed" or "not reviewed"), with the request range in the
-  technical details.
+  first change a person made to the finding or its issue after them. Reports written with
+  `--provenance` say it on each such finding ("agent's work reviewed" or "not reviewed"), with
+  the request range in the technical details.
 - **Repro pack** (`findings repro ID [--output FILE [--force]] [--no-redact | --mask VALUE]`):
   the request (secrets masked), a curl command, the response around the evidence, what the rule looks for, and the
   command that checks it again (for an active finding on anything but a plain GET, the scan
