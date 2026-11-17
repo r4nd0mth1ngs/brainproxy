@@ -561,7 +561,9 @@ fn crawl_filters_its_first_requests_and_reads_past_early_hints() {
     assert!(!seen.iter().any(|l| l.contains("robots.txt") || l.contains("sitemap.xml")), "{seen:?}");
     // The page after the 103 is the one read: its link is followed.
     assert!(seen.iter().any(|l| l.starts_with("GET /allowed/next ")), "{seen:?}");
-    assert_eq!(v["data"]["by_status"]["200"], 2, "{v}");
+    // The two pages and the probe for the catch-all page, which stays under the prefix.
+    assert!(seen.iter().any(|l| l.starts_with("GET /allowed/brainproxy-")), "{seen:?}");
+    assert_eq!(v["data"]["by_status"]["200"], 3, "{v}");
 }
 
 /// Like the Supportdesk lab: `/` links to `/login` (sets a device cookie) and to
@@ -635,6 +637,77 @@ fn crawl_keeps_cookies_and_follows_urls_in_page_text() {
     );
     assert_eq!(code, 0, "{v}");
     assert!(v["data"]["insertion_points"].as_u64().unwrap() >= 2, "{v}");
+}
+
+/// A site answered by `route` (request line → status, content type, body). Records the
+/// request lines.
+fn serve_routes(
+    route: fn(&str) -> (&'static str, &'static str, String),
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 16384];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                log.lock().unwrap().push(line.clone());
+                let (status, ct, body) = route(&line);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// Like Juice Shop: every unknown path is the app's index.html, whose relative links
+/// resolve against each path it is served at.
+fn spa_route(line: &str) -> (&'static str, &'static str, String) {
+    let path = line.split(' ').nth(1).unwrap_or("/");
+    match path {
+        "/main.js" => ("200 OK", "application/javascript", r#"x.get("/api/items")"#.into()),
+        "/api/items" => ("200 OK", "application/json", "[]".into()),
+        _ => (
+            "200 OK",
+            "text/html",
+            r#"<a href="login">Login</a> <a href="basket/view">Basket</a><script src="main.js"></script>"#.into(),
+        ),
+    }
+}
+
+#[test]
+fn crawl_reads_a_single_page_apps_fallback_page_once() {
+    let (port, seen) = serve_routes(spa_route);
+    let project = tmp_project("crawlspa");
+    run(&["engagement", "start", "--target", "127.0.0.1"], &project, None);
+    let site = format!("http://127.0.0.1:{port}/");
+    let (code, v) = run(&["crawl", &site, "--no-robots", "--no-sitemap"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let lines = seen.lock().unwrap().clone();
+    // Each copy of index.html would add basket/main.js, basket/login, basket/basket/view, ...
+    assert!(!lines.iter().any(|l| l.starts_with("GET /basket/main.js ")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("GET /api/items ")), "{lines:?}");
+    // The probe, /, main.js, the two routes and the API call.
+    assert_eq!(v["data"]["requests"], 6, "{lines:?} {v}");
+    assert_eq!(v["data"]["fallback_pages"], 2, "{v}");
+    let paths: Vec<&str> =
+        v["data"]["endpoints"].as_array().unwrap().iter().filter_map(|e| e["path"].as_str()).collect();
+    assert_eq!(paths, ["/", "/api/items", "/main.js"], "{v}");
 }
 
 #[test]
@@ -975,10 +1048,11 @@ fn crawl_rate_holds_across_concurrency() {
     let port = serve_links();
     let project = tmp_project("crawlrate");
     let site = format!("http://127.0.0.1:{port}/");
-    // 6 requests at 4/s take at least 1.25 s; the old per-batch delay sent the 5 links at once.
+    // 7 requests (the probe for the catch-all page, / and its 5 links) at 4/s take at least
+    // 1.5 s; the old per-batch delay sent the 5 links at once.
     let (code, v) = run(&["crawl", &site, "--rate", "4", "-c", "10", "--no-robots", "--no-sitemap"], &project, None);
     assert_eq!(code, 0, "{v}");
-    assert_eq!(v["data"]["requests"], 6, "{v}");
+    assert_eq!(v["data"]["requests"], 7, "{v}");
     assert!(v["data"]["elapsed_ms"].as_u64().unwrap() >= 1200, "{v}");
 }
 

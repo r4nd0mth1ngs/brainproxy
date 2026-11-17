@@ -2284,6 +2284,15 @@ Crawl and active-scan scope and safety flags:
   time-based ones get the wait they need. When several templates send the same GET or HEAD
   request, it's sent once and they share the response.
 - The crawler submits at most 200 forms per page.
+- Catch-all pages: before crawling, the plain crawler requests one path that can't exist
+  beside each seed (`brainproxy-` and 16 random hex digits; it is in history and counts
+  towards `--max-pages`, and is left out when `--max-pages` only covers the seeds). A
+  single-page app (or a soft-404 site) answers it with the same page it gives every unknown
+  path. A later response with exactly that status and body is read once, for its links; the
+  other copies are not counted as endpoints and their links aren't read again, so relative
+  links on an index.html served at `/a/b` don't multiply. The summary counts them in
+  `fallback_pages`. A catch-all page that changes with each request (it echoes the path or
+  carries a nonce) isn't recognised.
 - `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
   bounds its crawl too, with `--browser` both crawls together).
 - `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl

@@ -85,6 +85,10 @@ pub struct CrawlSummary {
     pub forms_submitted: usize,
     pub endpoints: Vec<Endpoint>,
     pub endpoint_count: usize,
+    /// Responses that were a copy of the site's answer to any unknown path (its catch-all
+    /// page, such as a single-page app's index.html), after the first: not counted as
+    /// endpoints, and their links aren't read again.
+    pub fallback_pages: usize,
     pub out_of_scope_hosts: Vec<String>,
     pub errors: usize,
     /// Exchanges that could not be saved to the project (e.g. too large).
@@ -252,6 +256,40 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     let mut endpoints: HashSet<Endpoint> = HashSet::new();
     let mut out_of_scope: HashSet<String> = HashSet::new();
     let jar = Arc::new(Mutex::new(CookieJar::default()));
+    let mut sent = 0;
+
+    // Single-page apps (and soft-404 sites) answer every unknown path with the same page. Its
+    // relative links resolve against each path it is served at (`/a/b` → `/a/main.js`, which is
+    // that page again), so reading every copy multiplies the crawl. A path that can't exist
+    // shows what that answer looks like on each seed's origin.
+    let mut fallbacks: HashMap<String, (u16, u64)> = HashMap::new();
+    for u in &seeds {
+        let origin = u.origin().ascii_serialization();
+        // A budget that only covers the seeds has no room for copies to skip.
+        if fallbacks.contains_key(&origin) || ctl.stopped() || sent + seeds.len() >= cfg.max_pages {
+            continue;
+        }
+        let Some(probe) = fallback_probe(u).filter(|p| scope.allows(p)) else { continue };
+        if let Some(l) = &limiter {
+            l.wait().await;
+        }
+        let req = Req { method: "GET".into(), url: probe.to_string(), body: None };
+        sent += 1;
+        let (target, raw_req, recorded, outcome) =
+            fetch(&client, &rows, cfg.auth.as_deref(), &jar, &req, &cfg.headers).await;
+        summary.requests += 1;
+        match outcome.as_deref().map(crate::http::client::final_response).map(|r| (parse_response_head(r), r)) {
+            Ok((Ok(head), last)) => {
+                *summary.by_status.entry(head.status.to_string()).or_default() += 1;
+                let body = decode_body(&head.headers, split_head_body(last).1);
+                fallbacks.insert(origin, (head.status, body_hash(&body)));
+            }
+            Ok((Err(_), _)) => *summary.by_status.entry("error".into()).or_default() += 1,
+            Err(e) => failed(&mut summary, &mut out_of_scope, &save, (&target, &raw_req, recorded), e),
+        }
+    }
+    // Origins whose catch-all page has been read once.
+    let mut fallback_read: HashSet<String> = HashSet::new();
 
     // Breadth first: a FIFO of (request, depth), with up to `concurrency` fetches in flight.
     let mut queue: VecDeque<(Req, usize)> = VecDeque::new();
@@ -281,7 +319,6 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     }
 
     let mut running = tokio::task::JoinSet::new();
-    let mut sent = 0;
     loop {
         // Start fetches up to the limit, within the page budget and per-path cap.
         while running.len() < cfg.concurrency.max(1) && !ctl.stopped() {
@@ -323,34 +360,24 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
         let Ok(Some((req, depth, (target, raw_req, recorded, outcome)))) = done else { continue };
         summary.requests += 1;
         match outcome {
-            Err(e) => {
-                summary.errors += 1;
-                *summary.by_status.entry("error".into()).or_default() += 1;
-                // A Host the scope doesn't list, refused as the request went out.
-                if let Some(h) = crate::http::client::refused_host(&e).filter(|_| out_of_scope.len() < 50) {
-                    out_of_scope.insert(h);
-                }
-                // Its row says how it failed; one refused before it went out gets one now.
-                if !recorded {
-                    let _ = save.send(Save::Unsent(Box::new(Capture::new(
-                        "crawl",
-                        &target,
-                        &raw_req,
-                        None,
-                        None,
-                        Some(&e.to_string()),
-                    ))));
-                }
-            }
+            Err(e) => failed(&mut summary, &mut out_of_scope, &save, (&target, &raw_req, recorded), &e),
             Ok(response) => {
                 let page = Url::parse(&req.url).ok();
                 // The final response, after any interim ones (100 Continue, 103 Early Hints).
                 let last = crate::http::client::final_response(&response);
                 if let (Some(page), Ok(head)) = (page.as_ref(), parse_response_head(last)) {
                     *summary.by_status.entry(head.status.to_string()).or_default() += 1;
-                    endpoints.insert(endpoint(&req, page));
                     let body = decode_body(&head.headers, split_head_body(last).1);
-                    let found = if depth < cfg.max_depth {
+                    let origin = page.origin().ascii_serialization();
+                    // The first copy is read: a seed is often the app's own page.
+                    let copy = fallbacks.get(&origin) == Some(&(head.status, body_hash(&body)))
+                        && !fallback_read.insert(origin);
+                    if copy {
+                        summary.fallback_pages += 1;
+                    } else {
+                        endpoints.insert(endpoint(&req, page));
+                    }
+                    let found = if depth < cfg.max_depth && !copy {
                         extract(page, &head.headers, &body, cfg.submit_forms)
                     } else {
                         vec![]
@@ -407,6 +434,26 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     summary.out_of_scope_hosts = oos;
     summary.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(summary)
+}
+
+/// Counts a request that failed. Its row says how; one refused before it went out gets one now.
+fn failed(
+    summary: &mut CrawlSummary,
+    out_of_scope: &mut HashSet<String>,
+    save: &std::sync::mpsc::Sender<Save>,
+    (target, raw_req, recorded): (&Target, &[u8], bool),
+    e: &Error,
+) {
+    summary.errors += 1;
+    *summary.by_status.entry("error".into()).or_default() += 1;
+    // A Host the scope doesn't list, refused as the request went out.
+    if let Some(h) = crate::http::client::refused_host(e).filter(|_| out_of_scope.len() < 50) {
+        out_of_scope.insert(h);
+    }
+    if !recorded {
+        let _ =
+            save.send(Save::Unsent(Box::new(Capture::new("crawl", target, raw_req, None, None, Some(&e.to_string())))));
+    }
 }
 
 /// The target, the request (as sent, if it was), whether it has a row, and the response.
@@ -589,6 +636,22 @@ fn endpoint(req: &Req, page: &Url) -> Endpoint {
     params.sort();
     params.dedup();
     Endpoint { method: req.method.clone(), path: page.path().to_string(), params }
+}
+
+/// A path that can't exist, beside the seed (so it stays under a path prefix).
+fn fallback_probe(seed: &Url) -> Option<Url> {
+    let mut b = [0u8; 8];
+    getrandom::fill(&mut b).ok()?;
+    let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    seed.join(&format!("brainproxy-{name}")).ok()
+}
+
+/// Identifies a body exactly; a catch-all page that echoes the path or a nonce isn't caught.
+fn body_hash(body: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
 }
 
 pub(crate) fn strip_fragment(u: &Url) -> String {
