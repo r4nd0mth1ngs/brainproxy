@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` runs 52 rules ported from OWASP ZAP's `ascanrules` and `ascanrulesBeta` add-ons (and
+`brainproxy scan active` runs 53 rules ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta` and `ascanrulesAlpha` add-ons (and
 helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
@@ -92,6 +92,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 40009 | Server Side Include | param | high | 40009 |
 | 40012 | Cross Site Scripting (Reflected) | param | high | 40012 |
 | 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
+| 40015 | LDAP Injection | param | high | 40015-1, 40015-2 |
 | 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |
 | 40017 | Cross Site Scripting (Persistent) - Spider | page | (none) | |
 | 40018 | SQL Injection | param | high | 40018 |
@@ -134,7 +135,8 @@ headers and URL path segments when enabled), `page` once per target request, `ho
 
 Every rule in ZAP's `ascanrules` add-on is ported (`zap-sync.json` lists the two
 `pscanrules` rules that aren't). From `ascanrulesBeta` so far: CORS (40040), Server Side
-Request Forgery (40046), and the two MongoDB rules (40033, 90039). Each file's header
+Request Forgery (40046), and the two MongoDB rules (40033, 90039). From `ascanrulesAlpha`:
+LDAP Injection (40015), with its own checks (see below). Each file's header
 lists where it differs from ZAP; for example, JSON attacks send a real operator object.
 The time based MongoDB rule keeps ZAP's small delay, because `sleep()` runs per document:
 the stall stays small, but it only fires on collections of roughly 1,000 documents.
@@ -187,6 +189,39 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   - the HTTP 500 check runs for quotes only, and the 500 must repeat and go away when
     each quote is doubled (an escaped quote in an SQL string): input validation and
     type errors (`true'` in a JSON boolean) reject both.
+- **LDAP Injection (40015)** keeps ZAP's id, alert texts and error attack (every filter
+  metacharacter), and checks differently:
+  - *Error based* (40015-1, high confidence): only messages an LDAP library or server
+    writes count (JNDI, Spring LDAP, UnboundID, Apache Directory, libldap as PHP and
+    python-ldap show it, ldap3, ldapjs, .NET `System.DirectoryServices`, Active Directory's
+    `LdapErr: DSID-`, go-ldap, Ruby net-ldap), not ZAP's list of generic texts such as
+    "out of memory". A random value of the same length must not bring the message, and an
+    unbalanced filter after a random value (`k3jd8a)(`) must bring one too. At MEDIUM and
+    above the original value with a closing parenthesis is tried as well.
+  - *Boolean based* (40015-2, medium confidence): ZAP compares `value)(objectClass=*` with
+    the original page alone, which any page that ignores the input passes. Here it is paired
+    with the same clause made false (`value)(objectClass=` and a random word). Read as plain
+    data, both are unknown values and give the same page; read as a filter, the one ANDed or
+    ORed with the original condition (`(&(uid=alice)(objectClass=*))`) keeps the original
+    page and the other changes it. The pair is also tried from `*`, for a value that found
+    nothing at first, and at HIGH and INSANE two and three parentheses deep. See *Boolean
+    differential* below.
+  - Like ZAP, it skips pages whose original answer is a 4xx or 5xx, and URL path segments.
+- **XPath Injection (90021)** also has a boolean check, not in ZAP, for apps that hide
+  XPath errors (medium confidence; the error check stays high). It closes the value and
+  adds an always-true and an always-false comparison, ANDed and then ORed:
+  `2' and '1'='1` / `2' and '1'='2`, then `or`. Single quotes at LOW; double quotes, and
+  numbers (`2 and 1=1`) for a numeric value, from MEDIUM; numbers for any value from HIGH.
+- **Boolean differential** (40015 and 90021): pages are compared by the words they contain,
+  with the values sent stripped out, also escaped or entity-encoded (a page that echoes the
+  whole query, encoded, echoes the attack too). The original page is requested twice first:
+  how much it changes by itself is the noise (when the two differ less with every word that
+  has a digit in it counted as one word, as a clock, counter or CSRF token makes them, pages
+  are compared that way), a page that changes too much isn't tested,
+  "the same page" may differ by little more than the noise and "a different page" must
+  differ by more than twice it. One of the pair must keep the original page and the other
+  change it; neither may be a 5xx or 429. A pair that passes is sent again with the
+  original, and must give the same answer.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.

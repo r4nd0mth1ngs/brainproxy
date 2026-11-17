@@ -110,13 +110,14 @@ fn policies_are_saved_shown_listed_and_removed() {
 
     let shown = ok(&p, &["scan", "policy", "show", "api"]);
     let table = shown["rule_table"].as_array().unwrap();
-    assert_eq!(table.len(), 56);
+    assert_eq!(table.len(), 57);
     let rule = |id: u64| table.iter().find(|r| r["id"] == id).unwrap().clone();
     assert_eq!(
         rule(40018),
         json!({"id": 40018, "name": rule(40018)["name"], "enabled": true, "strength": "insane", "threshold": "high", "own": true})
     );
     assert_eq!((rule(40012)["enabled"].as_bool(), rule(40034)["strength"].as_str()), (Some(false), Some("high")));
+    assert_eq!((rule(40015)["name"].as_str(), rule(40015)["enabled"].as_bool()), (Some("LDAP Injection"), Some(true)));
 
     // From another, changing only what's given; from JSON on stdin.
     let copy = ok(&p, &["scan", "policy", "save", "api2", "--from", "api", "--enable", "40012", "--reset", "40018"]);
