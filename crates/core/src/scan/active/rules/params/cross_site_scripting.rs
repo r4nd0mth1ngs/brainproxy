@@ -241,9 +241,10 @@ impl Xss<'_> {
             return None;
         }
         let (attack, evidence) = if o.null_byte {
-            // The parser would see no enclosing tag for a leading null byte.
-            let a = attack.replacen(NULL_BYTE, "", 1);
-            (a.clone(), a)
+            // The parser would see no enclosing tag for a leading null byte. The caller's
+            // evidence is kept: a mutated attack (`＜` for `<`) must be found converted
+            // back, not as the inert full-width text it was sent as.
+            (attack.replacen(NULL_BYTE, "", 1), evidence.unwrap_or(attack).replacen(NULL_BYTE, "", 1))
         } else {
             (attack.to_string(), evidence.unwrap_or(attack).to_string())
         };

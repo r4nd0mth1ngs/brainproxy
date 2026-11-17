@@ -92,6 +92,12 @@ mod e2e {
             // Markup in a JSON string or a text page, unescaped: no browser renders it.
             "/xss-json" => ok("application/json", format!("{{\"html\":\"<p>Hello {}</p>\"}}", param("q"))),
             "/xss-text" => ok("text/plain; charset=utf-8", format!("<p>Hello {}</p>", param("q"))),
+            // Strips ASCII brackets (and `%`), but echoes full-width ones as they came, which
+            // no browser reads as markup. The value is shown outside tags and in a paragraph.
+            "/xss-fullwidth" => {
+                let q: String = param("q").chars().filter(|c| !"<>%".contains(*c)).collect();
+                ok("text/html", format!("Hello {q}<html><body><p>{q}</p></body></html>"))
+            }
             "/comment-data" => {
                 sign(&mut GUESTBOOK_DATA.lock().unwrap(), param("text"));
                 ok("text/html", "<p>saved</p>".into())
@@ -373,6 +379,14 @@ mod e2e {
         let s = scan("pxss-json", port, &["/comment-data?text=hi", "/comments-json"], Some(vec![40014])).await;
         assert_eq!(s.raised.get("40014-2"), Some(&1), "{s:?}");
         assert_eq!(s.raised.len(), 1, "{s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xss_full_width_brackets_echoed_are_not_xss() {
+        let port = spawn_app();
+        let s = scan("xss-fullwidth", port, &["/xss-fullwidth?q=hi"], Some(vec![40012])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+        assert!(s.requests > 10, "the rule did attack: {s:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
