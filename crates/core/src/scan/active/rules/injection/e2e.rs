@@ -263,6 +263,22 @@ fn handle(path: &str, query: &str) -> String {
             };
             html(if rows { "<ul><li>apple: 3</li></ul>" } else { "<ul></ul>" })
         }
+        // A login, `WHERE email = '<value>'`: no row is a 401, a row logs in. For an
+        // unknown email only "OR true" changes the answer.
+        "/sqllogin" => {
+            let email = param("email");
+            let row = match email.split_once('\'') {
+                None => email == "admin",
+                Some((head, tail)) if tail.starts_with(" AND '1'='1'") => head == "admin",
+                Some((_, tail)) if tail.starts_with(" OR '1'='1'") => true,
+                Some(_) => false,
+            };
+            if row {
+                html("<p>token: abc</p>")
+            } else {
+                status(401, "<p>Invalid email or password.</p>")
+            }
+        }
         // String column in a 500 page for broken SQL: an unbalanced quote breaks it.
         "/sql500" => {
             if param("name").matches('\'').count() % 2 == 1 {
@@ -428,6 +444,27 @@ fn handle(path: &str, query: &str) -> String {
                 html("<p>item</p>")
             }
         }
+        // Node's driver, a quote breaking a `$where` clause.
+        "/mongonode" => {
+            if param("id").contains('\'') {
+                status(
+                    500,
+                    "MongoServerError: Executor error during find command :: caused by :: SyntaxError: unterminated \
+                     string literal",
+                )
+            } else {
+                html("<p>item</p>")
+            }
+        }
+        // Safe: Mongoose rejects any id that isn't an ObjectId, quote or not.
+        "/mongocast" => {
+            let id = param("id");
+            if id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                html("<p>item</p>")
+            } else {
+                status(500, &format!("CastError: Cast to ObjectId failed for value \"{id}\" at path \"_id\""))
+            }
+        }
         // $where running JavaScript over 1,000 documents: sleep() takes milliseconds.
         "/mongosleep" => {
             let id = param("id");
@@ -494,10 +531,56 @@ fn handle_json(path: &str, body: &str) -> String {
             html("<ul><li>mine</li><li>theirs</li></ul>")
         }
         "/mongojson" => html("<ul></ul>"),
+        "/marsdb" => marsdb_update(id),
+        // `find({email, password})`: only the password is checked here, as an operator.
+        "/mongologin" => {
+            let pw = &v["password"];
+            let any = ["$ne", "$gt", "$regex"].iter().any(|op| pw.get(op).is_some());
+            if any || *pw == serde_json::json!("secret") || pw["$eq"] == serde_json::json!("secret") {
+                html("<p>token: abc</p>")
+            } else {
+                status(401, "<p>Invalid email or password.</p>")
+            }
+        }
         _ if id.is_object() => html("<p>bad input</p>"),
         _ if *id == serde_json::json!(1) => html("<ul><li>mine</li></ul>"),
         _ => html("<ul></ul>"),
     }
+}
+
+/// Messages of the reviews `/marsdb` updates, by id.
+static REVIEWS: std::sync::Mutex<[(&str, &str); 3]> =
+    std::sync::Mutex::new([("r1", "old"), ("r2", "nice"), ("r3", "meh")]);
+
+/// An update by `{"id": <query>}` setting the message to "new", answered with the
+/// reviews before and after, as Juice Shop's review update on MarsDB: no `$eq`.
+fn marsdb_update(id: &serde_json::Value) -> String {
+    let matches: Box<dyn Fn(&str) -> bool> = match id {
+        serde_json::Value::String(s) => {
+            let s = s.clone();
+            Box::new(move |r| r == s)
+        }
+        v if v.get("$eq").is_some() => {
+            return status(500, r#"{"error":"Unrecognized operator: $eq"}"#);
+        }
+        v if v.get("$ne").is_some() || v.get("$gt").is_some() || v.get("$regex").is_some() => Box::new(|_| true),
+        v => {
+            let list: Vec<String> = v["$in"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Box::new(move |r| list.iter().any(|x| x == r))
+        }
+    };
+    let mut reviews = REVIEWS.lock().unwrap();
+    let (mut original, mut updated) = (Vec::new(), Vec::new());
+    for review in reviews.iter_mut().filter(|r| matches(r.0)) {
+        original.push(serde_json::json!({ "_id": review.0, "message": review.1 }));
+        review.1 = "new";
+        updated.push(serde_json::json!({ "_id": review.0, "message": review.1 }));
+    }
+    let body = serde_json::json!({ "modified": original.len(), "original": original, "updated": updated });
+    html(&body.to_string())
 }
 
 fn json_target(port: u16, path: &str, body: &str) -> ScanTarget {
@@ -570,10 +653,10 @@ fn project(name: &str) -> PathBuf {
     dir.join("project.db")
 }
 
-type Found = Vec<(String, String, String, String)>;
+type Found = Vec<(String, String, String, String, String)>;
 
 /// Runs one rule over `targets`; returns the summary and the stored findings
-/// (alert ref, name, param, attack).
+/// (alert ref, name, param, attack, and the stored request's URL and body).
 async fn scan(name: &str, rule: u32, strength: Strength, targets: Vec<ScanTarget>) -> (ActiveSummary, Found) {
     scan_points(name, rule, strength, PointOptions::default(), targets).await
 }
@@ -608,9 +691,17 @@ async fn scan_points(
     let path = project(name);
     let summary = run(&path, targets, cfg, JobControl::default()).await.unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
-    let mut st = conn.prepare("SELECT alert_ref, name, param, attack FROM findings ORDER BY id").unwrap();
-    let found =
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(|r| r.unwrap()).collect();
+    let mut st = conn
+        .prepare(
+            "SELECT f.alert_ref, f.name, f.param, f.attack, h.url || ' ' || COALESCE(h.req_body_text, '') \
+             FROM findings f JOIN history h ON h.id = f.history_id ORDER BY f.id",
+        )
+        .unwrap();
+    let found = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
     drop(st);
     drop(conn);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -635,6 +726,18 @@ async fn sql_injection_error_expression_and_boolean_based() {
     assert_eq!((expr.2.as_str(), expr.3.as_str()), ("id", "3-2"));
     let boolean = found.iter().find(|f| f.2 == "name").expect("boolean based finding");
     assert_eq!((boolean.1.as_str(), boolean.3.as_str()), ("SQL Injection", "apple' AND '1'='1' -- "));
+}
+
+/// `findings verify` replays the stored request: for an "OR true" finding it must be
+/// the "OR true" request, or the replay gives the original answer and no difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_injection_or_true_stores_the_or_true_request() {
+    let port = spawn_app();
+    let (s, found) = scan("sqllogin", 40018, Strength::Medium, vec![target(port, "/sqllogin?email=nobody")]).await;
+    assert_eq!(s.raised.get("40018"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "nobody' OR '1'='1' -- ");
+    let sent = url_decode(&found[0].4).replace('+', " ");
+    assert!(sent.contains("nobody' OR '1'='1' -- "), "{sent}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -680,6 +783,18 @@ async fn mongodb_unhandled_error_needs_more_than_low_strength() {
     assert!(s.raised.is_empty(), "{s:?}");
 }
 
+/// Node driver errors count; a cast error that any non-ObjectId value brings doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_node_errors() {
+    let port = spawn_app();
+    let (s, found) = scan("mongonode", 40033, Strength::Medium, vec![target(port, "/mongonode?id=1")]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!(found[0].3, "'");
+    let id = "/mongocast?id=5f1d7c2e9b1e8a3d4c6b2a10";
+    let (s, found) = scan("mongocast", 40033, Strength::Medium, vec![target(port, id)]).await;
+    assert!(s.raised.is_empty(), "{found:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mongodb_operators_as_json_values() {
     let port = spawn_app();
@@ -696,6 +811,30 @@ async fn mongodb_operators_as_json_values() {
     assert!(s.raised.is_empty(), "{s:?}");
     let (s, _) = scan("jsonlow2", 40033, Strength::Low, vec![json_target(port, "/mongojson", r#"{"id":1}"#)]).await;
     assert_eq!(s.raised.get("40033"), Some(&1), "{s:?}");
+}
+
+/// A login refused for the original password and let in for `{"$ne":"0"}`: the status
+/// changes, and `{"$eq":<original>}` is refused like the original.
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_login_bypass_changes_the_status() {
+    let port = spawn_app();
+    let body = r#"{"email":"admin@shop.test","password":"x"}"#;
+    let (s, found) = scan("mongologin", 40033, Strength::Medium, vec![json_target(port, "/mongologin", body)]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("password", "$ne0"));
+    assert!(found[0].4.contains(r#""password":{"$ne":"0"}"#), "{found:?}");
+}
+
+/// `$ne` updates every review; `$eq` is an error, so `$in` proves it. The original
+/// sent again answers like `$in`: both show the message the attack already wrote,
+/// which the recorded answer doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_operators_without_eq() {
+    let port = spawn_app();
+    let (s, found) =
+        scan("marsdb", 40033, Strength::Medium, vec![json_target(port, "/marsdb", r#"{"id":"r1"}"#)]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("id", "$ne0"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

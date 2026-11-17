@@ -189,7 +189,8 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   - values echoed with the quote escapes frameworks use (`&#39;`, `&#x27;`) or JSON
     escaped are stripped before comparing, as ZAP strips URL and its own HTML encoding;
   - "OR 1=1" findings need "OR 1=2" to keep the original page (free-text searches
-    match words of both);
+    match words of both). They store the "OR 1=1" request and response (ZAP stores the
+    "AND 1=1" one), so `findings verify` replays the attack the finding names;
   - the bare LIKE pair (`%` against `XYZABCDEFGHIJ`) isn't sent: a parameterised
     `LIKE` with unescaped wildcards answers it the same way. The quoted LIKE pairs
     (`%'  -- `) still find concatenated LIKE clauses;
@@ -206,6 +207,32 @@ those skips 40014. Prime and Spider never raise alerts themselves.
     first and names the database (Medium confidence), and the bare 500 (Low confidence)
     is reported only when no other check (error message, expression, boolean, UNION,
     ORDER BY) found the parameter.
+- **NoSQL Injection - MongoDB (40033)** sends real operator objects in JSON
+  (`{"$ne":"0"}`) and proves each with a counter-proof that must answer like the original
+  (`{"$eq":<original>}`, `name[$eq]=<original>`). The operator's answer may have another
+  status than the original's (not a 5xx or 429), so a login that refuses the original
+  password with a 401 and lets `{"$ne":"0"}` in is found; other info then says it may be an
+  authentication or authorisation bypass. When `$eq` doesn't answer like the original
+  (MarsDB, NeDB and older Mongo-likes don't have it and answer with an error), `$in` with
+  the original value (`{"$in":[<original>]}`, `name[$in][]=<original>`) is the
+  counter-proof. Both match only what the original request matched, so on an update they
+  change nothing it wouldn't; the `$ne`, `$gt` and `$regex` attacks themselves can still
+  change every record they match. A counter-proof also counts when it is nearly the same
+  (JSON value by value) as the original sent again just after it, which the attack must
+  not be: an update that answers with the record before and after differs from its
+  recorded answer once the attack has changed the data. Its error check knows Node's
+  errors (`MongoServerError`, `MongoError:`, a failed `$where` clause's "Executor error
+  during find command", Mongoose's `CastError`) as well as ZAP's Java ones; an error
+  counts only when a plain random value doesn't bring it, so a type check that rejects
+  every id that isn't an ObjectId isn't reported.
+- **CORS (40040)** rates an origin that any site may use without credentials
+  (`Access-Control-Allow-Origin: *`, or a reflected or `null` origin without
+  `Access-Control-Allow-Credentials: true`) Low (40040-2; ZAP: Medium), as passive 10098
+  rates a wildcard: the browser sends no cookies with it, so another site reads only what
+  anyone who can reach the server can. With credentials it stays High (40040-3). Both are
+  raised once per scheme://host:port in a scan, since CORS headers usually come from one
+  middleware for the whole host; every page is still probed, so a page that allows
+  credentials is found after one that doesn't.
 - **Remote OS Command Injection (90020)** sends a control before it reports: the same
   attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
   `;#get-help`). The output must not come back for it, so a search or help page that

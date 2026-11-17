@@ -6,6 +6,18 @@
 //!   operator. The counter-proof is `{"$eq":<original>}`, which must answer like the
 //!   original, where ZAP sends an unknown operator that a real server would reject. It
 //!   runs at every strength: ZAP skips it at LOW, where any changed answer raises an alert.
+//! - An operator's answer may have another status than the original's, if not a 5xx
+//!   or 429: a login that refuses the original password with a 401 and lets
+//!   `{"$ne":"0"}` in is the textbook case. ZAP needs the same status. The
+//!   counter-proof must then give the original's status and body.
+//! - When `$eq` doesn't answer like the original, `$in` with the original value is
+//!   tried (MarsDB, NeDB and older Mongo-likes have no `$eq`). Both match only what the
+//!   original matched, so on an update they change nothing the original request
+//!   wouldn't. A counter-proof may also answer like the original sent again just after
+//!   it, not only like the recorded answer: an update that shows the record before and
+//!   after differs from its recorded answer once the attack has changed the data. That
+//!   comparison is a similarity (`alike`), as other points and rules may be writing to
+//!   the same record meanwhile, and the attack must not be alike the original.
 //! - `name[$eq]=` is only the counter-proof. ZAP also attacks with an empty value, which
 //!   shows no more than the plain parameter can.
 //! - The not-handled error check stops at the first alert. ZAP raises one per payload.
@@ -13,11 +25,14 @@
 //! - No technology filter: ZAP only runs this against targets it knows use MongoDB,
 //!   and by default assumes all do.
 //! - A MongoDB error for a quote or bracket counts only when the same characters
-//!   after a random value bring it too (a search page may quote the error).
+//!   after a random value bring it too (a search page may quote the error), and a
+//!   plain random value doesn't (a type check rejects any value).
+//! - Node's MongoDB driver and Mongoose errors are recognised as well as ZAP's Java ones.
 
 use serde_json::{json, Value};
 
 use super::common::{control_token, point};
+use crate::authz::compare::{similarity, Body, Noise};
 use crate::scan::active::points::{self, PointKind};
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
@@ -53,6 +68,8 @@ const ALL_DATA_INFO: &str = "In some PHP or NodeJS based back end implementation
     it is possible to inject the \"[$ne]\" string (or other similar ones) that is processed as an associative array \
     rather than a simple text.\nThrough this, the queries made to MongoDB will always be true.";
 const CRASH_INFO: &str = "A MongoDB exception hasn't been properly handled.";
+const BYPASS_INFO: &str = "The original request was refused and the operator's was not: this may bypass \
+    authentication or authorisation.";
 const JSON_INFO: &str = "In some NodeJS based back end implementations, messages having the JSON format as \
     content-type are expected. In order to obtain sensitive data it is possible to attack these applications \
     injecting the \"{$ne:}\" string (or other similar ones) that is processed as an associative array rather than a \
@@ -62,17 +79,79 @@ const JSON_INFO: &str = "In some NodeJS based back end implementations, messages
 const ALL_DATA: [(&str, &str); 3] = [("[$ne]", ""), ("[$regex]", ".*"), ("[$gt]", "0")];
 const CRASH: [&str; 5] = ["\"", "'", "//", "});", ");"];
 const JSON_OPERATORS: [(&str, &str); 3] = [("$ne", "0"), ("$gt", ""), ("$regex", ".*")];
-/// Lower case: ZAP matches them case-insensitively.
-const ERRORS: [&str; 2] = ["runtimeexception: syntaxerror: unterminated string literal", "mongoresultexception"];
+/// Lower case: ZAP matches them case-insensitively. ZAP's two are the Java driver's;
+/// the others are Node's (the MongoDB driver before and since 4.0, the server's
+/// wrapper around a failed `$where` clause, Mongoose).
+const ERRORS: [&str; 6] = [
+    "runtimeexception: syntaxerror: unterminated string literal",
+    "mongoresultexception",
+    "mongoservererror",
+    "mongoerror:",
+    "executor error during find command",
+    "casterror: cast to",
+];
 
 fn same_answer(a: &Response, b: &Response) -> bool {
-    a.body_str() == b.body_str()
+    a.status == b.status && a.body_str() == b.body_str()
+}
+
+/// An operator's answer that may show it matched more: anything but a server failure
+/// or a rate limit. The status may differ from the original's (a refused login that
+/// lets the operator in); the counter-proof, which must answer like the original,
+/// tells a query that read the operator from a server that rejects any object.
+fn changed(attack: &Response, base: &Response) -> bool {
+    attack.status < 500 && attack.status != 429 && !same_answer(attack, base)
+}
+
+/// Other info for a finding: what the operator did to a refused request.
+fn info(text: &str, attack: &Response, base: &Response) -> String {
+    let refused = matches!(base.status, 401 | 403);
+    if refused && (200..400).contains(&attack.status) {
+        format!("{text}\n{BYPASS_INFO}")
+    } else {
+        text.to_string()
+    }
 }
 
 /// What an error in the response proves: the ones the original page shows prove nothing.
 fn new_error(base: &str, attacked: &str) -> bool {
     let (base, attacked) = (base.to_lowercase(), attacked.to_lowercase());
     ERRORS.iter().any(|e| !base.contains(e) && attacked.contains(e))
+}
+
+/// Nearly the same page: for the original sent again during a scan, which other
+/// insertion points and rules may be changing at the same time (an update's answer
+/// that shows the record before the update shows what they wrote).
+/// JSON is compared value by value (a word count can't tell one record from 29 in
+/// compact JSON).
+fn alike(a: &Response, b: &Response) -> bool {
+    a.status == b.status && similarity(&Body::parse(&a.raw), &Body::parse(&b.raw), &Noise::default()) >= 0.9
+}
+
+/// Sends the counter-proofs in order until one answers like the original: the
+/// recorded answer, or else the original sent again now (once, after them all), which
+/// `attack` must not be alike. False when none did or a request failed.
+async fn counter_proof(cx: &Cx, attack: &Response, proofs: Vec<Vec<u8>>) -> bool {
+    let base = cx.base_response();
+    let mut answers = Vec::new();
+    for proof in proofs {
+        if cx.stopped() {
+            return false;
+        }
+        let Ok(answer) = cx.send(proof).await else { return false };
+        if same_answer(&answer, base) {
+            return true;
+        }
+        // An unknown operator is an error; it says nothing either way.
+        if answer.status < 500 {
+            answers.push(answer);
+        }
+    }
+    if answers.is_empty() || cx.stopped() {
+        return false;
+    }
+    let Ok(now) = cx.send(cx.base_request().to_vec()).await else { return false };
+    !alike(attack, &now) && answers.iter().any(|answer| alike(answer, &now))
 }
 
 enum Step {
@@ -94,17 +173,16 @@ async fn all_data(cx: &Cx, param: &str, value: &str) -> Step {
             return Step::Next;
         };
         let Ok(resp) = cx.send(request).await else { return Step::Done };
-        if resp.status != base.status || same_answer(&resp, base) {
+        if !changed(&resp, base) {
             continue;
         }
-        let eq = format!("{param}[$eq]");
-        let Some(proof) = points::inject_named(cx.base_request(), cx.point(), &eq, value) else {
-            return Step::Next;
-        };
-        let Ok(proof) = cx.send(proof).await else { return Step::Done };
-        if same_answer(&proof, base) {
+        let proofs = [format!("{param}[$eq]"), format!("{param}[$in][]")]
+            .iter()
+            .filter_map(|n| points::inject_named(cx.base_request(), cx.point(), n, value))
+            .collect();
+        if counter_proof(cx, &resp, proofs).await {
             let attack = format!("{name}{injected}");
-            cx.report(ALERT.raise(param, "").attack(attack).other_info(ALL_DATA_INFO), &resp);
+            cx.report(ALERT.raise(param, "").attack(attack).other_info(info(ALL_DATA_INFO, &resp, base)), &resp);
             return Step::Done;
         }
     }
@@ -126,6 +204,13 @@ async fn crash(cx: &Cx, param: &str) -> Step {
             if !new_error(base, again.body_str()) {
                 continue;
             }
+            // Nor in ZAP: a plain random value must not bring it, or it is a type check
+            // that rejects any value of the wrong shape (Mongoose's CastError for an id
+            // that isn't an ObjectId), not a query the characters broke.
+            let Ok(plain) = cx.send_payload(&control_token(false)).await else { return Step::Done };
+            if new_error(base, plain.body_str()) {
+                return Step::Next;
+            }
             let finding = ALERT.raise(param, "").attack(injected).other_info(CRASH_INFO).confidence(Confidence::Medium);
             cx.report(finding, &resp);
             return Step::Done;
@@ -144,15 +229,16 @@ async fn json_query(cx: &Cx, param: &str) {
         let attack = points::inject_json(cx.base_request(), cx.point(), |_| json!({ operator: operand }));
         let Some(attack) = attack else { return };
         let Ok(resp) = cx.send_following(attack).await else { return };
-        if resp.status != base.status || same_answer(&resp, base) {
+        if !changed(&resp, base) {
             continue;
         }
         let name = format!("{operator}{operand}");
-        let proof = points::inject_json(cx.base_request(), cx.point(), |original: Value| json!({ "$eq": original }));
-        let Some(proof) = proof else { return };
-        let Ok(proof) = cx.send(proof).await else { return };
-        if same_answer(&proof, base) {
-            cx.report(ALERT.raise(param, "").attack(name).other_info(JSON_INFO), &resp);
+        let proofs = [
+            points::inject_json(cx.base_request(), cx.point(), |original: Value| json!({ "$eq": original })),
+            points::inject_json(cx.base_request(), cx.point(), |original: Value| json!({ "$in": [original] })),
+        ];
+        if counter_proof(cx, &resp, proofs.into_iter().flatten().collect()).await {
+            cx.report(ALERT.raise(param, "").attack(name).other_info(info(JSON_INFO, &resp, base)), &resp);
             return;
         }
     }
@@ -208,5 +294,8 @@ mod tests {
         assert!(new_error("<p>ok</p>", "RuntimeException: SyntaxError: unterminated string literal"));
         assert!(!new_error("MongoResultException in the docs", "MongoResultException in the docs"));
         assert!(!new_error("<p>ok</p>", "<p>no error</p>"));
+        assert!(new_error("<p>ok</p>", "MongoError: unknown operator: $foo"));
+        assert!(new_error("<p>ok</p>", "{\"name\":\"MongoServerError\",\"code\":2}"));
+        assert!(new_error("<p>ok</p>", "CastError: Cast to ObjectId failed for value"));
     }
 }

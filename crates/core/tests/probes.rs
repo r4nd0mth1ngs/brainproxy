@@ -69,9 +69,12 @@ fn rand_tag() -> u64 {
 
 /// Runs the given rule ids against one baseline (GET path, 200 html by default).
 fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> ActiveSummary {
+    run_scan_paths(port, &[path], rules, baseline)
+}
+
+/// Like `run_scan`, with one target per path.
+fn run_scan_paths(port: u16, paths: &[&str], rules: &[u32], baseline: Option<&str>) -> ActiveSummary {
     let base = format!("http://127.0.0.1:{port}");
-    let target = Target::from_url(&format!("{base}{path}")).unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: brainproxy-test\r\n\r\n");
     let response =
         baseline.map(str::to_string).unwrap_or_else(|| ok("200 OK", "text/html", "<html><body>base</body></html>"));
     let guard =
@@ -103,13 +106,17 @@ fn run_scan(port: u16, path: &str, rules: &[u32], baseline: Option<&str>) -> Act
         check_methods: vec![],
         prune: false,
     };
-    let targets = vec![ScanTarget {
-        history_id: None,
-        target,
-        request: request.into_bytes(),
-        response: response.into_bytes(),
-        duration_ms: None,
-    }];
+    let targets = paths
+        .iter()
+        .map(|path| ScanTarget {
+            history_id: None,
+            target: Target::from_url(&format!("{base}{path}")).unwrap(),
+            request: format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: brainproxy-test\r\n\r\n")
+                .into_bytes(),
+            response: response.clone().into_bytes(),
+            duration_ms: None,
+        })
+        .collect();
     let project = project();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     rt.block_on(active::run(&project, targets, cfg, JobControl::default())).unwrap()
@@ -224,6 +231,14 @@ fn cors_risk_follows_what_the_server_allows() {
     let s = run_scan(none, "/", &[40040], None);
     assert!(s.raised.is_empty(), "{s:?}");
     assert_eq!(s.requests, 6, "{s:?}");
+}
+
+/// A wildcard is a header the whole host sends: one finding, not one per page.
+#[test]
+fn cors_wildcard_is_reported_once_per_host() {
+    let any = spawn(|_| with_headers("Access-Control-Allow-Origin: *\r\n"));
+    let s = run_scan_paths(any, &["/", "/api/a", "/api/b"], &[40040], None);
+    assert_eq!(s.raised.get("40040-2"), Some(&1), "{s:?}");
 }
 
 #[test]
