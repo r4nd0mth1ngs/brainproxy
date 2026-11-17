@@ -696,6 +696,7 @@ fn state_json(state: &SessionState) -> serde_json::Value {
         "refresh_token": state.refresh_token.is_some(),
         "token_expires": state.token_expires,
         "vars": state.vars.iter().map(|v| &v.name).collect::<Vec<_>>(),
+        "storage": state.storage.iter().map(|s| s.name()).collect::<Vec<_>>(),
     })
 }
 

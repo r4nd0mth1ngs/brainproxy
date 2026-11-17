@@ -817,7 +817,9 @@ attack type, and pick payloads:
     `crawl-browser`, and the browser's own background features (updates, sync, safe
     browsing, WebRTC) are off. It uses a fresh temporary profile, removed afterwards, so
     nothing from your normal browser is used; with a login profile, the session is added
-    to every request on the site and renewed when lost. The crawl reloads pages to get back
+    to every request on the site and renewed when lost, and what a browser login left in the
+    site's `localStorage` and `sessionStorage` is put back in its pages (see *Replay* under
+    one-time codes, browser logins and passkeys in auth profiles). The crawl reloads pages to get back
     to a state; when the browser then asks whether a script, style, image or font it
     already fetched in this crawl has changed (a conditional GET), the crawl's proxy
     answers 304 itself, so that request isn't sent or recorded. The summary counts them in
@@ -2573,7 +2575,16 @@ One-time codes, browser logins and passkeys in an auth profile:
 - **Replay.** `auth login NAME`, and every re-login of scans, the fuzzer, the crawler, the proxy
   and `send --auth NAME`, starts a headless browser (the first Chromium-based one of
   `browser list`), runs the steps, and takes the site's cookies and the token its pages send
-  (the header `token_header` names) into the session. The browser's only way out is a gateway
+  (the header `token_header` names) into the session. When the login ends on the site's own
+  page (the check URL's host, else the page it ended on), what that origin keeps in
+  `localStorage` and `sessionStorage` goes in the session too (at most 100 items of 64 KiB):
+  single-page apps keep their token there rather than in a cookie. It is session material
+  like a cookie: replaced at every login, masked in reports, and shown only by name
+  (`"storage": ["local:token"]` in `auth login` and `auth show`). `crawl --browser --auth NAME`
+  writes it back into every page of that origin before the page's own scripts run (a page
+  of another site, or a frame of one, gets nothing), and again with the new values after a
+  re-login, so the app's pages show the signed-in user. A header a page builds from it
+  (other than the profile's `token_header`) is recorded as the page sent it. The browser's only way out is a gateway
   that sends with the engagement-guarded client, as for `crawl --browser`: a page a step opens
   outside the scope is refused before the browser starts, a step that leads outside it ends
   the login with an out-of-scope error, and other hosts the pages ask for are refused one by

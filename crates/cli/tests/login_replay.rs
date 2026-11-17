@@ -4,7 +4,8 @@
 //! - `/a`: a password form, then a one-time code on its own page. The site takes each code
 //!   once. Replayed as requests, with the code made from the profile's TOTP secret.
 //! - `/b`: a page that hashes the password in JavaScript, posts JSON with a one-time code, and
-//!   keeps a bearer token in localStorage. Replayed in a headless browser.
+//!   keeps a bearer token in localStorage. Replayed in a headless browser; the browser crawl
+//!   puts the token back in localStorage, where the app's pages read it.
 //! - `/c`: a passkey. The site checks the signature and that its counter goes up every time.
 //!   Registered and replayed with the browser's virtual authenticator.
 //!
@@ -349,6 +350,20 @@ f.addEventListener('submit', async (e) => {{
              localStorage.getItem('token')}}).then((r) => r.json()).then((j) => { who.textContent = j.user ? 'Hello ' + j.user : \
              'Signed out'; });</script>",
         ),
+        // The app's own page: it calls its API only with a token in localStorage, in a header the
+        // profile doesn't set.
+        ("GET", "/b/app") => page(
+            "200 OK",
+            "",
+            "<script>const t = localStorage.getItem('token'); if (t) fetch('/b/api/orders', {headers: {'X-Stored': t}});</script>",
+        ),
+        ("GET", "/b/api/orders") => {
+            if a.tokens.contains(&header("x-stored").unwrap_or_default()) {
+                api("200 OK", "", json!({"orders": []}))
+            } else {
+                api("401 Unauthorized", "", json!({"error": "login"}))
+            }
+        }
         ("GET", "/b/api/me") => {
             let bearer = header("authorization").and_then(|v| v.strip_prefix("Bearer ").map(str::to_string)).unwrap_or_default();
             if a.tokens.contains(&bearer) && a.sessions.contains(&cookie("bsid")) {
@@ -823,6 +838,7 @@ fn a_login_built_in_javascript_is_replayed_in_a_browser_and_made_again() {
     assert_eq!(login["login"]["success"], true, "{login}");
     assert_eq!(login["session"]["cookies"], json!(["bsid"]), "{login}");
     assert_eq!(login["session"]["token"], true, "{login}");
+    assert_eq!(login["session"]["storage"], json!(["local:token"]), "only the names are shown: {login}");
     assert_eq!(srv.with(|a| (a.logins, a.refused)), (2, 0));
 
     // Session and token are lost; `send --auth` logs in again in the browser and gets its answer.
@@ -834,6 +850,14 @@ fn a_login_built_in_javascript_is_replayed_in_a_browser_and_made_again() {
     let sent = p.ok(&["send", "--url", &me, "--auth", "js"]);
     assert_eq!(sent["response"]["status"], 200, "{sent}");
     assert_eq!(srv.with(|a| (a.logins, a.refused)), (3, 0));
+
+    // The browser crawl puts the token the last login left in localStorage back for the site
+    // before the app's scripts run, so its pages see a signed-in user. Only the newest token
+    // is valid now: the stored one was refreshed by that login.
+    let app = srv.url("/b/app");
+    let args = ["crawl", &app, "--browser", "--auth", "js", "--depth", "0", "--max-pages", "3", "--max-minutes", "2"];
+    p.ok(&args);
+    assert!(srv.with(|a| a.log.iter().any(|l| l == "GET /b/api/orders -> 200")), "{:?}", srv.with(|a| a.log.clone()));
 
     // What the login browser sent is on record (source auth) with the code as a placeholder.
     let recorded = p.recorded("auth").join("\n---\n");
@@ -851,6 +875,8 @@ fn a_login_built_in_javascript_is_replayed_in_a_browser_and_made_again() {
     let shown = p.ok(&["auth", "show", "js"]);
     assert_eq!(shown["browser_steps"].as_array().map(Vec::len), Some(4), "{shown}");
     assert!(!shown.to_string().contains(PASS) && !shown.to_string().contains(SECRET), "{shown}");
+    let tokens: Vec<String> = srv.with(|a| a.tokens.iter().cloned().collect());
+    assert!(tokens.iter().all(|t| !shown.to_string().contains(t.as_str())), "{shown}");
 }
 
 #[test]

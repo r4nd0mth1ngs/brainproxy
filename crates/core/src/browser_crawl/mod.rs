@@ -361,6 +361,9 @@ struct Explorer<'a> {
     not_clicked_count: usize,
     /// Where the tab is: the page loaded and the steps taken since.
     current: Option<(String, Vec<Step>)>,
+    /// The tab's script that puts the session's browser storage back, and the session's
+    /// generation it was made for.
+    storage_script: Option<(Option<String>, u64)>,
     summary: BrowserCrawlSummary,
 }
 
@@ -394,6 +397,7 @@ impl<'a> Explorer<'a> {
             not_clicked: BTreeSet::new(),
             not_clicked_count: 0,
             current: None,
+            storage_script: None,
             summary: BrowserCrawlSummary { mode: "browser".into(), ..Default::default() },
         }
     }
@@ -475,6 +479,40 @@ impl<'a> Explorer<'a> {
         let s = Some(self.session.as_str());
         self.chrome.call("Page.enable", json!({}), s).await?;
         self.chrome.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": PAGE_JS}), s).await?;
+        self.storage_script = None;
+        self.seed_storage().await
+    }
+
+    /// Puts what the login profile's site keeps in browser storage (a single-page app's token
+    /// in localStorage) into every document of the site the tab loads, before the page's own
+    /// scripts run, as the gateway puts the session's cookies on every request. Made again
+    /// when the session logs in again (a new generation), so the new values are the ones put.
+    async fn seed_storage(&mut self) -> Result<()> {
+        let Some(auth) = self.cfg.crawl.auth.as_deref() else { return Ok(()) };
+        let generation = auth.generation();
+        if self.storage_script.as_ref().is_some_and(|(_, g)| *g == generation) {
+            return Ok(());
+        }
+        let s = Some(self.session.as_str());
+        if let Some((Some(id), _)) = self.storage_script.take() {
+            let _ = self.chrome.call("Page.removeScriptToEvaluateOnNewDocument", json!({"identifier": id}), s).await;
+        }
+        let items: Vec<(String, bool, String, String)> = auth
+            .state()
+            .storage
+            .into_iter()
+            .filter(|i| Url::parse(&i.origin).is_ok_and(|u| self.scope.on_site(&u)))
+            .map(|i| (i.origin, i.session, i.key, i.value))
+            .collect();
+        let id = match items.is_empty() {
+            true => None,
+            false => {
+                let added =
+                    self.chrome.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": storage_js(&items)}), s);
+                added.await?["identifier"].as_str().map(str::to_string)
+            }
+        };
+        self.storage_script = Some((id, generation));
         Ok(())
     }
 
@@ -565,6 +603,7 @@ impl<'a> Explorer<'a> {
         if !self.spend() {
             return Ok(false);
         }
+        self.seed_storage().await?;
         let s = Some(self.session.as_str());
         self.chrome.call("Page.navigate", json!({"url": "about:blank"}), s).await?;
         let r = self.chrome.call("Page.navigate", json!({"url": url}), s).await?;
@@ -853,6 +892,21 @@ impl<'a> Explorer<'a> {
             }
         }
     }
+}
+
+/// The script that writes `items` (origin, sessionStorage or not, key, value) into the storage
+/// of a document on that origin, and nowhere else: a frame or page of another site gets
+/// nothing. JSON is a JavaScript literal, so the values go in as data (with the line and
+/// paragraph separators escaped, which older JavaScript took for line breaks).
+fn storage_js(items: &[(String, bool, String, String)]) -> String {
+    let data = serde_json::to_string(items)
+        .unwrap_or_else(|_| "[]".into())
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    format!(
+        "(() => {{ for (const [origin, session, key, value] of {data}) {{ if (location.origin !== origin) continue; \
+         try {{ (session ? sessionStorage : localStorage).setItem(key, value); }} catch (e) {{}} }} }})();"
+    )
 }
 
 /// The value to type into a field, if it needs one.
@@ -1180,6 +1234,18 @@ mod tests {
         // --allow-destructive: nothing avoided by label, but excluded URLs still are.
         assert!(!avoided(&click("button", "Delete"), &[], &exclude));
         assert!(avoided(&link, &[], &exclude));
+    }
+
+    #[test]
+    fn storage_goes_only_to_its_origin_as_data() {
+        // A quote, a script end and a line separator (a line break in JavaScript before ES2019)
+        // stay inside the string.
+        let items =
+            [("https://a.test".to_string(), false, "token".to_string(), "x\"});alert(1)//\u{2028}".to_string())];
+        let js = storage_js(&items);
+        assert!(js.contains(r#"[["https://a.test",false,"token","x\"});alert(1)//\u2028"]]"#), "{js}");
+        assert!(js.contains("if (location.origin !== origin) continue;"), "{js}");
+        assert!(storage_js(&[]).contains("of []"));
     }
 
     #[test]
