@@ -40,7 +40,7 @@ left to the active rule 100007, so a token isn't reported again on every request
 | 10024 | Information Disclosure - Sensitive Information in URL | info | 10024 |
 | 10025 | Information Disclosure - Sensitive Information in HTTP Referrer Header | info | 10025 |
 | 10027 | Information Disclosure - Suspicious Comments | info | 10027 |
-| 10028 | Off-site Redirect | high | 10028 |
+| 10028 | Off-site Redirect | medium | 10028 |
 | 10029 | Cookie Poisoning | info | 10029 |
 | 10030 | User Controllable Charset | info | 10030 |
 | 10031 | User Controllable HTML Element Attribute (Potential XSS) | info | 10031 |
@@ -148,3 +148,6 @@ noise on modern applications:
   as "Internal Server Error", "internal error" or "is not allowed to access"; a driver's
   message or another specific signature still counts there. 90022 raises nothing for a 500
   with an empty body.
+- **Off-site Redirect (10028)** is Medium (ZAP: High), since one sighting can't tell a
+  parameter that redirects anywhere from an allow-list, and gives the `Location` value as
+  evidence (ZAP: none).
