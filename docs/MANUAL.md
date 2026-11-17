@@ -1279,6 +1279,7 @@ echo '{"tabs":[{"title":"search","target":"https://app.acme.test","request":"GET
     | brainproxy replay tabs save --append                # adds a tab (replaces them without --append); sends nothing
 
 brainproxy findings list                  # one group per alert type, riskiest first; --limit N keeps N (truncated: true when more)
+brainproxy findings list --all --issue 4 --limit 50 --offset 50   # one row per finding of issue 4, the second page
 brainproxy findings show 12
 brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param id \
     --description-file idor.md                # an issue found by hand; nothing is sent
@@ -2982,6 +2983,10 @@ Findings are records with a history, not just rows:
   records the given `--state` and/or `--note` as a suggestion on each finding's timeline (kind
   `suggested`) and changes nothing else. `findings list` and `report` show work still to do by
   default: open, confirmed and retest pending.
+- **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
+  with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows
+  returned and `truncated` says more are left, so the next page is `--offset` plus `--limit`.
+  `--issue ISSUE` lists one issue's findings.
 - **A person's decisions stay a person's:** through MCP an agent can't change or clear what a
   person set last: a finding's state or note, an issue's write-up once a person wrote or
   reviewed it, the executive summary, an issue's CVSS rating or title, or the findings of an

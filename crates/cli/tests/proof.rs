@@ -301,3 +301,36 @@ fn an_agent_cannot_undo_what_a_person_decided() {
     agent_ok(&project, &["findings", "issue", "title", &spare_id, ""], None);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn findings_list_pages_and_says_how_many_there_are() {
+    let port = serve();
+    let (dir, project) = setup("pages");
+    for path in ["a", "b", "c"] {
+        ok(&project, &["send", "--url", &format!("http://127.0.0.1:{port}/{path}")]);
+    }
+    let all = ok(&project, &["findings", "list", "--all", "--limit", "1000"]);
+    let total = all["total"].as_u64().unwrap();
+    assert!(total > 3 && all["truncated"] == false && all["count"] == total, "{all}");
+    let ids = |v: &Value| v["items"].as_array().unwrap().iter().map(|i| i["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    let first = ok(&project, &["findings", "list", "--all", "--limit", "2"]);
+    assert_eq!(
+        (first["count"].as_u64(), first["total"].as_u64(), first["truncated"].as_bool()),
+        (Some(2), Some(total), Some(true))
+    );
+    let rest = ok(&project, &["findings", "list", "--all", "--limit", "1000", "--offset", "2"]);
+    assert_eq!((rest["offset"].as_u64(), rest["truncated"].as_bool()), (Some(2), Some(false)), "{rest}");
+    assert_eq!([ids(&first), ids(&rest)].concat(), ids(&all));
+    // One issue's findings.
+    let issue = all["items"][0]["issue_id"].as_i64().unwrap();
+    let of = ok(&project, &["findings", "list", "--all", "--issue", &issue.to_string()]);
+    let items = of["items"].as_array().unwrap();
+    assert!(!items.is_empty() && items.iter().all(|i| i["issue_id"] == issue), "{of}");
+    assert_eq!(of["total"].as_u64(), Some(items.len() as u64));
+    // Grouped, the rows are alert types.
+    let grouped = ok(&project, &["findings", "list", "--limit", "1", "--offset", "1"]);
+    let types = grouped["alert_types"].as_u64().unwrap();
+    assert_eq!((grouped["total"].as_u64(), grouped["count"].as_u64()), (Some(types), Some(1)), "{grouped}");
+    assert_eq!(grouped["truncated"].as_bool(), Some(types > 2));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

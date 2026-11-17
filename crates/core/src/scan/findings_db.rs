@@ -785,12 +785,32 @@ impl Store {
 
     /// Individual findings (one row per instance).
     pub fn findings_list(&self, filter: &FindingFilter, limit: usize) -> Result<Vec<Value>> {
+        self.findings_page(filter, limit, 0)
+    }
+
+    /// How many findings match `filter`.
+    pub fn findings_count(&self, filter: &FindingFilter) -> Result<usize> {
         let (where_sql, args) = filter.sql();
+        let n: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM findings WHERE {where_sql}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// [`Store::findings_list`] from the `offset`th match on, in the same order.
+    pub fn findings_page(&self, filter: &FindingFilter, limit: usize, offset: usize) -> Result<Vec<Value>> {
+        let (where_sql, args) = filter.sql();
+        // SQLite's LIMIT is a signed 64-bit integer: a larger one would be read as negative
+        // (no limit), which is what it means anyway, but say so rather than wrap.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
                 hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
                 issue_id
-             FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit}"
+             FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit} OFFSET {offset}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {

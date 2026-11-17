@@ -100,6 +100,8 @@ person's (the command refuses a tool call too); and `findings issue review` and
 `report-summary review`, since a person reviews what an agent drafted and an agent can't vouch
 for its own draft. (`connection review`, `browser open` and the `scan script` commands are left
 out too; see below.)
+`findings_list` returns a page: `limit` rows from `offset` on, with `total` and `truncated`,
+so an agent works through a large project page by page (`issue` lists one issue's findings).
 `findings_mark` marks the findings an agent names: `id` takes one id or a list, and `issue`
 every finding of an issue, all of them or none. `from` (marking every finding that matches a
 file's) is refused, so an agent marks findings by id, with a note. `if_state` makes the call

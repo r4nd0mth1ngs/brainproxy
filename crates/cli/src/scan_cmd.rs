@@ -164,11 +164,19 @@ pub enum FindingsCmd {
         /// One row per instance instead of grouping.
         #[arg(long)]
         all: bool,
+        /// Only the findings of this issue (`findings issues`).
+        #[arg(long, value_name = "ISSUE")]
+        issue: Option<i64>,
         /// Example URLs per group.
         #[arg(long, default_value_t = 3)]
         examples: usize,
+        /// Most rows (instances with --all, else alert types) to return; `total` counts them
+        /// all and `truncated` says more are left.
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Skip this many rows first, to page through: the next page starts at offset + limit.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Compare findings with a baseline (new, unchanged, fixed) and optionally fail on a risk (exit code 5).
     #[command(
@@ -1355,7 +1363,7 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
             let p = store.posture()?;
             out.ok(p.clone(), || serde_json::to_string_pretty(&p).unwrap_or_default());
         }
-        FindingsCmd::List { risk, confidence, host, alert, state, source, all, examples, limit } => {
+        FindingsCmd::List { risk, confidence, host, alert, state, source, issue, all, examples, limit, offset } => {
             let filter = FindingFilter {
                 min_risk: risk.map(RiskArg::get),
                 min_confidence: confidence.map(|c| c.get()),
@@ -1364,12 +1372,16 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 state,
                 source,
                 ids: None,
-                issue: None,
+                issue,
                 examples,
             };
             if all {
-                let items = store.findings_list(&filter, limit)?;
-                out.ok(json!({"count": items.len(), "items": items}), || {
+                let items = store.findings_page(&filter, limit, offset)?;
+                let total = store.findings_count(&filter)?;
+                let truncated = offset.saturating_add(items.len()) < total;
+                let data = json!({"count": items.len(), "items": items, "total": total, "offset": offset,
+                    "truncated": truncated});
+                out.ok(data, || {
                     items
                         .iter()
                         .map(|f| {
@@ -1394,14 +1406,17 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                     let n = by_risk.get(&r).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
                     by_risk.insert(r, json!(n));
                 }
-                // The counts are of every alert type; only the list is cut at --limit.
+                // The counts are of every alert type; only the list is cut at --offset and --limit.
                 let alert_types = groups.len();
-                groups.truncate(limit);
+                let groups: Vec<serde_json::Value> = groups.drain(..).skip(offset).take(limit).collect();
                 let data = json!({
                     "alert_types": alert_types,
                     "by_risk": by_risk,
                     "groups": groups,
-                    "truncated": alert_types > groups.len(),
+                    "count": groups.len(),
+                    "total": alert_types,
+                    "offset": offset,
+                    "truncated": offset.saturating_add(groups.len()) < alert_types,
                 });
                 out.ok(data, || {
                     groups
