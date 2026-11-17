@@ -44,3 +44,27 @@ export const TRIAGE_KEYS: TriageKey[] = [
 /** Moving keys. */
 export const NEXT_FINDING: ActionDef = { id: "findings.next", title: "Next finding", group: "Findings", keys: "J", where: "findings", keywords: "down triage" };
 export const PREVIOUS_FINDING: ActionDef = { id: "findings.previous", title: "Previous finding", group: "Findings", keys: "K", where: "findings", keywords: "up triage" };
+
+// Unsaved text (a note per finding, a write-up per issue), kept while other findings are
+// opened, so clicking away mid-sentence loses nothing. A draft equal to the saved text is no draft.
+
+/** The text the box shows: the draft, else the saved text. */
+export function draftOf(drafts: ReadonlyMap<number, string>, key: number, saved: string): string {
+  return drafts.get(key) ?? saved;
+}
+
+/** The drafts after typing `text` for `key`. */
+export function withDraft(drafts: ReadonlyMap<number, string>, key: number, text: string, saved: string): Map<number, string> {
+  const next = new Map(drafts);
+  if (text === saved) next.delete(key);
+  else next.set(key, text);
+  return next;
+}
+
+/** The drafts once `sent` was saved for `key`: dropped, unless typed on since. */
+export function dropDraft(drafts: ReadonlyMap<number, string>, key: number, sent: string): ReadonlyMap<number, string> {
+  if (drafts.get(key) !== sent) return drafts;
+  const next = new Map(drafts);
+  next.delete(key);
+  return next;
+}

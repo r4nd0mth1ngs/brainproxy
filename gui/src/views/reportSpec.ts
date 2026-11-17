@@ -124,6 +124,10 @@ export const maskValues = (text: string): string[] =>
     .map((v) => v.trim())
     .filter(Boolean);
 
+/** Most findings a report holds, the preview's the same: else the riskiest it lists ("Fix these
+ * first", say) could differ from the saved file's. */
+export const REPORT_LIMIT = 500;
+
 /** The flags that choose the findings and how secrets are shown, for the report and its preview. */
 export function contentArgs(spec: ReportSpec): string[] {
   const f = spec.filter;
@@ -164,13 +168,13 @@ export function layoutArgs(spec: ReportSpec, withProfile = true): string[] {
 /** The command that writes the report to `path`. */
 export function reportCommand(spec: ReportSpec, path: string): string[] {
   const title = spec.title.trim() ? [`--title=${spec.title.trim()}`] : [];
-  return ["report", spec.format, ...layoutArgs(spec), ...contentArgs(spec), ...title, "--output", path, "--force"];
+  return ["report", spec.format, ...layoutArgs(spec), ...contentArgs(spec), `--limit=${REPORT_LIMIT}`, ...title, "--output", path, "--force"];
 }
 
-/** The command for the live preview: the same layout as HTML, with short evidence. */
+/** The command for the live preview: the same layout and findings as HTML, with short evidence. */
 export function previewCommand(spec: ReportSpec): string[] {
   const title = spec.title.trim() ? [`--title=${spec.title.trim()}`] : [];
-  return ["report", "html", ...layoutArgs(spec), ...contentArgs(spec), ...title, "--max-evidence", "1024", "--limit", "200"];
+  return ["report", "html", ...layoutArgs(spec), ...contentArgs(spec), `--limit=${REPORT_LIMIT}`, ...title, "--max-evidence", "1024"];
 }
 
 /** The command that saves these choices as a profile, on top of the one they started from

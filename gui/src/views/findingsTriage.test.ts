@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { bindProblem, normalize } from "../ui/chords.ts";
 import { conflicts } from "../ui/actions.ts";
 import { STATES } from "./findingsFilter.ts";
-import { afterMark, NEXT_FINDING, PREVIOUS_FINDING, stepFinding, TRIAGE_KEYS } from "./findingsTriage.ts";
+import { afterMark, draftOf, dropDraft, NEXT_FINDING, PREVIOUS_FINDING, stepFinding, TRIAGE_KEYS, withDraft } from "./findingsTriage.ts";
 
 test("next and previous walk the list and stop at its ends", () => {
   const order = [4, 9, 2];
@@ -42,4 +42,19 @@ test("every triage key marks a known state, with a chord Settings accepts", () =
 
 test("the Findings keys don't clash with each other", () => {
   assert.equal(conflicts([...TRIAGE_KEYS, NEXT_FINDING, PREVIOUS_FINDING], {}).size, 0);
+});
+
+test("a draft is kept per finding until it is saved, and typing back to the saved text drops it", () => {
+  let d: ReadonlyMap<number, string> = new Map();
+  d = withDraft(d, 5, "half a sent", "");
+  d = withDraft(d, 6, "other", "saved");
+  // Another finding opened and back: each shows its own draft, or its saved note.
+  assert.equal(draftOf(d, 5, ""), "half a sent");
+  assert.equal(draftOf(d, 6, "saved"), "other");
+  assert.equal(draftOf(d, 7, "its note"), "its note");
+  assert.equal(withDraft(d, 6, "saved", "saved").has(6), false);
+  // Saved: dropped, unless more was typed while it saved.
+  assert.equal(dropDraft(d, 5, "half a sent").has(5), false);
+  assert.equal(dropDraft(d, 5, "half a").get(5), "half a sent");
+  assert.equal(dropDraft(d, 9, "x"), d);
 });

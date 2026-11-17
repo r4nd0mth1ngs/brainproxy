@@ -8,6 +8,7 @@ import {
   maskValues,
   PRESET_SECTIONS,
   previewCommand,
+  REPORT_LIMIT,
   profileSaveCommand,
   REPORT_SOURCES,
   REPORT_STATES,
@@ -33,7 +34,7 @@ test("branding travels as single arguments, a bad colour doesn't", () => {
   const spec = { ...DEFAULT_SPEC, company: " Acme --x ", accent: "#0a7cff", logo: "/tmp/logo.png", since: "2026-11-01", profile: "board" as string | null, title: "Q4" };
   assert.deepEqual(reportCommand(spec, "/tmp/r.pdf"), [
     "report", "html", "--profile=board", "--preset", "technical", "--company=Acme --x", "--accent=#0a7cff", "--logo=/tmp/logo.png",
-    "--since=2026-11-01", "--title=Q4", "--output", "/tmp/r.pdf", "--force",
+    "--since=2026-11-01", "--limit=500", "--title=Q4", "--output", "/tmp/r.pdf", "--force",
   ]);
   assert.ok(!layoutArgs({ ...DEFAULT_SPEC, accent: "red" }).some((a) => a.startsWith("--accent")));
   assert.equal(specProblem({ ...DEFAULT_SPEC, accent: "red" }), "The colour must be #rrggbb.");
@@ -43,6 +44,12 @@ test("branding travels as single arguments, a bad colour doesn't", () => {
   assert.deepEqual(profileSaveCommand(" dev ", spec).slice(0, 5), ["report-profile", "save", "dev", "--from=board", "--preset"]);
   assert.deepEqual(profileSaveCommand("dev", { ...spec, profile: null }).slice(0, 4), ["report-profile", "save", "dev", "--preset"]);
   assert.ok(previewCommand(spec).includes("--max-evidence"));
+});
+
+test("the preview holds the same findings as the saved report", () => {
+  const limits = (cmd: string[]) => cmd.filter((a) => a.startsWith("--limit"));
+  assert.deepEqual(limits(previewCommand(DEFAULT_SPEC)), [`--limit=${REPORT_LIMIT}`]);
+  assert.deepEqual(limits(reportCommand(DEFAULT_SPEC, "/r.html")), [`--limit=${REPORT_LIMIT}`]);
 });
 
 test("a saved layout fills the choices", () => {

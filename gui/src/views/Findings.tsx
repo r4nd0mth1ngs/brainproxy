@@ -21,14 +21,16 @@ import {
   trailLine,
   groupKey,
   hostsOf,
+  inView,
+  type ListView,
   markCommands,
-  matchesFinding,
   NO_FILTER,
   noteBy,
   noteCommand,
   recordTicketCommand,
   reproCommand,
   retestCommand,
+  riskCounts,
   SOURCES,
   type Source,
   STATES,
@@ -38,7 +40,7 @@ import {
   ticketText,
   type Tracker,
 } from "./findingsFilter";
-import { afterMark, NEXT_FINDING, PREVIOUS_FINDING, stepFinding, TRIAGE_KEYS } from "./findingsTriage.ts";
+import { afterMark, draftOf, dropDraft, NEXT_FINDING, PREVIOUS_FINDING, stepFinding, TRIAGE_KEYS, withDraft } from "./findingsTriage.ts";
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
@@ -88,7 +90,9 @@ export function FindingsView({ active }: { active: boolean }) {
   // Findings ticked for bulk triage; only the ones still shown are acted on.
   const [checked, setChecked] = useState(new Set<number>());
   const [busy, setBusy] = useState(false);
-  const [noteDraft, setNoteDraft] = useState("");
+  // Unsaved notes by finding and write-ups by issue: opening another finding keeps them.
+  const [noteDrafts, setNoteDrafts] = useState<ReadonlyMap<number, string>>(new Map());
+  const [writeupDrafts, setWriteupDrafts] = useState<ReadonlyMap<number, string>>(new Map());
   const [open, setOpen] = useState(new Set<string>());
   const [selected, setSelected] = useState<number | null>(null);
   const [finding, setFinding] = useState<Finding | null>(null);
@@ -99,7 +103,6 @@ export function FindingsView({ active }: { active: boolean }) {
   const [events, setEvents] = useState<FindingEvent[]>([]);
   // The issue's write-up and the agent trail of the open finding.
   const [narrative, setNarrative] = useState<Narrative | null>(null);
-  const [writeup, setWriteup] = useState("");
   const [trail, setTrail] = useState<Trail | null>(null);
   const [retesting, setRetesting] = useState(false);
   // The finding added by hand being edited, as it was when the dialog opened.
@@ -122,12 +125,11 @@ export function FindingsView({ active }: { active: boolean }) {
   const seen = useMemo(() => seenById(compared), [compared]);
   const comparing = compare !== "all" && scan != null;
 
+  const view = useMemo<ListView>(() => ({ hideClosed: hideFp, filter, compare: comparing ? { seen, want: compare } : null }), [hideFp, filter, comparing, seen, compare]);
   const groups = useMemo(() => {
     const by = new Map<string, Group>();
     for (const f of data?.items ?? []) {
-      if (!risks.has(f.risk) || (hideFp && CLOSED.has(f.state))) continue;
-      if (comparing && seen.get(f.id) !== compare) continue;
-      if (!matchesFinding(f, filter)) continue;
+      if (!risks.has(f.risk) || !inView(f, view)) continue;
       const key = groupKey(f);
       const g = by.get(key) ?? { key, alert: f.alert_ref, name: f.name, host: f.host, risk: f.risk, items: [] };
       if (RANK[f.risk] < RANK[g.risk]) g.risk = f.risk;
@@ -135,7 +137,7 @@ export function FindingsView({ active }: { active: boolean }) {
       by.set(key, g);
     }
     return [...by.values()].sort((a, b) => RANK[a.risk] - RANK[b.risk] || a.name.localeCompare(b.name));
-  }, [data, risks, hideFp, comparing, seen, compare, filter]);
+  }, [data, risks, view]);
 
   const hosts = useMemo(() => hostsOf(data?.items ?? []), [data]);
   const byId = useMemo(() => new Map((data?.items ?? []).map((f) => [f.id, f])), [data]);
@@ -143,11 +145,8 @@ export function FindingsView({ active }: { active: boolean }) {
   const picked = useMemo(() => shown.filter((id) => checked.has(id)), [shown, checked]);
   const filtering = filter.text !== "" || filter.source !== "all" || filter.host !== "";
 
-  const counts = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const f of data?.items ?? []) if (!CLOSED.has(f.state)) c[f.risk] = (c[f.risk] ?? 0) + 1;
-    return c;
-  }, [data]);
+  // As the list would show each risk: the same filters, a hidden risk counted as if shown.
+  const counts = useMemo(() => riskCounts(data?.items ?? [], view), [data, view]);
 
   useEffect(() => {
     if (selected == null) return;
@@ -156,7 +155,6 @@ export function FindingsView({ active }: { active: boolean }) {
     setVerified(null);
     setEvents([]);
     setNarrative(null);
-    setWriteup("");
     setTrail(null);
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(selected)]).then((t) => live && setEvents(t.events), () => {});
     run<Trail>(["findings", "trail", String(selected)]).then((t) => live && setTrail(t), () => {});
@@ -164,9 +162,9 @@ export function FindingsView({ active }: { active: boolean }) {
       .then((f) => {
         if (!live) return;
         setFinding(f);
-        setNoteDraft(f.note ?? "");
         if (f.issue_id != null) loadNarrative(f.issue_id, () => live);
-        if (f.history_id != null) run<HistoryEntry>(["history", "show", String(f.history_id), MAX_BODY]).then((e) => live && setEntry(e), () => {});
+        shownEntry.current = null;
+        loadEntry(f.history_id, () => live);
       })
       .catch((e) => app.toast(e.message, "error"));
     return () => {
@@ -218,20 +216,69 @@ export function FindingsView({ active }: { active: boolean }) {
   // An issue's write-up, unless another finding was opened meanwhile.
   const loadNarrative = (issue: number, live: () => boolean = () => true) =>
     run<{ narrative: Narrative | null }>(["findings", "issue", "show", String(issue)]).then(
-      (i) => {
-        if (!live()) return;
-        setNarrative(i.narrative);
-        setWriteup(i.narrative?.text ?? "");
-      },
+      (i) => live() && setNarrative((cur) => (same(cur, i.narrative) ? cur : i.narrative)),
       () => {},
     );
+
+  // The recorded request and response, read again only when the finding points at another one.
+  const shownEntry = useRef<number | null>(null);
+  const loadEntry = (history: number | null, live: () => boolean) => {
+    if (history != null && history === shownEntry.current) return;
+    shownEntry.current = history;
+    if (history == null) return setEntry(null);
+    run<HistoryEntry>(["history", "show", String(history), MAX_BODY]).then(
+      (e) => live() && setEntry(e),
+      () => {
+        if (shownEntry.current === history) shownEntry.current = null;
+      },
+    );
+  };
+
+  // The open finding as it is now: the list's poll brings changes made elsewhere (an agent, a
+  // rescan, a retest, a bulk mark), and the detail follows. Drafts are kept apart, so they stay.
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const reloadDetail = (id: number) => {
+    const live = () => openId.current === id;
+    run<Finding>(["findings", "show", String(id)]).then((f) => {
+      if (!live()) return;
+      setFinding((cur) => (same(cur, f) ? cur : f));
+      if (f.issue_id != null) loadNarrative(f.issue_id, live);
+      else setNarrative(null);
+      loadEntry(f.history_id, live);
+    }, () => {});
+    run<{ events: FindingEvent[] }>(["findings", "timeline", String(id)]).then((t) => {
+      if (!live() || same(eventsRef.current, t.events)) return;
+      const grew = eventsRef.current.length !== t.events.length;
+      setEvents(t.events);
+      if (grew) run<Trail>(["findings", "trail", String(id)]).then((tr) => live() && setTrail(tr), () => {});
+    }, () => {});
+  };
+  // Only on a poll: opening a finding reads it in full (above).
+  useEffect(() => {
+    if (selected != null && finding?.id === selected) reloadDetail(selected);
+  }, [data]);
+
+  const noteDraft = finding ? draftOf(noteDrafts, finding.id, finding.note ?? "") : "";
+  const writeup = finding?.issue_id != null ? draftOf(writeupDrafts, finding.issue_id, narrative?.text ?? "") : "";
+  const setNoteDraft = (text: string) => {
+    if (finding) setNoteDrafts((d) => withDraft(d, finding.id, text, finding.note ?? ""));
+  };
+  const setWriteup = (text: string) => {
+    const issue = finding?.issue_id;
+    if (issue != null) setWriteupDrafts((d) => withDraft(d, issue, text, narrative?.text ?? ""));
+  };
 
   const saveWriteup = async (review: boolean) => {
     const issue = finding?.issue_id;
     const id = finding?.id;
     if (issue == null || id == null) return;
+    const sent = writeup;
     try {
-      if (!review) await run(narrativeCommand(issue, writeup));
+      if (!review) {
+        await run(narrativeCommand(issue, sent));
+        setWriteupDrafts((d) => dropDraft(d, issue, sent));
+      }
       // The review names the text on screen; one changed since (by an agent, say) is refused.
       else await run(["findings", "issue", "review", String(issue), `--hash=${narrative?.hash ?? ""}`]);
       // Another finding opened meanwhile keeps its own write-up.
@@ -401,19 +448,22 @@ export function FindingsView({ active }: { active: boolean }) {
       app.toast(`${done ? `Marked ${done}, then: ` : ""}${e.message}`, "error");
     }
     setBusy(false);
+    // The open finding's timeline gets the mark, even when only some batches went through.
+    if (openId.current != null && picked.includes(openId.current)) reloadDetail(openId.current);
     refresh();
   };
 
   const saveNote = async () => {
     if (!finding) return;
     const id = finding.id;
+    const sent = noteDraft;
     try {
-      await run(noteCommand(id, noteDraft));
+      await run(noteCommand(id, sent));
+      setNoteDrafts((d) => dropDraft(d, id, sent));
       const f = await run<Finding>(["findings", "show", String(id)]);
       // Another finding was opened meanwhile: the note is saved, and that one is shown.
       if (openId.current !== id) return;
       setFinding(f);
-      setNoteDraft(f.note ?? "");
       reloadEvents(id);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -511,7 +561,7 @@ export function FindingsView({ active }: { active: boolean }) {
         )}
         <div className="toolbar-end">
           <span className="muted">
-            {groups.length} issue{groups.length === 1 ? "" : "s"}
+            {groups.length} issue{groups.length === 1 ? "" : "s"} · {shown.length} finding{shown.length === 1 ? "" : "s"}
           </span>
           <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
             New finding…
@@ -619,6 +669,11 @@ export function FindingsView({ active }: { active: boolean }) {
                           {f.url}
                           {f.param && <span className="muted"> [{f.param}]</span>}
                         </span>
+                        {noteDrafts.has(f.id) && (
+                          <span className="tag warn" title="A note typed for this finding isn't saved yet">
+                            unsaved note
+                          </span>
+                        )}
                         {f.state !== "open" && <span className="tag">{STATES.find((s) => s.id === f.state)?.label ?? f.state}</span>}
                       </button>
                     </div>
@@ -839,6 +894,11 @@ export function FindingsView({ active }: { active: boolean }) {
       {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
     </div>
   );
+}
+
+/** Whether two values read from the CLI are the same, so an unchanged poll doesn't render again. */
+function same(a: unknown, b: unknown): boolean {
+  return a === b || JSON.stringify(a) === JSON.stringify(b);
 }
 
 /** Whether a finding can be sent with and without its payload: one with an attack, or a baseline. */
