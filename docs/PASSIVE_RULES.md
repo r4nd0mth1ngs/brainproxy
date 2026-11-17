@@ -117,3 +117,14 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
 - **Findings are de-duplicated:** the same alert, method, URL (without its query) and
   parameter is one finding with a `hits` count; the first evidence is kept. ZAP lists each
   differing evidence separately (for example two `Server` headers in one response).
+
+### Less noise
+
+Some rules are deliberately stricter or rated lower than ZAP's, where ZAP's output is mostly
+noise on modern applications:
+
+- **Cross-Domain Misconfiguration (10098)** rates `Access-Control-Allow-Origin: *` Low (ZAP:
+  Medium), since a wildcard can't carry credentials, and skips fonts, images, stylesheets,
+  audio and video. It also raises Medium (low confidence) when a response allows the
+  request's `Origin` of another site, or `null`, with `Access-Control-Allow-Credentials: true`,
+  which ZAP's passive rule doesn't look at; the active CORS rule (40040) confirms it.
