@@ -347,7 +347,9 @@ prints in its terminal; `send` can't learn it (see GUI.md).
 Everything a tool call records is marked as an agent's: history entries and findings get
 origin `mcp`, and so does a finding state change (`findings_mark` sets `state_origin`). A
 proxy, job or fuzz run started by a tool call records `mcp` too, and so does the proxy a
-`proxy_restart` starts (or starts again, when the restart fails). `BRAINPROXY_MCP_CALL` wins
+`proxy_restart` starts (or starts again, when the restart fails). A fixed finding such a
+proxy's scan sees again is reopened with origin `scanner`, not `mcp`: the scanner did that, not
+the agent. `BRAINPROXY_MCP_CALL` wins
 over `BRAINPROXY_CLIENT=gui` (what the desktop app sets), and tool arguments can't set
 environment variables, so an agent can't make its records look like a person's. List them
 with `history_list` and `origin: "mcp"`.

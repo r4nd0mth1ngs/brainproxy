@@ -73,7 +73,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("time", "TEXT", "UTC time"),
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
-    ("origin", "TEXT", "Who: gui, cli, mcp; NULL when unknown (events backfilled from older projects)"),
+    ("origin", "TEXT", "Who: gui, cli, mcp, or scanner (a fixed finding seen again: regressed); NULL when unknown (events backfilled from older projects)"),
     ("kind", "TEXT", "created, state, note, suggested (`findings mark --suggest`: old is the state then, new the state suggested, text the note), retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; summary and summary_reviewed (the executive summary: no finding or issue)"),
     ("old", "TEXT", "Value before (a state, a note, an issue id; for edited, the changed fields as JSON)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
@@ -125,6 +125,8 @@ pub(crate) fn migrate_v15(conn: &Connection) -> Result<()> {
 /// One event in a finding's or issue's timeline.
 #[derive(Debug, Default)]
 pub(crate) struct Event<'a> {
+    /// Who made the change, when not this process's client: the scanner's own changes.
+    pub origin: Option<&'a str>,
     pub finding: Option<i64>,
     pub issue: Option<i64>,
     pub kind: &'a str,
@@ -135,7 +137,7 @@ pub(crate) struct Event<'a> {
     pub job_id: Option<i64>,
 }
 
-/// Records an event by this process's origin. A finding's event takes the finding's issue.
+/// Records an event by this process's origin (or the event's own). A finding's event takes the finding's issue.
 pub(crate) fn record(conn: &Connection, e: &Event) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO finding_events (finding_id, issue_id, origin, kind, old, new, text, history_id, job_id)
@@ -144,7 +146,7 @@ pub(crate) fn record(conn: &Connection, e: &Event) -> Result<()> {
     .execute(params![
         e.finding,
         e.issue,
-        crate::provenance::origin(),
+        e.origin.unwrap_or(crate::provenance::origin()),
         e.kind,
         e.old,
         e.new,

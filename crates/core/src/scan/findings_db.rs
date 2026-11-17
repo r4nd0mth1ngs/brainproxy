@@ -102,7 +102,8 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     (
         "state_origin",
         "TEXT",
-        "gui, cli or mcp: who last changed state with `findings mark` (or `findings remove`); NULL if never changed",
+        "gui, cli or mcp: who last changed state with `findings mark` (or `findings remove`); scanner when a scanner \
+         saw a fixed finding again and opened it; NULL if never changed",
     ),
     ("state_changed_at", "TEXT", "UTC time of the last state change; NULL if never changed"),
     ("note_origin", "TEXT", "gui, cli or mcp: who last set the note with `findings mark --note`; NULL if never set"),
@@ -660,7 +661,9 @@ impl Store {
             // not hide behind the low. Read first so a change goes on the timeline.
             let mut risk_before = tx.prepare_cached("SELECT risk FROM findings WHERE dedupe = ?1")?;
             // A finding marked fixed that is seen again is open again, when what saw it was
-            // recorded after it was marked: a rescan of older traffic doesn't reopen it.
+            // recorded after it was marked: a rescan of older traffic doesn't reopen it. The
+            // scanner made that change, not whoever started the process (an agent that started
+            // the proxy, say), so it is recorded as the scanner's.
             let mut reopen = tx.prepare_cached(
                 "UPDATE findings SET state = 'open', state_origin = ?2,
                     state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -726,11 +729,12 @@ impl Store {
                         },
                     )?;
                 }
-                if reopen.execute(params![id, crate::provenance::origin(), msg.history_id])? > 0 {
+                if reopen.execute(params![id, crate::provenance::SCANNER, msg.history_id])? > 0 {
                     crate::scan::issues::record(
                         &tx,
                         &crate::scan::issues::Event {
                             finding: Some(id),
+                            origin: Some(crate::provenance::SCANNER),
                             kind: "regressed",
                             old: Some("fixed"),
                             new: Some("open"),
@@ -2724,6 +2728,11 @@ mod tests {
         let kinds: Vec<String> =
             s.finding_events(id).unwrap().iter().map(|e| e["kind"].as_str().unwrap().into()).collect();
         assert_eq!(kinds, ["created", "state", "note", "regressed"]);
+        // The scanner reopened it, whoever started the process that scanned.
+        let f = s.finding_get(id).unwrap();
+        assert_eq!(f["state_origin"], crate::provenance::SCANNER, "{f}");
+        let last = s.finding_events(id).unwrap().pop().unwrap();
+        assert_eq!((last["origin"].as_str(), last["by"].as_str()), (Some("scanner"), Some("by the scanner")));
     }
 
     #[test]

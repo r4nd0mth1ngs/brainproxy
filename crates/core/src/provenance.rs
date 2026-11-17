@@ -17,6 +17,10 @@ pub const MCP_ENV: &str = "BRAINPROXY_MCP_CALL";
 /// Set to `gui` by the desktop app (and its development bridge) on the commands it runs.
 pub const CLIENT_ENV: &str = "BRAINPROXY_CLIENT";
 
+/// The origin of a change a scanner made by itself, whoever started the process it ran in: a
+/// fixed finding seen again and so opened again.
+pub const SCANNER: &str = "scanner";
+
 /// The origins a record can have; rows from before schema v13 have none ("unknown").
 pub const ORIGINS: &[&str] = &["gui", "cli", "mcp"];
 
@@ -73,6 +77,7 @@ pub fn describe(origin: Option<&str>) -> &'static str {
         Some("mcp") => "via MCP (an agent)",
         Some("gui") => "from the desktop app",
         Some("cli") => "from the command line",
+        Some(SCANNER) => "by the scanner",
         _ => "from an unknown origin (recorded before brainproxy kept it)",
     }
 }

@@ -2122,7 +2122,8 @@ brainproxy proxy status                      # recording_last_change, recording_
 
 Findings have an `origin` too (who added them: the proxy's passive scan, a scan job,
 `findings add`, ...), and `state_origin` and `state_changed_at` say who last changed the state
-with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. `note_origin` and
+with `findings mark` (or `findings remove`) and when, so a finding an agent marked as a false positive says so. A fixed finding a scanner
+sees again and opens is `scanner`'s, whoever started the proxy or scan. `note_origin` and
 `note_changed_at` do the same for the note. `findings list` and `findings show` include
 them. The description and solution a title added by hand shares keep who wrote them
 (`description_origin` and `solution_origin` in `findings show` and the `finding_types`
@@ -2976,7 +2977,8 @@ Findings are records with a history, not just rows:
   issue a person arranged (merge, split). The call fails with kind `conflict`; the agent
   suggests instead (`findings mark ID --suggest`). An agent's retest records its outcome
   without moving a state a person set, unless that state is `retest_pending`.
-  A fixed finding a scanner sees again goes back to open, with a `regressed` event.
+  A fixed finding a scanner sees again goes back to open, with a `regressed` event; both are
+  recorded with origin `scanner`, not the client that started the proxy or scan.
 - **Timeline** (`findings timeline ID`): created, state and note changes, suggestions, retests, moves
   between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
   afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
