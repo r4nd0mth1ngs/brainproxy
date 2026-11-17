@@ -4,6 +4,11 @@
 //! again in the same HTML context as the eye catcher, and reflections in non-HTML
 //! responses are not reported (the LOW-threshold "Cross Site Scripting Weakness
 //! (Reflected in JSON Response)" alert is therefore never raised).
+//!
+//! Unlike ZAP, that holds for every attack, not only the ones `processContexts`
+//! checks: a JSON string can hold markup the HTML parser finds a context in, but
+//! a browser never runs a script from an `application/json` or `text/plain`
+//! response (`renders_as_html`).
 
 use std::sync::{Arc, LazyLock};
 
@@ -134,6 +139,19 @@ const MUTATIONS: [&[Mutation]; 3] = [
     &[('(', '`', false), (')', '`', false), ('<', '＜', true), ('>', '＞', true)],
 ];
 
+/// Whether a browser shown this response would parse it as markup, so a reflected
+/// script runs: an HTML or SVG Content-Type, or none at all without
+/// `X-Content-Type-Options: nosniff` (the browser then sniffs the body). JSON,
+/// plain text and the rest are shown as text or downloaded.
+pub(super) fn renders_as_html(resp: &Response) -> bool {
+    let content_type = resp.content_type();
+    let mime = content_type.split(';').next().unwrap_or("").trim();
+    if mime.is_empty() {
+        return !resp.header("x-content-type-options").is_some_and(|v| v.trim().eq_ignore_ascii_case("nosniff"));
+    }
+    mime.contains("html") || mime == "image/svg+xml"
+}
+
 pub struct CrossSiteScripting;
 
 impl ActiveRule for CrossSiteScripting {
@@ -195,7 +213,16 @@ impl Xss<'_> {
             .attack(ctx.target.clone())
             .other_info(other_info)
             .confidence(Confidence::Medium);
-        self.cx.report(f, resp);
+        self.report(f, resp);
+    }
+
+    /// Every alert goes through here: a reflection in a response no browser renders
+    /// as HTML is not reported, though it still ends the attack (as ZAP's
+    /// `processContexts` does at MEDIUM).
+    fn report(&self, f: crate::scan::Finding, resp: &Response) {
+        if renders_as_html(resp) {
+            self.cx.report(f, resp);
+        }
     }
 
     /// One attack: send, then find the evidence in the expected context.
@@ -452,7 +479,7 @@ impl Xss<'_> {
                     let attack = common::url_encode(&common::url_encode(&c3.target));
                     let f =
                         ALERT.raise(self.param(), GENERIC_SCRIPT_ALERT).attack(attack).confidence(Confidence::Medium);
-                    self.cx.report(f, &c3.resp);
+                    self.report(f, &c3.resp);
                     return true;
                 }
             }
@@ -489,14 +516,12 @@ impl Xss<'_> {
         false
     }
 
-    /// processContexts at MEDIUM threshold: only HTML responses are reported, but any
-    /// match ends the attack.
+    /// processContexts at MEDIUM threshold: only HTML responses are reported (by
+    /// `report`), but any match ends the attack.
     fn process_contexts(&self, contexts: &[HtmlContext], requires_parent: bool) -> bool {
         for ctx in contexts {
             if ctx.parent_tag().is_some() || !requires_parent {
-                if common::is_html(&ctx.resp) {
-                    self.raise_with(ctx, &contexts[0].resp);
-                }
+                self.raise_with(ctx, &contexts[0].resp);
                 return true;
             }
         }
@@ -574,7 +599,7 @@ impl Xss<'_> {
             if let Some(c) = self.perform(&attack, None, Some(script_alert), o).await {
                 if let Some(c2) = c.first() {
                     let f = ALERT.raise(self.param(), c2.target.clone()).attack(attack).confidence(Confidence::Medium);
-                    self.cx.report(f, &c2.resp);
+                    self.report(f, &c2.resp);
                     return;
                 }
             }
@@ -598,6 +623,21 @@ mod tests {
         // The mutation filters remove every mutated character.
         let filtered: String = "<scrIpt>alert(1);</scRipt>".chars().filter(|c| !"()<>".contains(*c)).collect();
         assert_eq!(filtered, "scrIptalert1;/scRipt");
+    }
+
+    #[test]
+    fn only_responses_a_browser_renders_as_html() {
+        use super::super::common::testing::response;
+        let with = |headers: &str| renders_as_html(&response(&format!("HTTP/1.1 200 OK\r\n{headers}\r\n<p>x</p>")));
+        assert!(with("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(with("Content-Type: application/xhtml+xml\r\n"));
+        assert!(with("Content-Type: image/svg+xml\r\n"));
+        // No type: the browser sniffs the body, unless told not to.
+        assert!(with(""));
+        assert!(!with("X-Content-Type-Options: nosniff\r\n"));
+        assert!(!with("Content-Type: application/json\r\n"));
+        assert!(!with("Content-Type: text/plain\r\n"));
+        assert!(!with("Content-Type: application/problem+json\r\n"));
     }
 
     #[test]

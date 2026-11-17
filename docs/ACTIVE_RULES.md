@@ -207,6 +207,13 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **Persistent XSS (40014)** follows ZAP's MEDIUM threshold (attacks are looked for anywhere
   on the sink page; PUT requests are skipped) and stops at the first alert per parameter.
   Sinks are the target requests themselves, re-sent, rather than ZAP's temporary history.
+- **XSS and the response type.** Reflected XSS (40012) reports an attack only in a response
+  a browser renders as markup: an HTML or SVG Content-Type, or none without
+  `X-Content-Type-Options: nosniff`. A reflection in JSON, plain text or any other type is
+  not reported, whichever attack found it (ZAP checks the type on some paths only). For
+  Persistent XSS (40014) the sink page's type picks the alert on every path: 40014-1 (High)
+  for HTML, 40014-2 (Low, JSON weakness) for JSON, and 40014-3 (Low risk, High in ZAP) for
+  other types, which a browser shows as text.
 - **Heartbleed (20015)** opens its raw TCP connection through the guarded client
   (`Cx::connect_raw`), so the engagement scope applies; the heartbeat response is only
   measured (more than 3 bytes back means vulnerable), never stored. Port 80 is tested on
