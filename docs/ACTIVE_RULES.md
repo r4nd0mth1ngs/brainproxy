@@ -207,6 +207,12 @@ those skips 40014. Prime and Spider never raise alerts themselves.
     first and names the database (Medium confidence), and the bare 500 (Low confidence)
     is reported only when no other check (error message, expression, boolean, UNION,
     ORDER BY) found the parameter.
+- **NoSQL Injection - MongoDB (40033)** sends real operator objects in JSON
+  (`{"$ne":"0"}`) and proves each with a counter-proof that must answer like the original
+  (`{"$eq":<original>}`, `name[$eq]=<original>`). The operator's answer may have another
+  status than the original's (not a 5xx or 429), so a login that refuses the original
+  password with a 401 and lets `{"$ne":"0"}` in is found; other info then says it may be an
+  authentication or authorisation bypass.
 - **Remote OS Command Injection (90020)** sends a control before it reports: the same
   attack with its command commented out (`;#cat /etc/passwd;`, `&rem type …`,
   `;#get-help`). The output must not come back for it, so a search or help page that

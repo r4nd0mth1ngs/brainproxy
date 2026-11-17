@@ -6,6 +6,10 @@
 //!   operator. The counter-proof is `{"$eq":<original>}`, which must answer like the
 //!   original, where ZAP sends an unknown operator that a real server would reject. It
 //!   runs at every strength: ZAP skips it at LOW, where any changed answer raises an alert.
+//! - An operator's answer may have another status than the original's, if not a 5xx
+//!   or 429: a login that refuses the original password with a 401 and lets
+//!   `{"$ne":"0"}` in is the textbook case. ZAP needs the same status. The
+//!   counter-proof must then give the original's status and body.
 //! - `name[$eq]=` is only the counter-proof. ZAP also attacks with an empty value, which
 //!   shows no more than the plain parameter can.
 //! - The not-handled error check stops at the first alert. ZAP raises one per payload.
@@ -53,6 +57,8 @@ const ALL_DATA_INFO: &str = "In some PHP or NodeJS based back end implementation
     it is possible to inject the \"[$ne]\" string (or other similar ones) that is processed as an associative array \
     rather than a simple text.\nThrough this, the queries made to MongoDB will always be true.";
 const CRASH_INFO: &str = "A MongoDB exception hasn't been properly handled.";
+const BYPASS_INFO: &str = "The original request was refused and the operator's was not: this may bypass \
+    authentication or authorisation.";
 const JSON_INFO: &str = "In some NodeJS based back end implementations, messages having the JSON format as \
     content-type are expected. In order to obtain sensitive data it is possible to attack these applications \
     injecting the \"{$ne:}\" string (or other similar ones) that is processed as an associative array rather than a \
@@ -66,7 +72,25 @@ const JSON_OPERATORS: [(&str, &str); 3] = [("$ne", "0"), ("$gt", ""), ("$regex",
 const ERRORS: [&str; 2] = ["runtimeexception: syntaxerror: unterminated string literal", "mongoresultexception"];
 
 fn same_answer(a: &Response, b: &Response) -> bool {
-    a.body_str() == b.body_str()
+    a.status == b.status && a.body_str() == b.body_str()
+}
+
+/// An operator's answer that may show it matched more: anything but a server failure
+/// or a rate limit. The status may differ from the original's (a refused login that
+/// lets the operator in); the counter-proof, which must answer like the original,
+/// tells a query that read the operator from a server that rejects any object.
+fn changed(attack: &Response, base: &Response) -> bool {
+    attack.status < 500 && attack.status != 429 && !same_answer(attack, base)
+}
+
+/// Other info for a finding: what the operator did to a refused request.
+fn info(text: &str, attack: &Response, base: &Response) -> String {
+    let refused = matches!(base.status, 401 | 403);
+    if refused && (200..400).contains(&attack.status) {
+        format!("{text}\n{BYPASS_INFO}")
+    } else {
+        text.to_string()
+    }
 }
 
 /// What an error in the response proves: the ones the original page shows prove nothing.
@@ -94,7 +118,7 @@ async fn all_data(cx: &Cx, param: &str, value: &str) -> Step {
             return Step::Next;
         };
         let Ok(resp) = cx.send(request).await else { return Step::Done };
-        if resp.status != base.status || same_answer(&resp, base) {
+        if !changed(&resp, base) {
             continue;
         }
         let eq = format!("{param}[$eq]");
@@ -104,7 +128,7 @@ async fn all_data(cx: &Cx, param: &str, value: &str) -> Step {
         let Ok(proof) = cx.send(proof).await else { return Step::Done };
         if same_answer(&proof, base) {
             let attack = format!("{name}{injected}");
-            cx.report(ALERT.raise(param, "").attack(attack).other_info(ALL_DATA_INFO), &resp);
+            cx.report(ALERT.raise(param, "").attack(attack).other_info(info(ALL_DATA_INFO, &resp, base)), &resp);
             return Step::Done;
         }
     }
@@ -144,7 +168,7 @@ async fn json_query(cx: &Cx, param: &str) {
         let attack = points::inject_json(cx.base_request(), cx.point(), |_| json!({ operator: operand }));
         let Some(attack) = attack else { return };
         let Ok(resp) = cx.send_following(attack).await else { return };
-        if resp.status != base.status || same_answer(&resp, base) {
+        if !changed(&resp, base) {
             continue;
         }
         let name = format!("{operator}{operand}");
@@ -152,7 +176,7 @@ async fn json_query(cx: &Cx, param: &str) {
         let Some(proof) = proof else { return };
         let Ok(proof) = cx.send(proof).await else { return };
         if same_answer(&proof, base) {
-            cx.report(ALERT.raise(param, "").attack(name).other_info(JSON_INFO), &resp);
+            cx.report(ALERT.raise(param, "").attack(name).other_info(info(JSON_INFO, &resp, base)), &resp);
             return;
         }
     }

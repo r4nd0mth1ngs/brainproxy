@@ -510,6 +510,16 @@ fn handle_json(path: &str, body: &str) -> String {
             html("<ul><li>mine</li><li>theirs</li></ul>")
         }
         "/mongojson" => html("<ul></ul>"),
+        // `find({email, password})`: only the password is checked here, as an operator.
+        "/mongologin" => {
+            let pw = &v["password"];
+            let any = ["$ne", "$gt", "$regex"].iter().any(|op| pw.get(op).is_some());
+            if any || *pw == serde_json::json!("secret") || pw["$eq"] == serde_json::json!("secret") {
+                html("<p>token: abc</p>")
+            } else {
+                status(401, "<p>Invalid email or password.</p>")
+            }
+        }
         _ if id.is_object() => html("<p>bad input</p>"),
         _ if *id == serde_json::json!(1) => html("<ul><li>mine</li></ul>"),
         _ => html("<ul></ul>"),
@@ -732,6 +742,18 @@ async fn mongodb_operators_as_json_values() {
     assert!(s.raised.is_empty(), "{s:?}");
     let (s, _) = scan("jsonlow2", 40033, Strength::Low, vec![json_target(port, "/mongojson", r#"{"id":1}"#)]).await;
     assert_eq!(s.raised.get("40033"), Some(&1), "{s:?}");
+}
+
+/// A login refused for the original password and let in for `{"$ne":"0"}`: the status
+/// changes, and `{"$eq":<original>}` is refused like the original.
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_login_bypass_changes_the_status() {
+    let port = spawn_app();
+    let body = r#"{"email":"admin@shop.test","password":"x"}"#;
+    let (s, found) = scan("mongologin", 40033, Strength::Medium, vec![json_target(port, "/mongologin", body)]).await;
+    assert_eq!(s.raised.get("40033"), Some(&1), "{found:?}");
+    assert_eq!((found[0].2.as_str(), found[0].3.as_str()), ("password", "$ne0"));
+    assert!(found[0].4.contains(r#""password":{"$ne":"0"}"#), "{found:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
