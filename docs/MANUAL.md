@@ -3081,7 +3081,7 @@ Findings are records with a history, not just rows:
   recorded with origin `scanner`, not the client that started the proxy or scan.
 - **Timeline** (`findings timeline ID`): created, state and note changes, suggestions, retests, moves
   between issues, regressions, risk changes (a sighting rated it higher, or a rescan rated it
-  afresh) and removals, each with who did it (`gui`, `cli`, `mcp`) and
+  afresh), a person's ratings (`rated`), states taken from an issue's decision or a suppression rule (a `state` event saying which) and removals, each with who did it (`gui`, `cli`, `mcp`) and
   when. The `finding_events` table holds them for `query`; a project from an older build gets
   a timeline built from what its findings already recorded.
 - **Retest** (`findings retest ID [--auth PROFILE]`): a passive finding's latest request is
