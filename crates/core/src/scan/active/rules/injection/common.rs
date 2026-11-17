@@ -28,7 +28,7 @@ pub(super) const SQL_TIMING_TAGS: &[&str] =
     &["OWASP_2025_A05", "OWASP_2021_A03", "OWASP_2017_A01", "WSTG-v42-INPV-05", "HIPAA", "PCI_DSS", "TEST_TIMING"];
 
 /// Picks the value for an attack strength from `[LOW, MEDIUM, HIGH, INSANE]`.
-pub(super) fn by_strength<T: Copy>(s: Strength, v: [T; 4]) -> T {
+pub(in crate::scan::active::rules) fn by_strength<T: Copy>(s: Strength, v: [T; 4]) -> T {
     match s {
         Strength::Low => v[0],
         Strength::Medium => v[1],
@@ -146,7 +146,7 @@ pub(super) fn strip_off(body: &str, pattern: &str) -> String {
 }
 
 /// ZAP `stripOffOriginalAndAttackParam`.
-pub(super) fn strip_off_both(body: &str, original: &str, attack: &str) -> String {
+pub(in crate::scan::active::rules) fn strip_off_both(body: &str, original: &str, attack: &str) -> String {
     strip_off(&strip_off(body, attack), original)
 }
 
@@ -174,7 +174,7 @@ fn named_entity(name: &str) -> Option<char> {
 
 /// commons-text `StringEscapeUtils.unescapeHtml4` for numeric entities and the
 /// basic and ISO-8859-1 named ones (the HTML 4.0 extended names are left as-is).
-pub(super) fn unescape_html4(s: &str) -> String {
+pub(in crate::scan::active::rules) fn unescape_html4(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find('&') {
@@ -236,7 +236,7 @@ pub(super) fn insert_uninit_var(cmd: &str) -> String {
 /// 8 lowercase letters. Error checks send it in front of their error characters:
 /// a syntax error doesn't depend on the value before the quote, content that
 /// the attack value happened to find does.
-pub(super) fn control_token(numeric: bool) -> String {
+pub(in crate::scan::active::rules) fn control_token(numeric: bool) -> String {
     let mut n = crate::scan::active::rand_u64();
     (0..8)
         .map(|_| {

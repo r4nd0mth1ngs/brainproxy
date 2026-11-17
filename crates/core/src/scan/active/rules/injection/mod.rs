@@ -1,5 +1,5 @@
 //! Injection rules, including the time based ones, ported from ZAP's
-//! ascanrules and ascanrulesBeta add-ons (Apache License 2.0). Each file names its ZAP class;
+//! ascanrules, ascanrulesBeta and ascanrulesAlpha add-ons (Apache License 2.0). Each file names its ZAP class;
 //! `timing` is ZAP commonlib's TimingUtils, `common` the ZAP core and
 //! commons-text behaviour the rules depend on.
 
@@ -19,8 +19,9 @@ macro_rules! sleep_token {
 mod code_injection;
 mod command_injection;
 mod command_injection_timing;
-mod common;
+pub(super) mod common;
 mod hql_injection;
+mod ldap_injection;
 mod nosql_mongodb;
 mod nosql_mongodb_timing;
 mod sql_injection;
@@ -52,6 +53,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(nosql_mongodb::MongoDbInjection),
         Box::new(nosql_mongodb_timing::MongoDbInjectionTiming),
         Box::new(hql_injection::HqlInjection),
+        Box::new(ldap_injection::LdapInjection),
     ]
 }
 
@@ -67,7 +69,9 @@ mod tests {
         let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
-            HashSet::from([40018, 40019, 40020, 40021, 40022, 40027, 40033, 90019, 90020, 90036, 90037, 90039, 100003])
+            HashSet::from([
+                40015, 40018, 40019, 40020, 40021, 40022, 40027, 40033, 90019, 90020, 90036, 90037, 90039, 100003
+            ])
         );
         let mut refs = HashSet::new();
         for r in &rules {

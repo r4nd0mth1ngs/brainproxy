@@ -1,6 +1,7 @@
-//! Active rules, ported from ZAP's ascanrules and ascanrulesBeta add-ons (Apache License 2.0).
+//! Active rules, ported from ZAP's ascanrules, ascanrulesBeta and ascanrulesAlpha add-ons (Apache License 2.0).
 
 mod crlf_injection;
+mod differential;
 pub(crate) mod env_file;
 mod injection;
 mod jwt;
@@ -48,7 +49,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rules.len(), 56, "expected all active rules");
+        assert_eq!(rules.len(), 57, "expected all active rules");
         // No active rule id collides with a passive rule id.
         let passive: HashSet<u32> = crate::scan::passive::all_rules().iter().map(|r| r.id()).collect();
         for id in &ids {
