@@ -3009,7 +3009,7 @@ Findings are records with a history, not just rows:
   reproduced" older than the finding's latest sighting is recorded but marks nothing. Only GET, HEAD and OPTIONS
   are sent unless `--allow-unsafe`. An active finding's evidence is the attack, not the request
   the scan started from, and its rule may send other methods, so it is retested by scanning
-  again: the error gives the `scan active` command. Findings added by hand are retested by
+  again: the error gives the `scan active` command, which starts from the request the attack was built from (`--history-id`), not the attack. Findings added by hand are retested by
   hand, access-control findings with `authz run`.
 - **Verify** (`findings verify ID [--repeat N] [--auth PROFILE] [--allow-unsafe] [--request FILE]`):
   sends an active finding's request without and with its payload, now, and says what differs,
