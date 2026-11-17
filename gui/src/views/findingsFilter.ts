@@ -134,9 +134,17 @@ export function eventText(e: FindingEvent): string {
       return `${e.new === "jira" ? "Jira" : "GitHub"} ticket filed${e.text ? `: ${e.text}` : ""}`;
     case "edited":
       return editedText(e);
+    case "suggested":
+      return suggestionText(e);
     default:
       return `${e.kind} ${said(e.new)}`.trim();
   }
+}
+
+/** An agent's suggestion (`findings mark --suggest`) in words: the state and note it proposes. */
+export function suggestionText(e: FindingEvent): string {
+  const parts = [e.new ? `mark it ${said(e.new)}` : "", e.text ? `note "${e.text}"` : ""].filter(Boolean);
+  return `Suggested: ${parts.join(", with the ") || "nothing"}${e.old ? ` (it was ${said(e.old)})` : ""}`;
 }
 
 /** The longest value an edit's timeline line quotes. */

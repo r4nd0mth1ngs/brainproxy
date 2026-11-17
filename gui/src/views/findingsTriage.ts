@@ -1,6 +1,7 @@
 // Triage from the keyboard in the Findings view: moving through the findings the list shows
 // and marking the open one. Kept apart from the view so it can be tested without a window.
 
+import type { FindingEvent } from "../api.ts";
 import type { ActionDef } from "../ui/actions.ts";
 
 /**
@@ -67,4 +68,47 @@ export function dropDraft(drafts: ReadonlyMap<number, string>, key: number, sent
   const next = new Map(drafts);
   next.delete(key);
   return next;
+}
+
+// An agent's suggestions (`findings mark --suggest`, timeline kind `suggested`): proposals for a
+// person to accept or dismiss. A suggestion is settled once the finding's state or note changed
+// after it (someone decided), or it was dismissed in this app.
+
+/** The suggestions still waiting on the finding, oldest first. */
+export function pendingSuggestions(events: FindingEvent[], dismissed: ReadonlySet<number>): FindingEvent[] {
+  return events.filter((e) => e.kind === "suggested" && !dismissed.has(e.id) && !events.some((l) => l.id > e.id && (l.kind === "state" || l.kind === "note")));
+}
+
+/**
+ * The command that applies a suggestion as the person's own decision: its state and note, only
+ * while the finding is still in `shown` (the state on screen), so a change made meanwhile isn't
+ * overwritten (kind conflict).
+ */
+export function acceptCommand(id: number, s: FindingEvent, shown: string): string[] | null {
+  if (!s.new && !s.text) return null;
+  return ["findings", "mark", String(id), ...(s.new ? ["--state", s.new] : []), ...(s.text ? [`--note=${s.text}`] : []), "--if-state", shown];
+}
+
+/** Most dismissed suggestions remembered per project; the oldest go first. */
+export const DISMISSED_MAX = 2000;
+
+/** Where this app remembers the suggestions dismissed in a project (this window's storage only). */
+export const dismissedKey = (project: string) => `findings.dismissedSuggestions:${project}`;
+
+/** The dismissed suggestions' event ids, from what was stored; anything else reads as none. */
+export function parseDismissed(text: string | null): Set<number> {
+  try {
+    const v: unknown = text ? JSON.parse(text) : [];
+    return new Set(Array.isArray(v) ? v.filter((n): n is number => Number.isSafeInteger(n)) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** The stored form once `id` is dismissed too. */
+export function withDismissed(set: ReadonlySet<number>, id: number): { set: Set<number>; text: string } {
+  const list = [...set.values()].filter((n) => n !== id);
+  list.push(id);
+  const kept = list.slice(-DISMISSED_MAX);
+  return { set: new Set(kept), text: JSON.stringify(kept) };
 }

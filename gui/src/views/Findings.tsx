@@ -16,6 +16,7 @@ import {
   type FindingFilter,
   narrativeCommand,
   narrativeCredit,
+  suggestionText,
   type Narrative,
   type Trail,
   trailLine,
@@ -40,7 +41,21 @@ import {
   ticketText,
   type Tracker,
 } from "./findingsFilter";
-import { afterMark, draftOf, dropDraft, NEXT_FINDING, PREVIOUS_FINDING, stepFinding, TRIAGE_KEYS, withDraft } from "./findingsTriage.ts";
+import {
+  acceptCommand,
+  afterMark,
+  dismissedKey,
+  draftOf,
+  dropDraft,
+  NEXT_FINDING,
+  parseDismissed,
+  pendingSuggestions,
+  PREVIOUS_FINDING,
+  stepFinding,
+  TRIAGE_KEYS,
+  withDismissed,
+  withDraft,
+} from "./findingsTriage.ts";
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
@@ -195,6 +210,39 @@ export function FindingsView({ active }: { active: boolean }) {
       run<Finding>(["findings", "show", String(id)]).then((f) => openId.current === id && setFinding(f), () => {});
       reloadEvents(id);
     }
+    refresh();
+  };
+
+  // An agent's suggestions: the person accepts one (as their own mark, only while the finding
+  // is still in the state on screen) or dismisses it. Dismissals are this window's to remember.
+  const dismissKey = dismissedKey(app.project);
+  const [dismissed, setDismissed] = useState<ReadonlySet<number>>(() => readDismissed(dismissKey));
+  useEffect(() => setDismissed(readDismissed(dismissKey)), [dismissKey]);
+  const suggestions = useMemo(() => pendingSuggestions(events, dismissed), [events, dismissed]);
+  const dismiss = (s: FindingEvent) => {
+    const { set, text } = withDismissed(dismissed, s.id);
+    setDismissed(set);
+    try {
+      localStorage.setItem(dismissKey, text);
+    } catch {
+      /* storage unavailable: dismissed until the app restarts */
+    }
+  };
+  const accept = async (s: FindingEvent) => {
+    if (!finding) return;
+    const id = finding.id;
+    const cmd = acceptCommand(id, s, finding.state);
+    if (!cmd) return dismiss(s);
+    if (s.text && finding.note && finding.note !== s.text) {
+      const ok = await confirm("Replace the note?", `The finding's note becomes the agent's: "${s.text}". The note it has now stays on its timeline.`, "Replace it", "Cancel");
+      if (!ok) return;
+    }
+    try {
+      await run(cmd);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    if (openId.current === id) reloadDetail(id);
     refresh();
   };
 
@@ -817,6 +865,27 @@ export function FindingsView({ active }: { active: boolean }) {
               </dl>
               {verified && verified.id === finding.id && <VerifyStrip v={verified} onDiff={() => openVerifyDiff(app, verified).catch((e) => app.toast(e.message, "error"))} />}
               {trail && trailLine(trail) && <p className={trail.reviewed_by ? "muted" : "warn-text"}>{trailLine(trail)}</p>}
+              {suggestions.map((s) => (
+                <div key={s.id} className="suggestion" role="group" aria-label="Suggestion">
+                  <p>
+                    <strong>{s.by ? `Suggested ${s.by}` : "Suggested"}</strong>
+                    <span className="muted"> · {new Date(s.time).toLocaleString()}</span>
+                  </p>
+                  <p>{suggestionText(s).replace(/^Suggested: /, "")}</p>
+                  <div className="toolbar flat">
+                    <button
+                      className="btn small"
+                      onClick={() => accept(s)}
+                      title="Mark the finding as suggested, as your own decision; refused if its state changed since you read it"
+                    >
+                      Accept
+                    </button>
+                    <button className="btn small" onClick={() => dismiss(s)} title="Hide this suggestion; nothing changes on the finding">
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))}
               {finding.issue_id != null && (
                 <>
                   <h3>Write-up</h3>
@@ -859,7 +928,7 @@ export function FindingsView({ active }: { active: boolean }) {
                   <h3>Timeline</h3>
                   <ol className="timeline">
                     {events.map((e) => (
-                      <li key={e.id}>
+                      <li key={e.id} className={e.kind === "suggested" ? "suggested" : undefined}>
                         <span className="muted">{new Date(e.time).toLocaleString()}</span> {eventText(e)}
                         {e.by && <span className="muted"> · {e.by}</span>}
                       </li>
@@ -919,6 +988,15 @@ export function FindingsView({ active }: { active: boolean }) {
       {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
     </div>
   );
+}
+
+/** The suggestions dismissed in a project, as this window's storage has them. */
+function readDismissed(key: string): Set<number> {
+  try {
+    return parseDismissed(localStorage.getItem(key));
+  } catch {
+    return new Set();
+  }
 }
 
 /** Whether two values read from the CLI are the same, so an unchanged poll doesn't render again. */
